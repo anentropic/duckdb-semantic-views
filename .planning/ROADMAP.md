@@ -29,7 +29,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. A CI smoke test loads the extension via the DuckDB CLI (not just `cargo test`) and fails the build if the extension cannot be loaded — catching ABI version mismatches
   3. A scheduled CI job builds against the latest DuckDB release and opens a GitHub PR mentioning @copilot when the build breaks
   4. All Rust code passes `rustfmt` and `clippy` (pedantic lints) — violations fail CI
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Rust extension scaffold (Cargo.toml, src/lib.rs, rustfmt, deny, Justfile, cargo-husky)
+- [ ] 01-02-PLAN.md — CI workflows and LOAD smoke test (PullRequestCI, MainDistributionPipeline, CodeQuality, SQLLogicTest)
+- [ ] 01-03-PLAN.md — Scheduled DuckDB version monitor workflow
 
 ### Phase 2: Storage and DDL
 **Goal**: Users can register, inspect, and remove semantic view definitions, and those definitions survive a DuckDB restart
@@ -83,7 +88,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Scaffold | 0/? | Not started | - |
+| 1. Scaffold | 0/3 | In progress | - |
 | 2. Storage and DDL | 0/? | Not started | - |
 | 3. Expansion Engine | 0/? | Not started | - |
 | 4. Query Interface | 0/? | Not started | - |
