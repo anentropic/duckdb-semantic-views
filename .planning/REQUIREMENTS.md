@@ -104,35 +104,35 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INFRA-01 | Phase 1 | Pending |
-| INFRA-02 | Phase 1 | Pending |
-| INFRA-03 | Phase 1 | Pending |
-| INFRA-04 | Phase 1 | Pending |
-| DDL-01 | Phase 2 | Pending |
-| DDL-02 | Phase 2 | Pending |
-| DDL-03 | Phase 2 | Pending |
-| DDL-04 | Phase 2 | Pending |
-| DDL-05 | Phase 2 | Pending |
-| MODEL-01 | Phase 3 | Pending |
-| MODEL-02 | Phase 3 | Pending |
-| MODEL-03 | Phase 3 | Pending |
-| MODEL-04 | Phase 3 | Pending |
-| EXPAND-01 | Phase 3 | Pending |
-| EXPAND-02 | Phase 3 | Pending |
-| EXPAND-03 | Phase 3 | Pending |
-| EXPAND-04 | Phase 3 | Pending |
-| QUERY-01 | Phase 4 | Pending |
-| QUERY-02 | Phase 4 | Pending |
-| QUERY-03 | Phase 4 | Pending |
-| QUERY-04 | Phase 4 | Pending |
-| TEST-01 | Phase 3 | Pending |
-| TEST-02 | Phase 3 | Pending |
-| TEST-03 | Phase 4 | Pending |
-| TEST-04 | Phase 4 | Pending |
-| TEST-05 | Phase 5 | Pending |
-| STYLE-01 | Phase 1 | Pending |
-| STYLE-02 | Phase 1 | Pending |
-| DOCS-01 | Phase 5 | Pending |
+| INFRA-01 | Phase 1 — Scaffold | Pending |
+| INFRA-02 | Phase 1 — Scaffold | Pending |
+| INFRA-03 | Phase 1 — Scaffold | Pending |
+| INFRA-04 | Phase 1 — Scaffold | Pending |
+| STYLE-01 | Phase 1 — Scaffold | Pending |
+| STYLE-02 | Phase 1 — Scaffold | Pending |
+| DDL-01 | Phase 2 — Storage and DDL | Pending |
+| DDL-02 | Phase 2 — Storage and DDL | Pending |
+| DDL-03 | Phase 2 — Storage and DDL | Pending |
+| DDL-04 | Phase 2 — Storage and DDL | Pending |
+| DDL-05 | Phase 2 — Storage and DDL | Pending |
+| MODEL-01 | Phase 3 — Expansion Engine | Pending |
+| MODEL-02 | Phase 3 — Expansion Engine | Pending |
+| MODEL-03 | Phase 3 — Expansion Engine | Pending |
+| MODEL-04 | Phase 3 — Expansion Engine | Pending |
+| EXPAND-01 | Phase 3 — Expansion Engine | Pending |
+| EXPAND-02 | Phase 3 — Expansion Engine | Pending |
+| EXPAND-03 | Phase 3 — Expansion Engine | Pending |
+| EXPAND-04 | Phase 3 — Expansion Engine | Pending |
+| TEST-01 | Phase 3 — Expansion Engine | Pending |
+| TEST-02 | Phase 3 — Expansion Engine | Pending |
+| QUERY-01 | Phase 4 — Query Interface | Pending |
+| QUERY-02 | Phase 4 — Query Interface | Pending |
+| QUERY-03 | Phase 4 — Query Interface | Pending |
+| QUERY-04 | Phase 4 — Query Interface | Pending |
+| TEST-03 | Phase 4 — Query Interface | Pending |
+| TEST-04 | Phase 4 — Query Interface | Pending |
+| TEST-05 | Phase 5 — Hardening and Docs | Pending |
+| DOCS-01 | Phase 5 — Hardening and Docs | Pending |
 
 **Coverage:**
 - v0.1 requirements: 28 total
@@ -141,4 +141,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-02-23*
-*Last updated: 2026-02-23 after initial definition*
+*Last updated: 2026-02-23 after roadmap creation*
