@@ -48,26 +48,29 @@ mod extension {
         // Initialize the catalog: creates schema/table if needed, loads existing rows.
         let catalog_state = init_catalog(&con)?;
 
-        // Resolve the database file path for use in scalar function `invoke`.
-        // `Connection` is not `Send`, so scalar functions open a fresh connection
-        // using this path when they need to write to the catalog.
+        // Resolve the host database file path by querying PRAGMA database_list.
+        // This returns rows: (seq INTEGER, name VARCHAR, file VARCHAR).
+        // The row where name = 'main' gives the host DB file path.
+        // For in-memory databases, file is an empty string — we map that to
+        // ":memory:" to preserve the existing sentinel behavior (writes to a
+        // second ":memory:" connection are ephemeral, but in-memory DBs cannot
+        // survive restart anyway, so no regression).
         //
-        // `Connection::path()` is not available in duckdb-rs 1.4.4.  We use
-        // `":memory:"` as a sentinel: the entrypoint connection for a file-backed
-        // database will have been opened with a path by the DuckDB host, but we
-        // have no ergonomic way to retrieve it here via the public API.
-        //
-        // In practice, scalar functions called from a file-backed database will
-        // open `Connection::open(":memory:")` which creates a separate in-memory
-        // database — catalog writes from inside `invoke` go to that ephemeral DB
-        // and are not visible to the host connection.  This is an accepted v0.1
-        // limitation documented in the plan.  The plan's integration tests
-        // (02-03) must be written to verify behaviour against the HashMap state
-        // (already updated inside `invoke`), not the catalog table.
-        //
-        // A future revision may resolve this by threading the path through a
-        // DuckDB configuration pragma or a named-parameter passed to the function.
-        let db_path: Arc<str> = Arc::from(":memory:");
+        // When db_path is a real file path, `invoke` in define_semantic_view
+        // and drop_semantic_view will open Connection::open(db_path) and write
+        // catalog entries to the actual host database file, satisfying DDL-05.
+        let db_path: Arc<str> = {
+            let mut stmt =
+                con.prepare("SELECT file FROM pragma_database_list() WHERE name = 'main'")?;
+            let path = stmt
+                .query_row([], |row| row.get::<_, String>(0))
+                .unwrap_or_default(); // returns "" for :memory: or on error
+            if path.is_empty() {
+                Arc::from(":memory:")
+            } else {
+                Arc::from(path.as_str())
+            }
+        };
 
         // Register scalar DDL mutation functions.
         con.register_scalar_function_with_state::<DefineSemanticView>(
