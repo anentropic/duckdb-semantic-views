@@ -7,7 +7,7 @@
 
 ### Infrastructure
 
-- [ ] **INFRA-01**: Extension scaffold is built using `duckdb/extension-template-rs` with a CMake + Cargo build system producing correctly-exported C symbols
+- [x] **INFRA-01**: Extension scaffold is built using `duckdb/extension-template-rs` with a CMake + Cargo build system producing correctly-exported C symbols
 - [x] **INFRA-02**: Multi-platform CI build matrix covers Linux x86_64/arm64, macOS x86_64/arm64, and Windows x86_64
 - [x] **INFRA-03**: Scheduled CI job builds against the latest DuckDB release; on failure, opens a GitHub PR mentioning @copilot to investigate and fix the breakage
 - [x] **INFRA-04**: CI includes a `LOAD` smoke test (not just `cargo test`) to catch DuckDB ABI version mismatches
@@ -51,8 +51,8 @@
 
 ### Code Quality
 
-- [ ] **STYLE-01**: `rustfmt` is configured with a project-level `rustfmt.toml`; formatting violations fail CI
-- [ ] **STYLE-02**: `clippy` with pedantic lints is enforced; lint violations fail CI
+- [x] **STYLE-01**: `rustfmt` is configured with a project-level `rustfmt.toml`; formatting violations fail CI
+- [x] **STYLE-02**: `clippy` with pedantic lints is enforced; lint violations fail CI
 
 ### Documentation
 
@@ -104,12 +104,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INFRA-01 | Phase 1 — Scaffold | Pending |
+| INFRA-01 | Phase 1 — Scaffold | Complete |
 | INFRA-02 | Phase 1 — Scaffold | Complete |
 | INFRA-03 | Phase 1 — Scaffold | Complete |
 | INFRA-04 | Phase 1 — Scaffold | Complete |
-| STYLE-01 | Phase 1 — Scaffold | Pending |
-| STYLE-02 | Phase 1 — Scaffold | Pending |
+| STYLE-01 | Phase 1 — Scaffold | Complete |
+| STYLE-02 | Phase 1 — Scaffold | Complete |
 | DDL-01 | Phase 2 — Storage and DDL | Pending |
 | DDL-02 | Phase 2 — Storage and DDL | Pending |
 | DDL-03 | Phase 2 — Storage and DDL | Pending |

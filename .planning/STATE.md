@@ -19,19 +19,19 @@ Progress: [███░░░░░░░] 30%
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
+- Total plans completed: 3
 - Average duration: 3 min
-- Total execution time: 5 min
+- Total execution time: 9 min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 01-scaffold | 2 | 5 min | 3 min |
+| 01-scaffold | 3 | 9 min | 3 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-03 (1 min), 01-02 (4 min)
-- Trend: Building CI infrastructure
+- Last 5 plans: 01-01 (4 min), 01-03 (1 min), 01-02 (4 min)
+- Trend: Phase 1 scaffold complete
 
 *Updated after each plan completion*
 
@@ -50,6 +50,8 @@ Recent decisions affecting current work:
 - [01-03]: Breakage PR tags @copilot for automated fix; version-bump PR does not — signals human/bot attention only when build is broken
 - [01-02]: Arch names for exclude_archs verified from extension-ci-tools/config/distribution_matrix.json — plan examples were incomplete; actual matrix has linux_arm64_musl, windows_arm64, windows_amd64_mingw not listed in RESEARCH.md
 - [01-02]: PullRequestCI excludes all non-linux_amd64 targets; MainDistributionPipeline excludes only musl, windows variants (arm64/mingw), and WASM — keeping 5 target platforms
+- [01-01]: duckdb_entrypoint_c_api is re-exported from the duckdb crate — no separate duckdb_loadable_macros dep needed in Cargo.toml; accessed as duckdb::duckdb_entrypoint_c_api
+- [01-01]: workspace.lints.clippy pedantic requires { level = "deny", priority = -1 } for individual lint overrides to take precedence; lint_groups_priority clippy lint enforces this pattern
 
 ### Pending Todos
 
@@ -63,5 +65,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 01-02-PLAN.md (CI Workflows and LOAD smoke test)
+Stopped at: Completed 01-01-PLAN.md (Rust Extension Scaffold)
 Resume file: None

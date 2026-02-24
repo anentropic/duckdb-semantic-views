@@ -164,6 +164,20 @@ None — no external service configuration required.
 - Plan 03 (load smoke test) can proceed after Plan 02 CI is in place.
 - Phase 2+ (Storage/DDL) will register functions via the `_con: Connection` parameter in `extension_entrypoint`.
 
+## Self-Check: PASSED
+
+- FOUND: Cargo.toml
+- FOUND: Cargo.lock
+- FOUND: src/lib.rs
+- FOUND: .cargo-husky/hooks/pre-commit
+- FOUND: rustfmt.toml
+- FOUND: deny.toml
+- FOUND: Justfile
+- FOUND: CHANGELOG.md
+- FOUND: .planning/phases/01-scaffold/01-01-SUMMARY.md
+- FOUND: commit 93bdc9d (feat: initialize Rust extension scaffold)
+- FOUND: commit 251b6af (feat: add code quality tools and fix clippy pedantic violations)
+
 ---
 *Phase: 01-scaffold*
 *Completed: 2026-02-24*
