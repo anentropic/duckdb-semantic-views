@@ -158,4 +158,287 @@ mod tests {
             assert_eq!(quote_ident("my table"), "\"my table\"");
         }
     }
+
+    mod expand_tests {
+        use super::*;
+        use crate::model::{Dimension, Join, Metric, SemanticViewDefinition};
+
+        /// Helper to build a simple orders view definition.
+        fn orders_view() -> SemanticViewDefinition {
+            SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![
+                    Dimension {
+                        name: "region".to_string(),
+                        expr: "region".to_string(),
+                        source_table: None,
+                    },
+                    Dimension {
+                        name: "status".to_string(),
+                        expr: "status".to_string(),
+                        source_table: None,
+                    },
+                ],
+                metrics: vec![
+                    Metric {
+                        name: "total_revenue".to_string(),
+                        expr: "sum(amount)".to_string(),
+                        source_table: None,
+                    },
+                    Metric {
+                        name: "order_count".to_string(),
+                        expr: "count(*)".to_string(),
+                        source_table: None,
+                    },
+                ],
+                filters: vec![],
+                joins: vec![],
+            }
+        }
+
+        #[test]
+        fn test_basic_single_dimension_single_metric() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+WITH \"_base\" AS (
+    SELECT *
+    FROM \"orders\"
+)
+SELECT
+    region AS \"region\",
+    sum(amount) AS \"total_revenue\"
+FROM \"_base\"
+GROUP BY
+    region";
+            assert_eq!(sql, expected);
+        }
+
+        #[test]
+        fn test_multiple_dimensions_multiple_metrics() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string(), "status".to_string()],
+                metrics: vec!["total_revenue".to_string(), "order_count".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+WITH \"_base\" AS (
+    SELECT *
+    FROM \"orders\"
+)
+SELECT
+    region AS \"region\",
+    status AS \"status\",
+    sum(amount) AS \"total_revenue\",
+    count(*) AS \"order_count\"
+FROM \"_base\"
+GROUP BY
+    region,
+    status";
+            assert_eq!(sql, expected);
+        }
+
+        #[test]
+        fn test_global_aggregate_no_dimensions() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+WITH \"_base\" AS (
+    SELECT *
+    FROM \"orders\"
+)
+SELECT
+    sum(amount) AS \"total_revenue\"
+FROM \"_base\"";
+            assert_eq!(sql, expected);
+        }
+
+        #[test]
+        fn test_filters_and_composed() {
+            let mut def = orders_view();
+            def.filters = vec![
+                "status = 'completed'".to_string(),
+                "amount > 100".to_string(),
+            ];
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+WITH \"_base\" AS (
+    SELECT *
+    FROM \"orders\"
+    WHERE (status = 'completed') AND (amount > 100)
+)
+SELECT
+    region AS \"region\",
+    sum(amount) AS \"total_revenue\"
+FROM \"_base\"
+GROUP BY
+    region";
+            assert_eq!(sql, expected);
+        }
+
+        #[test]
+        fn test_single_filter() {
+            let mut def = orders_view();
+            def.filters = vec!["status = 'completed'".to_string()];
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+WITH \"_base\" AS (
+    SELECT *
+    FROM \"orders\"
+    WHERE (status = 'completed')
+)
+SELECT
+    region AS \"region\",
+    sum(amount) AS \"total_revenue\"
+FROM \"_base\"
+GROUP BY
+    region";
+            assert_eq!(sql, expected);
+        }
+
+        #[test]
+        fn test_identifier_quoting() {
+            let def = SemanticViewDefinition {
+                base_table: "select".to_string(),
+                dimensions: vec![Dimension {
+                    name: "col".to_string(),
+                    expr: "col".to_string(),
+                    source_table: None,
+                }],
+                metrics: vec![Metric {
+                    name: "cnt".to_string(),
+                    expr: "count(*)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["col".to_string()],
+                metrics: vec!["cnt".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            // Base table "select" must be quoted, CTE name is always "_base" quoted
+            assert!(sql.contains("FROM \"select\""));
+            assert!(sql.contains("\"_base\""));
+        }
+
+        #[test]
+        fn test_dimension_expression_not_quoted() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "month".to_string(),
+                    expr: "date_trunc('month', created_at)".to_string(),
+                    source_table: None,
+                }],
+                metrics: vec![Metric {
+                    name: "total_revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["month".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            // Expression appears verbatim in both SELECT and GROUP BY (not quoted)
+            assert!(sql.contains("date_trunc('month', created_at) AS \"month\""));
+            assert!(sql.contains("GROUP BY\n    date_trunc('month', created_at)"));
+        }
+
+        #[test]
+        fn test_empty_metrics_error() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec![],
+            };
+            let result = expand("orders", &def, &req);
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                ExpandError::EmptyMetrics { view_name } => {
+                    assert_eq!(view_name, "orders");
+                }
+                other => panic!("Expected EmptyMetrics, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_case_insensitive_dimension_lookup() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "Region".to_string(),
+                    expr: "region".to_string(),
+                    source_table: None,
+                }],
+                metrics: vec![Metric {
+                    name: "total_revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![],
+            };
+            // Request uses lowercase "region" but definition has "Region"
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            // Should succeed and use the definition's expression
+            assert!(sql.contains("region AS \"Region\""));
+            assert!(sql.contains("GROUP BY\n    region"));
+        }
+
+        #[test]
+        fn test_joins_included_in_cte() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "region".to_string(),
+                    source_table: None,
+                }],
+                metrics: vec![Metric {
+                    name: "total_revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "customers".to_string(),
+                    on: "orders.customer_id = customers.id".to_string(),
+                }],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            // For Plan 01, all declared joins are included (join pruning is Plan 02)
+            assert!(sql.contains("JOIN \"customers\" ON orders.customer_id = customers.id"));
+        }
+    }
 }
