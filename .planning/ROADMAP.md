@@ -46,12 +46,13 @@ Plans:
   3. `FROM list_semantic_views()` returns a row for every registered semantic view
   4. `FROM describe_semantic_view('orders')` returns the structured definition fields (name, dimensions, metrics, base table, filters)
   5. After closing and reopening the DuckDB file, all previously registered semantic views are available — definitions survive a restart
-**Plans**: 3 plans
+**Plans**: 4 plans
 
 Plans:
 - [ ] 02-01-PLAN.md — SemanticViewDefinition model, serde_json dep, CatalogState, init_catalog, catalog_insert, catalog_delete
 - [ ] 02-02-PLAN.md — VScalar DDL functions (define, drop) + VTab functions (list, describe) + entrypoint wiring
 - [ ] 02-03-PLAN.md — SQL logic test for full DDL round-trip including persistence (DDL-05)
+- [ ] 02-04-PLAN.md — Gap closure: fix DDL-05 by resolving host DB path via PRAGMA database_list; add restart SQLLogicTest section
 
 ### Phase 3: Expansion Engine
 **Goal**: The expansion engine correctly generates SQL for all metric types, single-hop joins, GROUP BY inference, row filter composition, and identifier quoting — verified by unit and property tests against known-answer datasets
@@ -94,7 +95,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Scaffold | 3/3 | Complete | 2026-02-24 |
-| 2. Storage and DDL | 3/3 | Complete | 2026-02-24 |
+| 2. Storage and DDL | 3/4 | Gap closure in progress | - |
 | 3. Expansion Engine | 0/? | Not started | - |
 | 4. Query Interface | 0/? | Not started | - |
 | 5. Hardening and Docs | 0/? | Not started | - |
