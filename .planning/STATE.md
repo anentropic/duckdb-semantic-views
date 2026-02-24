@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-02-23)
 ## Current Position
 
 Phase: 3 of 5 (Expansion Engine)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-02-25 — Completed plan 03-01 (Core Expansion Engine)
+Last activity: 2026-02-25 — Completed plan 03-02 (Join Resolution and Fuzzy Matching)
 
-Progress: [██████░░░░] 63%
+Progress: [███████░░░] 73%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6
+- Total plans completed: 7
 - Average duration: 5 min
-- Total execution time: 36 min
+- Total execution time: 40 min
 
 **By Phase:**
 
@@ -29,11 +29,11 @@ Progress: [██████░░░░] 63%
 |-------|-------|-------|----------|
 | 01-scaffold | 3 | 9 min | 3 min |
 | 02-storage-and-ddl | 4 | 35 min | 9 min |
-| 03-expansion-engine | 1 | 4 min | 4 min |
+| 03-expansion-engine | 2 | 8 min | 4 min |
 
 **Recent Trend:**
-- Last 5 plans: 02-01 (18 min), 02-02 (5 min), 02-03 (7 min), 02-04 (5 min), 03-01 (4 min)
-- Trend: Phase 3 started; core expand() function with 14 unit tests via TDD in 4 min
+- Last 5 plans: 02-02 (5 min), 02-03 (7 min), 02-04 (5 min), 03-01 (4 min), 03-02 (4 min)
+- Trend: Consistent 4 min/plan for Phase 3 TDD; join resolution + fuzzy matching in same velocity as core expand
 
 *Updated after each plan completion*
 
@@ -44,6 +44,10 @@ Progress: [██████░░░░] 63%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [03-02]: levenshtein-threshold-3: fuzzy "did you mean" suggestions use strsim Levenshtein distance with threshold <= 3; balances helpfulness vs false positives
+- [03-02]: on-clause-substring-matching: transitive join dependency detection uses substring check on ON clause; sufficient heuristic for v0.1 where users declare joins in dependency order
+- [03-02]: fixed-point-join-resolution: resolve_joins uses a fixed-point loop for transitive convergence; handles arbitrary chain depth
+- [03-02]: source-table-join-pruning: only joins whose table matches a source_table from requested dims/metrics are included; replaces Plan 01 "include all joins" behavior
 - [03-01]: all-joins-included: Plan 01 includes all declared joins in the base CTE; join pruning based on source_table deferred to Plan 02
 - [03-01]: case-insensitive-names: dimension/metric name lookup uses eq_ignore_ascii_case for DuckDB compatibility; definition name "Region" matches request "region"
 - [03-01]: expressions-verbatim: dimension expr, metric expr, filter strings, and join ON clauses are emitted as raw SQL; only engine-generated identifiers (table names, aliases, CTE name) are double-quoted
@@ -87,5 +91,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-25
-Stopped at: Completed 03-01-PLAN.md (Core Expansion Engine) — expand() function with CTE-wrapped SQL generation and 14 unit tests
+Stopped at: Completed 03-02-PLAN.md (Join Resolution and Fuzzy Matching) — join pruning, transitive resolution, strsim fuzzy suggestions, 27 expand tests
 Resume file: None

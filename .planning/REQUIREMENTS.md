@@ -24,7 +24,7 @@
 
 - [x] **MODEL-01**: User can define named dimensions as arbitrary SQL column expressions (e.g., `region`, `date_trunc('month', created_at) AS month`)
 - [x] **MODEL-02**: User can define named metrics as aggregation expressions (e.g., `sum(revenue) AS total_revenue`, `count(*) AS orders`, `count(DISTINCT user_id) AS unique_users`)
-- [ ] **MODEL-03**: User can specify a base table and define explicit JOIN relationships between multiple source entities
+- [x] **MODEL-03**: User can specify a base table and define explicit JOIN relationships between multiple source entities
 - [x] **MODEL-04**: User can define row-level filter conditions that are always applied when the view is queried
 
 ### Query Interface
@@ -37,8 +37,8 @@
 ### Expansion Engine
 
 - [x] **EXPAND-01**: Extension automatically generates a `GROUP BY` clause containing all requested dimensions
-- [ ] **EXPAND-02**: Extension infers `JOIN` clauses from the entity relationships defined in the semantic view
-- [ ] **EXPAND-03**: Extension validates dimension and metric names at query time; invalid member names produce a clear error identifying the semantic view and the unknown member name
+- [x] **EXPAND-02**: Extension infers `JOIN` clauses from the entity relationships defined in the semantic view
+- [x] **EXPAND-03**: Extension validates dimension and metric names at query time; invalid member names produce a clear error identifying the semantic view and the unknown member name
 - [x] **EXPAND-04**: All generated SQL identifiers are quoted to prevent reserved-word conflicts and SQL injection via user-supplied view and column names
 
 ### Test Coverage
@@ -117,11 +117,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DDL-05 | Phase 2 — Storage and DDL | Complete |
 | MODEL-01 | Phase 3 — Expansion Engine | Complete |
 | MODEL-02 | Phase 3 — Expansion Engine | Complete |
-| MODEL-03 | Phase 3 — Expansion Engine | Pending |
+| MODEL-03 | Phase 3 — Expansion Engine | Complete |
 | MODEL-04 | Phase 3 — Expansion Engine | Complete |
 | EXPAND-01 | Phase 3 — Expansion Engine | Complete |
-| EXPAND-02 | Phase 3 — Expansion Engine | Pending |
-| EXPAND-03 | Phase 3 — Expansion Engine | Pending |
+| EXPAND-02 | Phase 3 — Expansion Engine | Complete |
+| EXPAND-03 | Phase 3 — Expansion Engine | Complete |
 | EXPAND-04 | Phase 3 — Expansion Engine | Complete |
 | TEST-01 | Phase 3 — Expansion Engine | Complete |
 | TEST-02 | Phase 3 — Expansion Engine | Pending |
