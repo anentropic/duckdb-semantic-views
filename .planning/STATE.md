@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-23)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 2 — Storage and DDL
+**Current focus:** Phase 3 — Expansion Engine
 
 ## Current Position
 
-Phase: 2 of 5 (Storage and DDL)
-Plan: 4 of 4 in current phase
-Status: Phase complete
-Last activity: 2026-02-24 — Completed plan 02-04 (DDL-05 Gap Closure)
+Phase: 3 of 5 (Expansion Engine)
+Plan: 1 of 3 in current phase
+Status: In progress
+Last activity: 2026-02-25 — Completed plan 03-01 (Core Expansion Engine)
 
-Progress: [██████░░░░] 60%
+Progress: [██████░░░░] 63%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5
+- Total plans completed: 6
 - Average duration: 5 min
-- Total execution time: 32 min
+- Total execution time: 36 min
 
 **By Phase:**
 
@@ -29,10 +29,11 @@ Progress: [██████░░░░] 60%
 |-------|-------|-------|----------|
 | 01-scaffold | 3 | 9 min | 3 min |
 | 02-storage-and-ddl | 4 | 35 min | 9 min |
+| 03-expansion-engine | 1 | 4 min | 4 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (4 min), 02-01 (18 min), 02-02 (5 min), 02-03 (7 min), 02-04 (5 min)
-- Trend: Phase 2 fully complete with DDL-05 gap closure; sidecar persistence enables cross-restart survival
+- Last 5 plans: 02-01 (18 min), 02-02 (5 min), 02-03 (7 min), 02-04 (5 min), 03-01 (4 min)
+- Trend: Phase 3 started; core expand() function with 14 unit tests via TDD in 4 min
 
 *Updated after each plan completion*
 
@@ -43,6 +44,10 @@ Progress: [██████░░░░] 60%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [03-01]: all-joins-included: Plan 01 includes all declared joins in the base CTE; join pruning based on source_table deferred to Plan 02
+- [03-01]: case-insensitive-names: dimension/metric name lookup uses eq_ignore_ascii_case for DuckDB compatibility; definition name "Region" matches request "region"
+- [03-01]: expressions-verbatim: dimension expr, metric expr, filter strings, and join ON clauses are emitted as raw SQL; only engine-generated identifiers (table names, aliases, CTE name) are double-quoted
+- [03-01]: fuzzy-suggestions-deferred: ExpandError suggestion field is None for Plan 01; strsim-based fuzzy matching added in Plan 02
 - [02-04]: sidecar-persistence: invoke cannot execute DuckDB SQL (execution locks deadlock); sidecar file (<db>.semantic_views) written with plain fs I/O bridges the gap; init_catalog reads sidecar on next load and syncs into DuckDB table
 - [02-04]: pragma-database-list-path: entrypoint queries PRAGMA database_list to resolve the host DB file path; takes first row with non-empty file (not filtered by name='main' because Python DuckDB names DBs by filename stem)
 - [02-04]: atomic-rename-write: sidecar writes use write-to-tmp-then-rename pattern for POSIX atomicity
@@ -81,6 +86,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-24
-Stopped at: Completed 02-04-PLAN.md (DDL-05 Gap Closure) — Phase 2 fully complete with all 5 DDL requirements met
+Last session: 2026-02-25
+Stopped at: Completed 03-01-PLAN.md (Core Expansion Engine) — expand() function with CTE-wrapped SQL generation and 14 unit tests
 Resume file: None

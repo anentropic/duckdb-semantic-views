@@ -22,10 +22,10 @@
 
 ### Semantic Model
 
-- [ ] **MODEL-01**: User can define named dimensions as arbitrary SQL column expressions (e.g., `region`, `date_trunc('month', created_at) AS month`)
-- [ ] **MODEL-02**: User can define named metrics as aggregation expressions (e.g., `sum(revenue) AS total_revenue`, `count(*) AS orders`, `count(DISTINCT user_id) AS unique_users`)
+- [x] **MODEL-01**: User can define named dimensions as arbitrary SQL column expressions (e.g., `region`, `date_trunc('month', created_at) AS month`)
+- [x] **MODEL-02**: User can define named metrics as aggregation expressions (e.g., `sum(revenue) AS total_revenue`, `count(*) AS orders`, `count(DISTINCT user_id) AS unique_users`)
 - [ ] **MODEL-03**: User can specify a base table and define explicit JOIN relationships between multiple source entities
-- [ ] **MODEL-04**: User can define row-level filter conditions that are always applied when the view is queried
+- [x] **MODEL-04**: User can define row-level filter conditions that are always applied when the view is queried
 
 ### Query Interface
 
@@ -36,14 +36,14 @@
 
 ### Expansion Engine
 
-- [ ] **EXPAND-01**: Extension automatically generates a `GROUP BY` clause containing all requested dimensions
+- [x] **EXPAND-01**: Extension automatically generates a `GROUP BY` clause containing all requested dimensions
 - [ ] **EXPAND-02**: Extension infers `JOIN` clauses from the entity relationships defined in the semantic view
 - [ ] **EXPAND-03**: Extension validates dimension and metric names at query time; invalid member names produce a clear error identifying the semantic view and the unknown member name
-- [ ] **EXPAND-04**: All generated SQL identifiers are quoted to prevent reserved-word conflicts and SQL injection via user-supplied view and column names
+- [x] **EXPAND-04**: All generated SQL identifiers are quoted to prevent reserved-word conflicts and SQL injection via user-supplied view and column names
 
 ### Test Coverage
 
-- [ ] **TEST-01**: Unit tests cover the expansion engine (GROUP BY inference, JOIN generation, SQL emission) without requiring a DuckDB runtime
+- [x] **TEST-01**: Unit tests cover the expansion engine (GROUP BY inference, JOIN generation, SQL emission) without requiring a DuckDB runtime
 - [ ] **TEST-02**: Property-based tests (using `proptest`) cover expansion engine invariants: all requested dimensions appear in GROUP BY, emitted SQL is syntactically valid
 - [ ] **TEST-03**: Integration tests load the extension in-process, create semantic views, run real DuckDB SQL queries, and assert correct results
 - [ ] **TEST-04**: Integration test suite includes at least one test scenario using an Apache Iceberg table source
@@ -115,15 +115,15 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DDL-03 | Phase 2 — Storage and DDL | Complete |
 | DDL-04 | Phase 2 — Storage and DDL | Complete |
 | DDL-05 | Phase 2 — Storage and DDL | Complete |
-| MODEL-01 | Phase 3 — Expansion Engine | Pending |
-| MODEL-02 | Phase 3 — Expansion Engine | Pending |
+| MODEL-01 | Phase 3 — Expansion Engine | Complete |
+| MODEL-02 | Phase 3 — Expansion Engine | Complete |
 | MODEL-03 | Phase 3 — Expansion Engine | Pending |
-| MODEL-04 | Phase 3 — Expansion Engine | Pending |
-| EXPAND-01 | Phase 3 — Expansion Engine | Pending |
+| MODEL-04 | Phase 3 — Expansion Engine | Complete |
+| EXPAND-01 | Phase 3 — Expansion Engine | Complete |
 | EXPAND-02 | Phase 3 — Expansion Engine | Pending |
 | EXPAND-03 | Phase 3 — Expansion Engine | Pending |
-| EXPAND-04 | Phase 3 — Expansion Engine | Pending |
-| TEST-01 | Phase 3 — Expansion Engine | Pending |
+| EXPAND-04 | Phase 3 — Expansion Engine | Complete |
+| TEST-01 | Phase 3 — Expansion Engine | Complete |
 | TEST-02 | Phase 3 — Expansion Engine | Pending |
 | QUERY-01 | Phase 4 — Query Interface | Pending |
 | QUERY-02 | Phase 4 — Query Interface | Pending |
