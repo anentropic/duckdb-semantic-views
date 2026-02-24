@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-23)
 ## Current Position
 
 Phase: 2 of 5 (Storage and DDL)
-Plan: 1 of 3 in current phase
+Plan: 2 of 3 in current phase
 Status: In progress
-Last activity: 2026-02-24 — Completed plan 02-01 (Data Model and Catalog Foundation)
+Last activity: 2026-02-24 — Completed plan 02-02 (DDL Function Implementations)
 
-Progress: [████░░░░░░] 40%
+Progress: [█████░░░░░] 50%
 
 ## Performance Metrics
 
@@ -28,11 +28,11 @@ Progress: [████░░░░░░] 40%
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-scaffold | 3 | 9 min | 3 min |
-| 02-storage-and-ddl | 1 | 18 min | 18 min |
+| 02-storage-and-ddl | 2 | 23 min | 11.5 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (4 min), 01-03 (1 min), 01-02 (4 min), 02-01 (18 min)
-- Trend: Phase 2 plan 1 complete; catalog foundation in place
+- Last 5 plans: 01-03 (1 min), 01-02 (4 min), 01-01 (4 min), 02-01 (18 min), 02-02 (5 min)
+- Trend: Phase 2 plan 2 complete; all four DDL functions registered in extension entrypoint
 
 *Updated after each plan completion*
 
@@ -43,6 +43,10 @@ Progress: [████░░░░░░] 40%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [02-02]: Connection::path() not available in duckdb-rs 1.4.4 — scalar invoke opens Connection::open(":memory:") as sentinel; catalog writes from invoke go to a separate ephemeral DB; HashMap state is always correct; integration tests must verify via list/describe, not semantic_layer._definitions
+- [02-02]: DDL module gated behind #[cfg(feature = "extension")] — duckdb::vscalar and duckdb::vtab not available under bundled default feature; entire src/ddl/ excluded from cargo test compilation
+- [02-02]: register_table_function_with_extra_info requires two type params <T, E> — use ::<VTabType, _> turbofish; Rust infers E from the extra_info value
+- [02-02]: #[allow(clippy::needless_pass_by_value)] on extension_entrypoint — duckdb_entrypoint_c_api macro requires con: Connection by value for FFI bridge ownership transfer
 - [02-01]: Cargo feature split for testable DuckDB extensions: `default=["duckdb/bundled"]` enables `cargo test` with Connection::open_in_memory(); `extension=["duckdb/loadable-extension","duckdb/vscalar"]` used by Makefile for cdylib builds with --no-default-features --features extension
 - [02-01]: duckdb/loadable-extension replaces all C API calls with function-pointer stubs initialized by DuckDB at load time — standalone test binaries cannot use these stubs; bundled feature resolves this without workspace restructuring
 - [02-01]: Write-catalog-first pattern: catalog_insert/catalog_delete write to semantic_layer._definitions before updating HashMap; error propagates via ? preventing HashMap/catalog drift
@@ -71,5 +75,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 02-01-PLAN.md (Data Model and Catalog Foundation)
+Stopped at: Completed 02-02-PLAN.md (DDL Function Implementations)
 Resume file: None

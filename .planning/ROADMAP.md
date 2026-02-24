@@ -94,7 +94,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Scaffold | 2/3 | In Progress|  |
-| 2. Storage and DDL | 1/3 | In Progress|  |
+| 2. Storage and DDL | 2/3 | In Progress|  |
 | 3. Expansion Engine | 0/? | Not started | - |
 | 4. Query Interface | 0/? | Not started | - |
 | 5. Hardening and Docs | 0/? | Not started | - |
