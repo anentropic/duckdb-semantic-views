@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-23)
 ## Current Position
 
 Phase: 2 of 5 (Storage and DDL)
-Plan: 2 of 3 in current phase
-Status: In progress
-Last activity: 2026-02-24 — Completed plan 02-02 (DDL Function Implementations)
+Plan: 3 of 3 in current phase
+Status: Phase complete
+Last activity: 2026-02-24 — Completed plan 02-03 (DDL SQL Logic Test)
 
-Progress: [█████░░░░░] 50%
+Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
@@ -28,11 +28,11 @@ Progress: [█████░░░░░] 50%
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-scaffold | 3 | 9 min | 3 min |
-| 02-storage-and-ddl | 2 | 23 min | 11.5 min |
+| 02-storage-and-ddl | 3 | 30 min | 10 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-03 (1 min), 01-02 (4 min), 01-01 (4 min), 02-01 (18 min), 02-02 (5 min)
-- Trend: Phase 2 plan 2 complete; all four DDL functions registered in extension entrypoint
+- Last 5 plans: 01-02 (4 min), 01-01 (4 min), 02-01 (18 min), 02-02 (5 min), 02-03 (7 min)
+- Trend: Phase 2 complete; DDL functions verified end-to-end via SQLLogicTest; two catalog bugs fixed
 
 *Updated after each plan completion*
 
@@ -43,6 +43,10 @@ Progress: [█████░░░░░] 50%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [02-03]: init_catalog-before-write: any code path that opens a fresh Connection::open() must call init_catalog() before catalog writes — the fresh connection starts with no schema/table
+- [02-03]: HashMap is truth for catalog_delete: removed rows_affected == 0 check; ephemeral :memory: DB DELETE always returns 0 rows; contains_key() guard is authoritative
+- [02-03]: serde_json serializes JSON object keys alphabetically (expr before name) — integration test expected values must match this order
+- [02-03]: test-sql recipe delegates to make test_debug (Python duckdb_sqllogictest runner); no standalone DuckDB CLI available locally; SQLLogicTest format in test/sql/ picked up automatically
 - [02-02]: Connection::path() not available in duckdb-rs 1.4.4 — scalar invoke opens Connection::open(":memory:") as sentinel; catalog writes from invoke go to a separate ephemeral DB; HashMap state is always correct; integration tests must verify via list/describe, not semantic_layer._definitions
 - [02-02]: DDL module gated behind #[cfg(feature = "extension")] — duckdb::vscalar and duckdb::vtab not available under bundled default feature; entire src/ddl/ excluded from cargo test compilation
 - [02-02]: register_table_function_with_extra_info requires two type params <T, E> — use ::<VTabType, _> turbofish; Rust infers E from the extra_info value
@@ -75,5 +79,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 02-02-PLAN.md (DDL Function Implementations)
+Stopped at: Completed 02-03-PLAN.md (DDL SQL Logic Test) — Phase 2 complete
 Resume file: None
