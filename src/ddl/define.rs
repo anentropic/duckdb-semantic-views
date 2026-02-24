@@ -1,33 +1,27 @@
-use std::sync::Arc;
-
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     vscalar::{ScalarFunctionSignature, VScalar},
     vtab::arrow::WritableVector,
-    Connection,
 };
 use libduckdb_sys::duckdb_string_t;
 
-use crate::catalog::{catalog_insert, init_catalog, CatalogState};
+use crate::catalog::{CatalogState, CatalogWriterHandle};
+use crate::model::SemanticViewDefinition;
 
-/// Shared state for `define_semantic_view`: the in-memory catalog plus the
-/// database file path needed to open a connection for catalog writes.
+/// Shared state for `define_semantic_view`: the in-memory catalog plus an optional
+/// handle to the background catalog writer thread.
 ///
-/// `Connection` is not `Send + Sync`, so it cannot be stored in `VScalar::State`.
-/// Instead, we store the file path and open a fresh `Connection` per invocation.
+/// `writer` is `None` for in-memory databases — the [`CatalogState`] `HashMap` is the
+/// sole source of truth for the session, which is correct (in-memory DBs cannot
+/// survive restart anyway).
 ///
-/// For in-memory databases (the test sentinel path `":memory:"`), a fresh
-/// `Connection::open(":memory:")` creates a *separate* database — catalog writes
-/// from inside `invoke` will therefore be to a different DB than the one that
-/// registered the function.  The `catalog_insert` call will still succeed
-/// (because `init_catalog` is called on the new connection too), but the write
-/// will not be visible to the original connection.  This is an accepted v0.1
-/// limitation: integration tests that exercise `define_semantic_view` must use a
-/// file-backed database.
+/// For file-backed databases, `writer` holds a [`CatalogWriterHandle`] that sends
+/// INSERT ops to a background thread owning its own `Connection::open(db_path)`.
+/// This avoids executing SQL from within `invoke` while `DuckDB` holds internal locks.
 #[derive(Clone)]
 pub struct DefineState {
     pub catalog: CatalogState,
-    pub db_path: Arc<str>,
+    pub writer: Option<CatalogWriterHandle>,
 }
 
 pub struct DefineSemanticView;
@@ -64,17 +58,38 @@ impl VScalar for DefineSemanticView {
                 .as_str()
                 .to_string();
 
-            // Open a fresh connection to the same database file for catalog writes.
-            // `Connection` is not `Send`, so it cannot be stored in state.
+            // 1. Validate JSON — fail fast before touching any state.
+            SemanticViewDefinition::from_json(&name, &json)
+                .map_err(Box::<dyn std::error::Error>::from)?;
+
+            // 2. Check for duplicate in the in-memory catalog.
+            {
+                let guard = state.catalog.read().unwrap();
+                if guard.contains_key(&name) {
+                    return Err(format!(
+                        "semantic view '{name}' already exists; \
+                         call drop_semantic_view first"
+                    )
+                    .into());
+                }
+            }
+
+            // 3. Persist to `semantic_layer._definitions` via background writer thread.
+            //    For in-memory databases (writer is None) we skip persistence — the
+            //    HashMap below is the sole source of truth for the session.
             //
-            // The fresh connection starts with an empty catalog, so we call
-            // `init_catalog` to ensure the schema and table exist before writing.
-            // `init_catalog` is idempotent (`CREATE IF NOT EXISTS`) and also
-            // loads existing rows — the return value (the HashMap) is discarded
-            // here because the shared `CatalogState` is the source of truth.
-            let con = Connection::open(state.db_path.as_ref())?;
-            init_catalog(&con)?;
-            catalog_insert(&con, &state.catalog, &name, &json)?;
+            //    The writer blocks until the background thread confirms the INSERT is
+            //    committed, so the row is durable before we update the HashMap.
+            if let Some(ref writer) = state.writer {
+                writer.insert(&name, &json)?;
+            }
+
+            // 4. Update the in-memory catalog after successful persist.
+            state
+                .catalog
+                .write()
+                .unwrap()
+                .insert(name.clone(), json.clone());
 
             let msg = format!("Semantic view '{name}' registered successfully");
             out.insert(i, msg.as_str());

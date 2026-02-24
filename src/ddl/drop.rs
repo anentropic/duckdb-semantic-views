@@ -1,24 +1,19 @@
-use std::sync::Arc;
-
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     vscalar::{ScalarFunctionSignature, VScalar},
     vtab::arrow::WritableVector,
-    Connection,
 };
 use libduckdb_sys::duckdb_string_t;
 
-use crate::catalog::{catalog_delete, init_catalog, CatalogState};
+use crate::catalog::{CatalogState, CatalogWriterHandle};
 
 /// Shared state for `drop_semantic_view`.
-///
-/// Stores the catalog `HashMap` and the database file path for opening a fresh
-/// `Connection` inside `invoke` (see [`crate::ddl::define::DefineState`] for the
-/// full explanation of why a path is stored instead of a `Connection`).
+/// See [`crate::ddl::define::DefineState`] for the full explanation of the
+/// `Option<CatalogWriterHandle>` pattern.
 #[derive(Clone)]
 pub struct DropState {
     pub catalog: CatalogState,
-    pub db_path: Arc<str>,
+    pub writer: Option<CatalogWriterHandle>,
 }
 
 pub struct DropSemanticView;
@@ -49,12 +44,23 @@ impl VScalar for DropSemanticView {
                 .as_str()
                 .to_string();
 
-            // Open a fresh connection to the same database file for catalog writes.
-            // `init_catalog` is called first to ensure schema and table exist on
-            // the fresh connection before attempting the delete.
-            let con = Connection::open(state.db_path.as_ref())?;
-            init_catalog(&con)?;
-            catalog_delete(&con, &state.catalog, &name)?;
+            // 1. Check the view exists in the in-memory catalog.
+            {
+                let guard = state.catalog.read().unwrap();
+                if !guard.contains_key(&name) {
+                    return Err(
+                        format!("semantic view '{name}' does not exist").into()
+                    );
+                }
+            }
+
+            // 2. Persist the DELETE via background writer thread (file-backed only).
+            if let Some(ref writer) = state.writer {
+                writer.delete(&name)?;
+            }
+
+            // 3. Remove from in-memory catalog after successful persist.
+            state.catalog.write().unwrap().remove(&name);
 
             let msg = format!("Semantic view '{name}' removed successfully");
             out.insert(i, msg.as_str());

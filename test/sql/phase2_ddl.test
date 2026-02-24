@@ -141,3 +141,42 @@ query I
 SELECT count(*) FROM list_semantic_views();
 ----
 0
+
+# ============================================================
+# 10. DDL-05: persistence across restart
+#
+# define_semantic_view writes catalog entries to the host DB file via
+# Connection::open(db_path), where db_path is resolved from
+# pragma_database_list() in the extension entrypoint.
+#
+# The test runner starts with an in-memory DB. We use `load` to switch
+# to a file-backed database so that catalog entries can survive restart.
+# After `restart`, the runner reopens the same file and reloads the
+# semantic_views extension; init_catalog reads semantic_layer._definitions
+# and the restart_test view must be present in the returned catalog.
+# ============================================================
+
+load __TEST_DIR__/restart_test.db
+
+# Define a view in the file-backed database
+statement ok
+SELECT define_semantic_view(
+    'restart_test',
+    '{"base_table":"events","dimensions":[{"name":"type","expr":"type"}],"metrics":[{"name":"n","expr":"count(*)"}]}'
+);
+
+# Verify it is present before restart
+query TT rowsort
+SELECT name, base_table FROM list_semantic_views();
+----
+restart_test	events
+
+restart
+
+# After restart the extension is reloaded automatically; init_catalog reads
+# semantic_layer._definitions from the file-backed DB. The view defined before
+# restart must be present in the catalog.
+query TT rowsort
+SELECT name, base_table FROM list_semantic_views();
+----
+restart_test	events
