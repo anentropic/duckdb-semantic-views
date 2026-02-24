@@ -48,6 +48,22 @@ fmt:
 coverage:
     cargo llvm-cov nextest --fail-under-lines 80
 
+# Run SQL logic tests for Phase 2 DDL via the SQLLogicTest runner.
+#
+# There is no standalone DuckDB CLI available in this project; SQL logic tests
+# are run via the Python-based duckdb_sqllogictest runner (installed by
+# `make configure` into configure/venv).  This recipe builds the debug extension
+# and delegates to `make test_debug`, which invokes the runner against the full
+# test/sql/ directory.  All files matching test/sql/**/*.test are executed.
+#
+# The test/sql/phase2_ddl.test file exercises the full DDL round-trip:
+#   define_semantic_view, list_semantic_views, describe_semantic_view, drop_semantic_view.
+test-sql: build
+    make test_debug
+
+# Run all tests: Rust unit tests + SQL logic tests (via SQLLogicTest runner)
+test-all: test-rust test-sql
+
 # Clean build artifacts
 clean:
     make clean
