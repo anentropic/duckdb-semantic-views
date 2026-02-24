@@ -10,29 +10,29 @@ See: .planning/PROJECT.md (updated 2026-02-23)
 ## Current Position
 
 Phase: 2 of 5 (Storage and DDL)
-Plan: 3 of 3 in current phase
+Plan: 4 of 4 in current phase
 Status: Phase complete
-Last activity: 2026-02-24 — Completed plan 02-03 (DDL SQL Logic Test)
+Last activity: 2026-02-24 — Completed plan 02-04 (DDL-05 Gap Closure)
 
 Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
+- Total plans completed: 5
 - Average duration: 5 min
-- Total execution time: 27 min
+- Total execution time: 32 min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-scaffold | 3 | 9 min | 3 min |
-| 02-storage-and-ddl | 3 | 30 min | 10 min |
+| 02-storage-and-ddl | 4 | 35 min | 9 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-02 (4 min), 01-01 (4 min), 02-01 (18 min), 02-02 (5 min), 02-03 (7 min)
-- Trend: Phase 2 complete; DDL functions verified end-to-end via SQLLogicTest; two catalog bugs fixed
+- Last 5 plans: 01-01 (4 min), 02-01 (18 min), 02-02 (5 min), 02-03 (7 min), 02-04 (5 min)
+- Trend: Phase 2 fully complete with DDL-05 gap closure; sidecar persistence enables cross-restart survival
 
 *Updated after each plan completion*
 
@@ -43,6 +43,9 @@ Progress: [██████░░░░] 60%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [02-04]: sidecar-persistence: invoke cannot execute DuckDB SQL (execution locks deadlock); sidecar file (<db>.semantic_views) written with plain fs I/O bridges the gap; init_catalog reads sidecar on next load and syncs into DuckDB table
+- [02-04]: pragma-database-list-path: entrypoint queries PRAGMA database_list to resolve the host DB file path; takes first row with non-empty file (not filtered by name='main' because Python DuckDB names DBs by filename stem)
+- [02-04]: atomic-rename-write: sidecar writes use write-to-tmp-then-rename pattern for POSIX atomicity
 - [02-03]: init_catalog-before-write: any code path that opens a fresh Connection::open() must call init_catalog() before catalog writes — the fresh connection starts with no schema/table
 - [02-03]: HashMap is truth for catalog_delete: removed rows_affected == 0 check; ephemeral :memory: DB DELETE always returns 0 rows; contains_key() guard is authoritative
 - [02-03]: serde_json serializes JSON object keys alphabetically (expr before name) — integration test expected values must match this order
@@ -79,5 +82,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 02-03-PLAN.md (DDL SQL Logic Test) — Phase 2 complete
+Stopped at: Completed 02-04-PLAN.md (DDL-05 Gap Closure) — Phase 2 fully complete with all 5 DDL requirements met
 Resume file: None
