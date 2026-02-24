@@ -1,0 +1,143 @@
+# Phase 2 DDL round-trip integration test.
+#
+# Exercises define_semantic_view, list_semantic_views, describe_semantic_view,
+# and drop_semantic_view via the actual DuckDB extension LOAD mechanism.
+#
+# Requirements covered:
+#   DDL-01: define_semantic_view registers a view and returns a confirmation
+#   DDL-02: drop_semantic_view removes a registered view
+#   DDL-03: list_semantic_views returns one row per registered view
+#   DDL-04: describe_semantic_view returns all definition fields
+#   DDL-05: persistence is verified by Rust unit tests (catalog::tests::init_catalog_loads_existing_rows)
+#           because scalar function invoke opens Connection::open(":memory:") — catalog writes go to a
+#           separate ephemeral DB and are not visible to the file-backed host connection (v0.1 limitation).
+#
+# Run via: just test  (make test_debug)
+
+require semantic_views
+
+# ============================================================
+# 1. Define a semantic view — DDL-01
+# ============================================================
+
+statement ok
+SELECT define_semantic_view(
+    'orders',
+    '{"base_table":"orders","dimensions":[{"name":"region","expr":"region"}],"metrics":[{"name":"revenue","expr":"sum(amount)"}]}'
+);
+
+# Confirmation string is returned — verify it is non-empty
+query T
+SELECT define_semantic_view(
+    'customers',
+    '{"base_table":"customers","dimensions":[{"name":"country","expr":"country"}],"metrics":[{"name":"count","expr":"count(*)"}],"filters":["active = true"]}'
+);
+----
+Semantic view 'customers' registered successfully
+
+# ============================================================
+# 2. list_semantic_views returns all registered views — DDL-03
+# ============================================================
+
+# Two views should be present (orders + customers), sorted by name
+query TT rowsort
+SELECT name, base_table FROM list_semantic_views();
+----
+customers	customers
+orders	orders
+
+# ============================================================
+# 3. describe_semantic_view returns all fields — DDL-04
+# ============================================================
+
+query TTTTTT
+SELECT name, base_table, dimensions, metrics, filters, joins
+FROM describe_semantic_view('orders');
+----
+orders	orders	[{"expr":"region","name":"region"}]	[{"expr":"sum(amount)","name":"revenue"}]	null	null
+
+query TTTTTT
+SELECT name, base_table, dimensions, metrics, filters, joins
+FROM describe_semantic_view('customers');
+----
+customers	customers	[{"expr":"country","name":"country"}]	[{"expr":"count(*)","name":"count"}]	["active = true"]	null
+
+# ============================================================
+# 4. Duplicate define is an error — DDL-01
+# ============================================================
+
+statement error
+SELECT define_semantic_view(
+    'orders',
+    '{"base_table":"orders","dimensions":[],"metrics":[]}'
+);
+----
+already exists
+
+# ============================================================
+# 5. describe_semantic_view on unknown view is an error — DDL-04
+# ============================================================
+
+statement error
+SELECT * FROM describe_semantic_view('nonexistent');
+----
+does not exist
+
+# ============================================================
+# 6. drop_semantic_view removes the view — DDL-02
+# ============================================================
+
+statement ok
+SELECT drop_semantic_view('orders');
+
+# Orders should be gone from list
+query TT rowsort
+SELECT name, base_table FROM list_semantic_views();
+----
+customers	customers
+
+# describe_semantic_view on the dropped view should error
+statement error
+SELECT * FROM describe_semantic_view('orders');
+----
+does not exist
+
+# ============================================================
+# 7. drop_semantic_view on nonexistent view is an error — DDL-02
+# ============================================================
+
+statement error
+SELECT drop_semantic_view('orders');
+----
+does not exist
+
+# ============================================================
+# 8. Define a second view and verify list shows it — DDL-01, DDL-03
+# ============================================================
+
+statement ok
+SELECT define_semantic_view(
+    'products',
+    '{"base_table":"products","dimensions":[{"name":"category","expr":"category"}],"metrics":[{"name":"total","expr":"sum(price)"}]}'
+);
+
+query TT rowsort
+SELECT name, base_table FROM list_semantic_views();
+----
+customers	customers
+products	products
+
+# ============================================================
+# 9. Clean up: drop remaining views
+# ============================================================
+
+statement ok
+SELECT drop_semantic_view('customers');
+
+statement ok
+SELECT drop_semantic_view('products');
+
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+0

@@ -8,7 +8,7 @@ use duckdb::{
 };
 use libduckdb_sys::duckdb_string_t;
 
-use crate::catalog::{catalog_delete, CatalogState};
+use crate::catalog::{catalog_delete, init_catalog, CatalogState};
 
 /// Shared state for `drop_semantic_view`.
 ///
@@ -50,7 +50,10 @@ impl VScalar for DropSemanticView {
                 .to_string();
 
             // Open a fresh connection to the same database file for catalog writes.
+            // `init_catalog` is called first to ensure schema and table exist on
+            // the fresh connection before attempting the delete.
             let con = Connection::open(state.db_path.as_ref())?;
+            init_catalog(&con)?;
             catalog_delete(&con, &state.catalog, &name)?;
 
             let msg = format!("Semantic view '{name}' removed successfully");

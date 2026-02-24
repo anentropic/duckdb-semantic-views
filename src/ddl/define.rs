@@ -8,7 +8,7 @@ use duckdb::{
 };
 use libduckdb_sys::duckdb_string_t;
 
-use crate::catalog::{catalog_insert, CatalogState};
+use crate::catalog::{catalog_insert, init_catalog, CatalogState};
 
 /// Shared state for `define_semantic_view`: the in-memory catalog plus the
 /// database file path needed to open a connection for catalog writes.
@@ -66,7 +66,14 @@ impl VScalar for DefineSemanticView {
 
             // Open a fresh connection to the same database file for catalog writes.
             // `Connection` is not `Send`, so it cannot be stored in state.
+            //
+            // The fresh connection starts with an empty catalog, so we call
+            // `init_catalog` to ensure the schema and table exist before writing.
+            // `init_catalog` is idempotent (`CREATE IF NOT EXISTS`) and also
+            // loads existing rows — the return value (the HashMap) is discarded
+            // here because the shared `CatalogState` is the source of truth.
             let con = Connection::open(state.db_path.as_ref())?;
+            init_catalog(&con)?;
             catalog_insert(&con, &state.catalog, &name, &json)?;
 
             let msg = format!("Semantic view '{name}' registered successfully");
