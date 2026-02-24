@@ -22,7 +22,8 @@ lto = true
 strip = true
 
 [workspace.lints.clippy]
-pedantic = "deny"
+# Use priority = -1 so individual lint overrides take precedence over the group
+pedantic = { level = "deny", priority = -1 }
 # Suppress known-noisy pedantic rules per RESEARCH.md
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
