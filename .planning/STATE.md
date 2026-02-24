@@ -5,33 +5,34 @@
 See: .planning/PROJECT.md (updated 2026-02-23)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 1 — Scaffold
+**Current focus:** Phase 2 — Storage and DDL
 
 ## Current Position
 
-Phase: 1 of 5 (Scaffold)
-Plan: 3 of 3 in current phase
+Phase: 2 of 5 (Storage and DDL)
+Plan: 1 of 3 in current phase
 Status: In progress
-Last activity: 2026-02-24 — Completed plan 01-02 (CI Workflows and LOAD smoke test)
+Last activity: 2026-02-24 — Completed plan 02-01 (Data Model and Catalog Foundation)
 
-Progress: [███░░░░░░░] 30%
+Progress: [████░░░░░░] 40%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3
-- Average duration: 3 min
-- Total execution time: 9 min
+- Total plans completed: 4
+- Average duration: 5 min
+- Total execution time: 27 min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-scaffold | 3 | 9 min | 3 min |
+| 02-storage-and-ddl | 1 | 18 min | 18 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (4 min), 01-03 (1 min), 01-02 (4 min)
-- Trend: Phase 1 scaffold complete
+- Last 5 plans: 01-01 (4 min), 01-03 (1 min), 01-02 (4 min), 02-01 (18 min)
+- Trend: Phase 2 plan 1 complete; catalog foundation in place
 
 *Updated after each plan completion*
 
@@ -42,6 +43,11 @@ Progress: [███░░░░░░░] 30%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [02-01]: Cargo feature split for testable DuckDB extensions: `default=["duckdb/bundled"]` enables `cargo test` with Connection::open_in_memory(); `extension=["duckdb/loadable-extension","duckdb/vscalar"]` used by Makefile for cdylib builds with --no-default-features --features extension
+- [02-01]: duckdb/loadable-extension replaces all C API calls with function-pointer stubs initialized by DuckDB at load time — standalone test binaries cannot use these stubs; bundled feature resolves this without workspace restructuring
+- [02-01]: Write-catalog-first pattern: catalog_insert/catalog_delete write to semantic_layer._definitions before updating HashMap; error propagates via ? preventing HashMap/catalog drift
+- [02-01]: serde deny_unknown_fields on SemanticViewDefinition: unknown JSON fields return parse error immediately at define time
+- [02-01]: #[allow(clippy::unnecessary_wraps)] required on extension_entrypoint — duckdb_entrypoint_c_api macro calls it via ? requiring Result return type
 - [Init]: v0.1 uses function-based DDL (`define_semantic_view`, `drop_semantic_view`) not native `CREATE SEMANTIC VIEW` — parser hooks not available in DuckDB C API from Rust
 - [Init]: Expansion-only scope for v0.1; no pre-aggregation; DuckDB is the execution engine
 - [Init]: SQL expressions stored as opaque strings in the definition JSON; DuckDB validates them at execution time (avoids sqlparser-rs dialect gap)
@@ -65,5 +71,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 01-01-PLAN.md (Rust Extension Scaffold)
+Stopped at: Completed 02-01-PLAN.md (Data Model and Catalog Foundation)
 Resume file: None

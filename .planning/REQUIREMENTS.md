@@ -14,11 +14,11 @@
 
 ### Definition Interface (DDL)
 
-- [ ] **DDL-01**: User can register a semantic view via `SELECT define_semantic_view('name', '{definition_json}')`
-- [ ] **DDL-02**: User can remove a semantic view via `SELECT drop_semantic_view('name')`
-- [ ] **DDL-03**: User can list all registered semantic views via `FROM list_semantic_views()`
-- [ ] **DDL-04**: User can inspect a semantic view definition via `FROM describe_semantic_view('name')`
-- [ ] **DDL-05**: Semantic view definitions persist across DuckDB restarts, stored in a `_semantic_views_catalog` table within the user's `.duckdb` file
+- [x] **DDL-01**: User can register a semantic view via `SELECT define_semantic_view('name', '{definition_json}')`
+- [x] **DDL-02**: User can remove a semantic view via `SELECT drop_semantic_view('name')`
+- [x] **DDL-03**: User can list all registered semantic views via `FROM list_semantic_views()`
+- [x] **DDL-04**: User can inspect a semantic view definition via `FROM describe_semantic_view('name')`
+- [x] **DDL-05**: Semantic view definitions persist across DuckDB restarts, stored in a `_semantic_views_catalog` table within the user's `.duckdb` file
 
 ### Semantic Model
 
@@ -110,11 +110,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | INFRA-04 | Phase 1 — Scaffold | Complete |
 | STYLE-01 | Phase 1 — Scaffold | Complete |
 | STYLE-02 | Phase 1 — Scaffold | Complete |
-| DDL-01 | Phase 2 — Storage and DDL | Pending |
-| DDL-02 | Phase 2 — Storage and DDL | Pending |
-| DDL-03 | Phase 2 — Storage and DDL | Pending |
-| DDL-04 | Phase 2 — Storage and DDL | Pending |
-| DDL-05 | Phase 2 — Storage and DDL | Pending |
+| DDL-01 | Phase 2 — Storage and DDL | Complete |
+| DDL-02 | Phase 2 — Storage and DDL | Complete |
+| DDL-03 | Phase 2 — Storage and DDL | Complete |
+| DDL-04 | Phase 2 — Storage and DDL | Complete |
+| DDL-05 | Phase 2 — Storage and DDL | Complete |
 | MODEL-01 | Phase 3 — Expansion Engine | Pending |
 | MODEL-02 | Phase 3 — Expansion Engine | Pending |
 | MODEL-03 | Phase 3 — Expansion Engine | Pending |
