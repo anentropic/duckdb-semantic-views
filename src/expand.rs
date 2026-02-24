@@ -2,6 +2,29 @@ use std::fmt;
 
 use crate::model::SemanticViewDefinition;
 
+/// Suggest the closest matching name from `available` using Levenshtein distance.
+///
+/// Returns `Some(name)` (with original casing) if the best match has an edit
+/// distance of 3 or fewer characters. Returns `None` if no candidate is close
+/// enough. Both the query and candidates are lowercased for comparison.
+fn suggest_closest(name: &str, available: &[String]) -> Option<String> {
+    let query = name.to_ascii_lowercase();
+    let mut best: Option<(usize, &str)> = None;
+    for candidate in available {
+        let dist = strsim::levenshtein(&query, &candidate.to_ascii_lowercase());
+        if dist <= 3 {
+            if let Some((best_dist, _)) = best {
+                if dist < best_dist {
+                    best = Some((dist, candidate));
+                }
+            } else {
+                best = Some((dist, candidate));
+            }
+        }
+    }
+    best.map(|(_, s)| s.to_string())
+}
+
 /// A request to expand a semantic view into SQL.
 ///
 /// Contains the names of dimensions and metrics to include in the query.
@@ -165,11 +188,15 @@ pub fn expand(
                 name: name.clone(),
             });
         }
-        let dim = find_dimension(def, name).ok_or_else(|| ExpandError::UnknownDimension {
-            view_name: view_name.to_string(),
-            name: name.clone(),
-            available: def.dimensions.iter().map(|d| d.name.clone()).collect(),
-            suggestion: None, // Fuzzy matching added in Plan 02
+        let dim = find_dimension(def, name).ok_or_else(|| {
+            let available: Vec<String> = def.dimensions.iter().map(|d| d.name.clone()).collect();
+            let suggestion = suggest_closest(name, &available);
+            ExpandError::UnknownDimension {
+                view_name: view_name.to_string(),
+                name: name.clone(),
+                available,
+                suggestion,
+            }
         })?;
         resolved_dims.push(dim);
     }
@@ -184,11 +211,15 @@ pub fn expand(
                 name: name.clone(),
             });
         }
-        let met = find_metric(def, name).ok_or_else(|| ExpandError::UnknownMetric {
-            view_name: view_name.to_string(),
-            name: name.clone(),
-            available: def.metrics.iter().map(|m| m.name.clone()).collect(),
-            suggestion: None, // Fuzzy matching added in Plan 02
+        let met = find_metric(def, name).ok_or_else(|| {
+            let available: Vec<String> = def.metrics.iter().map(|m| m.name.clone()).collect();
+            let suggestion = suggest_closest(name, &available);
+            ExpandError::UnknownMetric {
+                view_name: view_name.to_string(),
+                name: name.clone(),
+                available,
+                suggestion,
+            }
         })?;
         resolved_mets.push(met);
     }
@@ -522,6 +553,197 @@ GROUP BY
             // Should succeed and use the definition's expression
             assert!(sql.contains("region AS \"Region\""));
             assert!(sql.contains("GROUP BY\n    region"));
+        }
+
+        #[test]
+        fn test_unknown_dimension_error() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec!["reigon".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let result = expand("orders", &def, &req);
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                ExpandError::UnknownDimension {
+                    view_name,
+                    name,
+                    available,
+                    suggestion,
+                } => {
+                    assert_eq!(view_name, "orders");
+                    assert_eq!(name, "reigon");
+                    assert!(available.contains(&"region".to_string()));
+                    assert_eq!(suggestion, Some("region".to_string()));
+                }
+                other => panic!("Expected UnknownDimension, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_unknown_metric_error() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["totl_revenue".to_string()],
+            };
+            let result = expand("orders", &def, &req);
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                ExpandError::UnknownMetric {
+                    view_name,
+                    name,
+                    available,
+                    suggestion,
+                } => {
+                    assert_eq!(view_name, "orders");
+                    assert_eq!(name, "totl_revenue");
+                    assert!(available.contains(&"total_revenue".to_string()));
+                    assert_eq!(suggestion, Some("total_revenue".to_string()));
+                }
+                other => panic!("Expected UnknownMetric, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_unknown_dimension_no_suggestion() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec!["xyzzy".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let result = expand("orders", &def, &req);
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                ExpandError::UnknownDimension { suggestion, .. } => {
+                    assert_eq!(suggestion, None);
+                }
+                other => panic!("Expected UnknownDimension, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_duplicate_dimension_error() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string(), "region".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let result = expand("orders", &def, &req);
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                ExpandError::DuplicateDimension { view_name, name } => {
+                    assert_eq!(view_name, "orders");
+                    assert_eq!(name, "region");
+                }
+                other => panic!("Expected DuplicateDimension, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_duplicate_metric_error() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["total_revenue".to_string(), "total_revenue".to_string()],
+            };
+            let result = expand("orders", &def, &req);
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                ExpandError::DuplicateMetric { view_name, name } => {
+                    assert_eq!(view_name, "orders");
+                    assert_eq!(name, "total_revenue");
+                }
+                other => panic!("Expected DuplicateMetric, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_case_insensitive_metric_lookup() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![],
+                metrics: vec![Metric {
+                    name: "Total_Revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![],
+            };
+            // Request uses lowercase "total_revenue" but definition has "Total_Revenue"
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            // Should succeed and use the definition's name casing in the alias
+            assert!(sql.contains("sum(amount) AS \"Total_Revenue\""));
+        }
+
+        #[test]
+        fn test_error_display_messages() {
+            // EmptyMetrics
+            let err = ExpandError::EmptyMetrics {
+                view_name: "orders".to_string(),
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains("orders"));
+            assert!(msg.contains("at least one metric is required"));
+
+            // UnknownDimension with suggestion
+            let err = ExpandError::UnknownDimension {
+                view_name: "orders".to_string(),
+                name: "reigon".to_string(),
+                available: vec!["region".to_string(), "status".to_string()],
+                suggestion: Some("region".to_string()),
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains("orders"));
+            assert!(msg.contains("reigon"));
+            assert!(msg.contains("region, status"));
+            assert!(msg.contains("Did you mean 'region'?"));
+
+            // UnknownDimension without suggestion
+            let err = ExpandError::UnknownDimension {
+                view_name: "orders".to_string(),
+                name: "xyzzy".to_string(),
+                available: vec!["region".to_string()],
+                suggestion: None,
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains("xyzzy"));
+            assert!(!msg.contains("Did you mean"));
+
+            // UnknownMetric with suggestion
+            let err = ExpandError::UnknownMetric {
+                view_name: "orders".to_string(),
+                name: "totl_revenue".to_string(),
+                available: vec!["total_revenue".to_string()],
+                suggestion: Some("total_revenue".to_string()),
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains("orders"));
+            assert!(msg.contains("totl_revenue"));
+            assert!(msg.contains("Did you mean 'total_revenue'?"));
+
+            // DuplicateDimension
+            let err = ExpandError::DuplicateDimension {
+                view_name: "orders".to_string(),
+                name: "region".to_string(),
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains("orders"));
+            assert!(msg.contains("duplicate dimension 'region'"));
+
+            // DuplicateMetric
+            let err = ExpandError::DuplicateMetric {
+                view_name: "orders".to_string(),
+                name: "total_revenue".to_string(),
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains("orders"));
+            assert!(msg.contains("duplicate metric 'total_revenue'"));
         }
 
         #[test]

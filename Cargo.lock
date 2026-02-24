@@ -1690,6 +1690,7 @@ dependencies = [
  "libduckdb-sys",
  "serde",
  "serde_json",
+ "strsim",
 ]
 
 [[package]]
