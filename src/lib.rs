@@ -1,3 +1,5 @@
+pub mod model;
+
 use duckdb::{duckdb_entrypoint_c_api, Connection, Result};
 use std::error::Error;
 
