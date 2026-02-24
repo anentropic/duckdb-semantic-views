@@ -36,6 +36,10 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - Hierarchies (drill-down paths, e.g., country → region → city) — future milestone
 - Cross-view optimisation (sharing materialised table across two semantic view references) — non-goal by design
 
+### v0.2 Requirements (Deferred)
+
+- [ ] **Replace sidecar persistence with `pragma_query_t` pattern.** v0.1 uses a `.semantic_views` sidecar file for catalog persistence because DuckDB holds execution locks during scalar `invoke`, preventing any SQL execution (same connection, `try_clone`, or `Connection::open` all deadlock/block). The C++ shim planned for `CREATE SEMANTIC VIEW` DDL must also register define/drop as `PragmaFunction` with `pragma_query_t` callbacks — these return SQL strings that DuckDB executes after the callback returns (during parsing, before execution locks), which is the blessed pattern used by the FTS extension. This eliminates the sidecar file entirely.
+
 ## Context
 
 **Design research:** A detailed design doc lives in `_notes/semantic-views-duckdb-design-doc.md`. It covers prior art (Cube.dev internals, Snowflake semantic views, Databricks metric views), the two-phase architecture (expansion → pre-aggregation selection), and why `egg`/e-graph rewriting is not needed for this approach.
@@ -64,6 +68,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 | SQL DDL before YAML | SQL is simpler to implement as a single interface; YAML adds a second definition path | — Pending |
 | Expansion-only v0.1 | Pre-aggregation is orthogonal complexity; ship the semantic layer first | — Pending |
 | DuckDB is the execution engine | Extension is a preprocessor; avoids building a query engine | ✓ Good |
+| Sidecar file for v0.1 catalog persistence | DuckDB locks prevent SQL from scalar `invoke`; `try_clone` deadlocks, `Connection::open` blocks on file lock. Sidecar (plain JSON file I/O) is the only deadlock-free pure-Rust option. v0.2 C++ shim replaces this with `pragma_query_t` (FTS pattern). | ✓ Accepted (temporary) |
 
 ---
 *Last updated: 2026-02-23 after initialization*
