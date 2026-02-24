@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::fmt;
 
-use crate::model::SemanticViewDefinition;
+use crate::model::{Join, SemanticViewDefinition};
 
 /// Suggest the closest matching name from `available` using Levenshtein distance.
 ///
@@ -134,6 +135,68 @@ pub fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Resolve which declared joins are needed for the requested dimensions and metrics.
+///
+/// Collects `source_table` values from resolved dimensions and metrics, then
+/// resolves transitive dependencies using a fixed-point loop: if a needed join's
+/// ON clause mentions another declared join's table, that join is also included.
+/// Returns the subset of joins in their original declaration order.
+fn resolve_joins<'a>(
+    joins: &'a [Join],
+    resolved_dims: &[&crate::model::Dimension],
+    resolved_mets: &[&crate::model::Metric],
+) -> Vec<&'a Join> {
+    // 1. Collect directly-needed tables from source_table fields (case-insensitive).
+    let mut needed: HashSet<String> = HashSet::new();
+    for dim in resolved_dims {
+        if let Some(ref st) = dim.source_table {
+            needed.insert(st.to_ascii_lowercase());
+        }
+    }
+    for met in resolved_mets {
+        if let Some(ref st) = met.source_table {
+            needed.insert(st.to_ascii_lowercase());
+        }
+    }
+
+    if needed.is_empty() {
+        return Vec::new();
+    }
+
+    // 2. Fixed-point loop: resolve transitive dependencies.
+    //    If a needed join's ON clause references another declared join's table name,
+    //    add that table to the needed set too.
+    loop {
+        let mut changed = false;
+        for join in joins {
+            let table_lower = join.table.to_ascii_lowercase();
+            if needed.contains(&table_lower) {
+                // This join is needed — check if its ON clause references other join tables.
+                let on_lower = join.on.to_ascii_lowercase();
+                for other in joins {
+                    let other_lower = other.table.to_ascii_lowercase();
+                    if other_lower != table_lower
+                        && !needed.contains(&other_lower)
+                        && on_lower.contains(&other_lower)
+                    {
+                        needed.insert(other_lower);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // 3. Filter declared joins, preserving declaration order.
+    joins
+        .iter()
+        .filter(|j| needed.contains(&j.table.to_ascii_lowercase()))
+        .collect()
+}
+
 /// Look up a dimension by name using case-insensitive matching.
 fn find_dimension<'a>(
     def: &'a SemanticViewDefinition,
@@ -224,13 +287,16 @@ pub fn expand(
         resolved_mets.push(met);
     }
 
-    // 4. Build the base CTE.
+    // 4. Resolve which joins are needed.
+    let needed_joins = resolve_joins(&def.joins, &resolved_dims, &resolved_mets);
+
+    // 5. Build the base CTE.
     let mut sql = String::with_capacity(256);
     sql.push_str("WITH \"_base\" AS (\n    SELECT *\n    FROM ");
     sql.push_str(&quote_ident(&def.base_table));
 
-    // Include all declared joins (join pruning deferred to Plan 02).
-    for join in &def.joins {
+    // Include only the joins needed by requested dimensions/metrics.
+    for join in &needed_joins {
         sql.push_str("\n    JOIN ");
         sql.push_str(&quote_ident(&join.table));
         sql.push_str(" ON ");
@@ -246,7 +312,7 @@ pub fn expand(
 
     sql.push_str("\n)");
 
-    // 5. Build the outer SELECT.
+    // 6. Build the outer SELECT.
     sql.push_str("\nSELECT\n");
 
     let mut select_items: Vec<String> = Vec::new();
@@ -258,10 +324,10 @@ pub fn expand(
     }
     sql.push_str(&select_items.join(",\n"));
 
-    // 6. FROM the base CTE.
+    // 7. FROM the base CTE.
     sql.push_str("\nFROM \"_base\"");
 
-    // 7. GROUP BY (only if dimensions are present).
+    // 8. GROUP BY (only if dimensions are present).
     if !resolved_dims.is_empty() {
         sql.push_str("\nGROUP BY\n");
         let group_items: Vec<String> = resolved_dims
@@ -747,13 +813,13 @@ GROUP BY
         }
 
         #[test]
-        fn test_joins_included_in_cte() {
+        fn test_join_included_when_dimension_needs_it() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
                 dimensions: vec![Dimension {
-                    name: "region".to_string(),
-                    expr: "region".to_string(),
-                    source_table: None,
+                    name: "customer_name".to_string(),
+                    expr: "customers.name".to_string(),
+                    source_table: Some("customers".to_string()),
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
@@ -767,12 +833,238 @@ GROUP BY
                 }],
             };
             let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(sql.contains("JOIN \"customers\" ON orders.customer_id = customers.id"));
+        }
+
+        #[test]
+        fn test_join_excluded_when_not_needed() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![
+                    Dimension {
+                        name: "region".to_string(),
+                        expr: "region".to_string(),
+                        source_table: None,
+                    },
+                    Dimension {
+                        name: "customer_name".to_string(),
+                        expr: "customers.name".to_string(),
+                        source_table: Some("customers".to_string()),
+                    },
+                ],
+                metrics: vec![Metric {
+                    name: "total_revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "customers".to_string(),
+                    on: "orders.customer_id = customers.id".to_string(),
+                }],
+            };
+            // Request only "region" which comes from base table
+            let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
                 metrics: vec!["total_revenue".to_string()],
             };
             let sql = expand("orders", &def, &req).unwrap();
-            // For Plan 01, all declared joins are included (join pruning is Plan 02)
+            assert!(
+                !sql.contains("JOIN"),
+                "JOIN should not appear when only base-table dims/metrics requested"
+            );
+        }
+
+        #[test]
+        fn test_join_included_when_metric_needs_it() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "region".to_string(),
+                    source_table: None,
+                }],
+                metrics: vec![Metric {
+                    name: "customer_count".to_string(),
+                    expr: "count(distinct customers.id)".to_string(),
+                    source_table: Some("customers".to_string()),
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "customers".to_string(),
+                    on: "orders.customer_id = customers.id".to_string(),
+                }],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["customer_count".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
             assert!(sql.contains("JOIN \"customers\" ON orders.customer_id = customers.id"));
+        }
+
+        #[test]
+        fn test_transitive_join_resolution() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "region_name".to_string(),
+                    expr: "regions.name".to_string(),
+                    source_table: Some("regions".to_string()),
+                }],
+                metrics: vec![Metric {
+                    name: "total_revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![
+                    Join {
+                        table: "customers".to_string(),
+                        on: "orders.customer_id = customers.id".to_string(),
+                    },
+                    Join {
+                        table: "regions".to_string(),
+                        on: "customers.region_id = regions.id".to_string(),
+                    },
+                ],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region_name".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            // regions depends on customers (ON clause references customers), so both must be included
+            assert!(
+                sql.contains("JOIN \"customers\""),
+                "transitive dependency 'customers' must be included"
+            );
+            assert!(
+                sql.contains("JOIN \"regions\""),
+                "directly needed 'regions' must be included"
+            );
+        }
+
+        #[test]
+        fn test_joins_emitted_in_declaration_order() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "region_name".to_string(),
+                    expr: "regions.name".to_string(),
+                    source_table: Some("regions".to_string()),
+                }],
+                metrics: vec![Metric {
+                    name: "total_revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![
+                    Join {
+                        table: "customers".to_string(),
+                        on: "orders.customer_id = customers.id".to_string(),
+                    },
+                    Join {
+                        table: "regions".to_string(),
+                        on: "customers.region_id = regions.id".to_string(),
+                    },
+                ],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region_name".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let customers_pos = sql
+                .find("JOIN \"customers\"")
+                .expect("customers join missing");
+            let regions_pos = sql.find("JOIN \"regions\"").expect("regions join missing");
+            assert!(
+                customers_pos < regions_pos,
+                "customers must appear before regions (declaration order)"
+            );
+        }
+
+        #[test]
+        fn test_no_joins_declared_no_error() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "region".to_string(),
+                    source_table: None,
+                }],
+                metrics: vec![Metric {
+                    name: "total_revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                !sql.contains("JOIN"),
+                "no JOIN clauses when no joins declared"
+            );
+        }
+
+        #[test]
+        fn test_mixed_base_and_joined_dimensions() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![
+                    Dimension {
+                        name: "region".to_string(),
+                        expr: "region".to_string(),
+                        source_table: None,
+                    },
+                    Dimension {
+                        name: "customer_name".to_string(),
+                        expr: "customers.name".to_string(),
+                        source_table: Some("customers".to_string()),
+                    },
+                ],
+                metrics: vec![Metric {
+                    name: "total_revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![
+                    Join {
+                        table: "customers".to_string(),
+                        on: "orders.customer_id = customers.id".to_string(),
+                    },
+                    Join {
+                        table: "products".to_string(),
+                        on: "orders.product_id = products.id".to_string(),
+                    },
+                ],
+            };
+            // Request base-table "region" AND joined "customer_name"
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string(), "customer_name".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("JOIN \"customers\""),
+                "customers join needed for customer_name"
+            );
+            assert!(
+                !sql.contains("JOIN \"products\""),
+                "products join NOT needed"
+            );
         }
     }
 }
