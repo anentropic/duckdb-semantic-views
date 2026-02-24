@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod expand;
 pub mod model;
 
 /// DDL function implementations — only compiled when building the `DuckDB` extension.

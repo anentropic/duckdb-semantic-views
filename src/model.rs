@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 pub struct Dimension {
     pub name: String,
     pub expr: String,
+    /// Optional source table — declares which join table this dimension comes from.
+    /// If `None`, the dimension is assumed to come from the base table.
+    #[serde(default)]
+    pub source_table: Option<String>,
 }
 
 /// A named aggregation expression used as a metric.
@@ -12,6 +16,10 @@ pub struct Dimension {
 pub struct Metric {
     pub name: String,
     pub expr: String,
+    /// Optional source table — declares which join table this metric comes from.
+    /// If `None`, the metric is assumed to come from the base table.
+    #[serde(default)]
+    pub source_table: Option<String>,
 }
 
 /// A JOIN relationship between the base table and another source table.
@@ -91,5 +99,30 @@ mod tests {
         let def = SemanticViewDefinition::from_json("test", json).unwrap();
         assert!(def.filters.is_empty());
         assert!(def.joins.is_empty());
+    }
+
+    #[test]
+    fn old_json_without_source_table_deserializes() {
+        // Backward compat: Phase 2 definitions don't have source_table.
+        let json = r#"{
+            "base_table": "orders",
+            "dimensions": [{"name": "region", "expr": "region"}],
+            "metrics": [{"name": "revenue", "expr": "sum(amount)"}]
+        }"#;
+        let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+        assert!(def.dimensions[0].source_table.is_none());
+        assert!(def.metrics[0].source_table.is_none());
+    }
+
+    #[test]
+    fn json_with_source_table_deserializes() {
+        let json = r#"{
+            "base_table": "orders",
+            "dimensions": [{"name": "customer_name", "expr": "customers.name", "source_table": "customers"}],
+            "metrics": [{"name": "revenue", "expr": "sum(amount)", "source_table": "line_items"}]
+        }"#;
+        let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+        assert_eq!(def.dimensions[0].source_table.as_deref(), Some("customers"));
+        assert_eq!(def.metrics[0].source_table.as_deref(), Some("line_items"));
     }
 }
