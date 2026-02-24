@@ -8,9 +8,8 @@
 #   DDL-02: drop_semantic_view removes a registered view
 #   DDL-03: list_semantic_views returns one row per registered view
 #   DDL-04: describe_semantic_view returns all definition fields
-#   DDL-05: persistence is verified by Rust unit tests (catalog::tests::init_catalog_loads_existing_rows)
-#           because scalar function invoke opens Connection::open(":memory:") — catalog writes go to a
-#           separate ephemeral DB and are not visible to the file-backed host connection (v0.1 limitation).
+#   DDL-05: persistence across restart — section 10 defines a view in a file-backed DB, triggers
+#           a restart, and verifies the view is still present via sidecar file persistence
 #
 # Run via: just test  (make test_debug)
 
@@ -180,3 +179,14 @@ query TT rowsort
 SELECT name, base_table FROM list_semantic_views();
 ----
 restart_test	events
+
+# Clean up: drop the view so the sidecar file is emptied.
+# Without this, the sidecar persists across test runs and causes
+# "already exists" errors on the next invocation.
+statement ok
+SELECT drop_semantic_view('restart_test');
+
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+0
