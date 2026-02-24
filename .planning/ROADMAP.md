@@ -64,7 +64,12 @@ Plans:
   3. Requesting a dimension or metric name that does not exist in the definition produces a clear error message identifying the semantic view name and the unknown member name
   4. All SQL identifiers (view name, column names, table names) in emitted SQL are quoted with double-quotes, preventing reserved-word conflicts
   5. Property-based tests (proptest) verify that for any combination of valid dimensions and metrics, all requested dimensions appear in GROUP BY and the emitted SQL is syntactically valid
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 03-01-PLAN.md — Model struct updates + expand() core: CTE generation, GROUP BY inference, filter composition, identifier quoting (TDD)
+- [ ] 03-02-PLAN.md — Join dependency resolution + name validation with fuzzy matching (TDD)
+- [ ] 03-03-PLAN.md — Property-based tests with proptest for expansion invariants
 
 ### Phase 4: Query Interface
 **Goal**: Users can query any registered semantic view with `FROM view_name(dimensions := [...], metrics := [...])` and receive correct results — the full round-trip from definition to DuckDB result set works
@@ -96,6 +101,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 |-------|----------------|--------|-----------|
 | 1. Scaffold | 3/3 | Complete | 2026-02-24 |
 | 2. Storage and DDL | 4/4 | Complete | 2026-02-24 |
-| 3. Expansion Engine | 0/? | Not started | - |
+| 3. Expansion Engine | 0/3 | Not started | - |
 | 4. Query Interface | 0/? | Not started | - |
 | 5. Hardening and Docs | 0/? | Not started | - |
