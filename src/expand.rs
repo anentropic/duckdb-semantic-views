@@ -111,6 +111,26 @@ pub fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Look up a dimension by name using case-insensitive matching.
+fn find_dimension<'a>(
+    def: &'a SemanticViewDefinition,
+    name: &str,
+) -> Option<&'a crate::model::Dimension> {
+    def.dimensions
+        .iter()
+        .find(|d| d.name.eq_ignore_ascii_case(name))
+}
+
+/// Look up a metric by name using case-insensitive matching.
+fn find_metric<'a>(
+    def: &'a SemanticViewDefinition,
+    name: &str,
+) -> Option<&'a crate::model::Metric> {
+    def.metrics
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case(name))
+}
+
 /// Expand a semantic view definition into a CTE-wrapped SQL query string.
 ///
 /// Takes a view name (for error messages), its definition, and a query request
@@ -124,11 +144,103 @@ pub fn quote_ident(ident: &str) -> String {
 /// - A requested dimension or metric name is not found (`UnknownDimension`, `UnknownMetric`)
 /// - A dimension or metric name is duplicated (`DuplicateDimension`, `DuplicateMetric`)
 pub fn expand(
-    _view_name: &str,
-    _def: &SemanticViewDefinition,
-    _req: &QueryRequest,
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    req: &QueryRequest,
 ) -> Result<String, ExpandError> {
-    todo!()
+    // 1. Validate: at least one metric is required.
+    if req.metrics.is_empty() {
+        return Err(ExpandError::EmptyMetrics {
+            view_name: view_name.to_string(),
+        });
+    }
+
+    // 2. Resolve requested dimensions to their definitions.
+    let mut resolved_dims = Vec::with_capacity(req.dimensions.len());
+    let mut seen_dims = std::collections::HashSet::new();
+    for name in &req.dimensions {
+        if !seen_dims.insert(name.to_ascii_lowercase()) {
+            return Err(ExpandError::DuplicateDimension {
+                view_name: view_name.to_string(),
+                name: name.clone(),
+            });
+        }
+        let dim = find_dimension(def, name).ok_or_else(|| ExpandError::UnknownDimension {
+            view_name: view_name.to_string(),
+            name: name.clone(),
+            available: def.dimensions.iter().map(|d| d.name.clone()).collect(),
+            suggestion: None, // Fuzzy matching added in Plan 02
+        })?;
+        resolved_dims.push(dim);
+    }
+
+    // 3. Resolve requested metrics to their definitions.
+    let mut resolved_mets = Vec::with_capacity(req.metrics.len());
+    let mut seen_mets = std::collections::HashSet::new();
+    for name in &req.metrics {
+        if !seen_mets.insert(name.to_ascii_lowercase()) {
+            return Err(ExpandError::DuplicateMetric {
+                view_name: view_name.to_string(),
+                name: name.clone(),
+            });
+        }
+        let met = find_metric(def, name).ok_or_else(|| ExpandError::UnknownMetric {
+            view_name: view_name.to_string(),
+            name: name.clone(),
+            available: def.metrics.iter().map(|m| m.name.clone()).collect(),
+            suggestion: None, // Fuzzy matching added in Plan 02
+        })?;
+        resolved_mets.push(met);
+    }
+
+    // 4. Build the base CTE.
+    let mut sql = String::with_capacity(256);
+    sql.push_str("WITH \"_base\" AS (\n    SELECT *\n    FROM ");
+    sql.push_str(&quote_ident(&def.base_table));
+
+    // Include all declared joins (join pruning deferred to Plan 02).
+    for join in &def.joins {
+        sql.push_str("\n    JOIN ");
+        sql.push_str(&quote_ident(&join.table));
+        sql.push_str(" ON ");
+        sql.push_str(&join.on);
+    }
+
+    // Append filters as WHERE clause (each parenthesized, AND-composed).
+    if !def.filters.is_empty() {
+        sql.push_str("\n    WHERE ");
+        let filter_clauses: Vec<String> = def.filters.iter().map(|f| format!("({f})")).collect();
+        sql.push_str(&filter_clauses.join(" AND "));
+    }
+
+    sql.push_str("\n)");
+
+    // 5. Build the outer SELECT.
+    sql.push_str("\nSELECT\n");
+
+    let mut select_items: Vec<String> = Vec::new();
+    for dim in &resolved_dims {
+        select_items.push(format!("    {} AS {}", dim.expr, quote_ident(&dim.name)));
+    }
+    for met in &resolved_mets {
+        select_items.push(format!("    {} AS {}", met.expr, quote_ident(&met.name)));
+    }
+    sql.push_str(&select_items.join(",\n"));
+
+    // 6. FROM the base CTE.
+    sql.push_str("\nFROM \"_base\"");
+
+    // 7. GROUP BY (only if dimensions are present).
+    if !resolved_dims.is_empty() {
+        sql.push_str("\nGROUP BY\n");
+        let group_items: Vec<String> = resolved_dims
+            .iter()
+            .map(|d| format!("    {}", d.expr))
+            .collect();
+        sql.push_str(&group_items.join(",\n"));
+    }
+
+    Ok(sql)
 }
 
 #[cfg(test)]
