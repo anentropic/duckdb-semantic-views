@@ -1,7 +1,5 @@
+pub mod catalog;
 pub mod model;
-
-use duckdb::{duckdb_entrypoint_c_api, Connection, Result};
-use std::error::Error;
 
 /// Extension entry point — called by `DuckDB` when the extension is loaded.
 ///
@@ -14,7 +12,16 @@ use std::error::Error;
 /// is provided by `DuckDB` and is guaranteed to be a valid connection handle for
 /// the duration of the call. The `#[duckdb_entrypoint_c_api]` macro handles the
 /// unsafe C FFI bridging and panic-catching automatically.
-#[duckdb_entrypoint_c_api()]
-pub unsafe fn extension_entrypoint(_con: Connection) -> Result<(), Box<dyn Error>> {
-    Ok(())
+#[cfg(feature = "extension")]
+mod extension {
+    use duckdb::{duckdb_entrypoint_c_api, Connection, Result};
+    use std::error::Error;
+
+    // The duckdb_entrypoint_c_api macro calls this function via `?` and requires
+    // the Result return type even though the body currently just returns Ok(()).
+    #[allow(clippy::unnecessary_wraps)]
+    #[duckdb_entrypoint_c_api()]
+    pub unsafe fn extension_entrypoint(_con: Connection) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
 }

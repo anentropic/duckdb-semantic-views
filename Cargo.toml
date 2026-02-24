@@ -8,8 +8,27 @@ license = "MIT"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# `bundled` is the default — it compiles DuckDB from source and links it
+# into the binary. This enables Connection::open_in_memory() in unit tests
+# (`cargo test` uses default features).
+#
+# `extension` enables duckdb/loadable-extension + duckdb/vscalar, required
+# for DuckDB to load this cdylib. The Makefile passes
+# `--no-default-features --features extension` when building for DuckDB.
+#
+# When building for DuckDB:
+#   cargo build --no-default-features --features extension
+#   (lean binary — no bundled DuckDB, uses function-pointer stubs)
+#
+# When running unit tests (default):
+#   cargo test
+#   (bundled DuckDB — Connection::open_in_memory() works)
+default = ["duckdb/bundled"]
+extension = ["duckdb/loadable-extension", "duckdb/vscalar"]
+
 [dependencies]
-duckdb = { version = "=1.4.4", features = ["loadable-extension", "vscalar"] }
+duckdb = { version = "=1.4.4", default-features = false }
 libduckdb-sys = "=1.4.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
