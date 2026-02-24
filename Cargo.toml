@@ -1,0 +1,32 @@
+[package]
+name = "semantic_views"
+version = "0.1.0"
+edition = "2021"
+description = "DuckDB extension providing semantic views — a declarative layer for dimensions, measures, and relationships"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+duckdb = { version = "=1.4.4", features = ["loadable-extension"] }
+libduckdb-sys = "=1.4.4"
+
+[dev-dependencies.cargo-husky]
+version = "1"
+default-features = false
+features = ["user-hooks"]
+
+[profile.release]
+lto = true
+strip = true
+
+[workspace.lints.clippy]
+pedantic = "deny"
+# Suppress known-noisy pedantic rules per RESEARCH.md
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[lints]
+workspace = true
