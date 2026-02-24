@@ -12,26 +12,26 @@ See: .planning/PROJECT.md (updated 2026-02-23)
 Phase: 1 of 5 (Scaffold)
 Plan: 3 of 3 in current phase
 Status: In progress
-Last activity: 2026-02-24 — Completed plan 01-03 (DuckDB Version Monitor workflow)
+Last activity: 2026-02-24 — Completed plan 01-02 (CI Workflows and LOAD smoke test)
 
-Progress: [██░░░░░░░░] 20%
+Progress: [███░░░░░░░] 30%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1
-- Average duration: 1 min
-- Total execution time: 1 min
+- Total plans completed: 2
+- Average duration: 3 min
+- Total execution time: 5 min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 01-scaffold | 1 | 1 min | 1 min |
+| 01-scaffold | 2 | 5 min | 3 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-03 (1 min)
-- Trend: Baseline established
+- Last 5 plans: 01-03 (1 min), 01-02 (4 min)
+- Trend: Building CI infrastructure
 
 *Updated after each plan completion*
 
@@ -48,6 +48,8 @@ Recent decisions affecting current work:
 - [Init]: Persistence via a plain DuckDB table (`semantic_layer._definitions`) in the user's `.duckdb` file; in-memory HashMap reconstructed from it at load time
 - [01-03]: Use steps.build.outcome (not steps.build.conclusion) in version monitor — conclusion is always success when continue-on-error: true; outcome reflects actual result
 - [01-03]: Breakage PR tags @copilot for automated fix; version-bump PR does not — signals human/bot attention only when build is broken
+- [01-02]: Arch names for exclude_archs verified from extension-ci-tools/config/distribution_matrix.json — plan examples were incomplete; actual matrix has linux_arm64_musl, windows_arm64, windows_amd64_mingw not listed in RESEARCH.md
+- [01-02]: PullRequestCI excludes all non-linux_amd64 targets; MainDistributionPipeline excludes only musl, windows variants (arm64/mingw), and WASM — keeping 5 target platforms
 
 ### Pending Todos
 
@@ -61,5 +63,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 01-03-PLAN.md (DuckDB Version Monitor workflow)
+Stopped at: Completed 01-02-PLAN.md (CI Workflows and LOAD smoke test)
 Resume file: None
