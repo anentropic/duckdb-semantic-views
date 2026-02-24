@@ -27,7 +27,7 @@ mod extension {
     use std::error::Error;
 
     use crate::{
-        catalog::{init_catalog, spawn_catalog_writer},
+        catalog::init_catalog,
         ddl::{
             define::{DefineSemanticView, DefineState},
             describe::DescribeSemanticViewVTab,
@@ -40,26 +40,20 @@ mod extension {
     #[allow(clippy::needless_pass_by_value)]
     #[duckdb_entrypoint_c_api()]
     pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
-        // Initialize the catalog: creates schema/table if needed, loads existing rows.
-        let catalog_state = init_catalog(&con)?;
-
         // Resolve the host database file path by querying PRAGMA database_list.
-        // The row where name = 'main' gives the host DB file path.
-        // For in-memory databases, file is an empty string — we map that to ":memory:".
+        // This must happen before init_catalog so the path can be passed in.
+        //
+        // PRAGMA database_list returns (seq, name, file).
+        // The main database name is NOT always "main" — when opened via the
+        // Python DuckDB client, the name is derived from the filename stem
+        // (e.g. "restart_test" for "restart_test.db").  We take the first
+        // row with a non-empty file path, which is always the primary DB.
         let db_path: Arc<str> = {
-            // PRAGMA database_list returns (seq INTEGER, name VARCHAR, file VARCHAR).
-            // We find the row where name = 'main' and extract the file path.
-            // For in-memory databases the file column is an empty string.
             let mut stmt = con.prepare("PRAGMA database_list")?;
             let path = stmt
-                .query_map([], |row| {
-                    let name: String = row.get(1)?;
-                    let file: String = row.get(2)?;
-                    Ok((name, file))
-                })?
+                .query_map([], |row| row.get::<_, String>(2))?
                 .filter_map(Result::ok)
-                .find(|(name, _)| name == "main")
-                .map(|(_, file)| file)
+                .find(|file| !file.is_empty())
                 .unwrap_or_default();
             if path.is_empty() {
                 Arc::from(":memory:")
@@ -68,34 +62,26 @@ mod extension {
             }
         };
 
-        // Spawn a background thread to handle catalog writes to the DuckDB file.
-        //
-        // Scalar function `invoke` cannot safely execute SQL against the host database:
-        // DuckDB holds internal locks during query execution, and any SQL on the same
-        // database instance (even via a cloned connection) will deadlock or spinlock.
-        //
-        // The background thread opens its own Connection::open(db_path) — a separate
-        // file-level connection — and processes INSERT/DELETE ops via a channel.
-        // `invoke` sends an op and blocks on the reply, making the write synchronous
-        // without holding any DuckDB locks on the background thread's connection.
-        //
-        // Returns None for in-memory databases (no file to write; HashMap is the
-        // sole source of truth for the session, which is correct behavior).
-        let writer = spawn_catalog_writer(db_path.as_ref());
+        // Initialize the catalog: creates schema/table if needed, loads existing
+        // rows from the DuckDB table, and merges in any sidecar file data (for
+        // file-backed databases).  The sidecar is written by invoke during
+        // define/drop — it bridges the gap because invoke cannot execute SQL.
+        let catalog_state = init_catalog(&con, &db_path)?;
 
         // Register scalar DDL mutation functions.
+        // State carries the db_path so invoke can write the sidecar file.
         con.register_scalar_function_with_state::<DefineSemanticView>(
             "define_semantic_view",
             &DefineState {
                 catalog: catalog_state.clone(),
-                writer: writer.clone(),
+                db_path: db_path.clone(),
             },
         )?;
         con.register_scalar_function_with_state::<DropSemanticView>(
             "drop_semantic_view",
             &DropState {
                 catalog: catalog_state.clone(),
-                writer: writer.clone(),
+                db_path: db_path.clone(),
             },
         )?;
 

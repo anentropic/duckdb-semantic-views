@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     vscalar::{ScalarFunctionSignature, VScalar},
@@ -5,23 +7,23 @@ use duckdb::{
 };
 use libduckdb_sys::duckdb_string_t;
 
-use crate::catalog::{CatalogState, CatalogWriterHandle};
-use crate::model::SemanticViewDefinition;
+use crate::catalog::{catalog_insert, write_sidecar, CatalogState};
 
-/// Shared state for `define_semantic_view`: the in-memory catalog plus an optional
-/// handle to the background catalog writer thread.
+/// Shared state for `define_semantic_view`: the in-memory catalog plus the
+/// database file path for sidecar persistence.
 ///
-/// `writer` is `None` for in-memory databases — the [`CatalogState`] `HashMap` is the
-/// sole source of truth for the session, which is correct (in-memory DBs cannot
-/// survive restart anyway).
+/// `db_path` is `":memory:"` for in-memory databases — the [`CatalogState`]
+/// `HashMap` is the sole source of truth for the session, which is correct
+/// (in-memory DBs cannot survive restart anyway).
 ///
-/// For file-backed databases, `writer` holds a [`CatalogWriterHandle`] that sends
-/// INSERT ops to a background thread owning its own `Connection::open(db_path)`.
-/// This avoids executing SQL from within `invoke` while `DuckDB` holds internal locks.
+/// For file-backed databases, after updating the `HashMap`, `invoke` writes the
+/// full state to a sidecar file (`<db_path>.semantic_views`) using plain
+/// filesystem I/O.  On next extension load, `init_catalog` reads the sidecar
+/// and syncs it into the `DuckDB` table.
 #[derive(Clone)]
 pub struct DefineState {
     pub catalog: CatalogState,
-    pub writer: Option<CatalogWriterHandle>,
+    pub db_path: Arc<str>,
 }
 
 pub struct DefineSemanticView;
@@ -58,38 +60,16 @@ impl VScalar for DefineSemanticView {
                 .as_str()
                 .to_string();
 
-            // 1. Validate JSON — fail fast before touching any state.
-            SemanticViewDefinition::from_json(&name, &json)
-                .map_err(Box::<dyn std::error::Error>::from)?;
+            // 1. Validate JSON and update the in-memory catalog.
+            //    catalog_insert checks for duplicates and validates the JSON.
+            catalog_insert(&state.catalog, &name, &json)?;
 
-            // 2. Check for duplicate in the in-memory catalog.
-            {
-                let guard = state.catalog.read().unwrap();
-                if guard.contains_key(&name) {
-                    return Err(format!(
-                        "semantic view '{name}' already exists; \
-                         call drop_semantic_view first"
-                    )
-                    .into());
-                }
+            // 2. Persist to sidecar file (file-backed databases only).
+            //    Uses plain filesystem I/O — no DuckDB SQL needed, so no
+            //    deadlock from within invoke.
+            if state.db_path.as_ref() != ":memory:" {
+                write_sidecar(&state.db_path, &state.catalog)?;
             }
-
-            // 3. Persist to `semantic_layer._definitions` via background writer thread.
-            //    For in-memory databases (writer is None) we skip persistence — the
-            //    HashMap below is the sole source of truth for the session.
-            //
-            //    The writer blocks until the background thread confirms the INSERT is
-            //    committed, so the row is durable before we update the HashMap.
-            if let Some(ref writer) = state.writer {
-                writer.insert(&name, &json)?;
-            }
-
-            // 4. Update the in-memory catalog after successful persist.
-            state
-                .catalog
-                .write()
-                .unwrap()
-                .insert(name.clone(), json.clone());
 
             let msg = format!("Semantic view '{name}' registered successfully");
             out.insert(i, msg.as_str());

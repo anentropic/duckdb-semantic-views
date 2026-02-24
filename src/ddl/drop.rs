@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     vscalar::{ScalarFunctionSignature, VScalar},
@@ -5,15 +7,15 @@ use duckdb::{
 };
 use libduckdb_sys::duckdb_string_t;
 
-use crate::catalog::{CatalogState, CatalogWriterHandle};
+use crate::catalog::{catalog_delete, write_sidecar, CatalogState};
 
 /// Shared state for `drop_semantic_view`.
 /// See [`crate::ddl::define::DefineState`] for the full explanation of the
-/// `Option<CatalogWriterHandle>` pattern.
+/// sidecar persistence pattern.
 #[derive(Clone)]
 pub struct DropState {
     pub catalog: CatalogState,
-    pub writer: Option<CatalogWriterHandle>,
+    pub db_path: Arc<str>,
 }
 
 pub struct DropSemanticView;
@@ -44,23 +46,13 @@ impl VScalar for DropSemanticView {
                 .as_str()
                 .to_string();
 
-            // 1. Check the view exists in the in-memory catalog.
-            {
-                let guard = state.catalog.read().unwrap();
-                if !guard.contains_key(&name) {
-                    return Err(
-                        format!("semantic view '{name}' does not exist").into()
-                    );
-                }
-            }
+            // 1. Remove from in-memory catalog (checks existence).
+            catalog_delete(&state.catalog, &name)?;
 
-            // 2. Persist the DELETE via background writer thread (file-backed only).
-            if let Some(ref writer) = state.writer {
-                writer.delete(&name)?;
+            // 2. Persist to sidecar file (file-backed databases only).
+            if state.db_path.as_ref() != ":memory:" {
+                write_sidecar(&state.db_path, &state.catalog)?;
             }
-
-            // 3. Remove from in-memory catalog after successful persist.
-            state.catalog.write().unwrap().remove(&name);
 
             let msg = format!("Semantic view '{name}' removed successfully");
             out.insert(i, msg.as_str());
