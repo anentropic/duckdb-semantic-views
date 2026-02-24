@@ -1,0 +1,46 @@
+name: Code Quality
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/*'
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint, format, and coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting (rustfmt)
+        run: cargo fmt --check
+
+      - name: Clippy (pedantic lints, deny warnings)
+        run: cargo clippy -- -D warnings
+
+      - name: cargo-deny (licenses + advisories)
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Note: --lib flag may be needed for cdylib crates. If this fails, try:
+      #   cargo llvm-cov --lib nextest --fail-under-lines 80
+      - name: Coverage check (80% minimum)
+        run: cargo llvm-cov nextest --fail-under-lines 80

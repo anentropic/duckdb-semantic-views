@@ -1,0 +1,12 @@
+# Smoke test: verify the extension loads via DuckDB's LOAD mechanism.
+# This catches ABI mismatches that cargo test cannot detect (INFRA-04).
+# The 'require' directive causes the SQLLogicTest runner to LOAD the extension.
+# If ABI doesn't match the pinned DuckDB CLI binary, this test fails.
+
+require semantic_views
+
+# Basic smoke: extension loaded and DuckDB is functional
+query I
+SELECT 42;
+----
+42
