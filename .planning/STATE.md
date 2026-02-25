@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-23)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 3 — Expansion Engine
+**Current focus:** Phase 3 complete — ready for Phase 4 (Query Interface)
 
 ## Current Position
 
-Phase: 3 of 5 (Expansion Engine)
-Plan: 2 of 3 in current phase
-Status: In progress
-Last activity: 2026-02-25 — Completed plan 03-02 (Join Resolution and Fuzzy Matching)
+Phase: 3 of 5 (Expansion Engine) -- COMPLETE
+Plan: 3 of 3 in current phase
+Status: Phase complete
+Last activity: 2026-02-25 — Completed plan 03-03 (Property-Based Tests)
 
-Progress: [███████░░░] 73%
+Progress: [████████░░] 80%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 7
+- Total plans completed: 8
 - Average duration: 5 min
-- Total execution time: 40 min
+- Total execution time: 45 min
 
 **By Phase:**
 
@@ -29,11 +29,11 @@ Progress: [███████░░░] 73%
 |-------|-------|-------|----------|
 | 01-scaffold | 3 | 9 min | 3 min |
 | 02-storage-and-ddl | 4 | 35 min | 9 min |
-| 03-expansion-engine | 2 | 8 min | 4 min |
+| 03-expansion-engine | 3 | 13 min | 4 min |
 
 **Recent Trend:**
-- Last 5 plans: 02-02 (5 min), 02-03 (7 min), 02-04 (5 min), 03-01 (4 min), 03-02 (4 min)
-- Trend: Consistent 4 min/plan for Phase 3 TDD; join resolution + fuzzy matching in same velocity as core expand
+- Last 5 plans: 02-03 (7 min), 02-04 (5 min), 03-01 (4 min), 03-02 (4 min), 03-03 (5 min)
+- Trend: Consistent 4-5 min/plan for Phase 3; proptest plan slightly longer due to new dependency compilation
 
 *Updated after each plan completion*
 
@@ -44,6 +44,9 @@ Progress: [███████░░░] 73%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [03-03]: lib-crate-type-for-integration-tests: added "lib" to crate-type alongside cdylib so integration tests in tests/ can link against the crate; cdylib alone only produces a dynamic library for FFI consumers
+- [03-03]: proptest-subsequence-strategy: arb_query_request() uses proptest::sample::subsequence to generate valid dimension/metric subsets from definitions; guarantees all generated requests reference valid names
+- [03-03]: proptest-default-config-256-cases: default proptest config (256 cases per property) is sufficient for the dimension/metric subset combinatorial space
 - [03-02]: levenshtein-threshold-3: fuzzy "did you mean" suggestions use strsim Levenshtein distance with threshold <= 3; balances helpfulness vs false positives
 - [03-02]: on-clause-substring-matching: transitive join dependency detection uses substring check on ON clause; sufficient heuristic for v0.1 where users declare joins in dependency order
 - [03-02]: fixed-point-join-resolution: resolve_joins uses a fixed-point loop for transitive convergence; handles arbitrary chain depth
@@ -91,5 +94,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-25
-Stopped at: Completed 03-02-PLAN.md (Join Resolution and Fuzzy Matching) — join pruning, transitive resolution, strsim fuzzy suggestions, 27 expand tests
+Stopped at: Completed 03-03-PLAN.md (Property-Based Tests) — Phase 3 complete; 6 proptest invariants, 52 total tests
 Resume file: None

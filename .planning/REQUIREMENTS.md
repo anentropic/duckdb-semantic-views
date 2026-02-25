@@ -44,7 +44,7 @@
 ### Test Coverage
 
 - [x] **TEST-01**: Unit tests cover the expansion engine (GROUP BY inference, JOIN generation, SQL emission) without requiring a DuckDB runtime
-- [ ] **TEST-02**: Property-based tests (using `proptest`) cover expansion engine invariants: all requested dimensions appear in GROUP BY, emitted SQL is syntactically valid
+- [x] **TEST-02**: Property-based tests (using `proptest`) cover expansion engine invariants: all requested dimensions appear in GROUP BY, emitted SQL is syntactically valid
 - [ ] **TEST-03**: Integration tests load the extension in-process, create semantic views, run real DuckDB SQL queries, and assert correct results
 - [ ] **TEST-04**: Integration test suite includes at least one test scenario using an Apache Iceberg table source
 - [ ] **TEST-05**: Fuzz targets (using `cargo-fuzz`) cover the unsafe C FFI boundary and the SQL generation path
@@ -124,7 +124,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | EXPAND-03 | Phase 3 — Expansion Engine | Complete |
 | EXPAND-04 | Phase 3 — Expansion Engine | Complete |
 | TEST-01 | Phase 3 — Expansion Engine | Complete |
-| TEST-02 | Phase 3 — Expansion Engine | Pending |
+| TEST-02 | Phase 3 — Expansion Engine | Complete |
 | QUERY-01 | Phase 4 — Query Interface | Pending |
 | QUERY-02 | Phase 4 — Query Interface | Pending |
 | QUERY-03 | Phase 4 — Query Interface | Pending |
