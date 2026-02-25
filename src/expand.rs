@@ -8,7 +8,8 @@ use crate::model::{Join, SemanticViewDefinition};
 /// Returns `Some(name)` (with original casing) if the best match has an edit
 /// distance of 3 or fewer characters. Returns `None` if no candidate is close
 /// enough. Both the query and candidates are lowercased for comparison.
-fn suggest_closest(name: &str, available: &[String]) -> Option<String> {
+#[must_use]
+pub fn suggest_closest(name: &str, available: &[String]) -> Option<String> {
     let query = name.to_ascii_lowercase();
     let mut best: Option<(usize, &str)> = None;
     for candidate in available {
@@ -29,8 +30,10 @@ fn suggest_closest(name: &str, available: &[String]) -> Option<String> {
 /// A request to expand a semantic view into SQL.
 ///
 /// Contains the names of dimensions and metrics to include in the query.
-/// Dimension names may be empty (producing a global aggregate), but at least
-/// one metric is required.
+/// At least one dimension or one metric must be specified. Supported modes:
+/// - Dimensions only: `SELECT DISTINCT` (no aggregation)
+/// - Metrics only: global aggregate (no `GROUP BY`)
+/// - Both: grouped aggregation with `GROUP BY`
 #[derive(Debug, Clone)]
 pub struct QueryRequest {
     pub dimensions: Vec<String>,
@@ -40,8 +43,8 @@ pub struct QueryRequest {
 /// Errors that can occur during semantic view expansion.
 #[derive(Debug)]
 pub enum ExpandError {
-    /// The request contained no metrics — at least one metric is required.
-    EmptyMetrics { view_name: String },
+    /// The request contained neither dimensions nor metrics.
+    EmptyRequest { view_name: String },
     /// A requested dimension name does not exist in the view definition.
     UnknownDimension {
         view_name: String,
@@ -65,10 +68,10 @@ pub enum ExpandError {
 impl fmt::Display for ExpandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyMetrics { view_name } => {
+            Self::EmptyRequest { view_name } => {
                 write!(
                     f,
-                    "semantic view '{view_name}': at least one metric is required"
+                    "semantic view '{view_name}': specify at least dimensions := [...] or metrics := [...]"
                 )
             }
             Self::UnknownDimension {
@@ -226,7 +229,7 @@ fn find_metric<'a>(
 /// # Errors
 ///
 /// Returns `ExpandError` if:
-/// - No metrics are requested (`EmptyMetrics`)
+/// - Neither dimensions nor metrics are requested (`EmptyRequest`)
 /// - A requested dimension or metric name is not found (`UnknownDimension`, `UnknownMetric`)
 /// - A dimension or metric name is duplicated (`DuplicateDimension`, `DuplicateMetric`)
 pub fn expand(
@@ -234,9 +237,9 @@ pub fn expand(
     def: &SemanticViewDefinition,
     req: &QueryRequest,
 ) -> Result<String, ExpandError> {
-    // 1. Validate: at least one metric is required.
-    if req.metrics.is_empty() {
-        return Err(ExpandError::EmptyMetrics {
+    // 1. Validate: at least one dimension or metric is required.
+    if req.dimensions.is_empty() && req.metrics.is_empty() {
+        return Err(ExpandError::EmptyRequest {
             view_name: view_name.to_string(),
         });
     }
@@ -313,7 +316,14 @@ pub fn expand(
     sql.push_str("\n)");
 
     // 6. Build the outer SELECT.
-    sql.push_str("\nSELECT\n");
+    //    Dimensions-only (no metrics): SELECT DISTINCT, no GROUP BY.
+    //    Metrics-only (no dimensions): SELECT (global aggregate), no GROUP BY.
+    //    Both: SELECT with GROUP BY.
+    if !resolved_dims.is_empty() && resolved_mets.is_empty() {
+        sql.push_str("\nSELECT DISTINCT\n");
+    } else {
+        sql.push_str("\nSELECT\n");
+    }
 
     let mut select_items: Vec<String> = Vec::new();
     for dim in &resolved_dims {
@@ -327,8 +337,8 @@ pub fn expand(
     // 7. FROM the base CTE.
     sql.push_str("\nFROM \"_base\"");
 
-    // 8. GROUP BY (only if dimensions are present).
-    if !resolved_dims.is_empty() {
+    // 8. GROUP BY (only when both dimensions and metrics are present).
+    if !resolved_dims.is_empty() && !resolved_mets.is_empty() {
         sql.push_str("\nGROUP BY\n");
         let group_items: Vec<String> = resolved_dims
             .iter()
@@ -577,20 +587,60 @@ GROUP BY
         }
 
         #[test]
-        fn test_empty_metrics_error() {
+        fn test_empty_request_error() {
             let def = orders_view();
             let req = QueryRequest {
-                dimensions: vec!["region".to_string()],
+                dimensions: vec![],
                 metrics: vec![],
             };
             let result = expand("orders", &def, &req);
             assert!(result.is_err());
             match result.unwrap_err() {
-                ExpandError::EmptyMetrics { view_name } => {
+                ExpandError::EmptyRequest { view_name } => {
                     assert_eq!(view_name, "orders");
                 }
-                other => panic!("Expected EmptyMetrics, got: {other}"),
+                other => panic!("Expected EmptyRequest, got: {other}"),
             }
+        }
+
+        #[test]
+        fn test_dimensions_only_generates_distinct() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string(), "status".to_string()],
+                metrics: vec![],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+WITH \"_base\" AS (
+    SELECT *
+    FROM \"orders\"
+)
+SELECT DISTINCT
+    region AS \"region\",
+    status AS \"status\"
+FROM \"_base\"";
+            assert_eq!(sql, expected);
+        }
+
+        #[test]
+        fn test_metrics_only_still_works() {
+            let def = orders_view();
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["total_revenue".to_string(), "order_count".to_string()],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+WITH \"_base\" AS (
+    SELECT *
+    FROM \"orders\"
+)
+SELECT
+    sum(amount) AS \"total_revenue\",
+    count(*) AS \"order_count\"
+FROM \"_base\"";
+            assert_eq!(sql, expected);
         }
 
         #[test]
@@ -749,13 +799,13 @@ GROUP BY
 
         #[test]
         fn test_error_display_messages() {
-            // EmptyMetrics
-            let err = ExpandError::EmptyMetrics {
+            // EmptyRequest
+            let err = ExpandError::EmptyRequest {
                 view_name: "orders".to_string(),
             };
             let msg = format!("{err}");
             assert!(msg.contains("orders"));
-            assert!(msg.contains("at least one metric is required"));
+            assert!(msg.contains("specify at least dimensions"));
 
             // UnknownDimension with suggestion
             let err = ExpandError::UnknownDimension {

@@ -113,20 +113,24 @@ fn joined_definition() -> SemanticViewDefinition {
 
 /// Generate a random valid `QueryRequest` from a definition.
 ///
-/// Dimensions: 0..all (empty = global aggregate).
-/// Metrics: 1..all (at least one required).
+/// Dimensions: 0..all.
+/// Metrics: 0..all.
+/// At least one dimension or one metric is always present (both-empty is invalid).
 fn arb_query_request(def: &SemanticViewDefinition) -> impl Strategy<Value = QueryRequest> {
     let dim_names: Vec<String> = def.dimensions.iter().map(|d| d.name.clone()).collect();
     let met_names: Vec<String> = def.metrics.iter().map(|m| m.name.clone()).collect();
 
     let dim_strategy = proptest::sample::subsequence(dim_names, 0..=def.dimensions.len());
-    // At least 1 metric required
-    let met_strategy = proptest::sample::subsequence(met_names, 1..=def.metrics.len());
+    let met_strategy = proptest::sample::subsequence(met_names, 0..=def.metrics.len());
 
-    (dim_strategy, met_strategy).prop_map(|(dims, mets)| QueryRequest {
-        dimensions: dims,
-        metrics: mets,
-    })
+    (dim_strategy, met_strategy)
+        .prop_filter("at least one dimension or metric", |(dims, mets)| {
+            !dims.is_empty() || !mets.is_empty()
+        })
+        .prop_map(|(dims, mets)| QueryRequest {
+            dimensions: dims,
+            metrics: mets,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -134,22 +138,47 @@ fn arb_query_request(def: &SemanticViewDefinition) -> impl Strategy<Value = Quer
 // ---------------------------------------------------------------------------
 
 proptest! {
-    /// Property 1: All requested dimensions appear in GROUP BY (or GROUP BY absent if no dims).
+    /// Property 1: Dimensions control aggregation mode.
+    /// - Dimensions + metrics: GROUP BY contains all dimension expressions.
+    /// - Dimensions only (no metrics): SELECT DISTINCT, no GROUP BY.
+    /// - Metrics only (no dimensions): no GROUP BY (global aggregate).
     #[test]
-    fn all_dimensions_in_group_by(req in arb_query_request(&simple_definition())) {
+    fn dimensions_control_aggregation(req in arb_query_request(&simple_definition())) {
         let def = simple_definition();
         let sql = expand("test", &def, &req).unwrap();
 
         if req.dimensions.is_empty() {
+            // Metrics-only: global aggregate, no GROUP BY.
             prop_assert!(
                 !sql.contains("GROUP BY"),
                 "Empty dimensions should produce no GROUP BY. SQL:\n{sql}"
             );
-        } else {
-            let group_by_section = sql.split("GROUP BY").nth(1)
-                .expect("GROUP BY section must exist when dimensions are non-empty");
+        } else if req.metrics.is_empty() {
+            // Dimensions-only: SELECT DISTINCT, no GROUP BY.
+            prop_assert!(
+                sql.contains("SELECT DISTINCT"),
+                "Dimensions-only should use SELECT DISTINCT. SQL:\n{sql}"
+            );
+            prop_assert!(
+                !sql.contains("GROUP BY"),
+                "Dimensions-only should not produce GROUP BY. SQL:\n{sql}"
+            );
+            // All dimension expressions appear in SELECT
             for dim_name in &req.dimensions {
-                // Find the definition dimension to get its expr
+                let dim_def = def.dimensions.iter()
+                    .find(|d| d.name.eq_ignore_ascii_case(dim_name))
+                    .unwrap();
+                prop_assert!(
+                    sql.contains(&dim_def.expr),
+                    "SELECT DISTINCT must contain expr '{}' for dimension '{}'. SQL:\n{}",
+                    dim_def.expr, dim_name, sql
+                );
+            }
+        } else {
+            // Both dimensions and metrics: GROUP BY with all dimension expressions.
+            let group_by_section = sql.split("GROUP BY").nth(1)
+                .expect("GROUP BY section must exist when both dimensions and metrics present");
+            for dim_name in &req.dimensions {
                 let dim_def = def.dimensions.iter()
                     .find(|d| d.name.eq_ignore_ascii_case(dim_name))
                     .unwrap();
@@ -190,7 +219,7 @@ proptest! {
         }
     }
 
-    /// Property 3: SQL structure is valid (WITH, SELECT, FROM present; GROUP BY iff dims).
+    /// Property 3: SQL structure is valid (WITH, SELECT, FROM present; GROUP BY iff dims+metrics).
     #[test]
     fn sql_structure_valid(req in arb_query_request(&simple_definition())) {
         let def = simple_definition();
@@ -208,10 +237,22 @@ proptest! {
             sql.contains("FROM \"_base\""),
             "SQL must contain FROM \"_base\". SQL:\n{sql}"
         );
-        if !req.dimensions.is_empty() {
+        // GROUP BY only when BOTH dimensions and metrics are present.
+        if !req.dimensions.is_empty() && !req.metrics.is_empty() {
             prop_assert!(
                 sql.contains("GROUP BY"),
-                "Non-empty dimensions must produce GROUP BY. SQL:\n{sql}"
+                "Both dims + metrics must produce GROUP BY. SQL:\n{sql}"
+            );
+        }
+        // Dimensions-only must use SELECT DISTINCT without GROUP BY.
+        if !req.dimensions.is_empty() && req.metrics.is_empty() {
+            prop_assert!(
+                sql.contains("SELECT DISTINCT"),
+                "Dimensions-only must use SELECT DISTINCT. SQL:\n{sql}"
+            );
+            prop_assert!(
+                !sql.contains("GROUP BY"),
+                "Dimensions-only must NOT use GROUP BY. SQL:\n{sql}"
             );
         }
     }
