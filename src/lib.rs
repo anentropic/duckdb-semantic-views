@@ -38,6 +38,7 @@ mod extension {
             drop::{DropSemanticView, DropState},
             list::ListSemanticViewsVTab,
         },
+        query::explain::ExplainSemanticViewVTab,
         query::table_function::{QueryState, SemanticViewVTab},
     };
 
@@ -108,6 +109,13 @@ mod extension {
         };
         con.register_table_function_with_extra_info::<SemanticViewVTab, _>(
             "semantic_query",
+            &query_state,
+        )?;
+
+        // Register the explain_semantic_view table function (shares the same
+        // QueryState for catalog access and SQL execution).
+        con.register_table_function_with_extra_info::<ExplainSemanticViewVTab, _>(
+            "explain_semantic_view",
             &query_state,
         )?;
 

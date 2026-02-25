@@ -80,7 +80,7 @@ unsafe impl Sync for SemanticViewInitData {}
 /// # Safety
 ///
 /// `conn` must be a valid, non-null `duckdb_connection` handle.
-unsafe fn execute_sql_raw(
+pub(crate) unsafe fn execute_sql_raw(
     conn: ffi::duckdb_connection,
     sql: &str,
 ) -> Result<ffi::duckdb_result, String> {
@@ -158,7 +158,7 @@ unsafe fn value_raw_ptr(value: &Value) -> ffi::duckdb_value {
 /// # Safety
 ///
 /// `value` must represent a LIST(VARCHAR) value.
-unsafe fn extract_list_strings(value: &Value) -> Vec<String> {
+pub(crate) unsafe fn extract_list_strings(value: &Value) -> Vec<String> {
     let value_ptr = value_raw_ptr(value);
     let size = ffi::duckdb_get_list_size(value_ptr);
     let mut result = Vec::with_capacity(size as usize);
