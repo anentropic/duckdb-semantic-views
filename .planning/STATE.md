@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-23)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 4 in progress — query + explain table functions complete, integration tests next
+**Current focus:** Phase 4 complete — all query interface plans done, ready for Phase 5
 
 ## Current Position
 
-Phase: 4 of 5 (Query Interface) -- IN PROGRESS
-Plan: 2 of 3 in current phase
-Status: Plan 04-02 complete, 04-03 pending (integration tests)
-Last activity: 2026-02-25 — Completed plan 04-02 (Explain Semantic View)
+Phase: 4 of 5 (Query Interface) -- COMPLETE
+Plan: 3 of 3 in current phase (all done)
+Status: Phase 4 complete, Phase 5 (Hardening and Docs) pending
+Last activity: 2026-02-25 — Completed plan 04-03 (Integration Tests)
 
-Progress: [█████████░] 87%
+Progress: [█████████░] 90%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 9
-- Average duration: 5 min
-- Total execution time: 49 min
+- Total plans completed: 10
+- Average duration: 8 min
+- Total execution time: 78 min
 
 **By Phase:**
 
@@ -30,13 +30,13 @@ Progress: [█████████░] 87%
 | 01-scaffold | 3 | 9 min | 3 min |
 | 02-storage-and-ddl | 4 | 35 min | 9 min |
 | 03-expansion-engine | 3 | 13 min | 4 min |
+| 04-query-interface | 3 | 53 min | 18 min |
 
 **Recent Trend:**
-- Last 5 plans: 02-04 (5 min), 03-01 (4 min), 03-02 (4 min), 03-03 (5 min), 04-02 (4 min)
-- Trend: Consistent 4-5 min/plan; explain function leveraged existing FFI patterns from 04-01
+- Last 5 plans: 03-02 (4 min), 03-03 (5 min), 04-01 (20 min), 04-02 (4 min), 04-03 (29 min)
+- Trend: Phase 4 plans longer due to FFI debugging and bug fixing; 04-03 included critical duckdb_value_varchar fix
 
 *Updated after each plan completion*
-| Phase 04 P02 | 4min | 1 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -45,6 +45,11 @@ Progress: [█████████░] 87%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [04-03]: varchar-output-columns: all semantic_query output columns declared as VARCHAR; avoids type mismatch panics when writing string data to typed output vectors
+- [04-03]: varchar-cast-wrapper: expanded SQL wrapped in SELECT CAST(...AS VARCHAR) subquery; ensures all result chunk vectors contain duckdb_string_t data for uniform reading
+- [04-03]: direct-string-t-decode: read duckdb_string_t inline/pointer union directly from vector memory; avoids reliance on C API helper functions in loadable-extension stubs
+- [04-03]: unqualified-join-expressions: dimension/metric expressions must use unqualified column names because CTE flattens all tables into _base namespace
+- [04-03]: python-ducklake-test: DuckLake integration test uses Python script instead of SQLLogicTest; runner cannot install DuckDB extensions dynamically
 - [04-02]: pub-crate-ffi-helpers: promoted execute_sql_raw and extract_list_strings to pub(crate) for reuse by explain module; avoids code duplication across query table functions
 - [04-02]: collect-explain-lines-helper: extracted EXPLAIN plan collection into separate unsafe fn; keeps bind() under clippy pedantic 100-line limit
 - [04-02]: graceful-explain-fallback: if EXPLAIN execution fails (tables not created), output shows '-- (not available -- {error})' instead of hard error
@@ -103,5 +108,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-25
-Stopped at: Completed 04-02-PLAN.md (Explain Semantic View) — explain_semantic_view registered with three-part output
+Stopped at: Completed 04-03-PLAN.md (Integration Tests) — Phase 4 complete, all 3 plans done
 Resume file: None

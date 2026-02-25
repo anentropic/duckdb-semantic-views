@@ -29,9 +29,9 @@
 
 ### Query Interface
 
-- [ ] **QUERY-01**: User can query a semantic view with named array parameters: `FROM my_view(dimensions := ['region', 'category'], metrics := ['total_revenue'])`
-- [ ] **QUERY-02**: User-supplied WHERE clauses are AND-composed with the view's row-level filters (user filters do not replace view filters)
-- [ ] **QUERY-03**: `SELECT *` on a semantic view returns all requested dimensions and metrics; schema is inferred correctly at bind time
+- [x] **QUERY-01**: User can query a semantic view with named array parameters: `FROM my_view(dimensions := ['region', 'category'], metrics := ['total_revenue'])`
+- [x] **QUERY-02**: User-supplied WHERE clauses are AND-composed with the view's row-level filters (user filters do not replace view filters)
+- [x] **QUERY-03**: `SELECT *` on a semantic view returns all requested dimensions and metrics; schema is inferred correctly at bind time
 - [x] **QUERY-04**: `EXPLAIN` on a semantic view query shows the expanded SQL for debugging and transparency
 
 ### Expansion Engine
@@ -45,8 +45,8 @@
 
 - [x] **TEST-01**: Unit tests cover the expansion engine (GROUP BY inference, JOIN generation, SQL emission) without requiring a DuckDB runtime
 - [x] **TEST-02**: Property-based tests (using `proptest`) cover expansion engine invariants: all requested dimensions appear in GROUP BY, emitted SQL is syntactically valid
-- [ ] **TEST-03**: Integration tests load the extension in-process, create semantic views, run real DuckDB SQL queries, and assert correct results
-- [ ] **TEST-04**: Integration test suite includes at least one test scenario using an Apache Iceberg table source
+- [x] **TEST-03**: Integration tests load the extension in-process, create semantic views, run real DuckDB SQL queries, and assert correct results
+- [x] **TEST-04**: Integration test suite includes at least one test scenario using an Apache Iceberg table source
 - [ ] **TEST-05**: Fuzz targets (using `cargo-fuzz`) cover the unsafe C FFI boundary and the SQL generation path
 
 ### Code Quality
@@ -125,12 +125,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 | EXPAND-04 | Phase 3 — Expansion Engine | Complete |
 | TEST-01 | Phase 3 — Expansion Engine | Complete |
 | TEST-02 | Phase 3 — Expansion Engine | Complete |
-| QUERY-01 | Phase 4 — Query Interface | Pending |
-| QUERY-02 | Phase 4 — Query Interface | Pending |
-| QUERY-03 | Phase 4 — Query Interface | Pending |
+| QUERY-01 | Phase 4 — Query Interface | Complete |
+| QUERY-02 | Phase 4 — Query Interface | Complete |
+| QUERY-03 | Phase 4 — Query Interface | Complete |
 | QUERY-04 | Phase 4 — Query Interface | Complete |
-| TEST-03 | Phase 4 — Query Interface | Pending |
-| TEST-04 | Phase 4 — Query Interface | Pending |
+| TEST-03 | Phase 4 — Query Interface | Complete |
+| TEST-04 | Phase 4 — Query Interface | Complete |
 | TEST-05 | Phase 5 — Hardening and Docs | Pending |
 | DOCS-01 | Phase 5 — Hardening and Docs | Pending |
 
@@ -141,4 +141,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-02-23*
-*Last updated: 2026-02-23 after roadmap creation*
+*Last updated: 2026-02-25 after Phase 4 completion*
