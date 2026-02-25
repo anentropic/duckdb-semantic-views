@@ -32,7 +32,7 @@
 - [x] **QUERY-01**: User can query a semantic view with named array parameters: `FROM my_view(dimensions := ['region', 'category'], metrics := ['total_revenue'])`
 - [x] **QUERY-02**: User-supplied WHERE clauses are AND-composed with the view's row-level filters (user filters do not replace view filters)
 - [x] **QUERY-03**: `SELECT *` on a semantic view returns all requested dimensions and metrics; schema is inferred correctly at bind time
-- [x] **QUERY-04**: `EXPLAIN` on a semantic view query shows the expanded SQL for debugging and transparency
+- [x] **QUERY-04**: Users can inspect the expanded SQL for a semantic view query via `explain_semantic_view()` for debugging and transparency
 
 ### Expansion Engine
 
@@ -66,6 +66,7 @@ Deferred to next milestone. Not in current roadmap.
 
 - **QUERY-V2-01**: Native `CREATE SEMANTIC VIEW` DDL syntax (requires C++ shim for DuckDB parser hooks)
 - **QUERY-V2-02**: Time dimensions with explicit granularity coarsening (day → week → month → year queries)
+- **QUERY-V2-03**: Native `EXPLAIN FROM semantic_query(...)` shows expanded SQL instead of physical plan (requires C++ shim for EXPLAIN hook interception)
 
 ### Distribution
 
