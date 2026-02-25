@@ -1,4 +1,3 @@
-use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use duckdb::{
@@ -11,7 +10,9 @@ use crate::expand::{expand, suggest_closest, QueryRequest};
 use crate::model::SemanticViewDefinition;
 
 use super::error::QueryError;
-use super::table_function::{execute_sql_raw, extract_list_strings, QueryState};
+use super::table_function::{
+    execute_sql_raw, extract_list_strings, read_varchar_from_vector, QueryState,
+};
 
 // ---------------------------------------------------------------------------
 // BindData / InitData
@@ -70,14 +71,8 @@ unsafe fn collect_explain_lines(conn: ffi::duckdb_connection, sql: &str) -> Vec<
 
                 for row_idx in 0..row_count {
                     for col_idx in 0..col_count {
-                        let val = ffi::duckdb_value_varchar(
-                            &raw mut result,
-                            col_idx as ffi::idx_t,
-                            row_idx as ffi::idx_t,
-                        );
-                        if !val.is_null() {
-                            let s = CStr::from_ptr(val).to_string_lossy().into_owned();
-                            ffi::duckdb_free(val.cast::<std::os::raw::c_void>());
+                        let s = read_varchar_from_vector(chunk, col_idx, row_idx);
+                        if !s.is_empty() {
                             for plan_line in s.lines() {
                                 lines.push(plan_line.to_string());
                             }

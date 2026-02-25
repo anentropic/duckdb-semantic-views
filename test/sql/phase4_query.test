@@ -1,0 +1,231 @@
+# Phase 4 query round-trip integration tests.
+#
+# Exercises semantic_query table function against real DuckDB tables with known
+# data. Covers basic aggregation, WHERE composition, multi-table joins,
+# EXPLAIN plan equivalence, dimensions-only, metrics-only, and error cases.
+#
+# NOTE: semantic_query returns all columns as VARCHAR. DuckDB handles implicit
+# casting in downstream operations (WHERE, ORDER BY). All query type specifiers
+# use T (text) accordingly.
+#
+# Requirements covered:
+#   TEST-03: Integration tests load the extension, create semantic views, run
+#            real DuckDB SQL queries, and assert correct results
+#   QUERY-01: semantic_query with named array parameters returns correct results
+#   QUERY-02: User WHERE clauses compose with view filters
+#   QUERY-03: SELECT * returns all requested dimensions and metrics
+#
+# Run via: just test-sql  (make test_debug)
+
+require semantic_views
+
+# ============================================================
+# 1. Setup -- Create test tables with known data
+# ============================================================
+
+statement ok
+CREATE TABLE test_orders (
+    id INTEGER, region VARCHAR, category VARCHAR,
+    amount DECIMAL(10,2), status VARCHAR, customer_id INTEGER
+);
+
+statement ok
+INSERT INTO test_orders VALUES
+    (1, 'EMEA', 'electronics', 100.00, 'completed', 1),
+    (2, 'APAC', 'electronics', 200.00, 'completed', 2),
+    (3, 'EMEA', 'clothing', 50.00, 'pending', 1),
+    (4, 'APAC', 'clothing', 150.00, 'completed', 3),
+    (5, 'EMEA', 'electronics', 75.00, 'completed', 2);
+
+statement ok
+CREATE TABLE test_customers (
+    id INTEGER, name VARCHAR, tier VARCHAR
+);
+
+statement ok
+INSERT INTO test_customers VALUES
+    (1, 'Alice', 'gold'),
+    (2, 'Bob', 'silver'),
+    (3, 'Charlie', 'gold');
+
+statement ok
+CREATE TABLE test_products (
+    category VARCHAR, supplier VARCHAR
+);
+
+statement ok
+INSERT INTO test_products VALUES
+    ('electronics', 'TechCorp'),
+    ('clothing', 'FashionInc');
+
+# ============================================================
+# 2. Scenario 1: Basic round-trip (TEST-03, QUERY-01)
+# ============================================================
+
+# Define a basic semantic view over test_orders
+statement ok
+SELECT define_semantic_view(
+    'simple_orders',
+    '{"base_table":"test_orders","dimensions":[{"name":"region","expr":"region"},{"name":"category","expr":"category"}],"metrics":[{"name":"total_revenue","expr":"sum(amount)"},{"name":"order_count","expr":"count(*)"}]}'
+);
+
+# Query with single dimension + single metric
+query TT rowsort
+SELECT * FROM semantic_query('simple_orders', dimensions := ['region'], metrics := ['total_revenue']);
+----
+APAC	350.00
+EMEA	225.00
+
+# Query with all dimensions + all metrics
+query TTTT rowsort
+SELECT * FROM semantic_query('simple_orders', dimensions := ['region', 'category'], metrics := ['total_revenue', 'order_count']);
+----
+APAC	clothing	150.00	1
+APAC	electronics	200.00	1
+EMEA	clothing	50.00	1
+EMEA	electronics	175.00	2
+
+# ============================================================
+# 3. Scenario 2: WHERE composition (QUERY-02)
+# ============================================================
+
+# Define a view with a row-level filter (only completed orders)
+statement ok
+SELECT define_semantic_view(
+    'filtered_orders',
+    '{"base_table":"test_orders","dimensions":[{"name":"region","expr":"region"}],"metrics":[{"name":"total_revenue","expr":"sum(amount)"}],"filters":["status = ''completed''"]}'
+);
+
+# View filter should exclude the pending order (EMEA clothing 50.00)
+query TT rowsort
+SELECT * FROM semantic_query('filtered_orders', dimensions := ['region'], metrics := ['total_revenue']);
+----
+APAC	350.00
+EMEA	175.00
+
+# User WHERE composes with view filter -- only EMEA completed orders
+query TT rowsort
+SELECT * FROM semantic_query('filtered_orders', dimensions := ['region'], metrics := ['total_revenue']) WHERE region = 'EMEA';
+----
+EMEA	175.00
+
+# ============================================================
+# 4. Scenario 4: Multi-table joins (QUERY-01 with joins)
+# ============================================================
+
+# Define a view joining orders -> customers and orders -> products.
+# NOTE: dimension/metric expressions must use unqualified column names
+# because the CTE flattens all tables into "_base". The source_table
+# field is used only for join resolution, not expression qualification.
+statement ok
+SELECT define_semantic_view(
+    'joined_orders',
+    '{"base_table":"test_orders","dimensions":[{"name":"region","expr":"region"},{"name":"customer_tier","expr":"tier","source_table":"test_customers"},{"name":"supplier","expr":"supplier","source_table":"test_products"}],"metrics":[{"name":"total_revenue","expr":"sum(amount)"},{"name":"order_count","expr":"count(*)"}],"joins":[{"table":"test_customers","on":"test_orders.customer_id = test_customers.id"},{"table":"test_products","on":"test_orders.category = test_products.category"}]}'
+);
+
+# Query by customer_tier -- needs test_customers join only
+# gold: Alice(100+50) + Charlie(150) = 300, silver: Bob(200+75) = 275
+query TT rowsort
+SELECT * FROM semantic_query('joined_orders', dimensions := ['customer_tier'], metrics := ['total_revenue']);
+----
+gold	300.00
+silver	275.00
+
+# Query by supplier -- needs test_products join only
+# TechCorp(electronics): 3 orders, FashionInc(clothing): 2 orders
+query TT rowsort
+SELECT * FROM semantic_query('joined_orders', dimensions := ['supplier'], metrics := ['order_count']);
+----
+FashionInc	2
+TechCorp	3
+
+# ============================================================
+# 5. Scenario 5: EXPLAIN equivalence via explain_semantic_view
+# ============================================================
+
+# Verify explain_semantic_view returns output with the expanded SQL
+# The output should contain the view name and key SQL clauses
+query T
+SELECT * FROM explain_semantic_view('simple_orders', dimensions := ['region'], metrics := ['total_revenue']) WHERE explain_output = '-- Semantic View: simple_orders';
+----
+-- Semantic View: simple_orders
+
+# Verify the expanded SQL contains the GROUP BY clause
+query I
+SELECT count(*) FROM explain_semantic_view('simple_orders', dimensions := ['region'], metrics := ['total_revenue']) WHERE explain_output LIKE '%GROUP BY%';
+----
+1
+
+# Verify the DuckDB plan section contains a reference to the base table
+# (appears in both the SQL and the execution plan)
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('simple_orders', dimensions := ['region'], metrics := ['total_revenue']) WHERE explain_output LIKE '%test_orders%';
+----
+true
+
+# ============================================================
+# 6. Dimensions-only and metrics-only queries
+# ============================================================
+
+# Dimensions-only: should return DISTINCT values
+query T rowsort
+SELECT * FROM semantic_query('simple_orders', dimensions := ['region']);
+----
+APAC
+EMEA
+
+# Metrics-only: should return global aggregate
+query T
+SELECT * FROM semantic_query('simple_orders', metrics := ['total_revenue']);
+----
+575.00
+
+# Metrics-only with count
+query T
+SELECT * FROM semantic_query('simple_orders', metrics := ['order_count']);
+----
+5
+
+# ============================================================
+# 7. Error cases
+# ============================================================
+
+# Nonexistent view -- should error with "not found"
+statement error
+SELECT * FROM semantic_query('nonexistent', dimensions := ['x']);
+----
+not found
+
+# Unknown dimension -- should error with "unknown dimension"
+statement error
+SELECT * FROM semantic_query('simple_orders', dimensions := ['nonexistent']);
+----
+unknown dimension
+
+# No dimensions or metrics -- should error
+statement error
+SELECT * FROM semantic_query('simple_orders');
+----
+specify at least
+
+# ============================================================
+# 8. Cleanup -- drop views and tables for idempotency
+# ============================================================
+
+statement ok
+SELECT drop_semantic_view('simple_orders');
+
+statement ok
+SELECT drop_semantic_view('filtered_orders');
+
+statement ok
+SELECT drop_semantic_view('joined_orders');
+
+statement ok
+DROP TABLE test_orders;
+
+statement ok
+DROP TABLE test_customers;
+
+statement ok
+DROP TABLE test_products;

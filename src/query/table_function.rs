@@ -105,6 +105,10 @@ pub(crate) unsafe fn execute_sql_raw(
 /// Uses `duckdb_create_logical_type` for primitive types. Falls back to VARCHAR
 /// for complex types (DECIMAL, LIST, STRUCT, etc.) since those require
 /// additional parameters.
+///
+/// Currently unused -- all output columns are declared as VARCHAR. Retained
+/// for potential future use if typed output columns are re-enabled.
+#[allow(dead_code)]
 fn logical_type_from_duckdb_type(ty: ffi::duckdb_type) -> LogicalTypeHandle {
     // For primitive types, use the duckdb-rs factory.
     // For complex/unsupported types, default to VARCHAR.
@@ -247,16 +251,20 @@ impl VTab for SemanticViewVTab {
         let expanded_sql = expand(&view_name, &def, &req)
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(QueryError::from(e)) })?;
 
-        // 6. Infer output schema.
+        // 6. Infer output schema (column names and underlying types for metadata).
         //    Try executing the expanded SQL with LIMIT 0 to discover column types.
         //    If that fails (e.g., re-entrant SQL not allowed in bind), fall back
         //    to defaults: dimensions -> VARCHAR, metrics -> DOUBLE.
         let (column_names, column_type_ids) =
             infer_schema_or_default(state.conn, &expanded_sql, &dimensions, &metrics, &def);
 
-        // 7. Declare output columns.
-        for (name, &ty) in column_names.iter().zip(&column_type_ids) {
-            bind.add_result_column(name, logical_type_from_duckdb_type(ty));
+        // 7. Declare all output columns as VARCHAR.
+        //    The func() phase reads result data as VARCHAR strings (via a
+        //    VARCHAR-cast wrapper query) and writes them using flat_vector::insert.
+        //    DuckDB will implicitly cast VARCHAR to target types in downstream
+        //    operations (WHERE, ORDER BY, etc.).
+        for name in &column_names {
+            bind.add_result_column(name, LogicalTypeHandle::from(LogicalTypeId::Varchar));
         }
 
         Ok(SemanticViewBindData {
@@ -287,25 +295,25 @@ impl VTab for SemanticViewVTab {
         let bind_data = func.get_bind_data();
         let state = unsafe { &*func.get_extra_info::<QueryState>() };
 
-        // Execute the expanded SQL via the raw FFI connection.
+        // Wrap the expanded SQL so that all columns are cast to VARCHAR.
+        // This ensures we only need to read VARCHAR vectors from the result
+        // chunks, avoiding type-specific vector parsing. DuckDB will
+        // implicitly cast the VARCHAR strings back to the declared output
+        // types when they are written via flat_vector::insert.
+        let varchar_sql = build_varchar_cast_sql(&bind_data.expanded_sql, &bind_data.column_names);
+
+        // Execute the VARCHAR-wrapped SQL via the raw FFI connection.
         let mut result = unsafe {
-            execute_sql_raw(state.conn, &bind_data.expanded_sql).map_err(|e| {
-                QueryError::SqlExecution {
-                    expanded_sql: bind_data.expanded_sql.clone(),
-                    duckdb_error: e,
-                }
+            execute_sql_raw(state.conn, &varchar_sql).map_err(|e| QueryError::SqlExecution {
+                expanded_sql: bind_data.expanded_sql.clone(),
+                duckdb_error: e,
             })?
         };
 
-        // Fetch data and copy to output chunks.
-        // DuckDB table functions emit data in chunks. We fetch all result chunks
-        // from the FFI result and copy them to the output. For simplicity in v0.1,
-        // we materialize ALL rows into a single output chunk call. If the result
-        // exceeds DataChunkHandle capacity, we will need pagination (deferred).
-        //
-        // Strategy: read all result data as VARCHAR strings and insert via flat_vector.
-        // This works regardless of the actual column type because DuckDB handles
-        // implicit casting from VARCHAR to the declared output type.
+        // Fetch data from result chunks.
+        // All columns are VARCHAR thanks to the wrapping query, so we can
+        // read string data directly from the duckdb_string_t layout in
+        // each vector.
         let col_count = unsafe { ffi::duckdb_column_count(&mut result) } as usize;
         let chunk_count = unsafe { ffi::duckdb_result_chunk_count(result) } as usize;
 
@@ -322,44 +330,8 @@ impl VTab for SemanticViewVTab {
             for row_idx in 0..row_count {
                 let mut row: Vec<String> = Vec::with_capacity(col_count);
                 for col_idx in 0..col_count {
-                    let vector =
-                        unsafe { ffi::duckdb_data_chunk_get_vector(chunk, col_idx as ffi::idx_t) };
-
-                    // Check for NULL using the validity mask.
-                    let validity = unsafe { ffi::duckdb_vector_get_validity(vector) };
-                    let is_null = if validity.is_null() {
-                        false // All valid when no validity mask
-                    } else {
-                        // Check bit at row_idx position
-                        let entry_idx = row_idx / 64;
-                        let bit_idx = row_idx % 64;
-                        unsafe {
-                            let entry = *validity.add(entry_idx);
-                            entry & (1u64 << bit_idx) == 0
-                        }
-                    };
-
-                    if is_null {
-                        row.push(String::new()); // NULL represented as empty string
-                    } else {
-                        // Use duckdb_get_varchar on a value extracted from the result.
-                        // For simplicity, use the deprecated but functional
-                        // duckdb_value_varchar approach via column value extraction.
-                        let val = unsafe {
-                            ffi::duckdb_value_varchar(
-                                &mut result,
-                                col_idx as ffi::idx_t,
-                                row_idx as ffi::idx_t,
-                            )
-                        };
-                        if val.is_null() {
-                            row.push(String::new());
-                        } else {
-                            let s = unsafe { CStr::from_ptr(val).to_string_lossy().into_owned() };
-                            unsafe { ffi::duckdb_free(val.cast::<c_void>()) };
-                            row.push(s);
-                        }
-                    }
+                    let s = unsafe { read_varchar_from_vector(chunk, col_idx, row_idx) };
+                    row.push(s);
                 }
                 all_rows.push(row);
             }
@@ -491,4 +463,96 @@ unsafe fn try_infer_schema(
 
     ffi::duckdb_destroy_result(&mut result);
     Some((names, types))
+}
+
+// ---------------------------------------------------------------------------
+// VARCHAR-cast SQL wrapping and chunk-based string reading
+// ---------------------------------------------------------------------------
+
+/// Wrap the expanded SQL in a subquery that casts every output column to VARCHAR.
+///
+/// The deprecated `duckdb_value_varchar` API does not work reliably with DuckDB's
+/// chunked result format. By casting all columns to VARCHAR in the SQL itself,
+/// we guarantee that every vector in every result chunk contains `duckdb_string_t`
+/// values, which can be read uniformly via `read_varchar_from_vector`.
+fn build_varchar_cast_sql(expanded_sql: &str, column_names: &[String]) -> String {
+    use crate::expand::quote_ident;
+
+    let cast_items: Vec<String> = column_names
+        .iter()
+        .map(|name| {
+            format!(
+                "CAST({} AS VARCHAR) AS {}",
+                quote_ident(name),
+                quote_ident(name)
+            )
+        })
+        .collect();
+    format!(
+        "SELECT {} FROM ({}) AS \"_sq\"",
+        cast_items.join(", "),
+        expanded_sql
+    )
+}
+
+/// Read a VARCHAR value from a data chunk vector at the given column and row.
+///
+/// The vector must contain VARCHAR (`duckdb_string_t`) data. Returns an empty
+/// string for NULL values.
+///
+/// Decodes the `duckdb_string_t` layout directly from vector memory to avoid
+/// reliance on C API helper functions that may not be available in loadable
+/// extension mode.
+///
+/// # Safety
+///
+/// `chunk` must be a valid, non-null `duckdb_data_chunk` handle.
+/// `col_idx` and `row_idx` must be within bounds.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) unsafe fn read_varchar_from_vector(
+    chunk: ffi::duckdb_data_chunk,
+    col_idx: usize,
+    row_idx: usize,
+) -> String {
+    let vector = ffi::duckdb_data_chunk_get_vector(chunk, col_idx as ffi::idx_t);
+
+    // Check for NULL using the validity mask.
+    let validity = ffi::duckdb_vector_get_validity(vector);
+    if !validity.is_null() {
+        let entry_idx = row_idx / 64;
+        let bit_idx = row_idx % 64;
+        let entry = *validity.add(entry_idx);
+        if entry & (1u64 << bit_idx) == 0 {
+            return String::new(); // NULL
+        }
+    }
+
+    // Read the duckdb_string_t from the vector data.
+    // Layout is a 16-byte union:
+    //   Inline  (len <= 12): { length: u32, inlined: [c_char; 12] }
+    //   Pointer (len > 12):  { length: u32, prefix: [c_char; 4], ptr: *mut c_char }
+    let data_ptr = ffi::duckdb_vector_get_data(vector);
+    let string_t_ptr = data_ptr.cast::<ffi::duckdb_string_t>().add(row_idx);
+    let string_t = &*string_t_ptr;
+
+    // The length field is at the same offset for both union variants.
+    let len = string_t.value.inlined.length as usize;
+    if len == 0 {
+        return String::new();
+    }
+
+    let bytes = if len <= 12 {
+        // Inline: string data follows the length field directly.
+        let inline_ptr = string_t.value.inlined.inlined.as_ptr().cast::<u8>();
+        std::slice::from_raw_parts(inline_ptr, len)
+    } else {
+        // Pointer: data is at the heap-allocated ptr.
+        let heap_ptr = string_t.value.pointer.ptr.cast::<u8>();
+        if heap_ptr.is_null() {
+            return String::new();
+        }
+        std::slice::from_raw_parts(heap_ptr, len)
+    };
+
+    String::from_utf8_lossy(bytes).into_owned()
 }
