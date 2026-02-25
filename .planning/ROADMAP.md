@@ -81,7 +81,12 @@ Plans:
   3. `SELECT *` on a semantic view query returns all requested dimensions and metrics with correct column names and types inferred at bind time
   4. `EXPLAIN` on a semantic view query shows the expanded SQL string rather than just the DuckDB physical plan, enabling users to inspect what SQL the extension generated
   5. Integration tests define a semantic view over a real DuckDB database (including at least one Apache Iceberg table source), run queries, and assert that result sets match known-correct values
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 04-01-PLAN.md — expand() dimensions-only support + semantic_query table function with FFI SQL execution
+- [ ] 04-02-PLAN.md — explain_semantic_view table function for EXPLAIN output
+- [ ] 04-03-PLAN.md — Integration tests (SQLLogicTest + DuckLake/Iceberg setup)
 
 ### Phase 5: Hardening and Docs
 **Goal**: The extension is resilient against malformed inputs at the FFI boundary and is documented well enough for a contributor to set up, build, test, and publish without asking for help
@@ -102,5 +107,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 1. Scaffold | 3/3 | Complete | 2026-02-24 |
 | 2. Storage and DDL | 4/4 | Complete | 2026-02-24 |
 | 3. Expansion Engine | 0/3 | Complete    | 2026-02-25 |
-| 4. Query Interface | 0/? | Not started | - |
+| 4. Query Interface | 0/3 | Not started | - |
 | 5. Hardening and Docs | 0/? | Not started | - |
