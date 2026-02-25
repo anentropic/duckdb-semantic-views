@@ -61,8 +61,20 @@ coverage:
 test-sql: build
     make test_debug
 
-# Run all tests: Rust unit tests + SQL logic tests (via SQLLogicTest runner)
-test-all: test-rust test-sql
+# Download jaffle-shop data and create DuckLake/Iceberg catalog for integration tests.
+# Idempotent — safe to run multiple times. Data files are gitignored.
+# Uses the project venv Python which has duckdb installed.
+setup-ducklake:
+    ./configure/venv/bin/python3 configure/setup_ducklake.py
+
+# Run DuckLake/Iceberg integration test (requires `just setup-ducklake` first).
+# Tests semantic_query against DuckLake-managed Iceberg tables with jaffle-shop data.
+test-iceberg: build
+    ./configure/venv/bin/python3 test/integration/test_ducklake.py
+
+# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration
+# Note: DuckLake test requires `just setup-ducklake` to have been run first.
+test-all: test-rust test-sql test-iceberg
 
 # Clean build artifacts
 clean:
