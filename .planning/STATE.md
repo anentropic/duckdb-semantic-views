@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-02-23)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 3 complete — ready for Phase 4 (Query Interface)
+**Current focus:** Phase 4 in progress — query table function complete, EXPLAIN + integration tests next
 
 ## Current Position
 
-Phase: 3 of 5 (Expansion Engine) -- COMPLETE
-Plan: 3 of 3 in current phase
-Status: Phase complete
-Last activity: 2026-02-25 — Completed plan 03-03 (Property-Based Tests)
+Phase: 4 of 5 (Query Interface) -- IN PROGRESS
+Plan: 1 of 3 in current phase
+Status: Plan 04-01 complete, Wave 2 pending (04-02 + 04-03)
+Last activity: 2026-02-25 — Completed plan 04-01 (Core Query Table Function)
 
 Progress: [████████░░] 80%
 
@@ -44,6 +44,11 @@ Progress: [████████░░] 80%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [04-01]: manual-ffi-entrypoint: replaced #[duckdb_entrypoint_c_api] macro with hand-written FFI entrypoint to capture raw duckdb_database handle; enables duckdb_connect for independent query connection
+- [04-01]: independent-query-connection: semantic_query uses a separate duckdb_connection via duckdb_connect; avoids lock conflicts with host during expanded SQL execution
+- [04-01]: limit0-schema-inference: bind() executes expanded SQL LIMIT 0 on independent connection to discover column types; falls back to VARCHAR dims / DOUBLE metrics if inference fails
+- [04-01]: varchar-string-materialization: func() reads all result values as VARCHAR via duckdb_value_varchar; DuckDB handles implicit casting to declared output types
+- [04-01]: empty-request-replaces-empty-metrics: EmptyMetrics replaced with EmptyRequest — triggered when both dims and metrics empty; dimensions-only is now valid (SELECT DISTINCT)
 - [03-03]: lib-crate-type-for-integration-tests: added "lib" to crate-type alongside cdylib so integration tests in tests/ can link against the crate; cdylib alone only produces a dynamic library for FFI consumers
 - [03-03]: proptest-subsequence-strategy: arb_query_request() uses proptest::sample::subsequence to generate valid dimension/metric subsets from definitions; guarantees all generated requests reference valid names
 - [03-03]: proptest-default-config-256-cases: default proptest config (256 cases per property) is sufficient for the dimension/metric subset combinatorial space
