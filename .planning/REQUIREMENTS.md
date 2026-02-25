@@ -32,7 +32,7 @@
 - [ ] **QUERY-01**: User can query a semantic view with named array parameters: `FROM my_view(dimensions := ['region', 'category'], metrics := ['total_revenue'])`
 - [ ] **QUERY-02**: User-supplied WHERE clauses are AND-composed with the view's row-level filters (user filters do not replace view filters)
 - [ ] **QUERY-03**: `SELECT *` on a semantic view returns all requested dimensions and metrics; schema is inferred correctly at bind time
-- [ ] **QUERY-04**: `EXPLAIN` on a semantic view query shows the expanded SQL for debugging and transparency
+- [x] **QUERY-04**: `EXPLAIN` on a semantic view query shows the expanded SQL for debugging and transparency
 
 ### Expansion Engine
 
@@ -128,7 +128,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | QUERY-01 | Phase 4 — Query Interface | Pending |
 | QUERY-02 | Phase 4 — Query Interface | Pending |
 | QUERY-03 | Phase 4 — Query Interface | Pending |
-| QUERY-04 | Phase 4 — Query Interface | Pending |
+| QUERY-04 | Phase 4 — Query Interface | Complete |
 | TEST-03 | Phase 4 — Query Interface | Pending |
 | TEST-04 | Phase 4 — Query Interface | Pending |
 | TEST-05 | Phase 5 — Hardening and Docs | Pending |

@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-23)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 4 in progress — query table function complete, EXPLAIN + integration tests next
+**Current focus:** Phase 4 in progress — query + explain table functions complete, integration tests next
 
 ## Current Position
 
 Phase: 4 of 5 (Query Interface) -- IN PROGRESS
-Plan: 1 of 3 in current phase
-Status: Plan 04-01 complete, Wave 2 pending (04-02 + 04-03)
-Last activity: 2026-02-25 — Completed plan 04-01 (Core Query Table Function)
+Plan: 2 of 3 in current phase
+Status: Plan 04-02 complete, 04-03 pending (integration tests)
+Last activity: 2026-02-25 — Completed plan 04-02 (Explain Semantic View)
 
-Progress: [████████░░] 80%
+Progress: [█████████░] 87%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 8
+- Total plans completed: 9
 - Average duration: 5 min
-- Total execution time: 45 min
+- Total execution time: 49 min
 
 **By Phase:**
 
@@ -32,10 +32,11 @@ Progress: [████████░░] 80%
 | 03-expansion-engine | 3 | 13 min | 4 min |
 
 **Recent Trend:**
-- Last 5 plans: 02-03 (7 min), 02-04 (5 min), 03-01 (4 min), 03-02 (4 min), 03-03 (5 min)
-- Trend: Consistent 4-5 min/plan for Phase 3; proptest plan slightly longer due to new dependency compilation
+- Last 5 plans: 02-04 (5 min), 03-01 (4 min), 03-02 (4 min), 03-03 (5 min), 04-02 (4 min)
+- Trend: Consistent 4-5 min/plan; explain function leveraged existing FFI patterns from 04-01
 
 *Updated after each plan completion*
+| Phase 04 P02 | 4min | 1 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -44,6 +45,9 @@ Progress: [████████░░] 80%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [04-02]: pub-crate-ffi-helpers: promoted execute_sql_raw and extract_list_strings to pub(crate) for reuse by explain module; avoids code duplication across query table functions
+- [04-02]: collect-explain-lines-helper: extracted EXPLAIN plan collection into separate unsafe fn; keeps bind() under clippy pedantic 100-line limit
+- [04-02]: graceful-explain-fallback: if EXPLAIN execution fails (tables not created), output shows '-- (not available -- {error})' instead of hard error
 - [04-01]: manual-ffi-entrypoint: replaced #[duckdb_entrypoint_c_api] macro with hand-written FFI entrypoint to capture raw duckdb_database handle; enables duckdb_connect for independent query connection
 - [04-01]: independent-query-connection: semantic_query uses a separate duckdb_connection via duckdb_connect; avoids lock conflicts with host during expanded SQL execution
 - [04-01]: limit0-schema-inference: bind() executes expanded SQL LIMIT 0 on independent connection to discover column types; falls back to VARCHAR dims / DOUBLE metrics if inference fails
@@ -99,5 +103,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-25
-Stopped at: Completed 03-03-PLAN.md (Property-Based Tests) — Phase 3 complete; 6 proptest invariants, 52 total tests
+Stopped at: Completed 04-02-PLAN.md (Explain Semantic View) — explain_semantic_view registered with three-part output
 Resume file: None
