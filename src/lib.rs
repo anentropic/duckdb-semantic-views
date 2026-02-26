@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod expand;
 pub mod model;
+#[cfg(feature = "extension")]
 pub mod query;
 
 /// DDL function implementations — only compiled when building the `DuckDB` extension.

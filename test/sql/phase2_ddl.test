@@ -157,6 +157,14 @@ SELECT count(*) FROM list_semantic_views();
 
 load __TEST_DIR__/restart_test.db
 
+# Idempotent cleanup: if a previous run left state behind via the sidecar file,
+# init_catalog will have already loaded the view. Drop it before re-defining.
+statement ok
+SELECT CASE WHEN (SELECT count(*) FROM list_semantic_views() WHERE name = 'restart_test') > 0
+       THEN drop_semantic_view('restart_test')
+       ELSE 'no-op'
+END;
+
 # Define a view in the file-backed database
 statement ok
 SELECT define_semantic_view(

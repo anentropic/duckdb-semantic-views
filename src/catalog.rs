@@ -247,7 +247,9 @@ mod tests {
 
     #[test]
     fn pragma_database_list_returns_file_path() {
-        let tmpfile = "/tmp/test_pragma_rust_check.duckdb";
+        let tmp = std::env::temp_dir();
+        let tmpfile_buf = tmp.join("test_pragma_rust_check.duckdb");
+        let tmpfile = tmpfile_buf.to_str().expect("temp dir is UTF-8");
         let _ = std::fs::remove_file(tmpfile);
         let con = Connection::open(tmpfile).expect("open file-backed connection");
         let mut stmt = con.prepare("PRAGMA database_list").expect("prepare PRAGMA");
@@ -303,7 +305,9 @@ mod tests {
 
     #[test]
     fn sidecar_round_trip() {
-        let db_path = "/tmp/test_sidecar_roundtrip.duckdb";
+        let tmp = std::env::temp_dir();
+        let db_path_buf = tmp.join("test_sidecar_roundtrip.duckdb");
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
         let sidecar = sidecar_path(db_path);
         // Clean up
         let _ = std::fs::remove_file(&sidecar);
@@ -327,7 +331,9 @@ mod tests {
 
     #[test]
     fn init_catalog_loads_from_sidecar() {
-        let db_path = "/tmp/test_init_sidecar.duckdb";
+        let tmp = std::env::temp_dir();
+        let db_path_buf = tmp.join("test_init_sidecar.duckdb");
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
         let sidecar = sidecar_path(db_path);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}.wal"));
