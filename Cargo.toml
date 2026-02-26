@@ -26,6 +26,7 @@ crate-type = ["cdylib", "lib"]
 #   (bundled DuckDB — Connection::open_in_memory() works)
 default = ["duckdb/bundled"]
 extension = ["duckdb/loadable-extension", "duckdb/vscalar"]
+arbitrary = ["dep:arbitrary"]
 
 [dependencies]
 duckdb = { version = "=1.4.4", default-features = false }
@@ -33,6 +34,7 @@ libduckdb-sys = "=1.4.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strsim = "0.11"
+arbitrary = { version = "1", optional = true, features = ["derive"] }
 
 [dev-dependencies]
 proptest = "1.9"

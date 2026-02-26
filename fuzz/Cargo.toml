@@ -1,0 +1,31 @@
+[package]
+name = "semantic-views-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+semantic_views = { path = "..", features = ["arbitrary"] }
+
+# Prevent this from being absorbed into the parent workspace
+[workspace]
+
+[[bin]]
+name = "fuzz_json_parse"
+path = "fuzz_targets/fuzz_json_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_sql_expand"
+path = "fuzz_targets/fuzz_sql_expand.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_query_names"
+path = "fuzz_targets/fuzz_query_names.rs"
+doc = false

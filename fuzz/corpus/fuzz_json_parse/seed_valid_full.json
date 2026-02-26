@@ -1,0 +1,1 @@
+{"base_table":"orders","dimensions":[{"name":"region","expr":"region"},{"name":"month","expr":"date_trunc('month', created_at)"}],"metrics":[{"name":"revenue","expr":"sum(amount)"},{"name":"count","expr":"count(*)"}],"filters":["status = 'active'"]}

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// A named SQL column expression used as a dimension.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Dimension {
     pub name: String,
     pub expr: String,
@@ -13,6 +14,7 @@ pub struct Dimension {
 
 /// A named aggregation expression used as a metric.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Metric {
     pub name: String,
     pub expr: String,
@@ -24,6 +26,7 @@ pub struct Metric {
 
 /// A JOIN relationship between the base table and another source table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Join {
     pub table: String,
     pub on: String,
@@ -35,6 +38,7 @@ pub struct Join {
 /// Required fields: `base_table`, `dimensions`, `metrics`.
 /// Optional fields: `filters` (defaults to []), `joins` (defaults to []).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[serde(deny_unknown_fields)]
 pub struct SemanticViewDefinition {
     pub base_table: String,

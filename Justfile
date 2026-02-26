@@ -76,6 +76,20 @@ test-iceberg: build
 # Note: DuckLake test requires `just setup-ducklake` to have been run first.
 test-all: test-rust test-sql test-iceberg
 
+# Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
+fuzz target="fuzz_json_parse":
+    cargo fuzz run {{target}} -- -max_total_time=300
+
+# Run all three fuzz targets sequentially (5 min each, 15 min total)
+fuzz-all:
+    cargo fuzz run fuzz_json_parse -- -max_total_time=300
+    cargo fuzz run fuzz_sql_expand -- -max_total_time=300
+    cargo fuzz run fuzz_query_names -- -max_total_time=300
+
+# Minimize corpus for a fuzz target (removes inputs that don't add coverage)
+fuzz-cmin target="fuzz_json_parse":
+    cargo fuzz cmin {{target}}
+
 # Clean build artifacts
 clean:
     make clean

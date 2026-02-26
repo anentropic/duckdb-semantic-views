@@ -32,6 +32,9 @@ configure/venv/
 configure/extension_version.txt
 configure/platform.txt
 
+# Fuzz crash artifacts (debug data, not corpus -- corpus IS committed)
+fuzz/artifacts/
+
 # DuckLake/Iceberg test data (downloaded by configure/setup_ducklake.py)
 test/data/seeds/
 test/data/*.ducklake
