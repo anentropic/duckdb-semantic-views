@@ -2,7 +2,7 @@
 
 ## Overview
 
-Five phases build the extension from a loadable scaffold to a fully queryable semantic layer. Phase 1 establishes the Rust/DuckDB integration foundation and resolves all architectural risks. Phase 2 adds the persistence layer and function-based DDL. Phase 3 implements the core expansion engine in pure Rust with comprehensive tests. Phase 4 wires the expansion engine to DuckDB's query pipeline so users can run `FROM my_view(dimensions := [...], metrics := [...])`. Phase 5 hardens the implementation with fuzz targets and writes maintainer documentation for community distribution.
+Five phases build the extension from a loadable scaffold to a fully queryable semantic layer. Phase 1 establishes the Rust/DuckDB integration foundation and resolves all architectural risks. Phase 2 adds the persistence layer and function-based DDL. Phase 3 implements the core expansion engine in pure Rust with comprehensive tests. Phase 4 wires the expansion engine to DuckDB's query pipeline so users can run `FROM my_view(dimensions := [...], metrics := [...])`. Phase 5 hardens the implementation with fuzz targets and writes maintainer documentation for community distribution. Phases 6-7 close tech debt identified by the v1.0 milestone audit.
 
 ## Phases
 
@@ -17,6 +17,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 3: Expansion Engine** - Pure Rust expansion logic with unit and property tests against known-answer datasets (completed 2026-02-25)
 - [x] **Phase 4: Query Interface** - Replacement scan + table function wiring the expansion engine to DuckDB's query pipeline (completed 2026-02-25)
 - [x] **Phase 5: Hardening and Docs** - Fuzz targets covering the FFI boundary, and MAINTAINER.md for community distribution (completed 2026-02-26)
+- [ ] **Phase 6: Tech Debt Code Cleanup** - Remove dead code, fix feature-gate inconsistency, fix test idempotency, fix sandbox test failures
+- [ ] **Phase 7: Verification & Formal Closure** - Human verification of CI/tests/fuzz, document accepted decisions and architectural limitations
 
 ## Phase Details
 
@@ -101,10 +103,37 @@ Plans:
 - [ ] 05-01-PLAN.md — Fuzz infrastructure: three cargo-fuzz targets, seed corpus, nightly CI workflow
 - [ ] 05-02-PLAN.md — MAINTAINER.md: complete maintainer documentation with architecture overview and worked examples
 
+### Phase 6: Tech Debt Code Cleanup
+**Goal**: Eliminate dead code, fix feature-gate inconsistency, and resolve test reliability issues identified by the v1.0 milestone audit
+**Depends on**: Phase 5
+**Requirements**: None (tech debt closure — all requirements already satisfied)
+**Gap Closure:** Closes tech debt from v1.0-MILESTONE-AUDIT.md
+**Success Criteria** (what must be TRUE):
+  1. No `#[allow(dead_code)]` annotations remain in `table_function.rs` — the dead `logical_type_from_duckdb_type` function and `column_type_ids` field are removed
+  2. `pub mod query` in `lib.rs` is gated with `#[cfg(feature = "loadable-extension")]` consistent with other modules
+  3. `phase2_ddl.test` restart section can be re-run without hanging — sidecar file cleanup added at section start
+  4. All 3 catalog sidecar tests pass in both local and sandbox environments
+**Plans**: TBD
+
+### Phase 7: Verification & Formal Closure
+**Goal**: Complete all human verification tasks and formally document accepted design decisions, deferred items, and architectural limitations before milestone archival
+**Depends on**: Phase 6
+**Requirements**: None (verification and documentation — all requirements already satisfied)
+**Gap Closure:** Closes tech debt from v1.0-MILESTONE-AUDIT.md
+**Success Criteria** (what must be TRUE):
+  1. CI workflows (PullRequestCI, MainDistributionPipeline, CodeQuality) confirmed passing on GitHub
+  2. Full SQLLogicTest suite (`just test-sql`) passes
+  3. DuckLake/Iceberg integration test (`just setup-ducklake && just test-iceberg`) passes
+  4. DuckDB Version Monitor workflow manually triggered and conditional PR logic confirmed
+  5. All 3 fuzz targets run without crashes (`cargo fuzz run` with nightly toolchain)
+  6. MAINTAINER.md reviewed for readability by someone unfamiliar with Rust
+  7. Accepted design decisions and architectural limitations documented in a TECH-DEBT.md file for v0.2 reference
+**Plans**: TBD
+
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
+Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -113,3 +142,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 3. Expansion Engine | 0/3 | Complete    | 2026-02-25 |
 | 4. Query Interface | 3/3 | Complete | 2026-02-25 |
 | 5. Hardening and Docs | 2/2 | Complete | 2026-02-26 |
+| 6. Tech Debt Code Cleanup | 0/0 | Pending | — |
+| 7. Verification & Formal Closure | 0/0 | Pending | — |
