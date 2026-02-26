@@ -116,7 +116,7 @@ Plans:
 **Plans**: 1 plan
 
 Plans:
-- [ ] 06-01-PLAN.md — Dead code removal, feature-gate fix, portable test paths, SQLLogicTest idempotency
+- [x] 06-01-PLAN.md — Dead code removal, feature-gate fix, portable test paths, SQLLogicTest idempotency
 
 ### Phase 7: Verification & Formal Closure
 **Goal**: Complete all human verification tasks and formally document accepted design decisions, deferred items, and architectural limitations before milestone archival
@@ -145,5 +145,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 3. Expansion Engine | 0/3 | Complete    | 2026-02-25 |
 | 4. Query Interface | 3/3 | Complete | 2026-02-25 |
 | 5. Hardening and Docs | 2/2 | Complete | 2026-02-26 |
-| 6. Tech Debt Code Cleanup | 0/0 | Pending | — |
+| 6. Tech Debt Code Cleanup | 1/1 | Complete | 2026-02-26 |
 | 7. Verification & Formal Closure | 0/0 | Pending | — |
