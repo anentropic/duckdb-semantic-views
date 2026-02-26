@@ -110,10 +110,13 @@ Plans:
 **Gap Closure:** Closes tech debt from v1.0-MILESTONE-AUDIT.md
 **Success Criteria** (what must be TRUE):
   1. No `#[allow(dead_code)]` annotations remain in `table_function.rs` — the dead `logical_type_from_duckdb_type` function and `column_type_ids` field are removed
-  2. `pub mod query` in `lib.rs` is gated with `#[cfg(feature = "loadable-extension")]` consistent with other modules
+  2. `pub mod query` in `lib.rs` is gated with `#[cfg(feature = "extension")]` consistent with other modules
   3. `phase2_ddl.test` restart section can be re-run without hanging — sidecar file cleanup added at section start
   4. All 3 catalog sidecar tests pass in both local and sandbox environments
-**Plans**: TBD
+**Plans**: 1 plan
+
+Plans:
+- [ ] 06-01-PLAN.md — Dead code removal, feature-gate fix, portable test paths, SQLLogicTest idempotency
 
 ### Phase 7: Verification & Formal Closure
 **Goal**: Complete all human verification tasks and formally document accepted design decisions, deferred items, and architectural limitations before milestone archival
