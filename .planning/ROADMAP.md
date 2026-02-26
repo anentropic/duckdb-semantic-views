@@ -95,7 +95,11 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. `cargo fuzz run` targets cover the C FFI boundary (input parsing) and the SQL generation path; no undefined behavior is triggered on a corpus of malformed inputs
   2. A contributor following only `MAINTAINER.md` can: set up a dev environment, build the extension, run all tests, load the extension in a DuckDB shell, update the DuckDB version pin, run the fuzzer, and understand the community extension registry publishing process — without needing to ask for clarification
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 05-01-PLAN.md — Fuzz infrastructure: three cargo-fuzz targets, seed corpus, nightly CI workflow
+- [ ] 05-02-PLAN.md — MAINTAINER.md: complete maintainer documentation with architecture overview and worked examples
 
 ## Progress
 
