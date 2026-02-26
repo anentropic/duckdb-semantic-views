@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-23)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** All 5 phases complete — v0.1 ready for publishing
+**Current focus:** Phase 6 gap closure -- tech debt cleanup from v1.0 milestone audit
 
 ## Current Position
 
-Phase: 5 of 5 (Hardening and Docs) -- COMPLETE
-Plan: 2 of 2 in current phase (all complete)
-Status: All phases complete. v0.1 roadmap fully executed.
-Last activity: 2026-02-26 — Completed plan 05-02 (MAINTAINER.md)
+Phase: 6 of 7 (Tech Debt Cleanup)
+Plan: 1 of 1 in current phase (all complete)
+Status: Phase 06 complete. Gap closure tech debt items resolved.
+Last activity: 2026-02-26 — Completed plan 06-01 (dead code, feature-gates, portable tests)
 
-Progress: [██████████] 100%
+Progress: [██████████] 100% (phases 1-6)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 12
+- Total plans completed: 13
 - Average duration: 7 min
-- Total execution time: 84 min
+- Total execution time: 87 min
 
 **By Phase:**
 
@@ -32,13 +32,14 @@ Progress: [██████████] 100%
 | 03-expansion-engine | 3 | 13 min | 4 min |
 | 04-query-interface | 3 | 53 min | 18 min |
 | 05-hardening-and-docs | 2 | 6 min | 3 min |
+| 06-tech-debt-cleanup | 1 | 3 min | 3 min |
 
 **Recent Trend:**
-- Last 5 plans: 04-01 (20 min), 04-02 (4 min), 04-03 (29 min), 05-01 (3 min), 05-02 (3 min)
-- Trend: Phase 5 plans fast due to straightforward file creation; no debugging or FFI issues
+- Last 5 plans: 04-02 (4 min), 04-03 (29 min), 05-01 (3 min), 05-02 (3 min), 06-01 (3 min)
+- Trend: Phase 6 fast due to purely mechanical edits; no debugging or FFI issues
 
 *Updated after each plan completion*
-| Phase 05 P02 | 3min | 1 tasks | 1 files |
+| Phase 06 P01 | 3min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -47,6 +48,9 @@ Progress: [██████████] 100%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [06-01]: infer-schema-returns-names-only: infer_schema_or_default returns Vec<String> only; types discarded at caller via _types (try_infer_schema unchanged)
+- [06-01]: case-conditional-cleanup: CASE-based conditional drop in SQLLogicTest section 10 (DuckDB evaluates CASE lazily)
+- [06-01]: temp-dir-pattern: all Rust tests creating temp files use std::env::temp_dir() for sandbox portability
 - [05-02]: python-audience-first-tone: All Rust concepts in MAINTAINER.md explained with Python analogies as inline footnotes, not standalone sections
 - [05-02]: single-source-doc: MAINTAINER.md is self-contained with no 'see also' chains for essential workflows
 - [05-02]: feature-flag-explainer: Dedicated subsection explaining bundled vs extension feature split since it is the #1 source of confusion
@@ -117,5 +121,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-26
-Stopped at: Completed 05-02-PLAN.md (MAINTAINER.md) — ALL PHASES COMPLETE
+Stopped at: Completed 06-01-PLAN.md (tech debt cleanup)
 Resume file: None
