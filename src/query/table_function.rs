@@ -49,9 +49,6 @@ pub struct SemanticViewBindData {
     expanded_sql: String,
     /// Output column names (dimensions first, then metrics).
     column_names: Vec<String>,
-    /// Output column types as DuckDB C API type enums (stored for error context).
-    #[allow(dead_code)]
-    column_type_ids: Vec<ffi::duckdb_type>,
 }
 
 // SAFETY: All fields are `Send + Sync` types.
@@ -98,40 +95,6 @@ pub(crate) unsafe fn execute_sql_raw(
         return Err(err_msg);
     }
     Ok(result)
-}
-
-/// Create a `LogicalTypeHandle` from a DuckDB C API type enum.
-///
-/// Uses `duckdb_create_logical_type` for primitive types. Falls back to VARCHAR
-/// for complex types (DECIMAL, LIST, STRUCT, etc.) since those require
-/// additional parameters.
-///
-/// Currently unused -- all output columns are declared as VARCHAR. Retained
-/// for potential future use if typed output columns are re-enabled.
-#[allow(dead_code)]
-fn logical_type_from_duckdb_type(ty: ffi::duckdb_type) -> LogicalTypeHandle {
-    // For primitive types, use the duckdb-rs factory.
-    // For complex/unsupported types, default to VARCHAR.
-    match ty {
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN => LogicalTypeHandle::from(LogicalTypeId::Boolean),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT => LogicalTypeHandle::from(LogicalTypeId::Tinyint),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => LogicalTypeHandle::from(LogicalTypeId::Smallint),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => LogicalTypeHandle::from(LogicalTypeId::Integer),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => LogicalTypeHandle::from(LogicalTypeId::Bigint),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT => LogicalTypeHandle::from(LogicalTypeId::UTinyint),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT => LogicalTypeHandle::from(LogicalTypeId::USmallint),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER => LogicalTypeHandle::from(LogicalTypeId::UInteger),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT => LogicalTypeHandle::from(LogicalTypeId::UBigint),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT => LogicalTypeHandle::from(LogicalTypeId::Float),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE => LogicalTypeHandle::from(LogicalTypeId::Double),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP => LogicalTypeHandle::from(LogicalTypeId::Timestamp),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE => LogicalTypeHandle::from(LogicalTypeId::Date),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIME => LogicalTypeHandle::from(LogicalTypeId::Time),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR => LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB => LogicalTypeHandle::from(LogicalTypeId::Blob),
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT => LogicalTypeHandle::from(LogicalTypeId::Hugeint),
-        _ => LogicalTypeHandle::from(LogicalTypeId::Varchar), // Safe fallback
-    }
 }
 
 /// Extract the raw `duckdb_value` pointer from a `duckdb::vtab::Value`.
@@ -255,7 +218,7 @@ impl VTab for SemanticViewVTab {
         //    Try executing the expanded SQL with LIMIT 0 to discover column types.
         //    If that fails (e.g., re-entrant SQL not allowed in bind), fall back
         //    to defaults: dimensions -> VARCHAR, metrics -> DOUBLE.
-        let (column_names, column_type_ids) =
+        let column_names =
             infer_schema_or_default(state.conn, &expanded_sql, &dimensions, &metrics, &def);
 
         // 7. Declare all output columns as VARCHAR.
@@ -270,7 +233,6 @@ impl VTab for SemanticViewVTab {
         Ok(SemanticViewBindData {
             expanded_sql,
             column_names,
-            column_type_ids,
         })
     }
 
@@ -395,18 +357,17 @@ fn infer_schema_or_default(
     dimensions: &[String],
     metrics: &[String],
     def: &SemanticViewDefinition,
-) -> (Vec<String>, Vec<ffi::duckdb_type>) {
+) -> Vec<String> {
     // Try LIMIT 0 for accurate type inference.
     let limit0_sql = format!("{expanded_sql} LIMIT 0");
     let inferred = unsafe { try_infer_schema(conn, &limit0_sql) };
 
-    if let Some((names, types)) = inferred {
-        return (names, types);
+    if let Some((names, _types)) = inferred {
+        return names;
     }
 
     // Fallback: derive schema from definition metadata.
     let mut column_names = Vec::new();
-    let mut column_types = Vec::new();
 
     for dim_name in dimensions {
         // Use the definition's canonical name casing.
@@ -416,7 +377,6 @@ fn infer_schema_or_default(
             .find(|d| d.name.eq_ignore_ascii_case(dim_name))
             .map_or_else(|| dim_name.clone(), |d| d.name.clone());
         column_names.push(canonical);
-        column_types.push(ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
     }
     for met_name in metrics {
         let canonical = def
@@ -425,10 +385,9 @@ fn infer_schema_or_default(
             .find(|m| m.name.eq_ignore_ascii_case(met_name))
             .map_or_else(|| met_name.clone(), |m| m.name.clone());
         column_names.push(canonical);
-        column_types.push(ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE);
     }
 
-    (column_names, column_types)
+    column_names
 }
 
 /// Attempt to infer column names and types by executing a LIMIT 0 query.
