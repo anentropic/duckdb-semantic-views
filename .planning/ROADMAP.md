@@ -131,7 +131,11 @@ Plans:
   5. All 3 fuzz targets run without crashes (`cargo fuzz run` with nightly toolchain)
   6. MAINTAINER.md reviewed for readability by someone unfamiliar with Rust
   7. Accepted design decisions and architectural limitations documented in a TECH-DEBT.md file for v0.2 reference
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 07-01-PLAN.md — Create TECH-DEBT.md documenting accepted decisions, deferred items, and architectural limitations
+- [ ] 07-02-PLAN.md — Human verification checklist (CI, tests, fuzz, MAINTAINER.md review) with report
 
 ## Progress
 
