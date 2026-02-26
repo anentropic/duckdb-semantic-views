@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-23)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 4 complete — all query interface plans done, ready for Phase 5
+**Current focus:** Phase 5 in progress — fuzz targets complete, MAINTAINER.md pending
 
 ## Current Position
 
-Phase: 4 of 5 (Query Interface) -- COMPLETE
-Plan: 3 of 3 in current phase (all done)
-Status: Phase 4 complete, Phase 5 (Hardening and Docs) pending
-Last activity: 2026-02-25 — Completed plan 04-03 (Integration Tests)
+Phase: 5 of 5 (Hardening and Docs)
+Plan: 1 of 2 in current phase (05-01 complete)
+Status: Plan 05-01 (Fuzz Targets) complete, Plan 05-02 (MAINTAINER.md) pending
+Last activity: 2026-02-26 — Completed plan 05-01 (Fuzz Targets)
 
-Progress: [█████████░] 90%
+Progress: [█████████▒] 92%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 10
-- Average duration: 8 min
-- Total execution time: 78 min
+- Total plans completed: 11
+- Average duration: 7 min
+- Total execution time: 81 min
 
 **By Phase:**
 
@@ -31,10 +31,11 @@ Progress: [█████████░] 90%
 | 02-storage-and-ddl | 4 | 35 min | 9 min |
 | 03-expansion-engine | 3 | 13 min | 4 min |
 | 04-query-interface | 3 | 53 min | 18 min |
+| 05-hardening-and-docs | 1 | 3 min | 3 min |
 
 **Recent Trend:**
-- Last 5 plans: 03-02 (4 min), 03-03 (5 min), 04-01 (20 min), 04-02 (4 min), 04-03 (29 min)
-- Trend: Phase 4 plans longer due to FFI debugging and bug fixing; 04-03 included critical duckdb_value_varchar fix
+- Last 5 plans: 03-03 (5 min), 04-01 (20 min), 04-02 (4 min), 04-03 (29 min), 05-01 (3 min)
+- Trend: 05-01 fast due to straightforward file creation; no debugging or FFI issues
 
 *Updated after each plan completion*
 
@@ -45,6 +46,10 @@ Progress: [█████████░] 90%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [05-01]: conditional-arbitrary-derive: Arbitrary derive gated behind feature flag (#[cfg_attr(feature = "arbitrary", ...)]) to avoid impacting default/extension builds
+- [05-01]: fuzz-crate-default-features: fuzz crate depends on default feature (duckdb/bundled) not extension; exercises pure Rust logic (model parsing, expand())
+- [05-01]: separate-corpus-job: commit-corpus CI job runs after all fuzz matrix jobs to avoid parallel push race condition
+- [05-01]: corpus-via-pr: corpus updates submitted as PR (peter-evans/create-pull-request) not direct push; consistent with DuckDB version monitor pattern
 - [04-03]: varchar-output-columns: all semantic_query output columns declared as VARCHAR; avoids type mismatch panics when writing string data to typed output vectors
 - [04-03]: varchar-cast-wrapper: expanded SQL wrapped in SELECT CAST(...AS VARCHAR) subquery; ensures all result chunk vectors contain duckdb_string_t data for uniform reading
 - [04-03]: direct-string-t-decode: read duckdb_string_t inline/pointer union directly from vector memory; avoids reliance on C API helper functions in loadable-extension stubs
@@ -107,6 +112,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-25
-Stopped at: Completed 04-03-PLAN.md (Integration Tests) — Phase 4 complete, all 3 plans done
+Last session: 2026-02-26
+Stopped at: Completed 05-01-PLAN.md (Fuzz Targets) — Plan 05-02 (MAINTAINER.md) pending
 Resume file: None

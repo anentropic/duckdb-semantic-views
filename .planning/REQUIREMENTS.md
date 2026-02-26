@@ -47,7 +47,7 @@
 - [x] **TEST-02**: Property-based tests (using `proptest`) cover expansion engine invariants: all requested dimensions appear in GROUP BY, emitted SQL is syntactically valid
 - [x] **TEST-03**: Integration tests load the extension in-process, create semantic views, run real DuckDB SQL queries, and assert correct results
 - [x] **TEST-04**: Integration test suite includes at least one test scenario using an Apache Iceberg table source
-- [ ] **TEST-05**: Fuzz targets (using `cargo-fuzz`) cover the unsafe C FFI boundary and the SQL generation path
+- [x] **TEST-05**: Fuzz targets (using `cargo-fuzz`) cover the unsafe C FFI boundary and the SQL generation path
 
 ### Code Quality
 
@@ -132,7 +132,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | QUERY-04 | Phase 4 — Query Interface | Complete |
 | TEST-03 | Phase 4 — Query Interface | Complete |
 | TEST-04 | Phase 4 — Query Interface | Complete |
-| TEST-05 | Phase 5 — Hardening and Docs | Pending |
+| TEST-05 | Phase 5 — Hardening and Docs | Complete |
 | DOCS-01 | Phase 5 — Hardening and Docs | Pending |
 
 **Coverage:**
