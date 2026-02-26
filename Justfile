@@ -12,6 +12,7 @@ setup:
     cargo install cargo-nextest --locked
     cargo install cargo-deny --locked
     cargo install cargo-llvm-cov --locked
+    cargo install cargo-fuzz --locked
     git submodule update --init --recursive
     make configure
     @echo "Running cargo test to install cargo-husky hooks..."
@@ -77,18 +78,18 @@ test-iceberg: build
 test-all: test-rust test-sql test-iceberg
 
 # Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
-fuzz target="fuzz_json_parse":
-    cargo fuzz run {{target}} -- -max_total_time=300
+fuzz target="fuzz_json_parse" time="300":
+    cargo +nightly fuzz run {{target}} -- -max_total_time={{time}}
 
 # Run all three fuzz targets sequentially (5 min each, 15 min total)
-fuzz-all:
-    cargo fuzz run fuzz_json_parse -- -max_total_time=300
-    cargo fuzz run fuzz_sql_expand -- -max_total_time=300
-    cargo fuzz run fuzz_query_names -- -max_total_time=300
+fuzz-all time="300":
+    cargo +nightly fuzz run fuzz_json_parse -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_sql_expand -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_query_names -- -max_total_time={{time}}
 
 # Minimize corpus for a fuzz target (removes inputs that don't add coverage)
 fuzz-cmin target="fuzz_json_parse":
-    cargo fuzz cmin {{target}}
+    cargo +nightly fuzz cmin {{target}}
 
 # Clean build artifacts
 clean:

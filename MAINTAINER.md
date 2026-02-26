@@ -344,9 +344,11 @@ The nightly toolchain is only used for fuzzing. All other development uses stabl
 
 ```bash
 just fuzz                         # run default target (fuzz_json_parse) for 5 minutes
-just fuzz target=fuzz_sql_expand  # run a specific target for 5 minutes
+just fuzz fuzz_sql_expand         # run a specific target for 5 minutes
+just fuzz fuzz_sql_expand 10      # run a specific target for 10 seconds
 just fuzz-all                     # run all three targets sequentially (15 min total)
-cargo fuzz list                   # see available targets
+just fuzz-all 60                  # run all three targets for 60 seconds each
+cargo +nightly fuzz list          # see available targets
 ```
 
 ### The Three Fuzz Targets
@@ -363,7 +365,7 @@ The fuzzer saves coverage-increasing inputs to `fuzz/corpus/<target>/`. This cor
 
 ```bash
 just fuzz-cmin                          # minimize corpus for default target (removes redundant inputs)
-just fuzz-cmin target=fuzz_sql_expand   # minimize a specific target's corpus
+just fuzz-cmin fuzz_sql_expand          # minimize a specific target's corpus
 ```
 
 Over time the corpus grows as the fuzzer discovers new code paths. Minimize periodically to keep it small.
@@ -374,10 +376,10 @@ When the fuzzer finds a crash, it saves the triggering input to `fuzz/artifacts/
 
 ```bash
 # Reproduce a crash
-cargo fuzz run fuzz_json_parse fuzz/artifacts/fuzz_json_parse/crash-abc123
+cargo +nightly fuzz run fuzz_json_parse fuzz/artifacts/fuzz_json_parse/crash-abc123
 
 # See the debug representation of the crash input
-cargo fuzz fmt fuzz_json_parse fuzz/artifacts/fuzz_json_parse/crash-abc123
+cargo +nightly fuzz fmt fuzz_json_parse fuzz/artifacts/fuzz_json_parse/crash-abc123
 ```
 
 The `fuzz/artifacts/` directory is gitignored -- crash artifacts are debugging data, not part of the corpus.
@@ -669,7 +671,7 @@ error: `-Zsanitizer=address` is not a valid flag
 ```bash
 rustup show          # check which toolchain is active
 rustup install nightly
-cargo fuzz run fuzz_json_parse  # cargo-fuzz automatically uses +nightly
+cargo +nightly fuzz run fuzz_json_parse  # must use +nightly for sanitizer flags
 ```
 
 Do **not** set a directory-level nightly override (`rustup override set nightly`) -- this would break the stable-toolchain builds for everything else.
