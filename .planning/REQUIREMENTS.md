@@ -56,7 +56,7 @@
 
 ### Documentation
 
-- [ ] **DOCS-01**: `MAINTAINER.md` covers: dev environment setup, build instructions, running tests, loading the extension in a DuckDB shell, updating the DuckDB version pin, running the fuzzer, and publishing to the community extension registry
+- [x] **DOCS-01**: `MAINTAINER.md` covers: dev environment setup, build instructions, running tests, loading the extension in a DuckDB shell, updating the DuckDB version pin, running the fuzzer, and publishing to the community extension registry
 
 ## v0.2 Requirements
 
@@ -133,7 +133,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | TEST-03 | Phase 4 — Query Interface | Complete |
 | TEST-04 | Phase 4 — Query Interface | Complete |
 | TEST-05 | Phase 5 — Hardening and Docs | Complete |
-| DOCS-01 | Phase 5 — Hardening and Docs | Pending |
+| DOCS-01 | Phase 5 — Hardening and Docs | Complete |
 
 **Coverage:**
 - v0.1 requirements: 28 total

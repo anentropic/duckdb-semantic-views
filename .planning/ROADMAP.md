@@ -12,11 +12,11 @@ Five phases build the extension from a loadable scaffold to a fully queryable se
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Scaffold** - Loadable extension with CI, code quality gates, and architectural decisions locked
+- [x] **Phase 1: Scaffold** - Loadable extension with CI, code quality gates, and architectural decisions locked
 - [x] **Phase 2: Storage and DDL** - Persistence layer, function-based DDL, and round-trip survival across restarts
 - [x] **Phase 3: Expansion Engine** - Pure Rust expansion logic with unit and property tests against known-answer datasets (completed 2026-02-25)
 - [x] **Phase 4: Query Interface** - Replacement scan + table function wiring the expansion engine to DuckDB's query pipeline (completed 2026-02-25)
-- [ ] **Phase 5: Hardening and Docs** - Fuzz targets covering the FFI boundary, and MAINTAINER.md for community distribution
+- [x] **Phase 5: Hardening and Docs** - Fuzz targets covering the FFI boundary, and MAINTAINER.md for community distribution (completed 2026-02-26)
 
 ## Phase Details
 
@@ -112,4 +112,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 2. Storage and DDL | 4/4 | Complete | 2026-02-24 |
 | 3. Expansion Engine | 0/3 | Complete    | 2026-02-25 |
 | 4. Query Interface | 3/3 | Complete | 2026-02-25 |
-| 5. Hardening and Docs | 0/? | Not started | - |
+| 5. Hardening and Docs | 2/2 | Complete | 2026-02-26 |

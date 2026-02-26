@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-23)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 5 in progress — fuzz targets complete, MAINTAINER.md pending
+**Current focus:** All 5 phases complete — v0.1 ready for publishing
 
 ## Current Position
 
-Phase: 5 of 5 (Hardening and Docs)
-Plan: 1 of 2 in current phase (05-01 complete)
-Status: Plan 05-01 (Fuzz Targets) complete, Plan 05-02 (MAINTAINER.md) pending
-Last activity: 2026-02-26 — Completed plan 05-01 (Fuzz Targets)
+Phase: 5 of 5 (Hardening and Docs) -- COMPLETE
+Plan: 2 of 2 in current phase (all complete)
+Status: All phases complete. v0.1 roadmap fully executed.
+Last activity: 2026-02-26 — Completed plan 05-02 (MAINTAINER.md)
 
-Progress: [█████████▒] 92%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 11
+- Total plans completed: 12
 - Average duration: 7 min
-- Total execution time: 81 min
+- Total execution time: 84 min
 
 **By Phase:**
 
@@ -31,13 +31,14 @@ Progress: [█████████▒] 92%
 | 02-storage-and-ddl | 4 | 35 min | 9 min |
 | 03-expansion-engine | 3 | 13 min | 4 min |
 | 04-query-interface | 3 | 53 min | 18 min |
-| 05-hardening-and-docs | 1 | 3 min | 3 min |
+| 05-hardening-and-docs | 2 | 6 min | 3 min |
 
 **Recent Trend:**
-- Last 5 plans: 03-03 (5 min), 04-01 (20 min), 04-02 (4 min), 04-03 (29 min), 05-01 (3 min)
-- Trend: 05-01 fast due to straightforward file creation; no debugging or FFI issues
+- Last 5 plans: 04-01 (20 min), 04-02 (4 min), 04-03 (29 min), 05-01 (3 min), 05-02 (3 min)
+- Trend: Phase 5 plans fast due to straightforward file creation; no debugging or FFI issues
 
 *Updated after each plan completion*
+| Phase 05 P02 | 3min | 1 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -46,6 +47,9 @@ Progress: [█████████▒] 92%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [05-02]: python-audience-first-tone: All Rust concepts in MAINTAINER.md explained with Python analogies as inline footnotes, not standalone sections
+- [05-02]: single-source-doc: MAINTAINER.md is self-contained with no 'see also' chains for essential workflows
+- [05-02]: feature-flag-explainer: Dedicated subsection explaining bundled vs extension feature split since it is the #1 source of confusion
 - [05-01]: conditional-arbitrary-derive: Arbitrary derive gated behind feature flag (#[cfg_attr(feature = "arbitrary", ...)]) to avoid impacting default/extension builds
 - [05-01]: fuzz-crate-default-features: fuzz crate depends on default feature (duckdb/bundled) not extension; exercises pure Rust logic (model parsing, expand())
 - [05-01]: separate-corpus-job: commit-corpus CI job runs after all fuzz matrix jobs to avoid parallel push race condition
@@ -113,5 +117,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-26
-Stopped at: Completed 05-01-PLAN.md (Fuzz Targets) — Plan 05-02 (MAINTAINER.md) pending
+Stopped at: Completed 05-02-PLAN.md (MAINTAINER.md) — ALL PHASES COMPLETE
 Resume file: None
