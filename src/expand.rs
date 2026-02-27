@@ -138,6 +138,23 @@ pub fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Quote a potentially dot-qualified table reference.
+///
+/// Splits on `.` and quotes each part individually. This handles:
+/// - Simple names: `orders` -> `"orders"`
+/// - Catalog-qualified: `jaffle.raw_orders` -> `"jaffle"."raw_orders"`
+/// - Fully qualified: `catalog.schema.table` -> `"catalog"."schema"."table"`
+///
+/// Each part is quoted via `quote_ident`, so embedded double quotes are escaped.
+#[must_use]
+pub fn quote_table_ref(table: &str) -> String {
+    table
+        .split('.')
+        .map(quote_ident)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// Resolve which declared joins are needed for the requested dimensions and metrics.
 ///
 /// Collects `source_table` values from resolved dimensions and metrics, then
@@ -296,12 +313,12 @@ pub fn expand(
     // 5. Build the base CTE.
     let mut sql = String::with_capacity(256);
     sql.push_str("WITH \"_base\" AS (\n    SELECT *\n    FROM ");
-    sql.push_str(&quote_ident(&def.base_table));
+    sql.push_str(&quote_table_ref(&def.base_table));
 
     // Include only the joins needed by requested dimensions/metrics.
     for join in &needed_joins {
         sql.push_str("\n    JOIN ");
-        sql.push_str(&quote_ident(&join.table));
+        sql.push_str(&quote_table_ref(&join.table));
         sql.push_str(" ON ");
         sql.push_str(&join.on);
     }
@@ -375,6 +392,44 @@ mod tests {
         #[test]
         fn identifier_with_spaces() {
             assert_eq!(quote_ident("my table"), "\"my table\"");
+        }
+    }
+
+    mod quote_table_ref_tests {
+        use super::*;
+
+        #[test]
+        fn simple_table_name() {
+            assert_eq!(quote_table_ref("orders"), "\"orders\"");
+        }
+
+        #[test]
+        fn catalog_qualified() {
+            assert_eq!(
+                quote_table_ref("jaffle.raw_orders"),
+                "\"jaffle\".\"raw_orders\""
+            );
+        }
+
+        #[test]
+        fn fully_qualified() {
+            assert_eq!(
+                quote_table_ref("catalog.schema.table"),
+                "\"catalog\".\"schema\".\"table\""
+            );
+        }
+
+        #[test]
+        fn reserved_word_parts() {
+            assert_eq!(quote_table_ref("select.from"), "\"select\".\"from\"");
+        }
+
+        #[test]
+        fn embedded_quotes_in_parts() {
+            assert_eq!(
+                quote_table_ref("my\"db.my\"table"),
+                "\"my\"\"db\".\"my\"\"table\""
+            );
         }
     }
 
@@ -1065,6 +1120,66 @@ FROM \"_base\"";
             assert!(
                 !sql.contains("JOIN"),
                 "no JOIN clauses when no joins declared"
+            );
+        }
+
+        #[test]
+        fn test_dot_qualified_base_table() {
+            let def = SemanticViewDefinition {
+                base_table: "jaffle.raw_orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "status".to_string(),
+                    expr: "status".to_string(),
+                    source_table: None,
+                }],
+                metrics: vec![Metric {
+                    name: "order_count".to_string(),
+                    expr: "count(*)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["status".to_string()],
+                metrics: vec!["order_count".to_string()],
+            };
+            let sql = expand("jaffle_orders", &def, &req).unwrap();
+            // Must produce "jaffle"."raw_orders" not "jaffle.raw_orders"
+            assert!(
+                sql.contains("FROM \"jaffle\".\"raw_orders\""),
+                "dot-qualified base_table must be split and quoted: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_dot_qualified_join_table() {
+            let def = SemanticViewDefinition {
+                base_table: "jaffle.raw_orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "customer_name".to_string(),
+                    expr: "customers.name".to_string(),
+                    source_table: Some("jaffle.raw_customers".to_string()),
+                }],
+                metrics: vec![Metric {
+                    name: "order_count".to_string(),
+                    expr: "count(*)".to_string(),
+                    source_table: None,
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "jaffle.raw_customers".to_string(),
+                    on: "raw_orders.customer_id = raw_customers.id".to_string(),
+                }],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec!["order_count".to_string()],
+            };
+            let sql = expand("jaffle_orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("JOIN \"jaffle\".\"raw_customers\""),
+                "dot-qualified join table must be split and quoted: {sql}"
             );
         }
 
