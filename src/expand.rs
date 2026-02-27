@@ -355,11 +355,12 @@ pub fn expand(
     sql.push_str("\nFROM \"_base\"");
 
     // 8. GROUP BY (only when both dimensions and metrics are present).
+    //    Use ordinal positions (GROUP BY 1, 2, ...) instead of expressions to avoid
+    //    ambiguity when an expression matches its alias (e.g., `status AS "status"`).
     if !resolved_dims.is_empty() && !resolved_mets.is_empty() {
         sql.push_str("\nGROUP BY\n");
-        let group_items: Vec<String> = resolved_dims
-            .iter()
-            .map(|d| format!("    {}", d.expr))
+        let group_items: Vec<String> = (1..=resolved_dims.len())
+            .map(|i| format!("    {i}"))
             .collect();
         sql.push_str(&group_items.join(",\n"));
     }
@@ -488,7 +489,7 @@ SELECT
     sum(amount) AS \"total_revenue\"
 FROM \"_base\"
 GROUP BY
-    region";
+    1";
             assert_eq!(sql, expected);
         }
 
@@ -512,8 +513,8 @@ SELECT
     count(*) AS \"order_count\"
 FROM \"_base\"
 GROUP BY
-    region,
-    status";
+    1,
+    2";
             assert_eq!(sql, expected);
         }
 
@@ -559,7 +560,7 @@ SELECT
     sum(amount) AS \"total_revenue\"
 FROM \"_base\"
 GROUP BY
-    region";
+    1";
             assert_eq!(sql, expected);
         }
 
@@ -583,7 +584,7 @@ SELECT
     sum(amount) AS \"total_revenue\"
 FROM \"_base\"
 GROUP BY
-    region";
+    1";
             assert_eq!(sql, expected);
         }
 
@@ -636,9 +637,9 @@ GROUP BY
                 metrics: vec!["total_revenue".to_string()],
             };
             let sql = expand("orders", &def, &req).unwrap();
-            // Expression appears verbatim in both SELECT and GROUP BY (not quoted)
+            // Expression appears verbatim in SELECT; GROUP BY uses ordinal position
             assert!(sql.contains("date_trunc('month', created_at) AS \"month\""));
-            assert!(sql.contains("GROUP BY\n    date_trunc('month', created_at)"));
+            assert!(sql.contains("GROUP BY\n    1"));
         }
 
         #[test]
@@ -723,7 +724,7 @@ FROM \"_base\"";
             let sql = expand("orders", &def, &req).unwrap();
             // Should succeed and use the definition's expression
             assert!(sql.contains("region AS \"Region\""));
-            assert!(sql.contains("GROUP BY\n    region"));
+            assert!(sql.contains("GROUP BY\n    1"));
         }
 
         #[test]

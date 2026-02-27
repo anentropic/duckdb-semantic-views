@@ -99,13 +99,15 @@ def run_tests():
     failed = 0
 
     # ---- Test 1: Define semantic view over DuckLake table ----
+    # Actual jaffle-shop raw_orders columns: id, customer, ordered_at,
+    # store_id, subtotal, tax_paid, order_total
     print()
     print("Test 1: Define semantic view over DuckLake/Iceberg table")
     try:
         con.execute("""
             SELECT define_semantic_view(
                 'jaffle_orders',
-                '{"base_table":"jaffle.raw_orders","dimensions":[{"name":"status","expr":"status"}],"metrics":[{"name":"order_count","expr":"count(*)"},{"name":"total_orders","expr":"count(id)"}]}'
+                '{"base_table":"jaffle.raw_orders","dimensions":[{"name":"store_id","expr":"store_id"}],"metrics":[{"name":"order_count","expr":"count(*)"},{"name":"total_revenue","expr":"sum(order_total)"}]}'
             )
         """)
         print("  PASS: View defined successfully")
@@ -121,16 +123,16 @@ def run_tests():
         result = con.execute("""
             SELECT * FROM semantic_query(
                 'jaffle_orders',
-                dimensions := ['status'],
+                dimensions := ['store_id'],
                 metrics := ['order_count']
             )
         """).fetchall()
         print(f"  Result: {result}")
         assert len(result) > 0, "Expected at least one row"
-        # Verify the result has status and order_count columns
-        statuses = {row[0] for row in result}
-        print(f"  Statuses found: {statuses}")
-        assert len(statuses) > 0, "Expected at least one distinct status"
+        # Verify the result has store_id and order_count columns
+        store_ids = {row[0] for row in result}
+        print(f"  Store IDs found: {len(store_ids)}")
+        assert len(store_ids) > 0, "Expected at least one distinct store_id"
         print("  PASS: Query returned correct results")
         passed += 1
     except Exception as e:
@@ -144,18 +146,16 @@ def run_tests():
         result = con.execute("""
             SELECT * FROM semantic_query(
                 'jaffle_orders',
-                metrics := ['order_count', 'total_orders']
+                metrics := ['order_count', 'total_revenue']
             )
         """).fetchall()
         print(f"  Result: {result}")
         assert len(result) == 1, f"Expected 1 row, got {len(result)}"
         order_count = int(result[0][0])
-        total_orders = int(result[0][1])
+        total_revenue = int(result[0][1])
         assert order_count > 0, f"Expected positive order_count, got {order_count}"
-        assert order_count == total_orders, (
-            f"count(*) and count(id) should match: {order_count} vs {total_orders}"
-        )
-        print(f"  Total orders: {order_count}")
+        assert total_revenue > 0, f"Expected positive total_revenue, got {total_revenue}"
+        print(f"  Total orders: {order_count}, Total revenue: {total_revenue}")
         print("  PASS: Global aggregate returned correct results")
         passed += 1
     except Exception as e:
@@ -169,7 +169,7 @@ def run_tests():
         result = con.execute("""
             SELECT * FROM explain_semantic_view(
                 'jaffle_orders',
-                dimensions := ['status'],
+                dimensions := ['store_id'],
                 metrics := ['order_count']
             )
         """).fetchall()
