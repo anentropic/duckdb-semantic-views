@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-02-23)
 Phase: 7 of 7 (Verification & Formal Closure)
 Plan: 1 of 2 in current phase (07-01 complete)
 Status: Plan 07-01 complete. TECH-DEBT.md created with full v0.1 inventory.
-Last activity: 2026-02-26 — Completed plan 07-01 (TECH-DEBT.md)
+Last activity: 2026-02-27 - Completed quick task 1: fix dot-qualified table name issue
 
 Progress: [█████████░] 94% (phases 1-6 complete, phase 7 in progress)
 
@@ -132,6 +132,12 @@ None yet.
 
 - [Phase 1 risk]: `duckdb-rs` vtab/replacement-scan API coverage must be verified by prototype in Phase 1. If gaps exist, raw `libduckdb-sys` FFI wrappers must be scoped before Phase 3 planning.
 - [Phase 4 risk]: Re-entrant query execution in the vtab bind phase may not be allowed by DuckDB. Output schema must be inferred from definition metadata if SQL re-execution is blocked. Prototype needed early in Phase 4.
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Status | Directory |
+|---|-------------|------|--------|--------|-----------|
+| 1 | fix dot-qualified table name issue | 2026-02-27 | 3a90dad | Verified | [1-fix-dot-qualified-table-name-issue](./quick/1-fix-dot-qualified-table-name-issue/) |
 
 ## Session Continuity
 
