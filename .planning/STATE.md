@@ -49,9 +49,10 @@ None — v1.0 shipped. See TECH-DEBT.md for v0.2 items.
 |---|-------------|------|--------|--------|-----------|
 | 1 | fix dot-qualified table name issue | 2026-02-27 | 3a90dad | Verified | [1-fix-dot-qualified-table-name-issue](./quick/1-fix-dot-qualified-table-name-issue/) |
 | 2 | convert setup_ducklake.py to uv script | 2026-02-28 | ab4bf0c, bb1309f | Verified | [2-convert-setup-ducklake-py-to-uv-script-r](./quick/2-convert-setup-ducklake-py-to-uv-script-r/) |
+| 3 | fix CI failures (cargo-deny licenses + Windows restart test) | 2026-02-28 | 9056292, 6935892 | Verified | [3-fix-ci-failures](./quick/3-fix-ci-failures/) |
 
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: v1.0 milestone completed and archived.
+Stopped at: Completed quick-3 (fix CI failures)
 Resume file: None
