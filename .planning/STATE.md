@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: MVP
 status: shipped
-last_updated: "2026-02-28T00:45:00.000Z"
+last_updated: "2026-02-28T21:41:00.000Z"
 progress:
   total_phases: 7
   completed_phases: 7
@@ -24,7 +24,7 @@ See: .planning/PROJECT.md (updated 2026-02-28)
 
 Phase: 7 of 7 (all complete)
 Status: v1.0 MVP shipped 2026-02-28
-Last activity: 2026-02-28 — Completed quick task 3: fix CI failures
+Last activity: 2026-02-28 — Fixed proptest assertion bug, Code Quality CI fully green
 
 Progress: [██████████] 100% (all 7 phases complete, all 18 plans executed)
 
@@ -50,9 +50,10 @@ None — v1.0 shipped. See TECH-DEBT.md for v0.2 items.
 | 1 | fix dot-qualified table name issue | 2026-02-27 | 3a90dad | Verified | [1-fix-dot-qualified-table-name-issue](./quick/1-fix-dot-qualified-table-name-issue/) |
 | 2 | convert setup_ducklake.py to uv script | 2026-02-28 | ab4bf0c, bb1309f | Verified | [2-convert-setup-ducklake-py-to-uv-script-r](./quick/2-convert-setup-ducklake-py-to-uv-script-r/) |
 | 3 | fix CI failures (cargo-deny licenses + Windows restart test) | 2026-02-28 | 9056292, 6935892 | Verified | [3-fix-ci-failures](./quick/3-fix-ci-failures/) |
+| 4 | check CI results and fix proptest assertion bug | 2026-02-28 | 652e7d2 | Verified | [4-check-ci-results-and-fix-coverage-if-nee](./quick/4-check-ci-results-and-fix-coverage-if-nee/) |
 
 ## Session Continuity
 
 Last session: 2026-02-28
-Stopped at: Completed quick-3 (fix CI failures)
+Stopped at: Completed quick-4. Code Quality CI fully green (run 22529263743). All 61 tests pass, coverage >= 80%.
 Resume file: None
