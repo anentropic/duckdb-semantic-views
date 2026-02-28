@@ -141,9 +141,10 @@ None yet.
 | # | Description | Date | Commit | Status | Directory |
 |---|-------------|------|--------|--------|-----------|
 | 1 | fix dot-qualified table name issue | 2026-02-27 | 3a90dad | Verified | [1-fix-dot-qualified-table-name-issue](./quick/1-fix-dot-qualified-table-name-issue/) |
+| 2 | convert setup_ducklake.py to uv script | 2026-02-28 | ab4bf0c, bb1309f | Complete | [2-convert-setup-ducklake-py-to-uv-script-r](./quick/2-convert-setup-ducklake-py-to-uv-script-r/) |
 
 ## Session Continuity
 
-Last session: 2026-02-27
-Stopped at: Completed 07-02-PLAN.md -- ALL PLANS COMPLETE. v1.0 milestone verified.
+Last session: 2026-02-28
+Stopped at: Completed quick task 2 -- convert Python scripts to PEP 723 uv scripts.
 Resume file: None
