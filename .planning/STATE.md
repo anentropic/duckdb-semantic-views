@@ -1,6 +1,6 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
+milestone: v0.1.0
 milestone_name: MVP
 status: shipped
 last_updated: "2026-02-28T21:41:00.000Z"
@@ -18,12 +18,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-28)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** v1.0 shipped — planning next milestone
+**Current focus:** v0.1.0 shipped — planning next milestone (v0.2.0)
 
 ## Current Position
 
 Phase: 7 of 7 (all complete)
-Status: v1.0 MVP shipped 2026-02-28
+Status: v0.1.0 MVP shipped 2026-02-28
 Last activity: 2026-02-28 — Fixed proptest assertion bug, Code Quality CI fully green
 
 Progress: [██████████] 100% (all 7 phases complete, all 18 plans executed)
@@ -33,7 +33,7 @@ Progress: [██████████] 100% (all 7 phases complete, all 18 p
 ### Decisions
 
 Decisions are logged in PROJECT.md Key Decisions table.
-All v1.0 decisions archived in milestones/v1.0-ROADMAP.md.
+All v0.1.0 decisions archived in milestones/v1.0-ROADMAP.md.
 
 ### Pending Todos
 
@@ -41,7 +41,7 @@ None.
 
 ### Blockers/Concerns
 
-None — v1.0 shipped. See TECH-DEBT.md for v0.2 items.
+None — v0.1.0 shipped. See TECH-DEBT.md for v0.2.0 items.
 
 ### Quick Tasks Completed
 

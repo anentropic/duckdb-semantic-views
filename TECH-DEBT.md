@@ -1,16 +1,16 @@
-# Tech Debt & Deferred Items (v0.1 -> v0.2)
+# Tech Debt & Deferred Items (v0.1.0 -> v0.2.0)
 
-This document catalogs all accepted design decisions, deferred requirements, known architectural limitations, and test coverage gaps from the v0.1 milestone. It serves as the sole input for v0.2 milestone planning so that future work does not need to re-discover trade-offs made during v0.1.
+This document catalogs all accepted design decisions, deferred requirements, known architectural limitations, and test coverage gaps from the v0.1.0 milestone. It serves as the sole input for v0.2.0 milestone planning so that future work does not need to re-discover trade-offs made during v0.1.0.
 
 ## Accepted Design Decisions
 
-These are intentional trade-offs made during v0.1 development. Each was the best available option given constraints at the time.
+These are intentional trade-offs made during v0.1.0 development. Each was the best available option given constraints at the time.
 
 ### 1. Sidecar file persistence instead of SQL-based catalog writes
 
 - **Origin:** Phase 2, decision [02-04] sidecar-persistence
 - **Decision:** DuckDB holds execution locks during scalar `invoke()`, which prevents any SQL execution from within DDL functions (`define_semantic_view`, `drop_semantic_view`). Both `try_clone()` (same-instance locks) and `Connection::open(path)` (file-level lock) deadlock or block. The extension writes catalog changes to a `.semantic_views` sidecar file using plain file I/O with atomic rename (write-to-tmp-then-rename). On next extension load, `init_catalog` reads the sidecar and syncs definitions into the `semantic_layer._definitions` DuckDB table.
-- **Action:** Replace with `pragma_query_t` callbacks in the v0.2 C++ shim. The `pragma_query_t` pattern (used by the FTS extension) returns a SQL string that DuckDB executes after the callback returns, during parsing before execution locks are held. This eliminates the sidecar file entirely.
+- **Action:** Replace with `pragma_query_t` callbacks in the v0.2.0 C++ shim. The `pragma_query_t` pattern (used by the FTS extension) returns a SQL string that DuckDB executes after the callback returns, during parsing before execution locks are held. This eliminates the sidecar file entirely.
 
 ### 2. Catalog table naming: `semantic_layer._definitions`
 
@@ -22,7 +22,7 @@ These are intentional trade-offs made during v0.1 development. Each was the best
 
 - **Origin:** Phase 4, decision [04-03] varchar-output-columns
 - **Decision:** The `semantic_query()` table function declares all output columns as VARCHAR and wraps expanded SQL in `SELECT CAST(... AS VARCHAR)`. This avoids type mismatch panics when writing string data to typed DuckDB output vectors through the FFI layer. The `duckdb_string_t` inline/pointer union is read directly from vector memory (decision [04-03] direct-string-t-decode).
-- **Action:** v0.2 may restore typed output columns by implementing proper type-specific vector writes in the FFI layer. Consumers currently must cast numeric columns themselves.
+- **Action:** v0.2.0 may restore typed output columns by implementing proper type-specific vector writes in the FFI layer. Consumers currently must cast numeric columns themselves.
 
 ### 4. Manual FFI entrypoint instead of macro
 
@@ -30,7 +30,7 @@ These are intentional trade-offs made during v0.1 development. Each was the best
 - **Decision:** Replaced the `#[duckdb_entrypoint_c_api]` macro with a hand-written FFI entrypoint function. This was necessary to capture the raw `duckdb_database` handle, which enables creating an independent `duckdb_connection` via `duckdb_connect`. The independent connection is used by `semantic_query()` to execute expanded SQL without lock conflicts with the host connection.
 - **Action:** None needed unless the `duckdb-rs` macro adds database handle capture in a future release.
 
-### 5. Native EXPLAIN deferred to v0.2
+### 5. Native EXPLAIN deferred to v0.2.0
 
 - **Origin:** Phase 4, QUERY-04 (reworded); tracked as QUERY-V2-03
 - **Decision:** The `explain_semantic_view()` table function provides expanded SQL inspection as a workaround. Native `EXPLAIN FROM semantic_query(...)` would show the expanded SQL instead of the DuckDB physical plan, but this requires a C++ shim to intercept the EXPLAIN hook.
@@ -39,23 +39,23 @@ These are intentional trade-offs made during v0.1 development. Each was the best
 ### 6. ON-clause substring matching for join dependency detection
 
 - **Origin:** Phase 3, decision [03-02] on-clause-substring-matching
-- **Decision:** Transitive join dependency detection checks whether a table name appears as a substring in the ON clause of other joins. This is a sufficient heuristic for v0.1 where users declare joins in dependency order and ON clauses reference table names directly. It avoids the complexity of a full SQL parser for join clause analysis.
-- **Action:** If v0.2 supports more complex join patterns (subqueries in ON clauses, aliased references), this may need to be replaced with proper SQL parsing using `sqlparser-rs` or similar.
+- **Decision:** Transitive join dependency detection checks whether a table name appears as a substring in the ON clause of other joins. This is a sufficient heuristic for v0.1.0 where users declare joins in dependency order and ON clauses reference table names directly. It avoids the complexity of a full SQL parser for join clause analysis.
+- **Action:** If v0.2.0 supports more complex join patterns (subqueries in ON clauses, aliased references), this may need to be replaced with proper SQL parsing using `sqlparser-rs` or similar.
 
 ### 7. Unqualified column names required in expressions
 
 - **Origin:** Phase 4, decision [04-03] unqualified-join-expressions
 - **Decision:** Dimension and metric expressions must use unqualified column names (e.g., `region` not `orders.region`) because the CTE-based expansion flattens all source tables into a single `_base` namespace. Qualified names would reference tables that do not exist in the CTE scope.
-- **Action:** If v0.2 changes the expansion strategy away from CTEs, qualified column names could be supported.
+- **Action:** If v0.2.0 changes the expansion strategy away from CTEs, qualified column names could be supported.
 
-## Deferred to v0.2
+## Deferred to v0.2.0
 
-Requirements explicitly moved to the next milestone. These are documented in REQUIREMENTS.md under "v0.2 Requirements."
+Requirements explicitly moved to the next milestone. These are documented in REQUIREMENTS.md under "v0.2.0 Requirements."
 
 | ID | Description | Reason |
 |----|-------------|--------|
 | QUERY-V2-01 | Native `CREATE SEMANTIC VIEW` DDL syntax | Requires C++ shim for DuckDB parser hooks (not exposed to Rust via C API) |
-| QUERY-V2-02 | Time dimensions with granularity coarsening (day/week/month/year) | Scoped out of v0.1 to reduce complexity |
+| QUERY-V2-02 | Time dimensions with granularity coarsening (day/week/month/year) | Scoped out of v0.1.0 to reduce complexity |
 | QUERY-V2-03 | Native `EXPLAIN` interception for `semantic_query()` | Requires C++ shim for EXPLAIN hook |
 | DIST-V2-01 | Published to DuckDB community extension registry | Requires upstream PR to `duckdb/community-extensions` repository |
 | DIST-V2-02 | Real-world TPC-H demo with documented example queries | Documentation deliverable deferred to align with registry publishing |
@@ -63,7 +63,7 @@ Requirements explicitly moved to the next milestone. These are documented in REQ
 
 ## Known Architectural Limitations
 
-Constraints inherent to the current v0.1 approach that affect users or maintainers.
+Constraints inherent to the current v0.1.0 approach that affect users or maintainers.
 
 ### 1. FFI execution layer not fuzz-covered
 
@@ -118,5 +118,5 @@ Areas where test coverage is reduced compared to ideal, with justification.
 ---
 
 **Date:** 2026-02-26
-**Milestone:** v0.1
-**Audit report:** `.planning/v1.0-MILESTONE-AUDIT.md`
+**Milestone:** v0.1.0
+**Audit report:** `.planning/milestones/v1.0-MILESTONE-AUDIT.md`
