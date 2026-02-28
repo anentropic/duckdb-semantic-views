@@ -24,7 +24,7 @@ See: .planning/PROJECT.md (updated 2026-02-28)
 
 Phase: 7 of 7 (all complete)
 Status: v1.0 MVP shipped 2026-02-28
-Last activity: 2026-02-28 — Milestone v1.0 archived
+Last activity: 2026-02-28 — Completed quick task 3: fix CI failures
 
 Progress: [██████████] 100% (all 7 phases complete, all 18 plans executed)
 
