@@ -79,13 +79,13 @@ test-all: test-rust test-sql test-iceberg
 
 # Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
 fuzz target="fuzz_json_parse" time="300":
-    cargo +nightly fuzz run {{target}} -- -max_total_time={{time}}
+    cargo +nightly fuzz run {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{time}}
 
 # Run all three fuzz targets sequentially (5 min each, 15 min total)
 fuzz-all time="300":
-    cargo +nightly fuzz run fuzz_json_parse -- -max_total_time={{time}}
-    cargo +nightly fuzz run fuzz_sql_expand -- -max_total_time={{time}}
-    cargo +nightly fuzz run fuzz_query_names -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_json_parse fuzz/corpus/fuzz_json_parse fuzz/seeds/fuzz_json_parse -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_sql_expand fuzz/corpus/fuzz_sql_expand fuzz/seeds/fuzz_sql_expand -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_query_names fuzz/corpus/fuzz_query_names fuzz/seeds/fuzz_query_names -- -max_total_time={{time}}
 
 # Minimize corpus for a fuzz target (removes inputs that don't add coverage)
 fuzz-cmin target="fuzz_json_parse":

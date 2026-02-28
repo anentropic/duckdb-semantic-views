@@ -1,0 +1,1 @@
+{"base_table":"orders","dimensions":[{"name":"customer_name","expr":"customers.name","source_table":"customers"}],"metrics":[{"name":"revenue","expr":"sum(amount)"}],"filters":[],"joins":[{"table":"customers","on":"orders.customer_id = customers.id"}]}

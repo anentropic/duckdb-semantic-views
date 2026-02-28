@@ -32,7 +32,10 @@ configure/venv/
 configure/extension_version.txt
 configure/platform.txt
 
-# Fuzz crash artifacts (debug data, not corpus -- corpus IS committed)
+# Fuzz corpus (grows locally, bootstraps from fuzz/seeds/ on fresh clone)
+fuzz/corpus/
+
+# Fuzz crash artifacts
 fuzz/artifacts/
 
 # DuckLake/Iceberg test data (downloaded by configure/setup_ducklake.py)
