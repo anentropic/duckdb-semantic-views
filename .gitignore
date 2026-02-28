@@ -47,5 +47,8 @@ test/data/*.duckdb
 test/data/*.duckdb.wal
 test/data/duckdb_extensions/
 
+# Proptest regression files (generated locally on failure)
+**/*.proptest-regressions
+
 # dbt reference material (not part of the project)
 dbt/

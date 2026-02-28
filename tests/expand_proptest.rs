@@ -139,7 +139,8 @@ fn arb_query_request(def: &SemanticViewDefinition) -> impl Strategy<Value = Quer
 
 proptest! {
     /// Property 1: Dimensions control aggregation mode.
-    /// - Dimensions + metrics: GROUP BY contains all dimension expressions.
+    /// - Dimensions + metrics: GROUP BY uses ordinals for all dimensions, and
+    ///   each dimension expression appears in SELECT.
     /// - Dimensions only (no metrics): SELECT DISTINCT, no GROUP BY.
     /// - Metrics only (no dimensions): no GROUP BY (global aggregate).
     #[test]
@@ -175,17 +176,33 @@ proptest! {
                 );
             }
         } else {
-            // Both dimensions and metrics: GROUP BY with all dimension expressions.
+            // Both dimensions and metrics: GROUP BY with ordinal positions for
+            // each dimension, and all dimension expressions present in SELECT.
             let group_by_section = sql.split("GROUP BY").nth(1)
                 .expect("GROUP BY section must exist when both dimensions and metrics present");
+
+            // The expand function uses ordinal positions (GROUP BY 1, 2, ...).
+            // Verify the correct number of ordinals are present.
+            let dim_count = req.dimensions.len();
+            for i in 1..=dim_count {
+                let ordinal = format!("{i}");
+                prop_assert!(
+                    group_by_section.contains(&ordinal),
+                    "GROUP BY must contain ordinal '{i}' for dimension {i} of {dim_count}. GROUP BY section:\n{group_by_section}"
+                );
+            }
+
+            // Verify dimension expressions appear in the SELECT clause
+            // (before the GROUP BY).
+            let select_section = sql.split("GROUP BY").next().unwrap();
             for dim_name in &req.dimensions {
                 let dim_def = def.dimensions.iter()
                     .find(|d| d.name.eq_ignore_ascii_case(dim_name))
                     .unwrap();
                 prop_assert!(
-                    group_by_section.contains(&dim_def.expr),
-                    "GROUP BY must contain expr '{}' for dimension '{}'. GROUP BY section:\n{}",
-                    dim_def.expr, dim_name, group_by_section
+                    select_section.contains(&dim_def.expr),
+                    "SELECT must contain expr '{}' for dimension '{}'. SELECT section:\n{}",
+                    dim_def.expr, dim_name, select_section
                 );
             }
         }
