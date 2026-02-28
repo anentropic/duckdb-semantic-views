@@ -10,6 +10,16 @@ The project targets open source release via the DuckDB community extension regis
 
 A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
 
+## Current Milestone: v0.2.0 Native DDL + Time Dimensions
+
+**Goal:** Introduce C++ shim infrastructure for native `CREATE SEMANTIC VIEW` DDL and `pragma_query_t` catalog persistence, add time dimension support, and expose EXPLAIN for expanded SQL.
+
+**Target features:**
+- Native `CREATE SEMANTIC VIEW` DDL (C++ shim for parser hooks)
+- Time dimensions with granularity coarsening (day → week → month → year)
+- Native `EXPLAIN FROM semantic_query(...)` (C++ EXPLAIN hook)
+- Replace sidecar persistence with `pragma_query_t` via C++ shim
+
 ## Requirements
 
 ### Validated
@@ -28,10 +38,8 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Active
 
-- [ ] Native `CREATE SEMANTIC VIEW` DDL syntax (requires C++ shim for parser hooks)
-- [ ] Time dimensions with granularity coarsening (day → week → month → year)
-- [ ] Extension installable as a DuckDB community extension (`INSTALL semantic_views FROM community`) — v0.2.0
-- [ ] Real-world demo using TPC-H or similar dataset — v0.2.0
+- [ ] Native `CREATE SEMANTIC VIEW` DDL syntax (requires C++ shim for parser hooks) — v0.2.0
+- [ ] Time dimensions with granularity coarsening (day → week → month → year) — v0.2.0
 - [ ] Native `EXPLAIN FROM semantic_query(...)` shows expanded SQL (requires C++ EXPLAIN hook) — v0.2.0
 - [ ] Replace sidecar persistence with `pragma_query_t` pattern (via C++ shim) — v0.2.0
 
@@ -45,6 +53,8 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - Custom query engine — DuckDB is the engine; the extension is a preprocessor only
 - BI tool HTTP API — not a DuckDB extension concern; Cube.dev handles this use case
 - Column-level security — beyond row-level filter scope; DuckDB handles column access
+- Community extension registry publication — deferred to v0.3.0 (native DDL first)
+- Real-world TPC-H demo — deferred to v0.3.0 alongside registry publication
 
 ## Context
 
@@ -63,9 +73,9 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ## Constraints
 
-- **Language**: Rust — all extension code written in Rust
+- **Language**: Rust + C++ — Rust for extension logic, C++ shim required for parser hooks and pragma callbacks
 - **Target**: DuckDB extension — must integrate with DuckDB's extension loading mechanism
-- **v0.1.0 scope**: Expansion only, no pre-aggregation — keeps the problem tractable and ships value faster
+- **v0.2.0 scope**: Native DDL, time dimensions, EXPLAIN, pragma persistence — no pre-aggregation
 - **Correctness over performance**: Expansion must produce correct results; DuckDB handles optimisation
 
 ## Key Decisions
@@ -84,4 +94,4 @@ A DuckDB user can define a semantic view once and query it with any combination 
 | CTE-based expansion | All source tables flattened into single `_base` CTE; dimensions/metrics reference flat namespace | ✓ Good — simple and correct; requires unqualified column names in expressions |
 
 ---
-*Last updated: 2026-02-28 — milestones aligned to semver (v0.1.0 shipped, v0.2.0 next)*
+*Last updated: 2026-02-28 — milestone v0.2.0 started (Native DDL + Time Dimensions)*
