@@ -46,3 +46,6 @@ test/data/jaffle_data/
 test/data/*.duckdb
 test/data/*.duckdb.wal
 test/data/duckdb_extensions/
+
+# dbt reference material (not part of the project)
+dbt/
