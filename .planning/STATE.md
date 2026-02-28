@@ -141,7 +141,7 @@ None yet.
 | # | Description | Date | Commit | Status | Directory |
 |---|-------------|------|--------|--------|-----------|
 | 1 | fix dot-qualified table name issue | 2026-02-27 | 3a90dad | Verified | [1-fix-dot-qualified-table-name-issue](./quick/1-fix-dot-qualified-table-name-issue/) |
-| 2 | convert setup_ducklake.py to uv script | 2026-02-28 | ab4bf0c, bb1309f | Complete | [2-convert-setup-ducklake-py-to-uv-script-r](./quick/2-convert-setup-ducklake-py-to-uv-script-r/) |
+| 2 | convert setup_ducklake.py to uv script | 2026-02-28 | ab4bf0c, bb1309f | Verified | [2-convert-setup-ducklake-py-to-uv-script-r](./quick/2-convert-setup-ducklake-py-to-uv-script-r/) |
 
 ## Session Continuity
 
