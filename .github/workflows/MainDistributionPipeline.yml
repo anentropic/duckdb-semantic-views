@@ -1,7 +1,9 @@
 name: Main Extension Distribution Pipeline
 
 on:
-  push:
+  workflow_run:
+    workflows: ["Code Quality"]
+    types: [completed]
     branches:
       - main
       - 'release/*'
@@ -14,6 +16,7 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries (all platforms)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       duckdb_version: v1.4.4
