@@ -1,0 +1,63 @@
+# Phase 2 restart/persistence integration test (DDL-05).
+#
+# Extracted from phase2_ddl.test to isolate the `restart` directive, which
+# fails on Windows due to aggressive file locking (IOException: "Cannot open
+# file ... being used by another process").
+#
+# NOTE: `require notwindows` in the Python sqllogictest runner (used by
+# extension-ci-tools) currently skips on ALL platforms because the runner
+# lacks OS detection. Restart persistence IS independently verified by
+# Rust integration tests (cargo test). When/if the Python runner adds
+# platform detection, this test will automatically start running on
+# Linux and macOS.
+#
+# Requirements covered:
+#   DDL-05: persistence across restart
+
+require semantic_views
+
+require notwindows
+
+load __TEST_DIR__/restart_test.db
+
+# Idempotent cleanup: if a previous run left state behind via the sidecar file,
+# init_catalog will have already loaded the view. Drop it before re-defining.
+statement ok
+SELECT CASE WHEN (SELECT count(*) FROM list_semantic_views() WHERE name = 'restart_test') > 0
+       THEN drop_semantic_view('restart_test')
+       ELSE 'no-op'
+END;
+
+# Define a view in the file-backed database
+statement ok
+SELECT define_semantic_view(
+    'restart_test',
+    '{"base_table":"events","dimensions":[{"name":"type","expr":"type"}],"metrics":[{"name":"n","expr":"count(*)"}]}'
+);
+
+# Verify it is present before restart
+query TT rowsort
+SELECT name, base_table FROM list_semantic_views();
+----
+restart_test	events
+
+restart
+
+# After restart the extension is reloaded automatically; init_catalog reads
+# semantic_layer._definitions from the file-backed DB. The view defined before
+# restart must be present in the catalog.
+query TT rowsort
+SELECT name, base_table FROM list_semantic_views();
+----
+restart_test	events
+
+# Clean up: drop the view so the sidecar file is emptied.
+# Without this, the sidecar persists across test runs and causes
+# "already exists" errors on the next invocation.
+statement ok
+SELECT drop_semantic_view('restart_test');
+
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+0

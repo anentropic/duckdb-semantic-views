@@ -8,8 +8,7 @@
 #   DDL-02: drop_semantic_view removes a registered view
 #   DDL-03: list_semantic_views returns one row per registered view
 #   DDL-04: describe_semantic_view returns all definition fields
-#   DDL-05: persistence across restart — section 10 defines a view in a file-backed DB, triggers
-#           a restart, and verifies the view is still present via sidecar file persistence
+#   DDL-05: persistence across restart — see phase2_restart.test
 #
 # Run via: just test  (make test_debug)
 
@@ -135,64 +134,6 @@ SELECT drop_semantic_view('customers');
 
 statement ok
 SELECT drop_semantic_view('products');
-
-query I
-SELECT count(*) FROM list_semantic_views();
-----
-0
-
-# ============================================================
-# 10. DDL-05: persistence across restart
-#
-# define_semantic_view writes catalog entries to the host DB file via
-# Connection::open(db_path), where db_path is resolved from
-# pragma_database_list() in the extension entrypoint.
-#
-# The test runner starts with an in-memory DB. We use `load` to switch
-# to a file-backed database so that catalog entries can survive restart.
-# After `restart`, the runner reopens the same file and reloads the
-# semantic_views extension; init_catalog reads semantic_layer._definitions
-# and the restart_test view must be present in the returned catalog.
-# ============================================================
-
-load __TEST_DIR__/restart_test.db
-
-# Idempotent cleanup: if a previous run left state behind via the sidecar file,
-# init_catalog will have already loaded the view. Drop it before re-defining.
-statement ok
-SELECT CASE WHEN (SELECT count(*) FROM list_semantic_views() WHERE name = 'restart_test') > 0
-       THEN drop_semantic_view('restart_test')
-       ELSE 'no-op'
-END;
-
-# Define a view in the file-backed database
-statement ok
-SELECT define_semantic_view(
-    'restart_test',
-    '{"base_table":"events","dimensions":[{"name":"type","expr":"type"}],"metrics":[{"name":"n","expr":"count(*)"}]}'
-);
-
-# Verify it is present before restart
-query TT rowsort
-SELECT name, base_table FROM list_semantic_views();
-----
-restart_test	events
-
-restart
-
-# After restart the extension is reloaded automatically; init_catalog reads
-# semantic_layer._definitions from the file-backed DB. The view defined before
-# restart must be present in the catalog.
-query TT rowsort
-SELECT name, base_table FROM list_semantic_views();
-----
-restart_test	events
-
-# Clean up: drop the view so the sidecar file is emptied.
-# Without this, the sidecar persists across test runs and causes
-# "already exists" errors on the next invocation.
-statement ok
-SELECT drop_semantic_view('restart_test');
 
 query I
 SELECT count(*) FROM list_semantic_views();
