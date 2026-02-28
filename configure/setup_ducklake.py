@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# dependencies = ["duckdb"]
+# requires-python = ">=3.9"
+# ///
 """Set up a local DuckLake catalog with jaffle-shop sample data.
 
 Downloads jaffle-shop CSV seeds from dbt-labs/jaffle-shop on GitHub,

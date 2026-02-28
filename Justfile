@@ -53,7 +53,7 @@ coverage:
 #
 # There is no standalone DuckDB CLI available in this project; SQL logic tests
 # are run via the Python-based duckdb_sqllogictest runner (installed by
-# `make configure` into configure/venv).  This recipe builds the debug extension
+# `make configure` into its Python venv).  This recipe builds the debug extension
 # and delegates to `make test_debug`, which invokes the runner against the full
 # test/sql/ directory.  All files matching test/sql/**/*.test are executed.
 #
@@ -64,14 +64,14 @@ test-sql: build
 
 # Download jaffle-shop data and create DuckLake/Iceberg catalog for integration tests.
 # Idempotent — safe to run multiple times. Data files are gitignored.
-# Uses the project venv Python which has duckdb installed.
+# Uses uv to run the script with its declared dependencies (PEP 723).
 setup-ducklake:
-    ./configure/venv/bin/python3 configure/setup_ducklake.py
+    uv run configure/setup_ducklake.py
 
 # Run DuckLake/Iceberg integration test (requires `just setup-ducklake` first).
 # Tests semantic_query against DuckLake-managed Iceberg tables with jaffle-shop data.
 test-iceberg: build
-    ./configure/venv/bin/python3 test/integration/test_ducklake.py
+    uv run test/integration/test_ducklake.py
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration
 # Note: DuckLake test requires `just setup-ducklake` to have been run first.
