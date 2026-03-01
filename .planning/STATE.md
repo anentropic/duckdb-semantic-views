@@ -3,7 +3,7 @@ gsd_state_version: 1.0
 milestone: v0.2.0
 milestone_name: Native DDL + Time Dimensions
 status: in_progress
-last_updated: "2026-03-01T02:16:06Z"
+last_updated: "2026-03-01T02:19:26Z"
 progress:
   total_phases: 5
   completed_phases: 1
@@ -18,7 +18,7 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-28)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 8 — C++ Shim Infrastructure
+**Current focus:** Phase 9 — Time Dimensions (Phase 8 complete 2026-03-01)
 
 ## Current Position
 

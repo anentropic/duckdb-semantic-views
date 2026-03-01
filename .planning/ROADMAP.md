@@ -26,7 +26,7 @@ Full details: [milestones/v0.1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md)
 
 **Milestone Goal:** Introduce a C++ shim to unlock native `CREATE SEMANTIC VIEW` DDL and `pragma_query_t` persistence, add time dimension granularity coarsening, and expose EXPLAIN for expanded SQL.
 
-- [ ] **Phase 8: C++ Shim Infrastructure** - Validate the build mechanics of the Rust+C++ boundary in isolation before any parser logic is added
+- [x] **Phase 8: C++ Shim Infrastructure** - Validate the build mechanics of the Rust+C++ boundary in isolation before any parser logic is added — completed 2026-03-01
 - [ ] **Phase 9: Time Dimensions** - Add time-typed dimensions with granularity coarsening and per-query granularity override (pure Rust, delivers user value early)
 - [ ] **Phase 10: pragma_query_t Catalog Persistence** - Replace the sidecar file with DuckDB-native table persistence via the C++ shim's PRAGMA callback
 - [ ] **Phase 11: CREATE SEMANTIC VIEW Parser Hook** - Implement native SQL DDL syntax for creating and dropping semantic views via the C++ parser extension
@@ -46,8 +46,8 @@ Full details: [milestones/v0.1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md)
 **Plans:** 2 plans
 
 Plans:
-- [ ] 08-01-PLAN.md — Vendor duckdb.hpp, create C++ shim skeleton (shim.cpp, shim.h, mod.rs), update Cargo.toml and Justfile
-- [ ] 08-02-PLAN.md — Create build.rs with feature-gated C++ compilation and symbol visibility; wire lib.rs extern C call; verify full build
+- [x] 08-01-PLAN.md — Vendor duckdb.hpp, create C++ shim skeleton (shim.cpp, shim.h, mod.rs), update Cargo.toml and Justfile
+- [x] 08-02-PLAN.md — Create build.rs with feature-gated C++ compilation and symbol visibility; wire lib.rs extern C call; verify full build
 
 ### Phase 9: Time Dimensions
 **Goal**: Users can declare time-typed dimensions in semantic view definitions and query them with automatic or overridden granularity
@@ -103,7 +103,7 @@ Plans:
 | 5. Hardening and Docs | v0.1.0 | 2/2 | Complete | 2026-02-26 |
 | 6. Tech Debt Code Cleanup | v0.1.0 | 1/1 | Complete | 2026-02-26 |
 | 7. Verification & Formal Closure | v0.1.0 | 2/2 | Complete | 2026-02-27 |
-| 8. C++ Shim Infrastructure | v0.2.0 | 0/2 | Planning complete | - |
+| 8. C++ Shim Infrastructure | v0.2.0 | 2/2 | Complete | 2026-03-01 |
 | 9. Time Dimensions | v0.2.0 | 0/? | Not started | - |
 | 10. pragma_query_t Catalog Persistence | v0.2.0 | 0/? | Not started | - |
 | 11. CREATE SEMANTIC VIEW Parser Hook | v0.2.0 | 0/? | Not started | - |
