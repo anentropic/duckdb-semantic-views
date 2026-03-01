@@ -43,6 +43,13 @@ mod extension {
         query::table_function::{QueryState, SemanticViewVTab},
     };
 
+    // Extern C declaration for the C++ shim entry point.
+    // Compiled and linked when `--features extension` is active (see build.rs).
+    // Phase 8: no-op. Phases 10/11 add parser/pragma registration logic.
+    unsafe extern "C" {
+        fn semantic_views_register_shim(db_instance_ptr: *mut std::ffi::c_void);
+    }
+
     /// Core initialization logic, called with both the high-level Connection and
     /// the raw database handle (extracted by the manual FFI entrypoint below).
     fn init_extension(
@@ -119,6 +126,14 @@ mod extension {
             "explain_semantic_view",
             &query_state,
         )?;
+
+        // Call C++ shim to register parser hooks and pragma callbacks.
+        // Phase 8: no-op. Phases 10/11 add real logic.
+        // Safety: db_handle is a valid duckdb_database for the extension lifetime.
+        //         The shim does not outlive the database instance.
+        unsafe {
+            semantic_views_register_shim(db_handle.cast());
+        }
 
         Ok(())
     }

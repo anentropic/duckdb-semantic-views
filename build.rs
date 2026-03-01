@@ -4,9 +4,10 @@
 // Design: Only the `extension` feature triggers C++ compilation. During `cargo test`
 // (default/bundled feature), this script exits immediately — no C++ toolchain required.
 //
-// Symbol visibility: restricts the exported symbols of the cdylib to the two DuckDB
-// entry points on Linux and macOS. Without this, Rust stdlib symbols leak into the
-// extension binary.
+// Symbol visibility: restricts the exported symbols of the cdylib to the Rust entry
+// point on Linux and macOS. Without this, Rust stdlib symbols leak into the extension
+// binary. Note: semantic_views_version is appended by the CI post-build script after
+// compilation; it is NOT compiled into the binary and must not appear in the symbol list.
 
 fn main() {
     // Only compile the C++ shim when building the loadable extension binary.
@@ -32,24 +33,27 @@ fn main() {
 
     match target_os.as_str() {
         "linux" => {
-            // ELF version script: only DuckDB entry points are globally visible.
+            // ELF version script: only the Rust entry point is globally visible.
+            // Note: semantic_views_version is appended by the CI post-build script
+            // (extension-ci-tools); it does NOT exist in the compiled binary and must
+            // not be listed here — the linker would fail with "symbol not found".
             let map_path = format!("{out_dir}/semantic_views.map");
             std::fs::write(
                 &map_path,
-                "{\n  global:\n    semantic_views_init_c_api;\n    semantic_views_version;\n  local: *;\n};\n",
+                "{\n  global:\n    semantic_views_init_c_api;\n  local: *;\n};\n",
             )
             .expect("failed to write ELF version script");
             println!("cargo:rustc-link-arg=-Wl,--version-script={map_path}");
         }
         "macos" => {
-            // Exported symbols list: only DuckDB entry points are externally visible.
+            // Exported symbols list: only the Rust entry point is externally visible.
             // macOS uses underscore-prefixed names in the exported symbols file.
+            // Note: semantic_views_version is appended by the CI post-build script
+            // (extension-ci-tools); it does NOT exist in the compiled binary and must
+            // not be listed here — the linker would fail with "undefined symbol".
             let exp_path = format!("{out_dir}/semantic_views.exp");
-            std::fs::write(
-                &exp_path,
-                "_semantic_views_init_c_api\n_semantic_views_version\n",
-            )
-            .expect("failed to write macOS exported symbols list");
+            std::fs::write(&exp_path, "_semantic_views_init_c_api\n")
+                .expect("failed to write macOS exported symbols list");
             println!("cargo:rustc-link-arg=-Wl,-exported_symbols_list,{exp_path}");
         }
         _ => {
