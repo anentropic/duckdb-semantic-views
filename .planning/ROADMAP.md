@@ -89,7 +89,13 @@ Plans:
   3. `CREATE OR REPLACE SEMANTIC VIEW sales_summary (...)` overwrites the existing definition without error
   4. All capabilities available via `define_semantic_view()` (dimensions, metrics, joins, filters) are expressible in the native DDL syntax
   5. `SELECT 1`, `CREATE TABLE`, and all other non-semantic-view SQL executes identically before and after loading the extension — the parser hook passes through cleanly
-**Plans**: TBD
+**Plans**: 4 plans
+
+Plans:
+- [ ] 11-01-PLAN.md — Update model.rs (Fact struct, Join evolution) + catalog.rs (catalog_upsert, catalog_delete_if_exists, FFI catalog functions)
+- [ ] 11-02-PLAN.md — C++ parser hook in shim.cpp (parse_function_t, plan_function_t, DDL scan, tokenizer, shim.h catalog FFI declarations)
+- [ ] 11-03-PLAN.md — Rust cleanup: delete define.rs/drop.rs, trim ddl/mod.rs, update lib.rs shim call signature (DDL-05)
+- [ ] 11-04-PLAN.md — Rewrite phase2_ddl.test + new phase11_ddl.test (DDL-01 through DDL-06 integration coverage)
 
 ### Phase 12: EXPLAIN + Typed Output
 **Goal**: `EXPLAIN FROM semantic_query(...)` shows the expanded SQL, and `semantic_query` returns typed columns instead of all-VARCHAR
