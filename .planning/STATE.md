@@ -1,14 +1,14 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.2.0
-milestone_name: Native DDL + Time Dimensions
-status: in_progress
-last_updated: "2026-03-01T02:19:26Z"
+milestone: v0.1
+milestone_name: milestone
+status: unknown
+last_updated: "2026-03-01T14:13:56.239Z"
 progress:
-  total_phases: 5
-  completed_phases: 1
-  total_plans: 10
-  completed_plans: 2
+  total_phases: 3
+  completed_phases: 3
+  total_plans: 7
+  completed_plans: 7
 ---
 
 # Project State

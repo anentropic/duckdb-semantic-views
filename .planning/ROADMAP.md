@@ -28,7 +28,7 @@ Full details: [milestones/v0.1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md)
 
 - [x] **Phase 8: C++ Shim Infrastructure** - Validate the build mechanics of the Rust+C++ boundary in isolation before any parser logic is added — completed 2026-03-01
 - [x] **Phase 9: Time Dimensions** - Add time-typed dimensions with granularity coarsening and per-query granularity override (pure Rust, delivers user value early) — completed 2026-03-01
-- [ ] **Phase 10: pragma_query_t Catalog Persistence** - Replace the sidecar file with DuckDB-native table persistence via the C++ shim's PRAGMA callback
+- [x] **Phase 10: pragma_query_t Catalog Persistence** - Replace the sidecar file with DuckDB-native table persistence via the C++ shim's PRAGMA callback (completed 2026-03-01)
 - [ ] **Phase 11: CREATE SEMANTIC VIEW Parser Hook** - Implement native SQL DDL syntax for creating and dropping semantic views via the C++ parser extension
 - [ ] **Phase 12: EXPLAIN + Typed Output** - Wire EXPLAIN support for expanded SQL and replace all-VARCHAR output with typed columns
 
@@ -114,6 +114,6 @@ Plans:
 | 7. Verification & Formal Closure | v0.1.0 | 2/2 | Complete | 2026-02-27 |
 | 8. C++ Shim Infrastructure | v0.2.0 | 2/2 | Complete | 2026-03-01 |
 | 9. Time Dimensions | v0.2.0 | 0/? | Not started | - |
-| 10. pragma_query_t Catalog Persistence | v0.2.0 | 0/? | Not started | - |
+| 10. pragma_query_t Catalog Persistence | 3/3 | Complete    | 2026-03-01 | - |
 | 11. CREATE SEMANTIC VIEW Parser Hook | v0.2.0 | 0/? | Not started | - |
 | 12. EXPLAIN + Typed Output | v0.2.0 | 0/? | Not started | - |
