@@ -72,9 +72,10 @@ None.
 | 2 | convert setup_ducklake.py to uv script | 2026-02-28 | ab4bf0c, bb1309f | Verified | [2-convert-setup-ducklake-py-to-uv-script-r](./quick/2-convert-setup-ducklake-py-to-uv-script-r/) |
 | 3 | fix CI failures (cargo-deny licenses + Windows restart test) | 2026-02-28 | 9056292, 6935892 | Verified | [3-fix-ci-failures](./quick/3-fix-ci-failures/) |
 | 4 | check CI results and fix proptest assertion bug | 2026-02-28 | 652e7d2 | Verified | [4-check-ci-results-and-fix-coverage-if-nee](./quick/4-check-ci-results-and-fix-coverage-if-nee/) |
+| 5 | fix require notwindows skipping phase2 restart test | 2026-03-01 | 4cc9b83, b35746f | Verified | [5-fix-require-notwindows-skipping-phase2-r](./quick/5-fix-require-notwindows-skipping-phase2-r/) |
 
 ## Session Continuity
 
 Last session: 2026-03-01
-Stopped at: Phase 8 complete — verification passed, roadmap updated. Ready for Phase 9 (Time Dimensions).
+Stopped at: Quick task 5 complete — notwindows patch script + Makefile wiring done. Ready for Phase 9 (Time Dimensions).
 Resume file: None
