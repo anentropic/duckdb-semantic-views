@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -142,6 +143,36 @@ pub(crate) unsafe fn extract_list_strings(value: &Value) -> Vec<String> {
     result
 }
 
+/// Extract key-value pairs from a DuckDB MAP(VARCHAR, VARCHAR) named parameter value.
+///
+/// Returns a `HashMap` with all keys lowercased for case-insensitive dimension name
+/// matching. Only entries where both key and value are non-null are inserted.
+///
+/// # Safety
+///
+/// `value` must represent a MAP(VARCHAR, VARCHAR) value.
+unsafe fn extract_map_strings(value: &Value) -> HashMap<String, String> {
+    let value_ptr = value_raw_ptr(value);
+    let size = ffi::duckdb_get_map_size(value_ptr);
+    let mut result = HashMap::with_capacity(size as usize);
+    for i in 0..size {
+        let mut key = ffi::duckdb_get_map_key(value_ptr, i);
+        let mut val = ffi::duckdb_get_map_value(value_ptr, i);
+        let k_cstr = ffi::duckdb_get_varchar(key);
+        let v_cstr = ffi::duckdb_get_varchar(val);
+        if !k_cstr.is_null() && !v_cstr.is_null() {
+            let k = CStr::from_ptr(k_cstr).to_string_lossy().into_owned();
+            let v = CStr::from_ptr(v_cstr).to_string_lossy().into_owned();
+            ffi::duckdb_free(k_cstr.cast::<c_void>());
+            ffi::duckdb_free(v_cstr.cast::<c_void>());
+            result.insert(k.to_ascii_lowercase(), v);
+        }
+        ffi::duckdb_destroy_value(&mut key);
+        ffi::duckdb_destroy_value(&mut val);
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // VTab implementation
 // ---------------------------------------------------------------------------
@@ -177,6 +208,13 @@ impl VTab for SemanticViewVTab {
             None => vec![],
         };
 
+        // Extract optional granularities MAP(VARCHAR, VARCHAR) for query-time override (TIME-03).
+        let granularity_overrides: HashMap<String, String> =
+            match bind.get_named_parameter("granularities") {
+                Some(ref val) => unsafe { extract_map_strings(val) },
+                None => HashMap::new(),
+            };
+
         // 3. Validate: at least one dimension or metric.
         if dimensions.is_empty() && metrics.is_empty() {
             return Err(Box::new(QueryError::EmptyRequest {
@@ -207,9 +245,39 @@ impl VTab for SemanticViewVTab {
         // 5. Parse definition and expand.
         let def = SemanticViewDefinition::from_json(&view_name, &json_str)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+        // Validate granularity overrides against the view definition (TIME-03).
+        const VALID_GRANULARITIES: &[&str] = &["day", "week", "month", "year"];
+        for (override_dim_lower, override_gran) in &granularity_overrides {
+            if let Some(dim_def) = def
+                .dimensions
+                .iter()
+                .find(|d| d.name.to_ascii_lowercase() == *override_dim_lower)
+            {
+                if dim_def.dim_type.as_deref() != Some("time") {
+                    return Err(format!(
+                        "dimension '{}' is not a time dimension and cannot have a granularity override",
+                        dim_def.name
+                    )
+                    .into());
+                }
+                if !VALID_GRANULARITIES.contains(&override_gran.as_str()) {
+                    return Err(format!(
+                        "granularity override '{}' for dimension '{}' is not supported; valid values: {}",
+                        override_gran,
+                        dim_def.name,
+                        VALID_GRANULARITIES.join(", ")
+                    )
+                    .into());
+                }
+            }
+            // If dimension doesn't exist in the view at all, expand() will catch it as UnknownDimension.
+        }
+
         let req = QueryRequest {
             dimensions: dimensions.clone(),
             metrics: metrics.clone(),
+            granularity_overrides,
         };
         let expanded_sql = expand(&view_name, &def, &req)
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(QueryError::from(e)) })?;
@@ -336,6 +404,15 @@ impl VTab for SemanticViewVTab {
             (
                 "metrics".to_string(),
                 LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ),
+            // granularities: query-time granularity override map (TIME-03)
+            // MAP(VARCHAR, VARCHAR) — e.g., granularities := {'order_date': 'month'}
+            (
+                "granularities".to_string(),
+                LogicalTypeHandle::map(
+                    &LogicalTypeHandle::from(LogicalTypeId::Varchar),
+                    &LogicalTypeHandle::from(LogicalTypeId::Varchar),
+                ),
             ),
         ])
     }

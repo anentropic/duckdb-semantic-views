@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use duckdb::{
@@ -158,6 +159,7 @@ impl VTab for ExplainSemanticViewVTab {
         let req = QueryRequest {
             dimensions: dimensions.clone(),
             metrics: metrics.clone(),
+            granularity_overrides: HashMap::new(),
         };
         let expanded_sql = expand(&view_name, &def, &req)
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(QueryError::from(e)) })?;
