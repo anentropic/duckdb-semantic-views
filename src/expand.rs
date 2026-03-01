@@ -447,11 +447,15 @@ mod tests {
                         name: "region".to_string(),
                         expr: "region".to_string(),
                         source_table: None,
+                        dim_type: None,
+                        granularity: None,
                     },
                     Dimension {
                         name: "status".to_string(),
                         expr: "status".to_string(),
                         source_table: None,
+                        dim_type: None,
+                        granularity: None,
                     },
                 ],
                 metrics: vec![
@@ -596,6 +600,8 @@ GROUP BY
                     name: "col".to_string(),
                     expr: "col".to_string(),
                     source_table: None,
+                    dim_type: None,
+                    granularity: None,
                 }],
                 metrics: vec![Metric {
                     name: "cnt".to_string(),
@@ -623,6 +629,8 @@ GROUP BY
                     name: "month".to_string(),
                     expr: "date_trunc('month', created_at)".to_string(),
                     source_table: None,
+                    dim_type: None,
+                    granularity: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
@@ -707,6 +715,8 @@ FROM \"_base\"";
                     name: "Region".to_string(),
                     expr: "region".to_string(),
                     source_table: None,
+                    dim_type: None,
+                    granularity: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
@@ -926,6 +936,8 @@ FROM \"_base\"";
                     name: "customer_name".to_string(),
                     expr: "customers.name".to_string(),
                     source_table: Some("customers".to_string()),
+                    dim_type: None,
+                    granularity: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
@@ -955,11 +967,15 @@ FROM \"_base\"";
                         name: "region".to_string(),
                         expr: "region".to_string(),
                         source_table: None,
+                        dim_type: None,
+                        granularity: None,
                     },
                     Dimension {
                         name: "customer_name".to_string(),
                         expr: "customers.name".to_string(),
                         source_table: Some("customers".to_string()),
+                        dim_type: None,
+                        granularity: None,
                     },
                 ],
                 metrics: vec![Metric {
@@ -993,6 +1009,8 @@ FROM \"_base\"";
                     name: "region".to_string(),
                     expr: "region".to_string(),
                     source_table: None,
+                    dim_type: None,
+                    granularity: None,
                 }],
                 metrics: vec![Metric {
                     name: "customer_count".to_string(),
@@ -1021,6 +1039,8 @@ FROM \"_base\"";
                     name: "region_name".to_string(),
                     expr: "regions.name".to_string(),
                     source_table: Some("regions".to_string()),
+                    dim_type: None,
+                    granularity: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
@@ -1063,6 +1083,8 @@ FROM \"_base\"";
                     name: "region_name".to_string(),
                     expr: "regions.name".to_string(),
                     source_table: Some("regions".to_string()),
+                    dim_type: None,
+                    granularity: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
@@ -1104,6 +1126,8 @@ FROM \"_base\"";
                     name: "region".to_string(),
                     expr: "region".to_string(),
                     source_table: None,
+                    dim_type: None,
+                    granularity: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
@@ -1132,6 +1156,8 @@ FROM \"_base\"";
                     name: "status".to_string(),
                     expr: "status".to_string(),
                     source_table: None,
+                    dim_type: None,
+                    granularity: None,
                 }],
                 metrics: vec![Metric {
                     name: "order_count".to_string(),
@@ -1161,6 +1187,8 @@ FROM \"_base\"";
                     name: "customer_name".to_string(),
                     expr: "customers.name".to_string(),
                     source_table: Some("jaffle.raw_customers".to_string()),
+                    dim_type: None,
+                    granularity: None,
                 }],
                 metrics: vec![Metric {
                     name: "order_count".to_string(),
@@ -1193,11 +1221,15 @@ FROM \"_base\"";
                         name: "region".to_string(),
                         expr: "region".to_string(),
                         source_table: None,
+                        dim_type: None,
+                        granularity: None,
                     },
                     Dimension {
                         name: "customer_name".to_string(),
                         expr: "customers.name".to_string(),
                         source_table: Some("customers".to_string()),
+                        dim_type: None,
+                        granularity: None,
                     },
                 ],
                 metrics: vec![Metric {
