@@ -43,7 +43,11 @@ Full details: [milestones/v0.1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md)
   2. `cargo test` (no extension feature) continues to pass — shim compilation is fully gated behind `CARGO_FEATURE_EXTENSION`
   3. `LOAD 'semantic_views'` in DuckDB succeeds after the C++ addition — existing v0.1.0 functionality is unaffected
   4. The loaded extension exports exactly the three DuckDB entry point symbols — no Rust standard library symbols leak into the binary
-**Plans**: TBD
+**Plans:** 2 plans
+
+Plans:
+- [ ] 08-01-PLAN.md — Vendor duckdb.hpp, create C++ shim skeleton (shim.cpp, shim.h, mod.rs), update Cargo.toml and Justfile
+- [ ] 08-02-PLAN.md — Create build.rs with feature-gated C++ compilation and symbol visibility; wire lib.rs extern C call; verify full build
 
 ### Phase 9: Time Dimensions
 **Goal**: Users can declare time-typed dimensions in semantic view definitions and query them with automatic or overridden granularity
@@ -99,7 +103,7 @@ Full details: [milestones/v0.1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md)
 | 5. Hardening and Docs | v0.1.0 | 2/2 | Complete | 2026-02-26 |
 | 6. Tech Debt Code Cleanup | v0.1.0 | 1/1 | Complete | 2026-02-26 |
 | 7. Verification & Formal Closure | v0.1.0 | 2/2 | Complete | 2026-02-27 |
-| 8. C++ Shim Infrastructure | v0.2.0 | 0/? | Not started | - |
+| 8. C++ Shim Infrastructure | v0.2.0 | 0/2 | Planning complete | - |
 | 9. Time Dimensions | v0.2.0 | 0/? | Not started | - |
 | 10. pragma_query_t Catalog Persistence | v0.2.0 | 0/? | Not started | - |
 | 11. CREATE SEMANTIC VIEW Parser Hook | v0.2.0 | 0/? | Not started | - |
