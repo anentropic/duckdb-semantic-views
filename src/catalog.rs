@@ -105,7 +105,7 @@ pub fn catalog_insert(
         let guard = state.read().unwrap();
         if guard.contains_key(name) {
             return Err(format!(
-                "semantic view '{name}' already exists; call drop_semantic_view first"
+                "semantic view '{name}' already exists; use CREATE OR REPLACE SEMANTIC VIEW to overwrite"
             )
             .into());
         }

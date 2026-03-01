@@ -33,21 +33,22 @@ mod extension {
 
     use crate::{
         catalog::init_catalog,
-        ddl::{
-            define::{DefineSemanticView, DefineState},
-            describe::DescribeSemanticViewVTab,
-            drop::{DropSemanticView, DropState},
-            list::ListSemanticViewsVTab,
-        },
+        ddl::{describe::DescribeSemanticViewVTab, list::ListSemanticViewsVTab},
         query::explain::ExplainSemanticViewVTab,
         query::table_function::{QueryState, SemanticViewVTab},
     };
 
     // Extern C declaration for the C++ shim entry point.
     // Compiled and linked when `--features extension` is active (see build.rs).
-    // Phase 10: registers pragma_query_t callbacks. Phase 11 adds parser hooks.
+    // Phase 10: registers pragma_query_t callbacks.
+    // Phase 11: also registers parser hooks for CREATE/DROP SEMANTIC VIEW DDL.
+    //   Updated signature: accepts catalog_raw_ptr and persist_conn for the parser hook.
     unsafe extern "C" {
-        fn semantic_views_register_shim(db_instance_ptr: *mut std::ffi::c_void);
+        fn semantic_views_register_shim(
+            db_instance_ptr: *mut std::ffi::c_void,
+            catalog_raw_ptr: *const std::ffi::c_void,
+            persist_conn: ffi::duckdb_connection,
+        );
     }
 
     /// Core initialization logic, called with both the high-level Connection and
@@ -74,37 +75,12 @@ mod extension {
         // Initialize the catalog.
         let catalog_state = init_catalog(con, &db_path)?;
 
-        // Register scalar DDL mutation functions.
-        con.register_scalar_function_with_state::<DefineSemanticView>(
-            "define_semantic_view",
-            &DefineState {
-                catalog: catalog_state.clone(),
-                persist_conn,
-            },
-        )?;
-        con.register_scalar_function_with_state::<DropSemanticView>(
-            "drop_semantic_view",
-            &DropState {
-                catalog: catalog_state.clone(),
-                persist_conn,
-            },
-        )?;
-
-        // Register table DDL read functions.
-        con.register_table_function_with_extra_info::<ListSemanticViewsVTab, _>(
-            "list_semantic_views",
-            &catalog_state,
-        )?;
-        con.register_table_function_with_extra_info::<DescribeSemanticViewVTab, _>(
-            "describe_semantic_view",
-            &catalog_state,
-        )?;
-
-        // Create a separate connection for DDL persistence (define_semantic_view / drop_semantic_view).
+        // Create a separate connection for DDL persistence.
         // Only created for file-backed databases — in-memory DBs use HashMap only.
-        // This connection is stored in DefineState and DropState and called from invoke
-        // to execute INSERT/DELETE on semantic_layer._definitions without deadlocking
-        // the main connection's execution lock.
+        // This connection is passed to the C++ parser hook scan function, which uses it
+        // to write to semantic_layer._definitions without deadlocking the main connection's
+        // execution lock (context_lock is non-reentrant; a second duckdb_connection has its
+        // own context).
         let persist_conn: Option<ffi::duckdb_connection> = if db_path.as_ref() != ":memory:" {
             let mut conn: ffi::duckdb_connection = ptr::null_mut();
             let rc = unsafe { ffi::duckdb_connect(db_handle, &mut conn) };
@@ -115,6 +91,19 @@ mod extension {
         } else {
             None
         };
+
+        // Register table DDL read functions (list_semantic_views, describe_semantic_view).
+        // Note: define_semantic_view and drop_semantic_view scalar functions are removed
+        // in Phase 11 — native CREATE/DROP SEMANTIC VIEW DDL replaces them via the
+        // C++ parser hook registered below.
+        con.register_table_function_with_extra_info::<ListSemanticViewsVTab, _>(
+            "list_semantic_views",
+            &catalog_state,
+        )?;
+        con.register_table_function_with_extra_info::<DescribeSemanticViewVTab, _>(
+            "describe_semantic_view",
+            &catalog_state,
+        )?;
 
         // Create a NEW connection for the semantic_query table function.
         // The host connection may hold execution locks during query processing.
@@ -146,8 +135,12 @@ mod extension {
         // Call C++ shim to register pragma callbacks (Phase 10) and parser hooks (Phase 11).
         // Safety: db_handle is a valid duckdb_database for the extension lifetime.
         //         The shim does not outlive the database instance.
+        //         catalog_raw is a non-owning raw pointer — the Arc's refcount is elevated
+        //         because catalog_state is cloned into QueryState above, keeping it alive.
+        let catalog_raw = Arc::as_ptr(&catalog_state) as *const std::ffi::c_void;
+        let raw_persist_conn = persist_conn.unwrap_or(std::ptr::null_mut());
         unsafe {
-            semantic_views_register_shim(db_handle.cast());
+            semantic_views_register_shim(db_handle.cast(), catalog_raw, raw_persist_conn);
         }
 
         Ok(())

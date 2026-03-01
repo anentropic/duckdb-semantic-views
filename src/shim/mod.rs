@@ -4,12 +4,14 @@
 // into the cdylib. They are NOT exported (internal link only).
 //
 // Two write paths exist:
-// 1. semantic_views_register_shim: registers pragma_query_t callbacks —
-//    transactional (DuckDB executes returned SQL in caller's transaction).
+// 1. semantic_views_register_shim: registers pragma_query_t callbacks +
+//    parser hooks for CREATE/DROP SEMANTIC VIEW DDL (Phase 11).
+//    Transactional path: pragma_query_t callbacks return SQL that DuckDB
+//    executes in the caller's transaction. Parser hook scan uses persist_conn.
 //    Called at load time from lib.rs. Declared in lib.rs (not here).
 // 2. semantic_views_pragma_define / _drop: execute INSERT/DELETE directly
-//    on a separate stored connection — NOT in the user's transaction.
-//    Called from ddl/define.rs and ddl/drop.rs invoke.
+//    on persist_conn (a separate stored connection) — NOT in the user's transaction.
+//    Called from the C++ parser hook scan function (SemanticViewsDDLScan).
 //
 // Only feature = "extension" compiles shim.cpp, so these declarations
 // are also gated. Unit tests (default/bundled feature) never call them.
