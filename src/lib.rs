@@ -45,7 +45,7 @@ mod extension {
 
     // Extern C declaration for the C++ shim entry point.
     // Compiled and linked when `--features extension` is active (see build.rs).
-    // Phase 8: no-op. Phases 10/11 add parser/pragma registration logic.
+    // Phase 10: registers pragma_query_t callbacks. Phase 11 adds parser hooks.
     unsafe extern "C" {
         fn semantic_views_register_shim(db_instance_ptr: *mut std::ffi::c_void);
     }
@@ -79,14 +79,14 @@ mod extension {
             "define_semantic_view",
             &DefineState {
                 catalog: catalog_state.clone(),
-                db_path: db_path.clone(),
+                persist_conn,
             },
         )?;
         con.register_scalar_function_with_state::<DropSemanticView>(
             "drop_semantic_view",
             &DropState {
                 catalog: catalog_state.clone(),
-                db_path: db_path.clone(),
+                persist_conn,
             },
         )?;
 
@@ -99,6 +99,22 @@ mod extension {
             "describe_semantic_view",
             &catalog_state,
         )?;
+
+        // Create a separate connection for DDL persistence (define_semantic_view / drop_semantic_view).
+        // Only created for file-backed databases — in-memory DBs use HashMap only.
+        // This connection is stored in DefineState and DropState and called from invoke
+        // to execute INSERT/DELETE on semantic_layer._definitions without deadlocking
+        // the main connection's execution lock.
+        let persist_conn: Option<ffi::duckdb_connection> = if db_path.as_ref() != ":memory:" {
+            let mut conn: ffi::duckdb_connection = ptr::null_mut();
+            let rc = unsafe { ffi::duckdb_connect(db_handle, &mut conn) };
+            if rc != ffi::DuckDBSuccess {
+                return Err("Failed to create persist connection for DDL writes".into());
+            }
+            Some(conn)
+        } else {
+            None
+        };
 
         // Create a NEW connection for the semantic_query table function.
         // The host connection may hold execution locks during query processing.
@@ -127,8 +143,7 @@ mod extension {
             &query_state,
         )?;
 
-        // Call C++ shim to register parser hooks and pragma callbacks.
-        // Phase 8: no-op. Phases 10/11 add real logic.
+        // Call C++ shim to register pragma callbacks (Phase 10) and parser hooks (Phase 11).
         // Safety: db_handle is a valid duckdb_database for the extension lifetime.
         //         The shim does not outlive the database instance.
         unsafe {
