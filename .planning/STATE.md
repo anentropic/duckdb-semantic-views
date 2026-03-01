@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v0.2.0
 milestone_name: Native DDL + Time Dimensions
-status: ready_to_plan
-last_updated: "2026-03-01T00:00:00.000Z"
+status: in_progress
+last_updated: "2026-03-01T02:12:09Z"
 progress:
   total_phases: 5
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 10
+  completed_plans: 1
 ---
 
 # Project State
@@ -23,11 +23,11 @@ See: .planning/PROJECT.md (updated 2026-02-28)
 ## Current Position
 
 Phase: 8 of 12 (C++ Shim Infrastructure)
-Plan: 0 of ? in current phase
-Status: Ready to plan
-Last activity: 2026-03-01 — v0.2.0 roadmap created (Phases 8-12, 16 requirements mapped)
+Plan: 1 of 2 in current phase
+Status: In Progress
+Last activity: 2026-03-01 — Plan 08-01 complete: vendored DuckDB headers, C++ shim skeleton, cc build-dependency
 
-Progress: [░░░░░░░░░░] 0% (v0.2.0)
+Progress: [█░░░░░░░░░] 10% (v0.2.0)
 
 ## Performance Metrics
 
@@ -49,6 +49,8 @@ Recent decisions affecting current work:
 - [v0.1.0 close]: Build strategy is Cargo-primary with `cc` crate — never introduce CMakeLists.txt
 - [v0.1.0 close]: `define_semantic_view()` / `drop_semantic_view()` functions removed after native DDL is validated (DDL-05)
 - [v0.1.0 close]: VARCHAR output columns are accepted tech debt; typed output targeted in Phase 12 (OUT-01)
+- [08-01]: Vendor full duckdb/src/include/ tree (not just duckdb.hpp) — duckdb.hpp includes subdirectory headers that must be present
+- [08-01]: Source headers from existing cargo build cache (target/debug/build/libduckdb-sys-*/out/) rather than downloading
 
 ### Pending Todos
 
@@ -72,5 +74,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-03-01
-Stopped at: v0.2.0 roadmap created — Phases 8-12, all 16 requirements mapped, STATE.md updated
+Stopped at: Phase 8, Plan 01 complete — C++ shim skeleton + vendored headers done, executing Plan 02 (build.rs wiring)
 Resume file: None
