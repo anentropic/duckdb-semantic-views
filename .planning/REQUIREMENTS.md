@@ -78,28 +78,28 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INFRA-01 | — | Pending |
-| PERSIST-01 | — | Pending |
-| PERSIST-02 | — | Pending |
-| PERSIST-03 | — | Pending |
-| DDL-01 | — | Pending |
-| DDL-02 | — | Pending |
-| DDL-03 | — | Pending |
-| DDL-04 | — | Pending |
-| DDL-05 | — | Pending |
-| DDL-06 | — | Pending |
-| TIME-01 | — | Pending |
-| TIME-02 | — | Pending |
-| TIME-03 | — | Pending |
-| TIME-04 | — | Pending |
-| EXPL-01 | — | Pending |
-| OUT-01 | — | Pending |
+| INFRA-01 | Phase 8 | Pending |
+| TIME-01 | Phase 9 | Pending |
+| TIME-02 | Phase 9 | Pending |
+| TIME-03 | Phase 9 | Pending |
+| TIME-04 | Phase 9 | Pending |
+| PERSIST-01 | Phase 10 | Pending |
+| PERSIST-02 | Phase 10 | Pending |
+| PERSIST-03 | Phase 10 | Pending |
+| DDL-01 | Phase 11 | Pending |
+| DDL-02 | Phase 11 | Pending |
+| DDL-03 | Phase 11 | Pending |
+| DDL-04 | Phase 11 | Pending |
+| DDL-05 | Phase 11 | Pending |
+| DDL-06 | Phase 11 | Pending |
+| EXPL-01 | Phase 12 | Pending |
+| OUT-01 | Phase 12 | Pending |
 
 **Coverage:**
 - v0.2.0 requirements: 16 total
-- Mapped to phases: 0
-- Unmapped: 16 ⚠️
+- Mapped to phases: 16
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-03-01*
-*Last updated: 2026-03-01 after initial definition*
+*Last updated: 2026-03-01 — traceability complete after roadmap creation*
