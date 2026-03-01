@@ -1,51 +1,20 @@
 // src/shim/mod.rs
-// Phase 10: FFI declarations for C++ pragma functions.
-// These are implemented in src/shim/shim.cpp and statically linked
-// into the cdylib. They are NOT exported (internal link only).
+// Phase 11: The C++ shim is a no-op stub. All DDL functionality is
+// implemented in Rust (src/ddl/) using the duckdb-rs VScalar interface.
 //
-// Two write paths exist:
-// 1. semantic_views_register_shim: registers pragma_query_t callbacks +
-//    parser hooks for CREATE/DROP SEMANTIC VIEW DDL (Phase 11).
-//    Transactional path: pragma_query_t callbacks return SQL that DuckDB
-//    executes in the caller's transaction. Parser hook scan uses persist_conn.
-//    Called at load time from lib.rs. Declared in lib.rs (not here).
-// 2. semantic_views_pragma_define / _drop: execute INSERT/DELETE directly
-//    on persist_conn (a separate stored connection) — NOT in the user's transaction.
-//    Called from the C++ parser hook scan function (SemanticViewsDDLScan).
+// The DuckDB C++ API (parser extensions, ExtensionLoader, PragmaFunction)
+// and C API symbols (duckdb_query, duckdb_destroy_result) are not accessible
+// via direct symbol references from a Python-DuckDB-loaded extension:
+// - C++ symbols: compiled with -fvisibility=hidden in the Python bundle
+// - C API symbols: accessed through function-pointer tables, not exported
 //
-// Only feature = "extension" compiles shim.cpp, so these declarations
-// are also gated. Unit tests (default/bundled feature) never call them.
+// Rust duckdb-rs accesses C API functions through AtomicPtr indirection,
+// which works correctly with the Python DuckDB extension loading mechanism.
+//
+// This module is kept for the extern "C" shim entry point declaration.
 
 #[cfg(feature = "extension")]
 pub mod ffi {
-    use libduckdb_sys::duckdb_connection;
-
-    extern "C" {
-        /// Write a semantic view definition to `semantic_layer._definitions`
-        /// using a pre-stored separate connection.
-        ///
-        /// Returns 0 on success, -1 on error.
-        ///
-        /// # Safety
-        /// `conn` must be a valid `duckdb_connection`. `name` and `json` must
-        /// be valid null-terminated C strings for the duration of the call.
-        pub fn semantic_views_pragma_define(
-            conn: duckdb_connection,
-            name: *const std::ffi::c_char,
-            json: *const std::ffi::c_char,
-        ) -> i32;
-
-        /// Delete a semantic view definition from `semantic_layer._definitions`
-        /// using a pre-stored separate connection.
-        ///
-        /// Returns 0 on success, -1 on error.
-        ///
-        /// # Safety
-        /// `conn` must be a valid `duckdb_connection`. `name` must be a valid
-        /// null-terminated C string for the duration of the call.
-        pub fn semantic_views_pragma_drop(
-            conn: duckdb_connection,
-            name: *const std::ffi::c_char,
-        ) -> i32;
-    }
+    // No FFI declarations needed — all persistence is done in Rust using
+    // ffi::duckdb_query through the loadable-extension function pointer table.
 }

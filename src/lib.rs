@@ -3,6 +3,8 @@ pub mod expand;
 pub mod model;
 #[cfg(feature = "extension")]
 pub mod query;
+#[cfg(feature = "extension")]
+pub mod shim;
 
 /// DDL function implementations — only compiled when building the `DuckDB` extension.
 /// The `ddl` module uses `duckdb::vscalar` and `duckdb::vtab`, which are only
@@ -14,7 +16,7 @@ pub mod ddl;
 /// Extension entry point — called by `DuckDB` when the extension is loaded.
 ///
 /// Initializes the catalog (`semantic_layer._definitions` schema and table),
-/// then registers all four DDL functions on the connection.
+/// then registers all DDL and query functions on the connection.
 ///
 /// # Safety
 ///
@@ -33,16 +35,19 @@ mod extension {
 
     use crate::{
         catalog::init_catalog,
-        ddl::{describe::DescribeSemanticViewVTab, list::ListSemanticViewsVTab},
+        ddl::{
+            define::{DefineSemanticView, DefineState},
+            describe::DescribeSemanticViewVTab,
+            drop::{DropSemanticView, DropState},
+            list::ListSemanticViewsVTab,
+        },
         query::explain::ExplainSemanticViewVTab,
         query::table_function::{QueryState, SemanticViewVTab},
     };
 
     // Extern C declaration for the C++ shim entry point.
-    // Compiled and linked when `--features extension` is active (see build.rs).
-    // Phase 10: registers pragma_query_t callbacks.
-    // Phase 11: also registers parser hooks for CREATE/DROP SEMANTIC VIEW DDL.
-    //   Updated signature: accepts catalog_raw_ptr and persist_conn for the parser hook.
+    // The shim is a no-op in Phase 11 (C++ parser extension APIs are hidden in
+    // the Python DuckDB bundle). Kept for ABI compatibility.
     unsafe extern "C" {
         fn semantic_views_register_shim(
             db_instance_ptr: *mut std::ffi::c_void,
@@ -77,10 +82,10 @@ mod extension {
 
         // Create a separate connection for DDL persistence.
         // Only created for file-backed databases — in-memory DBs use HashMap only.
-        // This connection is passed to the C++ parser hook scan function, which uses it
-        // to write to semantic_layer._definitions without deadlocking the main connection's
-        // execution lock (context_lock is non-reentrant; a second duckdb_connection has its
-        // own context).
+        // This connection is used by define_semantic_view / drop_semantic_view via FFI
+        // to write to semantic_layer._definitions without deadlocking the main
+        // connection's execution lock (context_lock is non-reentrant; a second
+        // duckdb_connection has its own context).
         let persist_conn: Option<ffi::duckdb_connection> = if db_path.as_ref() != ":memory:" {
             let mut conn: ffi::duckdb_connection = ptr::null_mut();
             let rc = unsafe { ffi::duckdb_connect(db_handle, &mut conn) };
@@ -92,10 +97,55 @@ mod extension {
             None
         };
 
+        // Register define_semantic_view(name, json) scalar.
+        // Inserts a new view; errors if the view already exists.
+        let define_state = DefineState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            or_replace: false,
+        };
+        con.register_scalar_function_with_state::<DefineSemanticView>(
+            "define_semantic_view",
+            &define_state,
+        )?;
+
+        // Register define_or_replace_semantic_view(name, json) scalar.
+        // Upserts a view definition; silent overwrite if the view already exists.
+        let define_or_replace_state = DefineState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            or_replace: true,
+        };
+        con.register_scalar_function_with_state::<DefineSemanticView>(
+            "define_or_replace_semantic_view",
+            &define_or_replace_state,
+        )?;
+
+        // Register drop_semantic_view(name) scalar.
+        // Removes a view; errors if the view does not exist.
+        let drop_state = DropState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            if_exists: false,
+        };
+        con.register_scalar_function_with_state::<DropSemanticView>(
+            "drop_semantic_view",
+            &drop_state,
+        )?;
+
+        // Register drop_semantic_view_if_exists(name) scalar.
+        // Removes a view; silently succeeds if the view does not exist.
+        let drop_if_exists_state = DropState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            if_exists: true,
+        };
+        con.register_scalar_function_with_state::<DropSemanticView>(
+            "drop_semantic_view_if_exists",
+            &drop_if_exists_state,
+        )?;
+
         // Register table DDL read functions (list_semantic_views, describe_semantic_view).
-        // Note: define_semantic_view and drop_semantic_view scalar functions are removed
-        // in Phase 11 — native CREATE/DROP SEMANTIC VIEW DDL replaces them via the
-        // C++ parser hook registered below.
         con.register_table_function_with_extra_info::<ListSemanticViewsVTab, _>(
             "list_semantic_views",
             &catalog_state,
@@ -132,11 +182,8 @@ mod extension {
             &query_state,
         )?;
 
-        // Call C++ shim to register pragma callbacks (Phase 10) and parser hooks (Phase 11).
+        // Call C++ shim (no-op in Phase 11 — kept for ABI compatibility).
         // Safety: db_handle is a valid duckdb_database for the extension lifetime.
-        //         The shim does not outlive the database instance.
-        //         catalog_raw is a non-owning raw pointer — the Arc's refcount is elevated
-        //         because catalog_state is cloned into QueryState above, keeping it alive.
         let catalog_raw = Arc::as_ptr(&catalog_state) as *const std::ffi::c_void;
         let raw_persist_conn = persist_conn.unwrap_or(std::ptr::null_mut());
         unsafe {

@@ -1754,6 +1754,7 @@ version = "0.1.0"
 dependencies = [
  "arbitrary",
  "cargo-husky",
+ "cc",
  "duckdb",
  "libduckdb-sys",
  "proptest",
