@@ -1,591 +1,454 @@
-# Architecture Research: DuckDB Semantic Views Extension
+# Architecture Patterns: v0.2.0 Integration Design
 
-**Research date:** 2026-02-23
-**Confidence:** Medium-High. DuckDB's extension API is well-documented at the C++ level; Rust bindings via `duckdb-rs` are less documented and require careful bridging. Findings on custom DDL and parser hooks are based on deep study of DuckDB internals and existing extension examples.
-
----
-
-## Summary
-
-DuckDB extensions integrate through a stable C ABI and a rich C++ SDK exposing hooks into the parser, catalog, planner, and function registry. Semantic view expansion fits cleanly as a **parser/statement-level hook**: the extension intercepts `CREATE SEMANTIC VIEW` DDL statements and `FROM my_view(...)` table function calls before the planner runs, rewrites them to concrete SQL, and lets DuckDB handle all subsequent execution. The `duckdb-rs` crate wraps the C API sufficiently for table functions and scalar functions but has limited (and partially unsafe) support for custom DDL and catalog integration; bridging via raw FFI to the C++ extension SDK is the realistic path for custom DDL.
+**Project:** DuckDB Semantic Views Extension
+**Researched:** 2026-02-28
+**Scope:** How v0.2.0 features integrate with existing CMake + Rust architecture
+**Confidence:** HIGH for build mechanics and C API limits; MEDIUM for C++ shim internals (no shipped Rust+C++ mixed DuckDB extension as reference)
 
 ---
 
-## Component Architecture
+## Existing Architecture (Do Not Re-Research)
 
-### DuckDB Extension Integration Points
+The v0.1.0 codebase establishes:
 
-DuckDB extensions interact with the engine through several well-defined hooks. All are exposed via `DatabaseInstance` and `Connection`-level APIs in the C++ SDK, which is what extensions compiled against DuckDB's header-only `duckdb.hpp` or `duckdb_extension.h` interface use.
+- **Build:** `make debug/release` → `cargo build --no-default-features --features extension` → cdylib. No CMake. The `Makefile` includes `extension-ci-tools/makefiles/c_api_extensions/rust.Makefile`, which drives pure Cargo builds. No CMakeLists.txt exists at the repo root.
+- **Entry point:** Manual `extern "C" fn semantic_views_init_c_api(info, access)` — hand-written to capture `duckdb_database` handle before Connection wraps it.
+- **Catalog:** `Arc<RwLock<HashMap<String, String>>>` (in-memory) + sidecar JSON file for cross-restart persistence. DuckDB SQL writes are blocked during scalar `invoke`.
+- **Query interface:** `semantic_query` VTab — expand in bind phase, execute on independent `duckdb_connection` via raw `ffi::duckdb_query`.
+- **EXPLAIN interface:** `explain_semantic_view` VTab — runs `EXPLAIN {expanded_sql}` on the same independent connection, returns text rows.
+- **Feature split:** `default = [duckdb/bundled]` for `cargo test`; `extension = [duckdb/loadable-extension, duckdb/vscalar]` for cdylib builds.
 
-#### 1. Extension Lifecycle
+---
 
-Every DuckDB extension exports two C symbols:
+## v0.2.0 Feature Integration Analysis
+
+### Feature 1: C++ Shim Layer
+
+**What it enables:** Parser hooks (`CREATE SEMANTIC VIEW` DDL) and pragma registration (`pragma_query_t` callbacks). Both require `DBConfig` access — specifically `config.parser_extensions.push_back()` and DuckDB's internal `ExtensionUtil::RegisterFunction` / `Catalog::RegisterEntry` for pragma functions. These are C++ SDK APIs only; they are not exposed in the C extension API struct (`duckdb_extension_access`).
+
+**Integration point in the existing build:**
+
+The current build is pure Cargo — no C++ compilation today. Adding C++ requires either:
+
+- **Option A (Cargo `build.rs` + `cc` crate):** Write `src/shim/shim.cpp` and compile it from `build.rs` using the `cc` crate. The `cc` crate links the resulting `.o` directly into the Rust cdylib. This is the standard Rust pattern for embedding a small amount of C or C++. The shim `.cpp` file uses DuckDB headers (from `libduckdb-sys` or downloaded separately) and exports `extern "C"` functions that Rust calls. **This is the recommended approach for this project** — it keeps one build system (Cargo), avoids introducing CMake, and requires minimal tooling changes.
+
+- **Option B (CMake invokes Cargo):** Add a `CMakeLists.txt` at the repo root. CMake compiles the C++ shim into a static library, then invokes `cargo build` as an `ExternalProject` (or via `add_custom_command`), then links shim + cdylib together. This is how the C++ `extension-template` works. The existing `extension-ci-tools/makefiles/c_api_extensions/c_cpp.Makefile` supports this flow. However, it introduces CMake as a new dependency and substantially increases build complexity for what is mostly a Rust project.
+
+**Recommendation:** Option A (Cargo build.rs + cc crate). Reasons:
+
+1. All existing tooling (`just`, `cargo nextest`, `cargo-llvm-cov`, CI workflows) works unchanged — they drive `cargo build`.
+2. The shim is small: one `.cpp` file with two functions (`register_parser_extension`, `register_pragma_function`). The cc crate handles cross-compilation targets (osx_arm64, linux_amd64, etc.) automatically.
+3. DuckDB headers needed by the shim (`duckdb.hpp` or targeted headers) can be pinned via `libduckdb-sys`'s bundled headers or downloaded at configure time (the `update_duckdb_headers` make target already handles this for the C header).
+4. Option B (CMake) would require switching the Makefile include from `rust.Makefile` to `c_cpp.Makefile` and introducing a CMakeLists.txt — viable but disproportionate.
+
+**Shim file placement:**
+
+```
+src/
+  shim/
+    shim.cpp         ← C++ code: registers parser extension + pragma
+    shim.h           ← C header: extern "C" declarations called by Rust
+build.rs             ← NEW: compiles shim.cpp via cc crate
+```
+
+**build.rs pattern:**
+
+```rust
+fn main() {
+    cc::Build::new()
+        .cpp(true)
+        .file("src/shim/shim.cpp")
+        .include("duckdb_capi/")           // headers already present
+        .flag("-std=c++17")
+        .compile("semantic_views_shim");   // produces libsemantic_views_shim.a
+    // Cargo automatically links the static lib into the cdylib
+}
+```
+
+The `cc` crate is a standard Rust build dependency; add it to `[build-dependencies]` in `Cargo.toml`.
+
+**C++ header requirement:** The shim needs DuckDB C++ headers — specifically `duckdb/main/config.hpp` and `duckdb/parser/parser_extension.hpp`. These are part of DuckDB's internal SDK, not the public `duckdb.h`. The project already has `duckdb_capi/duckdb.h` and `duckdb.extension.h` from the `extension-template-rs` pattern. The C++ headers are in a different location: either bundle `duckdb.hpp` (the amalgamated single-header C++ SDK, ~6MB) or use the `duckdb` git submodule.
+
+Pragmatic approach: download `duckdb.hpp` from the pinned DuckDB release tag and place it in `duckdb_capi/duckdb.hpp`. Add a `just update-headers` recipe. This is one file, version-pinned alongside the Rust crate.
+
+**Confidence:** HIGH for the `cc` crate / build.rs approach being mechanically correct. MEDIUM for the specific headers needed — the exact include paths for `DBConfig` and `ParserExtension` need validation against DuckDB v1.4.4's amalgam.
+
+---
+
+### Feature 2: Parser Hook — `CREATE SEMANTIC VIEW` DDL
+
+**DuckDB's parser extension API (C++ only):**
+
+From DuckDB's `parser_extension.hpp` and the code pattern seen in real extensions:
+
+```cpp
+// Registration (in LoadInternal or called from it):
+auto& config = DBConfig::GetConfig(instance);
+DuckParserExtension parser_ext;  // custom struct
+config.parser_extensions.push_back(parser_ext);
+config.operator_extensions.push_back(make_uniq<DuckOperatorExtension>());
+```
+
+`ParserExtension` holds three function pointers:
+- `parse_function_t` — called when DuckDB's native parser fails; receives the query string, returns `ParserExtensionParseResult`
+- `plan_function_t` — called by the planner when it encounters an `ExtensionStatement` (result of a successful parse); returns `ParserExtensionPlanResult` containing a `TableFunction` to execute
+- `parser_override_function_t` — optional; can intercept before DuckDB's parser even tries
+
+**How `CREATE SEMANTIC VIEW` flows:**
+
+```
+User sends:  CREATE SEMANTIC VIEW my_view (...)
+             ↓
+DuckDB native parser fails (unknown statement)
+             ↓
+parse_function_t fires → extension parses DDL text
+             ↓ success
+Returns ExtensionStatement(parse_data)
+             ↓
+plan_function_t fires with parse_data
+             ↓
+Returns ParserExtensionPlanResult { function: semantic_view_ddl_fn, parameters: [...] }
+             ↓
+DuckDB executes semantic_view_ddl_fn with parameters
+             ↓
+Rust FFI: semantic_view_ddl_fn calls back to Rust extern "C" fn
+             → registers view in catalog
+             → writes sidecar (or runs pragma SQL string if pragma_query_t is used)
+```
+
+**Critical constraint: `plan_function_t` returns a `TableFunction`, not a SQL string.** The TableFunction's bind/execute phases run inside DuckDB's normal execution path — they have the same execution lock constraints as the current `invoke`. This means the `plan_function_t` path cannot run SQL on the host connection either. Options:
+
+- Use the independent `duckdb_connection` (already created in `init_extension`) for catalog writes from within the TableFunction. This avoids locks.
+- Use the `pragma_query_t` pattern (see Feature 3) where the planner callback returns a SQL string that DuckDB executes post-lock. This is cleaner.
+
+**Where the parse logic lives:** The `parse_function_t` in `shim.cpp` parses the DDL syntax. It can delegate to Rust for the heavy lifting via an `extern "C"` function:
+
+```cpp
+// shim.cpp
+extern "C" {
+    // Declared in shim.h, implemented in Rust (src/shim/ffi.rs)
+    bool semantic_views_parse_ddl(const char* query, char** out_view_name, char** out_json, char** out_error);
+    bool semantic_views_plan_ddl(const char* view_name, const char* json, char** out_error);
+}
+```
+
+The Rust side implements the actual parsing and catalog registration. The C++ shim is thin — it forwards to Rust and converts DuckDB C++ types to C-compatible strings.
+
+**Confidence:** MEDIUM-HIGH. The `DBConfig::GetConfig + config.parser_extensions.push_back` registration pattern is confirmed by DuckDB GitHub issue #18485. The flow through `plan_function_t` returning a `TableFunction` is documented in `parser_extension.hpp`. The execution lock constraint for the plan phase is inferred from v0.1.0 learnings — needs validation.
+
+---
+
+### Feature 3: `pragma_query_t` — Replacing Sidecar Persistence
+
+**What `pragma_query_t` is:** A function pointer type in DuckDB's pragma system:
+
+```cpp
+typedef string (*pragma_query_t)(ClientContext &context, const FunctionParameters &parameters);
+```
+
+A pragma registered with `pragma_query_t` returns a SQL string. DuckDB executes that SQL string instead of (or after) the pragma callback. This runs outside execution locks — the SQL executes normally in the DuckDB query pipeline.
+
+**How the FTS extension uses it:** The FTS `PRAGMA create_fts_index(...)` callback builds the index schema as a set of `CREATE TABLE` and `INSERT` SQL statements, returns them as a combined string, and DuckDB executes them. Persistence happens automatically because DuckDB persists the created tables in the `.duckdb` file.
+
+**Integration with existing catalog sync:**
+
+Current flow (v0.1.0):
+```
+define_semantic_view invoked
+  → catalog_insert (HashMap write)
+  → write_sidecar (JSON file write, avoids SQL locks)
+  → [next load] init_catalog syncs sidecar → semantic_layer._definitions table
+```
+
+v0.2.0 target flow with `pragma_query_t`:
+```
+CREATE SEMANTIC VIEW fires
+  → parse_function_t parses DDL (C++ shim → Rust parser)
+  → plan_function_t called by planner
+  → returns INSERT SQL: "INSERT INTO semantic_layer._definitions VALUES (...)"
+  → DuckDB executes INSERT (no locks — runs in normal query pipeline)
+  → definition is in semantic_layer._definitions table (persisted by DuckDB)
+  → also update in-memory CatalogState HashMap
+```
+
+The `semantic_layer._definitions` table already exists and is already loaded at init time. The pragma_query_t approach eliminates the sidecar entirely: the DuckDB table becomes the sole source of truth.
+
+**How to register a pragma from C++:**
+
+```cpp
+// shim.cpp
+PragmaFunction pf = PragmaFunction::PragmaStatement(
+    "create_semantic_view_internal",
+    semantic_view_pragma_query  // pragma_query_t function pointer
+);
+ExtensionUtil::RegisterFunction(instance, pf);
+```
+
+`semantic_view_pragma_query` returns a SQL `INSERT` string. DuckDB executes it. No execution locks involved.
+
+**However:** `pragma_query_t` is a C++ API. It requires `duckdb/function/pragma_function.hpp`. If implementing via C++ shim, this is natural. If the shim is thin and just registers the pragma, the actual SQL string construction can happen in Rust via an `extern "C"` call.
+
+**Does pragma_query_t replace the define_semantic_view scalar function?** For file-backed databases, yes — `CREATE SEMANTIC VIEW` + pragma becomes the canonical path. The function-based DDL (`define_semantic_view`) can remain as a compatibility alias or be deprecated in v0.2.0. The sidecar code in `catalog.rs` becomes dead code once pragma_query_t is the persistence path.
+
+**Confidence:** HIGH for `pragma_query_t` returning SQL that DuckDB executes. HIGH that this runs outside the execution lock (that's the entire point of the pattern). MEDIUM for the exact C++ registration path — needs validation against DuckDB 1.4.4's `ExtensionUtil` API.
+
+---
+
+### Feature 4: EXPLAIN Hook
+
+**Current state (v0.1.0):** `explain_semantic_view('view', dimensions := [...], metrics := [...])` is a VTab that:
+1. Calls `expand()` to get the expanded SQL
+2. Runs `EXPLAIN {expanded_sql}` on the independent connection
+3. Returns text rows with metadata header, expanded SQL, and DuckDB plan
+
+This already works. The v0.2.0 "native EXPLAIN" goal is to make `EXPLAIN FROM semantic_query(...)` show the expanded SQL in the standard DuckDB EXPLAIN output (i.e., without needing a separate `explain_semantic_view` call).
+
+**What native EXPLAIN interception requires:**
+
+DuckDB's EXPLAIN processing happens in the planner after the logical plan is built. An extension hook that intercepts EXPLAIN output would need access to the `OptimizerExtension` or the logical plan tree after the table function's bind phase. The bind phase already has the expanded SQL — the EXPLAIN text just needs to be captured and inserted into the plan tree.
+
+**How the hook would work:**
+
+Option A: `OptimizerExtension` — fires after logical planning. The callback can inspect the plan for `SemanticViewVTab` nodes and annotate them with the expanded SQL string. This is the cleaner approach but requires C++ SDK access.
+
+Option B: Modify `SemanticViewVTab.bind()` to store the expanded SQL in a side-channel (already done — `SemanticViewBindData.expanded_sql` exists). DuckDB's physical plan for the table function already includes this data. The gap is surfacing it in `EXPLAIN` output. DuckDB's `PhysicalTableFunction::GetOperatorName()` or similar virtual method could be overridden, but this requires C++ subclassing.
+
+Option C (pragmatic, no C++ shim needed): Keep `explain_semantic_view` as the EXPLAIN interface and document it. Defer true EXPLAIN interception. This is what v0.1.0 already does — `TECH-DEBT.md` item QUERY-V2-03 notes this requires a C++ shim.
+
+**Recommendation for v0.2.0:** Keep the existing `explain_semantic_view` VTab as-is. It already runs `EXPLAIN {expanded_sql}` and returns the DuckDB plan. The only missing UX is that `EXPLAIN FROM semantic_query(...)` doesn't automatically call it. This gap is a documentation issue, not an architecture gap. Intercepting EXPLAIN itself is complex C++ work with unclear benefit given the existing workaround.
+
+If the C++ shim is being built anyway for the parser hook, adding an `OptimizerExtension` that prints expanded SQL when it sees a `SemanticViewVTab` node is feasible — but not required for the core v0.2.0 goals.
+
+**Confidence:** HIGH that the existing `explain_semantic_view` VTab is sufficient for practical use. MEDIUM that an OptimizerExtension approach would work for native EXPLAIN interception — not validated against 1.4.4.
+
+---
+
+### Feature 5: Time Dimensions
+
+**No C++ required.** Time dimension support is purely Rust expansion engine work. Integration points:
+
+**a. Model change (`src/model.rs`):**
+
+`Dimension` needs a new optional field:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dimension {
+    pub name: String,
+    pub expr: String,
+    #[serde(default)]
+    pub source_table: Option<String>,
+    // NEW for v0.2.0:
+    #[serde(default)]
+    pub time_grain: Option<TimeGrain>,   // if Some, this is a time dimension
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TimeGrain {
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+}
+```
+
+Because `SemanticViewDefinition` uses `#[serde(deny_unknown_fields)]`, adding `time_grain` with `#[serde(default)]` is backward-compatible — existing definitions without the field deserialize with `time_grain: None`.
+
+**b. Expansion engine change (`src/expand.rs`):**
+
+The `QueryRequest` gains an optional `granularity` override per dimension:
+
+```rust
+pub struct QueryRequest {
+    pub dimensions: Vec<String>,
+    pub metrics: Vec<String>,
+    // NEW: per-dimension granularity override
+    pub granularities: HashMap<String, TimeGrain>,  // dim_name → requested grain
+}
+```
+
+In `build_sql()`, when a dimension has `time_grain: Some(grain)`, the SQL expression wraps the dimension expr in `date_trunc`:
+
+```sql
+-- grain=Month:
+date_trunc('month', "order_date") AS "order_date"
+-- grain=Week:
+date_trunc('week', "order_date") AS "order_date"
+```
+
+DuckDB's `date_trunc(precision, timestamp)` handles all granularities: `'day'`, `'week'`, `'month'`, `'quarter'`, `'year'`.
+
+**c. Table function interface change (`src/query/table_function.rs`):**
+
+The `semantic_query` VTab gains an optional named parameter `granularities` (a MAP or STRUCT of dimension-name to grain string). The bind phase parses this into `QueryRequest.granularities`.
+
+Alternatively, granularity can be encoded in the dimension name: `'order_date__month'` → dimension `order_date` at `month` grain. This avoids changing the function signature but is less clean.
+
+**d. The CTE-based expansion (`src/expand.rs`) is unchanged:** Time dimensions are just a modified expression in the SELECT and GROUP BY. The flat `_base` CTE namespace still works — `date_trunc('month', order_date)` is valid in the CTE scope.
+
+**Backward compatibility:** Existing `SemanticViewDefinition` JSON (no `time_grain` field) deserializes correctly because the field defaults to `None`. No migration needed.
+
+**Confidence:** HIGH. `date_trunc` is standard DuckDB SQL. The model and expansion engine changes are additive. The only design decision is how to express granularity in `semantic_query` parameters — the chosen approach (new named parameter `granularities`) is straightforward.
+
+---
+
+## Component Map: New vs. Modified
+
+| Component | Status | File(s) | What Changes |
+|-----------|--------|---------|--------------|
+| `shim.cpp` | NEW | `src/shim/shim.cpp` | C++ code: parser extension registration, pragma registration |
+| `shim.h` | NEW | `src/shim/shim.h` | `extern "C"` declarations for Rust↔C++ boundary |
+| `src/shim/ffi.rs` | NEW | `src/shim/ffi.rs` (or `src/lib.rs`) | Rust `extern "C"` implementations called by shim |
+| `build.rs` | NEW | `build.rs` | Compiles `shim.cpp` via `cc` crate when `extension` feature active |
+| `Cargo.toml` | MODIFIED | `Cargo.toml` | Add `cc` to `[build-dependencies]` |
+| `duckdb_capi/duckdb.hpp` | NEW | `duckdb_capi/duckdb.hpp` | Amalgamated C++ SDK header (downloaded, version-pinned) |
+| `Justfile` | MODIFIED | `Justfile` | Add `just update-headers` recipe for `duckdb.hpp` |
+| `src/model.rs` | MODIFIED | `src/model.rs` | Add `TimeGrain` enum, `time_grain` field to `Dimension` |
+| `src/expand.rs` | MODIFIED | `src/expand.rs` | Add granularity coarsening via `date_trunc` in SQL builder |
+| `src/query/table_function.rs` | MODIFIED | `src/query/table_function.rs` | Add `granularities` named parameter to `semantic_query` |
+| `src/catalog.rs` | MODIFIED | `src/catalog.rs` | Remove sidecar logic once pragma_query_t is the write path (or keep as fallback) |
+| `src/lib.rs` | MODIFIED | `src/lib.rs` | Call C++ shim registration from `init_extension` |
+| `src/query/explain.rs` | UNCHANGED | `src/query/explain.rs` | Already works; no changes needed |
+| `src/ddl/define.rs` | UNCHANGED or DEPRECATED | `src/ddl/define.rs` | Function-based DDL stays as compatibility shim; sidecar write path may be removed |
+
+---
+
+## Rust ↔ C++ Boundary
+
+The shim is thin by design. The C++ side only:
+1. Holds DuckDB C++ types (`DatabaseInstance&`, `DBConfig&`, `ParserExtension`)
+2. Registers hooks with DuckDB
+3. Forwards to Rust via `extern "C"` for all logic
 
 ```c
-void <name>_init(duckdb::DatabaseInstance &db);
-std::string <name>_version();
-```
+// shim.h — the complete boundary
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-`_init` receives the live `DatabaseInstance` and is where the extension registers all of its capabilities. For Rust extensions compiled as `cdylib`, these are `#[no_mangle] pub extern "C"` functions that call into the `duckdb-rs` registration helpers or raw DuckDB C FFI.
+// Called from Rust init_extension to wire up C++ hooks
+void semantic_views_register_parser(void* db_instance_ptr);
+void semantic_views_register_pragma(void* db_instance_ptr);
 
-#### 2. Function Registration
+// Called by DuckDB from within parse_function_t, forwarded to Rust
+// Returns 1 on success, 0 on failure. Caller frees out_* with sv_free_str().
+int sv_parse_ddl(const char* query,
+                 char** out_view_name,
+                 char** out_json,
+                 char** out_error);
 
-The most stable and well-supported extension API. DuckDB provides:
+// Called by DuckDB from within pragma_query_t
+// Returns SQL string to execute (caller frees with sv_free_str())
+char* sv_make_define_sql(const char* view_name, const char* json);
+char* sv_make_drop_sql(const char* view_name);
+void sv_free_str(char* s);
 
-- **Table functions** (`duckdb::TableFunction`): Return a relation from a function call. This is the mechanism for `FROM my_semantic_view(DIMENSIONS ..., METRICS ...)`.
-- **Scalar functions** (`duckdb::ScalarFunction`): Return a single value per row.
-- **Aggregate functions** (`duckdb::AggregateFunction`): Custom aggregates.
-- **Table macro functions** (`CreateMacroFunction`): SQL-level macros that expand to a subquery. Less flexible than table functions but simpler.
-
-Table functions are the **primary mechanism for the query interface** of this extension. A table function receives named parameters and has a `bind` phase (determines output schema from parameters) and an `execute` phase (produces tuples). For semantic view expansion, the bind phase is where expansion logic runs — the table function inspects the semantic view definition, resolves dimensions/metrics, and either:
-  - Returns a schema that maps to a virtual relation (pull model), or
-  - Emits an internal SQL string that DuckDB re-executes (push model via `duckdb::TableFunction` with `replacement_scan`).
-
-#### 3. Parser Hooks / Statement-Level Interception
-
-DuckDB provides two hook points for intercepting SQL before planning:
-
-**a. `AddParserExtension` (custom statement types)**
-
-Allows an extension to register a custom parser that handles unrecognised SQL statements. When DuckDB's built-in parser fails to parse a statement, it tries each registered parser extension in order. If the custom parser succeeds, it returns an `ExtensionParseData` object (a `unique_ptr<ParserExtensionParseData>`) that DuckDB carries through the pipeline. The extension must also register a `PlannerExtension` callback to convert this custom parse data into a `LogicalOperator` subtree.
-
-This mechanism supports `CREATE SEMANTIC VIEW` DDL: DuckDB's Postgres-dialect parser will not recognise the statement, so the extension's parser hook fires, parses the definition, stores it, and returns a custom parse node. The planner extension callback then stores the definition in the catalog.
-
-**b. `AddStatementMatcher` / query rewriting** (less stable path)
-
-Some extensions use DuckDB's `ClientContext` hooks to intercept queries post-parse. The `config.replacement_scans` hook (a list of `ReplacementScanCallback`) fires when the binder encounters an unresolved table reference. This is the mechanism used by `httpfs` (to intercept `FROM 'file.parquet'`) and the JSON extension. For semantic views, a replacement scan hook can fire whenever the binder encounters `FROM my_semantic_view(...)` and the name doesn't resolve to a regular table — the callback can then return a `TableFunctionRef` pointing at the extension's table function.
-
-**c. `AddOptimizerExtension`**
-
-Registers a callback that fires after the logical plan is built but before physical planning. The callback receives the `LogicalOperator` tree and can modify it. This is a planner-level rewrite hook. Useful if semantic view expansion needs to happen after binding rather than during parsing (e.g., to leverage DuckDB's existing name resolution).
-
-#### 4. Catalog APIs
-
-DuckDB's internal catalog is organized as: `Catalog → Schema → CatalogEntry`. Entry types include `TableCatalogEntry`, `ViewCatalogEntry`, `FunctionCatalogEntry`, and the extensible `CatalogEntry` base.
-
-Extensions can add custom catalog entry types by subclassing `CatalogEntry` and registering them via `Catalog::CreateEntry`. For semantic view definitions, the options are:
-
-**Option A: Custom CatalogEntry subclass** — Define `SemanticViewCatalogEntry` extending `CatalogEntry`. Register via `catalog.CreateEntry(context, CatalogType::TABLE_ENTRY, ...)` with a custom `CreateInfo`. This integrates with DuckDB's transaction model and `SHOW TABLES`-style queries. However, DuckDB's `Catalog::CreateEntry` API accepts only known `CatalogType` values by default; adding a truly custom type requires modifying enum values (not extensible from outside), or aliasing to an existing type.
-
-**Option B: Store as DuckDB views or tables** — The simplest approach: serialize the semantic view definition (as JSON or SQL text) and store it in a regular DuckDB table within a dedicated schema (e.g., `semantic_layer._definitions`). On extension load, read this table to reconstruct the in-memory representation. This avoids all catalog API complexity and works with DuckDB's existing `ATTACH`/persistence model.
-
-**Option C: Macro-based storage** — DuckDB's `CREATE MACRO` system stores macro definitions in the catalog and persists them. Some extensions encode metadata as macros. Not clean for structured definitions.
-
-**Recommended for v0.1:** Option B (plain DuckDB table in a `semantic_layer` schema). It's the most portable, avoids deep catalog integration, and survives database restart because DuckDB persists user-defined tables. The extension, on load, creates the schema and table if they don't exist, and registers all defined semantic views from that table into its in-memory registry.
-
-#### 5. Replacement Scan API
-
-`config.replacement_scans` is a vector of `ReplacementScan` callbacks in `DBConfig`. Each callback receives a `ClientContext`, a table name, and (optionally) schema/catalog names. If the callback recognizes the name as a semantic view, it returns a `ReplacementScanData` that substitutes a `TableFunctionRef` in place of the unresolved table reference.
-
-This is how the query interface works without requiring users to write `FROM SEMANTIC_VIEW(...)` — they can write `FROM orders_by_region(DIMENSIONS region, METRICS revenue)` and the extension's replacement scan resolves `orders_by_region` to the semantic view table function.
-
----
-
-### Catalog & Persistence
-
-#### How DuckDB Persists Extension State
-
-DuckDB uses a WAL (write-ahead log) and block-based storage in `.duckdb` files. All user-created catalog objects (tables, views, macros, sequences) are stored in this file and reloaded on open.
-
-Extensions that need persistent state have two patterns:
-
-**Pattern 1: Piggyback on DuckDB's catalog (via internal tables)**
-Create a schema at extension load (`CREATE SCHEMA IF NOT EXISTS semantic_layer`). Store definitions in a regular table:
-
-```sql
-CREATE TABLE IF NOT EXISTS semantic_layer._definitions (
-    name      VARCHAR PRIMARY KEY,
-    schema    VARCHAR,
-    definition JSON,
-    created_at TIMESTAMP DEFAULT now()
-);
-```
-
-The extension reads this table in `_init` to rebuild its in-memory `HashMap<String, SemanticViewDef>`. When `CREATE SEMANTIC VIEW` runs, the extension inserts a row here and registers the view in its in-memory map. This survives database restart automatically because DuckDB persists the table.
-
-**Pattern 2: External file**
-Store definitions as a JSON/TOML file alongside the database. Less robust; not recommended because it breaks with `ATTACH` and relative path assumptions.
-
-**Pattern 3: DuckDB Macro system**
-DuckDB persists macros. An extension can encode semantic view metadata as macro body text. This is a hack and limits definition size to SQL string length constraints.
-
-**Recommendation:** Pattern 1 is correct for this extension. The `semantic_layer` schema acts as the extension's private catalog namespace. JSON column stores the full definition (dimensions, measures, join paths, filter expressions). A secondary in-memory registry (populated from this table at load time) provides fast lookup during query expansion.
-
-#### Schema Design for Semantic View Definitions
-
-```sql
--- Main definitions table
-CREATE TABLE semantic_layer._definitions (
-    name       VARCHAR PRIMARY KEY,
-    catalog    VARCHAR DEFAULT current_catalog(),
-    schema     VARCHAR DEFAULT current_schema(),
-    definition JSONB,         -- full definition including dims, measures, joins
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now()
-);
-
--- Optional: separate table for relationship graph
-CREATE TABLE semantic_layer._relationships (
-    from_view  VARCHAR,
-    to_view    VARCHAR,
-    join_key   VARCHAR,
-    join_expr  VARCHAR,       -- SQL expression for the join condition
-    cardinality VARCHAR       -- 'many_to_one', 'one_to_many', etc.
-);
-```
-
-#### JSON Schema for a Semantic View Definition
-
-```json
-{
-  "name": "sales_analysis",
-  "base_table": "orders",
-  "dimensions": [
-    {
-      "name": "region",
-      "expr": "customers.region",
-      "requires_join": "customers"
-    },
-    {
-      "name": "order_date",
-      "expr": "orders.order_date",
-      "is_time": true
-    }
-  ],
-  "measures": [
-    {
-      "name": "total_revenue",
-      "expr": "SUM(orders.amount)",
-      "is_additive": true
-    },
-    {
-      "name": "unique_customers",
-      "expr": "COUNT(DISTINCT orders.customer_id)",
-      "is_additive": false
-    }
-  ],
-  "joins": [
-    {
-      "alias": "customers",
-      "table": "customers",
-      "condition": "orders.customer_id = customers.id",
-      "type": "LEFT"
-    }
-  ],
-  "row_filter": null
+#ifdef __cplusplus
 }
+#endif
 ```
 
----
-
-### Query Expansion Pipeline
-
-#### Where Expansion Fits in DuckDB's Pipeline
-
-DuckDB's query execution pipeline:
-
-```
-SQL Text
-  → Parser (produces ParsedStatement tree)
-  → Binder (resolves names, produces BoundStatement)
-  → LogicalPlanner (produces LogicalOperator tree)
-  → Optimizer (rewrite rules → optimized LogicalOperator)
-  → Physical Planner (produces PhysicalOperator tree)
-  → Executor (produces result tuples)
-```
-
-Semantic view expansion must happen **before** the Binder, because the expanded SQL references physical tables that the Binder needs to resolve. Two viable injection points:
-
-**Injection Point A: Table Function (bind phase) — Recommended for v0.1**
-
-Register a table function `semantic_view_scan` (or name it after each semantic view). During the bind phase of this table function, perform the expansion:
-1. Look up the semantic view definition by name.
-2. Parse the `DIMENSIONS` and `METRICS` parameters.
-3. Construct the concrete SQL SELECT/FROM/JOIN/GROUP BY.
-4. Execute this SQL internally using `context.Query(expanded_sql)` or by returning the result as a `TableFunctionInput`.
-
-The challenge: DuckDB does not natively support a table function that "re-executes" a SQL string as its output. The cleanest approach is for the table function to act as a **view expander** — it produces the concrete SQL and DuckDB then evaluates it. This can be achieved via:
-- `QueryResult`-based approach: in the bind phase, execute the expanded SQL and return its schema; in the scan phase, return rows from the cached result.
-- Or use `replacement_scan` to return an `Expression` (subquery) that DuckDB evaluates as a derived table.
-
-**Injection Point B: Parser Extension Hook — For custom DDL**
-
-`CREATE SEMANTIC VIEW` cannot be a table function. It is a DDL statement. The parser extension hook intercepts it before DuckDB's Postgres parser rejects it. The flow:
-
-```
-"CREATE SEMANTIC VIEW orders_kpis (...)"
-  → DuckDB parser fails to parse
-  → Parser extension callback fires
-  → Extension parses definition, validates, stores in _definitions table
-  → Returns success / error to user
-```
-
-**Injection Point C: Replacement Scan — For FROM my_view(...) syntax**
-
-When the user writes `FROM orders_kpis(DIMENSIONS region, METRICS revenue)`, the binder looks up `orders_kpis` in the catalog. If it doesn't find a regular table, the replacement scan callbacks fire. The extension's callback:
-1. Checks if `orders_kpis` matches a registered semantic view.
-2. Builds the expanded SQL as a subquery expression.
-3. Returns a `TableFunctionRef` or a subquery `SelectStatement` that replaces the unresolved reference.
-
-This allows the syntax `FROM my_semantic_view(DIMENSIONS ..., METRICS ...)` where parameters are passed as function arguments.
-
-#### Concrete Expansion Algorithm
-
-```
-Input:  semantic view name, requested dimensions [d1, d2, ...],
-        requested measures [m1, m2, ...], optional WHERE filter
-
-1. Load SemanticViewDef from in-memory registry (keyed by name)
-2. Resolve requested dimensions:
-   - For each dim name, find the dimension definition
-   - Collect required joins (which tables must be joined)
-3. Resolve requested measures:
-   - For each measure name, find the measure definition
-   - Collect additional required joins
-4. Compute minimal join set (union of joins required by dims + measures)
-5. Build SQL:
-   SELECT {dim.expr AS dim.name, ...}, {measure.expr AS measure.name, ...}
-   FROM {base_table}
-   {LEFT JOIN alias ON condition for each join in minimal_join_set}
-   WHERE {row_filter if defined} AND {user_filter if provided}
-   GROUP BY {dim.expr, ... for all requested dimensions}
-6. Return expanded SQL string
-```
-
-Step 5 produces a concrete, executable SQL string. This string is what DuckDB sees and plans against physical tables.
-
----
-
-### Rust Binding Layer
-
-#### duckdb-rs Crate Overview
-
-The `duckdb` crate on crates.io (v0.10.x as of early 2025) wraps DuckDB's C API (`libduckdb`). It provides:
-
-- `Connection`, `Statement`, `Row`, `Rows` — standard query execution
-- `ToSql`, `FromSql` traits — Rust type mapping
-- `vtab` module — virtual table (table-valued function) support
-- `arrow` feature — Arrow RecordBatch integration
-
-The crate does **not** expose:
-- Parser extension hooks
-- Replacement scan registration
-- Custom catalog entry types
-- Optimizer extension hooks
-
-These require calling DuckDB's C++ SDK directly via raw FFI or using the `libduckdb-sys` crate (which exposes the C API) as a foundation for manual bindings.
-
-#### Extension Registration in duckdb-rs
-
-For building a DuckDB extension in Rust, the typical approach is to compile a `cdylib` that exports the two required C symbols:
+The Rust side exports these via:
 
 ```rust
+// src/shim/ffi.rs
 #[no_mangle]
-pub extern "C" fn semantic_views_init(db: *mut duckdb_sys::duckdb_database) {
-    // register table functions, replacement scans, etc.
-}
+pub extern "C" fn sv_parse_ddl(...) { ... }
 
 #[no_mangle]
-pub extern "C" fn semantic_views_version() -> *const std::os::raw::c_char {
-    // return DuckDB version string this was compiled against
-}
+pub extern "C" fn sv_make_define_sql(...) -> *mut c_char { ... }
 ```
 
-The `duckdb_sys` crate provides raw FFI bindings to DuckDB's C API. The `duckdb` crate builds on top of `duckdb_sys`.
+The C++ shim calls these Rust functions. The Rust functions have no DuckDB C++ dependency — they work on strings and call into existing Rust catalog logic.
 
-#### Table Function Registration (duckdb-rs vtab module)
-
-The `vtab` module in `duckdb-rs` allows implementing virtual tables (table-valued functions). A virtual table implements:
-
-```rust
-pub trait VTab: Sized {
-    type InitData: Sized;
-    type BindData: Sized;
-    fn bind(bind: &BindInfo, data: *mut Self::BindData) -> Result<(), Box<dyn std::error::Error>>;
-    fn init(init: &InitInfo, data: *mut Self::InitData) -> Result<(), Box<dyn std::error::Error>>;
-    fn func(func: &FunctionInfo, output: &mut DataChunk) -> Result<(), Box<dyn std::error::Error>>;
-    fn parameters() -> Option<Vec<LogicalType>>;
-}
-```
-
-This is adequate for table functions that produce rows. The bind phase receives parameters and registers output column names/types. The func phase produces rows in Arrow-style `DataChunk`s.
-
-#### Named Parameters for Table Functions
-
-For the `FROM my_view(DIMENSIONS region, METRICS revenue)` syntax, parameters need to be parsed. DuckDB table functions support named parameters via `duckdb_bind_get_named_parameter`. In duckdb-rs this is exposed through `BindInfo`. The extension would use named parameters:
-
-```sql
-FROM my_view(dimensions=['region', 'product'], metrics=['revenue', 'orders'])
-```
-
-or positional parameters if a fixed calling convention is chosen.
-
-#### Raw FFI for Parser/Replacement Scan Hooks
-
-For parser extension hooks and replacement scan registration, the extension must use `libduckdb-sys` directly. The relevant C API functions:
-
-```c
-// Add a replacement scan (fires when table name is unresolved)
-void duckdb_add_replacement_scan(
-    duckdb_database db,
-    duckdb_replacement_callback_t replacement,
-    void *extra_data,
-    duckdb_delete_callback_t delete_callback
-);
-```
-
-In Rust:
-```rust
-extern "C" fn replacement_scan(
-    info: duckdb_sys::duckdb_replacement_scan_info,
-    table_name: *const c_char,
-    data: *mut c_void,
-) {
-    let name = unsafe { CStr::from_ptr(table_name).to_str().unwrap() };
-    if is_semantic_view(name) {
-        // set the replacement function
-        unsafe {
-            duckdb_sys::duckdb_replacement_scan_set_function_name(info, c"semantic_view_scan".as_ptr());
-            // add parameters...
-        }
-    }
-}
-```
-
-Parser extension hooks are exposed via the C++ SDK but **not** via the C API (`duckdb.h`). This is the most significant friction point: `CREATE SEMANTIC VIEW` DDL requires either:
-1. Calling C++ API via FFI (brittle, ABI-sensitive), or
-2. Intercepting at the SQL level using a workaround (see below).
-
-#### Workaround for Custom DDL Without Parser Hooks
-
-Since the C API does not expose parser extension hooks, the cleanest workaround for `CREATE SEMANTIC VIEW` is to use a **scalar function or table function that acts as DDL**:
-
-```sql
--- Instead of:
-CREATE SEMANTIC VIEW my_view (...);
-
--- Use:
-SELECT define_semantic_view('my_view', '{...json definition...}');
--- or:
-FROM create_semantic_view('my_view', dimensions => [...], measures => [...]);
-```
-
-This is less ergonomic but implementable entirely within duckdb-rs's table function API.
-
-**Alternative:** Implement the extension in C++ for the DDL registration parts and link a Rust library for the core logic. The DuckDB extension template supports mixed C++/Rust builds.
-
-**Alternative 2:** Use the `duckdb-extension` crate (if it has matured — see Research Gaps below) which may provide higher-level wrappers.
+**No Rust→C++ calls for catalog operations.** The C++ side of the boundary only registers hooks; it never calls back into C++ catalog APIs. The pragma_query_t callback returns a SQL string; DuckDB executes it. Clean separation.
 
 ---
 
-## Component Build Order
+## Build Order for Implementation
 
-The components have clear dependencies. Build in this sequence:
+Dependencies flow is:
 
-### Phase 0: Project Skeleton
-- Cargo workspace with `duckdb-sys` and `duckdb` dependencies
-- cdylib crate structure with `_init` and `_version` exports
-- Minimal "hello world" extension that loads in DuckDB without crashing
-- Test harness: DuckDB process that loads the `.so`/`.dylib` and runs SQL
-
-**Unblocks:** Everything.
-
-### Phase 1: Storage Layer (In-Memory Registry + Persistence)
-- `SemanticViewDef` struct with full definition schema (Rust)
-- JSON serialization/deserialization (serde_json)
-- `Registry` — in-memory `HashMap<String, SemanticViewDef>`
-- DuckDB table `semantic_layer._definitions` creation at init time
-- Load definitions from table into registry at init time
-- Write definition to table when a view is created
-
-**Depends on:** Phase 0
-**Unblocks:** Phase 2 (needs something to expand), Phase 3 (needs something to query)
-
-### Phase 2: DDL Interface (`CREATE SEMANTIC VIEW`)
-- Parser for the DDL syntax (either custom SQL text or function-based)
-- Validation of definition (join references, expression syntax, etc.)
-- Integration with Phase 1 storage
-
-Two sub-paths:
-- **2A (function-based, faster):** Implement `define_semantic_view(name, json)` as a scalar/table function. User writes `SELECT define_semantic_view(...)`. Entirely within duckdb-rs table function API.
-- **2B (native DDL, better UX):** Custom parser hook via C++ SDK FFI. Implements `CREATE SEMANTIC VIEW` natively. More complex but aligns with the project's stated goal.
-
-Start with 2A to validate the registry and expansion before tackling 2B.
-
-**Depends on:** Phase 0, Phase 1
-**Unblocks:** Phase 3 (need views before querying them)
-
-### Phase 3: Expansion Engine
-- `expand(view_name, dimensions, measures, filter) -> String` pure function
-- Join dependency resolution (which joins are needed for requested dims/measures)
-- SQL builder (produces SELECT/FROM/JOIN/GROUP BY string)
-- Validation (requested dims/measures exist, join graph is connected, etc.)
-- Error messages for invalid combinations
-
-**Depends on:** Phase 1 (registry lookup)
-**Unblocks:** Phase 4
-
-### Phase 4: Query Interface (Table Function / Replacement Scan)
-- Table function `semantic_view_scan` registered with DuckDB
-- Bind phase: look up view, validate parameters, return output schema
-- Scan/execute phase: call expansion engine, execute expanded SQL, return rows
-- Registration: either table function users call explicitly, or replacement scan for transparent name lookup
-
-**Depends on:** Phase 3
-**Unblocks:** Phase 5
-
-### Phase 5: Integration & Testing
-- End-to-end tests: `CREATE SEMANTIC VIEW` → `FROM my_view(...)` → correct SQL output
-- TPC-H or jaffle-shop demo
-- Error path tests (invalid dim name, missing join, etc.)
-- Performance baseline (expansion latency)
-
-**Depends on:** Phases 1–4
-
-### Phase 6: Native DDL (if pursuing 2B)
-- C++ FFI wrapper for parser extension hooks
-- `CREATE SEMANTIC VIEW` parsed natively
-- `DROP SEMANTIC VIEW` / `SHOW SEMANTIC VIEWS`
-
-**Depends on:** Phase 2A working (validates the rest of the stack first)
-
----
-
-## Reference Implementations
-
-### Extensions with Custom Table Functions
-
-**`httpfs` extension (C++)**
-- Registers replacement scans for `FROM 'file.parquet'`, `FROM 'http://...'`
-- Uses `config.replacement_scans` to intercept unresolved table names
-- Source: `duckdb/extension/httpfs/` in DuckDB monorepo
-- Relevant: shows the replacement scan pattern for transparent syntax
-
-**`json` extension (C++)**
-- Adds scalar functions (`json_extract`, `json_object`, etc.)
-- Registers table function `read_json` / `read_json_auto`
-- Source: `duckdb/extension/json/` in DuckDB monorepo
-- Relevant: shows table function registration and named parameter handling
-
-**`spatial` extension (C++)**
-- Adds custom types, scalar functions, table functions
-- Source: `duckdb/extension/spatial/` (community extension)
-- Relevant: most complex community extension; shows how a large extension is structured
-
-### Extensions with Rust (duckdb-rs)
-
-**`duckdb-extension-template-rs`**
-- Official Rust template for DuckDB extensions
-- GitHub: `duckdb/duckdb-extension-template-rust` (or similar; check DuckDB GitHub org)
-- Provides the `cdylib` skeleton, build scripts, and CI pipeline
-- Uses `duckdb-rs` vtab module for table functions
-- The canonical starting point for Rust extensions
-
-**Community Rust extension examples:**
-- `duckdb-excel` — reads Excel files, table function
-- `duckdb-rs` itself has examples in `examples/` showing vtab usage
-
-### Extensions with Custom DDL
-
-**`delta` extension (C++)**
-- Handles `FROM delta_scan('path')` — table function approach
-- No custom DDL; uses function-based interface
-- Shows that even complex extensions avoid custom DDL
-
-**`iceberg` extension (C++)**
-- `FROM iceberg_scan(...)` — same pattern
-- No custom `CREATE ICEBERG ...` DDL
-
-**Key observation:** No widely-used DuckDB extension implements custom `CREATE ...` DDL via the parser extension hook in a production-shipped extension. The pattern exists in the C++ SDK but is rarely used. The community practice is to use function-based interfaces for extension state management. This strongly suggests starting with the function-based DDL approach (Phase 2A).
-
-### Closest Analog: DuckDB's Own `CREATE VIEW`
-
-DuckDB's built-in `CREATE VIEW` is handled by the core parser and stores view definitions in the catalog as `ViewCatalogEntry`. Reading its implementation shows:
-- View definitions are stored as SQL strings
-- At query time, the binder substitutes the view's query in place of the view reference
-- This is functionally identical to what semantic view expansion needs to do
-
-The semantic view extension is essentially extending this pattern: store a parameterized view definition, and at query time, instantiate it with the user's requested dimensions and metrics.
-
----
-
-## Open Questions
-
-### Q1: Table Function vs. Replacement Scan for Query Syntax
-
-Should the user write:
-- `FROM my_view(dimensions=['region'], metrics=['revenue'])` (explicit table function call), or
-- `FROM SEMANTIC_VIEW(my_view, DIMENSIONS region, METRICS revenue)` (single table function for all views)
-
-The first requires one registration per view. The second uses a single global table function. The second is simpler to implement (no dynamic registration), but is slightly less ergonomic. Decision needed before Phase 4.
-
-### Q2: Custom DDL vs. Function-Based Interface
-
-`CREATE SEMANTIC VIEW` as native SQL DDL requires C++ FFI for parser hooks (not available in the C API). The function-based alternative (`SELECT define_semantic_view(...)`) is implementable entirely in Rust.
-
-Open question: is native DDL essential for the v0.1 user experience, or is the function-based interface acceptable for an initial release?
-
-**Lean:** Start with function-based (Phase 2A) and add native DDL in Phase 6. Validate the rest of the stack first.
-
-### Q3: In-Process SQL Execution in Table Function Bind Phase
-
-When the table function expands a semantic view and needs to execute the resulting SQL to determine the output schema (column types), it needs to call back into DuckDB from within a bind-phase callback. DuckDB may or may not permit re-entrant query execution during bind. This is a known limitation: the bind phase should be side-effect free and not execute queries.
-
-**Mitigations:**
-- Infer output schema from the semantic view definition (compute types from the dimension/measure definitions without executing SQL)
-- Pre-declare all types in the definition (require users to annotate types)
-- Use DuckDB's `DESCRIBE` or schema inference on the expanded SQL in a separate connection
-
-This needs a prototype to determine the correct approach.
-
-### Q4: Persistence Across `ATTACH`
-
-When a DuckDB database file is opened with `ATTACH`, do tables in the `semantic_layer` schema appear correctly? Does the extension need to be loaded before or after `ATTACH`? The init hook needs to handle the case where the extension loads into a connection that already has an attached database containing semantic view definitions.
-
-### Q5: duckdb-rs Extension API Completeness
-
-The `duckdb-rs` crate's `vtab` module and extension registration APIs may not expose everything needed (replacement scan registration, named parameters for table functions, custom parameter types). The exact gap needs to be determined by reading the current source of `duckdb-rs` (v0.10.x or v0.11.x).
-
-**Risk:** Medium-High. If the vtab API doesn't support all needed features, the extension will need to use `libduckdb-sys` raw FFI, significantly increasing complexity.
-
-### Q6: DuckDB Version Stability
-
-DuckDB's extension ABI requires that the extension is compiled against the exact same DuckDB version as the host. The `_version()` export enforces this. Community extensions are distributed as pre-compiled binaries per DuckDB version.
-
-**Question:** What DuckDB version to target for v0.1? DuckDB is releasing frequently (0.9, 0.10, 1.0 in 2024; 1.1+ in 2025). Targeting a stable release (1.0+) is advisable.
-
-### Q7: Syntax for Dimension/Metric Parameters
-
-How should dimensions and metrics be passed to the table function?
-
-```sql
--- Option A: Array literals
-FROM my_view(dimensions => ['region', 'date'], metrics => ['revenue'])
-
--- Option B: Variadic strings (not standard)
-FROM my_view(DIMENSIONS region, date, METRICS revenue)
-
--- Option C: Single struct parameter
-FROM my_view({dimensions: ['region'], metrics: ['revenue']})
+```
+duckdb.hpp download      → shim.cpp compilation
+build.rs                 → shim compilation (cc crate)
+shim.h / ffi.rs          → Rust/C++ boundary
+model.rs (TimeGrain)     → expand.rs (date_trunc) → table_function.rs (parameter)
+shim registration        → parser hook → catalog (pragma_query_t replaces sidecar)
 ```
 
-Option A is most compatible with DuckDB's table function parameter system. Options B and C require custom parsing. Decision needed before Phase 4.
+Recommended implementation sequence:
+
+**Step 1: Build infrastructure** — Add `build.rs` + `cc` crate + `duckdb.hpp`. Compile a minimal `shim.cpp` that just includes the headers and compiles cleanly. Verify the extension still loads in DuckDB. This validates that the C++ compilation works before adding any logic.
+
+**Step 2: Time dimensions** — Add `TimeGrain` to model, `date_trunc` wrapping in expand, `granularities` parameter in table_function. This is pure Rust, testable with existing `cargo test`. No C++ shim needed. Fuzz targets and proptest cover the expansion engine.
+
+**Step 3: Pragma registration** — Implement `sv_make_define_sql` and `sv_make_drop_sql` in Rust ffi.rs. Implement `semantic_views_register_pragma` in shim.cpp. Test that `PRAGMA define_semantic_view_internal(...)` executes an INSERT and survives restart without sidecar.
+
+**Step 4: Parser hook** — Implement `sv_parse_ddl` in Rust. Implement `semantic_views_register_parser` in shim.cpp with `parse_function_t` and `plan_function_t`. Test `CREATE SEMANTIC VIEW my_view (...)` end-to-end. This is the most complex step.
+
+**Step 5: Sidecar removal** — Once Step 4 validates persistence via pragma_query_t, remove sidecar logic from `catalog.rs` and `define.rs`. Keep the function-based DDL (`define_semantic_view`) as a compatibility path for in-memory databases (where pragma_query_t inserts into a non-persisted table, which is fine).
+
+**Step 6: Integration tests** — Update SQLLogicTest files for native DDL syntax. Verify that existing `define_semantic_view` function still works (backward compat). Add tests for time dimension granularity coarsening.
 
 ---
 
-## Confidence Levels
+## Anti-Patterns to Avoid
 
-| Finding | Confidence | Notes |
-|---------|------------|-------|
-| Extensions use `_init` / `_version` C exports | High | Documented, stable, used by all extensions |
-| Table functions are the primary query interface mechanism | High | Well-documented, multiple reference implementations |
-| Replacement scan API exists and works for name interception | High | Used by httpfs, documented in DuckDB internals |
-| Parser extension hooks exist for custom DDL | Medium | Exists in C++ SDK; not exposed in C API; rarely used in production |
-| duckdb-rs vtab module supports table functions | High | Documented in crate; examples exist |
-| duckdb-rs does NOT expose parser hooks or replacement scan | Medium-High | Based on reading crate API; would need verification against current version |
-| Storing definitions in a DuckDB table (semantic_layer schema) persists across restarts | High | DuckDB persists all user-created tables in .duckdb file |
-| In-process SQL re-execution during table function bind phase is problematic | Medium | Based on DuckDB's bind-phase semantics; needs prototype to confirm |
-| No widely-used extension implements custom DDL via parser hooks | Medium | Based on surveying community extensions; may have missed examples |
-| duckdb-extension-template-rust exists | Medium | Referenced in project documentation; current state/maintenance level unknown |
-| DuckDB 1.0+ is a stable target | Medium | DuckDB reached 1.0 in 2024; API stability improved but extension ABI still version-locked |
-| Optimizer extension hook is available for post-bind rewriting | Medium | Exists in C++ SDK; C API exposure status unknown |
+### Anti-Pattern 1: Making the C++ Shim Fat
+
+**What goes wrong:** Putting parsing logic, validation, or catalog access in `shim.cpp`. Rust code is well-tested and has ownership semantics; C++ code in this project will not. The shim should be 50-100 lines of registration + forwarding.
+
+**Instead:** Parse DDL in Rust (reuse `SemanticViewDefinition::from_json` or extend it). Build SQL strings in Rust. The C++ shim only translates between DuckDB C++ types and the `extern "C"` boundary.
+
+### Anti-Pattern 2: Using CMake When cc Crate Suffices
+
+**What goes wrong:** Adding CMakeLists.txt forces all existing CI workflows, developer tools, and the `just` task runner to work through a CMake layer. The whole build system changes for a 50-line C++ file.
+
+**Instead:** `build.rs` + `cc` crate. Cargo knows how to compile C++, link the result, and propagate platform flags. The existing `rust.Makefile` and CI continue to work unchanged.
+
+### Anti-Pattern 3: Calling C++ Catalog APIs from Rust
+
+**What goes wrong:** Trying to call `Catalog::CreateEntry` or `Schema::CreateEntry` from Rust via FFI. DuckDB's C++ catalog types are complex, and their ABI is not stable. Any C++ API not in `duckdb.h` can change across patch versions.
+
+**Instead:** Use SQL strings returned from `pragma_query_t`. DuckDB executes them in the normal pipeline. The `semantic_layer._definitions` table (already exists from v0.1.0) is the persistence target.
+
+### Anti-Pattern 4: Registering Pragma Without Needing Sidecar Removal
+
+**What goes wrong:** Implementing `pragma_query_t` alongside the sidecar, creating two persistence paths that can diverge.
+
+**Instead:** Remove the sidecar entirely in the same phase that activates `pragma_query_t`. Two persistence paths is worse than one.
+
+### Anti-Pattern 5: Time Dimension Granularity in Dimension Name Encoding
+
+**What goes wrong:** Encoding granularity in the dimension name string (`order_date__month`) rather than as a separate parameter. Users then need string hacking to reference dimensions by name in filters or other functions.
+
+**Instead:** Add `granularities` as a proper named parameter to `semantic_query`. The expand engine receives a clean `HashMap<String, TimeGrain>` and applies `date_trunc` to matching dimensions.
+
+---
+
+## Scalability Considerations
+
+This extension is a preprocessor — DuckDB handles all execution. Scale concerns are:
+
+| Concern | Current (v0.1.0) | v0.2.0 |
+|---------|------------------|--------|
+| Catalog reads | RwLock on in-memory HashMap — reads non-blocking | Unchanged |
+| Catalog writes (define/drop) | Sidecar file write (~microseconds) | pragma_query_t → SQL INSERT (DuckDB lock, safe outside invoke) |
+| Parser hook overhead | N/A | One `str.contains("SEMANTIC VIEW")` check per statement that native parser fails — negligible |
+| Time dimension expansion | N/A | One `date_trunc` wrapper per time dimension — zero runtime overhead |
+| C++ shim binary size | N/A | ~10KB static lib linked into cdylib — negligible |
+
+---
+
+## Sources
+
+- DuckDB `pragma_function.hpp` (raw.githubusercontent.com) — confirmed `pragma_query_t` type signature (HIGH confidence)
+- DuckDB GitHub issue #18485 — confirmed `DBConfig::GetConfig(instance)` + `config.parser_extensions.push_back()` pattern (HIGH confidence)
+- DuckDB `parser_extension.hpp` (deepwiki summary) — confirmed `parse_function_t`, `plan_function_t`, `ParserExtensionPlanResult` structure (MEDIUM-HIGH confidence)
+- `duckdb_extension.h` v1.4.4 — confirmed parser hooks and pragma registration are NOT in `duckdb_extension_access` struct (HIGH confidence)
+- TECH-DEBT.md (v0.1.0) — confirmed sidecar approach, execution lock constraints, deferred items (HIGH confidence — first-party)
+- CIDR 2025 paper (Mühleisen & Raasveldt) — confirmed DuckDB extensible parser mechanism exists at C++ level
+- DuckDB FTS source analysis — confirmed schema-based persistence pattern (FTS index = DuckDB tables in schema) (MEDIUM confidence)
+- Rust `cc` crate documentation — standard approach for C/C++ compilation in Rust build scripts (HIGH confidence)

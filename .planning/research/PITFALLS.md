@@ -1,436 +1,455 @@
-# PITFALLS — DuckDB Semantic Views Extension
+# PITFALLS — DuckDB Semantic Views Extension v0.2.0
 
 **Research type:** Project Research — Pitfalls dimension
-**Milestone context:** Greenfield — what do DuckDB extension projects and semantic layer implementations commonly get wrong?
-**Date:** 2026-02-23
+**Milestone context:** Subsequent milestone — adding C++ shim, time dimensions, EXPLAIN hook, and pragma_query_t catalog persistence to an existing Rust DuckDB extension.
+**Date:** 2026-02-28
 
 ---
 
 ## Purpose
 
-This document catalogs concrete mistakes, gotchas, and failure modes specific to:
-1. Building DuckDB extensions in Rust
-2. Implementing a semantic layer / query expansion engine
-3. Designing DDL for persistent schema objects in DuckDB
-4. Handling DuckDB's extension versioning and ABI model
+This document catalogs concrete mistakes, gotchas, and failure modes specific to the v0.2.0 additions:
 
-Each pitfall includes: what goes wrong, warning signs, prevention strategy, and which project phase should address it.
+1. Adding a C++ shim to an existing Rust DuckDB extension (build system integration, symbol visibility, ABI)
+2. Implementing DuckDB parser hooks for native `CREATE SEMANTIC VIEW` DDL
+3. Using `pragma_query_t`-pattern callbacks for catalog persistence
+4. Implementing an EXPLAIN interception hook
+5. Adding time dimension support with granularity coarsening in the SQL expansion engine
+6. C++/Rust FFI at the DuckDB extension boundary (memory ownership, panics, exception safety)
 
----
+**Known pitfalls already addressed in v0.1.0 research are not repeated here.** Specifically excluded: ABI instability across DuckDB minor versions, duckdb-rs not exposing parser hooks, SQL execution deadlock in scalar `invoke`, PRAGMA database_list Python naming, and duckdb/loadable-extension stub replacement.
 
-## Part 1 — DuckDB Extension Development in Rust
-
-### P1.1 — ABI breakage across DuckDB minor versions
-
-**What goes wrong:**
-DuckDB does not guarantee ABI stability between minor versions (e.g., 1.1.x → 1.2.x). The C extension API (`duckdb_extension.h`) changes when DuckDB adds or modifies internal struct layouts, function signatures, or the extension entry point contract. A `.duckdb_extension` binary compiled against DuckDB 1.1 will fail to load on DuckDB 1.2 with a cryptic error ("extension was compiled for a different version" or silent segfault). This is especially sharp in Rust because `duckdb-rs` wraps the C bindings, and the Rust crate version must exactly match the DuckDB runtime version.
-
-**Warning signs:**
-- The `duckdb-rs` crate version in `Cargo.toml` diverges from the DuckDB binary installed locally.
-- CI passes on one DuckDB version but fails on another.
-- Users report "extension not loading" without a clear error message — this is often an ABI mismatch.
-- The extension entry point symbol (`_duckdb_extension_api_version`) is missing or returns a version the runtime rejects.
-
-**Prevention strategy:**
-- Pin `duckdb-rs` to the exact DuckDB version you target and document this prominently in README.
-- Use the DuckDB community extension CI pipeline, which compiles against a fixed DuckDB version per release slot. Do not assume local dev and CI are using the same DuckDB build.
-- Build the extension with `-C link-arg=-Wl,--no-undefined` (or the macOS/Windows equivalent) to catch missing symbols at link time rather than at load time.
-- Version your extension releases against DuckDB releases explicitly: `v0.1.0-duckdb1.1`, not just `v0.1.0`. Consider automating this with a matrix CI job.
-- Read the DuckDB changelog before each DuckDB upgrade; look specifically for "Extension API changes" sections.
-
-**Phase:** Address in Phase 1 (project scaffold / extension skeleton). Lock versions before writing any business logic.
+Each pitfall includes: what goes wrong, warning signs, prevention strategy, and which v0.2.0 phase should address it.
 
 ---
 
-### P1.2 — `duckdb-rs` is not the official DuckDB Rust API
+## Part 1 — Adding a C++ Shim to an Existing Rust Extension
+
+### P1.1 — Build system inversion: the project must switch from Cargo-primary to CMake-primary
 
 **What goes wrong:**
-`duckdb-rs` is a community crate that wraps DuckDB's C API. It is not maintained by DuckDB GmbH and has historically lagged behind the official C extension SDK. The official DuckDB extension template (used for first-party and community extensions) is C++-based (`duckdb/extension-template`). Building in Rust on top of this template requires either: (a) using `duckdb-rs` and accepting its lag and coverage gaps, or (b) writing raw `unsafe` Rust FFI against the C headers directly. Neither option gives you the ergonomics of a first-class SDK.
+The v0.1.0 extension uses `extension-template-rs`, a Cargo-primary build that delegates packaging to a Python script. When you add a C++ shim, the build must instead follow the C++ `extension-template` model: CMake drives the top-level build, invokes Cargo as a CMake custom target to produce a Rust static library (`libsemantic_views.a`), and the CMake linker then links the C++ shim object files and the Rust staticlib together into the final `.duckdb_extension` shared library.
+
+The inversion is not cosmetic. The Cargo-primary model's `build.rs` and post-build Python script assume Cargo controls symbol export and footer injection. The CMake-primary model's footer-injection script assumes CMake controls the final link step. Running both in sequence produces a binary with two incompatible footer stamps, or one footer is silently overwritten.
 
 **Warning signs:**
-- `duckdb-rs` does not expose the extension API hooks you need (e.g., `AddParserExtension`, `AddStatementRewriter`, catalog hooks).
-- You find yourself writing `unsafe extern "C"` blocks to reach C functions that `duckdb-rs` doesn't wrap.
-- The `duckdb-rs` version on crates.io was last updated months before the DuckDB version you need.
+- The extension loads under `LOAD '/path/to/ext'` but fails under `INSTALL; LOAD` (the registry path enforces the official footer format).
+- The `.duckdb_extension` file size doubles or triples — a sign the footer was appended twice.
+- `nm -D` on the final shared library shows both the Rust entry symbol (`semantic_views_init_c_api`) and unexpected Rust std symbols with `pub` visibility — a sign the C++ link step did not override Rust symbol export defaults.
 
 **Prevention strategy:**
-- Evaluate at project start whether `duckdb-rs` exposes the specific hooks required: custom parser extension (for `CREATE SEMANTIC VIEW` DDL), table function registration (for the query syntax), and catalog object serialization. If any hook is missing, plan for raw FFI wrappers early.
-- Consider the Rust-in-C++ model: write the extension entry point in a thin C++ shim using the official template, and call into a Rust static library for all business logic. This gives you access to the full C++ extension API while keeping the semantic expansion logic in safe Rust.
-- Budget 1–2 weeks to evaluate FFI coverage before committing to a pure-Rust approach.
+- Commit to CMake-primary early. The C++ `extension-template` repository is the reference. Delete the Cargo-primary Python script and `cargo-duckdb-ext-tools` configuration from v0.1.0 before starting C++ shim work.
+- In `CMakeLists.txt`, add a `ExternalProject_Add` or `add_custom_command` that runs `cargo build --release --lib --features extension` and produces `target/release/libsemantic_views.a`. Link this as a static library in the CMake target.
+- Use only one footer-injection path. Let the CMake extension template's `duckdb_extension_load` macro handle the footer. Remove or disable any Rust-side post-build hooks.
 
-**Phase:** Address in Phase 1 (architecture decision). The custom DDL syntax (`CREATE SEMANTIC VIEW`) and the table function / parser hook requirements make this a high-priority early decision.
+**Phase assignment:** Resolve in the C++ shim scaffold phase (first v0.2.0 phase), before any parser hook implementation.
 
 ---
 
-### P1.3 — Custom parser extension hooks are underdocumented and fragile
+### P1.2 — Rust staticlib exports all std symbols into the shared library
 
 **What goes wrong:**
-Adding a new SQL statement type (`CREATE SEMANTIC VIEW`) requires hooking into DuckDB's parser at a level that the extension API exposes only partially. DuckDB supports `AddParserExtension` for injecting a custom parser callback, but the callback receives a raw token stream and must return a parsed statement that DuckDB's planner can accept. The internal statement types accepted by the planner are not part of the stable extension API. Many extension authors end up parsing their DDL to a generic `ExtensionStatement` and then resolving it in a custom catalog function — a pattern that is not well-documented and breaks subtly when DuckDB changes how it dispatches statements.
+When `libsemantic_views.a` (a Rust staticlib) is linked into the C++ shared library, the Rust compiler marks all `#[no_mangle]` and `pub extern "C"` symbols as globally visible ELF symbols. But it also exports the full Rust standard library symbol table into the shared object's PLT. The result: the `.duckdb_extension` exports hundreds of `_ZN3std...` symbols, bloating the shared library, confusing the dynamic linker, and potentially clashing with symbols in the DuckDB runtime itself if it also embeds Rust.
+
+A subtle version: if DuckDB's own binary embeds Rust (future versions might), symbol collisions can cause the wrong function to be called, producing silent data corruption or crashes.
 
 **Warning signs:**
-- You cannot find documented examples of `AddParserExtension` being used in community extensions.
-- The DuckDB source for `ParserExtension` callback types changes between releases without announcement.
-- Your `CREATE SEMANTIC VIEW` statement parses correctly in one DuckDB version but the planner rejects the resulting AST node in another.
+- `nm -D libsemantic_views.duckdb_extension | wc -l` returns thousands of symbols where a C++ extension returns hundreds.
+- The linker on Linux emits "multiple definition" warnings for standard library symbols during the CMake link step.
+- The binary is 5-10x larger than a comparable C++ extension.
 
 **Prevention strategy:**
-- Study the handful of community extensions that add custom DDL (e.g., `spatial` extension's custom type DDL) as implementation references. Read the source, not just the docs.
-- Design the initial DDL as a `CREATE ... AS SELECT` or a function call that DuckDB already knows how to parse. For example, `SELECT create_semantic_view('name', ...)` is crude but bypasses the parser hook problem entirely for an MVP. Graduate to proper DDL once the expansion logic is proven.
-- If using custom DDL, write integration tests that execute `CREATE SEMANTIC VIEW` in a fresh DuckDB process — not just a test harness that bypasses the parser. Catch parser regressions immediately.
-- Keep a note of the DuckDB commit where you validated your parser hook works; re-validate on every DuckDB bump.
+- Add a version script (`-Wl,--version-script`) on Linux that restricts exported symbols to exactly the three DuckDB-required entry points: `<extname>_init_c_api`, `<extname>_version`, and `<extname>_storage_init` (if used). All other symbols are marked `local`.
+- On macOS, use `-exported_symbols_list` with the same set of three symbols.
+- Add a `build.rs` step that generates the version script automatically from the extension name, so it is not maintained manually.
+- Verify after build: `nm -D *.duckdb_extension | grep -v 'semantic_views_' | grep ' T '` should return zero lines on Linux (all non-entry exported text symbols suppressed).
+- Confidence: MEDIUM (Rust staticlib symbol bloat is a documented Rust issue; the DuckDB-specific version script pattern is inferred from C++ extension practice).
 
-**Phase:** Phase 1 (syntax design decision). Phase 2 (implementation). Decide on the MVP syntax before investing in the catalog schema.
+**Phase assignment:** C++ shim scaffold phase. The version script must be in place before the first CI build.
 
 ---
 
-### P1.4 — Build system: CMake / Makefile wrapper complexity for Rust + C++ hybrid
+### P1.3 — The Rust and C++ runtimes both want to handle thread-local storage (TLS) and unwinding
 
 **What goes wrong:**
-The official DuckDB extension template uses CMake + `vcpkg` + a Makefile wrapper. When introducing Rust, you add Cargo into this build graph. The two build systems do not compose naturally: CMake does not know about Cargo's incremental compilation, Cargo does not know about CMake's build graph, and the linking step (producing a `.duckdb_extension` shared library with the correct symbol exports) requires careful coordination. Common failures: Rust symbols get stripped, the extension entry point is not exported with C linkage, or `cargo build` succeeds but the resulting `.so` / `.dylib` / `.dll` fails to load.
+On Linux, both the Rust runtime and the C++ runtime independently manage thread-local storage and stack unwinding. When the Rust staticlib and the C++ shim code are linked into the same shared library, the two runtimes may initialize conflicting TLS implementations. This is typically silent on macOS (where TLS and unwinding are handled by the OS) but manifests on Linux glibc as a crash in `__tls_get_addr` or an abort in `__cxa_throw` when a C++ exception propagates past Rust frames (or vice versa).
+
+The specific DuckDB scenario: the C++ shim registers a parser callback. DuckDB's parser throws a C++ exception on a parse error. If the exception unwinds through a Rust stack frame in the shim (because the Rust `#[no_mangle]` function is in the call stack), the Rust runtime will see a "foreign exception" — behavior is currently defined as either aborting the process or returning an opaque error from `catch_unwind`.
 
 **Warning signs:**
-- The `.duckdb_extension` binary loads in local `LOAD 'path/to/ext'` but fails when installed via `INSTALL`.
-- Symbol stripping removes the `_duckdb_extension_api_version` or `_duckdb_init` symbols.
-- The build works on macOS (where dylib linking is lenient) but fails on Linux (where symbol visibility defaults are stricter).
-- CI produces different `.duckdb_extension` sizes than local builds — a sign of different link flags.
+- Intermittent crashes on Linux that do not reproduce on macOS.
+- Crash in `libstdc++` or `libunwind` rather than in extension code.
+- The `backtrace` shows frames alternating between Rust and C++ in the shim layer.
+- `SEGFAULT` or `SIGABRT` on the first `CREATE SEMANTIC VIEW` statement that triggers a parse error.
 
 **Prevention strategy:**
-- Use `#[no_mangle]` and `extern "C"` on all symbols that must be visible to DuckDB's extension loader. Add `visibility("default")` attributes on Linux.
-- Add a `[lib] crate-type = ["cdylib"]` in `Cargo.toml`. Verify the symbol is present after build with `nm -D target/.../libext.so | grep duckdb_init`.
-- Write a smoke test that does `LOAD 'path'` in a fresh DuckDB process as part of CI, not just unit tests. This catches linker and ABI issues that unit tests never see.
-- Consider starting from an existing Rust DuckDB extension (e.g., `duckdb-rs` examples or community Rust extensions) rather than adapting the C++ template from scratch.
+- Treat every `extern "C"` function called from C++ as a hard boundary: wrap the Rust code body in `std::panic::catch_unwind`. Convert the caught panic to a DuckDB error string via `set_error`; never let a Rust panic cross into C++.
+- Treat every C++ callback that calls into Rust as a C++ `try`/`catch` boundary: catch all C++ exceptions before they reach a Rust stack frame, convert them to a Rust-compatible error, and return.
+- Do not use `extern "C-unwind"` ABI (RFC 2945) for DuckDB callback functions unless DuckDB's own extension shim examples explicitly use it. Default to `extern "C"` with explicit catch-at-boundary discipline.
+- Confidence: HIGH (Rust reference, RFC 2945, Rustonomicon all confirm this; panic-unwind across FFI is undefined behavior under `extern "C"`).
 
-**Phase:** Phase 1 (build scaffold). Fix this before any feature work.
+**Phase assignment:** C++ shim scaffold phase. Establish the catch-at-boundary pattern before writing any parser logic.
 
 ---
 
-### P1.5 — Community extension registry: signing and CI requirements
+## Part 2 — Parser Hook Implementation
+
+### P2.1 — `parse_function` vs `parser_override`: wrong hook chosen for `CREATE` statements
 
 **What goes wrong:**
-The DuckDB community extension registry (`community-extensions.duckdb.org`) requires that extensions are built by a specific GitHub Actions pipeline controlled by the DuckDB team, signed with DuckDB's key, and submitted via a PR to the `duckdb/community-extensions` repository. You cannot self-host a signed community extension. The registry builds extensions for all supported platforms (Linux x86_64, Linux ARM64, macOS ARM64, macOS x86_64, Windows x86_64) against a specific DuckDB version. If your extension requires native dependencies (e.g., a C library for SQL parsing), those dependencies must be available in the build environment or vendored.
+DuckDB exposes two parser extension hook points:
+
+- `parser_override`: Called before DuckDB's own parser attempts to parse the statement. If the override returns a result, DuckDB skips its own parser entirely.
+- `parse_function` (fallback): Called only when DuckDB's parser fails to parse a statement.
+
+`CREATE SEMANTIC VIEW` starts with `CREATE`, which DuckDB's parser parses successfully — it just doesn't know about `SEMANTIC VIEW` and produces an error at the second token. The `parse_function` fallback is triggered. But the `parse_function` receives the raw query string for that statement, not a pre-split individual statement. The query string may include a trailing semicolon on some interfaces (CLI) but not others (DuckDB UI, Python), and this is a documented inconsistency (GitHub issue #18485, labeled "under review" as of August 2025).
+
+**What goes wrong concretely:** The extension pattern-matches the query string for `CREATE SEMANTIC VIEW` using a regex or prefix check. The match fails if the string has a trailing semicolon on one interface but not another, producing a confusing "parse error" that is interface-dependent.
 
 **Warning signs:**
-- Your extension compiles locally but uses a system library that is not in the community extension CI image.
-- Your extension uses Rust features or nightly-only APIs not available in the Rust toolchain version used by the community extension CI.
-- You try to publish for a DuckDB version that the registry does not yet support.
+- `CREATE SEMANTIC VIEW my_view (...)` works from Python but fails from the DuckDB CLI.
+- The parser hook fires in one test environment but not another.
+- The hook fires with different query strings for the same SQL depending on whether the query ends with `;`.
 
 **Prevention strategy:**
-- Minimize native dependencies. The semantic views extension should be pure Rust (no C library dependencies beyond the DuckDB C API itself, which is provided by the build environment).
-- Check the `duckdb/community-extensions` repository's CI configuration before designing the build to understand the exact toolchain versions used.
-- Test the extension on all target platforms early (use cross-compilation or GitHub Actions matrix). Linking behavior differs significantly between macOS, Linux, and Windows.
-- Register intent to publish early by opening a draft PR to `duckdb/community-extensions`. The DuckDB team can flag blockers before you have a finished extension.
+- In the parse function, normalize the query string: trim leading/trailing whitespace and trailing semicolons before pattern matching.
+- Use `parser_override` rather than the fallback `parse_function` for `CREATE SEMANTIC VIEW`. `parser_override` is called before DuckDB's parser, giving the extension full control. The tradeoff: `parser_override` is called for every query, not just failed ones — write the fast-exit path (check if the trimmed query starts with `CREATE SEMANTIC VIEW` case-insensitively) as the first operation.
+- Write integration tests that exercise the hook from: Python `duckdb.connect().execute(...)`, CLI `duckdb -c "..."`, and the DuckDB test runner (`sqllogictest`). All three send queries differently.
+- Confidence: MEDIUM (semicolon inconsistency confirmed in GitHub issue #18485; parser_override vs parse_function choice is based on DuckDB parser source code analysis and CIDR 2025 paper).
 
-**Phase:** Phase 1 (project setup). Phase 3 (pre-release). The signing requirement means you cannot wait until "done" to figure out distribution.
+**Phase assignment:** Parser hook implementation phase.
 
 ---
 
-## Part 2 — Semantic Layer / Query Expansion Engine
-
-### P2.1 — Silent correctness failures in GROUP BY inference
+### P2.2 — `plan_function` must return a `TableFunction` result — not a plan node
 
 **What goes wrong:**
-The expansion engine infers a `GROUP BY` clause from the list of requested dimensions. If the dimension resolution is wrong — for example, if a dimension expression contains a column that is not uniquely named across joined tables, or if the expression is an alias that DuckDB resolves differently in `SELECT` vs `GROUP BY` — the emitted SQL will produce results that are wrong in a non-obvious way. The query succeeds, returns rows, but the numbers are incorrect. This is the hardest class of bug to catch: no error, no crash, wrong answer.
+Once the `parse_function` produces a custom `ExtensionStatement` for `CREATE SEMANTIC VIEW`, DuckDB calls `plan_function` to convert that statement into an executable plan. The `plan_function` API does not accept arbitrary logical operators — it must return a `TableFunction` result (similar to how `PRAGMA` statements return table-valued results). Many extension authors expect to return a `CreateStatement`-style catalog plan and encounter undocumented type errors when DuckDB's planner rejects the result.
 
-**Concrete failure modes:**
-- Two joined tables both have a column named `id`. The dimension expression `id` is ambiguous; DuckDB resolves it to one table, but the semantic view definition intended the other.
-- A dimension is defined as a SQL expression (`YEAR(order_date) AS year`). The `GROUP BY` emits `YEAR(order_date)` but the `SELECT` emits the alias `year`. On DuckDB this works, but the expression-vs-alias behavior differs from PostgreSQL and can cause confusion if users try to run the same SQL elsewhere.
-- A measure uses a subquery or window function that is illegal inside an aggregate. The emitted SQL fails, but the error message points at the generated SQL rather than the user's semantic view definition.
+The canonical pattern (used by all documented community extension custom DDL): `plan_function` returns a table function that, when executed, performs the DDL side effects (inserting into the catalog) and returns a success/message result set (or an empty result). The DDL effect happens during query execution, not during planning — this means the `CREATE SEMANTIC VIEW` is not transactional in the same way as a DuckDB `CREATE TABLE`.
 
 **Warning signs:**
-- Test results have row counts that don't match hand-written SQL for the same query.
-- The same semantic query with and without a specific dimension returns the same numbers (a dimension that has no effect is a sign of an incorrect GROUP BY).
-- Metrics return wildly high numbers — a classic sign of a fan-out join where GROUP BY didn't de-duplicate correctly.
+- The `plan_function` compiles but DuckDB panics or returns an internal error at planning time.
+- `CREATE SEMANTIC VIEW` appears to succeed (no error) but the view is not visible in `list_semantic_views()`.
+- Attempting to return a logical plan node from `plan_function` produces a static assertion failure in the C++ shim at compile time.
 
 **Prevention strategy:**
-- Always fully qualify column references in emitted SQL: `table_alias.column_name`, never bare `column_name`. This eliminates ambiguity in multi-table joins.
-- Generate a reference SQL for every test case by hand and assert exact equality (not just row-count equality) in expansion tests.
-- Test every supported metric type (SUM, COUNT, COUNT DISTINCT, AVG, MIN, MAX) against a small known dataset where the correct answer is computable by hand.
-- Test the fan-out case explicitly: a semantic view that joins two tables where the join multiplies rows. Verify the metric is not double-counted.
-- Build a test harness that runs expansion against TPC-H with known expected values before shipping.
+- Model `plan_function` exactly after the FTS extension's PRAGMA pattern: return a table function call that performs the DDL mutation when executed. The table function can call back into the Rust `define_semantic_view` logic (the same logic already used in v0.1.0), now triggered from the native DDL path rather than the scalar function path.
+- The table function result should return a single VARCHAR column `"message"` with a success message (e.g., `"Semantic view 'name' created"`). This is the simplest valid result type.
+- Write a test that checks: `CREATE SEMANTIC VIEW` succeeds, `list_semantic_views()` shows the new view, `DROP SEMANTIC VIEW` removes it, `list_semantic_views()` no longer shows it — all in the same test session.
+- Confidence: MEDIUM (based on FTS extension pattern and DuckDB parser source; plan_function API behavior inferred from parser.cpp analysis).
 
-**Phase:** Phase 2 (expansion engine). These correctness tests must gate the MVP, not be deferred.
+**Phase assignment:** Parser hook implementation phase.
 
 ---
 
-### P2.2 — Non-additive metric handling: COUNT DISTINCT, percentiles, HLL
+### P2.3 — Parser hook registered globally — affects all connections and all databases
 
 **What goes wrong:**
-`COUNT(DISTINCT x)` is not additive — you cannot sum `COUNT(DISTINCT x)` across pre-aggregated partitions and get the correct total. This is explicitly called out in Cube's pre-aggregation matching algorithm. The semantic layer must know which metrics are additive and refuse to serve non-additive metrics from pre-aggregated tables at coarser granularity. If this check is omitted, pre-aggregation selection silently returns wrong answers: the `COUNT DISTINCT` of customers per region at monthly granularity served from a daily rollup will be wrong.
+DuckDB parser extensions are registered at the database level, not per-connection. When the extension is loaded, the parser hook is registered for all queries on all connections to that database. If another extension also registers a `parser_override`, the override functions are called sequentially in registration order. If the semantic views extension's parser override throws a C++ exception (or invokes `set_error`) for a statement it doesn't recognize, it can incorrectly reject queries that the next override or DuckDB's own parser would have handled.
 
-For v0.1 (expansion only, no pre-aggregation), this is a design-time concern: the metric type system must model additivity even if pre-aggregation isn't implemented yet, because getting it wrong in v0.1 makes v0.2 harder.
+Additionally, DuckDB's extension system uses `STRICT_OVERRIDE` and `FALLBACK_OVERRIDE` modes. Using `STRICT_OVERRIDE` means the extension's parser failure is final — DuckDB will not try its own parser as a fallback. Using `FALLBACK_OVERRIDE` (the correct choice) means DuckDB falls through to the next parser extension or its own parser if the extension doesn't handle the statement.
 
 **Warning signs:**
-- The semantic view definition accepts `COUNT(DISTINCT customer_id)` as a measure without recording its additivity class.
-- Tests only cover `SUM` and `COUNT(*)` metrics.
-- The design doc's metric representation is a plain SQL expression string without metadata about additivity.
+- Standard DuckDB SQL statements fail to execute after loading the semantic views extension.
+- `SELECT 1` or `PRAGMA database_list` throws a "parse error" that did not occur before loading the extension.
+- The extension's `parser_override` returns an error for unknown statements instead of returning a "not handled" signal.
 
 **Prevention strategy:**
-- Classify metrics by additivity at definition time: `additive` (SUM, COUNT, MIN, MAX), `semi-additive` (distinct count at a given grain), `non-additive` (percentile, ratio, any custom expression). Store this classification in the catalog serialization.
-- For v0.1, emit the correct SQL expression regardless of additivity class (the expansion is still correct at raw table granularity). Mark non-additive metrics as not pre-aggregation eligible in the metadata so v0.2 doesn't accidentally misuse them.
-- Document the additivity class in the DDL (e.g., `MEASURE dau AS COUNT(DISTINCT user_id) TYPE non_additive`) so users understand the constraint.
+- Use `FALLBACK_OVERRIDE` mode. Return "not handled" for any statement that does not start with `CREATE SEMANTIC VIEW` (after normalization). Do not return an error — return the correct "pass through" enum value.
+- The fast-exit path must be unconditional: if the trimmed statement does not start with `CREATE SEMANTIC VIEW` (case-insensitive), return immediately without inspecting the rest.
+- Do not call `set_error` from within the `parser_override` for unrecognized statements. Only call it for statements that are recognized as `CREATE SEMANTIC VIEW` but are syntactically invalid.
+- Test by loading both the semantic views extension and another community extension in the same session and verifying both function correctly.
+- Confidence: MEDIUM (based on DuckDB parser source code analysis showing sequential extension evaluation and early-exit on success).
 
-**Phase:** Phase 1 (DDL design) and Phase 2 (expansion engine). Must be in the data model from the start.
+**Phase assignment:** Parser hook implementation phase.
 
 ---
 
-### P2.3 — Relationship / join inference producing cartesian products
+## Part 3 — pragma_query_t Catalog Persistence
+
+### P3.1 — `pragma_query_t` returns SQL that DuckDB executes — not a result set
 
 **What goes wrong:**
-When the expansion engine infers JOINs from entity relationships, a missing or incorrect join condition produces a cartesian product. DuckDB will execute this — it won't error — and return wildly incorrect results. This is especially dangerous with multi-hop joins: `orders → customers → regions`. If the join from `customers` to `regions` uses the wrong key, every order is joined to every region.
+The `pragma_query_t` pattern (used by the FTS extension) is a PRAGMA function type that returns a `string` — a SQL query string that DuckDB then executes. This is how FTS's `create_fts_index` triggers the creation of a schema full of tables: the PRAGMA callback constructs a multi-statement SQL string (creating tables, inserting data, defining macros) and returns it; DuckDB executes it.
 
-A subtler version: the semantic view definition allows multiple paths between two tables (different join keys for different contexts). If the expansion engine picks the wrong path based on which dimensions/metrics were requested, the join is semantically wrong even though the SQL is valid.
+Extension authors unfamiliar with this pattern attempt to implement a standard `pragma_function_t` (which returns a result table directly) and cannot figure out why the catalog changes they make inside the callback don't persist — because `pragma_function_t` runs inside the execution context where SQL is blocked (the v0.1.0 deadlock problem).
+
+`pragma_query_t` works because the SQL is returned and executed after the callback returns, before execution locks are held. But this means the SQL must be completely constructed in the callback — it cannot depend on query results from within the callback itself.
 
 **Warning signs:**
-- Row counts in expansion output are orders of magnitude larger than expected.
-- Metric values are exact multiples of the correct value (e.g., 3x, 5x) — a sign of join fan-out.
-- Adding or removing a dimension changes metric values (it shouldn't — the metric total should be stable across different dimension groupings).
+- The PRAGMA callback appears to succeed but the catalog table (`semantic_layer._definitions`) is not updated.
+- Attempting to run DuckDB SQL from within the `pragma_query_t` callback causes the same deadlock as v0.1.0's scalar invoke.
+- The returned SQL string is not valid at the time of construction (e.g., it references tables that don't exist yet).
 
 **Prevention strategy:**
-- Validate join conditions at semantic view definition time, not just at expansion time. Check that the join key columns actually exist in the referenced tables.
-- In integration tests, assert that metric totals are stable across different dimension combinations: `SUM(revenue) GROUP BY region` should equal `SUM(revenue)` (the ungrouped total). Any divergence is a join correctness failure.
-- Limit multi-hop join inference in v0.1 to explicit, linear chains. Do not attempt to infer join paths algorithmically from the relationship graph — require the definition to specify the join chain explicitly.
+- Return a complete, self-contained SQL string from the `pragma_query_t` callback. For `CREATE SEMANTIC VIEW`, this is an `INSERT INTO semantic_layer._definitions VALUES (...)` statement where the definition JSON is embedded as a string literal in the SQL.
+- The JSON must be serialized to a SQL string literal with all single quotes escaped (or use `$$`-style dollar quoting if DuckDB supports it — verify; DuckDB does not support PostgreSQL-style dollar quoting as of 1.4.x).
+- Test the persistence round-trip explicitly: call the PRAGMA, close the connection, reopen the database, verify the definition is present in `semantic_layer._definitions`.
+- Confidence: MEDIUM (FTS extension uses this pattern; the execution-after-return mechanism is inferred from the FTS implementation analysis and the v0.1.0 deadlock root cause).
 
-**Phase:** Phase 2 (expansion engine). Include join-correctness tests as first-class acceptance criteria.
+**Phase assignment:** pragma_query_t implementation phase.
 
 ---
 
-### P2.4 — WHERE clause placement in expanded SQL
+### P3.2 — Transaction rollback does not undo `pragma_query_t` side effects
 
 **What goes wrong:**
-The user's `WHERE` clause in a semantic view query (e.g., `WHERE order_date >= '2025-01-01'`) must be placed correctly in the expanded SQL. Three failure modes:
-1. The filter is applied after aggregation (HAVING instead of WHERE) — filters rows out of the result set instead of reducing the rows before aggregation. For a time filter this produces wrong metrics.
-2. The filter is pushed inside a subquery that is later joined — the join produces a partial result.
-3. Row-level filters defined in the semantic view itself (`CREATE SEMANTIC VIEW ... WHERE status = 'active'`) interact with user-supplied WHERE clauses in an unexpected way (AND vs OR composition).
+When DuckDB executes the SQL returned by a `pragma_query_t` callback, that SQL runs as a DuckDB query. If the surrounding user transaction is rolled back, the `INSERT INTO semantic_layer._definitions` is rolled back too (correct). However, the PRAGMA callback itself — which may have already updated the in-memory Rust catalog — is not rolled back. The result: after a rollback, the in-memory catalog says the semantic view exists but the persistent catalog table says it does not.
+
+On the next extension load, `init_catalog` reads the persistent table and the in-memory catalog is rebuilt correctly — but within the current session, the discrepancy causes `semantic_query` to find the view in memory while `list_semantic_views` (which reads the persistent table) shows it as absent.
 
 **Warning signs:**
-- `WHERE order_date BETWEEN ...` on a metric produces a different result than running the equivalent hand-written SQL with the same filter.
-- Row-level filters in the semantic view definition appear to be ignored in some query combinations.
-- Adding a WHERE clause changes the metric total in a way that doesn't match a hand-written GROUP BY.
+- `BEGIN; CREATE SEMANTIC VIEW x ...; ROLLBACK; SELECT * FROM list_semantic_views()` shows view `x` when it should not.
+- `BEGIN; CREATE SEMANTIC VIEW x ...; ROLLBACK; FROM semantic_query('x', ...)` succeeds when it should fail with "view not found".
+- Tests that test rollback behavior pass on fresh sessions but fail after prior aborted transactions.
 
 **Prevention strategy:**
-- Distinguish between pre-aggregation filters (applied before GROUP BY in the inner subquery) and post-aggregation filters (applied on the outer query). Route user-supplied dimension filters to pre-aggregation position; route metric-level filters (e.g., `WHERE total_revenue > 1000`) to post-aggregation position.
-- Semantic view row-level filters (`CREATE SEMANTIC VIEW ... WHERE status = 'active'`) are always AND-composed with user WHERE clauses. Make this explicit in the design and test the composition.
-- Write a test case for each WHERE placement scenario with known correct outputs.
+- Update the in-memory Rust catalog only after the `pragma_query_t` SQL has been committed, not during the callback. This means: do not add to the in-memory catalog inside the PRAGMA callback. Instead, add a post-commit hook, or accept eventual consistency: the in-memory catalog is rebuilt from the persistent table on the next read if a discrepancy is detected.
+- The simplest approach: the in-memory catalog is a cache, always authoritative from the persistent table. Before any operation that reads the catalog, check if the persistent table version matches the in-memory version (a sequence counter or row count). If not, rebuild.
+- Write an explicit rollback test in the test suite.
+- Confidence: MEDIUM (DuckDB transaction semantics for table operations are well-documented; the in-memory/persistent discrepancy is inferred from the architectural pattern).
 
-**Phase:** Phase 2 (expansion engine). This is a correctness requirement, not a nice-to-have.
+**Phase assignment:** pragma_query_t implementation phase.
 
 ---
 
-### P2.5 — SQL identifier quoting and injection
+### P3.3 — The pragma SQL string must embed definition JSON as a SQL literal — injection risk
 
 **What goes wrong:**
-The expansion engine builds SQL strings from user-supplied identifiers: semantic view names, dimension names, metric names, table names, column expressions. If identifiers are not properly quoted, two failure modes occur:
-1. A dimension named `year` (a reserved word in SQL) causes a parse error in the emitted SQL.
-2. A malicious or careless table name like `my_table; DROP TABLE orders; --` produces SQL injection in the emitted query. This is a DuckDB extension — it runs with full database privileges.
+The `pragma_query_t` callback constructs SQL like:
+```sql
+INSERT INTO semantic_layer._definitions (name, definition_json)
+VALUES ('my_view', '<json here>');
+```
+The `<json here>` placeholder is replaced by the serialized definition. If the JSON contains a single quote (any SQL string field with an apostrophe, e.g., a filter expression `WHERE status = 'active'`), the generated SQL will be syntactically broken, producing a parse error or, worse, SQL injection if the JSON is attacker-controlled.
 
 **Warning signs:**
-- Identifiers that are SQL reserved words cause mysterious parse errors in expansion output.
-- The expansion engine uses string concatenation (`format!("SELECT {} FROM {}", dim, table)`) without quoting.
+- `CREATE SEMANTIC VIEW` with a filter expression containing a single quote silently fails or truncates the definition.
+- Integration tests do not cover definitions with SQL expressions containing apostrophes.
 
 **Prevention strategy:**
-- Quote all identifiers in emitted SQL: `"dimension_name"`, `"table_name"`. In DuckDB, double-quotes are the standard SQL identifier quoting mechanism.
-- Never accept user-supplied SQL expressions directly into emitted SQL without a validation/sanitization step. For metric and dimension expressions defined in the semantic view DDL, treat them as trusted (they were already accepted into the catalog), but validate at `CREATE SEMANTIC VIEW` time.
-- Use a SQL builder library or template approach rather than raw string concatenation for emitted SQL. This makes quoting systematic.
+- Escape all single quotes in the JSON string by doubling them (`'` → `''`) before embedding in the SQL literal. This is the standard SQL string literal escaping rule.
+- Alternatively, serialize the JSON with Rust's `serde_json::to_string` and then apply the single-quote doubling pass. A dedicated function `fn sql_escape_string(s: &str) -> String` in the shim should be tested independently.
+- Add a specific test: create a semantic view with a filter expression `WHERE description = 'it''s here'` and verify the definition round-trips correctly through save and reload.
+- Confidence: HIGH (standard SQL string escaping requirement; no DuckDB-specific uncertainty).
 
-**Phase:** Phase 1 (design) and Phase 2 (implementation). Quoting must be baked in from the first SQL generation code.
+**Phase assignment:** pragma_query_t implementation phase.
 
 ---
 
-### P2.6 — Time dimension granularity coarsening edge cases
+## Part 4 — EXPLAIN Hook
+
+### P4.1 — There is no stable, documented `EXPLAIN` interception hook in DuckDB's extension API
 
 **What goes wrong:**
-Time granularity coarsening (`day → month → quarter → year`) is more nuanced than it appears:
-- `date_trunc('month', ts)` returns a `TIMESTAMP`, not a `DATE`. Downstream queries that expect a `DATE` type will silently receive a `TIMESTAMP`.
-- Week granularity is locale-dependent: ISO week starts Monday, US week starts Sunday. `date_trunc('week', ts)` uses ISO. If users expect US weeks, results are wrong by 0–6 days.
-- Fiscal year / quarter granularity (common in analytics) does not exist in DuckDB's `date_trunc`. Extensions that promise `FISCAL_QUARTER` granularity must implement it manually, which is complex.
-- When a user requests `year` granularity for a time series that crosses a DST boundary, `date_trunc` in DuckDB operates in UTC. If the base data has timezone-aware timestamps, results can be off by one day near DST transitions.
+DuckDB's official extension API (the C API used by `extension-template-rs` and the stable `duckdb-cpp-api`) does not expose an `EXPLAIN` statement interception hook. The EXPLAIN statement is handled internally by DuckDB's planner and produces a `PhysicalExplain` operator. Extensions can intercept the logical plan via an optimizer extension (`OptimizerExtension`) but cannot intercept `EXPLAIN` before DuckDB begins planning.
+
+The workaround used in v0.1.0 (`explain_semantic_view()` table function) is effectively the only stable approach. Implementing true `EXPLAIN FROM semantic_query(...)` that shows expanded SQL instead of DuckDB's physical plan would require either:
+- A C++ internal API hook (not in the stable extension API), or
+- A `parser_override` that detects `EXPLAIN ... semantic_query(...)`, executes the expansion to get the SQL, and returns that as the result of a custom statement — effectively reimplementing `explain_semantic_view()` as a native DDL statement.
 
 **Warning signs:**
-- Time-series test data at the day level does not aggregate to the expected month-level totals.
-- Week-level queries return unfamiliar week boundaries.
-- Type errors downstream when the emitted SQL uses `date_trunc` and the result is joined to a `DATE` column.
+- No DuckDB community extension in the registry implements EXPLAIN interception (the absence is evidence that the hook does not exist or is too fragile).
+- Searching the DuckDB source for "explain" in extension API headers returns zero results.
+- The `duckdb-cpp-api` stable API (work in progress as of 2025) does not include EXPLAIN hooks in its surface area.
 
 **Prevention strategy:**
-- For v0.1, support only the granularities that map directly and unambiguously to DuckDB's `date_trunc`: `second`, `minute`, `hour`, `day`, `week` (ISO), `month`, `quarter`, `year`.
-- Document the week convention (ISO) explicitly. Do not support fiscal granularities in v0.1.
-- Cast the `date_trunc` output to `DATE` when the time dimension column is a `DATE` type, not a `TIMESTAMP`.
-- Include time-series test cases that span month boundaries, year boundaries, and (if timestamps are supported) DST transitions.
+- Do not attempt to intercept `EXPLAIN` at the physical plan level. It requires internal C++ DuckDB API access that is not stable and will break with every DuckDB release.
+- The `parser_override` approach: detect `EXPLAIN FROM semantic_query(...)` pattern, strip the `EXPLAIN` keyword, run `explain_semantic_view()` logic, and return the expanded SQL as a result table. This is syntactic sugar on top of the existing v0.1.0 `explain_semantic_view` function, not true EXPLAIN interception.
+- For the v0.2.0 EXPLAIN goal, scope the feature as: `EXPLAIN semantic_query('view', dimensions := [...])` is rewritten by the parser override to `FROM explain_semantic_view('view', dimensions := [...])`. This is honest with users: the result is the expanded SQL string, not DuckDB's physical plan.
+- Document clearly what `EXPLAIN` shows (the expansion, not the DuckDB physical plan) to avoid user confusion.
+- Confidence: MEDIUM (absence of EXPLAIN hooks in community extension radar and stable C API; inferred from DuckDB architecture).
 
-**Phase:** Phase 2 (expansion engine). Include in DDL design (what granularities are declared valid).
+**Phase assignment:** EXPLAIN hook phase. Scope correctly before building.
 
 ---
 
-### P2.7 — Schema evolution: semantic view definitions going stale
+### P4.2 — `parser_override` for EXPLAIN detection fires for all `EXPLAIN` statements, not just semantic query ones
 
 **What goes wrong:**
-A semantic view is defined against a set of base tables. When those tables evolve (columns renamed, dropped, type changed), the semantic view definition becomes invalid. If the extension discovers this only at query time (when expansion produces SQL against a non-existent column), users get a cryptic DuckDB error message that does not reference the semantic view definition. Worse, if a column type changes (e.g., from INTEGER to BIGINT), the expansion may silently succeed with wrong implicit casts.
+If the EXPLAIN interception uses `parser_override`, the override fires for `EXPLAIN SELECT 1`, `EXPLAIN FROM parquet_scan(...)`, and every other `EXPLAIN` statement. If the fast-exit path is wrong, every `EXPLAIN` in the database is affected.
+
+The pattern match must be both fast (it runs before every parse) and precise (it must not match `EXPLAIN SELECT` but must match `EXPLAIN FROM semantic_query(...)` and `EXPLAIN semantic_query(...)`).
 
 **Warning signs:**
-- A semantic view that worked yesterday throws a "column not found" error today, with no mention of the semantic view in the error.
-- Numeric metrics that used INTEGER columns now return BIGINT values after a schema change, causing downstream type comparison failures.
-- Semantic view definitions reference tables that have been renamed.
+- Standard `EXPLAIN SELECT 1` returns an empty result or an error after loading the extension.
+- `EXPLAIN SELECT * FROM some_table` is broken.
+- The override is called for every query, noticeably slowing query execution (measurable with benchmarking).
 
 **Prevention strategy:**
-- At `CREATE SEMANTIC VIEW` time, validate that all referenced tables and columns exist and record the column types. Store this in the catalog entry.
-- Add a `VALIDATE SEMANTIC VIEW name` command (or equivalent) that reruns this validation against the current schema without executing a query.
-- On expansion failure due to a missing column, emit an error that identifies the semantic view, the dimension or metric that failed, and the expected column — not just a raw SQL error.
-- For v0.1, explicit validation at creation time is sufficient. Automatic schema change detection (catalog triggers) is a future enhancement.
+- Use a two-stage check: first check if the normalized query starts with `EXPLAIN` (fast string prefix check), then check if it contains `semantic_query(` as a substring. Only trigger the custom path if both conditions are true.
+- Benchmark the `parser_override` overhead: for a 1000-query loop of `SELECT 1`, the overhead of the prefix check should be below 1 microsecond per query. If it is higher, the check is doing too much work.
+- Write negative tests: verify that `EXPLAIN SELECT 1` still works correctly after loading the extension.
+- Confidence: HIGH (general parser override design principle; specific DuckDB behavior confirmed by parser source analysis).
 
-**Phase:** Phase 2 (expansion engine) for validation. Phase 1 (catalog design) for storing column type metadata.
+**Phase assignment:** EXPLAIN hook phase.
 
 ---
 
-## Part 3 — DDL and Catalog Persistence
+## Part 5 — Time Dimension Granularity
 
-### P3.1 — DuckDB catalog persistence model for custom schema objects
+### P5.1 — `date_trunc('week', ...)` returns ISO Monday boundaries — wrong for US-convention users
 
 **What goes wrong:**
-DuckDB's catalog (the internal registry of tables, views, functions, and types) is session-local for in-memory databases and file-based for persistent databases (`.duckdb` files). Custom extension objects — including `SEMANTIC VIEW` definitions — are not automatically persisted in the DuckDB catalog in the same way as tables and views. Extension authors must implement their own persistence mechanism.
+DuckDB's `date_trunc('week', ts)` follows ISO 8601 — weeks start on Monday. If a user's semantic view time dimension uses `'week'` granularity, all weekly aggregations will use Monday-aligned bins. For US-standard analytics (Sunday-start weeks) the results will be misaligned by 0–6 days depending on the day of the week.
 
-The common failure: an extension registers a custom catalog entry type during `LOAD`. The user creates a semantic view. When DuckDB is restarted, the extension is auto-loaded (via `autoload`), but the semantic view definitions are gone because there is no mechanism to reload them from the catalog file. The user gets silent data loss without any error.
+The ISO week year boundary is a deeper edge case: ISO week 1 of year N may begin in late December of year N-1. For example, 2015-01-01 falls in ISO week 1 of 2015, but the week begins on 2014-12-29. Aggregating by `date_trunc('week', ...)` for dates in the last days of December will group them into a bin that starts in the following year, which is counterintuitive when users expect year-aligned weekly data.
 
 **Warning signs:**
-- `SELECT * FROM semantic_views` returns results, but after `DuckDB.connect('file.duckdb')` (restart), the query fails.
-- The extension registers objects into DuckDB's catalog at load time but does not hook the catalog serialization/deserialization path.
-- Tests only run against fresh in-memory DuckDB instances, never against a restarted persistent database.
+- Weekly aggregations do not match the user's BI tool (which may use Sunday-start weeks).
+- Year-end weekly reports show data attributed to the following year's first week.
+- The documented granularity options do not specify ISO vs. US week conventions.
 
 **Prevention strategy:**
-- Do not rely on DuckDB's internal catalog for persistence of semantic view definitions. Store definitions separately:
-  - **Option A (simple, recommended for v0.1):** Persist semantic view definitions in a dedicated DuckDB table (`_semantic_views_catalog`) inside the user's database file. This is a regular DuckDB table; it survives restarts automatically. On extension load, read from this table to reconstruct the in-memory representation.
-  - **Option B (complex, not recommended for v0.1):** Hook DuckDB's catalog serialization extension points (if they exist) to serialize custom catalog entries. This requires deep knowledge of DuckDB internals and may not be exposed in the extension API.
-- Write a test that: creates a semantic view, closes the DuckDB connection, reopens the `.duckdb` file, verifies the semantic view is still queryable. This must be a passing test before v0.1 ships.
+- Document the week convention explicitly: "Week granularity uses ISO 8601 (Monday-start). Sunday-start weeks are not supported in v0.2.0."
+- Do not offer a `FISCAL_WEEK` or `US_WEEK` granularity in v0.2.0. Add it only after implementing a clear convention specification mechanism in the DDL (e.g., `GRANULARITY week CONVENTION iso`).
+- For time dimension definitions, add a validation check: if granularity is `'week'`, emit a warning (not an error) in the definition output that documents the ISO convention.
+- Include a test: verify that a date of `2014-12-30` (which is in ISO week 1 of 2015) aggregates to the week starting `2014-12-29`, and that this behavior is asserted and documented.
+- Confidence: HIGH (ISO 8601 week behavior in DuckDB is confirmed by DuckDB documentation and PostgreSQL date_trunc gotcha documentation; the ISO convention is standard SQL).
 
-**Phase:** Phase 1 (catalog design). The persistence model is a foundational architectural decision that affects the DDL design, the in-memory representation, and the extension initialization path.
+**Phase assignment:** Time dimension implementation phase.
 
 ---
 
-### P3.2 — Serialization format for semantic view definitions
+### P5.2 — `date_trunc` on `TIMESTAMP` returns `TIMESTAMP`, not `DATE` — type mismatch downstream
 
 **What goes wrong:**
-The semantic view definition (dimensions, measures, joins, relationships, row filters) must be serialized to the persistence store and deserialized on load. Failure modes:
-- Using a format (e.g., bincode, custom binary) that is not inspectable by users. When the extension has a bug in deserialization, there is no way to recover the definition without the old extension version.
-- Using a format that is not forward-compatible. Adding a new field (e.g., a `time_zone` field on a time dimension) causes deserialization of older definitions to fail.
-- Storing the definition as a raw SQL string (the original `CREATE SEMANTIC VIEW` statement) but not re-parsing it on load. If the parser changes, old definitions silently behave differently.
+`date_trunc('month', my_date_column)` where `my_date_column` is a `DATE` type returns a `TIMESTAMP` (specifically `TIMESTAMP '2024-01-01 00:00:00'`), not a `DATE` (`DATE '2024-01-01'`). When the generated SQL uses the result in a `JOIN` or comparison against a `DATE` column, DuckDB will implicitly cast — which usually works but can cause performance degradation (preventing index use) or subtle type errors if the consuming query applies strict type checks.
+
+More concretely: if the user's semantic view groups by a `DATE` time dimension and then the user compares the output (VARCHAR, due to v0.1.0 architecture) against another date, the string representation `2024-01-01 00:00:00` does not sort or compare the same as `2024-01-01`.
 
 **Warning signs:**
-- The serialization format is not JSON or a similarly human-readable format.
-- There are no migration tests that create a definition in version N-1 format and load it in version N.
-- The definition is stored as an opaque blob in the catalog table.
+- Time dimension output values look like `2024-01-01 00:00:00` instead of `2024-01-01` in the VARCHAR output.
+- String comparison on time dimension output gives wrong sort order (e.g., `'2024-01-01 00:00:00' > '2024-01-02'` evaluates as string comparison).
+- Joining the `semantic_query` output to a table with a `DATE` column requires an explicit cast.
 
 **Prevention strategy:**
-- Store the canonical definition as a JSON blob (or TOML/YAML) in the `_semantic_views_catalog` table. JSON is human-readable, forward-compatible with optional fields, and inspectable via DuckDB's JSON functions (`json_extract`, etc.).
-- Use serde with `#[serde(default)]` on all optional fields so new fields added in future versions don't break deserialization of old definitions.
-- Store the extension version alongside each definition. On load, if the stored version is older than the current extension, run a migration function.
-- Write migration tests from v0.1 format to v0.2 format as part of the extension upgrade process.
+- In the SQL expansion, wrap `date_trunc(...)` in a `CAST(... AS DATE)` when the source time dimension column is a `DATE` type. The model must record whether the source column is a `DATE` or `TIMESTAMP` (this metadata must be captured at definition time via `DESCRIBE` on the base table).
+- For `TIMESTAMP` source columns, keep the `date_trunc` result as `TIMESTAMP` — the VARCHAR output will serialize as a consistent format either way.
+- Add explicit tests for each combination: (`DATE` source, `month` granularity) → output is `2024-01-01`; (`TIMESTAMP` source, `month` granularity) → output is `2024-01-01 00:00:00`.
+- Confidence: HIGH (DuckDB date_trunc behavior documented in DuckDB function reference; TIMESTAMP vs DATE return confirmed by issue #9223 analysis).
 
-**Phase:** Phase 1 (catalog design). JSON + serde with versioning is the recommended approach from the start.
+**Phase assignment:** Time dimension implementation phase.
 
 ---
 
-### P3.3 — In-memory catalog and multi-connection consistency
+### P5.3 — `TIMESTAMP WITH TIME ZONE` date truncation shifts by timezone — produces wrong day boundaries
 
 **What goes wrong:**
-DuckDB supports multiple concurrent connections to the same database file. An extension that maintains its in-memory catalog (reconstructed from the persistence table at load time) is not automatically aware of changes made by other connections. Connection A creates a semantic view; connection B's in-memory catalog does not see it. Connection B deletes a semantic view; connection A's in-memory cache is stale.
+DuckDB stores `TIMESTAMPTZ` internally as UTC. When `date_trunc('day', ts_with_tz)` is called, DuckDB converts the UTC timestamp to the session's configured timezone before truncating. This means a UTC timestamp of `2024-01-01 23:00:00+00` will truncate to `2024-01-01` in UTC but to `2024-01-02` in UTC+8 (East Asia) or `2023-12-31` in UTC-5 (US East). The session timezone is a DuckDB configuration setting — if users configure different timezones, the same query returns different results.
 
-For a single-user analytical tool (DuckDB's primary use case), this may be acceptable, but it must be a conscious decision.
+This is not a DuckDB bug — it is correct timezone-aware behavior — but it is a semantic layer pitfall because:
+1. The semantic view is defined once and shared across users with different timezones.
+2. The expansion engine does not have access to the session timezone at definition time.
+3. The expanded SQL produces different results depending on who runs it.
 
 **Warning signs:**
-- Two DuckDB connections to the same file are opened; a semantic view created in one is not visible in the other.
-- A `DROP SEMANTIC VIEW` in one connection causes unexpected errors in another.
-- The extension caches the catalog at load time and never refreshes it.
+- The same semantic view query returns different daily totals in different timezones.
+- Tests using `TIMESTAMPTZ` pass in CI (UTC timezone) but fail for US-timezone users.
+- The `DuckDB` configuration setting `TimeZone` is not accounted for in time dimension expansion.
 
 **Prevention strategy:**
-- For v0.1, document the single-connection assumption explicitly. DuckDB's primary analytical use case is typically single-process.
-- Design the in-memory catalog to be reconstructable from the persistence table at any point. Avoid caching that is hard to invalidate.
-- Use DuckDB's write-ahead log (WAL) semantics: writes to the `_semantic_views_catalog` table are transactional and durable when the connection commits. This is automatic if you use a regular DuckDB table as the persistence store.
+- In v0.2.0, explicitly support only `TIMESTAMP` (naive/UTC) and `DATE` column types for time dimensions. Reject `TIMESTAMPTZ` columns at definition time with a clear error: "Time dimension columns must be TIMESTAMP (without timezone) or DATE. TIMESTAMPTZ is not supported in v0.2.0 due to timezone-dependent truncation behavior."
+- Document this limitation explicitly. TIMESTAMPTZ support requires either a per-view timezone setting or an always-UTC normalization step, both of which are deferred.
+- In CI, always verify: `SELECT current_setting('TimeZone')` returns `UTC` before running time dimension tests. Add this as a test setup assertion.
+- Confidence: HIGH (DuckDB timezone behavior for TIMESTAMPTZ confirmed in DuckDB issue #9223 and DuckDB timestamp documentation).
 
-**Phase:** Phase 1 (design decision). Document the limitation, don't solve it prematurely.
+**Phase assignment:** Time dimension implementation phase. Validation check at definition time.
 
 ---
 
-### P3.4 — DROP SEMANTIC VIEW and transaction safety
+### P5.4 — NULL timestamps in time dimension columns silently drop rows
 
 **What goes wrong:**
-`DROP SEMANTIC VIEW` must atomically remove the definition from the persistence table and the in-memory catalog. If the operation removes from one but fails on the other (e.g., a crash between the two steps), the catalog is inconsistent. The next time the extension loads, it either fails to find the in-memory entry (definition appears deleted) or fails to find the persistence entry (definition appears to exist only in memory — will be lost on next restart).
+`date_trunc('month', NULL)` returns `NULL`. If the base table has rows with NULL values in the time dimension column, those rows are silently excluded from groupings that use that time dimension — they have no bucket to fall into. This can cause metric totals to change depending on whether the time dimension is included in the query.
+
+This is correct SQL behavior, but it violates the semantic layer contract: "the metric total should be stable across different dimension combinations." A `SUM(revenue)` without time dimension should equal `SUM(revenue)` with time dimension when all non-NULL dates are included — but if some rows have NULL dates, they are excluded from the time-dimensioned query, making the totals differ.
 
 **Warning signs:**
-- `DROP SEMANTIC VIEW` is implemented as two separate steps without a transaction.
-- Tests do not cover `DROP` followed by restart followed by `CREATE` with the same name.
+- `semantic_query('view', metrics := ['total_revenue'])` returns a different total than `semantic_query('view', dimensions := ['order_month'], metrics := ['total_revenue'])` summed across all buckets.
+- The difference equals the revenue for rows with NULL order dates.
+- No error is emitted — the results are silently wrong.
 
 **Prevention strategy:**
-- Make persistence-table writes (INSERT/DELETE on `_semantic_views_catalog`) the source of truth. The in-memory catalog is derived. Update the in-memory cache only after the persistence transaction commits.
-- On extension load, always reconstruct the in-memory catalog from the persistence table. Never cache across restarts.
-- Test the `DROP` → restart → re-create sequence explicitly.
+- When a time dimension is included in the query, document that NULL values in the time column are excluded from the result. Add this as a visible note in the `describe_semantic_view()` output for time dimension columns.
+- Optionally: add a `COALESCE` wrapper in the expansion — `date_trunc('month', COALESCE(order_date, DATE '1970-01-01'))` — to bucket NULLs into a sentinel value. But this is misleading: the sentinel bucket will appear in results with a fake date. The cleaner approach is to leave NULL handling to the user and document it.
+- Write a test that includes NULL dates in the test dataset and verifies the documented behavior (NULL rows excluded from time-dimensioned queries).
+- Confidence: HIGH (standard SQL NULL behavior; not DuckDB-specific).
 
-**Phase:** Phase 2 (DDL implementation).
+**Phase assignment:** Time dimension implementation phase.
 
 ---
 
-## Part 4 — DuckDB Extension Versioning
+## Part 6 — C++/Rust FFI at the Extension Boundary
 
-### P4.1 — Extension API version vs. DuckDB version: two separate things
+### P6.1 — Memory ownership mismatch: C++ allocates, Rust frees (or vice versa)
 
 **What goes wrong:**
-DuckDB has two version numbers relevant to extensions:
-1. **DuckDB version** (e.g., `1.2.0`): the database runtime version.
-2. **Extension API version** (e.g., `v1`): a separate versioning scheme for the extension entry point ABI.
+DuckDB's C++ API passes strings and data structures as raw pointers. When the C++ shim passes a string (e.g., the query string from `parse_function`) to Rust code, and Rust stores or copies it, there are two hazards:
 
-Extensions compiled against extension API `v0` cannot load in a DuckDB runtime that requires `v1`. The extension API version is embedded in the compiled binary via the `_duckdb_extension_api_version` symbol. If this symbol is absent or returns an incompatible value, DuckDB refuses to load the extension with a version mismatch error.
+1. Rust converts a `*const c_char` to a `&str` — this is a borrow with a lifetime tied to when DuckDB frees the buffer. If DuckDB frees the buffer before the Rust code finishes using it (e.g., the Rust code queues work asynchronously), the `&str` becomes dangling.
 
-The Rust-specific failure: if you set the extension API version via a constant in your `Cargo.toml` or a build script, and that constant gets out of sync with the DuckDB C headers you compiled against, you get a runtime mismatch that is hard to diagnose.
+2. Rust allocates a `String` to hold the definition JSON and passes a `*const c_char` back to C++ (via `set_error` or similar). If C++ frees this pointer with `free()` but Rust allocated it with the Rust allocator (which may differ on Windows), the free is undefined behavior.
 
 **Warning signs:**
-- "Extension version mismatch" error when loading, even though the DuckDB version numbers look compatible.
-- The `_duckdb_extension_api_version` symbol in the compiled library returns `0` (the default from an uninitialized constant).
-- Different behavior between `LOAD '/path/to/ext'` and `INSTALL ext; LOAD ext` — the latter goes through a version check that the former may not.
+- Intermittent crashes (use-after-free) that only occur under high query load or when multiple queries are in flight.
+- Valgrind or AddressSanitizer reports "invalid read" in the shim after extension load.
+- The extension crashes on Windows but not on macOS/Linux (different default allocators).
 
 **Prevention strategy:**
-- Derive the extension API version constant from the DuckDB C headers used at compile time, not from a hardcoded Rust constant. Use a `build.rs` script that extracts the version from `duckdb_extension.h` and writes it to a generated file.
-- Test the `INSTALL; LOAD` path in CI, not just `LOAD '/path'`. The community extension registry will use `INSTALL; LOAD`.
-- When upgrading DuckDB, upgrade both the DuckDB binary AND the header files (via `duckdb-rs` version bump or manual header update) atomically.
+- For strings passed from C++ to Rust: always copy into a Rust-owned `String` immediately. Never store a `&str` that points into C++ memory across an await point or function call boundary.
+- For strings passed from Rust to C++ (e.g., error messages via `set_error`): use a `CString` that is kept alive for the duration of the C++ call, then drop it after. Do not rely on C++ to free Rust-allocated memory.
+- If DuckDB's API requires passing a heap-allocated string that DuckDB will free: use `libc::malloc` to allocate it so `free()` is the correct deallocation, not Rust's allocator. Or arrange for DuckDB to copy the string immediately (verify with DuckDB API documentation whether `set_error` copies its argument or stores a pointer).
+- Confidence: HIGH (standard C/Rust FFI memory ownership requirements; Rustonomicon FFI chapter).
 
-**Phase:** Phase 1 (build scaffold). Phase 3 (pre-release validation).
+**Phase assignment:** C++ shim scaffold phase. Establish ownership protocol before writing any logic.
 
 ---
 
-### P4.2 — Extension must be rebuilt for every supported DuckDB release
+### P6.2 — `unsafe` Rust in FFI callbacks is not covered by existing fuzz targets
 
 **What goes wrong:**
-The DuckDB community extension registry builds separate extension binaries for each supported DuckDB release (e.g., `1.1.x`, `1.2.x`). There is no forward compatibility — an extension binary for DuckDB 1.1 does not load in DuckDB 1.2. This means every time DuckDB releases a new version, you must submit a new extension build. If your extension has not been rebuilt for the latest DuckDB release, users on that version cannot install it.
+The v0.1.0 extension already has a known gap: the FFI execution layer (`execute_sql_raw`, `read_varchar_from_vector`) is not fuzz-covered because the loadable-extension function pointers are only initialized at DuckDB runtime. The C++ shim introduces new `unsafe` Rust code in:
 
-This creates an ongoing maintenance burden that is easy to underestimate at project start.
+- Parser callback functions (converting C pointers to Rust types)
+- The `plan_function` result construction (writing DuckDB result types from Rust)
+- The `pragma_query_t` string construction (reading parameters from C API)
+
+These functions will be called from DuckDB's parse/plan path, which is triggered by user-supplied SQL. A malformed `CREATE SEMANTIC VIEW` statement could reach this path.
 
 **Warning signs:**
-- Your extension is only tested against one DuckDB version in CI.
-- You don't have an automated process to rebuild and resubmit for each new DuckDB release.
-- User bug reports mention "extension not found" for a DuckDB version you have not targeted.
+- The new C++ shim code has more `unsafe {}` blocks than the v0.1.0 codebase.
+- No fuzz target covers the `parse_function` or `plan_function` call paths.
+- The CI test suite does not include malformed `CREATE SEMANTIC VIEW` statements as negative test cases.
 
 **Prevention strategy:**
-- Set up a CI matrix from day one: test against the last two DuckDB stable releases and the current RC/nightly (if available). Use GitHub Actions matrix builds.
-- Follow the `duckdb/community-extensions` contribution process, which handles multi-version builds via the registry CI. Once your extension is in the registry, the registry CI handles rebuilds for new DuckDB releases (with a PR to update the DuckDB version pin).
-- Monitor the DuckDB release schedule. New minor releases happen roughly quarterly.
+- Add a fuzz target `fuzz_create_ddl` that generates random SQL strings starting with `CREATE SEMANTIC VIEW` and feeds them through the Rust-side parse logic. The fuzz target cannot test the full C++ callback chain (requires DuckDB runtime) but can test the definition JSON parsing and SQL string construction logic.
+- For the full integration path: add SQLLogicTest negative test cases covering: empty view name, invalid granularity, missing base table, SQL injection attempts in field names.
+- Each `unsafe` block in the C++ shim FFI code should have a comment explaining the safety invariant being upheld and the DuckDB API guarantee that ensures the invariant.
+- Confidence: HIGH (v0.1.0 TECH-DEBT.md explicitly documents this gap; C++ shim amplifies it).
 
-**Phase:** Phase 3 (pre-release) through ongoing maintenance.
+**Phase assignment:** Hardening phase (after C++ shim is functional). Do not defer past the first CI run of the shim.
 
 ---
 
-### P4.3 — Autoload and trust model
-
-**What goes works:**
-DuckDB 0.10+ introduced autoload: extensions registered in the official or community registry are automatically loaded when a SQL statement references them. For the community extension registry, extensions must be signed by the DuckDB team's key. Unsigned extensions require `SET allow_unsigned_extensions = true`, which is not enabled by default.
+### P6.3 — Double initialization if extension is loaded twice in the same session
 
 **What goes wrong:**
-If you distribute the extension outside the registry (e.g., users download the `.duckdb_extension` binary directly from GitHub releases), they must enable unsigned extension loading. This is a friction point and a potential security concern for enterprise users. Worse, if your GitHub release binary is not built with the correct extension API version for the user's DuckDB installation, the error message ("unsigned extension" vs "version mismatch") is confusing.
+DuckDB's extension loader calls the entrypoint function once per database session. However, if a user calls `LOAD 'semantic_views'` twice (or if the extension is both autoloaded and manually loaded), the Rust initialization code runs a second time. The v0.1.0 code calls `init_catalog`, which creates the `semantic_layer` schema and `_definitions` table — this is idempotent (`CREATE SCHEMA IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS`). But the C++ shim adds `AddParserExtension` to register the parser hook. Calling `AddParserExtension` twice registers two copies of the hook. Both fire for every query, the second one processes what the first already handled (a statement that was already parsed), and the behavior is undefined.
 
 **Warning signs:**
-- Users report "Extension is not trusted" or "allow_unsigned_extensions" errors.
-- You are distributing extension binaries outside the community extension registry.
-- The README does not explain the trust model.
+- After `LOAD 'semantic_views'` is called twice, `CREATE SEMANTIC VIEW` is processed twice (or errors on the second processing attempt).
+- The `CREATE SEMANTIC VIEW` result set contains two rows.
+- Fuzz or stress tests that reload the extension between tests see inconsistent behavior.
 
 **Prevention strategy:**
-- Target the community extension registry as the primary distribution channel. This is the only way to get signed, autoloadable extensions.
-- For development and testing, document the `SET allow_unsigned_extensions = true; LOAD '/path'` workflow clearly.
-- Do not rely on GitHub Releases as a primary distribution mechanism — use it only as a fallback with clear documentation of the trust requirement.
+- In the C++ `LoadInternal` function (called by DuckDB's extension loader): check if the parser extension is already registered before calling `AddParserExtension`. Maintain a static boolean `semantic_views_parser_registered` (with thread-safe initialization using `std::once_flag`) that prevents double registration.
+- Alternatively, rely on DuckDB's extension loader guarantee: the entrypoint is called exactly once per database handle lifetime. Document this assumption. If violated, the static guard is the safety net.
+- Add a test: explicitly call `LOAD 'semantic_views'` twice in a test script and verify that `CREATE SEMANTIC VIEW` works exactly once and `list_semantic_views()` returns one row.
+- Confidence: MEDIUM (DuckDB extension loader is expected to call entrypoint once; the double-registration hazard is inferred from how AddParserExtension works in DuckDB's parser source).
 
-**Phase:** Phase 3 (pre-release). Design for registry distribution from the start.
+**Phase assignment:** C++ shim scaffold phase. Establish the guard pattern before the first integration test.
 
 ---
 
@@ -438,20 +457,68 @@ If you distribute the extension outside the registry (e.g., users download the `
 
 | Phase | Critical Pitfalls | Why |
 |-------|-------------------|-----|
-| Phase 1 (Project Scaffold) | P1.1 ABI lock, P1.2 duckdb-rs coverage, P1.3 parser hook design, P1.4 build system, P1.5 registry requirements, P3.1 persistence model, P3.2 serialization format, P4.1 API version | Foundational architectural decisions; wrong choices here require expensive rework |
-| Phase 2 (Expansion Engine) | P2.1 GROUP BY correctness, P2.2 non-additive metrics, P2.3 join fan-out, P2.4 WHERE placement, P2.5 identifier quoting, P2.6 time granularity, P2.7 schema evolution, P3.4 DROP safety | Correctness requirements that gate the MVP |
-| Phase 3 (Pre-release) | P1.5 registry process, P4.2 multi-version builds, P4.3 trust model | Distribution and maintenance concerns |
+| C++ Shim Scaffold | P1.1 (build inversion), P1.2 (symbol bloat), P1.3 (unwind/TLS conflict), P6.1 (memory ownership), P6.3 (double init) | Foundational; wrong choices require complete rework of the build and FFI layer |
+| Parser Hook | P2.1 (parse_function vs parser_override), P2.2 (plan_function returns TableFunction), P2.3 (global registration, fallback mode) | Parser bugs affect all users and all queries; hard to debug after the fact |
+| pragma_query_t | P3.1 (SQL-not-result semantics), P3.2 (rollback discrepancy), P3.3 (SQL literal escaping) | Persistence bugs cause silent data loss or corruption |
+| EXPLAIN Hook | P4.1 (no stable hook exists), P4.2 (fires for all EXPLAIN) | Scope correctness prevents wasted implementation effort |
+| Time Dimensions | P5.1 (ISO week convention), P5.2 (DATE vs TIMESTAMP return type), P5.3 (TIMESTAMPTZ timezone dependence), P5.4 (NULL silent exclusion) | All are silent correctness failures — no error, wrong answer |
+| Hardening | P6.2 (fuzz gap amplified by C++ shim) | Security and correctness; should not be deferred to v0.3.0 |
+
+---
+
+## Phase-Specific Warnings
+
+| Phase Topic | Likely Pitfall | Mitigation |
+|-------------|---------------|------------|
+| C++ shim, first CMake build | P1.1 — footer injected twice | Delete Cargo-primary packaging before adding CMake |
+| Linking Rust staticlib | P1.2 — symbol bloat | Add version script before first CI build |
+| Parser callback error path | P1.3 — panic unwinds through C++ | `catch_unwind` wrapper on every Rust function called from C++ |
+| `CREATE SEMANTIC VIEW` from CLI vs Python | P2.1 — trailing semicolon mismatch | Normalize query string before pattern match |
+| Parser hook registration | P2.3 — breaks all SQL if wrong mode | Use FALLBACK_OVERRIDE, fast-exit on non-matching statements |
+| pragma_query_t returns SQL | P3.1 — SQL not result | Model on FTS extension's `CreateFTSIndexQuery` pattern |
+| Rollback of CREATE SEMANTIC VIEW | P3.2 — in-memory/persistent discrepancy | Defer in-memory update until after commit |
+| View name with SQL chars | P3.3 — single-quote injection | Escape with doubled quotes, dedicated test |
+| `EXPLAIN semantic_query(...)` | P4.1 — no stable hook | Use parser_override rewrite to explain_semantic_view() |
+| EXPLAIN override | P4.2 — captures all EXPLAIN | Two-stage check: starts with EXPLAIN + contains semantic_query( |
+| Week granularity | P5.1 — ISO week convention | Document ISO convention, test year-end boundary |
+| date_trunc on DATE column | P5.2 — returns TIMESTAMP | Add CAST(... AS DATE) in expansion for DATE source columns |
+| TIMESTAMPTZ time dimensions | P5.3 — timezone-dependent results | Reject TIMESTAMPTZ at definition time in v0.2.0 |
+| NULL in time column | P5.4 — silent row exclusion | Document, add test with NULL dates in dataset |
+| C++ shim unsafe code | P6.2 — not fuzz covered | Add fuzz_create_ddl target in hardening phase |
+| Extension loaded twice | P6.3 — double parser registration | `std::once_flag` guard in LoadInternal |
 
 ---
 
 ## Research Notes
 
-This document is based on:
-- DuckDB extension API documentation and community extension registry requirements (as of DuckDB 1.x)
-- Cube.dev pre-aggregation matching algorithm (sourced from `_notes/semantic-views-duckdb-design-doc.md`)
-- Snowflake semantic view design patterns (sourced from `_notes/semantic-views-duckdb-design-doc.md`)
-- Rust FFI/C interop patterns for shared library extension development
-- General semantic layer implementation experience (dbt Semantic Layer, Metriql, LookML)
-- Project requirements from `.planning/PROJECT.md`
+**Confidence assessment:**
 
-Web access was not available during this research session. Specific DuckDB version numbers, registry API details, and `duckdb-rs` crate status should be verified against current documentation before implementation begins.
+| Area | Confidence | Basis |
+|------|------------|-------|
+| Build system inversion (P1.1) | MEDIUM | Inferred from extension-template-rs vs extension-template architecture; no direct "how to convert" documentation found |
+| Symbol bloat (P1.2) | MEDIUM | Documented Rust language issue (#33221, #73295); DuckDB-specific version script pattern is inferred |
+| Unwind/TLS (P1.3) | HIGH | Rust RFC 2945, Rustonomicon, catch_unwind documentation |
+| parser_override vs parse_function (P2.1) | MEDIUM | DuckDB parser.cpp source analysis; semicolon inconsistency confirmed in issue #18485 |
+| plan_function returns TableFunction (P2.2) | MEDIUM | FTS extension pattern analysis; DuckDB parser.cpp source |
+| Global parser registration (P2.3) | MEDIUM | DuckDB parser.cpp override mode enum analysis |
+| pragma_query_t SQL semantics (P3.1) | MEDIUM | FTS extension implementation (CreateFTSIndexQuery pattern confirmed); `pragma_query_t` type confirmed in DuckDB source |
+| Rollback discrepancy (P3.2) | MEDIUM | DuckDB transaction model documentation; architectural inference |
+| SQL literal escaping (P3.3) | HIGH | Standard SQL escaping; no DuckDB specifics needed |
+| No stable EXPLAIN hook (P4.1) | MEDIUM | Absence of evidence in extension API, community extensions, duckdb-cpp-api; cannot confirm definitively without testing |
+| Time granularity pitfalls (P5.1–P5.4) | HIGH | DuckDB function documentation, ISO 8601 standard, confirmed DuckDB issue #9223 |
+| Memory ownership (P6.1) | HIGH | Standard C/Rust FFI; Rustonomicon |
+| Fuzz gap (P6.2) | HIGH | Directly stated in v0.1.0 TECH-DEBT.md |
+| Double init (P6.3) | MEDIUM | DuckDB extension loader behavior inferred from architecture; std::once_flag pattern is standard |
+
+**Sources consulted:**
+- DuckDB parser source: `duckdb/src/parser/parser.cpp` (GitHub)
+- DuckDB extension issues: #18485 (semicolon handling), #9223 (date_trunc timezone)
+- DuckDB community extensions issue #54 (Rust extension development guidance)
+- DuckDB duckdb-rs issue #370 (C API extension for Rust)
+- Rust RFC 2945 (c-unwind-abi), RFC 2797 (ffi-unwind project)
+- Rust language issues: #33221 (staticlib symbol bloat), #73295 (symbol export from staticlib)
+- DuckDB FTS extension (duckdb/duckdb-fts): CreateFTSIndexQuery pattern
+- CIDR 2025 paper: "Runtime-Extensible Parsers" (Mühleisen and Raasveldt)
+- DuckDB timestamp documentation and timezone guide
+- v0.1.0 TECH-DEBT.md (this project)
+- v0.1.0 src/lib.rs (this project) — manual FFI entrypoint reference
