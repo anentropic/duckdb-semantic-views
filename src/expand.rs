@@ -489,6 +489,7 @@ mod tests {
                 ],
                 filters: vec![],
                 joins: vec![],
+                facts: vec![],
             }
         }
 
@@ -632,6 +633,7 @@ GROUP BY
                 }],
                 filters: vec![],
                 joins: vec![],
+                facts: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["col".to_string()],
@@ -662,6 +664,7 @@ GROUP BY
                 }],
                 filters: vec![],
                 joins: vec![],
+                facts: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["month".to_string()],
@@ -752,6 +755,7 @@ FROM \"_base\"";
                 }],
                 filters: vec![],
                 joins: vec![],
+                facts: vec![],
             };
             // Request uses lowercase "region" but definition has "Region"
             let req = QueryRequest {
@@ -885,6 +889,7 @@ FROM \"_base\"";
                 }],
                 filters: vec![],
                 joins: vec![],
+                facts: vec![],
             };
             // Request uses lowercase "total_revenue" but definition has "Total_Revenue"
             let req = QueryRequest {
@@ -982,7 +987,9 @@ FROM \"_base\"";
                 joins: vec![Join {
                     table: "customers".to_string(),
                     on: "orders.customer_id = customers.id".to_string(),
+                    from_cols: vec![],
                 }],
+                facts: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["customer_name".to_string()],
@@ -1022,7 +1029,9 @@ FROM \"_base\"";
                 joins: vec![Join {
                     table: "customers".to_string(),
                     on: "orders.customer_id = customers.id".to_string(),
+                    from_cols: vec![],
                 }],
+                facts: vec![],
             };
             // Request only "region" which comes from base table
             let req = QueryRequest {
@@ -1057,7 +1066,9 @@ FROM \"_base\"";
                 joins: vec![Join {
                     table: "customers".to_string(),
                     on: "orders.customer_id = customers.id".to_string(),
+                    from_cols: vec![],
                 }],
+                facts: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
@@ -1089,12 +1100,15 @@ FROM \"_base\"";
                     Join {
                         table: "customers".to_string(),
                         on: "orders.customer_id = customers.id".to_string(),
+                        from_cols: vec![],
                     },
                     Join {
                         table: "regions".to_string(),
                         on: "customers.region_id = regions.id".to_string(),
+                        from_cols: vec![],
                     },
                 ],
+                facts: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["region_name".to_string()],
@@ -1134,12 +1148,15 @@ FROM \"_base\"";
                     Join {
                         table: "customers".to_string(),
                         on: "orders.customer_id = customers.id".to_string(),
+                        from_cols: vec![],
                     },
                     Join {
                         table: "regions".to_string(),
                         on: "customers.region_id = regions.id".to_string(),
+                        from_cols: vec![],
                     },
                 ],
+                facts: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["region_name".to_string()],
@@ -1175,6 +1192,7 @@ FROM \"_base\"";
                 }],
                 filters: vec![],
                 joins: vec![],
+                facts: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
@@ -1206,6 +1224,7 @@ FROM \"_base\"";
                 }],
                 filters: vec![],
                 joins: vec![],
+                facts: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["status".to_string()],
@@ -1240,7 +1259,9 @@ FROM \"_base\"";
                 joins: vec![Join {
                     table: "jaffle.raw_customers".to_string(),
                     on: "raw_orders.customer_id = raw_customers.id".to_string(),
+                    from_cols: vec![],
                 }],
+                facts: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["customer_name".to_string()],
@@ -1284,12 +1305,15 @@ FROM \"_base\"";
                     Join {
                         table: "customers".to_string(),
                         on: "orders.customer_id = customers.id".to_string(),
+                        from_cols: vec![],
                     },
                     Join {
                         table: "products".to_string(),
                         on: "orders.product_id = products.id".to_string(),
+                        from_cols: vec![],
                     },
                 ],
+                facts: vec![],
             };
             // Request base-table "region" AND joined "customer_name"
             let req = QueryRequest {
@@ -1340,6 +1364,7 @@ FROM \"_base\"";
                 }],
                 filters: vec![],
                 joins: vec![],
+                facts: vec![],
             }
         }
 
@@ -1414,6 +1439,7 @@ FROM \"_base\"";
                 metrics: vec![],
                 filters: vec![],
                 joins: vec![],
+                facts: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["d".to_string()],

@@ -32,22 +32,42 @@ pub struct Metric {
     pub source_table: Option<String>,
 }
 
+/// A named raw SQL column expression — a pre-aggregation fact, scoped to a table alias.
+/// Added in Phase 11 for the FACTS clause of CREATE SEMANTIC VIEW.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct Fact {
+    pub name: String,
+    pub expr: String,
+    /// Which table alias this fact is scoped to.
+    #[serde(default)]
+    pub source_table: Option<String>,
+}
+
 /// A JOIN relationship between the base table and another source table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Join {
     pub table: String,
+    /// Legacy field (Phase 10 and earlier): raw SQL ON clause.
+    /// Kept for backward compat with stored JSON. Not written by Phase 11 DDL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub on: String,
+    /// New field (Phase 11): FK column names from this table to the base table.
+    /// Set by CREATE SEMANTIC VIEW RELATIONSHIPS clause.
+    #[serde(default)]
+    pub from_cols: Vec<String>,
 }
 
 /// Top-level definition of a semantic view.
 ///
 /// Stored as JSON in `semantic_layer._definitions`.
 /// Required fields: `base_table`, `dimensions`, `metrics`.
-/// Optional fields: `filters` (defaults to []), `joins` (defaults to []).
+/// Optional fields: `filters` (defaults to []), `joins` (defaults to []), `facts` (defaults to []).
+/// Note: `deny_unknown_fields` is intentionally NOT set — old stored JSON with extra
+/// fields (e.g., from future schema changes) must still load without error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-#[serde(deny_unknown_fields)]
 pub struct SemanticViewDefinition {
     pub base_table: String,
     pub dimensions: Vec<Dimension>,
@@ -56,6 +76,8 @@ pub struct SemanticViewDefinition {
     pub filters: Vec<String>,
     #[serde(default)]
     pub joins: Vec<Join>,
+    #[serde(default)]
+    pub facts: Vec<Fact>,
 }
 
 impl SemanticViewDefinition {
@@ -132,12 +154,6 @@ mod tests {
     #[test]
     fn invalid_json_is_error() {
         assert!(SemanticViewDefinition::from_json("test", "{not json}").is_err());
-    }
-
-    #[test]
-    fn unknown_fields_are_rejected() {
-        let json = r#"{"base_table": "t", "dimensions": [], "metrics": [], "extra": 1}"#;
-        assert!(SemanticViewDefinition::from_json("test", json).is_err());
     }
 
     #[test]
@@ -252,6 +268,78 @@ mod tests {
                 SemanticViewDefinition::from_json("orders", &json)
                     .unwrap_or_else(|e| panic!("granularity '{gran}' rejected: {e}"));
             }
+        }
+    }
+
+    mod phase11_model_tests {
+        use super::*;
+
+        #[test]
+        fn fact_roundtrip() {
+            // Fact with source_table
+            let json = r#"{"name":"rev","expr":"amount","source_table":"orders"}"#;
+            let fact: Fact = serde_json::from_str(json).unwrap();
+            assert_eq!(fact.name, "rev");
+            assert_eq!(fact.expr, "amount");
+            assert_eq!(fact.source_table.as_deref(), Some("orders"));
+
+            // Fact without source_table — defaults to None
+            let json2 = r#"{"name":"total","expr":"price * qty"}"#;
+            let fact2: Fact = serde_json::from_str(json2).unwrap();
+            assert_eq!(fact2.name, "total");
+            assert!(fact2.source_table.is_none());
+        }
+
+        #[test]
+        fn join_old_format_backwards_compat() {
+            // Old Join with `on` field (Phase 10 and earlier format)
+            let json = r#"{"table":"customers","on":"a.id=b.id"}"#;
+            let join: Join = serde_json::from_str(json).unwrap();
+            assert_eq!(join.table, "customers");
+            assert_eq!(join.on, "a.id=b.id");
+            assert!(join.from_cols.is_empty(), "from_cols should default to []");
+        }
+
+        #[test]
+        fn join_new_format() {
+            // New Join with `from_cols` (Phase 11 format)
+            let json = r#"{"table":"customers","from_cols":["customer_id"]}"#;
+            let join: Join = serde_json::from_str(json).unwrap();
+            assert_eq!(join.table, "customers");
+            assert_eq!(join.on, "", "on should default to empty string");
+            assert_eq!(join.from_cols, vec!["customer_id"]);
+        }
+
+        #[test]
+        fn definition_with_facts() {
+            let json = r#"{
+                "base_table": "orders",
+                "dimensions": [],
+                "metrics": [],
+                "facts": [{"name":"unit_price","expr":"amount / qty","source_table":"orders"}]
+            }"#;
+            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+            assert_eq!(def.facts.len(), 1);
+            assert_eq!(def.facts[0].name, "unit_price");
+            assert_eq!(def.facts[0].expr, "amount / qty");
+            assert_eq!(def.facts[0].source_table.as_deref(), Some("orders"));
+        }
+
+        #[test]
+        fn definition_without_facts_defaults_empty() {
+            let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+            assert!(def.facts.is_empty(), "facts should default to []");
+        }
+
+        #[test]
+        fn unknown_fields_are_allowed() {
+            // deny_unknown_fields removed — old stored JSON with extra fields must load
+            let json = r#"{"base_table": "t", "dimensions": [], "metrics": [], "extra": 1}"#;
+            assert!(
+                SemanticViewDefinition::from_json("test", json).is_ok(),
+                "unknown fields must not cause rejection after deny_unknown_fields removal"
+            );
         }
     }
 }

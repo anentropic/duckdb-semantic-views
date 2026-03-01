@@ -136,6 +136,119 @@ pub fn catalog_delete(
     Ok(())
 }
 
+/// Write or overwrite a semantic view definition in the in-memory catalog.
+///
+/// Unlike `catalog_insert`, this does not error on duplicates — it replaces
+/// any existing definition for `name`.
+///
+/// Returns an error if the JSON is invalid.
+pub fn catalog_upsert(
+    state: &CatalogState,
+    name: &str,
+    json: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    SemanticViewDefinition::from_json(name, json).map_err(Box::<dyn std::error::Error>::from)?;
+    state
+        .write()
+        .unwrap()
+        .insert(name.to_string(), json.to_string());
+    Ok(())
+}
+
+/// Remove a semantic view definition from the in-memory catalog if it exists.
+///
+/// Unlike `catalog_delete`, this silently succeeds when the view does not exist.
+pub fn catalog_delete_if_exists(state: &CatalogState, name: &str) {
+    state.write().unwrap().remove(name);
+}
+
+/// FFI-callable catalog mutation functions — called from the C++ parser hook scan function.
+///
+/// These functions are gated on the `extension` feature so they are not included in
+/// standalone test binaries (which cannot use the loadable-extension C API stubs).
+///
+/// All functions take an opaque `*const CatalogState` pointer (the Rust Arc<RwLock<HashMap>>)
+/// and return 0 on success, -1 on error.
+#[cfg(feature = "extension")]
+mod ffi_catalog {
+    use super::*;
+    use std::ffi::c_char;
+
+    unsafe fn str_from_ptr<'a>(ptr: *const c_char) -> Option<&'a str> {
+        if ptr.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(ptr).to_str().ok()
+    }
+
+    /// Insert a new semantic view into the in-memory catalog.
+    /// Returns 0 on success, -1 if pointer null / json invalid / duplicate.
+    #[no_mangle]
+    pub unsafe extern "C" fn semantic_views_catalog_insert(
+        catalog_ptr: *const CatalogState,
+        name_ptr: *const c_char,
+        json_ptr: *const c_char,
+    ) -> i32 {
+        let Some(state) = catalog_ptr.as_ref() else {
+            return -1;
+        };
+        let (Some(name), Some(json)) = (str_from_ptr(name_ptr), str_from_ptr(json_ptr)) else {
+            return -1;
+        };
+        catalog_insert(state, name, json).map(|_| 0).unwrap_or(-1)
+    }
+
+    /// Upsert a semantic view in the in-memory catalog.
+    /// Returns 0 on success, -1 if pointer null or json invalid.
+    #[no_mangle]
+    pub unsafe extern "C" fn semantic_views_catalog_upsert(
+        catalog_ptr: *const CatalogState,
+        name_ptr: *const c_char,
+        json_ptr: *const c_char,
+    ) -> i32 {
+        let Some(state) = catalog_ptr.as_ref() else {
+            return -1;
+        };
+        let (Some(name), Some(json)) = (str_from_ptr(name_ptr), str_from_ptr(json_ptr)) else {
+            return -1;
+        };
+        catalog_upsert(state, name, json).map(|_| 0).unwrap_or(-1)
+    }
+
+    /// Delete a semantic view from the in-memory catalog.
+    /// Returns 0 on success, -1 if not found.
+    #[no_mangle]
+    pub unsafe extern "C" fn semantic_views_catalog_delete(
+        catalog_ptr: *const CatalogState,
+        name_ptr: *const c_char,
+    ) -> i32 {
+        let Some(state) = catalog_ptr.as_ref() else {
+            return -1;
+        };
+        let Some(name) = str_from_ptr(name_ptr) else {
+            return -1;
+        };
+        catalog_delete(state, name).map(|_| 0).unwrap_or(-1)
+    }
+
+    /// Delete a semantic view if it exists; silently succeeds if absent.
+    /// Returns 0 always (unless null pointer, which returns -1).
+    #[no_mangle]
+    pub unsafe extern "C" fn semantic_views_catalog_delete_if_exists(
+        catalog_ptr: *const CatalogState,
+        name_ptr: *const c_char,
+    ) -> i32 {
+        let Some(state) = catalog_ptr.as_ref() else {
+            return -1;
+        };
+        let Some(name) = str_from_ptr(name_ptr) else {
+            return -1;
+        };
+        catalog_delete_if_exists(state, name);
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +368,57 @@ mod tests {
         let state2 = init_catalog(&con, ":memory:").unwrap();
         assert!(state2.read().unwrap().contains_key("orders"));
         drop(state);
+    }
+
+    #[test]
+    fn upsert_inserts_when_absent() {
+        let con = in_memory_con();
+        let state = init_catalog(&con, ":memory:").unwrap();
+        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+        catalog_upsert(&state, "orders", json).unwrap();
+        let guard = state.read().unwrap();
+        assert_eq!(guard.get("orders").map(String::as_str), Some(json));
+    }
+
+    #[test]
+    fn upsert_replaces_when_present() {
+        let con = in_memory_con();
+        let state = init_catalog(&con, ":memory:").unwrap();
+        let json1 = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+        let json2 = r#"{"base_table":"orders","dimensions":[{"name":"region","expr":"region"}],"metrics":[]}"#;
+        catalog_upsert(&state, "orders", json1).unwrap();
+        catalog_upsert(&state, "orders", json2).unwrap();
+        let guard = state.read().unwrap();
+        assert_eq!(guard.get("orders").map(String::as_str), Some(json2));
+    }
+
+    #[test]
+    fn upsert_rejects_invalid_json() {
+        let con = in_memory_con();
+        let state = init_catalog(&con, ":memory:").unwrap();
+        let result = catalog_upsert(&state, "orders", "{invalid json}");
+        assert!(result.is_err());
+        // Catalog must remain unchanged
+        assert!(!state.read().unwrap().contains_key("orders"));
+    }
+
+    #[test]
+    fn delete_if_exists_removes() {
+        let con = in_memory_con();
+        let state = init_catalog(&con, ":memory:").unwrap();
+        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+        catalog_insert(&state, "orders", json).unwrap();
+        catalog_delete_if_exists(&state, "orders");
+        assert!(!state.read().unwrap().contains_key("orders"));
+    }
+
+    #[test]
+    fn delete_if_exists_silent_when_absent() {
+        let con = in_memory_con();
+        let state = init_catalog(&con, ":memory:").unwrap();
+        // Should not panic or error
+        catalog_delete_if_exists(&state, "nonexistent");
+        assert!(state.read().unwrap().is_empty());
     }
 
     #[test]
