@@ -1,18 +1,18 @@
-# Phase 2 restart/persistence integration test (DDL-05).
+# Phase 10 restart/persistence integration test (PERSIST-01, PERSIST-02).
 #
-# Extracted from phase2_ddl.test to isolate the `restart` directive, which
-# fails on Windows due to aggressive file locking (IOException: "Cannot open
-# file ... being used by another process").
+# Verifies that semantic view definitions persist across restart via
+# DuckDB-native table storage (semantic_layer._definitions). No companion
+# file is involved — the table is part of the DuckDB WAL and persists
+# across restarts automatically.
 #
-# NOTE: `require notwindows` in the Python sqllogictest runner (used by
-# extension-ci-tools) currently skips on ALL platforms because the runner
-# lacks OS detection. Restart persistence IS independently verified by
-# Rust integration tests (cargo test). When/if the Python runner adds
-# platform detection, this test will automatically start running on
-# Linux and macOS.
+# NOTE: `require notwindows` — the Python sqllogictest runner currently
+# skips on ALL platforms. Restart persistence is independently verified
+# by Rust integration tests (cargo test). When the runner adds platform
+# detection, this test will run on Linux and macOS.
 #
 # Requirements covered:
-#   DDL-05: persistence across restart
+#   PERSIST-01: definitions persist via DuckDB table (no companion file)
+#   PERSIST-02: ROLLBACK reverts definition change in the table
 
 require semantic_views
 
@@ -20,15 +20,14 @@ require notwindows
 
 load __TEST_DIR__/restart_test.db
 
-# Idempotent cleanup: if a previous run left state behind via the sidecar file,
-# init_catalog will have already loaded the view. Drop it before re-defining.
+# Idempotent cleanup: drop any leftover view from a previous run
 statement ok
 SELECT CASE WHEN (SELECT count(*) FROM list_semantic_views() WHERE name = 'restart_test') > 0
        THEN drop_semantic_view('restart_test')
        ELSE 'no-op'
 END;
 
-# Define a view in the file-backed database
+# Define a view in the file-backed database (PERSIST-01)
 statement ok
 SELECT define_semantic_view(
     'restart_test',
@@ -43,17 +42,32 @@ restart_test	events
 
 restart
 
-# After restart the extension is reloaded automatically; init_catalog reads
-# semantic_layer._definitions from the file-backed DB. The view defined before
-# restart must be present in the catalog.
+# After restart the extension is reloaded; init_catalog loads from
+# semantic_layer._definitions (DuckDB table, persisted via WAL).
+# The view defined before restart must be present.
 query TT rowsort
 SELECT name, base_table FROM list_semantic_views();
 ----
 restart_test	events
 
-# Clean up: drop the view so the sidecar file is emptied.
-# Without this, the sidecar persists across test runs and causes
-# "already exists" errors on the next invocation.
+# PERSIST-02: PRAGMA define_semantic_view_internal is transaction-aware.
+# BEGIN + PRAGMA + ROLLBACK must leave the catalog table unchanged.
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA define_semantic_view_internal('rollback_test', '{"base_table":"t","dimensions":[],"metrics":[]}');
+
+statement ok
+ROLLBACK;
+
+# rollback_test must NOT be present after ROLLBACK
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'rollback_test';
+----
+0
+
+# Clean up: drop the restart_test view
 statement ok
 SELECT drop_semantic_view('restart_test');
 
