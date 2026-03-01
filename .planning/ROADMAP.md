@@ -72,7 +72,12 @@ Plans:
   1. A semantic view defined in one DuckDB session is still queryable after closing and reopening the database — no `.semantic_views` file exists on disk
   2. `BEGIN; PRAGMA define_semantic_view_internal(...); ROLLBACK;` leaves the catalog unchanged — both the persistent table and in-memory catalog reflect the pre-transaction state
   3. No reference to sidecar file logic exists anywhere in the codebase — `grep -r "semantic_views"` on file paths returns nothing
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+- [ ] 10-01-PLAN.md — C++ shim pragma registration + semantic_views_pragma_define/drop C functions + Rust FFI declarations in mod.rs
+- [ ] 10-02-PLAN.md — Replace write_sidecar in define.rs/drop.rs with pragma FFI write-first pattern; lib.rs creates persist_conn
+- [ ] 10-03-PLAN.md — Delete sidecar functions from catalog.rs, add migration, update test files, delete physical sidecar data files
 
 ### Phase 11: CREATE SEMANTIC VIEW Parser Hook
 **Goal**: Users can create and drop semantic views using native SQL DDL syntax (`CREATE SEMANTIC VIEW`, `DROP SEMANTIC VIEW`)
