@@ -58,3 +58,6 @@ missing_panics_doc = "allow"
 
 [lints]
 workspace = true
+
+[build-dependencies]
+cc = "1.2"

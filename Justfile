@@ -91,6 +91,15 @@ fuzz-all time="300":
 fuzz-cmin target="fuzz_json_parse":
     cargo +nightly fuzz cmin {{target}}
 
+# Re-vendor DuckDB C++ headers from the cargo build cache (run after DuckDB version bump)
+# Requires `cargo test` to have been run at least once to unpack the bundled source.
+update-headers:
+    @echo "Copying DuckDB headers from cargo build cache..."
+    @SRC=$$(find target/debug/build/libduckdb-sys-*/out/duckdb/src/include/ -maxdepth 0 -type d 2>/dev/null | head -1); \
+    if [ -z "$$SRC" ]; then echo "ERROR: Run 'cargo test' first to unpack DuckDB headers"; exit 1; fi; \
+    cp -r "$$SRC/." duckdb_capi/; \
+    echo "Headers copied from $$SRC"
+
 # Clean build artifacts
 clean:
     make clean
