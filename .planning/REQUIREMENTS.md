@@ -23,7 +23,7 @@ Requirements for milestone v0.2.0 — Native DDL + Time Dimensions. Each maps to
 - [ ] **DDL-02**: User can drop a semantic view with `DROP SEMANTIC VIEW` SQL syntax
 - [x] **DDL-03**: `CREATE OR REPLACE SEMANTIC VIEW` overwrites an existing definition
 - [x] **DDL-04**: Native DDL supports all capabilities of `define_semantic_view()` (dimensions, metrics, joins, filters)
-- [ ] **DDL-05**: `define_semantic_view()` and `drop_semantic_view()` functions removed after native DDL is validated
+- [x] **DDL-05**: `define_semantic_view()` and `drop_semantic_view()` functions removed after native DDL is validated
 - [ ] **DDL-06**: Non-semantic-view SQL is unaffected by parser hook (no regression)
 
 ### Time Dimensions
@@ -90,7 +90,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DDL-02 | Phase 11 | Pending |
 | DDL-03 | Phase 11 | Complete |
 | DDL-04 | Phase 11 | Complete |
-| DDL-05 | Phase 11 | Pending |
+| DDL-05 | Phase 11 | Complete |
 | DDL-06 | Phase 11 | Pending |
 | EXPL-01 | Phase 12 | Pending |
 | OUT-01 | Phase 12 | Pending |

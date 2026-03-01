@@ -121,5 +121,5 @@ Plans:
 | 8. C++ Shim Infrastructure | v0.2.0 | 2/2 | Complete | 2026-03-01 |
 | 9. Time Dimensions | v0.2.0 | 0/? | Not started | - |
 | 10. pragma_query_t Catalog Persistence | 3/3 | Complete    | 2026-03-01 | - |
-| 11. CREATE SEMANTIC VIEW Parser Hook | 1/4 | In Progress|  | - |
+| 11. CREATE SEMANTIC VIEW Parser Hook | 2/4 | In Progress|  | - |
 | 12. EXPLAIN + Typed Output | v0.2.0 | 0/? | Not started | - |
