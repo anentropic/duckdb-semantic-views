@@ -12,13 +12,18 @@ use crate::model::SemanticViewDefinition;
 /// Key: view name. Value: raw JSON string of the definition.
 pub type CatalogState = Arc<RwLock<HashMap<String, String>>>;
 
+// Extension appended to the DuckDB file path to form the v0.1.0 companion file.
+// Used only in the one-time migration below. After the migration runs, the
+// companion file is deleted and this constant is never referenced again at runtime.
+const V010_COMPANION_EXT: &str = "semantic_views";
+
 /// Create the `semantic_layer` schema and `_definitions` table if they do not exist,
 /// then load all existing rows into a new [`CatalogState`].
 ///
-/// If `db_path` points to a file-backed database, this also reads the sidecar file
-/// (written by `invoke` during define/drop) and merges its contents into the table
-/// and `HashMap`.  The sidecar is the source of truth for cross-restart persistence
-/// because `invoke` cannot execute `DuckDB` SQL (deadlock) but can write plain files.
+/// For file-backed databases, performs a one-time migration: if a v0.1.0 companion
+/// file exists alongside the database, its contents are imported into the table
+/// and the file is deleted. After the migration runs once, the companion file is
+/// gone and this block is a no-op on subsequent loads.
 ///
 /// This function is called once at extension load time. It is idempotent: safe to call
 /// on every extension load regardless of whether the catalog already exists.
@@ -42,91 +47,44 @@ pub fn init_catalog(con: &Connection, db_path: &str) -> Result<CatalogState> {
         map.insert(name, def);
     }
 
-    // Merge sidecar data (sidecar wins on conflict — it reflects the latest state
-    // from the most recent session).
+    // One-time migration: if a v0.1.0 companion file exists alongside the database,
+    // import its contents into the table then delete the file.
+    // After this migration runs once, the companion file is gone and this block
+    // is a no-op on subsequent loads (file absent → skip silently).
     if db_path != ":memory:" {
-        let sidecar = read_sidecar(db_path);
-        if !sidecar.is_empty() {
-            // Replace table contents with merged state.
-            // Sidecar is authoritative: it was written atomically at each
-            // define/drop, so it reflects the final session state.
-            map = sidecar;
-            sync_table_from_map(con, &map)?;
+        // Derive the companion file path: <db_path>.<ext>.<V010_COMPANION_EXT>
+        // e.g. /path/to/mydb.duckdb → /path/to/mydb.duckdb.<companion>
+        let migration_path: PathBuf = {
+            let mut p = PathBuf::from(db_path);
+            let ext = match p.extension() {
+                Some(e) => format!("{}.{V010_COMPANION_EXT}", e.to_string_lossy()),
+                None => V010_COMPANION_EXT.to_string(),
+            };
+            p.set_extension(ext);
+            p
+        };
+        if migration_path.exists() {
+            // Read v0.1.0 definitions from the companion file
+            if let Ok(contents) = std::fs::read_to_string(&migration_path) {
+                if let Ok(migrated) = serde_json::from_str::<HashMap<String, String>>(&contents) {
+                    for (name, def) in &migrated {
+                        // INSERT OR REPLACE: companion file wins on conflict (latest session state)
+                        con.execute(
+                            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
+                            duckdb::params![name, def],
+                        )?;
+                        // Also update the in-memory map
+                        map.insert(name.clone(), def.clone());
+                    }
+                }
+            }
+            // Delete the companion file regardless of whether it had data.
+            // Ignore errors (read-only filesystem, race condition, etc.)
+            let _ = std::fs::remove_file(&migration_path);
         }
     }
 
     Ok(Arc::new(RwLock::new(map)))
-}
-
-/// Replace `semantic_layer._definitions` contents with the given map.
-///
-/// Called during `init_catalog` to sync sidecar data into the `DuckDB` table.
-fn sync_table_from_map(con: &Connection, map: &HashMap<String, String>) -> Result<()> {
-    con.execute_batch("DELETE FROM semantic_layer._definitions")?;
-    let mut stmt =
-        con.prepare("INSERT INTO semantic_layer._definitions (name, definition) VALUES (?, ?)")?;
-    for (name, def) in map {
-        stmt.execute(duckdb::params![name, def])?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Sidecar file persistence
-//
-// DuckDB holds internal execution locks during scalar function `invoke`.  Any
-// SQL executed from within invoke — whether on the same connection, a cloned
-// connection (`try_clone`), or a separate `Connection::open(path)` — deadlocks
-// or blocks on file-level locks.
-//
-// The sidecar approach avoids DuckDB SQL entirely during invoke: the HashMap is
-// serialized as JSON to a companion file (`<db_path>.semantic_views`) using
-// plain filesystem I/O, which is not subject to DuckDB locks.
-//
-// On the next extension load, `init_catalog` reads the sidecar and syncs its
-// contents into the DuckDB table, making definitions queryable via SQL and
-// ensuring they survive subsequent restarts even if the sidecar is lost.
-// ---------------------------------------------------------------------------
-
-/// Derive the sidecar file path from the database path.
-///
-/// For `/path/to/mydb.duckdb`, returns `/path/to/mydb.duckdb.semantic_views`.
-fn sidecar_path(db_path: &str) -> PathBuf {
-    let mut p = PathBuf::from(db_path);
-    let ext = match p.extension() {
-        Some(e) => format!("{}.semantic_views", e.to_string_lossy()),
-        None => "semantic_views".to_string(),
-    };
-    p.set_extension(ext);
-    p
-}
-
-/// Read definitions from the sidecar file.
-///
-/// Returns an empty map if the file does not exist or cannot be parsed.
-fn read_sidecar(db_path: &str) -> HashMap<String, String> {
-    let path = sidecar_path(db_path);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
-}
-
-/// Atomically write the current catalog state to the sidecar file.
-///
-/// Writes to a temporary file first, then renames — this is atomic on POSIX
-/// systems and prevents partial writes from corrupting the sidecar.
-pub fn write_sidecar(
-    db_path: &str,
-    state: &CatalogState,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let path = sidecar_path(db_path);
-    let tmp = path.with_extension("tmp");
-    let guard = state.read().unwrap();
-    let json = serde_json::to_string(&*guard)?;
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
 }
 
 /// Write a new semantic view definition to the in-memory catalog.
@@ -134,9 +92,6 @@ pub fn write_sidecar(
 /// Returns an error if:
 /// - The JSON is invalid
 /// - A view with `name` already exists
-///
-/// For file-backed databases, the caller is responsible for calling
-/// [`write_sidecar`] after this function to persist the change.
 pub fn catalog_insert(
     state: &CatalogState,
     name: &str,
@@ -166,9 +121,6 @@ pub fn catalog_insert(
 /// Remove a semantic view definition from the in-memory catalog.
 ///
 /// Returns an error if no view with `name` exists.
-///
-/// For file-backed databases, the caller is responsible for calling
-/// [`write_sidecar`] after this function to persist the change.
 pub fn catalog_delete(
     state: &CatalogState,
     name: &str,
@@ -288,89 +240,6 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_path_derivation() {
-        assert_eq!(
-            sidecar_path("/tmp/test.duckdb"),
-            PathBuf::from("/tmp/test.duckdb.semantic_views")
-        );
-        assert_eq!(
-            sidecar_path("/tmp/test.db"),
-            PathBuf::from("/tmp/test.db.semantic_views")
-        );
-        assert_eq!(
-            sidecar_path("/tmp/test"),
-            PathBuf::from("/tmp/test.semantic_views")
-        );
-    }
-
-    #[test]
-    fn sidecar_round_trip() {
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_sidecar_roundtrip.duckdb");
-        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let sidecar = sidecar_path(db_path);
-        // Clean up
-        let _ = std::fs::remove_file(&sidecar);
-        let _ = std::fs::remove_file(sidecar.with_extension("tmp"));
-
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        catalog_insert(&state, "orders", json).unwrap();
-
-        // Write sidecar
-        write_sidecar(db_path, &state).unwrap();
-
-        // Read it back
-        let loaded = read_sidecar(db_path);
-        assert_eq!(loaded.get("orders").map(String::as_str), Some(json));
-
-        // Clean up
-        let _ = std::fs::remove_file(&sidecar);
-    }
-
-    #[test]
-    fn init_catalog_loads_from_sidecar() {
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_init_sidecar.duckdb");
-        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let sidecar = sidecar_path(db_path);
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(format!("{db_path}.wal"));
-        let _ = std::fs::remove_file(&sidecar);
-
-        // Simulate a previous session: write a sidecar with one definition
-        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        let mut prev = HashMap::new();
-        prev.insert("orders".to_string(), json.to_string());
-        let sidecar_json = serde_json::to_string(&prev).unwrap();
-        std::fs::write(&sidecar, sidecar_json).unwrap();
-
-        // Open a file-backed DB and init_catalog — should pick up the sidecar
-        let con = Connection::open(db_path).expect("open file-backed DB");
-        let state = init_catalog(&con, db_path).unwrap();
-        assert!(state.read().unwrap().contains_key("orders"));
-
-        // Verify the table was also synced
-        let mut stmt = con
-            .prepare("SELECT name FROM semantic_layer._definitions")
-            .unwrap();
-        let names: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        assert!(names.contains(&"orders".to_string()));
-
-        // Clean up
-        drop(stmt);
-        drop(con);
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(format!("{db_path}.wal"));
-        let _ = std::fs::remove_file(&sidecar);
-    }
-
-    #[test]
     fn init_catalog_loads_existing_rows() {
         // Simulate data already in the DuckDB table (no sidecar).
         let con = in_memory_con();
@@ -386,5 +255,55 @@ mod tests {
         let state2 = init_catalog(&con, ":memory:").unwrap();
         assert!(state2.read().unwrap().contains_key("orders"));
         drop(state);
+    }
+
+    #[test]
+    fn persist_02_rollback_leaves_catalog_unchanged() {
+        let tmp = std::env::temp_dir();
+        let db_path_buf = tmp.join("test_persist02_rollback.duckdb");
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}.wal"));
+
+        let con = Connection::open(db_path).expect("open file-backed DB");
+        init_catalog(&con, db_path).unwrap();
+
+        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+        con.execute(
+            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
+            duckdb::params!["orders", json],
+        )
+        .unwrap();
+
+        let count_before: i64 = con
+            .query_row(
+                "SELECT count(*) FROM semantic_layer._definitions WHERE name = 'orders'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_before, 1);
+
+        // DuckDB table rollback: BEGIN + DELETE + ROLLBACK must leave row present
+        con.execute_batch(
+            "BEGIN; DELETE FROM semantic_layer._definitions WHERE name = 'orders'; ROLLBACK;",
+        )
+        .unwrap();
+
+        let count_after: i64 = con
+            .query_row(
+                "SELECT count(*) FROM semantic_layer._definitions WHERE name = 'orders'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_after, 1,
+            "Row must still exist after ROLLBACK (PERSIST-02)"
+        );
+
+        drop(con);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}.wal"));
     }
 }
