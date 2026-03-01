@@ -27,7 +27,7 @@ Full details: [milestones/v0.1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md)
 **Milestone Goal:** Introduce a C++ shim to unlock native `CREATE SEMANTIC VIEW` DDL and `pragma_query_t` persistence, add time dimension granularity coarsening, and expose EXPLAIN for expanded SQL.
 
 - [x] **Phase 8: C++ Shim Infrastructure** - Validate the build mechanics of the Rust+C++ boundary in isolation before any parser logic is added — completed 2026-03-01
-- [ ] **Phase 9: Time Dimensions** - Add time-typed dimensions with granularity coarsening and per-query granularity override (pure Rust, delivers user value early)
+- [x] **Phase 9: Time Dimensions** - Add time-typed dimensions with granularity coarsening and per-query granularity override (pure Rust, delivers user value early) — completed 2026-03-01
 - [ ] **Phase 10: pragma_query_t Catalog Persistence** - Replace the sidecar file with DuckDB-native table persistence via the C++ shim's PRAGMA callback
 - [ ] **Phase 11: CREATE SEMANTIC VIEW Parser Hook** - Implement native SQL DDL syntax for creating and dropping semantic views via the C++ parser extension
 - [ ] **Phase 12: EXPLAIN + Typed Output** - Wire EXPLAIN support for expanded SQL and replace all-VARCHAR output with typed columns
@@ -58,7 +58,11 @@ Plans:
   2. `SELECT * FROM semantic_query('view', dimensions := ['order_date'])` returns dates truncated to the declared granularity using `date_trunc`
   3. User can pass `granularities := {'order_date': 'month'}` to `semantic_query` to override the declared granularity at query time
   4. A time dimension backed by a DATE source column returns DATE values — not TIMESTAMP strings like `2024-01-01 00:00:00`
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [x] 09-01-PLAN.md — Extend Dimension struct with dim_type + granularity fields; from_json validation for time dimensions
+- [x] 09-02-PLAN.md — date_trunc codegen in expand(); granularities MAP named parameter in semantic_query; bind-time validation
 
 ### Phase 10: pragma_query_t Catalog Persistence
 **Goal**: Semantic view definitions persist via DuckDB-native tables and the sidecar `.semantic_views` file is gone from the codebase
