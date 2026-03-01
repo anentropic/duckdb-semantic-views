@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::ffi::CString;
 
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
@@ -7,24 +7,25 @@ use duckdb::{
 };
 use libduckdb_sys::duckdb_string_t;
 
-use crate::catalog::{catalog_insert, write_sidecar, CatalogState};
+use crate::catalog::{catalog_insert, CatalogState};
 
-/// Shared state for `define_semantic_view`: the in-memory catalog plus the
-/// database file path for sidecar persistence.
+/// Shared state for `define_semantic_view`.
 ///
-/// `db_path` is `":memory:"` for in-memory databases — the [`CatalogState`]
-/// `HashMap` is the sole source of truth for the session, which is correct
-/// (in-memory DBs cannot survive restart anyway).
-///
-/// For file-backed databases, after updating the `HashMap`, `invoke` writes the
-/// full state to a sidecar file (`<db_path>.semantic_views`) using plain
-/// filesystem I/O.  On next extension load, `init_catalog` reads the sidecar
-/// and syncs it into the `DuckDB` table.
+/// `persist_conn` is `Some` for file-backed databases — it is a separate
+/// `duckdb_connection` created at init time and used to execute INSERT into
+/// `semantic_layer._definitions` from within invoke (avoids deadlock with
+/// the main connection's execution lock). For in-memory databases, `persist_conn`
+/// is `None` and the `HashMap` is the sole source of truth for the session.
 #[derive(Clone)]
 pub struct DefineState {
     pub catalog: CatalogState,
-    pub db_path: Arc<str>,
+    pub persist_conn: Option<libduckdb_sys::duckdb_connection>,
 }
+
+// SAFETY: duckdb_connection is an opaque pointer managed by DuckDB.
+// DuckDB handles concurrent access internally.
+unsafe impl Send for DefineState {}
+unsafe impl Sync for DefineState {}
 
 pub struct DefineSemanticView;
 
@@ -60,16 +61,34 @@ impl VScalar for DefineSemanticView {
                 .as_str()
                 .to_string();
 
-            // 1. Validate JSON and update the in-memory catalog.
-            //    catalog_insert checks for duplicates and validates the JSON.
-            catalog_insert(&state.catalog, &name, &json)?;
-
-            // 2. Persist to sidecar file (file-backed databases only).
-            //    Uses plain filesystem I/O — no DuckDB SQL needed, so no
-            //    deadlock from within invoke.
-            if state.db_path.as_ref() != ":memory:" {
-                write_sidecar(&state.db_path, &state.catalog)?;
+            // 1. Persist to DuckDB table FIRST (file-backed databases only).
+            //    Uses a separate connection — no deadlock with invoke's execution lock.
+            //    Write-first ordering: if this fails, HashMap is unchanged (PERSIST-02).
+            #[cfg(feature = "extension")]
+            if let Some(conn) = state.persist_conn {
+                let c_name = CString::new(name.as_str())
+                    .map_err(|_| format!("semantic view name '{}' contains null byte", name))?;
+                let c_json = CString::new(json.as_str())
+                    .map_err(|_| "definition JSON contains null byte".to_string())?;
+                let rc = unsafe {
+                    crate::shim::ffi::semantic_views_pragma_define(
+                        conn,
+                        c_name.as_ptr(),
+                        c_json.as_ptr(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(format!(
+                        "failed to persist semantic view '{}': table write failed",
+                        name
+                    )
+                    .into());
+                }
             }
+
+            // 2. Update in-memory catalog AFTER successful persist.
+            //    catalog_insert validates JSON and checks for duplicates.
+            catalog_insert(&state.catalog, &name, &json)?;
 
             let msg = format!("Semantic view '{name}' registered successfully");
             out.insert(i, msg.as_str());

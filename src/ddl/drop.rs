@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::ffi::CString;
 
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
@@ -7,16 +7,20 @@ use duckdb::{
 };
 use libduckdb_sys::duckdb_string_t;
 
-use crate::catalog::{catalog_delete, write_sidecar, CatalogState};
+use crate::catalog::{catalog_delete, CatalogState};
 
 /// Shared state for `drop_semantic_view`.
-/// See [`crate::ddl::define::DefineState`] for the full explanation of the
-/// sidecar persistence pattern.
+/// See [`crate::ddl::define::DefineState`] for the persist_conn pattern.
 #[derive(Clone)]
 pub struct DropState {
     pub catalog: CatalogState,
-    pub db_path: Arc<str>,
+    pub persist_conn: Option<libduckdb_sys::duckdb_connection>,
 }
+
+// SAFETY: duckdb_connection is an opaque pointer managed by DuckDB.
+// DuckDB handles concurrent access internally.
+unsafe impl Send for DropState {}
+unsafe impl Sync for DropState {}
 
 pub struct DropSemanticView;
 
@@ -46,13 +50,25 @@ impl VScalar for DropSemanticView {
                 .as_str()
                 .to_string();
 
-            // 1. Remove from in-memory catalog (checks existence).
-            catalog_delete(&state.catalog, &name)?;
-
-            // 2. Persist to sidecar file (file-backed databases only).
-            if state.db_path.as_ref() != ":memory:" {
-                write_sidecar(&state.db_path, &state.catalog)?;
+            // 1. Delete from DuckDB table FIRST (write-first for consistency).
+            //    Uses a separate connection — no deadlock with invoke's execution lock.
+            #[cfg(feature = "extension")]
+            if let Some(conn) = state.persist_conn {
+                let c_name = CString::new(name.as_str())
+                    .map_err(|_| format!("semantic view name '{}' contains null byte", name))?;
+                let rc =
+                    unsafe { crate::shim::ffi::semantic_views_pragma_drop(conn, c_name.as_ptr()) };
+                if rc != 0 {
+                    return Err(format!(
+                        "failed to remove semantic view '{}' from persistent storage",
+                        name
+                    )
+                    .into());
+                }
             }
+
+            // 2. Remove from in-memory catalog AFTER successful table delete.
+            catalog_delete(&state.catalog, &name)?;
 
             let msg = format!("Semantic view '{name}' removed successfully");
             out.insert(i, msg.as_str());
