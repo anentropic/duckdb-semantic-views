@@ -9,7 +9,7 @@ Requirements for milestone v0.2.0 — Native DDL + Time Dimensions. Each maps to
 
 ### Infrastructure
 
-- [ ] **INFRA-01**: C++ shim compiles via `cc` crate on all 5 CI targets without breaking `cargo test` workflow
+- [x] **INFRA-01**: C++ shim compiles via `cc` crate on all 5 CI targets without breaking `cargo test` workflow
 
 ### Persistence
 
@@ -78,7 +78,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INFRA-01 | Phase 8 | Pending |
+| INFRA-01 | Phase 8 | Complete |
 | TIME-01 | Phase 9 | Pending |
 | TIME-02 | Phase 9 | Pending |
 | TIME-03 | Phase 9 | Pending |

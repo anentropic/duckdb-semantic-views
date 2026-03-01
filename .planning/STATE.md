@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v0.2.0
 milestone_name: Native DDL + Time Dimensions
 status: in_progress
-last_updated: "2026-03-01T02:12:09Z"
+last_updated: "2026-03-01T02:16:06Z"
 progress:
   total_phases: 5
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 10
-  completed_plans: 1
+  completed_plans: 2
 ---
 
 # Project State
@@ -22,12 +22,12 @@ See: .planning/PROJECT.md (updated 2026-02-28)
 
 ## Current Position
 
-Phase: 8 of 12 (C++ Shim Infrastructure)
-Plan: 1 of 2 in current phase
-Status: In Progress
-Last activity: 2026-03-01 — Plan 08-01 complete: vendored DuckDB headers, C++ shim skeleton, cc build-dependency
+Phase: 8 of 12 (C++ Shim Infrastructure) — COMPLETE
+Plan: 2 of 2 in current phase
+Status: Phase Complete — moving to Phase 9 (Time Dimensions)
+Last activity: 2026-03-01 — Phase 8 complete: C++ shim compiles, all tests pass, symbol visibility confirmed
 
-Progress: [█░░░░░░░░░] 10% (v0.2.0)
+Progress: [██░░░░░░░░] 20% (v0.2.0)
 
 ## Performance Metrics
 
@@ -51,6 +51,8 @@ Recent decisions affecting current work:
 - [v0.1.0 close]: VARCHAR output columns are accepted tech debt; typed output targeted in Phase 12 (OUT-01)
 - [08-01]: Vendor full duckdb/src/include/ tree (not just duckdb.hpp) — duckdb.hpp includes subdirectory headers that must be present
 - [08-01]: Source headers from existing cargo build cache (target/debug/build/libduckdb-sys-*/out/) rather than downloading
+- [08-02]: semantic_views_version is NOT compiled into the binary — it is appended by CI post-build script; exclude from exported symbols list or linker fails
+- [08-02]: Use db_handle.cast() not as *mut c_void — avoids pedantic clippy ptr_as_ptr lint
 
 ### Pending Todos
 
@@ -74,5 +76,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-03-01
-Stopped at: Phase 8, Plan 01 complete — C++ shim skeleton + vendored headers done, executing Plan 02 (build.rs wiring)
+Stopped at: Phase 8 complete — verification passed, roadmap updated. Ready for Phase 9 (Time Dimensions).
 Resume file: None
