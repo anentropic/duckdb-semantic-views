@@ -49,3 +49,20 @@ build_extension_library_release: check_configure
 	DUCKDB_EXTENSION_NAME=$(EXTENSION_NAME) DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=$(TARGET_DUCKDB_VERSION) cargo build $(CARGO_OVERRIDE_DUCKDB_RS_FLAG) --release $(TARGET_INFO) --no-default-features --features extension
 	$(PYTHON_VENV_BIN) -c "from pathlib import Path;Path('$(EXTENSION_BUILD_PATH)/release/extension/$(EXTENSION_NAME)').mkdir(parents=True, exist_ok=True)"
 	$(PYTHON_VENV_BIN) -c "import shutil;shutil.copyfile('$(TARGET_PATH)/release$(IS_EXAMPLE)/$(RUST_LIBNAME)', '$(EXTENSION_BUILD_PATH)/release/$(EXTENSION_LIB_FILENAME)')"
+
+# Patch installed duckdb_sqllogictest to add notwindows/windows platform detection.
+# Idempotent. Remove once extension-ci-tools updates its pinned sqllogictest commit.
+.PHONY: patch-runner
+patch-runner: check_configure
+	@$(PYTHON_VENV_BIN) scripts/patch_sqllogictest.py
+
+# Override base.Makefile test targets to patch runner before tests.
+# SKIP_TESTS platforms (musl, mingw) resolve to tests_skipped before reaching these
+# targets, so patch-runner is never called on those platforms — which is correct.
+test_extension_debug_internal: patch-runner
+	@echo "Running DEBUG tests.."
+	@$(TEST_RUNNER_DEBUG)
+
+test_extension_release_internal: patch-runner
+	@echo "Running RELEASE tests.."
+	@$(TEST_RUNNER_RELEASE)
