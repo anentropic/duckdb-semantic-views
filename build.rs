@@ -34,13 +34,16 @@ fn main() {
     match target_os.as_str() {
         "linux" => {
             // ELF version script: only the Rust entry point is globally visible.
+            // MUST use a named version tag (not anonymous) because rustc also emits a
+            // --version-script for cdylib targets; GNU ld rejects mixing anonymous
+            // and named version tags.
             // Note: semantic_views_version is appended by the CI post-build script
             // (extension-ci-tools); it does NOT exist in the compiled binary and must
             // not be listed here — the linker would fail with "symbol not found".
             let map_path = format!("{out_dir}/semantic_views.map");
             std::fs::write(
                 &map_path,
-                "{\n  global:\n    semantic_views_init_c_api;\n  local: *;\n};\n",
+                "SEMANTIC_VIEWS_1.0 {\n  global:\n    semantic_views_init_c_api;\n  local: *;\n};\n",
             )
             .expect("failed to write ELF version script");
             println!("cargo:rustc-link-arg=-Wl,--version-script={map_path}");
