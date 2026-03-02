@@ -22,8 +22,8 @@ Requirements for milestone v0.2.0 — Native DDL + Time Dimensions. Each maps to
 - [ ] **DDL-01**: User can create a semantic view with `CREATE SEMANTIC VIEW` SQL syntax
 - [ ] **DDL-02**: User can drop a semantic view with `DROP SEMANTIC VIEW` SQL syntax
 - [x] **DDL-03**: `CREATE OR REPLACE SEMANTIC VIEW` overwrites an existing definition
-- [x] **DDL-04**: Native DDL supports all capabilities of `define_semantic_view()` (dimensions, metrics, joins, filters)
-- [x] **DDL-05**: `define_semantic_view()` and `drop_semantic_view()` functions removed after native DDL is validated
+- [x] **DDL-04**: Native DDL supports all capabilities of `create_semantic_view()` (dimensions, metrics, joins, filters)
+- [x] **DDL-05**: `create_semantic_view()` and `drop_semantic_view()` functions removed after native DDL is validated
 - [ ] **DDL-06**: Non-semantic-view SQL is unaffected by parser hook (no regression)
 
 ### Time Dimensions
@@ -35,11 +35,11 @@ Requirements for milestone v0.2.0 — Native DDL + Time Dimensions. Each maps to
 
 ### EXPLAIN
 
-- [ ] **EXPL-01**: `EXPLAIN FROM semantic_query(...)` shows DuckDB's full physical query plan for the expanded SQL
+- [x] **EXPL-01**: `EXPLAIN FROM semantic_query(...)` shows DuckDB's full physical query plan for the expanded SQL
 
 ### Output Typing
 
-- [ ] **OUT-01**: `semantic_query` returns typed columns (BIGINT, DOUBLE, DATE, etc.) matching source column types instead of all-VARCHAR
+- [x] **OUT-01**: `semantic_query` returns typed columns (BIGINT, DOUBLE, DATE, etc.) matching source column types instead of all-VARCHAR
 
 ## v0.3.0 Requirements
 
@@ -92,8 +92,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DDL-04 | Phase 11 | Complete |
 | DDL-05 | Phase 11 | Complete |
 | DDL-06 | Phase 11 | Pending |
-| EXPL-01 | Phase 12 | Pending |
-| OUT-01 | Phase 12 | Pending |
+| EXPL-01 | Phase 12 | Complete |
+| OUT-01 | Phase 12 | Complete |
 
 **Coverage:**
 - v0.2.0 requirements: 16 total
