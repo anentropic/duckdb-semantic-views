@@ -102,7 +102,7 @@ Plans:
 **Goal:** Reshape DDL from raw JSON string to typed STRUCT/LIST parameters and rename semantic_query to semantic_view, aligning the interface with Snowflake semantic view concepts without adding new capabilities
 **Requirements**: DDL-03, DDL-04, DDL-05, DDL-06
 **Depends on:** Phase 11
-**Plans:** 5 plans
+**Plans:** 1/5 plans executed
 
 Plans:
 - [ ] 11.1-01-PLAN.md — DESIGN.md + model.rs additions (TableRef, JoinColumn, Join.join_columns, SemanticViewDefinition.tables)
