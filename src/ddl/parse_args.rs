@@ -116,9 +116,16 @@ pub unsafe fn parse_define_args(
 
         let (rel_offset, rel_len) = rel_list.get_entry(row);
         for rel_i in rel_offset..rel_offset + rel_len {
-            let to_table = read_str(to_table_data, rel_i);
-            // from_table is stored for reference (used in context, join.table = to_table)
-            let _from_table = read_str(from_table_data, rel_i);
+            let to_alias = read_str(to_table_data, rel_i);
+            // from_table alias is unused in the Join model (join direction is implicit).
+            let _from_alias = read_str(from_table_data, rel_i);
+            // Resolve to_alias to the physical table name via the tables vec.
+            // join.table must be the physical name so expand.rs can emit it in the FROM clause.
+            let to_table = tables
+                .iter()
+                .find(|t| t.alias.eq_ignore_ascii_case(&to_alias))
+                .map(|t| t.table.clone())
+                .unwrap_or(to_alias);
 
             // Read nested join_columns for this relationship entry
             let mut join_columns: Vec<JoinColumn> = Vec::new();

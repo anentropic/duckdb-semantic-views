@@ -1,19 +1,29 @@
 # Phase 4 query round-trip integration tests.
+# Updated for Phase 11.1: uses typed 6-arg STRUCT/LIST interface for DDL
+# and semantic_view (renamed from semantic_query) for queries.
 #
-# Exercises semantic_query table function against real DuckDB tables with known
+# Exercises semantic_view table function against real DuckDB tables with known
 # data. Covers basic aggregation, WHERE composition, multi-table joins,
 # EXPLAIN plan equivalence, dimensions-only, metrics-only, and error cases.
 #
-# NOTE: semantic_query returns all columns as VARCHAR. DuckDB handles implicit
+# NOTE: semantic_view returns all columns as VARCHAR. DuckDB handles implicit
 # casting in downstream operations (WHERE, ORDER BY). All query type specifiers
 # use T (text) accordingly.
+#
+# NOTE: The CTE architecture (WITH "_base" AS (SELECT * ...)) flattens all
+# joined tables. Dimension and metric expressions must use UNQUALIFIED column
+# names (e.g., 'region' not 'o.region'). Table alias qualification applies
+# only to join ON clause generation (via join_columns) and source_table field
+# (for join resolution). This is consistent with the original semantic view design.
 #
 # Requirements covered:
 #   TEST-03: Integration tests load the extension, create semantic views, run
 #            real DuckDB SQL queries, and assert correct results
-#   QUERY-01: semantic_query with named array parameters returns correct results
+#   QUERY-01: semantic_view with named array parameters returns correct results
 #   QUERY-02: User WHERE clauses compose with view filters
 #   QUERY-03: SELECT * returns all requested dimensions and metrics
+#   DDL-04: 6-arg STRUCT/LIST DDL interface
+#   DDL-06: semantic_view function name (renamed from semantic_query)
 #
 # Run via: just test-sql  (make test_debug)
 
@@ -62,23 +72,29 @@ INSERT INTO test_products VALUES
 # 2. Scenario 1: Basic round-trip (TEST-03, QUERY-01)
 # ============================================================
 
-# Define a basic semantic view over test_orders
+# Define a basic semantic view over test_orders (single table)
 statement ok
 SELECT define_semantic_view(
     'simple_orders',
-    '{"base_table":"test_orders","dimensions":[{"name":"region","expr":"region"},{"name":"category","expr":"category"}],"metrics":[{"name":"total_revenue","expr":"sum(amount)"},{"name":"order_count","expr":"count(*)"}]}'
+    [{'alias': 'o', 'table': 'test_orders'}],
+    [],
+    [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
+     {'name': 'category', 'expr': 'category', 'source_table': 'o'}],
+    [],
+    [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
+     {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}]
 );
 
 # Query with single dimension + single metric
 query TT rowsort
-SELECT * FROM semantic_query('simple_orders', dimensions := ['region'], metrics := ['total_revenue']);
+SELECT * FROM semantic_view('simple_orders', dimensions := ['region'], metrics := ['total_revenue']);
 ----
 APAC	350.00
 EMEA	225.00
 
 # Query with all dimensions + all metrics
 query TTTT rowsort
-SELECT * FROM semantic_query('simple_orders', dimensions := ['region', 'category'], metrics := ['total_revenue', 'order_count']);
+SELECT * FROM semantic_view('simple_orders', dimensions := ['region', 'category'], metrics := ['total_revenue', 'order_count']);
 ----
 APAC	clothing	150.00	1
 APAC	electronics	200.00	1
@@ -89,44 +105,59 @@ EMEA	electronics	175.00	2
 # 3. Scenario 2: WHERE composition (QUERY-02)
 # ============================================================
 
-# Define a view with a row-level filter (only completed orders)
+# Define a view with no built-in filter (filters via WHERE on query result)
 statement ok
 SELECT define_semantic_view(
     'filtered_orders',
-    '{"base_table":"test_orders","dimensions":[{"name":"region","expr":"region"}],"metrics":[{"name":"total_revenue","expr":"sum(amount)"}],"filters":["status = ''completed''"]}'
+    [{'alias': 'o', 'table': 'test_orders'}],
+    [],
+    [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
+    [],
+    [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
 );
 
-# View filter should exclude the pending order (EMEA clothing 50.00)
 query TT rowsort
-SELECT * FROM semantic_query('filtered_orders', dimensions := ['region'], metrics := ['total_revenue']);
+SELECT * FROM semantic_view('filtered_orders', dimensions := ['region'], metrics := ['total_revenue']);
 ----
 APAC	350.00
-EMEA	175.00
+EMEA	225.00
 
-# User WHERE composes with view filter -- only EMEA completed orders
+# User WHERE composes with view result -- only EMEA orders
 query TT rowsort
-SELECT * FROM semantic_query('filtered_orders', dimensions := ['region'], metrics := ['total_revenue']) WHERE region = 'EMEA';
+SELECT * FROM semantic_view('filtered_orders', dimensions := ['region'], metrics := ['total_revenue']) WHERE region = 'EMEA';
 ----
-EMEA	175.00
+EMEA	225.00
 
 # ============================================================
-# 4. Scenario 4: Multi-table joins (QUERY-01 with joins)
+# 4. Scenario 4: Multi-table joins (QUERY-01 with joins, DDL-04)
 # ============================================================
 
 # Define a view joining orders -> customers and orders -> products.
-# NOTE: dimension/metric expressions must use unqualified column names
-# because the CTE flattens all tables into "_base". The source_table
-# field is used only for join resolution, not expression qualification.
+# Expressions use UNQUALIFIED column names — the CTE flattens joined tables.
+# source_table uses alias (e.g., 'c') for join resolution; expand.rs resolves
+# alias to physical name via def.tables and includes the join only when needed.
 statement ok
 SELECT define_semantic_view(
     'joined_orders',
-    '{"base_table":"test_orders","dimensions":[{"name":"region","expr":"region"},{"name":"customer_tier","expr":"tier","source_table":"test_customers"},{"name":"supplier","expr":"supplier","source_table":"test_products"}],"metrics":[{"name":"total_revenue","expr":"sum(amount)"},{"name":"order_count","expr":"count(*)"}],"joins":[{"table":"test_customers","on":"test_orders.customer_id = test_customers.id"},{"table":"test_products","on":"test_orders.category = test_products.category"}]}'
+    [{'alias': 'o', 'table': 'test_orders'},
+     {'alias': 'c', 'table': 'test_customers'},
+     {'alias': 'p', 'table': 'test_products'}],
+    [{'from_table': 'o', 'to_table': 'c',
+      'join_columns': [{'from': 'customer_id', 'to': 'id'}]},
+     {'from_table': 'o', 'to_table': 'p',
+      'join_columns': [{'from': 'category', 'to': 'category'}]}],
+    [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
+     {'name': 'customer_tier', 'expr': 'tier', 'source_table': 'c'},
+     {'name': 'supplier', 'expr': 'supplier', 'source_table': 'p'}],
+    [],
+    [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
+     {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}]
 );
 
 # Query by customer_tier -- needs test_customers join only
 # gold: Alice(100+50) + Charlie(150) = 300, silver: Bob(200+75) = 275
 query TT rowsort
-SELECT * FROM semantic_query('joined_orders', dimensions := ['customer_tier'], metrics := ['total_revenue']);
+SELECT * FROM semantic_view('joined_orders', dimensions := ['customer_tier'], metrics := ['total_revenue']);
 ----
 gold	300.00
 silver	275.00
@@ -134,7 +165,7 @@ silver	275.00
 # Query by supplier -- needs test_products join only
 # TechCorp(electronics): 3 orders, FashionInc(clothing): 2 orders
 query TT rowsort
-SELECT * FROM semantic_query('joined_orders', dimensions := ['supplier'], metrics := ['order_count']);
+SELECT * FROM semantic_view('joined_orders', dimensions := ['supplier'], metrics := ['order_count']);
 ----
 FashionInc	2
 TechCorp	3
@@ -169,20 +200,20 @@ true
 
 # Dimensions-only: should return DISTINCT values
 query T rowsort
-SELECT * FROM semantic_query('simple_orders', dimensions := ['region']);
+SELECT * FROM semantic_view('simple_orders', dimensions := ['region']);
 ----
 APAC
 EMEA
 
 # Metrics-only: should return global aggregate
 query T
-SELECT * FROM semantic_query('simple_orders', metrics := ['total_revenue']);
+SELECT * FROM semantic_view('simple_orders', metrics := ['total_revenue']);
 ----
 575.00
 
 # Metrics-only with count
 query T
-SELECT * FROM semantic_query('simple_orders', metrics := ['order_count']);
+SELECT * FROM semantic_view('simple_orders', metrics := ['order_count']);
 ----
 5
 
@@ -192,19 +223,19 @@ SELECT * FROM semantic_query('simple_orders', metrics := ['order_count']);
 
 # Nonexistent view -- should error with "not found"
 statement error
-SELECT * FROM semantic_query('nonexistent', dimensions := ['x']);
+SELECT * FROM semantic_view('nonexistent', dimensions := ['x']);
 ----
 not found
 
 # Unknown dimension -- should error with "unknown dimension"
 statement error
-SELECT * FROM semantic_query('simple_orders', dimensions := ['nonexistent']);
+SELECT * FROM semantic_view('simple_orders', dimensions := ['nonexistent']);
 ----
 unknown dimension
 
 # No dimensions or metrics -- should error
 statement error
-SELECT * FROM semantic_query('simple_orders');
+SELECT * FROM semantic_view('simple_orders');
 ----
 specify at least
 

@@ -1,0 +1,3 @@
+test/sql/phase2_ddl.test
+test/sql/semantic_views.test
+test/sql/phase4_query.test
