@@ -459,6 +459,7 @@ mod tests {
         fn orders_view() -> SemanticViewDefinition {
             SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![
                     Dimension {
                         name: "region".to_string(),
@@ -619,6 +620,7 @@ GROUP BY
         fn test_identifier_quoting() {
             let def = SemanticViewDefinition {
                 base_table: "select".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "col".to_string(),
                     expr: "col".to_string(),
@@ -650,6 +652,7 @@ GROUP BY
         fn test_dimension_expression_not_quoted() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "month".to_string(),
                     expr: "date_trunc('month', created_at)".to_string(),
@@ -741,6 +744,7 @@ FROM \"_base\"";
         fn test_case_insensitive_dimension_lookup() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "Region".to_string(),
                     expr: "region".to_string(),
@@ -881,6 +885,7 @@ FROM \"_base\"";
         fn test_case_insensitive_metric_lookup() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![],
                 metrics: vec![Metric {
                     name: "Total_Revenue".to_string(),
@@ -971,6 +976,7 @@ FROM \"_base\"";
         fn test_join_included_when_dimension_needs_it() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "customer_name".to_string(),
                     expr: "customers.name".to_string(),
@@ -988,6 +994,7 @@ FROM \"_base\"";
                     table: "customers".to_string(),
                     on: "orders.customer_id = customers.id".to_string(),
                     from_cols: vec![],
+                    join_columns: vec![],
                 }],
                 facts: vec![],
             };
@@ -1004,6 +1011,7 @@ FROM \"_base\"";
         fn test_join_excluded_when_not_needed() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![
                     Dimension {
                         name: "region".to_string(),
@@ -1030,6 +1038,7 @@ FROM \"_base\"";
                     table: "customers".to_string(),
                     on: "orders.customer_id = customers.id".to_string(),
                     from_cols: vec![],
+                    join_columns: vec![],
                 }],
                 facts: vec![],
             };
@@ -1050,6 +1059,7 @@ FROM \"_base\"";
         fn test_join_included_when_metric_needs_it() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
                     expr: "region".to_string(),
@@ -1067,6 +1077,7 @@ FROM \"_base\"";
                     table: "customers".to_string(),
                     on: "orders.customer_id = customers.id".to_string(),
                     from_cols: vec![],
+                    join_columns: vec![],
                 }],
                 facts: vec![],
             };
@@ -1083,6 +1094,7 @@ FROM \"_base\"";
         fn test_transitive_join_resolution() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "region_name".to_string(),
                     expr: "regions.name".to_string(),
@@ -1101,11 +1113,13 @@ FROM \"_base\"";
                         table: "customers".to_string(),
                         on: "orders.customer_id = customers.id".to_string(),
                         from_cols: vec![],
+                        join_columns: vec![],
                     },
                     Join {
                         table: "regions".to_string(),
                         on: "customers.region_id = regions.id".to_string(),
                         from_cols: vec![],
+                        join_columns: vec![],
                     },
                 ],
                 facts: vec![],
@@ -1131,6 +1145,7 @@ FROM \"_base\"";
         fn test_joins_emitted_in_declaration_order() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "region_name".to_string(),
                     expr: "regions.name".to_string(),
@@ -1149,11 +1164,13 @@ FROM \"_base\"";
                         table: "customers".to_string(),
                         on: "orders.customer_id = customers.id".to_string(),
                         from_cols: vec![],
+                        join_columns: vec![],
                     },
                     Join {
                         table: "regions".to_string(),
                         on: "customers.region_id = regions.id".to_string(),
                         from_cols: vec![],
+                        join_columns: vec![],
                     },
                 ],
                 facts: vec![],
@@ -1178,6 +1195,7 @@ FROM \"_base\"";
         fn test_no_joins_declared_no_error() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
                     expr: "region".to_string(),
@@ -1210,6 +1228,7 @@ FROM \"_base\"";
         fn test_dot_qualified_base_table() {
             let def = SemanticViewDefinition {
                 base_table: "jaffle.raw_orders".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "status".to_string(),
                     expr: "status".to_string(),
@@ -1243,6 +1262,7 @@ FROM \"_base\"";
         fn test_dot_qualified_join_table() {
             let def = SemanticViewDefinition {
                 base_table: "jaffle.raw_orders".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "customer_name".to_string(),
                     expr: "customers.name".to_string(),
@@ -1260,6 +1280,7 @@ FROM \"_base\"";
                     table: "jaffle.raw_customers".to_string(),
                     on: "raw_orders.customer_id = raw_customers.id".to_string(),
                     from_cols: vec![],
+                    join_columns: vec![],
                 }],
                 facts: vec![],
             };
@@ -1279,6 +1300,7 @@ FROM \"_base\"";
         fn test_mixed_base_and_joined_dimensions() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![
                     Dimension {
                         name: "region".to_string(),
@@ -1306,11 +1328,13 @@ FROM \"_base\"";
                         table: "customers".to_string(),
                         on: "orders.customer_id = customers.id".to_string(),
                         from_cols: vec![],
+                        join_columns: vec![],
                     },
                     Join {
                         table: "products".to_string(),
                         on: "orders.product_id = products.id".to_string(),
                         from_cols: vec![],
+                        join_columns: vec![],
                     },
                 ],
                 facts: vec![],
@@ -1341,6 +1365,7 @@ FROM \"_base\"";
         fn time_orders_view() -> SemanticViewDefinition {
             SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![
                     Dimension {
                         name: "order_date".to_string(),
@@ -1429,6 +1454,7 @@ FROM \"_base\"";
         fn test_date_trunc_includes_date_cast() {
             let def = SemanticViewDefinition {
                 base_table: "orders".to_string(),
+                tables: vec![],
                 dimensions: vec![Dimension {
                     name: "d".to_string(),
                     expr: "d".to_string(),

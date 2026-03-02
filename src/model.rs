@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+/// A table alias entry for the `tables` DDL parameter.
+/// Maps a short alias (e.g., `"o"`) to a physical table name (e.g., `"orders"`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct TableRef {
+    pub alias: String,
+    pub table: String,
+}
+
 /// A named SQL column expression used as a dimension.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -44,6 +53,15 @@ pub struct Fact {
     pub source_table: Option<String>,
 }
 
+/// A column-pair relationship entry for composite or single FK declarations.
+/// Used in the `relationships` DDL parameter's `join_columns` field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct JoinColumn {
+    pub from: String,
+    pub to: String,
+}
+
 /// A JOIN relationship between the base table and another source table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -57,6 +75,10 @@ pub struct Join {
     /// Set by CREATE SEMANTIC VIEW RELATIONSHIPS clause.
     #[serde(default)]
     pub from_cols: Vec<String>,
+    /// Phase 11.1: column-pair FK declarations. Replaces `from_cols` for new definitions.
+    /// Old stored JSON without this field deserializes with empty Vec.
+    #[serde(default)]
+    pub join_columns: Vec<JoinColumn>,
 }
 
 /// Top-level definition of a semantic view.
@@ -70,6 +92,10 @@ pub struct Join {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SemanticViewDefinition {
     pub base_table: String,
+    /// Phase 11.1: table alias registry for multi-table views.
+    /// Old stored JSON without this field deserializes with empty Vec.
+    #[serde(default)]
+    pub tables: Vec<TableRef>,
     pub dimensions: Vec<Dimension>,
     pub metrics: Vec<Metric>,
     #[serde(default)]
@@ -339,6 +365,96 @@ mod tests {
             assert!(
                 SemanticViewDefinition::from_json("test", json).is_ok(),
                 "unknown fields must not cause rejection after deny_unknown_fields removal"
+            );
+        }
+    }
+
+    mod phase11_1_model_tests {
+        use super::*;
+
+        #[test]
+        fn table_ref_roundtrip() {
+            let tr = TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+            };
+            let json = serde_json::to_string(&tr).unwrap();
+            assert_eq!(json, r#"{"alias":"o","table":"orders"}"#);
+            let rt: TableRef = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.alias, "o");
+            assert_eq!(rt.table, "orders");
+        }
+
+        #[test]
+        fn join_column_roundtrip() {
+            let jc = JoinColumn {
+                from: "customer_id".to_string(),
+                to: "id".to_string(),
+            };
+            let json = serde_json::to_string(&jc).unwrap();
+            assert_eq!(json, r#"{"from":"customer_id","to":"id"}"#);
+            let rt: JoinColumn = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.from, "customer_id");
+            assert_eq!(rt.to, "id");
+        }
+
+        #[test]
+        fn join_old_on_format_backwards_compat_with_join_columns_default() {
+            // Old Join with only `on` field — join_columns must default to []
+            let json = r#"{"table":"customers","on":"a.id=b.id"}"#;
+            let join: Join = serde_json::from_str(json).unwrap();
+            assert_eq!(join.table, "customers");
+            assert_eq!(join.on, "a.id=b.id");
+            assert!(
+                join.join_columns.is_empty(),
+                "join_columns should default to [] for old JSON"
+            );
+        }
+
+        #[test]
+        fn join_new_format_with_join_columns() {
+            let json = r#"{"table":"customers","join_columns":[{"from":"customer_id","to":"id"}]}"#;
+            let join: Join = serde_json::from_str(json).unwrap();
+            assert_eq!(join.table, "customers");
+            assert_eq!(join.on, "", "on should default to empty string");
+            assert_eq!(join.join_columns.len(), 1);
+            assert_eq!(join.join_columns[0].from, "customer_id");
+            assert_eq!(join.join_columns[0].to, "id");
+        }
+
+        #[test]
+        fn semantic_view_definition_with_tables_roundtrip() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![TableRef {
+                    alias: "o".to_string(),
+                    table: "orders".to_string(),
+                }],
+                dimensions: vec![],
+                metrics: vec![],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![],
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            assert!(
+                json.contains(r#""tables":[{"alias":"o","table":"orders"}]"#),
+                "tables field must appear in serialized JSON: {json}"
+            );
+            let rt: SemanticViewDefinition = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.tables.len(), 1);
+            assert_eq!(rt.tables[0].alias, "o");
+            assert_eq!(rt.tables[0].table, "orders");
+        }
+
+        #[test]
+        fn old_definition_without_tables_deserializes_with_empty_vec() {
+            // Old stored JSON without `tables` field — must load with tables: []
+            let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+            let def: SemanticViewDefinition = serde_json::from_str(json).unwrap();
+            assert!(
+                def.tables.is_empty(),
+                "tables should default to [] for old JSON without tables field"
             );
         }
     }

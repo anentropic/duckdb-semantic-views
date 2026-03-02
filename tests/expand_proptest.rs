@@ -10,6 +10,7 @@ use semantic_views::model::{Dimension, Join, Metric, SemanticViewDefinition};
 fn simple_definition() -> SemanticViewDefinition {
     SemanticViewDefinition {
         base_table: "orders".to_string(),
+        tables: vec![],
         dimensions: vec![
             Dimension {
                 name: "region".to_string(),
@@ -61,6 +62,7 @@ fn simple_definition() -> SemanticViewDefinition {
 fn joined_definition() -> SemanticViewDefinition {
     SemanticViewDefinition {
         base_table: "orders".to_string(),
+        tables: vec![],
         dimensions: vec![
             Dimension {
                 name: "region".to_string(),
@@ -114,11 +116,13 @@ fn joined_definition() -> SemanticViewDefinition {
                 table: "customers".to_string(),
                 on: "\"orders\".\"customer_id\" = \"customers\".\"id\"".to_string(),
                 from_cols: vec![],
+                join_columns: vec![],
             },
             Join {
                 table: "products".to_string(),
                 on: "\"orders\".\"product_id\" = \"products\".\"id\"".to_string(),
                 from_cols: vec![],
+                join_columns: vec![],
             },
         ],
         facts: vec![],
