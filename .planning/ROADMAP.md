@@ -144,3 +144,14 @@ Plans:
 | 11. CREATE SEMANTIC VIEW Parser Hook | v0.2.0 | 2/4 | In Progress | - |
 | 11.1 Typed STRUCT/LIST DDL + semantic_view rename | v0.2.0 | 5/5 | Complete | 2026-03-02 |
 | 12. EXPLAIN + Typed Output | 4/4 | Complete    | 2026-03-02 | - |
+
+### Phase 13: Type-mapping and property-based tests for typed column dispatch
+
+**Goal:** Replace the VARCHAR-cast intermediary with direct binary chunk reads per type, fixing TIMESTAMP all-NULL, BOOLEAN UB, and DECIMAL/LIST-as-string bugs, and validate the full typed output pipeline with property-based tests
+**Requirements**: none formally assigned
+**Depends on:** Phase 12
+**Plans:** 2 plans
+
+Plans:
+- [ ] 13-01-PLAN.md — table_function.rs refactor: extend TypedValue, binary-read dispatch, rewrite func(), extend bind() for DECIMAL/LIST/ENUM, delete dead code
+- [ ] 13-02-PLAN.md — output_proptest.rs: unit PBTs for binary-read helpers + integration PBTs for full roundtrip (TIMESTAMP/BOOLEAN/DECIMAL/LIST/NULL)
