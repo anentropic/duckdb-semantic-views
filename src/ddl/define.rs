@@ -4,10 +4,10 @@ use duckdb::{
     vtab::arrow::WritableVector,
 };
 use libduckdb_sys as ffi;
-use libduckdb_sys::duckdb_string_t;
 use std::ffi::CString;
 
 use crate::catalog::{catalog_insert, catalog_upsert, CatalogState};
+use crate::ddl::parse_args::parse_define_args;
 
 /// Shared state for `define_semantic_view` and `define_or_replace_semantic_view`.
 ///
@@ -61,7 +61,8 @@ fn persist_define(conn: ffi::duckdb_connection, name: &str, json: &str) -> Resul
     }
 }
 
-/// `define_semantic_view(name, json)` scalar function.
+/// `define_semantic_view(name, tables, relationships, dimensions, time_dimensions, metrics)`
+/// scalar function.
 ///
 /// Inserts a new semantic view definition. Errors if the view already exists.
 /// Use `define_or_replace_semantic_view` to overwrite an existing view.
@@ -71,12 +72,46 @@ impl VScalar for DefineSemanticView {
     type State = DefineState;
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
+        let varchar = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
+
+        let tables_type = LogicalTypeHandle::list(&LogicalTypeHandle::struct_type(&[
+            ("alias", varchar()),
+            ("table", varchar()),
+        ]));
+        let col_pair_struct =
+            LogicalTypeHandle::struct_type(&[("from", varchar()), ("to", varchar())]);
+        let join_columns_type = LogicalTypeHandle::list(&col_pair_struct);
+        let relationships_type = LogicalTypeHandle::list(&LogicalTypeHandle::struct_type(&[
+            ("from_table", varchar()),
+            ("to_table", varchar()),
+            ("join_columns", join_columns_type),
+        ]));
+        let dimensions_type = LogicalTypeHandle::list(&LogicalTypeHandle::struct_type(&[
+            ("name", varchar()),
+            ("expr", varchar()),
+            ("source_table", varchar()),
+        ]));
+        let time_dimensions_type = LogicalTypeHandle::list(&LogicalTypeHandle::struct_type(&[
+            ("name", varchar()),
+            ("expr", varchar()),
+            ("granularity", varchar()),
+        ]));
+        let metrics_type = LogicalTypeHandle::list(&LogicalTypeHandle::struct_type(&[
+            ("name", varchar()),
+            ("expr", varchar()),
+            ("source_table", varchar()),
+        ]));
+
         vec![ScalarFunctionSignature::exact(
             vec![
-                LogicalTypeHandle::from(LogicalTypeId::Varchar), // view name
-                LogicalTypeHandle::from(LogicalTypeId::Varchar), // definition JSON
+                varchar(),            // 0: view name
+                tables_type,          // 1: tables LIST(STRUCT(alias, table))
+                relationships_type,   // 2: relationships LIST(STRUCT(..., join_columns LIST(...)))
+                dimensions_type,      // 3: dimensions LIST(STRUCT(name, expr, source_table))
+                time_dimensions_type, // 4: time_dimensions LIST(STRUCT(name, expr, granularity))
+                metrics_type,         // 5: metrics LIST(STRUCT(name, expr, source_table))
             ],
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // returns view name on success
+            varchar(), // returns view name on success
         )]
     }
 
@@ -85,36 +120,29 @@ impl VScalar for DefineSemanticView {
         input: &mut DataChunkHandle,
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let name_col = input.flat_vector(0);
-        let names = name_col.as_slice_with_len::<duckdb_string_t>(input.len());
-        let json_col = input.flat_vector(1);
-        let jsons = json_col.as_slice_with_len::<duckdb_string_t>(input.len());
-
         let out = output.flat_vector();
         for i in 0..input.len() {
-            let name = duckdb::types::DuckString::new(&mut { names[i] })
-                .as_str()
-                .to_string();
-            let json = duckdb::types::DuckString::new(&mut { jsons[i] })
-                .as_str()
-                .to_string();
+            let parsed =
+                parse_define_args(input, i).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+            let json = serde_json::to_string(&parsed.def)
+                .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
             // 1. Persist to DuckDB table FIRST (file-backed databases only).
             //    Uses a separate connection — no deadlock with invoke's execution lock.
             //    Write-first ordering: if persist fails, HashMap is unchanged.
             if let Some(conn) = state.persist_conn {
-                persist_define(conn, &name, &json)
+                persist_define(conn, &parsed.name, &json)
                     .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
             }
 
             // 2. Update in-memory catalog.
             if state.or_replace {
-                catalog_upsert(&state.catalog, &name, &json)?;
+                catalog_upsert(&state.catalog, &parsed.name, &json)?;
             } else {
-                catalog_insert(&state.catalog, &name, &json)?;
+                catalog_insert(&state.catalog, &parsed.name, &json)?;
             }
 
-            out.insert(i, name.as_str());
+            out.insert(i, parsed.name.as_str());
         }
         Ok(())
     }

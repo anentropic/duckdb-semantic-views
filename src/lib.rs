@@ -155,23 +155,23 @@ mod extension {
             &catalog_state,
         )?;
 
-        // Create a NEW connection for the semantic_query table function.
+        // Create a NEW connection for the semantic_view table function.
         // The host connection may hold execution locks during query processing.
         // A separate connection avoids lock conflicts when executing the expanded
         // SQL from within the table function.
         let mut query_conn: ffi::duckdb_connection = ptr::null_mut();
         let rc = unsafe { ffi::duckdb_connect(db_handle, &mut query_conn) };
         if rc != ffi::DuckDBSuccess {
-            return Err("Failed to create query connection for semantic_query".into());
+            return Err("Failed to create query connection for semantic_view".into());
         }
 
-        // Register the semantic_query table function.
+        // Register the semantic_view table function.
         let query_state = QueryState {
             catalog: catalog_state.clone(),
             conn: query_conn,
         };
         con.register_table_function_with_extra_info::<SemanticViewVTab, _>(
-            "semantic_query",
+            "semantic_view",
             &query_state,
         )?;
 
