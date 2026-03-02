@@ -5,16 +5,33 @@
 # ///
 """DuckLake/Iceberg integration test for the semantic_views extension.
 
-Verifies that semantic_query works correctly against DuckLake-managed
+Verifies that semantic_view works correctly against DuckLake-managed
 tables (which use the Iceberg table format under the hood). This proves
 the extension handles non-standard table sources end-to-end.
+
+Uses the v0.2.0 API:
+  - create_semantic_view(name, tables, relationships, dimensions, time_dimensions, metrics)
+  - semantic_view(name, dimensions := [...], metrics := [...])
+  - explain_semantic_view(name, ...)
+  - drop_semantic_view(name)
+
+Test cases:
+    1. Define semantic view over DuckLake/Iceberg table
+    2. Query the DuckLake-backed semantic view with dimension
+    3. Metrics-only query (global aggregate)
+    4. Explain on DuckLake-backed view
+    5. Typed BIGINT output — count(*) returns Python int, not str
+    6. Time dimension with day granularity — ordered_at returns datetime.date values
 
 Prerequisites:
     Run `just setup-ducklake` first to download jaffle-shop data and
     create the DuckLake catalog.
 
 Usage:
-    python3 test/integration/test_ducklake.py
+    uv run test/integration/test_ducklake.py
+
+    Or via Justfile:
+    just test-iceberg
 
 Exit codes:
     0 = all assertions passed
@@ -23,11 +40,21 @@ Exit codes:
 Requirement: TEST-04 (integration test with Apache Iceberg table source)
 """
 
-import os
+import datetime
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# Add test/integration to path for helpers import
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_ducklake_helpers import (
+    attach_ducklake,
+    get_ext_dir,
+    get_extension_path,
+    get_project_root,
+    load_extension,
+)
+
+PROJECT_ROOT = get_project_root()
 
 # DuckLake catalog paths (must match setup_ducklake.py)
 DATA_DIR = PROJECT_ROOT / "test" / "data"
@@ -35,8 +62,8 @@ CATALOG_DB = DATA_DIR / "test_catalog.duckdb"
 DUCKLAKE_FILE = DATA_DIR / "jaffle.ducklake"
 JAFFLE_DATA_DIR = DATA_DIR / "jaffle_data"
 
-# Extension path
-EXTENSION_PATH = PROJECT_ROOT / "build" / "debug" / "semantic_views.duckdb_extension"
+# Extension path (resolved via helpers)
+EXTENSION_PATH = get_extension_path()
 
 
 def check_prerequisites():
@@ -70,24 +97,18 @@ def run_tests():
     print()
 
     # Connect to the catalog database (which has DuckLake already set up).
-    # Use the project-local extension directory to avoid needing ~/.duckdb.
-    ext_dir = str(DATA_DIR / "duckdb_extensions")
-    con = duckdb.connect(str(CATALOG_DB), config={
-        "allow_unsigned_extensions": "true",
-        "extension_directory": ext_dir,
-    })
-
-    # Load extensions
-    con.execute(f"INSTALL '{EXTENSION_PATH}'")
-    con.execute("LOAD semantic_views")
-    con.execute("LOAD ducklake")
-
-    # Attach the DuckLake catalog
-    ducklake_uri = f"ducklake:{DUCKLAKE_FILE}"
-    data_path = str(JAFFLE_DATA_DIR) + "/"
-    con.execute(
-        f"ATTACH '{ducklake_uri}' AS jaffle (DATA_PATH '{data_path}')"
+    ext_dir = get_ext_dir()
+    con = duckdb.connect(
+        str(CATALOG_DB),
+        config={
+            "allow_unsigned_extensions": "true",
+            "extension_directory": ext_dir,
+        },
     )
+
+    # Load extensions and attach DuckLake catalog
+    load_extension(con, EXTENSION_PATH)
+    attach_ducklake(con, str(DUCKLAKE_FILE), str(JAFFLE_DATA_DIR) + "/", alias="jaffle")
 
     # Verify DuckLake tables are accessible
     tables = con.execute(
@@ -108,12 +129,19 @@ def run_tests():
     print()
     print("Test 1: Define semantic view over DuckLake/Iceberg table")
     try:
-        con.execute("""
-            SELECT define_semantic_view(
+        con.execute(
+            """
+            SELECT create_semantic_view(
                 'jaffle_orders',
-                '{"base_table":"jaffle.raw_orders","dimensions":[{"name":"store_id","expr":"store_id"}],"metrics":[{"name":"order_count","expr":"count(*)"},{"name":"total_revenue","expr":"sum(order_total)"}]}'
+                [{'alias': 'o', 'table': 'jaffle.raw_orders'}],
+                [],
+                [{'name': 'store_id', 'expr': 'store_id', 'source_table': 'o'}],
+                [{'name': 'ordered_at', 'expr': 'ordered_at', 'granularity': 'day'}],
+                [{'name': 'order_count',   'expr': 'count(*)',          'source_table': 'o'},
+                 {'name': 'total_revenue', 'expr': 'sum(order_total)', 'source_table': 'o'}]
             )
-        """)
+            """
+        )
         print("  PASS: View defined successfully")
         passed += 1
     except Exception as e:
@@ -124,16 +152,17 @@ def run_tests():
     print()
     print("Test 2: Query DuckLake-backed semantic view")
     try:
-        result = con.execute("""
-            SELECT * FROM semantic_query(
+        result = con.execute(
+            """
+            SELECT * FROM semantic_view(
                 'jaffle_orders',
                 dimensions := ['store_id'],
                 metrics := ['order_count']
             )
-        """).fetchall()
+            """
+        ).fetchall()
         print(f"  Result: {result}")
         assert len(result) > 0, "Expected at least one row"
-        # Verify the result has store_id and order_count columns
         store_ids = {row[0] for row in result}
         print(f"  Store IDs found: {len(store_ids)}")
         assert len(store_ids) > 0, "Expected at least one distinct store_id"
@@ -147,12 +176,14 @@ def run_tests():
     print()
     print("Test 3: Global aggregate over DuckLake table")
     try:
-        result = con.execute("""
-            SELECT * FROM semantic_query(
+        result = con.execute(
+            """
+            SELECT * FROM semantic_view(
                 'jaffle_orders',
                 metrics := ['order_count', 'total_revenue']
             )
-        """).fetchall()
+            """
+        ).fetchall()
         print(f"  Result: {result}")
         assert len(result) == 1, f"Expected 1 row, got {len(result)}"
         order_count = int(result[0][0])
@@ -170,19 +201,70 @@ def run_tests():
     print()
     print("Test 4: Explain on DuckLake-backed semantic view")
     try:
-        result = con.execute("""
+        result = con.execute(
+            """
             SELECT * FROM explain_semantic_view(
                 'jaffle_orders',
                 dimensions := ['store_id'],
                 metrics := ['order_count']
             )
-        """).fetchall()
+            """
+        ).fetchall()
         lines = [row[0] for row in result]
         explain_text = "\n".join(lines)
         assert "jaffle_orders" in explain_text, "Expected view name in explain output"
         assert "raw_orders" in explain_text, "Expected base table in explain output"
         print(f"  Explain output: {len(lines)} lines")
         print("  PASS: Explain output contains expected metadata")
+        passed += 1
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        failed += 1
+
+    # ---- Test 5: Typed BIGINT output ----
+    print()
+    print("Test 5: Typed BIGINT output for count(*) metric")
+    try:
+        result = con.execute(
+            """
+            SELECT * FROM semantic_view('jaffle_orders', metrics := ['order_count'])
+            """
+        ).fetchall()
+        assert len(result) == 1, f"Expected 1 row, got {len(result)}"
+        order_count_val = result[0][0]
+        assert isinstance(order_count_val, int), (
+            f"Expected int (BIGINT) for order_count, got "
+            f"{type(order_count_val).__name__}: {order_count_val!r}"
+        )
+        print(f"  order_count type: {type(order_count_val).__name__} = {order_count_val}")
+        print("  PASS: count(*) returns BIGINT (Python int)")
+        passed += 1
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        failed += 1
+
+    # ---- Test 6: Time dimension with day granularity ----
+    print()
+    print("Test 6: Time dimension truncated to day granularity")
+    try:
+        result = con.execute(
+            """
+            SELECT * FROM semantic_view(
+                'jaffle_orders',
+                dimensions := ['ordered_at'],
+                metrics := ['order_count']
+            )
+            """
+        ).fetchall()
+        assert len(result) > 0, "Expected at least one row"
+        # All date values should be datetime.date instances
+        for row in result:
+            assert isinstance(row[0], datetime.date), (
+                f"Expected datetime.date for ordered_at, got "
+                f"{type(row[0]).__name__}: {row[0]!r}"
+            )
+        print(f"  Time dimension rows: {len(result)} distinct days")
+        print("  PASS: ordered_at returns datetime.date values")
         passed += 1
     except Exception as e:
         print(f"  FAIL: {e}")
