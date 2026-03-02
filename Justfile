@@ -69,13 +69,19 @@ setup-ducklake:
     uv run configure/setup_ducklake.py
 
 # Run DuckLake/Iceberg integration test (requires `just setup-ducklake` first).
-# Tests semantic_query against DuckLake-managed Iceberg tables with jaffle-shop data.
+# Tests semantic_view against DuckLake-managed Iceberg tables with jaffle-shop data.
 test-iceberg: build
     uv run test/integration/test_ducklake.py
 
-# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration
-# Note: DuckLake test requires `just setup-ducklake` to have been run first.
-test-all: test-rust test-sql test-iceberg
+# Run DuckLake CI integration test (uses inline synthetic data, no setup required).
+# Tests semantic_view against an in-memory DuckLake catalog with known synthetic rows.
+# Set SEMANTIC_VIEWS_EXTENSION_PATH to override the extension path (default: build/debug/).
+test-ducklake-ci:
+    uv run test/integration/test_ducklake_ci.py
+
+# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration tests
+# Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
+test-all: test-rust test-sql test-iceberg test-ducklake-ci
 
 # Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
 fuzz target="fuzz_json_parse" time="300":
