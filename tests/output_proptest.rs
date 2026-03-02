@@ -522,20 +522,17 @@ proptest! {
     }
 
     /// TIMESTAMP column roundtrip — TIMESTAMP NULL fix regression.
-    /// Insert microsecond timestamps, read back as TypedValue::I64.
-    ///
-    /// DuckDB's INTERVAL multiplier is limited to INT32, so we restrict usecs to
-    /// the range 0..=2_000_000_000 (about year 2033 at microsecond granularity),
-    /// which still covers the TIMESTAMP-as-NULL bug regardless of timestamp magnitude.
+    /// Insert microsecond timestamps via `epoch_us()`, read back as TypedValue::I64,
+    /// and assert the exact value matches. Covers year 0001 through year 9999.
     #[test]
-    fn timestamp_column_roundtrip(usecs in prop::collection::vec(0i32..=2_000_000_000i32, 1..10)) {
+    fn timestamp_column_roundtrip(
+        usecs in prop::collection::vec(-62_135_596_800_000_000_i64..=253_402_300_799_999_999_i64, 1..10)
+    ) {
         let db = RawDb::open_in_memory();
         unsafe {
             db.exec("CREATE TABLE t_ts (v TIMESTAMP)");
             for u in &usecs {
-                db.exec(&format!(
-                    "INSERT INTO t_ts VALUES ('epoch'::TIMESTAMP + ({u}::INTEGER * INTERVAL '1 microsecond'))"
-                ));
+                db.exec(&format!("INSERT INTO t_ts VALUES (make_timestamp({u}::BIGINT))"));
             }
         }
         let result = unsafe {
@@ -543,24 +540,25 @@ proptest! {
         };
         prop_assert_eq!(result.len(), usecs.len());
         for (expected, actual) in usecs.iter().zip(result.iter()) {
-            prop_assert!(
-                matches!(actual, TestValue::I64(v) if v != &0 || expected == &0),
-                "TIMESTAMP must not be NULL, got: {:?} for usecs={expected}",
-                actual
+            prop_assert_eq!(
+                actual, &TestValue::I64(*expected),
+                "TIMESTAMP roundtrip mismatch for usecs={}",
+                expected
             );
         }
     }
 
-    /// DATE column roundtrip.
+    /// DATE column roundtrip. Covers both pre-epoch (negative) and post-epoch days,
+    /// approximately 1833 to 2107. Uses DATE + INTEGER arithmetic which supports
+    /// negative offsets, unlike INTERVAL which requires non-negative values.
     #[test]
-    fn date_column_roundtrip(days in prop::collection::vec(0i32..=54787i32, 1..10)) {
+    fn date_column_roundtrip(days in prop::collection::vec(-50_000_i32..=50_000_i32, 1..10)) {
         let db = RawDb::open_in_memory();
         unsafe {
             db.exec("CREATE TABLE t_date (v DATE)");
             for d in &days {
-                // Construct date from days-since-epoch.
                 db.exec(&format!(
-                    "INSERT INTO t_date VALUES ('1970-01-01'::DATE + INTERVAL ({d}) DAYS)"
+                    "INSERT INTO t_date VALUES ('1970-01-01'::DATE + ({d}::INTEGER))"
                 ));
             }
         }
@@ -569,7 +567,11 @@ proptest! {
         };
         prop_assert_eq!(result.len(), days.len());
         for (expected, actual) in days.iter().zip(result.iter()) {
-            prop_assert_eq!(actual, &TestValue::I32(*expected));
+            prop_assert_eq!(
+                actual, &TestValue::I32(*expected),
+                "DATE roundtrip mismatch for days={}",
+                expected
+            );
         }
     }
 }
