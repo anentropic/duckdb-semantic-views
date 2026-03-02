@@ -180,44 +180,96 @@ unsafe fn extract_map_strings(value: &Value) -> HashMap<String, String> {
 // Type mapping helpers
 // ---------------------------------------------------------------------------
 
+/// RAII wrapper for `ffi::duckdb_logical_type` handles.
+///
+/// Automatically calls `duckdb_destroy_logical_type` when dropped.
+struct LogicalTypeOwned(ffi::duckdb_logical_type);
+
+impl Drop for LogicalTypeOwned {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { ffi::duckdb_destroy_logical_type(&mut self.0) };
+        }
+    }
+}
+
 /// Typed value enum for accumulating column data across chunks before writing to output.
 enum TypedValue {
     Null,
-    I64(i64),    // BIGINT, UBIGINT, HUGEINT (truncated), SMALLINT upcast, etc.
-    I32(i32),    // INTEGER, DATE (days-since-epoch), SMALLINT, TINYINT
-    F64(f64),    // DOUBLE, FLOAT upcast
-    Str(String), // VARCHAR, all other types (fallback)
+    Bool(bool),            // BOOLEAN
+    I8(i8),                // TINYINT
+    I16(i16),              // SMALLINT
+    I32(i32),              // INTEGER, DATE (days-since-epoch)
+    I64(i64),              // BIGINT, TIMESTAMP variants, TIME, HUGEINT (truncated)
+    U8(u8),                // UTINYINT
+    U16(u16),              // USMALLINT
+    U32(u32),              // UINTEGER
+    U64(u64),              // UBIGINT, UHUGEINT (truncated)
+    F32(f32),              // FLOAT
+    F64(f64),              // DOUBLE
+    I128(i128),            // DECIMAL (HUGEINT-backed), HUGEINT raw
+    Str(String),           // VARCHAR, ENUM decoded, UUID formatted, fallback
+    List(Vec<TypedValue>), // LIST with scalar elements
 }
 
 /// Convert a raw `ffi::duckdb_type` (u32) to a `LogicalTypeHandle`.
 ///
-/// Complex types (LIST, STRUCT, MAP, ENUM) and DECIMAL fall back to VARCHAR/DOUBLE.
+/// DECIMAL, LIST, ENUM, and STRUCT/MAP/complex types need the logical type handle
+/// for accurate metadata; they are handled separately via `declare_output_type`.
 /// INVALID (0) falls back to VARCHAR.
 fn type_from_duckdb_type_u32(t: u32) -> LogicalTypeHandle {
     // Named constants matching libduckdb-sys DUCKDB_TYPE_DUCKDB_TYPE_* values.
     const INVALID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID;
-    const DECIMAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL;
-    const ENUM: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_ENUM;
-    const LIST: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST;
     const STRUCT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT;
     const MAP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP;
-    // 128-bit integer types: DuckDB HUGEINT/UHUGEINT use 16 bytes per slot.
-    // We write them as i64 (8 bytes) via parse_typed_from_str, so declare
-    // the output column as BIGINT to match the write operation size.
+    // HUGEINT/UHUGEINT: we read lower 64 bits and output as BIGINT/UBIGINT.
     const HUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT;
     const UHUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT;
     match t {
-        // Complex types and DECIMAL fall back to VARCHAR.
-        // DECIMAL is kept as VARCHAR to preserve exact precision formatting
-        // (e.g., "350.00" instead of "350.0") and to avoid needing the scale
-        // metadata for correct parsing in func().
-        INVALID | DECIMAL | ENUM | LIST | STRUCT | MAP => {
+        // Complex types with no flat binary representation fall back to VARCHAR.
+        INVALID | STRUCT | MAP => LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        // HUGEINT/UHUGEINT: output as BIGINT/UBIGINT (we truncate to 64 bits).
+        HUGEINT => LogicalTypeHandle::from(LogicalTypeId::Bigint),
+        UHUGEINT => LogicalTypeHandle::from(LogicalTypeId::UBigint),
+        // All other types map directly via the type_id.
+        _ => LogicalTypeHandle::from(LogicalTypeId::from(t)),
+    }
+}
+
+/// Declare the output type for a column, using logical type metadata for DECIMAL/LIST/ENUM.
+///
+/// For complex types that need logical type metadata (DECIMAL width/scale, LIST child type,
+/// ENUM → VARCHAR), this function reads the metadata and returns the correct output type.
+/// All other types delegate to `type_from_duckdb_type_u32`.
+///
+/// # Safety
+///
+/// `logical_type` must be a valid `duckdb_logical_type` handle for column `type_id`.
+unsafe fn declare_output_type(
+    logical_type: ffi::duckdb_logical_type,
+    type_id: u32,
+) -> LogicalTypeHandle {
+    const DECIMAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL;
+    const LIST: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST;
+    const ENUM: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_ENUM;
+
+    match type_id {
+        DECIMAL => {
+            let width = ffi::duckdb_decimal_width(logical_type);
+            let scale = ffi::duckdb_decimal_scale(logical_type);
+            LogicalTypeHandle::decimal(width, scale)
+        }
+        LIST => {
+            let child_lt = LogicalTypeOwned(ffi::duckdb_list_type_child_type(logical_type));
+            let child_type_id = ffi::duckdb_get_type_id(child_lt.0) as u32;
+            let child_lth = LogicalTypeHandle::from(LogicalTypeId::from(child_type_id));
+            LogicalTypeHandle::list(&child_lth)
+        }
+        ENUM => {
+            // ENUM output is declared as VARCHAR — users see string values, not ordinals.
             LogicalTypeHandle::from(LogicalTypeId::Varchar)
         }
-        // HUGEINT/UHUGEINT are 16-byte types; we store them as i64 (BIGINT slot size).
-        // Declaring output as BIGINT avoids writing 8 bytes into a 16-byte slot.
-        HUGEINT | UHUGEINT => LogicalTypeHandle::from(LogicalTypeId::Bigint),
-        _ => LogicalTypeHandle::from(LogicalTypeId::from(t)),
+        _ => type_from_duckdb_type_u32(type_id),
     }
 }
 
@@ -404,9 +456,45 @@ impl VTab for SemanticViewVTab {
         };
 
         // 7. Declare typed output columns.
-        //    type_from_duckdb_type_u32 maps complex/invalid types to VARCHAR fallback.
-        for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
-            bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
+        //    For DECIMAL/LIST/ENUM: we need the logical type for metadata.
+        //    Check if any column requires a LIMIT-0 query for logical type metadata.
+        const DECIMAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL;
+        const LIST: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST;
+        const ENUM: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_ENUM;
+
+        let needs_logical_types = column_type_ids
+            .iter()
+            .any(|&t| t == DECIMAL || t == LIST || t == ENUM);
+
+        if needs_logical_types {
+            // Run a LIMIT 0 query to get logical type handles for columns that need them.
+            let limit0_sql = format!("{expanded_sql} LIMIT 0");
+            if let Ok(mut limit0_result) = unsafe { execute_sql_raw(state.conn, &limit0_sql) } {
+                for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
+                    let col_pos =
+                        column_names.iter().position(|n| n == name).unwrap_or(0) as ffi::idx_t;
+                    if type_id == DECIMAL || type_id == LIST || type_id == ENUM {
+                        let lt = LogicalTypeOwned(unsafe {
+                            ffi::duckdb_column_logical_type(&mut limit0_result, col_pos)
+                        });
+                        let out_type = unsafe { declare_output_type(lt.0, type_id) };
+                        bind.add_result_column(name, out_type);
+                    } else {
+                        bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
+                    }
+                }
+                unsafe { ffi::duckdb_destroy_result(&mut limit0_result) };
+            } else {
+                // LIMIT 0 failed — fall back to basic type mapping for all columns.
+                for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
+                    bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
+                }
+            }
+        } else {
+            // No DECIMAL/LIST/ENUM — fast path, no LIMIT 0 needed.
+            for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
+                bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
+            }
         }
 
         Ok(SemanticViewBindData {
@@ -437,25 +525,31 @@ impl VTab for SemanticViewVTab {
         let bind_data = func.get_bind_data();
         let state = unsafe { &*func.get_extra_info::<QueryState>() };
 
-        // Execute with a VARCHAR cast wrapper to guarantee uniform string layout in
-        // result chunks. This handles all DuckDB types (DECIMAL, HUGEINT, complex types)
-        // without requiring type-specific binary chunk parsing.
-        // Typed columns are written via parse_typed_from_str() after reading the strings.
-        let varchar_sql = build_varchar_cast_sql(&bind_data.expanded_sql, &bind_data.column_names);
-
+        // Execute the expanded SQL directly — no VARCHAR cast wrapper.
+        // Binary reads via read_typed_from_vector handle all type conversions.
         let mut result = unsafe {
-            execute_sql_raw(state.conn, &varchar_sql).map_err(|e| QueryError::SqlExecution {
-                expanded_sql: bind_data.expanded_sql.clone(),
-                duckdb_error: e,
+            execute_sql_raw(state.conn, &bind_data.expanded_sql).map_err(|e| {
+                QueryError::SqlExecution {
+                    expanded_sql: bind_data.expanded_sql.clone(),
+                    duckdb_error: e,
+                }
             })?
         };
 
         let col_count = unsafe { ffi::duckdb_column_count(&mut result) } as usize;
         let chunk_count = unsafe { ffi::duckdb_result_chunk_count(result) } as usize;
 
-        // Collect all rows as string vectors (column-major for efficient typed writes).
+        // Collect all rows as TypedValues (column-major for efficient typed writes).
         let mut total_rows = 0usize;
-        let mut col_strings: Vec<Vec<String>> = vec![Vec::new(); col_count];
+        let mut col_values: Vec<Vec<TypedValue>> = (0..col_count).map(|_| Vec::new()).collect();
+
+        // Pre-fetch logical types for all columns (needed for DECIMAL/LIST/ENUM/ENUM dispatch).
+        let mut col_logical_types: Vec<ffi::duckdb_logical_type> =
+            vec![std::ptr::null_mut(); col_count];
+        for col_idx in 0..col_count {
+            col_logical_types[col_idx] =
+                unsafe { ffi::duckdb_column_logical_type(&mut result, col_idx as ffi::idx_t) };
+        }
 
         for chunk_idx in 0..chunk_count {
             let chunk = unsafe { ffi::duckdb_result_get_chunk(result, chunk_idx as ffi::idx_t) };
@@ -466,9 +560,17 @@ impl VTab for SemanticViewVTab {
             total_rows += row_count;
 
             for col_idx in 0..col_count {
+                let type_id = if col_idx < bind_data.column_type_ids.len() {
+                    bind_data.column_type_ids[col_idx]
+                } else {
+                    0
+                };
+                let logical_type = col_logical_types[col_idx];
                 for row_idx in 0..row_count {
-                    let s = unsafe { read_varchar_from_vector(chunk, col_idx, row_idx) };
-                    col_strings[col_idx].push(s);
+                    let val = unsafe {
+                        read_typed_from_vector(chunk, col_idx, row_idx, type_id, logical_type)
+                    };
+                    col_values[col_idx].push(val);
                 }
             }
 
@@ -477,7 +579,14 @@ impl VTab for SemanticViewVTab {
             }
         }
 
-        // Write typed output: parse string values to the appropriate typed vectors.
+        // Destroy logical type handles.
+        for lt in &mut col_logical_types {
+            if !lt.is_null() {
+                unsafe { ffi::duckdb_destroy_logical_type(lt) };
+            }
+        }
+
+        // Write typed output.
         if total_rows > 0 {
             for col_idx in 0..col_count.min(bind_data.column_names.len()) {
                 let type_id = if col_idx < bind_data.column_type_ids.len() {
@@ -485,11 +594,7 @@ impl VTab for SemanticViewVTab {
                 } else {
                     0
                 };
-                let col_data: Vec<TypedValue> = col_strings[col_idx]
-                    .iter()
-                    .map(|s| parse_typed_from_str(s, type_id))
-                    .collect();
-                write_typed_column(output, col_idx, &col_data, total_rows, type_id);
+                write_typed_column(output, col_idx, &col_values[col_idx], total_rows, type_id);
             }
         }
         output.set_len(total_rows);
@@ -568,34 +673,8 @@ pub(crate) unsafe fn try_infer_schema(
 }
 
 // ---------------------------------------------------------------------------
-// VARCHAR-cast SQL wrapping and chunk-based string reading
+// Binary chunk reading
 // ---------------------------------------------------------------------------
-
-/// Wrap the expanded SQL in a subquery that casts every output column to VARCHAR.
-///
-/// The deprecated `duckdb_value_varchar` API does not work reliably with DuckDB's
-/// chunked result format. By casting all columns to VARCHAR in the SQL itself,
-/// we guarantee that every vector in every result chunk contains `duckdb_string_t`
-/// values, which can be read uniformly via `read_varchar_from_vector`.
-fn build_varchar_cast_sql(expanded_sql: &str, column_names: &[String]) -> String {
-    use crate::expand::quote_ident;
-
-    let cast_items: Vec<String> = column_names
-        .iter()
-        .map(|name| {
-            format!(
-                "CAST({} AS VARCHAR) AS {}",
-                quote_ident(name),
-                quote_ident(name)
-            )
-        })
-        .collect();
-    format!(
-        "SELECT {} FROM ({}) AS \"_sq\"",
-        cast_items.join(", "),
-        expanded_sql
-    )
-}
 
 /// Read a VARCHAR value from a data chunk vector at the given column and row.
 ///
@@ -659,90 +738,281 @@ pub(crate) unsafe fn read_varchar_from_vector(
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-// ---------------------------------------------------------------------------
-// Typed column parse/write helpers
-// ---------------------------------------------------------------------------
-
-/// Parse a YYYY-MM-DD date string into days since the Unix epoch (1970-01-01).
+/// Read a varchar value from a child vector (used for LIST child reads and VARCHAR columns).
 ///
-/// Returns `None` if the string is not a valid YYYY-MM-DD date.
-/// DuckDB's `duckdb_date` (stored as `i32` in FlatVector) counts days since
-/// 1970-01-01 (negative for dates before epoch).
-fn date_str_to_epoch_days(s: &str) -> Option<i32> {
-    // Expect exactly "YYYY-MM-DD" (10 bytes).
-    if s.len() != 10 || &s[4..5] != "-" || &s[7..8] != "-" {
-        return None;
-    }
-    let year: i32 = s[0..4].parse().ok()?;
-    let month: i32 = s[5..7].parse().ok()?;
-    let day: i32 = s[8..10].parse().ok()?;
-
-    // Use the proleptic Gregorian calendar formula (Julian Day Number approach).
-    // Days since epoch = JDN(date) - JDN(1970-01-01)
-    // JDN(1970-01-01) = 2440588
-    fn jdn(y: i32, m: i32, d: i32) -> i32 {
-        // Algorithm from Astronomical Algorithms (Meeus), valid for Gregorian calendar.
-        let a = (14 - m) / 12;
-        let yy = y + 4800 - a;
-        let mm = m + 12 * a - 3;
-        d + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045
+/// Unlike `read_varchar_from_vector` which takes a chunk + col_idx, this takes a raw vector
+/// pointer directly — used when iterating LIST child vectors.
+///
+/// # Safety
+///
+/// `vector` must be a valid `duckdb_vector` containing VARCHAR data.
+/// `row_idx` must be within bounds.
+#[allow(clippy::cast_possible_truncation)]
+unsafe fn read_varchar_from_raw_vector(
+    vector: ffi::duckdb_vector,
+    row_idx: usize,
+) -> Option<String> {
+    let validity = ffi::duckdb_vector_get_validity(vector);
+    if !validity.is_null() {
+        let entry = *validity.add(row_idx / 64);
+        if entry & (1u64 << (row_idx % 64)) == 0 {
+            return None; // NULL
+        }
     }
 
-    const JDN_EPOCH: i32 = 2_440_588; // JDN for 1970-01-01
-    Some(jdn(year, month, day) - JDN_EPOCH)
+    let data_ptr = ffi::duckdb_vector_get_data(vector);
+    let string_t_ptr = data_ptr.cast::<ffi::duckdb_string_t>().add(row_idx);
+    let string_t = &*string_t_ptr;
+    let len = string_t.value.inlined.length as usize;
+    if len == 0 {
+        return Some(String::new());
+    }
+    let bytes = if len <= 12 {
+        let inline_ptr = string_t.value.inlined.inlined.as_ptr().cast::<u8>();
+        std::slice::from_raw_parts(inline_ptr, len)
+    } else {
+        let heap_ptr = string_t.value.pointer.ptr.cast::<u8>();
+        if heap_ptr.is_null() {
+            return Some(String::new());
+        }
+        std::slice::from_raw_parts(heap_ptr, len)
+    };
+    Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// Parse a VARCHAR string representation into a `TypedValue` based on the DDL-time type_id.
+/// Read a typed value from a DuckDB data chunk vector using direct binary reads.
 ///
-/// Called after reading all columns as VARCHAR strings from the result chunks.
-/// Empty strings are treated as NULL for numeric types.
-fn parse_typed_from_str(s: &str, type_id: u32) -> TypedValue {
+/// This is the central dispatch point replacing the old `parse_typed_from_str` approach.
+/// Instead of casting everything to VARCHAR and parsing strings, we read the raw binary
+/// data directly from the chunk vector memory, matching the DuckDB internal layout.
+///
+/// # Safety
+///
+/// - `chunk` must be a valid, non-null `duckdb_data_chunk` handle.
+/// - `col_idx` and `row_idx` must be within bounds.
+/// - `logical_type` must be a valid handle for the column (may be null for non-complex types).
+/// - `type_id` must match the actual column type in the chunk.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) unsafe fn read_typed_from_vector(
+    chunk: ffi::duckdb_data_chunk,
+    col_idx: usize,
+    row_idx: usize,
+    type_id: u32,
+    logical_type: ffi::duckdb_logical_type,
+) -> TypedValue {
     use ffi::{
-        DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_DATE as DATE,
-        DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL as DECIMAL, DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE as DOUBLE,
+        DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN as BOOLEAN,
+        DUCKDB_TYPE_DUCKDB_TYPE_DATE as DATE, DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL as DECIMAL,
+        DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE as DOUBLE, DUCKDB_TYPE_DUCKDB_TYPE_ENUM as ENUM,
         DUCKDB_TYPE_DUCKDB_TYPE_FLOAT as FLOAT, DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT as HUGEINT,
-        DUCKDB_TYPE_DUCKDB_TYPE_INTEGER as INTEGER, DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as SMALLINT,
-        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP as TIMESTAMP, DUCKDB_TYPE_DUCKDB_TYPE_TINYINT as TINYINT,
-        DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT as UBIGINT, DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER as UINTEGER,
+        DUCKDB_TYPE_DUCKDB_TYPE_INTEGER as INTEGER, DUCKDB_TYPE_DUCKDB_TYPE_LIST as LIST,
+        DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as SMALLINT, DUCKDB_TYPE_DUCKDB_TYPE_TIME as TIME,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP as TIMESTAMP,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS as TIMESTAMP_MS,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS as TIMESTAMP_NS,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S as TIMESTAMP_S,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ as TIMESTAMP_TZ,
+        DUCKDB_TYPE_DUCKDB_TYPE_TINYINT as TINYINT, DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT as UBIGINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT as UHUGEINT, DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER as UINTEGER,
         DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT as USMALLINT,
-        DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT as UTINYINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT as UTINYINT, DUCKDB_TYPE_DUCKDB_TYPE_UUID as UUID,
+        DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR as VARCHAR,
     };
 
-    if s.is_empty() {
-        return TypedValue::Null;
+    let vector = ffi::duckdb_data_chunk_get_vector(chunk, col_idx as ffi::idx_t);
+
+    // NULL check using validity mask (same bit-array pattern as read_varchar_from_vector).
+    let validity = ffi::duckdb_vector_get_validity(vector);
+    if !validity.is_null() {
+        let entry = *validity.add(row_idx / 64);
+        if entry & (1u64 << (row_idx % 64)) == 0 {
+            return TypedValue::Null;
+        }
     }
 
+    let data_ptr = ffi::duckdb_vector_get_data(vector);
+
     match type_id {
-        // 64-bit integer types: parse as i64.
-        BIGINT | UBIGINT | TIMESTAMP | HUGEINT => s
-            .parse::<i64>()
-            .map(TypedValue::I64)
-            .unwrap_or(TypedValue::Null),
-        // DATE: "YYYY-MM-DD" → days since 1970-01-01 stored as i32.
-        DATE => date_str_to_epoch_days(s)
-            .map(TypedValue::I32)
-            .unwrap_or(TypedValue::Null),
-        // 32-bit integer types.
-        INTEGER | UINTEGER | SMALLINT | TINYINT | USMALLINT | UTINYINT => s
-            .parse::<i32>()
-            .map(TypedValue::I32)
-            .unwrap_or(TypedValue::Null),
-        // Floating-point types: parse as f64.
-        DOUBLE | FLOAT => s
-            .parse::<f64>()
-            .map(TypedValue::F64)
-            .unwrap_or(TypedValue::Null),
-        // DECIMAL: keep as string to preserve exact precision formatting ("350.00" not "350.0").
-        DECIMAL => TypedValue::Str(s.to_owned()),
-        // VARCHAR and all other types: preserve as string.
-        _ => TypedValue::Str(s.to_owned()),
+        BOOLEAN => {
+            let v = *data_ptr.cast::<u8>().add(row_idx);
+            TypedValue::Bool(v != 0)
+        }
+        TINYINT => TypedValue::I8(*data_ptr.cast::<i8>().add(row_idx)),
+        SMALLINT => TypedValue::I16(*data_ptr.cast::<i16>().add(row_idx)),
+        INTEGER => TypedValue::I32(*data_ptr.cast::<i32>().add(row_idx)),
+        BIGINT => TypedValue::I64(*data_ptr.cast::<i64>().add(row_idx)),
+        UTINYINT => TypedValue::U8(*data_ptr.cast::<u8>().add(row_idx)),
+        USMALLINT => TypedValue::U16(*data_ptr.cast::<u16>().add(row_idx)),
+        UINTEGER => TypedValue::U32(*data_ptr.cast::<u32>().add(row_idx)),
+        UBIGINT => TypedValue::U64(*data_ptr.cast::<u64>().add(row_idx)),
+        FLOAT => TypedValue::F32(*data_ptr.cast::<f32>().add(row_idx)),
+        DOUBLE => TypedValue::F64(*data_ptr.cast::<f64>().add(row_idx)),
+        DATE => TypedValue::I32(*data_ptr.cast::<i32>().add(row_idx)),
+        TIMESTAMP | TIMESTAMP_S | TIMESTAMP_MS | TIMESTAMP_NS | TIMESTAMP_TZ | TIME => {
+            TypedValue::I64(*data_ptr.cast::<i64>().add(row_idx))
+        }
+        HUGEINT => {
+            // HUGEINT is 16 bytes: lower u64 + upper i64.
+            // We output the lower 64 bits as a signed i64 (declared as BIGINT in bind).
+            let raw = *data_ptr.cast::<i128>().add(row_idx);
+            TypedValue::I64(raw as i64)
+        }
+        UHUGEINT => {
+            // UHUGEINT is 16 bytes (u128). Output lower 64 bits as u64.
+            let raw = *data_ptr.cast::<u128>().add(row_idx);
+            TypedValue::U64(raw as u64)
+        }
+        DECIMAL => {
+            // DECIMAL internal type depends on precision:
+            // 1-4 digits  → SMALLINT (i16)
+            // 5-9 digits  → INTEGER  (i32)
+            // 10-18 digits → BIGINT  (i64)
+            // 19-38 digits → HUGEINT (i128)
+            if logical_type.is_null() {
+                return TypedValue::Null;
+            }
+            let internal = ffi::duckdb_decimal_internal_type(logical_type) as u32;
+            match internal {
+                SMALLINT => TypedValue::I128(i128::from(*data_ptr.cast::<i16>().add(row_idx))),
+                INTEGER => TypedValue::I128(i128::from(*data_ptr.cast::<i32>().add(row_idx))),
+                BIGINT => TypedValue::I128(i128::from(*data_ptr.cast::<i64>().add(row_idx))),
+                _ => {
+                    // HUGEINT backing (precision 19-38)
+                    TypedValue::I128(*data_ptr.cast::<i128>().add(row_idx))
+                }
+            }
+        }
+        UUID => {
+            // UUID is stored as a duckdb_uhugeint (16 bytes in a specific layout).
+            // DuckDB stores UUID as upper i64 XOR'd with sign bit + lower u64.
+            // Layout: { lower: u64, upper: i64 } (note: NOT a simple u128).
+            // We read as two u64 parts and format as standard UUID string.
+            let lower = *data_ptr.cast::<u64>().add(row_idx * 2);
+            let upper_raw = *data_ptr.cast::<i64>().add(row_idx * 2 + 1);
+            // DuckDB XORs the upper half with the sign bit for correct sorting.
+            let upper = (upper_raw ^ i64::MIN) as u64;
+            let uuid_str = format!(
+                "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+                (upper >> 32) as u32,
+                ((upper >> 16) & 0xffff) as u16,
+                (upper & 0xffff) as u16,
+                (lower >> 48) as u16,
+                lower & 0x0000_ffff_ffff_ffff,
+            );
+            TypedValue::Str(uuid_str)
+        }
+        ENUM => {
+            if logical_type.is_null() {
+                return TypedValue::Null;
+            }
+            // ENUM ordinal width depends on dictionary size.
+            let dict_size = ffi::duckdb_enum_dictionary_size(logical_type);
+            let ordinal: u32 = if dict_size <= 256 {
+                u32::from(*data_ptr.cast::<u8>().add(row_idx))
+            } else if dict_size <= 65536 {
+                u32::from(*data_ptr.cast::<u16>().add(row_idx))
+            } else {
+                *data_ptr.cast::<u32>().add(row_idx)
+            };
+            // Decode to string value via dictionary lookup.
+            let raw_ptr = ffi::duckdb_enum_dictionary_value(logical_type, ordinal as ffi::idx_t);
+            if raw_ptr.is_null() {
+                return TypedValue::Null;
+            }
+            let s = CStr::from_ptr(raw_ptr).to_string_lossy().into_owned();
+            ffi::duckdb_free(raw_ptr.cast::<c_void>());
+            TypedValue::Str(s)
+        }
+        LIST => {
+            if logical_type.is_null() {
+                return TypedValue::Null;
+            }
+            // LIST parent contains duckdb_list_entry { offset: u64, length: u64 }.
+            let entry = *data_ptr.cast::<ffi::duckdb_list_entry>().add(row_idx);
+            let offset = entry.offset as usize;
+            let length = entry.length as usize;
+
+            // Get child vector and its type.
+            let child_vec = ffi::duckdb_list_vector_get_child(vector);
+            let child_lt = LogicalTypeOwned(ffi::duckdb_list_type_child_type(logical_type));
+            let child_type_id = ffi::duckdb_get_type_id(child_lt.0) as u32;
+
+            let mut elements = Vec::with_capacity(length);
+            for i in 0..length {
+                let child_row = offset + i;
+                // Read child element — check child validity mask first.
+                let child_validity = ffi::duckdb_vector_get_validity(child_vec);
+                if !child_validity.is_null() {
+                    let child_entry = *child_validity.add(child_row / 64);
+                    if child_entry & (1u64 << (child_row % 64)) == 0 {
+                        elements.push(TypedValue::Null);
+                        continue;
+                    }
+                }
+                let child_data = ffi::duckdb_vector_get_data(child_vec);
+                let elem = match child_type_id {
+                    BOOLEAN => {
+                        let v = *child_data.cast::<u8>().add(child_row);
+                        TypedValue::Bool(v != 0)
+                    }
+                    TINYINT => TypedValue::I8(*child_data.cast::<i8>().add(child_row)),
+                    SMALLINT => TypedValue::I16(*child_data.cast::<i16>().add(child_row)),
+                    INTEGER => TypedValue::I32(*child_data.cast::<i32>().add(child_row)),
+                    BIGINT => TypedValue::I64(*child_data.cast::<i64>().add(child_row)),
+                    UTINYINT => TypedValue::U8(*child_data.cast::<u8>().add(child_row)),
+                    USMALLINT => TypedValue::U16(*child_data.cast::<u16>().add(child_row)),
+                    UINTEGER => TypedValue::U32(*child_data.cast::<u32>().add(child_row)),
+                    UBIGINT => TypedValue::U64(*child_data.cast::<u64>().add(child_row)),
+                    FLOAT => TypedValue::F32(*child_data.cast::<f32>().add(child_row)),
+                    DOUBLE => TypedValue::F64(*child_data.cast::<f64>().add(child_row)),
+                    DATE => TypedValue::I32(*child_data.cast::<i32>().add(child_row)),
+                    TIMESTAMP | TIMESTAMP_S | TIMESTAMP_MS | TIMESTAMP_NS | TIMESTAMP_TZ | TIME => {
+                        TypedValue::I64(*child_data.cast::<i64>().add(child_row))
+                    }
+                    VARCHAR => match read_varchar_from_raw_vector(child_vec, child_row) {
+                        Some(s) => TypedValue::Str(s),
+                        None => TypedValue::Null,
+                    },
+                    _ => {
+                        // Fallback: try varchar read for unknown child types.
+                        match read_varchar_from_raw_vector(child_vec, child_row) {
+                            Some(s) => TypedValue::Str(s),
+                            None => TypedValue::Null,
+                        }
+                    }
+                };
+                elements.push(elem);
+            }
+            TypedValue::List(elements)
+        }
+        VARCHAR => {
+            // VARCHAR: use existing string reader on this vector.
+            let s = read_varchar_from_vector(chunk, col_idx, row_idx);
+            if s.is_empty() {
+                // Could be empty string or NULL — validity already checked above,
+                // so this is a genuine empty string.
+                TypedValue::Str(s)
+            } else {
+                TypedValue::Str(s)
+            }
+        }
+        _ => {
+            // Fallback for any unhandled types: read as VARCHAR.
+            let s = read_varchar_from_vector(chunk, col_idx, row_idx);
+            TypedValue::Str(s)
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Typed column write helpers
+// ---------------------------------------------------------------------------
 
 /// Write a collected column of `TypedValue`s into the output `DataChunkHandle`.
 ///
 /// Dispatches based on `type_id` to write typed scalar data via `as_mut_slice_with_len`.
 /// NULL values are written via `set_null`. VARCHAR fallback uses `insert`.
+#[allow(clippy::too_many_lines)]
 fn write_typed_column(
     output: &mut DataChunkHandle,
     col_idx: usize,
@@ -751,60 +1021,183 @@ fn write_typed_column(
     type_id: u32,
 ) {
     use ffi::{
-        DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_DATE as DATE,
+        DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN as BOOLEAN,
+        DUCKDB_TYPE_DUCKDB_TYPE_DATE as DATE, DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL as DECIMAL,
         DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE as DOUBLE, DUCKDB_TYPE_DUCKDB_TYPE_FLOAT as FLOAT,
         DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT as HUGEINT, DUCKDB_TYPE_DUCKDB_TYPE_INTEGER as INTEGER,
-        DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as SMALLINT,
-        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP as TIMESTAMP, DUCKDB_TYPE_DUCKDB_TYPE_TINYINT as TINYINT,
-        DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT as UBIGINT, DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER as UINTEGER,
+        DUCKDB_TYPE_DUCKDB_TYPE_LIST as LIST, DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as SMALLINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIME as TIME, DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP as TIMESTAMP,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS as TIMESTAMP_MS,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS as TIMESTAMP_NS,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S as TIMESTAMP_S,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ as TIMESTAMP_TZ,
+        DUCKDB_TYPE_DUCKDB_TYPE_TINYINT as TINYINT, DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT as UBIGINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT as UHUGEINT, DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER as UINTEGER,
         DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT as USMALLINT,
         DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT as UTINYINT,
     };
 
-    let mut out_vec = output.flat_vector(col_idx);
+    /// Collect null positions before the slice borrow.
+    fn null_positions(values: &[TypedValue]) -> Vec<usize> {
+        values
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| matches!(v, TypedValue::Null).then_some(i))
+            .collect()
+    }
 
     match type_id {
-        BIGINT | UBIGINT | TIMESTAMP | HUGEINT => {
-            // Collect null positions before taking the slice borrow.
-            let null_positions: Vec<usize> = values
-                .iter()
-                .enumerate()
-                .filter_map(|(i, v)| matches!(v, TypedValue::Null).then_some(i))
-                .collect();
+        BOOLEAN => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
             {
-                let dst = out_vec.as_mut_slice_with_len::<i64>(n_rows);
+                let dst = out_vec.as_mut_slice_with_len::<u8>(n_rows);
                 for (i, val) in values.iter().enumerate() {
-                    dst[i] = if let TypedValue::I64(v) = val { *v } else { 0 };
+                    dst[i] = if let TypedValue::Bool(b) = val {
+                        u8::from(*b)
+                    } else {
+                        0
+                    };
                 }
-            } // dst borrow released here
-            for i in null_positions {
+            }
+            for i in nulls {
                 out_vec.set_null(i);
             }
         }
 
-        INTEGER | UINTEGER | SMALLINT | TINYINT | USMALLINT | UTINYINT | DATE => {
-            let null_positions: Vec<usize> = values
-                .iter()
-                .enumerate()
-                .filter_map(|(i, v)| matches!(v, TypedValue::Null).then_some(i))
-                .collect();
+        TINYINT => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
+            {
+                let dst = out_vec.as_mut_slice_with_len::<i8>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::I8(v) = val { *v } else { 0 };
+                }
+            }
+            for i in nulls {
+                out_vec.set_null(i);
+            }
+        }
+
+        SMALLINT => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
+            {
+                let dst = out_vec.as_mut_slice_with_len::<i16>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::I16(v) = val { *v } else { 0 };
+                }
+            }
+            for i in nulls {
+                out_vec.set_null(i);
+            }
+        }
+
+        INTEGER | DATE => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
             {
                 let dst = out_vec.as_mut_slice_with_len::<i32>(n_rows);
                 for (i, val) in values.iter().enumerate() {
                     dst[i] = if let TypedValue::I32(v) = val { *v } else { 0 };
                 }
             }
-            for i in null_positions {
+            for i in nulls {
                 out_vec.set_null(i);
             }
         }
 
-        DOUBLE | FLOAT => {
-            let null_positions: Vec<usize> = values
-                .iter()
-                .enumerate()
-                .filter_map(|(i, v)| matches!(v, TypedValue::Null).then_some(i))
-                .collect();
+        BIGINT | TIMESTAMP | TIMESTAMP_S | TIMESTAMP_MS | TIMESTAMP_NS | TIMESTAMP_TZ | TIME => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
+            {
+                let dst = out_vec.as_mut_slice_with_len::<i64>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::I64(v) = val { *v } else { 0 };
+                }
+            }
+            for i in nulls {
+                out_vec.set_null(i);
+            }
+        }
+
+        UTINYINT => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
+            {
+                let dst = out_vec.as_mut_slice_with_len::<u8>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::U8(v) = val { *v } else { 0 };
+                }
+            }
+            for i in nulls {
+                out_vec.set_null(i);
+            }
+        }
+
+        USMALLINT => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
+            {
+                let dst = out_vec.as_mut_slice_with_len::<u16>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::U16(v) = val { *v } else { 0 };
+                }
+            }
+            for i in nulls {
+                out_vec.set_null(i);
+            }
+        }
+
+        UINTEGER => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
+            {
+                let dst = out_vec.as_mut_slice_with_len::<u32>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::U32(v) = val { *v } else { 0 };
+                }
+            }
+            for i in nulls {
+                out_vec.set_null(i);
+            }
+        }
+
+        UBIGINT | UHUGEINT => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
+            {
+                let dst = out_vec.as_mut_slice_with_len::<u64>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::U64(v) = val { *v } else { 0 };
+                }
+            }
+            for i in nulls {
+                out_vec.set_null(i);
+            }
+        }
+
+        FLOAT => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
+            {
+                let dst = out_vec.as_mut_slice_with_len::<f32>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::F32(v) = val {
+                        *v
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            for i in nulls {
+                out_vec.set_null(i);
+            }
+        }
+
+        DOUBLE => {
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
             {
                 let dst = out_vec.as_mut_slice_with_len::<f64>(n_rows);
                 for (i, val) in values.iter().enumerate() {
@@ -815,22 +1208,164 @@ fn write_typed_column(
                     };
                 }
             }
-            for i in null_positions {
+            for i in nulls {
                 out_vec.set_null(i);
             }
         }
 
+        HUGEINT | DECIMAL => {
+            // HUGEINT is declared as BIGINT (i64) output in type_from_duckdb_type_u32.
+            // DECIMAL output is declared as DECIMAL(width, scale) — the backing integer
+            // is written as i128 for HUGEINT-backed DECIMALs.
+            // We use i128 slot here; for DECIMAL the output column must have been declared
+            // with the appropriate DECIMAL type in bind().
+            let nulls = null_positions(values);
+            let mut out_vec = output.flat_vector(col_idx);
+            {
+                let dst = out_vec.as_mut_slice_with_len::<i128>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = match val {
+                        TypedValue::I128(v) => *v,
+                        TypedValue::I64(v) => i128::from(*v),
+                        _ => 0,
+                    };
+                }
+            }
+            for i in nulls {
+                out_vec.set_null(i);
+            }
+        }
+
+        LIST => {
+            // LIST output: build flat child array, set entries per row.
+            // First pass: collect all child elements and compute offsets.
+            let mut child_i64s: Vec<i64> = Vec::new();
+            let mut child_i32s: Vec<i32> = Vec::new();
+            let mut child_bools: Vec<u8> = Vec::new();
+            let mut child_f64s: Vec<f64> = Vec::new();
+            let mut child_strs: Vec<String> = Vec::new();
+
+            // Detect child element type from first non-null list value.
+            enum ChildKind {
+                I64,
+                I32,
+                Bool,
+                F64,
+                Str,
+                Unknown,
+            }
+            let child_kind = values
+                .iter()
+                .find_map(|v| {
+                    if let TypedValue::List(elems) = v {
+                        elems.first().map(|e| match e {
+                            TypedValue::I64(_) => ChildKind::I64,
+                            TypedValue::I32(_) => ChildKind::I32,
+                            TypedValue::Bool(_) => ChildKind::Bool,
+                            TypedValue::F64(_) => ChildKind::F64,
+                            TypedValue::Str(_) => ChildKind::Str,
+                            _ => ChildKind::Unknown,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(ChildKind::Unknown);
+
+            let mut list_vec = output.list_vector(col_idx);
+            let mut child_offset = 0usize;
+
+            for (row_idx, val) in values.iter().enumerate() {
+                match val {
+                    TypedValue::Null => {
+                        list_vec.set_null(row_idx);
+                        list_vec.set_entry(row_idx, child_offset, 0);
+                    }
+                    TypedValue::List(elems) => {
+                        list_vec.set_entry(row_idx, child_offset, elems.len());
+                        child_offset += elems.len();
+                        for e in elems {
+                            match e {
+                                TypedValue::I64(v) => child_i64s.push(*v),
+                                TypedValue::I32(v) => child_i32s.push(*v),
+                                TypedValue::Bool(b) => child_bools.push(u8::from(*b)),
+                                TypedValue::F64(v) => child_f64s.push(*v),
+                                TypedValue::Str(s) => child_strs.push(s.clone()),
+                                TypedValue::Null => {
+                                    // Push a zero placeholder; null marking happens via child validity.
+                                    match child_kind {
+                                        ChildKind::I64 => child_i64s.push(0),
+                                        ChildKind::I32 => child_i32s.push(0),
+                                        ChildKind::Bool => child_bools.push(0),
+                                        ChildKind::F64 => child_f64s.push(0.0),
+                                        ChildKind::Str => child_strs.push(String::new()),
+                                        ChildKind::Unknown => child_i64s.push(0),
+                                    }
+                                }
+                                _ => child_i64s.push(0), // fallback for other types
+                            }
+                        }
+                    }
+                    _ => {
+                        list_vec.set_entry(row_idx, child_offset, 0);
+                    }
+                }
+            }
+
+            // Write child data based on detected kind.
+            if !child_i64s.is_empty() {
+                list_vec.set_child(child_i64s.as_slice());
+            } else if !child_i32s.is_empty() {
+                list_vec.set_child(child_i32s.as_slice());
+            } else if !child_bools.is_empty() {
+                list_vec.set_child(child_bools.as_slice());
+            } else if !child_f64s.is_empty() {
+                list_vec.set_child(child_f64s.as_slice());
+            } else if !child_strs.is_empty() {
+                // VARCHAR child: use reserve + insert per element.
+                let child_fv = list_vec.child(child_strs.len());
+                for (i, s) in child_strs.iter().enumerate() {
+                    child_fv.insert(i, s.as_str());
+                }
+                list_vec.set_len(child_strs.len());
+            }
+            // If no child elements: nothing to write (empty lists).
+        }
+
         _ => {
             // VARCHAR and all fallback types: insert as strings.
+            let mut out_vec = output.flat_vector(col_idx);
             for (i, val) in values.iter().enumerate() {
                 match val {
                     TypedValue::Str(s) => out_vec.insert(i, s.as_str()),
                     TypedValue::Null => out_vec.insert(i, ""),
-                    TypedValue::I64(v) => out_vec.insert(i, &v.to_string()),
-                    TypedValue::I32(v) => out_vec.insert(i, &v.to_string()),
-                    TypedValue::F64(v) => out_vec.insert(i, &v.to_string()),
+                    TypedValue::I64(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::I32(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::F64(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::F32(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::Bool(b) => out_vec.insert(i, if *b { "true" } else { "false" }),
+                    TypedValue::I8(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::I16(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::U8(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::U16(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::U32(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::U64(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::I128(v) => out_vec.insert(i, v.to_string().as_str()),
+                    TypedValue::List(_) => out_vec.insert(i, "[list]"),
                 }
             }
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Note on tests for this module:
+//
+// This module is only compiled under `#[cfg(feature = "extension")]` (see query/mod.rs).
+// The `extension` feature enables the `loadable-extension` DuckDB feature which replaces
+// all C API calls with function-pointer stubs — incompatible with `Connection::open_in_memory()`.
+//
+// Binary-read correctness is verified via the integration test suite in:
+//   tests/output_proptest.rs
+// which accesses the VTab pipeline end-to-end via the high-level duckdb-rs Connection API.
+// ---------------------------------------------------------------------------
