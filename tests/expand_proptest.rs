@@ -18,6 +18,7 @@ fn simple_definition() -> SemanticViewDefinition {
                 source_table: None,
                 dim_type: None,
                 granularity: None,
+                output_type: None,
             },
             Dimension {
                 name: "month".to_string(),
@@ -25,6 +26,7 @@ fn simple_definition() -> SemanticViewDefinition {
                 source_table: None,
                 dim_type: None,
                 granularity: None,
+                output_type: None,
             },
             Dimension {
                 name: "status".to_string(),
@@ -32,6 +34,7 @@ fn simple_definition() -> SemanticViewDefinition {
                 source_table: None,
                 dim_type: None,
                 granularity: None,
+                output_type: None,
             },
         ],
         metrics: vec![
@@ -39,21 +42,26 @@ fn simple_definition() -> SemanticViewDefinition {
                 name: "total_revenue".to_string(),
                 expr: "sum(amount)".to_string(),
                 source_table: None,
+                output_type: None,
             },
             Metric {
                 name: "order_count".to_string(),
                 expr: "count(*)".to_string(),
                 source_table: None,
+                output_type: None,
             },
             Metric {
                 name: "avg_amount".to_string(),
                 expr: "avg(amount)".to_string(),
                 source_table: None,
+                output_type: None,
             },
         ],
         filters: vec!["status = 'active'".to_string()],
         joins: vec![],
         facts: vec![],
+        column_type_names: vec![],
+        column_types_inferred: vec![],
     }
 }
 
@@ -70,6 +78,7 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: None,
                 dim_type: None,
                 granularity: None,
+                output_type: None,
             },
             Dimension {
                 name: "customer_name".to_string(),
@@ -77,6 +86,7 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: Some("customers".to_string()),
                 dim_type: None,
                 granularity: None,
+                output_type: None,
             },
             Dimension {
                 name: "month".to_string(),
@@ -84,6 +94,7 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: None,
                 dim_type: None,
                 granularity: None,
+                output_type: None,
             },
             Dimension {
                 name: "product_category".to_string(),
@@ -91,6 +102,7 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: Some("products".to_string()),
                 dim_type: None,
                 granularity: None,
+                output_type: None,
             },
         ],
         metrics: vec![
@@ -98,16 +110,19 @@ fn joined_definition() -> SemanticViewDefinition {
                 name: "total_revenue".to_string(),
                 expr: "sum(amount)".to_string(),
                 source_table: None,
+                output_type: None,
             },
             Metric {
                 name: "customer_count".to_string(),
                 expr: "count(DISTINCT customer_id)".to_string(),
                 source_table: Some("customers".to_string()),
+                output_type: None,
             },
             Metric {
                 name: "product_count".to_string(),
                 expr: "count(DISTINCT product_id)".to_string(),
                 source_table: Some("products".to_string()),
+                output_type: None,
             },
         ],
         filters: vec!["status = 'active'".to_string()],
@@ -126,6 +141,8 @@ fn joined_definition() -> SemanticViewDefinition {
             },
         ],
         facts: vec![],
+        column_type_names: vec![],
+        column_types_inferred: vec![],
     }
 }
 

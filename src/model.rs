@@ -27,10 +27,16 @@ pub struct Dimension {
     /// Valid values: `"day"`, `"week"`, `"month"`, `"year"`.
     #[serde(default)]
     pub granularity: Option<String>,
+    /// Optional user-declared output type for this dimension column.
+    /// When set, the generated SQL wraps the expression in `CAST(expr AS <type>)`
+    /// AND declares the output column as this type in `bind()`.
+    /// If None, the inferred or fallback type is used.
+    #[serde(default)]
+    pub output_type: Option<String>,
 }
 
 /// A named aggregation expression used as a metric.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Metric {
     pub name: String,
@@ -39,6 +45,12 @@ pub struct Metric {
     /// If `None`, the metric is assumed to come from the base table.
     #[serde(default)]
     pub source_table: Option<String>,
+    /// Optional user-declared output type for this metric column.
+    /// When set, the generated SQL wraps the expression in `CAST(expr AS <type>)`
+    /// AND declares the output column as this type in `bind()`.
+    /// If None, the inferred or fallback type is used.
+    #[serde(default)]
+    pub output_type: Option<String>,
 }
 
 /// A named raw SQL column expression — a pre-aggregation fact, scoped to a table alias.
@@ -88,7 +100,7 @@ pub struct Join {
 /// Optional fields: `filters` (defaults to []), `joins` (defaults to []), `facts` (defaults to []).
 /// Note: `deny_unknown_fields` is intentionally NOT set — old stored JSON with extra
 /// fields (e.g., from future schema changes) must still load without error.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SemanticViewDefinition {
     pub base_table: String,
@@ -104,6 +116,18 @@ pub struct SemanticViewDefinition {
     pub joins: Vec<Join>,
     #[serde(default)]
     pub facts: Vec<Fact>,
+    /// Column names from DDL-time LIMIT 0 inference, parallel to `column_types_inferred`.
+    /// Populated by `create_semantic_view` `invoke()`. Empty = no inference ran.
+    /// Used by `bind()` to build a name→type map for subquery column lookups.
+    #[serde(default)]
+    pub column_type_names: Vec<String>,
+    /// DDL-time inferred column types stored as `ffi::duckdb_type` (u32) values.
+    /// Populated by `create_semantic_view` `invoke()` after running LIMIT 0.
+    /// Parallel to `column_type_names`: `column_type_names[i]` ↔ `column_types_inferred[i]`.
+    /// Empty vec = no inference ran (in-memory DB or inference failed) → VARCHAR fallback.
+    /// `bind()` builds a name→type `HashMap` from both vecs to look up requested columns by name.
+    #[serde(default)]
+    pub column_types_inferred: Vec<u32>,
 }
 
 impl SemanticViewDefinition {
@@ -435,6 +459,8 @@ mod tests {
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let json = serde_json::to_string(&def).unwrap();
             assert!(
@@ -455,6 +481,91 @@ mod tests {
             assert!(
                 def.tables.is_empty(),
                 "tables should default to [] for old JSON without tables field"
+            );
+        }
+    }
+
+    mod phase12_model_tests {
+        use super::*;
+
+        #[test]
+        fn output_type_on_dimension_roundtrips() {
+            let dim = Dimension {
+                name: "region".to_string(),
+                expr: "region".to_string(),
+                source_table: None,
+                dim_type: None,
+                granularity: None,
+                output_type: Some("BIGINT".to_string()),
+            };
+            let json = serde_json::to_string(&dim).unwrap();
+            let rt: Dimension = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.output_type.as_deref(), Some("BIGINT"));
+        }
+
+        #[test]
+        fn output_type_on_metric_roundtrips() {
+            let met = Metric {
+                name: "revenue".to_string(),
+                expr: "sum(amount)".to_string(),
+                source_table: None,
+                output_type: Some("DOUBLE".to_string()),
+            };
+            let json = serde_json::to_string(&met).unwrap();
+            let rt: Metric = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.output_type.as_deref(), Some("DOUBLE"));
+        }
+
+        #[test]
+        fn column_types_inferred_roundtrips() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![],
+                dimensions: vec![],
+                metrics: vec![],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![],
+                column_type_names: vec!["region".to_string(), "revenue".to_string()],
+                column_types_inferred: vec![17u32, 20u32],
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            let rt: SemanticViewDefinition = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.column_type_names, vec!["region", "revenue"]);
+            assert_eq!(rt.column_types_inferred, vec![17u32, 20u32]);
+        }
+
+        #[test]
+        fn old_json_without_output_type_deserializes() {
+            // Old JSON without output_type field — must deserialize to None
+            let json = r#"{
+                "base_table": "orders",
+                "dimensions": [{"name": "region", "expr": "region"}],
+                "metrics": [{"name": "revenue", "expr": "sum(amount)"}]
+            }"#;
+            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+            assert!(
+                def.dimensions[0].output_type.is_none(),
+                "output_type should default to None"
+            );
+            assert!(
+                def.metrics[0].output_type.is_none(),
+                "output_type should default to None"
+            );
+        }
+
+        #[test]
+        fn old_json_without_column_types_inferred_deserializes() {
+            // Old JSON without column_type_names or column_types_inferred — must succeed with empty vecs
+            let json = r#"{"base_table": "orders", "dimensions": [], "metrics": []}"#;
+            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+            assert!(
+                def.column_type_names.is_empty(),
+                "column_type_names should default to []"
+            );
+            assert!(
+                def.column_types_inferred.is_empty(),
+                "column_types_inferred should default to []"
             );
         }
     }

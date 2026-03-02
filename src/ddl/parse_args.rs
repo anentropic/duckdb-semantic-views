@@ -182,6 +182,7 @@ pub unsafe fn parse_define_args(
                 source_table,
                 dim_type: None,
                 granularity: None,
+                output_type: None,
             });
         }
     }
@@ -211,6 +212,7 @@ pub unsafe fn parse_define_args(
                 source_table: None,
                 dim_type: Some("time".to_string()),
                 granularity: Some(gran),
+                output_type: None,
             });
         }
     }
@@ -243,6 +245,7 @@ pub unsafe fn parse_define_args(
                 name: met_name,
                 expr: met_expr,
                 source_table,
+                output_type: None,
             });
         }
     }
@@ -262,6 +265,8 @@ pub unsafe fn parse_define_args(
             filters: vec![],
             joins,
             facts: vec![],
+            column_type_names: vec![],
+            column_types_inferred: vec![],
         },
     })
 }

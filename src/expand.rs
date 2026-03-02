@@ -580,6 +580,7 @@ mod tests {
                         source_table: None,
                         dim_type: None,
                         granularity: None,
+                        output_type: None,
                     },
                     Dimension {
                         name: "status".to_string(),
@@ -587,6 +588,7 @@ mod tests {
                         source_table: None,
                         dim_type: None,
                         granularity: None,
+                        output_type: None,
                     },
                 ],
                 metrics: vec![
@@ -594,16 +596,20 @@ mod tests {
                         name: "total_revenue".to_string(),
                         expr: "sum(amount)".to_string(),
                         source_table: None,
+                        output_type: None,
                     },
                     Metric {
                         name: "order_count".to_string(),
                         expr: "count(*)".to_string(),
                         source_table: None,
+                        output_type: None,
                     },
                 ],
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             }
         }
 
@@ -740,15 +746,19 @@ GROUP BY
                     source_table: None,
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![Metric {
                     name: "cnt".to_string(),
                     expr: "count(*)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["col".to_string()],
@@ -772,15 +782,19 @@ GROUP BY
                     source_table: None,
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
                     expr: "sum(amount)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["month".to_string()],
@@ -864,15 +878,19 @@ FROM \"_base\"";
                     source_table: None,
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
                     expr: "sum(amount)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             // Request uses lowercase "region" but definition has "Region"
             let req = QueryRequest {
@@ -1004,10 +1022,13 @@ FROM \"_base\"";
                     name: "Total_Revenue".to_string(),
                     expr: "sum(amount)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             // Request uses lowercase "total_revenue" but definition has "Total_Revenue"
             let req = QueryRequest {
@@ -1096,11 +1117,13 @@ FROM \"_base\"";
                     source_table: Some("customers".to_string()),
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
                     expr: "sum(amount)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![Join {
@@ -1110,6 +1133,8 @@ FROM \"_base\"";
                     join_columns: vec![],
                 }],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["customer_name".to_string()],
@@ -1132,6 +1157,7 @@ FROM \"_base\"";
                         source_table: None,
                         dim_type: None,
                         granularity: None,
+                        output_type: None,
                     },
                     Dimension {
                         name: "customer_name".to_string(),
@@ -1139,12 +1165,14 @@ FROM \"_base\"";
                         source_table: Some("customers".to_string()),
                         dim_type: None,
                         granularity: None,
+                        output_type: None,
                     },
                 ],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
                     expr: "sum(amount)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![Join {
@@ -1154,6 +1182,8 @@ FROM \"_base\"";
                     join_columns: vec![],
                 }],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             // Request only "region" which comes from base table
             let req = QueryRequest {
@@ -1179,11 +1209,13 @@ FROM \"_base\"";
                     source_table: None,
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![Metric {
                     name: "customer_count".to_string(),
                     expr: "count(distinct customers.id)".to_string(),
                     source_table: Some("customers".to_string()),
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![Join {
@@ -1193,6 +1225,8 @@ FROM \"_base\"";
                     join_columns: vec![],
                 }],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
@@ -1214,11 +1248,13 @@ FROM \"_base\"";
                     source_table: Some("regions".to_string()),
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
                     expr: "sum(amount)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![
@@ -1236,6 +1272,8 @@ FROM \"_base\"";
                     },
                 ],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["region_name".to_string()],
@@ -1265,11 +1303,13 @@ FROM \"_base\"";
                     source_table: Some("regions".to_string()),
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
                     expr: "sum(amount)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![
@@ -1287,6 +1327,8 @@ FROM \"_base\"";
                     },
                 ],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["region_name".to_string()],
@@ -1315,15 +1357,19 @@ FROM \"_base\"";
                     source_table: None,
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
                     expr: "sum(amount)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
@@ -1348,15 +1394,19 @@ FROM \"_base\"";
                     source_table: None,
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![Metric {
                     name: "order_count".to_string(),
                     expr: "count(*)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["status".to_string()],
@@ -1382,11 +1432,13 @@ FROM \"_base\"";
                     source_table: Some("jaffle.raw_customers".to_string()),
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![Metric {
                     name: "order_count".to_string(),
                     expr: "count(*)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![Join {
@@ -1396,6 +1448,8 @@ FROM \"_base\"";
                     join_columns: vec![],
                 }],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["customer_name".to_string()],
@@ -1421,6 +1475,7 @@ FROM \"_base\"";
                         source_table: None,
                         dim_type: None,
                         granularity: None,
+                        output_type: None,
                     },
                     Dimension {
                         name: "customer_name".to_string(),
@@ -1428,12 +1483,14 @@ FROM \"_base\"";
                         source_table: Some("customers".to_string()),
                         dim_type: None,
                         granularity: None,
+                        output_type: None,
                     },
                 ],
                 metrics: vec![Metric {
                     name: "total_revenue".to_string(),
                     expr: "sum(amount)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![
@@ -1451,6 +1508,8 @@ FROM \"_base\"";
                     },
                 ],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             // Request base-table "region" AND joined "customer_name"
             let req = QueryRequest {
@@ -1486,6 +1545,7 @@ FROM \"_base\"";
                         source_table: None,
                         dim_type: Some("time".to_string()),
                         granularity: Some("month".to_string()),
+                        output_type: None,
                     },
                     Dimension {
                         name: "region".to_string(),
@@ -1493,16 +1553,20 @@ FROM \"_base\"";
                         source_table: None,
                         dim_type: None,
                         granularity: None,
+                        output_type: None,
                     },
                 ],
                 metrics: vec![Metric {
                     name: "revenue".to_string(),
                     expr: "sum(amount)".to_string(),
                     source_table: None,
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             }
         }
 
@@ -1574,11 +1638,14 @@ FROM \"_base\"";
                     source_table: None,
                     dim_type: Some("time".to_string()),
                     granularity: Some("day".to_string()),
+                    output_type: None,
                 }],
                 metrics: vec![],
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["d".to_string()],
@@ -1617,6 +1684,7 @@ FROM \"_base\"";
                         source_table: Some("o".to_string()),
                         dim_type: None,
                         granularity: None,
+                        output_type: None,
                     },
                     crate::model::Dimension {
                         name: "tier".to_string(),
@@ -1624,12 +1692,14 @@ FROM \"_base\"";
                         source_table: Some("c".to_string()),
                         dim_type: None,
                         granularity: None,
+                        output_type: None,
                     },
                 ],
                 metrics: vec![crate::model::Metric {
                     name: "revenue".to_string(),
                     expr: "sum(o.amount)".to_string(),
                     source_table: Some("o".to_string()),
+                    output_type: None,
                 }],
                 filters: vec![],
                 joins: vec![crate::model::Join {
@@ -1642,6 +1712,8 @@ FROM \"_base\"";
                     }],
                 }],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             }
         }
 
@@ -1686,6 +1758,7 @@ FROM \"_base\"";
                     source_table: Some("li".to_string()),
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![],
                 filters: vec![],
@@ -1705,6 +1778,8 @@ FROM \"_base\"";
                     ],
                 }],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["item".to_string()],
@@ -1735,6 +1810,7 @@ FROM \"_base\"";
                     source_table: Some("customers".to_string()),
                     dim_type: None,
                     granularity: None,
+                    output_type: None,
                 }],
                 metrics: vec![],
                 filters: vec![],
@@ -1745,6 +1821,8 @@ FROM \"_base\"";
                     join_columns: vec![],
                 }],
                 facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
             };
             let req = QueryRequest {
                 dimensions: vec!["customer_name".to_string()],
