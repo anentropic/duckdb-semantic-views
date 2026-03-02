@@ -50,6 +50,9 @@ pub struct SemanticViewBindData {
     expanded_sql: String,
     /// Output column names (dimensions first, then metrics).
     column_names: Vec<String>,
+    /// DuckDB type enums (as u32) for each output column, parallel to column_names.
+    /// `DUCKDB_TYPE_INVALID` (0) signals VARCHAR fallback for that column.
+    column_type_ids: Vec<u32>,
 }
 
 // SAFETY: All fields are `Send + Sync` types.
@@ -174,6 +177,38 @@ unsafe fn extract_map_strings(value: &Value) -> HashMap<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Type mapping helpers
+// ---------------------------------------------------------------------------
+
+/// Typed value enum for accumulating column data across chunks before writing to output.
+enum TypedValue {
+    Null,
+    I64(i64),    // BIGINT, UBIGINT, HUGEINT (truncated), SMALLINT upcast, etc.
+    I32(i32),    // INTEGER, DATE (days-since-epoch), SMALLINT, TINYINT
+    F64(f64),    // DOUBLE, FLOAT upcast
+    Str(String), // VARCHAR, all other types (fallback)
+}
+
+/// Convert a raw `ffi::duckdb_type` (u32) to a `LogicalTypeHandle`.
+///
+/// Complex types (LIST, STRUCT, MAP, ENUM) and DECIMAL fall back to VARCHAR/DOUBLE.
+/// INVALID (0) falls back to VARCHAR.
+fn type_from_duckdb_type_u32(t: u32) -> LogicalTypeHandle {
+    // Named constants matching libduckdb-sys DUCKDB_TYPE_DUCKDB_TYPE_* values.
+    const INVALID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID;
+    const DECIMAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL;
+    const ENUM: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_ENUM;
+    const LIST: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST;
+    const STRUCT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT;
+    const MAP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP;
+    match t {
+        INVALID | ENUM | LIST | STRUCT | MAP => LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        DECIMAL => LogicalTypeHandle::from(LogicalTypeId::Double),
+        _ => LogicalTypeHandle::from(LogicalTypeId::from(t)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VTab implementation
 // ---------------------------------------------------------------------------
 
@@ -282,25 +317,89 @@ impl VTab for SemanticViewVTab {
         let expanded_sql = expand(&view_name, &def, &req)
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(QueryError::from(e)) })?;
 
-        // 6. Infer output schema (column names and underlying types for metadata).
-        //    Try executing the expanded SQL with LIMIT 0 to discover column types.
-        //    If that fails (e.g., re-entrant SQL not allowed in bind), fall back
-        //    to defaults: dimensions -> VARCHAR, metrics -> DOUBLE.
-        let column_names =
-            infer_schema_or_default(state.conn, &expanded_sql, &dimensions, &metrics, &def);
+        // 6. Resolve output column names and types.
+        //    Primary path: use DDL-time stored type data (column_type_names + column_types_inferred).
+        //    Fallback path: run LIMIT 0 at bind time (in-memory DB or inference failed at DDL time).
+        //    Full fallback: derive names from definition, all VARCHAR.
+        let type_map: HashMap<String, u32> = def
+            .column_type_names
+            .iter()
+            .zip(def.column_types_inferred.iter())
+            .map(|(name, &t)| (name.to_ascii_lowercase(), t))
+            .collect();
 
-        // 7. Declare all output columns as VARCHAR.
-        //    The func() phase reads result data as VARCHAR strings (via a
-        //    VARCHAR-cast wrapper query) and writes them using flat_vector::insert.
-        //    DuckDB will implicitly cast VARCHAR to target types in downstream
-        //    operations (WHERE, ORDER BY, etc.).
-        for name in &column_names {
-            bind.add_result_column(name, LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        let (column_names, column_type_ids) = if !type_map.is_empty() {
+            // Primary path: DDL-time inference stored both names and types.
+            // Derive column names from requested dims+metrics (expand() order),
+            // look up each name in the DDL-time type map. No LIMIT 0 at query time.
+            let mut names = Vec::new();
+            let mut type_ids = Vec::new();
+            for dim_name in &dimensions {
+                let canonical = def
+                    .dimensions
+                    .iter()
+                    .find(|d| d.name.eq_ignore_ascii_case(dim_name))
+                    .map_or_else(|| dim_name.clone(), |d| d.name.clone());
+                let t = *type_map
+                    .get(&canonical.to_ascii_lowercase())
+                    .unwrap_or(&0u32);
+                names.push(canonical);
+                type_ids.push(t);
+            }
+            for met_name in &metrics {
+                let canonical = def
+                    .metrics
+                    .iter()
+                    .find(|m| m.name.eq_ignore_ascii_case(met_name))
+                    .map_or_else(|| met_name.clone(), |m| m.name.clone());
+                let t = *type_map
+                    .get(&canonical.to_ascii_lowercase())
+                    .unwrap_or(&0u32);
+                names.push(canonical);
+                type_ids.push(t);
+            }
+            (names, type_ids)
+        } else {
+            // Fallback path: in-memory DB or DDL inference failed.
+            // Run try_infer_schema on the per-query expanded SQL (bind-time, safe on state.conn).
+            let limit0_sql = format!("{expanded_sql} LIMIT 0");
+            if let Some((names, types)) = unsafe { try_infer_schema(state.conn, &limit0_sql) } {
+                let type_ids: Vec<u32> = types.iter().map(|t| *t as u32).collect();
+                (names, type_ids)
+            } else {
+                // Full fallback: derive names from definition, all VARCHAR (0 = INVALID).
+                let mut names = Vec::new();
+                for dim_name in &dimensions {
+                    let canonical = def
+                        .dimensions
+                        .iter()
+                        .find(|d| d.name.eq_ignore_ascii_case(dim_name))
+                        .map_or_else(|| dim_name.clone(), |d| d.name.clone());
+                    names.push(canonical);
+                }
+                for met_name in &metrics {
+                    let canonical = def
+                        .metrics
+                        .iter()
+                        .find(|m| m.name.eq_ignore_ascii_case(met_name))
+                        .map_or_else(|| met_name.clone(), |m| m.name.clone());
+                    names.push(canonical);
+                }
+                let type_ids = vec![0u32; names.len()];
+                (names, type_ids)
+            }
+        };
+
+        // 7. Declare typed output columns.
+        //    type_from_duckdb_type_u32 maps complex/invalid types to VARCHAR fallback.
+        for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
+            bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
         }
 
         Ok(SemanticViewBindData {
             expanded_sql,
             column_names,
+            column_type_ids,
         })
     }
 
@@ -325,30 +424,23 @@ impl VTab for SemanticViewVTab {
         let bind_data = func.get_bind_data();
         let state = unsafe { &*func.get_extra_info::<QueryState>() };
 
-        // Wrap the expanded SQL so that all columns are cast to VARCHAR.
-        // This ensures we only need to read VARCHAR vectors from the result
-        // chunks, avoiding type-specific vector parsing. DuckDB will
-        // implicitly cast the VARCHAR strings back to the declared output
-        // types when they are written via flat_vector::insert.
-        let varchar_sql = build_varchar_cast_sql(&bind_data.expanded_sql, &bind_data.column_names);
-
-        // Execute the VARCHAR-wrapped SQL via the raw FFI connection.
+        // Execute the expanded SQL directly — no VARCHAR cast wrapper needed.
+        // bind() declared typed output columns; func() writes typed data.
         let mut result = unsafe {
-            execute_sql_raw(state.conn, &varchar_sql).map_err(|e| QueryError::SqlExecution {
-                expanded_sql: bind_data.expanded_sql.clone(),
-                duckdb_error: e,
+            execute_sql_raw(state.conn, &bind_data.expanded_sql).map_err(|e| {
+                QueryError::SqlExecution {
+                    expanded_sql: bind_data.expanded_sql.clone(),
+                    duckdb_error: e,
+                }
             })?
         };
 
-        // Fetch data from result chunks.
-        // All columns are VARCHAR thanks to the wrapping query, so we can
-        // read string data directly from the duckdb_string_t layout in
-        // each vector.
         let col_count = unsafe { ffi::duckdb_column_count(&mut result) } as usize;
         let chunk_count = unsafe { ffi::duckdb_result_chunk_count(result) } as usize;
 
-        // Collect all rows as string vectors.
-        let mut all_rows: Vec<Vec<String>> = Vec::new();
+        // Collect typed column data across all chunks (column-major layout for efficient writes).
+        let mut total_rows = 0usize;
+        let mut col_data: Vec<Vec<TypedValue>> = vec![Vec::new(); col_count];
 
         for chunk_idx in 0..chunk_count {
             let chunk = unsafe { ffi::duckdb_result_get_chunk(result, chunk_idx as ffi::idx_t) };
@@ -356,14 +448,13 @@ impl VTab for SemanticViewVTab {
                 continue;
             }
             let row_count = unsafe { ffi::duckdb_data_chunk_get_size(chunk) } as usize;
+            total_rows += row_count;
 
-            for row_idx in 0..row_count {
-                let mut row: Vec<String> = Vec::with_capacity(col_count);
-                for col_idx in 0..col_count {
-                    let s = unsafe { read_varchar_from_vector(chunk, col_idx, row_idx) };
-                    row.push(s);
+            for col_idx in 0..col_count.min(bind_data.column_type_ids.len()) {
+                let type_id = bind_data.column_type_ids[col_idx];
+                unsafe {
+                    read_typed_column(chunk, col_idx, row_count, type_id, &mut col_data[col_idx]);
                 }
-                all_rows.push(row);
             }
 
             unsafe {
@@ -371,17 +462,18 @@ impl VTab for SemanticViewVTab {
             }
         }
 
-        // Write rows to the output DataChunkHandle.
-        let n = all_rows.len();
-        if n > 0 {
-            for col_idx in 0..bind_data.column_names.len().min(col_count) {
-                let out_vec = output.flat_vector(col_idx);
-                for (row_idx, row) in all_rows.iter().enumerate() {
-                    out_vec.insert(row_idx, row[col_idx].as_str());
-                }
+        // Write typed column data to the output DataChunkHandle.
+        if total_rows > 0 {
+            for col_idx in 0..col_count.min(bind_data.column_names.len()) {
+                let type_id = if col_idx < bind_data.column_type_ids.len() {
+                    bind_data.column_type_ids[col_idx]
+                } else {
+                    0
+                };
+                write_typed_column(output, col_idx, &col_data[col_idx], total_rows, type_id);
             }
         }
-        output.set_len(n);
+        output.set_len(total_rows);
 
         unsafe {
             ffi::duckdb_destroy_result(&mut result);
@@ -421,51 +513,6 @@ impl VTab for SemanticViewVTab {
 // ---------------------------------------------------------------------------
 // Schema inference
 // ---------------------------------------------------------------------------
-
-/// Try to infer the output schema by executing the expanded SQL with LIMIT 0.
-///
-/// If schema inference succeeds, returns the actual column names and DuckDB type
-/// enums from DuckDB's type inference. If it fails (e.g., re-entrant SQL blocked
-/// in bind), falls back to default types: dimension columns as VARCHAR, metric
-/// columns as DOUBLE.
-fn infer_schema_or_default(
-    conn: ffi::duckdb_connection,
-    expanded_sql: &str,
-    dimensions: &[String],
-    metrics: &[String],
-    def: &SemanticViewDefinition,
-) -> Vec<String> {
-    // Try LIMIT 0 for accurate type inference.
-    let limit0_sql = format!("{expanded_sql} LIMIT 0");
-    let inferred = unsafe { try_infer_schema(conn, &limit0_sql) };
-
-    if let Some((names, _types)) = inferred {
-        return names;
-    }
-
-    // Fallback: derive schema from definition metadata.
-    let mut column_names = Vec::new();
-
-    for dim_name in dimensions {
-        // Use the definition's canonical name casing.
-        let canonical = def
-            .dimensions
-            .iter()
-            .find(|d| d.name.eq_ignore_ascii_case(dim_name))
-            .map_or_else(|| dim_name.clone(), |d| d.name.clone());
-        column_names.push(canonical);
-    }
-    for met_name in metrics {
-        let canonical = def
-            .metrics
-            .iter()
-            .find(|m| m.name.eq_ignore_ascii_case(met_name))
-            .map_or_else(|| met_name.clone(), |m| m.name.clone());
-        column_names.push(canonical);
-    }
-
-    column_names
-}
 
 /// Attempt to infer column names and types by executing a LIMIT 0 query.
 ///
@@ -591,4 +638,208 @@ pub(crate) unsafe fn read_varchar_from_vector(
     };
 
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Typed column read/write helpers
+// ---------------------------------------------------------------------------
+
+/// Read all values in a single column of a result chunk into `out`, appending `TypedValue`s.
+///
+/// Dispatches based on `type_id` to read the appropriate scalar type from the
+/// raw vector data. For unsupported or complex types, falls back to VARCHAR.
+///
+/// # Safety
+///
+/// `chunk` must be a valid, non-null `duckdb_data_chunk` handle.
+/// `col_idx` and `row_count` must be within bounds for the chunk.
+#[allow(clippy::cast_possible_truncation)]
+unsafe fn read_typed_column(
+    chunk: ffi::duckdb_data_chunk,
+    col_idx: usize,
+    row_count: usize,
+    type_id: u32,
+    out: &mut Vec<TypedValue>,
+) {
+    let vector = ffi::duckdb_data_chunk_get_vector(chunk, col_idx as ffi::idx_t);
+    let validity = ffi::duckdb_vector_get_validity(vector);
+
+    /// Check if row `r` is NULL using the validity bitmask.
+    /// If validity pointer is null, DuckDB guarantees all values are valid.
+    #[inline]
+    unsafe fn is_null(validity: *const u64, r: usize) -> bool {
+        if validity.is_null() {
+            return false;
+        }
+        let entry = *validity.add(r / 64);
+        (entry & (1u64 << (r % 64))) == 0
+    }
+
+    use ffi::{
+        DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_DATE as DATE,
+        DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE as DOUBLE, DUCKDB_TYPE_DUCKDB_TYPE_FLOAT as FLOAT,
+        DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT as HUGEINT, DUCKDB_TYPE_DUCKDB_TYPE_INTEGER as INTEGER,
+        DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as SMALLINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP as TIMESTAMP, DUCKDB_TYPE_DUCKDB_TYPE_TINYINT as TINYINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT as UBIGINT, DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER as UINTEGER,
+        DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT as USMALLINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT as UTINYINT,
+    };
+
+    match type_id {
+        // --- i64 types: BIGINT, UBIGINT, HUGEINT (upper 8 bytes discarded), TIMESTAMP ---
+        BIGINT | UBIGINT | TIMESTAMP => {
+            let data = ffi::duckdb_vector_get_data(vector).cast::<i64>();
+            let slice = std::slice::from_raw_parts(data, row_count);
+            for (r, &v) in slice.iter().enumerate() {
+                out.push(if is_null(validity, r) {
+                    TypedValue::Null
+                } else {
+                    TypedValue::I64(v)
+                });
+            }
+        }
+        HUGEINT => {
+            // HUGEINT is a 16-byte struct; read only the lower 8 bytes as i64.
+            let data_ptr = ffi::duckdb_vector_get_data(vector);
+            for r in 0..row_count {
+                if is_null(validity, r) {
+                    out.push(TypedValue::Null);
+                } else {
+                    // duckdb_hugeint: { lower: u64, upper: i64 } — read lower as i64.
+                    let elem_ptr = data_ptr.add(r * 16);
+                    let lower = std::ptr::read_unaligned(elem_ptr.cast::<i64>());
+                    out.push(TypedValue::I64(lower));
+                }
+            }
+        }
+
+        // --- i32 types: INTEGER, UINTEGER (cast), SMALLINT, TINYINT, DATE ---
+        INTEGER | UINTEGER | SMALLINT | TINYINT | USMALLINT | UTINYINT | DATE => {
+            let data = ffi::duckdb_vector_get_data(vector).cast::<i32>();
+            let slice = std::slice::from_raw_parts(data, row_count);
+            for (r, &v) in slice.iter().enumerate() {
+                out.push(if is_null(validity, r) {
+                    TypedValue::Null
+                } else {
+                    TypedValue::I32(v)
+                });
+            }
+        }
+
+        // --- f64 types: DOUBLE ---
+        DOUBLE => {
+            let data = ffi::duckdb_vector_get_data(vector).cast::<f64>();
+            let slice = std::slice::from_raw_parts(data, row_count);
+            for (r, &v) in slice.iter().enumerate() {
+                out.push(if is_null(validity, r) {
+                    TypedValue::Null
+                } else {
+                    TypedValue::F64(v)
+                });
+            }
+        }
+
+        // --- f32 upcast to f64: FLOAT ---
+        FLOAT => {
+            let data = ffi::duckdb_vector_get_data(vector).cast::<f32>();
+            let slice = std::slice::from_raw_parts(data, row_count);
+            for (r, &v) in slice.iter().enumerate() {
+                out.push(if is_null(validity, r) {
+                    TypedValue::Null
+                } else {
+                    TypedValue::F64(f64::from(v))
+                });
+            }
+        }
+
+        // --- VARCHAR and all other types: fall back to string read ---
+        _ => {
+            for r in 0..row_count {
+                out.push(TypedValue::Str(read_varchar_from_vector(chunk, col_idx, r)));
+            }
+        }
+    }
+}
+
+/// Write a collected column of `TypedValue`s into the output `DataChunkHandle`.
+///
+/// Dispatches based on `type_id` to write typed scalar data via `as_mut_slice_with_len`.
+/// NULL values are written via `set_null`. VARCHAR fallback uses `insert`.
+fn write_typed_column(
+    output: &mut DataChunkHandle,
+    col_idx: usize,
+    values: &[TypedValue],
+    n_rows: usize,
+    type_id: u32,
+) {
+    use ffi::{
+        DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_DATE as DATE,
+        DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE as DOUBLE, DUCKDB_TYPE_DUCKDB_TYPE_FLOAT as FLOAT,
+        DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT as HUGEINT, DUCKDB_TYPE_DUCKDB_TYPE_INTEGER as INTEGER,
+        DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as SMALLINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP as TIMESTAMP, DUCKDB_TYPE_DUCKDB_TYPE_TINYINT as TINYINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT as UBIGINT, DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER as UINTEGER,
+        DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT as USMALLINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT as UTINYINT,
+    };
+
+    let mut out_vec = output.flat_vector(col_idx);
+
+    match type_id {
+        BIGINT | UBIGINT | TIMESTAMP | HUGEINT => {
+            let dst = out_vec.as_mut_slice_with_len::<i64>(n_rows);
+            for (i, val) in values.iter().enumerate() {
+                match val {
+                    TypedValue::I64(v) => dst[i] = *v,
+                    TypedValue::Null => {
+                        dst[i] = 0;
+                        out_vec.set_null(i);
+                    }
+                    _ => dst[i] = 0,
+                }
+            }
+        }
+
+        INTEGER | UINTEGER | SMALLINT | TINYINT | USMALLINT | UTINYINT | DATE => {
+            let dst = out_vec.as_mut_slice_with_len::<i32>(n_rows);
+            for (i, val) in values.iter().enumerate() {
+                match val {
+                    TypedValue::I32(v) => dst[i] = *v,
+                    TypedValue::Null => {
+                        dst[i] = 0;
+                        out_vec.set_null(i);
+                    }
+                    _ => dst[i] = 0,
+                }
+            }
+        }
+
+        DOUBLE | FLOAT => {
+            let dst = out_vec.as_mut_slice_with_len::<f64>(n_rows);
+            for (i, val) in values.iter().enumerate() {
+                match val {
+                    TypedValue::F64(v) => dst[i] = *v,
+                    TypedValue::Null => {
+                        dst[i] = 0.0;
+                        out_vec.set_null(i);
+                    }
+                    _ => dst[i] = 0.0,
+                }
+            }
+        }
+
+        _ => {
+            // VARCHAR and all fallback types: insert as strings.
+            for (i, val) in values.iter().enumerate() {
+                match val {
+                    TypedValue::Str(s) => out_vec.insert(i, s.as_str()),
+                    TypedValue::Null => out_vec.insert(i, ""),
+                    TypedValue::I64(v) => out_vec.insert(i, &v.to_string()),
+                    TypedValue::I32(v) => out_vec.insert(i, &v.to_string()),
+                    TypedValue::F64(v) => out_vec.insert(i, &v.to_string()),
+                }
+            }
+        }
+    }
 }
