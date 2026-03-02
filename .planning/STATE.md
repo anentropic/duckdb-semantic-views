@@ -61,6 +61,7 @@ None.
 ### Roadmap Evolution
 
 - Phase 11.1 inserted after Phase 11: review possible DDL and query syntax options and bring it as close as we can to Snowflake semantic views (URGENT)
+- Phase 13 added: Type-mapping and property-based tests for typed column dispatch
 
 ### Blockers/Concerns
 
