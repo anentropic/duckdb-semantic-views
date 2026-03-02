@@ -580,9 +580,7 @@ impl VTab for SemanticViewVTab {
                 // inferred type. LIMIT-0 inference can disagree with the runtime type
                 // (e.g. sum() plans as HUGEINT but optimizes to sum_no_overflow → BIGINT).
                 let type_id = if !col_logical_types[col_idx].is_null() {
-                    unsafe {
-                        ffi::duckdb_get_type_id(col_logical_types[col_idx]) as u32
-                    }
+                    unsafe { ffi::duckdb_get_type_id(col_logical_types[col_idx]) as u32 }
                 } else if col_idx < bind_data.column_type_ids.len() {
                     bind_data.column_type_ids[col_idx]
                 } else {

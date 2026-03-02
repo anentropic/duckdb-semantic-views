@@ -154,9 +154,7 @@ impl VScalar for DefineSemanticView {
                         parsed.def.column_type_names = names;
                         parsed.def.column_types_inferred = types
                             .iter()
-                            .map(|t| {
-                                crate::query::table_function::normalize_type_id(*t as u32)
-                            })
+                            .map(|t| crate::query::table_function::normalize_type_id(*t as u32))
                             .collect();
                     }
                 }
