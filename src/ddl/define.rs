@@ -152,8 +152,12 @@ impl VScalar for DefineSemanticView {
                         // Essential because query-time requests may only include a subset of
                         // all dims+metrics, so positional indexing would not match DDL column order.
                         parsed.def.column_type_names = names;
-                        parsed.def.column_types_inferred =
-                            types.iter().map(|t| *t as u32).collect();
+                        parsed.def.column_types_inferred = types
+                            .iter()
+                            .map(|t| {
+                                crate::query::table_function::normalize_type_id(*t as u32)
+                            })
+                            .collect();
                     }
                 }
             }

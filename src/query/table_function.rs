@@ -212,6 +212,25 @@ enum TypedValue {
     List(Vec<TypedValue>), // LIST with scalar elements
 }
 
+/// Normalize HUGEINT/UHUGEINT type IDs to BIGINT/UBIGINT.
+///
+/// DuckDB's query planner infers `sum()` as HUGEINT at LIMIT-0 time, but the
+/// runtime optimizer may substitute `sum_no_overflow` → BIGINT (8 bytes/value).
+/// Normalizing stored type IDs prevents stale HUGEINT values from propagating
+/// into `write_typed_column`, which uses `column_type_ids` for output dispatch.
+/// (The read side uses the actual runtime column type via `duckdb_get_type_id`.)
+pub(crate) fn normalize_type_id(t: u32) -> u32 {
+    const HUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT;
+    const UHUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT;
+    const BIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT;
+    const UBIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT;
+    match t {
+        HUGEINT => BIGINT,
+        UHUGEINT => UBIGINT,
+        _ => t,
+    }
+}
+
 /// Convert a raw `ffi::duckdb_type` (u32) to a `LogicalTypeHandle`.
 ///
 /// DECIMAL, LIST, ENUM, and STRUCT/MAP/complex types need the logical type handle
@@ -222,16 +241,12 @@ fn type_from_duckdb_type_u32(t: u32) -> LogicalTypeHandle {
     const INVALID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID;
     const STRUCT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT;
     const MAP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP;
-    // HUGEINT/UHUGEINT: we read lower 64 bits and output as BIGINT/UBIGINT.
-    const HUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT;
-    const UHUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT;
     match t {
         // Complex types with no flat binary representation fall back to VARCHAR.
         INVALID | STRUCT | MAP => LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        // HUGEINT/UHUGEINT: output as BIGINT/UBIGINT (we truncate to 64 bits).
-        HUGEINT => LogicalTypeHandle::from(LogicalTypeId::Bigint),
-        UHUGEINT => LogicalTypeHandle::from(LogicalTypeId::UBigint),
         // All other types map directly via the type_id.
+        // Note: HUGEINT/UHUGEINT should already be normalized to BIGINT/UBIGINT
+        // via normalize_type_id() before reaching here.
         _ => LogicalTypeHandle::from(LogicalTypeId::from(t)),
     }
 }
@@ -390,7 +405,7 @@ impl VTab for SemanticViewVTab {
             .column_type_names
             .iter()
             .zip(def.column_types_inferred.iter())
-            .map(|(name, &t)| (name.to_ascii_lowercase(), t))
+            .map(|(name, &t)| (name.to_ascii_lowercase(), normalize_type_id(t)))
             .collect();
 
         let (column_names, column_type_ids) = if !type_map.is_empty() {
@@ -429,7 +444,8 @@ impl VTab for SemanticViewVTab {
             // Run try_infer_schema on the per-query expanded SQL (bind-time, safe on state.conn).
             let limit0_sql = format!("{expanded_sql} LIMIT 0");
             if let Some((names, types)) = unsafe { try_infer_schema(state.conn, &limit0_sql) } {
-                let type_ids: Vec<u32> = types.iter().map(|t| *t as u32).collect();
+                let type_ids: Vec<u32> =
+                    types.iter().map(|t| normalize_type_id(*t as u32)).collect();
                 (names, type_ids)
             } else {
                 // Full fallback: derive names from definition, all VARCHAR (0 = INVALID).
@@ -560,7 +576,14 @@ impl VTab for SemanticViewVTab {
             total_rows += row_count;
 
             for col_idx in 0..col_count {
-                let type_id = if col_idx < bind_data.column_type_ids.len() {
+                // Use the actual result column type for reading — not the bind-time
+                // inferred type. LIMIT-0 inference can disagree with the runtime type
+                // (e.g. sum() plans as HUGEINT but optimizes to sum_no_overflow → BIGINT).
+                let type_id = if !col_logical_types[col_idx].is_null() {
+                    unsafe {
+                        ffi::duckdb_get_type_id(col_logical_types[col_idx]) as u32
+                    }
+                } else if col_idx < bind_data.column_type_ids.len() {
                     bind_data.column_type_ids[col_idx]
                 } else {
                     0
@@ -1214,11 +1237,9 @@ fn write_typed_column(
         }
 
         HUGEINT | DECIMAL => {
-            // HUGEINT is declared as BIGINT (i64) output in type_from_duckdb_type_u32.
-            // DECIMAL output is declared as DECIMAL(width, scale) — the backing integer
-            // is written as i128 for HUGEINT-backed DECIMALs.
-            // We use i128 slot here; for DECIMAL the output column must have been declared
-            // with the appropriate DECIMAL type in bind().
+            // HUGEINT is normalized to BIGINT by normalize_type_id(), so this arm
+            // only fires for DECIMAL (which uses HUGEINT-backed i128 internally).
+            // DECIMAL output is declared as DECIMAL(width, scale) in bind().
             let nulls = null_positions(values);
             let mut out_vec = output.flat_vector(col_idx);
             {
