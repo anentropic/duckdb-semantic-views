@@ -156,3 +156,15 @@ Plans:
 Plans:
 - [x] 13-01-PLAN.md — table_function.rs refactor: extend TypedValue, binary-read dispatch, rewrite func(), extend bind() for DECIMAL/LIST/ENUM, delete dead code
 - [x] 13-02-PLAN.md — output_proptest.rs: unit PBTs for binary-read helpers + integration PBTs for full roundtrip (TIMESTAMP/BOOLEAN/DECIMAL/LIST/NULL)
+
+### Phase 14: DuckLake integration test refresh and CI job
+
+**Goal:** Update the DuckLake integration test to v0.2.0 API, add a CI-runnable variant with inline synthetic data, wire a parallel CI job into PullRequestCI.yml, and add DuckLake compatibility checking to the DuckDB version monitor
+**Requirements**: DUCKLAKE-CI, DUCKLAKE-LOCAL, DUCKLAKE-MONITOR
+**Depends on:** Phase 13
+**Plans:** 3 plans
+
+Plans:
+- [ ] 14-01-PLAN.md — Create test_ducklake_helpers.py (shared boilerplate) + test_ducklake_ci.py (CI test, 6 test cases, inline synthetic data)
+- [ ] 14-02-PLAN.md — Update test_ducklake.py to v0.2.0 API (create_semantic_view, semantic_view) + 2 new test cases
+- [ ] 14-03-PLAN.md — Wire ducklake-ci-check job into PullRequestCI.yml + DuckLake step in DuckDBVersionMonitor.yml + Justfile target
