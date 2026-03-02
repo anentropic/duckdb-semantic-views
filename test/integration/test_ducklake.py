@@ -3,7 +3,8 @@
 # dependencies = ["duckdb"]
 # requires-python = ">=3.9"
 # ///
-"""DuckLake/Iceberg integration test for the semantic_views extension.
+"""
+DuckLake/Iceberg integration test for the semantic_views extension.
 
 Verifies that semantic_view works correctly against DuckLake-managed
 tables (which use the Iceberg table format under the hood). This proves

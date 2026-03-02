@@ -3,7 +3,8 @@
 # dependencies = ["duckdb"]
 # requires-python = ">=3.9"
 # ///
-"""DuckLake CI integration test for the semantic_views extension.
+"""
+DuckLake CI integration test for the semantic_views extension.
 
 Verifies that semantic_view works correctly against DuckLake-managed
 tables using entirely inline synthetic data. No jaffle-shop data download
@@ -48,7 +49,8 @@ from test_ducklake_helpers import attach_ducklake, get_ext_dir, get_extension_pa
 
 
 def setup_synthetic_ducklake(ext_dir: str) -> tuple:
-    """Create a DuckLake catalog in a temp directory with synthetic jaffle-shop data.
+    """
+    Create a DuckLake catalog in a temp directory with synthetic jaffle-shop data.
 
     Mirrors the raw_orders schema from the real jaffle-shop dataset with
     5 rows of known values for deterministic assertions.

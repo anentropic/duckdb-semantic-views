@@ -1,0 +1,24 @@
+line-length = 100
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "D213", # multi-line docstring summary starts on second line
+]
+ignore = [
+    "D212", # conflicts with D213
+]
+
+[lint.pydocstyle]
+convention = "google"
+
+[format]
+docstring-code-format = true
+
+exclude = [
+    "dbt/",
+    "extension-ci-tools/",
+    "fuzz/",
+    ".venv/",
+]

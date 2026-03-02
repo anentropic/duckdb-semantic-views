@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Patch duckdb_sqllogictest to support notwindows/windows require directives.
+"""
+Patch duckdb_sqllogictest to support notwindows/windows require directives.
 Idempotent — safe to run on every test invocation.
 
 Remove this script once extension-ci-tools updates its pinned
@@ -42,9 +43,9 @@ def main() -> None:
         "                self.runner.skip_reload = True\n"
         "                return RequireResult.PRESENT\n"
         "            if param == 'notwindows':\n"
-        "                return RequireResult.PRESENT if sys.platform != 'win32' else RequireResult.MISSING\n"
+        "                return RequireResult.PRESENT if sys.platform != 'win32' else RequireResult.MISSING\n"  # noqa: E501
         "            if param == 'windows':\n"
-        "                return RequireResult.PRESENT if sys.platform == 'win32' else RequireResult.MISSING\n"
+        "                return RequireResult.PRESENT if sys.platform == 'win32' else RequireResult.MISSING\n"  # noqa: E501
         "            return RequireResult.MISSING\n"
     )
 

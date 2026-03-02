@@ -1,4 +1,5 @@
-"""Shared helpers for DuckLake integration tests.
+"""
+Shared helpers for DuckLake integration tests.
 
 Provides common boilerplate for loading the semantic_views extension and
 attaching a DuckLake catalog. Used by both test_ducklake.py (local) and
@@ -23,7 +24,8 @@ def get_ext_dir() -> str:
 
 
 def get_extension_path() -> Path:
-    """Return the semantic_views extension path.
+    """
+    Return the semantic_views extension path.
 
     Checks SEMANTIC_VIEWS_EXTENSION_PATH environment variable first.
     Falls back to the CMake debug build path.
@@ -35,19 +37,23 @@ def get_extension_path() -> Path:
 
 
 def load_extension(con, extension_path: Path) -> None:
-    """Install and load the semantic_views extension plus DuckLake.
+    """
+    Install and load the semantic_views extension plus DuckLake.
 
     Args:
         con: A duckdb.DuckDBPyConnection instance.
         extension_path: Path to the semantic_views .duckdb_extension file.
     """
-    con.execute(f"INSTALL '{extension_path}'")
+    # FORCE INSTALL ensures the freshly-built binary overwrites any stale cached copy
+    # in the project-local extension directory.
+    con.execute(f"FORCE INSTALL '{extension_path}'")
     con.execute("LOAD semantic_views")
     con.execute("LOAD ducklake")
 
 
 def attach_ducklake(con, ducklake_file: str, data_dir: str, alias: str = "jaffle") -> None:
-    """Attach a DuckLake catalog to an existing connection.
+    """
+    Attach a DuckLake catalog to an existing connection.
 
     Args:
         con: A duckdb.DuckDBPyConnection instance.

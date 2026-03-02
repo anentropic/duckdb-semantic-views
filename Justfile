@@ -73,6 +73,11 @@ setup-ducklake:
 test-iceberg: build
     uv run test/integration/test_ducklake.py
 
+# Download jaffle-shop data (if needed) and run the local DuckLake integration test.
+# Convenience wrapper — safe to run repeatedly; setup-ducklake is idempotent.
+test-ducklake: setup-ducklake build
+    uv run test/integration/test_ducklake.py
+
 # Run DuckLake CI integration test (uses inline synthetic data, no setup required).
 # Tests semantic_view against an in-memory DuckLake catalog with known synthetic rows.
 # Set SEMANTIC_VIEWS_EXTENSION_PATH to override the extension path (default: build/debug/).
