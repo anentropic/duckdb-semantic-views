@@ -415,10 +415,27 @@ pub fn expand(
     sql.push_str("WITH \"_base\" AS (\n    SELECT *\n    FROM ");
     sql.push_str(&quote_table_ref(&def.base_table));
 
+    // If tables aliases are declared (Phase 11.1), emit AS "alias" after the base table.
+    if let Some(base_ref) = def.tables.first() {
+        sql.push_str(" AS ");
+        sql.push_str(&quote_ident(&base_ref.alias));
+    }
+
     // Include only the joins needed by requested dimensions/metrics.
     for join in &needed_joins {
         sql.push_str("\n    JOIN ");
         sql.push_str(&quote_table_ref(&join.table));
+        // Emit AS "alias" when a tables entry matches this join table.
+        if !def.tables.is_empty() {
+            if let Some(tr) = def
+                .tables
+                .iter()
+                .find(|t| t.table.eq_ignore_ascii_case(&join.table))
+            {
+                sql.push_str(" AS ");
+                sql.push_str(&quote_ident(&tr.alias));
+            }
+        }
         sql.push_str(" ON ");
         append_join_on_clause(&mut sql, join, def);
     }
@@ -1639,8 +1656,8 @@ FROM \"_base\"";
             };
             let sql = expand("sales_view", &def, &req).unwrap();
             assert!(
-                sql.contains("JOIN \"customers\" ON"),
-                "Must emit JOIN customers: {sql}"
+                sql.contains("JOIN \"customers\" AS \"c\" ON"),
+                "Must emit JOIN customers with alias: {sql}"
             );
             assert!(
                 sql.contains("\"o\".\"customer_id\" = \"c\".\"id\""),
