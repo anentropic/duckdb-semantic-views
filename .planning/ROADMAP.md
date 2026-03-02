@@ -119,7 +119,13 @@ Plans:
   1. `EXPLAIN FROM semantic_query('view', dimensions := [...], metrics := [...])` outputs the expanded SQL that the extension generates — the result is readable and matches what `semantic_query` would execute
   2. A metric defined as a BIGINT aggregate returns a BIGINT column from `semantic_query` — not a VARCHAR
   3. A time dimension backed by a DATE column returns a DATE column from `semantic_query` — not a VARCHAR
-**Plans**: TBD
+**Plans:** 4 plans
+
+Plans:
+- [ ] 12-01-PLAN.md — Add output_type + column_types_inferred fields to model.rs
+- [ ] 12-02-PLAN.md — DDL rename (create_semantic_view*) + if_not_exists variant + DDL-time inference + output_type CAST codegen
+- [ ] 12-03-PLAN.md — Typed bind() + typed func() in table_function.rs (OUT-01)
+- [ ] 12-04-PLAN.md — Update all test files for DDL rename + add explain_semantic_view and typed output tests
 
 ## Progress
 
