@@ -201,9 +201,22 @@ fn type_from_duckdb_type_u32(t: u32) -> LogicalTypeHandle {
     const LIST: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST;
     const STRUCT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT;
     const MAP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP;
+    // 128-bit integer types: DuckDB HUGEINT/UHUGEINT use 16 bytes per slot.
+    // We write them as i64 (8 bytes) via parse_typed_from_str, so declare
+    // the output column as BIGINT to match the write operation size.
+    const HUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT;
+    const UHUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT;
     match t {
-        INVALID | ENUM | LIST | STRUCT | MAP => LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        DECIMAL => LogicalTypeHandle::from(LogicalTypeId::Double),
+        // Complex types and DECIMAL fall back to VARCHAR.
+        // DECIMAL is kept as VARCHAR to preserve exact precision formatting
+        // (e.g., "350.00" instead of "350.0") and to avoid needing the scale
+        // metadata for correct parsing in func().
+        INVALID | DECIMAL | ENUM | LIST | STRUCT | MAP => {
+            LogicalTypeHandle::from(LogicalTypeId::Varchar)
+        }
+        // HUGEINT/UHUGEINT are 16-byte types; we store them as i64 (BIGINT slot size).
+        // Declaring output as BIGINT avoids writing 8 bytes into a 16-byte slot.
+        HUGEINT | UHUGEINT => LogicalTypeHandle::from(LogicalTypeId::Bigint),
         _ => LogicalTypeHandle::from(LogicalTypeId::from(t)),
     }
 }
@@ -714,11 +727,13 @@ fn parse_typed_from_str(s: &str, type_id: u32) -> TypedValue {
             .parse::<i32>()
             .map(TypedValue::I32)
             .unwrap_or(TypedValue::Null),
-        // Floating-point and DECIMAL types: parse as f64.
-        DOUBLE | FLOAT | DECIMAL => s
+        // Floating-point types: parse as f64.
+        DOUBLE | FLOAT => s
             .parse::<f64>()
             .map(TypedValue::F64)
             .unwrap_or(TypedValue::Null),
+        // DECIMAL: keep as string to preserve exact precision formatting ("350.00" not "350.0").
+        DECIMAL => TypedValue::Str(s.to_owned()),
         // VARCHAR and all other types: preserve as string.
         _ => TypedValue::Str(s.to_owned()),
     }
@@ -750,44 +765,58 @@ fn write_typed_column(
 
     match type_id {
         BIGINT | UBIGINT | TIMESTAMP | HUGEINT => {
-            let dst = out_vec.as_mut_slice_with_len::<i64>(n_rows);
-            for (i, val) in values.iter().enumerate() {
-                match val {
-                    TypedValue::I64(v) => dst[i] = *v,
-                    TypedValue::Null => {
-                        dst[i] = 0;
-                        out_vec.set_null(i);
-                    }
-                    _ => dst[i] = 0,
+            // Collect null positions before taking the slice borrow.
+            let null_positions: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| matches!(v, TypedValue::Null).then_some(i))
+                .collect();
+            {
+                let dst = out_vec.as_mut_slice_with_len::<i64>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::I64(v) = val { *v } else { 0 };
                 }
+            } // dst borrow released here
+            for i in null_positions {
+                out_vec.set_null(i);
             }
         }
 
         INTEGER | UINTEGER | SMALLINT | TINYINT | USMALLINT | UTINYINT | DATE => {
-            let dst = out_vec.as_mut_slice_with_len::<i32>(n_rows);
-            for (i, val) in values.iter().enumerate() {
-                match val {
-                    TypedValue::I32(v) => dst[i] = *v,
-                    TypedValue::Null => {
-                        dst[i] = 0;
-                        out_vec.set_null(i);
-                    }
-                    _ => dst[i] = 0,
+            let null_positions: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| matches!(v, TypedValue::Null).then_some(i))
+                .collect();
+            {
+                let dst = out_vec.as_mut_slice_with_len::<i32>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::I32(v) = val { *v } else { 0 };
                 }
+            }
+            for i in null_positions {
+                out_vec.set_null(i);
             }
         }
 
         DOUBLE | FLOAT => {
-            let dst = out_vec.as_mut_slice_with_len::<f64>(n_rows);
-            for (i, val) in values.iter().enumerate() {
-                match val {
-                    TypedValue::F64(v) => dst[i] = *v,
-                    TypedValue::Null => {
-                        dst[i] = 0.0;
-                        out_vec.set_null(i);
-                    }
-                    _ => dst[i] = 0.0,
+            let null_positions: Vec<usize> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| matches!(v, TypedValue::Null).then_some(i))
+                .collect();
+            {
+                let dst = out_vec.as_mut_slice_with_len::<f64>(n_rows);
+                for (i, val) in values.iter().enumerate() {
+                    dst[i] = if let TypedValue::F64(v) = val {
+                        *v
+                    } else {
+                        0.0
+                    };
                 }
+            }
+            for i in null_positions {
+                out_vec.set_null(i);
             }
         }
 

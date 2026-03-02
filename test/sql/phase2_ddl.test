@@ -1,15 +1,15 @@
 # Phase 2 DDL round-trip integration test.
-# Updated for Phase 11.1: uses typed 6-arg STRUCT/LIST interface for
-# define_semantic_view / define_or_replace_semantic_view.
+# Updated for Phase 12: uses create_semantic_view / create_or_replace_semantic_view.
 #
-# Exercises define_semantic_view, define_or_replace_semantic_view,
-# drop_semantic_view, drop_semantic_view_if_exists, list_semantic_views,
-# and describe_semantic_view via the actual DuckDB extension LOAD mechanism.
+# Exercises create_semantic_view, create_or_replace_semantic_view,
+# create_semantic_view_if_not_exists, drop_semantic_view,
+# drop_semantic_view_if_exists, list_semantic_views, and describe_semantic_view
+# via the actual DuckDB extension LOAD mechanism.
 #
 # Requirements covered:
-#   DDL-01: define_semantic_view() registers a view
+#   DDL-01: create_semantic_view() registers a view
 #   DDL-02: drop_semantic_view() removes a registered view
-#   DDL-03: define_or_replace_semantic_view() overwrites an existing definition
+#   DDL-03: create_or_replace_semantic_view() overwrites an existing definition
 #   DDL-04: 6-arg STRUCT/LIST parameter interface
 #
 # Run via: just test  (make test_debug)
@@ -21,7 +21,7 @@ require semantic_views
 # ============================================================
 
 statement ok
-SELECT define_semantic_view(
+SELECT create_semantic_view(
     'orders',
     [{'alias': 'o', 'table': 'orders'}],
     [],
@@ -31,7 +31,7 @@ SELECT define_semantic_view(
 );
 
 statement ok
-SELECT define_semantic_view(
+SELECT create_semantic_view(
     'customers',
     [{'alias': 'c', 'table': 'customers'}],
     [],
@@ -67,11 +67,11 @@ SELECT name, base_table FROM describe_semantic_view('customers');
 customers	customers
 
 # ============================================================
-# 4. Duplicate define is an error — DDL-01
+# 4. Duplicate create is an error — DDL-01
 # ============================================================
 
 statement error
-SELECT define_semantic_view(
+SELECT create_semantic_view(
     'orders',
     [{'alias': 'o', 'table': 'orders'}],
     [],
@@ -120,11 +120,11 @@ SELECT drop_semantic_view('orders');
 does not exist
 
 # ============================================================
-# 8. define_or_replace_semantic_view overwrites — DDL-03
+# 8. create_or_replace_semantic_view overwrites — DDL-03
 # ============================================================
 
 statement ok
-SELECT define_or_replace_semantic_view(
+SELECT create_or_replace_semantic_view(
     'customers',
     [{'alias': 'c', 'table': 'customers'}],
     [],
@@ -155,7 +155,7 @@ SELECT drop_semantic_view_if_exists('orders');
 # ============================================================
 
 statement ok
-SELECT define_semantic_view(
+SELECT create_semantic_view(
     'x_test',
     [],
     [],
@@ -172,7 +172,7 @@ SELECT drop_semantic_view('x_test');
 # ============================================================
 
 statement ok
-SELECT define_semantic_view(
+SELECT create_semantic_view(
     'products',
     [{'alias': 'p', 'table': 'products'}],
     [],
@@ -192,7 +192,7 @@ products	products
 # ============================================================
 
 statement ok
-SELECT define_semantic_view(
+SELECT create_semantic_view(
     'sales',
     [{'alias': 'o', 'table': 'orders'}, {'alias': 'c', 'table': 'customers'}],
     [{'from_table': 'o', 'to_table': 'c',
@@ -215,7 +215,7 @@ sales	orders
 # ============================================================
 
 statement ok
-SELECT define_semantic_view(
+SELECT create_semantic_view(
     'time_orders',
     [{'alias': 'o', 'table': 'orders'}],
     [],
@@ -252,3 +252,33 @@ query I
 SELECT count(*) FROM list_semantic_views();
 ----
 0
+
+# ============================================================
+# 15. create_semantic_view_if_not_exists — silent no-op on duplicate
+# ============================================================
+
+# First call creates the view (normal behavior)
+statement ok
+SELECT create_semantic_view_if_not_exists(
+    'idempotent_test',
+    [{'alias': 't', 'table': 'orders'}],
+    [],
+    [{'name': 'region', 'expr': 'region', 'source_table': 't'}],
+    [],
+    []
+);
+
+# Second call on same view name must NOT error (if_not_exists behavior)
+statement ok
+SELECT create_semantic_view_if_not_exists(
+    'idempotent_test',
+    [{'alias': 't', 'table': 'orders'}],
+    [],
+    [{'name': 'region', 'expr': 'region', 'source_table': 't'}],
+    [],
+    []
+);
+
+# Clean up
+statement ok
+SELECT drop_semantic_view('idempotent_test');
