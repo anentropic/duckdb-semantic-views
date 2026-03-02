@@ -22,3 +22,23 @@ jobs:
       # Only Linux x86_64 for fast PR feedback — full matrix runs on main/release branches.
       # Verified arch names from extension-ci-tools/config/distribution_matrix.json.
       exclude_archs: 'linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
+  ducklake-ci-check:
+    name: DuckLake integration test (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build extension
+        run: cargo build --features extension
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Run DuckLake CI integration test
+        run: uv run test/integration/test_ducklake_ci.py
+        env:
+          SEMANTIC_VIEWS_EXTENSION_PATH: target/debug/semantic_views.duckdb_extension
