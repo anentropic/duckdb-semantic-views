@@ -1,20 +1,21 @@
 ---
-status: testing
+status: passed
 phase: 14-ducklake-integration-test-refresh-and-ci-job
 source: 14-01-SUMMARY.md, 14-02-SUMMARY.md, 14-03-SUMMARY.md
 started: 2026-03-02T00:00:00Z
-updated: 2026-03-02T00:01:00Z
+updated: 2026-03-02T00:00:00Z
 ---
 
 ## Current Test
 <!-- OVERWRITE each test - shows where we are -->
 
-number: 3
-name: test-all includes DuckLake CI target
+number: 5
+name: DuckDBVersionMonitor.yml has DuckLake compatibility step
 expected: |
-  Running `just test-all` (or inspecting the Justfile) shows `test-ducklake-ci`
-  is included in the full test suite.
-awaiting: user response
+  Opening `.github/workflows/DuckDBVersionMonitor.yml` shows a `ducklake_test` step
+  with `continue-on-error: true`, and both PR body templates reference
+  `steps.ducklake_test.outcome`.
+awaiting: complete
 
 ## Tests
 
@@ -28,24 +29,27 @@ result: pass
 
 ### 3. test-all includes DuckLake CI target
 expected: Running `just test-all` (or inspecting the Justfile) shows `test-ducklake-ci` is included in the full test suite.
-result: [pending]
+result: pass
+notes: Justfile:89 `test-all: test-rust test-sql test-iceberg test-ducklake-ci`. Confirmed via `just test-all` — all tests passed (including after HUGEINT bug fix).
 
 ### 4. PullRequestCI.yml has ducklake-ci-check job
 expected: Opening `.github/workflows/PullRequestCI.yml` shows a `ducklake-ci-check` parallel job (no `needs:` dependency) that builds the extension and runs `test_ducklake_ci.py`.
-result: [pending]
+result: pass
+notes: Job at line 26, no `needs:` key (runs in parallel). Builds extension then runs `uv run test/integration/test_ducklake_ci.py`.
 
 ### 5. DuckDBVersionMonitor.yml has DuckLake compatibility step
 expected: Opening `.github/workflows/DuckDBVersionMonitor.yml` shows a `ducklake_test` step with `continue-on-error: true`, and both PR body templates reference `steps.ducklake_test.outcome`.
-result: [pending]
+result: pass
+notes: Step at line 64 with `continue-on-error: true` (line 69). Both PR templates reference outcome at lines 82 and 101.
 
 ## Summary
 
 total: 5
-passed: 2
+passed: 5
 issues: 0
-pending: 3
+pending: 0
 skipped: 0
 
 ## Gaps
 
-[none yet]
+[none]
