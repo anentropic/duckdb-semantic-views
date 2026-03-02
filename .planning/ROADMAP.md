@@ -162,7 +162,7 @@ Plans:
 **Goal:** Update the DuckLake integration test to v0.2.0 API, add a CI-runnable variant with inline synthetic data, wire a parallel CI job into PullRequestCI.yml, and add DuckLake compatibility checking to the DuckDB version monitor
 **Requirements**: DUCKLAKE-CI, DUCKLAKE-LOCAL, DUCKLAKE-MONITOR
 **Depends on:** Phase 13
-**Plans:** 3 plans
+**Plans:** 2/3 plans executed
 
 Plans:
 - [ ] 14-01-PLAN.md — Create test_ducklake_helpers.py (shared boilerplate) + test_ducklake_ci.py (CI test, 6 test cases, inline synthetic data)
