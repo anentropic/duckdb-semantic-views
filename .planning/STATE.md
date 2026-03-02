@@ -18,14 +18,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-28)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 12 complete — EXPL-01 + OUT-01 delivered (2026-03-02)
+**Current focus:** Phase 13 complete — binary-read pipeline PBTs delivered (2026-03-02)
 
 ## Current Position
 
-Phase: 12 of 12 (EXPLAIN + Typed Output) — COMPLETE
-Plan: 4 of 4 in current phase
-Status: Phase Complete — all v0.2.0 phases done
-Last activity: 2026-03-02 — Phase 12 complete: explain_semantic_view + typed output BIGINT/DATE, make test_debug 3x SUCCESS
+Phase: 13 of 13 (Type-mapping + PBTs for typed column dispatch) — COMPLETE
+Plan: 2 of 2 in current phase
+Status: Phase Complete — all active v0.2.0 phases done
+Last activity: 2026-03-02 — Phase 13 complete: binary-read dispatch + 36 output_proptest.rs PBTs, 136 total tests pass
 
 Progress: [██████████] 100% (v0.2.0)
 
