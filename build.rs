@@ -33,20 +33,19 @@ fn main() {
 
     match target_os.as_str() {
         "linux" => {
-            // ELF version script: only the Rust entry point is globally visible.
-            // MUST use a named version tag (not anonymous) because rustc also emits a
-            // --version-script for cdylib targets; GNU ld rejects mixing anonymous
-            // and named version tags.
-            // Note: semantic_views_version is appended by the CI post-build script
-            // (extension-ci-tools); it does NOT exist in the compiled binary and must
-            // not be listed here — the linker would fail with "symbol not found".
-            let map_path = format!("{out_dir}/semantic_views.map");
+            // Linux symbol visibility: rustc already generates a --version-script for
+            // cdylib targets. Adding a second version script causes GNU ld (especially
+            // gcc-toolset-14 on arm64) to reject the link with "anonymous version tag
+            // cannot be combined with other version tags". Instead, we use
+            // --dynamic-list which cooperates with rustc's version script and restricts
+            // visible symbols to our entry point.
+            let dynlist_path = format!("{out_dir}/semantic_views.dynlist");
             std::fs::write(
-                &map_path,
-                "SEMANTIC_VIEWS_1.0 {\n  global:\n    semantic_views_init_c_api;\n  local: *;\n};\n",
+                &dynlist_path,
+                "{\n  semantic_views_init_c_api;\n};\n",
             )
-            .expect("failed to write ELF version script");
-            println!("cargo:rustc-link-arg=-Wl,--version-script={map_path}");
+            .expect("failed to write dynamic list");
+            println!("cargo:rustc-link-arg=-Wl,--dynamic-list={dynlist_path}");
         }
         "macos" => {
             // Exported symbols list: only the Rust entry point is externally visible.
