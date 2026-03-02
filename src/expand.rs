@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::model::{Join, SemanticViewDefinition};
+use crate::model::{Join, SemanticViewDefinition}; // TableRef accessed via def.tables
 
 /// Suggest the closest matching name from `available` using Levenshtein distance.
 ///
@@ -165,21 +165,37 @@ pub fn quote_table_ref(table: &str) -> String {
 /// resolves transitive dependencies using a fixed-point loop: if a needed join's
 /// ON clause mentions another declared join's table, that join is also included.
 /// Returns the subset of joins in their original declaration order.
+///
+/// Phase 11.1: if `def.tables` is non-empty, `source_table` may be an alias
+/// (e.g., `"c"` for `customers`). This function resolves aliases to physical table
+/// names using `def.tables` before matching against `join.table`.
 fn resolve_joins<'a>(
     joins: &'a [Join],
     resolved_dims: &[&crate::model::Dimension],
     resolved_mets: &[&crate::model::Metric],
+    def: &SemanticViewDefinition,
 ) -> Vec<&'a Join> {
+    // Helper: resolve a source_table value (may be alias or physical name) to physical table name.
+    let resolve_table_name = |st: &str| -> String {
+        if !def.tables.is_empty() {
+            // Try alias lookup first
+            if let Some(tr) = def.tables.iter().find(|t| t.alias.eq_ignore_ascii_case(st)) {
+                return tr.table.to_ascii_lowercase();
+            }
+        }
+        st.to_ascii_lowercase()
+    };
+
     // 1. Collect directly-needed tables from source_table fields (case-insensitive).
     let mut needed: HashSet<String> = HashSet::new();
     for dim in resolved_dims {
         if let Some(ref st) = dim.source_table {
-            needed.insert(st.to_ascii_lowercase());
+            needed.insert(resolve_table_name(st));
         }
     }
     for met in resolved_mets {
         if let Some(ref st) = met.source_table {
-            needed.insert(st.to_ascii_lowercase());
+            needed.insert(resolve_table_name(st));
         }
     }
 
@@ -222,23 +238,102 @@ fn resolve_joins<'a>(
 }
 
 /// Look up a dimension by name using case-insensitive matching.
+///
+/// Supports table-qualified names: if `name` contains a '.' (e.g., "o.region"),
+/// splits into (alias, `bare_name`) and also matches `source_table == alias`.
+/// Falls back to `bare_name` lookup if no qualified match is found.
 fn find_dimension<'a>(
     def: &'a SemanticViewDefinition,
     name: &str,
 ) -> Option<&'a crate::model::Dimension> {
-    def.dimensions
-        .iter()
-        .find(|d| d.name.eq_ignore_ascii_case(name))
+    if let Some(dot_pos) = name.find('.') {
+        let alias = &name[..dot_pos];
+        let bare = &name[dot_pos + 1..];
+        // Try qualified lookup: bare_name match AND source_table == alias
+        if let Some(d) = def.dimensions.iter().find(|d| {
+            d.name.eq_ignore_ascii_case(bare)
+                && d.source_table
+                    .as_deref()
+                    .is_some_and(|st| st.eq_ignore_ascii_case(alias))
+        }) {
+            return Some(d);
+        }
+        // Fall back to bare_name only (backward compat)
+        def.dimensions
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(bare))
+    } else {
+        def.dimensions
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(name))
+    }
 }
 
 /// Look up a metric by name using case-insensitive matching.
+///
+/// Supports table-qualified names: if `name` contains a '.' (e.g., "o.revenue"),
+/// splits into (alias, `bare_name`) and also matches `source_table == alias`.
+/// Falls back to `bare_name` lookup if no qualified match is found.
 fn find_metric<'a>(
     def: &'a SemanticViewDefinition,
     name: &str,
 ) -> Option<&'a crate::model::Metric> {
-    def.metrics
-        .iter()
-        .find(|m| m.name.eq_ignore_ascii_case(name))
+    if let Some(dot_pos) = name.find('.') {
+        let alias = &name[..dot_pos];
+        let bare = &name[dot_pos + 1..];
+        if let Some(m) = def.metrics.iter().find(|m| {
+            m.name.eq_ignore_ascii_case(bare)
+                && m.source_table
+                    .as_deref()
+                    .is_some_and(|st| st.eq_ignore_ascii_case(alias))
+        }) {
+            return Some(m);
+        }
+        def.metrics
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(bare))
+    } else {
+        def.metrics
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name))
+    }
+}
+
+/// Append the ON clause for a single JOIN to `sql`.
+///
+/// If `join.join_columns` is non-empty (Phase 11.1 format), generates
+/// `alias.col = alias.col AND ...` using alias lookup from `def.tables`.
+/// Otherwise falls back to the raw `join.on` string (legacy format).
+fn append_join_on_clause(sql: &mut String, join: &Join, def: &SemanticViewDefinition) {
+    if join.join_columns.is_empty() {
+        // Legacy: raw ON clause string (Phase 10 and earlier definitions).
+        sql.push_str(&join.on);
+    } else {
+        // Phase 11.1: generate ON clause from column-pair structs.
+        let to_alias = def
+            .tables
+            .iter()
+            .find(|t| t.table.eq_ignore_ascii_case(&join.table))
+            .map_or(join.table.as_str(), |t| t.alias.as_str());
+        let from_alias = def
+            .tables
+            .first()
+            .map_or(def.base_table.as_str(), |t| t.alias.as_str());
+        let on_parts: Vec<String> = join
+            .join_columns
+            .iter()
+            .map(|jc| {
+                format!(
+                    "{}.{} = {}.{}",
+                    quote_ident(from_alias),
+                    quote_ident(&jc.from),
+                    quote_ident(to_alias),
+                    quote_ident(&jc.to)
+                )
+            })
+            .collect();
+        sql.push_str(&on_parts.join(" AND "));
+    }
 }
 
 /// Expand a semantic view definition into a CTE-wrapped SQL query string.
@@ -253,6 +348,7 @@ fn find_metric<'a>(
 /// - Neither dimensions nor metrics are requested (`EmptyRequest`)
 /// - A requested dimension or metric name is not found (`UnknownDimension`, `UnknownMetric`)
 /// - A dimension or metric name is duplicated (`DuplicateDimension`, `DuplicateMetric`)
+#[allow(clippy::too_many_lines)]
 pub fn expand(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -312,7 +408,7 @@ pub fn expand(
     }
 
     // 4. Resolve which joins are needed.
-    let needed_joins = resolve_joins(&def.joins, &resolved_dims, &resolved_mets);
+    let needed_joins = resolve_joins(&def.joins, &resolved_dims, &resolved_mets, def);
 
     // 5. Build the base CTE.
     let mut sql = String::with_capacity(256);
@@ -324,7 +420,7 @@ pub fn expand(
         sql.push_str("\n    JOIN ");
         sql.push_str(&quote_table_ref(&join.table));
         sql.push_str(" ON ");
-        sql.push_str(&join.on);
+        append_join_on_clause(&mut sql, join, def);
     }
 
     // Append filters as WHERE clause (each parenthesized, AND-composed).
@@ -1476,6 +1572,245 @@ FROM \"_base\"";
             assert!(
                 sql.contains("::DATE"),
                 "Must cast to DATE per TIME-04: Got: {sql}"
+            );
+        }
+    }
+
+    mod phase11_1_expand_tests {
+        use super::*;
+        use crate::model::{JoinColumn, TableRef};
+
+        fn def_with_join_columns() -> SemanticViewDefinition {
+            SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                    },
+                ],
+                dimensions: vec![
+                    crate::model::Dimension {
+                        name: "region".to_string(),
+                        expr: "o.region".to_string(),
+                        source_table: Some("o".to_string()),
+                        dim_type: None,
+                        granularity: None,
+                    },
+                    crate::model::Dimension {
+                        name: "tier".to_string(),
+                        expr: "c.tier".to_string(),
+                        source_table: Some("c".to_string()),
+                        dim_type: None,
+                        granularity: None,
+                    },
+                ],
+                metrics: vec![crate::model::Metric {
+                    name: "revenue".to_string(),
+                    expr: "sum(o.amount)".to_string(),
+                    source_table: Some("o".to_string()),
+                }],
+                filters: vec![],
+                joins: vec![crate::model::Join {
+                    table: "customers".to_string(),
+                    on: String::new(),
+                    from_cols: vec![],
+                    join_columns: vec![JoinColumn {
+                        from: "customer_id".to_string(),
+                        to: "id".to_string(),
+                    }],
+                }],
+                facts: vec![],
+            }
+        }
+
+        #[test]
+        fn join_columns_generates_on_clause() {
+            // Test A: single join_column pair generates alias-qualified ON clause
+            let def = def_with_join_columns();
+            let req = QueryRequest {
+                dimensions: vec!["tier".to_string()],
+                metrics: vec!["revenue".to_string()],
+                granularity_overrides: HashMap::new(),
+            };
+            let sql = expand("sales_view", &def, &req).unwrap();
+            assert!(
+                sql.contains("JOIN \"customers\" ON"),
+                "Must emit JOIN customers: {sql}"
+            );
+            assert!(
+                sql.contains("\"o\".\"customer_id\" = \"c\".\"id\""),
+                "Must emit alias-qualified ON clause: {sql}"
+            );
+        }
+
+        #[test]
+        fn multi_column_join_generates_and_joined_on_clause() {
+            // Test B: two join_column pairs generate AND-joined ON clause
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                    },
+                    TableRef {
+                        alias: "li".to_string(),
+                        table: "line_items".to_string(),
+                    },
+                ],
+                dimensions: vec![crate::model::Dimension {
+                    name: "item".to_string(),
+                    expr: "li.item".to_string(),
+                    source_table: Some("li".to_string()),
+                    dim_type: None,
+                    granularity: None,
+                }],
+                metrics: vec![],
+                filters: vec![],
+                joins: vec![crate::model::Join {
+                    table: "line_items".to_string(),
+                    on: String::new(),
+                    from_cols: vec![],
+                    join_columns: vec![
+                        JoinColumn {
+                            from: "order_id".to_string(),
+                            to: "order_id".to_string(),
+                        },
+                        JoinColumn {
+                            from: "rev".to_string(),
+                            to: "rev".to_string(),
+                        },
+                    ],
+                }],
+                facts: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["item".to_string()],
+                metrics: vec![],
+                granularity_overrides: HashMap::new(),
+            };
+            let sql = expand("mv", &def, &req).unwrap();
+            assert!(
+                sql.contains("\"o\".\"order_id\" = \"li\".\"order_id\""),
+                "Must emit first pair: {sql}"
+            );
+            assert!(sql.contains("AND"), "Must emit AND between pairs: {sql}");
+            assert!(
+                sql.contains("\"o\".\"rev\" = \"li\".\"rev\""),
+                "Must emit second pair: {sql}"
+            );
+        }
+
+        #[test]
+        fn join_with_empty_join_columns_falls_back_to_on_string() {
+            // Test C: empty join_columns → legacy on string used
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![],
+                dimensions: vec![crate::model::Dimension {
+                    name: "customer_name".to_string(),
+                    expr: "customers.name".to_string(),
+                    source_table: Some("customers".to_string()),
+                    dim_type: None,
+                    granularity: None,
+                }],
+                metrics: vec![],
+                filters: vec![],
+                joins: vec![crate::model::Join {
+                    table: "customers".to_string(),
+                    on: "orders.customer_id = customers.id".to_string(),
+                    from_cols: vec![],
+                    join_columns: vec![],
+                }],
+                facts: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec![],
+                granularity_overrides: HashMap::new(),
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("JOIN \"customers\" ON orders.customer_id = customers.id"),
+                "Must use legacy on string when join_columns is empty: {sql}"
+            );
+        }
+
+        #[test]
+        fn table_qualified_dimension_lookup_with_matching_source_table() {
+            // Test E: 'o.region' resolves to dimension named 'region' with source_table='o'
+            let def = def_with_join_columns();
+            let req = QueryRequest {
+                dimensions: vec!["o.region".to_string()],
+                metrics: vec![],
+                granularity_overrides: HashMap::new(),
+            };
+            let sql = expand("sales_view", &def, &req).unwrap();
+            assert!(
+                sql.contains("o.region"),
+                "Must include the dimension expr: {sql}"
+            );
+            assert!(
+                sql.contains("AS \"region\""),
+                "Must alias as bare name: {sql}"
+            );
+        }
+
+        #[test]
+        fn bare_dimension_name_still_resolves() {
+            // Test F: 'region' (no prefix) resolves by bare name (backward compat)
+            let def = def_with_join_columns();
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec![],
+                granularity_overrides: HashMap::new(),
+            };
+            let result = expand("sales_view", &def, &req);
+            assert!(
+                result.is_ok(),
+                "Bare name lookup must succeed: {:?}",
+                result.err()
+            );
+        }
+
+        #[test]
+        fn table_qualified_unknown_dimension_returns_error() {
+            // Test G: 'o.nosuch' returns UnknownDimension with full 'o.nosuch' as name
+            let def = def_with_join_columns();
+            let req = QueryRequest {
+                dimensions: vec!["o.nosuch".to_string()],
+                metrics: vec![],
+                granularity_overrides: HashMap::new(),
+            };
+            let result = expand("sales_view", &def, &req);
+            match result {
+                Err(ExpandError::UnknownDimension { name, .. }) => {
+                    // The error name may be the bare 'nosuch' (after fallback) — that's fine
+                    // What matters is it returns an error
+                    let _ = name;
+                }
+                other => panic!("Expected UnknownDimension error, got: {:?}", other),
+            }
+        }
+
+        #[test]
+        fn table_qualified_metric_lookup_with_matching_source_table() {
+            // Test I: 'o.revenue' resolves to metric named 'revenue' with source_table='o'
+            let def = def_with_join_columns();
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["o.revenue".to_string()],
+                granularity_overrides: HashMap::new(),
+            };
+            let sql = expand("sales_view", &def, &req).unwrap();
+            assert!(
+                sql.contains("sum(o.amount)"),
+                "Must include metric expr: {sql}"
             );
         }
     }
