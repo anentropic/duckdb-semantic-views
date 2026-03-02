@@ -62,6 +62,7 @@ None.
 
 - Phase 11.1 inserted after Phase 11: review possible DDL and query syntax options and bring it as close as we can to Snowflake semantic views (URGENT)
 - Phase 13 added: Type-mapping and property-based tests for typed column dispatch
+- Phase 14 added: DuckLake integration test refresh and CI job (refresh local test to v0.2.0 DDL; add CI job with synthetic data, no S3 download)
 
 ### Blockers/Concerns
 
