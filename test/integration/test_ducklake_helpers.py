@@ -61,6 +61,4 @@ def attach_ducklake(con, ducklake_file: str, data_dir: str, alias: str = "jaffle
         data_dir: Path to the data directory. Must end with '/'.
         alias: The catalog alias to use in SQL (default: 'jaffle').
     """
-    con.execute(
-        f"ATTACH 'ducklake:{ducklake_file}' AS {alias} (DATA_PATH '{data_dir}')"
-    )
+    con.execute(f"ATTACH 'ducklake:{ducklake_file}' AS {alias} (DATA_PATH '{data_dir}')")

@@ -52,3 +52,8 @@ test/data/duckdb_extensions/
 
 # dbt reference material (not part of the project)
 dbt/
+
+# Python artifacts
+__pycache__/
+*.py[codz]
+*$py.class

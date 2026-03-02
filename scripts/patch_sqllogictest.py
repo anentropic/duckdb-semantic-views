@@ -13,13 +13,13 @@ import sys
 
 
 def main() -> None:
-    spec = importlib.util.find_spec('duckdb_sqllogictest')
+    spec = importlib.util.find_spec("duckdb_sqllogictest")
     if spec is None:
         print("ERROR: duckdb_sqllogictest not found", file=sys.stderr)
         sys.exit(1)
 
-    result_py = pathlib.Path(spec.origin).parent / 'result.py'
-    content = result_py.read_text(encoding='utf-8')
+    result_py = pathlib.Path(spec.origin).parent / "result.py"
+    content = result_py.read_text(encoding="utf-8")
 
     # Idempotency guard
     if "if param == 'notwindows':" in content:
@@ -27,8 +27,8 @@ def main() -> None:
         return
 
     # Inject 'import sys' after 'import os' if missing
-    if 'import sys' not in content:
-        content = content.replace('import os\n', 'import os\nimport sys\n', 1)
+    if "import sys" not in content:
+        content = content.replace("import os\n", "import os\nimport sys\n", 1)
 
     # Insert platform checks before the fallthrough return.
     # Anchored on the skip_reload block which immediately precedes it.
@@ -58,9 +58,9 @@ def main() -> None:
         sys.exit(1)
 
     content = content.replace(SEARCH, REPLACE, 1)
-    result_py.write_text(content, encoding='utf-8')
+    result_py.write_text(content, encoding="utf-8")
     print(f"patch_sqllogictest: patched {result_py}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

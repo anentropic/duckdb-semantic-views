@@ -79,9 +79,7 @@ def setup_synthetic_ducklake(ext_dir: str) -> tuple:
     try:
         catalog_con.execute("INSTALL ducklake")
         catalog_con.execute("LOAD ducklake")
-        catalog_con.execute(
-            f"ATTACH 'ducklake:{ducklake_file}' AS jaffle (DATA_PATH '{data_dir}')"
-        )
+        catalog_con.execute(f"ATTACH 'ducklake:{ducklake_file}' AS jaffle (DATA_PATH '{data_dir}')")
 
         # Mirror real jaffle-shop raw_orders schema
         catalog_con.execute(

@@ -98,9 +98,7 @@ def create_ducklake_catalog():
     ducklake_uri = f"ducklake:{DUCKLAKE_FILE}"
     data_path = str(JAFFLE_DATA_DIR) + "/"
     print(f"  Creating DuckLake catalog at {DUCKLAKE_FILE}")
-    con.execute(
-        f"ATTACH '{ducklake_uri}' AS jaffle (DATA_PATH '{data_path}')"
-    )
+    con.execute(f"ATTACH '{ducklake_uri}' AS jaffle (DATA_PATH '{data_path}')")
 
     for filename in SEED_FILES:
         csv_path = SEEDS_DIR / filename
@@ -110,8 +108,7 @@ def create_ducklake_catalog():
         table_name = csv_path.stem  # e.g., raw_orders
         print(f"  Loading {filename} -> jaffle.{table_name}")
         con.execute(
-            f"CREATE OR REPLACE TABLE jaffle.{table_name} "
-            f"AS SELECT * FROM read_csv('{csv_path}')"
+            f"CREATE OR REPLACE TABLE jaffle.{table_name} AS SELECT * FROM read_csv('{csv_path}')"
         )
 
     # Verify

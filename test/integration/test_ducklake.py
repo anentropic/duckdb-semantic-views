@@ -261,8 +261,7 @@ def run_tests():
         # All date values should be datetime.date instances
         for row in result:
             assert isinstance(row[0], datetime.date), (
-                f"Expected datetime.date for ordered_at, got "
-                f"{type(row[0]).__name__}: {row[0]!r}"
+                f"Expected datetime.date for ordered_at, got {type(row[0]).__name__}: {row[0]!r}"
             )
         print(f"  Time dimension rows: {len(result)} distinct days")
         print("  PASS: ordered_at returns datetime.date values")
