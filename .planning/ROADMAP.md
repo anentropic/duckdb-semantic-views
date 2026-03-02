@@ -150,7 +150,7 @@ Plans:
 **Goal:** Replace the VARCHAR-cast intermediary with direct binary chunk reads per type, fixing TIMESTAMP all-NULL, BOOLEAN UB, and DECIMAL/LIST-as-string bugs, and validate the full typed output pipeline with property-based tests
 **Requirements**: none formally assigned
 **Depends on:** Phase 12
-**Plans:** 2 plans
+**Plans:** 1/2 plans executed
 
 Plans:
 - [ ] 13-01-PLAN.md — table_function.rs refactor: extend TypedValue, binary-read dispatch, rewrite func(), extend bind() for DECIMAL/LIST/ENUM, delete dead code
