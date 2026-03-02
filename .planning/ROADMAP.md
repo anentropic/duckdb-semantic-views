@@ -143,4 +143,4 @@ Plans:
 | 10. pragma_query_t Catalog Persistence | v0.2.0 | 3/3 | Complete | 2026-03-01 |
 | 11. CREATE SEMANTIC VIEW Parser Hook | v0.2.0 | 2/4 | In Progress | - |
 | 11.1 Typed STRUCT/LIST DDL + semantic_view rename | v0.2.0 | 5/5 | Complete | 2026-03-02 |
-| 12. EXPLAIN + Typed Output | 4/4 | Complete   | 2026-03-02 | - |
+| 12. EXPLAIN + Typed Output | 4/4 | Complete    | 2026-03-02 | - |
