@@ -6,6 +6,258 @@ pub mod query;
 #[cfg(feature = "extension")]
 pub mod shim;
 
+/// Test helpers for integration tests.
+///
+/// Exposes low-level FFI utilities needed by `tests/output_proptest.rs` which
+/// runs under the default `bundled` feature (NOT the `extension` feature).
+/// The `extension` feature enables `duckdb/loadable-extension` which replaces
+/// all C API calls with stubs — incompatible with `Connection::open_in_memory()`.
+///
+/// These helpers mirror the functions in `query::table_function` but are compiled
+/// under the `bundled` (default) feature so that integration tests can access them.
+#[cfg(not(feature = "extension"))]
+#[allow(clippy::pedantic, clippy::doc_markdown)]
+pub mod test_helpers {
+    use libduckdb_sys as ffi;
+    use std::ffi::{CStr, CString};
+
+    /// Execute a SQL string via the DuckDB C API and return the result.
+    ///
+    /// # Safety
+    ///
+    /// `conn` must be a valid, non-null `duckdb_connection` handle.
+    pub unsafe fn execute_sql_raw(
+        conn: ffi::duckdb_connection,
+        sql: &str,
+    ) -> Result<ffi::duckdb_result, String> {
+        let sql_cstr = CString::new(sql).map_err(|e| e.to_string())?;
+        let mut result: ffi::duckdb_result = std::mem::zeroed();
+        let rc = ffi::duckdb_query(conn, sql_cstr.as_ptr(), &mut result);
+        if rc != ffi::DuckDBSuccess {
+            let err_ptr = ffi::duckdb_result_error(&mut result);
+            let err_msg = if err_ptr.is_null() {
+                "unknown error".to_string()
+            } else {
+                CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+            };
+            ffi::duckdb_destroy_result(&mut result);
+            return Err(err_msg);
+        }
+        Ok(result)
+    }
+
+    /// Typed value for test assertions.
+    #[derive(Debug, PartialEq)]
+    pub enum TestValue {
+        Null,
+        Bool(bool),
+        I8(i8),
+        I16(i16),
+        I32(i32),
+        I64(i64),
+        U8(u8),
+        U16(u16),
+        U32(u32),
+        U64(u64),
+        F32(f32),
+        F64(f64),
+        I128(i128),
+        Str(String),
+        List(Vec<TestValue>),
+    }
+
+    /// Read a typed value from a DuckDB result chunk column/row using binary reads.
+    ///
+    /// This mirrors `read_typed_from_vector` in `query::table_function` but is
+    /// compiled with the default (bundled) feature for integration test use.
+    ///
+    /// # Safety
+    ///
+    /// `chunk` must be a valid `duckdb_data_chunk`. `col_idx` and `row_idx` must be in bounds.
+    /// `logical_type` must be valid for the column (may be null for non-complex types).
+    #[allow(clippy::cast_possible_truncation)]
+    pub unsafe fn read_typed_value(
+        chunk: ffi::duckdb_data_chunk,
+        col_idx: usize,
+        row_idx: usize,
+        type_id: u32,
+        logical_type: ffi::duckdb_logical_type,
+    ) -> TestValue {
+        use ffi::{
+            DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN as BOOLEAN,
+            DUCKDB_TYPE_DUCKDB_TYPE_DATE as DATE, DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL as DECIMAL,
+            DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE as DOUBLE, DUCKDB_TYPE_DUCKDB_TYPE_FLOAT as FLOAT,
+            DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT as HUGEINT, DUCKDB_TYPE_DUCKDB_TYPE_INTEGER as INTEGER,
+            DUCKDB_TYPE_DUCKDB_TYPE_LIST as LIST, DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as SMALLINT,
+            DUCKDB_TYPE_DUCKDB_TYPE_TIME as TIME, DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP as TIMESTAMP,
+            DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS as TIMESTAMP_MS,
+            DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS as TIMESTAMP_NS,
+            DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S as TIMESTAMP_S,
+            DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ as TIMESTAMP_TZ,
+            DUCKDB_TYPE_DUCKDB_TYPE_TINYINT as TINYINT, DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT as UBIGINT,
+            DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT as UHUGEINT,
+            DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER as UINTEGER,
+            DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT as USMALLINT,
+            DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT as UTINYINT,
+            DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR as VARCHAR,
+        };
+
+        let vector = ffi::duckdb_data_chunk_get_vector(chunk, col_idx as ffi::idx_t);
+
+        // NULL check via validity mask.
+        let validity = ffi::duckdb_vector_get_validity(vector);
+        if !validity.is_null() {
+            let entry = *validity.add(row_idx / 64);
+            if entry & (1u64 << (row_idx % 64)) == 0 {
+                return TestValue::Null;
+            }
+        }
+
+        let data_ptr = ffi::duckdb_vector_get_data(vector);
+
+        match type_id {
+            BOOLEAN => TestValue::Bool(*data_ptr.cast::<u8>().add(row_idx) != 0),
+            TINYINT => TestValue::I8(*data_ptr.cast::<i8>().add(row_idx)),
+            SMALLINT => TestValue::I16(*data_ptr.cast::<i16>().add(row_idx)),
+            INTEGER => TestValue::I32(*data_ptr.cast::<i32>().add(row_idx)),
+            BIGINT => TestValue::I64(*data_ptr.cast::<i64>().add(row_idx)),
+            UTINYINT => TestValue::U8(*data_ptr.cast::<u8>().add(row_idx)),
+            USMALLINT => TestValue::U16(*data_ptr.cast::<u16>().add(row_idx)),
+            UINTEGER => TestValue::U32(*data_ptr.cast::<u32>().add(row_idx)),
+            UBIGINT => TestValue::U64(*data_ptr.cast::<u64>().add(row_idx)),
+            FLOAT => TestValue::F32(*data_ptr.cast::<f32>().add(row_idx)),
+            DOUBLE => TestValue::F64(*data_ptr.cast::<f64>().add(row_idx)),
+            DATE => TestValue::I32(*data_ptr.cast::<i32>().add(row_idx)),
+            TIMESTAMP | TIMESTAMP_S | TIMESTAMP_MS | TIMESTAMP_NS | TIMESTAMP_TZ | TIME => {
+                TestValue::I64(*data_ptr.cast::<i64>().add(row_idx))
+            }
+            HUGEINT => TestValue::I64(*data_ptr.cast::<i128>().add(row_idx) as i64),
+            UHUGEINT => TestValue::U64(*data_ptr.cast::<u128>().add(row_idx) as u64),
+            DECIMAL => {
+                if logical_type.is_null() {
+                    return TestValue::Null;
+                }
+                let internal = ffi::duckdb_decimal_internal_type(logical_type) as u32;
+                match internal {
+                    SMALLINT => TestValue::I128(i128::from(*data_ptr.cast::<i16>().add(row_idx))),
+                    INTEGER => TestValue::I128(i128::from(*data_ptr.cast::<i32>().add(row_idx))),
+                    BIGINT => TestValue::I128(i128::from(*data_ptr.cast::<i64>().add(row_idx))),
+                    _ => TestValue::I128(*data_ptr.cast::<i128>().add(row_idx)),
+                }
+            }
+            LIST => {
+                if logical_type.is_null() {
+                    return TestValue::Null;
+                }
+                let entry = *data_ptr.cast::<ffi::duckdb_list_entry>().add(row_idx);
+                let offset = entry.offset as usize;
+                let length = entry.length as usize;
+                let child_vec = ffi::duckdb_list_vector_get_child(vector);
+                let child_lt = ffi::duckdb_list_type_child_type(logical_type);
+                let child_type_id = ffi::duckdb_get_type_id(child_lt) as u32;
+                ffi::duckdb_destroy_logical_type(&mut { child_lt });
+
+                let mut elements = Vec::with_capacity(length);
+                for i in 0..length {
+                    let child_row = offset + i;
+                    let child_validity = ffi::duckdb_vector_get_validity(child_vec);
+                    if !child_validity.is_null() {
+                        let centry = *child_validity.add(child_row / 64);
+                        if centry & (1u64 << (child_row % 64)) == 0 {
+                            elements.push(TestValue::Null);
+                            continue;
+                        }
+                    }
+                    let child_data = ffi::duckdb_vector_get_data(child_vec);
+                    let elem = match child_type_id {
+                        BOOLEAN => TestValue::Bool(*child_data.cast::<u8>().add(child_row) != 0),
+                        INTEGER => TestValue::I32(*child_data.cast::<i32>().add(child_row)),
+                        BIGINT => TestValue::I64(*child_data.cast::<i64>().add(child_row)),
+                        DOUBLE => TestValue::F64(*child_data.cast::<f64>().add(child_row)),
+                        _ => TestValue::Null,
+                    };
+                    elements.push(elem);
+                }
+                TestValue::List(elements)
+            }
+            VARCHAR => {
+                // Read VARCHAR using the duckdb_string_t layout.
+                let string_t_ptr = data_ptr.cast::<ffi::duckdb_string_t>().add(row_idx);
+                let string_t = &*string_t_ptr;
+                let len = string_t.value.inlined.length as usize;
+                if len == 0 {
+                    return TestValue::Str(String::new());
+                }
+                let bytes = if len <= 12 {
+                    let p = string_t.value.inlined.inlined.as_ptr().cast::<u8>();
+                    std::slice::from_raw_parts(p, len)
+                } else {
+                    let p = string_t.value.pointer.ptr.cast::<u8>();
+                    if p.is_null() {
+                        return TestValue::Str(String::new());
+                    }
+                    std::slice::from_raw_parts(p, len)
+                };
+                TestValue::Str(String::from_utf8_lossy(bytes).into_owned())
+            }
+            _ => TestValue::Null,
+        }
+    }
+
+    /// A raw in-memory DuckDB database + connection pair.
+    ///
+    /// Automatically disconnects and closes on drop.
+    pub struct RawDb {
+        pub db: ffi::duckdb_database,
+        pub conn: ffi::duckdb_connection,
+    }
+
+    impl RawDb {
+        /// Open a new in-memory DuckDB database and connection via the C API.
+        pub fn open_in_memory() -> Self {
+            unsafe {
+                let path = c":memory:";
+                let mut db: ffi::duckdb_database = std::ptr::null_mut();
+                let rc = ffi::duckdb_open(path.as_ptr(), &mut db);
+                assert!(
+                    rc == ffi::DuckDBSuccess,
+                    "Failed to open in-memory DuckDB database"
+                );
+                let mut conn: ffi::duckdb_connection = std::ptr::null_mut();
+                let rc = ffi::duckdb_connect(db, &mut conn);
+                assert!(
+                    rc == ffi::DuckDBSuccess,
+                    "Failed to connect to in-memory DuckDB"
+                );
+                Self { db, conn }
+            }
+        }
+
+        /// Execute a SQL string, panicking on error.
+        ///
+        /// # Safety
+        ///
+        /// `self.conn` must be a valid, open `duckdb_connection` handle.
+        pub unsafe fn exec(&self, sql: &str) {
+            execute_sql_raw(self.conn, sql)
+                .unwrap_or_else(|e| panic!("SQL failed: {sql}\nError: {e}"));
+        }
+    }
+
+    impl Drop for RawDb {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.conn.is_null() {
+                    ffi::duckdb_disconnect(&mut self.conn);
+                }
+                if !self.db.is_null() {
+                    ffi::duckdb_close(&mut self.db);
+                }
+            }
+        }
+    }
+}
+
 /// DDL function implementations — only compiled when building the `DuckDB` extension.
 /// The `ddl` module uses `duckdb::vscalar` and `duckdb::vtab`, which are only
 /// available when the `extension` feature (and thus `vscalar` + `loadable-extension`)
