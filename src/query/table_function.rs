@@ -474,7 +474,7 @@ fn infer_schema_or_default(
 /// # Safety
 ///
 /// `conn` must be a valid `duckdb_connection`.
-unsafe fn try_infer_schema(
+pub(crate) unsafe fn try_infer_schema(
     conn: ffi::duckdb_connection,
     sql: &str,
 ) -> Option<(Vec<String>, Vec<ffi::duckdb_type>)> {

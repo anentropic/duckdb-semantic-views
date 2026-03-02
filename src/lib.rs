@@ -97,28 +97,43 @@ mod extension {
             None
         };
 
-        // Register define_semantic_view(name, json) scalar.
+        // Register create_semantic_view(name, tables, relationships, dimensions, time_dimensions, metrics) scalar.
         // Inserts a new view; errors if the view already exists.
         let define_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
             or_replace: false,
+            if_not_exists: false,
         };
         con.register_scalar_function_with_state::<DefineSemanticView>(
-            "define_semantic_view",
+            "create_semantic_view",
             &define_state,
         )?;
 
-        // Register define_or_replace_semantic_view(name, json) scalar.
+        // Register create_or_replace_semantic_view(name, tables, relationships, dimensions, time_dimensions, metrics) scalar.
         // Upserts a view definition; silent overwrite if the view already exists.
         let define_or_replace_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
             or_replace: true,
+            if_not_exists: false,
         };
         con.register_scalar_function_with_state::<DefineSemanticView>(
-            "define_or_replace_semantic_view",
+            "create_or_replace_semantic_view",
             &define_or_replace_state,
+        )?;
+
+        // Register create_semantic_view_if_not_exists(name, tables, relationships, dimensions, time_dimensions, metrics) scalar.
+        // Succeeds silently (no-op) if the view already exists; errors only on other failures.
+        let define_if_not_exists_state = DefineState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            or_replace: false,
+            if_not_exists: true,
+        };
+        con.register_scalar_function_with_state::<DefineSemanticView>(
+            "create_semantic_view_if_not_exists",
+            &define_if_not_exists_state,
         )?;
 
         // Register drop_semantic_view(name) scalar.
@@ -177,6 +192,9 @@ mod extension {
 
         // Register the explain_semantic_view table function (shares the same
         // QueryState for catalog access and SQL execution).
+        // Note: EXPLAIN SELECT * FROM semantic_view('name', ...) shows DuckDB's physical
+        // plan (TABLE_FUNCTION node). Use explain_semantic_view('name', ...) to see the
+        // expanded SQL that runs inside the table function.
         con.register_table_function_with_extra_info::<ExplainSemanticViewVTab, _>(
             "explain_semantic_view",
             &query_state,

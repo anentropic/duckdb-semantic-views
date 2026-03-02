@@ -8,6 +8,7 @@ use std::ffi::CString;
 
 use crate::catalog::{catalog_insert, catalog_upsert, CatalogState};
 use crate::ddl::parse_args::parse_define_args;
+use crate::expand::{expand, QueryRequest};
 
 /// Shared state for `define_semantic_view` and `define_or_replace_semantic_view`.
 ///
@@ -22,6 +23,9 @@ pub struct DefineState {
     pub persist_conn: Option<ffi::duckdb_connection>,
     /// When true, uses INSERT OR REPLACE (upsert); when false, errors on duplicate.
     pub or_replace: bool,
+    /// When true, silently succeeds (no-op) if the view already exists.
+    /// Mutually exclusive with `or_replace` (or_replace takes precedence if both set).
+    pub if_not_exists: bool,
 }
 
 // SAFETY: duckdb_connection is an opaque pointer managed by DuckDB.
@@ -122,8 +126,39 @@ impl VScalar for DefineSemanticView {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let out = output.flat_vector();
         for i in 0..input.len() {
-            let parsed =
+            let mut parsed =
                 parse_define_args(input, i).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
+            // DDL-time type inference (file-backed databases only).
+            // Runs LIMIT 0 on the expanded SQL via the persist connection.
+            // The persist connection has its own context — safe from invoke's execution lock.
+            if let Some(conn) = state.persist_conn {
+                let req_all = QueryRequest {
+                    dimensions: parsed
+                        .def
+                        .dimensions
+                        .iter()
+                        .map(|d| d.name.clone())
+                        .collect(),
+                    metrics: parsed.def.metrics.iter().map(|m| m.name.clone()).collect(),
+                    granularity_overrides: std::collections::HashMap::new(),
+                };
+                if let Ok(expanded_for_inference) = expand(&parsed.name, &parsed.def, &req_all) {
+                    let limit0_sql = format!("{expanded_for_inference} LIMIT 0");
+                    if let Some((names, types)) =
+                        crate::query::table_function::try_infer_schema(conn, &limit0_sql)
+                    {
+                        // Store BOTH names and types so bind() can look up by name (not position).
+                        // Essential because query-time requests may only include a subset of
+                        // all dims+metrics, so positional indexing would not match DDL column order.
+                        parsed.def.column_type_names = names;
+                        parsed.def.column_types_inferred =
+                            types.iter().map(|t| *t as u32).collect();
+                    }
+                }
+            }
+            // In-memory: both vecs stay empty — VARCHAR fallback in bind().
+
             let json = serde_json::to_string(&parsed.def)
                 .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
@@ -138,6 +173,14 @@ impl VScalar for DefineSemanticView {
             // 2. Update in-memory catalog.
             if state.or_replace {
                 catalog_upsert(&state.catalog, &parsed.name, &json)?;
+            } else if state.if_not_exists {
+                match catalog_insert(&state.catalog, &parsed.name, &json) {
+                    Ok(()) => {}
+                    Err(e) if e.to_string().contains("already exists") => {
+                        // Silently succeed — view exists, no replacement needed.
+                    }
+                    Err(e) => return Err(e),
+                }
             } else {
                 catalog_insert(&state.catalog, &parsed.name, &json)?;
             }

@@ -461,7 +461,7 @@ pub fn expand(
 
     let mut select_items: Vec<String> = Vec::new();
     for dim in &resolved_dims {
-        let expr = if dim.dim_type.as_deref() == Some("time") {
+        let base_expr = if dim.dim_type.as_deref() == Some("time") {
             // TIME-02/TIME-04: wrap with date_trunc and cast to DATE.
             // Override takes precedence over declared granularity.
             let effective_gran = req
@@ -474,10 +474,22 @@ pub fn expand(
         } else {
             dim.expr.clone()
         };
-        select_items.push(format!("    {} AS {}", expr, quote_ident(&dim.name)));
+        // If output_type is set, wrap the expression in CAST(... AS <type>).
+        let final_expr = if let Some(ref type_str) = dim.output_type {
+            format!("CAST({base_expr} AS {type_str})")
+        } else {
+            base_expr
+        };
+        select_items.push(format!("    {} AS {}", final_expr, quote_ident(&dim.name)));
     }
     for met in &resolved_mets {
-        select_items.push(format!("    {} AS {}", met.expr, quote_ident(&met.name)));
+        // If output_type is set, wrap the aggregate in CAST(... AS <type>).
+        let final_expr = if let Some(ref type_str) = met.output_type {
+            format!("CAST({} AS {type_str})", met.expr)
+        } else {
+            met.expr.clone()
+        };
+        select_items.push(format!("    {} AS {}", final_expr, quote_ident(&met.name)));
     }
     sql.push_str(&select_items.join(",\n"));
 
@@ -1906,6 +1918,108 @@ FROM \"_base\"";
             assert!(
                 sql.contains("sum(o.amount)"),
                 "Must include metric expr: {sql}"
+            );
+        }
+    }
+
+    mod phase12_cast_tests {
+        use super::*;
+        use crate::model::{Dimension, Metric};
+        use std::collections::HashMap;
+
+        #[test]
+        fn output_type_on_metric_emits_cast() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![],
+                dimensions: vec![],
+                metrics: vec![Metric {
+                    name: "revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                    output_type: Some("BIGINT".to_string()),
+                }],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["revenue".to_string()],
+                granularity_overrides: HashMap::new(),
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("CAST(sum(amount) AS BIGINT)"),
+                "output_type BIGINT must generate CAST wrapper: {sql}"
+            );
+        }
+
+        #[test]
+        fn output_type_on_dimension_emits_cast() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![],
+                dimensions: vec![Dimension {
+                    name: "region_id".to_string(),
+                    expr: "region_id".to_string(),
+                    source_table: None,
+                    dim_type: None,
+                    granularity: None,
+                    output_type: Some("INTEGER".to_string()),
+                }],
+                metrics: vec![],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region_id".to_string()],
+                metrics: vec![],
+                granularity_overrides: HashMap::new(),
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("CAST(region_id AS INTEGER)"),
+                "output_type INTEGER on dimension must generate CAST wrapper: {sql}"
+            );
+        }
+
+        #[test]
+        fn no_output_type_no_cast() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![],
+                dimensions: vec![],
+                metrics: vec![Metric {
+                    name: "revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["revenue".to_string()],
+                granularity_overrides: HashMap::new(),
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                !sql.contains("CAST(sum(amount) AS"),
+                "No output_type must not generate CAST: {sql}"
+            );
+            assert!(
+                sql.contains("sum(amount) AS"),
+                "Bare expr must be present: {sql}"
             );
         }
     }
