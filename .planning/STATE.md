@@ -18,16 +18,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-02-28)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 9 — Time Dimensions (Phase 8 complete 2026-03-01)
+**Current focus:** Phase 12 complete — EXPL-01 + OUT-01 delivered (2026-03-02)
 
 ## Current Position
 
-Phase: 8 of 12 (C++ Shim Infrastructure) — COMPLETE
-Plan: 2 of 2 in current phase
-Status: Phase Complete — moving to Phase 9 (Time Dimensions)
-Last activity: 2026-03-01 — Phase 8 complete: C++ shim compiles, all tests pass, symbol visibility confirmed
+Phase: 12 of 12 (EXPLAIN + Typed Output) — COMPLETE
+Plan: 4 of 4 in current phase
+Status: Phase Complete — all v0.2.0 phases done
+Last activity: 2026-03-02 — Phase 12 complete: explain_semantic_view + typed output BIGINT/DATE, make test_debug 3x SUCCESS
 
-Progress: [██░░░░░░░░] 20% (v0.2.0)
+Progress: [██████████] 100% (v0.2.0)
 
 ## Performance Metrics
 

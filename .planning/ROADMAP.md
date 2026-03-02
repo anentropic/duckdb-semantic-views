@@ -30,7 +30,7 @@ Full details: [milestones/v0.1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md)
 - [x] **Phase 9: Time Dimensions** - Add time-typed dimensions with granularity coarsening and per-query granularity override (pure Rust, delivers user value early) — completed 2026-03-01
 - [x] **Phase 10: pragma_query_t Catalog Persistence** - Replace the sidecar file with DuckDB-native table persistence via the C++ shim's PRAGMA callback (completed 2026-03-01)
 - [ ] **Phase 11: CREATE SEMANTIC VIEW Parser Hook** - Implement native SQL DDL syntax for creating and dropping semantic views via the C++ parser extension
-- [ ] **Phase 12: EXPLAIN + Typed Output** - Wire EXPLAIN support for expanded SQL and replace all-VARCHAR output with typed columns
+- [x] **Phase 12: EXPLAIN + Typed Output** - Wire EXPLAIN support for expanded SQL and replace all-VARCHAR output with typed columns (completed 2026-03-02)
 
 ## Phase Details
 
@@ -119,7 +119,7 @@ Plans:
   1. `EXPLAIN FROM semantic_query('view', dimensions := [...], metrics := [...])` outputs the expanded SQL that the extension generates — the result is readable and matches what `semantic_query` would execute
   2. A metric defined as a BIGINT aggregate returns a BIGINT column from `semantic_query` — not a VARCHAR
   3. A time dimension backed by a DATE column returns a DATE column from `semantic_query` — not a VARCHAR
-**Plans:** 4 plans
+**Plans:** 4/4 plans complete
 
 Plans:
 - [ ] 12-01-PLAN.md — Add output_type + column_types_inferred fields to model.rs
@@ -143,4 +143,4 @@ Plans:
 | 10. pragma_query_t Catalog Persistence | v0.2.0 | 3/3 | Complete | 2026-03-01 |
 | 11. CREATE SEMANTIC VIEW Parser Hook | v0.2.0 | 2/4 | In Progress | - |
 | 11.1 Typed STRUCT/LIST DDL + semantic_view rename | v0.2.0 | 5/5 | Complete | 2026-03-02 |
-| 12. EXPLAIN + Typed Output | v0.2.0 | 0/? | Not started | - |
+| 12. EXPLAIN + Typed Output | 4/4 | Complete   | 2026-03-02 | - |
