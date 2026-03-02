@@ -97,6 +97,20 @@ Plans:
 - [ ] 11-03-PLAN.md — Rust cleanup: delete define.rs/drop.rs, trim ddl/mod.rs, update lib.rs shim call signature (DDL-05)
 - [ ] 11-04-PLAN.md — Rewrite phase2_ddl.test + new phase11_ddl.test (DDL-01 through DDL-06 integration coverage)
 
+### Phase 11.1: review possible DDL and query syntax options and bring it as close as we can to Snowflake semantic views (INSERTED)
+
+**Goal:** Reshape DDL from raw JSON string to typed STRUCT/LIST parameters and rename semantic_query to semantic_view, aligning the interface with Snowflake semantic view concepts without adding new capabilities
+**Requirements**: DDL-03, DDL-04, DDL-05, DDL-06
+**Depends on:** Phase 11
+**Plans:** 5 plans
+
+Plans:
+- [ ] 11.1-01-PLAN.md — DESIGN.md + model.rs additions (TableRef, JoinColumn, Join.join_columns, SemanticViewDefinition.tables)
+- [ ] 11.1-02-PLAN.md — src/ddl/parse_args.rs — STRUCT/LIST → SemanticViewDefinition parser (TDD)
+- [ ] 11.1-03-PLAN.md — src/expand.rs — join_columns codegen + table-qualified dim/metric name resolution
+- [ ] 11.1-04-PLAN.md — Wire parse_args into define.rs (6-arg signature); rename semantic_query → semantic_view in lib.rs
+- [ ] 11.1-05-PLAN.md — Update all .test files to new syntax; make test passes
+
 ### Phase 12: EXPLAIN + Typed Output
 **Goal**: `EXPLAIN FROM semantic_query(...)` shows the expanded SQL, and `semantic_query` returns typed columns instead of all-VARCHAR
 **Depends on**: Phase 11
