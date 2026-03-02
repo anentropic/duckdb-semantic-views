@@ -424,23 +424,25 @@ impl VTab for SemanticViewVTab {
         let bind_data = func.get_bind_data();
         let state = unsafe { &*func.get_extra_info::<QueryState>() };
 
-        // Execute the expanded SQL directly — no VARCHAR cast wrapper needed.
-        // bind() declared typed output columns; func() writes typed data.
+        // Execute with a VARCHAR cast wrapper to guarantee uniform string layout in
+        // result chunks. This handles all DuckDB types (DECIMAL, HUGEINT, complex types)
+        // without requiring type-specific binary chunk parsing.
+        // Typed columns are written via parse_typed_from_str() after reading the strings.
+        let varchar_sql = build_varchar_cast_sql(&bind_data.expanded_sql, &bind_data.column_names);
+
         let mut result = unsafe {
-            execute_sql_raw(state.conn, &bind_data.expanded_sql).map_err(|e| {
-                QueryError::SqlExecution {
-                    expanded_sql: bind_data.expanded_sql.clone(),
-                    duckdb_error: e,
-                }
+            execute_sql_raw(state.conn, &varchar_sql).map_err(|e| QueryError::SqlExecution {
+                expanded_sql: bind_data.expanded_sql.clone(),
+                duckdb_error: e,
             })?
         };
 
         let col_count = unsafe { ffi::duckdb_column_count(&mut result) } as usize;
         let chunk_count = unsafe { ffi::duckdb_result_chunk_count(result) } as usize;
 
-        // Collect typed column data across all chunks (column-major layout for efficient writes).
+        // Collect all rows as string vectors (column-major for efficient typed writes).
         let mut total_rows = 0usize;
-        let mut col_data: Vec<Vec<TypedValue>> = vec![Vec::new(); col_count];
+        let mut col_strings: Vec<Vec<String>> = vec![Vec::new(); col_count];
 
         for chunk_idx in 0..chunk_count {
             let chunk = unsafe { ffi::duckdb_result_get_chunk(result, chunk_idx as ffi::idx_t) };
@@ -450,10 +452,10 @@ impl VTab for SemanticViewVTab {
             let row_count = unsafe { ffi::duckdb_data_chunk_get_size(chunk) } as usize;
             total_rows += row_count;
 
-            for col_idx in 0..col_count.min(bind_data.column_type_ids.len()) {
-                let type_id = bind_data.column_type_ids[col_idx];
-                unsafe {
-                    read_typed_column(chunk, col_idx, row_count, type_id, &mut col_data[col_idx]);
+            for col_idx in 0..col_count {
+                for row_idx in 0..row_count {
+                    let s = unsafe { read_varchar_from_vector(chunk, col_idx, row_idx) };
+                    col_strings[col_idx].push(s);
                 }
             }
 
@@ -462,7 +464,7 @@ impl VTab for SemanticViewVTab {
             }
         }
 
-        // Write typed column data to the output DataChunkHandle.
+        // Write typed output: parse string values to the appropriate typed vectors.
         if total_rows > 0 {
             for col_idx in 0..col_count.min(bind_data.column_names.len()) {
                 let type_id = if col_idx < bind_data.column_type_ids.len() {
@@ -470,7 +472,11 @@ impl VTab for SemanticViewVTab {
                 } else {
                     0
                 };
-                write_typed_column(output, col_idx, &col_data[col_idx], total_rows, type_id);
+                let col_data: Vec<TypedValue> = col_strings[col_idx]
+                    .iter()
+                    .map(|s| parse_typed_from_str(s, type_id))
+                    .collect();
+                write_typed_column(output, col_idx, &col_data, total_rows, type_id);
             }
         }
         output.set_len(total_rows);
@@ -641,124 +647,80 @@ pub(crate) unsafe fn read_varchar_from_vector(
 }
 
 // ---------------------------------------------------------------------------
-// Typed column read/write helpers
+// Typed column parse/write helpers
 // ---------------------------------------------------------------------------
 
-/// Read all values in a single column of a result chunk into `out`, appending `TypedValue`s.
+/// Parse a YYYY-MM-DD date string into days since the Unix epoch (1970-01-01).
 ///
-/// Dispatches based on `type_id` to read the appropriate scalar type from the
-/// raw vector data. For unsupported or complex types, falls back to VARCHAR.
-///
-/// # Safety
-///
-/// `chunk` must be a valid, non-null `duckdb_data_chunk` handle.
-/// `col_idx` and `row_count` must be within bounds for the chunk.
-#[allow(clippy::cast_possible_truncation)]
-unsafe fn read_typed_column(
-    chunk: ffi::duckdb_data_chunk,
-    col_idx: usize,
-    row_count: usize,
-    type_id: u32,
-    out: &mut Vec<TypedValue>,
-) {
-    let vector = ffi::duckdb_data_chunk_get_vector(chunk, col_idx as ffi::idx_t);
-    let validity = ffi::duckdb_vector_get_validity(vector);
+/// Returns `None` if the string is not a valid YYYY-MM-DD date.
+/// DuckDB's `duckdb_date` (stored as `i32` in FlatVector) counts days since
+/// 1970-01-01 (negative for dates before epoch).
+fn date_str_to_epoch_days(s: &str) -> Option<i32> {
+    // Expect exactly "YYYY-MM-DD" (10 bytes).
+    if s.len() != 10 || &s[4..5] != "-" || &s[7..8] != "-" {
+        return None;
+    }
+    let year: i32 = s[0..4].parse().ok()?;
+    let month: i32 = s[5..7].parse().ok()?;
+    let day: i32 = s[8..10].parse().ok()?;
 
-    /// Check if row `r` is NULL using the validity bitmask.
-    /// If validity pointer is null, DuckDB guarantees all values are valid.
-    #[inline]
-    unsafe fn is_null(validity: *const u64, r: usize) -> bool {
-        if validity.is_null() {
-            return false;
-        }
-        let entry = *validity.add(r / 64);
-        (entry & (1u64 << (r % 64))) == 0
+    // Use the proleptic Gregorian calendar formula (Julian Day Number approach).
+    // Days since epoch = JDN(date) - JDN(1970-01-01)
+    // JDN(1970-01-01) = 2440588
+    fn jdn(y: i32, m: i32, d: i32) -> i32 {
+        // Algorithm from Astronomical Algorithms (Meeus), valid for Gregorian calendar.
+        let a = (14 - m) / 12;
+        let yy = y + 4800 - a;
+        let mm = m + 12 * a - 3;
+        d + (153 * mm + 2) / 5 + 365 * yy + yy / 4 - yy / 100 + yy / 400 - 32045
     }
 
+    const JDN_EPOCH: i32 = 2_440_588; // JDN for 1970-01-01
+    Some(jdn(year, month, day) - JDN_EPOCH)
+}
+
+/// Parse a VARCHAR string representation into a `TypedValue` based on the DDL-time type_id.
+///
+/// Called after reading all columns as VARCHAR strings from the result chunks.
+/// Empty strings are treated as NULL for numeric types.
+fn parse_typed_from_str(s: &str, type_id: u32) -> TypedValue {
     use ffi::{
         DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_DATE as DATE,
-        DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE as DOUBLE, DUCKDB_TYPE_DUCKDB_TYPE_FLOAT as FLOAT,
-        DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT as HUGEINT, DUCKDB_TYPE_DUCKDB_TYPE_INTEGER as INTEGER,
-        DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as SMALLINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL as DECIMAL, DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE as DOUBLE,
+        DUCKDB_TYPE_DUCKDB_TYPE_FLOAT as FLOAT, DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT as HUGEINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_INTEGER as INTEGER, DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as SMALLINT,
         DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP as TIMESTAMP, DUCKDB_TYPE_DUCKDB_TYPE_TINYINT as TINYINT,
         DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT as UBIGINT, DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER as UINTEGER,
         DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT as USMALLINT,
         DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT as UTINYINT,
     };
 
+    if s.is_empty() {
+        return TypedValue::Null;
+    }
+
     match type_id {
-        // --- i64 types: BIGINT, UBIGINT, HUGEINT (upper 8 bytes discarded), TIMESTAMP ---
-        BIGINT | UBIGINT | TIMESTAMP => {
-            let data = ffi::duckdb_vector_get_data(vector).cast::<i64>();
-            let slice = std::slice::from_raw_parts(data, row_count);
-            for (r, &v) in slice.iter().enumerate() {
-                out.push(if is_null(validity, r) {
-                    TypedValue::Null
-                } else {
-                    TypedValue::I64(v)
-                });
-            }
-        }
-        HUGEINT => {
-            // HUGEINT is a 16-byte struct; read only the lower 8 bytes as i64.
-            let data_ptr = ffi::duckdb_vector_get_data(vector);
-            for r in 0..row_count {
-                if is_null(validity, r) {
-                    out.push(TypedValue::Null);
-                } else {
-                    // duckdb_hugeint: { lower: u64, upper: i64 } — read lower as i64.
-                    let elem_ptr = data_ptr.add(r * 16);
-                    let lower = std::ptr::read_unaligned(elem_ptr.cast::<i64>());
-                    out.push(TypedValue::I64(lower));
-                }
-            }
-        }
-
-        // --- i32 types: INTEGER, UINTEGER (cast), SMALLINT, TINYINT, DATE ---
-        INTEGER | UINTEGER | SMALLINT | TINYINT | USMALLINT | UTINYINT | DATE => {
-            let data = ffi::duckdb_vector_get_data(vector).cast::<i32>();
-            let slice = std::slice::from_raw_parts(data, row_count);
-            for (r, &v) in slice.iter().enumerate() {
-                out.push(if is_null(validity, r) {
-                    TypedValue::Null
-                } else {
-                    TypedValue::I32(v)
-                });
-            }
-        }
-
-        // --- f64 types: DOUBLE ---
-        DOUBLE => {
-            let data = ffi::duckdb_vector_get_data(vector).cast::<f64>();
-            let slice = std::slice::from_raw_parts(data, row_count);
-            for (r, &v) in slice.iter().enumerate() {
-                out.push(if is_null(validity, r) {
-                    TypedValue::Null
-                } else {
-                    TypedValue::F64(v)
-                });
-            }
-        }
-
-        // --- f32 upcast to f64: FLOAT ---
-        FLOAT => {
-            let data = ffi::duckdb_vector_get_data(vector).cast::<f32>();
-            let slice = std::slice::from_raw_parts(data, row_count);
-            for (r, &v) in slice.iter().enumerate() {
-                out.push(if is_null(validity, r) {
-                    TypedValue::Null
-                } else {
-                    TypedValue::F64(f64::from(v))
-                });
-            }
-        }
-
-        // --- VARCHAR and all other types: fall back to string read ---
-        _ => {
-            for r in 0..row_count {
-                out.push(TypedValue::Str(read_varchar_from_vector(chunk, col_idx, r)));
-            }
-        }
+        // 64-bit integer types: parse as i64.
+        BIGINT | UBIGINT | TIMESTAMP | HUGEINT => s
+            .parse::<i64>()
+            .map(TypedValue::I64)
+            .unwrap_or(TypedValue::Null),
+        // DATE: "YYYY-MM-DD" → days since 1970-01-01 stored as i32.
+        DATE => date_str_to_epoch_days(s)
+            .map(TypedValue::I32)
+            .unwrap_or(TypedValue::Null),
+        // 32-bit integer types.
+        INTEGER | UINTEGER | SMALLINT | TINYINT | USMALLINT | UTINYINT => s
+            .parse::<i32>()
+            .map(TypedValue::I32)
+            .unwrap_or(TypedValue::Null),
+        // Floating-point and DECIMAL types: parse as f64.
+        DOUBLE | FLOAT | DECIMAL => s
+            .parse::<f64>()
+            .map(TypedValue::F64)
+            .unwrap_or(TypedValue::Null),
+        // VARCHAR and all other types: preserve as string.
+        _ => TypedValue::Str(s.to_owned()),
     }
 }
 
