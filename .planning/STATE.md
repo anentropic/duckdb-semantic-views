@@ -58,6 +58,10 @@ Recent decisions affecting current work:
 
 None.
 
+### Roadmap Evolution
+
+- Phase 11.1 inserted after Phase 11: review possible DDL and query syntax options and bring it as close as we can to Snowflake semantic views (URGENT)
+
 ### Blockers/Concerns
 
 - [Phase 10 planning]: Confirm `pragma_query_t` non-PRAGMA DDL integration path against DuckDB 1.4.4 source before writing Phase 10 plan
