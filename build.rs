@@ -40,11 +40,8 @@ fn main() {
             // --dynamic-list which cooperates with rustc's version script and restricts
             // visible symbols to our entry point.
             let dynlist_path = format!("{out_dir}/semantic_views.dynlist");
-            std::fs::write(
-                &dynlist_path,
-                "{\n  semantic_views_init_c_api;\n};\n",
-            )
-            .expect("failed to write dynamic list");
+            std::fs::write(&dynlist_path, "{\n  semantic_views_init_c_api;\n};\n")
+                .expect("failed to write dynamic list");
             println!("cargo:rustc-link-arg=-Wl,--dynamic-list={dynlist_path}");
         }
         "macos" => {
