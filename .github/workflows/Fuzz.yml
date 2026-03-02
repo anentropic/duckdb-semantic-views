@@ -24,20 +24,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz
 
+      - name: Build fuzz target
+        run: cargo fuzz build ${{ matrix.target }}
+
       - name: Run fuzzer
-        id: fuzz
-        continue-on-error: true
-        run: cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- -max_total_time=${{ env.FUZZ_TIME }}
+        run: cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- -max_total_time=${{ env.FUZZ_TIME }} || true
+
+      - name: Check for crash artifacts
+        id: check
+        run: |
+          if find fuzz/artifacts/${{ matrix.target }} -type f \( -name 'crash-*' -o -name 'oom-*' -o -name 'timeout-*' -o -name 'slow-unit-*' \) 2>/dev/null | grep -q .; then
+            echo "crash_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "crash_found=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload crash artifacts
-        if: steps.fuzz.outcome == 'failure'
+        if: steps.check.outputs.crash_found == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: crash-${{ matrix.target }}-${{ github.sha }}
           path: fuzz/artifacts/${{ matrix.target }}/
 
       - name: Open issue on crash
-        if: steps.fuzz.outcome == 'failure'
+        if: steps.check.outputs.crash_found == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -52,8 +62,17 @@ jobs:
                 '',
                 'Download the crash artifact and reproduce locally:',
                 '```bash',
-                'cargo fuzz run ${{ matrix.target }} fuzz/artifacts/${{ matrix.target }}/<crash-file>',
+                '# 1. Download the artifact from the Actions run linked above',
+                '#    (Artifacts section at the bottom of the run page)',
+                '# 2. Unzip and reproduce:',
+                'cargo +nightly fuzz run ${{ matrix.target }} fuzz/artifacts/${{ matrix.target }}/<crash-file>',
                 '```',
               ].join('\n'),
               labels: ['bug', 'fuzzing']
             })
+
+      - name: Fail job on crash
+        if: steps.check.outputs.crash_found == 'true'
+        run: |
+          echo "::error::Fuzzer found a crash in ${{ matrix.target }} — see uploaded artifacts"
+          exit 1

@@ -95,7 +95,7 @@ test/
 ├── MainDistributionPipeline.yml  # Full 5-platform build on main/release
 ├── CodeQuality.yml            #   Formatting, linting, coverage
 ├── DuckDBVersionMonitor.yml   #   Weekly check for new DuckDB releases
-└── NightlyFuzz.yml            #   Daily fuzzing with crash reporting
+└── Fuzz.yml                   #   Fuzzing on push to main, with crash reporting
 ```
 
 ### Data Flow
@@ -384,14 +384,41 @@ cargo +nightly fuzz fmt fuzz_json_parse fuzz/artifacts/fuzz_json_parse/crash-abc
 
 The `fuzz/artifacts/` directory is gitignored -- crash artifacts are debugging data, not part of the corpus.
 
-### Nightly CI
+### CI Fuzzing
 
-The `NightlyFuzz.yml` workflow runs all three targets daily (5 minutes each). On a crash:
+The `Fuzz.yml` workflow runs all three targets on push to `main` (10 minutes each). Crash detection works by checking for artifact files (not the fuzzer exit code), so build failures or timeouts do not trigger false positives.
+
+On a real crash:
 
 1. The crash artifact is uploaded as a GitHub Actions artifact
-2. A GitHub issue is opened with the `bug` and `fuzzing` labels, including reproduction steps
+2. A GitHub issue is opened with the `bug` and `fuzzing` labels
+3. The job fails (red status)
 
-After fuzzing, a separate job checks for new corpus entries and submits a PR via `peter-evans/create-pull-request` if new coverage-increasing inputs were found.
+**Reproducing a CI crash locally:**
+
+```bash
+# 1. Go to the Actions run linked in the issue
+# 2. Scroll to the bottom of the run page and download the crash artifact zip
+# 3. Unzip it into the fuzz artifacts directory:
+mkdir -p fuzz/artifacts/fuzz_json_parse
+unzip crash-fuzz_json_parse-*.zip -d fuzz/artifacts/fuzz_json_parse/
+
+# 4. Reproduce the crash:
+cargo +nightly fuzz run fuzz_json_parse fuzz/artifacts/fuzz_json_parse/crash-*
+
+# 5. Inspect the crash input:
+cargo +nightly fuzz fmt fuzz_json_parse fuzz/artifacts/fuzz_json_parse/crash-*
+```
+
+You can also download artifacts via the `gh` CLI:
+
+```bash
+# List artifacts from a specific run
+gh run view <run-id> --repo anentropic/duckdb-semantic-views
+
+# Download the crash artifact
+gh run download <run-id> --repo anentropic/duckdb-semantic-views --name crash-fuzz_json_parse-<sha>
+```
 
 ## Publishing to Community Extension Registry
 
@@ -684,6 +711,6 @@ Do **not** set a directory-level nightly override (`rustup override set nightly`
 | **MainDistributionPipeline** | Push to `main` or `release/*` | Full build across 5 platforms: Linux x86_64, Linux arm64, macOS x86_64, macOS arm64, Windows x86_64. Excluded: WASM, musl, mingw variants. |
 | **CodeQuality** | Push to `main`/`release/*` and PRs | Runs `cargo fmt --check`, `cargo clippy`, `cargo-deny` (license/advisory audit), and coverage check (80% minimum line coverage via `cargo-llvm-cov`). |
 | **DuckDBVersionMonitor** | Weekly (Monday 09:00 UTC) | Queries the DuckDB GitHub API for the latest release. If newer than the current pin, updates all four version locations, builds, and tests. Opens a version-bump PR on success or a breakage PR (tagging `@copilot`) on failure. |
-| **NightlyFuzz** | Daily (03:00 UTC) | Runs all three fuzz targets for 5 minutes each (15 minutes total). Uploads crash artifacts and opens a GitHub issue on any crash. After fuzzing, checks for new corpus entries and submits a PR if found. |
+| **Fuzz** | Push to `main` | Runs all three fuzz targets for 10 minutes each. Detects crashes by checking for artifact files (not exit codes). Uploads crash artifacts, opens a GitHub issue, and fails the job on any crash. |
 
 All workflows can be triggered manually via `workflow_dispatch` for debugging.
