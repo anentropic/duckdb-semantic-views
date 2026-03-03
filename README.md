@@ -1,42 +1,38 @@
 # DuckDB Semantic Views
 
-DuckDB extension providing semantic views -- a declarative layer for dimensions, measures, and relationships.
+A DuckDB extension that lets you define dimensions and metrics once, then query them in any combination. The extension writes the GROUP BY and JOIN logic for you.
 
-**Version:** 0.3.0 | **Status:** Early-stage, pre-community-registry
+Inspired by [Snowflake Semantic Views](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view), adapted for DuckDB as a loadable extension.
 
-Semantic views are defined once with named dimensions and metrics, then queried in any combination without writing GROUP BY or JOIN logic by hand. The extension handles SQL expansion; DuckDB handles execution.
+v0.3.0 -- early-stage, not yet on the community registry.
 
-## What are Semantic Views?
+## How it works
 
-A semantic view is a reusable definition that maps business concepts (dimensions, metrics, time grains) onto physical tables. Instead of writing aggregation queries from scratch, you define the mapping once:
+You define a semantic view over one or more tables, declaring:
 
-- **Dimensions** -- columns you group by (e.g., region, category, customer tier)
-- **Time dimensions** -- date/timestamp columns with a granularity (e.g., monthly, yearly)
-- **Metrics** -- aggregate expressions (e.g., `sum(amount)`, `count(*)`)
-- **Relationships** -- join paths between tables, resolved automatically based on which dimensions/metrics you request
+- **Dimensions** -- columns to group by (region, category, etc.)
+- **Time dimensions** -- date/timestamp columns with a granularity (month, year, etc.)
+- **Metrics** -- aggregates (`sum(amount)`, `count(*)`, etc.)
+- **Relationships** -- join paths between tables, included only when needed
 
-When you query a semantic view, the extension generates the appropriate SQL -- selecting only the tables, joins, and aggregations needed for your request.
-
-This extension implements a concept similar to [Snowflake Semantic Views](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view), adapted for DuckDB as a loadable extension.
+Then you query it by picking which dimensions and metrics you want. The extension figures out the SQL.
 
 ## Loading
-
-For local builds, load the extension from the build output:
 
 ```sql
 LOAD 'semantic_views';
 ```
 
-Community registry installation (not yet published):
+Once published to the community registry (not yet):
 
 ```sql
 INSTALL semantic_views FROM community;
 LOAD semantic_views;
 ```
 
-## Creating a Semantic View
+## Creating a semantic view
 
-Use `create_semantic_view()` with 6 positional arguments:
+`create_semantic_view()` takes 6 positional arguments:
 
 ```
 create_semantic_view(
@@ -49,7 +45,7 @@ create_semantic_view(
 )
 ```
 
-### Single-table example
+### Single table
 
 ```sql
 CREATE TABLE orders (
@@ -57,39 +53,35 @@ CREATE TABLE orders (
     amount DECIMAL(10,2), created_at DATE
 );
 
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'orders',
-    [{'alias': 'o', 'table': 'orders'}],
-    [],
-    [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
+    tables := [{'alias': 'o', 'table': 'orders'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
      {'name': 'category', 'expr': 'category', 'source_table': 'o'}],
-    [{'name': 'order_date', 'expr': 'created_at', 'granularity': 'month'}],
-    [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
+    time_dimensions := [{'name': 'order_date', 'expr': 'created_at', 'granularity': 'month'}],
+    metrics := [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
      {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}]
 );
 ```
 
-### Multi-table join example
+### Multi-table joins
 
 ```sql
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'order_analytics',
-    [{'alias': 'o', 'table': 'orders'},
+    tables := [{'alias': 'o', 'table': 'orders'},
      {'alias': 'c', 'table': 'customers'}],
-    [{'from_table': 'o', 'to_table': 'c',
+    relationships := [{'from_table': 'o', 'to_table': 'c',
       'join_columns': [{'from': 'customer_id', 'to': 'id'}]}],
-    [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
      {'name': 'customer_tier', 'expr': 'tier', 'source_table': 'c'}],
-    [],
-    [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
+    metrics := [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
 );
 ```
 
-Joins are resolved automatically -- only the tables needed for the requested dimensions and metrics are included in the generated SQL.
+Only the tables needed for your requested dimensions/metrics get joined.
 
 ## Querying
-
-Use the `semantic_view()` table function with named `dimensions` and `metrics` parameters:
 
 ```sql
 -- Dimensions + metrics
@@ -97,12 +89,12 @@ SELECT * FROM semantic_view('orders',
     dimensions := ['region'],
     metrics := ['revenue']);
 
--- Multiple dimensions and metrics
+-- Multiple of each
 SELECT * FROM semantic_view('orders',
     dimensions := ['region', 'category'],
     metrics := ['revenue', 'order_count']);
 
--- Dimensions only (returns DISTINCT values)
+-- Dimensions only (returns distinct values)
 SELECT * FROM semantic_view('orders',
     dimensions := ['region']);
 
@@ -110,12 +102,12 @@ SELECT * FROM semantic_view('orders',
 SELECT * FROM semantic_view('orders',
     metrics := ['revenue']);
 
--- Time dimension (truncated to defined granularity)
+-- Time dimension (truncated to the defined granularity)
 SELECT * FROM semantic_view('orders',
     dimensions := ['order_date'],
     metrics := ['revenue']);
 
--- WHERE composition (filters applied to the expanded result)
+-- WHERE works on the result
 SELECT * FROM semantic_view('orders',
     dimensions := ['region'],
     metrics := ['revenue'])
@@ -124,7 +116,7 @@ WHERE region = 'EMEA';
 
 ## Explain
 
-Use `explain_semantic_view()` to see the expanded SQL the extension generates:
+See what SQL the extension generates:
 
 ```sql
 SELECT * FROM explain_semantic_view('orders',
@@ -132,56 +124,33 @@ SELECT * FROM explain_semantic_view('orders',
     metrics := ['revenue']);
 ```
 
-This returns the full SQL statement and DuckDB execution plan. Useful for debugging or understanding what the semantic view expands into.
+Returns the expanded SQL and the DuckDB execution plan.
 
-## Other DDL Functions
+## Other DDL functions
 
-- `create_or_replace_semantic_view(...)` -- overwrites an existing definition
-- `create_semantic_view_if_not_exists(...)` -- no-op if the view already exists
-- `drop_semantic_view('name')` -- removes a semantic view
-- `drop_semantic_view_if_exists('name')` -- no-op if the view is not found
-- `list_semantic_views()` -- returns a table of all registered views (columns: `name`, `base_table`)
-- `describe_semantic_view('name')` -- returns view metadata (columns: `name`, `base_table`)
+All use the same 6-argument signature as `create_semantic_view()`:
 
-All DDL variants use the same 6-argument interface as `create_semantic_view()`.
+- `create_or_replace_semantic_view(...)` -- overwrites an existing view
+- `create_semantic_view_if_not_exists(...)` -- no-op if already exists
+- `drop_semantic_view('name')` -- removes a view
+- `drop_semantic_view_if_exists('name')` -- no-op if not found
+- `list_semantic_views()` -- table of all registered views
+- `describe_semantic_view('name')` -- view metadata
 
-## Tech Stack and Building
+## Building
 
-Built in Rust with a C++ shim, on top of the [DuckDB Extension Template for Rust](https://github.com/duckdb/extension-template-rs).
+Rust with a C++ shim, built on the [DuckDB extension template for Rust](https://github.com/duckdb/extension-template-rs).
 
-### Prerequisites
-
-- Rust toolchain (stable)
-- just (command runner)
-- make
-- Python 3 (for the sqllogictest runner and integration tests)
-
-### Build commands
+You need: Rust (stable), just, make, Python 3.
 
 ```bash
-# Debug build (extension binary)
-just build
-
-# Rust unit + property-based tests
-cargo test
-
-# SQL logic tests (requires just build first)
-just test-sql
-
-# Full test suite (Rust + SQL logic + DuckLake integration)
-just test-all
-
-# Linting (format check + clippy + cargo-deny)
-just lint
+just setup     # one-time: installs dev tools, configures build
+just build     # debug build
+cargo test     # unit + property-based tests
+just test-sql  # SQL logic tests (needs just build first)
+just test-all  # everything
+just lint      # fmt + clippy + cargo-deny
 ```
-
-### First-time setup
-
-```bash
-just setup
-```
-
-This installs dev tools (cargo-nextest, cargo-deny, cargo-llvm-cov, cargo-fuzz), initializes git submodules, and configures the build environment.
 
 ## License
 

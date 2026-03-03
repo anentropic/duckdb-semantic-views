@@ -1,5 +1,5 @@
 # Phase 4 query round-trip integration tests.
-# Updated for Phase 12: uses create_semantic_view
+# Updated for keyword args: uses create_semantic_view with named params
 # and typed output columns (BIGINT metrics use query I, DATE time dimensions use query D).
 #
 # Exercises semantic_view table function against real DuckDB tables with known
@@ -76,14 +76,12 @@ INSERT INTO test_products VALUES
 
 # Define a basic semantic view over test_orders (single table)
 statement ok
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'simple_orders',
-    [{'alias': 'o', 'table': 'test_orders'}],
-    [],
-    [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
+    tables := [{'alias': 'o', 'table': 'test_orders'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
      {'name': 'category', 'expr': 'category', 'source_table': 'o'}],
-    [],
-    [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
+    metrics := [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
      {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}]
 );
 
@@ -110,13 +108,11 @@ EMEA	electronics	175.00	2
 
 # Define a view with no built-in filter (filters via WHERE on query result)
 statement ok
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'filtered_orders',
-    [{'alias': 'o', 'table': 'test_orders'}],
-    [],
-    [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
-    [],
-    [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
+    tables := [{'alias': 'o', 'table': 'test_orders'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
+    metrics := [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
 );
 
 query TT rowsort
@@ -136,24 +132,23 @@ EMEA	225.00
 # ============================================================
 
 # Define a view joining orders -> customers and orders -> products.
-# Expressions use UNQUALIFIED column names — the CTE flattens joined tables.
+# Expressions use UNQUALIFIED column names -- the CTE flattens joined tables.
 # source_table uses alias (e.g., 'c') for join resolution; expand.rs resolves
 # alias to physical name via def.tables and includes the join only when needed.
 statement ok
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'joined_orders',
-    [{'alias': 'o', 'table': 'test_orders'},
+    tables := [{'alias': 'o', 'table': 'test_orders'},
      {'alias': 'c', 'table': 'test_customers'},
      {'alias': 'p', 'table': 'test_products'}],
-    [{'from_table': 'o', 'to_table': 'c',
+    relationships := [{'from_table': 'o', 'to_table': 'c',
       'join_columns': [{'from': 'customer_id', 'to': 'id'}]},
      {'from_table': 'o', 'to_table': 'p',
       'join_columns': [{'from': 'category', 'to': 'category'}]}],
-    [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
      {'name': 'customer_tier', 'expr': 'tier', 'source_table': 'c'},
      {'name': 'supplier', 'expr': 'supplier', 'source_table': 'p'}],
-    [],
-    [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
+    metrics := [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
      {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}]
 );
 
@@ -253,13 +248,11 @@ specify at least
 
 # Define a view with a count metric (BIGINT output, typed I)
 statement ok
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'typed_output_test',
-    [{'alias': 'o', 'table': 'test_orders'}],
-    [],
-    [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
-    [],
-    [{'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}]
+    tables := [{'alias': 'o', 'table': 'test_orders'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
+    metrics := [{'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}]
 );
 
 # query TI confirms: region is VARCHAR (T), order_count is BIGINT (I)
@@ -270,7 +263,7 @@ APAC	2
 EMEA	3
 
 statement ok
-SELECT drop_semantic_view('typed_output_test');
+SELECT * FROM drop_semantic_view('typed_output_test');
 
 # DATE typed column test (OUT-01)
 statement ok
@@ -285,13 +278,11 @@ INSERT INTO test_events VALUES
     ('2024-02-20', 3);
 
 statement ok
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'typed_date_test',
-    [{'alias': 'e', 'table': 'test_events'}],
-    [],
-    [],
-    [{'name': 'event_date', 'expr': 'event_date', 'granularity': 'month'}],
-    [{'name': 'total_count', 'expr': 'sum(event_count)', 'source_table': 'e'}]
+    tables := [{'alias': 'e', 'table': 'test_events'}],
+    time_dimensions := [{'name': 'event_date', 'expr': 'event_date', 'granularity': 'month'}],
+    metrics := [{'name': 'total_count', 'expr': 'sum(event_count)', 'source_table': 'e'}]
 );
 
 # The time dimension returns DATE values (declared as DATE in bind()).
@@ -304,7 +295,7 @@ FROM semantic_view('typed_date_test', dimensions := ['event_date'], metrics := [
 2024-02-01	3
 
 statement ok
-SELECT drop_semantic_view('typed_date_test');
+SELECT * FROM drop_semantic_view('typed_date_test');
 
 statement ok
 DROP TABLE test_events;
@@ -314,13 +305,13 @@ DROP TABLE test_events;
 # ============================================================
 
 statement ok
-SELECT drop_semantic_view('simple_orders');
+SELECT * FROM drop_semantic_view('simple_orders');
 
 statement ok
-SELECT drop_semantic_view('filtered_orders');
+SELECT * FROM drop_semantic_view('filtered_orders');
 
 statement ok
-SELECT drop_semantic_view('joined_orders');
+SELECT * FROM drop_semantic_view('joined_orders');
 
 statement ok
 DROP TABLE test_orders;

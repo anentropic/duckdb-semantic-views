@@ -1,5 +1,6 @@
 # Phase 2 DDL round-trip integration test.
-# Updated for Phase 12: uses create_semantic_view / create_or_replace_semantic_view.
+# Updated for keyword args support: DDL functions are now table functions
+# (VTab) and require FROM syntax with keyword arguments.
 #
 # Exercises create_semantic_view, create_or_replace_semantic_view,
 # create_semantic_view_if_not_exists, drop_semantic_view,
@@ -11,37 +12,34 @@
 #   DDL-02: drop_semantic_view() removes a registered view
 #   DDL-03: create_or_replace_semantic_view() overwrites an existing definition
 #   DDL-04: 6-arg STRUCT/LIST parameter interface
+#   KWARG-01: keyword args syntax for DDL table functions
 #
 # Run via: just test  (make test_debug)
 
 require semantic_views
 
 # ============================================================
-# 1. Create a semantic view — DDL-01, DDL-04
+# 1. Create a semantic view -- DDL-01, DDL-04
 # ============================================================
 
 statement ok
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'orders',
-    [{'alias': 'o', 'table': 'orders'}],
-    [],
-    [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
-    [],
-    [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
+    tables := [{'alias': 'o', 'table': 'orders'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
+    metrics := [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
 );
 
 statement ok
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'customers',
-    [{'alias': 'c', 'table': 'customers'}],
-    [],
-    [{'name': 'country', 'expr': 'country', 'source_table': 'c'}],
-    [],
-    [{'name': 'count', 'expr': 'count(*)', 'source_table': 'c'}]
+    tables := [{'alias': 'c', 'table': 'customers'}],
+    dimensions := [{'name': 'country', 'expr': 'country', 'source_table': 'c'}],
+    metrics := [{'name': 'count', 'expr': 'count(*)', 'source_table': 'c'}]
 );
 
 # ============================================================
-# 2. list_semantic_views returns all registered views — DDL-01
+# 2. list_semantic_views returns all registered views -- DDL-01
 # ============================================================
 
 # Two views should be present (orders + customers), sorted by name
@@ -67,17 +65,15 @@ SELECT name, base_table FROM describe_semantic_view('customers');
 customers	customers
 
 # ============================================================
-# 4. Duplicate create is an error — DDL-01
+# 4. Duplicate create is an error -- DDL-01
 # ============================================================
 
 statement error
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'orders',
-    [{'alias': 'o', 'table': 'orders'}],
-    [],
-    [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
-    [],
-    [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
+    tables := [{'alias': 'o', 'table': 'orders'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
+    metrics := [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
 );
 ----
 already exists
@@ -92,11 +88,11 @@ SELECT * FROM describe_semantic_view('nonexistent');
 does not exist
 
 # ============================================================
-# 6. drop_semantic_view removes the view — DDL-02
+# 6. drop_semantic_view removes the view -- DDL-02
 # ============================================================
 
 statement ok
-SELECT drop_semantic_view('orders');
+SELECT * FROM drop_semantic_view('orders');
 
 # Orders should be gone from list
 query TT rowsort
@@ -111,26 +107,24 @@ SELECT * FROM describe_semantic_view('orders');
 does not exist
 
 # ============================================================
-# 7. drop_semantic_view on nonexistent view is an error — DDL-02
+# 7. drop_semantic_view on nonexistent view is an error -- DDL-02
 # ============================================================
 
 statement error
-SELECT drop_semantic_view('orders');
+SELECT * FROM drop_semantic_view('orders');
 ----
 does not exist
 
 # ============================================================
-# 8. create_or_replace_semantic_view overwrites — DDL-03
+# 8. create_or_replace_semantic_view overwrites -- DDL-03
 # ============================================================
 
 statement ok
-SELECT create_or_replace_semantic_view(
+SELECT * FROM create_or_replace_semantic_view(
     'customers',
-    [{'alias': 'c', 'table': 'customers'}],
-    [],
-    [{'name': 'country', 'expr': 'country', 'source_table': 'c'}],
-    [],
-    [{'name': 'count', 'expr': 'count(*)', 'source_table': 'c'},
+    tables := [{'alias': 'c', 'table': 'customers'}],
+    dimensions := [{'name': 'country', 'expr': 'country', 'source_table': 'c'}],
+    metrics := [{'name': 'count', 'expr': 'count(*)', 'source_table': 'c'},
      {'name': 'active_count', 'expr': 'count(distinct id)', 'source_table': 'c'}]
 );
 
@@ -141,44 +135,35 @@ SELECT count(*) FROM list_semantic_views() WHERE name = 'customers';
 1
 
 # ============================================================
-# 9. drop_semantic_view_if_exists is silent — DDL-02
+# 9. drop_semantic_view_if_exists is silent -- DDL-02
 # ============================================================
 
 statement ok
-SELECT drop_semantic_view_if_exists('nonexistent_view');
+SELECT * FROM drop_semantic_view_if_exists('nonexistent_view');
 
 statement ok
-SELECT drop_semantic_view_if_exists('orders');
+SELECT * FROM drop_semantic_view_if_exists('orders');
 
 # ============================================================
-# 10. Scalar functions are present with new 6-arg interface (DDL-04, DDL-05)
-# ============================================================
-
-statement ok
-SELECT create_semantic_view(
-    'x_test',
-    [],
-    [],
-    [],
-    [],
-    []
-);
-
-statement ok
-SELECT drop_semantic_view('x_test');
-
-# ============================================================
-# 11. Define a second view and verify list — DDL-01
+# 10. Table functions are present with minimal args (DDL-04, DDL-05)
 # ============================================================
 
 statement ok
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view('x_test');
+
+statement ok
+SELECT * FROM drop_semantic_view('x_test');
+
+# ============================================================
+# 11. Define a second view and verify list -- DDL-01
+# ============================================================
+
+statement ok
+SELECT * FROM create_semantic_view(
     'products',
-    [{'alias': 'p', 'table': 'products'}],
-    [],
-    [{'name': 'category', 'expr': 'category', 'source_table': 'p'}],
-    [],
-    [{'name': 'total', 'expr': 'sum(price)', 'source_table': 'p'}]
+    tables := [{'alias': 'p', 'table': 'products'}],
+    dimensions := [{'name': 'category', 'expr': 'category', 'source_table': 'p'}],
+    metrics := [{'name': 'total', 'expr': 'sum(price)', 'source_table': 'p'}]
 );
 
 query TT rowsort
@@ -188,19 +173,18 @@ customers	customers
 products	products
 
 # ============================================================
-# 12. Multi-table view with join relationships — DDL-04
+# 12. Multi-table view with join relationships -- DDL-04
 # ============================================================
 
 statement ok
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'sales',
-    [{'alias': 'o', 'table': 'orders'}, {'alias': 'c', 'table': 'customers'}],
-    [{'from_table': 'o', 'to_table': 'c',
+    tables := [{'alias': 'o', 'table': 'orders'}, {'alias': 'c', 'table': 'customers'}],
+    relationships := [{'from_table': 'o', 'to_table': 'c',
       'join_columns': [{'from': 'customer_id', 'to': 'id'}]}],
-    [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
      {'name': 'customer_name', 'expr': 'name', 'source_table': 'c'}],
-    [],
-    [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
+    metrics := [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
 );
 
 query TT rowsort
@@ -211,17 +195,16 @@ products	products
 sales	orders
 
 # ============================================================
-# 13. View with time dimensions — DDL-04
+# 13. View with time dimensions -- DDL-04
 # ============================================================
 
 statement ok
-SELECT create_semantic_view(
+SELECT * FROM create_semantic_view(
     'time_orders',
-    [{'alias': 'o', 'table': 'orders'}],
-    [],
-    [{'name': 'status', 'expr': 'status', 'source_table': 'o'}],
-    [{'name': 'order_date', 'expr': 'created_at', 'granularity': 'month'}],
-    [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
+    tables := [{'alias': 'o', 'table': 'orders'}],
+    dimensions := [{'name': 'status', 'expr': 'status', 'source_table': 'o'}],
+    time_dimensions := [{'name': 'order_date', 'expr': 'created_at', 'granularity': 'month'}],
+    metrics := [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
 );
 
 query TT rowsort
@@ -237,16 +220,16 @@ time_orders	orders
 # ============================================================
 
 statement ok
-SELECT drop_semantic_view('customers');
+SELECT * FROM drop_semantic_view('customers');
 
 statement ok
-SELECT drop_semantic_view('products');
+SELECT * FROM drop_semantic_view('products');
 
 statement ok
-SELECT drop_semantic_view('sales');
+SELECT * FROM drop_semantic_view('sales');
 
 statement ok
-SELECT drop_semantic_view('time_orders');
+SELECT * FROM drop_semantic_view('time_orders');
 
 query I
 SELECT count(*) FROM list_semantic_views();
@@ -254,31 +237,70 @@ SELECT count(*) FROM list_semantic_views();
 0
 
 # ============================================================
-# 15. create_semantic_view_if_not_exists — silent no-op on duplicate
+# 15. create_semantic_view_if_not_exists -- silent no-op on duplicate
 # ============================================================
 
 # First call creates the view (normal behavior)
 statement ok
-SELECT create_semantic_view_if_not_exists(
+SELECT * FROM create_semantic_view_if_not_exists(
     'idempotent_test',
-    [{'alias': 't', 'table': 'orders'}],
-    [],
-    [{'name': 'region', 'expr': 'region', 'source_table': 't'}],
-    [],
-    []
+    tables := [{'alias': 't', 'table': 'orders'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 't'}]
 );
 
 # Second call on same view name must NOT error (if_not_exists behavior)
 statement ok
-SELECT create_semantic_view_if_not_exists(
+SELECT * FROM create_semantic_view_if_not_exists(
     'idempotent_test',
-    [{'alias': 't', 'table': 'orders'}],
-    [],
-    [{'name': 'region', 'expr': 'region', 'source_table': 't'}],
-    [],
-    []
+    tables := [{'alias': 't', 'table': 'orders'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 't'}]
 );
 
 # Clean up
 statement ok
-SELECT drop_semantic_view('idempotent_test');
+SELECT * FROM drop_semantic_view('idempotent_test');
+
+# ============================================================
+# 16. Keyword args syntax -- create_semantic_view with all named params (KWARG-01)
+# ============================================================
+
+statement ok
+SELECT * FROM create_semantic_view(
+    'kwarg_test',
+    tables := [{'alias': 'o', 'table': 'orders'}],
+    relationships := [],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
+    time_dimensions := [],
+    metrics := [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
+);
+
+# Verify it was created
+query TT
+SELECT name, base_table FROM describe_semantic_view('kwarg_test');
+----
+kwarg_test	orders
+
+# Clean up
+statement ok
+SELECT * FROM drop_semantic_view('kwarg_test');
+
+# ============================================================
+# 17. Mixed positional name + keyword args (KWARG-01)
+# ============================================================
+
+# Omitting optional params (relationships, time_dimensions) defaults to empty lists
+statement ok
+SELECT * FROM create_semantic_view(
+    'mixed_test',
+    tables := [{'alias': 'o', 'table': 'orders'}],
+    dimensions := [{'name': 'status', 'expr': 'status', 'source_table': 'o'}],
+    metrics := [{'name': 'total', 'expr': 'count(*)', 'source_table': 'o'}]
+);
+
+query TT
+SELECT name, base_table FROM describe_semantic_view('mixed_test');
+----
+mixed_test	orders
+
+statement ok
+SELECT * FROM drop_semantic_view('mixed_test');

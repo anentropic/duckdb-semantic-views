@@ -157,15 +157,19 @@ def run_tests() -> None:
         try:
             con.execute(
                 """
-                SELECT create_semantic_view(
+                SELECT * FROM create_semantic_view(
                     'ci_orders',
-                    [{'alias': 'o', 'table': 'jaffle.raw_orders'}],
-                    [],
-                    [{'name': 'store_id',  'expr': 'store_id',  'source_table': 'o'},
-                     {'name': 'customer',  'expr': 'customer',  'source_table': 'o'}],
-                    [{'name': 'ordered_at', 'expr': 'ordered_at', 'granularity': 'day'}],
-                    [{'name': 'order_count',   'expr': 'count(*)',          'source_table': 'o'},
-                     {'name': 'total_revenue', 'expr': 'sum(order_total)', 'source_table': 'o'}]
+                    tables := [{'alias': 'o', 'table': 'jaffle.raw_orders'}],
+                    dimensions := [
+                        {'name': 'store_id', 'expr': 'store_id', 'source_table': 'o'},
+                        {'name': 'customer', 'expr': 'customer', 'source_table': 'o'}],
+                    time_dimensions := [
+                        {'name': 'ordered_at', 'expr': 'ordered_at',
+                         'granularity': 'day'}],
+                    metrics := [
+                        {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'},
+                        {'name': 'total_revenue', 'expr': 'sum(order_total)',
+                         'source_table': 'o'}]
                 )
                 """
             )
@@ -313,7 +317,7 @@ def run_tests() -> None:
         print()
         print("Cleanup: dropping semantic view")
         try:
-            con.execute("SELECT drop_semantic_view('ci_orders')")
+            con.execute("SELECT * FROM drop_semantic_view('ci_orders')")
         except Exception:
             pass  # Best-effort cleanup
 

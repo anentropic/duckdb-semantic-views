@@ -196,7 +196,9 @@ impl VTab for DefineSemanticViewVTab {
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        // Positional parameter 0: view name (VARCHAR)
+        // Only the view name is positional. The 5 LIST(STRUCT) params are
+        // named-only (via named_parameters) because DuckDB cannot infer
+        // STRUCT types from empty list literals like `[]`.
         Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
     }
 

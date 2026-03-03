@@ -87,10 +87,13 @@ unsafe fn extract_struct_child_varchar(struct_val: ffi::duckdb_value, index: u64
     result
 }
 
-/// Get the named parameter if present, otherwise fall back to the positional parameter.
-fn get_param(bind: &BindInfo, name: &str, positional_idx: u64) -> Option<Value> {
+/// Get the named parameter if present.
+///
+/// Named parameters are the only way to pass LIST(STRUCT) values to the DDL
+/// table functions. DuckDB cannot infer STRUCT types from empty list literals
+/// (`[]`), so positional fallback is not supported for these parameters.
+fn get_named_param(bind: &BindInfo, name: &str) -> Option<Value> {
     bind.get_named_parameter(name)
-        .or_else(|| Some(bind.get_parameter(positional_idx)))
 }
 
 /// Parse `create_semantic_view` arguments from a VTab [`BindInfo`].
@@ -112,7 +115,7 @@ pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, 
     // Param 1: tables LIST(STRUCT(alias:0, table:1))
     // ------------------------------------------------------------------
     let mut tables: Vec<TableRef> = Vec::new();
-    if let Some(ref val) = get_param(bind, "tables", 1) {
+    if let Some(ref val) = get_named_param(bind, "tables") {
         unsafe {
             let val_ptr = value_raw_ptr(val);
             let size = ffi::duckdb_get_list_size(val_ptr);
@@ -131,7 +134,7 @@ pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, 
     //   where join_columns is LIST(STRUCT(from:0, to:1))
     // ------------------------------------------------------------------
     let mut joins: Vec<Join> = Vec::new();
-    if let Some(ref val) = get_param(bind, "relationships", 2) {
+    if let Some(ref val) = get_named_param(bind, "relationships") {
         unsafe {
             let val_ptr = value_raw_ptr(val);
             let size = ffi::duckdb_get_list_size(val_ptr);
@@ -175,7 +178,7 @@ pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, 
     // Param 3: dimensions LIST(STRUCT(name:0, expr:1, source_table:2))
     // ------------------------------------------------------------------
     let mut dimensions: Vec<Dimension> = Vec::new();
-    if let Some(ref val) = get_param(bind, "dimensions", 3) {
+    if let Some(ref val) = get_named_param(bind, "dimensions") {
         unsafe {
             let val_ptr = value_raw_ptr(val);
             let size = ffi::duckdb_get_list_size(val_ptr);
@@ -205,7 +208,7 @@ pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, 
     // ------------------------------------------------------------------
     // Param 4: time_dimensions LIST(STRUCT(name:0, expr:1, granularity:2))
     // ------------------------------------------------------------------
-    if let Some(ref val) = get_param(bind, "time_dimensions", 4) {
+    if let Some(ref val) = get_named_param(bind, "time_dimensions") {
         unsafe {
             let val_ptr = value_raw_ptr(val);
             let size = ffi::duckdb_get_list_size(val_ptr);
@@ -232,7 +235,7 @@ pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, 
     // Param 5: metrics LIST(STRUCT(name:0, expr:1, source_table:2))
     // ------------------------------------------------------------------
     let mut metrics: Vec<Metric> = Vec::new();
-    if let Some(ref val) = get_param(bind, "metrics", 5) {
+    if let Some(ref val) = get_named_param(bind, "metrics") {
         unsafe {
             let val_ptr = value_raw_ptr(val);
             let size = ffi::duckdb_get_list_size(val_ptr);

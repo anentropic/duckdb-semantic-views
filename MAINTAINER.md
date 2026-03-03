@@ -284,7 +284,7 @@ con.execute("FROM explain_semantic_view('orders', dimensions := ['region'], metr
 con.execute("FROM list_semantic_views()").fetchall()
 
 # Remove a view
-con.execute("SELECT drop_semantic_view('orders')")
+con.execute("SELECT * FROM drop_semantic_view('orders')")
 ```
 
 For release builds, change the path to `build/release/semantic_views.duckdb_extension`.

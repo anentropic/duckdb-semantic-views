@@ -2,7 +2,7 @@
 #
 # Verifies that semantic view definitions persist across restart via
 # DuckDB-native table storage (semantic_layer._definitions). No companion
-# file is involved — the table is part of the DuckDB WAL and persists
+# file is involved -- the table is part of the DuckDB WAL and persists
 # across restarts automatically.
 #
 # NOTE: This test is EXCLUDED from test/sql/TEST_LIST (the standard make test
@@ -26,20 +26,15 @@ load __TEST_DIR__/restart_test.db
 
 # Idempotent cleanup: drop any leftover view from a previous run
 statement ok
-SELECT CASE WHEN (SELECT count(*) FROM list_semantic_views() WHERE name = 'restart_test') > 0
-       THEN drop_semantic_view('restart_test')
-       ELSE 'no-op'
-END;
+SELECT * FROM drop_semantic_view_if_exists('restart_test');
 
 # Define a view in the file-backed database (PERSIST-01)
 statement ok
-SELECT define_semantic_view(
+SELECT * FROM create_semantic_view(
     'restart_test',
-    [{'alias': 'e', 'table': 'events'}],
-    [],
-    [{'name': 'type', 'expr': 'type', 'source_table': 'e'}],
-    [],
-    [{'name': 'n', 'expr': 'count(*)', 'source_table': 'e'}]
+    tables := [{'alias': 'e', 'table': 'events'}],
+    dimensions := [{'name': 'type', 'expr': 'type', 'source_table': 'e'}],
+    metrics := [{'name': 'n', 'expr': 'count(*)', 'source_table': 'e'}]
 );
 
 # Verify it is present before restart
@@ -58,13 +53,13 @@ SELECT name, base_table FROM list_semantic_views();
 ----
 restart_test	events
 
-# PERSIST-02: define_semantic_view scalar function writes via an independent
+# PERSIST-02: create_semantic_view table function writes via an independent
 # persist_conn (separate from the main connection). This means the write to
 # semantic_layer._definitions happens outside the caller's transaction scope
 # and is NOT rolled back by ROLLBACK on the main connection.
 #
 # NOTE: The original PRAGMA-based ROLLBACK test (from Phase 10) is no longer
-# valid — PRAGMA define_semantic_view_internal was removed in Phase 11.1 in
+# valid -- PRAGMA define_semantic_view_internal was removed in Phase 11.1 in
 # favour of the scalar function DDL interface. Transaction-scoped DDL rollback
 # is a known limitation and deferred to a future phase.
 #
@@ -76,7 +71,7 @@ SELECT count(*) FROM list_semantic_views() WHERE name = 'rollback_test';
 
 # Clean up: drop the restart_test view
 statement ok
-SELECT drop_semantic_view('restart_test');
+SELECT * FROM drop_semantic_view('restart_test');
 
 query I
 SELECT count(*) FROM list_semantic_views();
