@@ -8,11 +8,11 @@ DuckLake CI integration test for the semantic_views extension.
 
 Verifies that semantic_view works correctly against DuckLake-managed
 tables using entirely inline synthetic data. No jaffle-shop data download
-or setup step required — suitable for CI/CD environments.
+or setup step required -- suitable for CI/CD environments.
 
 Creates a DuckLake catalog in a temp directory, inserts known synthetic
 rows, and asserts specific expected outputs (including typed BIGINT output
-and time dimension truncation to day granularity).
+and date dimension with date_trunc).
 
 Usage:
     uv run test/integration/test_ducklake_ci.py
@@ -26,12 +26,12 @@ Exit codes:
     1 = test failure or setup error
 
 Test cases:
-    1. Define semantic view over DuckLake table (v0.2.0 create_semantic_view API)
+    1. Define semantic view over DuckLake table (create_semantic_view API)
     2. Query with dimension (store_id)
     3. Global aggregate (order_count, total_revenue)
     4. Explain on DuckLake-backed view
     5. Typed BIGINT output — count(*) returns Python int, not str
-    6. Time dimension with day granularity — ordered_at truncated to known dates
+    6. Date dimension with date_trunc — ordered_at truncated to known dates
 
 Requirement: DuckLake integration test (CI variant, inline synthetic data)
 """
@@ -162,10 +162,9 @@ def run_tests() -> None:
                     tables := [{'alias': 'o', 'table': 'jaffle.raw_orders'}],
                     dimensions := [
                         {'name': 'store_id', 'expr': 'store_id', 'source_table': 'o'},
-                        {'name': 'customer', 'expr': 'customer', 'source_table': 'o'}],
-                    time_dimensions := [
-                        {'name': 'ordered_at', 'expr': 'ordered_at',
-                         'granularity': 'day'}],
+                        {'name': 'customer', 'expr': 'customer', 'source_table': 'o'},
+                        {'name': 'ordered_at', 'expr': "date_trunc('day', ordered_at)",
+                         'source_table': 'o'}],
                     metrics := [
                         {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'},
                         {'name': 'total_revenue', 'expr': 'sum(order_total)',
@@ -273,9 +272,9 @@ def run_tests() -> None:
             print(f"  FAIL: {e}")
             failed += 1
 
-        # ---- Test 6: Time dimension with day granularity ----
+        # ---- Test 6: Date dimension with date_trunc ----
         print()
-        print("Test 6: Time dimension truncated to day granularity")
+        print("Test 6: Date dimension with date_trunc('day', ...)")
         try:
             result = con.execute(
                 """
@@ -306,7 +305,7 @@ def run_tests() -> None:
             assert datetime.date(2024, 3, 5) in dates, f"Expected 2024-03-05 in {dates}"
             assert len(result) == 3, f"Expected 3 distinct day groups, got {len(result)}: {result}"
 
-            print(f"  Time dimension rows: {result}")
+            print(f"  Date dimension rows: {result}")
             print("  PASS: ordered_at returns datetime.date values with correct day truncation")
             passed += 1
         except Exception as e:

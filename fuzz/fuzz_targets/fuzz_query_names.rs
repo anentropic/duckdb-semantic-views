@@ -1,6 +1,4 @@
 #![no_main]
-use std::collections::HashMap;
-
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use semantic_views::expand::{expand, QueryRequest};
@@ -17,7 +15,6 @@ fuzz_target!(|input: NameFuzzInput| {
     let req = QueryRequest {
         dimensions: input.dim_names,
         metrics: input.metric_names,
-        granularity_overrides: HashMap::new(),
     };
     if let Ok(sql) = expand("fuzz_view", &def, &req) {
         assert!(!sql.is_empty());

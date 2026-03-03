@@ -195,15 +195,15 @@ products	products
 sales	orders
 
 # ============================================================
-# 13. View with time dimensions -- DDL-04
+# 13. View with date_trunc dimension -- DDL-04
 # ============================================================
 
 statement ok
 SELECT * FROM create_semantic_view(
     'time_orders',
     tables := [{'alias': 'o', 'table': 'orders'}],
-    dimensions := [{'name': 'status', 'expr': 'status', 'source_table': 'o'}],
-    time_dimensions := [{'name': 'order_date', 'expr': 'created_at', 'granularity': 'month'}],
+    dimensions := [{'name': 'status', 'expr': 'status', 'source_table': 'o'},
+     {'name': 'order_date', 'expr': "date_trunc('month', created_at)", 'source_table': 'o'}],
     metrics := [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
 );
 
@@ -270,7 +270,6 @@ SELECT * FROM create_semantic_view(
     tables := [{'alias': 'o', 'table': 'orders'}],
     relationships := [],
     dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
-    time_dimensions := [],
     metrics := [{'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
 );
 
@@ -288,7 +287,7 @@ SELECT * FROM drop_semantic_view('kwarg_test');
 # 17. Mixed positional name + keyword args (KWARG-01)
 # ============================================================
 
-# Omitting optional params (relationships, time_dimensions) defaults to empty lists
+# Omitting optional params (relationships) defaults to empty lists
 statement ok
 SELECT * FROM create_semantic_view(
     'mixed_test',

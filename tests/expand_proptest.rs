@@ -16,24 +16,21 @@ fn simple_definition() -> SemanticViewDefinition {
                 name: "region".to_string(),
                 expr: "region".to_string(),
                 source_table: None,
-                dim_type: None,
-                granularity: None,
+
                 output_type: None,
             },
             Dimension {
                 name: "month".to_string(),
                 expr: "date_trunc('month', created_at)".to_string(),
                 source_table: None,
-                dim_type: None,
-                granularity: None,
+
                 output_type: None,
             },
             Dimension {
                 name: "status".to_string(),
                 expr: "status".to_string(),
                 source_table: None,
-                dim_type: None,
-                granularity: None,
+
                 output_type: None,
             },
         ],
@@ -76,32 +73,28 @@ fn joined_definition() -> SemanticViewDefinition {
                 name: "region".to_string(),
                 expr: "region".to_string(),
                 source_table: None,
-                dim_type: None,
-                granularity: None,
+
                 output_type: None,
             },
             Dimension {
                 name: "customer_name".to_string(),
                 expr: "customers.name".to_string(),
                 source_table: Some("customers".to_string()),
-                dim_type: None,
-                granularity: None,
+
                 output_type: None,
             },
             Dimension {
                 name: "month".to_string(),
                 expr: "date_trunc('month', created_at)".to_string(),
                 source_table: None,
-                dim_type: None,
-                granularity: None,
+
                 output_type: None,
             },
             Dimension {
                 name: "product_category".to_string(),
                 expr: "products.category".to_string(),
                 source_table: Some("products".to_string()),
-                dim_type: None,
-                granularity: None,
+
                 output_type: None,
             },
         ],
@@ -169,7 +162,6 @@ fn arb_query_request(def: &SemanticViewDefinition) -> impl Strategy<Value = Quer
         .prop_map(|(dims, mets)| QueryRequest {
             dimensions: dims,
             metrics: mets,
-            granularity_overrides: std::collections::HashMap::new(),
         })
 }
 
@@ -365,14 +357,14 @@ proptest! {
         _dummy in Just(QueryRequest {
             dimensions: vec![],
             metrics: vec!["total_revenue".to_string()],
-            granularity_overrides: std::collections::HashMap::new(),
+
         })
     ) {
         let def = simple_definition();
         let req = QueryRequest {
             dimensions: vec![],
             metrics: vec!["total_revenue".to_string()],
-            granularity_overrides: std::collections::HashMap::new(),
+
         };
         let sql = expand("test", &def, &req).unwrap();
 

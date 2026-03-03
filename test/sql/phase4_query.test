@@ -1,6 +1,6 @@
 # Phase 4 query round-trip integration tests.
 # Updated for keyword args: uses create_semantic_view with named params
-# and typed output columns (BIGINT metrics use query I, DATE time dimensions use query D).
+# and typed output columns (BIGINT metrics use query I, DATE dimensions use date_trunc).
 #
 # Exercises semantic_view table function against real DuckDB tables with known
 # data. Covers basic aggregation, WHERE composition, multi-table joins,
@@ -22,7 +22,7 @@
 #   QUERY-01: semantic_view with named array parameters returns correct results
 #   QUERY-02: User WHERE clauses compose with view filters
 #   QUERY-03: SELECT * returns all requested dimensions and metrics
-#   DDL-04: 6-arg STRUCT/LIST DDL interface
+#   DDL-04: 5-arg STRUCT/LIST DDL interface
 #   DDL-06: semantic_view function name (renamed from semantic_query)
 #   EXPL-01: explain_semantic_view returns expanded SQL
 #   OUT-01: semantic_view returns typed columns (BIGINT, DATE) for numeric/date data
@@ -281,11 +281,11 @@ statement ok
 SELECT * FROM create_semantic_view(
     'typed_date_test',
     tables := [{'alias': 'e', 'table': 'test_events'}],
-    time_dimensions := [{'name': 'event_date', 'expr': 'event_date', 'granularity': 'month'}],
+    dimensions := [{'name': 'event_date', 'expr': "date_trunc('month', event_date)", 'source_table': 'e'}],
     metrics := [{'name': 'total_count', 'expr': 'sum(event_count)', 'source_table': 'e'}]
 );
 
-# The time dimension returns DATE values (declared as DATE in bind()).
+# date_trunc('month', DATE) returns DATE values.
 # SQLLogicTest does not support the 'D' specifier; 'T' reads any column as text.
 # The metric total_count is sum(INTEGER) = BIGINT (typed I).
 query TI rowsort

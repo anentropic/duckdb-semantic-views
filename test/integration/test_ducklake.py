@@ -10,8 +10,8 @@ Verifies that semantic_view works correctly against DuckLake-managed
 tables (which use the Iceberg table format under the hood). This proves
 the extension handles non-standard table sources end-to-end.
 
-Uses the v0.2.0 API:
-  - create_semantic_view(name, tables, relationships, dimensions, time_dimensions, metrics)
+Uses the API:
+  - create_semantic_view(name, tables, relationships, dimensions, metrics)
   - semantic_view(name, dimensions := [...], metrics := [...])
   - explain_semantic_view(name, ...)
   - drop_semantic_view(name)
@@ -22,7 +22,7 @@ Test cases:
     3. Metrics-only query (global aggregate)
     4. Explain on DuckLake-backed view
     5. Typed BIGINT output — count(*) returns Python int, not str
-    6. Time dimension with day granularity — ordered_at returns datetime.date values
+    6. Date dimension with date_trunc — ordered_at returns datetime.date values
 
 Prerequisites:
     Run `just setup-ducklake` first to download jaffle-shop data and
@@ -136,9 +136,10 @@ def run_tests():
                 'jaffle_orders',
                 tables := [{'alias': 'o', 'table': 'jaffle.raw_orders'}],
                 dimensions := [
-                    {'name': 'store_id', 'expr': 'store_id', 'source_table': 'o'}],
-                time_dimensions := [
-                    {'name': 'ordered_at', 'expr': 'ordered_at', 'granularity': 'day'}],
+                    {'name': 'store_id', 'expr': 'store_id', 'source_table': 'o'},
+                    {'name': 'ordered_at',
+                     'expr': "date_trunc('day', ordered_at)",
+                     'source_table': 'o'}],
                 metrics := [
                     {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'},
                     {'name': 'total_revenue', 'expr': 'sum(order_total)', 'source_table': 'o'}]
@@ -246,9 +247,9 @@ def run_tests():
         print(f"  FAIL: {e}")
         failed += 1
 
-    # ---- Test 6: Time dimension with day granularity ----
+    # ---- Test 6: Date dimension with date_trunc ----
     print()
-    print("Test 6: Time dimension truncated to day granularity")
+    print("Test 6: Date dimension with date_trunc('day', ...)")
     try:
         result = con.execute(
             """
@@ -265,7 +266,7 @@ def run_tests():
             assert isinstance(row[0], datetime.date), (
                 f"Expected datetime.date for ordered_at, got {type(row[0]).__name__}: {row[0]!r}"
             )
-        print(f"  Time dimension rows: {len(result)} distinct days")
+        print(f"  Date dimension rows: {len(result)} distinct days")
         print("  PASS: ordered_at returns datetime.date values")
         passed += 1
     except Exception as e:
