@@ -47,9 +47,8 @@ fn vector_reference_survives_source_destruction() {
              (7, NULL, '1969-12-31')",
         );
 
-        let mut result =
-            execute_sql_raw(db.conn, "SELECT i, v, d FROM ref_test ORDER BY rowid")
-                .expect("query failed");
+        let mut result = execute_sql_raw(db.conn, "SELECT i, v, d FROM ref_test ORDER BY rowid")
+            .expect("query failed");
 
         let col_count = ffi::duckdb_column_count(&mut result) as usize;
         assert_eq!(col_count, 3);
@@ -57,7 +56,10 @@ fn vector_reference_survives_source_destruction() {
         // Get logical types for creating the output chunk.
         let mut logical_types: Vec<ffi::duckdb_logical_type> = Vec::with_capacity(col_count);
         for i in 0..col_count {
-            logical_types.push(ffi::duckdb_column_logical_type(&mut result, i as ffi::idx_t));
+            logical_types.push(ffi::duckdb_column_logical_type(
+                &mut result,
+                i as ffi::idx_t,
+            ));
         }
 
         // Get the source chunk.
@@ -70,7 +72,8 @@ fn vector_reference_survives_source_destruction() {
         assert_eq!(row_count, 3);
 
         // Create a new output chunk with the same schema.
-        let out_chunk = ffi::duckdb_create_data_chunk(logical_types.as_mut_ptr(), col_count as ffi::idx_t);
+        let out_chunk =
+            ffi::duckdb_create_data_chunk(logical_types.as_mut_ptr(), col_count as ffi::idx_t);
         assert!(!out_chunk.is_null());
 
         // Reference each source vector into the output chunk.
@@ -157,11 +160,13 @@ fn vector_reference_multi_chunk() {
         ));
 
         let mut result =
-            execute_sql_raw(db.conn, "SELECT i FROM big_ref ORDER BY i")
-                .expect("query failed");
+            execute_sql_raw(db.conn, "SELECT i FROM big_ref ORDER BY i").expect("query failed");
 
         let chunk_count = ffi::duckdb_result_chunk_count(result) as usize;
-        assert!(chunk_count > 1, "Expected multiple chunks for {n_rows} rows, got {chunk_count}");
+        assert!(
+            chunk_count > 1,
+            "Expected multiple chunks for {n_rows} rows, got {chunk_count}"
+        );
 
         let mut logical_types = vec![ffi::duckdb_column_logical_type(&mut result, 0)];
         let lt = logical_types[0];
@@ -217,9 +222,8 @@ fn vector_reference_complex_types() {
         db.exec("INSERT INTO complex_ref VALUES ([4], {'a': 20, 'b': 'world'})");
         db.exec("INSERT INTO complex_ref VALUES (NULL, NULL)");
 
-        let mut result =
-            execute_sql_raw(db.conn, "SELECT l, s FROM complex_ref ORDER BY rowid")
-                .expect("query failed");
+        let mut result = execute_sql_raw(db.conn, "SELECT l, s FROM complex_ref ORDER BY rowid")
+            .expect("query failed");
 
         let col_count = ffi::duckdb_column_count(&mut result) as usize;
         assert_eq!(col_count, 2);
@@ -232,7 +236,8 @@ fn vector_reference_complex_types() {
         assert!(!src_chunk.is_null());
         let row_count = ffi::duckdb_data_chunk_get_size(src_chunk) as usize;
 
-        let out_chunk = ffi::duckdb_create_data_chunk(logical_types.as_mut_ptr(), col_count as ffi::idx_t);
+        let out_chunk =
+            ffi::duckdb_create_data_chunk(logical_types.as_mut_ptr(), col_count as ffi::idx_t);
         for col_idx in 0..col_count {
             let src_vec = ffi::duckdb_data_chunk_get_vector(src_chunk, col_idx as ffi::idx_t);
             let dst_vec = ffi::duckdb_data_chunk_get_vector(out_chunk, col_idx as ffi::idx_t);
@@ -318,9 +323,8 @@ fn vector_copy_sel_basic() {
         db.exec("CREATE TABLE copy_test (i INTEGER, v VARCHAR)");
         db.exec("INSERT INTO copy_test VALUES (1, 'alpha'), (2, 'beta'), (NULL, 'gamma')");
 
-        let mut result =
-            execute_sql_raw(db.conn, "SELECT i, v FROM copy_test ORDER BY rowid")
-                .expect("query failed");
+        let mut result = execute_sql_raw(db.conn, "SELECT i, v FROM copy_test ORDER BY rowid")
+            .expect("query failed");
 
         let col_count = ffi::duckdb_column_count(&mut result) as usize;
         let mut logical_types: Vec<ffi::duckdb_logical_type> = (0..col_count)
@@ -331,7 +335,8 @@ fn vector_copy_sel_basic() {
         let row_count = ffi::duckdb_data_chunk_get_size(src_chunk) as usize;
 
         // Create output chunk.
-        let out_chunk = ffi::duckdb_create_data_chunk(logical_types.as_mut_ptr(), col_count as ffi::idx_t);
+        let out_chunk =
+            ffi::duckdb_create_data_chunk(logical_types.as_mut_ptr(), col_count as ffi::idx_t);
 
         // Create identity selection vector.
         let sel = create_identity_sel(row_count);
@@ -351,9 +356,18 @@ fn vector_copy_sel_basic() {
         // Read values from output.
         let lt0 = logical_types[0];
         let type0 = ffi::duckdb_get_type_id(lt0) as u32;
-        assert_eq!(read_typed_value(out_chunk, 0, 0, type0, lt0), TestValue::I32(1));
-        assert_eq!(read_typed_value(out_chunk, 0, 1, type0, lt0), TestValue::I32(2));
-        assert_eq!(read_typed_value(out_chunk, 0, 2, type0, lt0), TestValue::Null);
+        assert_eq!(
+            read_typed_value(out_chunk, 0, 0, type0, lt0),
+            TestValue::I32(1)
+        );
+        assert_eq!(
+            read_typed_value(out_chunk, 0, 1, type0, lt0),
+            TestValue::I32(2)
+        );
+        assert_eq!(
+            read_typed_value(out_chunk, 0, 2, type0, lt0),
+            TestValue::Null
+        );
 
         let lt1 = logical_types[1];
         let type1 = ffi::duckdb_get_type_id(lt1) as u32;
@@ -391,8 +405,7 @@ fn vector_copy_sel_multi_chunk() {
         ));
 
         let mut result =
-            execute_sql_raw(db.conn, "SELECT i FROM big_copy ORDER BY i")
-                .expect("query failed");
+            execute_sql_raw(db.conn, "SELECT i FROM big_copy ORDER BY i").expect("query failed");
 
         let chunk_count = ffi::duckdb_result_chunk_count(result) as usize;
         assert!(chunk_count > 1);
