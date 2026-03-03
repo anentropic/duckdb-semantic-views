@@ -162,7 +162,7 @@ pub fn catalog_delete_if_exists(state: &CatalogState, name: &str) {
     state.write().unwrap().remove(name);
 }
 
-/// FFI-callable catalog mutation functions — called from the C++ parser hook scan function.
+/// FFI-callable catalog mutation functions.
 ///
 /// These functions are gated on the `extension` feature so they are not included in
 /// standalone test binaries (which cannot use the loadable-extension C API stubs).

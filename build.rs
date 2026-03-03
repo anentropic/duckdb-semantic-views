@@ -1,8 +1,8 @@
 // build.rs
-// Cargo build script — compiles the C++ shim when building the loadable extension.
+// Cargo build script — restricts exported symbols when building the loadable extension.
 //
-// Design: Only the `extension` feature triggers C++ compilation. During `cargo test`
-// (default/bundled feature), this script exits immediately — no C++ toolchain required.
+// Design: Only the `extension` feature triggers symbol visibility configuration. During
+// `cargo test` (default/bundled feature), this script exits immediately.
 //
 // Symbol visibility: restricts the exported symbols of the cdylib to the Rust entry
 // point on Linux and macOS. Without this, Rust stdlib symbols leak into the extension
@@ -10,20 +10,12 @@
 // compilation; it is NOT compiled into the binary and must not appear in the symbol list.
 
 fn main() {
-    // Only compile the C++ shim when building the loadable extension binary.
+    // Only configure symbol visibility when building the loadable extension binary.
     // CARGO_FEATURE_EXTENSION is set by Cargo when `--features extension` is passed.
     // During `cargo test` (uses default/bundled feature), this block is skipped.
     if std::env::var("CARGO_FEATURE_EXTENSION").is_err() {
         return;
     }
-
-    cc::Build::new()
-        .cpp(true) // C++ mode (uses CXX, not CC)
-        .file("src/shim/shim.cpp") // the only C++ source file
-        .include("duckdb_capi/") // vendored duckdb.hpp and header tree
-        .flag_if_supported("-std=c++17") // safe on GCC/clang; skipped on MSVC
-        .warnings(false) // suppress DuckDB's own internal warnings
-        .compile("semantic_views_shim"); // produces libsemantic_views_shim.a, auto-linked
 
     // Symbol visibility: restrict the cdylib's exported symbols to the DuckDB entry
     // points only. Without this, Rust stdlib symbols leak into the extension binary.

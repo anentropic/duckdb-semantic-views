@@ -3,8 +3,6 @@ pub mod expand;
 pub mod model;
 #[cfg(feature = "extension")]
 pub mod query;
-#[cfg(feature = "extension")]
-pub mod shim;
 
 /// Test helpers for integration tests.
 ///
@@ -297,17 +295,6 @@ mod extension {
         query::table_function::{QueryState, SemanticViewVTab},
     };
 
-    // Extern C declaration for the C++ shim entry point.
-    // The shim is a no-op in Phase 11 (C++ parser extension APIs are hidden in
-    // the Python DuckDB bundle). Kept for ABI compatibility.
-    unsafe extern "C" {
-        fn semantic_views_register_shim(
-            db_instance_ptr: *mut std::ffi::c_void,
-            catalog_raw_ptr: *const std::ffi::c_void,
-            persist_conn: ffi::duckdb_connection,
-        );
-    }
-
     /// Core initialization logic, called with both the high-level Connection and
     /// the raw database handle (extracted by the manual FFI entrypoint below).
     fn init_extension(
@@ -451,14 +438,6 @@ mod extension {
             "explain_semantic_view",
             &query_state,
         )?;
-
-        // Call C++ shim (no-op in Phase 11 — kept for ABI compatibility).
-        // Safety: db_handle is a valid duckdb_database for the extension lifetime.
-        let catalog_raw = Arc::as_ptr(&catalog_state) as *const std::ffi::c_void;
-        let raw_persist_conn = persist_conn.unwrap_or(std::ptr::null_mut());
-        unsafe {
-            semantic_views_register_shim(db_handle.cast(), catalog_raw, raw_persist_conn);
-        }
 
         Ok(())
     }
