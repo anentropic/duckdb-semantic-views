@@ -2,6 +2,12 @@ name: Fuzz
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'fuzz/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/Fuzz.yml'
   workflow_dispatch:
 
 permissions:
