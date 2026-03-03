@@ -48,6 +48,7 @@ Decisions are logged in PROJECT.md Key Decisions table.
 All v0.1.0 decisions archived in milestones/v1.0-ROADMAP.md.
 All v0.2.0 decisions archived in milestones/v0.2-ROADMAP.md.
 - [Phase quick-12]: Remove time_dimensions and granularities -- users write date_trunc() in dimension expr
+- [Phase quick-13]: Removed C++ shim entirely -- was no-op since v0.2.0 Phase 11; extension is now pure Rust
 
 ### Pending Todos
 
@@ -72,9 +73,10 @@ None.
 | 9 | write README with usage examples and build instructions | 2026-03-03 | db9cee6 | Complete | [9-write-readme-with-usage-examples-and-bui](./quick/9-write-readme-with-usage-examples-and-bui/) |
 | 10 | add keyword args support for create_semantic_view | 2026-03-03 | b132929, 3e0a0d5 | Verified | [10-add-keyword-args-support-for-create-sema](./quick/10-add-keyword-args-support-for-create-sema/) |
 | 12 | remove time dimensions and granularities | 2026-03-03 | c393859, 7044649 | Verified | [12-remove-time-dimensions-and-granularities](./quick/12-remove-time-dimensions-and-granularities/) |
+| 13 | remove unused C++ shim and update docs | 2026-03-03 | aa42e8c, 6daf965 | Complete | [13-update-readme-and-remove-unused-c-shim](./quick/13-update-readme-and-remove-unused-c-shim/) |
 
 ## Session Continuity
 
 Last session: 2026-03-03
-Stopped at: Completed quick-12 (remove time dimensions and granularities).
+Stopped at: Completed quick-13 (remove unused C++ shim and update docs).
 Resume file: None
