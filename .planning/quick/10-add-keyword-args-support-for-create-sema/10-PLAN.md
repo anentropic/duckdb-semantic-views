@@ -8,8 +8,11 @@ files_modified:
   - src/ddl/define.rs
   - src/ddl/drop.rs
   - src/ddl/parse_args.rs
+  - src/query/table_function.rs
   - src/lib.rs
   - test/sql/phase2_ddl.test
+  - test/sql/phase4_query.test
+  - test/sql/phase2_restart.test
 autonomous: true
 requirements: [KWARG-01]
 
@@ -141,9 +144,9 @@ pub struct ParsedDefineArgs {
 }
 ```
 
-From src/query/table_function.rs (extracting struct fields from Value via FFI):
+From src/query/table_function.rs (extracting struct fields from Value via FFI -- NOTE: value_raw_ptr is currently PRIVATE and must be changed to pub(crate) in Task 1):
 ```rust
-unsafe fn value_raw_ptr(value: &Value) -> ffi::duckdb_value {
+unsafe fn value_raw_ptr(value: &Value) -> ffi::duckdb_value {  // PRIVATE -- must change to pub(crate)
     let ptr_to_value = std::ptr::from_ref(value).cast::<ffi::duckdb_value>();
     std::ptr::read(ptr_to_value)
 }
@@ -161,7 +164,7 @@ pub(crate) unsafe fn extract_list_strings(value: &Value) -> Vec<String> {
 
 <task type="auto">
   <name>Task 1: Convert define.rs and drop.rs from VScalar to VTab, add parse_args_from_bind, update registration</name>
-  <files>src/ddl/define.rs, src/ddl/drop.rs, src/ddl/parse_args.rs, src/lib.rs</files>
+  <files>src/ddl/define.rs, src/ddl/drop.rs, src/ddl/parse_args.rs, src/query/table_function.rs, src/lib.rs</files>
   <action>
 This task converts all 5 DDL functions from VScalar to VTab table functions.
 
@@ -172,7 +175,7 @@ This task converts all 5 DDL functions from VScalar to VTab table functions.
 3. To extract LIST(STRUCT(...)) values from a `duckdb::vtab::Value`, use the FFI approach from `src/query/table_function.rs`: call `value_raw_ptr()` to get the `duckdb_value`, then `duckdb_get_list_size()` + `duckdb_get_list_child()` to iterate list elements, then for each child struct use `duckdb_get_map_size`/`duckdb_struct_type_child_count`/`duckdb_get_struct_child` or equivalently `duckdb_struct_extract_entry` to extract struct fields. Specifically: for each LIST element (a STRUCT), use `ffi::duckdb_struct_extract_entry(child_val, field_name_cstr)` to get each field, then `ffi::duckdb_get_varchar()` to read it as a string. Remember to call `duckdb_destroy_value` on extracted values and `duckdb_free` on varchar char pointers.
 4. Keep the existing `parse_define_args(DataChunkHandle)` function -- it can be removed later but keeping it avoids breaking anything during transition. Mark it `#[allow(dead_code)]` or simply let the compiler warn. Actually, since it will no longer be called, remove it and the `read_str` helper. Keep `validate_granularity` and `ParsedDefineArgs` and the unit tests for validate_granularity.
 5. Add necessary imports: `use duckdb::vtab::{BindInfo, Value};` and `use libduckdb_sys as ffi;` and `use std::ffi::{CStr, CString};` and `use std::os::raw::c_void;`.
-6. The `value_raw_ptr` and `extract_list_strings` functions from `src/query/table_function.rs` should be made `pub(crate)` (they already are). Reuse `value_raw_ptr` from table_function -- either import it or duplicate the 3-line helper locally. Prefer importing: `use crate::query::table_function::value_raw_ptr;`. Note: `value_raw_ptr` is currently `unsafe fn` -- the call site in parse_args must be unsafe too.
+6. The `value_raw_ptr` function in `src/query/table_function.rs` is currently private (`unsafe fn`). It MUST be changed to `pub(crate) unsafe fn value_raw_ptr(...)` so it can be imported from `parse_args.rs`. The `extract_list_strings` function is already `pub(crate)`. After making `value_raw_ptr` pub(crate), import it in parse_args: `use crate::query::table_function::value_raw_ptr;`. Note: `value_raw_ptr` is `unsafe fn` -- the call site in parse_args must be inside an unsafe block.
 7. IMPORTANT: The LIST(STRUCT) named parameter values are DuckDB `duckdb_value` handles representing complex nested types. To extract struct fields from a list of structs: iterate list children with `duckdb_get_list_child(list_val, i)`, then for each struct child, use `duckdb_struct_extract_entry(child, field_cstr)` where `field_cstr` is a C string like `c"alias"`. Each extracted value must be read with `duckdb_get_varchar()` and then freed with `duckdb_free` + `duckdb_destroy_value`.
 
 **src/ddl/define.rs** -- Convert DefineSemanticView from VScalar to VTab:
@@ -233,14 +236,14 @@ This task converts all 5 DDL functions from VScalar to VTab table functions.
 Note: Converting from scalar to table function changes the SQL calling convention. Users must now use `FROM create_semantic_view(...)` or `SELECT * FROM create_semantic_view(...)` instead of `SELECT create_semantic_view(...)`. This is a breaking change but acceptable since we are pre-1.0 and the keyword args benefit outweighs the cost.
   </action>
   <verify>
-    <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && cargo build --features extension 2>&1 | tail -20</automated>
+    <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && cargo build --features extension 2>&1 | tail -20 && cargo test 2>&1 | tail -20</automated>
   </verify>
-  <done>All 5 DDL functions compile as VTab implementations. DefineSemanticViewVTab has named_parameters() returning the 5 LIST(STRUCT) param types. DropSemanticViewVTab compiles with VTab. lib.rs registers all via register_table_function_with_extra_info. No VScalar references remain for DDL functions.</done>
+  <done>All 5 DDL functions compile as VTab implementations. DefineSemanticViewVTab has named_parameters() returning the 5 LIST(STRUCT) param types. DropSemanticViewVTab compiles with VTab. lib.rs registers all via register_table_function_with_extra_info. No VScalar references remain for DDL functions. `cargo test` passes (Rust unit tests verify runtime correctness of FFI struct-field extraction).</done>
 </task>
 
 <task type="auto">
   <name>Task 2: Update SQL tests for table function syntax and add keyword args test cases</name>
-  <files>test/sql/phase2_ddl.test, test/sql/phase4_query.test, test/sql/phase2_restart.test, test/sql/semantic_views.test</files>
+  <files>test/sql/phase2_ddl.test, test/sql/phase4_query.test, test/sql/phase2_restart.test</files>
   <action>
 Update all SQL test files that call DDL functions to use table function syntax, and add new test cases for keyword args.
 
@@ -304,11 +307,30 @@ Note: When named params are used, omitting optional ones (relationships, time_di
 **test/sql/phase4_query.test** -- Update DDL calls:
 Change any `SELECT create_semantic_view(...)` to `SELECT * FROM create_semantic_view(...)` and any `SELECT drop_semantic_view(...)` to `SELECT * FROM drop_semantic_view(...)`.
 
-**test/sql/phase2_restart.test** -- Update DDL calls:
-Same pattern: add `* FROM` to all DDL function calls.
+**test/sql/phase2_restart.test** -- Update DDL calls (requires special handling):
 
-**test/sql/semantic_views.test** -- Update DDL calls:
-Same pattern: add `* FROM` to all DDL function calls.
+This file uses OLD function names (`define_semantic_view`, `drop_semantic_view`) that must be updated to match current DDL function names (`create_semantic_view`, `drop_semantic_view`). Additionally, it has a CASE WHEN pattern on line 29-32 that is INCOMPATIBLE with table functions:
+
+```sql
+-- CURRENT (broken for table functions -- table functions cannot appear inside CASE expressions):
+SELECT CASE WHEN (SELECT count(*) FROM list_semantic_views() WHERE name = 'restart_test') > 0
+       THEN drop_semantic_view('restart_test')
+       ELSE 'no-op'
+END;
+```
+
+This must be rewritten. Replace the CASE WHEN cleanup block with `drop_semantic_view_if_exists` which handles the "does not exist" case without error:
+
+```sql
+statement ok
+SELECT * FROM drop_semantic_view_if_exists('restart_test');
+```
+
+Also update the remaining calls:
+- Line 36: `SELECT define_semantic_view(...)` -> `SELECT * FROM create_semantic_view(...)`
+- Line 79: `SELECT drop_semantic_view('restart_test')` -> `SELECT * FROM drop_semantic_view('restart_test')`
+
+Note: `semantic_views.test` does NOT contain any DDL function calls (confirmed by grep) -- no changes needed there.
 
 IMPORTANT: After updating tests, verify that `statement ok` assertions still match — table functions return a result row (the view name), not a scalar. The `statement ok` directive should still work since it only checks success/failure, not the output.
   </action>
