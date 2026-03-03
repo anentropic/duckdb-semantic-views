@@ -1,5 +1,30 @@
 # Milestones
 
+## v0.2.0 Native DDL + Time Dimensions (Shipped: 2026-03-03)
+
+**Phases completed:** 8 phases (8-14, including 11.1), 25 plans
+**Lines of code:** 7,462 Rust (across 21 files)
+**Commits:** 125
+**Tests:** 136 (unit + proptest + sqllogictest + DuckLake CI)
+**Timeline:** 3 days (2026-02-28 → 2026-03-02)
+
+**Delivered:** Typed DDL interface with Snowflake-aligned STRUCT/LIST syntax, time dimension support with granularity coarsening, DuckDB-native catalog persistence via pragma_query_t, typed output columns with binary-read dispatch, and DuckLake CI integration.
+
+**Key accomplishments:**
+1. C++ shim infrastructure — cc crate build with vendored DuckDB headers, feature-gated compilation, symbol visibility
+2. Time dimensions — date_trunc codegen with granularity coarsening (day/week/month/year) and per-query override
+3. pragma_query_t catalog persistence — transactional DuckDB-native storage, sidecar file fully eliminated
+4. Snowflake-aligned DDL — 6-arg STRUCT/LIST `create_semantic_view` syntax, `semantic_view` table function rename
+5. Typed output columns — binary-read dispatch replacing all-VARCHAR, 36 property-based tests for type dispatch
+6. DuckLake CI integration — test refresh to v0.2.0 API, parallel CI job, DuckDB version monitor
+
+**Requirements:** 14/16 satisfied
+**Known gaps:**
+- DDL-01 (`CREATE SEMANTIC VIEW` native syntax) — architecturally impossible: Python DuckDB compiles C++ with `-fvisibility=hidden`, hiding all parser hook symbols
+- DDL-02 (`DROP SEMANTIC VIEW` native syntax) — same root cause as DDL-01
+
+---
+
 ## v1.0 MVP (Shipped: 2026-02-28)
 
 **Phases completed:** 7 phases, 18 plans

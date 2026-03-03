@@ -1,9 +1,9 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.1
-milestone_name: milestone
-status: unknown
-last_updated: "2026-03-02T18:21:43.514Z"
+milestone: v0.2
+milestone_name: Native DDL + Time Dimensions
+status: complete
+last_updated: "2026-03-03"
 progress:
   total_phases: 8
   completed_phases: 8
@@ -15,17 +15,16 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-02-28)
+See: .planning/PROJECT.md (updated 2026-03-03)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 13 complete — binary-read pipeline PBTs delivered (2026-03-02)
+**Current focus:** v0.2.0 milestone complete — planning next milestone
 
 ## Current Position
 
-Phase: 13 of 13 (Type-mapping + PBTs for typed column dispatch) — COMPLETE
-Plan: 2 of 2 in current phase
-Status: Phase Complete — all active v0.2.0 phases done
-Last activity: 2026-03-02 — Phase 13 complete: binary-read dispatch + 36 output_proptest.rs PBTs, 136 total tests pass
+Milestone: v0.2.0 — SHIPPED 2026-03-03
+Status: Between milestones
+Last activity: 2026-03-03 — v0.2.0 milestone archived
 
 Progress: [██████████] 100% (v0.2.0)
 
@@ -36,7 +35,10 @@ Progress: [██████████] 100% (v0.2.0)
 - Average duration: ~20 min
 - Total execution time: ~6 hours
 
-*v0.2.0 metrics will populate as plans complete*
+**Velocity (v0.2.0):**
+- Total plans completed: 25
+- Commits: 125
+- Timeline: 3 days (2026-02-28 → 2026-03-02)
 
 ## Accumulated Context
 
@@ -44,33 +46,17 @@ Progress: [██████████] 100% (v0.2.0)
 
 Decisions are logged in PROJECT.md Key Decisions table.
 All v0.1.0 decisions archived in milestones/v1.0-ROADMAP.md.
-
-Recent decisions affecting current work:
-- [v0.1.0 close]: Build strategy is Cargo-primary with `cc` crate — never introduce CMakeLists.txt
-- [v0.1.0 close]: `define_semantic_view()` / `drop_semantic_view()` functions removed after native DDL is validated (DDL-05)
-- [v0.1.0 close]: VARCHAR output columns are accepted tech debt; typed output targeted in Phase 12 (OUT-01)
-- [08-01]: Vendor full duckdb/src/include/ tree (not just duckdb.hpp) — duckdb.hpp includes subdirectory headers that must be present
-- [08-01]: Source headers from existing cargo build cache (target/debug/build/libduckdb-sys-*/out/) rather than downloading
-- [08-02]: semantic_views_version is NOT compiled into the binary — it is appended by CI post-build script; exclude from exported symbols list or linker fails
-- [08-02]: Use db_handle.cast() not as *mut c_void — avoids pedantic clippy ptr_as_ptr lint
+All v0.2.0 decisions archived in milestones/v0.2-ROADMAP.md.
 
 ### Pending Todos
 
 None.
 
-### Roadmap Evolution
-
-- Phase 11.1 inserted after Phase 11: review possible DDL and query syntax options and bring it as close as we can to Snowflake semantic views (URGENT)
-- Phase 13 added: Type-mapping and property-based tests for typed column dispatch
-- Phase 14 added: DuckLake integration test refresh and CI job (refresh local test to v0.2.0 DDL; add CI job with synthetic data, no S3 download)
-
 ### Blockers/Concerns
 
-- [Phase 10 planning]: Confirm `pragma_query_t` non-PRAGMA DDL integration path against DuckDB 1.4.4 source before writing Phase 10 plan
-- [Phase 11 planning]: `plan_function_t` return type for SQL-executing DDL needs hands-on verification against `parser_extension.hpp` before Phase 11 plan is written
-- [Phase 11 planning]: `CREATE SEMANTIC VIEW` DDL grammar (clause keywords, JOIN/TIME syntax) must be designed before Phase 11 starts
+- Native `CREATE SEMANTIC VIEW` DDL is architecturally impossible when loaded via Python DuckDB (`-fvisibility=hidden`)
 
-### Quick Tasks Completed (v0.1.0)
+### Quick Tasks Completed
 
 | # | Description | Date | Commit | Status | Directory |
 |---|-------------|------|--------|--------|-----------|
@@ -83,6 +69,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-02
-Stopped at: Quick task 6 complete — cargo fmt + ELF version tag fixes committed. CI unblocked.
+Last session: 2026-03-03
+Stopped at: v0.2.0 milestone archived and tagged.
 Resume file: None
