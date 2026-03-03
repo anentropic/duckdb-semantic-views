@@ -24,7 +24,7 @@ See: .planning/PROJECT.md (updated 2026-03-03)
 
 Milestone: v0.2.0 — SHIPPED 2026-03-03
 Status: Between milestones
-Last activity: 2026-03-03 - Completed quick task 8: gate fuzz CI on relevant file changes
+Last activity: 2026-03-03 - Completed quick task 9: write README with usage examples and build instructions
 
 Progress: [██████████] 100% (v0.2.0)
 
@@ -68,9 +68,10 @@ None.
 | 6 | fix all outstanding CI failures (fmt + linker) | 2026-03-02 | 8964b29, f8996d2 | Verified | [6-fix-all-outstanding-ci-failures](./quick/6-fix-all-outstanding-ci-failures/) |
 | 7 | fix rustfmt CI failure + add pre-commit hook | 2026-03-03 | 8f01f7a, ade0433 | Verified | [7-check-gh-run-list-and-fix](./quick/7-check-gh-run-list-and-fix/) |
 | 8 | gate fuzz CI on relevant file changes | 2026-03-03 | 261473c | Complete | [8-gate-fuzz-ci-on-relevant-file-changes](./quick/8-gate-fuzz-ci-on-relevant-file-changes/) |
+| 9 | write README with usage examples and build instructions | 2026-03-03 | db9cee6 | Complete | [9-write-readme-with-usage-examples-and-bui](./quick/9-write-readme-with-usage-examples-and-bui/) |
 
 ## Session Continuity
 
 Last session: 2026-03-03
-Stopped at: Completed quick-8 (gate fuzz CI on relevant file changes).
+Stopped at: Completed quick-9 (write README with usage examples and build instructions).
 Resume file: None
