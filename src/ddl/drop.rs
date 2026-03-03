@@ -1,10 +1,10 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    vscalar::{ScalarFunctionSignature, VScalar},
-    vtab::arrow::WritableVector,
+    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
 };
 use libduckdb_sys as ffi;
-use libduckdb_sys::duckdb_string_t;
 use std::ffi::CString;
 
 use crate::catalog::{catalog_delete, catalog_delete_if_exists, CatalogState};
@@ -26,7 +26,7 @@ unsafe impl Sync for DropState {}
 /// Persist the removal of a view from `semantic_layer._definitions` using
 /// the separate persist_conn.
 ///
-/// Returns Ok(()) always — silently ignores SQL errors (the row may not exist
+/// Returns Ok(()) always -- silently ignores SQL errors (the row may not exist
 /// in the table for in-memory sessions where it was never persisted).
 fn persist_drop(conn: ffi::duckdb_connection, name: &str) {
     let safe_name = name.replace('\'', "''");
@@ -43,63 +43,97 @@ fn persist_drop(conn: ffi::duckdb_connection, name: &str) {
     }
 }
 
-/// `drop_semantic_view(name)` scalar function.
+/// Bind-time data for the DDL drop table function.
+pub struct DropBindData {
+    name: String,
+}
+
+// SAFETY: String is Send + Sync.
+unsafe impl Send for DropBindData {}
+unsafe impl Sync for DropBindData {}
+
+/// Init data for the DDL drop table function.
+pub struct DropInitData {
+    done: AtomicBool,
+}
+
+// SAFETY: AtomicBool is Send + Sync.
+unsafe impl Send for DropInitData {}
+unsafe impl Sync for DropInitData {}
+
+/// `drop_semantic_view(name)` table function.
 ///
 /// Removes a semantic view definition. Errors if the view does not exist.
 /// Use `drop_semantic_view_if_exists` for silent no-op when absent.
-pub struct DropSemanticView;
+pub struct DropSemanticViewVTab;
 
-impl VScalar for DropSemanticView {
-    type State = DropState;
+impl VTab for DropSemanticViewVTab {
+    type BindData = DropBindData;
+    type InitData = DropInitData;
 
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // returns view name on success
-        )]
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        // Declare output schema: single VARCHAR column with the view name.
+        bind.add_result_column("view_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+
+        // Read view name (positional parameter 0).
+        let name = bind.get_parameter(0).to_string();
+
+        // Access the DropState from extra_info.
+        let state_ptr = bind.get_extra_info::<DropState>();
+        let state = unsafe { &*state_ptr };
+
+        // Check catalog first -- gives better error messages than the SQL DELETE.
+        let exists = {
+            let guard = state.catalog.read().unwrap();
+            guard.contains_key(&name)
+        };
+
+        if !exists && !state.if_exists {
+            return Err(format!("semantic view '{name}' does not exist").into());
+        }
+
+        if exists {
+            // 1. Delete from DuckDB table FIRST (write-first for consistency).
+            if let Some(conn) = state.persist_conn {
+                persist_drop(conn, &name);
+            }
+
+            // 2. Remove from in-memory catalog.
+            if state.if_exists {
+                catalog_delete_if_exists(&state.catalog, &name);
+            } else {
+                catalog_delete(&state.catalog, &name)?;
+            }
+        }
+
+        Ok(DropBindData { name })
     }
 
-    unsafe fn invoke(
-        state: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(DropInitData {
+            done: AtomicBool::new(false),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let name_col = input.flat_vector(0);
-        let names = name_col.as_slice_with_len::<duckdb_string_t>(input.len());
-
-        let out = output.flat_vector();
-        for (i, raw) in names.iter().enumerate().take(input.len()) {
-            let name = duckdb::types::DuckString::new(&mut { *raw })
-                .as_str()
-                .to_string();
-
-            // Check catalog first — gives better error messages than the SQL DELETE.
-            let exists = {
-                let guard = state.catalog.read().unwrap();
-                guard.contains_key(&name)
-            };
-
-            if !exists && !state.if_exists {
-                return Err(format!("semantic view '{name}' does not exist").into());
-            }
-
-            if exists {
-                // 1. Delete from DuckDB table FIRST (write-first for consistency).
-                //    Uses a separate connection — no deadlock with invoke's execution lock.
-                if let Some(conn) = state.persist_conn {
-                    persist_drop(conn, &name);
-                }
-
-                // 2. Remove from in-memory catalog.
-                if state.if_exists {
-                    catalog_delete_if_exists(&state.catalog, &name);
-                } else {
-                    catalog_delete(&state.catalog, &name)?;
-                }
-            }
-
-            out.insert(i, name.as_str());
+        let init_data = func.get_init_data();
+        if init_data.done.swap(true, Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
         }
+
+        let bind_data = func.get_bind_data();
+        let name_vec = output.flat_vector(0);
+        name_vec.insert(0, bind_data.name.as_str());
+        output.set_len(1);
         Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        // Positional parameter: view name (VARCHAR)
+        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
     }
 }

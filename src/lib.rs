@@ -288,9 +288,9 @@ mod extension {
     use crate::{
         catalog::init_catalog,
         ddl::{
-            define::{DefineSemanticView, DefineState},
+            define::{DefineSemanticViewVTab, DefineState},
             describe::DescribeSemanticViewVTab,
-            drop::{DropSemanticView, DropState},
+            drop::{DropSemanticViewVTab, DropState},
             list::ListSemanticViewsVTab,
         },
         query::explain::ExplainSemanticViewVTab,
@@ -349,7 +349,7 @@ mod extension {
             None
         };
 
-        // Register create_semantic_view(name, tables, relationships, dimensions, time_dimensions, metrics) scalar.
+        // Register create_semantic_view(name, tables :=, ...) table function.
         // Inserts a new view; errors if the view already exists.
         let define_state = DefineState {
             catalog: catalog_state.clone(),
@@ -357,12 +357,12 @@ mod extension {
             or_replace: false,
             if_not_exists: false,
         };
-        con.register_scalar_function_with_state::<DefineSemanticView>(
+        con.register_table_function_with_extra_info::<DefineSemanticViewVTab, _>(
             "create_semantic_view",
             &define_state,
         )?;
 
-        // Register create_or_replace_semantic_view(name, tables, relationships, dimensions, time_dimensions, metrics) scalar.
+        // Register create_or_replace_semantic_view(name, tables :=, ...) table function.
         // Upserts a view definition; silent overwrite if the view already exists.
         let define_or_replace_state = DefineState {
             catalog: catalog_state.clone(),
@@ -370,12 +370,12 @@ mod extension {
             or_replace: true,
             if_not_exists: false,
         };
-        con.register_scalar_function_with_state::<DefineSemanticView>(
+        con.register_table_function_with_extra_info::<DefineSemanticViewVTab, _>(
             "create_or_replace_semantic_view",
             &define_or_replace_state,
         )?;
 
-        // Register create_semantic_view_if_not_exists(name, tables, relationships, dimensions, time_dimensions, metrics) scalar.
+        // Register create_semantic_view_if_not_exists(name, tables :=, ...) table function.
         // Succeeds silently (no-op) if the view already exists; errors only on other failures.
         let define_if_not_exists_state = DefineState {
             catalog: catalog_state.clone(),
@@ -383,31 +383,31 @@ mod extension {
             or_replace: false,
             if_not_exists: true,
         };
-        con.register_scalar_function_with_state::<DefineSemanticView>(
+        con.register_table_function_with_extra_info::<DefineSemanticViewVTab, _>(
             "create_semantic_view_if_not_exists",
             &define_if_not_exists_state,
         )?;
 
-        // Register drop_semantic_view(name) scalar.
+        // Register drop_semantic_view(name) table function.
         // Removes a view; errors if the view does not exist.
         let drop_state = DropState {
             catalog: catalog_state.clone(),
             persist_conn,
             if_exists: false,
         };
-        con.register_scalar_function_with_state::<DropSemanticView>(
+        con.register_table_function_with_extra_info::<DropSemanticViewVTab, _>(
             "drop_semantic_view",
             &drop_state,
         )?;
 
-        // Register drop_semantic_view_if_exists(name) scalar.
+        // Register drop_semantic_view_if_exists(name) table function.
         // Removes a view; silently succeeds if the view does not exist.
         let drop_if_exists_state = DropState {
             catalog: catalog_state.clone(),
             persist_conn,
             if_exists: true,
         };
-        con.register_scalar_function_with_state::<DropSemanticView>(
+        con.register_table_function_with_extra_info::<DropSemanticViewVTab, _>(
             "drop_semantic_view_if_exists",
             &drop_if_exists_state,
         )?;

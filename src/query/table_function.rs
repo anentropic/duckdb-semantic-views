@@ -139,7 +139,7 @@ pub(crate) unsafe fn execute_sql_raw(
 ///
 /// Relies on `duckdb::vtab::Value` layout being a single `duckdb_value` field.
 /// This is stable for `duckdb = "=1.4.4"`.
-unsafe fn value_raw_ptr(value: &Value) -> ffi::duckdb_value {
+pub(crate) unsafe fn value_raw_ptr(value: &Value) -> ffi::duckdb_value {
     // Value is repr(Rust) with one field: duckdb_value (*mut c_void).
     // Reading the pointer without taking ownership.
     let ptr_to_value = std::ptr::from_ref(value).cast::<ffi::duckdb_value>();
