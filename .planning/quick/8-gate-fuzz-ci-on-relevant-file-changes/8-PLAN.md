@@ -10,7 +10,7 @@ requirements: [QUICK-8]
 
 must_haves:
   truths:
-    - "Fuzz CI runs on pushes to main that modify src/**, fuzz/**, Cargo.toml, or Cargo.lock"
+    - "Fuzz CI runs on pushes to main that modify src/**, fuzz/**, Cargo.toml, Cargo.lock, or .github/workflows/Fuzz.yml"
     - "Fuzz CI does NOT run on pushes that only modify docs, planning, tests, shim, or tooling files"
     - "Manual workflow_dispatch always triggers fuzz regardless of changed files"
   artifacts:
@@ -65,6 +65,7 @@ on:
       - 'fuzz/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - '.github/workflows/Fuzz.yml'
   workflow_dispatch:
 ```
 
@@ -77,7 +78,7 @@ Rationale for each included path:
 - `Cargo.lock` -- pinned dependency version changes
 
 Paths deliberately excluded (cannot affect fuzz outcomes):
-- `.github/workflows/` -- CI config (would create a loop; also fuzz targets don't depend on CI config)
+- `.github/workflows/` (other than Fuzz.yml itself) -- CI config for other workflows doesn't affect fuzz
 - `shim/`, `build.rs` -- C++ shim only used for `extension` feature, fuzz targets use default features
 - `tests/`, `sql/` -- integration/SQL tests, separate from fuzz
 - `.planning/`, `docs/`, `README.md`, `CLAUDE.md` -- documentation
@@ -86,7 +87,7 @@ Paths deliberately excluded (cannot affect fuzz outcomes):
   <verify>
     <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && grep -A 6 'push:' .github/workflows/Fuzz.yml | grep -q "paths:" && grep -q "src/\*\*" .github/workflows/Fuzz.yml && grep -q "fuzz/\*\*" .github/workflows/Fuzz.yml && grep -q "Cargo.toml" .github/workflows/Fuzz.yml && grep -q "Cargo.lock" .github/workflows/Fuzz.yml && grep -q "workflow_dispatch" .github/workflows/Fuzz.yml && echo "PASS: All path filters present and workflow_dispatch preserved"</automated>
   </verify>
-  <done>Fuzz.yml has paths filter with exactly 4 entries (src/**, fuzz/**, Cargo.toml, Cargo.lock) under push trigger, workflow_dispatch remains unconditional, no other changes to the workflow.</done>
+  <done>Fuzz.yml has paths filter with 5 entries (src/**, fuzz/**, Cargo.toml, Cargo.lock, .github/workflows/Fuzz.yml) under push trigger, workflow_dispatch remains unconditional, no other changes to the workflow.</done>
 </task>
 
 </tasks>
@@ -99,7 +100,7 @@ Paths deliberately excluded (cannot affect fuzz outcomes):
 </verification>
 
 <success_criteria>
-- `.github/workflows/Fuzz.yml` contains `paths:` filter gating push triggers to `src/**`, `fuzz/**`, `Cargo.toml`, `Cargo.lock`
+- `.github/workflows/Fuzz.yml` contains `paths:` filter gating push triggers to `src/**`, `fuzz/**`, `Cargo.toml`, `Cargo.lock`, `.github/workflows/Fuzz.yml`
 - `workflow_dispatch` remains unconditional for manual runs
 - Workflow file is valid YAML with no other modifications
 </success_criteria>
