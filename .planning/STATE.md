@@ -24,7 +24,7 @@ See: .planning/PROJECT.md (updated 2026-03-03)
 
 Milestone: v0.2.0 — SHIPPED 2026-03-03
 Status: Between milestones
-Last activity: 2026-03-03 — v0.2.0 milestone archived
+Last activity: 2026-03-03 - Completed quick task 7: check gh run list and fix
 
 Progress: [██████████] 100% (v0.2.0)
 
