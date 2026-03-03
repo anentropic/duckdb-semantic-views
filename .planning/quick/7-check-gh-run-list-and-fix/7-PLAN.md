@@ -6,6 +6,7 @@ wave: 1
 depends_on: []
 files_modified:
   - tests/vector_reference_test.rs
+  - .pre-commit-config.yaml
 autonomous: true
 requirements: []
 must_haves:
@@ -53,6 +54,33 @@ After formatting, verify:
     <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && cargo fmt --check && cargo test 2>&1 | tail -5</automated>
   </verify>
   <done>cargo fmt --check returns 0, cargo test passes, tests/vector_reference_test.rs is properly formatted</done>
+</task>
+
+<task type="auto">
+  <name>Task 2: Add cargo fmt check to pre-commit hooks</name>
+  <files>.pre-commit-config.yaml</files>
+  <action>
+Add a `cargo fmt --check` hook to `.pre-commit-config.yaml` so rustfmt issues are caught locally before push.
+
+Use the `local` repo type with a simple system command hook since there's no standard pre-commit repo for cargo fmt:
+
+```yaml
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+```
+
+This runs `cargo fmt --check` on any commit touching Rust files. It's fast (sub-second) and matches what CI checks.
+  </action>
+  <verify>
+    <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && cat .pre-commit-config.yaml</automated>
+  </verify>
+  <done>.pre-commit-config.yaml includes cargo-fmt hook entry</done>
 </task>
 
 </tasks>
