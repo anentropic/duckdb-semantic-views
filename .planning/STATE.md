@@ -24,7 +24,7 @@ See: .planning/PROJECT.md (updated 2026-03-03)
 
 Milestone: v0.2.0 — SHIPPED 2026-03-03
 Status: Between milestones
-Last activity: 2026-03-03 - Completed quick task 7: check gh run list and fix
+Last activity: 2026-03-03 - Completed quick task 8: gate fuzz CI on relevant file changes
 
 Progress: [██████████] 100% (v0.2.0)
 
@@ -67,9 +67,10 @@ None.
 | 5 | fix require notwindows skipping phase2 restart test | 2026-03-01 | 4cc9b83, b35746f | Verified | [5-fix-require-notwindows-skipping-phase2-r](./quick/5-fix-require-notwindows-skipping-phase2-r/) |
 | 6 | fix all outstanding CI failures (fmt + linker) | 2026-03-02 | 8964b29, f8996d2 | Verified | [6-fix-all-outstanding-ci-failures](./quick/6-fix-all-outstanding-ci-failures/) |
 | 7 | fix rustfmt CI failure + add pre-commit hook | 2026-03-03 | 8f01f7a, ade0433 | Verified | [7-check-gh-run-list-and-fix](./quick/7-check-gh-run-list-and-fix/) |
+| 8 | gate fuzz CI on relevant file changes | 2026-03-03 | 261473c | Complete | [8-gate-fuzz-ci-on-relevant-file-changes](./quick/8-gate-fuzz-ci-on-relevant-file-changes/) |
 
 ## Session Continuity
 
 Last session: 2026-03-03
-Stopped at: Completed quick-7 (fix rustfmt CI failure).
+Stopped at: Completed quick-8 (gate fuzz CI on relevant file changes).
 Resume file: None
