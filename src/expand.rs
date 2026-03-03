@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 
 use crate::model::{Join, SemanticViewDefinition}; // TableRef accessed via def.tables
@@ -38,10 +38,6 @@ pub fn suggest_closest(name: &str, available: &[String]) -> Option<String> {
 pub struct QueryRequest {
     pub dimensions: Vec<String>,
     pub metrics: Vec<String>,
-    /// Per-query granularity overrides for time dimensions. Keys are lowercased
-    /// dimension names; values are the effective granularity to use instead of
-    /// the declared granularity in the view definition.
-    pub granularity_overrides: HashMap<String, String>,
 }
 
 /// Errors that can occur during semantic view expansion.
@@ -461,19 +457,7 @@ pub fn expand(
 
     let mut select_items: Vec<String> = Vec::new();
     for dim in &resolved_dims {
-        let base_expr = if dim.dim_type.as_deref() == Some("time") {
-            // TIME-02/TIME-04: wrap with date_trunc and cast to DATE.
-            // Override takes precedence over declared granularity.
-            let effective_gran = req
-                .granularity_overrides
-                .get(&dim.name.to_ascii_lowercase())
-                .map(String::as_str)
-                .or(dim.granularity.as_deref())
-                .unwrap_or("day"); // fallback — from_json validation prevents None here
-            format!("date_trunc('{}', {})::DATE", effective_gran, dim.expr)
-        } else {
-            dim.expr.clone()
-        };
+        let base_expr = dim.expr.clone();
         // If output_type is set, wrap the expression in CAST(... AS <type>).
         let final_expr = if let Some(ref type_str) = dim.output_type {
             format!("CAST({base_expr} AS {type_str})")
@@ -590,16 +574,14 @@ mod tests {
                         name: "region".to_string(),
                         expr: "region".to_string(),
                         source_table: None,
-                        dim_type: None,
-                        granularity: None,
+
                         output_type: None,
                     },
                     Dimension {
                         name: "status".to_string(),
                         expr: "status".to_string(),
                         source_table: None,
-                        dim_type: None,
-                        granularity: None,
+
                         output_type: None,
                     },
                 ],
@@ -631,7 +613,6 @@ mod tests {
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
@@ -654,7 +635,6 @@ GROUP BY
             let req = QueryRequest {
                 dimensions: vec!["region".to_string(), "status".to_string()],
                 metrics: vec!["total_revenue".to_string(), "order_count".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
@@ -680,7 +660,6 @@ GROUP BY
             let req = QueryRequest {
                 dimensions: vec![],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
@@ -704,7 +683,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
@@ -729,7 +707,6 @@ GROUP BY
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
@@ -756,8 +733,7 @@ GROUP BY
                     name: "col".to_string(),
                     expr: "col".to_string(),
                     source_table: None,
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![Metric {
@@ -775,7 +751,6 @@ GROUP BY
             let req = QueryRequest {
                 dimensions: vec!["col".to_string()],
                 metrics: vec!["cnt".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("test", &def, &req).unwrap();
             // Base table "select" must be quoted, CTE name is always "_base" quoted
@@ -792,8 +767,7 @@ GROUP BY
                     name: "month".to_string(),
                     expr: "date_trunc('month', created_at)".to_string(),
                     source_table: None,
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![Metric {
@@ -811,7 +785,6 @@ GROUP BY
             let req = QueryRequest {
                 dimensions: vec!["month".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             // Expression appears verbatim in SELECT; GROUP BY uses ordinal position
@@ -825,7 +798,6 @@ GROUP BY
             let req = QueryRequest {
                 dimensions: vec![],
                 metrics: vec![],
-                granularity_overrides: HashMap::new(),
             };
             let result = expand("orders", &def, &req);
             assert!(result.is_err());
@@ -843,7 +815,6 @@ GROUP BY
             let req = QueryRequest {
                 dimensions: vec!["region".to_string(), "status".to_string()],
                 metrics: vec![],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
@@ -864,7 +835,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec![],
                 metrics: vec!["total_revenue".to_string(), "order_count".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
@@ -888,8 +858,7 @@ FROM \"_base\"";
                     name: "Region".to_string(),
                     expr: "region".to_string(),
                     source_table: None,
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![Metric {
@@ -908,7 +877,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             // Should succeed and use the definition's expression
@@ -922,7 +890,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["reigon".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let result = expand("orders", &def, &req);
             assert!(result.is_err());
@@ -948,7 +915,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec![],
                 metrics: vec!["totl_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let result = expand("orders", &def, &req);
             assert!(result.is_err());
@@ -974,7 +940,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["xyzzy".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let result = expand("orders", &def, &req);
             assert!(result.is_err());
@@ -992,7 +957,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region".to_string(), "region".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let result = expand("orders", &def, &req);
             assert!(result.is_err());
@@ -1011,7 +975,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec![],
                 metrics: vec!["total_revenue".to_string(), "total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let result = expand("orders", &def, &req);
             assert!(result.is_err());
@@ -1046,7 +1009,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec![],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             // Should succeed and use the definition's name casing in the alias
@@ -1127,8 +1089,7 @@ FROM \"_base\"";
                     name: "customer_name".to_string(),
                     expr: "customers.name".to_string(),
                     source_table: Some("customers".to_string()),
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![Metric {
@@ -1151,7 +1112,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["customer_name".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             assert!(sql.contains("JOIN \"customers\" ON orders.customer_id = customers.id"));
@@ -1167,16 +1127,14 @@ FROM \"_base\"";
                         name: "region".to_string(),
                         expr: "region".to_string(),
                         source_table: None,
-                        dim_type: None,
-                        granularity: None,
+
                         output_type: None,
                     },
                     Dimension {
                         name: "customer_name".to_string(),
                         expr: "customers.name".to_string(),
                         source_table: Some("customers".to_string()),
-                        dim_type: None,
-                        granularity: None,
+
                         output_type: None,
                     },
                 ],
@@ -1201,7 +1159,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             assert!(
@@ -1219,8 +1176,7 @@ FROM \"_base\"";
                     name: "region".to_string(),
                     expr: "region".to_string(),
                     source_table: None,
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![Metric {
@@ -1243,7 +1199,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
                 metrics: vec!["customer_count".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             assert!(sql.contains("JOIN \"customers\" ON orders.customer_id = customers.id"));
@@ -1258,8 +1213,7 @@ FROM \"_base\"";
                     name: "region_name".to_string(),
                     expr: "regions.name".to_string(),
                     source_table: Some("regions".to_string()),
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![Metric {
@@ -1290,7 +1244,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region_name".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             // regions depends on customers (ON clause references customers), so both must be included
@@ -1313,8 +1266,7 @@ FROM \"_base\"";
                     name: "region_name".to_string(),
                     expr: "regions.name".to_string(),
                     source_table: Some("regions".to_string()),
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![Metric {
@@ -1345,7 +1297,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region_name".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             let customers_pos = sql
@@ -1367,8 +1318,7 @@ FROM \"_base\"";
                     name: "region".to_string(),
                     expr: "region".to_string(),
                     source_table: None,
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![Metric {
@@ -1386,7 +1336,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             assert!(
@@ -1404,8 +1353,7 @@ FROM \"_base\"";
                     name: "status".to_string(),
                     expr: "status".to_string(),
                     source_table: None,
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![Metric {
@@ -1423,7 +1371,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["status".to_string()],
                 metrics: vec!["order_count".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("jaffle_orders", &def, &req).unwrap();
             // Must produce "jaffle"."raw_orders" not "jaffle.raw_orders"
@@ -1442,8 +1389,7 @@ FROM \"_base\"";
                     name: "customer_name".to_string(),
                     expr: "customers.name".to_string(),
                     source_table: Some("jaffle.raw_customers".to_string()),
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![Metric {
@@ -1466,7 +1412,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["customer_name".to_string()],
                 metrics: vec!["order_count".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("jaffle_orders", &def, &req).unwrap();
             assert!(
@@ -1485,16 +1430,14 @@ FROM \"_base\"";
                         name: "region".to_string(),
                         expr: "region".to_string(),
                         source_table: None,
-                        dim_type: None,
-                        granularity: None,
+
                         output_type: None,
                     },
                     Dimension {
                         name: "customer_name".to_string(),
                         expr: "customers.name".to_string(),
                         source_table: Some("customers".to_string()),
-                        dim_type: None,
-                        granularity: None,
+
                         output_type: None,
                     },
                 ],
@@ -1527,7 +1470,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region".to_string(), "customer_name".to_string()],
                 metrics: vec!["total_revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             assert!(
@@ -1537,137 +1479,6 @@ FROM \"_base\"";
             assert!(
                 !sql.contains("JOIN \"products\""),
                 "products join NOT needed"
-            );
-        }
-    }
-
-    mod time_dimension_expand_tests {
-        use super::*;
-        use crate::model::{Dimension, Metric};
-        use std::collections::HashMap;
-
-        fn time_orders_view() -> SemanticViewDefinition {
-            SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![],
-                dimensions: vec![
-                    Dimension {
-                        name: "order_date".to_string(),
-                        expr: "order_date".to_string(),
-                        source_table: None,
-                        dim_type: Some("time".to_string()),
-                        granularity: Some("month".to_string()),
-                        output_type: None,
-                    },
-                    Dimension {
-                        name: "region".to_string(),
-                        expr: "region".to_string(),
-                        source_table: None,
-                        dim_type: None,
-                        granularity: None,
-                        output_type: None,
-                    },
-                ],
-                metrics: vec![Metric {
-                    name: "revenue".to_string(),
-                    expr: "sum(amount)".to_string(),
-                    source_table: None,
-                    output_type: None,
-                }],
-                filters: vec![],
-                joins: vec![],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            }
-        }
-
-        #[test]
-        fn test_time_dimension_uses_date_trunc() {
-            let def = time_orders_view();
-            let req = QueryRequest {
-                dimensions: vec!["order_date".to_string()],
-                metrics: vec![],
-                granularity_overrides: HashMap::new(),
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            assert!(
-                sql.contains("date_trunc('month', order_date)::DATE AS \"order_date\""),
-                "Got: {sql}"
-            );
-        }
-
-        #[test]
-        fn test_time_dimension_with_granularity_override() {
-            let def = time_orders_view();
-            let req = QueryRequest {
-                dimensions: vec!["order_date".to_string()],
-                metrics: vec![],
-                granularity_overrides: {
-                    let mut m = HashMap::new();
-                    m.insert("order_date".to_string(), "week".to_string());
-                    m
-                },
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            assert!(
-                sql.contains("date_trunc('week', order_date)::DATE AS \"order_date\""),
-                "Got: {sql}"
-            );
-            assert!(
-                !sql.contains("'month'"),
-                "Should use override 'week', not declared 'month'"
-            );
-        }
-
-        #[test]
-        fn test_regular_dimension_unaffected_by_time_codegen() {
-            let def = time_orders_view();
-            let req = QueryRequest {
-                dimensions: vec!["region".to_string()],
-                metrics: vec![],
-                granularity_overrides: HashMap::new(),
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            assert!(
-                sql.contains("region AS \"region\""),
-                "Regular dim must be unchanged: {sql}"
-            );
-            assert!(
-                !sql.contains("date_trunc"),
-                "Regular dim must not use date_trunc: {sql}"
-            );
-        }
-
-        #[test]
-        fn test_date_trunc_includes_date_cast() {
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![],
-                dimensions: vec![Dimension {
-                    name: "d".to_string(),
-                    expr: "d".to_string(),
-                    source_table: None,
-                    dim_type: Some("time".to_string()),
-                    granularity: Some("day".to_string()),
-                    output_type: None,
-                }],
-                metrics: vec![],
-                filters: vec![],
-                joins: vec![],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            let req = QueryRequest {
-                dimensions: vec!["d".to_string()],
-                metrics: vec![],
-                granularity_overrides: HashMap::new(),
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            assert!(
-                sql.contains("::DATE"),
-                "Must cast to DATE per TIME-04: Got: {sql}"
             );
         }
     }
@@ -1694,16 +1505,14 @@ FROM \"_base\"";
                         name: "region".to_string(),
                         expr: "o.region".to_string(),
                         source_table: Some("o".to_string()),
-                        dim_type: None,
-                        granularity: None,
+
                         output_type: None,
                     },
                     crate::model::Dimension {
                         name: "tier".to_string(),
                         expr: "c.tier".to_string(),
                         source_table: Some("c".to_string()),
-                        dim_type: None,
-                        granularity: None,
+
                         output_type: None,
                     },
                 ],
@@ -1736,7 +1545,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["tier".to_string()],
                 metrics: vec!["revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("sales_view", &def, &req).unwrap();
             assert!(
@@ -1768,8 +1576,7 @@ FROM \"_base\"";
                     name: "item".to_string(),
                     expr: "li.item".to_string(),
                     source_table: Some("li".to_string()),
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![],
@@ -1796,7 +1603,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["item".to_string()],
                 metrics: vec![],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("mv", &def, &req).unwrap();
             assert!(
@@ -1820,8 +1626,7 @@ FROM \"_base\"";
                     name: "customer_name".to_string(),
                     expr: "customers.name".to_string(),
                     source_table: Some("customers".to_string()),
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: None,
                 }],
                 metrics: vec![],
@@ -1839,7 +1644,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["customer_name".to_string()],
                 metrics: vec![],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("test", &def, &req).unwrap();
             assert!(
@@ -1855,7 +1659,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["o.region".to_string()],
                 metrics: vec![],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("sales_view", &def, &req).unwrap();
             assert!(
@@ -1875,7 +1678,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region".to_string()],
                 metrics: vec![],
-                granularity_overrides: HashMap::new(),
             };
             let result = expand("sales_view", &def, &req);
             assert!(
@@ -1892,7 +1694,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["o.nosuch".to_string()],
                 metrics: vec![],
-                granularity_overrides: HashMap::new(),
             };
             let result = expand("sales_view", &def, &req);
             match result {
@@ -1912,7 +1713,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec![],
                 metrics: vec!["o.revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("sales_view", &def, &req).unwrap();
             assert!(
@@ -1925,7 +1725,6 @@ FROM \"_base\"";
     mod phase12_cast_tests {
         use super::*;
         use crate::model::{Dimension, Metric};
-        use std::collections::HashMap;
 
         #[test]
         fn output_type_on_metric_emits_cast() {
@@ -1948,7 +1747,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec![],
                 metrics: vec!["revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             assert!(
@@ -1966,8 +1764,7 @@ FROM \"_base\"";
                     name: "region_id".to_string(),
                     expr: "region_id".to_string(),
                     source_table: None,
-                    dim_type: None,
-                    granularity: None,
+
                     output_type: Some("INTEGER".to_string()),
                 }],
                 metrics: vec![],
@@ -1980,7 +1777,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec!["region_id".to_string()],
                 metrics: vec![],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             assert!(
@@ -2010,7 +1806,6 @@ FROM \"_base\"";
             let req = QueryRequest {
                 dimensions: vec![],
                 metrics: vec!["revenue".to_string()],
-                granularity_overrides: HashMap::new(),
             };
             let sql = expand("orders", &def, &req).unwrap();
             assert!(

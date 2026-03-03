@@ -86,7 +86,7 @@ pub struct DefineInitData {
 unsafe impl Send for DefineInitData {}
 unsafe impl Sync for DefineInitData {}
 
-/// `create_semantic_view(name, tables, relationships, dimensions, time_dimensions, metrics)`
+/// `create_semantic_view(name, tables, relationships, dimensions, metrics)`
 /// table function.
 ///
 /// Inserts a new semantic view definition. Errors if the view already exists.
@@ -95,7 +95,7 @@ unsafe impl Sync for DefineInitData {}
 /// Supports both positional and keyword argument syntax:
 /// ```sql
 /// -- Positional:
-/// FROM create_semantic_view('name', [...tables], [...rels], [...dims], [...tdims], [...metrics])
+/// FROM create_semantic_view('name', [...tables], [...rels], [...dims], [...metrics])
 /// -- Keyword:
 /// FROM create_semantic_view('name', tables := [...], dimensions := [...], metrics := [...])
 /// ```
@@ -109,7 +109,7 @@ impl VTab for DefineSemanticViewVTab {
         // Declare output schema: single VARCHAR column with the view name.
         bind.add_result_column("view_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
-        // Parse all 6 arguments (name + 5 LIST(STRUCT) params).
+        // Parse all 5 arguments (name + 4 LIST(STRUCT) params).
         let mut parsed =
             parse_define_args_from_bind(bind).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
@@ -129,7 +129,6 @@ impl VTab for DefineSemanticViewVTab {
                     .map(|d| d.name.clone())
                     .collect(),
                 metrics: parsed.def.metrics.iter().map(|m| m.name.clone()).collect(),
-                granularity_overrides: std::collections::HashMap::new(),
             };
             if let Ok(expanded_for_inference) = expand(&parsed.name, &parsed.def, &req_all) {
                 let limit0_sql = format!("{expanded_for_inference} LIMIT 0");
@@ -196,7 +195,7 @@ impl VTab for DefineSemanticViewVTab {
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        // Only the view name is positional. The 5 LIST(STRUCT) params are
+        // Only the view name is positional. The 4 LIST(STRUCT) params are
         // named-only (via named_parameters) because DuckDB cannot infer
         // STRUCT types from empty list literals like `[]`.
         Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
@@ -222,11 +221,6 @@ impl VTab for DefineSemanticViewVTab {
             ("expr", varchar()),
             ("source_table", varchar()),
         ]));
-        let time_dimensions_type = LogicalTypeHandle::list(&LogicalTypeHandle::struct_type(&[
-            ("name", varchar()),
-            ("expr", varchar()),
-            ("granularity", varchar()),
-        ]));
         let metrics_type = LogicalTypeHandle::list(&LogicalTypeHandle::struct_type(&[
             ("name", varchar()),
             ("expr", varchar()),
@@ -237,7 +231,6 @@ impl VTab for DefineSemanticViewVTab {
             ("tables".to_string(), tables_type),
             ("relationships".to_string(), relationships_type),
             ("dimensions".to_string(), dimensions_type),
-            ("time_dimensions".to_string(), time_dimensions_type),
             ("metrics".to_string(), metrics_type),
         ])
     }

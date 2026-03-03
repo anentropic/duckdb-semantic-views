@@ -1,8 +1,8 @@
-/// Parse the 6 keyword/positional arguments of `create_semantic_view` from a
+/// Parse the 5 keyword/positional arguments of `create_semantic_view` from a
 /// [`BindInfo`] into a [`SemanticViewDefinition`].
 ///
 /// Supports both positional and keyword argument syntax:
-///   - Positional: `create_semantic_view('name', [...tables], [...rels], [...dims], [...tdims], [...metrics])`
+///   - Positional: `create_semantic_view('name', [...tables], [...rels], [...dims], [...metrics])`
 ///   - Keyword: `create_semantic_view('name', tables := [...], dimensions := [...], metrics := [...])`
 ///   - Mixed: `create_semantic_view('name', tables := [...], dimensions := [...], metrics := [...])`
 ///
@@ -17,8 +17,7 @@
 /// | `tables`           | 1          | `LIST(STRUCT(alias VARCHAR, table VARCHAR))` |
 /// | `relationships`    | 2          | `LIST(STRUCT(from_table VARCHAR, to_table VARCHAR, join_columns LIST(STRUCT(from VARCHAR, to VARCHAR))))` |
 /// | `dimensions`       | 3          | `LIST(STRUCT(name VARCHAR, expr VARCHAR, source_table VARCHAR))` |
-/// | `time_dimensions`  | 4          | `LIST(STRUCT(name VARCHAR, expr VARCHAR, granularity VARCHAR))` |
-/// | `metrics`          | 5          | `LIST(STRUCT(name VARCHAR, expr VARCHAR, source_table VARCHAR))` |
+/// | `metrics`          | 4          | `LIST(STRUCT(name VARCHAR, expr VARCHAR, source_table VARCHAR))` |
 use duckdb::vtab::{BindInfo, Value};
 use libduckdb_sys as ffi;
 use std::ffi::CStr;
@@ -27,29 +26,10 @@ use std::os::raw::c_void;
 use crate::model::{Dimension, Join, JoinColumn, Metric, SemanticViewDefinition, TableRef};
 use crate::query::table_function::value_raw_ptr;
 
-/// Result of parsing the 6 `create_semantic_view` arguments.
+/// Result of parsing the 5 `create_semantic_view` arguments.
 pub struct ParsedDefineArgs {
     pub name: String,
     pub def: SemanticViewDefinition,
-}
-
-/// Valid granularity values for time dimensions.
-const VALID_GRANULARITIES: &[&str] = &["day", "week", "month", "year"];
-
-/// Validate a granularity string.
-///
-/// Returns `Ok(())` if the value is one of `day`, `week`, `month`, `year`.
-/// Returns `Err` with a descriptive message otherwise.
-pub fn validate_granularity(granularity: &str) -> Result<(), String> {
-    if VALID_GRANULARITIES.contains(&granularity) {
-        Ok(())
-    } else {
-        Err(format!(
-            "time_dimension has unsupported granularity '{}'; valid values: {}",
-            granularity,
-            VALID_GRANULARITIES.join(", ")
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -100,11 +80,6 @@ fn get_named_param(bind: &BindInfo, name: &str) -> Option<Value> {
 ///
 /// This is the primary parse path used by the VTab `bind()` implementation.
 /// It reads arguments from either named parameters or positional parameters.
-///
-/// # Errors
-///
-/// Returns `Err` if:
-/// - A time dimension has an invalid granularity value
 pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, String> {
     // ------------------------------------------------------------------
     // Param 0: name (VARCHAR) -- always positional
@@ -197,8 +172,6 @@ pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, 
                     name: dim_name,
                     expr: dim_expr,
                     source_table,
-                    dim_type: None,
-                    granularity: None,
                     output_type: None,
                 });
             }
@@ -206,33 +179,7 @@ pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, 
     }
 
     // ------------------------------------------------------------------
-    // Param 4: time_dimensions LIST(STRUCT(name:0, expr:1, granularity:2))
-    // ------------------------------------------------------------------
-    if let Some(ref val) = get_named_param(bind, "time_dimensions") {
-        unsafe {
-            let val_ptr = value_raw_ptr(val);
-            let size = ffi::duckdb_get_list_size(val_ptr);
-            for i in 0..size {
-                let mut child = ffi::duckdb_get_list_child(val_ptr, i);
-                let dim_name = extract_struct_child_varchar(child, 0); // name
-                let dim_expr = extract_struct_child_varchar(child, 1); // expr
-                let gran = extract_struct_child_varchar(child, 2); // granularity
-                ffi::duckdb_destroy_value(&mut child);
-                validate_granularity(&gran)?;
-                dimensions.push(Dimension {
-                    name: dim_name,
-                    expr: dim_expr,
-                    source_table: None,
-                    dim_type: Some("time".to_string()),
-                    granularity: Some(gran),
-                    output_type: None,
-                });
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Param 5: metrics LIST(STRUCT(name:0, expr:1, source_table:2))
+    // Param 4: metrics LIST(STRUCT(name:0, expr:1, source_table:2))
     // ------------------------------------------------------------------
     let mut metrics: Vec<Metric> = Vec::new();
     if let Some(ref val) = get_named_param(bind, "metrics") {
@@ -279,61 +226,4 @@ pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, 
             column_types_inferred: vec![],
         },
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ----------------------------------------------------------------
-    // Unit tests for pure helper functions that don't require
-    // BindInfo construction. The full parse_define_args_from_bind function
-    // is validated end-to-end via the integration tests (sqllogictest).
-    // ----------------------------------------------------------------
-
-    mod granularity_validation_tests {
-        use super::*;
-
-        #[test]
-        fn valid_granularities_are_accepted() {
-            for gran in ["day", "week", "month", "year"] {
-                assert!(
-                    validate_granularity(gran).is_ok(),
-                    "granularity '{gran}' should be accepted"
-                );
-            }
-        }
-
-        #[test]
-        fn invalid_granularity_quarter_rejected() {
-            let err = validate_granularity("quarter").unwrap_err();
-            assert!(
-                err.contains("quarter"),
-                "Error must mention 'quarter': {err}"
-            );
-            assert!(
-                err.contains("day, week, month, year"),
-                "Error must list valid values: {err}"
-            );
-        }
-
-        #[test]
-        fn empty_granularity_rejected() {
-            let err = validate_granularity("").unwrap_err();
-            assert!(
-                err.contains("unsupported granularity"),
-                "Error must mention unsupported: {err}"
-            );
-        }
-
-        #[test]
-        fn mixed_case_granularity_rejected() {
-            // Granularity is case-sensitive -- "Day" is not valid, user must write "day"
-            let err = validate_granularity("Day").unwrap_err();
-            assert!(
-                err.contains("Day"),
-                "Error must include the bad value: {err}"
-            );
-        }
-    }
 }
