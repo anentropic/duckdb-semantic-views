@@ -167,7 +167,7 @@ All use the same argument signature as `create_semantic_view()`:
 
 ## Building
 
-Rust with a C++ shim, built on the [DuckDB extension template for Rust](https://github.com/duckdb/extension-template-rs).
+Rust, built on the [DuckDB extension template for Rust](https://github.com/duckdb/extension-template-rs).
 
 You need: Rust (stable), just, make, Python 3.
 

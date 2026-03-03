@@ -10,7 +10,7 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 
 - **Origin:** Phase 2, decision [02-04] sidecar-persistence
 - **Decision:** DuckDB holds execution locks during scalar `invoke()`, which prevents any SQL execution from within DDL functions (`define_semantic_view`, `drop_semantic_view`). Both `try_clone()` (same-instance locks) and `Connection::open(path)` (file-level lock) deadlock or block. The extension writes catalog changes to a `.semantic_views` sidecar file using plain file I/O with atomic rename (write-to-tmp-then-rename). On next extension load, `init_catalog` reads the sidecar and syncs definitions into the `semantic_layer._definitions` DuckDB table.
-- **Action:** Replace with `pragma_query_t` callbacks in the v0.2.0 C++ shim. The `pragma_query_t` pattern (used by the FTS extension) returns a SQL string that DuckDB executes after the callback returns, during parsing before execution locks are held. This eliminates the sidecar file entirely.
+- **Action:** Resolved in v0.2.0 with `pragma_query_t` using a separate `persist_conn` (write-first pattern). The sidecar file was eliminated. The C++ shim was subsequently removed in v0.4.0 (it was a no-op stub) -- all persistence is handled in pure Rust.
 
 ### 2. Catalog table naming: `semantic_layer._definitions`
 
@@ -33,8 +33,8 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 ### 5. Native EXPLAIN deferred to v0.2.0
 
 - **Origin:** Phase 4, QUERY-04 (reworded); tracked as QUERY-V2-03
-- **Decision:** The `explain_semantic_view()` table function provides expanded SQL inspection as a workaround. Native `EXPLAIN FROM semantic_query(...)` would show the expanded SQL instead of the DuckDB physical plan, but this requires a C++ shim to intercept the EXPLAIN hook.
-- **Action:** Implement as QUERY-V2-03 when the C++ shim is built for native DDL.
+- **Decision:** The `explain_semantic_view()` table function provides expanded SQL inspection as a workaround. Native `EXPLAIN FROM semantic_query(...)` would show the expanded SQL instead of the DuckDB physical plan, but this would require intercepting the EXPLAIN hook, which is not accessible from a loadable extension (Python DuckDB uses `-fvisibility=hidden`).
+- **Action:** The C++ shim was removed in v0.4.0 (it was a no-op stub). Native EXPLAIN interception remains architecturally blocked -- it would require DuckDB to expose EXPLAIN hooks via the C API or extension loading mechanism.
 
 ### 6. ON-clause substring matching for join dependency detection
 
@@ -54,12 +54,12 @@ Requirements explicitly moved to the next milestone. These are documented in REQ
 
 | ID | Description | Reason |
 |----|-------------|--------|
-| QUERY-V2-01 | Native `CREATE SEMANTIC VIEW` DDL syntax | Requires C++ shim for DuckDB parser hooks (not exposed to Rust via C API) |
+| QUERY-V2-01 | Native `CREATE SEMANTIC VIEW` DDL syntax | Architecturally blocked: DuckDB parser hooks not exposed to loadable extensions (Python DuckDB `-fvisibility=hidden`). C++ shim removed in v0.4.0 -- was a no-op. |
 | QUERY-V2-02 | Time dimensions with granularity coarsening (day/week/month/year) | Scoped out of v0.1.0 to reduce complexity |
-| QUERY-V2-03 | Native `EXPLAIN` interception for `semantic_query()` | Requires C++ shim for EXPLAIN hook |
+| QUERY-V2-03 | Native `EXPLAIN` interception for `semantic_query()` | Architecturally blocked: EXPLAIN hooks not exposed to loadable extensions. C++ shim removed in v0.4.0. |
 | DIST-V2-01 | Published to DuckDB community extension registry | Requires upstream PR to `duckdb/community-extensions` repository |
 | DIST-V2-02 | Real-world TPC-H demo with documented example queries | Documentation deliverable deferred to align with registry publishing |
-| (sidecar replacement) | Replace sidecar file persistence with `pragma_query_t` callbacks | Requires C++ shim; see Accepted Decision 1 above |
+| (sidecar replacement) | Replace sidecar file persistence with `pragma_query_t` callbacks | Resolved in v0.2.0 with `persist_conn` write-first pattern. C++ shim removed in v0.4.0. |
 
 ## Known Architectural Limitations
 

@@ -25,7 +25,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - ✓ All generated SQL identifiers quoted to prevent reserved-word conflicts — v0.1.0
 - ✓ Unit tests, property-based tests (proptest), integration tests, and fuzz targets — v0.1.0
 - ✓ MAINTAINER.md covering complete developer lifecycle — v0.1.0
-- ✓ C++ shim infrastructure with feature-gated cc crate compilation and symbol visibility — v0.2.0
+- ✓ Symbol visibility for extension builds (feature-gated in build.rs) — v0.2.0 (C++ shim removed in v0.4.0)
 - ✓ Time dimensions with date_trunc granularity coarsening (day/week/month/year) and per-query override — v0.2.0
 - ✓ DuckDB-native catalog persistence via pragma_query_t (sidecar file eliminated) — v0.2.0
 - ✓ Snowflake-aligned 6-arg STRUCT/LIST DDL syntax (`create_semantic_view`) — v0.2.0
@@ -58,7 +58,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 ## Context
 
 **Shipped v0.4.0** — breaking change: removed time_dimensions/granularities, simplified to 4-param DDL + 2-param query.
-**Tech stack:** Rust, C++ (shim), duckdb-rs 1.4.4, cc crate, serde_json, strsim, proptest.
+**Tech stack:** Rust, duckdb-rs 1.4.4, serde_json, strsim, proptest.
 **Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern).
 **Tests:** 136 total — Rust unit tests, property-based tests (proptest), sqllogictest integration tests, DuckLake CI tests.
 **Known limitations:** See TECH-DEBT.md at repo root for accepted decisions and deferred items.
@@ -72,7 +72,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ## Constraints
 
-- **Language**: Rust + C++ — Rust for extension logic, C++ shim for pragma callbacks (parser hooks proven impossible)
+- **Language**: Rust — pure Rust extension, no C++ shim needed (parser hooks proven impossible via Python DuckDB `-fvisibility=hidden`)
 - **Target**: DuckDB extension — must integrate with DuckDB's extension loading mechanism
 - **Correctness over performance**: Expansion must produce correct results; DuckDB handles optimisation
 - **Python DuckDB compatibility**: All extension entry points must use C API function pointers only — C++ symbols are hidden
@@ -81,7 +81,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Function-based DDL for v0.1.0 | Parser hooks not exposed to Rust via C API; native DDL deferred to v0.2.0 C++ shim | ✓ Good — shipped quickly, clean API |
+| Function-based DDL for v0.1.0 | Parser hooks not exposed to Rust via C API; native DDL architecturally impossible (C++ shim removed in v0.4.0) | ✓ Good — shipped quickly, clean API |
 | SQL DDL before YAML | SQL is simpler to implement as a single interface; YAML adds a second definition path | ✓ Good — JSON definition via SQL function works well |
 | Expansion-only v0.1.0 | Pre-aggregation is orthogonal complexity; ship the semantic layer first | ✓ Good — validated the core value without extra complexity |
 | DuckDB is the execution engine | Extension is a preprocessor; avoids building a query engine | ✓ Good |
@@ -91,7 +91,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 | Independent query connection via duckdb_connect | semantic_query uses separate connection to avoid lock conflicts during expanded SQL execution | ✓ Good — critical for table function to work |
 | CTE-based expansion | All source tables flattened into single `_base` CTE; dimensions/metrics reference flat namespace | ✓ Good — simple and correct; requires unqualified column names in expressions |
 | Scalar function DDL as permanent v0.2.0 interface | C++ parser hook impossible in Python DuckDB (`-fvisibility=hidden`); scalar functions work via C API function pointers | ✓ Good — discovered architectural limitation early |
-| Vendor full duckdb/src/include/ header tree | duckdb.hpp includes subdirectory headers that must be present; sourced from cargo build cache | ✓ Good — no network dependency |
+| ~~Vendor full duckdb/src/include/ header tree~~ | Was needed for C++ shim compilation; removed in v0.4.0 with shim removal | Removed — no longer needed |
 | pragma_query_t for catalog persistence | Write-first pattern with separate persist_conn avoids execution lock deadlock | ✓ Good — transactional, sidecar eliminated |
 | Snowflake-aligned STRUCT/LIST DDL syntax | 6-arg typed parameters instead of raw JSON string; aligns with Snowflake semantic view concepts | ✓ Good — cleaner API, better IDE support |
 | Zero-copy vector reference for typed output | `duckdb_vector_reference_vector` streams result chunks directly into output; type mismatches handled by `build_execution_sql` casts. Replaced binary-read dispatch post-v0.2.0 (-600 LOC). | ✓ Good — correct types, zero overhead, validated by PBTs + vector_reference_test |
