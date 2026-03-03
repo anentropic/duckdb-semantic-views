@@ -99,12 +99,6 @@ Only the tables needed for your requested dimensions/metrics get joined.
 
 ```sql
 -- Dimensions + metrics
-SELECT * FROM semantic_view(
-    'orders',
-    dimensions := ['region'],
-    metrics := ['revenue']
-);
-
 -- Multiple of each
 SELECT * FROM semantic_view(
     'orders',
@@ -121,13 +115,6 @@ SELECT * FROM semantic_view(
 -- Metrics only (grand total)
 SELECT * FROM semantic_view(
     'orders',
-    metrics := ['revenue']
-);
-
--- Date truncation via dimension expr
-SELECT * FROM semantic_view(
-    'orders',
-    dimensions := ['order_month'],
     metrics := ['revenue']
 );
 
