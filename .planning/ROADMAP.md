@@ -4,6 +4,7 @@
 
 - ✅ **v0.1.0 MVP** — Phases 1-7 (shipped 2026-02-28)
 - ✅ **v0.2.0 Native DDL + Time Dimensions** — Phases 8-14 (shipped 2026-03-03)
+- ✅ **v0.3.0 Zero-Copy Query Pipeline** — (shipped 2026-03-03)
 
 ## Phases
 
@@ -38,6 +39,15 @@ Full details: [milestones/v0.2-ROADMAP.md](milestones/v0.2-ROADMAP.md)
 
 </details>
 
+<details>
+<summary>✅ v0.3.0 Zero-Copy Query Pipeline — SHIPPED 2026-03-03</summary>
+
+Replaced binary-read dispatch with zero-copy vector references (`duckdb_vector_reference_vector`).
+Eliminated ~600 LOC of per-type read/write code. Type mismatches handled at SQL generation time
+via `build_execution_sql` cast wrapper. Streaming chunk-by-chunk instead of collect-all-then-write.
+
+</details>
+
 ## Progress
 
 | Phase | Milestone | Plans Complete | Status | Completed |
@@ -57,3 +67,4 @@ Full details: [milestones/v0.2-ROADMAP.md](milestones/v0.2-ROADMAP.md)
 | 12. EXPLAIN + Typed Output | v0.2.0 | 4/4 | Complete | 2026-03-02 |
 | 13. Type-mapping + PBTs | v0.2.0 | 2/2 | Complete | 2026-03-02 |
 | 14. DuckLake Integration + CI | v0.2.0 | 3/3 | Complete | 2026-03-02 |
+| Zero-Copy Query Pipeline | v0.3.0 | — | Complete | 2026-03-03 |

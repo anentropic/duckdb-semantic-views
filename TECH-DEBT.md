@@ -18,11 +18,11 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 - **Decision:** REQUIREMENTS.md originally specified `_semantic_views_catalog` as the table name. The implementation uses `semantic_layer._definitions` (a dedicated schema with a prefixed table name). This provides better namespace isolation and follows DuckDB conventions for extension-owned objects. The requirement text (DDL-05) was updated to match the implementation.
 - **Action:** None needed. The naming is accepted as correct.
 
-### 3. All output columns are VARCHAR
+### 3. All output columns are VARCHAR — RESOLVED
 
 - **Origin:** Phase 4, decision [04-03] varchar-output-columns
-- **Decision:** The `semantic_query()` table function declares all output columns as VARCHAR and wraps expanded SQL in `SELECT CAST(... AS VARCHAR)`. This avoids type mismatch panics when writing string data to typed DuckDB output vectors through the FFI layer. The `duckdb_string_t` inline/pointer union is read directly from vector memory (decision [04-03] direct-string-t-decode).
-- **Action:** v0.2.0 may restore typed output columns by implementing proper type-specific vector writes in the FFI layer. Consumers currently must cast numeric columns themselves.
+- **Decision:** Originally declared all columns as VARCHAR to avoid type mismatch panics. Resolved in v0.2.0 with typed output, then further simplified post-v0.2.0 with zero-copy vector references (`duckdb_vector_reference_vector`). Type mismatches are now handled at SQL generation time via `build_execution_sql` casts.
+- **Action:** None needed. Output is fully typed with zero-copy transfer.
 
 ### 4. Manual FFI entrypoint instead of macro
 
@@ -67,10 +67,10 @@ Constraints inherent to the current v0.1.0 approach that affect users or maintai
 
 ### 1. FFI execution layer not fuzz-covered
 
-- **What:** The `execute_sql_raw` and `read_varchar_from_vector` functions in `src/query/table_function.rs` contain the highest-risk unsafe code in the extension. They handle raw DuckDB C API calls for query execution and result reading.
+- **What:** The `execute_sql_raw` function and `duckdb_vector_reference_vector` call in `src/query/table_function.rs` contain the remaining unsafe code in the extension. The query pipeline uses zero-copy vector references to stream result chunks directly into output, replacing the previous binary-read dispatch.
 - **Why:** These functions require the DuckDB loadable-extension function-pointer stubs, which are only initialized at runtime when DuckDB loads the extension via `LOAD`. They cannot run in a standalone test binary.
-- **Impact:** Malformed data from DuckDB's result vectors could cause undefined behavior that would not be caught by the existing fuzz targets.
-- **Mitigation:** SQLLogicTest integration tests exercise these paths with real data across multiple query patterns. A future `fuzz_varchar_read` target could be added if a test harness for the loadable-extension stubs is built.
+- **Impact:** The unsafe surface area is significantly smaller than v0.2.0's binary-read dispatch — only `execute_sql_raw` (query execution) and `duckdb_vector_reference_vector` (shared vector ownership) remain in the hot path. Type mismatches are handled at SQL generation time via `build_execution_sql` casts, not at read/write time.
+- **Mitigation:** SQLLogicTest integration tests exercise these paths with real data. `tests/vector_reference_test.rs` validates the zero-copy mechanism directly (lifetime safety, multi-chunk, complex types). The 36 PBTs in `tests/output_proptest.rs` still validate end-to-end type correctness via `test_helpers`.
 
 ### 2. DuckDB version pinning (`= 1.4.4`)
 
@@ -79,12 +79,11 @@ Constraints inherent to the current v0.1.0 approach that affect users or maintai
 - **Impact:** Every DuckDB release requires a version bump, rebuild, and re-test of the extension. The `DuckDBVersionMonitor.yml` CI workflow automates detection and opens a PR when a new DuckDB version is available.
 - **Mitigation:** The version monitor workflow (Phase 1, INFRA-03) detects new releases and opens a PR with `@copilot` mention for automated investigation. Manual version bumps follow the process documented in MAINTAINER.md.
 
-### 3. All output columns are VARCHAR
+### 3. All output columns are VARCHAR — RESOLVED
 
-- **What:** The `semantic_query()` table function returns all columns as VARCHAR regardless of the underlying data types.
-- **Why:** See Accepted Decision 3 above. The FFI layer writes all values as strings to avoid type mismatch panics with DuckDB's typed output vectors.
-- **Impact:** Consumers must cast numeric columns (e.g., `CAST(total_revenue AS DECIMAL)`) for arithmetic operations. Sorting on numeric columns produces lexicographic rather than numeric ordering unless cast.
-- **Mitigation:** The `explain_semantic_view()` function shows the expanded SQL, which consumers can run directly if typed output is needed.
+- **What:** Originally, the `semantic_query()` table function returned all columns as VARCHAR. This was resolved in v0.2.0 with binary-read dispatch, then further improved post-v0.2.0 with zero-copy vector references.
+- **Current state:** Output columns are fully typed. The table function uses `duckdb_vector_reference_vector` to stream result chunks directly into output with zero copying. Type mismatches between bind-time inference and runtime (e.g., HUGEINT→BIGINT from optimizer changes, STRUCT/MAP→VARCHAR) are handled by `build_execution_sql`, which wraps the expanded SQL with explicit casts where needed.
+- **Impact:** None — consumers receive correctly typed output. No manual casting required.
 
 ### 4. Unqualified column names required in expressions
 
@@ -107,7 +106,7 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 - **Origin:** Phase 5 audit item (TEST-05 partial scope)
 - **Reason:** The loadable-extension function-pointer stubs (`duckdb_query`, `duckdb_value_varchar`, etc.) are only available at runtime when DuckDB loads the extension. A standalone fuzz binary cannot initialize these stubs.
-- **Mitigation:** Three fuzz targets cover the non-FFI attack surface: `fuzz_json_parse` (definition JSON parsing), `fuzz_sql_expand` (expansion engine SQL generation), `fuzz_query_names` (dimension/metric name validation). SQLLogicTest provides integration coverage of the FFI layer.
+- **Mitigation:** Three fuzz targets cover the non-FFI attack surface: `fuzz_json_parse` (definition JSON parsing), `fuzz_sql_expand` (expansion engine SQL generation), `fuzz_query_names` (dimension/metric name validation). SQLLogicTest provides integration coverage of the FFI layer. Post-v0.2.0, the FFI unsafe surface is much smaller — the zero-copy vector reference approach eliminated all per-type binary read/write code; only `execute_sql_raw` and `duckdb_vector_reference_vector` remain in the hot path. `tests/vector_reference_test.rs` validates zero-copy lifetime safety under `cargo test`.
 
 ### 3. Sandbox test portability (resolved in Phase 6)
 
@@ -117,6 +116,6 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ---
 
-**Date:** 2026-02-26
-**Milestone:** v0.1.0
+**Date:** 2026-03-03
+**Milestone:** v0.3.0 (updated from v0.1.0 original)
 **Audit report:** `.planning/milestones/v1.0-MILESTONE-AUDIT.md`

@@ -104,6 +104,35 @@
 
 ---
 
+## Milestone: v0.3.0 — Zero-Copy Query Pipeline
+
+**Shipped:** 2026-03-03
+**Scope:** Single refactor of `src/query/table_function.rs` (-738, +151 lines)
+
+### What Was Built
+- Zero-copy vector reference pipeline replacing binary-read dispatch
+- `StreamingState` with `Mutex` for chunk-by-chunk streaming (reduced peak memory)
+- `build_execution_sql` cast wrapper for type mismatch handling at SQL generation time
+- `tests/vector_reference_test.rs` validating lifetime safety, multi-chunk, LIST/STRUCT types
+
+### What Worked
+- The refactor was a clean replacement — zero-copy is simpler, faster, and eliminates an entire category of type dispatch bugs
+- `duckdb_vector_reference_vector` shares buffer ownership, confirmed by dedicated tests
+- Moving type mismatch handling to SQL generation time (`build_execution_sql`) is more maintainable than handling it at read/write time
+- Done outside GSD planning process — appropriate for a focused single-file refactor
+
+### Key Lessons
+1. `duckdb_vector_reference_vector` creates shared ownership (not a shallow alias) — source chunk destruction is safe after reference
+2. Type mismatches between bind-time and runtime are better handled at SQL generation time than at read/write time
+3. Binary-read dispatch was over-engineered for what DuckDB already handles natively — let DuckDB own the data format
+
+### Patterns Established
+- Zero-copy vector transfer: `duckdb_vector_reference_vector(dst, src)` per column per chunk
+- SQL-time type casting via wrapper query for known mismatch patterns
+- `StreamingState` with `Mutex<Option<...>>` for lazy-init streaming in VTab `func()`
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -112,6 +141,7 @@
 |-----------|---------|--------|------------|
 | v1.0 | 99 | 7 | Initial release — established all patterns |
 | v0.2.0 | 125 | 8 | Architecture pivot (parser hook → scalar DDL), typed output, PBTs |
+| v0.3.0 | 1 | — | Zero-copy refactor — replaced binary-read dispatch (-600 LOC) |
 
 ### Cumulative Quality
 
@@ -119,6 +149,7 @@
 |-----------|------------|----------------|-------------|-------------------|
 | v1.0 | ~30 | 4 properties (256 cases each) | 3 targets | 2 (SQLLogicTest + DuckLake) |
 | v0.2.0 | 136 | 40 properties (256+ cases each) | 3 targets | 3 (SQLLogicTest + DuckLake CI + DuckLake local) |
+| v0.3.0 | 136+ | 40 properties | 3 targets | 3 + vector_reference_test |
 
 ### Top Lessons (Verified Across Milestones)
 

@@ -1,5 +1,20 @@
 # Milestones
 
+## v0.3.0 Zero-Copy Query Pipeline (Shipped: 2026-03-03)
+
+**Delivered:** Replaced binary-read dispatch with zero-copy vector references. The table function now streams result chunks directly into output via `duckdb_vector_reference_vector`, eliminating ~600 lines of per-type read/write code. Type mismatches (HUGEINT→BIGINT, STRUCT/MAP→VARCHAR) handled at SQL generation time via `build_execution_sql` cast wrapper. Streaming is chunk-by-chunk instead of collect-all-then-write.
+
+**Key changes:**
+1. Zero-copy vector transfer — `duckdb_vector_reference_vector` shares buffer ownership between source and output chunks
+2. Streaming execution — chunks processed one at a time via `StreamingState` with `Mutex`, reducing peak memory
+3. SQL-time type casting — `build_execution_sql` wraps expanded SQL with explicit casts for mismatched columns
+4. Removed: `TypedValue` enum, `read_typed_from_vector`, `read_varchar_from_raw_vector`, `write_typed_column` (all ~600 LOC)
+5. New tests: `tests/vector_reference_test.rs` validates lifetime safety, multi-chunk streaming, and complex types (LIST, STRUCT)
+
+**LOC:** 5,660 Rust (src) + 1,492 (tests) — net reduction of ~600 LOC from v0.2.0
+
+---
+
 ## v0.2.0 Native DDL + Time Dimensions (Shipped: 2026-03-03)
 
 **Phases completed:** 8 phases (8-14, including 11.1), 25 plans

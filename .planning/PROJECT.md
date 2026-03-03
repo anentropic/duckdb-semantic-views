@@ -30,7 +30,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - ✓ DuckDB-native catalog persistence via pragma_query_t (sidecar file eliminated) — v0.2.0
 - ✓ Snowflake-aligned 6-arg STRUCT/LIST DDL syntax (`create_semantic_view`) — v0.2.0
 - ✓ `explain_semantic_view` shows DuckDB's full physical query plan for expanded SQL — v0.2.0
-- ✓ Typed output columns with binary-read dispatch (BIGINT, DOUBLE, DATE, TIMESTAMP, etc.) — v0.2.0
+- ✓ Typed output columns via zero-copy vector reference (replaced binary-read dispatch) — v0.3.0
 - ✓ 36 property-based tests for typed output pipeline covering all scalar/composite types — v0.2.0
 - ✓ DuckLake integration tests with CI job and DuckDB version monitor — v0.2.0
 
@@ -43,7 +43,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Out of Scope
 
-- Pre-aggregation / materialization selection — deferred to future milestone (v0.3.0+)
+- Pre-aggregation / materialization selection — deferred to future milestone (v0.4.0+)
 - YAML definition format — SQL DDL first; YAML is a future path
 - Derived metrics (metric-on-metric, e.g., profit = revenue - cost) — future milestone
 - Hierarchies (drill-down paths, e.g., country → region → city) — future milestone
@@ -56,9 +56,9 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ## Context
 
-**Shipped v0.2.0** with 7,462 LOC Rust across 21 .rs files in 3 days (125 commits).
+**Shipped v0.3.0** with 5,660 LOC Rust (src) + 1,492 LOC tests across 21 .rs files.
 **Tech stack:** Rust, C++ (shim), duckdb-rs 1.4.4, cc crate, serde_json, strsim, proptest.
-**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns. DuckDB handles all execution. Persistence via `pragma_query_t` with separate connection (write-first pattern).
+**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern).
 **Tests:** 136 total — Rust unit tests, property-based tests (proptest), sqllogictest integration tests, DuckLake CI tests.
 **Known limitations:** See TECH-DEBT.md at repo root for accepted decisions and deferred items.
 
@@ -93,8 +93,8 @@ A DuckDB user can define a semantic view once and query it with any combination 
 | Vendor full duckdb/src/include/ header tree | duckdb.hpp includes subdirectory headers that must be present; sourced from cargo build cache | ✓ Good — no network dependency |
 | pragma_query_t for catalog persistence | Write-first pattern with separate persist_conn avoids execution lock deadlock | ✓ Good — transactional, sidecar eliminated |
 | Snowflake-aligned STRUCT/LIST DDL syntax | 6-arg typed parameters instead of raw JSON string; aligns with Snowflake semantic view concepts | ✓ Good — cleaner API, better IDE support |
-| Binary-read dispatch for typed output | Direct chunk reads per type instead of VARCHAR cast intermediary; fixes TIMESTAMP/BOOLEAN/DECIMAL bugs | ✓ Good — correct types, validated by 36 PBTs |
+| Zero-copy vector reference for typed output | `duckdb_vector_reference_vector` streams result chunks directly into output; type mismatches handled by `build_execution_sql` casts. Replaced binary-read dispatch post-v0.2.0 (-600 LOC). | ✓ Good — correct types, zero overhead, validated by PBTs + vector_reference_test |
 | LIMIT 0 type inference at define time | Query source tables with LIMIT 0 to infer column types without reading data | ✓ Good — zero-cost type discovery |
 
 ---
-*Last updated: 2026-03-03 after v0.2.0 milestone*
+*Last updated: 2026-03-03 after v0.3.0 milestone*
