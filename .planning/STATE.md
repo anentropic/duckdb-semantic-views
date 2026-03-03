@@ -1,14 +1,14 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.2
-milestone_name: Native DDL + Time Dimensions
-status: complete
-last_updated: "2026-03-03"
+milestone: v0.1
+milestone_name: milestone
+status: unknown
+last_updated: "2026-03-03T14:41:35.568Z"
 progress:
-  total_phases: 8
-  completed_phases: 8
-  total_plans: 25
-  completed_plans: 25
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
 ---
 
 # Project State
@@ -24,7 +24,7 @@ See: .planning/PROJECT.md (updated 2026-03-03)
 
 Milestone: v0.2.0 — SHIPPED 2026-03-03
 Status: Between milestones
-Last activity: 2026-03-03 - Completed quick task 10: add keyword args support for create_semantic_view
+Last activity: 2026-03-03 - Completed quick task 12: remove time dimensions and granularities
 
 Progress: [██████████] 100% (v0.2.0)
 
@@ -47,6 +47,7 @@ Progress: [██████████] 100% (v0.2.0)
 Decisions are logged in PROJECT.md Key Decisions table.
 All v0.1.0 decisions archived in milestones/v1.0-ROADMAP.md.
 All v0.2.0 decisions archived in milestones/v0.2-ROADMAP.md.
+- [Phase quick-12]: Remove time_dimensions and granularities -- users write date_trunc() in dimension expr
 
 ### Pending Todos
 
@@ -70,9 +71,10 @@ None.
 | 8 | gate fuzz CI on relevant file changes | 2026-03-03 | 261473c | Complete | [8-gate-fuzz-ci-on-relevant-file-changes](./quick/8-gate-fuzz-ci-on-relevant-file-changes/) |
 | 9 | write README with usage examples and build instructions | 2026-03-03 | db9cee6 | Complete | [9-write-readme-with-usage-examples-and-bui](./quick/9-write-readme-with-usage-examples-and-bui/) |
 | 10 | add keyword args support for create_semantic_view | 2026-03-03 | b132929, 3e0a0d5 | Verified | [10-add-keyword-args-support-for-create-sema](./quick/10-add-keyword-args-support-for-create-sema/) |
+| 12 | remove time dimensions and granularities | 2026-03-03 | c393859, 7044649 | Verified | [12-remove-time-dimensions-and-granularities](./quick/12-remove-time-dimensions-and-granularities/) |
 
 ## Session Continuity
 
 Last session: 2026-03-03
-Stopped at: Completed quick-10 (keyword args DDL).
+Stopped at: Completed quick-12 (remove time dimensions and granularities).
 Resume file: None
