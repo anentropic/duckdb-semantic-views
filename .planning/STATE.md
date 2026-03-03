@@ -18,15 +18,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-03)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** v0.2.0 milestone complete — planning next milestone
+**Current focus:** v0.4.0 shipped — simplified dimensions (breaking change)
 
 ## Current Position
 
-Milestone: v0.2.0 — SHIPPED 2026-03-03
+Milestone: v0.4.0 — SHIPPED 2026-03-03
 Status: Between milestones
-Last activity: 2026-03-03 - Completed quick task 12: remove time dimensions and granularities
+Last activity: 2026-03-03 - Shipped v0.4.0: removed time_dimensions/granularities, simplified to 4-param DDL
 
-Progress: [██████████] 100% (v0.2.0)
+Progress: [██████████] 100% (v0.4.0)
 
 ## Performance Metrics
 

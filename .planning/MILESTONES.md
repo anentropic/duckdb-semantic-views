@@ -1,5 +1,11 @@
 # Milestones
 
+## v0.4.0 Simplified Dimensions (Shipped: 2026-03-03)
+
+**Delivered:** Breaking change — removed `time_dimensions` DDL parameter and `granularities` query parameter. Time truncation is now expressed via the dimension `expr` directly (e.g., `date_trunc('month', created_at)`). Simplified DDL from 6 to 4 named params (`tables`, `relationships`, `dimensions`, `metrics`) and query function from 3 to 2 named params (`dimensions`, `metrics`). Removed `dim_type`, `granularity` from `Dimension` struct and `granularity_overrides` from `QueryRequest`.
+
+---
+
 ## v0.3.0 Zero-Copy Query Pipeline (Shipped: 2026-03-03)
 
 **Delivered:** Replaced binary-read dispatch with zero-copy vector references. The table function now streams result chunks directly into output via `duckdb_vector_reference_vector`, eliminating ~600 lines of per-type read/write code. Type mismatches (HUGEINT→BIGINT, STRUCT/MAP→VARCHAR) handled at SQL generation time via `build_execution_sql` cast wrapper. Streaming is chunk-by-chunk instead of collect-all-then-write.

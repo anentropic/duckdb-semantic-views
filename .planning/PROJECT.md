@@ -31,6 +31,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - ✓ Snowflake-aligned 6-arg STRUCT/LIST DDL syntax (`create_semantic_view`) — v0.2.0
 - ✓ `explain_semantic_view` shows DuckDB's full physical query plan for expanded SQL — v0.2.0
 - ✓ Typed output columns via zero-copy vector reference (replaced binary-read dispatch) — v0.3.0
+- ✓ Removed time_dimensions and granularities; time truncation expressed via dimension expr directly — v0.4.0
 - ✓ 36 property-based tests for typed output pipeline covering all scalar/composite types — v0.2.0
 - ✓ DuckLake integration tests with CI job and DuckDB version monitor — v0.2.0
 
@@ -38,12 +39,12 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 - [ ] Community extension registry publication (`INSTALL semantic_views FROM community`)
 - [ ] Real-world TPC-H demo notebook
-- [ ] WEEK and QUARTER time granularities
+- ~~WEEK and QUARTER time granularities~~ — removed in v0.4.0 (users write `date_trunc()` in dimension expr)
 - [ ] Native `CREATE SEMANTIC VIEW` DDL syntax (blocked: Python DuckDB `-fvisibility=hidden`)
 
 ### Out of Scope
 
-- Pre-aggregation / materialization selection — deferred to future milestone (v0.4.0+)
+- Pre-aggregation / materialization selection — deferred to future milestone (v0.5.0+)
 - YAML definition format — SQL DDL first; YAML is a future path
 - Derived metrics (metric-on-metric, e.g., profit = revenue - cost) — future milestone
 - Hierarchies (drill-down paths, e.g., country → region → city) — future milestone
@@ -56,7 +57,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ## Context
 
-**Shipped v0.3.0** with 5,660 LOC Rust (src) + 1,492 LOC tests across 21 .rs files.
+**Shipped v0.4.0** — breaking change: removed time_dimensions/granularities, simplified to 4-param DDL + 2-param query.
 **Tech stack:** Rust, C++ (shim), duckdb-rs 1.4.4, cc crate, serde_json, strsim, proptest.
 **Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern).
 **Tests:** 136 total — Rust unit tests, property-based tests (proptest), sqllogictest integration tests, DuckLake CI tests.
@@ -97,4 +98,4 @@ A DuckDB user can define a semantic view once and query it with any combination 
 | LIMIT 0 type inference at define time | Query source tables with LIMIT 0 to infer column types without reading data | ✓ Good — zero-cost type discovery |
 
 ---
-*Last updated: 2026-03-03 after v0.3.0 milestone*
+*Last updated: 2026-03-03 after v0.4.0 release*

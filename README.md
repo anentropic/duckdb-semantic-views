@@ -4,7 +4,7 @@ A DuckDB extension that lets you define dimensions and metrics once, then query 
 
 Inspired by [Snowflake Semantic Views](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view), adapted for DuckDB as a loadable extension.
 
-v0.3.0 -- early-stage, not yet on the community registry.
+v0.4.0 -- early-stage, not yet on the community registry.
 
 ## How it works
 

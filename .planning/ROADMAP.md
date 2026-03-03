@@ -5,6 +5,7 @@
 - ✅ **v0.1.0 MVP** — Phases 1-7 (shipped 2026-02-28)
 - ✅ **v0.2.0 Native DDL + Time Dimensions** — Phases 8-14 (shipped 2026-03-03)
 - ✅ **v0.3.0 Zero-Copy Query Pipeline** — (shipped 2026-03-03)
+- ✅ **v0.4.0 Simplified Dimensions** — (shipped 2026-03-03)
 
 ## Phases
 
@@ -48,6 +49,15 @@ via `build_execution_sql` cast wrapper. Streaming chunk-by-chunk instead of coll
 
 </details>
 
+<details>
+<summary>✅ v0.4.0 Simplified Dimensions — SHIPPED 2026-03-03</summary>
+
+Breaking change: removed `time_dimensions` DDL parameter and `granularities` query parameter.
+Time truncation expressed via dimension `expr` directly (e.g., `date_trunc('month', created_at)`).
+DDL simplified from 6 to 4 named params; query function from 3 to 2 named params.
+
+</details>
+
 ## Progress
 
 | Phase | Milestone | Plans Complete | Status | Completed |
@@ -68,3 +78,4 @@ via `build_execution_sql` cast wrapper. Streaming chunk-by-chunk instead of coll
 | 13. Type-mapping + PBTs | v0.2.0 | 2/2 | Complete | 2026-03-02 |
 | 14. DuckLake Integration + CI | v0.2.0 | 3/3 | Complete | 2026-03-02 |
 | Zero-Copy Query Pipeline | v0.3.0 | — | Complete | 2026-03-03 |
+| Simplified Dimensions | v0.4.0 | — | Complete | 2026-03-03 |
