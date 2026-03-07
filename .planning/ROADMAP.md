@@ -79,7 +79,10 @@ DDL simplified from 6 to 4 named params; query function from 3 to 2 named params
   2. Existing `FROM semantic_view('name', dimensions := [...], metrics := [...])` queries return correct results after loading the new extension binary
   3. A go/no-go decision is recorded: which entry point strategy works, which was abandoned, and why
   4. `shim.cpp` compiles via `cc` crate against vendored `duckdb.hpp` without new external dependencies
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 15-01-PLAN.md -- Build infrastructure: vendor duckdb.hpp, cc crate compilation, CPP symbol visibility
+- [ ] 15-02-PLAN.md -- CPP entry point switch: shim.cpp + Rust FFI bridge, Makefile ABI, test-all, go/no-go decision
 
 ### Phase 16: Parser Hook Registration
 **Goal**: DuckDB's parser calls the extension's parse_function for unrecognized statements, and the extension correctly detects `CREATE SEMANTIC VIEW` prefix via Rust FFI
@@ -134,7 +137,7 @@ DDL simplified from 6 to 4 named params; query function from 3 to 2 named params
 | 14. DuckLake Integration + CI | v0.2.0 | 3/3 | Complete | 2026-03-02 |
 | Zero-Copy Query Pipeline | v0.3.0 | — | Complete | 2026-03-03 |
 | Simplified Dimensions | v0.4.0 | — | Complete | 2026-03-03 |
-| 15. Entry Point POC | v0.5.0 | 0/TBD | Not started | - |
+| 15. Entry Point POC | v0.5.0 | 0/2 | Planning | - |
 | 16. Parser Hook Registration | v0.5.0 | 0/TBD | Not started | - |
 | 17. DDL Execution | v0.5.0 | 0/TBD | Not started | - |
 | 18. Verification and Integration | v0.5.0 | 0/TBD | Not started | - |
