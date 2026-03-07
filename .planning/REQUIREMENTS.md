@@ -74,29 +74,30 @@ Deferred to subsequent milestone after spike validates the approach.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| BUILD-01 | TBD | Pending |
-| BUILD-02 | TBD | Pending |
-| BUILD-03 | TBD | Pending |
-| BUILD-04 | TBD | Pending |
-| ENTRY-01 | TBD | Pending |
-| ENTRY-02 | TBD | Pending |
-| ENTRY-03 | TBD | Pending |
-| PARSE-01 | TBD | Pending |
-| PARSE-02 | TBD | Pending |
-| PARSE-03 | TBD | Pending |
-| PARSE-04 | TBD | Pending |
-| PARSE-05 | TBD | Pending |
-| DDL-01 | TBD | Pending |
-| DDL-02 | TBD | Pending |
-| DDL-03 | TBD | Pending |
-| VERIFY-01 | TBD | Pending |
-| VERIFY-02 | TBD | Pending |
+| BUILD-01 | Phase 15 | Pending |
+| BUILD-02 | Phase 15 | Pending |
+| BUILD-03 | Phase 17 | Pending |
+| BUILD-04 | Phase 18 | Pending |
+| BUILD-05 | Phase 18 | Pending |
+| ENTRY-01 | Phase 15 | Pending |
+| ENTRY-02 | Phase 15 | Pending |
+| ENTRY-03 | Phase 15 | Pending |
+| PARSE-01 | Phase 16 | Pending |
+| PARSE-02 | Phase 16 | Pending |
+| PARSE-03 | Phase 16 | Pending |
+| PARSE-04 | Phase 16 | Pending |
+| PARSE-05 | Phase 16 | Pending |
+| DDL-01 | Phase 17 | Pending |
+| DDL-02 | Phase 17 | Pending |
+| DDL-03 | Phase 17 | Pending |
+| VERIFY-01 | Phase 18 | Pending |
+| VERIFY-02 | Phase 18 | Pending |
 
 **Coverage:**
-- v0.5.0 requirements: 17 total
-- Mapped to phases: 0
-- Unmapped: 17
+- v0.5.0 requirements: 18 total
+- Mapped to phases: 18
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-07*
-*Last updated: 2026-03-07 after initial definition*
+*Last updated: 2026-03-07 after roadmap creation*

@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v0.5.0
 milestone_name: Parser Extension Spike
-status: requirements
+status: roadmap
 last_updated: "2026-03-07"
 progress:
-  total_phases: 0
+  total_phases: 4
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -18,14 +18,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-07)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** v0.5.0 Parser Extension Spike — prove C++ shim with parser hooks coexists with Rust
+**Current focus:** Phase 15 - Entry Point POC (go/no-go for v0.5.0)
 
 ## Current Position
 
 Milestone: v0.5.0 — Parser Extension Spike
-Phase: Not started (defining requirements)
-Status: Defining requirements
-Last activity: 2026-03-07 — Milestone v0.5.0 started
+Phase: 15 of 18 (Entry Point POC)
+Plan: 0 of TBD in current phase
+Status: Ready to plan
+Last activity: 2026-03-07 — Roadmap created for v0.5.0 (Phases 15-18)
+
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
@@ -37,7 +40,12 @@ Last activity: 2026-03-07 — Milestone v0.5.0 started
 **Velocity (v0.2.0):**
 - Total plans completed: 25
 - Commits: 125
-- Timeline: 3 days (2026-02-28 → 2026-03-02)
+- Timeline: 3 days (2026-02-28 -> 2026-03-02)
+
+**v0.5.0:**
+- Total plans completed: 0
+- Average duration: -
+- Total execution time: -
 
 ## Accumulated Context
 
@@ -48,7 +56,9 @@ All v0.1.0 decisions archived in milestones/v1.0-ROADMAP.md.
 All v0.2.0 decisions archived in milestones/v0.2-ROADMAP.md.
 - [Phase quick-12]: Remove time_dimensions and granularities -- users write date_trunc() in dimension expr
 - [Phase quick-13]: Removed C++ shim entirely -- was no-op since v0.2.0 Phase 11; extension is now pure Rust
-- [v0.5.0 start]: Parser extension via static-linked C++ shim viable — dynamic symbol resolution is the blocker, not the mechanism itself
+- [v0.5.0 start]: Parser extension via static-linked C++ shim viable -- dynamic symbol resolution is the blocker, not the mechanism itself
+- [v0.5.0 roadmap]: Entry point POC is go/no-go blocker -- must resolve before parser work begins
+- [v0.5.0 roadmap]: Statement rewrite approach (not custom parser) for the spike
 
 ### Pending Todos
 
@@ -56,28 +66,11 @@ None.
 
 ### Blockers/Concerns
 
-- Build system complexity: C++ shim must compile against DuckDB amalgamation (~15MB source), entry point ABI switch from C_STRUCT to CPP
-- Entry point bridge: CPP ABI entry receives ExtensionLoader&, not duckdb_extension_access* — Rust C API stubs need alternative initialization
-
-### Quick Tasks Completed
-
-| # | Description | Date | Commit | Status | Directory |
-|---|-------------|------|--------|--------|-----------|
-| 1 | fix dot-qualified table name issue | 2026-02-27 | 3a90dad | Verified | [1-fix-dot-qualified-table-name-issue](./quick/1-fix-dot-qualified-table-name-issue/) |
-| 2 | convert setup_ducklake.py to uv script | 2026-02-28 | ab4bf0c, bb1309f | Verified | [2-convert-setup-ducklake-py-to-uv-script-r](./quick/2-convert-setup-ducklake-py-to-uv-script-r/) |
-| 3 | fix CI failures (cargo-deny licenses + Windows restart test) | 2026-02-28 | 9056292, 6935892 | Verified | [3-fix-ci-failures](./quick/3-fix-ci-failures/) |
-| 4 | check CI results and fix proptest assertion bug | 2026-02-28 | 652e7d2 | Verified | [4-check-ci-results-and-fix-coverage-if-nee](./quick/4-check-ci-results-and-fix-coverage-if-nee/) |
-| 5 | fix require notwindows skipping phase2 restart test | 2026-03-01 | 4cc9b83, b35746f | Verified | [5-fix-require-notwindows-skipping-phase2-r](./quick/5-fix-require-notwindows-skipping-phase2-r/) |
-| 6 | fix all outstanding CI failures (fmt + linker) | 2026-03-02 | 8964b29, f8996d2 | Verified | [6-fix-all-outstanding-ci-failures](./quick/6-fix-all-outstanding-ci-failures/) |
-| 7 | fix rustfmt CI failure + add pre-commit hook | 2026-03-03 | 8f01f7a, ade0433 | Verified | [7-check-gh-run-list-and-fix](./quick/7-check-gh-run-list-and-fix/) |
-| 8 | gate fuzz CI on relevant file changes | 2026-03-03 | 261473c | Complete | [8-gate-fuzz-ci-on-relevant-file-changes](./quick/8-gate-fuzz-ci-on-relevant-file-changes/) |
-| 9 | write README with usage examples and build instructions | 2026-03-03 | db9cee6 | Complete | [9-write-readme-with-usage-examples-and-bui](./quick/9-write-readme-with-usage-examples-and-bui/) |
-| 10 | add keyword args support for create_semantic_view | 2026-03-03 | b132929, 3e0a0d5 | Verified | [10-add-keyword-args-support-for-create-sema](./quick/10-add-keyword-args-support-for-create-sema/) |
-| 12 | remove time dimensions and granularities | 2026-03-03 | c393859, 7044649 | Verified | [12-remove-time-dimensions-and-granularities](./quick/12-remove-time-dimensions-and-granularities/) |
-| 13 | remove unused C++ shim and update docs | 2026-03-03 | aa42e8c, 6daf965 | Complete | [13-update-readme-and-remove-unused-c-shim](./quick/13-update-readme-and-remove-unused-c-shim/) |
+- P2/P4 (dual entry point conflict / null function pointers) are LOW confidence -- Phase 15 exists to resolve this
+- If neither Option A nor Option B works, milestone must be re-scoped
 
 ## Session Continuity
 
 Last session: 2026-03-07
-Stopped at: Starting milestone v0.5.0 — Parser Extension Spike
+Stopped at: Roadmap created for v0.5.0 (Phases 15-18), ready to plan Phase 15
 Resume file: None
