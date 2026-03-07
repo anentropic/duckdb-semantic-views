@@ -1,9 +1,9 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.1
-milestone_name: milestone
-status: unknown
-last_updated: "2026-03-03T14:41:35.568Z"
+milestone: v0.5.0
+milestone_name: Parser Extension Spike
+status: requirements
+last_updated: "2026-03-07"
 progress:
   total_phases: 0
   completed_phases: 0
@@ -15,18 +15,17 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-03-03)
+See: .planning/PROJECT.md (updated 2026-03-07)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** v0.4.0 shipped — simplified dimensions (breaking change)
+**Current focus:** v0.5.0 Parser Extension Spike — prove C++ shim with parser hooks coexists with Rust
 
 ## Current Position
 
-Milestone: v0.4.0 — SHIPPED 2026-03-03
-Status: Between milestones
-Last activity: 2026-03-03 - Shipped v0.4.0: removed time_dimensions/granularities, simplified to 4-param DDL
-
-Progress: [██████████] 100% (v0.4.0)
+Milestone: v0.5.0 — Parser Extension Spike
+Phase: Not started (defining requirements)
+Status: Defining requirements
+Last activity: 2026-03-07 — Milestone v0.5.0 started
 
 ## Performance Metrics
 
@@ -49,6 +48,7 @@ All v0.1.0 decisions archived in milestones/v1.0-ROADMAP.md.
 All v0.2.0 decisions archived in milestones/v0.2-ROADMAP.md.
 - [Phase quick-12]: Remove time_dimensions and granularities -- users write date_trunc() in dimension expr
 - [Phase quick-13]: Removed C++ shim entirely -- was no-op since v0.2.0 Phase 11; extension is now pure Rust
+- [v0.5.0 start]: Parser extension via static-linked C++ shim viable — dynamic symbol resolution is the blocker, not the mechanism itself
 
 ### Pending Todos
 
@@ -56,7 +56,8 @@ None.
 
 ### Blockers/Concerns
 
-- Native `CREATE SEMANTIC VIEW` DDL is architecturally impossible when loaded via Python DuckDB (`-fvisibility=hidden`)
+- Build system complexity: C++ shim must compile against DuckDB amalgamation (~15MB source), entry point ABI switch from C_STRUCT to CPP
+- Entry point bridge: CPP ABI entry receives ExtensionLoader&, not duckdb_extension_access* — Rust C API stubs need alternative initialization
 
 ### Quick Tasks Completed
 
@@ -77,6 +78,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-03
-Stopped at: Completed quick-13 (remove unused C++ shim and update docs).
+Last session: 2026-03-07
+Stopped at: Starting milestone v0.5.0 — Parser Extension Spike
 Resume file: None

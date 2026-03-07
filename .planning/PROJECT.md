@@ -37,10 +37,21 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Active
 
+- [ ] Native `CREATE SEMANTIC VIEW` DDL syntax — parser extension spike (v0.5.0)
 - [ ] Community extension registry publication (`INSTALL semantic_views FROM community`)
 - [ ] Real-world TPC-H demo notebook
 - ~~WEEK and QUARTER time granularities~~ — removed in v0.4.0 (users write `date_trunc()` in dimension expr)
-- [ ] Native `CREATE SEMANTIC VIEW` DDL syntax (blocked: Python DuckDB `-fvisibility=hidden`)
+
+## Current Milestone: v0.5.0 Parser Extension Spike
+
+**Goal:** Prove that a C++ shim with DuckDB parser hooks can coexist with the existing Rust extension code — validating the path to native `CREATE SEMANTIC VIEW` syntax.
+
+**Target features:**
+- C++ shim compiled via `cc` crate with DuckDB amalgamation, exporting `semantic_views_duckdb_cpp_init`
+- Parser fallback hook (`parse_function`) registered and called by DuckDB for unrecognized `CREATE SEMANTIC VIEW` statements
+- Rust receives the statement text via FFI and returns a valid `ExtensionStatement`
+- ABI switch from `C_STRUCT` to `CPP` footer
+- Existing table function / scalar function registration continues to work
 
 ### Out of Scope
 
@@ -53,7 +64,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - BI tool HTTP API — not a DuckDB extension concern; Cube.dev handles this use case
 - Column-level security — beyond row-level filter scope; DuckDB handles column access
 - Fiscal calendar / Sunday-start weeks — ISO 8601 only for now
-- Native `CREATE SEMANTIC VIEW` parser hook — architecturally impossible when loaded via Python DuckDB (`-fvisibility=hidden` hides all C++ symbols)
+- Native `CREATE SEMANTIC VIEW` parser hook via dynamic C++ symbol resolution — impossible (`-fvisibility=hidden`), but static linking approach viable (see `_notes/parser-extension-investigation.md`)
 
 ## Context
 
@@ -97,5 +108,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 | Zero-copy vector reference for typed output | `duckdb_vector_reference_vector` streams result chunks directly into output; type mismatches handled by `build_execution_sql` casts. Replaced binary-read dispatch post-v0.2.0 (-600 LOC). | ✓ Good — correct types, zero overhead, validated by PBTs + vector_reference_test |
 | LIMIT 0 type inference at define time | Query source tables with LIMIT 0 to infer column types without reading data | ✓ Good — zero-cost type discovery |
 
+| Parser extension via static-linked C++ shim | Dynamic C++ symbol resolution impossible; static linking against amalgamation bypasses `-fvisibility=hidden` (validated by prql/duckpgq existence proofs) | — Pending |
+
 ---
-*Last updated: 2026-03-03 after v0.4.0 release*
+*Last updated: 2026-03-07 after v0.5.0 milestone start*
