@@ -1,206 +1,157 @@
 # Project Research Summary
 
-**Project:** DuckDB Semantic Views Extension
-**Domain:** DuckDB extension (Rust + C++) — semantic layer / query expansion engine
-**Researched:** 2026-02-28 / 2026-03-01
-**Milestone:** v0.2.0 — Native DDL + Time Dimensions
-**Confidence:** MEDIUM-HIGH (stack is well-confirmed; C++ parser hook internals require hands-on validation at implementation time)
+**Project:** DuckDB Semantic Views Extension -- Parser Extension Spike
+**Domain:** DuckDB Rust extension -- C++ parser hook integration for native SQL DDL syntax
+**Researched:** 2026-03-07
+**Milestone:** v0.5.0 -- Native `CREATE SEMANTIC VIEW` syntax via parser extension hooks
+**Confidence:** MEDIUM (entry point strategy unproven; parser hook API surface verified)
 
 ---
 
 ## Executive Summary
 
-v0.1.0 shipped a working semantic layer extension with a known architectural debt: all SQL-native features (native `CREATE SEMANTIC VIEW` DDL, `pragma_query_t` catalog persistence, EXPLAIN interception) were blocked by the DuckDB C API not exposing parser hooks to Rust. v0.2.0 resolves this by introducing a thin C++ shim — compiled via the `cc` build crate from a new `build.rs` — that registers parser extension hooks and PRAGMA callbacks with DuckDB's C++ SDK. All logic remains in Rust; the shim is strictly a DuckDB registration forwarding layer (~80 lines of C++).
+Adding native `CREATE SEMANTIC VIEW` DDL syntax to this Rust DuckDB extension requires integrating C++ parser extension hooks (`parse_function_t` / `plan_function_t`) into the existing pure-Rust architecture. The DuckDB parser hook API is well-documented and stable at v1.4.1+, with proven implementations in prql and duckpgq extensions. The recommended spike approach is **statement rewriting**: the `parse_function` intercepts `CREATE SEMANTIC VIEW ...` statements that DuckDB's parser rejects at the `SEMANTIC` keyword, rewrites them into the existing `FROM create_semantic_view(...)` table function syntax, and the `plan_function` returns a `TableFunction` directly (Path A -- no stash/OperatorExtension pattern needed for DDL). This validates parser hooks end-to-end without building a custom SQL parser.
 
-The recommended build approach is Cargo-primary with `cc` crate (not CMake). This keeps existing CI, `just` tasks, and developer tooling unchanged while adding C++ compilation for the shim only. The only new Cargo dependency is `cc = "1.2"` in `[build-dependencies]`. DuckDB's C++ headers are vendored as `duckdb_capi/duckdb.hpp` (version-pinned to v1.4.4) to ensure reproducible extension builds. Time dimensions require no C++ work at all — they are pure Rust expansion engine changes using the existing `serde_json` dependency and DuckDB's built-in `date_trunc` SQL function.
+The single largest risk is the **entry point strategy** (P2/P4 in PITFALLS.md). The current extension uses a Rust C API entry point (`semantic_views_init_c_api` with `C_STRUCT_UNSTABLE` footer). Parser hooks require C++ API access (`DBConfig::GetConfig`), which means either switching to a CPP entry point or calling C++ from the existing Rust entry. Switching to CPP breaks Rust's `ffi::duckdb_*` function pointer initialization -- the `AtomicPtr` stubs populated by `duckdb_rs_extension_api_init` are never called, causing null pointer dereference on the first `ffi::duckdb_query` call. Two viable options exist: **(A)** keep `C_STRUCT` footer and Rust entry, call a C++ helper from Rust that receives the `duckdb_database` handle and registers parser hooks; or **(B)** switch to CPP footer and C++ entry, bridge the C API initialization by extracting `duckdb_extension_info`/`duckdb_extension_access` from `ExtensionLoader`. Both need a POC before committing. This is a go/no-go blocker for the milestone.
 
-The critical risk in v0.2.0 is the C++ shim integration: build system footprint (avoid CMake inversion), symbol visibility (Rust staticlib exports too many symbols without a linker version script), panic/exception safety across the FFI boundary, and `pragma_query_t` transaction semantics (in-memory catalog can diverge from persistent catalog after a rollback). These are all known pitfalls with clear mitigations, not open research questions. The implementation sequence must treat C++ infrastructure as a prerequisite, validate it independently, and layer features on top.
+The build system changes are minimal: `cc = "1.2"` is already a build dependency, `duckdb.hpp` is already vendored at `duckdb_capi/`. The C++ shim is approximately 40-50 lines. All existing Rust code (catalog, DDL functions, query execution, zero-copy output) is unchanged. Both DDL interfaces (function-based and native SQL) coexist permanently -- parser hooks only fire for statements DuckDB's parser cannot handle.
 
 ---
 
 ## Key Findings
 
-### From STACK.md — Minimal, Well-Defined Additions
+### Recommended Stack
 
-The v0.2.0 stack change is surgical. **Exactly one new Cargo dependency:** `cc = "1.2"` in `[build-dependencies]`. All existing dependencies (`duckdb = "=1.4.4"`, `libduckdb-sys = "=1.4.4"`, `serde`, `serde_json`, `proptest`, `arbitrary`) are sufficient for all other features. Key findings:
+No new runtime dependencies are needed for v0.5.0. The `cc` crate and vendored `duckdb.hpp` are already in place from prior milestones.
 
-- **`cc` crate** (v1.2.45 current): Standard Rust ecosystem tool for C++ compilation via `build.rs`. Already used internally by `libduckdb-sys`. Build-time only — not in the compiled extension binary.
-- **`duckdb.hpp` vendoring**: The C++ shim needs DuckDB's internal C++ headers. These are NOT available in extension mode builds (only in bundled/test mode). Vendor `duckdb.hpp` at `duckdb_capi/duckdb.hpp` from the pinned v1.4.4 release. One file, ~6MB, committed to the repo.
-- **No `chrono`**: Time dimensions are SQL string codegen (`date_trunc('month', col)`) — Rust never does date arithmetic. `std::fmt` is sufficient.
-- **No `cxx` crate**: The Rust/C++ boundary is a thin `extern "C"` surface (~5 functions). `cxx` is overkill for this; hand-written `extern "C"` is standard.
-- **DuckDB `ParserExtension` API** is present in v1.4.4 (confirmed via GitHub issue #18485 and CIDR 2025 paper). Version pinning strategy is unchanged from v0.1.0.
+**Core technologies:**
+- **`cc` crate (1.2, build-dep):** Compiles `shim.cpp` against DuckDB amalgamation -- already present
+- **`duckdb.hpp` (vendored, v1.4.4):** Provides `ParserExtension`, `DBConfig`, `ExtensionLoader` C++ types -- already at `duckdb_capi/`
+- **`build.rs`:** Feature-gated C++ compilation under `CARGO_FEATURE_EXTENSION` -- already exists, needs symbol visibility update
+- **No new `[dependencies]`:** All Rust logic reuses existing crates (`duckdb`, `serde_json`, `strsim`)
 
-### From FEATURES.md — Four New Features, Clear Build Order
+### Expected Features
 
-v0.2.0 adds four features, all building on a common C++ shim prerequisite:
+**Must have (table stakes -- v0.5.0 spike):**
+- `CREATE SEMANTIC VIEW name (...)` via parser hook -- the entire point of this milestone
+- C++ shim entry point or helper -- architectural foundation for parser hook registration
+- Entry point conflict resolution (P2/P4) -- must be solved before anything else
+- Existing function-based DDL (`FROM create_semantic_view(...)`) continues working unchanged
 
-**Table Stakes (must have):**
+**Should have (same milestone if time permits):**
+- `CREATE OR REPLACE SEMANTIC VIEW` -- standard SQL DDL pattern, same parse hook
+- `DROP SEMANTIC VIEW [IF EXISTS]` -- symmetric with CREATE, same mechanism
+- `CREATE SEMANTIC VIEW IF NOT EXISTS` -- standard SQL guard
+- Semicolon normalization -- known DuckDB inconsistency (issue #18485)
 
-| Feature | Complexity | Key Constraint |
-|---------|-----------|----------------|
-| `CREATE SEMANTIC VIEW` DDL | High | Requires C++ shim + `ParserExtension` registration |
-| `DROP SEMANTIC VIEW` DDL | Low | Complement to CREATE; same parser hook |
-| Time dimensions with granularity coarsening | Medium | Pure Rust; no C++ needed |
-| `pragma_query_t` catalog persistence | High | Requires C++ shim; replaces sidecar file entirely |
-| `EXPLAIN` showing expanded SQL | Medium | Use `parser_override` to rewrite to existing `explain_semantic_view`; true EXPLAIN interception is not feasible via stable API |
+**Defer (post v0.5.0):**
+- `DESCRIBE SEMANTIC VIEW` / `SHOW SEMANTIC VIEWS` -- natural SQL syntax, lower priority
+- `parser_override` hook -- wrong hook type; `parse_function` (fallback) is correct
+- OperatorExtension / stash pattern -- unnecessary for DDL
+- Custom `ParserExtensionInfo` with Rust catalog pointer
+- Error location reporting (`error_location` field)
+- Native query syntax changes
 
-**Differentiators for v0.2.0:**
-- Typed output columns (BIGINT/DOUBLE/DATE instead of all-VARCHAR) — Rust-only, not shim-dependent, but deferred to keep scope focused
-- WEEK and QUARTER granularity — low-cost extension of time dimension enum
+### Architecture Approach
 
-**Anti-features (explicitly deferred):**
-- Community extension registry publication — deferred to v0.3.0 when DDL is stable and TPC-H demo exists
-- YAML definition format — SQL DDL only; YAML adds no value
-- Custom time spine table — `date_trunc` directly is sufficient
-- Fiscal calendar / Sunday-start weeks — ISO 8601 only in v0.2.0 (document the convention)
+The architecture adds a thin C++ layer (shim or helper function) for parser hook registration and FFI trampolines. All parsing logic, DDL execution, and catalog management remain in Rust. The `plan_function` uses Path A (direct `TableFunction` return), mapping parsed DDL to the existing `create_semantic_view` table function. The statement rewrite approach for the spike converts `CREATE SEMANTIC VIEW sales (tables := [...], ...)` into `FROM create_semantic_view('sales', tables := [...], ...)`, reusing 100% of existing DDL code without building a new parser.
 
-**Critical path:** C++ shim → `pragma_query_t` → `CREATE SEMANTIC VIEW` parser hook → time dimension DDL syntax → granularity expansion → EXPLAIN rewrite
+**Major components:**
+1. **`shim.cpp` (NEW or MODIFY, ~40-50 lines)** -- C++ entry point or helper function; parser extension registration; FFI trampolines calling Rust `sv_parse`/`sv_plan`
+2. **`src/parser.rs` (NEW, ~100-200 lines)** -- Rust-side `sv_parse` (prefix detection + statement rewrite to existing function call) and `sv_plan` (returns table function + parameters)
+3. **`build.rs` (MODIFY)** -- Update exported symbol visibility for new/changed entry point
+4. **`src/lib.rs` (MODIFY)** -- Add `sv_init_rust` FFI function (Option B) or add C++ helper call after existing init (Option A)
+5. **All existing components (UNCHANGED)** -- `catalog.rs`, `expand.rs`, `ddl/*`, `query/*`, `model.rs`
 
-**Recommended build order:**
-1. C++ shim infrastructure (build.rs + cc + duckdb.hpp + minimal shim.cpp compiles cleanly)
-2. `pragma_query_t` catalog persistence (replace sidecar)
-3. `CREATE SEMANTIC VIEW` parser hook (native DDL)
-4. Time dimension DDL syntax + granularity expansion (pure Rust)
-5. EXPLAIN `parser_override` rewrite
-6. Sidecar removal + integration test update
+### Critical Pitfalls
 
-### From ARCHITECTURE.md — Build Strategy and Component Map
+All 14 pitfalls from PITFALLS.md, organized by severity:
 
-The architecture decision is settled: **Cargo-primary with `cc` crate, not CMake**. Reasoning confirmed:
+**CRITICAL (blocks shipping if hit):**
 
-- Existing CI workflows, `just` task runner, and `cargo nextest` / `cargo-llvm-cov` tooling work unchanged
-- The C++ shim is ~80 lines of registration + forwarding; the `cc` crate handles cross-compilation automatically
-- CMake would require switching from `rust.Makefile` to `c_cpp.Makefile` and adding a `CMakeLists.txt` — disproportionate for a 50–100 line C++ file
+1. **P2: Dual entry point conflict** -- DuckDB calls exactly one entry based on footer ABI type. If footer says CPP but Rust stubs are not initialized, SEGFAULT on first `ffi::duckdb_*` call. **Avoid:** Resolve via Option A (keep C_STRUCT, call C++ helper) or Option B (CPP entry, bridge C API init). POC required.
 
-**New and modified files:**
+2. **P4: Rust function pointer table not initialized under CPP entry** -- The specific mechanism behind P2. `duckdb_rs_extension_api_init` populates `AtomicPtr` stubs; never called under CPP ABI path. **Avoid:** Same resolution as P2 -- this is the go/no-go blocker.
 
-| Component | Status | Purpose |
-|-----------|--------|---------|
-| `src/shim/shim.cpp` | NEW | C++ registration: parser extension + pragma function |
-| `src/shim/shim.h` | NEW | `extern "C"` boundary declarations |
-| `src/shim/ffi.rs` | NEW | Rust implementations of `extern "C"` functions called by shim |
-| `build.rs` | NEW | Compiles shim.cpp via `cc` crate (extension feature only) |
-| `duckdb_capi/duckdb.hpp` | NEW | Vendored DuckDB C++ SDK header (version-pinned) |
-| `Cargo.toml` | MODIFIED | Add `cc = "1.2"` to `[build-dependencies]` |
-| `Justfile` | MODIFIED | Add `just update-headers` recipe |
-| `src/model.rs` | MODIFIED | Add `TimeGrain` enum + `time_grain` field to `Dimension` |
-| `src/expand.rs` | MODIFIED | `date_trunc` wrapping in SQL builder |
-| `src/query/table_function.rs` | MODIFIED | Add `granularities` named parameter |
-| `src/catalog.rs` | MODIFIED | Remove sidecar logic once `pragma_query_t` is active |
-| `src/lib.rs` | MODIFIED | Call shim registration from `init_extension` |
+3. **P1: ODR violations (two copies of DuckDB statics)** -- Safe under `RTLD_LOCAL` isolation for data access through host references, but exceptions and `std::string` must NOT cross the boundary. **Avoid:** Keep C++ shim minimal, use `const char*` at FFI boundary, wrap all C++ in `try/catch`.
 
-**Key architectural constraints confirmed:**
-- `plan_function_t` executes inside DuckDB's normal execution path — same lock constraints as v0.1.0's `invoke`. Use `pragma_query_t` (returns SQL string; DuckDB executes it post-lock) for all catalog writes.
-- The C++ side holds only DuckDB C++ types and forwards all logic to Rust via `extern "C"`. No Rust→C++ catalog API calls.
-- `build.rs` guards shim compilation behind `CARGO_FEATURE_EXTENSION` — `cargo test` does not compile C++.
-- Backward compatibility: `#[serde(default)]` on `time_grain` field means existing definitions without it deserialize correctly.
+4. **P3: C++ ABI compiler mismatch** -- CPP ABI requires same compiler as host DuckDB. **Avoid:** Pin compiler in CI via `extension-ci-tools`; keep C++ surface to ~50 lines with only C types at boundaries.
 
-### From PITFALLS.md — Six Risk Areas with Clear Mitigations
-
-v0.2.0 introduces a qualitatively different risk profile from v0.1.0: the Rust+C++ FFI boundary is new territory. The pitfall research identified 15 concrete failure modes across 6 areas. Top pitfalls by impact:
-
-**CRITICAL (blocks shipping if hit late):**
-
-1. **P1.1 — Build system inversion**: Adding a C++ shim naively triggers a Cargo-primary → CMake-primary inversion that breaks footer injection. **Prevention:** Commit to `cc` crate / `build.rs` approach from the start; never introduce CMakeLists.txt.
-
-2. **P1.3 — Panic/exception safety across FFI**: Rust panics crossing into C++ are undefined behavior. DuckDB C++ exceptions crossing into Rust frames can abort the process. **Prevention:** Every `extern "C"` function wraps the Rust body in `std::panic::catch_unwind`; every C++ callback wraps Rust calls in `try`/`catch`.
-
-3. **P2.1 — Wrong parser hook chosen**: `CREATE` statements require `parser_override` (not the fallback `parse_function`), but `parser_override` fires for every query — the fast-exit path must be a case-insensitive prefix check returning "not handled" immediately for non-semantic-view statements.
-
-4. **P3.2 — Transaction rollback divergence**: `pragma_query_t` SQL executes in DuckDB's normal transaction pipeline, so rollbacks undo the INSERT — but the in-memory Rust catalog may already have been updated. **Prevention:** Do not update in-memory catalog inside the PRAGMA callback; rebuild from persistent table on next read.
+5. **P5: Footer ABI type must match entry strategy** -- Wrong footer = wrong entry point called = parser hooks silently not registered. **Avoid:** Update Makefile flag if using CPP; no change if using Option A.
 
 **MODERATE (correctness or platform-specific):**
 
-5. **P1.2 — Rust staticlib symbol bloat**: Linking Rust staticlib into C++ shared library exports hundreds of `_ZN3std...` symbols. **Prevention:** Linker version script (Linux) / exported symbols list (macOS) restricting exports to exactly the three DuckDB entry points.
+6. **P6: Symbol visibility macOS vs Linux** -- `build.rs` must export correct entry symbol name with correct underscore convention per platform. **Avoid:** Update export lists, verify with `nm -gU` post-build.
 
-6. **P3.3 — SQL injection in pragma string**: JSON with single quotes breaks the `INSERT ... VALUES (...)` SQL string. **Prevention:** `sql_escape_string()` function doubling all single quotes before embedding in SQL literal.
+7. **P7: Thread safety of parse_function** -- Called from any DuckDB parser thread. **Avoid:** Keep `sv_parse` stateless and reentrant; no shared mutable state.
 
-7. **P5.1 — ISO week Monday boundary**: `date_trunc('week', ...)` is Monday-start (ISO 8601). US Sunday-start weeks are not supported in v0.2.0. **Prevention:** Document the convention; reject requests for FISCAL_WEEK.
+8. **P8: Memory ownership across FFI** -- `CString` lifetimes, heap allocation in correct allocator. **Avoid:** `CString::into_raw` + explicit free; C++ trampoline copies to `std::string` immediately.
 
-8. **P5.2 — `date_trunc` on DATE returns TIMESTAMP**: Wrap with `CAST(... AS DATE)` when source column is `DATE` type to avoid `2024-01-01 00:00:00` vs `2024-01-01` string format mismatch in VARCHAR output.
+9. **P9: Semicolon inconsistency** -- Trailing `;` presence varies by interface. **Avoid:** Strip trailing semicolons before prefix matching.
 
-9. **P4.1 — No stable EXPLAIN interception hook**: DuckDB's stable extension API has no EXPLAIN hook. **Prevention:** Use `parser_override` to detect `EXPLAIN ... semantic_query(...)` and rewrite to `explain_semantic_view()`. Document that this shows expansion, not DuckDB's physical plan.
+10. **P10: Double parser hook registration on reload** -- Guard with `std::once_flag`. **Avoid:** Cheap insurance even if DuckDB prevents double-load.
 
-**MINOR (one-time setup, low blast radius):**
+11. **P11: Panic across FFI boundary** -- Undefined behavior under `extern "C"`. **Avoid:** Wrap all Rust FFI in `catch_unwind`; never `unwrap()` on untrusted input.
 
-10. **P6.1 — Memory ownership at FFI boundary**: Strings allocated by Rust must be freed by Rust; use `sv_free_str()` pattern. Never pass Rust-allocated `*mut c_char` to C++ for `free()`.
+**MINOR (one-time setup):**
+
+12. **P12: Stale cc crate build artifacts** -- Previously hit in this project. **Avoid:** Explicit `rerun-if-changed` directives in `build.rs`.
+
+13. **P13: Amalgamation header version mismatch** -- Must match pinned DuckDB v1.4.4 exactly. **Avoid:** Already vendored at correct version; CI version monitor covers updates.
+
+14. **P14: parse_function vs parser_override** -- Use `parse_function` (fallback), NOT `parser_override`. Zero overhead for normal SQL. **Avoid:** Register `parse_function` only; confirmed by prql pattern.
 
 ---
 
 ## Implications for Roadmap
 
-### Suggested Phase Structure
+Based on research, suggested phase structure:
 
-v0.2.0 naturally decomposes into 5 phases ordered by dependency and risk:
+### Phase 1: Entry Point POC (Go/No-Go)
 
-**Phase 1: C++ Shim Infrastructure**
-Rationale: All C++-dependent features are blocked until this is validated. Doing it first on its own (no parser logic yet) limits blast radius if build mechanics are wrong.
-- Add `cc = "1.2"` to `[build-dependencies]`
-- Download and vendor `duckdb.hpp` at `duckdb_capi/duckdb.hpp`
-- Write `build.rs` guarded by `CARGO_FEATURE_EXTENSION`
-- Write minimal `shim.cpp` that includes headers and compiles cleanly (no logic yet)
-- Add linker version script for symbol visibility
-- Establish `catch_unwind` / `try-catch` FFI boundary discipline in `src/shim/ffi.rs`
-- Verify extension loads in DuckDB after C++ addition: `LOAD` smoke test passes
-Pitfalls addressed: P1.1, P1.2, P1.3, P6.1
-Research flag: **None** — patterns are confirmed; this is implementation work
+**Rationale:** P2/P4 are the highest-risk unknowns with LOW confidence. Everything else depends on knowing which entry strategy works. This must be resolved before any other work begins.
+**Delivers:** A loadable extension that enters via the chosen strategy, registers a stub parser hook returning `DISPLAY_ORIGINAL_ERROR` for all queries, and successfully runs existing `semantic_view()` queries proving Rust FFI still works.
+**Addresses:** Entry point resolution, ABI footer (if needed)
+**Avoids:** P2 (dual entry conflict), P4 (null function pointers), P5 (wrong footer)
+**Approach:** Try Option A first (simpler -- keep C_STRUCT, call C++ helper from Rust). If blocked (e.g., `duckdb_database` to `DatabaseInstance*` cast is not feasible), try Option B (CPP entry + bridge C API init from `ExtensionLoader`).
 
-**Phase 2: Time Dimensions (Pure Rust)**
-Rationale: Independent of C++ shim; can proceed in parallel or immediately after Phase 1. Pure Rust, testable with `cargo test`. Delivers user-visible value before parser hook complexity.
-- Add `TimeGrain` enum to `src/model.rs` with `#[serde(default)]` backward compat
-- Add `date_trunc` wrapping in `build_sql()` for time dimension columns
-- Add `granularities` named parameter to `semantic_query` VTab
-- Validate: DATE source → CAST(date_trunc(...) AS DATE); TIMESTAMP source → TIMESTAMP output
-- Explicitly reject TIMESTAMPTZ columns at definition time
-- Document ISO week convention; add year-boundary edge case test
-- Extend proptest coverage for time dimension expansion paths
-Features delivered: TIME-1 through TIME-4 (day/week/month/quarter/year granularities)
-Pitfalls addressed: P5.1, P5.2, P5.3, P5.4
-Research flag: **None** — pure Rust SQL codegen; standard patterns
+### Phase 2: Build System Hardening
 
-**Phase 3: `pragma_query_t` Catalog Persistence**
-Rationale: Prerequisite for native DDL (Phase 4). Validates the persistence mechanism in isolation before adding parser complexity. Eliminates the sidecar file.
-- Implement `sv_make_define_sql` and `sv_make_drop_sql` in `src/shim/ffi.rs` (builds SQL INSERT/DELETE strings with single-quote escaping)
-- Implement `semantic_views_register_pragma` in `shim.cpp`
-- Test: `PRAGMA define_semantic_view_internal(...)` → INSERT executed → definition survives restart
-- Write rollback test: `BEGIN; PRAGMA ...; ROLLBACK;` → in-memory catalog reflects persistent table state
-- Remove sidecar logic from `catalog.rs` once validated
-Features delivered: `pragma_query_t` persistence replacing sidecar
-Pitfalls addressed: P3.1, P3.2, P3.3
-Research flag: **Moderate** — `pragma_query_t` + custom DDL (not just PRAGMA) integration path needs hands-on verification that `plan_function_t` can return SQL-for-execution rather than just a TableFunction. Validate against DuckDB 1.4.4 source during implementation.
+**Rationale:** Once the entry strategy is proven, formalize the build: symbol visibility for correct entry point, `rerun-if-changed` directives, CI verification of exported symbols and footer ABI type.
+**Delivers:** Clean reproducible build that compiles `shim.cpp`, exports correct symbols, stamps correct footer, passes `just test-all`.
+**Addresses:** Build infrastructure
+**Avoids:** P3 (compiler mismatch), P5 (footer), P6 (symbol visibility), P12 (stale artifacts), P13 (header version)
 
-**Phase 4: `CREATE SEMANTIC VIEW` Parser Hook**
-Rationale: The flagship v0.2.0 feature; highest implementation complexity. Built on validated shim (Phase 1) and persistence (Phase 3).
-- Implement `sv_parse_ddl` in Rust: parse DDL text into `SemanticViewDefinition` struct
-- Implement `semantic_views_register_parser` in `shim.cpp`: register `parser_override` with fast-exit path (case-insensitive `CREATE SEMANTIC VIEW` prefix check)
-- Implement `plan_function_t` to return table function that calls `sv_make_define_sql` and returns success message
-- Implement `FALLBACK_OVERRIDE` semantics: pass through all non-semantic-view statements without error
-- Support `CREATE OR REPLACE` and `IF NOT EXISTS` modifiers
-- Update SQLLogicTest files for native DDL syntax
-- Verify: function-based DDL (`define_semantic_view`) still works (backward compat)
-Features delivered: `CREATE SEMANTIC VIEW`, `DROP SEMANTIC VIEW`
-Pitfalls addressed: P2.1, P2.2, P2.3
-Research flag: **High** — parser hook integration for a CREATE statement (not a PRAGMA) is the most under-documented pattern in DuckDB extension development. Validate `parse_function_t` + `plan_function_t` signature expectations against DuckDB 1.4.4 before writing implementation estimates.
+### Phase 3: Parse Function (CREATE SEMANTIC VIEW)
 
-**Phase 5: EXPLAIN Rewrite + Integration Hardening**
-Rationale: Completes the v0.2.0 feature set. EXPLAIN interception via `parser_override` is a documentation-constrained feature (show expansion, not DuckDB plan). Integration hardening covers multi-platform CI and TPC-H demo.
-- Add `parser_override` detection for `EXPLAIN ... semantic_query(...)` pattern
-- Rewrite matching queries to `FROM explain_semantic_view(...)` — sugar over existing v0.1.0 VTab
-- Add two-stage check: prefix `EXPLAIN` + contains `semantic_query(` substring
-- Document clearly: output is expanded SQL, not DuckDB physical plan
-- Add negative tests: `EXPLAIN SELECT 1` unchanged after extension load
-- TPC-H demo notebook (real-world validation)
-- Community extension registry research and CI prep (formal publication deferred to v0.3.0)
-Features delivered: native-feeling EXPLAIN, TPC-H demo
-Pitfalls addressed: P4.1, P4.2
-Research flag: **Low** — EXPLAIN rewrite via parser_override is a documented pattern; no unknowns
+**Rationale:** With the shim proven and build stable, implement the actual parse hook. The statement rewrite approach keeps this phase focused on FFI mechanics and prefix matching, not SQL grammar design.
+**Delivers:** `CREATE SEMANTIC VIEW name (tables := [...], dimensions := [...], metrics := [...])` works end-to-end via rewrite to `FROM create_semantic_view(...)`.
+**Addresses:** Core DDL syntax (the milestone's primary deliverable)
+**Avoids:** P7 (thread safety -- stateless parse function), P8 (memory ownership -- CString pattern), P9 (semicolons -- normalize input), P11 (panic safety -- catch_unwind), P14 (use parse_function not parser_override)
 
-### Deferred to v0.3.0+
+### Phase 4: Extended DDL Surface + Tests
 
-- Typed output columns (BIGINT/DOUBLE/DATE instead of VARCHAR) — Rust-only but deferred to keep v0.2.0 scope focused
-- Community extension registry publication — requires stable native DDL + TPC-H demo
-- Fiscal calendar / Sunday-start week convention
-- QUARTER granularity (trivial to add; deferred with WEEK for consistency)
+**Rationale:** Once CREATE works, the same prefix-match + rewrite pattern extends mechanically to DROP, OR REPLACE, IF NOT EXISTS. Add sqllogictest coverage for all variants.
+**Delivers:** Full DDL surface via native SQL syntax. Both interfaces (function-based + native DDL) tested for interoperability. Guard against double registration (P10).
+**Addresses:** Remaining table stakes and differentiators
+**Avoids:** P10 (double registration -- add `std::once_flag` guard)
+
+### Phase Ordering Rationale
+
+- **Phase 1 before everything:** The entry point strategy is a go/no-go decision. If neither Option A nor Option B works, the milestone must be re-scoped.
+- **Phase 2 before 3:** Build system must be stable before writing parser logic. Stale artifact issues (P12) from prior milestones cost hours of debugging.
+- **Phase 3 before 4:** Statement rewrite for CREATE validates the entire pipeline (parse -> plan -> table function -> catalog). Extending to DROP/DESCRIBE is mechanical once this works.
+- **Phases 3 and 4 could merge** if Phase 1 resolves cleanly and the spike is straightforward.
+
+### Research Flags
+
+Phases likely needing deeper research during planning:
+- **Phase 1:** NEEDS RESEARCH -- `ExtensionLoader` API surface for extracting `duckdb_extension_info`/`duckdb_extension_access` (Option B). The `duckdb_database` to `DatabaseInstance*` cast (Option A). No Rust+C++ mixed DuckDB extension with parser hooks exists as prior art.
+
+Phases with standard patterns (skip research-phase):
+- **Phase 2:** Standard `cc` crate configuration and symbol visibility -- well-documented, partially implemented in this project already.
+- **Phase 3:** FFI trampoline pattern is standard Rustonomicon material. Statement rewrite is string manipulation. Parser hook registration follows prql pattern.
+- **Phase 4:** Mechanical extension of Phase 3 patterns to additional statement types. sqllogictest patterns established in the project.
 
 ---
 
@@ -208,49 +159,48 @@ Research flag: **Low** — EXPLAIN rewrite via parser_override is a documented p
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | One new dependency (`cc`), confirmed via crates.io + libduckdb-sys build output inspection. DuckDB ParserExtension API presence at v1.4.4 confirmed. |
-| Features | HIGH | Four features explicitly listed in v0.1.0 TECH-DEBT.md with root-cause analysis complete. Behavior contracts are clear. Grammar design for DDL requires design work but is not a research gap. |
-| Architecture | MEDIUM-HIGH | Build strategy (cc crate / build.rs) and Rust/C++ boundary design are confirmed. Specific C++ header include paths and `plan_function_t` return type constraints need hands-on validation at implementation time. |
-| Pitfalls | HIGH | 15 concrete failure modes with prevention strategies and phase assignments. FFI boundary pitfalls (P1.3, P6.1) are HIGH-confidence based on Rust reference and RFC 2945. Parser hook pitfalls (P2.x) are MEDIUM-confidence; confirmed in DuckDB source/issues but exact signatures need verification. |
+| Stack | HIGH | No new dependencies. `cc` crate and `duckdb.hpp` already in place. Parser hook API verified from v1.4.1 source. |
+| Features | HIGH | API surface verified verbatim from DuckDB source. Statement types, prefix patterns, and parse/plan function signatures well-defined. Path A (direct TableFunction return) confirmed from `bind_extension.cpp`. |
+| Architecture | HIGH for data flow, MEDIUM for entry point | Parse -> plan -> TableFunction -> catalog flow verified from source. Entry point bridge (C++ <-> Rust stub init) is uncharted -- no Rust+C++ mixed DuckDB extension exists. |
+| Pitfalls | HIGH for 12 of 14, LOW for P2/P4 | Entry point strategy (P2/P4) is the critical unknown requiring POC. All other pitfalls have well-documented, high-confidence mitigations. |
 
-**Overall:** MEDIUM-HIGH. The v0.2.0 plan is well-researched and well-bounded. The main uncertainty is not "what to build" but "exact C++ API surface at implementation time." This is expected for DuckDB extension work and is mitigated by the phased approach (validate C++ infrastructure before adding parser logic).
+**Overall confidence:** MEDIUM -- architecture and API are well-understood, but the entry point strategy (the foundation) has LOW confidence and requires a POC spike.
 
-### Gaps to Address During Planning
+### Gaps to Address
 
-1. **`plan_function_t` return type for SQL-executing DDL**: Does returning a table function from `plan_function_t` correctly support the `pragma_query_t` SQL-return pattern, or is a PRAGMA the only route to executing SQL post-lock? Validate against DuckDB 1.4.4 `parser_extension.hpp` before writing Phase 4 implementation plan.
-
-2. **DDL grammar design**: The exact `CREATE SEMANTIC VIEW` syntax (DIMENSIONS/METRICS/FILTERS keywords, JOIN declaration, TIME annotation) is not finalized. This is a design decision, not a research gap, but it must happen before Phase 4 implementation starts.
-
-3. **`function-based DDL` deprecation path**: Should `define_semantic_view` / `drop_semantic_view` functions be deprecated in v0.2.0 or kept as compatibility aliases? Decision affects test migration scope.
-
-4. **Symbol export verification CI step**: The linker version script approach (P1.2 mitigation) needs a CI step that runs `nm -D *.duckdb_extension` and asserts zero non-entry exported text symbols. Must be added before the first C++ shim build hits CI.
+- **`ExtensionLoader` C API handle access:** Does `ExtensionLoader` expose `GetExtensionInfo()` / `GetExtensionAccess()`? If not, Option B is blocked. Verify against DuckDB v1.4.4 source.
+- **`duckdb_database` to `DatabaseInstance*` cast:** For Option A, the C++ helper receives a C API handle and must extract the C++ reference. Internal layout of DuckDB's C API wrapper must be verified. Fragile across versions.
+- **`plan_function` TableFunction return for DDL:** Verified from `ParserExtensionPlanResult` header definition and `bind_extension.cpp` flow, but no DDL extension source code has been fully traced through this path. The duckpgq extension (CREATE PROPERTY GRAPH) is the closest precedent but was not source-verified.
+- **Windows build:** Not a primary target. `cc` crate handles MSVC but `duckdb.hpp` may need specific flags. Defer to post-spike.
 
 ---
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- `cc` crate — crates.io v1.2.45 + docs.rs — standard Rust C++ compilation (confirmed current)
-- Project `target/debug/build/libduckdb-sys-*/output` — confirmed `duckdb.hpp` in bundled mode, absent in extension mode (first-party)
-- DuckDB GitHub issue #18485 — confirmed `DBConfig::GetConfig + config.parser_extensions.push_back()` at DuckDB 1.4.x
-- `duckdb/pragma_function.hpp` (raw.githubusercontent.com) — confirmed `pragma_query_t` type signature
-- `duckdb_extension.h` v1.4.4 — confirmed parser hooks NOT in `duckdb_extension_access` struct
-- v0.1.0 TECH-DEBT.md — deferred requirements and root-cause analysis (first-party)
+- [DuckDB `parser_extension.hpp` (v1.4.1)](https://github.com/duckdb/duckdb/blob/v1.4.1/src/include/duckdb/parser/parser_extension.hpp) -- API types, function pointer typedefs, result types
+- [DuckDB `bind_extension.cpp` (v1.4.1)](https://github.com/duckdb/duckdb/blob/v1.4.1/src/planner/binder/statement/bind_extension.cpp) -- plan_function -> BindTableFunction flow
+- [DuckDB `parser.cpp` (main)](https://github.com/duckdb/duckdb/blob/main/src/parser/parser.cpp) -- fallback hook trigger flow, statement splitting
+- [prql DuckDB extension](https://github.com/ywelsch/duckdb-prql) -- parser extension registration pattern, stash pattern reference
+- [duckpgq extension](https://github.com/cwida/duckpgq-extension) -- DDL parser extension precedent (CREATE PROPERTY GRAPH)
+- [cc crate (crates.io)](https://crates.io/crates/cc) -- C++ compilation from build.rs
+- Project `_notes/parser-extension-investigation.md` -- prior art analysis
+- Project `build.rs`, `src/lib.rs` -- current entry point and symbol visibility
 
 ### Secondary (MEDIUM confidence)
-- CIDR 2025 paper (Mühleisen & Raasveldt) — "Runtime-Extensible Parsers" — confirms `parse_function_t` / `plan_function_t` as production API
-- DuckDB `parser_extension.hpp` (deepwiki summary) — `parse_function_t`, `plan_function_t`, `ParserExtensionPlanResult` structure
-- DuckDB FTS extension source analysis — confirmed `pragma_query_t` SQL-return pattern
-- Snowflake CREATE SEMANTIC VIEW docs — reference for DDL grammar design
-- dbt MetricFlow time dimensions — reference for granularity coarsening design
+- [DuckDB PR #3783](https://github.com/duckdb/duckdb/pull/3783) -- RTLD_LOCAL extension isolation, static linking per-extension
+- [DuckDB PR #12682](https://github.com/duckdb/duckdb/pull/12682) -- C API extensions, ABI types, entry point dispatch
+- [DuckDB issue #18485](https://github.com/duckdb/duckdb/issues/18485) -- semicolon inconsistency in parser extension input
+- [DuckDB extension-ci-tools](https://github.com/duckdb/extension-ci-tools/) -- footer stamping script, `--abi-type CPP` support
+- [RBAC Extension RFC](https://gist.github.com/dufferzafar/f12081d4f32e640966d984b33e7077e6) -- plan_function returning TableFunction for DDL
+- [DuckDB CIDR 2025 paper](https://duckdb.org/pdf/CIDR2025-muehleisen-raasveldt-extensible-parsers.pdf) -- parse_function vs parser_override semantics
+- [Rust FFI (Rustonomicon)](https://doc.rust-lang.org/nomicon/ffi.html) -- thread safety, memory ownership, panic safety
 
-### Tertiary (require implementation-time verification)
-- Exact `plan_function_t` return type for SQL-executing DDL (vs. PRAGMA-only path)
-- Specific `#include` paths within `duckdb.hpp` for `DBConfig` and `ParserExtension`
-- DuckDB community extension registry current CI requirements (for v0.3.0)
+### Tertiary (LOW confidence -- needs POC validation)
+- `ExtensionLoader` C API handle extraction -- architecturally sound but unverified against v1.4.4 source
+- `duckdb_database` to `DatabaseInstance*` cast -- inferred from C API wrapper patterns, fragile across versions
 
 ---
-
-*Research completed: 2026-03-01*
-*Milestone: v0.2.0 — Native DDL + Time Dimensions*
-*Ready for roadmap: yes*
+*Research completed: 2026-03-07*
+*Milestone: v0.5.0 -- Parser Extension Spike*
+*Ready for roadmap: yes (after Phase 1 POC validates entry point strategy)*
