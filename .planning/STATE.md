@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.5
-milestone_name: Parser Extension Spike
-status: completed
-stopped_at: v0.5.0 milestone archived
+milestone: v0.5.1
+milestone_name: DDL Polish
+status: defining_requirements
+stopped_at: null
 last_updated: "2026-03-08"
-last_activity: 2026-03-08 — v0.5.0 milestone completion and archival
+last_activity: 2026-03-08 — Milestone v0.5.1 started
 progress:
-  total_phases: 5
-  completed_phases: 5
-  total_plans: 8
-  completed_plans: 8
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -21,13 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-08)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Planning next milestone
+**Current focus:** Defining requirements for v0.5.1
 
 ## Current Position
 
-Milestone: v0.5.0 — Parser Extension Spike (SHIPPED 2026-03-08)
-Status: Milestone Complete — archived to `.planning/milestones/`
-Next: `/gsd:new-milestone` to start next version
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-03-08 — Milestone v0.5.1 started
 
 ## Performance Metrics
 
@@ -61,10 +62,10 @@ None.
 
 ### Blockers/Concerns
 
-None — all resolved.
+None.
 
 ## Session Continuity
 
 Last session: 2026-03-08
-Stopped at: v0.5.0 milestone archived
-Resume: `/gsd:new-milestone` for next version
+Stopped at: Defining v0.5.1 requirements
+Resume: Continue requirements definition → roadmap

@@ -40,11 +40,27 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Active
 
-- [ ] Community extension registry publication (`INSTALL semantic_views FROM community`)
-- [ ] Real-world TPC-H demo notebook
-- [ ] Extended DDL surface: `DROP SEMANTIC VIEW`, `CREATE OR REPLACE`, `IF NOT EXISTS`, `DESCRIBE`, `SHOW`
-- [ ] Error location reporting for malformed `CREATE SEMANTIC VIEW` statements
-- ~~WEEK and QUARTER time granularities~~ — removed in v0.4.0 (users write `date_trunc()` in dimension expr)
+- [ ] `DROP SEMANTIC VIEW [name]` native DDL
+- [ ] `CREATE OR REPLACE SEMANTIC VIEW` native DDL
+- [ ] `CREATE SEMANTIC VIEW IF NOT EXISTS` native DDL
+- [ ] `DESCRIBE SEMANTIC VIEW [name]` — shows dimensions, metrics, types
+- [ ] `SHOW SEMANTIC VIEWS` — lists all defined semantic views
+- [ ] Error location reporting: clause-level hints + character position + "did you mean" suggestions
+- [ ] README DDL syntax reference + worked examples (minimal, matching current style)
+
+**Deferred to future milestones:**
+- Community extension registry publication (`INSTALL semantic_views FROM community`)
+- Real-world TPC-H demo notebook
+- ~~WEEK and QUARTER time granularities~~ — removed in v0.4.0
+
+## Current Milestone: v0.5.1 DDL Polish
+
+**Goal:** Complete the DDL surface for semantic views — DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW — with quality error reporting and updated documentation.
+
+**Target features:**
+- Extended DDL: DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW
+- Error location reporting with clause hints, character position, and suggestions
+- README update with DDL reference and examples
 
 ## Shipped: v0.5.0 Parser Extension Spike (2026-03-08)
 
@@ -112,4 +128,4 @@ Native `CREATE SEMANTIC VIEW` DDL syntax achieved via DuckDB parser extension ho
 | Runtime type validation before vector reference | Defensive type check before `duckdb_vector_reference_vector` returns recoverable error instead of SIGABRT | ✓ Good — prevents Python crashes |
 
 ---
-*Last updated: 2026-03-08 after v0.5.0 milestone completion*
+*Last updated: 2026-03-08 after v0.5.1 milestone start*
