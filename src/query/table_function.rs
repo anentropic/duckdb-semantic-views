@@ -267,51 +267,107 @@ unsafe fn declare_output_type(
 // Execution SQL generation
 // ---------------------------------------------------------------------------
 
+/// Map a DuckDB type ID to its SQL cast name.
+///
+/// Returns `Some("TYPE")` for types that can be cast via SQL text, `None` for
+/// types whose precision/metadata cannot be expressed in a bare cast (DECIMAL,
+/// LIST) -- those are handled via logical type metadata at bind time.
+fn type_id_to_cast_sql(type_id: u32) -> Option<&'static str> {
+    const BOOLEAN: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN;
+    const TINYINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT;
+    const SMALLINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT;
+    const INTEGER: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER;
+    const BIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT;
+    const UTINYINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT;
+    const USMALLINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT;
+    const UINTEGER: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER;
+    const UBIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT;
+    const FLOAT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT;
+    const DOUBLE: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE;
+    const TIMESTAMP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP;
+    const DATE: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE;
+    const TIME: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIME;
+    const HUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT;
+    const UHUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT;
+    const VARCHAR: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR;
+    const TIMESTAMP_S: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S;
+    const TIMESTAMP_MS: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS;
+    const TIMESTAMP_NS: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS;
+    const TIMESTAMP_TZ: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ;
+
+    // Complex types that are declared as VARCHAR at bind time.
+    const STRUCT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT;
+    const MAP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP;
+    const INVALID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID;
+
+    // Note: DECIMAL is intentionally NOT cast via SQL text here -- DECIMAL
+    // precision/scale is declared from the logical type handle at bind time,
+    // and a bare "DECIMAL" cast would lose width/scale. Instead, DECIMAL
+    // columns pass through without a text cast; the bind-time declaration
+    // already ensures the correct output type.
+    const DECIMAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL;
+
+    match type_id {
+        BOOLEAN => Some("BOOLEAN"),
+        TINYINT => Some("TINYINT"),
+        SMALLINT => Some("SMALLINT"),
+        INTEGER => Some("INTEGER"),
+        BIGINT | HUGEINT => Some("BIGINT"),
+        UTINYINT => Some("UTINYINT"),
+        USMALLINT => Some("USMALLINT"),
+        UINTEGER => Some("UINTEGER"),
+        UBIGINT | UHUGEINT => Some("UBIGINT"),
+        FLOAT => Some("FLOAT"),
+        DOUBLE => Some("DOUBLE"),
+        DATE => Some("DATE"),
+        TIME => Some("TIME"),
+        TIMESTAMP => Some("TIMESTAMP"),
+        TIMESTAMP_S => Some("TIMESTAMP_S"),
+        TIMESTAMP_MS => Some("TIMESTAMP_MS"),
+        TIMESTAMP_NS => Some("TIMESTAMP_NS"),
+        TIMESTAMP_TZ => Some("TIMESTAMPTZ"),
+        VARCHAR => Some("VARCHAR"),
+        STRUCT | MAP | INVALID => Some("VARCHAR"),
+        // DECIMAL and LIST columns cannot be cast via bare SQL type name --
+        // DECIMAL requires precision/scale (bare "DECIMAL" defaults to (18,3)
+        // which changes the value), LIST requires child type. These types are
+        // handled via logical type metadata at bind time, so pass through
+        // unmodified in the execution SQL wrapper.
+        DECIMAL => None,
+        // Unknown types: pass through rather than risk a lossy VARCHAR cast.
+        // The runtime type check in func() will catch any real mismatch.
+        _ => None,
+    }
+}
+
 /// Build the SQL used at execution time, wrapping the expanded SQL with explicit
-/// type casts for columns whose runtime type may differ from the bind declaration.
+/// type casts for EVERY output column.
 ///
-/// This handles two known mismatches:
-/// 1. HUGEINT→BIGINT / UHUGEINT→UBIGINT: DuckDB's optimizer may change `sum()`
-///    return types between LIMIT-0 planning and actual execution. The cast ensures
-///    the result always matches the bind-declared type.
-/// 2. STRUCT/MAP→VARCHAR: These complex types are declared as VARCHAR at bind time.
-///    The cast produces a string representation at runtime.
+/// This ensures that runtime column types always match the bind-time schema
+/// declaration, preventing type mismatches in `duckdb_vector_reference_vector`.
+/// DuckDB optimizes away no-op casts (e.g., `col::BIGINT` when `col` is already
+/// BIGINT), so the wrapper has negligible performance overhead.
 ///
-/// For all other types, columns pass through unmodified. If no columns need casting,
-/// the original expanded SQL is returned as-is (no wrapper overhead).
+/// Key type mappings:
+/// - HUGEINT/UHUGEINT → BIGINT/UBIGINT (optimizer substitution)
+/// - STRUCT/MAP/INVALID → VARCHAR (complex types declared as VARCHAR at bind)
+/// - All scalar types → explicit cast matching bind declaration
 fn build_execution_sql(
     expanded_sql: &str,
     column_names: &[String],
     column_type_ids: &[u32],
 ) -> String {
-    const BIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT;
-    const UBIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT;
-    const STRUCT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT;
-    const MAP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP;
-    const INVALID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID;
-
-    let needs_wrapping = column_type_ids
-        .iter()
-        .any(|&t| matches!(t, BIGINT | UBIGINT | STRUCT | MAP | INVALID));
-
-    if !needs_wrapping {
+    // If there are no columns, return the original SQL (edge case).
+    if column_names.is_empty() {
         return expanded_sql.to_string();
     }
 
     let clauses: Vec<String> = column_names
         .iter()
         .zip(column_type_ids.iter())
-        .map(|(name, &tid)| {
-            let cast_type = match tid {
-                BIGINT => Some("BIGINT"),
-                UBIGINT => Some("UBIGINT"),
-                STRUCT | MAP | INVALID => Some("VARCHAR"),
-                _ => None,
-            };
-            match cast_type {
-                Some(ty) => format!("\"{name}\"::{ty} AS \"{name}\""),
-                None => format!("\"{name}\""),
-            }
+        .map(|(name, &tid)| match type_id_to_cast_sql(tid) {
+            Some(cast_type) => format!("\"{name}\"::{cast_type} AS \"{name}\""),
+            None => format!("\"{name}\""),
         })
         .collect();
 
@@ -587,6 +643,11 @@ impl VTab for SemanticViewVTab {
         // Zero-copy transfer: reference each source vector into the output chunk.
         // After duckdb_vector_reference_vector, both vectors share ownership of the
         // underlying data buffer, so the source chunk can be safely destroyed.
+        //
+        // SAFETY: Before referencing, we validate that source and destination vector
+        // types match. A mismatch would trigger a DuckDB internal assertion
+        // ("Vector::Reference used on vector of different type") which is a hard
+        // crash (SIGABRT). The runtime check converts this to a recoverable error.
         let out_ptr = output.get_ptr();
         let n_cols = streaming.col_count.min(bind_data.column_names.len());
         for col_idx in 0..n_cols {
@@ -594,6 +655,27 @@ impl VTab for SemanticViewVTab {
                 unsafe { ffi::duckdb_data_chunk_get_vector(src_chunk, col_idx as ffi::idx_t) };
             let dst_vec =
                 unsafe { ffi::duckdb_data_chunk_get_vector(out_ptr, col_idx as ffi::idx_t) };
+
+            // Runtime type validation: compare source and destination vector types.
+            let src_lt = LogicalTypeOwned(unsafe { ffi::duckdb_vector_get_column_type(src_vec) });
+            let dst_lt = LogicalTypeOwned(unsafe { ffi::duckdb_vector_get_column_type(dst_vec) });
+            let src_tid = unsafe { ffi::duckdb_get_type_id(src_lt.0) } as u32;
+            let dst_tid = unsafe { ffi::duckdb_get_type_id(dst_lt.0) } as u32;
+
+            if src_tid != dst_tid {
+                let col_name = bind_data
+                    .column_names
+                    .get(col_idx)
+                    .map_or("?", |n| n.as_str());
+                unsafe { ffi::duckdb_destroy_data_chunk(&mut { src_chunk }) };
+                return Err(Box::new(QueryError::TypeMismatch {
+                    column_index: col_idx,
+                    column_name: col_name.to_string(),
+                    source_type_id: src_tid,
+                    dest_type_id: dst_tid,
+                }));
+            }
+
             unsafe { ffi::duckdb_vector_reference_vector(dst_vec, src_vec) };
         }
         output.set_len(row_count);

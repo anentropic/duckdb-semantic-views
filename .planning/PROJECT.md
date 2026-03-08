@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A DuckDB extension written in Rust that implements semantic views — a declarative layer for defining measures, dimensions, and relationships directly in DuckDB. Users register semantic views via `create_semantic_view()` with typed STRUCT/LIST parameters (Snowflake-aligned syntax), then query them with `FROM semantic_view('view', dimensions := [...], metrics := [...])`. The extension expands semantic view references into concrete SQL (with GROUP BY, JOINs, typed output columns, and filters) and hands the result to DuckDB for execution.
+A DuckDB extension written in Rust that implements semantic views — a declarative layer for defining measures, dimensions, and relationships directly in DuckDB. Users register semantic views via native `CREATE SEMANTIC VIEW` DDL syntax or `create_semantic_view()` function with typed STRUCT/LIST parameters (Snowflake-aligned syntax), then query them with `FROM semantic_view('view', dimensions := [...], metrics := [...])`. The extension expands semantic view references into concrete SQL (with GROUP BY, JOINs, typed output columns, and filters) and hands the result to DuckDB for execution.
 
 The project targets open source release via the DuckDB community extension registry, filling a gap that exists in the ecosystem: Snowflake, Databricks, and Cube.dev all have semantic layers, but DuckDB has none.
 
@@ -34,24 +34,21 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - ✓ Removed time_dimensions and granularities; time truncation expressed via dimension expr directly — v0.4.0
 - ✓ 36 property-based tests for typed output pipeline covering all scalar/composite types — v0.2.0
 - ✓ DuckLake integration tests with CI job and DuckDB version monitor — v0.2.0
+- ✓ Native `CREATE SEMANTIC VIEW` DDL syntax via parser extension hooks — v0.5.0
+- ✓ C++ shim with vendored DuckDB amalgamation for parser hook registration — v0.5.0
+- ✓ Runtime type validation + defensive SQL wrapping for Python crash prevention — v0.5.0
 
 ### Active
 
-- [ ] Native `CREATE SEMANTIC VIEW` DDL syntax — parser extension spike (v0.5.0)
 - [ ] Community extension registry publication (`INSTALL semantic_views FROM community`)
 - [ ] Real-world TPC-H demo notebook
+- [ ] Extended DDL surface: `DROP SEMANTIC VIEW`, `CREATE OR REPLACE`, `IF NOT EXISTS`, `DESCRIBE`, `SHOW`
+- [ ] Error location reporting for malformed `CREATE SEMANTIC VIEW` statements
 - ~~WEEK and QUARTER time granularities~~ — removed in v0.4.0 (users write `date_trunc()` in dimension expr)
 
-## Current Milestone: v0.5.0 Parser Extension Spike
+## Shipped: v0.5.0 Parser Extension Spike (2026-03-08)
 
-**Goal:** Prove that a C++ shim with DuckDB parser hooks can coexist with the existing Rust extension code — validating the path to native `CREATE SEMANTIC VIEW` syntax.
-
-**Target features:**
-- C++ shim compiled via `cc` crate with DuckDB amalgamation, exporting `semantic_views_duckdb_cpp_init`
-- Parser fallback hook (`parse_function`) registered and called by DuckDB for unrecognized `CREATE SEMANTIC VIEW` statements
-- Rust receives the statement text via FFI and returns a valid `ExtensionStatement`
-- ABI switch from `C_STRUCT` to `CPP` footer
-- Existing table function / scalar function registration continues to work
+Native `CREATE SEMANTIC VIEW` DDL syntax achieved via DuckDB parser extension hooks. C++ shim compiled via `cc` crate against vendored DuckDB amalgamation. Parser fallback hook detects `CREATE SEMANTIC VIEW` statements and rewrites them to function-based DDL. Both DDL interfaces coexist. 172 tests green.
 
 ### Out of Scope
 
@@ -64,15 +61,15 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - BI tool HTTP API — not a DuckDB extension concern; Cube.dev handles this use case
 - Column-level security — beyond row-level filter scope; DuckDB handles column access
 - Fiscal calendar / Sunday-start weeks — ISO 8601 only for now
-- Native `CREATE SEMANTIC VIEW` parser hook via dynamic C++ symbol resolution — impossible (`-fvisibility=hidden`), but static linking approach viable (see `_notes/parser-extension-investigation.md`)
+- Native `CREATE SEMANTIC VIEW` via dynamic C++ symbol resolution — impossible (`-fvisibility=hidden`); solved via static linking in v0.5.0
 
 ## Context
 
-**Shipped v0.4.0** — breaking change: removed time_dimensions/granularities, simplified to 4-param DDL + 2-param query.
-**Tech stack:** Rust, duckdb-rs 1.4.4, serde_json, strsim, proptest.
-**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern).
-**Tests:** 136 total — Rust unit tests, property-based tests (proptest), sqllogictest integration tests, DuckLake CI tests.
-**Known limitations:** See TECH-DEBT.md at repo root for accepted decisions and deferred items.
+**Shipped v0.5.0** — native `CREATE SEMANTIC VIEW` DDL syntax via parser extension hooks. Both native DDL and function-based DDL coexist.
+**Tech stack:** Rust + C++ shim (vendored DuckDB amalgamation via cc crate), duckdb-rs 1.4.4, serde_json, strsim, proptest.
+**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern). Parser hook via C++ shim: `parse_function` fallback detects `CREATE SEMANTIC VIEW`, Rust rewrites to function-based DDL, C++ `plan_function` executes via dedicated DDL connection.
+**Tests:** 172 total — Rust unit tests, property-based tests (proptest), sqllogictest integration tests, DuckLake CI tests, Python vtab crash tests.
+**Known limitations:** See TECH-DEBT.md at repo root for 18 accepted decisions and deferred items (4 new in v0.5.0).
 
 **Design research:** A detailed design doc lives in `_notes/semantic-views-duckdb-design-doc.md`. It covers prior art (Cube.dev internals, Snowflake semantic views, Databricks metric views), the two-phase architecture (expansion → pre-aggregation selection), and why `egg`/e-graph rewriting is not needed for this approach.
 
@@ -83,7 +80,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ## Constraints
 
-- **Language**: Rust — pure Rust extension, no C++ shim needed (parser hooks proven impossible via Python DuckDB `-fvisibility=hidden`)
+- **Language**: Rust + C++ shim — parser hooks require C++ (static-linked DuckDB amalgamation bypasses `-fvisibility=hidden`)
 - **Target**: DuckDB extension — must integrate with DuckDB's extension loading mechanism
 - **Correctness over performance**: Expansion must produce correct results; DuckDB handles optimisation
 - **Python DuckDB compatibility**: All extension entry points must use C API function pointers only — C++ symbols are hidden
@@ -108,7 +105,11 @@ A DuckDB user can define a semantic view once and query it with any combination 
 | Zero-copy vector reference for typed output | `duckdb_vector_reference_vector` streams result chunks directly into output; type mismatches handled by `build_execution_sql` casts. Replaced binary-read dispatch post-v0.2.0 (-600 LOC). | ✓ Good — correct types, zero overhead, validated by PBTs + vector_reference_test |
 | LIMIT 0 type inference at define time | Query source tables with LIMIT 0 to infer column types without reading data | ✓ Good — zero-cost type discovery |
 
-| Parser extension via static-linked C++ shim | Dynamic C++ symbol resolution impossible; static linking against amalgamation bypasses `-fvisibility=hidden` (validated by prql/duckpgq existence proofs) | — Pending |
+| Parser extension via static-linked C++ shim | Dynamic C++ symbol resolution impossible; static linking against amalgamation bypasses `-fvisibility=hidden` (validated by prql/duckpgq existence proofs) | ✓ Good — v0.5.0 shipped with C_STRUCT_UNSTABLE ABI |
+| Statement rewriting for DDL | Rewrite `CREATE SEMANTIC VIEW` to `create_semantic_view()` function call instead of custom parser grammar | ✓ Good — simpler than custom grammar, full backward compatibility |
+| DDL connection isolation | Separate connection for DDL execution from parser hook path to avoid lock conflicts | ✓ Good — same pattern as semantic_query |
+| DuckDB amalgamation compilation | Full DuckDB compiled into extension binary (~20MB) for parser hook symbol access | ⚠️ Revisit — binary size concern; investigate selective linking in future |
+| Runtime type validation before vector reference | Defensive type check before `duckdb_vector_reference_vector` returns recoverable error instead of SIGABRT | ✓ Good — prevents Python crashes |
 
 ---
-*Last updated: 2026-03-07 after v0.5.0 milestone start*
+*Last updated: 2026-03-08 after v0.5.0 milestone completion*

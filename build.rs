@@ -1,24 +1,61 @@
 // build.rs
-// Cargo build script — restricts exported symbols when building the loadable extension.
+// Cargo build script — compiles C++ shim and restricts exported symbols when building the
+// loadable extension.
 //
-// Design: Only the `extension` feature triggers symbol visibility configuration. During
-// `cargo test` (default/bundled feature), this script exits immediately.
+// Design: Only the `extension` feature triggers C++ compilation and symbol visibility
+// configuration. During `cargo test` (default/bundled feature), this script exits immediately.
 //
-// Symbol visibility: restricts the exported symbols of the cdylib to the Rust entry
-// point on Linux and macOS. Without this, Rust stdlib symbols leak into the extension
-// binary. Note: semantic_views_version is appended by the CI post-build script after
-// compilation; it is NOT compiled into the binary and must not appear in the symbol list.
+// C++ compilation: The cc crate compiles shim.cpp against the vendored DuckDB amalgamation
+// header (cpp/include/duckdb.hpp). This produces a static library that gets linked into the
+// cdylib extension binary.
+//
+// Symbol visibility: restricts the exported symbols of the cdylib to the C_STRUCT entry
+// point (semantic_views_init_c_api) on Linux and macOS. Without this, Rust stdlib symbols
+// leak into the extension binary.
+// Note: semantic_views_version is appended by the CI post-build script after compilation;
+// it is NOT compiled into the binary and must not appear in the symbol list.
 
 fn main() {
-    // Only configure symbol visibility when building the loadable extension binary.
-    // CARGO_FEATURE_EXTENSION is set by Cargo when `--features extension` is passed.
-    // During `cargo test` (uses default/bundled feature), this block is skipped.
+    // Only configure C++ compilation and symbol visibility when building the loadable
+    // extension binary. CARGO_FEATURE_EXTENSION is set by Cargo when `--features extension`
+    // is passed. During `cargo test` (uses default/bundled feature), this block is skipped.
     if std::env::var("CARGO_FEATURE_EXTENSION").is_err() {
         return;
     }
 
-    // Symbol visibility: restrict the cdylib's exported symbols to the DuckDB entry
-    // points only. Without this, Rust stdlib symbols leak into the extension binary.
+    // Compile the DuckDB amalgamation source + C++ shim.
+    // duckdb.cpp provides all DuckDB C++ symbol definitions (constructors, RTTI,
+    // vtables) so the shim can use ParserExtension, TableFunction, etc. without
+    // relying on symbol export from the host process (Python DuckDB compiles with
+    // -fvisibility=hidden). Symbol visibility in the cdylib is restricted below
+    // so these definitions stay internal to the extension binary.
+    //
+    // First build: ~2-5 min (duckdb.cpp is ~300K lines). Cached by cc crate after.
+    //
+    // The cc crate is an optional build-dependency gated on the `extension` feature.
+    #[cfg(feature = "extension")]
+    {
+        // Ensure cargo re-runs this script when the C++ shim changes.
+        // The cc crate should emit rerun-if-changed automatically, but adding
+        // explicit directives ensures changes to shim.cpp always trigger rebuilds.
+        println!("cargo:rerun-if-changed=cpp/src/shim.cpp");
+        println!("cargo:rerun-if-changed=cpp/include/duckdb.hpp");
+
+        cc::Build::new()
+            .cpp(true)
+            .std("c++17")
+            .include("cpp/include")
+            .file("cpp/include/duckdb.cpp")
+            .file("cpp/src/shim.cpp")
+            .warnings(false) // Suppress warnings from DuckDB amalgamation
+            .compile("semantic_views_shim");
+    }
+
+    // Symbol visibility: restrict the cdylib's exported symbols to the DuckDB CPP
+    // entry point only. Without this, Rust stdlib symbols leak into the extension binary.
+    //
+    // Exports: semantic_views_init_c_api (Rust entry point, C_STRUCT ABI)
+    //
     // Windows: __declspec(dllexport) on the #[no_mangle] entry point handles visibility.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let out_dir = std::env::var("OUT_DIR").unwrap();
@@ -37,7 +74,7 @@ fn main() {
             println!("cargo:rustc-link-arg=-Wl,--dynamic-list={dynlist_path}");
         }
         "macos" => {
-            // Exported symbols list: only the Rust entry point is externally visible.
+            // Exported symbols list: only the entry point is externally visible.
             // macOS uses underscore-prefixed names in the exported symbols file.
             // Note: semantic_views_version is appended by the CI post-build script
             // (extension-ci-tools); it does NOT exist in the compiled binary and must

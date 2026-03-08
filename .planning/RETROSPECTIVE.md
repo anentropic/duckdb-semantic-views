@@ -2,6 +2,52 @@
 
 *A living document updated after each milestone. Lessons feed forward into future planning.*
 
+## Milestone: v0.5.0 — Parser Extension Spike
+
+**Shipped:** 2026-03-08
+**Phases:** 5 | **Plans:** 8 | **Commits:** 45
+
+### What Was Built
+- C++ shim with vendored DuckDB amalgamation compiled via `cc` crate for parser hook access
+- Parser fallback hook (`parse_function`) detecting `CREATE SEMANTIC VIEW` via Rust FFI trampoline
+- Statement rewriting: native DDL rewritten to function-based DDL for execution
+- Dedicated DDL connection for parser hook execution path (avoids lock conflicts)
+- Runtime type validation before `duckdb_vector_reference_vector` (prevents Python crashes)
+- Registry-ready binary with C_STRUCT_UNSTABLE ABI, 172 tests green
+
+### What Worked
+- Go/no-go phase (Phase 15) as first phase — resolved the highest-risk question before investing in parser work
+- Statement rewriting approach — dramatically simpler than building a custom parser grammar
+- Phase 17.1 decimal insertion for urgent Python crash investigation — clean disruption handling
+- Phase 18 branch integration via cherry-pick — zero conflicts, clean merge of parallel work streams
+- Milestone audit before completion — caught the Phase 15 VERIFICATION.md gap and REQUIREMENTS.md checkbox drift
+
+### What Was Inefficient
+- Phase 15 never produced a VERIFICATION.md — downstream phases covered the requirements, but the documentation gap persisted until audit
+- REQUIREMENTS.md checkboxes drifted — 11 requirements were satisfied but showed `[ ]` until a bulk audit update
+- Nyquist validation files created but never marked compliant — process gap carried forward from v0.2.0
+
+### Patterns Established
+- Static-linked amalgamation for parser hook access (bypasses `-fvisibility=hidden`)
+- C_STRUCT entry + C++ helper function pattern (not CPP entry) for mixed Rust+C++ extensions
+- Statement rewriting as parser hook strategy (simpler than custom grammar)
+- Dedicated DDL connection from parser hook path (same pattern as semantic_query)
+- `catch_unwind` at every FFI boundary for panic safety
+
+### Key Lessons
+1. Static linking against DuckDB amalgamation solves the `-fvisibility=hidden` problem — dynamic symbol resolution is impossible but static linking bypasses it entirely
+2. Statement rewriting is a viable and simpler alternative to custom parser grammar — the parser hook only needs to detect the prefix, not parse the full statement
+3. Phase verification documentation should be produced at phase completion, not deferred — the Phase 15 gap required retroactive closure
+4. Python client exercises different code paths than CLI/sqllogictest — the vtab crash investigation (Phase 17.1) found defensive gaps not caught by Rust tests
+5. Amalgamation compilation adds ~20MB to binary — acceptable for a spike, but selective linking should be explored for production
+
+### Cost Observations
+- 45 commits in 2 days
+- 8 plans averaging ~7 min each (~56 min total execution)
+- Notable: Phase 17.1 (Python crash investigation) was the only unplanned insertion — all other phases executed as roadmapped
+
+---
+
 ## Milestone: v1.0 — MVP
 
 **Shipped:** 2026-02-28
@@ -142,6 +188,8 @@
 | v1.0 | 99 | 7 | Initial release — established all patterns |
 | v0.2.0 | 125 | 8 | Architecture pivot (parser hook → scalar DDL), typed output, PBTs |
 | v0.3.0 | 1 | — | Zero-copy refactor — replaced binary-read dispatch (-600 LOC) |
+| v0.4.0 | — | — | Breaking simplification — removed time_dimensions/granularities |
+| v0.5.0 | 45 | 5 | Parser extension spike — native DDL via C++ shim + statement rewriting |
 
 ### Cumulative Quality
 
@@ -150,6 +198,7 @@
 | v1.0 | ~30 | 4 properties (256 cases each) | 3 targets | 2 (SQLLogicTest + DuckLake) |
 | v0.2.0 | 136 | 40 properties (256+ cases each) | 3 targets | 3 (SQLLogicTest + DuckLake CI + DuckLake local) |
 | v0.3.0 | 136+ | 40 properties | 3 targets | 3 + vector_reference_test |
+| v0.5.0 | 172 | 40 properties | 3 targets | 4 (SQLLogicTest + DuckLake CI + vector_reference + vtab_crash) |
 
 ### Top Lessons (Verified Across Milestones)
 
@@ -157,3 +206,4 @@
 2. The bundled/extension feature split is the foundational pattern for testable DuckDB Rust extensions
 3. Property-based tests catch bugs that unit tests miss — especially for type dispatch and SQL generation
 4. Keep traceability/progress tables updated during execution, not at milestone close
+5. Static linking against DuckDB amalgamation is the path for C++ features in Python-compatible extensions — `-fvisibility=hidden` blocks all dynamic approaches

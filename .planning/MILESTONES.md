@@ -1,5 +1,30 @@
 # Milestones
 
+## v0.5.0 Parser Extension Spike (Shipped: 2026-03-08)
+
+**Phases completed:** 5 phases (15-18, including 17.1), 8 plans
+**Source changes:** 14 files, +1,769 / -112 lines
+**Commits:** 45
+**Timeline:** 2 days (2026-03-07 → 2026-03-08)
+
+**Delivered:** Native `CREATE SEMANTIC VIEW` DDL syntax via DuckDB parser extension hooks. C++ shim compiled via `cc` crate against vendored DuckDB amalgamation, with Rust FFI trampoline for statement detection and rewriting. Extension preserves full backward compatibility with function-based DDL.
+
+**Key accomplishments:**
+1. Vendored DuckDB amalgamation + cc crate C++ build pipeline for parser hook compilation
+2. C_STRUCT entry point + C++ helper for parser hook registration (Option A — CPP entry rejected due to `-fvisibility=hidden`)
+3. Rust FFI parse function with `catch_unwind` panic safety and C++ trampoline for `CREATE SEMANTIC VIEW` detection
+4. Native DDL execution via statement rewriting to function-based DDL with dedicated DDL connection
+5. Runtime type validation + defensive SQL wrapping preventing Python client crashes
+6. Registry-ready binary verified: C_STRUCT_UNSTABLE ABI, 172 tests green, no CMake dependency
+
+**Requirements:** 18/18 functionally satisfied (5 had verification documentation gap, resolved by downstream phases)
+
+**Known Gaps:**
+- Phase 15 VERIFICATION.md was retroactively created (gaps confirmed resolved by Phase 16-18 work)
+- Nyquist compliance: all 5 phases have VALIDATION.md but none formally marked `nyquist_compliant: true`
+
+---
+
 ## v0.4.0 Simplified Dimensions (Shipped: 2026-03-03)
 
 **Delivered:** Breaking change — removed `time_dimensions` DDL parameter and `granularities` query parameter. Time truncation is now expressed via the dimension `expr` directly (e.g., `date_trunc('month', created_at)`). Simplified DDL from 6 to 4 named params (`tables`, `relationships`, `dimensions`, `metrics`) and query function from 3 to 2 named params (`dimensions`, `metrics`). Removed `dim_type`, `granularity` from `Dimension` struct and `granularity_overrides` from `QueryRequest`.

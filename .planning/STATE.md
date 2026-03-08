@@ -1,37 +1,33 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.1
-milestone_name: milestone
-status: planning
-stopped_at: Phase 15 context gathered
-last_updated: "2026-03-07T14:14:31.048Z"
-last_activity: 2026-03-07 — Roadmap created for v0.5.0 (Phases 15-18)
+milestone: v0.5
+milestone_name: Parser Extension Spike
+status: completed
+stopped_at: v0.5.0 milestone archived
+last_updated: "2026-03-08"
+last_activity: 2026-03-08 — v0.5.0 milestone completion and archival
 progress:
-  total_phases: 4
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  total_phases: 5
+  completed_phases: 5
+  total_plans: 8
+  completed_plans: 8
+  percent: 100
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-03-07)
+See: .planning/PROJECT.md (updated 2026-03-08)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 15 - Entry Point POC (go/no-go for v0.5.0)
+**Current focus:** Planning next milestone
 
 ## Current Position
 
-Milestone: v0.5.0 — Parser Extension Spike
-Phase: 15 of 18 (Entry Point POC)
-Plan: 0 of TBD in current phase
-Status: Ready to plan
-Last activity: 2026-03-07 — Roadmap created for v0.5.0 (Phases 15-18)
-
-Progress: [░░░░░░░░░░] 0%
+Milestone: v0.5.0 — Parser Extension Spike (SHIPPED 2026-03-08)
+Status: Milestone Complete — archived to `.planning/milestones/`
+Next: `/gsd:new-milestone` to start next version
 
 ## Performance Metrics
 
@@ -45,10 +41,10 @@ Progress: [░░░░░░░░░░] 0%
 - Commits: 125
 - Timeline: 3 days (2026-02-28 -> 2026-03-02)
 
-**v0.5.0:**
-- Total plans completed: 0
-- Average duration: -
-- Total execution time: -
+**Velocity (v0.5.0):**
+- Total plans completed: 8
+- Commits: 45
+- Timeline: 2 days (2026-03-07 -> 2026-03-08)
 
 ## Accumulated Context
 
@@ -57,11 +53,7 @@ Progress: [░░░░░░░░░░] 0%
 Decisions are logged in PROJECT.md Key Decisions table.
 All v0.1.0 decisions archived in milestones/v1.0-ROADMAP.md.
 All v0.2.0 decisions archived in milestones/v0.2-ROADMAP.md.
-- [Phase quick-12]: Remove time_dimensions and granularities -- users write date_trunc() in dimension expr
-- [Phase quick-13]: Removed C++ shim entirely -- was no-op since v0.2.0 Phase 11; extension is now pure Rust
-- [v0.5.0 start]: Parser extension via static-linked C++ shim viable -- dynamic symbol resolution is the blocker, not the mechanism itself
-- [v0.5.0 roadmap]: Entry point POC is go/no-go blocker -- must resolve before parser work begins
-- [v0.5.0 roadmap]: Statement rewrite approach (not custom parser) for the spike
+All v0.5.0 decisions archived in milestones/v0.5-ROADMAP.md.
 
 ### Pending Todos
 
@@ -69,11 +61,10 @@ None.
 
 ### Blockers/Concerns
 
-- P2/P4 (dual entry point conflict / null function pointers) are LOW confidence -- Phase 15 exists to resolve this
-- If neither Option A nor Option B works, milestone must be re-scoped
+None — all resolved.
 
 ## Session Continuity
 
-Last session: 2026-03-07T14:14:31.045Z
-Stopped at: Phase 15 context gathered
-Resume file: .planning/phases/15-entry-point-poc/15-CONTEXT.md
+Last session: 2026-03-08
+Stopped at: v0.5.0 milestone archived
+Resume: `/gsd:new-milestone` for next version

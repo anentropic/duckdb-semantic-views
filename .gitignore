@@ -53,6 +53,12 @@ test/data/duckdb_extensions/
 # dbt reference material (not part of the project)
 dbt/
 
+# Vendored DuckDB amalgamation (header ~1.8MB, source ~23MB)
+# Re-fetched locally via: just update-headers
+# Re-fetched in CI via: DuckDB Version Monitor workflow
+cpp/include/duckdb.hpp
+cpp/include/duckdb.cpp
+
 # Python artifacts
 __pycache__/
 *.py[codz]

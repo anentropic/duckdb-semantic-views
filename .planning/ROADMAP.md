@@ -6,7 +6,7 @@
 - ✅ **v0.2.0 Native DDL + Time Dimensions** — Phases 8-14 (shipped 2026-03-03)
 - ✅ **v0.3.0 Zero-Copy Query Pipeline** — (shipped 2026-03-03)
 - ✅ **v0.4.0 Simplified Dimensions** — (shipped 2026-03-03)
-- [ ] **v0.5.0 Parser Extension Spike** — Phases 15-18 (in progress)
+- ✅ **v0.5.0 Parser Extension Spike** — Phases 15-18 (shipped 2026-03-08)
 
 ## Phases
 
@@ -59,62 +59,18 @@ DDL simplified from 6 to 4 named params; query function from 3 to 2 named params
 
 </details>
 
-### v0.5.0 Parser Extension Spike (In Progress)
+<details>
+<summary>✅ v0.5.0 Parser Extension Spike (Phases 15-18) — SHIPPED 2026-03-08</summary>
 
-**Milestone Goal:** Prove that native `CREATE SEMANTIC VIEW` DDL syntax is achievable via DuckDB parser extension hooks in a Rust+C++ mixed extension.
+- [x] Phase 15: Entry Point POC (2/2 plans) — completed 2026-03-07
+- [x] Phase 16: Parser Hook Registration (1/1 plan) — completed 2026-03-07
+- [x] Phase 17: DDL Execution (1/1 plan) — completed 2026-03-07
+- [x] Phase 17.1: Python vtab crash investigation (2/2 plans) — completed 2026-03-08
+- [x] Phase 18: Verification and Integration (2/2 plans) — completed 2026-03-08
 
-- [ ] **Phase 15: Entry Point POC** - Resolve go/no-go: try both Option A (C_STRUCT + C++ helper) and Option B (CPP entry + Rust FFI bridge), pick the strategy that works
-- [ ] **Phase 16: Parser Hook Registration** - Register parse_function fallback hook and implement Rust-side statement detection via FFI trampoline
-- [ ] **Phase 17: DDL Execution** - Wire plan_function to existing catalog code so `CREATE SEMANTIC VIEW` works end-to-end
-- [ ] **Phase 18: Verification and Integration** - Full test suite passes with both DDL interfaces coexisting; extension is registry-publishable
+Full details: [milestones/v0.5-ROADMAP.md](milestones/v0.5-ROADMAP.md)
 
-## Phase Details
-
-### Phase 15: Entry Point POC
-**Goal**: Determine which entry point strategy (C_STRUCT + C++ helper vs CPP + Rust FFI bridge) allows parser hook registration while preserving existing Rust C API functionality
-**Depends on**: Nothing (first phase of v0.5.0)
-**Requirements**: ENTRY-01, ENTRY-02, ENTRY-03, BUILD-01, BUILD-02
-**Success Criteria** (what must be TRUE):
-  1. Extension loads via `LOAD` in DuckDB CLI and a stub parser hook is registered (verified by log output or successful parse_function callback)
-  2. Existing `FROM semantic_view('name', dimensions := [...], metrics := [...])` queries return correct results after loading the new extension binary
-  3. A go/no-go decision is recorded: which entry point strategy works, which was abandoned, and why
-  4. `shim.cpp` compiles via `cc` crate against vendored `duckdb.hpp` without new external dependencies
-**Plans:** 2 plans
-Plans:
-- [ ] 15-01-PLAN.md -- Build infrastructure: vendor duckdb.hpp, cc crate compilation, CPP symbol visibility
-- [ ] 15-02-PLAN.md -- CPP entry point switch: shim.cpp + Rust FFI bridge, Makefile ABI, test-all, go/no-go decision
-
-### Phase 16: Parser Hook Registration
-**Goal**: DuckDB's parser calls the extension's parse_function for unrecognized statements, and the extension correctly detects `CREATE SEMANTIC VIEW` prefix via Rust FFI
-**Depends on**: Phase 15
-**Requirements**: PARSE-01, PARSE-02, PARSE-03, PARSE-04, PARSE-05
-**Success Criteria** (what must be TRUE):
-  1. Typing `CREATE SEMANTIC VIEW test (...)` in DuckDB CLI triggers the extension's parse function (not DuckDB's default "unrecognized" error)
-  2. Normal SQL statements (`SELECT 1`, `CREATE TABLE ...`) execute with zero overhead -- the parse function returns `DISPLAY_ORIGINAL_ERROR` immediately
-  3. The Rust parse function is callable from C++ via FFI trampoline, receives the statement text, and returns a parse result without panicking or crashing on malformed input
-  4. Parse function handles case variations (`create semantic view`, `CREATE SEMANTIC VIEW`, `Create Semantic View`) and leading whitespace
-**Plans**: TBD
-
-### Phase 17: DDL Execution
-**Goal**: `CREATE SEMANTIC VIEW name (tables := [...], dimensions := [...], metrics := [...])` creates a semantic view that is immediately queryable via the existing `semantic_view()` table function
-**Depends on**: Phase 16
-**Requirements**: DDL-01, DDL-02, DDL-03, BUILD-03
-**Success Criteria** (what must be TRUE):
-  1. A semantic view created via `CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...], metrics := [...])` is queryable via `FROM semantic_view('sales', dimensions := [...], metrics := [...])`
-  2. The existing function-based DDL (`FROM create_semantic_view(...)`) continues to work and creates views that are indistinguishable from those created via native DDL
-  3. Extension loads successfully via `LOAD` in both DuckDB CLI and Python client (`import duckdb; conn.load_extension(...)`)
-**Plans**: TBD
-
-### Phase 18: Verification and Integration
-**Goal**: Full test suite passes, native DDL has sqllogictest coverage, and the extension binary meets community registry publication requirements
-**Depends on**: Phase 17
-**Requirements**: VERIFY-01, VERIFY-02, BUILD-04, BUILD-05
-**Success Criteria** (what must be TRUE):
-  1. `just test-all` passes (Rust unit tests, sqllogictest, DuckLake CI) with no regressions from v0.4.0
-  2. At least one sqllogictest exercises the full native DDL cycle: `CREATE SEMANTIC VIEW` followed by `FROM semantic_view()` query with expected output
-  3. `cargo test` (bundled mode, no extension feature) passes without C++ compilation -- existing test workflow is unaffected
-  4. Extension binary has correct footer ABI type, platform symbols, and no CMake dependency (registry-publishable)
-**Plans**: TBD
+</details>
 
 ## Progress
 
@@ -137,7 +93,8 @@ Plans:
 | 14. DuckLake Integration + CI | v0.2.0 | 3/3 | Complete | 2026-03-02 |
 | Zero-Copy Query Pipeline | v0.3.0 | — | Complete | 2026-03-03 |
 | Simplified Dimensions | v0.4.0 | — | Complete | 2026-03-03 |
-| 15. Entry Point POC | v0.5.0 | 0/2 | Planning | - |
-| 16. Parser Hook Registration | v0.5.0 | 0/TBD | Not started | - |
-| 17. DDL Execution | v0.5.0 | 0/TBD | Not started | - |
-| 18. Verification and Integration | v0.5.0 | 0/TBD | Not started | - |
+| 15. Entry Point POC | v0.5.0 | 2/2 | Complete | 2026-03-07 |
+| 16. Parser Hook Registration | v0.5.0 | 1/1 | Complete | 2026-03-07 |
+| 17. DDL Execution | v0.5.0 | 1/1 | Complete | 2026-03-07 |
+| 17.1. Python vtab crash investigation | v0.5.0 | 2/2 | Complete | 2026-03-08 |
+| 18. Verification and Integration | v0.5.0 | 2/2 | Complete | 2026-03-08 |

@@ -79,9 +79,15 @@ test-ducklake: setup-ducklake build
 test-ducklake-ci:
     uv run test/integration/test_ducklake_ci.py
 
-# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration tests
+# Run Python vtab crash reproduction tests against the built extension.
+# Exercises 5 crash vectors (13 tests) for type mismatch, connection lifetime,
+# bind-time execution, chunking, and pointer stability.
+test-vtab-crash: build
+    uv run test/integration/test_vtab_crash.py
+
+# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration tests + vtab crash
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
-test-all: test-rust test-sql test-ducklake-ci
+test-all: test-rust test-sql test-ducklake-ci test-vtab-crash
 
 # Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
 fuzz target="fuzz_json_parse" time="300":
@@ -97,14 +103,16 @@ fuzz-all time="300":
 fuzz-cmin target="fuzz_json_parse":
     cargo +nightly fuzz cmin {{target}}
 
-# Re-vendor DuckDB C++ headers from the cargo build cache (run after DuckDB version bump)
-# Requires `cargo test` to have been run at least once to unpack the bundled source.
+# Re-fetch vendored DuckDB amalgamation (duckdb.hpp + duckdb.cpp) from GitHub release.
+# Run after DuckDB version bump. Version is read from TARGET_DUCKDB_VERSION in Makefile.
 update-headers:
-    @echo "Copying DuckDB headers from cargo build cache..."
-    @SRC=$$(find target/debug/build/libduckdb-sys-*/out/duckdb/src/include/ -maxdepth 0 -type d 2>/dev/null | head -1); \
-    if [ -z "$$SRC" ]; then echo "ERROR: Run 'cargo test' first to unpack DuckDB headers"; exit 1; fi; \
-    cp -r "$$SRC/." duckdb_capi/; \
-    echo "Headers copied from $$SRC"
+    @VER=$$(grep '^TARGET_DUCKDB_VERSION=' Makefile | cut -d= -f2); \
+    echo "Fetching DuckDB $${VER} amalgamation..."; \
+    curl -sL -o /tmp/libduckdb-src.zip \
+      "https://github.com/duckdb/duckdb/releases/download/$${VER}/libduckdb-src.zip"; \
+    unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d cpp/include/; \
+    rm /tmp/libduckdb-src.zip; \
+    echo "Updated cpp/include/duckdb.{hpp,cpp} to $${VER}"
 
 # Clean build artifacts
 clean:

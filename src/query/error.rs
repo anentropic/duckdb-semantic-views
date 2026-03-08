@@ -20,6 +20,15 @@ pub enum QueryError {
         expanded_sql: String,
         duckdb_error: String,
     },
+    /// Runtime type mismatch between source query result and bind-time output
+    /// declaration. This would cause a hard crash (SIGABRT) in
+    /// `duckdb_vector_reference_vector` if not caught.
+    TypeMismatch {
+        column_index: usize,
+        column_name: String,
+        source_type_id: u32,
+        dest_type_id: u32,
+    },
 }
 
 impl fmt::Display for QueryError {
@@ -62,6 +71,21 @@ impl fmt::Display for QueryError {
                 write!(
                     f,
                     "SQL execution failed: {duckdb_error}\nExpanded SQL:\n{expanded_sql}"
+                )
+            }
+            Self::TypeMismatch {
+                column_index,
+                column_name,
+                source_type_id,
+                dest_type_id,
+            } => {
+                write!(
+                    f,
+                    "Type mismatch at column {column_index} (\"{column_name}\"): \
+                     query result type ID {source_type_id} does not match \
+                     bind-declared type ID {dest_type_id}. \
+                     This prevents zero-copy vector transfer. \
+                     Please report this as a bug."
                 )
             }
         }

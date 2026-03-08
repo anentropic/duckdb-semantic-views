@@ -1,6 +1,5 @@
 {
   "mode": "yolo",
-  "depth": "standard",
   "parallelization": true,
   "commit_docs": true,
   "model_profile": "quality",
@@ -13,5 +12,6 @@
   },
   "git": {
     "branching_strategy": "milestone"
-  }
+  },
+  "granularity": "standard"
 }

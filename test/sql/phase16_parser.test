@@ -1,0 +1,104 @@
+# Phase 17: Native DDL execution integration tests
+# Verifies that CREATE SEMANTIC VIEW actually creates queryable views,
+# function-based DDL still works, and normal SQL passes through unaffected.
+#
+# Requirements covered:
+#   DDL-01: CREATE SEMANTIC VIEW creates a view in the catalog
+#   DDL-02: View created via native DDL is queryable via semantic_view()
+#   DDL-03: Existing function-based DDL (create_semantic_view) still works
+#   BUILD-03: Extension loads in DuckDB CLI (verified by this test running)
+#   PARSE-02: Case-insensitive DDL detection
+#   PARSE-03: Normal SQL still works (zero overhead for non-extension queries)
+
+require semantic_views
+
+# ============================================================
+# 1. Normal SQL still works (PARSE-03)
+# ============================================================
+
+query I
+SELECT 42;
+----
+42
+
+# Normal CREATE TABLE still works (PARSE-03)
+statement ok
+CREATE TABLE parser_test_table (id INTEGER);
+
+statement ok
+DROP TABLE parser_test_table;
+
+# ============================================================
+# 2. Setup -- Create source table for semantic views
+# ============================================================
+
+statement ok
+CREATE TABLE sales (region VARCHAR, amount DOUBLE);
+
+statement ok
+INSERT INTO sales VALUES ('East', 100.0), ('East', 200.0), ('West', 150.0);
+
+# ============================================================
+# 3. DDL-01: Create a semantic view via native DDL syntax
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW sales_view (
+    tables := [{'alias': 'sales', 'table': 'sales'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sales'}],
+    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sales'}]
+);
+
+# ============================================================
+# 4. DDL-02: Query the view created via native DDL
+# ============================================================
+# Expected: East 300.0, West 150.0
+
+query TT rowsort
+SELECT * FROM semantic_view('sales_view', dimensions := ['region'], metrics := ['total_amount']);
+----
+East	300.0
+West	150.0
+
+# ============================================================
+# 5. DDL-03: Function-based DDL still works
+# ============================================================
+
+statement ok
+FROM create_semantic_view('sales_fn_view',
+    tables := [{'alias': 'sales', 'table': 'sales'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sales'}],
+    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sales'}]
+);
+
+# Query the function-created view to verify it works
+query TT rowsort
+SELECT * FROM semantic_view('sales_fn_view', dimensions := ['region'], metrics := ['total_amount']);
+----
+East	300.0
+West	150.0
+
+# ============================================================
+# 6. PARSE-02: Case insensitive DDL
+# ============================================================
+
+statement ok
+create semantic view sales_lower (
+    tables := [{'alias': 'sales', 'table': 'sales'}],
+    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sales'}],
+    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sales'}]
+);
+
+# Verify the lowercase-created view is queryable
+query TT rowsort
+SELECT * FROM semantic_view('sales_lower', dimensions := ['region'], metrics := ['total_amount']);
+----
+East	300.0
+West	150.0
+
+# ============================================================
+# 7. Cleanup
+# ============================================================
+
+statement ok
+DROP TABLE sales;

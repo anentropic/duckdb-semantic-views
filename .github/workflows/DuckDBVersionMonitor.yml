@@ -49,6 +49,18 @@ jobs:
           sed -i "s/duckdb_version: .*/duckdb_version: ${LATEST}/" .github/workflows/PullRequestCI.yml
           echo "Updated version pin to ${LATEST}"
 
+      - name: Update vendored DuckDB amalgamation (header + source)
+        if: steps.latest.outputs.is_new == 'true'
+        run: |
+          LATEST="${{ steps.latest.outputs.latest }}"
+          # Download amalgamation source zip for the new version
+          curl -L -o /tmp/libduckdb-src.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${LATEST}/libduckdb-src.zip"
+          # Extract duckdb.hpp and duckdb.cpp from the amalgamation
+          unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d cpp/include/
+          rm /tmp/libduckdb-src.zip
+          echo "Updated cpp/include/duckdb.{hpp,cpp} to ${LATEST}"
+
       - name: Install Rust stable
         if: steps.latest.outputs.is_new == 'true'
         uses: dtolnay/rust-toolchain@stable

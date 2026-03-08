@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod expand;
 pub mod model;
+pub mod parse;
 #[cfg(feature = "extension")]
 pub mod query;
 
@@ -263,17 +264,16 @@ pub mod test_helpers {
 #[cfg(feature = "extension")]
 pub mod ddl;
 
-/// Extension entry point — called by `DuckDB` when the extension is loaded.
+/// Extension entry point — called by DuckDB when the extension is loaded.
 ///
-/// Initializes the catalog (`semantic_layer._definitions` schema and table),
-/// then registers all DDL and query functions on the connection.
+/// Uses C_STRUCT ABI (semantic_views_init_c_api) for the DuckDB handshake.
+/// After Rust-side initialization (catalog, DDL functions, query functions),
+/// calls a C++ helper (sv_register_parser_hooks) to register parser extension
+/// hooks that require C++ types (ParserExtension, DBConfig).
 ///
-/// # Safety
-///
-/// This function is called by `DuckDB` across an FFI boundary. The `con` parameter
-/// is provided by `DuckDB` and is guaranteed to be a valid connection handle for
-/// the duration of the call. The `#[duckdb_entrypoint_c_api]` macro handles the
-/// unsafe C FFI bridging and panic-catching automatically.
+/// This is "Option A" from Phase 15: keep C_STRUCT entry, call C++ helper.
+/// Option B (CPP entry via DUCKDB_CPP_EXTENSION_ENTRY) was tried first but
+/// failed due to unresolved C++ symbols from -fvisibility=hidden in the host.
 #[cfg(feature = "extension")]
 mod extension {
     use std::ptr;
@@ -294,6 +294,14 @@ mod extension {
         query::explain::ExplainSemanticViewVTab,
         query::table_function::{QueryState, SemanticViewVTab},
     };
+
+    // C++ helper for parser hook registration (defined in cpp/src/shim.cpp)
+    extern "C" {
+        fn sv_register_parser_hooks(
+            db_handle: ffi::duckdb_database,
+            ddl_conn: ffi::duckdb_connection,
+        ) -> bool;
+    }
 
     /// Core initialization logic, called with both the high-level Connection and
     /// the raw database handle (extracted by the manual FFI entrypoint below).
@@ -337,7 +345,6 @@ mod extension {
         };
 
         // Register create_semantic_view(name, tables :=, ...) table function.
-        // Inserts a new view; errors if the view already exists.
         let define_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
@@ -350,7 +357,6 @@ mod extension {
         )?;
 
         // Register create_or_replace_semantic_view(name, tables :=, ...) table function.
-        // Upserts a view definition; silent overwrite if the view already exists.
         let define_or_replace_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
@@ -363,7 +369,6 @@ mod extension {
         )?;
 
         // Register create_semantic_view_if_not_exists(name, tables :=, ...) table function.
-        // Succeeds silently (no-op) if the view already exists; errors only on other failures.
         let define_if_not_exists_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
@@ -376,7 +381,6 @@ mod extension {
         )?;
 
         // Register drop_semantic_view(name) table function.
-        // Removes a view; errors if the view does not exist.
         let drop_state = DropState {
             catalog: catalog_state.clone(),
             persist_conn,
@@ -388,7 +392,6 @@ mod extension {
         )?;
 
         // Register drop_semantic_view_if_exists(name) table function.
-        // Removes a view; silently succeeds if the view does not exist.
         let drop_if_exists_state = DropState {
             catalog: catalog_state.clone(),
             persist_conn,
@@ -410,9 +413,6 @@ mod extension {
         )?;
 
         // Create a NEW connection for the semantic_view table function.
-        // The host connection may hold execution locks during query processing.
-        // A separate connection avoids lock conflicts when executing the expanded
-        // SQL from within the table function.
         let mut query_conn: ffi::duckdb_connection = ptr::null_mut();
         let rc = unsafe { ffi::duckdb_connect(db_handle, &mut query_conn) };
         if rc != ffi::DuckDBSuccess {
@@ -429,21 +429,37 @@ mod extension {
             &query_state,
         )?;
 
-        // Register the explain_semantic_view table function (shares the same
-        // QueryState for catalog access and SQL execution).
-        // Note: EXPLAIN SELECT * FROM semantic_view('name', ...) shows DuckDB's physical
-        // plan (TABLE_FUNCTION node). Use explain_semantic_view('name', ...) to see the
-        // expanded SQL that runs inside the table function.
+        // Register the explain_semantic_view table function.
         con.register_table_function_with_extra_info::<ExplainSemanticViewVTab, _>(
             "explain_semantic_view",
             &query_state,
         )?;
 
+        // Create a dedicated DDL connection for the parser hook path.
+        // This connection is ALWAYS created (even for in-memory databases) because
+        // the native DDL path rewrites to `SELECT * FROM create_semantic_view(...)`
+        // which needs a separate connection to avoid deadlocking the ClientContext
+        // lock held during plan/bind. This is distinct from persist_conn (which
+        // writes to the _definitions catalog table for file-backed databases).
+        let mut ddl_conn: ffi::duckdb_connection = ptr::null_mut();
+        let rc = unsafe { ffi::duckdb_connect(db_handle, &mut ddl_conn) };
+        if rc != ffi::DuckDBSuccess {
+            return Err("Failed to create DDL connection for parser hook".into());
+        }
+
+        // Register parser hooks via C++ helper.
+        // The C++ shim extracts DatabaseInstance& from the duckdb_database handle
+        // and registers ParserExtension hooks on DBConfig. This requires C++ types
+        // that are only available via the duckdb.hpp amalgamation header.
+        if !unsafe { sv_register_parser_hooks(db_handle, ddl_conn) } {
+            return Err("Failed to register parser hooks via C++ helper".into());
+        }
+
         Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // Manual FFI entrypoint (replaces #[duckdb_entrypoint_c_api()] macro)
+    // Manual FFI entrypoint (C_STRUCT ABI)
     //
     // We write the entrypoint by hand to capture the raw duckdb_database handle
     // BEFORE it is wrapped in a Connection. This avoids unsafe pointer arithmetic
@@ -485,7 +501,7 @@ mod extension {
         Ok(true)
     }
 
-    /// FFI entrypoint called by DuckDB when the extension is loaded.
+    /// FFI entrypoint called by DuckDB when the extension is loaded (C_STRUCT ABI).
     ///
     /// # Safety
     ///
