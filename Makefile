@@ -18,6 +18,21 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 # Rust owns the entry point (semantic_views_init_c_api), C++ helper registers hooks.
 UNSTABLE_C_API_FLAG=--abi-type C_STRUCT_UNSTABLE
 
+# Auto-download DuckDB amalgamation (gitignored, ~25MB) if not present.
+# CI checks out the repo without these files; local devs fetch via `just update-headers`.
+# The version comes from .duckdb-version via TARGET_DUCKDB_VERSION.
+AMALGAMATION_URL=https://github.com/duckdb/duckdb/releases/download/$(TARGET_DUCKDB_VERSION)/libduckdb-src.zip
+
+cpp/include/duckdb.cpp:
+	@echo "Downloading DuckDB $(TARGET_DUCKDB_VERSION) amalgamation..."
+	@mkdir -p cpp/include
+	@curl -sL -o /tmp/libduckdb-src.zip "$(AMALGAMATION_URL)"
+	@unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d cpp/include/
+	@rm -f /tmp/libduckdb-src.zip
+	@echo "Downloaded cpp/include/duckdb.{hpp,cpp}"
+
+ensure_amalgamation: cpp/include/duckdb.cpp
+
 configure: venv platform extension_version
 
 debug: build_extension_library_debug build_extension_with_metadata_debug
@@ -41,12 +56,12 @@ clean_all: clean_configure clean
 # so that it links against the DuckDB that loads it at runtime.
 # --no-default-features removes duckdb/bundled; --features extension adds
 # duckdb/loadable-extension + duckdb/vscalar.
-build_extension_library_debug: check_configure
+build_extension_library_debug: check_configure ensure_amalgamation
 	DUCKDB_EXTENSION_NAME=$(EXTENSION_NAME) DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=$(TARGET_DUCKDB_VERSION) cargo build $(CARGO_OVERRIDE_DUCKDB_RS_FLAG) $(TARGET_INFO) --no-default-features --features extension
 	$(PYTHON_VENV_BIN) -c "from pathlib import Path;Path('$(EXTENSION_BUILD_PATH)/debug/extension/$(EXTENSION_NAME)').mkdir(parents=True, exist_ok=True)"
 	$(PYTHON_VENV_BIN) -c "import shutil;shutil.copyfile('$(TARGET_PATH)/debug$(IS_EXAMPLE)/$(RUST_LIBNAME)', '$(EXTENSION_BUILD_PATH)/debug/$(EXTENSION_LIB_FILENAME)')"
 
-build_extension_library_release: check_configure
+build_extension_library_release: check_configure ensure_amalgamation
 	DUCKDB_EXTENSION_NAME=$(EXTENSION_NAME) DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=$(TARGET_DUCKDB_VERSION) cargo build $(CARGO_OVERRIDE_DUCKDB_RS_FLAG) --release $(TARGET_INFO) --no-default-features --features extension
 	$(PYTHON_VENV_BIN) -c "from pathlib import Path;Path('$(EXTENSION_BUILD_PATH)/release/extension/$(EXTENSION_NAME)').mkdir(parents=True, exist_ok=True)"
 	$(PYTHON_VENV_BIN) -c "import shutil;shutil.copyfile('$(TARGET_PATH)/release$(IS_EXAMPLE)/$(RUST_LIBNAME)', '$(EXTENSION_BUILD_PATH)/release/$(EXTENSION_LIB_FILENAME)')"

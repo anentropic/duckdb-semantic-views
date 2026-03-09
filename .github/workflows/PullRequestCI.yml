@@ -32,6 +32,15 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Download DuckDB amalgamation
+        run: |
+          VER=$(cat .duckdb-version)
+          curl -sL -o /tmp/libduckdb-src.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${VER}/libduckdb-src.zip"
+          mkdir -p cpp/include
+          unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d cpp/include/
+          rm -f /tmp/libduckdb-src.zip
+
       - name: Build extension
         run: cargo build --features extension
 

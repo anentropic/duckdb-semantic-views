@@ -110,9 +110,9 @@ fuzz-cmin target="fuzz_json_parse":
     cargo +nightly fuzz cmin {{target}}
 
 # Re-fetch vendored DuckDB amalgamation (duckdb.hpp + duckdb.cpp) from GitHub release.
-# Run after DuckDB version bump. Version is read from TARGET_DUCKDB_VERSION in Makefile.
+# Run after DuckDB version bump. Version is read from .duckdb-version.
 update-headers:
-    @VER=$$(grep '^TARGET_DUCKDB_VERSION=' Makefile | cut -d= -f2); \
+    @VER=$$(cat .duckdb-version); \
     echo "Fetching DuckDB $${VER} amalgamation..."; \
     curl -sL -o /tmp/libduckdb-src.zip \
       "https://github.com/duckdb/duckdb/releases/download/$${VER}/libduckdb-src.zip"; \
