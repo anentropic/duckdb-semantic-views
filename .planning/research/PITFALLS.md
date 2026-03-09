@@ -1,352 +1,415 @@
-# PITFALLS -- DDL Polish (v0.5.1)
+# Domain Pitfalls -- SQL DDL Syntax & PK/FK Relationship Model (v0.5.2)
 
-**Domain:** Adding DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW native DDL and error location reporting to an existing DuckDB extension with parser hooks
-**Researched:** 2026-03-08
-**Context:** The extension already has a working `CREATE SEMANTIC VIEW` parser hook (fallback `parse_function` + `plan_function`), statement rewriting to function-based DDL, a dedicated DDL connection, and `strsim` for fuzzy matching. The catalog is a dual-store: `Arc<RwLock<HashMap>>` in-memory + `semantic_layer._definitions` DuckDB table via separate `persist_conn`. All DDL functions are registered as table functions with `extra_info` state injection. v0.5.0 shipped with 172 tests green.
+**Domain:** Adding proper SQL DDL keyword syntax and Snowflake-style PK/FK relationship model to an existing DuckDB semantic views extension
+**Researched:** 2026-03-09
+**Context:** The extension already has a working DDL pipeline (parse -> detect -> rewrite -> execute via function calls), CTE-based expansion with ON-clause heuristic join resolution, dual DDL interface (function-based + native SQL), table aliases, join_columns FK pairs, and qualified column lookup. This research covers pitfalls specific to the v0.5.2 transition.
 
 ---
 
 ## Critical Pitfalls
 
-Mistakes that cause crashes, data loss, or require rearchitecting.
+Mistakes that cause rewrites, data corruption, or silent wrong results.
 
-### P1: DROP/DESCRIBE/SHOW May Not Trigger Parser Fallback Hook
+### C1: SQL DDL Keyword Parser Eats Function-Call DDL Body -- Backward Compatibility Break
 
 **What goes wrong:**
-The current parser hook uses `parse_function` (fallback), which is only called when DuckDB's native parser FAILS on a statement. For `CREATE SEMANTIC VIEW`, this works because DuckDB's parser does not recognize `SEMANTIC` after `CREATE` and produces a parser error, triggering the fallback.
+The current `rewrite_ddl` function passes the CREATE body verbatim to the underlying function call: `CREATE SEMANTIC VIEW sales (dimensions := [...])` becomes `SELECT * FROM create_semantic_view('sales', dimensions := [...])`. The body uses DuckDB function-call syntax (`:=` named parameters, struct/list literals).
 
-For `DROP SEMANTIC VIEW`, `DESCRIBE SEMANTIC VIEW`, and `SHOW SEMANTIC VIEWS`, the behavior depends on how DuckDB's native parser handles these prefixes:
+When you add SQL keyword syntax (`TABLES (...) DIMENSIONS (...) METRICS (...)`), the parser must distinguish between the OLD function-call body and the NEW keyword body. If the new parser consumes ALL `CREATE SEMANTIC VIEW` statements and applies keyword parsing, it will break existing definitions that use `:=` syntax.
 
-- `DROP SEMANTIC VIEW x` -- DuckDB's parser recognizes `DROP` but not `SEMANTIC` as a valid object type (DuckDB supports TABLE, VIEW, FUNCTION, INDEX, SCHEMA, SEQUENCE, MACRO, TYPE). This likely produces a **parser error** at the `SEMANTIC` token, which WILL trigger the fallback hook.
-- `DESCRIBE SEMANTIC VIEW x` -- DuckDB's `DESCRIBE` expects a table name, view name, or query. `SEMANTIC` is not a table/view, so DuckDB may attempt to resolve it as an identifier and produce a **catalog error** (not a parser error). Catalog errors happen AFTER parsing and do NOT trigger the parser fallback.
-- `SHOW SEMANTIC VIEWS` -- `SHOW` in DuckDB is an alias for `DESCRIBE`. Same risk as DESCRIBE.
+The `TECH-DEBT.md` item #8 explicitly flags this: "The DDL body uses DuckDB function-call syntax because `rewrite_ddl` passes the body verbatim. A Snowflake-style SQL DDL grammar was the original intent but was never implemented."
 
-If DuckDB successfully parses `DESCRIBE SEMANTIC` (treating `SEMANTIC` as an identifier) and then fails at the binder/catalog level, the parser fallback is never called and the extension never gets a chance to intercept the statement.
+**Why it happens:**
+The temptation is to replace `parse_create_body` (which just extracts text between outer parens) with a keyword parser. But any stored definitions, documentation examples, and user scripts that use `:=` syntax will break immediately.
 
-**Consequences:** `DROP SEMANTIC VIEW` likely works via parser fallback. `DESCRIBE SEMANTIC VIEW` and `SHOW SEMANTIC VIEWS` may silently fail with unhelpful DuckDB errors ("Table 'SEMANTIC' does not exist") instead of being intercepted by the extension.
+**Consequences:**
+- All existing `CREATE SEMANTIC VIEW` statements stop working
+- Stored catalog definitions cannot be re-created from their JSON (the function-based path still works, but users lose the native DDL path for existing syntax)
+- Breaking change in a minor version, violating user trust
 
 **Prevention:**
-- Test each statement prefix in isolation FIRST, before implementing any logic. Run `DROP SEMANTIC VIEW x;`, `DESCRIBE SEMANTIC VIEW x;`, and `SHOW SEMANTIC VIEWS;` against a DuckDB instance with the extension loaded (but without the new parser detection) and observe the error type (Parser Error vs Catalog Error).
-- If DESCRIBE/SHOW produce catalog errors (not parser errors), they CANNOT use the parser hook approach. Instead, implement them as table functions only: `FROM describe_semantic_view('name')` and `FROM list_semantic_views()` (which already exist). Document that `DESCRIBE SEMANTIC VIEW` is not supported as native syntax and users should use the function form.
-- If they DO produce parser errors, add prefix detection for `DROP SEMANTIC VIEW`, `DESCRIBE SEMANTIC VIEW`, and `SHOW SEMANTIC VIEWS` alongside the existing `CREATE SEMANTIC VIEW` detection.
-- **Confidence:** MEDIUM. DuckDB's parser behavior for unknown object types after DROP/DESCRIBE is not documented. The resolution requires empirical testing.
+- Detect which syntax variant the body uses BEFORE parsing. Heuristic: if the body contains `:=` at the top level (outside strings/brackets), it is function-call syntax -- pass verbatim. If the body starts with a known keyword (`TABLES`, `DIMENSIONS`, `METRICS`, `RELATIONSHIPS`) followed by `(`, it is keyword syntax -- parse and translate.
+- The detection must happen in `rewrite_ddl` or `validate_and_rewrite`, not deeper in the parser. The existing `scan_clause_keywords` function already scans for keyword presence -- extend it to also detect `:=` assignments.
+- During a transition period (v0.5.2), support BOTH body formats. Deprecate the `:=` format in documentation. Remove support in a later version (v0.7.0+) when backward compatibility is no longer needed.
+- **Test:** A sqllogictest that creates a view with OLD `:=` syntax, then queries it, MUST pass after the v0.5.2 parser changes.
+- **Confidence:** HIGH. This is the #1 backward compatibility risk. The codebase already has the detection infrastructure (`scan_clause_keywords` + `parse_create_body`).
 
-**Phase assignment:** Must be the FIRST thing validated. A 10-minute spike determines which DDL verbs can use the parser hook and which must remain function-only.
+**Phase assignment:** Must be the FIRST parser change. Build the syntax discriminator before implementing keyword parsing.
 
 ---
 
-### P2: Catalog Inconsistency During CREATE OR REPLACE -- Persist Succeeds, In-Memory Fails
+### C2: PK/FK Join Path Ambiguity -- Diamond Joins Produce Wrong Results Silently
 
 **What goes wrong:**
-The existing `define.rs` uses a write-first pattern: persist to DuckDB table via `persist_conn` FIRST, then update the in-memory `HashMap`. For CREATE OR REPLACE, the persist step uses `INSERT OR REPLACE` (always succeeds), but the in-memory step uses `catalog_upsert` (validates JSON first). If JSON validation passes for persist but fails for the in-memory update (e.g., a subtle difference in validation paths), the DuckDB table has the new definition but the HashMap has the old one.
+The current ON-clause heuristic (`resolve_joins` in `expand.rs`) is simple: collect `source_table` values from requested dimensions/metrics, then do a fixed-point transitive closure over ON-clause substring matching. There is at most ONE path between any two tables because joins are declared linearly and matched by table name.
 
-Looking at the actual code, this specific scenario is unlikely because both paths validate JSON. But a more realistic variant exists: if `persist_define` succeeds but the Rust process panics or the connection is interrupted between the persist and the in-memory update, the DuckDB table is updated but the HashMap is not. On next extension load, `init_catalog` re-reads from the DuckDB table, so the next session picks up the change. But the CURRENT session has stale state.
+With PK/FK relationships, you introduce a JOIN GRAPH where multiple paths can exist between two tables. Classic example (diamond):
 
-For CREATE OR REPLACE specifically, this means the user thinks they replaced a view (the persist succeeded, no error), but queries against the view in the same session use the OLD definition from the HashMap.
+```
+       orders
+      /      \
+  customers  products
+      \      /
+       region
+```
 
-**Consequences:** Silent use of stale definition in the current session after a successful CREATE OR REPLACE. The user observes "wrong results" rather than an error. This is worse than a crash because it is hard to diagnose.
+If a dimension comes from `region`, should the join path go through `customers` or `products`? The PK/FK model does not answer this -- it only says edges exist, not which path to take. Cube.dev calls this the "diamond subgraph problem" and requires explicit `join_path` declarations to resolve it. Snowflake prohibits circular relationships entirely (even through transitive paths) and does not support self-referencing tables.
+
+**Why it happens:**
+The current model has no graph -- it has a flat list of joins with table names. Moving to PK/FK creates an implicit directed graph (FK table -> PK table). When the graph has diamonds or multiple paths, the `resolve_joins` function's fixed-point loop will include ALL tables on ALL paths, producing a cartesian product or duplicate rows.
+
+**Consequences:**
+- Aggregation metrics (SUM, COUNT) return inflated values because rows are duplicated across multiple join paths
+- The user sees no error -- the query executes successfully with wrong numbers
+- This is the "fan trap" in BI terminology: "measures are very hard to de-duplicate because SUM DISTINCT is semantically invalid"
 
 **Prevention:**
-- The current code already handles this correctly: `catalog_upsert` is called after `persist_define`, and both validate JSON. The risk is theoretical, not demonstrated.
-- Add an integration test that does CREATE, then CREATE OR REPLACE with different metrics, then queries using the new metrics. Assert the new metric values appear. This catches any cache staleness.
-- Consider reversing the order for CREATE OR REPLACE specifically: update the HashMap first (recoverable), then persist (if persist fails, the HashMap has the new definition for the current session, and the DuckDB table has the old one -- next session reverts, but at least the current session is consistent). However, this contradicts the write-first pattern used everywhere else and introduces a different inconsistency risk. **Keep the current write-first order but test the round-trip.**
-- **Confidence:** LOW for the actual bug occurring (code paths are well-tested). HIGH for the importance of having a round-trip test.
+- **Option A (recommended for v0.5.2): Require explicit join path per dimension/metric.** The `source_table` field already exists on `Dimension` and `Metric`. Require it to be set when the view has more than one join. The join resolver follows the SINGLE path from base table to the source table, not all possible paths.
+- **Option B: Disallow diamond graphs at define time.** At `CREATE SEMANTIC VIEW` validation, check that the FK graph is a tree (no cycles, no diamonds). Reject definitions where a table is reachable via multiple paths. This is what Snowflake does: "You cannot define circular relationships, even through transitive paths."
+- **Option C: Shortest-path resolution.** If multiple paths exist, pick the shortest (fewest hops). This is what Holistics does with its tier-based ranking. But shortest path may not be the semantically correct path.
+- **Recommendation:** Option B for v0.5.2 (simplest, matches Snowflake, prevents the problem entirely). Option A for a future version if multi-path support is needed.
+- **Validation algorithm:** At define time, build a directed graph from FK -> PK. Run DFS from each table. If any table is visited twice, reject with error: "Ambiguous join path: table 'X' is reachable via multiple paths. Remove one relationship to create a tree structure."
+- **Confidence:** HIGH. Diamond join problems are thoroughly documented in Cube.dev, dbt MetricFlow, Holistics, and Sisense. Every semantic layer has either solved or forbidden this.
 
-**Phase assignment:** Testing phase. Add a round-trip sqllogictest for CREATE OR REPLACE.
+**Phase assignment:** Must be part of the define-time validation phase, BEFORE the expansion engine is changed. Reject bad graphs early.
 
 ---
 
-### P3: DROP via Parser Hook Runs DDL on Dedicated Connection -- Catalog Bypass
+### C3: CTE Flat Namespace Breaks When Adding Qualified Columns
 
 **What goes wrong:**
-The existing parser hook path (`sv_parse_stub` -> `sv_plan_function` -> `sv_ddl_bind`) executes rewritten DDL on the `sv_ddl_conn` (the dedicated DDL connection stored as a C++ file-scope static). For `CREATE SEMANTIC VIEW`, this works because `rewrite_ddl_to_function_call` rewrites to `SELECT * FROM create_semantic_view(...)`, which calls the Rust VTab `bind` function, which updates both the DuckDB table and the HashMap.
+The current expansion strategy (`expand()` in `expand.rs`) creates a single `_base` CTE that joins all needed tables, then the outer SELECT references columns from `_base` using unqualified names. This is explicitly documented in `TECH-DEBT.md` item #7: "Dimension and metric expressions must use unqualified column names because the CTE-based expansion flattens all source tables into a single `_base` namespace."
 
-For `DROP SEMANTIC VIEW`, the rewrite must produce `SELECT * FROM drop_semantic_view('name')`. This calls `DropSemanticViewVTab::bind`, which:
-1. Checks the HashMap for existence
-2. Calls `persist_drop` (deletes from DuckDB table via persist_conn)
-3. Calls `catalog_delete` (removes from HashMap)
+When you add qualified column support (`orders.revenue`, `customers.name`), the expressions contain dot-qualified references. But after the CTE flattens everything into `_base`, there is no `orders` or `customers` alias in scope -- only `_base`. DuckDB will error: "Table 'orders' does not exist."
 
-**The problem:** The `DropState` stored as `extra_info` on the `drop_semantic_view` function was registered with `persist_conn` pointing to the persistence connection created during `init_extension`. But when `DROP SEMANTIC VIEW` arrives via the parser hook path, the DDL is executed on `sv_ddl_conn` (the parser's dedicated DDL connection), NOT on the main connection. The `drop_semantic_view` function was registered on the main connection, and its `extra_info` (including `persist_conn`) was set at registration time.
+This is the core architectural tension: the CTE strategy REQUIRES unqualified names, but qualified columns REQUIRE table aliases to be in scope.
 
-**Question:** Does executing `SELECT * FROM drop_semantic_view('name')` on `sv_ddl_conn` still find the registered table function? YES -- table functions are registered at the database level (not per-connection), so `sv_ddl_conn` can invoke them. The `extra_info` pointer was set during registration and is accessible from any connection. So this should work.
+**Why it happens:**
+The CTE was designed for a flat namespace model. Qualified columns fundamentally need either (a) table aliases inside the CTE, or (b) no CTE at all.
 
-**Where it actually breaks:** If there is a connection-specific state assumption. The `persist_conn` is a separate connection handle. When `drop_semantic_view` runs on `sv_ddl_conn` and then calls `persist_drop` on `persist_conn`, we have THREE connections involved: main, sv_ddl_conn (parser's DDL connection), and persist_conn. All three share the same database. DuckDB's single-writer model means only one can write at a time. If `sv_ddl_conn` is in a transaction (from the plan_function binding), and `persist_drop` tries to write via `persist_conn`, there may be a lock conflict.
-
-**Consequences:** Potential deadlock or write-lock timeout during DROP via native DDL syntax.
+**Consequences:**
+- Any expression using `alias.column` syntax fails at query time with DuckDB errors about missing tables
+- The error comes from DuckDB's SQL engine, not from the extension, so the error message is confusing
+- Partial fixes (string-replacing `alias.` with nothing) break for column names that contain dots or for expressions like `CASE WHEN orders.status = 'shipped' THEN orders.amount END`
 
 **Prevention:**
-- Test `DROP SEMANTIC VIEW x;` via the native DDL path (not just the function path) as an early integration test. If it deadlocks, the three-connection pattern needs restructuring.
-- If a lock conflict occurs: rewrite DROP to also use `sv_ddl_conn` for persistence (skip `persist_conn` entirely when coming from the parser hook path). This may require modifying the FFI contract.
-- The simplest fix if this is a problem: have `sv_execute_ddl_rust` call `drop_semantic_view` on the SAME connection it was given (the `exec_conn` parameter), which avoids the cross-connection lock conflict.
-- **Confidence:** MEDIUM. The three-connection interaction is not tested in v0.5.0 (which only has CREATE via parser hook, not DROP). The lock behavior depends on DuckDB's transaction isolation for internal connections.
+Two viable approaches:
 
-**Phase assignment:** Validate early. The first DROP implementation MUST be tested via the native DDL path.
+**Approach A: Keep CTE, emit aliases inside it (recommended).**
+The `_base` CTE already uses `AS "alias"` for table references when `def.tables` is non-empty (lines 415-418, 425-433 of `expand.rs`). Inside the CTE, DuckDB DOES have the aliases in scope. The problem is only in the OUTER SELECT, which references `_base.column`. Fix: move dimension/metric expressions INTO the CTE's SELECT list (as named columns), then the outer SELECT just references `_base."dim_name"` and `_base."met_name"` by their semantic names. The expressions execute inside the CTE where aliases are available.
+
+```sql
+-- Current (broken for qualified exprs):
+WITH "_base" AS (
+    SELECT *
+    FROM "orders" AS "o"
+    JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id"
+)
+SELECT o.region AS "region"  -- ERROR: no "o" in scope
+FROM "_base"
+
+-- Fixed: expressions inside CTE
+WITH "_base" AS (
+    SELECT "o"."region" AS "region", SUM("o"."amount") AS "revenue"
+    FROM "orders" AS "o"
+    JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id"
+    GROUP BY 1
+)
+SELECT "region", "revenue"
+FROM "_base"
+```
+
+Wait -- moving aggregation INTO the CTE changes the semantics. Currently the CTE is `SELECT *` (all rows), and the outer query does `GROUP BY`. If aggregation moves into the CTE, the CTE must include the `GROUP BY`. This is a structural change to the expansion engine.
+
+**Approach B: Drop CTE entirely, use direct FROM/JOIN.**
+Generate a direct query without a CTE:
+
+```sql
+SELECT "o"."region" AS "region", SUM("o"."amount") AS "revenue"
+FROM "orders" AS "o"
+JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id"
+WHERE (filter1) AND (filter2)
+GROUP BY 1
+```
+
+This is simpler, keeps aliases in scope, and avoids the CTE abstraction layer. The downside: the current `LIMIT 0` type inference runs the expanded SQL -- changing the shape may affect type inference if any edge cases depend on the CTE structure.
+
+**Recommendation:** Approach B (drop CTE). The CTE was an early design decision that served its purpose for the flat-namespace model. Qualified columns are a fundamentally different model. Dropping the CTE simplifies the code and aligns with how Snowflake and Cube generate SQL.
+
+**Migration risk:** The `build_execution_sql` function wraps the expansion output in a subquery for type casting. This wrapping does not depend on CTE structure -- it wraps the entire SQL string. So Approach B should be compatible.
+
+**Confidence:** HIGH. The CTE-vs-direct tradeoff is well understood. The codebase has clear separation between expansion (SQL generation) and execution (type inference + vector reference), so the expansion can be changed without affecting execution.
+
+**Phase assignment:** Must be done BEFORE or ALONGSIDE qualified column support. Cannot add qualified columns to the current CTE structure without breakage.
+
+---
+
+### C4: Stored Definitions with ON-Clause Format Cannot Use PK/FK Join Inference
+
+**What goes wrong:**
+Existing catalog definitions stored in `semantic_layer._definitions` use the old `Join` format with a raw `on` string field. The model already supports backward compatibility via serde defaults: old JSON without `join_columns` deserializes with an empty `join_columns` vec (tested in `join_old_on_format_backwards_compat`). But the NEW expansion engine using PK/FK join inference will not understand old ON-clause joins.
+
+If the expansion engine is changed to generate ON clauses from `join_columns` (FK/PK pairs) and falls back to the raw `on` string when `join_columns` is empty, this works. But if old definitions are NEVER migrated, the old heuristic transitive closure in `resolve_joins` (which uses `on_lower.contains(&other_lower)` for substring matching) must be kept forever.
+
+**Why it happens:**
+The old `resolve_joins` function has TWO responsibilities: (1) determine which joins are needed (from `source_table` fields), and (2) resolve transitive dependencies via ON-clause substring matching. For PK/FK joins, responsibility #2 changes (transitive deps are resolved via the FK graph), but responsibility #1 stays the same.
+
+If you remove the substring-matching transitive closure and replace it with graph-based resolution, old definitions with only `on` strings and no `join_columns` will lose transitive dependency resolution entirely.
+
+**Consequences:**
+- Old definitions that relied on transitive join resolution silently stop including needed tables
+- Queries return wrong results (missing joins = missing data or cartesian products) with no error
+
+**Prevention:**
+- Keep BOTH resolution strategies in `resolve_joins`, selected by the presence of `join_columns`:
+  - If ALL joins have `join_columns` non-empty: use graph-based FK resolution
+  - If ANY join has only `on` string: use the old substring-matching transitive closure
+  - Do NOT mix strategies within a single definition
+- Add a define-time validation: if the definition uses the new SQL keyword syntax (which produces `join_columns`), require ALL joins to have `join_columns`. If using the old function-call syntax, all joins use `on` strings.
+- The `append_join_on_clause` function already handles both formats (lines 303-333 of `expand.rs`). The resolution strategy selection is the new piece.
+- **Confidence:** HIGH. The serde backward compat is already tested. The resolution strategy split is the gap.
+
+**Phase assignment:** Expansion engine phase. Must be decided before `resolve_joins` is modified.
 
 ---
 
 ## Moderate Pitfalls
 
-### P4: Parser Detection Must Handle Multiple Prefixes Without Ambiguity
+### M1: SQL Keyword Parser Must Handle Nested Parentheses in Expressions
 
 **What goes wrong:**
-The current `detect_create_semantic_view` function checks a single prefix: `"create semantic view"`. Adding DROP, DESCRIBE, SHOW, CREATE OR REPLACE, and CREATE IF NOT EXISTS requires matching MULTIPLE prefixes. The detection function is called for EVERY failed parse in DuckDB, so it must be fast and unambiguous.
+The new SQL DDL syntax uses keyword clauses:
+```sql
+CREATE SEMANTIC VIEW sales
+TABLES (
+    o AS orders PRIMARY KEY (order_id),
+    c AS customers PRIMARY KEY (customer_id)
+)
+DIMENSIONS (
+    region AS (c.region),
+    order_year AS (date_trunc('year', o.order_date))
+)
+```
 
-Prefix ambiguity risks:
-- `CREATE OR REPLACE SEMANTIC VIEW` starts with `CREATE` -- must match the longer prefix, not just `CREATE SEMANTIC VIEW`.
-- `CREATE SEMANTIC VIEW IF NOT EXISTS` starts with `CREATE SEMANTIC VIEW` but has additional tokens before the view name.
-- `DROP SEMANTIC VIEW IF EXISTS` vs `DROP SEMANTIC VIEW` -- the IF EXISTS variant must be detected as a DROP, not misidentified.
+Parsing this requires finding the boundaries of each clause. The naive approach (find `DIMENSIONS (` and match its closing `)`) breaks because expressions inside contain nested parentheses: `date_trunc('year', o.order_date)` has its own parentheses.
 
-If the detection function matches `CREATE SEMANTIC VIEW` for a `CREATE OR REPLACE SEMANTIC VIEW` statement, the rewrite will be wrong (the view name extraction will start at the wrong position).
-
-**Consequences:** Wrong view name extracted. Malformed rewritten SQL. Confusing error messages.
+The existing `scan_clause_keywords` and `validate_brackets` functions already handle bracket depth tracking and string literal escaping. But they scan for CLAUSE KEYWORDS, not for the BOUNDARIES of clause contents.
 
 **Prevention:**
-- Use ordered prefix matching: check LONGER prefixes first.
-  1. `CREATE OR REPLACE SEMANTIC VIEW` (longest CREATE variant)
-  2. `CREATE SEMANTIC VIEW IF NOT EXISTS` (but note: IF NOT EXISTS comes AFTER the view name in standard SQL -- need to decide on syntax)
-  3. `CREATE SEMANTIC VIEW` (base case)
-  4. `DROP SEMANTIC VIEW IF EXISTS`
-  5. `DROP SEMANTIC VIEW`
-  6. `DESCRIBE SEMANTIC VIEW`
-  7. `SHOW SEMANTIC VIEWS`
-- Return a discriminant (enum or integer code) indicating WHICH statement type was detected, not just a boolean. The current `PARSE_NOT_OURS` / `PARSE_DETECTED` binary result is insufficient.
-- DuckDB SQL convention: `IF NOT EXISTS` follows the object name in `CREATE TABLE IF NOT EXISTS t (...)` but follows the object type in `CREATE SCHEMA IF NOT EXISTS s`. For semantic views, use the `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)` syntax (IF NOT EXISTS after the type, before the name) -- this matches `CREATE TABLE IF NOT EXISTS`.
-- Wait: DuckDB's standard `CREATE VIEW IF NOT EXISTS v AS ...` puts IF NOT EXISTS after VIEW, before the name. Follow this convention: `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)`.
-- **Confidence:** HIGH. This is a pure string-matching problem. The mitigation is straightforward prefix ordering.
+- Build the keyword parser on top of the existing bracket-tracking infrastructure in `parse.rs` (`validate_brackets`, `scan_clause_keywords`).
+- Parse clause boundaries by: (1) find keyword, (2) find the opening paren after the keyword, (3) track bracket depth until the matching close paren at depth 0.
+- Handle edge cases: string literals containing parentheses (`'hello (world)'`), nested function calls (`COALESCE(a, NULLIF(b, 0))`), array literals (`[1, 2, 3]`), struct literals (`{'key': 'value'}`).
+- The bracket validator already handles `()`, `[]`, `{}` nesting and single-quoted strings. Reuse it.
+- **Confidence:** HIGH. The infrastructure exists. The gap is using it for clause boundary detection rather than validation.
 
-**Phase assignment:** Parser detection phase. Extend `detect_create_semantic_view` to return an enum.
+**Phase assignment:** Parser implementation phase.
 
 ---
 
-### P5: IF NOT EXISTS Position Ambiguity in DDL Syntax
+### M2: PK/FK Validation Must Reject Self-References and Cycles
 
 **What goes wrong:**
-SQL standards and DuckDB place `IF NOT EXISTS` differently depending on the statement:
-- `CREATE TABLE IF NOT EXISTS t (...)` -- after TABLE, before name
-- `CREATE VIEW IF NOT EXISTS v AS ...` -- after VIEW, before name
-- `CREATE SCHEMA IF NOT EXISTS s` -- after SCHEMA, before name
-- `CREATE OR REPLACE TABLE t (...)` -- OR REPLACE after CREATE, before TABLE
+The PK/FK model creates a directed graph: each RELATIONSHIP declares `table_A (fk_col) REFERENCES table_B`. If a user accidentally creates a cycle (`A -> B -> C -> A`) or a self-reference (`A -> A`), the join resolution algorithm enters an infinite loop or produces nonsensical SQL.
 
-For semantic views, the natural syntax would be:
-- `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)`
-- `CREATE OR REPLACE SEMANTIC VIEW name (...)`
-- `DROP SEMANTIC VIEW IF EXISTS name`
+Snowflake explicitly prohibits both: "You cannot define circular relationships, even through transitive paths" and "currently, a table cannot reference itself."
 
-But there is a subtlety: `CREATE OR REPLACE SEMANTIC VIEW IF NOT EXISTS name (...)` -- can OR REPLACE and IF NOT EXISTS coexist? In DuckDB, `CREATE OR REPLACE TABLE IF NOT EXISTS` is a parser error. The same should apply here.
+**Why it happens:**
+The define-time validation in the current system does not inspect the join graph topology. Joins are stored as a flat list and resolved at query time. With PK/FK, the graph must be validated at define time.
 
-**Consequences:** If the parser accepts conflicting modifiers, the behavior is undefined (replace OR skip?). If the parser rejects them, the error message must be clear.
+**Consequences:**
+- Cycles: infinite loop in transitive dependency resolution (the fixed-point loop in `resolve_joins` never converges)
+- Self-references: the join tries to join a table to itself without distinguishing the two instances, producing nonsensical results or DuckDB errors
 
 **Prevention:**
-- Reject `CREATE OR REPLACE ... IF NOT EXISTS` explicitly with a clear error: "Cannot combine OR REPLACE with IF NOT EXISTS."
-- The `DefineState` struct already has `or_replace: bool` and `if_not_exists: bool` fields. The existing code comment says "Mutually exclusive with or_replace (or_replace takes precedence if both set)." Change this to an explicit error instead of silent precedence.
-- Define the canonical syntax:
-  - `CREATE SEMANTIC VIEW name (...)`
-  - `CREATE OR REPLACE SEMANTIC VIEW name (...)`
-  - `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)`
-  - `DROP SEMANTIC VIEW name`
-  - `DROP SEMANTIC VIEW IF EXISTS name`
-- **Confidence:** HIGH. Syntax design decision with clear precedent from DuckDB's own behavior.
+- At define time, build the FK directed graph and run cycle detection (DFS with a visited set).
+- Reject self-referencing relationships with a clear error: "Table 'employees' cannot reference itself. Self-joins require explicit aliases."
+- Reject cycles with: "Circular relationship detected: orders -> customers -> orders. Remove one relationship to break the cycle."
+- This validation runs in the `create_semantic_view` bind function, before persisting the definition.
+- **Confidence:** HIGH. Standard graph validation. DFS cycle detection is O(V+E) on a small graph.
 
-**Phase assignment:** Parser detection phase. Document the syntax before implementing.
+**Phase assignment:** Define-time validation phase, alongside C2 (diamond detection).
 
 ---
 
-### P6: Error Location Reporting -- Character Positions Meaningless After Rewriting
+### M3: Dual DDL Interface Desynchronization During Transition
 
 **What goes wrong:**
-The user writes: `CREATE SEMANTIC VIEW sales (tbles := [...], dimensions := [...])` (typo: `tbles` instead of `tables`). The extension rewrites this to: `SELECT * FROM create_semantic_view('sales', tbles := [...], dimensions := [...])`. DuckDB executes the rewritten SQL and returns an error: "Unknown named parameter 'tbles'... at position 47." Position 47 refers to the REWRITTEN SQL, not the original DDL. The user sees a position that does not correspond to their input.
+The extension maintains two DDL interfaces: function-based (`create_semantic_view('name', ...)`) and native SQL (`CREATE SEMANTIC VIEW name (...)`). Both must produce identical JSON definitions in the catalog. During the v0.5.2 transition, the function-based path continues to accept `:=` syntax with raw struct/list literals, while the new SQL keyword path parses keyword clauses and translates them to JSON.
 
-This is even worse when the rewrite changes the string layout significantly. The `SELECT * FROM create_semantic_view('name', ` prefix shifts all positions by a variable amount depending on the view name length.
+If the translation logic has subtle differences (e.g., different handling of whitespace in expressions, different quoting of identifiers, different default values for optional fields), the same semantic view defined via two paths will produce different JSON, leading to different query behavior.
 
-**Consequences:** Error positions are misleading. Users cannot find the error in their original SQL. This undermines the "quality error reporting" goal of v0.5.1.
+**Why it happens:**
+The two paths share the CATALOG and EXPANSION code but have different PARSING code. The function-based path receives pre-parsed DuckDB types (STRUCTs and LISTs from DuckDB's expression evaluator), while the SQL keyword path receives raw text that must be parsed by the extension.
+
+**Consequences:**
+- A view created via SQL keywords produces different results than the same view created via function calls
+- Users report "the same definition gives different results" depending on how it was created
+- Debugging is extremely difficult because the difference is in the JSON, not in the SQL
 
 **Prevention:**
-- Do NOT pass through DuckDB's character positions from rewritten SQL errors. Instead, catch errors from the rewritten SQL execution and re-report them with context from the ORIGINAL DDL.
-- For parameter name errors (e.g., unknown named parameter `tbles`): extract the parameter name from the DuckDB error, find its position in the ORIGINAL DDL string, and report that position.
-- For structural errors (missing parens, malformed STRUCT literals): parse the original DDL enough to identify which clause contains the error, and report the clause name rather than a character position.
-- The `sv_execute_ddl_rust` function already catches errors from `ffi::duckdb_query` and returns them as strings. Enhance the error path to:
-  1. Catch the raw DuckDB error from the rewritten SQL
-  2. Map it back to the original DDL context
-  3. Add clause-level hints ("in the dimensions clause") and "did you mean" suggestions
-- For "did you mean" on parameter names: the known parameter names are fixed (`tables`, `relationships`, `dimensions`, `metrics`). Use `strsim` to suggest corrections.
-- **Confidence:** HIGH. This is a known problem with statement rewriting. The mitigation is error message post-processing, not architectural change.
+- Both paths MUST produce the same `SemanticViewDefinition` JSON. Add property-based tests:
+  - Generate a random valid definition
+  - Serialize it through the function-call path -> JSON
+  - Serialize it through the keyword path -> JSON
+  - Assert the JSON is identical (or semantically equivalent after normalization)
+- The SQL keyword parser's output should be a `SemanticViewDefinition` struct, not raw JSON. This forces the same model through both paths.
+- Add round-trip sqllogictests: create a view via keywords, describe it, create another view via functions with the same parameters, describe it, assert both descriptions match.
+- **Confidence:** HIGH. The risk is real but the mitigation (shared model struct) is architecturally sound and already in place.
 
-**Phase assignment:** Error reporting phase. This is the core of v0.5.1's error UX improvement.
+**Phase assignment:** Testing phase. Add cross-path equivalence tests after both parsers are implemented.
 
 ---
 
-### P7: Error Messages from C++ BinderException Truncated at Buffer Boundary
+### M4: Fan Trap -- Metrics Silently Double-Count Across One-to-Many Joins
 
 **What goes wrong:**
-The `sv_ddl_bind` function in `shim.cpp` calls `sv_execute_ddl_rust` which writes errors into a fixed-size buffer (`char error_buf[1024]`). If the error message exceeds 1024 bytes (plausible for errors that include the full expanded SQL, available column lists, or "did you mean" suggestions), the message is truncated at the buffer boundary.
+When a metric (e.g., `SUM(amount)`) is defined on a table that is joined to another table via a one-to-many relationship, the join duplicates rows from the "one" side. The SUM then counts each row multiple times.
 
-The C++ side then throws `BinderException("CREATE SEMANTIC VIEW failed: %s", error_buf)`, which DuckDB formats and shows to the user. A truncated error message ending mid-word or mid-suggestion is confusing and unhelpful.
+Example: `orders` (1) -> `line_items` (many). A metric `total_orders = COUNT(*)` on `orders` joined with a dimension from `line_items` will count each order N times (once per line item), inflating the count.
 
-**Consequences:** Long error messages are silently truncated. Users see incomplete suggestions or partial SQL fragments.
+Cube.dev solves this by requiring `primary_key` declarations and generating deduplication subqueries. MetricFlow restricts fan-out joins based on entity types.
+
+**Why it happens:**
+The current expansion engine does a simple `JOIN` and then `GROUP BY` in the outer query. It does not detect or prevent fan-out.
+
+**Consequences:**
+- Metrics return inflated values with no error or warning
+- Users may not notice until comparing results against a known baseline
+- This is a fundamental correctness issue that cannot be fixed with post-processing
 
 **Prevention:**
-- Increase the error buffer size. 1024 bytes is tight for error messages that include "did you mean" suggestions with available names listed. Use 4096 bytes.
-- Alternatively, allocate the error string dynamically: have `sv_execute_ddl_rust` return a `malloc`'d C string (via `CString::into_raw`) and have the C++ side free it after use. This eliminates the size limit entirely. The pattern is: Rust allocates, C++ copies into the BinderException string, then calls a Rust-side free function (`sv_free_string`).
-- At minimum, if using a fixed buffer, ensure the error message is constructed to fit: put the most important information (error type, parameter name, suggestion) first, and the expanded SQL (if any) last, so truncation cuts the least important part.
-- **Confidence:** HIGH. Buffer overflow is a well-understood problem. The fix is mechanical.
+- **For v0.5.2:** Document the constraint: "Metrics and dimensions in the same query should reference the same table or tables joined via many-to-one relationships. Joining a metric's table to a dimension's table via one-to-many will inflate metric values."
+- **For v0.5.2:** At define time, if PK/FK is declared, record the relationship cardinality (one-to-many vs many-to-one based on which side has the PK). At query time, warn if a metric's source table is on the "one" side of a one-to-many join that was triggered by a dimension on the "many" side.
+- **For future:** Implement Cube-style deduplication: pre-aggregate the metric in a subquery keyed by the PK, then join the pre-aggregated result to the dimension table. This eliminates fan-out but adds complexity.
+- **Confidence:** MEDIUM. The problem is well-documented in the literature. The prevention for v0.5.2 is documentation + optional warning, not a full solution. A full solution requires metric-aware expansion.
 
-**Phase assignment:** Error reporting phase. Increase buffer or switch to dynamic allocation.
+**Phase assignment:** Documentation for v0.5.2. Full deduplication deferred to a future milestone.
 
 ---
 
-### P8: DROP Semantic View Leaves Orphaned References in Active Queries
+### M5: Role-Playing Dimensions -- Same Table Joined Multiple Times With Different Meaning
 
 **What goes wrong:**
-If a user executes `DROP SEMANTIC VIEW sales` while another connection has an active `FROM semantic_view('sales', ...)` query in flight, the DROP removes the definition from the HashMap. The in-flight query may be in the middle of execution (it read the definition during bind, expanded the SQL, and is streaming results). The DROP does not affect the in-flight query because the expanded SQL is already being executed by DuckDB on its own connection.
+A common data model pattern: an `orders` table has `created_date`, `shipped_date`, and `delivered_date`, all referencing a `dates` dimension table. The PK/FK model declares three relationships from `orders` to `dates`, each via a different FK column.
 
-But if the in-flight query fails and retries (or if DuckDB re-binds for any reason), it will find the definition missing from the HashMap and produce a confusing error: "Semantic view 'sales' not found" -- even though it was just working moments ago.
+The current join model uses `join.table` as the key for join identity. Two joins to the same table (`dates`) are indistinguishable -- the second one overwrites the first in the `needed` set. Holistics calls this "role-playing dimensions" and flags it as a case where automatic path resolution fails.
 
-**This is standard database behavior** -- DuckDB's own `DROP TABLE` has the same semantics. But for semantic views, the "not found" error is more confusing because the view is not visible in DuckDB's catalog (it is in our custom HashMap), so `SHOW TABLES` never showed it in the first place.
+**Why it happens:**
+The `Join` struct uses `table: String` as its primary identifier. The `resolve_joins` function deduplicates by `table_lower` in a `HashSet`. Two joins to the same table are treated as one.
 
-**Consequences:** Confusing error during concurrent DROP + query. Not a data corruption risk.
+**Consequences:**
+- Only one instance of the joined table is included in the SQL
+- Dimensions from other instances silently reference the wrong join, producing wrong results
+- No error is raised because the table name IS found in the join list
 
 **Prevention:**
-- This is acceptable behavior. DuckDB's own DROP has the same semantics.
-- Document in README: "DROP SEMANTIC VIEW takes effect immediately. In-flight queries that reference the dropped view may continue until completion but cannot be re-executed."
-- The error message for "view not found" already includes "Did you mean?" suggestions and "Run FROM list_semantic_views()" guidance. This is sufficient.
-- **Confidence:** HIGH. Standard database behavior. No code change needed, just documentation.
+- Use the RELATIONSHIP NAME (or join alias) as the join identifier, not the table name. Snowflake's syntax requires naming each relationship: `orders_to_customers AS orders (o_custkey) REFERENCES customers`.
+- The current `TableRef` struct has `alias` and `table` fields. Extend `Join` (or its replacement) to include a `relationship_name` or `alias` field that distinguishes multiple joins to the same physical table.
+- At expansion time, use the relationship alias to emit `AS` clauses: `JOIN dates AS "created_dates" ON ...`, `JOIN dates AS "shipped_dates" ON ...`.
+- This requires `source_table` on dimensions/metrics to reference the RELATIONSHIP alias, not the physical table name.
+- **Confidence:** HIGH. Role-playing dimensions are a well-known pattern. The fix is aliasing, which the model already partially supports via `TableRef.alias`.
 
-**Phase assignment:** Documentation phase.
+**Phase assignment:** Model design phase. Must be addressed in the PK/FK model before implementation.
 
 ---
 
-### P9: DESCRIBE/SHOW Rewriting Harder Than DROP -- No Clean Function Target
+### M6: LIMIT 0 Type Inference Breaks When Expansion Strategy Changes
 
 **What goes wrong:**
-For DROP, the rewrite is clean: `DROP SEMANTIC VIEW x` becomes `SELECT * FROM drop_semantic_view('x')`. The drop function already exists and returns a result.
+The current define-time type inference runs `LIMIT 0` against the expanded SQL to discover column types. The expanded SQL uses the CTE structure (`WITH "_base" AS (...) SELECT ... FROM "_base" GROUP BY ...`). If the expansion strategy changes (C3: dropping CTE for direct FROM/JOIN), the SQL shape changes, and DuckDB may infer different types for the same expressions.
 
-For DESCRIBE and SHOW, the rewrite targets also already exist:
-- `DESCRIBE SEMANTIC VIEW x` -> `SELECT * FROM describe_semantic_view('x')`
-- `SHOW SEMANTIC VIEWS` -> `SELECT * FROM list_semantic_views()`
-
-But the rewrite is more complex because:
-1. `DESCRIBE SEMANTIC VIEW x` must extract the view name `x` from a different position than CREATE (no parenthesized body).
-2. `SHOW SEMANTIC VIEWS` has no view name at all -- it is a parameterless command.
-3. `DROP SEMANTIC VIEW IF EXISTS x` must handle the IF EXISTS modifier.
-
-Each statement type requires its own parse-and-rewrite function. The current `parse_ddl_text` and `rewrite_ddl_to_function_call` are specific to CREATE and assume a parenthesized body.
-
-**Consequences:** If you try to reuse the CREATE parser for DROP/DESCRIBE/SHOW, view names are extracted from the wrong position or the parser fails on missing parentheses.
+Specific risks:
+- CTE wrapping can affect DuckDB's type coercion (e.g., integer promotion inside vs outside CTEs)
+- The `build_execution_sql` function wraps the expansion in a subquery and adds casts -- changing the inner SQL may invalidate the wrapper
+- Edge case: expressions that reference CTE aliases (e.g., `_base.column`) will fail after CTE removal
 
 **Prevention:**
-- Write a separate rewrite function for each statement type. Each function extracts only the parameters it needs:
-  - `rewrite_drop(query) -> "SELECT * FROM drop_semantic_view('name')"` or `"SELECT * FROM drop_semantic_view_if_exists('name')"`
-  - `rewrite_describe(query) -> "SELECT * FROM describe_semantic_view('name')"`
-  - `rewrite_show(query) -> "SELECT * FROM list_semantic_views()"`
-- The detection function returns a statement type discriminant. The `sv_execute_ddl_rust` function dispatches to the correct rewriter based on the type.
-- **Alternatively:** Build a single `parse_ddl` function that returns a structured result: `{ stmt_type: Create/Drop/Describe/Show, name: Option<&str>, body: Option<&str>, or_replace: bool, if_exists: bool, if_not_exists: bool }`. Each rewriter is a match arm on `stmt_type`.
-- **Confidence:** HIGH. This is straightforward parsing work. The risk is only in trying to be too clever with shared code.
+- Run type inference AFTER the expansion strategy is finalized. Do not mix old-style expansion with new-style type inference.
+- The `build_execution_sql` wrapping is independent of CTE structure -- it wraps the entire SQL. Verify this is still true after expansion changes.
+- Add sqllogictests that create views with all supported column types and verify query results after the expansion change.
+- **Confidence:** MEDIUM. Type inference is robust (VARCHAR fallback on any failure), but behavioral differences between CTE and non-CTE SQL in DuckDB are not well-documented.
 
-**Phase assignment:** Parser extension phase. Build the dispatch table before implementing individual DDL verbs.
-
----
-
-### P10: FFI Return Code Insufficient for Multiple Statement Types
-
-**What goes wrong:**
-The current FFI contract between Rust and C++ is:
-- `sv_parse_rust(query, len) -> u8`: returns 0 (not ours) or 1 (detected CREATE SEMANTIC VIEW)
-- `sv_execute_ddl_rust(query, len, conn, name_out, ...) -> u8`: returns 0 (success) or 1 (error)
-
-For v0.5.1, the parse function needs to detect MULTIPLE statement types and communicate WHICH type was detected back to C++. A single u8 return of 0/1 is insufficient.
-
-The execute function also needs different behavior per type: CREATE returns a view name, DROP returns a view name, DESCRIBE returns multiple columns of metadata, SHOW returns a list of views. These have different output schemas.
-
-**Consequences:** If the FFI contract is not extended, all new DDL types must produce the same output schema (single VARCHAR "view_name"), which is wrong for DESCRIBE and SHOW.
-
-**Prevention:**
-- Extend `sv_parse_rust` to return a discriminant: 0 = not ours, 1 = CREATE, 2 = CREATE OR REPLACE, 3 = CREATE IF NOT EXISTS, 4 = DROP, 5 = DROP IF EXISTS, 6 = DESCRIBE, 7 = SHOW. These fit in a u8.
-- For `sv_execute_ddl_rust`: keep the current contract for CREATE/DROP (which both return a view name). For DESCRIBE and SHOW, use the rewrite-to-function approach: the Rust side rewrites the DDL to the corresponding `SELECT * FROM describe_semantic_view(...)` or `SELECT * FROM list_semantic_views()`, executes it on the DDL connection, and returns a success signal. The C++ `sv_ddl_bind` function declares a minimal output schema (single VARCHAR) for CREATE/DROP, but for DESCRIBE/SHOW, the actual results are produced by the table function executing on the DDL connection, and the plan function should return a different TableFunction with the correct schema.
-- **Simpler approach:** Have the C++ `sv_plan_function` check the discriminant and select different TableFunction implementations for each statement type. Only CREATE/DROP use `sv_ddl_bind`. DESCRIBE/SHOW get their own bind functions that declare the correct output schemas.
-- **Simplest approach:** All statement types are rewritten to `SELECT * FROM [function](...)` by Rust, executed on the DDL connection by `sv_execute_ddl_rust`, and the C++ plan function always returns a minimal "success message" TableFunction. The actual query results come from the rewritten function call. This works for CREATE and DROP (which return a view name), but DESCRIBE and SHOW should return their full result sets. If the rewritten SQL is executed on `sv_ddl_conn` and the results are discarded (only the side effect matters for CREATE/DROP), then DESCRIBE/SHOW need a different approach because their VALUE is the result set, not a side effect.
-- **Recommended approach:** Only use the parser hook rewriting for DDL STATEMENTS (CREATE, DROP) which have side effects. For QUERIES (DESCRIBE, SHOW) that return result sets, either:
-  (a) Rewrite to the function call and have the C++ plan_function return a table function that executes the rewrite and returns results, or
-  (b) Accept that DESCRIBE/SHOW remain function-only (no native syntax) for v0.5.1.
-  Option (b) is simpler and still delivers value. Document the function syntax in README.
-- **Confidence:** MEDIUM. The FFI extension is mechanical but the output schema problem for DESCRIBE/SHOW requires an architectural decision.
-
-**Phase assignment:** Architecture decision needed before implementation. Decide whether DESCRIBE/SHOW get native syntax in v0.5.1 or remain function-only.
+**Phase assignment:** Expansion engine phase, after C3 is resolved.
 
 ---
 
 ## Minor Pitfalls
 
-### P11: Fuzzy Matching Suggestions in DDL Errors May Be Wrong Context
+### m1: SQL Keyword Parsing of Expressions Is Not Full SQL Parsing
 
 **What goes wrong:**
-The existing `suggest_closest` function (using `strsim::levenshtein`) is used at query time to suggest corrections for unknown dimension/metric names. For DDL errors, the same function could suggest corrections for unknown parameter names (e.g., `tbles` -> `tables`).
+The SQL keyword syntax includes expressions:
+```sql
+DIMENSIONS (
+    region AS (c.region),
+    year AS (date_trunc('year', o.order_date))
+)
+```
 
-But the available names differ by context:
-- In a query: available names are dimensions and metrics of the specific view
-- In DDL: available names are the fixed set of parameter names (`tables`, `relationships`, `dimensions`, `metrics`)
-- In DROP: available names are existing view names
-
-If `suggest_closest` is called with the wrong candidate list, the suggestions will be nonsensical.
+The extension must extract the expression text (e.g., `c.region`, `date_trunc('year', o.order_date)`) from within the `DIMENSIONS (...)` clause. This is NOT full SQL parsing -- it is bracket-matching to find expression boundaries. But expressions can contain:
+- Commas inside function arguments: `COALESCE(a, b)` -- the comma is NOT an expression separator
+- Nested parentheses: `CAST(x AS DATE)`
+- String literals with special characters: `CASE WHEN status = 'it''s done' THEN 1 END`
+- `AS` keyword inside expressions: `CAST(x AS VARCHAR)` -- the `AS` is NOT the alias separator
 
 **Prevention:**
-- Parameterize suggestions by context. When constructing error messages for DDL, pass the correct candidate list.
-- For unknown parameter names in CREATE DDL: candidates = `["tables", "relationships", "dimensions", "metrics"]`
-- For "view not found" in DROP: candidates = list of existing view names from the HashMap
-- **Confidence:** HIGH. The function already takes `available: &[String]` as a parameter. Just pass the right list.
+- Use the same bracket-depth + string-literal tracking from `validate_brackets` to find expression boundaries.
+- Expression separators (commas) are only valid at depth 0 (outside all brackets).
+- The `AS` keyword is only an alias separator at depth 0, outside string literals.
+- Consider requiring expressions to be wrapped in parentheses: `region AS (c.region)`. This makes boundary detection unambiguous -- the expression is everything between the matched parens.
+- **Confidence:** HIGH. Bracket-depth parsing is already implemented. The edge cases are known.
 
-**Phase assignment:** Error reporting phase.
+**Phase assignment:** Parser implementation phase.
 
 ---
 
-### P12: SHOW SEMANTIC VIEWS Name Conflicts with DuckDB SHOW
+### m2: `tables` Field Empty for Legacy Definitions Breaks Qualified Column Resolution
 
 **What goes wrong:**
-DuckDB's `SHOW` command is an alias for `DESCRIBE`. The full set of DuckDB SHOW commands includes `SHOW TABLES`, `SHOW ALL TABLES`, `SHOW DATABASES`. If the extension intercepts `SHOW SEMANTIC VIEWS`, it must ensure that `SHOW TABLES` and other DuckDB SHOW commands are NOT intercepted.
+Legacy definitions (created before v0.5.2) have `tables: []` in their JSON (serde default). If the qualified column resolution code (`find_dimension`, `find_metric`) assumes `tables` is non-empty and uses it for alias lookup, legacy definitions will fail to resolve ANY qualified column lookups -- the alias map is empty.
 
-The prefix `SHOW SEMANTIC` is unique enough (DuckDB has no built-in `SHOW SEMANTIC` command), but careless prefix matching could intercept `SHOW SETTINGS` if only checking `SHOW S...`.
+Currently, `find_dimension` and `find_metric` already handle this: they try qualified lookup (alias match) first, then fall back to bare name. But if the qualified column support adds new code paths that bypass this fallback, legacy definitions break.
 
 **Prevention:**
-- Match the exact prefix `SHOW SEMANTIC VIEWS` (three words, case-insensitive), not just `SHOW S`.
-- The existing `detect_create_semantic_view` pattern of comparing a full prefix string handles this correctly.
-- Test that `SHOW TABLES`, `SHOW ALL TABLES`, and `SHOW DATABASES` still work after the extension is loaded.
-- **Confidence:** HIGH. String prefix matching. Straightforward.
+- All new code that accesses `def.tables` must handle the empty case.
+- Add a test: create a legacy definition (no `tables` field), query it with an unqualified dimension name, assert it works.
+- Consider: when `tables` is empty, populate it automatically from `base_table` and `joins[].table` with default aliases = table name. This normalization at load time eliminates the empty-tables edge case from all downstream code.
+- **Confidence:** HIGH. The existing code handles this. The risk is in NEW code that assumes `tables` is populated.
 
-**Phase assignment:** Parser detection phase. Add negative tests for DuckDB's own SHOW commands.
+**Phase assignment:** Model migration phase.
 
 ---
 
-### P13: CREATE OR REPLACE Does Not Re-Infer Column Types
+### m3: Semicolon Handling in Multi-Statement DDL
 
 **What goes wrong:**
-The existing `DefineSemanticViewVTab::bind` performs DDL-time type inference via `LIMIT 0` on the expanded SQL (lines 123-145 of `define.rs`). This populates `column_type_names` and `column_types_inferred` in the definition JSON. For CREATE OR REPLACE, if the new definition has different source tables or expressions, the column types may have changed. If the type inference step is skipped (e.g., because `persist_conn` is None for in-memory databases), the definition retains the old type information from the previous CREATE.
+DuckDB's parser extension splits multi-statement input on `;` before passing individual statements to the fallback parser. The current `rewrite_ddl` trims trailing semicolons. But if a SQL DDL body contains semicolons inside string literals (e.g., a filter expression `status != 'a;b'`), DuckDB may split the statement at the wrong place, sending a truncated statement to the parser hook.
 
-In practice, type inference runs in the same `bind` call for CREATE OR REPLACE as for CREATE, so the types ARE re-inferred. But if the source tables do not exist yet when CREATE OR REPLACE runs (e.g., the user is redefining a view before recreating the underlying tables), the `LIMIT 0` query fails, type inference is silently skipped, and the definition stores empty type vectors.
-
-**Consequences:** Subsequent queries against the replaced view may use stale type information, leading to type mismatches handled by `build_execution_sql` cast wrappers. This works but is inefficient and may produce unexpected cast behavior.
+This is documented in the v0.5.0 PITFALLS as an existing known issue (citing DuckDB issue #18485). The new keyword syntax does not change this risk, but it does introduce more complex bodies where semicolons in string literals are more likely.
 
 **Prevention:**
-- This is already handled correctly by the existing code: type inference failure is non-fatal, and `build_execution_sql` handles mismatches at query time.
-- Add a test: CREATE a view, DROP the source table, CREATE OR REPLACE the view with a different source, re-create the source table, then query. Assert types are correct at query time.
-- **Confidence:** HIGH. The existing defensive type system handles this. Test coverage is the gap.
+- The extension cannot control DuckDB's statement splitting. This is a DuckDB-level limitation.
+- Document: "Avoid semicolons in string literals within DDL bodies. If needed, use the function-based DDL interface."
+- This is a pre-existing issue, not new to v0.5.2.
+- **Confidence:** HIGH. Well-known DuckDB parser extension limitation.
 
-**Phase assignment:** Testing phase.
+**Phase assignment:** Documentation only.
 
 ---
 
-### P14: Error Buffer UTF-8 Safety at FFI Boundary
+### m4: Keyword Name Collision Between TABLES Clause and DuckDB Keywords
 
 **What goes wrong:**
-The `write_to_buffer` function in `parse.rs` copies Rust string bytes into a raw C buffer. If the error message contains multi-byte UTF-8 characters (e.g., from table names or column names with accented characters), truncation at the buffer boundary may cut a multi-byte sequence in half. The C++ side reads the buffer as a `char*` and constructs a `std::string`. A truncated UTF-8 sequence is invalid, but `std::string` does not validate encoding, so it becomes a `BinderException` with mojibake or partial characters.
-
-**Consequences:** Garbled error messages when non-ASCII identifiers are involved and the error message is near the buffer size limit.
+The SQL keyword syntax introduces `TABLES`, `DIMENSIONS`, `METRICS`, `RELATIONSHIPS`, `FACTS` as clause keywords. If a user chooses a view name or table alias that matches these keywords (e.g., `CREATE SEMANTIC VIEW tables TABLES (...)`), the parser may misidentify the view name as a clause keyword.
 
 **Prevention:**
-- In `write_to_buffer`: after determining `copy_len`, walk backward to find a valid UTF-8 boundary. Truncate to the last complete UTF-8 code point.
-- Alternatively, switch to dynamic allocation (see P7) to eliminate truncation entirely.
-- This is a minor issue because DuckDB identifiers are typically ASCII. But it is a correctness gap.
-- **Confidence:** HIGH. UTF-8 truncation is a well-known problem.
+- Parse view name FIRST (immediately after `CREATE SEMANTIC VIEW`), then parse clause keywords from the remainder.
+- The view name position is fixed: always immediately after the DDL prefix, before any clause keyword.
+- If the view name matches a clause keyword, it is still the view name -- clause keywords are only valid at the top level of the body, not in the name position.
+- Add tests for view names that match clause keywords: `CREATE SEMANTIC VIEW tables TABLES (...)`.
+- **Confidence:** HIGH. Positional parsing eliminates ambiguity.
 
-**Phase assignment:** Error reporting phase. Fix if switching to dynamic allocation; otherwise, add boundary-safe truncation.
+**Phase assignment:** Parser implementation phase.
 
 ---
 
@@ -354,13 +417,12 @@ The `write_to_buffer` function in `parse.rs` copies Rust string bytes into a raw
 
 | Phase Topic | Likely Pitfall | Mitigation |
 |-------------|---------------|------------|
-| Parser hook validation spike | P1 (DROP/DESCRIBE/SHOW may not trigger fallback) | Empirical test of each prefix against DuckDB's parser |
-| Parser detection extension | P4 (multiple prefix matching), P5 (IF NOT EXISTS position), P12 (SHOW conflicts) | Ordered prefix matching, define syntax, negative tests |
-| FFI contract extension | P10 (return code insufficient), P7 (buffer truncation), P14 (UTF-8 safety) | Extended discriminant, larger/dynamic buffers |
-| DROP implementation | P3 (three-connection lock conflict), P8 (concurrent DROP + query) | Test native DDL path early, document behavior |
-| CREATE OR REPLACE | P2 (persist vs memory inconsistency), P5 (mutual exclusion with IF NOT EXISTS), P13 (type re-inference) | Round-trip tests, explicit rejection of conflicting modifiers |
-| Error reporting | P6 (position meaningless after rewrite), P7 (buffer truncation), P11 (wrong suggestion context) | Error post-processing, context-aware suggestions |
-| DESCRIBE/SHOW | P1 (may not trigger parser hook), P9 (different rewrite structure), P10 (output schema mismatch) | Decide function-only vs native syntax before implementing |
+| SQL keyword parser | C1 (backward compat break), M1 (nested parens), m1 (expression parsing), m4 (keyword collisions) | Build syntax discriminator first; reuse bracket-depth tracking; positional parsing |
+| PK/FK model and validation | C2 (diamond joins), M2 (cycles/self-ref), M5 (role-playing dims) | Tree validation at define time; relationship aliases; reject diamonds/cycles |
+| Expansion engine changes | C3 (CTE breaks qualified cols), C4 (old ON-clause format), M6 (type inference shape) | Drop CTE for direct FROM/JOIN; keep dual resolution strategy; re-test type inference |
+| Dual interface maintenance | M3 (desynchronization) | Shared model struct; cross-path equivalence tests; property-based tests |
+| Fan-out prevention | M4 (silent double-counting) | Document constraint; optional warning; defer deduplication to future |
+| Legacy compatibility | m2 (empty tables field), C4 (old join format) | Handle empty tables; keep substring-matching for old definitions |
 
 ---
 
@@ -370,33 +432,28 @@ The `write_to_buffer` function in `parse.rs` copies Rust string bytes into a raw
 
 | Area | Confidence | Basis |
 |------|------------|-------|
-| Parser fallback behavior for DROP (P1) | MEDIUM | DuckDB docs confirm DROP supports specific object types; `SEMANTIC` is not one; likely parser error but needs empirical test |
-| Parser fallback behavior for DESCRIBE/SHOW (P1) | LOW | DESCRIBE may treat next token as identifier, causing catalog error not parser error; needs empirical test |
-| Catalog consistency (P2) | HIGH | Code review of existing write-first pattern; risk is theoretical |
-| Three-connection locking (P3) | MEDIUM | DuckDB single-writer documented; but three-connection interaction during parser hook bind is novel territory |
-| Prefix matching (P4) | HIGH | Pure string matching; ordered prefixes solve this |
-| IF NOT EXISTS syntax (P5) | HIGH | DuckDB precedent clear: IF NOT EXISTS after object type, before name |
-| Error position mapping (P6) | HIGH | Well-known statement rewriting problem; error post-processing is standard approach |
-| Buffer truncation (P7) | HIGH | Fixed buffer arithmetic; obvious fix |
-| FFI contract extension (P10) | MEDIUM | Mechanical change but DESCRIBE/SHOW output schema needs architectural decision |
+| Backward compat (C1) | HIGH | Direct code review of `rewrite_ddl`, `scan_clause_keywords`, TECH-DEBT.md item #8 |
+| Diamond join problem (C2) | HIGH | Cube.dev docs, Snowflake validation rules, Holistics path ambiguity docs, dbt MetricFlow join logic |
+| CTE vs qualified columns (C3) | HIGH | Direct analysis of `expand()` code, TECH-DEBT.md item #7 |
+| Stored definition compat (C4) | HIGH | Code review of serde defaults in model.rs, existing backward compat tests |
+| Fan trap / chasm trap (M4) | MEDIUM | Literature consensus (Cube, Sisense, datacadamia); v0.5.2 mitigation is documentation, not code |
+| Role-playing dimensions (M5) | HIGH | Holistics docs, Snowflake relationship naming; existing model already has aliases |
 
 **Sources consulted:**
-- [DuckDB DROP statement documentation](https://duckdb.org/docs/stable/sql/statements/drop) -- supported object types
-- [DuckDB DESCRIBE statement documentation](https://duckdb.org/docs/stable/sql/statements/describe) -- DESCRIBE syntax and behavior
-- [DuckDB issue #18485: Inconsistent semicolon handling](https://github.com/duckdb/duckdb/issues/18485) -- parser extension input normalization (already handled in v0.5.0)
-- [DuckDB Runtime-Extensible Parsers (blog)](https://duckdb.org/2024/11/22/runtime-extensible-parsers) -- parse_function is fallback, not override
-- [DuckDB Runtime-Extensible Parsers (CIDR 2025 paper)](https://duckdb.org/pdf/CIDR2025-muehleisen-raasveldt-extensible-parsers.pdf) -- extension parsers replace full grammar, not extend it
-- [Effective Rust: Control what crosses FFI boundaries](https://effective-rust.com/ffi.html) -- FFI error handling best practices
-- [Rust FFI error reporting (users.rust-lang.org)](https://users.rust-lang.org/t/best-practices-for-error-reporting-from-rust-to-c/18345) -- Rust-to-C error patterns
-- [DuckPGQ extension (GitHub)](https://github.com/cwida/duckpgq-extension) -- existence proof for DROP PROPERTY GRAPH via parser hooks
-- This project's `src/parse.rs` -- current parser detection and rewriting
-- This project's `cpp/src/shim.cpp` -- current C++ shim with plan_function and DDL connection
-- This project's `src/catalog.rs` -- dual-store catalog (HashMap + DuckDB table)
-- This project's `src/ddl/define.rs` -- CREATE with or_replace and if_not_exists flags
-- This project's `src/ddl/drop.rs` -- DROP with persist_conn and if_exists patterns
-- This project's `src/ddl/describe.rs` -- DESCRIBE as table function (existing)
-- This project's `src/ddl/list.rs` -- LIST as table function (existing)
-- This project's `src/query/error.rs` -- existing error types and display formatting
-- This project's `src/expand.rs` -- fuzzy matching via strsim, ExpandError types
-- This project's `src/lib.rs` -- extension init, connection creation, function registration
-- This project's `TECH-DEBT.md` -- accepted decisions and deferred items
+- [Cube.dev: Working with Joins](https://cube.dev/docs/product/data-modeling/concepts/working-with-joins) -- diamond subgraph detection, primary key requirement for fan/chasm trap prevention
+- [Cube.dev: Joins Reference](https://cube.dev/docs/reference/data-model/joins) -- relationship types, deduplication strategy
+- [Snowflake: How Snowflake validates semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules) -- circular relationship prohibition, self-reference prohibition
+- [Snowflake: CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- PK/FK syntax, relationship naming
+- [Snowflake: Semantic View Example](https://docs.snowflake.com/en/user-guide/views-semantic/example) -- TPC-H example with full PK/FK declarations
+- [dbt: MetricFlow Join Logic](https://docs.getdbt.com/docs/build/join-logic) -- multi-hop join limits, fan-out prevention via entity types
+- [Holistics: Path Ambiguity in Dataset](https://docs.holistics.io/docs/dataset-path-ambiguity) -- tiered path ranking, role-playing dimension handling
+- [datacadamia: Fan Trap Issue](https://www.datacadamia.com/data/type/cube/semantic/fan_trap) -- fan trap definition, measure deduplication challenge
+- [datacadamia: Chasm Trap Issue](https://datacadamia.com/data/type/cube/semantic/chasm_trap) -- chasm trap via multiple FK references
+- [Sisense: Chasm and Fan Traps](https://docs.sisense.com/main/SisenseLinux/chasm-and-fan-traps.htm) -- detection and resolution
+- [DuckDB: Runtime-Extensible SQL Parsers](https://duckdb.org/2024/11/22/runtime-extensible-parsers) -- parser hook fallback mechanism
+- [boring-semantic-layer: Issue #32](https://github.com/boringdata/boring-semantic-layer/issues/32) -- multiple joins to same dimension table
+- This project's `src/expand.rs` -- CTE construction, `resolve_joins`, `find_dimension`, `find_metric`, `append_join_on_clause`
+- This project's `src/parse.rs` -- DDL detection, rewriting, validation, bracket tracking
+- This project's `src/model.rs` -- `SemanticViewDefinition`, `Join`, `TableRef`, `JoinColumn`, serde defaults
+- This project's `src/catalog.rs` -- dual-store catalog, JSON validation
+- This project's `TECH-DEBT.md` -- items #6 (ON-clause heuristic), #7 (unqualified columns), #8 (statement rewrite syntax gap)

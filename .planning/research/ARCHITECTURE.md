@@ -1,842 +1,693 @@
-# Architecture: v0.5.1 DDL Polish — Extended DDL Surface + Error Reporting
+# Architecture: SQL DDL Syntax & PK/FK Relationship Model Integration
 
-**Project:** DuckDB Semantic Views Extension (v0.5.1)
-**Researched:** 2026-03-08
-**Scope:** How DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW integrate with the existing parser hook architecture; how error location reporting works within the Rust FFI parse function; what data flow changes are needed
-**Confidence:** HIGH -- all new features use patterns already proven in v0.5.0, with no new architectural unknowns
+**Domain:** DuckDB semantic views extension -- SQL DDL parser and join inference
+**Researched:** 2026-03-09
+**Confidence:** HIGH (based on codebase analysis + Snowflake reference)
 
----
+## Executive Summary
 
-## Current Architecture (v0.5.0 Baseline)
+This document analyzes how proper SQL DDL syntax parsing and a PK/FK relationship model integrate with the existing semantic views extension architecture. The analysis covers four specific integration points: (1) where the SQL-to-function-call translation layer fits in the rewrite pipeline, (2) how the PK/FK model changes internal structs, (3) how join inference changes from ON-clause substring matching to PK/FK graph traversal, and (4) how qualified column names change CTE expansion.
 
-The v0.5.0 parser extension spike established a two-layer DDL architecture:
+The key architectural insight: **the existing pipeline already has all the right boundaries**. The parser hook already intercepts DDL, validation already scans clause keywords, the model already has `TableRef`/`Join`/`JoinColumn` structs, and the expansion engine already handles table aliases. The gap is a **translation layer** between the keyword-based DDL body and the function-call execution target -- currently the body is passed verbatim, which forces users to write DuckDB struct/list literal syntax inside what should be SQL DDL.
 
-```
-User SQL Input
-    |
-    v
-DuckDB Native Parser
-    |
-    +--[parses OK]---> Standard DuckDB execution
-    |                  (includes function-based DDL:
-    |                   create_semantic_view(), drop_semantic_view(), etc.)
-    |
-    +--[parse fails]--> Parser Extension Fallback Chain
-                        |
-                        v
-                   sv_parse_stub (C++, shim.cpp)
-                        |
-                        v
-                   sv_parse_rust (Rust FFI, parse.rs)
-                        |
-                   Detects "CREATE SEMANTIC VIEW" prefix?
-                        |
-                   +--[no]--> DISPLAY_ORIGINAL_ERROR (pass through)
-                   |
-                   +--[yes]--> PARSE_SUCCESSFUL + SemanticViewParseData
-                                    |
-                                    v
-                              sv_plan_function (C++, shim.cpp)
-                                    |
-                              Returns TableFunction "sv_ddl_internal"
-                              with original query text as parameter
-                                    |
-                                    v
-                              sv_ddl_bind (C++, shim.cpp)
-                                    |
-                              Calls sv_execute_ddl_rust (Rust FFI)
-                                    |
-                              Rewrites: CREATE SEMANTIC VIEW name (body)
-                              Into:     SELECT * FROM create_semantic_view('name', body)
-                                    |
-                              Executes via sv_ddl_conn (dedicated connection)
-                                    |
-                                    v
-                              Existing VTab bind path
-                              (DefineSemanticViewVTab in define.rs)
-```
+## Current Architecture (v0.5.1)
 
-**Key observation:** The current architecture already has separate Rust functions in `parse.rs`:
-
-| Function | Purpose | Signature |
-|----------|---------|-----------|
-| `detect_create_semantic_view(query)` | Prefix detection (0/1) | `&str -> u8` |
-| `parse_ddl_text(query)` | Extract `(name, body)` | `&str -> Result<(&str, &str), String>` |
-| `rewrite_ddl_to_function_call(query)` | Full rewrite to function call | `&str -> Result<String, String>` |
-| `sv_parse_rust(ptr, len)` | FFI: detection trampoline | `*const u8, usize -> u8` |
-| `sv_execute_ddl_rust(...)` | FFI: rewrite + execute | Multiple params -> u8 |
-
-The function-based DDL layer (registered at extension init) already has all the variants:
-
-| Function name | Behavior |
-|---------------|----------|
-| `create_semantic_view` | INSERT, error on duplicate |
-| `create_or_replace_semantic_view` | UPSERT, overwrite existing |
-| `create_semantic_view_if_not_exists` | INSERT, silent on duplicate |
-| `drop_semantic_view` | DELETE, error if not found |
-| `drop_semantic_view_if_exists` | DELETE, silent if not found |
-| `list_semantic_views` | List all views |
-| `describe_semantic_view` | Describe one view |
-
-**The function layer is complete. The parser hook layer only exposes `CREATE SEMANTIC VIEW`.**
-
----
-
-## Target Architecture (v0.5.1)
-
-The new features extend the parse layer to detect and rewrite more statement variants, without touching the function layer or the plan/bind/execute layer.
-
-### Statement Detection Matrix
-
-| Native DDL Syntax | Rewrites To | Function Already Registered |
-|-------------------|-------------|---------------------------|
-| `CREATE SEMANTIC VIEW name (...)` | `SELECT * FROM create_semantic_view('name', ...)` | Yes (v0.5.0) |
-| `CREATE OR REPLACE SEMANTIC VIEW name (...)` | `SELECT * FROM create_or_replace_semantic_view('name', ...)` | Yes (lib.rs:366) |
-| `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)` | `SELECT * FROM create_semantic_view_if_not_exists('name', ...)` | Yes (lib.rs:378) |
-| `DROP SEMANTIC VIEW name` | `SELECT * FROM drop_semantic_view('name')` | Yes (lib.rs:389) |
-| `DROP SEMANTIC VIEW IF EXISTS name` | `SELECT * FROM drop_semantic_view_if_exists('name')` | Yes (lib.rs:400) |
-| `DESCRIBE SEMANTIC VIEW name` | `SELECT * FROM describe_semantic_view('name')` | Yes (lib.rs:412) |
-| `SHOW SEMANTIC VIEWS` | `SELECT * FROM list_semantic_views()` | Yes (lib.rs:406) |
-
-**Every new native DDL statement rewrites to an existing registered table function.** No new VTab implementations are needed.
-
----
-
-## Integration Points: What Changes Where
-
-### 1. `src/parse.rs` -- MODIFY (Primary Change)
-
-The detection function (`detect_create_semantic_view`) and the rewrite function must be extended to handle all seven statement forms. This is the largest code change.
-
-#### Detection: Multi-Prefix Matching
-
-The current detection is a single prefix match. It must become a multi-prefix dispatcher:
+### End-to-End DDL Flow
 
 ```
-Input:  raw query string (from DuckDB parser fallback)
-Output: StatementKind enum variant + u8 detection flag
+User SQL                          C++ shim.cpp                    Rust parse.rs
+---------                         ------------                    -------------
+CREATE SEMANTIC VIEW x (          sv_parse_stub()                 sv_validate_ddl_rust()
+  tables := [...],                  |                               |
+  dimensions := [...]               | parse hook fires              | detect_ddl_kind()
+)                                   | when DuckDB parser fails      | validate_clauses()
+                                    v                               | scan_clause_keywords()
+                                  sv_plan_function()                |
+                                    | carries raw query              v
+                                    v                             sv_rewrite_ddl_rust()
+                                  sv_ddl_bind()                     |
+                                    | calls Rust to rewrite         | rewrite_ddl()
+                                    | DDL -> function call          | parse_create_body()
+                                    v                               |
+                                  duckdb_query(sv_ddl_conn, sql)    v
+                                    | executes on isolated conn   "SELECT * FROM
+                                    v                              create_semantic_view(
+                                  Results forwarded as VARCHAR       'x', tables := [...],
+                                  to DuckDB output                   dimensions := [...])"
 
-StatementKind:
-  CreateSemanticView           -> "create semantic view"
-  CreateOrReplaceSemanticView  -> "create or replace semantic view"
-  CreateIfNotExists            -> "create semantic view if not exists"
-  DropSemanticView             -> "drop semantic view"
-  DropIfExists                 -> "drop semantic view if exists"
-  DescribeSemanticView         -> "describe semantic view"
-  ShowSemanticViews            -> "show semantic views"
-  NotOurs                      -> fallback
+                                                                  Rust ddl/define.rs
+                                                                  ----------------
+                                                                  parse_define_args_from_bind()
+                                                                    | reads LIST(STRUCT) params
+                                                                    | from DuckDB BindInfo
+                                                                    v
+                                                                  SemanticViewDefinition
+                                                                    | stored as JSON
+                                                                    v
+                                                                  catalog_insert() / catalog_upsert()
 ```
 
-**Detection order matters.** Longer prefixes must be checked before shorter ones:
-1. `create or replace semantic view` (36 chars) -- before `create semantic view`
-2. `create semantic view if not exists` (35 chars) -- before `create semantic view`
-3. `create semantic view` (20 chars) -- after the above two
-4. `drop semantic view if exists` (28 chars) -- before `drop semantic view`
-5. `drop semantic view` (19 chars) -- after the above
-6. `describe semantic view` (22 chars)
-7. `show semantic views` (19 chars)
+### End-to-End Query Flow
 
-#### Rewrite: Statement-Specific Function Call Generation
-
-Each statement kind has a different rewrite shape:
-
-**CREATE variants** (have a body with parenthesized clauses):
 ```
-CREATE SEMANTIC VIEW name (body)
-  -> SELECT * FROM create_semantic_view('name', body)
-
-CREATE OR REPLACE SEMANTIC VIEW name (body)
-  -> SELECT * FROM create_or_replace_semantic_view('name', body)
-
-CREATE SEMANTIC VIEW IF NOT EXISTS name (body)
-  -> SELECT * FROM create_semantic_view_if_not_exists('name', body)
-```
-
-**DROP variants** (name only, no body):
-```
-DROP SEMANTIC VIEW name
-  -> SELECT * FROM drop_semantic_view('name')
-
-DROP SEMANTIC VIEW IF EXISTS name
-  -> SELECT * FROM drop_semantic_view_if_exists('name')
+User SQL                          Rust query/table_function.rs    Rust expand.rs
+---------                         --------------------------     -------------
+FROM semantic_view(               bind()                         expand()
+  'x',                              | loads def from catalog       |
+  dimensions := [...],              | infers types (LIMIT 0)       | resolve dims/mets
+  metrics := [...]                  v                              | resolve_joins()
+)                                 func()                           | build _base CTE
+                                    | calls expand()               | build outer SELECT
+                                    | executes expanded SQL        | GROUP BY ordinals
+                                    | via execute_sql_raw()         |
+                                    | streams via vector_ref        v
+                                    v                             Concrete SQL:
+                                  Output columns (typed)          WITH "_base" AS (
+                                                                    SELECT *
+                                                                    FROM "orders" AS "o"
+                                                                    JOIN "customers" AS "c"
+                                                                      ON "o"."customer_id" = "c"."id"
+                                                                  )
+                                                                  SELECT region, SUM(amount)
+                                                                  FROM "_base"
+                                                                  GROUP BY 1
 ```
 
-**DESCRIBE** (name only):
-```
-DESCRIBE SEMANTIC VIEW name
-  -> SELECT * FROM describe_semantic_view('name')
-```
+### The Translation Gap
 
-**SHOW** (no arguments):
-```
-SHOW SEMANTIC VIEWS
-  -> SELECT * FROM list_semantic_views()
-```
-
-#### Proposed Internal API
+The `rewrite_ddl()` function in `parse.rs` performs this rewrite for CREATE-with-body forms:
 
 ```rust
-/// Recognized statement kinds for the parser hook.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum StatementKind {
-    Create,
-    CreateOrReplace,
-    CreateIfNotExists,
-    Drop,
-    DropIfExists,
-    Describe,
-    ShowAll,
+let (name, body) = parse_create_body(trimmed, plen)?;
+let safe_name = name.replace('\'', "''");
+Ok(format!("SELECT * FROM {fn_name}('{safe_name}', {body})"))
+```
+
+**The body is passed verbatim.** This means the DDL body must already be valid DuckDB function-call syntax (`tables := [{alias: 'o', table: 'orders'}]`). The validation layer (`scan_clause_keywords`) can detect SQL-style clause keywords (`TABLES (...)`, `DIMENSIONS (...)`) but there is no code to convert from SQL keyword syntax to function-call syntax.
+
+This is explicitly documented in TECH-DEBT.md item 8:
+
+> The phase 21 validation layer (scan_clause_keywords) can parse a conventional SQL-style body (TABLES (...), DIMENSIONS (...), METRICS (...)) but there is no translation layer to convert it into executable function-call syntax.
+
+## Recommended Architecture (v0.5.2)
+
+### Component 1: SQL DDL Body Parser (NEW)
+
+**Location:** New module `src/parse_sql_body.rs` (or extend `src/parse.rs`)
+
+**Purpose:** Parse Snowflake-style SQL DDL body into a `SemanticViewDefinition` struct, bypassing the function-call rewrite entirely.
+
+**Why a new component instead of extending the rewrite:** The current rewrite approach (`body -> function call SQL -> DuckDB parses SQL -> BindInfo -> parse_define_args_from_bind`) is a round-trip through DuckDB's SQL parser. We can go directly from text to `SemanticViewDefinition` without that round-trip.
+
+Two architectural options were evaluated:
+
+**OPTION A -- Direct parse (bypass DuckDB SQL parser):**
+```
+DDL text -> parse_sql_body() -> SemanticViewDefinition -> JSON -> catalog_insert()
+```
+This requires a new FFI path: instead of `sv_ddl_bind` executing rewritten SQL on `sv_ddl_conn`, it would call a Rust FFI function directly to parse the body and insert into the catalog. Changes required in `shim.cpp` (new FFI call path), new Rust FFI entry point, and the parser itself.
+
+**OPTION B -- Translator (convert SQL syntax to function-call syntax):**
+```
+DDL text -> translate_sql_body() -> function-call syntax -> existing pipeline unchanged
+```
+The translator converts SQL keyword syntax into DuckDB struct/list literal syntax. The rest of the pipeline (`sv_ddl_bind` -> `duckdb_query` -> `create_semantic_view` VTab -> `parse_define_args_from_bind`) is unchanged.
+
+**Recommendation: OPTION B (translator approach).** It has the smallest blast radius -- no changes to `shim.cpp`, no new FFI boundary, and the existing pipeline is already tested. The translator is a pure function (`&str -> Result<String, String>`) that can be unit-tested independently.
+
+**Target SQL syntax** (Snowflake-aligned):
+
+```sql
+CREATE SEMANTIC VIEW order_analytics (
+  TABLES (
+    o AS orders PRIMARY KEY (order_id),
+    c AS customers PRIMARY KEY (customer_id),
+    li AS line_items PRIMARY KEY (line_item_id)
+  ),
+  RELATIONSHIPS (
+    o (customer_id) REFERENCES c,
+    li (order_id) REFERENCES o
+  ),
+  DIMENSIONS (
+    o.region AS region,
+    o.order_date AS o_orderdate,
+    c.name AS customer_name
+  ),
+  METRICS (
+    o.revenue AS SUM(li.amount),
+    o.order_count AS COUNT(o.order_id)
+  )
+)
+```
+
+**Grammar sketch** (recursive descent, not a formal grammar):
+
+```
+body        ::= clause ( ',' clause )*
+clause      ::= TABLES '(' table_list ')'
+              | RELATIONSHIPS '(' rel_list ')'
+              | DIMENSIONS '(' dim_list ')'
+              | METRICS '(' metric_list ')'
+table_list  ::= table_def ( ',' table_def )*
+table_def   ::= IDENT 'AS' table_ref [ 'PRIMARY' 'KEY' '(' col_list ')' ]
+rel_list    ::= rel_def ( ',' rel_def )*
+rel_def     ::= IDENT '(' col_list ')' 'REFERENCES' IDENT
+dim_list    ::= dim_def ( ',' dim_def )*
+dim_def     ::= table_alias '.' IDENT 'AS' sql_expr
+metric_list ::= metric_def ( ',' metric_def )*
+metric_def  ::= table_alias '.' IDENT 'AS' sql_expr
+sql_expr    ::= <balanced parentheses, no commas at depth 0>
+col_list    ::= IDENT ( ',' IDENT )*
+table_ref   ::= IDENT [ '.' IDENT [ '.' IDENT ] ]
+```
+
+**Translation output for the example above:**
+
+```sql
+SELECT * FROM create_semantic_view('order_analytics',
+  tables := [
+    {alias: 'o', table: 'orders'},
+    {alias: 'c', table: 'customers'},
+    {alias: 'li', table: 'line_items'}
+  ],
+  relationships := [
+    {from_table: 'o', to_table: 'c', join_columns: [{from: 'customer_id', to: 'customer_id'}]},
+    {from_table: 'li', to_table: 'o', join_columns: [{from: 'order_id', to: 'order_id'}]}
+  ],
+  dimensions := [
+    {name: 'region', expr: 'o.region', source_table: 'o'},
+    {name: 'o_orderdate', expr: 'o.order_date', source_table: 'o'},
+    {name: 'customer_name', expr: 'c.name', source_table: 'c'}
+  ],
+  metrics := [
+    {name: 'revenue', expr: 'SUM(li.amount)', source_table: 'o'},
+    {name: 'order_count', expr: 'COUNT(o.order_id)', source_table: 'o'}
+  ]
+)
+```
+
+**Key parsing decisions:**
+
+- **Dimension/metric scoping:** `o.region AS region` -- the `o.` prefix before the dot is the `source_table`, `region` after AS is the output `name`, and the text between AS and the next comma/end is the `expr`. For metrics the expr is expected to be an aggregate.
+- **Relationship PK resolution:** `o (customer_id) REFERENCES c` -- the FK column is `customer_id` on table `o`, and the PK column on `c` must be looked up from `c`'s PRIMARY KEY declaration. If `c` has `PRIMARY KEY (customer_id)`, the join column pair is `{from: 'customer_id', to: 'customer_id'}`. If the FK name differs from the PK name, the relationship syntax would need `REFERENCES c (id)` to specify the target column.
+- **Expression boundaries:** Expressions after `AS` extend until the next comma at depth 0 or the closing `)` of the clause. Parentheses, string literals, and nested function calls are tracked to avoid splitting mid-expression.
+
+### Component 2: PK/FK Table Registry (MODIFIED)
+
+**Location:** `src/model.rs` -- modify existing `TableRef` and `Join` structs
+
+**Current state:**
+
+```rust
+pub struct TableRef {
+    pub alias: String,
+    pub table: String,
 }
 
-/// Detect which (if any) semantic view statement this query is.
-/// Returns None for non-matching queries.
-pub fn detect_statement(query: &str) -> Option<StatementKind> { ... }
+pub struct Join {
+    pub table: String,
+    pub on: String,              // legacy
+    pub from_cols: Vec<String>,  // legacy
+    pub join_columns: Vec<JoinColumn>,  // Phase 11.1
+}
 
-/// Rewrite a detected statement into its function-call equivalent.
-/// Requires: detect_statement(query) returned Some(_).
-pub fn rewrite_to_function_call(query: &str) -> Result<String, ParseError> { ... }
+pub struct JoinColumn {
+    pub from: String,
+    pub to: String,
+}
 ```
 
-The existing `detect_create_semantic_view` and `rewrite_ddl_to_function_call` can be refactored into this wider API. The old functions can remain as thin wrappers for backward compatibility in tests if desired, or be replaced entirely.
-
-### 2. `src/parse.rs` -- FFI Functions: MODIFY
-
-The current FFI functions need adjustment:
-
-**`sv_parse_rust`** -- Currently returns `u8` (0 or 1) for "is this CREATE SEMANTIC VIEW?". Must now return 1 for ALL seven statement kinds. Since any match means the parser hook should claim the statement, the return type stays the same: `0 = not ours, 1 = ours`.
-
-The C++ side does not need to know which kind it is. The kind is determined again in `sv_execute_ddl_rust` when the full query text is rewritten.
-
-**`sv_execute_ddl_rust`** -- Currently calls `rewrite_ddl_to_function_call`, which only handles CREATE. Must now call the new `rewrite_to_function_call` which handles all seven forms. The output contract changes slightly:
-- For CREATE variants: `name_out` = view name, return 0
-- For DROP variants: `name_out` = view name, return 0
-- For DESCRIBE: `name_out` = view name, return 0
-- For SHOW: `name_out` = "semantic_views" (or empty), return 0
-
-The C++ `sv_ddl_bind` receives the name in `name_buf` for the single-row output. For SHOW, the output schema is different (two columns: name + base_table), so SHOW needs special handling. Two options:
-
-**Option A (recommended): SHOW bypasses sv_ddl_bind entirely.** The rewrite `SELECT * FROM list_semantic_views()` is a standard table function call that DuckDB can parse natively. The parse function could rewrite SHOW and then return `DISPLAY_ORIGINAL_ERROR` to let DuckDB re-parse the rewritten SQL. But this is not how the fallback mechanism works -- the parse function cannot modify the query string and then reject it.
-
-**Option B (recommended): Execute SHOW via the same sv_ddl_conn path.** The `sv_execute_ddl_rust` function executes `SELECT * FROM list_semantic_views()` on the DDL connection, but `sv_ddl_bind` currently outputs a single VARCHAR column `view_name`. For SHOW, the result has two columns (name, base_table) with multiple rows.
-
-**Option C (recommended, simplest): All statements go through sv_execute_ddl_rust, which runs the rewritten SQL on sv_ddl_conn. The sv_ddl_bind/execute C++ functions become passthrough: they execute any rewritten SQL and return its result.** This requires generalizing sv_ddl_bind to not hardcode a single-column output schema.
-
-**Chosen approach: Generalize the C++ plan function to be schema-flexible.** Currently `sv_ddl_bind` hardcodes one VARCHAR column. The cleanest approach:
-
-1. `sv_execute_ddl_rust` rewrites the query and executes it on `sv_ddl_conn`
-2. The Rust FFI returns a result summary (for CREATE/DROP: view name; for DESCRIBE: full row; for SHOW: all rows)
-3. The C++ bind/execute functions emit the appropriate schema
-
-However, this adds significant C++ complexity. A better approach:
-
-**Final recommendation: Two C++ plan paths.**
-
-The `sv_plan_function` inspects the `SemanticViewParseData` query text and returns different table functions:
-- For CREATE/DROP: `sv_ddl_internal` (existing, single VARCHAR output)
-- For DESCRIBE/SHOW: `sv_query_internal` (new, executes rewritten SQL and returns DuckDB's native result)
-
-Actually, the simplest approach that requires minimal C++ changes:
-
-**Simplest approach: Have sv_execute_ddl_rust handle everything, and the C++ side just shows the view name for DDL mutations, while DESCRIBE and SHOW are handled differently.**
-
-Let me reconsider the architecture more carefully.
-
-### 3. C++ shim (`cpp/src/shim.cpp`) -- MODIFY
-
-The C++ shim currently has:
-- `sv_parse_stub`: Calls `sv_parse_rust`, returns PARSE_SUCCESSFUL or default (DISPLAY_ORIGINAL_ERROR)
-- `sv_plan_function`: Returns a TableFunction `sv_ddl_internal` with the query text as a VARCHAR parameter
-- `sv_ddl_bind`: Calls `sv_execute_ddl_rust` to rewrite + execute, returns single `view_name` VARCHAR column
-- `sv_ddl_execute`: Emits one row with the view name
-
-**Changes needed:**
-
-For CREATE/DROP variants: **No C++ changes needed.** The existing `sv_ddl_bind` calls `sv_execute_ddl_rust`, which will be updated in Rust to handle all CREATE/DROP variants. The output is still a single view name. The Rust side handles the rewrite; C++ is oblivious to the variant.
-
-For DESCRIBE and SHOW: The output schema differs (DESCRIBE = 6 columns, SHOW = 2 columns with N rows). Two approaches:
-
-**Approach A: Separate C++ table functions for DESCRIBE/SHOW.**
-- Add `sv_describe_bind` + `sv_describe_execute` (6 VARCHAR columns, 1 row)
-- Add `sv_show_bind` + `sv_show_execute` (2 VARCHAR columns, N rows)
-- `sv_plan_function` dispatches to the appropriate table function based on query prefix
-- Each calls its own Rust FFI function
-
-**Approach B (recommended): Rewrite DESCRIBE/SHOW in Rust, execute via sv_ddl_conn, read results back via C API.**
-The Rust FFI function `sv_execute_ddl_rust` already has the DDL connection. For DESCRIBE/SHOW:
-1. Rust rewrites the query to the function call equivalent
-2. Rust executes it on `sv_ddl_conn`
-3. Rust reads the result columns and rows
-4. Rust writes them into output buffers
-5. C++ `sv_ddl_bind` declares the appropriate output schema
-6. C++ `sv_ddl_execute` emits the data from the buffers
-
-This is complex. Let me reconsider.
-
-**Approach C (simplest, recommended): The Rust detect function classifies statement kind. The C++ plan function uses this to choose the appropriate rewritten SQL. For DESCRIBE/SHOW, the plan function returns a TableFunction that simply redirects to the existing registered table function by executing the rewritten SQL.**
-
-Actually, the simplest architecture is:
-
-**Approach D: Extend sv_execute_ddl_rust to return a "kind" code alongside the result. In the C++ side, use the kind to adjust the output schema.**
-
-This is still complex. Let me step back and think about this differently.
-
-**The real simplest approach:**
-
-Currently, `sv_plan_function` returns `ParserExtensionPlanResult` with a custom internal `TableFunction`. But `ParserExtensionPlanResult` has a `function` field -- it can point to ANY `TableFunction`.
-
-What if `sv_plan_function`:
-1. Receives the raw query text via `SemanticViewParseData`
-2. Calls a Rust FFI function to get the rewritten SQL string
-3. Uses `Connection::Query(rewritten_sql)` to execute directly -- NO, this would deadlock (we're in the plan phase, ClientContext lock is held)
-
-The DDL connection (`sv_ddl_conn`) exists precisely for this reason. The existing pattern works: plan returns a table function, bind executes via sv_ddl_conn.
-
-**Final recommended approach for DESCRIBE/SHOW:**
-
-Keep the existing pattern. All seven statements go through `sv_execute_ddl_rust`. For CREATE/DROP, the rewritten SQL executes and returns the view name. For DESCRIBE/SHOW, the rewritten SQL executes and the result is... discarded? No.
-
-The issue is that `sv_ddl_bind` hardcodes `return_types.push_back(LogicalType::VARCHAR)` and `names.push_back("view_name")`. This works for CREATE/DROP but not for DESCRIBE (6 columns) or SHOW (2 columns, N rows).
-
-**Cleanest solution: Have the Rust FFI return the statement kind, and let the C++ side dispatch to different bind/execute functions.**
-
-Here is the concrete architecture:
-
-```
-sv_parse_stub
-    |
-    sv_parse_rust(query) -> u8 (0 = not ours, 1 = ours)
-    |
-    [if 1] -> PARSE_SUCCESSFUL + SemanticViewParseData(query)
-    |
-sv_plan_function
-    |
-    sv_classify_rust(query) -> u8 kind code
-    |
-    [kind 0-4: CREATE/DROP] -> return sv_ddl_internal table function
-    [kind 5: DESCRIBE]      -> return sv_describe_internal table function
-    [kind 6: SHOW]          -> return sv_show_internal table function
-```
-
-Three table functions in C++:
-1. **`sv_ddl_internal`** (existing) -- CREATE/DROP variants, single VARCHAR output
-2. **`sv_describe_internal`** (new) -- DESCRIBE, 6 VARCHAR columns, calls Rust to get data
-3. **`sv_show_internal`** (new) -- SHOW, 2 VARCHAR columns + N rows, calls Rust to get data
-
-Each has its own bind/execute. The FFI boundary for DESCRIBE/SHOW can use fixed-size buffers (DESCRIBE is always 6 fields; SHOW rows can use a JSON array serialized to a buffer).
-
-### Revised Component Diagram
-
-```
-User SQL Input
-    |
-    v
-DuckDB Native Parser
-    |
-    +--[parses OK]---> Standard execution (function-based DDL, queries)
-    |
-    +--[parse fails]--> sv_parse_stub (C++)
-                            |
-                        sv_parse_rust (Rust) -- detect_statement()
-                            |
-                        [None] -> DISPLAY_ORIGINAL_ERROR / DISPLAY_EXTENSION_ERROR
-                        [Some] -> PARSE_SUCCESSFUL + SemanticViewParseData
-                                    |
-                                sv_plan_function (C++)
-                                    |
-                                sv_classify_rust (Rust) -- detect_statement() again
-                                    |
-                        +-----------+-----------+
-                        |           |           |
-                   CREATE/DROP   DESCRIBE     SHOW
-                        |           |           |
-                sv_ddl_internal  sv_describe  sv_show
-                (existing)       (new)        (new)
-                        |           |           |
-                sv_execute_ddl_rust   |        |
-                (Rust, extended)      |        |
-                        |             |        |
-                  rewrite + execute   |        |
-                  on sv_ddl_conn      |        |
-                        |             |        |
-                  return view_name    |        |
-                                      |        |
-                        sv_describe_rust        sv_show_rust
-                        (Rust FFI, new)         (Rust FFI, new)
-                              |                       |
-                        Read catalog              Read catalog
-                        Return JSON               Return JSON
-                              |                       |
-                        C++ parses JSON          C++ parses JSON
-                        Emits 6 columns          Emits N x 2 columns
-```
-
-Wait -- this is overcomplicating things. DESCRIBE and SHOW don't need to go through the DDL connection at all. They are read-only operations that only need the in-memory catalog. The existing `describe_semantic_view` and `list_semantic_views` VTab functions access the catalog via `get_extra_info::<CatalogState>()`.
-
-But through the parser hook path, we don't have access to `extra_info` -- the table function returned by `sv_plan_function` is a raw C++ `TableFunction`, not a registered Rust VTab.
-
-**Simplest correct approach: For DESCRIBE and SHOW, the C++ plan function returns a table function whose bind callback rewrites and executes the SQL on sv_ddl_conn, then reads the result back.**
-
-This is exactly what `sv_ddl_bind` does for CREATE/DROP, but the output schema and row count differ.
-
-Let me lay out the final, concrete approach:
-
-### Final Architecture: Unified Rewrite-and-Execute
-
-**All seven statements use the same pattern:**
-1. Rust detects and classifies the statement
-2. Rust rewrites to the function-call equivalent
-3. The rewritten SQL is executed on `sv_ddl_conn`
-4. The C++ table function reads the result and outputs it
-
-The key change is making the C++ bind/execute functions schema-flexible:
-
-**Option: Use a single generalized table function in C++ that reads the result schema from the executed query.**
-
-```cpp
-// sv_ddl_bind (modified):
-// 1. Call sv_execute_ddl_rust to rewrite + execute
-// 2. After execution, query the result metadata to learn column names/types
-// 3. Declare matching output columns
-// 4. Store the result data for emit in execute phase
-
-// sv_ddl_execute (modified):
-// Emit all rows from the stored result
-```
-
-This is the approach. The C++ `sv_ddl_bind` already calls `sv_execute_ddl_rust` which executes on `sv_ddl_conn`. Currently it ignores the result data and just reads the view name from Rust's output buffer. The modification:
-
-1. `sv_execute_ddl_rust` executes the rewritten SQL and returns the `duckdb_result` handle
-2. The C++ side reads column count, column names, column types, and row data from the result
-3. The C++ bind function declares matching output columns
-4. The C++ execute function emits all rows
-
-**But `sv_execute_ddl_rust` currently destroys the result after reading it.** The change: the Rust FFI should NOT destroy the result. Instead, it returns the raw `duckdb_result` to C++. But `duckdb_result` is a C API type, not a C++ type...
-
-Actually, the cleanest approach is to have Rust NOT execute the query. Instead:
-
-1. Rust rewrites the query and returns the rewritten SQL string
-2. C++ executes it on `sv_ddl_conn` (which is already a C API connection)
-3. C++ reads the native result
-
-This moves execution from Rust to C++. The C++ side already has `sv_ddl_conn` as a `duckdb_connection` (C API handle).
-
-### Final Final Architecture (Concrete)
-
-**Step 1: Rust FFI -- rewrite only (no execute)**
-
-New Rust FFI function (replaces `sv_execute_ddl_rust` in the DESCRIBE/SHOW path):
+**Proposed changes:**
 
 ```rust
-/// Rewrite any semantic view statement into its function-call equivalent.
-/// Returns 0 on success (rewritten SQL in out buffer), 1 on error.
-#[no_mangle]
-pub extern "C" fn sv_rewrite_rust(
-    query_ptr: *const u8, query_len: usize,
-    sql_out: *mut u8, sql_out_len: usize,
-    error_out: *mut u8, error_out_len: usize,
-) -> u8
+pub struct TableRef {
+    pub alias: String,
+    pub table: String,
+    #[serde(default)]
+    pub primary_key: Vec<String>,  // NEW: PK column names for this table
+}
+
+pub struct Join {
+    pub table: String,           // target table (PK side, physical name)
+    #[serde(default)]
+    pub from_table: String,      // NEW: source table alias (FK side)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on: String,              // legacy
+    #[serde(default)]
+    pub from_cols: Vec<String>,  // legacy
+    #[serde(default)]
+    pub join_columns: Vec<JoinColumn>,
+}
 ```
 
-**Step 2: C++ plan function -- dispatch by kind**
+**Why `from_table` is needed on `Join`:** In the current model, `Join` only stores the target table. The FK source table is implicitly the base table. But with the PK/FK graph, a FK can be on any table, not just the base. The relationship `li (order_id) REFERENCES o` creates a `Join` where `table` is `orders` (the PK side) and `from_table` is `li` (the FK side). Without `from_table`, the graph traversal cannot determine which table holds the FK.
 
-The C++ `sv_plan_function` calls `sv_rewrite_rust` to get the rewritten SQL, then returns a table function that:
-1. Stores the rewritten SQL
-2. In bind: executes it on `sv_ddl_conn`, reads result metadata, declares matching schema
-3. In execute: emits all rows from the result
+**Evidence:** In `parse_args.rs` line 118, the `from_alias` is already read from the relationship struct but discarded:
 
-This generalizes the current `sv_ddl_bind`/`sv_ddl_execute` pair.
+```rust
+let _from_alias = extract_struct_child_varchar(rel_child, 0); // from_table
+```
 
-**Step 3: C++ bind -- schema-flexible**
+Preserving this value is a one-line change.
 
-```cpp
-static unique_ptr<FunctionData> sv_ddl_bind(
-    ClientContext &, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+**Backward compatibility:** `#[serde(default)]` on both new fields ensures old stored JSON deserializes correctly:
+- Old `TableRef` without `primary_key` -> empty Vec
+- Old `Join` without `from_table` -> empty String (legacy path assumed base table)
 
-    auto rewritten_sql = StringValue::Get(input.inputs[0]);
+### Component 3: PK/FK Join Graph Traversal (MODIFIED)
 
-    // Execute on the DDL connection
-    duckdb_result result;
-    auto rc = duckdb_query(sv_ddl_conn, rewritten_sql.c_str(), &result);
-    if (rc != DuckDBSuccess) {
-        auto err = duckdb_result_error(&result);
-        duckdb_destroy_result(&result);
-        throw BinderException("%s", err);
+**Location:** `src/expand.rs` -- modify `resolve_joins()`
+
+**Current join resolution** (ON-clause substring matching):
+
+```rust
+// Fixed-point loop: if a needed join's ON clause references another
+// declared join's table name, add that table to the needed set too.
+loop {
+    let on_lower = join.on.to_ascii_lowercase();
+    // ...
+    if on_lower.contains(&other_lower) {  // <-- substring match!
+        needed.insert(other_lower);
+    }
+}
+```
+
+This is Tech Debt item 6. It works for simple cases but is fragile -- a table named `ord` would match inside `orders`.
+
+**PK/FK model makes transitive dependencies explicit.** Given:
+
+```
+RELATIONSHIPS (
+    o (customer_id) REFERENCES c,
+    li (order_id) REFERENCES o
+)
+```
+
+This creates a directed graph:
+
+```
+li --[order_id]--> o --[customer_id]--> c
+```
+
+When a metric has `source_table: "li"`, the resolver walks the graph:
+1. `li` is needed -> find Join where `from_table == "li"` -> join target is `o` -> need `o`
+2. `o` is needed -> find Join where `from_table == "o"` -> join target is `c` -> need `c`
+3. `c` is needed -> no Join where `from_table == "c"` -> stop (or `c` is joined to base)
+
+**Implementation approach:**
+
+```rust
+fn resolve_joins_pkfk<'a>(
+    joins: &'a [Join],
+    needed_aliases: &HashSet<String>,
+    def: &SemanticViewDefinition,
+) -> Vec<&'a Join> {
+    let mut resolved: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = needed_aliases.iter().cloned().collect();
+
+    // Base table alias is always "resolved" (no join needed)
+    if let Some(base) = def.tables.first() {
+        resolved.insert(base.alias.to_ascii_lowercase());
     }
 
-    // Read schema from result
-    auto col_count = duckdb_column_count(&result);
-    for (idx_t i = 0; i < col_count; i++) {
-        names.push_back(duckdb_column_name(&result, i));
-        // Map duckdb_column_type to LogicalType...
-        return_types.push_back(LogicalType::VARCHAR); // Safe fallback
-    }
+    let mut result_joins: Vec<&Join> = Vec::new();
 
-    // Store result data for execute phase
-    // ... read all rows into a vector of string vectors ...
-
-    duckdb_destroy_result(&result);
-    return make_uniq<SvDdlBindData>(row_data);
-}
-```
-
-This is a solid approach. All seven statement types go through the same C++ table function. The schema adapts to whatever the underlying function returns.
-
-**However, there is a simpler alternative that avoids ALL C++ changes:**
-
-### Alternative: No C++ Changes At All
-
-The existing `sv_execute_ddl_rust` already has access to `sv_ddl_conn` (passed as a parameter). It executes the rewritten SQL. Currently it only reads the view name.
-
-For DESCRIBE and SHOW, the Rust code can:
-1. Execute the rewritten SQL on `exec_conn`
-2. Read the full result (all columns, all rows)
-3. Serialize it to JSON
-4. Write the JSON to `name_out` (repurposing the buffer)
-5. Return a new code (e.g., 2 = "result is JSON, not a name")
-
-The C++ `sv_ddl_bind` checks the return code:
-- `0`: Single VARCHAR output with `name_buf` as the view name (existing behavior)
-- `2`: The result is JSON, parse and emit multi-column output
-
-This requires minimal C++ changes (an if-else in bind) and keeps all parsing logic in Rust.
-
-**But this is hacky.** Let me recommend the clean approach.
-
----
-
-## Recommended Architecture
-
-### Approach: Generalized C++ Table Function + Pure Rust Rewrite
-
-**Principle: Rust handles all parsing and rewriting. C++ handles execution and result forwarding.**
-
-#### Changes by file:
-
-**`src/parse.rs` (MODIFY -- primary Rust change)**
-- Add `StatementKind` enum
-- Add `detect_statement(query: &str) -> Option<StatementKind>` function
-- Add `rewrite_to_function_call(query: &str) -> Result<String, ParseError>` function
-- Add `ParseError` struct with `message` and `position` fields (for error reporting)
-- Update `sv_parse_rust` to detect all seven statement kinds
-- Add `sv_rewrite_rust` FFI function: rewrite only, no execute
-- Keep `sv_execute_ddl_rust` for backward compatibility but mark as unused (or remove)
-
-**`cpp/src/shim.cpp` (MODIFY -- generalize table function)**
-- `sv_parse_stub`: No change (still calls `sv_parse_rust`)
-- `sv_plan_function`: Call `sv_rewrite_rust` to get the rewritten SQL, pass it as parameter to the table function
-- `sv_ddl_bind`: Execute rewritten SQL on `sv_ddl_conn`, read schema + data from result, declare matching output
-- `sv_ddl_execute`: Emit stored rows
-- `SvDdlBindData`: Expand to hold column names, types, and row data (not just view_name)
-
-**`src/ddl/*` (NO CHANGES)**
-- All function-based DDL VTab implementations remain unchanged
-- They continue to serve the `FROM create_semantic_view(...)` path
-
-**`src/catalog.rs` (NO CHANGES)**
-- Both paths converge on the same catalog functions
-
-**`src/expand.rs`, `src/query/*`, `src/model.rs` (NO CHANGES)**
-- Query execution is orthogonal
-
----
-
-## Error Location Reporting Architecture
-
-### DuckDB's Error Location Mechanism
-
-DuckDB's `ParserExtensionParseResult` has an `error_location` field of type `optional_idx_t`. When the parse function returns `DISPLAY_EXTENSION_ERROR`, DuckDB calls `ParserException::SyntaxError(query, result.error, result.error_location)`, which formats the error with a caret (^) pointing to the error position:
-
-```
-Parser Error: syntax error near "VEIW" in CREATE SEMANTIC VEIW
-CREATE SEMANTIC VEIW sales (...)
-                ^^^^
-Did you mean: VIEW?
-```
-
-### Integration with Rust FFI
-
-The current `sv_parse_rust` returns `u8` (0 or 1). To support error reporting, the FFI contract must expand:
-
-```rust
-/// FFI result from Rust parse function.
-/// Returned as a struct so C++ can read both the status and error details.
-#[repr(C)]
-pub struct SvParseResult {
-    /// 0 = not ours (DISPLAY_ORIGINAL_ERROR)
-    /// 1 = detected (PARSE_SUCCESSFUL)
-    /// 2 = ours but malformed (DISPLAY_EXTENSION_ERROR)
-    pub status: u8,
-    /// Character position of error (0 = not set). Only meaningful when status == 2.
-    pub error_position: u32,
-}
-```
-
-The C++ `sv_parse_stub` checks the status:
-- `0`: Return default `ParserExtensionParseResult()` (DISPLAY_ORIGINAL_ERROR)
-- `1`: Return `ParserExtensionParseResult(make_uniq<SemanticViewParseData>(query))`
-- `2`: Return `ParserExtensionParseResult(error_message, error_location)`
-
-For status 2, the error message comes from a second Rust FFI call or from a separate buffer:
-
-```rust
-#[repr(C)]
-pub struct SvParseResult {
-    pub status: u8,
-    pub error_position: u32,
-    // Error message written to a buffer provided by C++
-}
-
-// Or: use separate error buffer parameters (matching existing pattern):
-#[no_mangle]
-pub extern "C" fn sv_parse_rust(
-    query_ptr: *const u8, query_len: usize,
-    error_out: *mut u8, error_out_len: usize,
-    error_position_out: *mut u32,
-) -> u8
-```
-
-### When Errors Are Reported
-
-Error reporting happens at **two stages**:
-
-**Stage 1: Parse-time (sv_parse_rust) -- Prefix-level errors**
-
-These are errors where the statement LOOKS like a semantic view DDL but is malformed at the prefix level:
-- `CREATE SEMANTIC VEIW` -- typo in keyword (detected because DuckDB parser failed, and our prefix match failed, but we can suggest)
-- `DROP SEMANTIC VIEW` with no name after it
-- `DESCRIBE SEMANTIC` with no `VIEW` after it
-
-For near-miss detection (e.g., `CREATE SEMANTIC VEIW`), the parse function can check if the query starts with `CREATE SEMANTIC` or `DROP SEMANTIC` and then fuzzy-match the next word against "VIEW" using the existing `strsim` crate.
-
-**Stage 2: Bind-time (sv_ddl_bind -> sv_execute_ddl_rust) -- Body-level errors**
-
-These are errors in the DDL body after rewriting:
-- Missing required clauses (no `tables :=`)
-- Invalid struct literal syntax
-- Referenced table does not exist (caught by DuckDB when executing the rewritten SQL)
-
-Body-level errors are already reported via the existing mechanism: `sv_execute_ddl_rust` catches the DuckDB error from executing the rewritten SQL and writes it to `error_out`. The C++ `sv_ddl_bind` throws `BinderException` with this message.
-
-### Error Message Enhancement
-
-The existing `ExpandError` variants in `expand.rs` already include fuzzy suggestions (via `strsim::levenshtein`). For the parse layer, new errors should follow the same pattern:
-
-```rust
-pub struct ParseError {
-    pub message: String,
-    /// Character offset in the original query where the error was detected.
-    /// Used by DuckDB to render a caret (^) under the error location.
-    pub position: Option<usize>,
-    /// Optional "did you mean" suggestion (using strsim).
-    pub suggestion: Option<String>,
-}
-```
-
-Error messages should include:
-1. **What went wrong** (clause-level context: "in DIMENSIONS clause")
-2. **Where** (character position)
-3. **Suggestion** (fuzzy match, if applicable)
-
-Example error messages:
-```
-CREATE SEMANTIC VIEW sales: missing view name after 'CREATE SEMANTIC VIEW'
-CREATE SEMANTIC VIEW sales (): expected 'tables :=' clause
-DROP SEMANTIC VIEW nonexistent: semantic view 'nonexistent' does not exist. Did you mean 'sales_view'?
-```
-
-### Clause-Level Position Tracking
-
-For body-level errors (after the prefix), the parse function can track positions within the original query:
-
-```rust
-fn parse_ddl_text(query: &str) -> Result<(&str, &str), ParseError> {
-    let trimmed = query.trim();
-    let prefix = detect_prefix(trimmed);
-    match prefix {
-        None => Err(ParseError {
-            message: "Not a semantic view statement".into(),
-            position: Some(0),
-            suggestion: None,
-        }),
-        Some((kind, prefix_end)) => {
-            let after_prefix = &trimmed[prefix_end..].trim_start();
-            if after_prefix.is_empty() {
-                return Err(ParseError {
-                    message: format!("Missing view name after '{}'", &trimmed[..prefix_end]),
-                    position: Some(prefix_end),
-                    suggestion: None,
-                });
+    while let Some(alias) = queue.pop() {
+        if resolved.contains(&alias) {
+            continue;
+        }
+        // Find the join that brings this alias into scope.
+        // The join.table is the physical table; look up alias from def.tables.
+        if let Some(join) = joins.iter().find(|j| {
+            def.tables.iter().any(|t|
+                t.table.eq_ignore_ascii_case(&j.table)
+                && t.alias.eq_ignore_ascii_case(&alias)
+            )
+        }) {
+            result_joins.push(join);
+            resolved.insert(alias.clone());
+            // The from_table of this join is a transitive dependency
+            if !join.from_table.is_empty() {
+                let from_lower = join.from_table.to_ascii_lowercase();
+                if !resolved.contains(&from_lower) {
+                    queue.push(from_lower);
+                }
             }
-            // ... extract name, body, track positions
+        } else {
+            resolved.insert(alias); // table not found in joins -- likely base table
         }
     }
+
+    // Topological sort: joins ordered so dependencies appear first
+    // (ensures SQL JOIN order is valid)
+    topological_sort(&result_joins, def)
 }
 ```
 
-The `position` value is the byte offset in the original query string. DuckDB renders this as a caret under the error location.
+**Topological sort rationale:** While SQL does not strictly require joins in dependency order (all previously joined tables are available in ON clauses), producing deterministic, logically ordered SQL makes debugging easier and aligns with Snowflake's behavior.
 
----
+**Dispatch logic:** The entry point `resolve_joins()` checks which model the definition uses:
 
-## Data Flow Changes Summary
+```rust
+fn resolve_joins<'a>(
+    joins: &'a [Join],
+    resolved_dims: &[&Dimension],
+    resolved_mets: &[&Metric],
+    def: &SemanticViewDefinition,
+) -> Vec<&'a Join> {
+    // Collect needed aliases
+    let mut needed: HashSet<String> = /* same as current */;
 
-### Current Flow (v0.5.0)
+    if has_pkfk_joins(joins) {
+        resolve_joins_pkfk(joins, &needed, def)
+    } else {
+        resolve_joins_legacy(joins, &needed, def)  // current ON-clause substring code
+    }
+}
+
+fn has_pkfk_joins(joins: &[Join]) -> bool {
+    joins.iter().any(|j| !j.from_table.is_empty())
+}
+```
+
+### Component 4: Direct Query Expansion (MODIFIED)
+
+**Location:** `src/expand.rs` -- new expansion function alongside existing `expand()`
+
+**The CTE problem with qualified names:**
+
+The current expansion produces:
+
+```sql
+WITH "_base" AS (
+    SELECT *
+    FROM "orders" AS "o"
+    JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id"
+)
+SELECT
+    o.region AS "region"    -- ERROR: "o" is not a table in the outer query
+FROM "_base"
+GROUP BY 1
+```
+
+After `SELECT *`, table aliases are flattened into the CTE. The outer query only sees `_base`, not `o` or `c`. Qualified references like `o.region` fail.
+
+**Three options were evaluated:**
+
+| Option | Approach | Pros | Cons |
+|--------|----------|------|------|
+| A: No CTE | `SELECT ... FROM orders AS o JOIN ...` directly | Simplest. Aliases work naturally. | Different expansion path from legacy. |
+| B: CTE with projection | CTE projects specific columns with unique names | Keeps CTE pattern. | Must enumerate all needed columns. Complex. |
+| C: CTE with subquery aliases | Outer query re-aliases CTE | Unnatural SQL. | Hacky. |
+
+**Recommendation: Option A (no CTE) for PK/FK definitions.** The CTE was originally needed because `SELECT *` flattened all tables. With the PK/FK model, expressions are qualified and we know exactly which tables are involved. A direct FROM+JOIN query is simpler and correct.
+
+**Dual expansion dispatch:**
+
+```rust
+pub fn expand(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    req: &QueryRequest,
+) -> Result<String, ExpandError> {
+    // ... validation (unchanged) ...
+
+    if uses_direct_expansion(def) {
+        expand_direct(view_name, def, req, &resolved_dims, &resolved_mets)
+    } else {
+        expand_cte(view_name, def, req, &resolved_dims, &resolved_mets)
+    }
+}
+
+fn uses_direct_expansion(def: &SemanticViewDefinition) -> bool {
+    // Use direct expansion when we have table aliases with PKs
+    !def.tables.is_empty()
+        && def.joins.iter().any(|j| !j.from_table.is_empty())
+}
+```
+
+**Direct expansion output:**
+
+```sql
+SELECT
+    "o"."region" AS "region",
+    SUM("li"."amount") AS "revenue"
+FROM "orders" AS "o"
+JOIN "customers" AS "c" ON "o"."customer_id" = "c"."customer_id"
+JOIN "line_items" AS "li" ON "li"."order_id" = "o"."order_id"
+WHERE (status = 'active')
+GROUP BY 1
+```
+
+**Legacy CTE expansion** (existing code, unchanged) continues to work for definitions without PK/FK model.
+
+## Integration Point Map
+
+### Files to MODIFY
+
+| File | What Changes | Why |
+|------|-------------|-----|
+| `src/model.rs` | Add `primary_key: Vec<String>` to `TableRef`, add `from_table: String` to `Join` | PK/FK model needs PK storage and FK source tracking |
+| `src/parse.rs` | `rewrite_ddl()` detects SQL-style body and calls translator; `validate_clauses()` updated for new syntax | Translation layer between SQL DDL and function-call syntax |
+| `src/expand.rs` | New `expand_direct()` function (no CTE, qualified names); `resolve_joins()` dispatches to PK/FK graph traversal for new-style definitions | New expansion path for PK/FK definitions |
+| `src/ddl/parse_args.rs` | Preserve `from_alias` (currently discarded with `let _from_alias`) in `Join.from_table` | FK source table needed for graph traversal |
+| `src/lib.rs` | Add `pub mod parse_sql_body;` if new module created | Module declaration |
+
+### Files to CREATE
+
+| File | Purpose |
+|------|---------|
+| `src/parse_sql_body.rs` | SQL DDL body translator: parses `TABLES (...) RELATIONSHIPS (...) DIMENSIONS (...) METRICS (...)` keyword syntax and emits DuckDB struct/list literal syntax for the existing rewrite pipeline |
+
+### Files UNCHANGED
+
+| File | Why Unchanged |
+|------|--------------|
+| `cpp/src/shim.cpp` | Parser hook, plan function, DDL bind/execute all unchanged. The translator approach keeps the same rewrite-then-execute pipeline. |
+| `src/catalog.rs` | Catalog storage is JSON strings -- serde handles new fields automatically |
+| `src/query/table_function.rs` | Query execution pipeline unchanged -- it calls `expand()` which dispatches internally |
+| `src/ddl/define.rs` | VTab bind/invoke unchanged -- receives translated function-call syntax |
+| `src/ddl/describe.rs` | Reads from catalog JSON -- will reflect new fields via serde |
+| `src/ddl/list.rs` | Lists view names only -- unaffected |
+| `src/ddl/drop.rs` | Removes by name -- unaffected |
+
+## Data Flow: Proposed vs Current
+
+### Current DDL Flow (v0.5.1)
 
 ```
-parse: detect "CREATE SEMANTIC VIEW" -> u8 (0/1)
-plan:  carry query text -> TableFunction
-bind:  rewrite to function call + execute on sv_ddl_conn -> view_name
-exec:  emit view_name (1 row, 1 column)
-```
-
-### New Flow (v0.5.1)
-
-```
-parse: detect 7 statement kinds -> u8 (0/1/2) + error info
-plan:  get rewritten SQL from Rust -> TableFunction with rewritten SQL as param
-bind:  execute rewritten SQL on sv_ddl_conn -> read result schema + data
-exec:  emit result (N rows, M columns -- adapts to statement kind)
-```
-
-### Key Data Flow Differences
-
-| Aspect | v0.5.0 | v0.5.1 |
-|--------|--------|--------|
-| Detection | Single prefix | Seven prefix patterns |
-| Parse result | Binary (ours / not ours) | Ternary (ours / not ours / ours-but-error) |
-| Rewrite | In Rust FFI (sv_execute_ddl_rust) | In Rust FFI (sv_rewrite_rust) |
-| Execution | In Rust FFI via duckdb_query | In C++ via duckdb_query on sv_ddl_conn |
-| Result reading | Rust reads view name only | C++ reads full result (schema + data) |
-| Output schema | Fixed: 1 VARCHAR column | Dynamic: matches rewritten query result |
-| Error info | Error message string | Error message + character position + suggestion |
-
----
-
-## Suggested Build Order
-
-### Wave 1: Parse Layer (No C++ Changes)
-
-**1a. Refactor `parse.rs` detection and rewrite functions (Rust only, testable with `cargo test`)**
-- Add `StatementKind` enum
-- Implement `detect_statement()` for all 7 kinds
-- Implement `rewrite_to_function_call()` for all 7 kinds
-- Add `ParseError` with position tracking
-- Unit tests for every statement kind and error case
-- **No FFI changes yet -- pure Rust, full test coverage**
-
-**1b. Add error location reporting to parse layer (Rust only)**
-- Near-miss detection (e.g., `CREATE SEMANTIC VEIW`)
-- Position tracking for missing-name, missing-body errors
-- "Did you mean" suggestions using existing `strsim` crate
-- Unit tests for error messages and positions
-
-### Wave 2: FFI + C++ Integration
-
-**2a. Update `sv_parse_rust` FFI to handle all 7 kinds + error reporting**
-- Extend return type to include error status
-- Add error buffer and position output parameters
-- Keep backward-compatible for C++ side
-
-**2b. Add `sv_rewrite_rust` FFI function**
-- Takes query, returns rewritten SQL string
-- C++ calls this from plan_function
-
-**2c. Generalize C++ `sv_ddl_bind` / `sv_ddl_execute`**
-- Execute rewritten SQL on sv_ddl_conn
-- Read result schema dynamically (column count, names, types)
-- Read all result rows
-- Emit matching output
-
-**2d. Update C++ `sv_parse_stub` for error reporting**
-- Check new return status from sv_parse_rust
-- Return DISPLAY_EXTENSION_ERROR with error message and position when status == 2
-
-### Wave 3: Integration Tests + README
-
-**3a. SQLLogicTest cases for all 7 statement kinds**
-**3b. Error reporting tests (expected error messages with positions)**
-**3c. README DDL reference section**
-
-### Dependency Graph
-
-```
-Wave 1a (detect + rewrite)
+"CREATE SEMANTIC VIEW x (tables := [...], dimensions := [...])"
     |
-    +---> Wave 1b (error reporting)
-    |         |
-    |         v
-    +---> Wave 2a (FFI detect) + Wave 2b (FFI rewrite)
-              |
-              v
-          Wave 2c (C++ generalize) + Wave 2d (C++ error)
-              |
-              v
-          Wave 3 (tests + docs)
+    v
+sv_parse_stub() -> PARSE_SUCCESSFUL
+    |
+    v
+sv_ddl_bind() -> sv_rewrite_ddl_rust():
+    rewrite_ddl() -> "SELECT * FROM create_semantic_view('x', tables := [...], ...)"
+                     body passed VERBATIM (must be function-call syntax)
+    |
+    v
+duckdb_query(sv_ddl_conn, rewritten_sql) -> create_semantic_view VTab
+    parse_define_args_from_bind() -> SemanticViewDefinition -> catalog
 ```
 
-Waves 1a and 1b are independent of each other and can proceed in parallel, but both must complete before Wave 2. Within Wave 2, 2a/2b can proceed in parallel, but 2c/2d depend on them.
+### Proposed DDL Flow (v0.5.2) -- Translator Approach
 
----
+```
+"CREATE SEMANTIC VIEW x (
+    TABLES (o AS orders PRIMARY KEY (order_id)),
+    DIMENSIONS (o.region AS region),
+    METRICS (o.revenue AS SUM(amount))
+)"
+    |
+    v
+sv_parse_stub() -> PARSE_SUCCESSFUL  [unchanged]
+    |
+    v
+sv_ddl_bind() -> sv_rewrite_ddl_rust():
+    rewrite_ddl():
+        parse_create_body() -> body="TABLES (o AS orders ...) ..."
+        body_uses_sql_syntax(body)? -> YES
+        translate_sql_body(body) -> function-call syntax  [NEW]
+            "tables := [{alias: 'o', table: 'orders'}], ..."
+        -> "SELECT * FROM create_semantic_view('x', tables := [...], ...)"
+    |
+    v
+duckdb_query(sv_ddl_conn, rewritten_sql) -> create_semantic_view VTab  [unchanged]
+    parse_define_args_from_bind() -> SemanticViewDefinition -> catalog  [unchanged]
+```
+
+### Proposed Query Expansion Flow (v0.5.2)
+
+```
+FROM semantic_view('x', dimensions := ['region'], metrics := ['revenue'])
+    |
+    v
+expand("x", def, req):
+    uses_direct_expansion(def)?
+      YES -> expand_direct():
+        resolve_joins_pkfk() -- graph walk, not substring
+        Build direct SQL (no CTE):
+          SELECT "o"."region" AS "region", SUM(amount) AS "revenue"
+          FROM "orders" AS "o"
+          WHERE ...
+          GROUP BY 1
+      NO -> expand_cte():  [existing code, unchanged]
+        resolve_joins_legacy() -- ON-clause substring
+        Build CTE SQL (SELECT * FROM base JOIN ...)
+```
+
+## Patterns to Follow
+
+### Pattern 1: Serde Default for Backward Compatibility
+
+**What:** All new fields on serialized structs use `#[serde(default)]` so that old stored JSON deserializes without error.
+
+**When:** Every time a field is added to model structs stored in the catalog.
+
+**Example:**
+
+```rust
+pub struct TableRef {
+    pub alias: String,
+    pub table: String,
+    #[serde(default)]
+    pub primary_key: Vec<String>,  // old JSON without this field -> empty Vec
+}
+```
+
+### Pattern 2: Dual Expansion Paths with Feature Detection
+
+**What:** The `expand()` function detects whether the definition uses the PK/FK model or the legacy model and dispatches accordingly.
+
+**When:** The expansion strategy differs fundamentally between definition formats.
+
+**Example:**
+
+```rust
+fn uses_direct_expansion(def: &SemanticViewDefinition) -> bool {
+    !def.tables.is_empty()
+        && def.joins.iter().any(|j| !j.from_table.is_empty())
+}
+```
+
+### Pattern 3: Body Syntax Detection for Translator Dispatch
+
+**What:** `rewrite_ddl()` detects whether the DDL body uses SQL keyword syntax or function-call syntax, then either translates or passes through.
+
+**When:** The body is about to be embedded in a function call.
+
+**Example:**
+
+```rust
+fn body_uses_sql_syntax(body: &str) -> bool {
+    let trimmed = body.trim();
+    // SQL syntax uses TABLES keyword without := assignment
+    // Function-call syntax uses tables := [...] with list literals
+    let has_keyword_pattern = trimmed.to_ascii_uppercase().starts_with("TABLES");
+    let has_assign_pattern = trimmed.contains(":=");
+    has_keyword_pattern && !has_assign_pattern
+}
+```
 
 ## Anti-Patterns to Avoid
 
-### Anti-Pattern 1: Separate C++ Table Functions Per Statement Kind
+### Anti-Pattern 1: Parsing SQL Expressions
 
-**What:** Creating `sv_create_internal`, `sv_drop_internal`, `sv_describe_internal`, `sv_show_internal` as separate C++ table functions.
+**What:** Attempting to fully parse SQL expressions inside dimension/metric definitions (e.g., `SUM(li.amount * li.quantity)`).
 
-**Why bad:** Quadruples the C++ code surface. Each needs its own bind/state/execute. The user is not a C++ expert.
+**Why bad:** SQL expression syntax is vast -- parentheses, function calls, CASE, subqueries, operators. Building a full SQL parser is out of scope.
 
-**Instead:** One generalized C++ table function that adapts its output schema to the rewritten SQL result. All parsing intelligence stays in Rust.
+**Instead:** Treat SQL expressions as opaque text between known delimiters. The translator only needs to find expression boundaries (comma at depth 0, clause-ending parenthesis), not understand expression internals. Use depth-tracking for parentheses and string literal awareness.
 
-### Anti-Pattern 2: Parsing DDL Body in the Parse Phase
+### Anti-Pattern 2: Removing Legacy Paths
 
-**What:** Attempting to parse the full DDL body (tables, dimensions, metrics) in `sv_parse_rust` during the parse phase.
+**What:** Removing the CTE expansion path or the function-call DDL syntax.
 
-**Why bad:** The parse function is called for every failed parse in DuckDB. It must be fast. Full body parsing is expensive and unnecessary -- the body is parsed later during bind when the rewritten SQL is executed by DuckDB's own parser.
+**Why bad:** Existing stored definitions use the old format. Users may have scripts using function-call syntax. Breaking backward compatibility causes data loss.
 
-**Instead:** The parse function only validates the prefix and extracts the view name. The body is passed through verbatim in the rewrite.
+**Instead:** Both paths coexist. Detection is automatic based on definition content. Old definitions continue to work unchanged.
 
-### Anti-Pattern 3: Hardcoding Error Positions
+### Anti-Pattern 3: Storing Derived Data in the Catalog
 
-**What:** Calculating byte offsets manually with string slicing that doesn't account for multi-byte UTF-8.
+**What:** Pre-computing ON clauses from PK/FK declarations and storing them in JSON.
 
-**Why bad:** DuckDB SQL is ASCII for keywords, but view names and string literals can contain UTF-8. Byte offsets passed to `ParserException::SyntaxError` are character positions in the query string.
+**Why bad:** Introduces normalization violation -- ON clauses are derived from `join_columns` and `tables` data. If one side changes, the other becomes stale.
 
-**Instead:** Use `query[..pos].chars().count()` if the error position needs to be character-based, or verify that DuckDB uses byte offsets (it does -- DuckDB's internal representation uses byte offsets for its own parser errors). Stick with byte offsets.
+**Instead:** Compute ON clauses at expansion time from PK/FK model data. `append_join_on_clause()` already does this.
 
-### Anti-Pattern 4: Duplicating Catalog Logic in Parse Layer
+### Anti-Pattern 4: Making shim.cpp Changes
 
-**What:** Having the parse layer check if a view exists (for DROP) or if it's a duplicate (for CREATE).
+**What:** Modifying the C++ shim to handle the new SQL syntax directly.
 
-**Why bad:** The parse layer should only detect and rewrite. Existence checks belong in the bind/execute phase where they already happen via the existing VTab implementations.
+**Why bad:** C++ changes are expensive (full amalgamation recompile), harder to test, and the current Rust-side translation approach avoids any C++ changes entirely.
 
-**Instead:** The parse layer rewrites `DROP SEMANTIC VIEW sales` to `SELECT * FROM drop_semantic_view('sales')`. If `sales` doesn't exist, the error comes from `DropSemanticViewVTab::bind`, which already has the catalog check and error message.
+**Instead:** Keep all new parsing logic in Rust. The C++ shim remains a thin bridge between DuckDB's parser hooks and Rust FFI functions.
 
----
+## Scalability Considerations
 
-## Component Boundaries (Updated for v0.5.1)
+| Concern | Current (v0.5.1) | Proposed (v0.5.2) | Notes |
+|---------|------------------|-------------------|-------|
+| Join graph complexity | O(J^2) per expansion (fixed-point substring scan) | O(J) per expansion (directed graph walk) | J = number of joins. PK/FK graph is directed acyclic. |
+| Column name collisions | Undefined behavior (CTE `SELECT *` may error) | Handled (qualified names, no `SELECT *`) | Major correctness improvement. |
+| DDL body size | 4096-byte buffer in shim.cpp | Same 4096-byte buffer | Consider increasing if large definitions hit the limit. |
+| Catalog migration | Automatic (serde defaults) | Automatic (serde defaults) | No migration step needed. |
+| Translation overhead | None (body passed verbatim) | One-time string transform at DDL time | Negligible -- DDL is not a hot path. |
 
-| Component | Responsibility | Communicates With | Changes |
-|-----------|---------------|-------------------|---------|
-| `src/parse.rs` | Detect all 7 DDL kinds, rewrite to function calls, error position tracking | `shim.cpp` (via FFI), `strsim` (for suggestions) | **MODIFY: major** |
-| `cpp/src/shim.cpp` | C++ entry, parser hook registration, rewrite execution, schema-flexible result forwarding | `parse.rs` (via FFI), DuckDB (C API), `sv_ddl_conn` | **MODIFY: moderate** |
-| `src/lib.rs` | Rust init, function registration | `catalog.rs`, `ddl/*`, `query/*` | **NO CHANGE** |
-| `src/ddl/define.rs` | CREATE function-based DDL | `parse_args.rs`, `catalog.rs` | **NO CHANGE** |
-| `src/ddl/drop.rs` | DROP function-based DDL | `catalog.rs` | **NO CHANGE** |
-| `src/ddl/describe.rs` | DESCRIBE function-based DDL | `catalog.rs` | **NO CHANGE** |
-| `src/ddl/list.rs` | SHOW/LIST function-based DDL | `catalog.rs` | **NO CHANGE** |
-| `src/catalog.rs` | In-memory + persistent catalog | All DDL paths | **NO CHANGE** |
-| `src/expand.rs` | Query expansion | `query/*` | **NO CHANGE** |
-| `src/query/*` | Query execution | `expand.rs`, `catalog.rs` | **NO CHANGE** |
+## Build Order (Dependency-Aware)
 
----
+### Phase 1: Model Changes (no dependencies, prerequisite for all others)
+
+1. Add `primary_key: Vec<String>` to `TableRef` with `#[serde(default)]`
+2. Add `from_table: String` to `Join` with `#[serde(default)]`
+3. Serde backward-compat tests (old JSON without new fields deserializes correctly)
+4. Update `parse_define_args_from_bind()` to preserve `from_alias` in `Join.from_table`
+
+**Test:** `cargo test` -- all existing tests pass (serde defaults handle old JSON).
+
+### Phase 2: SQL Body Translator (depends on Phase 1 for model knowledge)
+
+1. Create `src/parse_sql_body.rs` with `translate_sql_body()` function
+2. Implement clause splitting (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS)
+3. Implement per-clause parsing (table defs, relationship defs, dim/metric defs)
+4. Implement function-call syntax emission
+5. Integrate into `rewrite_ddl()` with `body_uses_sql_syntax()` detection
+6. Update `validate_clauses()` to accept the new syntax patterns
+7. Unit tests for each clause type and for full translation
+
+**Test:** `cargo test` -- new translation tests. Existing rewrite tests still pass (function-call syntax detected and passed through).
+
+### Phase 3: PK/FK Join Resolution (depends on Phase 1)
+
+1. Implement `resolve_joins_pkfk()` with directed graph traversal
+2. Implement topological sort for join ordering
+3. Modify `resolve_joins()` to dispatch based on `has_pkfk_joins()`
+4. Unit tests: single-hop, multi-hop, diamond pattern, mixed legacy+new
+
+**Test:** `cargo test` -- new PK/FK resolution tests. Existing substring-based tests still pass for legacy definitions.
+
+### Phase 4: Direct Query Expansion (depends on Phases 1 + 3)
+
+1. Implement `expand_direct()` for FROM+JOIN without CTE
+2. Handle qualified column names in SELECT expressions
+3. Modify `expand()` to dispatch based on `uses_direct_expansion()`
+4. Unit tests for direct expansion with various dim/metric combinations
+
+**Test:** `cargo test` -- new expansion tests. Legacy CTE expansion tests still pass.
+
+### Phase 5: Integration (depends on Phases 2 + 3 + 4)
+
+1. End-to-end: SQL DDL syntax -> translate -> define -> query -> correct results
+2. SQL logic tests (`test/sql/`) with Snowflake-style DDL syntax
+3. Verify legacy definitions still work end-to-end
+4. Verify mixed usage (SQL DDL define, function-call query)
+
+**Test:** `just test-all` -- full test suite including sqllogictest and DuckLake CI.
 
 ## Sources
 
-- [DuckDB parser_extension.hpp](https://raw.githubusercontent.com/duckdb/duckdb/main/src/include/duckdb/parser/parser_extension.hpp) -- ParserExtensionParseResult.error_location field, DISPLAY_EXTENSION_ERROR result type (HIGH confidence)
-- [DuckDB parser.cpp](https://github.com/duckdb/duckdb/blob/main/src/parser/parser.cpp) -- Parser fallback chain, how error_location is passed to ParserException::SyntaxError (HIGH confidence)
-- [DuckDB Runtime-Extensible Parsers (CIDR 2025)](https://duckdb.org/pdf/CIDR2025-muehleisen-raasveldt-extensible-parsers.pdf) -- Parser extension mechanism overview
-- Project source: `src/parse.rs`, `cpp/src/shim.cpp`, `src/lib.rs` -- existing architecture (HIGH confidence, direct code inspection)
-- Project source: `src/ddl/*.rs` -- existing function-based DDL implementations (HIGH confidence)
-- Project source: `src/catalog.rs` -- catalog API (HIGH confidence)
-- Project source: `src/expand.rs` -- ExpandError + suggest_closest for fuzzy matching pattern (HIGH confidence)
+- Codebase analysis: `src/parse.rs`, `src/expand.rs`, `src/model.rs`, `src/ddl/parse_args.rs`, `src/ddl/define.rs`, `cpp/src/shim.cpp`, `src/lib.rs`, `src/catalog.rs`
+- [Snowflake CREATE SEMANTIC VIEW DDL](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- reference syntax for SQL DDL
+- [Snowflake semantic view SQL example](https://docs.snowflake.com/en/user-guide/views-semantic/example) -- TPC-H worked example showing TABLES with PRIMARY KEY, RELATIONSHIPS with REFERENCES, qualified dimension/metric names
+- `TECH-DEBT.md` items 6 (ON-clause substring matching), 7 (unqualified column names), 8 (statement rewrite gap)
+- `_notes/semantic-views-duckdb-design-doc.md` -- original design rationale and Snowflake/Cube.dev prior art
