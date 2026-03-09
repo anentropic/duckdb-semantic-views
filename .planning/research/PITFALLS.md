@@ -1,386 +1,352 @@
-# PITFALLS -- Parser Extension Spike (v0.5.0)
+# PITFALLS -- DDL Polish (v0.5.1)
 
-**Domain:** Adding DuckDB parser extension hooks to an existing Rust DuckDB extension
-**Researched:** 2026-03-07
-**Context:** The existing extension is pure Rust with a C API entry point (`semantic_views_init_c_api`). v0.5.0 adds a C++ shim compiled against the DuckDB amalgamation (`duckdb.hpp`) to register parser hooks, switching the extension ABI from `C_STRUCT` to `CPP`.
+**Domain:** Adding DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW native DDL and error location reporting to an existing DuckDB extension with parser hooks
+**Researched:** 2026-03-08
+**Context:** The extension already has a working `CREATE SEMANTIC VIEW` parser hook (fallback `parse_function` + `plan_function`), statement rewriting to function-based DDL, a dedicated DDL connection, and `strsim` for fuzzy matching. The catalog is a dual-store: `Arc<RwLock<HashMap>>` in-memory + `semantic_layer._definitions` DuckDB table via separate `persist_conn`. All DDL functions are registered as table functions with `extra_info` state injection. v0.5.0 shipped with 172 tests green.
 
 ---
 
 ## Critical Pitfalls
 
-Mistakes that cause crashes, link failures, or require rearchitecting.
+Mistakes that cause crashes, data loss, or require rearchitecting.
 
-### P1: ODR (One Definition Rule) Violations -- Two Copies of DuckDB Static Globals
+### P1: DROP/DESCRIBE/SHOW May Not Trigger Parser Fallback Hook
 
 **What goes wrong:**
-When `shim.cpp` is compiled against the DuckDB amalgamation (`duckdb.hpp` / `duckdb.cpp`), the resulting object code contains its own copies of DuckDB's inline functions, template instantiations, and -- critically -- static local variables. At runtime, the extension binary contains one copy of these, and the host DuckDB binary contains another. The extension is loaded via `dlopen` with `RTLD_NOW | RTLD_LOCAL` (confirmed in DuckDB's extension loading code), which means:
+The current parser hook uses `parse_function` (fallback), which is only called when DuckDB's native parser FAILS on a statement. For `CREATE SEMANTIC VIEW`, this works because DuckDB's parser does not recognize `SEMANTIC` after `CREATE` and produces a parser error, triggering the fallback.
 
-1. **RTLD_LOCAL prevents symbol interposition**: The extension's copies of DuckDB classes are isolated from the host's copies. They do not collide at the symbol level -- each is resolved within its own translation unit.
+For `DROP SEMANTIC VIEW`, `DESCRIBE SEMANTIC VIEW`, and `SHOW SEMANTIC VIEWS`, the behavior depends on how DuckDB's native parser handles these prefixes:
 
-2. **Static globals are duplicated**: Any `static` variable inside an inline function (e.g., singleton registries, thread-local storage) will exist in two independent copies -- one in the host, one in the extension. Modifying one does not affect the other.
+- `DROP SEMANTIC VIEW x` -- DuckDB's parser recognizes `DROP` but not `SEMANTIC` as a valid object type (DuckDB supports TABLE, VIEW, FUNCTION, INDEX, SCHEMA, SEQUENCE, MACRO, TYPE). This likely produces a **parser error** at the `SEMANTIC` token, which WILL trigger the fallback hook.
+- `DESCRIBE SEMANTIC VIEW x` -- DuckDB's `DESCRIBE` expects a table name, view name, or query. `SEMANTIC` is not a table/view, so DuckDB may attempt to resolve it as an identifier and produce a **catalog error** (not a parser error). Catalog errors happen AFTER parsing and do NOT trigger the parser fallback.
+- `SHOW SEMANTIC VIEWS` -- `SHOW` in DuckDB is an alias for `DESCRIBE`. Same risk as DESCRIBE.
 
-3. **This is actually the intended architecture**: DuckDB's PR #3783 ("Extension loading by statically linking DuckDB") confirmed that each extension gets its own statically-linked copy of DuckDB. The `RTLD_LOCAL` flag ensures isolation. The parser extension mechanism works because the extension writes to the host's `DBConfig::parser_extensions` vector via inlined accessors that operate on the host-owned `DatabaseInstance` reference passed to the entry point -- not on an extension-local copy.
+If DuckDB successfully parses `DESCRIBE SEMANTIC` (treating `SEMANTIC` as an identifier) and then fails at the binder/catalog level, the parser fallback is never called and the extension never gets a chance to intercept the statement.
 
-**Why it works despite ODR concerns:**
-The key insight is that `DUCKDB_CPP_EXTENSION_ENTRY(semantic_views, loader)` receives an `ExtensionLoader&` reference to the **host's** object. When the extension calls `loader.GetDatabaseInstance()`, it gets a reference to the host's `DatabaseInstance`. The inlined `DBConfig::GetConfig(db)` compiles into the extension binary but operates on the host's memory. The function body is duplicated (ODR-technically), but it reads/writes the correct host-side data structure because the `this` pointer (or reference) points into the host's address space.
-
-**Where it can still break:**
-- **Exception type identity**: If the extension throws a DuckDB exception type (e.g., `ParserException`) and the host tries to catch it, the RTTI type_info objects may not match because they come from different copies. Exceptions must NOT cross the extension/host boundary through DuckDB C++ types. Use error return values or the C API error mechanism.
-- **std::string across boundary**: If the extension's copy of `std::string` uses a different allocator or small-string optimization layout than the host's (compiler version mismatch), passing a `std::string` by value across the boundary corrupts memory. Pass `const char*` across the boundary instead.
-
-**Consequences:** Silent memory corruption if exception types or std::string cross the boundary. Difficult to diagnose -- manifests as intermittent crashes or wrong data.
+**Consequences:** `DROP SEMANTIC VIEW` likely works via parser fallback. `DESCRIBE SEMANTIC VIEW` and `SHOW SEMANTIC VIEWS` may silently fail with unhelpful DuckDB errors ("Table 'SEMANTIC' does not exist") instead of being intercepted by the extension.
 
 **Prevention:**
-- The C++ shim must be kept minimal (~30-50 lines). All logic lives in Rust.
-- Never throw C++ exceptions from the shim. Use `try/catch` at every boundary.
-- Never pass `std::string` by value across the extension/host boundary. Pass `const char*` and copy immediately.
-- The `RTLD_LOCAL` isolation means extension-local DuckDB statics are harmless as long as you only interact with the host's `DatabaseInstance` through the reference provided at init.
-- **Confidence:** MEDIUM. Based on DuckDB PR #3783 analysis, dlopen documentation, and C++ ODR/RTTI semantics. Confirmed by prql/duckpgq existence proofs (they compile against amalgamation and work). The exception/string boundary risk is standard C++ FFI knowledge.
+- Test each statement prefix in isolation FIRST, before implementing any logic. Run `DROP SEMANTIC VIEW x;`, `DESCRIBE SEMANTIC VIEW x;`, and `SHOW SEMANTIC VIEWS;` against a DuckDB instance with the extension loaded (but without the new parser detection) and observe the error type (Parser Error vs Catalog Error).
+- If DESCRIBE/SHOW produce catalog errors (not parser errors), they CANNOT use the parser hook approach. Instead, implement them as table functions only: `FROM describe_semantic_view('name')` and `FROM list_semantic_views()` (which already exist). Document that `DESCRIBE SEMANTIC VIEW` is not supported as native syntax and users should use the function form.
+- If they DO produce parser errors, add prefix detection for `DROP SEMANTIC VIEW`, `DESCRIBE SEMANTIC VIEW`, and `SHOW SEMANTIC VIEWS` alongside the existing `CREATE SEMANTIC VIEW` detection.
+- **Confidence:** MEDIUM. DuckDB's parser behavior for unknown object types after DROP/DESCRIBE is not documented. The resolution requires empirical testing.
 
-**Phase assignment:** Validate in the first build phase. Write a smoke test that loads the extension and runs a basic query.
+**Phase assignment:** Must be the FIRST thing validated. A 10-minute spike determines which DDL verbs can use the parser hook and which must remain function-only.
 
 ---
 
-### P2: Dual Entry Point Conflict -- Both `_init` and `_init_c_api` Exported
+### P2: Catalog Inconsistency During CREATE OR REPLACE -- Persist Succeeds, In-Memory Fails
 
 **What goes wrong:**
-The current extension exports `semantic_views_init_c_api` (Rust-generated, C API entry point). Adding the C++ shim introduces `semantic_views_init` (C++ entry point via `DUCKDB_CPP_EXTENSION_ENTRY`). If both are exported, DuckDB's loader behavior depends on the ABI type stamped in the extension footer:
+The existing `define.rs` uses a write-first pattern: persist to DuckDB table via `persist_conn` FIRST, then update the in-memory `HashMap`. For CREATE OR REPLACE, the persist step uses `INSERT OR REPLACE` (always succeeds), but the in-memory step uses `catalog_upsert` (validates JSON first). If JSON validation passes for persist but fails for the in-memory update (e.g., a subtle difference in validation paths), the DuckDB table has the new definition but the HashMap has the old one.
 
-- **Footer says `CPP`**: DuckDB looks up `semantic_views_init` (the C++ symbol). If found, it calls it. `semantic_views_init_c_api` is ignored. This is the correct path.
-- **Footer says `C_STRUCT` or `C_STRUCT_UNSTABLE`**: DuckDB looks up `semantic_views_init_c_api`. It calls the Rust entry point. The C++ init never runs. Parser hooks are never registered.
+Looking at the actual code, this specific scenario is unlikely because both paths validate JSON. But a more realistic variant exists: if `persist_define` succeeds but the Rust process panics or the connection is interrupted between the persist and the in-memory update, the DuckDB table is updated but the HashMap is not. On next extension load, `init_catalog` re-reads from the DuckDB table, so the next session picks up the change. But the CURRENT session has stale state.
 
-The footer ABI type is deterministic -- it is set by the `append_extension_metadata.py` script's `--abi-type` argument. Currently the Makefile passes `C_STRUCT_UNSTABLE` (via `USE_UNSTABLE_C_API=1`). After v0.5.0, this must change to `CPP`.
+For CREATE OR REPLACE specifically, this means the user thinks they replaced a view (the persist succeeded, no error), but queries against the view in the same session use the OLD definition from the HashMap.
 
-**But there is a deeper problem:**
-If the footer says `CPP` and `semantic_views_init` is called, the Rust code's `duckdb_rs_extension_api_init` is never called. This function populates the `AtomicPtr`-based function pointer table that `libduckdb-sys` uses for all C API calls (`ffi::duckdb_query`, `ffi::duckdb_connect`, etc.). Without this initialization, **every Rust C API call is a null pointer dereference**.
-
-The C++ entry point receives an `ExtensionLoader&` (or `DatabaseInstance&`), not the `duckdb_extension_info` + `duckdb_extension_access` pair that `duckdb_rs_extension_api_init` expects. The C++ shim must somehow initialize the Rust function pointer table before calling any Rust code that uses `ffi::*`.
-
-**Consequences:** If the function pointer table is not initialized: immediate SEGFAULT on the first `ffi::duckdb_query` call from Rust. If the footer ABI type is wrong: parser hooks silently not registered, no error.
+**Consequences:** Silent use of stale definition in the current session after a successful CREATE OR REPLACE. The user observes "wrong results" rather than an error. This is worse than a crash because it is hard to diagnose.
 
 **Prevention:**
-- Switch the footer ABI type from `C_STRUCT_UNSTABLE` to `CPP` by changing the Makefile: remove `USE_UNSTABLE_C_API=1`, add `ABI_TYPE_FLAG=--abi-type CPP`. Update `UNSTABLE_C_API_FLAG` usage.
-- The C++ entry point must obtain the `duckdb_extension_access` struct and call `duckdb_rs_extension_api_init` to populate Rust's function pointer table BEFORE calling any Rust init code. This requires the CPP entry point to access the C API initialization mechanism -- investigate whether `ExtensionLoader` provides access to the `duckdb_extension_access` pointer.
-- **Alternative approach (simpler):** Keep the footer as `C_STRUCT_UNSTABLE`. Export only `semantic_views_init_c_api`. Have the Rust entry point call into a C++ function (`sv_register_parser_hooks`) that receives the raw `duckdb_database` handle, casts it to `DatabaseInstance*`, and registers the parser hooks. This avoids the dual-entry-point problem entirely. The C++ function is compiled against the amalgamation and linked into the extension, but the entry point remains Rust-owned.
+- The current code already handles this correctly: `catalog_upsert` is called after `persist_define`, and both validate JSON. The risk is theoretical, not demonstrated.
+- Add an integration test that does CREATE, then CREATE OR REPLACE with different metrics, then queries using the new metrics. Assert the new metric values appear. This catches any cache staleness.
+- Consider reversing the order for CREATE OR REPLACE specifically: update the HashMap first (recoverable), then persist (if persist fails, the HashMap has the new definition for the current session, and the DuckDB table has the old one -- next session reverts, but at least the current session is consistent). However, this contradicts the write-first pattern used everywhere else and introduces a different inconsistency risk. **Keep the current write-first order but test the round-trip.**
+- **Confidence:** LOW for the actual bug occurring (code paths are well-tested). HIGH for the importance of having a round-trip test.
 
-  **Risk with the alternative:** The cast from `duckdb_database` (C API opaque handle) to `DatabaseInstance*` requires knowing the internal layout of the C API wrapper. The existing codebase already does something similar in `lib.rs` line 477: `let db_handle: ffi::duckdb_database = *(*access).get_database.unwrap()(info);` -- but this returns a C API handle, not a C++ reference. The shim would need to dereference the C API handle to get the underlying `DatabaseInstance&`. This is fragile across DuckDB versions.
-
-- **Recommended approach:** Use the CPP entry point (`DUCKDB_CPP_EXTENSION_ENTRY`), which receives `ExtensionLoader&`. From within the C++ entry, obtain a `duckdb_connection` handle using the C++ `Connection` class, then pass it to Rust's init function. The Rust init function must NOT rely on `duckdb_rs_extension_api_init` for its function pointer table -- instead, it must use the raw `duckdb_database` handle obtained from the C++ side to call `ffi::duckdb_connect`, `ffi::duckdb_query`, etc. directly through the amalgamation-linked copies in the extension binary.
-
-  **Wait -- this is the ODR problem again.** If Rust calls `ffi::duckdb_query` through the function pointer table, those pointers must be initialized. But the function pointer table is populated by `duckdb_rs_extension_api_init`, which is only called by DuckDB's C_STRUCT/C_STRUCT_UNSTABLE loading path. Under CPP ABI, this function is never called.
-
-  **Resolution:** The Rust code must either (a) not use `ffi::duckdb_*` stubs at all (call DuckDB through the C++ amalgamation instead -- but this means rewriting all FFI), or (b) manually call `duckdb_rs_extension_api_init` from the C++ entry point by obtaining the `duckdb_extension_access` struct. Option (b) is feasible: `ExtensionLoader` wraps the same `duckdb_extension_info` handle, and the `duckdb_extension_access` is obtainable through it.
-
-- **Simplest viable path:** Investigate whether `duckdb_rs_extension_api_init` can be called from the C++ entry point. The function signature is `fn(info: duckdb_extension_info, access: *const duckdb_extension_access, min_version: &str) -> Result<bool, ...>`. The C++ `ExtensionLoader` must expose the underlying `info` and `access` handles. If it does, the C++ shim calls `duckdb_rs_extension_api_init` first, then calls the Rust init, then registers parser hooks.
-
-- **Confidence:** LOW. The interaction between CPP entry point and Rust function pointer initialization is not documented. This is the single most dangerous pitfall in v0.5.0 and needs a spike/POC before committing to an approach.
-
-**Phase assignment:** Must be resolved in the very first phase. A POC that loads the extension, initializes both the C++ parser hooks and the Rust function pointer table, and successfully runs a `semantic_view()` query is the minimum viable proof.
+**Phase assignment:** Testing phase. Add a round-trip sqllogictest for CREATE OR REPLACE.
 
 ---
 
-### P3: C++ ABI Compatibility -- Compiler Version Mismatch
+### P3: DROP via Parser Hook Runs DDL on Dedicated Connection -- Catalog Bypass
 
 **What goes wrong:**
-The CPP ABI type requires that the extension is compiled with the same (or ABI-compatible) compiler as the host DuckDB binary. DuckDB's CPP ABI enforces **exact DuckDB version match** (unlike C_STRUCT which allows cross-version compatibility). But beyond version, the C++ ABI also depends on:
+The existing parser hook path (`sv_parse_stub` -> `sv_plan_function` -> `sv_ddl_bind`) executes rewritten DDL on the `sv_ddl_conn` (the dedicated DDL connection stored as a C++ file-scope static). For `CREATE SEMANTIC VIEW`, this works because `rewrite_ddl_to_function_call` rewrites to `SELECT * FROM create_semantic_view(...)`, which calls the Rust VTab `bind` function, which updates both the DuckDB table and the HashMap.
 
-1. **Compiler identity (GCC vs Clang vs MSVC):** Different compilers may use different name mangling, vtable layouts, and exception handling mechanisms. The extension's C++ objects (e.g., `ParserExtension`) must be layout-compatible with the host's.
+For `DROP SEMANTIC VIEW`, the rewrite must produce `SELECT * FROM drop_semantic_view('name')`. This calls `DropSemanticViewVTab::bind`, which:
+1. Checks the HashMap for existence
+2. Calls `persist_drop` (deletes from DuckDB table via persist_conn)
+3. Calls `catalog_delete` (removes from HashMap)
 
-2. **libstdc++ vs libc++ (Linux/macOS):** On macOS, the system uses `libc++`. On Linux, distributions vary between `libstdc++` (GCC) and `libc++` (Clang). If the extension is compiled with `libc++` but the host DuckDB uses `libstdc++`, passing C++ standard library types across the boundary (especially `std::string`, `std::vector`) will corrupt memory.
+**The problem:** The `DropState` stored as `extra_info` on the `drop_semantic_view` function was registered with `persist_conn` pointing to the persistence connection created during `init_extension`. But when `DROP SEMANTIC VIEW` arrives via the parser hook path, the DDL is executed on `sv_ddl_conn` (the parser's dedicated DDL connection), NOT on the main connection. The `drop_semantic_view` function was registered on the main connection, and its `extra_info` (including `persist_conn`) was set at registration time.
 
-3. **GCC 5 std::string ABI break:** GCC 5 changed `std::basic_string` to use small-string optimization. Binaries compiled with GCC < 5 and GCC >= 5 have incompatible `std::string` layouts. Modern systems (GCC >= 5) are past this, but it is a CI concern if building on older toolchains.
+**Question:** Does executing `SELECT * FROM drop_semantic_view('name')` on `sv_ddl_conn` still find the registered table function? YES -- table functions are registered at the database level (not per-connection), so `sv_ddl_conn` can invoke them. The `extra_info` pointer was set during registration and is accessible from any connection. So this should work.
 
-**Why this is manageable for this project:**
-- The CI uses GitHub Actions runners with known compiler versions.
-- The DuckDB community extension CI builds extensions with the same toolchain used to build the DuckDB release.
-- The CPP ABI's "exact version match" requirement already forces version-pinning.
-- The C++ shim is ~30-50 lines and only passes `const char*` and simple structs across boundaries -- not C++ standard library types.
+**Where it actually breaks:** If there is a connection-specific state assumption. The `persist_conn` is a separate connection handle. When `drop_semantic_view` runs on `sv_ddl_conn` and then calls `persist_drop` on `persist_conn`, we have THREE connections involved: main, sv_ddl_conn (parser's DDL connection), and persist_conn. All three share the same database. DuckDB's single-writer model means only one can write at a time. If `sv_ddl_conn` is in a transaction (from the plan_function binding), and `persist_drop` tries to write via `persist_conn`, there may be a lock conflict.
 
-**Consequences:** If compilers mismatch: immediate crash on first call to any C++ function that passes objects by value. Hard to diagnose -- may look like a memory corruption bug.
-
-**Prevention:**
-- Pin the compiler in CI to match the DuckDB release toolchain. For community extensions, DuckDB provides the toolchain via `extension-ci-tools`.
-- Never pass `std::string`, `std::vector`, or other C++ standard library types by value across the extension/host boundary. Use `const char*` and `size_t`.
-- The `ParserExtension` struct itself is a DuckDB type that both sides agree on (same header, same version). This is safe because the extension and host are built against the same DuckDB version.
-- Test on all target platforms in CI. The most common failure mode is "works on macOS (Clang/libc++), breaks on Linux (GCC/libstdc++)".
-- **Confidence:** HIGH. C++ ABI compatibility rules are well-established. The mitigation (minimal C++ surface, pinned compiler) is standard practice.
-
-**Phase assignment:** CI setup phase. Ensure the build matrix matches the DuckDB release toolchain.
-
----
-
-### P4: Rust Function Pointer Table Not Initialized Under CPP Entry
-
-**What goes wrong:**
-This is the specific mechanism behind P2's deeper problem. When `duckdb-rs` compiles with `--features loadable-extension`, it replaces all C API function symbols (`duckdb_query`, `duckdb_connect`, `duckdb_open`, etc.) with stub functions that read from global `AtomicPtr` variables. These `AtomicPtr`s are initialized during `duckdb_rs_extension_api_init`, which extracts function pointers from the `duckdb_extension_access` struct passed by DuckDB.
-
-Under the CPP ABI loading path:
-1. DuckDB calls `semantic_views_init(DatabaseInstance& db)` (or `DUCKDB_CPP_EXTENSION_ENTRY`)
-2. This entry point receives `ExtensionLoader&`, NOT `duckdb_extension_info` + `duckdb_extension_access`
-3. `duckdb_rs_extension_api_init` is never called
-4. All `AtomicPtr`s remain null
-5. The first Rust call to `ffi::duckdb_query(conn, sql, &mut result)` dereferences a null function pointer
-6. SEGFAULT
-
-**What specifically breaks:**
-- `ffi::duckdb_query` -- used by `execute_sql_raw` in table function execution
-- `ffi::duckdb_connect` -- used in `init_extension` to create persist_conn and query_conn
-- `ffi::duckdb_data_chunk_get_vector` -- used in zero-copy vector reference pipeline
-- Every other `ffi::duckdb_*` call in the extension
-
-**Consequences:** Immediate crash. The extension cannot function at all.
+**Consequences:** Potential deadlock or write-lock timeout during DROP via native DDL syntax.
 
 **Prevention:**
-- **Option A (preferred):** Keep the C_STRUCT_UNSTABLE footer. Keep `semantic_views_init_c_api` as the entry point. The Rust entry point calls `duckdb_rs_extension_api_init` as it does today. After Rust init is complete, call a C++ helper function `sv_register_parser_hooks(db_handle)` that receives the raw `duckdb_database` handle, extracts `DatabaseInstance*`, and registers parser hooks. The challenge: the `duckdb_database` to `DatabaseInstance*` cast is an implementation detail of DuckDB's C API wrapper.
+- Test `DROP SEMANTIC VIEW x;` via the native DDL path (not just the function path) as an early integration test. If it deadlocks, the three-connection pattern needs restructuring.
+- If a lock conflict occurs: rewrite DROP to also use `sv_ddl_conn` for persistence (skip `persist_conn` entirely when coming from the parser hook path). This may require modifying the FFI contract.
+- The simplest fix if this is a problem: have `sv_execute_ddl_rust` call `drop_semantic_view` on the SAME connection it was given (the `exec_conn` parameter), which avoids the cross-connection lock conflict.
+- **Confidence:** MEDIUM. The three-connection interaction is not tested in v0.5.0 (which only has CREATE via parser hook, not DROP). The lock behavior depends on DuckDB's transaction isolation for internal connections.
 
-- **Option B:** Use CPP entry point. Within the C++ entry, call `duckdb_rs_extension_api_init` by extracting the `duckdb_extension_info` and `duckdb_extension_access` from the `ExtensionLoader`. This requires investigating whether `ExtensionLoader` exposes these handles. If it does not, this option is blocked.
-
-- **Option C (most invasive):** Replace all Rust `ffi::duckdb_*` calls with calls through a manually managed function pointer table that is initialized from the C++ side. The C++ shim would pass the host's DuckDB function addresses to Rust via a struct. This is effectively reimplementing what `duckdb_rs_extension_api_init` does, but controlled by C++ instead of the C API loading path. This is a large refactor.
-
-- **Option D (pragmatic):** Use CPP entry. In the C++ shim, create a `duckdb_database` C API handle from the `DatabaseInstance&` (DuckDB provides `duckdb_database_create_from_existing` or similar), then call the Rust `semantic_views_init_c_api` function directly, passing the handle through the same C API initialization path. This makes the Rust code think it was loaded via the C API, but the actual entry point is C++. **This needs verification that such a bridge function exists in the DuckDB C API.**
-
-- **Confidence:** HIGH that this is a real problem. LOW confidence on which option is viable -- requires a POC spike.
-
-**Phase assignment:** First phase. This is a go/no-go blocker.
-
----
-
-### P5: Extension Footer ABI Type Must Change
-
-**What goes wrong:**
-The extension footer's `abi_type` field determines which entry point DuckDB looks up. The current build stamps `C_STRUCT_UNSTABLE` (line 218-219 of `base.Makefile`). If the v0.5.0 extension exports a C++ entry point (`semantic_views_init`) but the footer still says `C_STRUCT_UNSTABLE`, DuckDB will look for `semantic_views_init_c_api` instead. The C++ parser hook registration code in `semantic_views_init` will never execute.
-
-**The `append_extension_metadata.py` script supports CPP:**
-Line 45 of the script: `arg_parser.add_argument('--abi-type', ..., default='C_STRUCT')`. Passing `--abi-type CPP` sets the correct footer.
-
-**But `cargo-duckdb-ext-tools` does NOT support CPP:**
-The Rust-only packaging tool only supports `C_STRUCT` and `C_STRUCT_UNSTABLE`. If the build pipeline uses `cargo-duckdb-ext-tools` anywhere, it cannot produce a CPP-stamped extension.
-
-**Consequences:** Parser hooks silently not registered. `CREATE SEMANTIC VIEW` fails with a standard DuckDB parse error. No error message indicates the entry point was wrong.
-
-**Prevention:**
-- Update the Makefile: replace `USE_UNSTABLE_C_API=1` with a direct `--abi-type CPP` flag in the `append_extension_metadata.py` invocation.
-- Also pass `--duckdb-version` with the exact pinned version (required for CPP ABI, which enforces exact version match).
-- Remove any `cargo-duckdb-ext-tools` usage from the build pipeline. Use the Python script exclusively for footer stamping.
-- **If staying with Option A from P4 (C_STRUCT_UNSTABLE footer):** No footer change needed. The Rust entry point is called normally, and the C++ parser hook registration happens via a helper function called from Rust. This is the simplest path if it works.
-- Add a CI test: after building, verify the footer ABI type matches expectations. A simple `python3 -c "f=open('ext.duckdb_extension','rb'); f.seek(-534,2); ..."` script can check the footer fields.
-- **Confidence:** HIGH. The footer mechanism is well-documented and the Python script supports CPP. The risk is forgetting to change the flag.
-
-**Phase assignment:** Build system phase.
+**Phase assignment:** Validate early. The first DROP implementation MUST be tested via the native DDL path.
 
 ---
 
 ## Moderate Pitfalls
 
-### P6: Symbol Visibility -- macOS vs Linux Differences for CPP Entry
+### P4: Parser Detection Must Handle Multiple Prefixes Without Ambiguity
 
 **What goes wrong:**
-The current `build.rs` exports only `_semantic_views_init_c_api` on macOS (via `-exported_symbols_list`) and `semantic_views_init_c_api` on Linux (via `--dynamic-list`). Switching to CPP ABI requires exporting `semantic_views_init` instead (or additionally).
+The current `detect_create_semantic_view` function checks a single prefix: `"create semantic view"`. Adding DROP, DESCRIBE, SHOW, CREATE OR REPLACE, and CREATE IF NOT EXISTS requires matching MULTIPLE prefixes. The detection function is called for EVERY failed parse in DuckDB, so it must be fast and unambiguous.
 
-The C++ entry point generated by `DUCKDB_CPP_EXTENSION_ENTRY` is an `extern "C"` function, so it has C linkage (no name mangling). But its exact symbol name depends on the macro expansion -- it may be `semantic_views_init` or `semantic_views_duckdb_cpp_init` or similar, depending on the DuckDB version's macro definition.
+Prefix ambiguity risks:
+- `CREATE OR REPLACE SEMANTIC VIEW` starts with `CREATE` -- must match the longer prefix, not just `CREATE SEMANTIC VIEW`.
+- `CREATE SEMANTIC VIEW IF NOT EXISTS` starts with `CREATE SEMANTIC VIEW` but has additional tokens before the view name.
+- `DROP SEMANTIC VIEW IF EXISTS` vs `DROP SEMANTIC VIEW` -- the IF EXISTS variant must be detected as a DROP, not misidentified.
 
-**Platform-specific gotchas:**
-- **macOS:** `-exported_symbols_list` requires underscore prefix (`_semantic_views_init`). Missing the underscore silently hides the symbol.
-- **Linux:** `--dynamic-list` does not use underscore prefix. Additionally, the existing `build.rs` uses `--dynamic-list` specifically because Linux's `rustc` already generates a `--version-script` for cdylib targets, and GNU ld rejects two version scripts with "anonymous version tag cannot be combined." The `--dynamic-list` cooperates with rustc's version script.
-- **Windows:** No change needed -- `__declspec(dllexport)` handles visibility.
+If the detection function matches `CREATE SEMANTIC VIEW` for a `CREATE OR REPLACE SEMANTIC VIEW` statement, the rewrite will be wrong (the view name extraction will start at the wrong position).
 
-**The cc crate complication:** When `shim.cpp` is compiled via the `cc` crate and linked into the Rust cdylib, the C++ object is part of the same link unit. The `build.rs` symbol visibility rules apply to ALL exported symbols, including those from the C++ object. If `build.rs` only exports `semantic_views_init_c_api`, the C++ `semantic_views_init` function is hidden. The extension loads, but DuckDB cannot find the C++ entry point.
+**Consequences:** Wrong view name extracted. Malformed rewritten SQL. Confusing error messages.
 
 **Prevention:**
-- Update `build.rs` to export both `semantic_views_init_c_api` (Rust) and `semantic_views_init` (C++) -- or only the one that matches the footer ABI type.
-- Determine the exact symbol name from the `DUCKDB_CPP_EXTENSION_ENTRY` macro expansion before writing the export list. Check with `nm -gU` on the built binary.
-- On macOS: add `_semantic_views_init` to the exported symbols file.
-- On Linux: add `semantic_views_init` to the dynamic list file.
-- Add a post-build verification step in CI: `nm -gU *.duckdb_extension | grep semantic_views_init` must show the expected symbol(s).
-- **Confidence:** HIGH. Build system change, well-understood mechanism. The existing `build.rs` already handles this for `semantic_views_init_c_api`.
+- Use ordered prefix matching: check LONGER prefixes first.
+  1. `CREATE OR REPLACE SEMANTIC VIEW` (longest CREATE variant)
+  2. `CREATE SEMANTIC VIEW IF NOT EXISTS` (but note: IF NOT EXISTS comes AFTER the view name in standard SQL -- need to decide on syntax)
+  3. `CREATE SEMANTIC VIEW` (base case)
+  4. `DROP SEMANTIC VIEW IF EXISTS`
+  5. `DROP SEMANTIC VIEW`
+  6. `DESCRIBE SEMANTIC VIEW`
+  7. `SHOW SEMANTIC VIEWS`
+- Return a discriminant (enum or integer code) indicating WHICH statement type was detected, not just a boolean. The current `PARSE_NOT_OURS` / `PARSE_DETECTED` binary result is insufficient.
+- DuckDB SQL convention: `IF NOT EXISTS` follows the object name in `CREATE TABLE IF NOT EXISTS t (...)` but follows the object type in `CREATE SCHEMA IF NOT EXISTS s`. For semantic views, use the `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)` syntax (IF NOT EXISTS after the type, before the name) -- this matches `CREATE TABLE IF NOT EXISTS`.
+- Wait: DuckDB's standard `CREATE VIEW IF NOT EXISTS v AS ...` puts IF NOT EXISTS after VIEW, before the name. Follow this convention: `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)`.
+- **Confidence:** HIGH. This is a pure string-matching problem. The mitigation is straightforward prefix ordering.
 
-**Phase assignment:** Build system phase, same as P5.
+**Phase assignment:** Parser detection phase. Extend `detect_create_semantic_view` to return an enum.
 
 ---
 
-### P7: Thread Safety of `parse_function` Callback
+### P5: IF NOT EXISTS Position Ambiguity in DDL Syntax
 
 **What goes wrong:**
-DuckDB's parser can be invoked from multiple threads concurrently. Each connection has its own parser, and DuckDB supports multiple concurrent connections. The `parse_function` callback registered via `cfg.parser_extensions.push_back(ext)` may be called from any thread at any time.
+SQL standards and DuckDB place `IF NOT EXISTS` differently depending on the statement:
+- `CREATE TABLE IF NOT EXISTS t (...)` -- after TABLE, before name
+- `CREATE VIEW IF NOT EXISTS v AS ...` -- after VIEW, before name
+- `CREATE SCHEMA IF NOT EXISTS s` -- after SCHEMA, before name
+- `CREATE OR REPLACE TABLE t (...)` -- OR REPLACE after CREATE, before TABLE
 
-If the Rust `sv_parse` function (called from the C++ trampoline) accesses shared mutable state -- e.g., the in-memory catalog (`Arc<RwLock<HashMap>>`) -- without proper synchronization, data races occur.
+For semantic views, the natural syntax would be:
+- `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)`
+- `CREATE OR REPLACE SEMANTIC VIEW name (...)`
+- `DROP SEMANTIC VIEW IF EXISTS name`
 
-**DuckDB's threading model:**
-- DuckDB uses a single writer, multiple reader model with MVCC
-- Multiple connections can parse queries simultaneously
-- The parser itself has no global lock -- each connection parses independently
-- `parse_function` receives the query string as `const std::string&` -- this is thread-safe (read-only)
-- `parse_function` must return a `ParserExtensionParseResult` -- this is a per-call allocation, no shared state
+But there is a subtlety: `CREATE OR REPLACE SEMANTIC VIEW IF NOT EXISTS name (...)` -- can OR REPLACE and IF NOT EXISTS coexist? In DuckDB, `CREATE OR REPLACE TABLE IF NOT EXISTS` is a parser error. The same should apply here.
 
-**For this extension specifically:**
-The `parse_function` only needs to: (1) check if the query starts with `CREATE SEMANTIC VIEW`, (2) if yes, extract the view name and parameter text. It does NOT need to access the catalog, execute SQL, or modify any shared state. The actual DDL execution happens later in `plan_function` / the table function execution path, which already handles concurrency through the existing `Arc<RwLock<...>>` catalog.
-
-**Where it can still break:**
-- If `sv_parse` in Rust allocates a `String` and returns a `*const c_char` pointer to C++, the `String` must outlive the C++ code's use of the pointer. If the `String` is stack-allocated in the Rust function and the C++ code stores the pointer, use-after-free.
-- If the Rust parse function panics, it must not unwind through the C++ stack (undefined behavior under `extern "C"`).
+**Consequences:** If the parser accepts conflicting modifiers, the behavior is undefined (replace OR skip?). If the parser rejects them, the error message must be clear.
 
 **Prevention:**
-- The `sv_parse` function must be pure: no shared mutable state, no global variables, no logging that writes to shared buffers.
-- Wrap the Rust parse function body in `std::panic::catch_unwind`. Return an error result if a panic occurs.
-- Allocate the `ExtensionStatement` (or equivalent return data) on the heap. Transfer ownership to C++ explicitly. Do not return pointers to stack-allocated Rust data.
-- Mark the function `unsafe extern "C"` with a safety comment documenting: "Called from any DuckDB parser thread. Must be reentrant and panic-safe."
-- **Confidence:** HIGH. Standard Rust FFI thread safety requirements. The parse function's stateless nature makes this straightforward.
+- Reject `CREATE OR REPLACE ... IF NOT EXISTS` explicitly with a clear error: "Cannot combine OR REPLACE with IF NOT EXISTS."
+- The `DefineState` struct already has `or_replace: bool` and `if_not_exists: bool` fields. The existing code comment says "Mutually exclusive with or_replace (or_replace takes precedence if both set)." Change this to an explicit error instead of silent precedence.
+- Define the canonical syntax:
+  - `CREATE SEMANTIC VIEW name (...)`
+  - `CREATE OR REPLACE SEMANTIC VIEW name (...)`
+  - `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)`
+  - `DROP SEMANTIC VIEW name`
+  - `DROP SEMANTIC VIEW IF EXISTS name`
+- **Confidence:** HIGH. Syntax design decision with clear precedent from DuckDB's own behavior.
 
-**Phase assignment:** Parser hook implementation phase. Establish the pattern in the first `sv_parse` implementation.
+**Phase assignment:** Parser detection phase. Document the syntax before implementing.
 
 ---
 
-### P8: Memory Ownership of ExtensionStatement Across FFI
+### P6: Error Location Reporting -- Character Positions Meaningless After Rewriting
 
 **What goes wrong:**
-When `parse_function` succeeds, it must return a `ParserExtensionParseResult` containing a `unique_ptr<ExtensionStatement>`. The `ExtensionStatement` carries the parsed information (statement type, original SQL text, extension-specific data).
+The user writes: `CREATE SEMANTIC VIEW sales (tbles := [...], dimensions := [...])` (typo: `tbles` instead of `tables`). The extension rewrites this to: `SELECT * FROM create_semantic_view('sales', tbles := [...], dimensions := [...])`. DuckDB executes the rewritten SQL and returns an error: "Unknown named parameter 'tbles'... at position 47." Position 47 refers to the REWRITTEN SQL, not the original DDL. The user sees a position that does not correspond to their input.
 
-The ownership chain is: Rust parses the SQL -> creates result data -> passes to C++ shim -> C++ wraps in `ExtensionStatement` -> transfers via `unique_ptr` to DuckDB. DuckDB owns the `ExtensionStatement` and frees it when done.
+This is even worse when the rewrite changes the string layout significantly. The `SELECT * FROM create_semantic_view('name', ` prefix shifts all positions by a variable amount depending on the view name length.
 
-**Memory management hazards:**
-1. **Rust String -> C++ std::string:** If Rust's `sv_parse` returns a `*const c_char` pointing to the parsed statement text, the C++ trampoline must copy it into a `std::string` before Rust's `CString` is dropped. If the C++ code stores the `*const c_char` pointer directly, it dangles when Rust's function returns.
-
-2. **ExtensionStatement allocation:** `ExtensionStatement` must be allocated with C++ `new` (not Rust's allocator). The C++ trampoline should: (a) call Rust's parse function to get the parsed data as plain C types, (b) construct the `ExtensionStatement` using `new` in C++, (c) return `make_unique<ExtensionStatement>(...)`.
-
-3. **plan_function state stash:** Following the prql pattern, `plan_function` may stash state in `context.registered_state`. This state must be C++-allocated and C++-freed. If Rust-allocated data is stashed, it must be behind a C-compatible wrapper with explicit free functions.
+**Consequences:** Error positions are misleading. Users cannot find the error in their original SQL. This undermines the "quality error reporting" goal of v0.5.1.
 
 **Prevention:**
-- In the C++ trampoline (`sv_parse_trampoline`):
-  ```cpp
-  auto result = sv_parse(query.c_str(), query.size());
-  if (!result.success) return ParserExtensionParseResult(); // not handled
-  auto stmt = make_unique<ExtensionStatement>(
-      extension, std::string(result.statement_text));
-  return ParserExtensionParseResult(std::move(stmt));
-  ```
-- The Rust `sv_parse` function returns a simple C struct: `{ success: bool, statement_text: *const c_char, statement_text_len: usize }`. The `statement_text` points to a `CString` that Rust keeps alive by leaking it (via `CString::into_raw`). The C++ trampoline copies the text into a `std::string`, then calls `sv_parse_free(result.statement_text)` to reclaim the Rust allocation.
-- Alternative: the Rust function writes into a caller-provided buffer. Simpler lifetime management but requires size negotiation.
-- **Confidence:** HIGH. Standard C/C++/Rust FFI memory ownership patterns. The `CString::into_raw` + explicit free pattern is documented in the Rustonomicon.
+- Do NOT pass through DuckDB's character positions from rewritten SQL errors. Instead, catch errors from the rewritten SQL execution and re-report them with context from the ORIGINAL DDL.
+- For parameter name errors (e.g., unknown named parameter `tbles`): extract the parameter name from the DuckDB error, find its position in the ORIGINAL DDL string, and report that position.
+- For structural errors (missing parens, malformed STRUCT literals): parse the original DDL enough to identify which clause contains the error, and report the clause name rather than a character position.
+- The `sv_execute_ddl_rust` function already catches errors from `ffi::duckdb_query` and returns them as strings. Enhance the error path to:
+  1. Catch the raw DuckDB error from the rewritten SQL
+  2. Map it back to the original DDL context
+  3. Add clause-level hints ("in the dimensions clause") and "did you mean" suggestions
+- For "did you mean" on parameter names: the known parameter names are fixed (`tables`, `relationships`, `dimensions`, `metrics`). Use `strsim` to suggest corrections.
+- **Confidence:** HIGH. This is a known problem with statement rewriting. The mitigation is error message post-processing, not architectural change.
 
-**Phase assignment:** Parser hook implementation phase.
+**Phase assignment:** Error reporting phase. This is the core of v0.5.1's error UX improvement.
 
 ---
 
-### P9: Semicolon Inconsistency in parse_function Input
+### P7: Error Messages from C++ BinderException Truncated at Buffer Boundary
 
 **What goes wrong:**
-DuckDB issue #18485 documents that the query string passed to `parse_function` has inconsistent semicolon handling:
-- CLI: trailing semicolon sometimes included, sometimes not
-- Python API: trailing semicolon sometimes stripped
-- DuckDB UI: trailing semicolon stripped
-- The behavior differs between `CREATE` statements and other statement types
+The `sv_ddl_bind` function in `shim.cpp` calls `sv_execute_ddl_rust` which writes errors into a fixed-size buffer (`char error_buf[1024]`). If the error message exceeds 1024 bytes (plausible for errors that include the full expanded SQL, available column lists, or "did you mean" suggestions), the message is truncated at the buffer boundary.
 
-The extension's prefix-matching logic (`query.starts_with("CREATE SEMANTIC VIEW")`) is not affected by trailing semicolons. But if the parser extracts the view body from the query string by taking "everything after the view name," a trailing semicolon becomes part of the view definition text.
+The C++ side then throws `BinderException("CREATE SEMANTIC VIEW failed: %s", error_buf)`, which DuckDB formats and shows to the user. A truncated error message ending mid-word or mid-suggestion is confusing and unhelpful.
+
+**Consequences:** Long error messages are silently truncated. Users see incomplete suggestions or partial SQL fragments.
 
 **Prevention:**
-- Always strip trailing semicolons and whitespace from the query string before parsing. This is a one-line normalization step.
-- Do not rely on the semicolon to determine statement boundaries -- DuckDB's statement splitter handles this before `parse_function` is called.
-- Test from all interfaces: CLI (`duckdb -c "CREATE SEMANTIC VIEW ...;"`), Python (`conn.execute("CREATE SEMANTIC VIEW ...;")`), and sqllogictest runner.
-- **Confidence:** HIGH. Confirmed in DuckDB issue #18485. The normalization is trivial.
+- Increase the error buffer size. 1024 bytes is tight for error messages that include "did you mean" suggestions with available names listed. Use 4096 bytes.
+- Alternatively, allocate the error string dynamically: have `sv_execute_ddl_rust` return a `malloc`'d C string (via `CString::into_raw`) and have the C++ side free it after use. This eliminates the size limit entirely. The pattern is: Rust allocates, C++ copies into the BinderException string, then calls a Rust-side free function (`sv_free_string`).
+- At minimum, if using a fixed buffer, ensure the error message is constructed to fit: put the most important information (error type, parameter name, suggestion) first, and the expanded SQL (if any) last, so truncation cuts the least important part.
+- **Confidence:** HIGH. Buffer overflow is a well-understood problem. The fix is mechanical.
 
-**Phase assignment:** Parser hook implementation phase.
+**Phase assignment:** Error reporting phase. Increase buffer or switch to dynamic allocation.
 
 ---
 
-### P10: Double Parser Hook Registration on Extension Reload
+### P8: DROP Semantic View Leaves Orphaned References in Active Queries
 
 **What goes wrong:**
-If the extension is loaded twice (e.g., `LOAD 'semantic_views'; LOAD 'semantic_views';`), the parser hook is registered twice. Both hooks fire for every query. The second hook attempts to parse statements that the first hook already handled, potentially causing:
-- Duplicate `ExtensionStatement` construction
-- Double execution of DDL operations (defining a view twice)
-- Confusing error messages
+If a user executes `DROP SEMANTIC VIEW sales` while another connection has an active `FROM semantic_view('sales', ...)` query in flight, the DROP removes the definition from the HashMap. The in-flight query may be in the middle of execution (it read the definition during bind, expanded the SQL, and is streaming results). The DROP does not affect the in-flight query because the expanded SQL is already being executed by DuckDB on its own connection.
 
-DuckDB's extension loader should prevent double-loading, but if it does not, the parser hook vector (`cfg.parser_extensions`) will contain two entries for the same extension.
+But if the in-flight query fails and retries (or if DuckDB re-binds for any reason), it will find the definition missing from the HashMap and produce a confusing error: "Semantic view 'sales' not found" -- even though it was just working moments ago.
+
+**This is standard database behavior** -- DuckDB's own `DROP TABLE` has the same semantics. But for semantic views, the "not found" error is more confusing because the view is not visible in DuckDB's catalog (it is in our custom HashMap), so `SHOW TABLES` never showed it in the first place.
+
+**Consequences:** Confusing error during concurrent DROP + query. Not a data corruption risk.
 
 **Prevention:**
-- Use a static `std::once_flag` (or equivalent) in the C++ shim to ensure `push_back(ext)` is called exactly once:
-  ```cpp
-  static std::once_flag parser_registered;
-  std::call_once(parser_registered, [&]() {
-      cfg.parser_extensions.push_back(ext);
-  });
-  ```
-- Alternative: check if the parser hook is already registered by iterating `cfg.parser_extensions` and checking for the extension's `parse_fun` pointer.
-- **Confidence:** MEDIUM. DuckDB likely prevents double-loading, but the guard is cheap insurance.
+- This is acceptable behavior. DuckDB's own DROP has the same semantics.
+- Document in README: "DROP SEMANTIC VIEW takes effect immediately. In-flight queries that reference the dropped view may continue until completion but cannot be re-executed."
+- The error message for "view not found" already includes "Did you mean?" suggestions and "Run FROM list_semantic_views()" guidance. This is sufficient.
+- **Confidence:** HIGH. Standard database behavior. No code change needed, just documentation.
 
-**Phase assignment:** C++ shim implementation phase.
+**Phase assignment:** Documentation phase.
 
 ---
 
-### P11: Panic Across FFI Boundary in Parse Callback
+### P9: DESCRIBE/SHOW Rewriting Harder Than DROP -- No Clean Function Target
 
 **What goes wrong:**
-If the Rust `sv_parse` function panics (e.g., due to an unexpected input, unwrap on None, index out of bounds), the panic unwinds through the C++ trampoline and into DuckDB's parser. Under `extern "C"` calling convention, unwinding across FFI is undefined behavior. The typical result: immediate abort with no useful error message, or memory corruption.
+For DROP, the rewrite is clean: `DROP SEMANTIC VIEW x` becomes `SELECT * FROM drop_semantic_view('x')`. The drop function already exists and returns a result.
 
-This is especially dangerous because `parse_function` is called for every query that DuckDB's parser cannot handle. A bug in the Rust parse logic would crash every query, not just `CREATE SEMANTIC VIEW` queries.
+For DESCRIBE and SHOW, the rewrite targets also already exist:
+- `DESCRIBE SEMANTIC VIEW x` -> `SELECT * FROM describe_semantic_view('x')`
+- `SHOW SEMANTIC VIEWS` -> `SELECT * FROM list_semantic_views()`
+
+But the rewrite is more complex because:
+1. `DESCRIBE SEMANTIC VIEW x` must extract the view name `x` from a different position than CREATE (no parenthesized body).
+2. `SHOW SEMANTIC VIEWS` has no view name at all -- it is a parameterless command.
+3. `DROP SEMANTIC VIEW IF EXISTS x` must handle the IF EXISTS modifier.
+
+Each statement type requires its own parse-and-rewrite function. The current `parse_ddl_text` and `rewrite_ddl_to_function_call` are specific to CREATE and assume a parenthesized body.
+
+**Consequences:** If you try to reuse the CREATE parser for DROP/DESCRIBE/SHOW, view names are extracted from the wrong position or the parser fails on missing parentheses.
 
 **Prevention:**
-- Wrap the entire Rust `sv_parse` body in `std::panic::catch_unwind(AssertUnwindSafe(|| { ... }))`. Convert panics to error returns.
-- The C++ trampoline checks the error return and returns `ParserExtensionParseResult()` (not handled) or sets an error.
-- The `sv_parse` function must never `unwrap()`, `expect()`, or use `[]` indexing on untrusted input. Use `match`, `if let`, and `.get()`.
-- Add negative tests: malformed `CREATE SEMANTIC VIEW` statements that exercise all error paths.
-- **Confidence:** HIGH. Standard Rust FFI practice. RFC 2945 (`extern "C-unwind"`) would allow safe unwinding, but DuckDB's callback signatures use `extern "C"`.
+- Write a separate rewrite function for each statement type. Each function extracts only the parameters it needs:
+  - `rewrite_drop(query) -> "SELECT * FROM drop_semantic_view('name')"` or `"SELECT * FROM drop_semantic_view_if_exists('name')"`
+  - `rewrite_describe(query) -> "SELECT * FROM describe_semantic_view('name')"`
+  - `rewrite_show(query) -> "SELECT * FROM list_semantic_views()"`
+- The detection function returns a statement type discriminant. The `sv_execute_ddl_rust` function dispatches to the correct rewriter based on the type.
+- **Alternatively:** Build a single `parse_ddl` function that returns a structured result: `{ stmt_type: Create/Drop/Describe/Show, name: Option<&str>, body: Option<&str>, or_replace: bool, if_exists: bool, if_not_exists: bool }`. Each rewriter is a match arm on `stmt_type`.
+- **Confidence:** HIGH. This is straightforward parsing work. The risk is only in trying to be too clever with shared code.
 
-**Phase assignment:** Parser hook implementation phase. This pattern must be established in the very first `sv_parse` implementation.
+**Phase assignment:** Parser extension phase. Build the dispatch table before implementing individual DDL verbs.
+
+---
+
+### P10: FFI Return Code Insufficient for Multiple Statement Types
+
+**What goes wrong:**
+The current FFI contract between Rust and C++ is:
+- `sv_parse_rust(query, len) -> u8`: returns 0 (not ours) or 1 (detected CREATE SEMANTIC VIEW)
+- `sv_execute_ddl_rust(query, len, conn, name_out, ...) -> u8`: returns 0 (success) or 1 (error)
+
+For v0.5.1, the parse function needs to detect MULTIPLE statement types and communicate WHICH type was detected back to C++. A single u8 return of 0/1 is insufficient.
+
+The execute function also needs different behavior per type: CREATE returns a view name, DROP returns a view name, DESCRIBE returns multiple columns of metadata, SHOW returns a list of views. These have different output schemas.
+
+**Consequences:** If the FFI contract is not extended, all new DDL types must produce the same output schema (single VARCHAR "view_name"), which is wrong for DESCRIBE and SHOW.
+
+**Prevention:**
+- Extend `sv_parse_rust` to return a discriminant: 0 = not ours, 1 = CREATE, 2 = CREATE OR REPLACE, 3 = CREATE IF NOT EXISTS, 4 = DROP, 5 = DROP IF EXISTS, 6 = DESCRIBE, 7 = SHOW. These fit in a u8.
+- For `sv_execute_ddl_rust`: keep the current contract for CREATE/DROP (which both return a view name). For DESCRIBE and SHOW, use the rewrite-to-function approach: the Rust side rewrites the DDL to the corresponding `SELECT * FROM describe_semantic_view(...)` or `SELECT * FROM list_semantic_views()`, executes it on the DDL connection, and returns a success signal. The C++ `sv_ddl_bind` function declares a minimal output schema (single VARCHAR) for CREATE/DROP, but for DESCRIBE/SHOW, the actual results are produced by the table function executing on the DDL connection, and the plan function should return a different TableFunction with the correct schema.
+- **Simpler approach:** Have the C++ `sv_plan_function` check the discriminant and select different TableFunction implementations for each statement type. Only CREATE/DROP use `sv_ddl_bind`. DESCRIBE/SHOW get their own bind functions that declare the correct output schemas.
+- **Simplest approach:** All statement types are rewritten to `SELECT * FROM [function](...)` by Rust, executed on the DDL connection by `sv_execute_ddl_rust`, and the C++ plan function always returns a minimal "success message" TableFunction. The actual query results come from the rewritten function call. This works for CREATE and DROP (which return a view name), but DESCRIBE and SHOW should return their full result sets. If the rewritten SQL is executed on `sv_ddl_conn` and the results are discarded (only the side effect matters for CREATE/DROP), then DESCRIBE/SHOW need a different approach because their VALUE is the result set, not a side effect.
+- **Recommended approach:** Only use the parser hook rewriting for DDL STATEMENTS (CREATE, DROP) which have side effects. For QUERIES (DESCRIBE, SHOW) that return result sets, either:
+  (a) Rewrite to the function call and have the C++ plan_function return a table function that executes the rewrite and returns results, or
+  (b) Accept that DESCRIBE/SHOW remain function-only (no native syntax) for v0.5.1.
+  Option (b) is simpler and still delivers value. Document the function syntax in README.
+- **Confidence:** MEDIUM. The FFI extension is mechanical but the output schema problem for DESCRIBE/SHOW requires an architectural decision.
+
+**Phase assignment:** Architecture decision needed before implementation. Decide whether DESCRIBE/SHOW get native syntax in v0.5.1 or remain function-only.
 
 ---
 
 ## Minor Pitfalls
 
-### P12: Stale Build Artifacts from cc Crate
+### P11: Fuzzy Matching Suggestions in DDL Errors May Be Wrong Context
 
 **What goes wrong:**
-The `cc` crate caches compiled C++ objects. When `shim.cpp` is modified, the cached object may not be recompiled if the `cc` crate's change detection does not notice the modification (e.g., the header it depends on changed, but `cc` only tracks the `.cpp` file).
+The existing `suggest_closest` function (using `strsim::levenshtein`) is used at query time to suggest corrections for unknown dimension/metric names. For DDL errors, the same function could suggest corrections for unknown parameter names (e.g., `tbles` -> `tables`).
 
-Phase 11 hit this: after editing `shim.cpp`, `nm -u` still showed old symbols from a cached `libsemantic_views_shim.a`. The fix was `cargo clean -p semantic_views`.
+But the available names differ by context:
+- In a query: available names are dimensions and metrics of the specific view
+- In DDL: available names are the fixed set of parameter names (`tables`, `relationships`, `dimensions`, `metrics`)
+- In DROP: available names are existing view names
+
+If `suggest_closest` is called with the wrong candidate list, the suggestions will be nonsensical.
 
 **Prevention:**
-- Add `println!("cargo:rerun-if-changed=src/shim/shim.cpp");` and `println!("cargo:rerun-if-changed=src/shim/duckdb.hpp");` in `build.rs`. The `cc` crate should handle this automatically, but explicit `rerun-if-changed` directives are insurance.
-- After any change to the C++ shim or amalgamation header: `cargo clean -p semantic_views && cargo build`.
-- **Confidence:** HIGH. Documented cc crate behavior. Previously hit in this project.
+- Parameterize suggestions by context. When constructing error messages for DDL, pass the correct candidate list.
+- For unknown parameter names in CREATE DDL: candidates = `["tables", "relationships", "dimensions", "metrics"]`
+- For "view not found" in DROP: candidates = list of existing view names from the HashMap
+- **Confidence:** HIGH. The function already takes `available: &[String]` as a parameter. Just pass the right list.
 
-**Phase assignment:** Build system phase.
+**Phase assignment:** Error reporting phase.
 
 ---
 
-### P13: Amalgamation Header Version Must Match DuckDB Pin
+### P12: SHOW SEMANTIC VIEWS Name Conflicts with DuckDB SHOW
 
 **What goes wrong:**
-The `shim.cpp` includes `duckdb.hpp` (the amalgamation header). This header defines the C++ class layouts, vtable orderings, and function signatures. If the amalgamation header version does not exactly match the DuckDB runtime version (`v1.4.4`), the extension's C++ objects will have wrong layouts. Calling virtual methods through mismatched vtables causes crashes.
+DuckDB's `SHOW` command is an alias for `DESCRIBE`. The full set of DuckDB SHOW commands includes `SHOW TABLES`, `SHOW ALL TABLES`, `SHOW DATABASES`. If the extension intercepts `SHOW SEMANTIC VIEWS`, it must ensure that `SHOW TABLES` and other DuckDB SHOW commands are NOT intercepted.
 
-The DuckDB CI workflow (`DuckDBVersionMonitor.yml`) already detects version mismatches for the Rust `duckdb-rs` crate. It must also update the amalgamation header.
+The prefix `SHOW SEMANTIC` is unique enough (DuckDB has no built-in `SHOW SEMANTIC` command), but careless prefix matching could intercept `SHOW SETTINGS` if only checking `SHOW S...`.
 
 **Prevention:**
-- Fetch the amalgamation from the same DuckDB release as the `duckdb-rs` pin. The download URL is deterministic: `https://github.com/duckdb/duckdb/releases/download/v1.4.4/libduckdb-src.zip`.
-- Pin the amalgamation download in `build.rs` using the same `TARGET_DUCKDB_VERSION` constant.
-- The `DuckDBVersionMonitor.yml` workflow should update both `Cargo.toml` (duckdb-rs version) and the amalgamation download URL when a new version is detected.
-- Add a build-time assertion: compare a version string from the amalgamation header against the Cargo.toml duckdb version.
-- **Confidence:** HIGH. Version mismatch causes obvious crashes. The mitigation is a build system check.
+- Match the exact prefix `SHOW SEMANTIC VIEWS` (three words, case-insensitive), not just `SHOW S`.
+- The existing `detect_create_semantic_view` pattern of comparing a full prefix string handles this correctly.
+- Test that `SHOW TABLES`, `SHOW ALL TABLES`, and `SHOW DATABASES` still work after the extension is loaded.
+- **Confidence:** HIGH. String prefix matching. Straightforward.
 
-**Phase assignment:** Build system phase.
+**Phase assignment:** Parser detection phase. Add negative tests for DuckDB's own SHOW commands.
 
 ---
 
-### P14: `parse_function` vs `parser_override` -- Use parse_function (Fallback)
+### P13: CREATE OR REPLACE Does Not Re-Infer Column Types
 
 **What goes wrong:**
-There are two parser extension hooks:
-- `parser_override`: Called BEFORE DuckDB's parser, for every query. Must handle the full SQL grammar if it claims a statement.
-- `parse_function`: Called AFTER DuckDB's parser fails. Only receives statements that DuckDB cannot parse.
+The existing `DefineSemanticViewVTab::bind` performs DDL-time type inference via `LIMIT 0` on the expanded SQL (lines 123-145 of `define.rs`). This populates `column_type_names` and `column_types_inferred` in the definition JSON. For CREATE OR REPLACE, if the new definition has different source tables or expressions, the column types may have changed. If the type inference step is skipped (e.g., because `persist_conn` is None for in-memory databases), the definition retains the old type information from the previous CREATE.
 
-`CREATE SEMANTIC VIEW ...` will fail DuckDB's parser at the `SEMANTIC` keyword (unrecognized after `CREATE`), triggering `parse_function`. This is the correct hook.
+In practice, type inference runs in the same `bind` call for CREATE OR REPLACE as for CREATE, so the types ARE re-inferred. But if the source tables do not exist yet when CREATE OR REPLACE runs (e.g., the user is redefining a view before recreating the underlying tables), the `LIMIT 0` query fails, type inference is silently skipped, and the definition stores empty type vectors.
 
-Using `parser_override` would require the extension to parse EVERY query (even `SELECT 1`) and return "not handled" for non-semantic-view queries. This adds overhead to every query and is unnecessary.
-
-The v0.2.0 PITFALLS.md (P2.1) incorrectly recommended `parser_override` for some scenarios. The investigation doc correctly identifies `parse_function` as the right choice.
+**Consequences:** Subsequent queries against the replaced view may use stale type information, leading to type mismatches handled by `build_execution_sql` cast wrappers. This works but is inefficient and may produce unexpected cast behavior.
 
 **Prevention:**
-- Register `parse_function`, not `parser_override`.
-- The first line of the parse function: check if the query starts with `CREATE SEMANTIC VIEW` (case-insensitive, after stripping whitespace/comments). If not, return "not handled" immediately.
-- The performance impact of `parse_function` is zero for normal queries (it is only called when DuckDB's parser fails).
-- **Confidence:** HIGH. Confirmed by prql extension source code (uses `parse_function`, not `parser_override`) and the DuckDB extensible parsers blog post.
+- This is already handled correctly by the existing code: type inference failure is non-fatal, and `build_execution_sql` handles mismatches at query time.
+- Add a test: CREATE a view, DROP the source table, CREATE OR REPLACE the view with a different source, re-create the source table, then query. Assert types are correct at query time.
+- **Confidence:** HIGH. The existing defensive type system handles this. Test coverage is the gap.
 
-**Phase assignment:** Parser hook implementation phase.
+**Phase assignment:** Testing phase.
+
+---
+
+### P14: Error Buffer UTF-8 Safety at FFI Boundary
+
+**What goes wrong:**
+The `write_to_buffer` function in `parse.rs` copies Rust string bytes into a raw C buffer. If the error message contains multi-byte UTF-8 characters (e.g., from table names or column names with accented characters), truncation at the buffer boundary may cut a multi-byte sequence in half. The C++ side reads the buffer as a `char*` and constructs a `std::string`. A truncated UTF-8 sequence is invalid, but `std::string` does not validate encoding, so it becomes a `BinderException` with mojibake or partial characters.
+
+**Consequences:** Garbled error messages when non-ASCII identifiers are involved and the error message is near the buffer size limit.
+
+**Prevention:**
+- In `write_to_buffer`: after determining `copy_len`, walk backward to find a valid UTF-8 boundary. Truncate to the last complete UTF-8 code point.
+- Alternatively, switch to dynamic allocation (see P7) to eliminate truncation entirely.
+- This is a minor issue because DuckDB identifiers are typically ASCII. But it is a correctness gap.
+- **Confidence:** HIGH. UTF-8 truncation is a well-known problem.
+
+**Phase assignment:** Error reporting phase. Fix if switching to dynamic allocation; otherwise, add boundary-safe truncation.
 
 ---
 
@@ -388,44 +354,49 @@ The v0.2.0 PITFALLS.md (P2.1) incorrectly recommended `parser_override` for some
 
 | Phase Topic | Likely Pitfall | Mitigation |
 |-------------|---------------|------------|
-| Build system setup | P5 (footer ABI type), P6 (symbol visibility), P12 (stale artifacts), P13 (amalgamation version) | Update Makefile, build.rs, and add CI verification steps |
-| C++ shim scaffold | P2 (dual entry point), P4 (Rust function pointers), P10 (double registration) | POC spike to prove entry point strategy works end-to-end |
-| Parser hook impl | P7 (thread safety), P8 (memory ownership), P9 (semicolons), P11 (panic safety), P14 (hook type) | Stateless parse function, catch_unwind, normalize input |
-| Integration testing | P1 (ODR at runtime), P3 (compiler ABI) | Test on macOS + Linux, verify no crashes under load |
-| C API bridge | P4 (function pointer table init) | Critical spike -- prove Rust ffi::* works under CPP entry |
+| Parser hook validation spike | P1 (DROP/DESCRIBE/SHOW may not trigger fallback) | Empirical test of each prefix against DuckDB's parser |
+| Parser detection extension | P4 (multiple prefix matching), P5 (IF NOT EXISTS position), P12 (SHOW conflicts) | Ordered prefix matching, define syntax, negative tests |
+| FFI contract extension | P10 (return code insufficient), P7 (buffer truncation), P14 (UTF-8 safety) | Extended discriminant, larger/dynamic buffers |
+| DROP implementation | P3 (three-connection lock conflict), P8 (concurrent DROP + query) | Test native DDL path early, document behavior |
+| CREATE OR REPLACE | P2 (persist vs memory inconsistency), P5 (mutual exclusion with IF NOT EXISTS), P13 (type re-inference) | Round-trip tests, explicit rejection of conflicting modifiers |
+| Error reporting | P6 (position meaningless after rewrite), P7 (buffer truncation), P11 (wrong suggestion context) | Error post-processing, context-aware suggestions |
+| DESCRIBE/SHOW | P1 (may not trigger parser hook), P9 (different rewrite structure), P10 (output schema mismatch) | Decide function-only vs native syntax before implementing |
 
 ---
 
 ## Research Notes
 
-**Confidence assessment:**
+**Confidence Assessment:**
 
 | Area | Confidence | Basis |
 |------|------------|-------|
-| ODR behavior (P1) | MEDIUM | DuckDB PR #3783, dlopen RTLD_LOCAL documentation, prql/duckpgq existence proofs |
-| Entry point conflict (P2, P4) | LOW | Novel problem -- no documented Rust+C++ DuckDB extension exists. Requires POC. |
-| C++ ABI (P3) | HIGH | Well-established C++ ABI rules, DuckDB community extension CI practices |
-| Footer stamping (P5) | HIGH | Directly read `append_extension_metadata.py` source -- confirmed `--abi-type CPP` support |
-| Symbol visibility (P6) | HIGH | Existing build.rs already handles this; extending to include C++ symbol is mechanical |
-| Thread safety (P7) | HIGH | DuckDB threading model documented; parse function is stateless |
-| Memory ownership (P8) | HIGH | Standard Rust FFI patterns, Rustonomicon |
-| Semicolons (P9) | HIGH | Confirmed in DuckDB issue #18485 |
-| Double registration (P10) | MEDIUM | DuckDB likely prevents double-load, but guard is cheap |
-| Panic safety (P11) | HIGH | Standard Rust FFI, RFC 2945 |
+| Parser fallback behavior for DROP (P1) | MEDIUM | DuckDB docs confirm DROP supports specific object types; `SEMANTIC` is not one; likely parser error but needs empirical test |
+| Parser fallback behavior for DESCRIBE/SHOW (P1) | LOW | DESCRIBE may treat next token as identifier, causing catalog error not parser error; needs empirical test |
+| Catalog consistency (P2) | HIGH | Code review of existing write-first pattern; risk is theoretical |
+| Three-connection locking (P3) | MEDIUM | DuckDB single-writer documented; but three-connection interaction during parser hook bind is novel territory |
+| Prefix matching (P4) | HIGH | Pure string matching; ordered prefixes solve this |
+| IF NOT EXISTS syntax (P5) | HIGH | DuckDB precedent clear: IF NOT EXISTS after object type, before name |
+| Error position mapping (P6) | HIGH | Well-known statement rewriting problem; error post-processing is standard approach |
+| Buffer truncation (P7) | HIGH | Fixed buffer arithmetic; obvious fix |
+| FFI contract extension (P10) | MEDIUM | Mechanical change but DESCRIBE/SHOW output schema needs architectural decision |
 
 **Sources consulted:**
-- [DuckDB PR #3783: Extension loading by statically linking DuckDB](https://github.com/duckdb/duckdb/pull/3783) -- RTLD_LOCAL, static linking per-extension
-- [DuckDB PR #12682: C API extensions](https://github.com/duckdb/duckdb/pull/12682) -- C_STRUCT ABI, function pointer struct
-- [DuckDB issue #18485: Inconsistent semicolon handling](https://github.com/duckdb/duckdb/issues/18485) -- parser extension semicolons
-- [DuckDB extension-ci-tools `append_extension_metadata.py`](https://github.com/duckdb/extension-ci-tools/) -- footer format, ABI type parameter
-- [DuckDB extension loading (DeepWiki)](https://deepwiki.com/duckdb/duckdb/4.3-extension-loading-and-installation) -- ABI types, entry point selection
-- [DuckDB extension system (DeepWiki)](https://deepwiki.com/duckdb/duckdb/3-extension-system) -- extension architecture
-- [duckdb-prql (GitHub)](https://github.com/ywelsch/duckdb-prql) -- existence proof for parser extension compiled against amalgamation
-- [duckdb-rs issue #370: Rust extensions via C API](https://github.com/duckdb/duckdb-rs/issues/370) -- function pointer mechanism
-- [DuckDB community extension development docs](https://duckdb.org/community_extensions/development) -- CI and build requirements
-- [C++ dlopen duplicate symbols](https://linuxvox.com/blog/loading-two-instances-of-a-shared-library/) -- RTLD_LOCAL isolation semantics
-- [Rust FFI (Rustonomicon)](https://doc.rust-lang.org/nomicon/ffi.html) -- thread safety, memory ownership, panic safety
-- This project's `_notes/parser-extension-investigation.md` -- prior investigation
-- This project's `build.rs` -- current symbol visibility setup
-- This project's `src/lib.rs` -- current entry point and Rust FFI surface
-- This project's phase 11 summary (`11-04-SUMMARY.md`) -- prior failure analysis
+- [DuckDB DROP statement documentation](https://duckdb.org/docs/stable/sql/statements/drop) -- supported object types
+- [DuckDB DESCRIBE statement documentation](https://duckdb.org/docs/stable/sql/statements/describe) -- DESCRIBE syntax and behavior
+- [DuckDB issue #18485: Inconsistent semicolon handling](https://github.com/duckdb/duckdb/issues/18485) -- parser extension input normalization (already handled in v0.5.0)
+- [DuckDB Runtime-Extensible Parsers (blog)](https://duckdb.org/2024/11/22/runtime-extensible-parsers) -- parse_function is fallback, not override
+- [DuckDB Runtime-Extensible Parsers (CIDR 2025 paper)](https://duckdb.org/pdf/CIDR2025-muehleisen-raasveldt-extensible-parsers.pdf) -- extension parsers replace full grammar, not extend it
+- [Effective Rust: Control what crosses FFI boundaries](https://effective-rust.com/ffi.html) -- FFI error handling best practices
+- [Rust FFI error reporting (users.rust-lang.org)](https://users.rust-lang.org/t/best-practices-for-error-reporting-from-rust-to-c/18345) -- Rust-to-C error patterns
+- [DuckPGQ extension (GitHub)](https://github.com/cwida/duckpgq-extension) -- existence proof for DROP PROPERTY GRAPH via parser hooks
+- This project's `src/parse.rs` -- current parser detection and rewriting
+- This project's `cpp/src/shim.cpp` -- current C++ shim with plan_function and DDL connection
+- This project's `src/catalog.rs` -- dual-store catalog (HashMap + DuckDB table)
+- This project's `src/ddl/define.rs` -- CREATE with or_replace and if_not_exists flags
+- This project's `src/ddl/drop.rs` -- DROP with persist_conn and if_exists patterns
+- This project's `src/ddl/describe.rs` -- DESCRIBE as table function (existing)
+- This project's `src/ddl/list.rs` -- LIST as table function (existing)
+- This project's `src/query/error.rs` -- existing error types and display formatting
+- This project's `src/expand.rs` -- fuzzy matching via strsim, ExpandError types
+- This project's `src/lib.rs` -- extension init, connection creation, function registration
+- This project's `TECH-DEBT.md` -- accepted decisions and deferred items

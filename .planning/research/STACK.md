@@ -1,265 +1,251 @@
-# Technology Stack: v0.2.0 Additions
+# Technology Stack: v0.5.1 DDL Polish
 
 **Project:** DuckDB Semantic Views Extension
-**Researched:** 2026-03-01
-**Milestone:** v0.2.0 — Native DDL + Time Dimensions
-**Scope:** What library/crate additions are needed for v0.2.0 features, and what already exists
+**Researched:** 2026-03-08
+**Milestone:** v0.5.1 -- DDL Polish (DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW + error reporting + README)
+**Scope:** What library/crate additions or changes are needed for v0.5.1 features
 
 ---
 
 ## Bottom Line Up Front
 
-**New Cargo dependency: exactly one.** Add `cc = "1.2"` to `[build-dependencies]` and add a new `build.rs`. Everything else — DuckDB headers, time dimension logic, the Rust/C++ boundary, string handling — is achievable with libraries already in the dependency tree or already present in the build environment. No new `[dependencies]` entries are needed.
+**Zero new Cargo dependencies.** The existing stack is sufficient for all v0.5.1 features. The new DDL verbs (DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW) are parser detection + statement rewriting in Rust and routing in the C++ shim -- the same pattern as CREATE. Error location reporting with clause hints, character positions, and "did you mean" suggestions is achievable with `strsim` (already present) and hand-crafted error formatting that follows DuckDB's own error message conventions. No error reporting framework (miette, ariadne, codespan-reporting) is needed or appropriate because errors flow through DuckDB's plain-text error channel, not a terminal renderer.
 
 ---
 
-## Existing Dependency Inventory (v0.1.0 Cargo.toml)
+## Existing Dependency Inventory (v0.5.0 Cargo.toml)
 
-The following are already present and sufficient for the v0.2.0 features they support:
+All dependencies are current and sufficient:
 
-| Crate | Version | Already Covers |
-|-------|---------|---------------|
-| `duckdb` | `=1.4.4` | All DuckDB Rust extension APIs, VTab, ScalarFunction |
-| `libduckdb-sys` | `=1.4.4` | Raw FFI bindings; the `duckdb.tar.gz` bundled source is the DuckDB header source |
-| `serde` + `serde_json` | `1` | `TimeGrain` serialization, pragma SQL string construction |
-| `arbitrary` | `1`, optional | Already present; no change needed for time dimensions |
-| `proptest` | `1.9` | Already covers expansion engine; time dimension tests fit naturally |
+| Crate | Version | Sufficient For v0.5.1 | Why |
+|-------|---------|----------------------|-----|
+| `duckdb` | `=1.4.4` | Yes | VTab, BindInfo, TableFunctionInfo -- all DDL functions use these |
+| `libduckdb-sys` | `=1.4.4` | Yes | Raw FFI (duckdb_query, duckdb_connection) for DDL execution path |
+| `serde` + `serde_json` | `1` | Yes | Catalog JSON serialization/deserialization unchanged |
+| `strsim` | `0.11` | Yes | "Did you mean" suggestions via Levenshtein distance -- already used in `expand.rs::suggest_closest()` |
+| `cc` | `1` (build-dep, optional) | Yes | C++ shim compilation unchanged |
+| `proptest` | `1.9` (dev-dep) | Yes | PBTs for new parse detection and error formatting |
+| `cargo-husky` | `1` (dev-dep) | Yes | Pre-commit hooks unchanged |
+
+### strsim 0.11 Verification
+
+**Latest version:** 0.11.1 (released 2024-04-02). No newer release exists. The project uses `strsim = "0.11"` which resolves to 0.11.1. The `levenshtein()` function used by `suggest_closest()` in `expand.rs` is sufficient for DDL error suggestions -- no additional string similarity algorithms needed.
+
+**Confidence:** HIGH -- verified via crates.io version listing.
 
 ---
 
-## New Dependency: `cc` crate (Build-Dependency Only)
+## Feature-by-Feature Stack Analysis
 
-### What it is
+### 1. Extended DDL Verbs (DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW)
 
-The `cc` crate is the standard Rust ecosystem tool for compiling C or C++ source files from `build.rs`. It wraps the host C++ compiler (clang++ on macOS, g++ on Linux, MSVC on Windows), handles cross-compilation flag propagation automatically, and links the compiled object into the cdylib.
+**What exists:** The function-based implementations are already complete:
+- `drop_semantic_view()` and `drop_semantic_view_if_exists()` -- `src/ddl/drop.rs`
+- `create_or_replace_semantic_view()` and `create_semantic_view_if_not_exists()` -- `src/ddl/define.rs` via `DefineState.or_replace` / `DefineState.if_not_exists`
+- `describe_semantic_view()` -- `src/ddl/describe.rs`
+- `list_semantic_views()` -- `src/ddl/list.rs`
 
-### Why it is needed
+**What v0.5.1 adds:** Native DDL syntax support via the parser hook -- the same pattern used for `CREATE SEMANTIC VIEW` in v0.5.0:
 
-The C++ shim (`src/shim/shim.cpp`) cannot be compiled by Cargo without an explicit build step. The `cc` crate is the only supported mechanism for this in a pure-Cargo build (i.e., without introducing CMake). It is a build-time-only dependency — it does not appear in the compiled extension binary.
+| Native DDL | Rewrites To | Existing Function |
+|------------|-------------|-------------------|
+| `DROP SEMANTIC VIEW name` | `SELECT * FROM drop_semantic_view('name')` | `drop_semantic_view` |
+| `DROP SEMANTIC VIEW IF EXISTS name` | `SELECT * FROM drop_semantic_view_if_exists('name')` | `drop_semantic_view_if_exists` |
+| `CREATE OR REPLACE SEMANTIC VIEW name (...)` | `SELECT * FROM create_or_replace_semantic_view('name', ...)` | `create_or_replace_semantic_view` |
+| `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)` | `SELECT * FROM create_semantic_view_if_not_exists('name', ...)` | `create_semantic_view_if_not_exists` |
+| `DESCRIBE SEMANTIC VIEW name` | `SELECT * FROM describe_semantic_view('name')` | `describe_semantic_view` |
+| `SHOW SEMANTIC VIEWS` | `SELECT * FROM list_semantic_views()` | `list_semantic_views` |
 
-### Version
+**Stack requirement:** None new. Changes needed:
+1. **`src/parse.rs`**: Extend `detect_create_semantic_view()` to handle all 6 DDL patterns. Rename to something broader (e.g., `detect_semantic_view_ddl()`). Add `parse_ddl_text()` variants or a unified parser that returns a DDL variant enum.
+2. **`cpp/src/shim.cpp`**: The `sv_parse_stub` calls `sv_parse_rust` which returns a u8. Extend to return the DDL type (or return a detected flag and let `sv_execute_ddl_rust` handle routing). The `sv_ddl_bind` function calls `sv_execute_ddl_rust` which rewrites and executes -- extend `rewrite_ddl_to_function_call()` in Rust to handle all 6 patterns.
+3. **No new C++ symbols needed** -- all rewriting is in Rust. The C++ shim just routes the query text through the same `sv_parse_rust` / `sv_execute_ddl_rust` path.
 
-**`cc = "1.2"`** — pin to the minor version, not an exact patch. This tracks the most stable API surface. The crate had 575M+ downloads as of 2026-03; it is the most widely deployed build-time C/C++ compilation tool in the Rust ecosystem.
+**Confidence:** HIGH -- direct code inspection confirms the pattern. The v0.5.0 architecture was explicitly designed for extensibility.
 
-Current latest: **1.2.45** (confirmed via crates.io, 2026-03-01). The `1.2` range is appropriate because the API is stable across patch versions and no breaking changes have occurred in the 1.x series.
+### 2. Error Location Reporting
 
-### Where it goes
+**The requirement:** When a `CREATE SEMANTIC VIEW` statement has errors (missing clauses, unknown keywords, malformed syntax), report:
+- Which clause the error is in (e.g., "in `dimensions` clause")
+- Character position within the original DDL
+- "Did you mean" suggestions for misspelled clause names
 
-```toml
-# Cargo.toml — NEW section
-[build-dependencies]
-cc = "1.2"
+**Why NOT miette/ariadne/codespan-reporting:**
+
+These are terminal diagnostic renderers. They produce ANSI-colored, multi-line error output with source spans, underlines, and margin annotations. DuckDB's error channel is plain text -- errors from `BinderException` or table function `Err(...)` are rendered by DuckDB's own error formatter. Fancy terminal rendering would:
+1. **Be mangled** -- DuckDB strips/wraps error text; ANSI codes would appear as garbage in many clients (DBeaver, Python, JDBC).
+2. **Conflict** -- DuckDB has its own `LINE 1:` / caret error format convention. Adding a competing format confuses users.
+3. **Be overkill** -- The DDL grammar is ~6 keywords with simple structure. A full diagnostic framework for a handful of error cases wastes binary size (~200KB for miette).
+4. **Add dependency churn** -- miette is at 7.6.0 with frequent breaking changes; ariadne is less stable. Neither is needed.
+
+**What to do instead:** Follow DuckDB's own error conventions:
+
+```
+CREATE SEMANTIC VIEW failed: missing 'dimensions' clause.
+  Hint: Expected one of: tables, relationships, dimensions, metrics
+  Did you mean 'dimesions'? (found 'dimesions' at position 45)
 ```
 
-No changes to `[dependencies]` or `[dev-dependencies]`.
+This matches DuckDB's style:
+- Error type prefix (`CREATE SEMANTIC VIEW failed:`)
+- Descriptive message
+- `Hint:` for additional context (DuckDB uses this)
+- `Did you mean` for suggestions (DuckDB uses this exact phrasing)
 
-### Confidence
+**Stack requirement:** `strsim` (already present) for clause name suggestions. `std::fmt` for error formatting. No new crates.
 
-HIGH — confirmed via crates.io, official Rust cc crate documentation, and the fact that `libduckdb-sys` itself already uses `cc` internally (visible in the `libduckdb-sys-1.4.4` build output).
+**Implementation approach:**
+1. Add a `ParseError` enum in `src/parse.rs` with variants for each failure mode, carrying byte offset and clause context.
+2. Use byte offsets from the string scanning already done in `parse_ddl_text()`.
+3. Format errors with clause hints and optional character position.
+4. The `suggest_closest()` function in `expand.rs` can be reused or extracted to a shared module for clause name suggestions.
+
+**Confidence:** HIGH -- DuckDB's error format verified from issue examples and documentation. The extension already uses this pattern in `ExpandError` and `QueryError`.
+
+### 3. "Did You Mean" Suggestions
+
+**Already implemented for:**
+- View names at query time (`QueryError::ViewNotFound` in `src/query/error.rs`)
+- Dimension/metric names at query time (`ExpandError::UnknownDimension`, `ExpandError::UnknownMetric` in `src/expand.rs`)
+- Both use `strsim::levenshtein` via `suggest_closest()` with threshold of 3
+
+**New for v0.5.1:**
+- DDL clause names (tables, relationships, dimensions, metrics) -- small fixed vocabulary
+- View names at DDL time (DROP, DESCRIBE for non-existent views)
+
+**Stack requirement:** `strsim` 0.11 (already present). The Levenshtein threshold of 3 is appropriate for short keywords. No additional algorithms needed.
+
+**Confidence:** HIGH -- direct code inspection of existing implementation.
+
+### 4. README Documentation
+
+**No stack implications.** Markdown documentation -- no tools needed beyond a text editor. The existing README.md structure will be extended with DDL syntax reference and worked examples.
 
 ---
 
-## DuckDB C++ Headers — No New Dependency, but New Artifact
+## What NOT to Add
 
-### The header situation
+| Candidate | Why Not |
+|-----------|---------|
+| `miette` 7.6.0 | Terminal diagnostic renderer -- incompatible with DuckDB's plain-text error channel. Adds ~200KB to binary. Frequent breaking changes. |
+| `ariadne` 0.4.x | Same as miette -- terminal renderer, not appropriate for DuckDB error output. |
+| `codespan-reporting` 0.11.x | Same category. Designed for compiler-style terminal diagnostics. |
+| `thiserror` 2.x | Proc macro for `Display` on error types. The extension already hand-implements `Display` for `ExpandError` and `QueryError`. Adding `thiserror` for 2 more error types is not worth a new proc-macro dependency in the build chain. |
+| `unicode-width` 0.2.x | For character-width-aware caret positioning. Not needed -- DDL text is ASCII SQL keywords; `str::len()` gives correct byte=char=display-width mapping. Unicode in identifiers is edge-case and not worth a dependency. |
+| `sqlparser` | Full SQL parser. The DDL grammar is trivial (6 prefix patterns). A 500KB parser dependency for prefix matching is extreme overkill. |
+| `nom` / `winnow` / `pest` | Parser combinators. Same reasoning as sqlparser -- the grammar is too simple to justify a parsing framework. |
+| `regex` | For DDL detection. The existing `eq_ignore_ascii_case` byte comparison is allocation-free and faster than regex for prefix matching. |
 
-The C++ shim (`shim.cpp`) needs DuckDB's C++ internal headers — specifically:
-- `duckdb/main/config.hpp` (for `DBConfig::GetConfig`, `config.parser_extensions`)
-- `duckdb/parser/parser_extension.hpp` (for `ParserExtension`, `parse_function_t`, `plan_function_t`)
-- `duckdb/function/pragma_function.hpp` (for `PragmaFunction`, `pragma_query_t`)
+---
 
-These are in `duckdb.hpp`, the amalgamated single-header C++ SDK that DuckDB ships alongside `duckdb.h`.
+## Alternatives Considered
 
-### What already exists
+| Category | Recommended | Alternative | Why Not |
+|----------|-------------|-------------|---------|
+| Error formatting | Hand-crafted `fmt::Display` following DuckDB conventions | `miette` / `ariadne` | Terminal renderers; DuckDB error channel is plain text; ~200KB binary bloat |
+| String similarity | `strsim` 0.11 (existing) | `rapidfuzz` 0.5 | Already have `strsim`; switching gains nothing for this use case |
+| DDL parsing | Hand-written prefix matcher + `parse_ddl_text()` | `sqlparser-rs` / `nom` | Grammar is 6 keyword patterns; parser framework is massive overkill |
+| Error derive | Manual `impl Display` | `thiserror` 2.x | Only 2 new error types; not worth adding a proc-macro dep |
+| Caret positioning | `str::len()` (byte offset) | `unicode-width` | DDL keywords are ASCII; Unicode edge case not worth a dependency |
 
-**During `cargo test` (bundled mode):** `libduckdb-sys` extracts `duckdb.tar.gz` into the build output directory. `duckdb.hpp` is present at `{OUT_DIR}/duckdb/src/include/duckdb.hpp` — verified on this project at `target/debug/build/libduckdb-sys-*/out/duckdb/src/include/duckdb.hpp`. Cargo propagates the `lib_dir` metadata (`cargo:lib_dir=...`) as the `DEP_DUCKDB_LIB_DIR` environment variable to dependent build scripts.
+---
 
-**During `make debug/release` (extension mode, `--no-default-features --features extension`):** `libduckdb-sys` uses the loadable-extension stub path — it does NOT extract `duckdb.tar.gz`. The DuckDB C++ headers are not available in `OUT_DIR`. This is the build that produces the distributable `.duckdb_extension` file.
+## C++ Shim Changes (No New Dependencies)
 
-### Solution: vendor `duckdb.hpp` into the repo
+The `cpp/src/shim.cpp` needs logic changes but no new C++ dependencies:
 
-Vendor `duckdb.hpp` at `duckdb_capi/duckdb.hpp` (alongside the existing `duckdb_capi/duckdb.h` and `duckdb_capi/duckdb_extension.h`). This file is:
+### Current FFI Boundary (v0.5.0)
 
-- Downloaded once from the pinned DuckDB release: `https://github.com/duckdb/duckdb/releases/download/v1.4.4/libduckdb-src.zip` (contains `duckdb.hpp`)
-- Committed to the repository (it is ~6MB — large but vendor-appropriate; DuckDB itself recommends this for embedding)
-- Version-locked to match `duckdb-rs` and `libduckdb-sys` at `=1.4.4`
-- Updated by a `just update-headers` recipe when `TARGET_DUCKDB_VERSION` changes in the Makefile
-
-The `build.rs` uses the vendored copy unconditionally:
-
-```rust
-fn main() {
-    cc::Build::new()
-        .cpp(true)
-        .file("src/shim/shim.cpp")
-        .include("duckdb_capi/")          // vendored duckdb.hpp lives here
-        .flag("-std=c++17")
-        .warnings(false)                  // suppress DuckDB's own warnings
-        .compile("semantic_views_shim");
-}
+```
+sv_parse_rust(query_ptr, query_len) -> u8   [0=not ours, 1=CREATE detected]
+sv_execute_ddl_rust(query_ptr, ...) -> u8   [0=success, 1=failure]
 ```
 
-### Why not rely on OUT_DIR for the extension build
+### Extended FFI Boundary (v0.5.1)
 
-`OUT_DIR` from `libduckdb-sys` is available during bundled builds (`cargo test`) but not during extension builds. Trying to detect and switch paths in `build.rs` based on active features is fragile. Vendoring is the reliable, reproducible approach.
+Two approaches, both zero-new-deps:
 
-### Confidence
-
-HIGH — confirmed by inspecting the actual `libduckdb-sys-1.4.4` build output in this project's `target/` directory. The two-mode behavior (bundled vs loadable-extension) is clearly documented in the project's Makefile and Cargo.toml.
-
----
-
-## Time Dimensions — No New Crates Needed
-
-### Why no `chrono`
-
-`chrono` is an optional dependency of `duckdb-rs` (enabled by the `modern-full` feature). The project does not enable that feature and should not add it just for time dimensions. The reason: time dimension support in v0.2.0 is **SQL codegen only** — the Rust code generates `date_trunc('month', "order_date")` SQL strings that DuckDB executes. Rust never performs date arithmetic itself. There is no date type to parse, format, or compute — just string construction.
-
-### What is sufficient
-
-`serde_json` (already present) handles serialization of the `TimeGrain` enum. `std::fmt` handles string formatting of the `date_trunc` SQL fragment. No date math library is needed.
-
-The complete time dimension feature adds:
-1. A `TimeGrain` enum to `src/model.rs` (derives `Serialize`, `Deserialize`, `Debug`, `Clone` — all from existing `serde` dep)
-2. A `granularities: HashMap<String, TimeGrain>` field to `QueryRequest` in `src/expand.rs`
-3. A `date_trunc('{grain}', {expr})` wrapper in `build_sql()` for dimensions with a matching entry in `granularities`
-4. A `granularities` named parameter parsed in `src/query/table_function.rs`
-
-### Confidence
-
-HIGH — time dimensions are purely additive Rust changes to the existing expansion engine. The existing proptest setup already covers `build_sql()` and will naturally extend to cover time dimension cases.
-
----
-
-## DuckDB ParserExtension API Version Constraints
-
-### `parse_function_t` and `plan_function_t`
-
-The `ParserExtension` mechanism (`parse_function_t`, `plan_function_t`) is documented in DuckDB's CIDR 2025 paper ("Runtime-Extensible Parsers", Mühleisen & Raasveldt), which describes the mechanism as production-ready. It is present in DuckDB 1.4.x. The mechanism has existed since DuckDB 0.9.x based on community extension usage evidence.
-
-**Key constraint confirmed by ARCHITECTURE.md (first-party research):** `plan_function_t` fires inside DuckDB's normal planner execution path, subject to the same execution lock constraints as the current `invoke`. The pragma_query_t approach sidesteps this by returning a SQL string that DuckDB executes post-lock.
-
-**Version requirement:** No minimum version beyond 1.4.4 is required. The `ParserExtension` API, `pragma_query_t`, and `ExtensionUtil::RegisterFunction` are all present in DuckDB 1.4.4. The project is already pinned to this version.
-
-**ABI stability:** The project's existing CI (DuckDBVersionMonitor) already handles version breakage detection. No change to the CI strategy is needed for v0.2.0.
-
-### Confidence
-
-MEDIUM — `parse_function_t` and `plan_function_t` existence at DuckDB 1.4.4 is confirmed via DuckDB GitHub issue #18485 and the CIDR 2025 paper. The exact function pointer signatures (`string (*)(ClientContext&, const FunctionParameters&)` for `pragma_query_t`) were confirmed against `pragma_function.hpp` in the ARCHITECTURE research. The specific include paths within `duckdb.hpp` need hands-on validation when implementing the shim.
-
----
-
-## Complete v0.2.0 Cargo.toml Changes
-
-The change is minimal:
-
-```toml
-# ADD to Cargo.toml:
-[build-dependencies]
-cc = "1.2"
+**Option A: Extended return codes from `sv_parse_rust`**
 ```
+0 = not ours
+1 = CREATE SEMANTIC VIEW
+2 = CREATE OR REPLACE SEMANTIC VIEW
+3 = CREATE SEMANTIC VIEW IF NOT EXISTS
+4 = DROP SEMANTIC VIEW
+5 = DROP SEMANTIC VIEW IF EXISTS
+6 = DESCRIBE SEMANTIC VIEW
+7 = SHOW SEMANTIC VIEWS
+```
+`sv_execute_ddl_rust` already handles the rewriting -- just extend it to handle all variant codes.
+
+**Option B: Keep `sv_parse_rust` returning 0/1, push all routing into `sv_execute_ddl_rust`**
+`sv_parse_rust` returns 1 for any `SEMANTIC VIEW` DDL. `sv_execute_ddl_rust` does the fine-grained parsing and routing. Simpler C++ side, more logic in Rust (preferred).
+
+**Recommendation:** Option B. Keep the C++ shim as thin as possible. All intelligence in Rust.
+
+### Why no new C++ symbols
+
+The DDL verbs are all handled by existing Rust table functions. The C++ `sv_ddl_bind` function just calls `sv_execute_ddl_rust` with the query text. `sv_execute_ddl_rust` rewrites the DDL to the appropriate function call and executes it. The C++ shim does not need to know about DROP, DESCRIBE, or SHOW -- it just forwards the text.
+
+---
+
+## Complete v0.5.1 Cargo.toml Changes
+
+**None.** The Cargo.toml is unchanged from v0.5.0:
 
 ```toml
-# NO CHANGES to [dependencies] — existing deps are sufficient:
+# NO CHANGES to [dependencies]:
 # duckdb = { version = "=1.4.4", default-features = false }
 # libduckdb-sys = "=1.4.4"
 # serde = { version = "1", features = ["derive"] }
 # serde_json = "1"
 # strsim = "0.11"
-# arbitrary = { version = "1", optional = true, features = ["derive"] }
-```
 
-```toml
+# NO CHANGES to [build-dependencies]:
+# cc = { version = "1", optional = true }
+
 # NO CHANGES to [dev-dependencies]:
 # proptest = "1.9"
 ```
 
----
-
-## New File: `build.rs`
-
-This file does not exist today. It must be added at the repository root. It runs only when the `extension` feature is active (guarded by a feature flag check) to avoid adding C++ compilation overhead to `cargo test`:
-
-```rust
-fn main() {
-    // Only compile the C++ shim when building the loadable extension.
-    // During `cargo test` (default/bundled feature), the shim is not needed
-    // because parser hooks and pragma registration are C++-only paths that
-    // only fire when DuckDB loads the extension — not in unit tests.
-    if std::env::var("CARGO_FEATURE_EXTENSION").is_ok() {
-        cc::Build::new()
-            .cpp(true)
-            .file("src/shim/shim.cpp")
-            .include("duckdb_capi/")
-            .flag("-std=c++17")
-            .warnings(false)
-            .compile("semantic_views_shim");
-    }
-}
-```
-
-The `CARGO_FEATURE_EXTENSION` environment variable is set by Cargo when `--features extension` is active.
+Version bump only: `version = "0.5.0"` -> `version = "0.5.1"` (at milestone completion).
 
 ---
 
-## Alternatives Considered and Rejected
+## Integration Points
 
-| Alternative | Why Rejected |
-|-------------|-------------|
-| Add `chrono` for time dimensions | Not needed — time dimensions are SQL string codegen only; DuckDB handles all date math |
-| Add `sqlparser` for DDL parsing | Not needed — `CREATE SEMANTIC VIEW` DDL parsing is a simple hand-written string matcher in Rust (far simpler grammar than full SQL) |
-| Download `duckdb.hpp` at configure time (not vendor) | Fragile — requires network access during `make configure` and introduces a download failure mode in CI |
-| Rely on `DEP_DUCKDB_LIB_DIR` for headers | Only works in bundled mode; fails in extension mode (`--no-default-features`) — confirmed by inspecting the project's actual build output |
-| Use CMake to compile the shim | Disproportionate — changes the entire build system for ~100 lines of C++; the `cc` crate handles cross-compilation correctly |
-| Add `cxx` crate for the Rust/C++ boundary | Overkill for a thin boundary (two C++ registration functions + five `extern "C"` callbacks); `cxx` is appropriate for complex bidirectional FFI, not for forwarding to string-based Rust functions |
+### Where new code touches existing code
 
----
+| New Feature | Touches | How |
+|-------------|---------|-----|
+| DDL verb detection | `src/parse.rs` | Extend `detect_create_semantic_view` to detect all 6 DDL patterns |
+| DDL rewriting | `src/parse.rs` | Extend `rewrite_ddl_to_function_call` to rewrite all 6 patterns |
+| DDL execution | `src/parse.rs` `sv_execute_ddl_rust` | Route to correct function based on DDL variant |
+| Parse hook routing | `cpp/src/shim.cpp` | Extend `sv_parse_stub` to detect broader `SEMANTIC VIEW` prefix |
+| Error reporting | `src/parse.rs` (new `ParseError` type) | New error type for DDL parse failures with position + suggestions |
+| "Did you mean" | `src/expand.rs::suggest_closest` | Reuse for clause name suggestions (may extract to shared util) |
+| DESCRIBE/SHOW | No new Rust DDL code | Rewriting routes to existing `describe_semantic_view` / `list_semantic_views` |
 
-## Installation Instructions for v0.2.0
+### What stays untouched
 
-### Step 1: Add build dependency
-
-```toml
-# Cargo.toml
-[build-dependencies]
-cc = "1.2"
-```
-
-### Step 2: Vendor the C++ header
-
-Download `duckdb.hpp` from the v1.4.4 release into `duckdb_capi/`:
-
-```bash
-# Justfile recipe: just update-headers
-curl -L https://github.com/duckdb/duckdb/releases/download/v1.4.4/libduckdb-src.zip \
-     -o /tmp/libduckdb-src.zip
-unzip -j /tmp/libduckdb-src.zip "duckdb.hpp" -d duckdb_capi/
-```
-
-Add `duckdb_capi/duckdb.hpp` to version control (gitignore currently excludes nothing from `duckdb_capi/`).
-
-### Step 3: Create `build.rs`
-
-Place at repo root. See the "New File: build.rs" section above.
-
-### Step 4: Create the shim files
-
-Per ARCHITECTURE.md:
-- `src/shim/shim.cpp` — C++ registration code (~80 lines)
-- `src/shim/shim.h` — `extern "C"` boundary declarations
-- `src/shim/ffi.rs` — Rust implementations of `extern "C"` functions
-
-No new crates required for any of these files.
+- `src/expand.rs` -- expansion engine unchanged
+- `src/model.rs` -- data model unchanged
+- `src/catalog.rs` -- catalog operations unchanged
+- `src/ddl/define.rs`, `drop.rs`, `describe.rs`, `list.rs` -- function implementations unchanged
+- `src/query/` -- query pipeline unchanged
+- `build.rs` -- build script unchanged
+- `cpp/include/duckdb.hpp`, `duckdb.cpp` -- amalgamation unchanged
 
 ---
 
 ## Sources
 
-- [cc crate — crates.io](https://crates.io/crates/cc) — version 1.2.45 confirmed current (HIGH confidence)
-- [cc crate — docs.rs](https://docs.rs/cc) — C++ compilation via `cc::Build::new().cpp(true)` (HIGH confidence)
-- Project's own `target/debug/build/libduckdb-sys-*/output` — confirmed `cargo:lib_dir` metadata and `duckdb.hpp` presence in bundled mode (HIGH confidence — first-party)
-- Project's own `target/release/build/libduckdb-sys-*/output` — confirmed headers absent in extension/loadable mode (HIGH confidence — first-party)
-- [duckdb-rs 1.4.4 dependencies — crates.io](https://crates.io/crates/duckdb) — `chrono` is optional, gated by `modern-full` feature; not transitively available with current feature flags (HIGH confidence)
-- [DuckDB GitHub issue #18485](https://github.com/duckdb/duckdb/issues/18485) — confirmed `DBConfig::GetConfig` + `config.parser_extensions.push_back()` pattern at DuckDB 1.4.x (HIGH confidence)
-- CIDR 2025 paper — "Runtime-Extensible Parsers", Mühleisen & Raasveldt — confirms `parse_function_t` / `plan_function_t` as production API (HIGH confidence)
-- ARCHITECTURE.md (this project, 2026-02-28) — confirmed two-mode build behavior, header strategy, shim file layout (HIGH confidence — first-party)
+- [strsim 0.11.1 -- crates.io](https://crates.io/crates/strsim) -- latest version confirmed (HIGH confidence)
+- [strsim-rs -- GitHub](https://github.com/rapidfuzz/strsim-rs) -- API reference (HIGH confidence)
+- [miette 7.6.0 -- crates.io](https://crates.io/crates/miette) -- evaluated and rejected (HIGH confidence)
+- [ariadne -- crates.io](https://crates.io/crates/ariadne) -- evaluated and rejected (HIGH confidence)
+- [DuckDB structured errors -- GitHub issue #13782](https://github.com/duckdb/duckdb/issues/13782) -- confirms DuckDB errors are plain text strings (HIGH confidence)
+- [DuckDB "Did you mean" format -- GitHub issue #16829](https://github.com/duckdb/duckdb/issues/16829) -- confirms `Did you mean` and `LINE 1:` / caret format (HIGH confidence)
+- [DuckDB Friendlier SQL](https://duckdb.org/2022/05/04/friendlier-sql) -- confirms DuckDB error message style with suggestions (HIGH confidence)
+- Project source: `src/parse.rs`, `src/expand.rs`, `src/query/error.rs`, `src/ddl/*.rs`, `cpp/src/shim.cpp` -- first-party code inspection (HIGH confidence)
+- Project `Cargo.toml` -- dependency versions confirmed via direct file read (HIGH confidence)
