@@ -47,7 +47,17 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Active
 
-None — all v0.5.1 requirements shipped.
+See: .planning/REQUIREMENTS.md
+
+## Current Milestone: v0.5.2 SQL DDL & PK/FK Relationships
+
+**Goal:** Replace function-call DDL syntax with proper SQL keyword syntax and adopt Snowflake-style PK/FK relationship model with table aliases, eliminating ON-clause heuristics and enabling qualified column names.
+
+**Target features:**
+- Proper SQL DDL syntax: `CREATE SEMANTIC VIEW` accepts `TABLES (...)`, `DIMENSIONS (...)`, `METRICS (...)` keyword clauses
+- PK/FK relationship model: tables declare aliases + PRIMARY KEY, relationships use FK REFERENCES
+- JOIN inference from PK/FK declarations (replaces ON-clause substring matching)
+- Qualified column names in expressions (`orders.revenue` works naturally via table aliases)
 
 **Deferred to future milestones:**
 - Community extension registry publication (`INSTALL semantic_views FROM community`)
@@ -124,4 +134,4 @@ Native `CREATE SEMANTIC VIEW` DDL syntax achieved via DuckDB parser extension ho
 | Runtime type validation before vector reference | Defensive type check before `duckdb_vector_reference_vector` returns recoverable error instead of SIGABRT | ✓ Good — prevents Python crashes |
 
 ---
-*Last updated: 2026-03-09 after v0.5.1 milestone complete*
+*Last updated: 2026-03-09 after v0.5.2 milestone started*
