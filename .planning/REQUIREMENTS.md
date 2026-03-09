@@ -1,7 +1,7 @@
 # Requirements: DuckDB Semantic Views
 
 **Defined:** 2026-03-09
-**Core Value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
+**Core Value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand -- the extension handles expansion, DuckDB handles execution.
 
 ## v0.5.1 Requirements
 
@@ -66,22 +66,22 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| DDL-03 | — | Pending |
-| DDL-04 | — | Pending |
-| DDL-05 | — | Pending |
-| DDL-06 | — | Pending |
-| DDL-07 | — | Pending |
-| DDL-08 | — | Pending |
-| ERR-01 | — | Pending |
-| ERR-02 | — | Pending |
-| ERR-03 | — | Pending |
-| DOC-01 | — | Pending |
+| DDL-03 | Phase 20 | Pending |
+| DDL-04 | Phase 20 | Pending |
+| DDL-05 | Phase 20 | Pending |
+| DDL-06 | Phase 20 | Pending |
+| DDL-07 | Phase 20 | Pending |
+| DDL-08 | Phase 20 | Pending |
+| ERR-01 | Phase 21 | Pending |
+| ERR-02 | Phase 21 | Pending |
+| ERR-03 | Phase 21 | Pending |
+| DOC-01 | Phase 22 | Pending |
 
 **Coverage:**
 - v0.5.1 requirements: 10 total
-- Mapped to phases: 0
-- Unmapped: 10 ⚠️
+- Mapped to phases: 10
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-09*
-*Last updated: 2026-03-09 after initial definition*
+*Last updated: 2026-03-09 after roadmap creation*

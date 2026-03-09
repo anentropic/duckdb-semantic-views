@@ -2,12 +2,12 @@
 gsd_state_version: 1.0
 milestone: v0.5.1
 milestone_name: DDL Polish
-status: defining_requirements
+status: ready_to_plan
 stopped_at: null
-last_updated: "2026-03-08"
-last_activity: 2026-03-08 — Milestone v0.5.1 started
+last_updated: "2026-03-09"
+last_activity: 2026-03-09 — Roadmap created for v0.5.1 (4 phases, 10 requirements)
 progress:
-  total_phases: 0
+  total_phases: 4
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -20,19 +20,21 @@ progress:
 
 See: .planning/PROJECT.md (updated 2026-03-08)
 
-**Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
-**Current focus:** Defining requirements for v0.5.1
+**Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand -- the extension handles expansion, DuckDB handles execution.
+**Current focus:** Phase 19 -- Parser Hook Validation Spike
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-03-08 — Milestone v0.5.1 started
+Phase: 19 of 22 (Parser Hook Validation Spike)
+Plan: --
+Status: Ready to plan
+Last activity: 2026-03-09 -- Roadmap created for v0.5.1
+
+Progress: [..........] 0%
 
 ## Performance Metrics
 
-**Velocity (v0.1.0 baseline):**
+**Velocity (v0.1.0):**
 - Total plans completed: 18
 - Average duration: ~20 min
 - Total execution time: ~6 hours
@@ -62,10 +64,11 @@ None.
 
 ### Blockers/Concerns
 
-None.
+- P1: DESCRIBE/SHOW may not trigger the parser fallback hook (catalog error vs parser error). Phase 19 spike resolves this before implementation.
+- P3: Three-connection lock conflict during DROP (main + sv_ddl_conn + persist_conn). Test early in Phase 20.
 
 ## Session Continuity
 
-Last session: 2026-03-08
-Stopped at: Defining v0.5.1 requirements
-Resume: Continue requirements definition → roadmap
+Last session: 2026-03-09
+Stopped at: Roadmap created for v0.5.1
+Resume: `/gsd:plan-phase 19`
