@@ -48,11 +48,12 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 - **Decision:** Dimension and metric expressions must use unqualified column names (e.g., `region` not `orders.region`) because the CTE-based expansion flattens all source tables into a single `_base` namespace. Qualified names would reference tables that do not exist in the CTE scope.
 - **Action:** If v0.2.0 changes the expansion strategy away from CTEs, qualified column names could be supported.
 
-### 8. ✅ Statement rewrite approach for native DDL (not custom grammar)
+### 8. ❓ Statement rewrite approach for native DDL (not custom grammar)
 
 - **Origin:** v0.5.0 Phase 16-17, parser extension spike
-- **Decision:** Native DDL (`CREATE SEMANTIC VIEW name (...)`) is implemented via DuckDB's parser hook fallback mechanism. The parse_function detects the `CREATE SEMANTIC VIEW` prefix, and the plan_function rewrites it to `SELECT * FROM create_semantic_view('name', ...)` which executes against the existing function-based DDL path. A custom SQL grammar parser was considered but deferred -- statement rewriting is simpler and reuses all existing catalog code.
-- **Action:** If a future milestone needs richer syntax (e.g., nested blocks, REFERENCES), a proper parser may be needed. For DDL-only statements, rewriting is sufficient.
+- **Decision:** Native DDL (`CREATE SEMANTIC VIEW name (...)`) is implemented via DuckDB's parser hook fallback mechanism. The parse_function detects the `CREATE SEMANTIC VIEW` prefix, and the plan_function rewrites it to `SELECT * FROM create_semantic_view('name', ...)` which executes against the existing function-based DDL path. The DDL body uses DuckDB function-call syntax (`:=` named parameters with struct/list literals) because `rewrite_ddl` passes the body verbatim to the underlying function call. This means the "native DDL" is syntactic sugar over function calls, not a true SQL DDL syntax.
+- **Gap:** The phase 21 validation layer (`scan_clause_keywords`) can parse a conventional SQL-style body (`TABLES (...), DIMENSIONS (...), METRICS (...)`) but there is no translation layer to convert it into executable function-call syntax. A Snowflake-style SQL DDL grammar (without `:=` and struct literals) was the original intent but was never implemented.
+- **Action:** Next milestone (v0.6.0) — implement proper SQL DDL syntax parsing so that `CREATE SEMANTIC VIEW` accepts conventional SQL keyword syntax, not function-call syntax. The function-based interface remains as the internal execution target.
 
 ### 9. ✅ DDL connection isolation pattern
 
@@ -71,6 +72,13 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 - **Origin:** v0.5.0 Phase 18, ABI evaluation
 - **Decision:** Evaluated switching from `C_STRUCT_UNSTABLE` to `CPP` ABI for community extension registry compatibility. Rejected: CPP entry point failed in Phase 15 because `ExtensionLoader` referenced non-inlined C++ symbols unavailable under Python DuckDB's `-fvisibility=hidden`. `C_STRUCT_UNSTABLE` pins the binary to an exact DuckDB version (same as CPP in practice). Compatible with the community extension registry (`rusty_quack` uses the same approach). The version-pinning cost is mitigated by the DuckDB Version Monitor CI workflow.
 - **Action:** No change. Re-evaluate if DuckDB stabilizes the C API or adds a new ABI type for mixed Rust+C++ extensions.
+
+### 12. ❓ DDL pipeline uses all-VARCHAR result forwarding
+
+- **Origin:** v0.5.1 Phase 20, C++ result forwarding for DESCRIBE/SHOW
+- **Decision:** The DDL parser hook pipeline (`sv_ddl_bind`/`sv_ddl_execute` in `shim.cpp`) executes rewritten SQL on `sv_ddl_conn`, reads results via `duckdb_value_varchar` into `vector<vector<string>>`, and declares all output columns as VARCHAR. This works but loses native types — DESCRIBE and SHOW return VARCHAR columns even though the underlying functions have known, static schemas.
+- **Why not fix now:** The schema for each `DdlKind` variant is known at detection time (e.g., DESCRIBE always returns 6 specific columns, SHOW returns 2). We could declare native types per variant and skip VARCHAR serialization. However, this creates schema coupling — any change to what `describe_semantic_view()` or `list_semantic_views()` returns would need updating in two places (the VTab bind in Rust and the DDL schema declaration). DDL results are single-digit rows, so the performance difference is immeasurable.
+- **Action:** If the DDL result schemas stabilize and a cleaner type contract is desired, declare static types per `DdlKind` in Rust, pass them across the FFI boundary, and use native types in `sv_ddl_bind`. Zero-copy vector transfer (as in the query path) is not worth the complexity here — the C++ execute callback receives a C++ `DataChunk&` while `sv_ddl_conn` results come from the C API, making bridging awkward for negligible gain.
 
 ## Deferred Requirements
 
@@ -140,6 +148,6 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ---
 
-**Date:** 2026-03-08
-**Milestone:** v0.5.0 (updated from v0.1.0 original)
+**Date:** 2026-03-09
+**Milestone:** v0.5.1 (updated from v0.5.0)
 **Audit report:** `.planning/milestones/v1.0-MILESTONE-AUDIT.md`

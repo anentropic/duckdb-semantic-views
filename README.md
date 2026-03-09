@@ -161,7 +161,7 @@ Returns the expanded SQL and the DuckDB execution plan.
 
 ## Function syntax
 
-The function-based DDL interface is still available as an alternative:
+The underlying function-based DDL interface is also available. The native DDL statements above are rewritten to these functions internally.
 
 - `create_semantic_view()`, `create_or_replace_semantic_view()`, `create_semantic_view_if_not_exists()`
 - `drop_semantic_view()`, `drop_semantic_view_if_exists()`
