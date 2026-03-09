@@ -99,9 +99,10 @@ None.
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 14 | Remove 3 orphaned backward-compat FFI exports | 2026-03-09 | ea84c9b | [14-remove-3-orphaned-backward-compat-ffi-ex](./quick/14-remove-3-orphaned-backward-compat-ffi-ex/) |
+| 15 | Fix CI amalgamation auto-download | 2026-03-09 | 3859d68 | [15-check-gh-run-list-and-fix-the-failing-jo](./quick/15-check-gh-run-list-and-fix-the-failing-jo/) |
 
 ## Session Continuity
 
-Last session: 2026-03-09T18:56:13.499Z
-Stopped at: Completed 21-03-PLAN.md
+Last session: 2026-03-09T21:29:01Z
+Stopped at: Completed quick task 15 (fix CI amalgamation auto-download)
 Resume file: None
