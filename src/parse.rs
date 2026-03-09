@@ -1,67 +1,97 @@
-// Parse detection for `CREATE SEMANTIC VIEW` statements.
+// Parse detection and rewriting for semantic view DDL statements.
 //
 // This module provides two layers:
-// 1. A pure detection function (`detect_create_semantic_view`) that is
-//    testable under `cargo test` without the extension feature.
-// 2. An FFI entry point (`sv_parse_rust`) that wraps the detection in
-//    `catch_unwind` for panic safety, feature-gated on `extension`.
+// 1. Pure detection/rewrite functions (`detect_semantic_view_ddl`, `rewrite_ddl`,
+//    `extract_ddl_name`, `validate_and_rewrite`) testable under `cargo test`
+//    without the extension feature.
+// 2. FFI entry points (`sv_validate_ddl_rust`, `sv_rewrite_ddl_rust`)
+//    feature-gated on `extension`, with `catch_unwind` for panic safety.
 
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.
 pub const PARSE_NOT_OURS: u8 = 0;
-/// Detected `CREATE SEMANTIC VIEW` -- return `PARSE_SUCCESSFUL`.
+/// Detected a semantic view DDL statement -- return `PARSE_SUCCESSFUL`.
 pub const PARSE_DETECTED: u8 = 1;
 
-/// Detect whether a query is a `CREATE SEMANTIC VIEW` statement.
+// ---------------------------------------------------------------------------
+// DdlKind enum and detection
+// ---------------------------------------------------------------------------
+
+/// The 7 supported DDL statement forms for semantic views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DdlKind {
+    Create,
+    CreateOrReplace,
+    CreateIfNotExists,
+    Drop,
+    DropIfExists,
+    Describe,
+    Show,
+}
+
+/// Check whether `trimmed` starts with `prefix` (case-insensitive ASCII).
+fn starts_with_ci(trimmed: &[u8], prefix: &[u8]) -> bool {
+    trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// Detect the DDL kind from a query string.
 ///
-/// Handles case variations, leading/trailing whitespace, and trailing
-/// semicolons (`DuckDB` inconsistently includes them per issue #18485).
-///
-/// This function is pure and allocation-free for the common case
-/// (non-matching queries). It performs no heap allocation.
+/// Returns `Some(DdlKind)` if the query matches one of the 7 semantic view
+/// DDL prefixes, `None` otherwise. Uses longest-first ordering to avoid
+/// prefix overlap (e.g. "create or replace semantic view" before
+/// "create semantic view").
 #[must_use]
-pub fn detect_create_semantic_view(query: &str) -> u8 {
+pub fn detect_ddl_kind(query: &str) -> Option<DdlKind> {
     let trimmed = query.trim();
-    // Strip trailing semicolons -- DuckDB's `SplitQueries` re-appends `;`
-    // to middle statements but not the last one (issue #18485).
     let trimmed = trimmed.trim_end_matches(';').trim();
-    let prefix = "create semantic view";
-    if trimmed.len() < prefix.len() {
-        return PARSE_NOT_OURS;
+    let bytes = trimmed.as_bytes();
+
+    // Longest-first ordering within each family to prevent prefix overlap.
+    // "create semantic view if not exists" (34) before "create semantic view" (20)
+    // "create or replace semantic view" (31) before "create semantic view" (20)
+    // "drop semantic view if exists" (28) before "drop semantic view" (18)
+    if starts_with_ci(bytes, b"create or replace semantic view") {
+        Some(DdlKind::CreateOrReplace)
+    } else if starts_with_ci(bytes, b"create semantic view if not exists") {
+        Some(DdlKind::CreateIfNotExists)
+    } else if starts_with_ci(bytes, b"create semantic view") {
+        Some(DdlKind::Create)
+    } else if starts_with_ci(bytes, b"drop semantic view if exists") {
+        Some(DdlKind::DropIfExists)
+    } else if starts_with_ci(bytes, b"drop semantic view") {
+        Some(DdlKind::Drop)
+    } else if starts_with_ci(bytes, b"describe semantic view") {
+        Some(DdlKind::Describe)
+    } else if starts_with_ci(bytes, b"show semantic views") {
+        Some(DdlKind::Show)
+    } else {
+        None
     }
-    // Compare only the prefix bytes, case-insensitively (ASCII SQL keywords).
-    if trimmed.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) {
+}
+
+/// Detect whether a query is any semantic view DDL statement.
+///
+/// Returns `PARSE_DETECTED` for all 7 DDL forms, `PARSE_NOT_OURS` otherwise.
+/// Handles case variations, leading/trailing whitespace, and trailing semicolons.
+#[must_use]
+pub fn detect_semantic_view_ddl(query: &str) -> u8 {
+    if detect_ddl_kind(query).is_some() {
         PARSE_DETECTED
     } else {
         PARSE_NOT_OURS
     }
 }
 
-/// Parse a `CREATE SEMANTIC VIEW` DDL statement, extracting the view name and body.
-///
-/// Returns `(name, body)` where `name` is the view identifier and `body` is
-/// everything between the first `(` and last `)`. Handles case variations,
-/// leading/trailing whitespace, and trailing semicolons.
-///
-/// # Errors
-///
-/// Returns a descriptive error string if:
-/// - The query is not a `CREATE SEMANTIC VIEW` statement
-/// - The view name is missing
-/// - The parenthesized body is missing
-pub fn parse_ddl_text(query: &str) -> Result<(&str, &str), String> {
-    let trimmed = query.trim();
-    // Strip trailing semicolons (DuckDB issue #18485)
-    let trimmed = trimmed.trim_end_matches(';').trim();
+// ---------------------------------------------------------------------------
+// Parsing helpers
+// ---------------------------------------------------------------------------
 
-    let prefix = "create semantic view";
-    if trimmed.len() < prefix.len()
-        || !trimmed.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-    {
-        return Err("Not a CREATE SEMANTIC VIEW statement".to_string());
-    }
-
-    // After the prefix, extract the view name
-    let after_prefix = &trimmed[prefix.len()..];
+/// Parse a CREATE-with-body DDL statement, extracting the view name and body.
+///
+/// `prefix` is the DDL prefix (e.g. "create semantic view") already known to
+/// match. Returns `(name, body)` where `body` is everything between the first
+/// `(` and last `)` after the name.
+fn parse_create_body(trimmed: &str, prefix_len: usize) -> Result<(&str, &str), String> {
+    let after_prefix = &trimmed[prefix_len..];
     let after_prefix = after_prefix.trim_start();
     if after_prefix.is_empty() {
         return Err("Missing view name".to_string());
@@ -93,50 +123,605 @@ pub fn parse_ddl_text(query: &str) -> Result<(&str, &str), String> {
     Ok((name, body))
 }
 
-/// Rewrite a `CREATE SEMANTIC VIEW` statement to a `create_semantic_view()` function call.
+/// Extract just the view name from a name-only DDL statement (DROP, DESCRIBE).
 ///
-/// Transforms:
-/// ```text
-/// CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])
-/// ```
-/// Into:
-/// ```text
-/// SELECT * FROM create_semantic_view('sales', tables := [...], dimensions := [...])
-/// ```
-///
-/// Single quotes in the view name are escaped (`'` -> `''`).
-pub fn rewrite_ddl_to_function_call(query: &str) -> Result<String, String> {
-    let (name, body) = parse_ddl_text(query)?;
-    let safe_name = name.replace('\'', "''");
-    Ok(format!(
-        "SELECT * FROM create_semantic_view('{safe_name}', {body})"
-    ))
+/// `prefix_len` is the byte length of the already-matched prefix.
+fn extract_name_only(trimmed: &str, prefix_len: usize) -> Result<String, String> {
+    let after_prefix = trimmed[prefix_len..].trim();
+    if after_prefix.is_empty() {
+        return Err("Missing view name".to_string());
+    }
+    // Name is everything up to whitespace (or end)
+    let name_end = after_prefix
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(after_prefix.len());
+    let name = &after_prefix[..name_end];
+    if name.is_empty() {
+        return Err("Missing view name".to_string());
+    }
+    Ok(name.to_string())
 }
 
-/// FFI entry point called from C++ `sv_parse_stub`.
+/// Parse a `CREATE SEMANTIC VIEW` DDL statement, extracting the view name and body.
 ///
-/// Wraps detection in `catch_unwind` for panic safety at the FFI boundary.
-/// On any panic, returns `PARSE_NOT_OURS` (DuckDB shows its normal error).
+/// This is the original function, now delegating to `parse_create_body`.
+/// Kept for backward compatibility with existing code paths.
+pub fn parse_ddl_text(query: &str) -> Result<(&str, &str), String> {
+    let trimmed = query.trim();
+    let trimmed = trimmed.trim_end_matches(';').trim();
+
+    let kind = detect_ddl_kind(trimmed)
+        .ok_or_else(|| "Not a CREATE SEMANTIC VIEW statement".to_string())?;
+
+    let prefix_len = match kind {
+        DdlKind::CreateOrReplace => "create or replace semantic view".len(),
+        DdlKind::CreateIfNotExists => "create semantic view if not exists".len(),
+        DdlKind::Create => "create semantic view".len(),
+        _ => return Err("Not a CREATE SEMANTIC VIEW statement".to_string()),
+    };
+
+    parse_create_body(trimmed, prefix_len)
+}
+
+// ---------------------------------------------------------------------------
+// Rewrite: DDL -> function call
+// ---------------------------------------------------------------------------
+
+/// Map a `DdlKind` to its target function name.
+fn function_name(kind: DdlKind) -> &'static str {
+    match kind {
+        DdlKind::Create => "create_semantic_view",
+        DdlKind::CreateOrReplace => "create_or_replace_semantic_view",
+        DdlKind::CreateIfNotExists => "create_semantic_view_if_not_exists",
+        DdlKind::Drop => "drop_semantic_view",
+        DdlKind::DropIfExists => "drop_semantic_view_if_exists",
+        DdlKind::Describe => "describe_semantic_view",
+        DdlKind::Show => "list_semantic_views",
+    }
+}
+
+/// Map a `DdlKind` to its prefix string length.
+fn prefix_len(kind: DdlKind) -> usize {
+    match kind {
+        DdlKind::Create => "create semantic view".len(),
+        DdlKind::CreateOrReplace => "create or replace semantic view".len(),
+        DdlKind::CreateIfNotExists => "create semantic view if not exists".len(),
+        DdlKind::Drop => "drop semantic view".len(),
+        DdlKind::DropIfExists => "drop semantic view if exists".len(),
+        DdlKind::Describe => "describe semantic view".len(),
+        DdlKind::Show => "show semantic views".len(),
+    }
+}
+
+/// Rewrite any semantic view DDL statement to its corresponding function call.
+///
+/// Dispatches to the appropriate rewrite based on the 3 parsing categories:
+/// - CREATE-with-body: `SELECT * FROM fn('name', body)`
+/// - Name-only (DROP, DESCRIBE): `SELECT * FROM fn('name')`
+/// - No-args (SHOW): `SELECT * FROM list_semantic_views()`
+pub fn rewrite_ddl(query: &str) -> Result<String, String> {
+    let trimmed = query.trim();
+    let trimmed = trimmed.trim_end_matches(';').trim();
+
+    let kind =
+        detect_ddl_kind(trimmed).ok_or_else(|| "Not a semantic view DDL statement".to_string())?;
+
+    let fn_name = function_name(kind);
+    let plen = prefix_len(kind);
+
+    match kind {
+        // CREATE-with-body forms
+        DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
+            let (name, body) = parse_create_body(trimmed, plen)?;
+            let safe_name = name.replace('\'', "''");
+            Ok(format!("SELECT * FROM {fn_name}('{safe_name}', {body})"))
+        }
+        // Name-only forms
+        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe => {
+            let name = extract_name_only(trimmed, plen)?;
+            let safe_name = name.replace('\'', "''");
+            Ok(format!("SELECT * FROM {fn_name}('{safe_name}')"))
+        }
+        // No-args form
+        DdlKind::Show => Ok(format!("SELECT * FROM {fn_name}()")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Name extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the view name from a semantic view DDL statement.
+///
+/// Returns `Ok(Some(name))` for DDL forms that have a view name (CREATE, DROP,
+/// DESCRIBE), and `Ok(None)` for SHOW (no name). Returns `Err` if the query
+/// is not a semantic view DDL statement or is malformed.
+pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
+    let trimmed = query.trim();
+    let trimmed = trimmed.trim_end_matches(';').trim();
+
+    let kind =
+        detect_ddl_kind(trimmed).ok_or_else(|| "Not a semantic view DDL statement".to_string())?;
+
+    let plen = prefix_len(kind);
+
+    match kind {
+        DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
+            let (name, _) = parse_create_body(trimmed, plen)?;
+            Ok(Some(name.to_string()))
+        }
+        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe => {
+            let name = extract_name_only(trimmed, plen)?;
+            Ok(Some(name))
+        }
+        DdlKind::Show => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validation layer: ParseError, validate_clauses, detect_near_miss,
+//                   validate_and_rewrite
+// ---------------------------------------------------------------------------
+
+/// Error from DDL validation with an optional byte offset into the original query.
+///
+/// The `position` field, when present, is a 0-based byte offset into the
+/// original query string (before any trimming). `DuckDB` uses this to render
+/// a caret (`^`) under the error location.
+#[derive(Debug)]
+pub struct ParseError {
+    pub message: String,
+    /// Byte offset into the original query string.
+    pub position: Option<usize>,
+}
+
+/// Known clause keywords for a CREATE SEMANTIC VIEW body.
+const CLAUSE_KEYWORDS: &[&str] = &["tables", "relationships", "dimensions", "metrics"];
+
+/// The 7 DDL prefixes used for near-miss detection.
+const DDL_PREFIXES: &[&str] = &[
+    "create semantic view",
+    "create or replace semantic view",
+    "create semantic view if not exists",
+    "drop semantic view",
+    "drop semantic view if exists",
+    "describe semantic view",
+    "show semantic views",
+];
+
+/// Suggest the closest clause keyword using Levenshtein distance.
+///
+/// Returns `Some(keyword)` if a keyword is within edit distance <= 3 of `word`.
+fn suggest_clause_keyword(word: &str) -> Option<&'static str> {
+    let lower = word.to_ascii_lowercase();
+    let mut best: Option<(usize, &str)> = None;
+    for &kw in CLAUSE_KEYWORDS {
+        let dist = strsim::levenshtein(&lower, kw);
+        if dist <= 3 {
+            if let Some((best_dist, _)) = best {
+                if dist < best_dist {
+                    best = Some((dist, kw));
+                }
+            } else {
+                best = Some((dist, kw));
+            }
+        }
+    }
+    best.map(|(_, kw)| kw)
+}
+
+/// Return the matching closing bracket for an opening one.
+fn matching_close(open: char) -> char {
+    match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        _ => '?',
+    }
+}
+
+/// Check a closing bracket against the top of the stack, returning an error
+/// on mismatch.
+fn check_close_bracket(
+    expected_open: char,
+    close_char: char,
+    paren_stack: &mut Vec<(char, usize)>,
+    pos: usize,
+) -> Result<(), ParseError> {
+    if let Some((open, _)) = paren_stack.last() {
+        if *open == expected_open {
+            paren_stack.pop();
+        } else {
+            return Err(ParseError {
+                message: format!(
+                    "Unbalanced bracket: expected closing '{}' but found '{close_char}'.",
+                    matching_close(*open)
+                ),
+                position: Some(pos),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate balanced brackets/parentheses within a body string,
+/// respecting single-quoted string literals.
+fn validate_brackets(body: &str, body_offset: usize) -> Result<(), ParseError> {
+    let mut paren_stack: Vec<(char, usize)> = Vec::new();
+    let mut in_string = false;
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if ch == '\'' {
+            if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_string = !in_string;
+        } else if !in_string {
+            match ch {
+                '(' | '[' | '{' => paren_stack.push((ch, body_offset + i)),
+                ')' => check_close_bracket('(', ')', &mut paren_stack, body_offset + i)?,
+                ']' => check_close_bracket('[', ']', &mut paren_stack, body_offset + i)?,
+                '}' => check_close_bracket('{', '}', &mut paren_stack, body_offset + i)?,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if let Some((open_char, open_pos)) = paren_stack.last() {
+        return Err(ParseError {
+            message: format!("Unbalanced bracket: '{open_char}' opened but never closed."),
+            position: Some(*open_pos),
+        });
+    }
+    Ok(())
+}
+
+/// Scan for clause keywords at the top level of the body (recognized by ':=' or '(' after the word).
+/// Validates them against known clause keywords (outside strings and nested brackets).
+fn scan_clause_keywords(body: &str, body_offset: usize) -> Result<Vec<String>, ParseError> {
+    let mut found_clauses: Vec<String> = Vec::new();
+    let mut in_string = false;
+    let mut depth: i32 = 0;
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if ch == '\'' {
+            if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            i += 1;
+            continue;
+        }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && ch.is_ascii_alphabetic() {
+            let word_start = i;
+            while i < bytes.len()
+                && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let word = &body[word_start..i];
+            let after_word = &body[i..];
+            let after_trimmed = after_word.trim_start();
+            if after_trimmed.starts_with(":=") || after_trimmed.starts_with('(') {
+                let lower = word.to_ascii_lowercase();
+                if CLAUSE_KEYWORDS.iter().any(|&kw| kw == lower) {
+                    found_clauses.push(lower);
+                } else {
+                    let msg = if let Some(kw) = suggest_clause_keyword(word) {
+                        format!("Unknown clause '{word}'. Did you mean '{kw}'?")
+                    } else {
+                        format!("Unknown clause '{word}'. Expected one of: tables, relationships, dimensions, metrics.")
+                    };
+                    return Err(ParseError {
+                        message: msg,
+                        position: Some(body_offset + word_start),
+                    });
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    Ok(found_clauses)
+}
+
+/// Validate clause definitions inside a CREATE body.
+///
+/// Checks for:
+/// 1. Empty body
+/// 2. Unbalanced brackets/parentheses
+/// 3. Unknown clause keywords (with "Did you mean" suggestions)
+/// 4. Missing required clauses (`tables` must be present; at least one of
+///    `dimensions` or `metrics`)
+///
+/// `body_offset` is the byte offset of the body start within the original query.
+pub fn validate_clauses(
+    body: &str,
+    body_offset: usize,
+    _original_query: &str,
+) -> Result<(), ParseError> {
+    let trimmed_body = body.trim();
+
+    if trimmed_body.is_empty() {
+        return Err(ParseError {
+            message: "Expected clause definitions (tables, dimensions, metrics). Body is empty."
+                .to_string(),
+            position: Some(body_offset),
+        });
+    }
+
+    validate_brackets(body, body_offset)?;
+    let found_clauses = scan_clause_keywords(body, body_offset)?;
+
+    let has_tables = found_clauses.iter().any(|c| c == "tables");
+    let has_dims = found_clauses.iter().any(|c| c == "dimensions");
+    let has_metrics = found_clauses.iter().any(|c| c == "metrics");
+
+    if !has_tables {
+        return Err(ParseError {
+            message: "Missing required clause 'tables'.".to_string(),
+            position: Some(body_offset),
+        });
+    }
+    if !has_dims && !has_metrics {
+        return Err(ParseError {
+            message:
+                "Missing required clause: at least one of 'dimensions' or 'metrics' must be specified."
+                    .to_string(),
+            position: Some(body_offset),
+        });
+    }
+
+    Ok(())
+}
+
+/// Detect near-miss DDL prefixes using fuzzy matching.
+///
+/// If the beginning of the query is close (Levenshtein distance <= 3) to one
+/// of the 7 known DDL prefixes, returns a `ParseError` suggesting the correct
+/// prefix. Returns `None` if no near-miss is found.
+#[must_use]
+pub fn detect_near_miss(query: &str) -> Option<ParseError> {
+    let trimmed = query.trim();
+    let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
+    let lower = trimmed_no_semi.to_ascii_lowercase();
+
+    let mut best: Option<(usize, &str)> = None;
+
+    for &prefix in DDL_PREFIXES {
+        // Extract the first N words from the query where N is the number of
+        // words in this DDL prefix. This ensures we compare apples-to-apples
+        // regardless of what follows the prefix in the query.
+        let prefix_word_count = prefix.split_whitespace().count();
+        let query_words: Vec<&str> = lower.split_whitespace().collect();
+        let query_slice_words = &query_words[..query_words.len().min(prefix_word_count)];
+        let query_slice = query_slice_words.join(" ");
+
+        let dist = strsim::levenshtein(&query_slice, prefix);
+        if dist <= 3 {
+            if let Some((best_dist, _)) = best {
+                if dist < best_dist {
+                    best = Some((dist, prefix));
+                }
+            } else {
+                best = Some((dist, prefix));
+            }
+        }
+    }
+
+    best.map(|(_, prefix)| {
+        let trim_offset = query.len() - query.trim_start().len();
+        ParseError {
+            message: format!(
+                "Unknown statement. Did you mean '{}'?",
+                prefix.to_uppercase()
+            ),
+            position: Some(trim_offset),
+        }
+    })
+}
+
+/// Validate a DDL statement and rewrite it if valid.
+///
+/// This is the main entry point for the validation layer. It wraps `rewrite_ddl()`
+/// with structural validation that catches errors before rewriting.
+///
+/// Returns:
+/// - `Ok(Some(sql))` -- DDL detected and validated, rewritten SQL returned
+/// - `Ok(None)` -- not a semantic view DDL statement
+/// - `Err(ParseError)` -- validation error with message and optional position
+pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
+    let trimmed = query.trim();
+    let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
+    let trim_offset = query.len() - query.trim_start().len();
+
+    let Some(kind) = detect_ddl_kind(query) else {
+        return Ok(None);
+    };
+
+    let plen = prefix_len(kind);
+
+    match kind {
+        // CREATE-with-body forms: validate clauses before rewriting
+        DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
+            validate_create_body(query, trimmed_no_semi, trim_offset, plen)
+        }
+        // Name-only forms: validate name is present
+        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe => {
+            let after_prefix = trimmed_no_semi[plen..].trim();
+            if after_prefix.is_empty() {
+                return Err(ParseError {
+                    message: "Missing view name.".to_string(),
+                    position: Some(trim_offset + plen),
+                });
+            }
+            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+                message: e,
+                position: Some(trim_offset + plen),
+            })
+        }
+        // No-args form: no validation needed
+        DdlKind::Show => rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+            message: e,
+            position: None,
+        }),
+    }
+}
+
+/// Validate a CREATE-with-body DDL statement and rewrite it if valid.
+fn validate_create_body(
+    query: &str,
+    trimmed_no_semi: &str,
+    trim_offset: usize,
+    plen: usize,
+) -> Result<Option<String>, ParseError> {
+    let after_prefix = trimmed_no_semi[plen..].trim_start();
+    if after_prefix.is_empty() {
+        return Err(ParseError {
+            message: "Missing view name after DDL prefix.".to_string(),
+            position: Some(trim_offset + plen),
+        });
+    }
+
+    let name_end = after_prefix
+        .find(|c: char| c.is_whitespace() || c == '(')
+        .unwrap_or(after_prefix.len());
+    let name = &after_prefix[..name_end];
+    if name.is_empty() {
+        return Err(ParseError {
+            message: "Missing view name after DDL prefix.".to_string(),
+            position: Some(trim_offset + plen),
+        });
+    }
+
+    let after_name = &after_prefix[name_end..];
+    let Some(open_paren_rel) = after_name.find('(') else {
+        let pos_in_trimmed = plen + (trimmed_no_semi.len() - plen - after_prefix.len()) + name_end;
+        return Err(ParseError {
+            message: "Expected '(' after view name.".to_string(),
+            position: Some(trim_offset + pos_in_trimmed),
+        });
+    };
+
+    let after_prefix_offset_in_trimmed = plen + (trimmed_no_semi.len() - plen - after_prefix.len());
+    let open_paren_in_trimmed = after_prefix_offset_in_trimmed + name_end + open_paren_rel;
+
+    let from_open = &after_name[open_paren_rel..];
+    let Some(close_paren) = from_open.rfind(')') else {
+        return Err(ParseError {
+            message: "Expected ')' to close DDL body.".to_string(),
+            position: Some(trim_offset + open_paren_in_trimmed),
+        });
+    };
+    let body = &from_open[1..close_paren];
+    let body_offset = trim_offset + open_paren_in_trimmed + 1;
+
+    validate_clauses(body, body_offset, query)?;
+
+    rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+        message: e,
+        position: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// FFI entry points (extension feature-gated)
+// ---------------------------------------------------------------------------
+
+/// FFI entry point for DDL validation with error reporting.
+///
+/// Validates a semantic view DDL statement and returns a tri-state result:
+/// - 0 = success: rewritten SQL written to `sql_out`
+/// - 1 = error: error message written to `error_out`, position to `*position_out`
+/// - 2 = not ours: no output written
+///
+/// `position_out` is set to `u32::MAX` when no position is available.
 ///
 /// # Safety
 ///
-/// `query_ptr` must point to a valid byte sequence of `query_len` bytes.
-/// The pointer must remain valid for the duration of this call.
+/// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
+/// - `sql_out` must point to a writable buffer of `sql_out_len` bytes.
+/// - `error_out` must point to a writable buffer of `error_out_len` bytes.
+/// - `position_out` must point to a writable `u32`.
 #[cfg(feature = "extension")]
 #[no_mangle]
-pub extern "C" fn sv_parse_rust(query_ptr: *const u8, query_len: usize) -> u8 {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+pub extern "C" fn sv_validate_ddl_rust(
+    query_ptr: *const u8,
+    query_len: usize,
+    sql_out: *mut u8,
+    sql_out_len: usize,
+    error_out: *mut u8,
+    error_out_len: usize,
+    position_out: *mut u32,
+) -> u8 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if query_ptr.is_null() || query_len == 0 {
-            return PARSE_NOT_OURS;
+            return 2_u8; // not ours
         }
-        // SAFETY: DuckDB query strings are always valid UTF-8 (ASCII SQL text).
-        // Even if not, we only inspect ASCII prefix bytes.
+        // SAFETY: guaranteed valid UTF-8 by the caller (DuckDB query text)
         let query = unsafe {
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(query_ptr, query_len))
         };
-        detect_create_semantic_view(query)
-    }))
-    .unwrap_or(PARSE_NOT_OURS)
+
+        match validate_and_rewrite(query) {
+            Ok(Some(sql)) => {
+                unsafe { write_to_buffer(sql_out, sql_out_len, &sql) };
+                0 // success
+            }
+            Ok(None) => {
+                // Not a recognized DDL -- check for near-miss
+                if let Some(err) = detect_near_miss(query) {
+                    unsafe { write_to_buffer(error_out, error_out_len, &err.message) };
+                    unsafe {
+                        write_position(position_out, err.position);
+                    }
+                    1 // error (near-miss suggestion)
+                } else {
+                    2 // not ours
+                }
+            }
+            Err(err) => {
+                unsafe { write_to_buffer(error_out, error_out_len, &err.message) };
+                unsafe {
+                    write_position(position_out, err.position);
+                }
+                1 // error (validation failure)
+            }
+        }
+    }));
+
+    result.unwrap_or(2) // on panic: not ours
+}
+
+/// Write a position value to a raw `u32` pointer, using `u32::MAX` as sentinel
+/// for "no position".
+///
+/// # Safety
+///
+/// `position_out` must point to a writable `u32`.
+#[cfg(feature = "extension")]
+unsafe fn write_position(position_out: *mut u32, position: Option<usize>) {
+    if !position_out.is_null() {
+        match position {
+            Some(pos) => *position_out = u32::try_from(pos).unwrap_or(u32::MAX),
+            None => *position_out = u32::MAX,
+        }
+    }
 }
 
 /// Write a string into a raw byte buffer, null-terminated and truncated to `len - 1`.
@@ -155,33 +740,29 @@ unsafe fn write_to_buffer(buf: *mut u8, len: usize, s: &str) {
     *buf.add(copy_len) = 0; // null terminate
 }
 
-/// FFI entry point for DDL execution, called from C++ `sv_ddl_bind`.
+/// FFI entry point for DDL rewriting (no execution), called from C++ `sv_ddl_bind`.
 ///
-/// Rewrites a `CREATE SEMANTIC VIEW` statement into a `create_semantic_view()`
-/// function call and executes it on the provided connection.
+/// Rewrites a semantic view DDL statement into the corresponding function call
+/// SQL string. The caller (C++) is responsible for executing it.
 ///
-/// On success: writes the view name to `name_out` (null-terminated), returns 0.
+/// On success: writes the rewritten SQL to `sql_out` (null-terminated), returns 0.
 /// On failure: writes the error message to `error_out` (null-terminated), returns 1.
 ///
 /// # Safety
 ///
 /// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
-/// - `exec_conn` must be a valid, open `duckdb_connection`.
-/// - `name_out` must point to a writable buffer of `name_out_len` bytes.
+/// - `sql_out` must point to a writable buffer of `sql_out_len` bytes.
 /// - `error_out` must point to a writable buffer of `error_out_len` bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
-pub extern "C" fn sv_execute_ddl_rust(
+pub extern "C" fn sv_rewrite_ddl_rust(
     query_ptr: *const u8,
     query_len: usize,
-    exec_conn: libduckdb_sys::duckdb_connection,
-    name_out: *mut u8,
-    name_out_len: usize,
+    sql_out: *mut u8,
+    sql_out_len: usize,
     error_out: *mut u8,
     error_out_len: usize,
 ) -> u8 {
-    use libduckdb_sys as ffi;
-
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<String, String> {
             if query_ptr.is_null() || query_len == 0 {
@@ -192,39 +773,14 @@ pub extern "C" fn sv_execute_ddl_rust(
                 std::str::from_utf8_unchecked(std::slice::from_raw_parts(query_ptr, query_len))
             };
 
-            // Rewrite DDL to function call
-            let rewritten = rewrite_ddl_to_function_call(query)?;
-
-            // Execute the rewritten SQL on the DDL connection
-            let c_sql = std::ffi::CString::new(rewritten)
-                .map_err(|_| "Rewritten SQL contains null byte".to_string())?;
-            unsafe {
-                let mut result: ffi::duckdb_result = std::mem::zeroed();
-                let rc = ffi::duckdb_query(exec_conn, c_sql.as_ptr(), &mut result);
-                if rc != ffi::DuckDBSuccess {
-                    let err_ptr = ffi::duckdb_result_error(&mut result);
-                    let err_msg = if err_ptr.is_null() {
-                        "DDL execution failed (unknown error)".to_string()
-                    } else {
-                        std::ffi::CStr::from_ptr(err_ptr)
-                            .to_string_lossy()
-                            .into_owned()
-                    };
-                    ffi::duckdb_destroy_result(&mut result);
-                    return Err(err_msg);
-                }
-                ffi::duckdb_destroy_result(&mut result);
-            }
-
-            // Extract the view name from the original query
-            let (name, _) = parse_ddl_text(query)?;
-            Ok(name.to_string())
+            // Rewrite DDL to function call (does NOT execute)
+            rewrite_ddl(query)
         },
     ));
 
     match result {
-        Ok(Ok(name)) => {
-            unsafe { write_to_buffer(name_out, name_out_len, &name) };
+        Ok(Ok(sql)) => {
+            unsafe { write_to_buffer(sql_out, sql_out_len, &sql) };
             0 // success
         }
         Ok(Err(err)) => {
@@ -232,7 +788,7 @@ pub extern "C" fn sv_execute_ddl_rust(
             1 // failure
         }
         Err(_panic) => {
-            unsafe { write_to_buffer(error_out, error_out_len, "Internal panic in DDL execution") };
+            unsafe { write_to_buffer(error_out, error_out_len, "Internal panic in DDL rewrite") };
             1 // failure
         }
     }
@@ -242,10 +798,322 @@ pub extern "C" fn sv_execute_ddl_rust(
 mod tests {
     use super::*;
 
+    // ===================================================================
+    // detect_semantic_view_ddl tests (multi-prefix detection)
+    // ===================================================================
+
+    #[test]
+    fn test_detect_create() {
+        assert_eq!(
+            detect_semantic_view_ddl("CREATE SEMANTIC VIEW x (...)"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn test_detect_create_or_replace() {
+        assert_eq!(
+            detect_semantic_view_ddl("CREATE OR REPLACE SEMANTIC VIEW x (...)"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn test_detect_create_if_not_exists() {
+        assert_eq!(
+            detect_semantic_view_ddl("CREATE SEMANTIC VIEW IF NOT EXISTS x (...)"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn test_detect_drop() {
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEW x"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn test_detect_drop_if_exists() {
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEW IF EXISTS x"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn test_detect_describe() {
+        assert_eq!(
+            detect_semantic_view_ddl("DESCRIBE SEMANTIC VIEW x"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn test_detect_show() {
+        assert_eq!(
+            detect_semantic_view_ddl("SHOW SEMANTIC VIEWS"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn test_detect_case_insensitive_all_forms() {
+        assert_eq!(
+            detect_semantic_view_ddl("create or replace semantic view x (...)"),
+            PARSE_DETECTED
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("drop semantic view if exists x"),
+            PARSE_DETECTED
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("describe semantic view x"),
+            PARSE_DETECTED
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("show semantic views"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn test_detect_whitespace_and_semicolon() {
+        assert_eq!(
+            detect_semantic_view_ddl("  DROP SEMANTIC VIEW x  ;"),
+            PARSE_DETECTED
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("\n\tSHOW SEMANTIC VIEWS;\n"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn test_detect_non_matching() {
+        assert_eq!(detect_semantic_view_ddl("SELECT 1"), PARSE_NOT_OURS);
+        assert_eq!(
+            detect_semantic_view_ddl("CREATE TABLE t (id INT)"),
+            PARSE_NOT_OURS
+        );
+        assert_eq!(detect_semantic_view_ddl(""), PARSE_NOT_OURS);
+    }
+
+    #[test]
+    fn test_detect_describe_must_have_view() {
+        // "DESCRIBE my_table" must NOT be intercepted
+        assert_eq!(
+            detect_semantic_view_ddl("DESCRIBE my_table"),
+            PARSE_NOT_OURS
+        );
+    }
+
+    #[test]
+    fn test_detect_show_must_have_views() {
+        // "SHOW TABLES" must NOT be intercepted
+        assert_eq!(detect_semantic_view_ddl("SHOW TABLES"), PARSE_NOT_OURS);
+    }
+
+    // ===================================================================
+    // detect_ddl_kind tests
+    // ===================================================================
+
+    #[test]
+    fn test_ddl_kind_create() {
+        assert_eq!(
+            detect_ddl_kind("CREATE SEMANTIC VIEW x (...)"),
+            Some(DdlKind::Create)
+        );
+    }
+
+    #[test]
+    fn test_ddl_kind_create_or_replace() {
+        // Must be CreateOrReplace, NOT Create
+        assert_eq!(
+            detect_ddl_kind("CREATE OR REPLACE SEMANTIC VIEW x (...)"),
+            Some(DdlKind::CreateOrReplace)
+        );
+    }
+
+    #[test]
+    fn test_ddl_kind_create_if_not_exists() {
+        // Must be CreateIfNotExists, NOT Create
+        assert_eq!(
+            detect_ddl_kind("CREATE SEMANTIC VIEW IF NOT EXISTS x (...)"),
+            Some(DdlKind::CreateIfNotExists)
+        );
+    }
+
+    #[test]
+    fn test_ddl_kind_drop() {
+        assert_eq!(detect_ddl_kind("DROP SEMANTIC VIEW x"), Some(DdlKind::Drop));
+    }
+
+    #[test]
+    fn test_ddl_kind_drop_if_exists() {
+        // Must be DropIfExists, NOT Drop
+        assert_eq!(
+            detect_ddl_kind("DROP SEMANTIC VIEW IF EXISTS x"),
+            Some(DdlKind::DropIfExists)
+        );
+    }
+
+    #[test]
+    fn test_ddl_kind_describe() {
+        assert_eq!(
+            detect_ddl_kind("DESCRIBE SEMANTIC VIEW x"),
+            Some(DdlKind::Describe)
+        );
+    }
+
+    #[test]
+    fn test_ddl_kind_show() {
+        assert_eq!(detect_ddl_kind("SHOW SEMANTIC VIEWS"), Some(DdlKind::Show));
+    }
+
+    #[test]
+    fn test_ddl_kind_none() {
+        assert_eq!(detect_ddl_kind("SELECT 1"), None);
+    }
+
+    // ===================================================================
+    // rewrite_ddl tests
+    // ===================================================================
+
+    #[test]
+    fn test_rewrite_create() {
+        let sql = rewrite_ddl("CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])")
+            .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM create_semantic_view('sales', tables := [...], dimensions := [...])"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_create_or_replace() {
+        let sql = rewrite_ddl(
+            "CREATE OR REPLACE SEMANTIC VIEW sales (tables := [...], dimensions := [...])",
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM create_or_replace_semantic_view('sales', tables := [...], dimensions := [...])"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_create_if_not_exists() {
+        let sql = rewrite_ddl(
+            "CREATE SEMANTIC VIEW IF NOT EXISTS sales (tables := [...], dimensions := [...])",
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM create_semantic_view_if_not_exists('sales', tables := [...], dimensions := [...])"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_drop() {
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW sales").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('sales')");
+    }
+
+    #[test]
+    fn test_rewrite_drop_if_exists() {
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW IF EXISTS sales").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view_if_exists('sales')");
+    }
+
+    #[test]
+    fn test_rewrite_describe() {
+        let sql = rewrite_ddl("DESCRIBE SEMANTIC VIEW sales").unwrap();
+        assert_eq!(sql, "SELECT * FROM describe_semantic_view('sales')");
+    }
+
+    #[test]
+    fn test_rewrite_show() {
+        let sql = rewrite_ddl("SHOW SEMANTIC VIEWS").unwrap();
+        assert_eq!(sql, "SELECT * FROM list_semantic_views()");
+    }
+
+    #[test]
+    fn test_rewrite_name_with_single_quote() {
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW it's_a_view").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('it''s_a_view')");
+    }
+
+    #[test]
+    fn test_rewrite_drop_missing_name() {
+        let err = rewrite_ddl("DROP SEMANTIC VIEW").unwrap_err();
+        assert!(err.contains("Missing view name"), "got: {err}");
+    }
+
+    #[test]
+    fn test_rewrite_not_semantic() {
+        let err = rewrite_ddl("SELECT 1").unwrap_err();
+        assert!(err.contains("Not a semantic view DDL"), "got: {err}");
+    }
+
+    // ===================================================================
+    // extract_ddl_name tests
+    // ===================================================================
+
+    #[test]
+    fn test_extract_name_drop() {
+        assert_eq!(
+            extract_ddl_name("DROP SEMANTIC VIEW x").unwrap(),
+            Some("x".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_drop_if_exists() {
+        assert_eq!(
+            extract_ddl_name("DROP SEMANTIC VIEW IF EXISTS x").unwrap(),
+            Some("x".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_describe() {
+        assert_eq!(
+            extract_ddl_name("DESCRIBE SEMANTIC VIEW x").unwrap(),
+            Some("x".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_show() {
+        assert_eq!(extract_ddl_name("SHOW SEMANTIC VIEWS").unwrap(), None);
+    }
+
+    #[test]
+    fn test_extract_name_create() {
+        assert_eq!(
+            extract_ddl_name("CREATE SEMANTIC VIEW x (body)").unwrap(),
+            Some("x".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_name_create_or_replace() {
+        assert_eq!(
+            extract_ddl_name("CREATE OR REPLACE SEMANTIC VIEW x (body)").unwrap(),
+            Some("x".to_string())
+        );
+    }
+
+    // ===================================================================
+    // Additional detect_semantic_view_ddl coverage (legacy test cases)
+    // ===================================================================
+
     #[test]
     fn test_basic_detection() {
         assert_eq!(
-            detect_create_semantic_view("CREATE SEMANTIC VIEW test (...)"),
+            detect_semantic_view_ddl("CREATE SEMANTIC VIEW test (...)"),
             PARSE_DETECTED
         );
     }
@@ -253,15 +1121,15 @@ mod tests {
     #[test]
     fn test_case_insensitive() {
         assert_eq!(
-            detect_create_semantic_view("create semantic view test"),
+            detect_semantic_view_ddl("create semantic view test"),
             PARSE_DETECTED
         );
         assert_eq!(
-            detect_create_semantic_view("Create Semantic View test"),
+            detect_semantic_view_ddl("Create Semantic View test"),
             PARSE_DETECTED
         );
         assert_eq!(
-            detect_create_semantic_view("CREATE semantic VIEW test"),
+            detect_semantic_view_ddl("CREATE semantic VIEW test"),
             PARSE_DETECTED
         );
     }
@@ -269,11 +1137,11 @@ mod tests {
     #[test]
     fn test_leading_whitespace() {
         assert_eq!(
-            detect_create_semantic_view("  CREATE SEMANTIC VIEW test"),
+            detect_semantic_view_ddl("  CREATE SEMANTIC VIEW test"),
             PARSE_DETECTED
         );
         assert_eq!(
-            detect_create_semantic_view("\n\tCREATE SEMANTIC VIEW test"),
+            detect_semantic_view_ddl("\n\tCREATE SEMANTIC VIEW test"),
             PARSE_DETECTED
         );
     }
@@ -281,48 +1149,44 @@ mod tests {
     #[test]
     fn test_trailing_semicolon() {
         assert_eq!(
-            detect_create_semantic_view("CREATE SEMANTIC VIEW test;"),
+            detect_semantic_view_ddl("CREATE SEMANTIC VIEW test;"),
             PARSE_DETECTED
         );
         assert_eq!(
-            detect_create_semantic_view("CREATE SEMANTIC VIEW test ;"),
+            detect_semantic_view_ddl("CREATE SEMANTIC VIEW test ;"),
             PARSE_DETECTED
         );
         assert_eq!(
-            detect_create_semantic_view("CREATE SEMANTIC VIEW test ;\n"),
+            detect_semantic_view_ddl("CREATE SEMANTIC VIEW test ;\n"),
             PARSE_DETECTED
         );
     }
 
     #[test]
     fn test_non_matching() {
-        assert_eq!(detect_create_semantic_view("SELECT 1"), PARSE_NOT_OURS);
+        assert_eq!(detect_semantic_view_ddl("SELECT 1"), PARSE_NOT_OURS);
         assert_eq!(
-            detect_create_semantic_view("CREATE TABLE test"),
+            detect_semantic_view_ddl("CREATE TABLE test"),
             PARSE_NOT_OURS
         );
-        assert_eq!(
-            detect_create_semantic_view("CREATE VIEW test"),
-            PARSE_NOT_OURS
-        );
-        assert_eq!(detect_create_semantic_view(""), PARSE_NOT_OURS);
-        assert_eq!(detect_create_semantic_view(";"), PARSE_NOT_OURS);
-        assert_eq!(detect_create_semantic_view("CREATE"), PARSE_NOT_OURS);
+        assert_eq!(detect_semantic_view_ddl("CREATE VIEW test"), PARSE_NOT_OURS);
+        assert_eq!(detect_semantic_view_ddl(""), PARSE_NOT_OURS);
+        assert_eq!(detect_semantic_view_ddl(";"), PARSE_NOT_OURS);
+        assert_eq!(detect_semantic_view_ddl("CREATE"), PARSE_NOT_OURS);
     }
 
     #[test]
     fn test_too_short() {
         assert_eq!(
-            detect_create_semantic_view("create semantic vie"),
+            detect_semantic_view_ddl("create semantic vie"),
             PARSE_NOT_OURS
         );
     }
 
     #[test]
     fn test_exact_prefix_only() {
-        // Exactly the prefix with nothing after -- still detected
         assert_eq!(
-            detect_create_semantic_view("create semantic view"),
+            detect_semantic_view_ddl("create semantic view"),
             PARSE_DETECTED
         );
     }
@@ -372,7 +1236,6 @@ mod tests {
 
     #[test]
     fn test_parse_ddl_nested_parens() {
-        // Nested parens in STRUCT literals -- rfind should find the last ')'
         let (name, body) = parse_ddl_text(
             "CREATE SEMANTIC VIEW v (tables := [{alias: 'a', table: 't'}], dimensions := [{name: 'x', expr: 'CAST(y AS INT)', source_table: 'a'}])"
         ).unwrap();
@@ -383,22 +1246,19 @@ mod tests {
 
     #[test]
     fn test_parse_ddl_name_with_paren_adjacent() {
-        // View name immediately followed by '(' with no space
         let (name, body) = parse_ddl_text("CREATE SEMANTIC VIEW myview(a := 1)").unwrap();
         assert_eq!(name, "myview");
         assert_eq!(body, "a := 1");
     }
 
     // -----------------------------------------------------------------------
-    // rewrite_ddl_to_function_call tests
+    // Additional rewrite_ddl coverage (legacy test cases)
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_rewrite_basic() {
-        let sql = rewrite_ddl_to_function_call(
-            "CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])",
-        )
-        .unwrap();
+        let sql = rewrite_ddl("CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])")
+            .unwrap();
         assert_eq!(
             sql,
             "SELECT * FROM create_semantic_view('sales', tables := [...], dimensions := [...])"
@@ -407,14 +1267,13 @@ mod tests {
 
     #[test]
     fn test_rewrite_escapes_single_quotes() {
-        let sql = rewrite_ddl_to_function_call("CREATE SEMANTIC VIEW it's_a_view (tables := [])")
-            .unwrap();
+        let sql = rewrite_ddl("CREATE SEMANTIC VIEW it's_a_view (tables := [])").unwrap();
         assert!(sql.contains("'it''s_a_view'"), "got: {sql}");
     }
 
     #[test]
     fn test_rewrite_preserves_body() {
-        let sql = rewrite_ddl_to_function_call(
+        let sql = rewrite_ddl(
             "CREATE SEMANTIC VIEW v (tables := [{alias: 'sales', table: 'sales'}], dimensions := [{name: 'region', expr: 'region', source_table: 'sales'}], metrics := [{name: 'total', expr: 'SUM(amount)', source_table: 'sales'}])",
         )
         .unwrap();
@@ -424,7 +1283,430 @@ mod tests {
 
     #[test]
     fn test_rewrite_error_propagation() {
-        let err = rewrite_ddl_to_function_call("SELECT 1").unwrap_err();
-        assert!(err.contains("Not a CREATE SEMANTIC VIEW"), "got: {err}");
+        let err = rewrite_ddl("SELECT 1").unwrap_err();
+        assert!(err.contains("Not a"), "got: {err}");
+    }
+
+    // ===================================================================
+    // validate_and_rewrite tests (all use ( syntax — no := syntax)
+    // ===================================================================
+
+    #[test]
+    fn test_validate_and_rewrite_success() {
+        let result = validate_and_rewrite(
+            "CREATE SEMANTIC VIEW sales (tables ([{alias: 'a', table: 't'}]), dimensions ([{name: 'x', expr: 'y', source_table: 'a'}]))"
+        );
+        assert!(result.is_ok());
+        let sql = result.unwrap();
+        assert!(sql.is_some());
+        assert!(sql
+            .unwrap()
+            .starts_with("SELECT * FROM create_semantic_view("));
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_not_ours() {
+        let result = validate_and_rewrite("SELECT 1");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_empty_body() {
+        let result = validate_and_rewrite("CREATE SEMANTIC VIEW x ()");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("tables")
+                && err.message.contains("dimensions")
+                && err.message.contains("metrics"),
+            "Expected empty body error mentioning required clauses, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_missing_tables() {
+        let result = validate_and_rewrite(
+            "CREATE SEMANTIC VIEW x (dimensions ([{name: 'x', expr: 'y', source_table: 'a'}]))",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("tables"),
+            "Expected missing tables error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_missing_dims_and_metrics() {
+        let result =
+            validate_and_rewrite("CREATE SEMANTIC VIEW x (tables ([{alias: 'a', table: 't'}]))");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("dimensions") || err.message.contains("metrics"),
+            "Expected missing dimensions/metrics error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_clause_typo() {
+        let result = validate_and_rewrite(
+            "CREATE SEMANTIC VIEW x (tbles ([{alias: 'a', table: 't'}]), dimensions ([{name: 'x', expr: 'y', source_table: 'a'}]))"
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("Did you mean") && err.message.contains("tables"),
+            "Expected typo suggestion for 'tbles', got: {}",
+            err.message
+        );
+        assert!(err.position.is_some(), "Expected position for clause typo");
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_unbalanced_brackets() {
+        let result = validate_and_rewrite(
+            "CREATE SEMANTIC VIEW x (tables ([{alias: 'a', table: 't'}), dimensions ([{name: 'x', expr: 'y', source_table: 'a'}]))"
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("bracket") || err.message.contains("Unbalanced"),
+            "Expected bracket error, got: {}",
+            err.message
+        );
+        assert!(
+            err.position.is_some(),
+            "Expected position for bracket mismatch"
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_drop() {
+        // Non-CREATE forms should pass through without clause validation
+        let result = validate_and_rewrite("DROP SEMANTIC VIEW x");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_show() {
+        let result = validate_and_rewrite("SHOW SEMANTIC VIEWS");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    // ===================================================================
+    // validate_and_rewrite coverage gap tests
+    // ===================================================================
+
+    #[test]
+    fn test_validate_and_rewrite_create_or_replace() {
+        let result = validate_and_rewrite(
+            "CREATE OR REPLACE SEMANTIC VIEW sv1 (tables ([{alias: 'a', table: 't'}]), dimensions ([{name: 'x', expr: 'y', source_table: 'a'}]))"
+        );
+        assert!(result.is_ok());
+        let sql = result.unwrap();
+        assert!(sql.is_some(), "Expected Some(rewritten SQL)");
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_create_if_not_exists() {
+        let result = validate_and_rewrite(
+            "CREATE SEMANTIC VIEW IF NOT EXISTS sv1 (tables ([{alias: 'a', table: 't'}]), dimensions ([{name: 'x', expr: 'y', source_table: 'a'}]))"
+        );
+        assert!(result.is_ok());
+        let sql = result.unwrap();
+        assert!(sql.is_some(), "Expected Some(rewritten SQL)");
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_relationships_clause() {
+        let result = validate_and_rewrite(
+            "CREATE SEMANTIC VIEW sv1 (tables ([{alias: 'a', table: 't'}]), relationships ([{from: 'a', to: 'b', on: 'a.id = b.id'}]), dimensions ([{name: 'x', expr: 'y', source_table: 'a'}]))"
+        );
+        assert!(result.is_ok());
+        let sql = result.unwrap();
+        assert!(
+            sql.is_some(),
+            "Expected Some(rewritten SQL) with relationships clause"
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_tables_and_metrics_only() {
+        // No dimensions, only tables + metrics -- should be valid
+        let result = validate_and_rewrite(
+            "CREATE SEMANTIC VIEW sv1 (tables ([{alias: 'a', table: 't'}]), metrics ([{name: 'total', expr: 'SUM(x)', source_table: 'a'}]))"
+        );
+        assert!(result.is_ok());
+        let sql = result.unwrap();
+        assert!(
+            sql.is_some(),
+            "Expected Some(rewritten SQL) with tables + metrics only"
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_describe() {
+        let result = validate_and_rewrite("DESCRIBE SEMANTIC VIEW sv1");
+        assert!(result.is_ok());
+        let sql = result.unwrap();
+        assert!(sql.is_some(), "Expected Some(rewritten SQL) for DESCRIBE");
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_drop_if_exists() {
+        let result = validate_and_rewrite("DROP SEMANTIC VIEW IF EXISTS sv1");
+        assert!(result.is_ok());
+        let sql = result.unwrap();
+        assert!(
+            sql.is_some(),
+            "Expected Some(rewritten SQL) for DROP IF EXISTS"
+        );
+    }
+
+    // ===================================================================
+    // validate_clauses tests (all use ( syntax -- no := syntax)
+    // ===================================================================
+
+    #[test]
+    fn test_validate_clauses_empty_body() {
+        let query = "CREATE SEMANTIC VIEW x ()";
+        let body_offset = query.find('(').unwrap() + 1;
+        let body = "";
+        let result = validate_clauses(body, body_offset, query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("tables")
+                && err.message.contains("dimensions")
+                && err.message.contains("metrics"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_clauses_unknown_keyword() {
+        let query = "CREATE SEMANTIC VIEW x (tbles ([]))";
+        let body_start = query.find('(').unwrap() + 1;
+        let body = &query[body_start..query.rfind(')').unwrap()];
+        let result = validate_clauses(body, body_start, query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("Did you mean") && err.message.contains("tables"),
+            "got: {}",
+            err.message
+        );
+        // Position should point to the start of "tbles" in the original query
+        assert!(err.position.is_some());
+        let pos = err.position.unwrap();
+        assert_eq!(&query[pos..pos + 5], "tbles");
+    }
+
+    #[test]
+    fn test_validate_clauses_missing_tables() {
+        let query = "CREATE SEMANTIC VIEW x (dimensions ([]), metrics ([]))";
+        let body_start = query.find('(').unwrap() + 1;
+        let body = &query[body_start..query.rfind(')').unwrap()];
+        let result = validate_clauses(body, body_start, query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("tables"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_validate_clauses_missing_dims_and_metrics() {
+        let query = "CREATE SEMANTIC VIEW x (tables ([]))";
+        let body_start = query.find('(').unwrap() + 1;
+        let body = &query[body_start..query.rfind(')').unwrap()];
+        let result = validate_clauses(body, body_start, query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("dimensions") || err.message.contains("metrics"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_clauses_valid() {
+        let query = "CREATE SEMANTIC VIEW x (tables ([{alias: 'a', table: 't'}]), dimensions ([{name: 'x', expr: 'y', source_table: 'a'}]))";
+        let body_start = query.find('(').unwrap() + 1;
+        let body = &query[body_start..query.rfind(')').unwrap()];
+        let result = validate_clauses(body, body_start, query);
+        assert!(result.is_ok(), "got: {:?}", result.unwrap_err().message);
+    }
+
+    #[test]
+    fn test_validate_clauses_unbalanced_brackets() {
+        let query = "CREATE SEMANTIC VIEW x (tables ([{alias: 'a', table: 't'}), dimensions ([]))";
+        let body_start = query.find('(').unwrap() + 1;
+        let body = &query[body_start..query.rfind(')').unwrap()];
+        let result = validate_clauses(body, body_start, query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("bracket") || err.message.contains("Unbalanced"),
+            "got: {}",
+            err.message
+        );
+        assert!(err.position.is_some());
+    }
+
+    // ===================================================================
+    // validate_clauses coverage gap tests
+    // ===================================================================
+
+    #[test]
+    fn test_validate_clauses_unknown_keyword_far() {
+        // "foobar" is far from any known keyword -- should get "Expected one of" not "Did you mean"
+        let query = "CREATE SEMANTIC VIEW x (foobar ([]))";
+        let body_start = query.find('(').unwrap() + 1;
+        let body = &query[body_start..query.rfind(')').unwrap()];
+        let result = validate_clauses(body, body_start, query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("Expected one of"),
+            "Expected 'Expected one of' for unknown keyword far from any known, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("Did you mean"),
+            "Should NOT suggest 'Did you mean' for foobar, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_clauses_case_insensitive() {
+        // Uppercase clause keywords should be recognized
+        let query = "CREATE SEMANTIC VIEW x (TABLES ([{alias: 'a', table: 't'}]), DIMENSIONS ([{name: 'x', expr: 'y', source_table: 'a'}]))";
+        let body_start = query.find('(').unwrap() + 1;
+        let body = &query[body_start..query.rfind(')').unwrap()];
+        let result = validate_clauses(body, body_start, query);
+        assert!(
+            result.is_ok(),
+            "Uppercase clause keywords should be accepted, got: {:?}",
+            result.unwrap_err().message
+        );
+    }
+
+    // ===================================================================
+    // detect_near_miss tests
+    // ===================================================================
+
+    #[test]
+    fn test_near_miss_creat() {
+        let result = detect_near_miss("CREAT SEMANTIC VIEW x (tables := [])");
+        assert!(result.is_some());
+        let err = result.unwrap();
+        assert!(
+            err.message.contains("Did you mean")
+                && err.message.to_lowercase().contains("create semantic view"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_near_miss_drop_semantc() {
+        let result = detect_near_miss("DROP SEMANTC VIEW x");
+        assert!(result.is_some());
+        let err = result.unwrap();
+        assert!(
+            err.message.contains("Did you mean")
+                && err.message.to_lowercase().contains("drop semantic view"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_near_miss_show_semantic_view() {
+        // "SHOW SEMANTIC VIEW" (missing 'S') should suggest "SHOW SEMANTIC VIEWS"
+        let result = detect_near_miss("SHOW SEMANTIC VIEW");
+        assert!(result.is_some());
+        let err = result.unwrap();
+        assert!(err.message.contains("Did you mean"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn test_near_miss_select() {
+        // Regular SQL should NOT trigger near-miss
+        let result = detect_near_miss("SELECT 1");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_near_miss_show_tables() {
+        // "SHOW TABLES" has too large edit distance from any DDL prefix
+        let result = detect_near_miss("SHOW TABLES");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_near_miss_position_zero() {
+        let result = detect_near_miss("CREAT SEMANTIC VIEW x ()");
+        assert!(result.is_some());
+        let err = result.unwrap();
+        assert_eq!(err.position, Some(0));
+    }
+
+    // ===================================================================
+    // ParseError position tests (all use ( syntax -- no := syntax)
+    // ===================================================================
+
+    #[test]
+    fn test_parse_error_position_clause_typo() {
+        // Position should point at the clause keyword in the original query
+        let query = "CREATE SEMANTIC VIEW x (tbles ([]))";
+        let result = validate_and_rewrite(query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.position.is_some());
+        let pos = err.position.unwrap();
+        // "tbles" should start at the position
+        assert_eq!(
+            &query[pos..pos + 5],
+            "tbles",
+            "Position {} doesn't point to 'tbles'",
+            pos
+        );
+    }
+
+    #[test]
+    fn test_parse_error_position_with_leading_whitespace() {
+        // Leading whitespace should be accounted for in position
+        let query = "   CREATE SEMANTIC VIEW x (tbles ([]))";
+        let result = validate_and_rewrite(query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.position.is_some());
+        let pos = err.position.unwrap();
+        assert_eq!(
+            &query[pos..pos + 5],
+            "tbles",
+            "Position {} doesn't point to 'tbles' in query with leading whitespace",
+            pos
+        );
+    }
+
+    #[test]
+    fn test_parse_error_position_structural() {
+        // For missing name, position should point at end of prefix
+        let query = "CREATE SEMANTIC VIEW";
+        let result = validate_and_rewrite(query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.position.is_some());
     }
 }

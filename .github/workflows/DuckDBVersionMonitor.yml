@@ -21,7 +21,7 @@ jobs:
         id: latest
         run: |
           LATEST=$(gh api repos/duckdb/duckdb/releases/latest --jq '.tag_name')
-          CURRENT=$(grep 'TARGET_DUCKDB_VERSION' Makefile | head -1 | cut -d'=' -f2 | tr -d ' ')
+          CURRENT=$(cat .duckdb-version)
           echo "latest=$LATEST" >> $GITHUB_OUTPUT
           echo "current=$CURRENT" >> $GITHUB_OUTPUT
           if [ "$LATEST" != "$CURRENT" ]; then
@@ -41,13 +41,25 @@ jobs:
         if: steps.latest.outputs.is_new == 'true'
         run: |
           LATEST="${{ steps.latest.outputs.latest }}"
-          # Update Makefile version pin
-          sed -i "s/TARGET_DUCKDB_VERSION=.*/TARGET_DUCKDB_VERSION=${LATEST}/" Makefile
-          # Update MainDistributionPipeline.yml duckdb_version field
+          VERSION_BARE="${LATEST#v}"
+
+          # 1. Update .duckdb-version (the single source of truth)
+          echo "${LATEST}" > .duckdb-version
+
+          # 2. Derive Cargo.toml pins (strip v prefix, use =X.Y.Z)
+          sed -i "s/duckdb = { version = \"=[^\"]*\"/duckdb = { version = \"=${VERSION_BARE}\"/" Cargo.toml
+          sed -i "s/libduckdb-sys = \"=[^\"]*\"/libduckdb-sys = \"=${VERSION_BARE}\"/" Cargo.toml
+
+          # 3. Derive Python PEP 723 dependency pins
+          find . -name '*.py' -exec grep -l 'dependencies.*duckdb==' {} \; | while read f; do
+            sed -i "s/\"duckdb==[^\"]*\"/\"duckdb==${VERSION_BARE}\"/" "$f"
+          done
+
+          # 4. Update CI workflow duckdb_version fields
           sed -i "s/duckdb_version: .*/duckdb_version: ${LATEST}/" .github/workflows/MainDistributionPipeline.yml
-          # Update PullRequestCI.yml duckdb_version field
           sed -i "s/duckdb_version: .*/duckdb_version: ${LATEST}/" .github/workflows/PullRequestCI.yml
-          echo "Updated version pin to ${LATEST}"
+
+          echo "Updated all version pins to ${LATEST}"
 
       - name: Update vendored DuckDB amalgamation (header + source)
         if: steps.latest.outputs.is_new == 'true'

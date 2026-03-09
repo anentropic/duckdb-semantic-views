@@ -291,41 +291,48 @@ For release builds, change the path to `build/release/semantic_views.duckdb_exte
 
 ## Updating the DuckDB Version Pin
 
-The DuckDB version is pinned in four places:
+The DuckDB version is pinned in a single source of truth: **`.duckdb-version`** (repo root). All other locations are derived from it.
 
-| File | Field | Example |
-|------|-------|---------|
-| `Cargo.toml` | `duckdb` and `libduckdb-sys` version | `"=1.4.4"` |
-| `Makefile` | `TARGET_DUCKDB_VERSION` | `v1.4.4` |
-| `.github/workflows/PullRequestCI.yml` | `duckdb_version` | `v1.4.4` |
-| `.github/workflows/MainDistributionPipeline.yml` | `duckdb_version` | `v1.4.4` |
+| File | How It Gets the Version |
+|------|------------------------|
+| `.duckdb-version` | **Source** — single `vX.Y.Z` line |
+| `Makefile` | Reads `.duckdb-version` via `$(shell cat .duckdb-version)` |
+| `Cargo.toml` | `duckdb` and `libduckdb-sys` `"=X.Y.Z"` — updated by monitor workflow |
+| `test/**/*.py`, `configure/*.py` | PEP 723 `"duckdb==X.Y.Z"` — updated by monitor workflow |
+| `.github/workflows/PullRequestCI.yml` | `duckdb_version: vX.Y.Z` — updated by monitor workflow |
+| `.github/workflows/MainDistributionPipeline.yml` | `duckdb_version: vX.Y.Z` — updated by monitor workflow |
 
-### Steps to Update
+### Steps to Update Manually
 
-1. Update `Cargo.toml`:
+1. Update `.duckdb-version`:
+   ```
+   v1.5.0
+   ```
+
+2. Update `Cargo.toml`:
    ```toml
    duckdb = { version = "=1.5.0", default-features = false }
    libduckdb-sys = "=1.5.0"
    ```
 
-2. Update `Makefile`:
-   ```
-   TARGET_DUCKDB_VERSION=v1.5.0
+3. Update Python PEP 723 headers (all `# dependencies = ["duckdb==..."]` lines):
+   ```bash
+   find . -name '*.py' -exec grep -l 'duckdb==' {} \; | xargs sed -i '' 's/duckdb==[^"]*/duckdb==1.5.0/g'
    ```
 
-3. Update both CI workflow files (search for `duckdb_version:`):
+4. Update both CI workflow files (search for `duckdb_version:`):
    ```yaml
    duckdb_version: v1.5.0
    ```
 
-4. Build and run all tests:
+5. Build and run all tests:
    ```bash
    just build && just test-all
    ```
 
-5. Commit all four files together.
+6. Commit all files together.
 
-The `DuckDBVersionMonitor` workflow checks for new DuckDB releases weekly and opens a PR automatically if one is found. If the build passes, the PR bumps the version. If it fails, the PR tags `@copilot` to attempt an automated fix.
+The `DuckDBVersionMonitor` workflow automates all of this: it checks for new DuckDB releases weekly, updates `.duckdb-version` and all derived locations, then opens a PR. If the build passes, the PR bumps the version. If it fails, the PR tags `@copilot` to attempt an automated fix.
 
 ## Fuzzing
 

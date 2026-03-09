@@ -1,0 +1,158 @@
+# Phase 21: Error location reporting integration tests
+# Verifies error messages flow through DuckDB's parser extension error path
+# with clause-level hints (ERR-01), character positions (ERR-02), and
+# "did you mean" suggestions (ERR-03).
+#
+# Error tests (statement error) use ( syntax to verify scan_clause_keywords
+# accepts the ( delimiter. Success tests (statement ok) use := syntax because
+# the rewrite layer passes the body verbatim to DuckDB function calls, which
+# require := named parameter syntax.
+
+require semantic_views
+
+# ============================================================
+# Section 1: ERR-01 -- Clause-level error hints
+# ============================================================
+
+# Missing tables clause (only dimensions present)
+statement error
+CREATE SEMANTIC VIEW err_test (
+    dimensions ([{'name': 'x', 'expr': 'x', 'source_table': 'y'}])
+);
+----
+Missing required clause 'tables'
+
+# Empty body
+statement error
+CREATE SEMANTIC VIEW err_test ();
+----
+Expected clause definitions
+
+# Missing dimensions and metrics (only tables present)
+statement error
+CREATE SEMANTIC VIEW err_test (
+    tables ([{'alias': 't', 'table': 't'}])
+);
+----
+dimensions
+
+# Typo in clause name -- suggests correct keyword
+statement error
+CREATE SEMANTIC VIEW err_test (
+    tbles ([{'alias': 't', 'table': 't'}]),
+    dimensions ([{'name': 'x', 'expr': 'x', 'source_table': 't'}])
+);
+----
+Did you mean
+
+# Unknown keyword far from any known -- "Expected one of" message
+statement error
+CREATE SEMANTIC VIEW err_test (
+    foobar ([]),
+    tables ([{'alias': 't', 'table': 't'}])
+);
+----
+Expected one of
+
+# ============================================================
+# Section 2: ERR-02 -- Character position (caret rendering)
+# ============================================================
+
+# Structural error: missing opening paren -- error_location is set for caret
+# (sqllogictest matches substring of the error message, not the caret line)
+statement error
+CREATE SEMANTIC VIEW err_test;
+----
+Expected '('
+
+# Missing view name after prefix
+statement error
+CREATE SEMANTIC VIEW;
+----
+Missing view name
+
+# Missing closing paren
+statement error
+CREATE SEMANTIC VIEW err_test (tables, dimensions
+----
+Expected ')'
+
+# ============================================================
+# Section 3: ERR-03 -- "Did you mean" suggestions
+# ============================================================
+
+# Typo in DDL prefix: "CREAT" instead of "CREATE"
+statement error
+CREAT SEMANTIC VIEW test_view (tables ([]));
+----
+Did you mean
+
+# Another near-miss: "DROP SEMANTC VIEW" (missing 'I')
+statement error
+DROP SEMANTC VIEW some_view;
+----
+Did you mean
+
+# ============================================================
+# Section 4: Non-interference -- normal SQL and valid DDL still work
+# ============================================================
+
+# Setup table for valid DDL test
+statement ok
+CREATE TABLE err_source (id INT, val DOUBLE);
+
+# Case insensitivity -- uppercase clause keywords work
+statement ok
+CREATE SEMANTIC VIEW err_case_test (
+    TABLES := [{'alias': 'err_source', 'table': 'err_source'}],
+    DIMENSIONS := [{'name': 'id', 'expr': 'id', 'source_table': 'err_source'}],
+    METRICS := [{'name': 'total', 'expr': 'SUM(val)', 'source_table': 'err_source'}]
+);
+
+statement ok
+DROP SEMANTIC VIEW err_case_test;
+
+# Valid CREATE still works
+statement ok
+CREATE SEMANTIC VIEW err_valid (
+    tables := [{'alias': 'err_source', 'table': 'err_source'}],
+    dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 'err_source'}],
+    metrics := [{'name': 'total', 'expr': 'SUM(val)', 'source_table': 'err_source'}]
+);
+
+# Valid DESCRIBE still works (6 columns: name, base_table, dimensions, metrics, filters, joins)
+query TTTTTT
+DESCRIBE SEMANTIC VIEW err_valid;
+----
+err_valid	err_source	[{"expr":"id","name":"id","output_type":null,"source_table":"err_source"}]	[{"expr":"SUM(val)","name":"total","output_type":null,"source_table":"err_source"}]	[]	[]
+
+# Normal SQL unaffected
+query I
+SELECT 42;
+----
+42
+
+# CREATE OR REPLACE works
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW err_valid (
+    tables := [{'alias': 'err_source', 'table': 'err_source'}],
+    dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 'err_source'}],
+    metrics := [{'name': 'total', 'expr': 'SUM(val)', 'source_table': 'err_source'}]
+);
+
+# Tables + metrics only (no dimensions) -- valid
+statement ok
+CREATE SEMANTIC VIEW err_metrics_only (
+    tables := [{'alias': 'err_source', 'table': 'err_source'}],
+    metrics := [{'name': 'total', 'expr': 'SUM(val)', 'source_table': 'err_source'}]
+);
+
+statement ok
+DROP SEMANTIC VIEW err_metrics_only;
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW err_valid;
+
+statement ok
+DROP TABLE err_source;

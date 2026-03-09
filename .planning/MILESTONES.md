@@ -1,5 +1,27 @@
 # Milestones
 
+## v0.5.1 DDL Polish (Shipped: 2026-03-09)
+
+**Phases completed:** 5 phases (19-23), 9 plans
+**Source changes:** 71 files, +12,112 / -1,800 lines
+**Tests:** 222 total (Rust unit + proptest + sqllogictest + DuckLake CI + Python integration)
+**Timeline:** 2 days (2026-03-08 → 2026-03-09)
+
+**Delivered:** Complete native DDL surface — all 7 DDL verbs (CREATE, CREATE OR REPLACE, CREATE IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, SHOW) via parser extension hooks. Error location reporting with clause-level hints, character positions, and "did you mean" suggestions. 33 property-based tests for parser module + Python caret integration tests through full extension pipeline.
+
+**Key accomplishments:**
+1. Empirically confirmed all 7 DDL prefixes trigger parser fallback hook — full native DDL scope validated
+2. `DdlKind` enum with multi-prefix detection/rewrite for DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW
+3. C++ result-forwarding pipeline with dynamic column schemas per DDL form (DESCRIBE: 6 cols, SHOW: 2 cols)
+4. Full error reporting — clause hints, byte-accurate positions, "did you mean" suggestions via tri-state FFI
+5. README updated with DDL syntax reference and full lifecycle example (create → query → describe → show → drop)
+6. 33 property-based tests for all 7 parser functions + Python caret integration test through full extension pipeline
+
+**Requirements:** 16/16 satisfied
+**Audit:** Passed — all requirements triple-confirmed across VERIFICATION.md, SUMMARY.md, REQUIREMENTS.md
+
+---
+
 ## v0.5.0 Parser Extension Spike (Shipped: 2026-03-08)
 
 **Phases completed:** 5 phases (15-18, including 17.1), 8 plans

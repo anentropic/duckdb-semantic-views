@@ -7,7 +7,7 @@
 - ✅ **v0.3.0 Zero-Copy Query Pipeline** — (shipped 2026-03-03)
 - ✅ **v0.4.0 Simplified Dimensions** — (shipped 2026-03-03)
 - ✅ **v0.5.0 Parser Extension Spike** — Phases 15-18 (shipped 2026-03-08)
-- **v0.5.1 DDL Polish** — Phases 19-22 (in progress)
+- ✅ **v0.5.1 DDL Polish** — Phases 19-23 (shipped 2026-03-09)
 
 ## Phases
 
@@ -73,65 +73,20 @@ Full details: [milestones/v0.5-ROADMAP.md](milestones/v0.5-ROADMAP.md)
 
 </details>
 
-### v0.5.1 DDL Polish (In Progress)
+<details>
+<summary>✅ v0.5.1 DDL Polish (Phases 19-23) — SHIPPED 2026-03-09</summary>
 
-**Milestone Goal:** Complete the native DDL surface for semantic views -- DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW -- with quality error reporting and updated documentation.
+- [x] Phase 19: Parser Hook Validation Spike (1/1 plan) — completed 2026-03-09
+- [x] Phase 20: Extended DDL Statements (2/2 plans) — completed 2026-03-09
+- [x] Phase 21: Error Location Reporting (3/3 plans) — completed 2026-03-09
+- [x] Phase 22: Documentation (1/1 plan) — completed 2026-03-09
+- [x] Phase 23: Parser Proptests and Caret Integration Tests (2/2 plans) — completed 2026-03-09
 
-- [ ] **Phase 19: Parser Hook Validation Spike** - Empirically determine which DDL prefixes trigger the parser fallback hook
-- [ ] **Phase 20: Extended DDL Statements** - Native syntax for DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW
-- [ ] **Phase 21: Error Location Reporting** - Clause-level hints, character positions, and "did you mean" suggestions
-- [ ] **Phase 22: Documentation** - README DDL syntax reference with worked examples
+Full details: [milestones/v0.5.1-ROADMAP.md](milestones/v0.5.1-ROADMAP.md)
 
-## Phase Details
-
-### Phase 19: Parser Hook Validation Spike
-**Goal**: Confirmed scope for v0.5.1 -- which DDL statements can use the parser fallback hook and which cannot
-**Depends on**: Phase 18 (v0.5.0 parser hook infrastructure)
-**Requirements**: None (scope-determination phase; informs DDL-07, DDL-08 feasibility)
-**Success Criteria** (what must be TRUE):
-  1. Each of the 7 DDL prefixes (DROP, DROP IF EXISTS, CREATE OR REPLACE, CREATE IF NOT EXISTS, DESCRIBE, SHOW) has been tested against DuckDB with the extension loaded
-  2. For each prefix, the error type is recorded: Parser Error (triggers hook) or Catalog Error (bypasses hook)
-  3. A concrete scope decision is documented: which statements get native syntax in v0.5.1 and which remain function-only
-**Plans:** 1 plan
-Plans:
-- [ ] 19-01-PLAN.md -- Empirically test all 7 DDL prefixes and document scope decision
-
-### Phase 20: Extended DDL Statements
-**Goal**: Users can manage semantic views entirely through native DDL syntax -- create, replace, drop, inspect, and list
-**Depends on**: Phase 19 (scope confirmation)
-**Requirements**: DDL-03, DDL-04, DDL-05, DDL-06, DDL-07, DDL-08
-**Success Criteria** (what must be TRUE):
-  1. User can run `DROP SEMANTIC VIEW name` and the view is removed from the catalog
-  2. User can run `DROP SEMANTIC VIEW IF EXISTS name` without error when the view does not exist
-  3. User can run `CREATE OR REPLACE SEMANTIC VIEW name (...)` and the existing view is updated in place
-  4. User can run `CREATE SEMANTIC VIEW IF NOT EXISTS name (...)` and no error occurs when the view already exists
-  5. User can run `DESCRIBE SEMANTIC VIEW name` and see dimensions, metrics, and types (native DDL or function fallback per Phase 19 findings)
-  6. User can run `SHOW SEMANTIC VIEWS` and see all defined semantic views (native DDL or function fallback per Phase 19 findings)
-**Plans**: TBD
-
-### Phase 21: Error Location Reporting
-**Goal**: Users get actionable, positioned error messages when DDL statements are malformed
-**Depends on**: Phase 20 (DDL parse infrastructure and `ParseError` struct)
-**Requirements**: ERR-01, ERR-02, ERR-03
-**Success Criteria** (what must be TRUE):
-  1. A malformed DDL statement shows which clause is wrong (e.g., "Error in DIMENSIONS clause: expected list of dimension definitions")
-  2. Error messages include a character position that DuckDB renders as a caret (`^`) under the offending location in the original DDL text
-  3. Misspelled clause names or view names produce "Did you mean '...'?" suggestions using fuzzy matching
-**Plans**: TBD
-
-### Phase 22: Documentation
-**Goal**: Users can learn the full DDL syntax from the README without reading source code
-**Depends on**: Phase 20 (all DDL verbs confirmed), Phase 21 (error behavior confirmed)
-**Requirements**: DOC-01
-**Success Criteria** (what must be TRUE):
-  1. README contains a DDL syntax reference section covering CREATE, CREATE OR REPLACE, CREATE IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, and SHOW
-  2. README includes at least one worked example showing the full lifecycle: create a semantic view, query it, describe it, drop it
-**Plans**: TBD
+</details>
 
 ## Progress
-
-**Execution Order:**
-Phases execute in numeric order: 19 -> 20 -> 21 -> 22
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
@@ -157,7 +112,8 @@ Phases execute in numeric order: 19 -> 20 -> 21 -> 22
 | 17. DDL Execution | v0.5.0 | 1/1 | Complete | 2026-03-07 |
 | 17.1. Python vtab crash investigation | v0.5.0 | 2/2 | Complete | 2026-03-08 |
 | 18. Verification and Integration | v0.5.0 | 2/2 | Complete | 2026-03-08 |
-| 19. Parser Hook Validation Spike | v0.5.1 | 0/1 | Not started | - |
-| 20. Extended DDL Statements | v0.5.1 | 0/? | Not started | - |
-| 21. Error Location Reporting | v0.5.1 | 0/? | Not started | - |
-| 22. Documentation | v0.5.1 | 0/? | Not started | - |
+| 19. Parser Hook Validation Spike | v0.5.1 | 1/1 | Complete | 2026-03-09 |
+| 20. Extended DDL Statements | v0.5.1 | 2/2 | Complete | 2026-03-09 |
+| 21. Error Location Reporting | v0.5.1 | 3/3 | Complete | 2026-03-09 |
+| 22. Documentation | v0.5.1 | 1/1 | Complete | 2026-03-09 |
+| 23. Parser Proptests + Caret Tests | v0.5.1 | 2/2 | Complete | 2026-03-09 |

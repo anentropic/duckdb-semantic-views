@@ -4,7 +4,7 @@ A DuckDB extension that lets you define dimensions and metrics once, then query 
 
 Inspired by [Snowflake Semantic Views](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view), adapted for DuckDB as a loadable extension.
 
-v0.4.0 -- early-stage, not yet on the community registry.
+v0.5.0 -- early-stage, not yet on the community registry.
 
 ## How it works
 
@@ -29,19 +29,7 @@ INSTALL semantic_views FROM community;
 LOAD semantic_views;
 ```
 
-## Creating a semantic view
-
-`create_semantic_view()` takes a view name and keyword arguments:
-
-```
-create_semantic_view(
-    name,             -- VARCHAR: view name
-    tables,           -- LIST of STRUCT: {alias, table}
-    relationships,    -- LIST of STRUCT: join definitions (empty [] for single-table)
-    dimensions,       -- LIST of STRUCT: {name, expr, source_table}
-    metrics           -- LIST of STRUCT: {name, expr, source_table}
-)
-```
+## Defining a semantic view
 
 ### Single table
 
@@ -51,11 +39,8 @@ CREATE TABLE orders (
     amount DECIMAL(10,2), created_at DATE
 );
 
-SELECT * FROM create_semantic_view(
-    'orders',
-    tables := [
-        {'alias': 'o', 'table': 'orders'}
-    ],
+CREATE SEMANTIC VIEW orders (
+    tables := [{'alias': 'o', 'table': 'orders'}],
     dimensions := [
         {'name': 'region', 'expr': 'region', 'source_table': 'o'},
         {'name': 'category', 'expr': 'category', 'source_table': 'o'},
@@ -71,18 +56,15 @@ SELECT * FROM create_semantic_view(
 ### Multi-table joins
 
 ```sql
-SELECT * FROM create_semantic_view(
-    'order_analytics',
+CREATE SEMANTIC VIEW order_analytics (
     tables := [
         {'alias': 'o', 'table': 'orders'},
         {'alias': 'c', 'table': 'customers'}
     ],
     relationships := [
-        {'from_table': 'o',
-         'to_table': 'c',
-         'join_columns': [
-            {'from': 'customer_id', 'to': 'id'}
-         ]}],
+        {'from_table': 'o', 'to_table': 'c',
+         'join_columns': [{'from': 'customer_id', 'to': 'id'}]}
+    ],
     dimensions := [
         {'name': 'region', 'expr': 'region', 'source_table': 'o'},
         {'name': 'customer_tier', 'expr': 'tier', 'source_table': 'c'}
@@ -127,6 +109,42 @@ SELECT * FROM semantic_view(
 WHERE region = 'EMEA';
 ```
 
+## DDL reference
+
+```sql
+CREATE OR REPLACE SEMANTIC VIEW orders (...);  -- overwrite an existing view
+CREATE SEMANTIC VIEW IF NOT EXISTS orders (...);  -- no-op if already exists
+DROP SEMANTIC VIEW orders;                      -- remove a view
+DROP SEMANTIC VIEW IF EXISTS orders;            -- no-op if not found
+DESCRIBE SEMANTIC VIEW orders;                  -- view metadata
+SHOW SEMANTIC VIEWS;                            -- list all semantic views
+```
+
+## Lifecycle example
+
+A complete create-query-inspect-drop workflow:
+
+```sql
+CREATE SEMANTIC VIEW orders (
+    tables := [{'alias': 'o', 'table': 'orders'}],
+    dimensions := [
+        {'name': 'region', 'expr': 'region', 'source_table': 'o'}
+    ],
+    metrics := [
+        {'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}
+    ]
+);
+
+SELECT * FROM semantic_view('orders',
+    dimensions := ['region'], metrics := ['revenue']);
+
+DESCRIBE SEMANTIC VIEW orders;
+
+SHOW SEMANTIC VIEWS;
+
+DROP SEMANTIC VIEW orders;
+```
+
 ## Explain
 
 See what SQL the extension generates:
@@ -141,16 +159,13 @@ SELECT * FROM explain_semantic_view(
 
 Returns the expanded SQL and the DuckDB execution plan.
 
-## Other DDL functions
+## Function syntax
 
-All use the same argument signature as `create_semantic_view()`:
+The function-based DDL interface is still available as an alternative:
 
-- `create_or_replace_semantic_view(...)` -- overwrites an existing view
-- `create_semantic_view_if_not_exists(...)` -- no-op if already exists
-- `drop_semantic_view('name')` -- removes a view
-- `drop_semantic_view_if_exists('name')` -- no-op if not found
-- `list_semantic_views()` -- table of all registered views
-- `describe_semantic_view('name')` -- view metadata
+- `create_semantic_view()`, `create_or_replace_semantic_view()`, `create_semantic_view_if_not_exists()`
+- `drop_semantic_view()`, `drop_semantic_view_if_exists()`
+- `list_semantic_views()`, `describe_semantic_view()`
 
 ## Building
 

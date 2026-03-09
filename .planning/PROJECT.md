@@ -37,30 +37,26 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - ✓ Native `CREATE SEMANTIC VIEW` DDL syntax via parser extension hooks — v0.5.0
 - ✓ C++ shim with vendored DuckDB amalgamation for parser hook registration — v0.5.0
 - ✓ Runtime type validation + defensive SQL wrapping for Python crash prevention — v0.5.0
+- ✓ `DROP SEMANTIC VIEW [name]` native DDL — v0.5.1
+- ✓ `CREATE OR REPLACE SEMANTIC VIEW` native DDL — v0.5.1
+- ✓ `CREATE SEMANTIC VIEW IF NOT EXISTS` native DDL — v0.5.1
+- ✓ `DESCRIBE SEMANTIC VIEW [name]` — shows dimensions, metrics, types — v0.5.1
+- ✓ `SHOW SEMANTIC VIEWS` — lists all defined semantic views — v0.5.1
+- ✓ Error location reporting: clause-level hints + character position + "did you mean" suggestions — v0.5.1
+- ✓ README DDL syntax reference + worked examples — v0.5.1
 
 ### Active
 
-- [ ] `DROP SEMANTIC VIEW [name]` native DDL
-- [ ] `CREATE OR REPLACE SEMANTIC VIEW` native DDL
-- [ ] `CREATE SEMANTIC VIEW IF NOT EXISTS` native DDL
-- [ ] `DESCRIBE SEMANTIC VIEW [name]` — shows dimensions, metrics, types
-- [ ] `SHOW SEMANTIC VIEWS` — lists all defined semantic views
-- [ ] Error location reporting: clause-level hints + character position + "did you mean" suggestions
-- [ ] README DDL syntax reference + worked examples (minimal, matching current style)
+None — all v0.5.1 requirements shipped.
 
 **Deferred to future milestones:**
 - Community extension registry publication (`INSTALL semantic_views FROM community`)
 - Real-world TPC-H demo notebook
 - ~~WEEK and QUARTER time granularities~~ — removed in v0.4.0
 
-## Current Milestone: v0.5.1 DDL Polish
+## Shipped: v0.5.1 DDL Polish (2026-03-09)
 
-**Goal:** Complete the DDL surface for semantic views — DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW — with quality error reporting and updated documentation.
-
-**Target features:**
-- Extended DDL: DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW
-- Error location reporting with clause hints, character position, and suggestions
-- README update with DDL reference and examples
+Complete native DDL surface — all 7 DDL verbs (CREATE, CREATE OR REPLACE, CREATE IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, SHOW) via parser extension hooks. Error location reporting with clause-level hints, character positions, and "did you mean" suggestions. README updated with DDL reference and lifecycle example. 209 Rust tests + 7 SQL logic tests + 6 DuckLake CI tests green.
 
 ## Shipped: v0.5.0 Parser Extension Spike (2026-03-08)
 
@@ -81,11 +77,11 @@ Native `CREATE SEMANTIC VIEW` DDL syntax achieved via DuckDB parser extension ho
 
 ## Context
 
-**Shipped v0.5.0** — native `CREATE SEMANTIC VIEW` DDL syntax via parser extension hooks. Both native DDL and function-based DDL coexist.
+**Shipped v0.5.1** — complete native DDL surface (all 7 DDL verbs), error location reporting, 33 parser proptests, Python caret integration tests. v0.5.0 native `CREATE SEMANTIC VIEW` DDL syntax remains foundation.
 **Tech stack:** Rust + C++ shim (vendored DuckDB amalgamation via cc crate), duckdb-rs 1.4.4, serde_json, strsim, proptest.
-**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern). Parser hook via C++ shim: `parse_function` fallback detects `CREATE SEMANTIC VIEW`, Rust rewrites to function-based DDL, C++ `plan_function` executes via dedicated DDL connection.
-**Tests:** 172 total — Rust unit tests, property-based tests (proptest), sqllogictest integration tests, DuckLake CI tests, Python vtab crash tests.
-**Known limitations:** See TECH-DEBT.md at repo root for 18 accepted decisions and deferred items (4 new in v0.5.0).
+**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern). Parser hook via C++ shim: `parse_function` fallback detects all 7 DDL forms, Rust `DdlKind` enum dispatches rewrite, C++ `sv_ddl_bind` executes and forwards result sets. Error validation via tri-state `sv_validate_ddl_rust` FFI.
+**Tests:** 222+ total — Rust unit tests, 33 property-based tests (proptest), sqllogictest integration tests (7), DuckLake CI tests (6), Python caret integration tests.
+**Known limitations:** See TECH-DEBT.md at repo root for accepted decisions and deferred items.
 
 **Design research:** A detailed design doc lives in `_notes/semantic-views-duckdb-design-doc.md`. It covers prior art (Cube.dev internals, Snowflake semantic views, Databricks metric views), the two-phase architecture (expansion → pre-aggregation selection), and why `egg`/e-graph rewriting is not needed for this approach.
 
@@ -128,4 +124,4 @@ Native `CREATE SEMANTIC VIEW` DDL syntax achieved via DuckDB parser extension ho
 | Runtime type validation before vector reference | Defensive type check before `duckdb_vector_reference_vector` returns recoverable error instead of SIGABRT | ✓ Good — prevents Python crashes |
 
 ---
-*Last updated: 2026-03-08 after v0.5.1 milestone start*
+*Last updated: 2026-03-09 after v0.5.1 milestone complete*

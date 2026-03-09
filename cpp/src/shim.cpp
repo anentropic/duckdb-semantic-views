@@ -30,16 +30,21 @@ struct SemanticViewParseData : public ParserExtensionParseData {
 // Rust FFI declarations (defined in src/parse.rs)
 // ---------------------------------------------------------------------------
 extern "C" {
-    // Parse detection: 0 = not ours, 1 = CREATE SEMANTIC VIEW detected
-    uint8_t sv_parse_rust(const char *query, size_t query_len);
-
-    // DDL execution: rewrites DDL to function call, executes via duckdb_query
-    // Returns 0 on success (name written to name_out), 1 on failure (error in error_out)
-    uint8_t sv_execute_ddl_rust(
+    // DDL rewrite: rewrites DDL to function call SQL (does NOT execute)
+    // Returns 0 on success (SQL written to sql_out), 1 on failure (error in error_out)
+    uint8_t sv_rewrite_ddl_rust(
         const char *query_ptr, size_t query_len,
-        duckdb_connection exec_conn,
-        char *name_out, size_t name_out_len,
+        char *sql_out, size_t sql_out_len,
         char *error_out, size_t error_out_len);
+
+    // DDL validation with error reporting: 0=success, 1=error, 2=not-ours
+    // On error: error message in error_out, position in *position_out.
+    // position_out is set to UINT32_MAX when no position is available.
+    uint8_t sv_validate_ddl_rust(
+        const char *query_ptr, size_t query_len,
+        char *sql_out, size_t sql_out_len,
+        char *error_out, size_t error_out_len,
+        uint32_t *position_out);
 }
 
 // ---------------------------------------------------------------------------
@@ -54,22 +59,41 @@ static duckdb_connection sv_ddl_conn = nullptr;
 // Parser hook: sv_parse_stub
 // ---------------------------------------------------------------------------
 // Fallback parse function: only called when DuckDB's own parser fails on a
-// statement. Delegates detection to Rust via FFI (sv_parse_rust) which handles
-// case-insensitive "CREATE SEMANTIC VIEW" prefix matching, whitespace, and
-// semicolon stripping. All other queries fall through to DuckDB's normal
-// parser error (DISPLAY_ORIGINAL_ERROR).
+// statement. Delegates validation to Rust via FFI (sv_validate_ddl_rust) which
+// handles case-insensitive prefix matching, clause validation, near-miss
+// detection, and error position tracking. Returns one of three outcomes:
+//   - PARSE_SUCCESSFUL: DDL detected and validated, carry query forward
+//   - DISPLAY_EXTENSION_ERROR: validation error with positioned caret
+//   - DISPLAY_ORIGINAL_ERROR: not our statement, let DuckDB show its error
 static ParserExtensionParseResult sv_parse_stub(
     ParserExtensionInfo *, const string &query) {
-    // Delegate detection to Rust
-    uint8_t result = sv_parse_rust(
+    char sql_buf[4096];
+    char error_buf[1024];
+    uint32_t position = UINT32_MAX;
+    memset(sql_buf, 0, sizeof(sql_buf));
+    memset(error_buf, 0, sizeof(error_buf));
+
+    uint8_t rc = sv_validate_ddl_rust(
         reinterpret_cast<const char *>(query.c_str()),
-        query.size());
-    if (result == 1) {
-        // Rust detected CREATE SEMANTIC VIEW -- carry query text forward
+        query.size(),
+        sql_buf, sizeof(sql_buf),
+        error_buf, sizeof(error_buf),
+        &position);
+
+    if (rc == 0) {
+        // Success: DDL detected and validated -- carry query text forward
         return ParserExtensionParseResult(
             make_uniq<SemanticViewParseData>(query));
+    } else if (rc == 1) {
+        // Error: validation failed -- return extension error with position
+        string err_msg(error_buf);
+        ParserExtensionParseResult err_result(err_msg);
+        if (position != UINT32_MAX) {
+            err_result.error_location = static_cast<idx_t>(position);
+        }
+        return err_result;
     }
-    // Not our statement -- let DuckDB show its normal error
+    // rc == 2: not our statement -- let DuckDB show its normal error
     return ParserExtensionParseResult();
 }
 
@@ -77,53 +101,106 @@ static ParserExtensionParseResult sv_parse_stub(
 // DDL plan function: bind, state, execute, plan
 // ---------------------------------------------------------------------------
 
-// Bind data: holds the view name returned from DDL execution.
+// Bind data: holds the full result set from executing rewritten DDL SQL.
+// Each row is a vector of string values (all columns forwarded as VARCHAR).
 struct SvDdlBindData : public FunctionData {
-    string view_name;
-    explicit SvDdlBindData(string name) : view_name(std::move(name)) {}
+    vector<vector<string>> rows;    // rows[row_idx][col_idx]
+    vector<string> col_names;
+
+    SvDdlBindData() = default;
+
     unique_ptr<FunctionData> Copy() const override {
-        return make_uniq<SvDdlBindData>(view_name);
+        auto copy = make_uniq<SvDdlBindData>();
+        copy->rows = rows;
+        copy->col_names = col_names;
+        return copy;
     }
     bool Equals(const FunctionData &other) const override {
         auto &o = other.Cast<SvDdlBindData>();
-        return view_name == o.view_name;
+        return rows == o.rows && col_names == o.col_names;
+    }
+    // Disable statement caching: the return schema varies per DDL form
+    // (CREATE returns 1 column, DESCRIBE returns 6, SHOW returns 2).
+    bool SupportStatementCache() const override {
+        return false;
     }
 };
 
-// Bind callback: extracts query from input, calls Rust FFI to execute DDL,
-// declares one VARCHAR output column "view_name".
+// Bind callback: extracts query from input, calls Rust FFI to rewrite DDL,
+// then executes the rewritten SQL on sv_ddl_conn and captures the full result.
 static unique_ptr<FunctionData> sv_ddl_bind(
     ClientContext &, TableFunctionBindInput &input,
     vector<LogicalType> &return_types, vector<string> &names) {
 
-    return_types.push_back(LogicalType::VARCHAR);
-    names.push_back("view_name");
-
     // The query text is passed as the first (and only) positional parameter
     auto query = StringValue::Get(input.inputs[0]);
 
-    // Execute the DDL via Rust FFI
-    char name_buf[256];
+    // Step 1: Rewrite DDL to function call SQL via Rust FFI
+    char sql_buf[4096];
     char error_buf[1024];
-    memset(name_buf, 0, sizeof(name_buf));
+    memset(sql_buf, 0, sizeof(sql_buf));
     memset(error_buf, 0, sizeof(error_buf));
 
-    uint8_t rc = sv_execute_ddl_rust(
+    uint8_t rc = sv_rewrite_ddl_rust(
         query.c_str(), query.size(),
-        sv_ddl_conn,
-        name_buf, sizeof(name_buf),
+        sql_buf, sizeof(sql_buf),
         error_buf, sizeof(error_buf));
 
     if (rc != 0) {
-        throw BinderException("CREATE SEMANTIC VIEW failed: %s", error_buf);
+        throw BinderException("Semantic view DDL failed: %s", error_buf);
     }
 
-    return make_uniq<SvDdlBindData>(string(name_buf));
+    // Step 2: Execute the rewritten SQL on the DDL connection
+    duckdb_result result;
+    if (duckdb_query(sv_ddl_conn, sql_buf, &result) != DuckDBSuccess) {
+        auto err_ptr = duckdb_result_error(&result);
+        string err_msg = err_ptr ? string(err_ptr) : "DDL execution failed (unknown error)";
+        duckdb_destroy_result(&result);
+        throw BinderException("Semantic view DDL failed: %s", err_msg);
+    }
+
+    // Step 3: Read result metadata and declare output columns
+    auto col_count = duckdb_column_count(&result);
+    auto row_count = duckdb_row_count(&result);
+
+    auto bind_data = make_uniq<SvDdlBindData>();
+
+    for (idx_t c = 0; c < col_count; c++) {
+        auto col_name = duckdb_column_name(&result, c);
+        names.push_back(col_name ? string(col_name) : "col" + to_string(c));
+        return_types.push_back(LogicalType::VARCHAR);
+        bind_data->col_names.push_back(names.back());
+    }
+
+    // Edge case: 0-column result (shouldn't happen but handle gracefully)
+    if (col_count == 0) {
+        names.push_back("result");
+        return_types.push_back(LogicalType::VARCHAR);
+        bind_data->col_names.push_back("result");
+    }
+
+    // Step 4: Read all result rows using duckdb_value_varchar
+    for (idx_t r = 0; r < row_count; r++) {
+        vector<string> row;
+        for (idx_t c = 0; c < col_count; c++) {
+            char *val = duckdb_value_varchar(&result, c, r);
+            row.push_back(val ? string(val) : string());
+            if (val) {
+                duckdb_free(val);
+            }
+        }
+        bind_data->rows.push_back(std::move(row));
+    }
+
+    // Step 5: Clean up the result
+    duckdb_destroy_result(&result);
+
+    return bind_data;
 }
 
-// Global state: tracks whether the single result row has been emitted.
+// Global state: tracks the current row offset for emitting result data.
 struct SvDdlGlobalState : public GlobalTableFunctionState {
-    bool done = false;
+    idx_t offset = 0;
 };
 
 static unique_ptr<GlobalTableFunctionState> sv_ddl_init_global(
@@ -131,18 +208,32 @@ static unique_ptr<GlobalTableFunctionState> sv_ddl_init_global(
     return make_uniq<SvDdlGlobalState>();
 }
 
-// Execute callback: returns one row with the view name, then marks done.
+// Execute callback: emits rows from the stored result data.
+// Handles 0, 1, or many rows. Uses offset tracking for chunked emission.
 static void sv_ddl_execute(ClientContext &, TableFunctionInput &input,
                            DataChunk &output) {
     auto &state = input.global_state->Cast<SvDdlGlobalState>();
-    if (state.done) {
+    auto &bind_data = input.bind_data->Cast<SvDdlBindData>();
+
+    auto total_rows = bind_data.rows.size();
+    if (state.offset >= total_rows) {
         output.SetCardinality(0);
         return;
     }
-    state.done = true;
-    auto &bind_data = input.bind_data->Cast<SvDdlBindData>();
-    output.SetCardinality(1);
-    output.SetValue(0, 0, Value(bind_data.view_name));
+
+    // Emit up to STANDARD_VECTOR_SIZE rows per chunk
+    idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total_rows - state.offset);
+    auto col_count = bind_data.col_names.size();
+
+    for (idx_t r = 0; r < count; r++) {
+        auto &row = bind_data.rows[state.offset + r];
+        for (idx_t c = 0; c < col_count && c < row.size(); c++) {
+            output.SetValue(c, r, Value(row[c]));
+        }
+    }
+
+    output.SetCardinality(count);
+    state.offset += count;
 }
 
 // Plan function: transforms the intercepted CREATE SEMANTIC VIEW statement

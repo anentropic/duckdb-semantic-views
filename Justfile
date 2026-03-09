@@ -85,9 +85,15 @@ test-ducklake-ci:
 test-vtab-crash: build
     uv run test/integration/test_vtab_crash.py
 
-# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration tests + vtab crash
+# Run Python caret position integration tests against the built extension.
+# Verifies that DuckDB error caret (^) renders at the correct character position
+# when malformed DDL flows through the extension's parser hook pipeline.
+test-caret: build
+    uv run test/integration/test_caret_position.py
+
+# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
-test-all: test-rust test-sql test-ducklake-ci test-vtab-crash
+test-all: test-rust test-sql test-ducklake-ci test-vtab-crash test-caret
 
 # Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
 fuzz target="fuzz_json_parse" time="300":

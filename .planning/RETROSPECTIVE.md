@@ -179,6 +179,49 @@
 
 ---
 
+## Milestone: v0.5.1 — DDL Polish
+
+**Shipped:** 2026-03-09
+**Phases:** 5 (19-23) | **Plans:** 9 | **Commits:** ~30
+
+### What Was Built
+- Empirical validation spike (Phase 19) confirming all 7 DDL prefixes trigger parser fallback hook
+- `DdlKind` enum with multi-prefix detection/rewrite for DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW
+- C++ result-forwarding pipeline with dynamic column schemas per DDL form (DESCRIBE: 6 cols, SHOW: 2 cols)
+- `ParseError` struct with byte-accurate positions; tri-state `sv_validate_ddl_rust` FFI for clause hints and "did you mean" suggestions
+- README DDL syntax reference with full lifecycle example (create → query → describe → show → drop)
+- 33 property-based tests for all 7 parser public functions + Python caret integration test through full extension pipeline
+
+### What Worked
+- Phase 19 empirical spike before implementation — eliminated all uncertainty about which DDL forms are viable before a single line of production code was written
+- Tri-state FFI design (0=not-semantic, 1=valid, 2=invalid) — clean separation of prefix detection, validation, and rewriting responsibilities
+- Phase 21 gap closure (Phase 21-03) — `scan_clause_keywords` dual-delimiter fix caught a real correctness bug in error reporting
+- Milestone audit before archiving — caught all gaps, all 16 requirements triple-confirmed
+
+### What Was Inefficient
+- Phase 21 required 3 plans (01: core implementation, 02: integration tests, 03: gap closure) — the delimiter gate bug wasn't caught until tests were written in Plan 02
+- Nyquist VALIDATION.md files created for all 5 phases but none populated — same process gap from v0.5.0 carried forward (all 5 marked as "MISSING" in audit)
+- Progress table in ROADMAP.md had formatting inconsistencies (Milestone and Plans columns mixed up in Phase 19 row)
+
+### Patterns Established
+- Dual-delimiter clause keyword scanning (`:=` and `(`) — both syntaxes present in the codebase for different contexts
+- Proptest `arb_case_variant` strategy for case-insensitive DDL testing — `vec(bool)` drives per-character casing
+- Parameterized DDL form testing via index strategy into const arrays (avoids proptest macro limitations)
+- Python caret extraction pattern: subtract `LINE 1: ` prefix (8 chars) to get 0-based offset
+
+### Key Lessons
+1. Empirical spikes before parser extension work eliminate the risk of building infrastructure for an impossible goal — Phase 19 took 1 plan vs. days of wasted effort
+2. Tri-state FFI (not-semantic / valid / invalid) cleanly handles prefix detection, validation failure, and validation success as distinct code paths
+3. Integration tests written immediately after implementation catch delimiter/protocol bugs that unit tests miss — Plan 02 found the `(` syntax gap that Plan 01 missed
+4. Nyquist VALIDATION.md process needs a completion gate — if validation files exist but are empty, they provide false confidence
+
+### Cost Observations
+- 5 phases, 9 plans in 2 days
+- Phase 23 (proptests) was the largest plan by LOC (+655 lines for `parse_proptest.rs`)
+- Notable: milestone audit found zero gaps — first milestone to pass audit clean since v0.5.0
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -190,6 +233,7 @@
 | v0.3.0 | 1 | — | Zero-copy refactor — replaced binary-read dispatch (-600 LOC) |
 | v0.4.0 | — | — | Breaking simplification — removed time_dimensions/granularities |
 | v0.5.0 | 45 | 5 | Parser extension spike — native DDL via C++ shim + statement rewriting |
+| v0.5.1 | ~30 | 5 | DDL Polish — 7 DDL verbs, error location reporting, 33 parser PBTs + Python caret tests |
 
 ### Cumulative Quality
 
@@ -199,6 +243,7 @@
 | v0.2.0 | 136 | 40 properties (256+ cases each) | 3 targets | 3 (SQLLogicTest + DuckLake CI + DuckLake local) |
 | v0.3.0 | 136+ | 40 properties | 3 targets | 3 + vector_reference_test |
 | v0.5.0 | 172 | 40 properties | 3 targets | 4 (SQLLogicTest + DuckLake CI + vector_reference + vtab_crash) |
+| v0.5.1 | 222+ | 73 properties (40 output + 33 parser) | 3 targets | 5 (+ Python caret integration) |
 
 ### Top Lessons (Verified Across Milestones)
 

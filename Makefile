@@ -4,8 +4,8 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 EXTENSION_NAME=semantic_views
 
-# Target DuckDB version — updated automatically by DuckDBVersionMonitor workflow
-TARGET_DUCKDB_VERSION=v1.4.4
+# Target DuckDB version — read from .duckdb-version (single source of truth)
+TARGET_DUCKDB_VERSION=$(shell cat .duckdb-version)
 
 all: configure debug
 
