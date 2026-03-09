@@ -92,7 +92,9 @@ Full details: [milestones/v0.5-ROADMAP.md](milestones/v0.5-ROADMAP.md)
   1. Each of the 7 DDL prefixes (DROP, DROP IF EXISTS, CREATE OR REPLACE, CREATE IF NOT EXISTS, DESCRIBE, SHOW) has been tested against DuckDB with the extension loaded
   2. For each prefix, the error type is recorded: Parser Error (triggers hook) or Catalog Error (bypasses hook)
   3. A concrete scope decision is documented: which statements get native syntax in v0.5.1 and which remain function-only
-**Plans**: TBD
+**Plans:** 1 plan
+Plans:
+- [ ] 19-01-PLAN.md -- Empirically test all 7 DDL prefixes and document scope decision
 
 ### Phase 20: Extended DDL Statements
 **Goal**: Users can manage semantic views entirely through native DDL syntax -- create, replace, drop, inspect, and list
@@ -148,14 +150,14 @@ Phases execute in numeric order: 19 -> 20 -> 21 -> 22
 | 12. EXPLAIN + Typed Output | v0.2.0 | 4/4 | Complete | 2026-03-02 |
 | 13. Type-mapping + PBTs | v0.2.0 | 2/2 | Complete | 2026-03-02 |
 | 14. DuckLake Integration + CI | v0.2.0 | 3/3 | Complete | 2026-03-02 |
-| Zero-Copy Query Pipeline | v0.3.0 | — | Complete | 2026-03-03 |
-| Simplified Dimensions | v0.4.0 | — | Complete | 2026-03-03 |
+| Zero-Copy Query Pipeline | v0.3.0 | -- | Complete | 2026-03-03 |
+| Simplified Dimensions | v0.4.0 | -- | Complete | 2026-03-03 |
 | 15. Entry Point POC | v0.5.0 | 2/2 | Complete | 2026-03-07 |
 | 16. Parser Hook Registration | v0.5.0 | 1/1 | Complete | 2026-03-07 |
 | 17. DDL Execution | v0.5.0 | 1/1 | Complete | 2026-03-07 |
 | 17.1. Python vtab crash investigation | v0.5.0 | 2/2 | Complete | 2026-03-08 |
 | 18. Verification and Integration | v0.5.0 | 2/2 | Complete | 2026-03-08 |
-| 19. Parser Hook Validation Spike | v0.5.1 | 0/? | Not started | - |
+| 19. Parser Hook Validation Spike | v0.5.1 | 0/1 | Not started | - |
 | 20. Extended DDL Statements | v0.5.1 | 0/? | Not started | - |
 | 21. Error Location Reporting | v0.5.1 | 0/? | Not started | - |
 | 22. Documentation | v0.5.1 | 0/? | Not started | - |
