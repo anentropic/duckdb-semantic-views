@@ -109,7 +109,10 @@ Full details: [milestones/v0.5.1-ROADMAP.md](milestones/v0.5.1-ROADMAP.md)
   3. Dimension and metric definitions carry a source table alias parsed from qualified `alias.name` syntax
   4. Composite primary keys (multi-column) round-trip correctly through JSON serialization
   5. All existing tests pass unchanged (serde defaults guarantee backward compat during transition)
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 24-01-PLAN.md -- Extend TableRef and Join structs with PK/FK fields and serde tests
+- [ ] 24-02-PLAN.md -- Update function DDL interface and migrate sqllogictest files
 
 ### Phase 25: SQL Body Parser
 **Goal**: Users can write `CREATE SEMANTIC VIEW` with SQL keyword clauses instead of function-call syntax
@@ -192,7 +195,7 @@ Phases execute in numeric order: 24 -> 25 -> 26 -> 27 -> 28
 | 21. Error Location Reporting | v0.5.1 | 3/3 | Complete | 2026-03-09 |
 | 22. Documentation | v0.5.1 | 1/1 | Complete | 2026-03-09 |
 | 23. Parser Proptests + Caret Tests | v0.5.1 | 2/2 | Complete | 2026-03-09 |
-| 24. PK/FK Model | v0.5.2 | 0/? | Not started | - |
+| 24. PK/FK Model | v0.5.2 | 0/2 | Not started | - |
 | 25. SQL Body Parser | v0.5.2 | 0/? | Not started | - |
 | 26. PK/FK Join Resolution | v0.5.2 | 0/? | Not started | - |
 | 27. Alias-Based Query Expansion | v0.5.2 | 0/? | Not started | - |
