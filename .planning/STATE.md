@@ -5,9 +5,9 @@ milestone_name: SQL DDL & PK/FK Relationships
 status: planning
 stopped_at: null
 last_updated: "2026-03-09"
-last_activity: "2026-03-09 - Milestone v0.5.2 started"
+last_activity: "2026-03-09 - Roadmap created (Phases 24-28)"
 progress:
-  total_phases: 0
+  total_phases: 5
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -21,26 +21,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-09)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand -- the extension handles expansion, DuckDB handles execution.
-**Current focus:** v0.5.2 — SQL DDL syntax + PK/FK relationship model
+**Current focus:** Phase 24 - PK/FK Model
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-03-09 — Milestone v0.5.2 started
+Phase: 24 (1 of 5 in v0.5.2)
+Plan: 0 of ? in current phase
+Status: Ready to plan
+Last activity: 2026-03-09 -- Roadmap created for v0.5.2 (Phases 24-28)
+
+Progress: [..........] 0%
 
 ## Performance Metrics
 
-**Velocity (v0.1.0):**
-- Total plans completed: 18
-- Average duration: ~20 min
-- Total execution time: ~6 hours
-
-**Velocity (v0.2.0):**
-- Total plans completed: 25
-- Commits: 125
-- Timeline: 3 days (2026-02-28 -> 2026-03-02)
+**Velocity (v0.5.1):**
+- Total plans completed: 9
+- Phases: 5 (19-23)
+- Timeline: 1 day (2026-03-09)
 
 **Velocity (v0.5.0):**
 - Total plans completed: 8
@@ -52,22 +49,21 @@ Last activity: 2026-03-09 — Milestone v0.5.2 started
 ### Decisions
 
 Decisions are logged in PROJECT.md Key Decisions table.
-All v0.1.0 decisions archived in milestones/v1.0-ROADMAP.md.
-All v0.2.0 decisions archived in milestones/v0.2-ROADMAP.md.
-All v0.5.0 decisions archived in milestones/v0.5-ROADMAP.md.
-All v0.5.1 decisions archived in milestones/v0.5.1-ROADMAP.md.
+All prior milestone decisions archived in milestones/ directories.
+
+Recent decisions affecting current work:
+- [v0.5.2 init]: NO backward compatibility needed -- pre-release, old syntax removed entirely
+- [v0.5.2 init]: Snowflake semantic view syntax is the DDL grammar model
+- [v0.5.2 init]: Zero new Cargo dependencies -- hand-written parser and graph traversal
 
 ### Pending Todos
 
 None.
 
-### Roadmap Evolution
-
-(New milestone — no changes yet)
-
 ### Blockers/Concerns
 
-None.
+- Research flag: verify `build_execution_sql` type-cast wrapper works with direct FROM+JOIN SQL (spike before Phase 27)
+- Research flag: C++ shim 4096-byte DDL buffer -- measure SQL keyword body sizes during Phase 25
 
 ### Quick Tasks Completed
 
@@ -79,5 +75,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-03-09
-Stopped at: Milestone v0.5.2 started — defining requirements
+Stopped at: Roadmap created for v0.5.2 -- ready to plan Phase 24
 Resume file: None

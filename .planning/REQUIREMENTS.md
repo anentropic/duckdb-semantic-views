@@ -1,7 +1,7 @@
 # Requirements: DuckDB Semantic Views
 
 **Defined:** 2026-03-09
-**Core Value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
+**Core Value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand -- the extension handles expansion, DuckDB handles execution.
 
 ## v0.5.2 Requirements
 
@@ -30,7 +30,7 @@ Requirements for SQL DDL syntax, PK/FK relationship model, and qualified column 
 - [ ] **EXP-01**: Query expansion generates alias-based `FROM base AS alias LEFT JOIN t AS alias ON ...` (no CTE flattening)
 - [ ] **EXP-02**: JOIN ON clauses synthesized from PK/FK declarations
 - [ ] **EXP-03**: Join ordering via topological sort of relationship graph
-- [ ] **EXP-04**: Transitive join inclusion — requesting dims from A and C auto-joins through B
+- [ ] **EXP-04**: Transitive join inclusion -- requesting dims from A and C auto-joins through B
 - [ ] **EXP-05**: Qualified column references (`alias.column`) work in generated SQL
 - [ ] **EXP-06**: Define-time validation: relationship graph must be a tree (error on diamonds/cycles)
 
@@ -55,7 +55,7 @@ Deferred to future milestones. Tracked but not in current roadmap.
 
 ### Advanced Features
 
-- **ADV-01**: FACTS clause (`alias.fact_name AS raw_expr` — named sub-expressions for metrics)
+- **ADV-01**: FACTS clause (`alias.fact_name AS raw_expr` -- named sub-expressions for metrics)
 - **ADV-02**: Derived metrics (metric referencing other metrics)
 - **ADV-03**: Hierarchies / drill-down paths (country -> region -> city)
 - **ADV-04**: Fan trap detection and deduplication warnings
@@ -84,34 +84,34 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| DDL-01 | — | Pending |
-| DDL-02 | — | Pending |
-| DDL-03 | — | Pending |
-| DDL-04 | — | Pending |
-| DDL-05 | — | Pending |
-| DDL-06 | — | Pending |
-| DDL-07 | — | Pending |
-| MDL-01 | — | Pending |
-| MDL-02 | — | Pending |
-| MDL-03 | — | Pending |
-| MDL-04 | — | Pending |
-| MDL-05 | — | Pending |
-| EXP-01 | — | Pending |
-| EXP-02 | — | Pending |
-| EXP-03 | — | Pending |
-| EXP-04 | — | Pending |
-| EXP-05 | — | Pending |
-| EXP-06 | — | Pending |
-| CLN-01 | — | Pending |
-| CLN-02 | — | Pending |
-| CLN-03 | — | Pending |
-| DOC-01 | — | Pending |
+| DDL-01 | Phase 25 | Pending |
+| DDL-02 | Phase 25 | Pending |
+| DDL-03 | Phase 25 | Pending |
+| DDL-04 | Phase 25 | Pending |
+| DDL-05 | Phase 25 | Pending |
+| DDL-06 | Phase 24 | Pending |
+| DDL-07 | Phase 25 | Pending |
+| MDL-01 | Phase 24 | Pending |
+| MDL-02 | Phase 24 | Pending |
+| MDL-03 | Phase 24 | Pending |
+| MDL-04 | Phase 24 | Pending |
+| MDL-05 | Phase 24 | Pending |
+| EXP-01 | Phase 27 | Pending |
+| EXP-02 | Phase 26 | Pending |
+| EXP-03 | Phase 26 | Pending |
+| EXP-04 | Phase 26 | Pending |
+| EXP-05 | Phase 27 | Pending |
+| EXP-06 | Phase 26 | Pending |
+| CLN-01 | Phase 27 | Pending |
+| CLN-02 | Phase 27 | Pending |
+| CLN-03 | Phase 27 | Pending |
+| DOC-01 | Phase 28 | Pending |
 
 **Coverage:**
 - v0.5.2 requirements: 22 total
-- Mapped to phases: 0
-- Unmapped: 22
+- Mapped to phases: 22
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-09*
-*Last updated: 2026-03-09 after initial definition*
+*Last updated: 2026-03-09 after roadmap creation*
