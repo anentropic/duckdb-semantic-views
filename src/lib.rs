@@ -287,7 +287,7 @@ mod extension {
     use crate::{
         catalog::init_catalog,
         ddl::{
-            define::{DefineSemanticViewVTab, DefineState},
+            define::{DefineFromJsonVTab, DefineSemanticViewVTab, DefineState},
             describe::DescribeSemanticViewVTab,
             drop::{DropSemanticViewVTab, DropState},
             list::ListSemanticViewsVTab,
@@ -378,6 +378,25 @@ mod extension {
         };
         con.register_table_function_with_extra_info::<DefineSemanticViewVTab, _>(
             "create_semantic_view_if_not_exists",
+            &define_if_not_exists_state,
+        )?;
+
+        // Register create_semantic_view_from_json(name, json) -- target for AS-body DDL.
+        // Uses the same DefineState as the corresponding paren-body variants.
+        con.register_table_function_with_extra_info::<DefineFromJsonVTab, _>(
+            "create_semantic_view_from_json",
+            &define_state,
+        )?;
+
+        // Register create_or_replace_semantic_view_from_json(name, json).
+        con.register_table_function_with_extra_info::<DefineFromJsonVTab, _>(
+            "create_or_replace_semantic_view_from_json",
+            &define_or_replace_state,
+        )?;
+
+        // Register create_semantic_view_if_not_exists_from_json(name, json).
+        con.register_table_function_with_extra_info::<DefineFromJsonVTab, _>(
+            "create_semantic_view_if_not_exists_from_json",
             &define_if_not_exists_state,
         )?;
 

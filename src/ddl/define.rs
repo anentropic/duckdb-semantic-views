@@ -235,3 +235,118 @@ impl VTab for DefineSemanticViewVTab {
         ])
     }
 }
+
+/// `create_semantic_view_from_json(name, json)` table function.
+///
+/// Accepts a pre-parsed JSON-serialized `SemanticViewDefinition` (produced by
+/// the AS-body DDL rewriter in parse.rs). Deserializes and stores the definition
+/// using the same catalog/persist logic as `DefineSemanticViewVTab`.
+///
+/// This is the execution target for `CREATE SEMANTIC VIEW name AS TABLES (...) ...`.
+/// Three variants are registered:
+/// - `create_semantic_view_from_json` (or_replace=false, if_not_exists=false)
+/// - `create_or_replace_semantic_view_from_json` (or_replace=true)
+/// - `create_semantic_view_if_not_exists_from_json` (if_not_exists=true)
+pub struct DefineFromJsonVTab;
+
+impl VTab for DefineFromJsonVTab {
+    type BindData = DefineBindData;
+    type InitData = DefineInitData;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        // Declare output schema: single VARCHAR column with the view name.
+        bind.add_result_column("view_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+
+        let name = bind.get_parameter(0).to_string();
+        let json = bind.get_parameter(1).to_string();
+
+        // Deserialize the JSON into a SemanticViewDefinition.
+        let mut def = crate::model::SemanticViewDefinition::from_json(&name, &json)
+            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
+        // Access the DefineState from extra_info.
+        let state_ptr = bind.get_extra_info::<DefineState>();
+        let state = unsafe { &*state_ptr };
+
+        // DDL-time type inference (same as DefineSemanticViewVTab).
+        // Runs LIMIT 0 on the expanded SQL via the persist connection.
+        if let Some(conn) = state.persist_conn {
+            let req_all = crate::expand::QueryRequest {
+                dimensions: def.dimensions.iter().map(|d| d.name.clone()).collect(),
+                metrics: def.metrics.iter().map(|m| m.name.clone()).collect(),
+            };
+            if let Ok(expanded_for_inference) = crate::expand::expand(&name, &def, &req_all) {
+                let limit0_sql = format!("{expanded_for_inference} LIMIT 0");
+                if let Some((names, types)) =
+                    unsafe { crate::query::table_function::try_infer_schema(conn, &limit0_sql) }
+                {
+                    def.column_type_names = names;
+                    def.column_types_inferred = types
+                        .iter()
+                        .map(|t| crate::query::table_function::normalize_type_id(*t as u32))
+                        .collect();
+                }
+            }
+        }
+
+        let json_out = serde_json::to_string(&def)
+            .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+
+        // Persist to DuckDB table first (file-backed databases only).
+        if let Some(conn) = state.persist_conn {
+            persist_define(conn, &name, &json_out)
+                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+        }
+
+        // Update in-memory catalog.
+        if state.or_replace {
+            catalog_upsert(&state.catalog, &name, &json_out)?;
+        } else if state.if_not_exists {
+            match catalog_insert(&state.catalog, &name, &json_out) {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("already exists") => {
+                    // Silently succeed -- view exists, no replacement needed.
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            catalog_insert(&state.catalog, &name, &json_out)?;
+        }
+
+        Ok(DefineBindData { name })
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(DefineInitData {
+            done: AtomicBool::new(false),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let init_data = func.get_init_data();
+        if init_data.done.swap(true, Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        let bind_data = func.get_bind_data();
+        let name_vec = output.flat_vector(0);
+        name_vec.insert(0, bind_data.name.as_str());
+        output.set_len(1);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        // Both name and json are positional VARCHAR parameters.
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // name
+            LogicalTypeHandle::from(LogicalTypeId::Varchar), // json
+        ])
+    }
+
+    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
+        None // No named parameters -- both are positional
+    }
+}
