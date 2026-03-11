@@ -1104,6 +1104,7 @@ FROM \"_base\"";
                     on: "orders.customer_id = customers.id".to_string(),
                     from_cols: vec![],
                     join_columns: vec![],
+                    ..Default::default()
                 }],
                 facts: vec![],
                 column_type_names: vec![],
@@ -1150,6 +1151,7 @@ FROM \"_base\"";
                     on: "orders.customer_id = customers.id".to_string(),
                     from_cols: vec![],
                     join_columns: vec![],
+                    ..Default::default()
                 }],
                 facts: vec![],
                 column_type_names: vec![],
@@ -1191,6 +1193,7 @@ FROM \"_base\"";
                     on: "orders.customer_id = customers.id".to_string(),
                     from_cols: vec![],
                     join_columns: vec![],
+                    ..Default::default()
                 }],
                 facts: vec![],
                 column_type_names: vec![],
@@ -1229,12 +1232,14 @@ FROM \"_base\"";
                         on: "orders.customer_id = customers.id".to_string(),
                         from_cols: vec![],
                         join_columns: vec![],
+                        ..Default::default()
                     },
                     Join {
                         table: "regions".to_string(),
                         on: "customers.region_id = regions.id".to_string(),
                         from_cols: vec![],
                         join_columns: vec![],
+                        ..Default::default()
                     },
                 ],
                 facts: vec![],
@@ -1282,12 +1287,14 @@ FROM \"_base\"";
                         on: "orders.customer_id = customers.id".to_string(),
                         from_cols: vec![],
                         join_columns: vec![],
+                        ..Default::default()
                     },
                     Join {
                         table: "regions".to_string(),
                         on: "customers.region_id = regions.id".to_string(),
                         from_cols: vec![],
                         join_columns: vec![],
+                        ..Default::default()
                     },
                 ],
                 facts: vec![],
@@ -1404,6 +1411,7 @@ FROM \"_base\"";
                     on: "raw_orders.customer_id = raw_customers.id".to_string(),
                     from_cols: vec![],
                     join_columns: vec![],
+                    ..Default::default()
                 }],
                 facts: vec![],
                 column_type_names: vec![],
@@ -1454,12 +1462,14 @@ FROM \"_base\"";
                         on: "orders.customer_id = customers.id".to_string(),
                         from_cols: vec![],
                         join_columns: vec![],
+                        ..Default::default()
                     },
                     Join {
                         table: "products".to_string(),
                         on: "orders.product_id = products.id".to_string(),
                         from_cols: vec![],
                         join_columns: vec![],
+                        ..Default::default()
                     },
                 ],
                 facts: vec![],
@@ -1494,10 +1504,12 @@ FROM \"_base\"";
                     TableRef {
                         alias: "o".to_string(),
                         table: "orders".to_string(),
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![
@@ -1531,6 +1543,7 @@ FROM \"_base\"";
                         from: "customer_id".to_string(),
                         to: "id".to_string(),
                     }],
+                    ..Default::default()
                 }],
                 facts: vec![],
                 column_type_names: vec![],
@@ -1566,10 +1579,12 @@ FROM \"_base\"";
                     TableRef {
                         alias: "o".to_string(),
                         table: "orders".to_string(),
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "li".to_string(),
                         table: "line_items".to_string(),
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![crate::model::Dimension {
@@ -1595,6 +1610,7 @@ FROM \"_base\"";
                             to: "rev".to_string(),
                         },
                     ],
+                    ..Default::default()
                 }],
                 facts: vec![],
                 column_type_names: vec![],
@@ -1636,6 +1652,7 @@ FROM \"_base\"";
                     on: "orders.customer_id = customers.id".to_string(),
                     from_cols: vec![],
                     join_columns: vec![],
+                    ..Default::default()
                 }],
                 facts: vec![],
                 column_type_names: vec![],

@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 pub struct TableRef {
     pub alias: String,
     pub table: String,
+    /// Primary key columns for this table (Phase 24: PK/FK model).
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pk_columns: Vec<String>,
 }
 
 /// A named SQL column expression used as a dimension.
@@ -67,7 +72,7 @@ pub struct JoinColumn {
 }
 
 /// A JOIN relationship between the base table and another source table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Join {
     pub table: String,
@@ -83,6 +88,18 @@ pub struct Join {
     /// Old stored JSON without this field deserializes with empty Vec.
     #[serde(default)]
     pub join_columns: Vec<JoinColumn>,
+    /// Phase 24: The source table alias from which FK columns are defined.
+    /// In `order_to_customer AS o(customer_id) REFERENCES c`, this is `"o"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from_alias: String,
+    /// Phase 24: FK column names from the source alias (`from_alias`) side.
+    /// In `order_to_customer AS o(customer_id) REFERENCES c`, this is `["customer_id"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fk_columns: Vec<String>,
+    /// Phase 24: Optional relationship name for multi-table FK declarations.
+    /// In `order_to_customer AS o(customer_id) REFERENCES c`, this is `Some("order_to_customer")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Top-level definition of a semantic view.
@@ -278,6 +295,7 @@ mod tests {
             let tr = TableRef {
                 alias: "o".to_string(),
                 table: "orders".to_string(),
+                ..Default::default()
             };
             let json = serde_json::to_string(&tr).unwrap();
             assert_eq!(json, r#"{"alias":"o","table":"orders"}"#);
@@ -330,6 +348,7 @@ mod tests {
                 tables: vec![TableRef {
                     alias: "o".to_string(),
                     table: "orders".to_string(),
+                    ..Default::default()
                 }],
                 dimensions: vec![],
                 metrics: vec![],

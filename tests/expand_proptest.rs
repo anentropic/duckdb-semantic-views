@@ -125,12 +125,14 @@ fn joined_definition() -> SemanticViewDefinition {
                 on: "\"orders\".\"customer_id\" = \"customers\".\"id\"".to_string(),
                 from_cols: vec![],
                 join_columns: vec![],
+                ..Default::default()
             },
             Join {
                 table: "products".to_string(),
                 on: "\"orders\".\"product_id\" = \"products\".\"id\"".to_string(),
                 from_cols: vec![],
                 join_columns: vec![],
+                ..Default::default()
             },
         ],
         facts: vec![],

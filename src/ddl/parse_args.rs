@@ -99,7 +99,11 @@ pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, 
                 let alias = extract_struct_child_varchar(child, 0); // alias
                 let table = extract_struct_child_varchar(child, 1); // table
                 ffi::duckdb_destroy_value(&mut child);
-                tables.push(TableRef { alias, table });
+                tables.push(TableRef {
+                    alias,
+                    table,
+                    ..Default::default()
+                });
             }
         }
     }
@@ -144,6 +148,7 @@ pub fn parse_define_args_from_bind(bind: &BindInfo) -> Result<ParsedDefineArgs, 
                     on: String::new(),
                     from_cols: vec![],
                     join_columns,
+                    ..Default::default()
                 });
             }
         }
