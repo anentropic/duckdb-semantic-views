@@ -1,9 +1,7 @@
 name: Build Extension
 
 on:
-  workflow_run:
-    workflows: ["Code Quality"]
-    types: [completed]
+  push:
     branches:
       - main
       - 'release/*'
@@ -17,11 +15,14 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries (all platforms)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    # IMPORTANT: The @tag below must match the version in .duckdb-version (currently v1.4.4).
+    # GitHub Actions 'uses:' does not support dynamic values, so update this manually
+    # whenever .duckdb-version changes.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
     with:
       duckdb_version: v1.4.4
-      ci_tools_version: main
+      ci_tools_version: v1.4.4
       extension_name: semantic_views
       extra_toolchains: 'rust;python3'
       # Target platforms: Linux x86_64, Linux arm64, macOS x86_64, macOS arm64, Windows x86_64.

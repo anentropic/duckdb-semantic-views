@@ -14,10 +14,13 @@ concurrency:
 jobs:
   linux-fast-check:
     name: Build and test (Linux x86_64)
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    # IMPORTANT: The @tag below must match the version in .duckdb-version (currently v1.4.4).
+    # GitHub Actions 'uses:' does not support dynamic values, so update this manually
+    # whenever .duckdb-version changes.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
     with:
       duckdb_version: v1.4.4
-      ci_tools_version: main
+      ci_tools_version: v1.4.4
       extension_name: semantic_views
       extra_toolchains: 'rust;python3'
       # Only Linux x86_64 for fast PR feedback — full matrix runs on main/release branches.
