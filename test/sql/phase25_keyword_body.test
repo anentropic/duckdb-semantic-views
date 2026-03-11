@@ -1,0 +1,111 @@
+# Phase 25: SQL keyword body parser integration tests
+# Tests for CREATE SEMANTIC VIEW ... AS TABLES (...) RELATIONSHIPS (...) DIMENSIONS (...) METRICS (...)
+
+# Setup: minimal test table
+statement ok
+CREATE TABLE IF NOT EXISTS orders (o_orderkey INTEGER, o_custkey INTEGER, revenue DOUBLE, region VARCHAR);
+
+statement ok
+CREATE TABLE IF NOT EXISTS customers (c_custkey INTEGER, c_name VARCHAR);
+
+# DDL-01: CREATE SEMANTIC VIEW with keyword body (single table, no relationships)
+statement ok
+CREATE SEMANTIC VIEW orders_view AS
+TABLES (
+    o AS orders PRIMARY KEY (o_orderkey)
+)
+DIMENSIONS (
+    o.region AS region
+)
+METRICS (
+    o.total_revenue AS SUM(revenue)
+)
+
+# DDL-01: Query the created view to confirm it works
+query I rowsort
+SELECT total_revenue FROM semantic_view('orders_view', dimensions := [], metrics := ['total_revenue'])
+----
+NULL
+
+# DDL-07: CREATE OR REPLACE works with keyword body
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW orders_view AS
+TABLES (
+    o AS orders PRIMARY KEY (o_orderkey)
+)
+DIMENSIONS (
+    o.region AS region
+)
+METRICS (
+    o.total_revenue AS SUM(revenue)
+)
+
+# DDL-07: CREATE IF NOT EXISTS works with keyword body
+statement ok
+CREATE SEMANTIC VIEW IF NOT EXISTS orders_view AS
+TABLES (
+    o AS orders PRIMARY KEY (o_orderkey)
+)
+DIMENSIONS (
+    o.region AS region
+)
+METRICS (
+    o.total_revenue AS SUM(revenue)
+)
+
+# DDL-07: Multi-table view with RELATIONSHIPS clause
+statement ok
+CREATE SEMANTIC VIEW orders_customers_view AS
+TABLES (
+    o AS orders PRIMARY KEY (o_orderkey),
+    c AS customers PRIMARY KEY (c_custkey)
+)
+RELATIONSHIPS (
+    order_to_customer AS o(o_custkey) REFERENCES c
+)
+DIMENSIONS (
+    o.region AS region,
+    c.c_name AS customer_name
+)
+METRICS (
+    o.total_revenue AS SUM(revenue)
+)
+
+# DDL-07: DESCRIBE works
+query IIIIII rowsort
+DESCRIBE SEMANTIC VIEW orders_view
+----
+
+# DDL-07: SHOW works
+query II rowsort
+SHOW SEMANTIC VIEWS
+----
+
+# DDL-07: DROP works
+statement ok
+DROP SEMANTIC VIEW orders_customers_view
+
+# DDL-07: DROP IF EXISTS works
+statement ok
+DROP SEMANTIC VIEW IF EXISTS orders_customers_view
+
+# Error: TABLES clause is required
+statement error
+CREATE SEMANTIC VIEW bad_view AS
+DIMENSIONS (
+    o.region AS region
+)
+METRICS (
+    o.revenue AS SUM(revenue)
+)
+
+# Error: DIMENSIONS or METRICS is required
+statement error
+CREATE SEMANTIC VIEW bad_view2 AS
+TABLES (
+    o AS orders PRIMARY KEY (o_orderkey)
+)
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW IF EXISTS orders_view
