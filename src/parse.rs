@@ -7,6 +7,8 @@
 // 2. FFI entry points (`sv_validate_ddl_rust`, `sv_rewrite_ddl_rust`)
 //    feature-gated on `extension`, with `catch_unwind` for panic safety.
 
+use crate::body_parser::parse_keyword_body;
+
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.
 pub const PARSE_NOT_OURS: u8 = 0;
 /// Detected a semantic view DDL statement -- return `PARSE_SUCCESSFUL`.
@@ -559,7 +561,7 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
     match kind {
         // CREATE-with-body forms: validate clauses before rewriting
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
-            validate_create_body(query, trimmed_no_semi, trim_offset, plen)
+            validate_create_body(query, trimmed_no_semi, trim_offset, plen, kind)
         }
         // Name-only forms: validate name is present
         DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe => {
@@ -589,6 +591,7 @@ fn validate_create_body(
     trimmed_no_semi: &str,
     trim_offset: usize,
     plen: usize,
+    kind: DdlKind,
 ) -> Result<Option<String>, ParseError> {
     let after_prefix = trimmed_no_semi[plen..].trim_start();
     if after_prefix.is_empty() {
@@ -610,6 +613,30 @@ fn validate_create_body(
     }
 
     let after_name = &after_prefix[name_end..];
+
+    // --- AS keyword body path (new in Phase 25) ---
+    // If text after the name starts with "AS" (whitespace-delimited), route to the
+    // AS-body keyword parser instead of the legacy paren-body path.
+    let after_name_trimmed = after_name.trim_start();
+    let is_as_body = after_name_trimmed
+        .get(..2)
+        .is_some_and(|s| s.eq_ignore_ascii_case("AS"))
+        && (after_name_trimmed.len() == 2
+            || after_name_trimmed.as_bytes()[2].is_ascii_whitespace());
+    if is_as_body {
+        // Compute the byte offset of after_name_trimmed[0] within trimmed_no_semi.
+        // after_prefix starts at: plen + whitespace-gap between trimmed_no_semi[plen..] and after_prefix
+        let after_prefix_in_tns = plen + (trimmed_no_semi.len() - plen - after_prefix.len());
+        // after_name starts at name_end within after_prefix
+        let after_name_in_tns = after_prefix_in_tns + name_end;
+        // after_name_trimmed trims leading whitespace from after_name
+        let as_trim_gap = after_name.len() - after_name_trimmed.len();
+        let body_offset_in_tns = after_name_in_tns + as_trim_gap;
+        let body_offset = trim_offset + body_offset_in_tns;
+        return rewrite_ddl_keyword_body(kind, name, after_name_trimmed, body_offset);
+    }
+    // --- End AS keyword body path ---
+
     let Some(open_paren_rel) = after_name.find('(') else {
         let pos_in_trimmed = plen + (trimmed_no_semi.len() - plen - after_prefix.len()) + name_end;
         return Err(ParseError {
@@ -637,6 +664,63 @@ fn validate_create_body(
         message: e,
         position: None,
     })
+}
+
+/// Rewrite an AS-body CREATE DDL statement to a JSON-parameterized function call.
+///
+/// Called when `validate_create_body` detects the `AS` keyword path.
+/// Parses the keyword body via `parse_keyword_body`, serializes to JSON, and embeds in
+/// a `SELECT * FROM create_semantic_view_from_json('name', 'json')` call.
+fn rewrite_ddl_keyword_body(
+    kind: DdlKind,
+    name: &str,
+    body_text: &str,    // text starting at "AS" (inclusive)
+    body_offset: usize, // byte offset of body_text[0] in original query
+) -> Result<Option<String>, ParseError> {
+    // 1. Call parse_keyword_body (body_text starts at "AS"; pass body_offset)
+    let keyword_body = parse_keyword_body(body_text, body_offset)?;
+
+    // 2. Construct SemanticViewDefinition from KeywordBody
+    //    base_table = first table's physical table name (backward compat)
+    let base_table = keyword_body
+        .tables
+        .first()
+        .map(|t| t.table.clone())
+        .unwrap_or_default();
+
+    let def = crate::model::SemanticViewDefinition {
+        base_table,
+        tables: keyword_body.tables,
+        dimensions: keyword_body.dimensions,
+        metrics: keyword_body.metrics,
+        joins: keyword_body.relationships,
+        filters: vec![],
+        facts: vec![],
+        column_type_names: vec![],
+        column_types_inferred: vec![],
+    };
+
+    // 3. Serialize to JSON
+    let json = serde_json::to_string(&def).map_err(|e| ParseError {
+        message: format!("Failed to serialize definition: {e}"),
+        position: None,
+    })?;
+
+    // 4. SQL-escape single quotes in name and JSON
+    let safe_name = name.replace('\'', "''");
+    let safe_json = json.replace('\'', "''");
+
+    // 5. Pick the correct _from_json function name based on DDL kind
+    let fn_name = match kind {
+        DdlKind::Create => "create_semantic_view_from_json",
+        DdlKind::CreateOrReplace => "create_or_replace_semantic_view_from_json",
+        DdlKind::CreateIfNotExists => "create_semantic_view_if_not_exists_from_json",
+        _ => unreachable!("rewrite_ddl_keyword_body only called for CREATE forms"),
+    };
+
+    Ok(Some(format!(
+        "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1708,5 +1792,58 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.position.is_some());
+    }
+
+    // ===================================================================
+    // Phase 25 Plan 03: AS-body dispatch tests
+    // ===================================================================
+
+    mod phase25_parse_tests {
+        use super::*;
+
+        #[test]
+        fn as_body_create_rewrites_to_from_json() {
+            let query = "CREATE SEMANTIC VIEW v AS TABLES (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))";
+            let result = validate_and_rewrite(query).unwrap().unwrap();
+            assert!(
+                result.starts_with("SELECT * FROM create_semantic_view_from_json("),
+                "Got: {result}"
+            );
+            assert!(result.contains("'v'"), "Must contain view name: {result}");
+        }
+
+        #[test]
+        fn as_body_create_or_replace_rewrites_to_from_json() {
+            let query = "CREATE OR REPLACE SEMANTIC VIEW v AS TABLES (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))";
+            let result = validate_and_rewrite(query).unwrap().unwrap();
+            assert!(
+                result.starts_with("SELECT * FROM create_or_replace_semantic_view_from_json("),
+                "Got: {result}"
+            );
+        }
+
+        #[test]
+        fn as_body_create_if_not_exists_rewrites_to_from_json() {
+            let query = "CREATE SEMANTIC VIEW IF NOT EXISTS v AS TABLES (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))";
+            let result = validate_and_rewrite(query).unwrap().unwrap();
+            assert!(
+                result.starts_with("SELECT * FROM create_semantic_view_if_not_exists_from_json("),
+                "Got: {result}"
+            );
+        }
+
+        #[test]
+        fn old_paren_body_still_works() {
+            let query = "CREATE SEMANTIC VIEW v (tables := [], dimensions := [])";
+            let result = validate_and_rewrite(query);
+            assert!(result.is_ok(), "Old paren path must still work: {result:?}");
+        }
+
+        #[test]
+        fn drop_still_rewrites_unchanged() {
+            let query = "DROP SEMANTIC VIEW v";
+            let result = validate_and_rewrite(query).unwrap().unwrap();
+            assert_eq!(result, "SELECT * FROM drop_semantic_view('v')");
+        }
     }
 }
