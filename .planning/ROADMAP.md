@@ -124,7 +124,12 @@ Plans:
   3. RELATIONSHIPS clause accepts `name AS from_alias(fk_cols) REFERENCES to_alias` syntax
   4. DIMENSIONS and METRICS clauses accept `alias.name AS sql_expr` with comma separation
   5. All 7 DDL verbs (CREATE, CREATE OR REPLACE, IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, SHOW) work with the new body syntax
-**Plans**: TBD
+**Plans:** 4 plans
+Plans:
+- [ ] 25-01-PLAN.md -- C++ buffer fix, body_parser.rs skeleton, test scaffolding
+- [ ] 25-02-PLAN.md -- Implement TABLES, RELATIONSHIPS, DIMENSIONS, METRICS clause parsers
+- [ ] 25-03-PLAN.md -- Wire AS dispatch in parse.rs + DefineFromJsonVTab in define.rs
+- [ ] 25-04-PLAN.md -- End-to-end integration verification and human checkpoint
 
 ### Phase 26: PK/FK Join Resolution
 **Goal**: JOIN ON clauses are deterministically synthesized from PK/FK declarations, with invalid graphs rejected at define time
