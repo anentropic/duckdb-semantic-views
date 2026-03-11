@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.5.2
-milestone_name: SQL Body Parser
+milestone: v0.1
+milestone_name: milestone
 status: executing
-stopped_at: Completed 25-01-PLAN.md
-last_updated: "2026-03-11T23:05:00Z"
-last_activity: 2026-03-11 -- Completed Phase 25 Plan 01 (SQL body parser foundation)
+stopped_at: Completed 25-02-PLAN.md
+last_updated: "2026-03-11T23:18:53.845Z"
+last_activity: 2026-03-11 -- Phase 25 Plan 01 complete (SQL body parser foundation)
 progress:
   total_phases: 5
   completed_phases: 0
-  total_plans: 2
-  completed_plans: 1
-  percent: 10
+  total_plans: 6
+  completed_plans: 2
+  percent: 33
 ---
 
 # Project State
@@ -26,13 +26,19 @@ See: .planning/PROJECT.md (updated 2026-03-09)
 ## Current Position
 
 Phase: 25 (2 of 5 in v0.5.2)
-Plan: 1 of 3 in current phase (25-01 complete)
+Plan: 2 of 3 in current phase (25-02 complete)
 Status: Executing
-Last activity: 2026-03-11 -- Phase 25 Plan 01 complete (SQL body parser foundation)
+Last activity: 2026-03-11 -- Phase 25 Plan 02 complete (keyword body parser implementation)
 
-Progress: [#.........] 10%
+Progress: [███░░░░░░░] 33%
 
 ## Performance Metrics
+
+**Velocity (v0.5.2, current):**
+- Plans completed: 2 (25-01, 25-02)
+- Timeline: 2026-03-11 (ongoing)
+- 25-01: 19 min / 3 tasks / 8 files
+- 25-02: 8 min / 2 tasks / 1 file
 
 **Velocity (v0.5.1):**
 - Total plans completed: 9
@@ -58,6 +64,8 @@ Recent decisions affecting current work:
 - [25-01]: 16 KB validation path / 64 KB execution path buffer sizes for C++ DDL shim
 - [25-01]: Phase 24 model fields (pk_columns, from_alias, fk_columns, name) added in 25-01 as Rule 3 auto-fix
 - [25-01]: skip_serializing_if on all new model fields for backward-compatible JSON
+- [Phase 25]: Single commit for Tasks 1+2: both operate on same file as coherent implementation unit
+- [Phase 25]: allow(too_many_lines) on find_clause_bounds: state machine intentionally kept in one place for readability
 
 ### Pending Todos
 
@@ -77,6 +85,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-11T23:05:00Z
-Stopped at: Completed 25-01-PLAN.md
-Resume file: .planning/phases/25-sql-body-parser/25-02-PLAN.md
+Last session: 2026-03-11T23:18:53.825Z
+Stopped at: Completed 25-02-PLAN.md
+Resume file: None

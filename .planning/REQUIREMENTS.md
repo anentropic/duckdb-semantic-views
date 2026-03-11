@@ -10,10 +10,10 @@ Requirements for SQL DDL syntax, PK/FK relationship model, and qualified column 
 ### DDL Syntax
 
 - [ ] **DDL-01**: `CREATE SEMANTIC VIEW` accepts SQL keyword body: `TABLES (...)`, `RELATIONSHIPS (...)`, `DIMENSIONS (...)`, `METRICS (...)`
-- [ ] **DDL-02**: TABLES clause parses `alias AS physical_table PRIMARY KEY (col, ...)`
-- [ ] **DDL-03**: RELATIONSHIPS clause parses `[name AS] from_alias(fk_cols) REFERENCES to_alias`
-- [ ] **DDL-04**: DIMENSIONS clause parses `alias.dim_name AS sql_expr`
-- [ ] **DDL-05**: METRICS clause parses `alias.metric_name AS agg_expr`
+- [x] **DDL-02**: TABLES clause parses `alias AS physical_table PRIMARY KEY (col, ...)`
+- [x] **DDL-03**: RELATIONSHIPS clause parses `[name AS] from_alias(fk_cols) REFERENCES to_alias`
+- [x] **DDL-04**: DIMENSIONS clause parses `alias.dim_name AS sql_expr`
+- [x] **DDL-05**: METRICS clause parses `alias.metric_name AS agg_expr`
 - [ ] **DDL-06**: Function-based `create_semantic_view()` accepts equivalent PK/FK model parameters
 - [ ] **DDL-07**: All 7 DDL verbs work with new syntax (CREATE, CREATE OR REPLACE, IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, SHOW)
 
@@ -85,10 +85,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | DDL-01 | Phase 25 | Pending |
-| DDL-02 | Phase 25 | Pending |
-| DDL-03 | Phase 25 | Pending |
-| DDL-04 | Phase 25 | Pending |
-| DDL-05 | Phase 25 | Pending |
+| DDL-02 | Phase 25 | Complete |
+| DDL-03 | Phase 25 | Complete |
+| DDL-04 | Phase 25 | Complete |
+| DDL-05 | Phase 25 | Complete |
 | DDL-06 | Phase 24 | Pending |
 | DDL-07 | Phase 25 | Pending |
 | MDL-01 | Phase 24 | Pending |
