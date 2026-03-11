@@ -67,16 +67,15 @@ static duckdb_connection sv_ddl_conn = nullptr;
 //   - DISPLAY_ORIGINAL_ERROR: not our statement, let DuckDB show its error
 static ParserExtensionParseResult sv_parse_stub(
     ParserExtensionInfo *, const string &query) {
-    char sql_buf[4096];
+    std::string sql_str(16384, '\0');  // 16 KB: validation path, not executed
     char error_buf[1024];
     uint32_t position = UINT32_MAX;
-    memset(sql_buf, 0, sizeof(sql_buf));
     memset(error_buf, 0, sizeof(error_buf));
 
     uint8_t rc = sv_validate_ddl_rust(
         reinterpret_cast<const char *>(query.c_str()),
         query.size(),
-        sql_buf, sizeof(sql_buf),
+        sql_str.data(), sql_str.size(),
         error_buf, sizeof(error_buf),
         &position);
 
@@ -136,14 +135,13 @@ static unique_ptr<FunctionData> sv_ddl_bind(
     auto query = StringValue::Get(input.inputs[0]);
 
     // Step 1: Rewrite DDL to function call SQL via Rust FFI
-    char sql_buf[4096];
+    std::string sql_str(65536, '\0');  // 64 KB: execution path needs headroom for large views
     char error_buf[1024];
-    memset(sql_buf, 0, sizeof(sql_buf));
     memset(error_buf, 0, sizeof(error_buf));
 
     uint8_t rc = sv_rewrite_ddl_rust(
         query.c_str(), query.size(),
-        sql_buf, sizeof(sql_buf),
+        sql_str.data(), sql_str.size(),
         error_buf, sizeof(error_buf));
 
     if (rc != 0) {
@@ -152,7 +150,7 @@ static unique_ptr<FunctionData> sv_ddl_bind(
 
     // Step 2: Execute the rewritten SQL on the DDL connection
     duckdb_result result;
-    if (duckdb_query(sv_ddl_conn, sql_buf, &result) != DuckDBSuccess) {
+    if (duckdb_query(sv_ddl_conn, sql_str.c_str(), &result) != DuckDBSuccess) {
         auto err_ptr = duckdb_result_error(&result);
         string err_msg = err_ptr ? string(err_ptr) : "DDL execution failed (unknown error)";
         duckdb_destroy_result(&result);
