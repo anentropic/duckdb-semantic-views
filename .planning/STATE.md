@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: executing
-stopped_at: Completed 25-02-PLAN.md
-last_updated: "2026-03-11T23:18:53.845Z"
-last_activity: 2026-03-11 -- Phase 25 Plan 01 complete (SQL body parser foundation)
+stopped_at: Completed 25-03-PLAN.md
+last_updated: "2026-03-11T23:29:48.774Z"
+last_activity: 2026-03-11 -- Phase 25 Plan 02 complete (keyword body parser implementation)
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 6
-  completed_plans: 2
+  completed_plans: 3
   percent: 33
 ---
 
@@ -66,6 +66,9 @@ Recent decisions affecting current work:
 - [25-01]: skip_serializing_if on all new model fields for backward-compatible JSON
 - [Phase 25]: Single commit for Tasks 1+2: both operate on same file as coherent implementation unit
 - [Phase 25]: allow(too_many_lines) on find_clause_bounds: state machine intentionally kept in one place for readability
+- [Phase 25-sql-body-parser]: kind param added to validate_create_body for AS-body dispatch without global state
+- [Phase 25-sql-body-parser]: DefineFromJsonVTab reuses DefineBindData/DefineInitData/DefineState; no new types needed
+- [Phase 25-sql-body-parser]: JSON-bridge pattern: AS-body parsed in Rust, serialized to JSON, embedded in SELECT * FROM fn_from_json(name, json)
 
 ### Pending Todos
 
@@ -82,9 +85,10 @@ None.
 |---|-------------|------|--------|-----------|
 | 14 | Remove 3 orphaned backward-compat FFI exports | 2026-03-09 | ea84c9b | [14-remove-3-orphaned-backward-compat-ffi-ex](./quick/14-remove-3-orphaned-backward-compat-ffi-ex/) |
 | 15 | Fix CI amalgamation auto-download | 2026-03-09 | 3859d68 | [15-check-gh-run-list-and-fix-the-failing-jo](./quick/15-check-gh-run-list-and-fix-the-failing-jo/) |
+| Phase 25-sql-body-parser P03 | 8 | 2 tasks | 3 files |
 
 ## Session Continuity
 
-Last session: 2026-03-11T23:18:53.825Z
-Stopped at: Completed 25-02-PLAN.md
+Last session: 2026-03-11T23:29:48.772Z
+Stopped at: Completed 25-03-PLAN.md
 Resume file: None
