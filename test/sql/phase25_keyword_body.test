@@ -1,18 +1,26 @@
 # Phase 25: SQL keyword body parser integration tests
 # Tests for CREATE SEMANTIC VIEW ... AS TABLES (...) RELATIONSHIPS (...) DIMENSIONS (...) METRICS (...)
 
-# Setup: minimal test table
+require semantic_views
+
+# Setup: minimal test tables with data
 statement ok
-CREATE TABLE IF NOT EXISTS orders (o_orderkey INTEGER, o_custkey INTEGER, revenue DOUBLE, region VARCHAR);
+CREATE TABLE p25_orders (o_orderkey INTEGER, o_custkey INTEGER, revenue DOUBLE, region VARCHAR);
 
 statement ok
-CREATE TABLE IF NOT EXISTS customers (c_custkey INTEGER, c_name VARCHAR);
+INSERT INTO p25_orders VALUES (1, 10, 100.0, 'East'), (2, 20, 200.0, 'West');
+
+statement ok
+CREATE TABLE p25_customers (c_custkey INTEGER, c_name VARCHAR);
+
+statement ok
+INSERT INTO p25_customers VALUES (10, 'Alice'), (20, 'Bob');
 
 # DDL-01: CREATE SEMANTIC VIEW with keyword body (single table, no relationships)
 statement ok
-CREATE SEMANTIC VIEW orders_view AS
+CREATE SEMANTIC VIEW p25_orders_view AS
 TABLES (
-    o AS orders PRIMARY KEY (o_orderkey)
+    o AS p25_orders PRIMARY KEY (o_orderkey)
 )
 DIMENSIONS (
     o.region AS region
@@ -21,17 +29,18 @@ METRICS (
     o.total_revenue AS SUM(revenue)
 )
 
-# DDL-01: Query the created view to confirm it works
-query I rowsort
-SELECT total_revenue FROM semantic_view('orders_view', dimensions := [], metrics := ['total_revenue'])
+# DDL-01: Query the created view to confirm it works end-to-end
+query TT rowsort
+SELECT region, total_revenue FROM semantic_view('p25_orders_view', dimensions := ['region'], metrics := ['total_revenue'])
 ----
-NULL
+East	100.0
+West	200.0
 
 # DDL-07: CREATE OR REPLACE works with keyword body
 statement ok
-CREATE OR REPLACE SEMANTIC VIEW orders_view AS
+CREATE OR REPLACE SEMANTIC VIEW p25_orders_view AS
 TABLES (
-    o AS orders PRIMARY KEY (o_orderkey)
+    o AS p25_orders PRIMARY KEY (o_orderkey)
 )
 DIMENSIONS (
     o.region AS region
@@ -40,11 +49,11 @@ METRICS (
     o.total_revenue AS SUM(revenue)
 )
 
-# DDL-07: CREATE IF NOT EXISTS works with keyword body
+# DDL-07: CREATE IF NOT EXISTS works with keyword body (no-op on existing view)
 statement ok
-CREATE SEMANTIC VIEW IF NOT EXISTS orders_view AS
+CREATE SEMANTIC VIEW IF NOT EXISTS p25_orders_view AS
 TABLES (
-    o AS orders PRIMARY KEY (o_orderkey)
+    o AS p25_orders PRIMARY KEY (o_orderkey)
 )
 DIMENSIONS (
     o.region AS region
@@ -55,10 +64,10 @@ METRICS (
 
 # DDL-07: Multi-table view with RELATIONSHIPS clause
 statement ok
-CREATE SEMANTIC VIEW orders_customers_view AS
+CREATE SEMANTIC VIEW p25_oc_view AS
 TABLES (
-    o AS orders PRIMARY KEY (o_orderkey),
-    c AS customers PRIMARY KEY (c_custkey)
+    o AS p25_orders PRIMARY KEY (o_orderkey),
+    c AS p25_customers PRIMARY KEY (c_custkey)
 )
 RELATIONSHIPS (
     order_to_customer AS o(o_custkey) REFERENCES c
@@ -71,41 +80,54 @@ METRICS (
     o.total_revenue AS SUM(revenue)
 )
 
-# DDL-07: DESCRIBE works
-query IIIIII rowsort
-DESCRIBE SEMANTIC VIEW orders_view
+# DDL-07: DESCRIBE works -- returns 6 VARCHAR columns
+query TTTTTT
+DESCRIBE SEMANTIC VIEW p25_orders_view
 ----
+p25_orders_view	p25_orders	[{"expr":"region","name":"region","output_type":null,"source_table":"o"}]	[{"expr":"SUM(revenue)","name":"total_revenue","output_type":null,"source_table":"o"}]	[]	[]
 
-# DDL-07: SHOW works
-query II rowsort
+# DDL-07: SHOW works -- returns view name and base_table for all current views
+query TT rowsort
 SHOW SEMANTIC VIEWS
 ----
+p25_oc_view	p25_orders
+p25_orders_view	p25_orders
 
 # DDL-07: DROP works
 statement ok
-DROP SEMANTIC VIEW orders_customers_view
+DROP SEMANTIC VIEW p25_oc_view
 
-# DDL-07: DROP IF EXISTS works
+# DDL-07: DROP IF EXISTS works (view already dropped -- should succeed silently)
 statement ok
-DROP SEMANTIC VIEW IF EXISTS orders_customers_view
+DROP SEMANTIC VIEW IF EXISTS p25_oc_view
 
 # Error: TABLES clause is required
 statement error
-CREATE SEMANTIC VIEW bad_view AS
+CREATE SEMANTIC VIEW p25_bad_view AS
 DIMENSIONS (
     o.region AS region
 )
 METRICS (
     o.revenue AS SUM(revenue)
 )
+----
+TABLES
 
 # Error: DIMENSIONS or METRICS is required
 statement error
-CREATE SEMANTIC VIEW bad_view2 AS
+CREATE SEMANTIC VIEW p25_bad_view2 AS
 TABLES (
-    o AS orders PRIMARY KEY (o_orderkey)
+    o AS p25_orders PRIMARY KEY (o_orderkey)
 )
+----
+DIMENSIONS
 
 # Cleanup
 statement ok
-DROP SEMANTIC VIEW IF EXISTS orders_view
+DROP SEMANTIC VIEW IF EXISTS p25_orders_view
+
+statement ok
+DROP TABLE p25_orders
+
+statement ok
+DROP TABLE p25_customers

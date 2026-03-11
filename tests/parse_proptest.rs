@@ -681,34 +681,56 @@ proptest! {
         );
     }
 
-    /// AS-body validate_and_rewrite returns Ok(Some(_)) for valid keyword body.
-    /// This test will FAIL until Plan 03 wires the AS dispatch into validate_create_body.
-    /// Expected failure documented here as part of Wave 0 gap contract.
+    /// AS-body validate_and_rewrite returns Ok(Some(_)) for valid keyword body,
+    /// and the rewritten SQL uses the create_semantic_view_from_json route with
+    /// the view name embedded as a quoted string.
     #[test]
     fn as_body_validate_and_rewrite_succeeds(
         name in arb_view_name(),
     ) {
         let query = format!("CREATE SEMANTIC VIEW{}", build_as_body_suffix(&name));
-        // This should succeed after Plan 03 implements the AS dispatch.
-        // For now, we assert the kind is detected (weaker check that always passes).
-        prop_assert_eq!(detect_ddl_kind(&query), Some(DdlKind::Create));
-        // The full validate_and_rewrite check is added in Plan 03 summary test update.
+        let result = validate_and_rewrite(&query);
+        prop_assert!(
+            result.is_ok(),
+            "Expected Ok for valid AS-body DDL, got: {:?}",
+            result
+        );
+        let sql = result.unwrap();
+        prop_assert!(
+            sql.is_some(),
+            "Expected Some(sql) for valid AS-body DDL"
+        );
+        let sql = sql.unwrap();
+        prop_assert!(
+            sql.starts_with("SELECT * FROM create_semantic_view_from_json("),
+            "Expected create_semantic_view_from_json route, got: {sql}"
+        );
+        prop_assert!(
+            sql.contains(&format!("'{name}'")),
+            "Expected view name in rewritten SQL, got: {sql}"
+        );
     }
 
-    /// Error position inside AS-body clause points at correct byte offset.
+    /// Error position inside AS-body clause points at the typo byte offset.
     /// This property verifies the base_offset threading invariant from RESEARCH.md Pitfall 1.
     #[test]
     fn as_body_position_invariant_clause_typo(
         spaces in "[ ]{0,20}",
     ) {
-        // When the implementation is complete, this error query should produce
-        // an error pointing at "TABLSE". Until Plan 02/03, validate_and_rewrite
-        // may return Err with Expected '(' message. We assert the query is detected.
         let query = format!("{spaces}CREATE SEMANTIC VIEW x AS TABLSE (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))");
+        let err = validate_and_rewrite(&query).unwrap_err();
+        let pos = err.position.unwrap();
+        // Position must point at "TABLSE" in the original query.
         prop_assert_eq!(
-            detect_ddl_kind(&query),
-            Some(DdlKind::Create),
-            "AS-body query should be detected even with clause typo in body"
+            &query[pos..pos + 6],
+            "TABLSE",
+            "Position {} does not point at 'TABLSE' in query: {:?}",
+            pos, query
+        );
+        prop_assert!(
+            err.message.contains("TABLES") || err.message.contains("tables"),
+            "Expected 'did you mean TABLES' error, got: {}",
+            err.message
         );
     }
 }

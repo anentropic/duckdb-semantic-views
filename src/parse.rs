@@ -857,8 +857,14 @@ pub extern "C" fn sv_rewrite_ddl_rust(
                 std::str::from_utf8_unchecked(std::slice::from_raw_parts(query_ptr, query_len))
             };
 
-            // Rewrite DDL to function call (does NOT execute)
-            rewrite_ddl(query)
+            // Use validate_and_rewrite so both paren-body and AS-body DDL are handled.
+            // validate_and_rewrite returns:
+            //   Ok(Some(sql)) -- DDL detected and rewritten
+            //   Ok(None)      -- not our DDL (should not happen here since parse hook already accepted it)
+            //   Err(ParseError) -- validation/parse error
+            validate_and_rewrite(query)
+                .map_err(|e| e.message)
+                .and_then(|opt| opt.ok_or_else(|| "DDL not recognized".to_string()))
         },
     ));
 
