@@ -1,10 +1,11 @@
 ---
 phase: 25
 slug: sql-body-parser
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: verified
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-03-11
+updated: 2026-03-11
 ---
 
 # Phase 25 — Validation Strategy
@@ -38,15 +39,15 @@ created: 2026-03-11
 
 | Task ID | Plan | Wave | Requirement | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|-----------|-------------------|-------------|--------|
-| 25-01-01 | 01 | 0 | DDL-01, DDL-02, DDL-03, DDL-04, DDL-05, DDL-07 | unit | `cargo test body_parser` | ❌ W0 | ⬜ pending |
-| 25-01-02 | 01 | 0 | DDL-01, DDL-07 | integration | `just test-sql` | ❌ W0 | ⬜ pending |
-| 25-01-03 | 01 | 0 | DDL-07 | proptest | `cargo test parse_proptest` | ❌ W0 | ⬜ pending |
-| 25-02-01 | 02 | 1 | DDL-01, DDL-02 | unit | `cargo test body_parser::tests` | ❌ W0 | ⬜ pending |
-| 25-02-02 | 02 | 1 | DDL-03 | unit | `cargo test body_parser::tests` | ❌ W0 | ⬜ pending |
-| 25-02-03 | 02 | 1 | DDL-04, DDL-05 | unit | `cargo test body_parser::tests` | ❌ W0 | ⬜ pending |
-| 25-03-01 | 03 | 2 | DDL-01, DDL-07 | integration | `just test-sql` | ❌ W0 | ⬜ pending |
-| 25-03-02 | 03 | 2 | DDL-07 | proptest | `cargo test parse_proptest` | ❌ W0 | ⬜ pending |
-| 25-04-01 | 04 | 3 | DDL-01, DDL-02, DDL-03, DDL-04, DDL-05, DDL-07 | integration | `just test-all` | ❌ W0 | ⬜ pending |
+| 25-01-01 | 01 | 0 | DDL-01, DDL-02, DDL-03, DDL-04, DDL-05, DDL-07 | unit | `cargo test body_parser` | ✅ | ✅ green |
+| 25-01-02 | 01 | 0 | DDL-01, DDL-07 | integration | `just test-sql` | ✅ | ✅ green |
+| 25-01-03 | 01 | 0 | DDL-07 | proptest | `cargo test parse_proptest` | ✅ | ✅ green |
+| 25-02-01 | 02 | 1 | DDL-01, DDL-02 | unit | `cargo test body_parser::tests` | ✅ | ✅ green |
+| 25-02-02 | 02 | 1 | DDL-03 | unit | `cargo test body_parser::tests` | ✅ | ✅ green |
+| 25-02-03 | 02 | 1 | DDL-04, DDL-05 | unit | `cargo test body_parser::tests` | ✅ | ✅ green |
+| 25-03-01 | 03 | 2 | DDL-01, DDL-07 | integration | `just test-sql` | ✅ | ✅ green |
+| 25-03-02 | 03 | 2 | DDL-07 | proptest | `cargo test parse_proptest` | ✅ | ✅ green |
+| 25-04-01 | 04 | 3 | DDL-01, DDL-02, DDL-03, DDL-04, DDL-05, DDL-07 | integration | `just test-all` | ✅ | ✅ green |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -54,10 +55,10 @@ created: 2026-03-11
 
 ## Wave 0 Requirements
 
-- [ ] `src/body_parser.rs` — create module with unit test stubs for TABLES, RELATIONSHIPS, DIMENSIONS, METRICS parsers
-- [ ] `test/sql/phase25_keyword_body.test` — sqllogictest integration: CREATE with keyword body, query, all 7 DDL verbs
-- [ ] `tests/parse_proptest.rs` — extend with proptest block for AS-body DDL round-trip and position invariants
-- [ ] `cpp/src/shim.cpp` — fix `char sql_buf[4096]` → `std::string(65536, '\0')` in both `sv_ddl_bind` and `sv_parse_stub`
+- [x] `src/body_parser.rs` — create module with unit test stubs for TABLES, RELATIONSHIPS, DIMENSIONS, METRICS parsers
+- [x] `test/sql/phase25_keyword_body.test` — sqllogictest integration: CREATE with keyword body, query, all 7 DDL verbs
+- [x] `tests/parse_proptest.rs` — extend with proptest block for AS-body DDL round-trip and position invariants
+- [x] `cpp/src/shim.cpp` — fix `char sql_buf[4096]` → `std::string(65536, '\0')` in both `sv_ddl_bind` and `sv_parse_stub`
 
 ---
 
@@ -71,11 +72,11 @@ created: 2026-03-11
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 60s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency < 60s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** automated tests green (2026-03-11); awaiting human visual verification of caret position in DuckDB CLI

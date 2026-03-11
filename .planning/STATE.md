@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: executing
-stopped_at: Completed 25-03-PLAN.md
-last_updated: "2026-03-11T23:29:48.774Z"
-last_activity: 2026-03-11 -- Phase 25 Plan 02 complete (keyword body parser implementation)
+stopped_at: "Paused at checkpoint:human-verify in 25-04-PLAN.md (Task 3)"
+last_updated: "2026-03-11T23:40:37.000Z"
+last_activity: 2026-03-11 -- Phase 25 Plan 04 Tasks 1-2 complete (integration tests + AS-body dispatch fix)
 progress:
   total_phases: 5
   completed_phases: 0
@@ -26,19 +26,21 @@ See: .planning/PROJECT.md (updated 2026-03-09)
 ## Current Position
 
 Phase: 25 (2 of 5 in v0.5.2)
-Plan: 2 of 3 in current phase (25-02 complete)
-Status: Executing
-Last activity: 2026-03-11 -- Phase 25 Plan 02 complete (keyword body parser implementation)
+Plan: 4 of 4 in current phase (25-04 Tasks 1-2 complete, awaiting checkpoint:human-verify)
+Status: Executing (paused at checkpoint)
+Last activity: 2026-03-11 -- Phase 25 Plan 04 Tasks 1-2 complete (integration tests + AS-body dispatch fix)
 
 Progress: [███░░░░░░░] 33%
 
 ## Performance Metrics
 
 **Velocity (v0.5.2, current):**
-- Plans completed: 2 (25-01, 25-02)
+- Plans completed: 3 (25-01, 25-02, 25-03); 25-04 in progress
 - Timeline: 2026-03-11 (ongoing)
 - 25-01: 19 min / 3 tasks / 8 files
 - 25-02: 8 min / 2 tasks / 1 file
+- 25-03: 8 min / 2 tasks / 3 files
+- 25-04: ~20 min / 2 tasks (auto) + 1 checkpoint / 5 files
 
 **Velocity (v0.5.1):**
 - Total plans completed: 9
@@ -69,6 +71,8 @@ Recent decisions affecting current work:
 - [Phase 25-sql-body-parser]: kind param added to validate_create_body for AS-body dispatch without global state
 - [Phase 25-sql-body-parser]: DefineFromJsonVTab reuses DefineBindData/DefineInitData/DefineState; no new types needed
 - [Phase 25-sql-body-parser]: JSON-bridge pattern: AS-body parsed in Rust, serialized to JSON, embedded in SELECT * FROM fn_from_json(name, json)
+- [25-04]: sv_rewrite_ddl_rust must use validate_and_rewrite (not rewrite_ddl) to route both paren-body and AS-body DDL correctly
+- [25-04]: sqllogictest tables use phase-prefixed names (p25_) to avoid cross-test catalog pollution
 
 ### Pending Todos
 
@@ -89,6 +93,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-11T23:29:48.772Z
-Stopped at: Completed 25-03-PLAN.md
+Last session: 2026-03-11T23:40:37Z
+Stopped at: "Paused at checkpoint:human-verify in 25-04-PLAN.md (Task 3)"
 Resume file: None

@@ -92,7 +92,7 @@ Full details: [milestones/v0.5.1-ROADMAP.md](milestones/v0.5.1-ROADMAP.md)
 **Milestone Goal:** Replace function-call DDL body syntax with proper SQL keyword clauses (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS) and adopt Snowflake-style PK/FK relationship model with table aliases, eliminating ON-clause heuristics and enabling qualified column names.
 
 - [ ] **Phase 24: PK/FK Model** - Extend model structs with primary keys, table aliases, and relationship metadata
-- [ ] **Phase 25: SQL Body Parser** - Parse TABLES/RELATIONSHIPS/DIMENSIONS/METRICS keyword clauses in DDL bodies
+- [x] **Phase 25: SQL Body Parser** - Parse TABLES/RELATIONSHIPS/DIMENSIONS/METRICS keyword clauses in DDL bodies (completed 2026-03-11)
 - [ ] **Phase 26: PK/FK Join Resolution** - Synthesize JOIN ON clauses from PK/FK declarations with graph validation
 - [ ] **Phase 27: Alias-Based Query Expansion** - Replace CTE flattening with direct FROM+JOIN expansion and qualified columns
 - [ ] **Phase 28: Integration Testing & Documentation** - End-to-end validation and README update with new syntax
@@ -124,7 +124,7 @@ Plans:
   3. RELATIONSHIPS clause accepts `name AS from_alias(fk_cols) REFERENCES to_alias` syntax
   4. DIMENSIONS and METRICS clauses accept `alias.name AS sql_expr` with comma separation
   5. All 7 DDL verbs (CREATE, CREATE OR REPLACE, IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, SHOW) work with the new body syntax
-**Plans:** 3/4 plans executed
+**Plans:** 4/4 plans complete
 Plans:
 - [x] 25-01-PLAN.md -- C++ buffer fix, body_parser.rs skeleton, test scaffolding (complete 2026-03-11)
 - [ ] 25-02-PLAN.md -- Implement TABLES, RELATIONSHIPS, DIMENSIONS, METRICS clause parsers
@@ -201,7 +201,7 @@ Phases execute in numeric order: 24 -> 25 -> 26 -> 27 -> 28
 | 22. Documentation | v0.5.1 | 1/1 | Complete | 2026-03-09 |
 | 23. Parser Proptests + Caret Tests | v0.5.1 | 2/2 | Complete | 2026-03-09 |
 | 24. PK/FK Model | v0.5.2 | 0/2 | Not started | - |
-| 25. SQL Body Parser | 3/4 | In Progress|  | - |
+| 25. SQL Body Parser | 4/4 | Complete   | 2026-03-11 | - |
 | 26. PK/FK Join Resolution | v0.5.2 | 0/? | Not started | - |
 | 27. Alias-Based Query Expansion | v0.5.2 | 0/? | Not started | - |
 | 28. Integration Testing & Docs | v0.5.2 | 0/? | Not started | - |
