@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.1
-milestone_name: milestone
-status: planning
-stopped_at: Phase 25 context gathered
-last_updated: "2026-03-11T22:22:51.571Z"
-last_activity: 2026-03-09 -- Roadmap created for v0.5.2 (Phases 24-28)
+milestone: v0.5.2
+milestone_name: SQL Body Parser
+status: executing
+stopped_at: Completed 25-01-PLAN.md
+last_updated: "2026-03-11T23:05:00Z"
+last_activity: 2026-03-11 -- Completed Phase 25 Plan 01 (SQL body parser foundation)
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 2
-  completed_plans: 0
-  percent: 0
+  completed_plans: 1
+  percent: 10
 ---
 
 # Project State
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-03-09)
 
 ## Current Position
 
-Phase: 24 (1 of 5 in v0.5.2)
-Plan: 0 of ? in current phase
-Status: Ready to plan
-Last activity: 2026-03-09 -- Roadmap created for v0.5.2 (Phases 24-28)
+Phase: 25 (2 of 5 in v0.5.2)
+Plan: 1 of 3 in current phase (25-01 complete)
+Status: Executing
+Last activity: 2026-03-11 -- Phase 25 Plan 01 complete (SQL body parser foundation)
 
-Progress: [..........] 0%
+Progress: [#.........] 10%
 
 ## Performance Metrics
 
@@ -55,6 +55,9 @@ Recent decisions affecting current work:
 - [v0.5.2 init]: NO backward compatibility needed -- pre-release, old syntax removed entirely
 - [v0.5.2 init]: Snowflake semantic view syntax is the DDL grammar model
 - [v0.5.2 init]: Zero new Cargo dependencies -- hand-written parser and graph traversal
+- [25-01]: 16 KB validation path / 64 KB execution path buffer sizes for C++ DDL shim
+- [25-01]: Phase 24 model fields (pk_columns, from_alias, fk_columns, name) added in 25-01 as Rule 3 auto-fix
+- [25-01]: skip_serializing_if on all new model fields for backward-compatible JSON
 
 ### Pending Todos
 
@@ -63,7 +66,7 @@ None.
 ### Blockers/Concerns
 
 - Research flag: verify `build_execution_sql` type-cast wrapper works with direct FROM+JOIN SQL (spike before Phase 27)
-- Research flag: C++ shim 4096-byte DDL buffer -- measure SQL keyword body sizes during Phase 25
+- C++ shim 4096-byte DDL buffer: RESOLVED in Phase 25 Plan 01 (upgraded to 64 KB heap allocation)
 
 ### Quick Tasks Completed
 
@@ -74,6 +77,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-11T22:22:51.564Z
-Stopped at: Phase 25 context gathered
-Resume file: .planning/phases/25-sql-body-parser/25-CONTEXT.md
+Last session: 2026-03-11T23:05:00Z
+Stopped at: Completed 25-01-PLAN.md
+Resume file: .planning/phases/25-sql-body-parser/25-02-PLAN.md

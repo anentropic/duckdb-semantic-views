@@ -126,7 +126,7 @@ Plans:
   5. All 7 DDL verbs (CREATE, CREATE OR REPLACE, IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, SHOW) work with the new body syntax
 **Plans:** 4 plans
 Plans:
-- [ ] 25-01-PLAN.md -- C++ buffer fix, body_parser.rs skeleton, test scaffolding
+- [x] 25-01-PLAN.md -- C++ buffer fix, body_parser.rs skeleton, test scaffolding (complete 2026-03-11)
 - [ ] 25-02-PLAN.md -- Implement TABLES, RELATIONSHIPS, DIMENSIONS, METRICS clause parsers
 - [ ] 25-03-PLAN.md -- Wire AS dispatch in parse.rs + DefineFromJsonVTab in define.rs
 - [ ] 25-04-PLAN.md -- End-to-end integration verification and human checkpoint
