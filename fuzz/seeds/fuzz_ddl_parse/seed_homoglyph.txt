@@ -1,0 +1,1 @@
+СREATE SEMANTIC VIEW v (tables := [], dimensions := [])
