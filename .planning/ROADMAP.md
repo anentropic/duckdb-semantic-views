@@ -201,7 +201,7 @@ Phases execute in numeric order: 24 -> 25 -> 26 -> 27 -> 28
 | 22. Documentation | v0.5.1 | 1/1 | Complete | 2026-03-09 |
 | 23. Parser Proptests + Caret Tests | v0.5.1 | 2/2 | Complete | 2026-03-09 |
 | 24. PK/FK Model | v0.5.2 | 0/2 | Not started | - |
-| 25. SQL Body Parser | 4/4 | Complete   | 2026-03-11 | - |
+| 25. SQL Body Parser | 4/4 | Complete   | 2026-03-12 | - |
 | 26. PK/FK Join Resolution | v0.5.2 | 0/? | Not started | - |
 | 27. Alias-Based Query Expansion | v0.5.2 | 0/? | Not started | - |
 | 28. Integration Testing & Docs | v0.5.2 | 0/? | Not started | - |

@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
-status: executing
-stopped_at: "Paused at checkpoint:human-verify in 25-04-PLAN.md (Task 3)"
-last_updated: "2026-03-11T23:40:37.000Z"
+status: paused
+stopped_at: Completed 25-04-PLAN.md (Phase 25 fully complete)
+last_updated: "2026-03-12T00:20:30.944Z"
 last_activity: 2026-03-11 -- Phase 25 Plan 04 Tasks 1-2 complete (integration tests + AS-body dispatch fix)
 progress:
   total_phases: 5
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 6
-  completed_plans: 3
+  completed_plans: 4
   percent: 33
 ---
 
@@ -73,6 +73,7 @@ Recent decisions affecting current work:
 - [Phase 25-sql-body-parser]: JSON-bridge pattern: AS-body parsed in Rust, serialized to JSON, embedded in SELECT * FROM fn_from_json(name, json)
 - [25-04]: sv_rewrite_ddl_rust must use validate_and_rewrite (not rewrite_ddl) to route both paren-body and AS-body DDL correctly
 - [25-04]: sqllogictest tables use phase-prefixed names (p25_) to avoid cross-test catalog pollution
+- [Phase 25-04]: sv_rewrite_ddl_rust must call validate_and_rewrite (not rewrite_ddl) to handle both paren-body and AS-body DDL through the same dispatch path
 
 ### Pending Todos
 
@@ -90,9 +91,10 @@ None.
 | 14 | Remove 3 orphaned backward-compat FFI exports | 2026-03-09 | ea84c9b | [14-remove-3-orphaned-backward-compat-ffi-ex](./quick/14-remove-3-orphaned-backward-compat-ffi-ex/) |
 | 15 | Fix CI amalgamation auto-download | 2026-03-09 | 3859d68 | [15-check-gh-run-list-and-fix-the-failing-jo](./quick/15-check-gh-run-list-and-fix-the-failing-jo/) |
 | Phase 25-sql-body-parser P03 | 8 | 2 tasks | 3 files |
+| Phase 25-sql-body-parser P04 | 25 | 3 tasks | 5 files |
 
 ## Session Continuity
 
-Last session: 2026-03-11T23:40:37Z
-Stopped at: "Paused at checkpoint:human-verify in 25-04-PLAN.md (Task 3)"
+Last session: 2026-03-12T00:20:30.935Z
+Stopped at: Completed 25-04-PLAN.md (Phase 25 fully complete)
 Resume file: None
