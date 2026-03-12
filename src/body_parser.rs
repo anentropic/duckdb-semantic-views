@@ -1121,4 +1121,75 @@ mod tests {
         assert_eq!(result[0].1, "revenue");
         assert_eq!(result[1].1, "count");
     }
+
+    // -----------------------------------------------------------------------
+    // Case insensitivity tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_keyword_body_lowercase_clause_keywords() {
+        let body = "as tables (o AS orders primary key (id)) dimensions (o.region AS region) metrics (o.rev AS SUM(amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.tables.len(), 1);
+        assert_eq!(kb.dimensions.len(), 1);
+        assert_eq!(kb.metrics.len(), 1);
+    }
+
+    #[test]
+    fn parse_keyword_body_mixedcase_clause_keywords() {
+        let body = "As Tables (o AS orders Primary Key (id)) Dimensions (o.region AS region) Metrics (o.rev AS SUM(amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.tables.len(), 1);
+        assert_eq!(kb.dimensions[0].name, "region");
+    }
+
+    #[test]
+    fn parse_tables_lowercase_as_and_primary_key() {
+        let result = parse_tables_clause("o as orders primary key (o_id)", 0).unwrap();
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "orders");
+        assert_eq!(result[0].pk_columns, vec!["o_id"]);
+    }
+
+    #[test]
+    fn parse_tables_primary_key_with_newline() {
+        // PRIMARY\nKEY — newline between the two words
+        let result = parse_tables_clause("o AS orders PRIMARY\nKEY (o_id)", 0).unwrap();
+        assert_eq!(result[0].pk_columns, vec!["o_id"]);
+    }
+
+    #[test]
+    fn parse_tables_primary_key_with_tab() {
+        let result = parse_tables_clause("o AS orders PRIMARY\tKEY (o_id)", 0).unwrap();
+        assert_eq!(result[0].pk_columns, vec!["o_id"]);
+    }
+
+    #[test]
+    fn parse_relationships_lowercase_as_and_references() {
+        let result =
+            parse_relationships_clause("ord_to_cust as o(cust_id) references c", 0).unwrap();
+        assert_eq!(result[0].name.as_deref(), Some("ord_to_cust"));
+        assert_eq!(result[0].from_alias, "o");
+        assert_eq!(result[0].table, "c");
+    }
+
+    #[test]
+    fn parse_qualified_entries_lowercase_as() {
+        let result = parse_qualified_entries("o.revenue as SUM(amount)", 0).unwrap();
+        assert_eq!(result[0].1, "revenue");
+        assert_eq!(result[0].2, "SUM(amount)");
+    }
+
+    #[test]
+    fn parse_keyword_body_all_lowercase_full_round_trip() {
+        // Fully lowercase: every keyword, operator, and token in lowercase
+        let body = "as\ntables (\n    o as main.orders primary\nkey (o_id)\n)\nrelationships (\n    ord_to_cust as o(o_cust_id) references c\n)\ndimensions (\n    o.region as region\n)\nmetrics (\n    o.revenue as sum(amount)\n)";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.tables.len(), 1);
+        assert_eq!(kb.tables[0].table, "main.orders");
+        assert_eq!(kb.relationships.len(), 1);
+        assert_eq!(kb.relationships[0].name.as_deref(), Some("ord_to_cust"));
+        assert_eq!(kb.dimensions[0].name, "region");
+        assert_eq!(kb.metrics[0].expr, "sum(amount)");
+    }
 }

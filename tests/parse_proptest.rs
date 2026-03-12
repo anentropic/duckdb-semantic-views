@@ -713,11 +713,12 @@ proptest! {
 
     /// Error position inside AS-body clause points at the typo byte offset.
     /// This property verifies the base_offset threading invariant from RESEARCH.md Pitfall 1.
+    /// Leading whitespace includes spaces, tabs, and newlines — all are valid SQL whitespace.
     #[test]
     fn as_body_position_invariant_clause_typo(
-        spaces in "[ ]{0,20}",
+        leading in "[ \t\n]{0,20}",
     ) {
-        let query = format!("{spaces}CREATE SEMANTIC VIEW x AS TABLSE (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))");
+        let query = format!("{leading}CREATE SEMANTIC VIEW x AS TABLSE (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))");
         let err = validate_and_rewrite(&query).unwrap_err();
         let pos = err.position.unwrap();
         // Position must point at "TABLSE" in the original query.
@@ -731,6 +732,60 @@ proptest! {
             err.message.contains("TABLES") || err.message.contains("tables"),
             "Expected 'did you mean TABLES' error, got: {}",
             err.message
+        );
+    }
+
+    /// Valid AS-body DDL is accepted regardless of inter-token whitespace style
+    /// within the body (spaces, tabs, newlines, or mixed).
+    ///
+    /// Note: the `CREATE SEMANTIC VIEW` prefix uses literal space matching in
+    /// `detect_ddl_kind`, so only body-internal whitespace is varied here.
+    /// Prefix whitespace normalization is tracked in TECH-DEBT.md.
+    #[test]
+    fn as_body_accepts_any_inter_token_whitespace(
+        sep in "[ \t\n]{1,4}",
+    ) {
+        // Vary whitespace between tokens WITHIN the body only (after "AS").
+        // The DDL prefix "CREATE SEMANTIC VIEW v AS" uses single spaces because
+        // detect_ddl_kind does literal prefix matching.
+        let query = format!(
+            "CREATE SEMANTIC VIEW v AS TABLES{sep}(\
+             t{sep}AS{sep}orders{sep}PRIMARY{sep}KEY{sep}(id)\
+             ){sep}DIMENSIONS{sep}(\
+             t.region{sep}AS{sep}region\
+             ){sep}METRICS{sep}(\
+             t.rev{sep}AS{sep}SUM(amount)\
+             )"
+        );
+        let result = validate_and_rewrite(&query);
+        prop_assert!(
+            result.is_ok(),
+            "Expected Ok for valid AS-body with sep={sep:?}, got: {:?}",
+            result
+        );
+        prop_assert!(result.unwrap().is_some());
+    }
+
+    /// Clause keywords are case-insensitive (tables/TABLES/Tables all accepted).
+    #[test]
+    fn as_body_clause_keywords_case_insensitive(
+        name in arb_view_name(),
+        tables_case in 0..3usize,
+        dims_case in 0..3usize,
+        metrics_case in 0..3usize,
+    ) {
+        let tables_kw = ["TABLES", "tables", "Tables"][tables_case];
+        let dims_kw = ["DIMENSIONS", "dimensions", "Dimensions"][dims_case];
+        let metrics_kw = ["METRICS", "metrics", "Metrics"][metrics_case];
+        let query = format!(
+            "CREATE SEMANTIC VIEW {name} AS {tables_kw} (t AS orders PRIMARY KEY (id)) \
+             {dims_kw} (t.region AS region) {metrics_kw} (t.rev AS SUM(amount))"
+        );
+        let result = validate_and_rewrite(&query);
+        prop_assert!(
+            result.is_ok(),
+            "Expected Ok for case variant tables={tables_kw} dims={dims_kw} metrics={metrics_kw}, got: {:?}",
+            result
         );
     }
 }
