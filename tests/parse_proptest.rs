@@ -789,3 +789,158 @@ proptest! {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// TEST-07: Prefix inter-keyword whitespace variants
+// ---------------------------------------------------------------------------
+// These tests MUST FAIL against the current starts_with_ci implementation and
+// MUST PASS after Plan 02's token-based fix is in place.
+// The current detect_ddl_kind uses literal byte prefix matching so it only
+// accepts single ASCII spaces between keywords.
+
+fn arb_inter_keyword_ws() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[ \t\n\r]{1,4}").unwrap()
+}
+
+proptest! {
+    /// Replacing single spaces between DDL keywords with tabs, newlines, or mixed
+    /// whitespace must still produce the correct DdlKind. Currently FAILS because
+    /// detect_ddl_kind uses literal starts_with_ci byte matching.
+    #[test]
+    fn prefix_whitespace_detection(
+        form_idx in 0..7usize,
+        sep in arb_inter_keyword_ws(),
+        name in arb_view_name(),
+    ) {
+        let (prefix, expected_kind) = DDL_FORMS[form_idx];
+        // Split on ASCII space and rejoin with the generated separator.
+        // e.g. "create semantic view" -> "create\tsemantic\tview"
+        let rejoined = prefix.split(' ').collect::<Vec<_>>().join(&sep);
+        let suffix = build_suffix(expected_kind, &name);
+        let query = format!("{rejoined}{suffix}");
+        prop_assert_eq!(
+            detect_ddl_kind(&query),
+            Some(expected_kind),
+            "Expected {:?} for query with sep={:?}: {:?}",
+            expected_kind, sep, query
+        );
+    }
+
+    /// For the 3 CREATE forms, replacing prefix spaces with non-space whitespace
+    /// and calling validate_and_rewrite must return Ok(Some(sql)) where sql
+    /// starts with "SELECT * FROM ". Currently FAILS.
+    #[test]
+    fn prefix_whitespace_rewrite_roundtrip(
+        form_idx in 0..3usize,
+        sep in arb_inter_keyword_ws(),
+        name in arb_view_name(),
+    ) {
+        let (prefix, _kind, _fn_name) = CREATE_FORMS[form_idx];
+        let rejoined = prefix.split(' ').collect::<Vec<_>>().join(&sep);
+        let query = format!("{rejoined} {name} (tables := ['t'], dimensions := ['d'])");
+        let result = validate_and_rewrite(&query);
+        prop_assert!(
+            result.is_ok(),
+            "Expected Ok for whitespace-variant CREATE prefix, got: {:?}",
+            result
+        );
+        let sql = result.unwrap();
+        prop_assert!(
+            sql.is_some(),
+            "Expected Some(sql) for whitespace-variant CREATE prefix"
+        );
+        let sql = sql.unwrap();
+        prop_assert!(
+            sql.starts_with("SELECT * FROM "),
+            "Rewritten SQL must start with 'SELECT * FROM ', got: {sql}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TEST-08: Adversarial inputs
+// These tests document safe behavior for inputs that are not expected in normal
+// DuckDB usage but must not cause panics or exploitable behavior.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_large_input_no_panic() {
+    let s: String = std::iter::repeat('A').take(1_000_000).collect();
+    let start = std::time::Instant::now();
+    let result = detect_semantic_view_ddl(&s);
+    let elapsed = start.elapsed();
+    assert_eq!(
+        result, PARSE_NOT_OURS,
+        "1MB non-DDL should return PARSE_NOT_OURS"
+    );
+    assert!(
+        elapsed.as_millis() < 50,
+        "1MB scan took {}ms, expected <50ms",
+        elapsed.as_millis()
+    );
+}
+
+#[test]
+fn test_null_byte_in_name() {
+    // Null bytes are valid UTF-8 in Rust but may truncate C strings at the FFI boundary.
+    // The parser must not panic. It may return Ok (if null byte in name is tolerated)
+    // or Err (if the name validator rejects it). Either is acceptable.
+    let query = "CREATE SEMANTIC VIEW x\x00bad (tables := [], dimensions := [])";
+    let result = std::panic::catch_unwind(|| validate_and_rewrite(query));
+    assert!(
+        result.is_ok(),
+        "validate_and_rewrite panicked on null byte in name"
+    );
+}
+
+#[test]
+fn test_semicolon_in_name() {
+    // Name extraction stops at whitespace or '(' — a ';' inside the "name" position
+    // means the name is everything before ';' or the whole token. Either way, the
+    // rewritten SQL must start with "SELECT * FROM " (no raw ';' injected into the wrapper).
+    let query = "CREATE SEMANTIC VIEW x;injection (tables := [], dimensions := [])";
+    match validate_and_rewrite(query) {
+        Ok(Some(sql)) => {
+            assert!(
+                sql.starts_with("SELECT * FROM "),
+                "Rewritten SQL must start with SELECT * FROM, got: {sql}"
+            );
+            // The semicolon must not appear outside a SQL string literal in a way
+            // that could terminate the wrapper SELECT statement.
+            // Since the name ends at whitespace/'(', the name is "x;injection" or
+            // the parser hits an error. Either outcome is safe.
+        }
+        Ok(None) => {} // Not detected as our DDL — acceptable
+        Err(_) => {}   // Parse error — acceptable
+    }
+}
+
+#[test]
+fn test_unicode_homoglyph() {
+    // Cyrillic 'С' (U+0421) looks like Latin 'C' but is a different byte sequence.
+    // The ASCII-only keyword matcher must return None — no near-miss confusion.
+    // Note: DuckDB may not pass Unicode-prefixed queries to extension hooks at all
+    // (StripUnicodeSpaces normalisation), but the pure-Rust parser must be safe.
+    let query = "СREATE SEMANTIC VIEW x (tables := [], dimensions := [])";
+    assert_eq!(
+        detect_ddl_kind(query),
+        None,
+        "Cyrillic С prefix should not match as DdlKind"
+    );
+    assert_eq!(
+        detect_semantic_view_ddl(query),
+        PARSE_NOT_OURS,
+        "Cyrillic С prefix should return PARSE_NOT_OURS"
+    );
+}
+
+#[test]
+fn test_control_char_in_name() {
+    // Control characters (0x01-0x1F except whitespace) in view names must not panic.
+    let query = "CREATE SEMANTIC VIEW x\x01bad (tables := [], dimensions := [])";
+    let result = std::panic::catch_unwind(|| validate_and_rewrite(query));
+    assert!(
+        result.is_ok(),
+        "validate_and_rewrite panicked on control char in name"
+    );
+}
