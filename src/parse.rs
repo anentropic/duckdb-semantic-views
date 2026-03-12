@@ -30,9 +30,96 @@ pub enum DdlKind {
     Show,
 }
 
-/// Check whether `trimmed` starts with `prefix` (case-insensitive ASCII).
-fn starts_with_ci(trimmed: &[u8], prefix: &[u8]) -> bool {
-    trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+/// Match a fixed sequence of keyword tokens at the start of `input`, tolerating
+/// arbitrary ASCII whitespace between tokens.
+///
+/// Returns `Some(bytes_consumed)` if all keywords matched (case-insensitively),
+/// where `bytes_consumed` is the number of bytes consumed by the keyword prefix
+/// (including inter-keyword whitespace). Returns `None` otherwise.
+///
+/// The match anchors at position 0. Leading whitespace in `input` is consumed
+/// as part of the match (counted in the returned byte count). If the caller has
+/// already trimmed leading whitespace, the returned count is from offset 0 of
+/// the trimmed slice.
+///
+/// Anti-pattern avoided: does NOT scan at increasing offsets (no O(n^2) behavior).
+/// If keyword[0] doesn't match at the start (after whitespace), returns None.
+///
+/// Note: only handles ASCII whitespace (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20).
+/// Unicode whitespace is handled by `DuckDB`'s `StripUnicodeSpaces` before the hook fires.
+fn match_keyword_prefix(input: &[u8], keywords: &[&[u8]]) -> Option<usize> {
+    let mut pos = 0;
+    for (i, &kw) in keywords.iter().enumerate() {
+        // Skip ASCII whitespace (but not before the first keyword -- caller is
+        // responsible for leading whitespace; we skip INTER-keyword whitespace
+        // only for i > 0).
+        if i > 0 {
+            // Require at least one whitespace character between keywords.
+            if pos >= input.len() || !input[pos].is_ascii_whitespace() {
+                return None;
+            }
+            while pos < input.len() && input[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+        }
+        // Match keyword case-insensitively.
+        if input.len() < pos + kw.len() {
+            return None;
+        }
+        if !input[pos..pos + kw.len()].eq_ignore_ascii_case(kw) {
+            return None;
+        }
+        pos += kw.len();
+    }
+    Some(pos)
+}
+
+/// Detect the DDL kind and consumed prefix byte count from a query string.
+///
+/// The input must already be trimmed of leading/trailing whitespace and
+/// trailing semicolons. Returns `Some((DdlKind, consumed_bytes))` where
+/// `consumed_bytes` is the number of bytes consumed by the matched prefix
+/// (including any inter-keyword whitespace in the input). Returns `None`
+/// if no prefix matches.
+///
+/// Longest-first ordering prevents prefix overlap.
+fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
+    let b = trimmed.as_bytes();
+
+    // CREATE OR REPLACE SEMANTIC VIEW (5 keywords) -- before CREATE SEMANTIC VIEW
+    if let Some(n) = match_keyword_prefix(b, &[b"create", b"or", b"replace", b"semantic", b"view"])
+    {
+        return Some((DdlKind::CreateOrReplace, n));
+    }
+    // CREATE SEMANTIC VIEW IF NOT EXISTS (6 keywords) -- before CREATE SEMANTIC VIEW
+    if let Some(n) = match_keyword_prefix(
+        b,
+        &[b"create", b"semantic", b"view", b"if", b"not", b"exists"],
+    ) {
+        return Some((DdlKind::CreateIfNotExists, n));
+    }
+    // CREATE SEMANTIC VIEW (3 keywords)
+    if let Some(n) = match_keyword_prefix(b, &[b"create", b"semantic", b"view"]) {
+        return Some((DdlKind::Create, n));
+    }
+    // DROP SEMANTIC VIEW IF EXISTS (5 keywords) -- before DROP SEMANTIC VIEW
+    if let Some(n) = match_keyword_prefix(b, &[b"drop", b"semantic", b"view", b"if", b"exists"]) {
+        return Some((DdlKind::DropIfExists, n));
+    }
+    // DROP SEMANTIC VIEW (3 keywords)
+    if let Some(n) = match_keyword_prefix(b, &[b"drop", b"semantic", b"view"]) {
+        return Some((DdlKind::Drop, n));
+    }
+    // DESCRIBE SEMANTIC VIEW (3 keywords)
+    if let Some(n) = match_keyword_prefix(b, &[b"describe", b"semantic", b"view"]) {
+        return Some((DdlKind::Describe, n));
+    }
+    // SHOW SEMANTIC VIEWS (3 keywords)
+    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"views"]) {
+        return Some((DdlKind::Show, n));
+    }
+
+    None
 }
 
 /// Detect the DDL kind from a query string.
@@ -41,33 +128,13 @@ fn starts_with_ci(trimmed: &[u8], prefix: &[u8]) -> bool {
 /// DDL prefixes, `None` otherwise. Uses longest-first ordering to avoid
 /// prefix overlap (e.g. "create or replace semantic view" before
 /// "create semantic view").
+///
+/// Tolerates arbitrary ASCII whitespace (spaces, tabs, newlines, carriage
+/// returns, vertical tabs, form feeds) between prefix keywords.
 #[must_use]
 pub fn detect_ddl_kind(query: &str) -> Option<DdlKind> {
-    let trimmed = query.trim();
-    let trimmed = trimmed.trim_end_matches(';').trim();
-    let bytes = trimmed.as_bytes();
-
-    // Longest-first ordering within each family to prevent prefix overlap.
-    // "create semantic view if not exists" (34) before "create semantic view" (20)
-    // "create or replace semantic view" (31) before "create semantic view" (20)
-    // "drop semantic view if exists" (28) before "drop semantic view" (18)
-    if starts_with_ci(bytes, b"create or replace semantic view") {
-        Some(DdlKind::CreateOrReplace)
-    } else if starts_with_ci(bytes, b"create semantic view if not exists") {
-        Some(DdlKind::CreateIfNotExists)
-    } else if starts_with_ci(bytes, b"create semantic view") {
-        Some(DdlKind::Create)
-    } else if starts_with_ci(bytes, b"drop semantic view if exists") {
-        Some(DdlKind::DropIfExists)
-    } else if starts_with_ci(bytes, b"drop semantic view") {
-        Some(DdlKind::Drop)
-    } else if starts_with_ci(bytes, b"describe semantic view") {
-        Some(DdlKind::Describe)
-    } else if starts_with_ci(bytes, b"show semantic views") {
-        Some(DdlKind::Show)
-    } else {
-        None
-    }
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    detect_ddl_prefix(trimmed).map(|(kind, _)| kind)
 }
 
 /// Detect whether a query is any semantic view DDL statement.
