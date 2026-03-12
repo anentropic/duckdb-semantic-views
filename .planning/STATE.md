@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: paused
-stopped_at: Completed 25-04-PLAN.md (Phase 25 fully complete)
-last_updated: "2026-03-12T00:27:20.451Z"
+stopped_at: Completed 25.1-01-PLAN.md
+last_updated: "2026-03-12T14:08:26.047Z"
 last_activity: 2026-03-11 -- Phase 25 Plan 04 Tasks 1-2 complete (integration tests + AS-body dispatch fix)
 progress:
-  total_phases: 5
+  total_phases: 6
   completed_phases: 1
-  total_plans: 6
-  completed_plans: 4
+  total_plans: 8
+  completed_plans: 5
   percent: 33
 ---
 
@@ -74,6 +74,9 @@ Recent decisions affecting current work:
 - [25-04]: sv_rewrite_ddl_rust must use validate_and_rewrite (not rewrite_ddl) to route both paren-body and AS-body DDL correctly
 - [25-04]: sqllogictest tables use phase-prefixed names (p25_) to avoid cross-test catalog pollution
 - [Phase 25-04]: sv_rewrite_ddl_rust must call validate_and_rewrite (not rewrite_ddl) to handle both paren-body and AS-body DDL through the same dispatch path
+- [Phase 25.1-01]: Corpus seeds placed in fuzz/seeds/fuzz_ddl_parse/ (git-tracked) not fuzz/corpus/ (gitignored by .gitignore convention)
+- [Phase 25.1-01]: TEST-08 adversarial tests use catch_unwind in standalone #[test] functions (not proptest blocks) for absolute invariant verification
+- [Phase 25.1-01]: Fuzz target rejects invalid UTF-8 early with early return (not a panic/crash)
 
 ### Pending Todos
 
@@ -92,9 +95,10 @@ None.
 | 15 | Fix CI amalgamation auto-download | 2026-03-09 | 3859d68 | [15-check-gh-run-list-and-fix-the-failing-jo](./quick/15-check-gh-run-list-and-fix-the-failing-jo/) |
 | Phase 25-sql-body-parser P03 | 8 | 2 tasks | 3 files |
 | Phase 25-sql-body-parser P04 | 25 | 3 tasks | 5 files |
+| Phase 25.1 P01 | 6 | 2 tasks | 8 files |
 
 ## Session Continuity
 
-Last session: 2026-03-12T00:20:30.935Z
-Stopped at: Completed 25-04-PLAN.md (Phase 25 fully complete)
+Last session: 2026-03-12T14:08:26.045Z
+Stopped at: Completed 25.1-01-PLAN.md
 Resume file: None
