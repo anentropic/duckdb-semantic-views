@@ -79,4 +79,4 @@ updated: 2026-03-11
 - [x] Feedback latency < 60s
 - [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** automated tests green (2026-03-11); awaiting human visual verification of caret position in DuckDB CLI
+**Approval:** automated tests green (2026-03-11); human visual verification of caret position in DuckDB CLI approved (2026-03-12)
