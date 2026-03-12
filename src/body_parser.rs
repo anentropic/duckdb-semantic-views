@@ -391,9 +391,9 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     let after_as = rest[2..].trim_start();
     let after_as_offset = rest_offset + 2 + (rest[2..].len() - after_as.len());
 
-    // Step 3: find "PRIMARY KEY" (case-insensitive) to delimit the table name
+    // Step 3: find "PRIMARY KEY" (case-insensitive, any whitespace between words)
     let upper = after_as.to_ascii_uppercase();
-    let pk_pos = find_keyword_ci(&upper, "PRIMARY KEY");
+    let pk_pos = find_primary_key(&upper);
     if pk_pos.is_none() {
         return Err(ParseError {
             message: format!(
@@ -402,7 +402,7 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
             position: Some(after_as_offset),
         });
     }
-    let pk_start = pk_pos.unwrap();
+    let (pk_start, pk_end) = pk_pos.unwrap();
     let table_name = after_as[..pk_start].trim();
     if table_name.is_empty() {
         return Err(ParseError {
@@ -414,21 +414,21 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     }
 
     // Step 4: parse "(col1, col2, ...)" after "PRIMARY KEY"
-    let after_pk = after_as[pk_start + "PRIMARY KEY".len()..].trim_start();
-    let after_pk_offset = after_as_offset + pk_start + "PRIMARY KEY".len();
+    let after_pk = after_as[pk_end..].trim_start();
+    let after_pk_offset = after_as_offset + pk_end;
     let _ = after_pk_offset; // offset tracked for future use
 
     if !after_pk.starts_with('(') {
         return Err(ParseError {
             message: "Expected '(' after PRIMARY KEY in TABLES clause.".to_string(),
-            position: Some(after_as_offset + pk_start + "PRIMARY KEY".len()),
+            position: Some(after_as_offset + pk_end),
         });
     }
 
     // Find matching closing paren
     let pk_body = extract_paren_content(after_pk).ok_or_else(|| ParseError {
         message: "Unclosed '(' in PRIMARY KEY column list.".to_string(),
-        position: Some(after_as_offset + pk_start + "PRIMARY KEY".len()),
+        position: Some(after_as_offset + pk_end),
     })?;
 
     let pk_columns: Vec<String> = pk_body
@@ -480,6 +480,41 @@ fn extract_paren_content(s: &str) -> Option<&str> {
 }
 
 /// Find the byte position of a keyword (already uppercased) in `upper_text`.
+/// Find "PRIMARY KEY" with any amount of whitespace between the two words.
+/// Returns `(start, end)` byte offsets into `upper_text`, where `upper_text` is already uppercased.
+/// `start` points at 'P', `end` points past 'Y' (exclusive).
+fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
+    let bytes = upper_text.as_bytes();
+    let mut i = 0;
+    while i + 7 <= bytes.len() {
+        // Look for "PRIMARY"
+        if &upper_text[i..i + 7] == "PRIMARY" {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let after_primary = i + 7;
+            if before_ok
+                && (after_primary == bytes.len() || !bytes[after_primary].is_ascii_alphanumeric())
+            {
+                // Skip whitespace between PRIMARY and KEY
+                let mut j = after_primary;
+                while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+                    j += 1;
+                }
+                // Match "KEY"
+                if j + 3 <= bytes.len() && &upper_text[j..j + 3] == "KEY" {
+                    let after_key = j + 3;
+                    let after_ok =
+                        after_key == bytes.len() || !bytes[after_key].is_ascii_alphanumeric();
+                    if after_ok {
+                        return Some((i, after_key));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Requires the keyword to be preceded by whitespace (or be at start) and
 /// followed by whitespace or end-of-string. Returns byte offset into `upper_text`.
 fn find_keyword_ci(upper_text: &str, keyword: &str) -> Option<usize> {
@@ -1016,5 +1051,74 @@ mod tests {
         let body = "AS DIMENSIONS (o.x AS x)";
         let result = parse_keyword_body(body, 0);
         assert!(result.is_err(), "Expected error for missing TABLES clause");
+    }
+
+    // -----------------------------------------------------------------------
+    // Whitespace tolerance tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_keyword_body_newlines_between_clauses() {
+        let body = "AS\nTABLES (\n  o AS orders PRIMARY KEY (id)\n)\nDIMENSIONS (\n  o.region AS region\n)\nMETRICS (\n  o.rev AS SUM(amount)\n)";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.tables.len(), 1);
+        assert_eq!(kb.dimensions.len(), 1);
+        assert_eq!(kb.metrics.len(), 1);
+    }
+
+    #[test]
+    fn parse_keyword_body_tabs_between_tokens() {
+        let body = "AS\tTABLES\t(\to\tAS\torders\tPRIMARY\tKEY\t(id)\t)\tDIMENSIONS\t(\to.region\tAS\tregion\t)\tMETRICS\t(\to.rev\tAS\tSUM(amount)\t)";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.tables.len(), 1);
+        assert_eq!(kb.dimensions[0].name, "region");
+    }
+
+    #[test]
+    fn parse_keyword_body_extra_spaces() {
+        let body = "AS  TABLES  (  o  AS  orders  PRIMARY  KEY  (  id  )  )  DIMENSIONS  (  o.region  AS  region  )  METRICS  (  o.rev  AS  SUM(amount)  )";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.tables[0].alias, "o");
+        assert_eq!(kb.tables[0].table, "orders");
+        assert_eq!(kb.tables[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn parse_keyword_body_mixed_whitespace_multientry() {
+        // Multiple entries with newline+indent separation
+        let body = "AS TABLES (\n    o AS orders PRIMARY KEY (o_id),\n    c AS customers PRIMARY KEY (c_id)\n) DIMENSIONS (\n    o.region AS region,\n    c.name AS customer_name\n) METRICS (\n    o.rev AS SUM(amount)\n)";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.tables.len(), 2);
+        assert_eq!(kb.dimensions.len(), 2);
+    }
+
+    #[test]
+    fn parse_tables_extra_whitespace_around_tokens() {
+        // Extra whitespace inside the clause body
+        let result = parse_tables_clause(
+            "  o   AS   main.orders   PRIMARY   KEY   ( o_id ,  o_seq )  ",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "main.orders");
+        assert_eq!(result[0].pk_columns, vec!["o_id", "o_seq"]);
+    }
+
+    #[test]
+    fn parse_relationships_newline_separated() {
+        let body = "\n  order_to_customer AS o(customer_id) REFERENCES c\n";
+        let result = parse_relationships_clause(body, 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name.as_deref(), Some("order_to_customer"));
+    }
+
+    #[test]
+    fn parse_qualified_entries_newline_separated() {
+        let body = "\n  o.revenue AS SUM(amount),\n  o.count AS COUNT(*)\n";
+        let result = parse_qualified_entries(body, 0).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].1, "revenue");
+        assert_eq!(result[1].1, "count");
     }
 }
