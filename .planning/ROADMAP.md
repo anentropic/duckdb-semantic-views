@@ -131,6 +131,21 @@ Plans:
 - [ ] 25-03-PLAN.md -- Wire AS dispatch in parse.rs + DefineFromJsonVTab in define.rs
 - [ ] 25-04-PLAN.md -- End-to-end integration verification and human checkpoint
 
+### Phase 25.1: Parser Robustness & Security Hardening
+**Goal**: The DDL parser correctly handles all valid whitespace variants and is hardened against adversarial inputs
+**Depends on**: Phase 25
+**Requirements**: (cross-cutting quality concern — no specific req ID)
+**Success Criteria** (what must be TRUE):
+  1. `detect_ddl_kind` uses token-based keyword matching — `CREATE\tSEMANTIC\tVIEW`, `CREATE  SEMANTIC  VIEW`, and `CREATE\nSEMANTIC\nVIEW` all parse correctly
+  2. All 7 DDL forms tolerate arbitrary inter-keyword whitespace (spaces, tabs, newlines, carriage returns, mixed)
+  3. Adversarial inputs (very long strings, null bytes, embedded semicolons in view names, Unicode homoglyphs, control characters) are handled safely — no panic, no buffer overrun, no silent wrong-detection
+  4. `body_parser.rs` clause keyword matching is similarly whitespace-tolerant
+  5. `just test-all` passes
+**Plans:** 2 plans
+Plans:
+- [ ] 25.1-01-PLAN.md -- Write failing TEST-07 proptests + TEST-08 adversarial tests + fuzz_ddl_parse target
+- [ ] 25.1-02-PLAN.md -- Implement token-based detect_ddl_kind, decouple prefix_len callers, close TECH-DEBT item 4
+
 ### Phase 26: PK/FK Join Resolution
 **Goal**: JOIN ON clauses are deterministically synthesized from PK/FK declarations, with invalid graphs rejected at define time
 **Depends on**: Phase 24
@@ -168,8 +183,8 @@ Plans:
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 24 -> 25 -> 26 -> 27 -> 28
-(Phase 25 and 26 both depend only on 24, but parser before expansion keeps feedback loop fast)
+Phases execute in numeric order: 24 -> 25 -> 25.1 -> 26 -> 27 -> 28
+(Phase 25.1 hardens the parser before the PK/FK work begins; 25 and 26 both depend on 24)
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
@@ -201,7 +216,8 @@ Phases execute in numeric order: 24 -> 25 -> 26 -> 27 -> 28
 | 22. Documentation | v0.5.1 | 1/1 | Complete | 2026-03-09 |
 | 23. Parser Proptests + Caret Tests | v0.5.1 | 2/2 | Complete | 2026-03-09 |
 | 24. PK/FK Model | v0.5.2 | 0/2 | Not started | - |
-| 25. SQL Body Parser | 4/4 | Complete    | 2026-03-12 | - |
+| 25. SQL Body Parser | v0.5.2 | 4/4 | Complete | 2026-03-12 |
+| 25.1. Parser Robustness & Security | v0.5.2 | 0/2 | Not started | - |
 | 26. PK/FK Join Resolution | v0.5.2 | 0/? | Not started | - |
 | 27. Alias-Based Query Expansion | v0.5.2 | 0/? | Not started | - |
 | 28. Integration Testing & Docs | v0.5.2 | 0/? | Not started | - |
