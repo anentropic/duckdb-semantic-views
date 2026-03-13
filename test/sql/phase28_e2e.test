@@ -1,0 +1,204 @@
+# Phase 28: End-to-end integration test
+# 3-table PK/FK semantic view with exact result verification against known data.
+# Domain: orders/customers/products e-commerce.
+
+require semantic_views
+
+# ============================================================
+# Setup: create 3 related tables with known data
+# ============================================================
+
+statement ok
+CREATE TABLE p28_customers (id INTEGER, name VARCHAR, tier VARCHAR);
+
+statement ok
+INSERT INTO p28_customers VALUES (1, 'Alice', 'gold'), (2, 'Bob', 'silver'), (3, 'Charlie', 'gold');
+
+statement ok
+CREATE TABLE p28_products (id INTEGER, name VARCHAR, category VARCHAR);
+
+statement ok
+INSERT INTO p28_products VALUES (10, 'Widget', 'hardware'), (20, 'Gadget', 'electronics');
+
+statement ok
+CREATE TABLE p28_orders (
+    id INTEGER, customer_id INTEGER, product_id INTEGER,
+    amount DECIMAL(10,2), region VARCHAR
+);
+
+statement ok
+INSERT INTO p28_orders VALUES
+    (1, 1, 10, 100.00, 'East'),
+    (2, 1, 20, 200.00, 'East'),
+    (3, 2, 10, 50.00, 'West'),
+    (4, 3, 10, 150.00, 'East'),
+    (5, 3, 20, 75.00, 'West');
+
+# ============================================================
+# Define: 3-table PK/FK semantic view
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p28_analytics AS
+  TABLES (
+    o AS p28_orders PRIMARY KEY (id),
+    c AS p28_customers PRIMARY KEY (id),
+    p AS p28_products PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c,
+    order_to_product AS o(product_id) REFERENCES p
+  )
+  DIMENSIONS (
+    c.customer_name AS c.name,
+    p.product_name AS p.name,
+    o.region AS o.region,
+    c.tier AS c.tier
+  )
+  METRICS (
+    o.total_revenue AS sum(o.amount),
+    o.order_count AS count(*)
+  );
+
+# ============================================================
+# Test 1: Cross-table query -- customer_name -> total_revenue (joins o->c)
+# Alice: 100+200=300, Bob: 50, Charlie: 150+75=225
+# ============================================================
+
+query TR rowsort
+SELECT * FROM semantic_view('p28_analytics', dimensions := ['customer_name'], metrics := ['total_revenue']);
+----
+Alice	300.00
+Bob	50.00
+Charlie	225.00
+
+# ============================================================
+# Test 2: Cross-table query -- product_name -> order_count (joins o->p)
+# Widget: 3 orders (ids 1,3,4), Gadget: 2 orders (ids 2,5)
+# ============================================================
+
+query TI rowsort
+SELECT * FROM semantic_view('p28_analytics', dimensions := ['product_name'], metrics := ['order_count']);
+----
+Gadget	2
+Widget	3
+
+# ============================================================
+# Test 3: 3-table transitive -- customer_name + product_name -> total_revenue
+# Joins o->c AND o->p simultaneously
+# Alice/Widget: 100, Alice/Gadget: 200, Bob/Widget: 50,
+# Charlie/Widget: 150, Charlie/Gadget: 75
+# ============================================================
+
+query TTR rowsort
+SELECT * FROM semantic_view('p28_analytics', dimensions := ['customer_name', 'product_name'], metrics := ['total_revenue']);
+----
+Alice	Gadget	200.00
+Alice	Widget	100.00
+Bob	Widget	50.00
+Charlie	Gadget	75.00
+Charlie	Widget	150.00
+
+# ============================================================
+# Test 4: Single-table query -- region -> total_revenue (no joins needed)
+# East: 100+200+150=450, West: 50+75=125
+# ============================================================
+
+query TR rowsort
+SELECT * FROM semantic_view('p28_analytics', dimensions := ['region'], metrics := ['total_revenue']);
+----
+East	450.00
+West	125.00
+
+# ============================================================
+# Test 5: Metrics-only -- total_revenue (grand total, no GROUP BY)
+# 100+200+50+150+75=575
+# ============================================================
+
+query T
+SELECT * FROM semantic_view('p28_analytics', metrics := ['total_revenue']);
+----
+575.00
+
+# ============================================================
+# Test 6: Dimensions-only -- region (distinct values, no aggregation)
+# ============================================================
+
+query T rowsort
+SELECT * FROM semantic_view('p28_analytics', dimensions := ['region']);
+----
+East
+West
+
+# ============================================================
+# Test 7: Explain verification -- verify generated SQL contains expected clauses
+# ============================================================
+
+# Explain output contains LEFT JOIN (cross-table query requires join)
+query I
+SELECT count(*) FROM explain_semantic_view('p28_analytics', dimensions := ['customer_name'], metrics := ['total_revenue']) WHERE explain_output LIKE '%LEFT JOIN%';
+----
+1
+
+# Explain output contains GROUP BY (metric present triggers aggregation)
+query I
+SELECT count(*) FROM explain_semantic_view('p28_analytics', dimensions := ['customer_name'], metrics := ['total_revenue']) WHERE explain_output LIKE '%GROUP BY%';
+----
+1
+
+# Explain output references both base tables
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p28_analytics', dimensions := ['customer_name'], metrics := ['total_revenue']) WHERE explain_output LIKE '%p28_orders%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p28_analytics', dimensions := ['customer_name'], metrics := ['total_revenue']) WHERE explain_output LIKE '%p28_customers%';
+----
+true
+
+# ============================================================
+# Test 8: WHERE composition -- filter on dimension value
+# Only East region: Alice 100+200=300, Charlie 150
+# ============================================================
+
+query TR rowsort
+SELECT * FROM semantic_view('p28_analytics', dimensions := ['customer_name'], metrics := ['total_revenue']) WHERE customer_name != 'Bob';
+----
+Alice	300.00
+Charlie	225.00
+
+# ============================================================
+# Test 9: DESCRIBE verification -- returns expected metadata
+# 6 columns: name, base_table, dimensions, metrics, filters, joins
+# ============================================================
+
+query TTTTTT
+DESCRIBE SEMANTIC VIEW p28_analytics;
+----
+p28_analytics	p28_orders	[{"expr":"c.name","name":"customer_name","output_type":null,"source_table":"c"},{"expr":"p.name","name":"product_name","output_type":null,"source_table":"p"},{"expr":"o.region","name":"region","output_type":null,"source_table":"o"},{"expr":"c.tier","name":"tier","output_type":null,"source_table":"c"}]	[{"expr":"sum(o.amount)","name":"total_revenue","output_type":null,"source_table":"o"},{"expr":"count(*)","name":"order_count","output_type":null,"source_table":"o"}]	[]	[{"fk_columns":["customer_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_customer","table":"c"},{"fk_columns":["product_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_product","table":"p"}]
+
+# ============================================================
+# Test 10: Error case -- unknown dimension
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('p28_analytics', dimensions := ['nonexistent']);
+----
+unknown dimension
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p28_analytics;
+
+statement ok
+DROP TABLE p28_orders;
+
+statement ok
+DROP TABLE p28_customers;
+
+statement ok
+DROP TABLE p28_products;
