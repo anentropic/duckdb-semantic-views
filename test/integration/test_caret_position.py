@@ -14,8 +14,8 @@ caret (^) renders at the correct character position when malformed DDL flows
 through the full extension load pipeline.
 
 Three representative error types are covered:
-  1. Structural error -- missing opening paren (ERR-02)
-  2. Clause-level error -- typo in keyword (ERR-01)
+  1. Structural error -- missing '(' after clause keyword (ERR-02)
+  2. Clause-level error -- typo in AS-body keyword (ERR-01)
   3. Near-miss prefix error (ERR-03)
 
 Usage:
@@ -110,14 +110,14 @@ def run_test(name, test_fn):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Structural error -- missing opening paren (ERR-02)
+# Test 1: Structural error -- missing '(' after clause keyword (ERR-02)
 # ---------------------------------------------------------------------------
 
 def test_caret_missing_paren():
-    """Caret points where '(' is expected after view name."""
+    """Caret points where '(' is expected after clause keyword."""
     conn = make_connection()
     try:
-        query = "CREATE SEMANTIC VIEW myview tables := []"
+        query = "CREATE SEMANTIC VIEW myview AS TABLES x"
         try:
             conn.execute(query)
             assert False, "Expected ParserException"
@@ -130,27 +130,27 @@ def test_caret_missing_paren():
             )
             pos = extract_caret_position(error_text)
             assert pos is not None, f"No caret found in: {error_text}"
-            # The caret should point at the space before 'tables'
-            # "CREATE SEMANTIC VIEW myview" = 27 chars, caret at 27
-            expected_pos = len("CREATE SEMANTIC VIEW myview")
+            # The caret should point at 'x' after "TABLES "
+            # "CREATE SEMANTIC VIEW myview AS TABLES " = 38 chars, 'x' at 38
+            expected_pos = len("CREATE SEMANTIC VIEW myview AS TABLES ")
             assert pos == expected_pos, (
                 f"Caret at {pos}, expected {expected_pos}. "
                 f"Char at pos: '{query[pos] if pos < len(query) else 'OOB'}'"
             )
-            print(f"  Caret position: {pos} (space before 'tables') -- correct")
+            print(f"  Caret position: {pos} (at 'x' after TABLES) -- correct")
     finally:
         conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Clause-level error -- typo in keyword (ERR-01)
+# Test 2: Clause-level error -- typo in AS-body keyword (ERR-01)
 # ---------------------------------------------------------------------------
 
 def test_caret_clause_typo():
-    """Caret points at misspelled clause keyword."""
+    """Caret points at misspelled clause keyword in AS body."""
     conn = make_connection()
     try:
-        query = "CREATE SEMANTIC VIEW x (tbles := [], dimensions := [])"
+        query = "CREATE SEMANTIC VIEW x AS TBLES (t AS tbl PRIMARY KEY (id)) DIMENSIONS (t.x AS x)"
         try:
             conn.execute(query)
             assert False, "Expected ParserException"
@@ -158,17 +158,19 @@ def test_caret_clause_typo():
             if "ParserException" not in type(e).__name__:
                 raise
             error_text = str(e)
-            assert "tables" in error_text.lower(), (
-                f"Expected suggestion for 'tables' but got: {error_text}"
+            assert "TABLES" in error_text, (
+                f"Expected suggestion for 'TABLES' but got: {error_text}"
             )
             pos = extract_caret_position(error_text)
             assert pos is not None, f"No caret found in: {error_text}"
-            # The caret should point at the 't' of 'tbles' (position 24)
-            assert query[pos:pos + 5] == "tbles", (
-                f"Caret at {pos}, expected 'tbles' but got "
+            # The caret should point at 'TBLES' after "AS "
+            # "CREATE SEMANTIC VIEW x AS " = 26 chars, 'TBLES' at 26
+            expected_pos = len("CREATE SEMANTIC VIEW x AS ")
+            assert query[pos:pos + 5] == "TBLES", (
+                f"Caret at {pos}, expected 'TBLES' but got "
                 f"'{query[pos:pos + 5]}'"
             )
-            print(f"  Caret position: {pos} (start of 'tbles') -- correct")
+            print(f"  Caret position: {pos} (start of 'TBLES') -- correct")
     finally:
         conn.close()
 
