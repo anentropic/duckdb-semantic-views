@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: executing
-stopped_at: Phase 26 Plan 01 complete
-last_updated: "2026-03-13T13:23:00.000Z"
-last_activity: 2026-03-13 -- Phase 26 Plan 01 complete (graph module + define-time validation)
+stopped_at: Phase 26 Plan 02 complete
+last_updated: "2026-03-13T14:38:03.000Z"
+last_activity: 2026-03-13 -- Phase 26 Plan 02 complete (PK/FK join resolution + integration tests)
 progress:
   total_phases: 6
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 8
-  completed_plans: 7
-  percent: 38
+  completed_plans: 8
+  percent: 46
 ---
 
 # Project State
@@ -25,18 +25,19 @@ See: .planning/PROJECT.md (updated 2026-03-09)
 
 ## Current Position
 
-Phase: 26 (3 of 5 in v0.5.2)
-Plan: 1 of 2 in current phase (26-01 complete)
-Status: Executing
-Last activity: 2026-03-13 -- Phase 26 Plan 01 complete (graph module + define-time validation)
+Phase: 26 (3 of 5 in v0.5.2) -- COMPLETE
+Plan: 2 of 2 in current phase (26-02 complete)
+Status: Phase 26 complete
+Last activity: 2026-03-13 -- Phase 26 Plan 02 complete (PK/FK join resolution + integration tests)
 
-Progress: [████░░░░░░] 38%
+Progress: [█████░░░░░] 46%
 
 ## Performance Metrics
 
 **Velocity (v0.5.2, current):**
-- Plans completed: 4 (25-01, 25-02, 25-03, 26-01); 25-04 verified, 26-02 next
+- Plans completed: 5 (25-01, 25-02, 25-03, 26-01, 26-02); 25-04 verified; Phase 26 complete
 - Timeline: 2026-03-11 to 2026-03-13 (ongoing)
+- 26-02: 14 min / 2 tasks / 4 files
 - 26-01: 12 min / 2 tasks / 3 files
 - 25-01: 19 min / 3 tasks / 8 files
 - 25-02: 8 min / 2 tasks / 1 file
@@ -84,6 +85,9 @@ Recent decisions affecting current work:
 - [Phase 26-01]: Adjacency list + reverse edges for O(1) diamond detection (parent count in reverse map)
 - [Phase 26-01]: Graph validation runs after parse, before type inference, before persist in both DDL paths
 - [Phase 26-01]: Legacy definitions (empty fk_columns or empty tables) skip graph validation entirely
+- [Phase 26-02]: CTE wrapper removed -- flat SELECT/FROM/JOIN pattern fixes table-qualified alias scoping for multi-table views
+- [Phase 26-02]: Bidirectional join lookup: expand finds Join structs by either from_alias or table to handle FK source and FK target aliases
+- [Phase 26-02]: LEFT JOIN is global for all definitions (PK/FK and legacy) per user decision
 
 ### Pending Todos
 
@@ -107,6 +111,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-13T13:23:00Z
-Stopped at: Completed 26-01-PLAN.md
-Resume file: .planning/phases/26-pk-fk-join-resolution/26-02-PLAN.md
+Last session: 2026-03-13T14:38:03Z
+Stopped at: Completed 26-02-PLAN.md (Phase 26 complete)
+Resume file: Next phase TBD

@@ -93,7 +93,7 @@ Full details: [milestones/v0.5.1-ROADMAP.md](milestones/v0.5.1-ROADMAP.md)
 
 - [ ] **Phase 24: PK/FK Model** - Extend model structs with primary keys, table aliases, and relationship metadata
 - [x] **Phase 25: SQL Body Parser** - Parse TABLES/RELATIONSHIPS/DIMENSIONS/METRICS keyword clauses in DDL bodies (completed 2026-03-11)
-- [ ] **Phase 26: PK/FK Join Resolution** - Synthesize JOIN ON clauses from PK/FK declarations with graph validation
+- [x] **Phase 26: PK/FK Join Resolution** - Synthesize JOIN ON clauses from PK/FK declarations with graph validation (completed 2026-03-13)
 - [ ] **Phase 27: Alias-Based Query Expansion** - Replace CTE flattening with direct FROM+JOIN expansion and qualified columns
 - [ ] **Phase 28: Integration Testing & Documentation** - End-to-end validation and README update with new syntax
 
@@ -155,10 +155,10 @@ Plans:
   2. Requesting dimensions from tables A and C that are connected through B automatically includes the A-B and B-C joins (transitive inclusion)
   3. Defining a semantic view with a cyclic or diamond relationship graph produces a clear error at define time (not at query time)
   4. Join ordering follows topological sort of the relationship graph, producing deterministic SQL regardless of declaration order
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 Plans:
-- [ ] 26-01-PLAN.md -- RelationshipGraph module with validation, toposort, and define-time wiring
-- [ ] 26-02-PLAN.md -- Graph-based expand.rs update and sqllogictest integration tests
+- [x] 26-01-PLAN.md -- RelationshipGraph module with validation, toposort, and define-time wiring (complete 2026-03-13)
+- [x] 26-02-PLAN.md -- Graph-based expand.rs update and sqllogictest integration tests (complete 2026-03-13)
 
 ### Phase 27: Alias-Based Query Expansion
 **Goal**: Query expansion generates direct FROM+JOIN SQL with qualified column references instead of CTE flattening
@@ -221,6 +221,6 @@ Phases execute in numeric order: 24 -> 25 -> 25.1 -> 26 -> 27 -> 28
 | 24. PK/FK Model | v0.5.2 | 0/2 | Not started | - |
 | 25. SQL Body Parser | v0.5.2 | 4/4 | Complete | 2026-03-12 |
 | 25.1. Parser Robustness & Security | 2/2 | Complete    | 2026-03-13 | - |
-| 26. PK/FK Join Resolution | 1/2 | In Progress|  | - |
+| 26. PK/FK Join Resolution | v0.5.2 | 2/2 | Complete | 2026-03-13 |
 | 27. Alias-Based Query Expansion | v0.5.2 | 0/? | Not started | - |
 | 28. Integration Testing & Docs | v0.5.2 | 0/? | Not started | - |

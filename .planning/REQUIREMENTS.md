@@ -27,17 +27,17 @@ Requirements for SQL DDL syntax, PK/FK relationship model, and qualified column 
 
 ### Expansion
 
-- [ ] **EXP-01**: Query expansion generates alias-based `FROM base AS alias LEFT JOIN t AS alias ON ...` (no CTE flattening)
-- [ ] **EXP-02**: JOIN ON clauses synthesized from PK/FK declarations
+- [x] **EXP-01**: Query expansion generates alias-based `FROM base AS alias LEFT JOIN t AS alias ON ...` (no CTE flattening)
+- [x] **EXP-02**: JOIN ON clauses synthesized from PK/FK declarations
 - [x] **EXP-03**: Join ordering via topological sort of relationship graph
-- [ ] **EXP-04**: Transitive join inclusion -- requesting dims from A and C auto-joins through B
+- [x] **EXP-04**: Transitive join inclusion -- requesting dims from A and C auto-joins through B
 - [ ] **EXP-05**: Qualified column references (`alias.column`) work in generated SQL
 - [x] **EXP-06**: Define-time validation: relationship graph must be a tree (error on diamonds/cycles)
 
 ### Cleanup
 
 - [ ] **CLN-01**: Remove old `:=`/struct literal DDL body parsing (no backward compat)
-- [ ] **CLN-02**: Remove CTE-based `_base` flattening expansion path
+- [x] **CLN-02**: Remove CTE-based `_base` flattening expansion path
 - [ ] **CLN-03**: Remove ON-clause substring matching join heuristic
 
 ### Documentation
@@ -96,14 +96,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | MDL-03 | Phase 24 | Pending |
 | MDL-04 | Phase 24 | Pending |
 | MDL-05 | Phase 24 | Pending |
-| EXP-01 | Phase 27 | Pending |
-| EXP-02 | Phase 26 | Pending |
+| EXP-01 | Phase 26 | Complete |
+| EXP-02 | Phase 26 | Complete |
 | EXP-03 | Phase 26 | Complete |
-| EXP-04 | Phase 26 | Pending |
+| EXP-04 | Phase 26 | Complete |
 | EXP-05 | Phase 27 | Pending |
 | EXP-06 | Phase 26 | Complete |
 | CLN-01 | Phase 27 | Pending |
-| CLN-02 | Phase 27 | Pending |
+| CLN-02 | Phase 26 | Complete |
 | CLN-03 | Phase 27 | Pending |
 | DOC-01 | Phase 28 | Pending |
 
