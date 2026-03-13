@@ -1,6 +1,6 @@
 # Phase 4 query round-trip integration tests.
-# Updated for keyword args: uses create_semantic_view with named params
-# and typed output columns (BIGINT metrics use query I, DATE dimensions use date_trunc).
+# Uses native CREATE SEMANTIC VIEW ... AS ... DDL syntax exclusively.
+# Typed output columns (BIGINT metrics use query I, DATE dimensions use date_trunc).
 #
 # Exercises semantic_view table function against real DuckDB tables with known
 # data. Covers basic aggregation, WHERE composition, multi-table joins,
@@ -12,8 +12,6 @@
 #
 # NOTE (Phase 27): PK/FK join resolution is the only join path. Dimension and
 # metric expressions use alias-qualified column names (e.g., 'o.region', 'c.tier').
-# Legacy join_columns definitions no longer produce JOINs in expanded SQL.
-# The joined_orders test below uses native CREATE SEMANTIC VIEW with PK/FK syntax.
 #
 # Requirements covered:
 #   TEST-03: Integration tests load the extension, create semantic views, run
@@ -21,7 +19,7 @@
 #   QUERY-01: semantic_view with named array parameters returns correct results
 #   QUERY-02: User WHERE clauses compose with view filters
 #   QUERY-03: SELECT * returns all requested dimensions and metrics
-#   DDL-04: 5-arg STRUCT/LIST DDL interface
+#   DDL-04: Native DDL interface
 #   DDL-06: semantic_view function name (renamed from semantic_query)
 #   EXPL-01: explain_semantic_view returns expanded SQL
 #   OUT-01: semantic_view returns typed columns (BIGINT, DATE) for numeric/date data
@@ -75,14 +73,18 @@ INSERT INTO test_products VALUES
 
 # Define a basic semantic view over test_orders (single table)
 statement ok
-SELECT * FROM create_semantic_view(
-    'simple_orders',
-    tables := [{'alias': 'o', 'table': 'test_orders'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
-     {'name': 'category', 'expr': 'category', 'source_table': 'o'}],
-    metrics := [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
-     {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}]
-);
+CREATE SEMANTIC VIEW simple_orders AS
+TABLES (
+    o AS test_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.category AS o.category
+)
+METRICS (
+    o.total_revenue AS sum(o.amount),
+    o.order_count AS count(*)
+)
 
 # Query with single dimension + single metric (DECIMAL stays VARCHAR)
 query TT rowsort
@@ -107,12 +109,16 @@ EMEA	electronics	175.00	2
 
 # Define a view with no built-in filter (filters via WHERE on query result)
 statement ok
-SELECT * FROM create_semantic_view(
-    'filtered_orders',
-    tables := [{'alias': 'o', 'table': 'test_orders'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
-    metrics := [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'}]
-);
+CREATE SEMANTIC VIEW filtered_orders AS
+TABLES (
+    o AS test_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total_revenue AS sum(o.amount)
+)
 
 query TT rowsort
 SELECT * FROM semantic_view('filtered_orders', dimensions := ['region'], metrics := ['total_revenue']);
@@ -250,12 +256,16 @@ specify at least
 
 # Define a view with a count metric (BIGINT output, typed I)
 statement ok
-SELECT * FROM create_semantic_view(
-    'typed_output_test',
-    tables := [{'alias': 'o', 'table': 'test_orders'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'}],
-    metrics := [{'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}]
-);
+CREATE SEMANTIC VIEW typed_output_test AS
+TABLES (
+    o AS test_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.order_count AS count(*)
+)
 
 # query TI confirms: region is VARCHAR (T), order_count is BIGINT (I)
 query TI rowsort
@@ -265,7 +275,7 @@ APAC	2
 EMEA	3
 
 statement ok
-SELECT * FROM drop_semantic_view('typed_output_test');
+DROP SEMANTIC VIEW typed_output_test;
 
 # DATE typed column test (OUT-01)
 statement ok
@@ -280,12 +290,16 @@ INSERT INTO test_events VALUES
     ('2024-02-20', 3);
 
 statement ok
-SELECT * FROM create_semantic_view(
-    'typed_date_test',
-    tables := [{'alias': 'e', 'table': 'test_events'}],
-    dimensions := [{'name': 'event_date', 'expr': "date_trunc('month', event_date)", 'source_table': 'e'}],
-    metrics := [{'name': 'total_count', 'expr': 'sum(event_count)', 'source_table': 'e'}]
-);
+CREATE SEMANTIC VIEW typed_date_test AS
+TABLES (
+    e AS test_events PRIMARY KEY (event_date)
+)
+DIMENSIONS (
+    e.event_date AS date_trunc('month', e.event_date)
+)
+METRICS (
+    e.total_count AS sum(e.event_count)
+)
 
 # date_trunc('month', DATE) returns DATE values.
 # SQLLogicTest does not support the 'D' specifier; 'T' reads any column as text.
@@ -297,7 +311,7 @@ FROM semantic_view('typed_date_test', dimensions := ['event_date'], metrics := [
 2024-02-01	3
 
 statement ok
-SELECT * FROM drop_semantic_view('typed_date_test');
+DROP SEMANTIC VIEW typed_date_test;
 
 statement ok
 DROP TABLE test_events;
@@ -307,10 +321,10 @@ DROP TABLE test_events;
 # ============================================================
 
 statement ok
-SELECT * FROM drop_semantic_view('simple_orders');
+DROP SEMANTIC VIEW simple_orders;
 
 statement ok
-SELECT * FROM drop_semantic_view('filtered_orders');
+DROP SEMANTIC VIEW filtered_orders;
 
 statement ok
 DROP SEMANTIC VIEW joined_orders;

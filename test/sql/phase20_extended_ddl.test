@@ -1,5 +1,5 @@
 # Phase 20: Extended DDL statements integration tests
-# Rewritten for AS-body keyword syntax (CLN-01: paren-body syntax removed).
+# Uses native CREATE SEMANTIC VIEW ... AS ... DDL syntax exclusively.
 #
 # Verifies all extended DDL forms work via native DDL syntax
 # (parser hook -> rewrite -> C++ result forwarding -> function call).
@@ -177,27 +177,6 @@ METRICS (
 
 statement ok
 drop semantic view sv_mixed_test;
-
-# ============================================================
-# Backward compatibility: normal SQL and function-based DDL
-# ============================================================
-
-# Normal SQL still works
-query I
-SELECT 42;
-----
-42
-
-# Function-based DDL still works
-statement ok
-SELECT * FROM create_semantic_view('fn_test',
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sv_test'}]
-);
-
-statement ok
-SELECT * FROM drop_semantic_view('fn_test');
 
 # ============================================================
 # DDL-07: DESCRIBE SEMANTIC VIEW
