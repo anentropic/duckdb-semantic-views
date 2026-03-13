@@ -97,11 +97,13 @@ fn build_as_body_suffix(name: &str) -> String {
     )
 }
 
-/// Build a valid suffix for a given DdlKind (name + body for CREATE, name for DROP/DESCRIBE, empty for SHOW).
+/// Build a valid suffix for a given DdlKind (AS-body for CREATE, name for DROP/DESCRIBE, empty for SHOW).
 fn build_suffix(kind: DdlKind, name: &str) -> String {
     match kind {
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
-            format!(" {name} (tables := [], dimensions := [])")
+            format!(
+                " {name} AS TABLES (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.region AS region) METRICS (t.revenue AS SUM(amount))"
+            )
         }
         DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe => {
             format!(" {name}")
@@ -257,57 +259,31 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    /// Rewrite of CREATE forms produces correct function call with view name.
+    /// Rewrite of CREATE forms via validate_and_rewrite produces correct _from_json function call.
     #[test]
     fn rewrite_create_forms(
         form_idx in 0..3usize,
         name in arb_view_name(),
     ) {
-        let (prefix, _kind, fn_name) = CREATE_FORMS[form_idx];
-        let ddl = format!("{prefix} {name} (tables := [], dimensions := [])");
-        let sql = rewrite_ddl(&ddl).unwrap();
-        let expected_start = format!("SELECT * FROM {fn_name}(");
+        let (prefix, _kind, _fn_name) = CREATE_FORMS[form_idx];
+        let ddl = format!("{prefix}{}", build_as_body_suffix(&name));
+        let result = validate_and_rewrite(&ddl);
         prop_assert!(
-            sql.starts_with(&expected_start),
-            "Expected rewrite to start with '{}', got: {}",
-            expected_start, sql
+            result.is_ok(),
+            "Expected Ok for valid AS-body DDL, got: {:?}",
+            result
+        );
+        let sql = result.unwrap().unwrap();
+        prop_assert!(
+            sql.starts_with("SELECT * FROM "),
+            "Expected rewrite to start with 'SELECT * FROM ', got: {}",
+            sql
         );
         prop_assert!(
             sql.contains(&format!("'{name}'")),
             "Expected rewrite to contain view name '{}', got: {}",
             name, sql
         );
-    }
-
-    /// Rewrite of name-only forms (DROP, DESCRIBE) produces correct function call.
-    #[test]
-    fn rewrite_name_only_forms(
-        form_idx in 0..3usize,
-        name in arb_view_name(),
-    ) {
-        let (prefix, _kind, fn_name) = NAME_ONLY_FORMS[form_idx];
-        let ddl = format!("{prefix} {name}");
-        let sql = rewrite_ddl(&ddl).unwrap();
-        let expected_start = format!("SELECT * FROM {fn_name}(");
-        prop_assert!(
-            sql.starts_with(&expected_start),
-            "Expected rewrite to start with '{}', got: {}",
-            expected_start, sql
-        );
-        prop_assert!(
-            sql.contains(&format!("'{name}'")),
-            "Expected rewrite to contain view name '{}', got: {}",
-            name, sql
-        );
-    }
-
-    /// Rewrite of SHOW produces exactly the list function call.
-    #[test]
-    fn rewrite_show_form(
-        prefix in arb_case_variant("show semantic views"),
-    ) {
-        let sql = rewrite_ddl(&prefix).unwrap();
-        prop_assert_eq!(sql, "SELECT * FROM list_semantic_views()");
     }
 
     /// extract_ddl_name returns the correct name for CREATE forms.
@@ -317,7 +293,7 @@ proptest! {
         name in arb_view_name(),
     ) {
         let (prefix, _kind, _fn_name) = CREATE_FORMS[form_idx];
-        let ddl = format!("{prefix} {name} (tables := [], dimensions := [])");
+        let ddl = format!("{prefix}{}", build_as_body_suffix(&name));
         let extracted = extract_ddl_name(&ddl).unwrap();
         prop_assert_eq!(extracted, Some(name));
     }
@@ -349,50 +325,19 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    /// Error position for unknown clause keyword points at the typo in the original
-    /// query, regardless of leading whitespace variation.
+    /// Paren-body syntax now returns "no longer supported" error with position.
     #[test]
-    fn position_invariant_clause_typo(
+    fn position_invariant_paren_body_rejected(
         spaces in "[ ]{0,20}",
     ) {
         let query = format!("{spaces}CREATE SEMANTIC VIEW x (tbles := [])");
         let err = validate_and_rewrite(&query).unwrap_err();
-        let pos = err.position.unwrap();
-        // The position must point at the start of "tbles" in the original query.
-        prop_assert_eq!(
-            &query[pos..pos + 5],
-            "tbles",
-            "Position {} does not point at 'tbles' in query: {:?}",
-            pos, query
-        );
         prop_assert!(
-            err.message.contains("Unknown clause"),
-            "Expected 'Unknown clause' error, got: {}",
+            err.message.contains("no longer supported"),
+            "Expected 'no longer supported' error, got: {}",
             err.message
         );
-    }
-
-    /// Error position for empty body points right after '(' regardless of whitespace.
-    #[test]
-    fn position_invariant_empty_body(
-        spaces in "[ ]{0,20}",
-    ) {
-        // The body is a single space between ( and ) so it's considered empty after trimming.
-        let query = format!("{spaces}CREATE SEMANTIC VIEW x ( )");
-        let err = validate_and_rewrite(&query).unwrap_err();
-        let pos = err.position.unwrap();
-        // Position should point inside the body area (right after '(').
-        let open_paren = query.find('(').unwrap();
-        prop_assert!(
-            pos > open_paren,
-            "Position {} should be after '(' at {} in query: {:?}",
-            pos, open_paren, query
-        );
-        prop_assert!(
-            err.message.contains("empty") || err.message.contains("Missing required clause"),
-            "Expected empty body or missing clause error, got: {}",
-            err.message
-        );
+        prop_assert!(err.position.is_some());
     }
 
     /// Error position for missing view name after DROP prefix accounts for whitespace.
@@ -419,9 +364,9 @@ proptest! {
         );
     }
 
-    /// Error position for missing '(' after view name accounts for whitespace.
+    /// Error position for missing 'AS' after view name accounts for whitespace.
     #[test]
-    fn position_invariant_missing_paren(
+    fn position_invariant_missing_as(
         spaces in "[ ]{0,20}",
         name in arb_view_name(),
     ) {
@@ -435,20 +380,20 @@ proptest! {
             pos, query
         );
         prop_assert!(
-            err.message.contains("Expected '('"),
-            "Expected \"Expected '('\" error, got: {}",
+            err.message.contains("Expected 'AS'"),
+            "Expected \"Expected 'AS'\" error, got: {}",
             err.message
         );
     }
 
-    /// validate_and_rewrite returns Ok(Some(_)) for valid DDL with varying whitespace.
+    /// validate_and_rewrite returns Ok(Some(_)) for valid AS-body DDL with varying whitespace.
     #[test]
     fn valid_ddl_with_whitespace_succeeds(
         spaces in "[ ]{0,20}",
         name in arb_view_name(),
     ) {
         let query = format!(
-            "{spaces}CREATE SEMANTIC VIEW {name} (tables := ['t'], dimensions := ['d'])"
+            "{spaces}CREATE SEMANTIC VIEW{}", build_as_body_suffix(&name)
         );
         let result = validate_and_rewrite(&query);
         prop_assert!(
@@ -529,134 +474,6 @@ proptest! {
             Some(spaces.len()),
             "Near-miss position should be at trim_offset ({}), got {:?}",
             spaces.len(), err.position
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bracket validation properties (TEST-05)
-// ---------------------------------------------------------------------------
-
-proptest! {
-    /// Balanced brackets in a valid body do not produce errors.
-    #[test]
-    fn brackets_balanced_valid_body(
-        _name in arb_view_name(),
-    ) {
-        let body = "tables := ['orders'], dimensions := [{'name': 'region', 'expr': 'region'}]";
-        let body_offset = 0;
-        let result = validate_clauses(body, body_offset, "");
-        prop_assert!(
-            result.is_ok(),
-            "Expected Ok for balanced brackets, got: {:?}",
-            result
-        );
-    }
-
-    /// An extra '[' appended to a valid body produces an unbalanced bracket error.
-    #[test]
-    fn brackets_extra_open_bracket(
-        _name in arb_view_name(),
-    ) {
-        let body = format!("tables := ['orders'], dimensions := []{}", "[");
-        let body_offset = 0;
-        let result = validate_clauses(&body, body_offset, "");
-        prop_assert!(
-            result.is_err(),
-            "Expected Err for unbalanced bracket, got Ok"
-        );
-        let err = result.unwrap_err();
-        prop_assert!(
-            err.message.contains("Unbalanced bracket"),
-            "Expected 'Unbalanced bracket' error, got: {}",
-            err.message
-        );
-    }
-
-    /// Extra ']' after balanced brackets: the current implementation silently
-    /// ignores unmatched close brackets when the stack is empty (check_close_bracket
-    /// returns Ok(()) because paren_stack.last() is None). This test documents
-    /// that behavior.
-    #[test]
-    fn brackets_extra_close_bracket_is_tolerated(
-        _name in arb_view_name(),
-    ) {
-        let body = format!("tables := ['orders'], dimensions := []{}", "]");
-        let body_offset = 0;
-        let _result = validate_clauses(&body, body_offset, "");
-        // Documenting current behavior: unmatched close brackets with an
-        // empty stack are silently ignored by the bracket validator.
-    }
-
-    /// Brackets inside single-quoted string literals do not affect bracket validation.
-    #[test]
-    fn brackets_inside_strings_ignored(
-        _name in arb_view_name(),
-    ) {
-        let body = "tables := ['a[b]c'], dimensions := [{'name': 'x', 'expr': 'y'}]";
-        let body_offset = 0;
-        let result = validate_clauses(body, body_offset, "");
-        prop_assert!(
-            result.is_ok(),
-            "Expected Ok for brackets inside strings, got: {:?}",
-            result
-        );
-    }
-
-    /// Nested brackets (array of maps) are handled correctly.
-    #[test]
-    fn brackets_nested_structures(
-        _name in arb_view_name(),
-    ) {
-        let body = "tables := [{'key': [1, 2, 3]}], dimensions := [{'name': 'x', 'expr': 'y'}]";
-        let body_offset = 0;
-        let result = validate_clauses(body, body_offset, "");
-        prop_assert!(
-            result.is_ok(),
-            "Expected Ok for nested brackets, got: {:?}",
-            result
-        );
-    }
-
-    /// body_offset is correctly added to the error position for unbalanced brackets.
-    #[test]
-    fn brackets_error_position_includes_offset(
-        offset in 10..100usize,
-    ) {
-        // Body with an unmatched '['
-        let body = "tables := [, dimensions := []";
-        let result = validate_clauses(body, offset, "");
-        prop_assert!(
-            result.is_err(),
-            "Expected Err for unbalanced bracket"
-        );
-        let err = result.unwrap_err();
-        let pos = err.position.unwrap();
-        // The position should be >= offset (because body_offset is added)
-        prop_assert!(
-            pos >= offset,
-            "Error position {} should be >= body_offset {}",
-            pos, offset
-        );
-    }
-
-    /// Mismatched bracket types produce an error (e.g. '[' closed with '}').
-    #[test]
-    fn brackets_mismatch_detected(
-        _name in arb_view_name(),
-    ) {
-        let body = "tables := [}, dimensions := []";
-        let body_offset = 0;
-        let result = validate_clauses(body, body_offset, "");
-        prop_assert!(
-            result.is_err(),
-            "Expected Err for mismatched brackets"
-        );
-        let err = result.unwrap_err();
-        prop_assert!(
-            err.message.contains("Unbalanced bracket"),
-            "Expected 'Unbalanced bracket' error, got: {}",
-            err.message
         );
     }
 }
@@ -828,7 +645,7 @@ proptest! {
 
     /// For the 3 CREATE forms, replacing prefix spaces with non-space whitespace
     /// and calling validate_and_rewrite must return Ok(Some(sql)) where sql
-    /// starts with "SELECT * FROM ". Currently FAILS.
+    /// starts with "SELECT * FROM ".
     #[test]
     fn prefix_whitespace_rewrite_roundtrip(
         form_idx in 0..3usize,
@@ -837,7 +654,7 @@ proptest! {
     ) {
         let (prefix, _kind, _fn_name) = CREATE_FORMS[form_idx];
         let rejoined = prefix.split(' ').collect::<Vec<_>>().join(&sep);
-        let query = format!("{rejoined} {name} (tables := ['t'], dimensions := ['d'])");
+        let query = format!("{rejoined}{}", build_as_body_suffix(&name));
         let result = validate_and_rewrite(&query);
         prop_assert!(
             result.is_ok(),
