@@ -288,7 +288,7 @@ mod extension {
     use crate::{
         catalog::init_catalog,
         ddl::{
-            define::{DefineFromJsonVTab, DefineSemanticViewVTab, DefineState},
+            define::{DefineFromJsonVTab, DefineState},
             describe::DescribeSemanticViewVTab,
             drop::{DropSemanticViewVTab, DropState},
             list::ListSemanticViewsVTab,
@@ -346,56 +346,37 @@ mod extension {
             None
         };
 
-        // Register create_semantic_view(name, tables :=, ...) table function.
+        // Register create_semantic_view_from_json(name, json) -- target for native DDL.
+        // The native DDL path (CREATE SEMANTIC VIEW ... AS ...) rewrites to a call to
+        // these _from_json table functions. Three variants cover the 3 CREATE forms.
         let define_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
             or_replace: false,
             if_not_exists: false,
         };
-        con.register_table_function_with_extra_info::<DefineSemanticViewVTab, _>(
-            "create_semantic_view",
+        con.register_table_function_with_extra_info::<DefineFromJsonVTab, _>(
+            "create_semantic_view_from_json",
             &define_state,
         )?;
 
-        // Register create_or_replace_semantic_view(name, tables :=, ...) table function.
         let define_or_replace_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
             or_replace: true,
             if_not_exists: false,
         };
-        con.register_table_function_with_extra_info::<DefineSemanticViewVTab, _>(
-            "create_or_replace_semantic_view",
+        con.register_table_function_with_extra_info::<DefineFromJsonVTab, _>(
+            "create_or_replace_semantic_view_from_json",
             &define_or_replace_state,
         )?;
 
-        // Register create_semantic_view_if_not_exists(name, tables :=, ...) table function.
         let define_if_not_exists_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
             or_replace: false,
             if_not_exists: true,
         };
-        con.register_table_function_with_extra_info::<DefineSemanticViewVTab, _>(
-            "create_semantic_view_if_not_exists",
-            &define_if_not_exists_state,
-        )?;
-
-        // Register create_semantic_view_from_json(name, json) -- target for AS-body DDL.
-        // Uses the same DefineState as the corresponding paren-body variants.
-        con.register_table_function_with_extra_info::<DefineFromJsonVTab, _>(
-            "create_semantic_view_from_json",
-            &define_state,
-        )?;
-
-        // Register create_or_replace_semantic_view_from_json(name, json).
-        con.register_table_function_with_extra_info::<DefineFromJsonVTab, _>(
-            "create_or_replace_semantic_view_from_json",
-            &define_or_replace_state,
-        )?;
-
-        // Register create_semantic_view_if_not_exists_from_json(name, json).
         con.register_table_function_with_extra_info::<DefineFromJsonVTab, _>(
             "create_semantic_view_if_not_exists_from_json",
             &define_if_not_exists_state,
