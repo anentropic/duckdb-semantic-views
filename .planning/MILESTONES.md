@@ -1,5 +1,28 @@
 # Milestones
 
+## v0.5.2 SQL DDL & PK/FK Relationships (Shipped: 2026-03-13)
+
+**Phases completed:** 5 active phases (24-28, Phase 24 cancelled), 14 plans
+**Source changes:** 144 files, +17,702 / -4,437 lines
+**Commits:** 89
+**Tests:** 282 Rust tests + 7 sqllogictest files + 6 DuckLake CI + 13 Python crash repro + 3 Python caret
+**Timeline:** 5 days (2026-03-09 → 2026-03-13)
+
+**Delivered:** SQL keyword body syntax (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS) replacing function-call DDL, Snowflake-style PK/FK relationship model with automatic JOIN ON synthesis, topological sort ordering, define-time graph validation, and qualified column references. Function-based DDL interface fully retired; native DDL is sole interface.
+
+**Key accomplishments:**
+1. SQL keyword body parser with state-machine clause boundary detection for TABLES, RELATIONSHIPS, DIMENSIONS, METRICS
+2. Parser robustness hardening: token-based DDL detection, adversarial input safety, fuzz_ddl_parse target
+3. RelationshipGraph module with Kahn's algorithm toposort, diamond/cycle detection, define-time validation
+4. Alias-based FROM+JOIN expansion with qualified column refs, replacing CTE flattening pattern
+5. Function DDL retired: DefineSemanticViewVTab + parse_args.rs removed; native DDL is sole interface
+6. README rewritten with AS-body PK/FK syntax examples; 3-table E2E integration test
+
+**Requirements:** 16/16 active satisfied, 6 cancelled (DDL-06 won't-do, MDL-01-05 delivered implicitly)
+**Audit:** Tech debt — no blockers, 2 minor cleanup items (stale doc comment, stale REQUIREMENTS checkboxes)
+
+---
+
 ## v0.5.1 DDL Polish (Shipped: 2026-03-09)
 
 **Phases completed:** 5 phases (19-23), 9 plans

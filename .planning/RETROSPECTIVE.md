@@ -222,6 +222,54 @@
 
 ---
 
+## Milestone: v0.5.2 — SQL DDL & PK/FK Relationships
+
+**Shipped:** 2026-03-13
+**Phases:** 5 active (Phase 24 cancelled) | **Plans:** 14 | **Commits:** 89
+
+### What Was Built
+- SQL keyword body parser: state-machine clause boundary detection for TABLES, RELATIONSHIPS, DIMENSIONS, METRICS
+- Parser robustness hardening: token-based DDL detection, adversarial input safety, fuzz_ddl_parse target
+- RelationshipGraph module: Kahn's algorithm toposort, diamond/cycle detection, define-time validation
+- Alias-based FROM+JOIN expansion with qualified column refs, replacing CTE flattening pattern
+- Function DDL retirement: DefineSemanticViewVTab + parse_args.rs removed; native DDL is sole interface
+- README rewritten with AS-body PK/FK syntax examples; 3-table E2E integration test
+
+### What Worked
+- Phase 24 cancellation with absorption into Phase 25-01 — model fields added as auto-fix rather than separate phase, saved a full phase of overhead
+- JSON-bridge pattern (AS-body parsed in Rust → JSON → DefineFromJsonVTab) — avoided building a second VTab, reused existing infrastructure
+- Kahn's algorithm for toposort — naturally detects cycles as leftover nodes, simpler than DFS-based approaches
+- Bidirectional join lookup in expand.rs — handles FK source and target aliases without separate traversal
+- Phase 28 integration testing caught real issues (DESCRIBE JSON field names, phase28_e2e.test stale data)
+
+### What Was Inefficient
+- Phase 24 planned as separate phase but all its work absorbed into Phase 25-01 — planning overhead for a phase that never executed
+- ROADMAP.md plan checkboxes inconsistent (some phases showed `[ ]` on completed plans) — manual tracking drift
+- STATE.md progress showed 93% because the CLI counted Phase 24 as incomplete rather than cancelled
+- Nyquist VALIDATION.md files still mostly drafts (4/5 partial) — same process gap from v0.5.0 and v0.5.1
+
+### Patterns Established
+- State-machine clause parser (`find_clause_bounds`) for multi-keyword SQL body parsing
+- `skip_serializing_if` on new model fields for backward-compatible JSON evolution
+- RelationshipGraph with adjacency list + reverse edges for O(1) validation
+- Flat FROM+LEFT JOIN expansion pattern (no CTE) with qualified column scoping
+- Phase cancellation with absorption — cancel phase, add its work as auto-fix to downstream plan
+
+### Key Lessons
+1. Phase cancellation is better than phase execution when the work naturally fits into downstream plans — avoid the overhead of a separate phase for model-only changes
+2. JSON-bridge patterns are powerful for integrating new parser paths with existing VTab infrastructure — parse differently, serialize to the same format
+3. Topological sort ordering produces deterministic SQL regardless of DDL declaration order — critical for test stability
+4. Retiring old interfaces early (function DDL) reduces test and maintenance surface area — -400 LOC and simpler test files
+5. Define-time graph validation (cycles, diamonds) prevents confusing query-time errors — fail fast at DDL, not at SELECT
+
+### Cost Observations
+- 89 commits in 5 days
+- 14 plans averaging ~13 min each (~180 min total execution)
+- Phase 24 cancelled (0 execution time), Phase 25 was largest (4 plans, ~55 min)
+- Notable: function DDL retirement (Phase 28-01) was cleaner than expected — 2 tasks, 18 min, -400 LOC
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -234,6 +282,7 @@
 | v0.4.0 | — | — | Breaking simplification — removed time_dimensions/granularities |
 | v0.5.0 | 45 | 5 | Parser extension spike — native DDL via C++ shim + statement rewriting |
 | v0.5.1 | ~30 | 5 | DDL Polish — 7 DDL verbs, error location reporting, 33 parser PBTs + Python caret tests |
+| v0.5.2 | 89 | 5 | SQL DDL body + PK/FK relationships, graph validation, function DDL retired |
 
 ### Cumulative Quality
 
@@ -244,6 +293,7 @@
 | v0.3.0 | 136+ | 40 properties | 3 targets | 3 + vector_reference_test |
 | v0.5.0 | 172 | 40 properties | 3 targets | 4 (SQLLogicTest + DuckLake CI + vector_reference + vtab_crash) |
 | v0.5.1 | 222+ | 73 properties (40 output + 33 parser) | 3 targets | 5 (+ Python caret integration) |
+| v0.5.2 | 282+ | 73+ properties | 4 targets | 7 sqllogictest + DuckLake CI + Python crash + caret |
 
 ### Top Lessons (Verified Across Milestones)
 
