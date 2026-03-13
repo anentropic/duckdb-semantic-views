@@ -141,7 +141,7 @@ Plans:
   3. Adversarial inputs (very long strings, null bytes, embedded semicolons in view names, Unicode homoglyphs, control characters) are handled safely — no panic, no buffer overrun, no silent wrong-detection
   4. `body_parser.rs` clause keyword matching is similarly whitespace-tolerant
   5. `just test-all` passes
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 Plans:
 - [ ] 25.1-01-PLAN.md -- Write failing TEST-07 proptests + TEST-08 adversarial tests + fuzz_ddl_parse target
 - [ ] 25.1-02-PLAN.md -- Implement token-based detect_ddl_kind, decouple prefix_len callers, close TECH-DEBT item 4
@@ -217,7 +217,7 @@ Phases execute in numeric order: 24 -> 25 -> 25.1 -> 26 -> 27 -> 28
 | 23. Parser Proptests + Caret Tests | v0.5.1 | 2/2 | Complete | 2026-03-09 |
 | 24. PK/FK Model | v0.5.2 | 0/2 | Not started | - |
 | 25. SQL Body Parser | v0.5.2 | 4/4 | Complete | 2026-03-12 |
-| 25.1. Parser Robustness & Security | 1/2 | In Progress|  | - |
+| 25.1. Parser Robustness & Security | 2/2 | Complete   | 2026-03-13 | - |
 | 26. PK/FK Join Resolution | v0.5.2 | 0/? | Not started | - |
 | 27. Alias-Based Query Expansion | v0.5.2 | 0/? | Not started | - |
 | 28. Integration Testing & Docs | v0.5.2 | 0/? | Not started | - |

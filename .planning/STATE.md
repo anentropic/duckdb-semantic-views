@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: paused
-stopped_at: Completed 25.1-01-PLAN.md
-last_updated: "2026-03-12T14:08:26.047Z"
+stopped_at: Completed 25.1-02-PLAN.md
+last_updated: "2026-03-13T08:22:12.286Z"
 last_activity: 2026-03-11 -- Phase 25 Plan 04 Tasks 1-2 complete (integration tests + AS-body dispatch fix)
 progress:
   total_phases: 6
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 8
-  completed_plans: 5
+  completed_plans: 6
   percent: 33
 ---
 
@@ -77,6 +77,8 @@ Recent decisions affecting current work:
 - [Phase 25.1-01]: Corpus seeds placed in fuzz/seeds/fuzz_ddl_parse/ (git-tracked) not fuzz/corpus/ (gitignored by .gitignore convention)
 - [Phase 25.1-01]: TEST-08 adversarial tests use catch_unwind in standalone #[test] functions (not proptest blocks) for absolute invariant verification
 - [Phase 25.1-01]: Fuzz target rejects invalid UTF-8 early with early return (not a panic/crash)
+- [Phase 25.1-parser-robustness-security-hardening]: validate_and_rewrite calls detect_ddl_prefix on trimmed_no_semi so plen is relative to trimmed start; trim_offset + plen invariant preserved
+- [Phase 25.1-parser-robustness-security-hardening]: prefix_len removed entirely (not kept as dead code); detect_ddl_prefix returns (kind, bytes) eliminating two-step detect + measure pattern
 
 ### Pending Todos
 
@@ -96,9 +98,10 @@ None.
 | Phase 25-sql-body-parser P03 | 8 | 2 tasks | 3 files |
 | Phase 25-sql-body-parser P04 | 25 | 3 tasks | 5 files |
 | Phase 25.1 P01 | 6 | 2 tasks | 8 files |
+| Phase 25.1-parser-robustness-security-hardening P02 | 15 | 2 tasks | 2 files |
 
 ## Session Continuity
 
-Last session: 2026-03-12T14:08:26.045Z
-Stopped at: Completed 25.1-01-PLAN.md
+Last session: 2026-03-13T08:22:12.284Z
+Stopped at: Completed 25.1-02-PLAN.md
 Resume file: None
