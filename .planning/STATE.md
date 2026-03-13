@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: completed
-stopped_at: Phase 28 context gathered
-last_updated: "2026-03-13T17:42:12.889Z"
-last_activity: 2026-03-13 -- Phase 27 Plan 03 complete (error message + caret test gap closure)
+stopped_at: Completed 28-01-PLAN.md
+last_updated: "2026-03-13T18:23:53Z"
+last_activity: 2026-03-13 -- Phase 28 Plan 01 complete (function DDL source code removal)
 progress:
   total_phases: 6
   completed_phases: 4
   total_plans: 13
-  completed_plans: 11
-  percent: 60
+  completed_plans: 12
+  percent: 80
 ---
 
 # Project State
@@ -21,22 +21,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-09)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand -- the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 27 - Alias-Based Query Expansion
+**Current focus:** Phase 28 - Integration Testing & Documentation
 
 ## Current Position
 
-Phase: 27 (4 of 5 in v0.5.2) -- COMPLETE
-Plan: 3 of 3 in current phase (27-03 complete)
-Status: Phase 27 complete (gap closure plan 03 added and completed)
-Last activity: 2026-03-13 -- Phase 27 Plan 03 complete (error message + caret test gap closure)
+Phase: 28 (5 of 5 in v0.5.2) -- In Progress
+Plan: 1 of 3 in current phase (28-01 complete)
+Status: Plan 28-01 complete (function DDL source code removal)
+Last activity: 2026-03-13 -- Phase 28 Plan 01 complete (function DDL source code removal)
 
-Progress: [██████░░░░] 60%
+Progress: [████████░░] 80%
 
 ## Performance Metrics
 
 **Velocity (v0.5.2, current):**
-- Plans completed: 8 (25-01, 25-02, 25-03, 26-01, 26-02, 27-01, 27-02, 27-03); 25-04 verified; Phase 26, 27 complete
+- Plans completed: 9 (25-01, 25-02, 25-03, 26-01, 26-02, 27-01, 27-02, 27-03, 28-01); 25-04 verified; Phases 25, 25.1, 26, 27 complete
 - Timeline: 2026-03-11 to 2026-03-13 (ongoing)
+- 28-01: 18 min / 2 tasks / 4 files
 - 27-03: 6 min / 2 tasks / 4 files
 - 27-02: 12 min / 2 tasks / 7 files
 - 27-01: 12 min / 2 tasks / 4 files
@@ -98,6 +99,8 @@ Recent decisions affecting current work:
 - [Phase 27-02]: CLAUSE_KEYWORDS/suggest_clause_keyword removed from parse.rs (body_parser.rs has own copies)
 - [Phase 27-02]: validate_create_body returns clear error for non-AS-body syntax with position
 - [Phase 27]: Error message says 'Expected AS keyword' without referencing old syntax that was never released
+- [Phase 28-01]: function_name() CREATE arms left as-is -- called before match rejects CREATE, so unreachable!() would panic
+- [Phase 28-01]: DefineSemanticViewVTab and parse_args.rs removed; only DefineFromJsonVTab path remains for CREATE operations
 
 ### Pending Todos
 
@@ -122,6 +125,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-13T17:42:12.876Z
-Stopped at: Phase 28 context gathered
-Resume file: .planning/phases/28-integration-testing-documentation/28-CONTEXT.md
+Last session: 2026-03-13T18:23:53Z
+Stopped at: Completed 28-01-PLAN.md
+Resume file: None

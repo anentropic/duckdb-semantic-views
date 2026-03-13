@@ -175,7 +175,7 @@ Plans:
   4. README shows the new SQL DDL syntax with a worked PK/FK relationship example
 **Plans:** 3 plans
 Plans:
-- [ ] 28-01-PLAN.md -- Remove function DDL source code (DefineSemanticViewVTab, parse_args.rs, lib.rs registrations)
+- [x] 28-01-PLAN.md -- Remove function DDL source code (DefineSemanticViewVTab, parse_args.rs, lib.rs registrations) (complete 2026-03-13)
 - [ ] 28-02-PLAN.md -- Rewrite/delete SQL and Python test files to use native DDL
 - [ ] 28-03-PLAN.md -- 3-table E2E integration test + README rewrite
 
@@ -219,4 +219,4 @@ Phases execute in numeric order: 24 -> 25 -> 25.1 -> 26 -> 27 -> 28
 | 25.1. Parser Robustness & Security | v0.5.2 | 2/2 | Complete | 2026-03-13 |
 | 26. PK/FK Join Resolution | v0.5.2 | 2/2 | Complete | 2026-03-13 |
 | 27. Alias-Based Query Expansion | v0.5.2 | 3/3 | Complete | 2026-03-13 |
-| 28. Integration Testing & Docs | v0.5.2 | 0/3 | Not started | - |
+| 28. Integration Testing & Docs | v0.5.2 | 1/3 | In Progress | - |
