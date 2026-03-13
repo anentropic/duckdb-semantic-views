@@ -12,17 +12,17 @@ require semantic_views
 # Section 1: CLN-01 -- Paren-body syntax rejected with clear error
 # ============================================================
 
-# Old paren-body syntax produces a clear "no longer supported" error
+# Non-AS-body syntax produces a clear "Expected 'AS' keyword" error
 statement error
 CREATE SEMANTIC VIEW err_test (tables := [{'alias': 't', 'table': 't'}], dimensions := [{'name': 'x', 'expr': 'x', 'source_table': 't'}])
 ----
-no longer supported
+Expected 'AS' keyword
 
 # Empty parens also rejected (no AS keyword)
 statement error
 CREATE SEMANTIC VIEW err_test ();
 ----
-no longer supported
+Expected 'AS' keyword
 
 # ============================================================
 # Section 2: ERR-02 -- Structural errors (missing name, etc.)

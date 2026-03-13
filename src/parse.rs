@@ -433,10 +433,10 @@ fn validate_create_body(
     }
     // --- End AS keyword body path ---
 
-    // Paren-body syntax (tables := [...]) is no longer supported (CLN-01).
+    // Non-AS-body syntax rejected -- AS keyword required after view name.
     let pos_in_trimmed = plen + (trimmed_no_semi.len() - plen - after_prefix.len()) + name_end;
     Err(ParseError {
-        message: "Expected 'AS' keyword after view name. The old paren-body syntax (tables := [...]) is no longer supported. Use: CREATE SEMANTIC VIEW name AS TABLES (...) DIMENSIONS (...) METRICS (...)".to_string(),
+        message: "Expected 'AS' keyword after view name. Use: CREATE SEMANTIC VIEW name AS TABLES (...) DIMENSIONS (...) METRICS (...)".to_string(),
         position: Some(trim_offset + pos_in_trimmed),
     })
 }
@@ -1038,15 +1038,15 @@ mod tests {
 
     #[test]
     fn test_validate_and_rewrite_rejects_paren_body() {
-        // CLN-01: paren-body syntax is no longer supported
+        // CLN-01: non-AS-body syntax rejected with clear error
         let result = validate_and_rewrite(
             "CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])",
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("no longer supported"),
-            "Expected 'no longer supported' error, got: {}",
+            err.message.contains("Expected 'AS' keyword"),
+            "Expected 'Expected 'AS' keyword' error, got: {}",
             err.message
         );
     }
@@ -1159,13 +1159,13 @@ mod tests {
 
     #[test]
     fn test_parse_error_position_paren_body_rejected() {
-        // Paren-body syntax now returns "no longer supported" error with position
+        // Non-AS-body syntax returns "Expected 'AS' keyword" error with position
         let query = "CREATE SEMANTIC VIEW x (tables := [])";
         let result = validate_and_rewrite(query);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("no longer supported"),
+            err.message.contains("Expected 'AS' keyword"),
             "got: {}",
             err.message
         );
@@ -1222,14 +1222,14 @@ mod tests {
 
         #[test]
         fn old_paren_body_is_rejected() {
-            // CLN-01: paren-body syntax is no longer supported
+            // CLN-01: non-AS-body syntax rejected with clear error
             let query = "CREATE SEMANTIC VIEW v (tables := [], dimensions := [])";
             let result = validate_and_rewrite(query);
             assert!(result.is_err(), "Paren-body must be rejected: {result:?}");
             let err = result.unwrap_err();
             assert!(
-                err.message.contains("no longer supported"),
-                "Expected 'no longer supported' error, got: {}",
+                err.message.contains("Expected 'AS' keyword"),
+                "Expected 'Expected 'AS' keyword' error, got: {}",
                 err.message
             );
         }
