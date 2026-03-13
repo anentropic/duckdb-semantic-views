@@ -7,6 +7,10 @@ EXTENSION_NAME=semantic_views
 # Target DuckDB version — read from .duckdb-version (single source of truth)
 TARGET_DUCKDB_VERSION=$(shell cat .duckdb-version)
 
+# Pin the test-runner DuckDB pip package to match the build version.
+# base.Makefile defaults to latest PyPI; strip `v` prefix for PEP 440 compliance.
+DUCKDB_TEST_VERSION=$(subst v,,$(TARGET_DUCKDB_VERSION))
+
 all: configure debug
 
 # Include makefiles from DuckDB
