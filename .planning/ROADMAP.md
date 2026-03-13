@@ -219,4 +219,4 @@ Phases execute in numeric order: 24 -> 25 -> 25.1 -> 26 -> 27 -> 28
 | 25.1. Parser Robustness & Security | v0.5.2 | 2/2 | Complete | 2026-03-13 |
 | 26. PK/FK Join Resolution | v0.5.2 | 2/2 | Complete | 2026-03-13 |
 | 27. Alias-Based Query Expansion | v0.5.2 | 3/3 | Complete | 2026-03-13 |
-| 28. Integration Testing & Docs | 3/3 | Complete   | 2026-03-13 | - |
+| 28. Integration Testing & Docs | 3/3 | Complete    | 2026-03-13 | - |
