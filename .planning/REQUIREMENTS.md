@@ -36,7 +36,7 @@ Requirements for SQL DDL syntax, PK/FK relationship model, and qualified column 
 
 ### Cleanup
 
-- [ ] **CLN-01**: Remove old `:=`/struct literal DDL body parsing (no backward compat)
+- [x] **CLN-01**: Remove old `:=`/struct literal DDL body parsing (no backward compat)
 - [x] **CLN-02**: Remove CTE-based `_base` flattening expansion path
 - [x] **CLN-03**: Remove ON-clause substring matching join heuristic
 
@@ -102,7 +102,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | EXP-04 | Phase 26 | Complete |
 | EXP-05 | Phase 27 | Complete |
 | EXP-06 | Phase 26 | Complete |
-| CLN-01 | Phase 27 | Pending |
+| CLN-01 | Phase 27 | Complete |
 | CLN-02 | Phase 26 | Complete |
 | CLN-03 | Phase 27 | Complete |
 | DOC-01 | Phase 28 | Pending |

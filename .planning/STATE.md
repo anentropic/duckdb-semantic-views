@@ -10,8 +10,8 @@ progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 10
-  completed_plans: 9
-  percent: 52
+  completed_plans: 10
+  percent: 60
 ---
 
 # Project State
@@ -25,18 +25,19 @@ See: .planning/PROJECT.md (updated 2026-03-09)
 
 ## Current Position
 
-Phase: 27 (4 of 5 in v0.5.2) -- IN PROGRESS
-Plan: 1 of 2 in current phase (27-01 complete)
-Status: Phase 27 Plan 01 complete
-Last activity: 2026-03-13 -- Phase 27 Plan 01 complete (qualified refs verification + legacy join removal)
+Phase: 27 (4 of 5 in v0.5.2) -- COMPLETE
+Plan: 2 of 2 in current phase (27-02 complete)
+Status: Phase 27 complete
+Last activity: 2026-03-13 -- Phase 27 Plan 02 complete (paren-body DDL removal, CLN-01)
 
-Progress: [█████░░░░░] 52%
+Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
 **Velocity (v0.5.2, current):**
-- Plans completed: 6 (25-01, 25-02, 25-03, 26-01, 26-02, 27-01); 25-04 verified; Phase 26 complete
+- Plans completed: 7 (25-01, 25-02, 25-03, 26-01, 26-02, 27-01, 27-02); 25-04 verified; Phase 26, 27 complete
 - Timeline: 2026-03-11 to 2026-03-13 (ongoing)
+- 27-02: 12 min / 2 tasks / 7 files
 - 27-01: 12 min / 2 tasks / 4 files
 - 26-02: 14 min / 2 tasks / 4 files
 - 26-01: 12 min / 2 tasks / 3 files
@@ -92,6 +93,9 @@ Recent decisions affecting current work:
 - [Phase 27-01]: resolve_joins() and append_join_on_clause() deleted -- resolve_joins_pkfk() is sole join path
 - [Phase 27-01]: 11 legacy join unit tests deleted; phase4_query.test joined_orders updated to PK/FK DDL syntax
 - [Phase 27-01]: create_semantic_view() function-based DDL does not populate fk_columns/from_alias -- join resolution only works with native DDL
+- [Phase 27-02]: rewrite_ddl made private, rejects CREATE forms -- validate_and_rewrite is sole DDL entry point
+- [Phase 27-02]: CLAUSE_KEYWORDS/suggest_clause_keyword removed from parse.rs (body_parser.rs has own copies)
+- [Phase 27-02]: validate_create_body returns clear error for non-AS-body syntax with position
 
 ### Pending Todos
 
@@ -115,6 +119,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-13T15:59:13Z
-Stopped at: Completed 27-01-PLAN.md
-Resume file: 27-02-PLAN.md
+Last session: 2026-03-13T16:13:54Z
+Stopped at: Completed 27-02-PLAN.md (Phase 27 complete)
+Resume file: Next phase
