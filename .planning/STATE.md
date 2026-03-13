@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
-status: paused
-stopped_at: Phase 26 context gathered
-last_updated: "2026-03-13T12:26:52.739Z"
-last_activity: 2026-03-11 -- Phase 25 Plan 04 Tasks 1-2 complete (integration tests + AS-body dispatch fix)
+status: executing
+stopped_at: Phase 26 Plan 01 complete
+last_updated: "2026-03-13T13:23:00.000Z"
+last_activity: 2026-03-13 -- Phase 26 Plan 01 complete (graph module + define-time validation)
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 8
-  completed_plans: 6
-  percent: 33
+  completed_plans: 7
+  percent: 38
 ---
 
 # Project State
@@ -21,22 +21,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-09)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand -- the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 24 - PK/FK Model
+**Current focus:** Phase 26 - PK/FK Join Resolution
 
 ## Current Position
 
-Phase: 25 (2 of 5 in v0.5.2)
-Plan: 4 of 4 in current phase (25-04 Tasks 1-2 complete, awaiting checkpoint:human-verify)
-Status: Executing (paused at checkpoint)
-Last activity: 2026-03-11 -- Phase 25 Plan 04 Tasks 1-2 complete (integration tests + AS-body dispatch fix)
+Phase: 26 (3 of 5 in v0.5.2)
+Plan: 1 of 2 in current phase (26-01 complete)
+Status: Executing
+Last activity: 2026-03-13 -- Phase 26 Plan 01 complete (graph module + define-time validation)
 
-Progress: [███░░░░░░░] 33%
+Progress: [████░░░░░░] 38%
 
 ## Performance Metrics
 
 **Velocity (v0.5.2, current):**
-- Plans completed: 3 (25-01, 25-02, 25-03); 25-04 in progress
-- Timeline: 2026-03-11 (ongoing)
+- Plans completed: 4 (25-01, 25-02, 25-03, 26-01); 25-04 verified, 26-02 next
+- Timeline: 2026-03-11 to 2026-03-13 (ongoing)
+- 26-01: 12 min / 2 tasks / 3 files
 - 25-01: 19 min / 3 tasks / 8 files
 - 25-02: 8 min / 2 tasks / 1 file
 - 25-03: 8 min / 2 tasks / 3 files
@@ -79,6 +80,10 @@ Recent decisions affecting current work:
 - [Phase 25.1-01]: Fuzz target rejects invalid UTF-8 early with early return (not a panic/crash)
 - [Phase 25.1-parser-robustness-security-hardening]: validate_and_rewrite calls detect_ddl_prefix on trimmed_no_semi so plen is relative to trimmed start; trim_offset + plen invariant preserved
 - [Phase 25.1-parser-robustness-security-hardening]: prefix_len removed entirely (not kept as dead code); detect_ddl_prefix returns (kind, bytes) eliminating two-step detect + measure pattern
+- [Phase 26-01]: Kahn's algorithm for toposort -- naturally detects cycles via leftover nodes, simpler than DFS for this use case
+- [Phase 26-01]: Adjacency list + reverse edges for O(1) diamond detection (parent count in reverse map)
+- [Phase 26-01]: Graph validation runs after parse, before type inference, before persist in both DDL paths
+- [Phase 26-01]: Legacy definitions (empty fk_columns or empty tables) skip graph validation entirely
 
 ### Pending Todos
 
@@ -102,6 +107,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-13T12:26:52.696Z
-Stopped at: Phase 26 context gathered
-Resume file: .planning/phases/26-pk-fk-join-resolution/26-CONTEXT.md
+Last session: 2026-03-13T13:23:00Z
+Stopped at: Completed 26-01-PLAN.md
+Resume file: .planning/phases/26-pk-fk-join-resolution/26-02-PLAN.md
