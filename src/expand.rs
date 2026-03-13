@@ -1835,4 +1835,375 @@ FROM \"_base\"";
             );
         }
     }
+
+    mod phase26_pkfk_expand_tests {
+        use super::*;
+        use crate::model::{Dimension, Join, Metric, TableRef};
+
+        /// Helper: build a 2-table PK/FK definition (orders -> customers).
+        fn pkfk_two_table_def() -> SemanticViewDefinition {
+            SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                ],
+                dimensions: vec![
+                    Dimension {
+                        name: "region".to_string(),
+                        expr: "o.region".to_string(),
+                        source_table: Some("o".to_string()),
+                        output_type: None,
+                    },
+                    Dimension {
+                        name: "customer_name".to_string(),
+                        expr: "c.name".to_string(),
+                        source_table: Some("c".to_string()),
+                        output_type: None,
+                    },
+                ],
+                metrics: vec![Metric {
+                    name: "total_amount".to_string(),
+                    expr: "sum(o.amount)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    ..Default::default()
+                }],
+                facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            }
+        }
+
+        /// Helper: build a 3-table PK/FK definition (li -> o -> c).
+        fn pkfk_three_table_def() -> SemanticViewDefinition {
+            SemanticViewDefinition {
+                base_table: "line_items".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "li".to_string(),
+                        table: "line_items".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                ],
+                dimensions: vec![
+                    Dimension {
+                        name: "product".to_string(),
+                        expr: "li.product".to_string(),
+                        source_table: Some("li".to_string()),
+                        output_type: None,
+                    },
+                    Dimension {
+                        name: "customer_name".to_string(),
+                        expr: "c.name".to_string(),
+                        source_table: Some("c".to_string()),
+                        output_type: None,
+                    },
+                ],
+                metrics: vec![Metric {
+                    name: "total_qty".to_string(),
+                    expr: "sum(li.qty)".to_string(),
+                    source_table: Some("li".to_string()),
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![
+                    Join {
+                        table: "o".to_string(),
+                        from_alias: "li".to_string(),
+                        fk_columns: vec!["order_id".to_string()],
+                        ..Default::default()
+                    },
+                    Join {
+                        table: "c".to_string(),
+                        from_alias: "o".to_string(),
+                        fk_columns: vec!["customer_id".to_string()],
+                        ..Default::default()
+                    },
+                ],
+                facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            }
+        }
+
+        #[test]
+        fn test_pkfk_on_clause_simple() {
+            // Single FK->PK: o.customer_id = c.id
+            let def = pkfk_two_table_def();
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec!["total_amount".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("\"o\".\"customer_id\" = \"c\".\"id\""),
+                "PK/FK ON clause must use from_alias.fk = to_alias.pk: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_pkfk_on_clause_composite() {
+            // Multi-column FK->PK: a.fk1 = b.pk1 AND a.fk2 = b.pk2
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "a".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                    TableRef {
+                        alias: "b".to_string(),
+                        table: "details".to_string(),
+                        pk_columns: vec!["pk1".to_string(), "pk2".to_string()],
+                    },
+                ],
+                dimensions: vec![Dimension {
+                    name: "detail".to_string(),
+                    expr: "b.detail".to_string(),
+                    source_table: Some("b".to_string()),
+                    output_type: None,
+                }],
+                metrics: vec![Metric {
+                    name: "cnt".to_string(),
+                    expr: "count(*)".to_string(),
+                    source_table: Some("a".to_string()),
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "b".to_string(),
+                    from_alias: "a".to_string(),
+                    fk_columns: vec!["fk1".to_string(), "fk2".to_string()],
+                    ..Default::default()
+                }],
+                facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["detail".to_string()],
+                metrics: vec!["cnt".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("\"a\".\"fk1\" = \"b\".\"pk1\""),
+                "First FK/PK pair must appear: {sql}"
+            );
+            assert!(sql.contains("AND"), "Composite ON must use AND: {sql}");
+            assert!(
+                sql.contains("\"a\".\"fk2\" = \"b\".\"pk2\""),
+                "Second FK/PK pair must appear: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_pkfk_left_join_emitted() {
+            let def = pkfk_two_table_def();
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec!["total_amount".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN"),
+                "PK/FK path must emit LEFT JOIN: {sql}"
+            );
+            // Must NOT have bare " JOIN " (without LEFT prefix) for the actual join
+            let join_lines: Vec<&str> = sql
+                .lines()
+                .filter(|l| l.trim().starts_with("LEFT JOIN") || l.trim().starts_with("JOIN"))
+                .collect();
+            for line in &join_lines {
+                assert!(
+                    line.trim().starts_with("LEFT JOIN"),
+                    "All joins must be LEFT JOIN, got: {line}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_pkfk_transitive_join_inclusion() {
+            // A(li)->B(o)->C(c): request dim from C, must include B(o) join too
+            let def = pkfk_three_table_def();
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec!["total_qty".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN \"orders\" AS \"o\""),
+                "Transitive intermediate join (o) must be included: {sql}"
+            );
+            assert!(
+                sql.contains("LEFT JOIN \"customers\" AS \"c\""),
+                "Target join (c) must be included: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_pkfk_pruning() {
+            // Request only base-table dims: no joins needed
+            let def = pkfk_three_table_def();
+            let req = QueryRequest {
+                dimensions: vec!["product".to_string()],
+                metrics: vec!["total_qty".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                !sql.contains("JOIN"),
+                "No joins needed when only base-table dims requested: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_pkfk_topological_order() {
+            // Joins must be emitted root-outward (li first, then o, then c)
+            // regardless of declaration order
+            let mut def = pkfk_three_table_def();
+            // Reverse declaration order of joins to test that topo sort overrides it
+            def.joins.reverse();
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec!["total_qty".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            let o_pos = sql
+                .find("LEFT JOIN \"orders\"")
+                .expect("orders join missing");
+            let c_pos = sql
+                .find("LEFT JOIN \"customers\"")
+                .expect("customers join missing");
+            assert!(
+                o_pos < c_pos,
+                "orders (closer to root) must appear before customers (further from root) in topo order: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_legacy_join_columns_still_works() {
+            // Phase 11.1 join_columns def should still expand correctly with LEFT JOIN
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        ..Default::default()
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                dimensions: vec![Dimension {
+                    name: "tier".to_string(),
+                    expr: "c.tier".to_string(),
+                    source_table: Some("c".to_string()),
+                    output_type: None,
+                }],
+                metrics: vec![Metric {
+                    name: "revenue".to_string(),
+                    expr: "sum(o.amount)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "customers".to_string(),
+                    on: String::new(),
+                    join_columns: vec![crate::model::JoinColumn {
+                        from: "customer_id".to_string(),
+                        to: "id".to_string(),
+                    }],
+                    ..Default::default()
+                }],
+                facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["tier".to_string()],
+                metrics: vec!["revenue".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN"),
+                "Legacy join_columns path must now emit LEFT JOIN: {sql}"
+            );
+            assert!(
+                sql.contains("\"o\".\"customer_id\" = \"c\".\"id\""),
+                "Legacy join_columns ON clause must still work: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_legacy_on_string_still_works() {
+            // Phase 10 on-string def should still expand correctly with LEFT JOIN
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![],
+                dimensions: vec![Dimension {
+                    name: "customer_name".to_string(),
+                    expr: "customers.name".to_string(),
+                    source_table: Some("customers".to_string()),
+                    output_type: None,
+                }],
+                metrics: vec![Metric {
+                    name: "total_revenue".to_string(),
+                    expr: "sum(amount)".to_string(),
+                    source_table: None,
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "customers".to_string(),
+                    on: "orders.customer_id = customers.id".to_string(),
+                    ..Default::default()
+                }],
+                facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec!["total_revenue".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN"),
+                "Legacy on-string path must now emit LEFT JOIN: {sql}"
+            );
+            assert!(
+                sql.contains("orders.customer_id = customers.id"),
+                "Legacy ON string must be preserved: {sql}"
+            );
+        }
+    }
 }
