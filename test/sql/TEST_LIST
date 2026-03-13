@@ -1,8 +1,6 @@
 test/sql/phase2_ddl.test
 test/sql/semantic_views.test
 test/sql/phase4_query.test
-test/sql/phase16_parser.test
-test/sql/phase19_parser_hook_validation.test
 test/sql/phase20_extended_ddl.test
 test/sql/phase21_error_reporting.test
 test/sql/phase25_keyword_body.test

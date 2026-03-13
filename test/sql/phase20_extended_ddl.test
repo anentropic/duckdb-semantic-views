@@ -1,4 +1,6 @@
 # Phase 20: Extended DDL statements integration tests
+# Rewritten for AS-body keyword syntax (CLN-01: paren-body syntax removed).
+#
 # Verifies all extended DDL forms work via native DDL syntax
 # (parser hook -> rewrite -> C++ result forwarding -> function call).
 #
@@ -28,11 +30,16 @@ INSERT INTO sv_test VALUES ('East', 100.0), ('West', 200.0);
 
 # Create initial view
 statement ok
-CREATE SEMANTIC VIEW sv_replace_test (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sv_test'}]
-);
+CREATE SEMANTIC VIEW sv_replace_test AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.total_amount AS SUM(amount)
+)
 
 # Query it to verify initial state
 query TT rowsort
@@ -43,11 +50,16 @@ West	200.0
 
 # Replace with a different metric (AVG instead of SUM)
 statement ok
-CREATE OR REPLACE SEMANTIC VIEW sv_replace_test (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'avg_amount', 'expr': 'AVG(amount)', 'source_table': 'sv_test'}]
-);
+CREATE OR REPLACE SEMANTIC VIEW sv_replace_test AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.avg_amount AS AVG(amount)
+)
 
 # Query the replaced view -- new metric should be available
 query TT rowsort
@@ -68,19 +80,29 @@ SELECT count(*) FROM list_semantic_views() WHERE name = 'sv_replace_test';
 
 # First call creates the view
 statement ok
-CREATE SEMANTIC VIEW IF NOT EXISTS sv_idempotent_test (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sv_test'}]
-);
+CREATE SEMANTIC VIEW IF NOT EXISTS sv_idempotent_test AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.total_amount AS SUM(amount)
+)
 
 # Second call on same view name -- should succeed (no error)
 statement ok
-CREATE SEMANTIC VIEW IF NOT EXISTS sv_idempotent_test (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'avg_amount', 'expr': 'AVG(amount)', 'source_table': 'sv_test'}]
-);
+CREATE SEMANTIC VIEW IF NOT EXISTS sv_idempotent_test AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.avg_amount AS AVG(amount)
+)
 
 # Verify still only one view
 query I
@@ -126,22 +148,32 @@ DROP SEMANTIC VIEW IF EXISTS sv_nonexistent;
 
 # Lowercase create + drop
 statement ok
-create semantic view sv_lower_test (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sv_test'}]
-);
+create semantic view sv_lower_test AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.total_amount AS SUM(amount)
+)
 
 statement ok
 drop semantic view if exists sv_lower_test;
 
 # Mixed case CREATE OR REPLACE
 statement ok
-Create Or Replace Semantic View sv_mixed_test (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sv_test'}]
-);
+Create Or Replace Semantic View sv_mixed_test AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.total_amount AS SUM(amount)
+)
 
 statement ok
 drop semantic view sv_mixed_test;
@@ -173,24 +205,28 @@ SELECT * FROM drop_semantic_view('fn_test');
 
 # Setup: create a view to describe
 statement ok
-CREATE SEMANTIC VIEW desc_test (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sv_test'}]
-);
+CREATE SEMANTIC VIEW desc_test AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.total_amount AS SUM(amount)
+)
 
 # DESCRIBE SEMANTIC VIEW returns 6 columns: name, base_table, dimensions, metrics, filters, joins
-# Use statement ok first to verify it runs, then query to verify column content
 query TTTTTT
 DESCRIBE SEMANTIC VIEW desc_test;
 ----
-desc_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"sv_test"}]	[{"expr":"SUM(amount)","name":"total_amount","output_type":null,"source_table":"sv_test"}]	[]	[]
+desc_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"s"}]	[{"expr":"SUM(amount)","name":"total_amount","output_type":null,"source_table":"s"}]	[]	[]
 
 # Case insensitive: lowercase describe
 query TTTTTT
 describe semantic view desc_test;
 ----
-desc_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"sv_test"}]	[{"expr":"SUM(amount)","name":"total_amount","output_type":null,"source_table":"sv_test"}]	[]	[]
+desc_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"s"}]	[{"expr":"SUM(amount)","name":"total_amount","output_type":null,"source_table":"s"}]	[]	[]
 
 # Error: describe nonexistent view
 statement error
@@ -212,18 +248,28 @@ DROP SEMANTIC VIEW desc_test;
 
 # Setup: create two views for listing
 statement ok
-CREATE SEMANTIC VIEW show_test_a (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sv_test'}]
-);
+CREATE SEMANTIC VIEW show_test_a AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.total_amount AS SUM(amount)
+)
 
 statement ok
-CREATE SEMANTIC VIEW show_test_b (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'avg_amount', 'expr': 'AVG(amount)', 'source_table': 'sv_test'}]
-);
+CREATE SEMANTIC VIEW show_test_b AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.avg_amount AS AVG(amount)
+)
 
 # SHOW SEMANTIC VIEWS returns 2 columns: name, base_table
 query TT rowsort
@@ -256,17 +302,22 @@ DROP SEMANTIC VIEW show_test_b;
 
 # Step 1: CREATE
 statement ok
-CREATE SEMANTIC VIEW lifecycle_test (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'total_amount', 'expr': 'SUM(amount)', 'source_table': 'sv_test'}]
-);
+CREATE SEMANTIC VIEW lifecycle_test AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.total_amount AS SUM(amount)
+)
 
 # Step 2: DESCRIBE -- verify it exists (check name and base_table from full 6-column result)
 query TTTTTT
 DESCRIBE SEMANTIC VIEW lifecycle_test;
 ----
-lifecycle_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"sv_test"}]	[{"expr":"SUM(amount)","name":"total_amount","output_type":null,"source_table":"sv_test"}]	[]	[]
+lifecycle_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"s"}]	[{"expr":"SUM(amount)","name":"total_amount","output_type":null,"source_table":"s"}]	[]	[]
 
 # Step 3: SHOW -- verify it appears in the list
 query TT
@@ -276,17 +327,22 @@ lifecycle_test	sv_test
 
 # Step 4: CREATE OR REPLACE -- update the view with a new metric
 statement ok
-CREATE OR REPLACE SEMANTIC VIEW lifecycle_test (
-    tables := [{'alias': 'sv_test', 'table': 'sv_test'}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'sv_test'}],
-    metrics := [{'name': 'avg_amount', 'expr': 'AVG(amount)', 'source_table': 'sv_test'}]
-);
+CREATE OR REPLACE SEMANTIC VIEW lifecycle_test AS
+TABLES (
+    s AS sv_test PRIMARY KEY (region)
+)
+DIMENSIONS (
+    s.region AS region
+)
+METRICS (
+    s.avg_amount AS AVG(amount)
+)
 
 # Step 5: DESCRIBE -- verify updated definition (metrics changed)
 query TTTTTT
 DESCRIBE SEMANTIC VIEW lifecycle_test;
 ----
-lifecycle_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"sv_test"}]	[{"expr":"AVG(amount)","name":"avg_amount","output_type":null,"source_table":"sv_test"}]	[]	[]
+lifecycle_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"s"}]	[{"expr":"AVG(amount)","name":"avg_amount","output_type":null,"source_table":"s"}]	[]	[]
 
 # Step 6: DROP
 statement ok
