@@ -146,12 +146,16 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Reason:** Three Rust tests creating temporary files used hardcoded paths that were inaccessible in sandboxed environments.
 - **Resolution:** Phase 6 (decision [06-01] temp-dir-pattern) updated all tests to use `std::env::temp_dir()` for portable temporary file paths. This gap is now closed.
 
-### 4. ⚠ DDL prefix whitespace not normalized (`detect_ddl_kind`)
+### 4. ✅ DDL prefix whitespace — RESOLVED in Phase 25.1
 
 - **Origin:** Phase 25 proptest surfaced this
-- **Reason:** `detect_ddl_kind` uses a literal byte prefix match (`starts_with_ci`). The sequence `CREATE SEMANTIC VIEW` must use single ASCII spaces. Tabs or newlines between those three words cause the query to fall through as unrecognised DDL. Body-internal whitespace (after `AS`) is fully normalised.
-- **Impact:** Low — DuckDB's own parser canonicalises whitespace before passing the query string to extensions in most paths. A user typing tabs/newlines between `CREATE`, `SEMANTIC`, `VIEW` in a raw DuckDB CLI session may hit this.
-- **Mitigation:** Proptest `as_body_accepts_any_inter_token_whitespace` and unit tests cover body whitespace. Prefix normalization deferred to a future cleanup phase.
+- **Resolution:** Phase 25.1 replaced `starts_with_ci` literal prefix matching with
+  `match_keyword_prefix` token-based scanning. All 7 DDL prefix forms now tolerate
+  arbitrary ASCII whitespace (space, tab, newline, carriage return, vertical tab,
+  form feed) between keywords. The `prefix_len()` static function was replaced by
+  the dynamic byte count returned by `detect_ddl_prefix(query)`.
+- **Scope:** ASCII whitespace only (6 characters: 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20).
+  Unicode whitespace is handled by DuckDB before the hook fires.
 
 ---
 

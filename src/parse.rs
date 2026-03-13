@@ -219,15 +219,15 @@ pub fn parse_ddl_text(query: &str) -> Result<(&str, &str), String> {
     let trimmed = query.trim();
     let trimmed = trimmed.trim_end_matches(';').trim();
 
-    let kind = detect_ddl_kind(trimmed)
+    let (kind, prefix_len) = detect_ddl_prefix(trimmed)
         .ok_or_else(|| "Not a CREATE SEMANTIC VIEW statement".to_string())?;
 
-    let prefix_len = match kind {
-        DdlKind::CreateOrReplace => "create or replace semantic view".len(),
-        DdlKind::CreateIfNotExists => "create semantic view if not exists".len(),
-        DdlKind::Create => "create semantic view".len(),
-        _ => return Err("Not a CREATE SEMANTIC VIEW statement".to_string()),
-    };
+    if !matches!(
+        kind,
+        DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists
+    ) {
+        return Err("Not a CREATE SEMANTIC VIEW statement".to_string());
+    }
 
     parse_create_body(trimmed, prefix_len)
 }
@@ -249,19 +249,6 @@ fn function_name(kind: DdlKind) -> &'static str {
     }
 }
 
-/// Map a `DdlKind` to its prefix string length.
-fn prefix_len(kind: DdlKind) -> usize {
-    match kind {
-        DdlKind::Create => "create semantic view".len(),
-        DdlKind::CreateOrReplace => "create or replace semantic view".len(),
-        DdlKind::CreateIfNotExists => "create semantic view if not exists".len(),
-        DdlKind::Drop => "drop semantic view".len(),
-        DdlKind::DropIfExists => "drop semantic view if exists".len(),
-        DdlKind::Describe => "describe semantic view".len(),
-        DdlKind::Show => "show semantic views".len(),
-    }
-}
-
 /// Rewrite any semantic view DDL statement to its corresponding function call.
 ///
 /// Dispatches to the appropriate rewrite based on the 3 parsing categories:
@@ -272,11 +259,10 @@ pub fn rewrite_ddl(query: &str) -> Result<String, String> {
     let trimmed = query.trim();
     let trimmed = trimmed.trim_end_matches(';').trim();
 
-    let kind =
-        detect_ddl_kind(trimmed).ok_or_else(|| "Not a semantic view DDL statement".to_string())?;
+    let (kind, plen) = detect_ddl_prefix(trimmed)
+        .ok_or_else(|| "Not a semantic view DDL statement".to_string())?;
 
     let fn_name = function_name(kind);
-    let plen = prefix_len(kind);
 
     match kind {
         // CREATE-with-body forms
@@ -309,10 +295,8 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
     let trimmed = query.trim();
     let trimmed = trimmed.trim_end_matches(';').trim();
 
-    let kind =
-        detect_ddl_kind(trimmed).ok_or_else(|| "Not a semantic view DDL statement".to_string())?;
-
-    let plen = prefix_len(kind);
+    let (kind, plen) = detect_ddl_prefix(trimmed)
+        .ok_or_else(|| "Not a semantic view DDL statement".to_string())?;
 
     match kind {
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
@@ -619,11 +603,9 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
     let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
     let trim_offset = query.len() - query.trim_start().len();
 
-    let Some(kind) = detect_ddl_kind(query) else {
+    let Some((kind, plen)) = detect_ddl_prefix(trimmed_no_semi) else {
         return Ok(None);
     };
-
-    let plen = prefix_len(kind);
 
     match kind {
         // CREATE-with-body forms: validate clauses before rewriting
