@@ -4,3 +4,4 @@ test/sql/phase21_error_reporting.test
 test/sql/phase25_keyword_body.test
 test/sql/phase26_join_resolution.test
 test/sql/phase27_qualified_refs.test
+test/sql/phase28_e2e.test
