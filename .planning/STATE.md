@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
-status: in-progress
-stopped_at: Completed 27-01-PLAN.md
-last_updated: "2026-03-13T15:59:13Z"
-last_activity: 2026-03-13 -- Phase 27 Plan 01 complete (qualified refs verification + legacy join removal)
+status: completed
+stopped_at: Completed 27-03-PLAN.md (error message + caret test gap closure)
+last_updated: "2026-03-13T17:02:21.797Z"
+last_activity: 2026-03-13 -- Phase 27 Plan 02 complete (paren-body DDL removal, CLN-01)
 progress:
   total_phases: 6
-  completed_phases: 3
-  total_plans: 10
-  completed_plans: 10
+  completed_phases: 4
+  total_plans: 13
+  completed_plans: 11
   percent: 60
 ---
 
@@ -26,17 +26,18 @@ See: .planning/PROJECT.md (updated 2026-03-09)
 ## Current Position
 
 Phase: 27 (4 of 5 in v0.5.2) -- COMPLETE
-Plan: 2 of 2 in current phase (27-02 complete)
-Status: Phase 27 complete
-Last activity: 2026-03-13 -- Phase 27 Plan 02 complete (paren-body DDL removal, CLN-01)
+Plan: 3 of 3 in current phase (27-03 complete)
+Status: Phase 27 complete (gap closure plan 03 added and completed)
+Last activity: 2026-03-13 -- Phase 27 Plan 03 complete (error message + caret test gap closure)
 
 Progress: [██████░░░░] 60%
 
 ## Performance Metrics
 
 **Velocity (v0.5.2, current):**
-- Plans completed: 7 (25-01, 25-02, 25-03, 26-01, 26-02, 27-01, 27-02); 25-04 verified; Phase 26, 27 complete
+- Plans completed: 8 (25-01, 25-02, 25-03, 26-01, 26-02, 27-01, 27-02, 27-03); 25-04 verified; Phase 26, 27 complete
 - Timeline: 2026-03-11 to 2026-03-13 (ongoing)
+- 27-03: 6 min / 2 tasks / 4 files
 - 27-02: 12 min / 2 tasks / 7 files
 - 27-01: 12 min / 2 tasks / 4 files
 - 26-02: 14 min / 2 tasks / 4 files
@@ -96,6 +97,7 @@ Recent decisions affecting current work:
 - [Phase 27-02]: rewrite_ddl made private, rejects CREATE forms -- validate_and_rewrite is sole DDL entry point
 - [Phase 27-02]: CLAUSE_KEYWORDS/suggest_clause_keyword removed from parse.rs (body_parser.rs has own copies)
 - [Phase 27-02]: validate_create_body returns clear error for non-AS-body syntax with position
+- [Phase 27]: Error message says 'Expected AS keyword' without referencing old syntax that was never released
 
 ### Pending Todos
 
@@ -116,9 +118,10 @@ None.
 | Phase 25-sql-body-parser P04 | 25 | 3 tasks | 5 files |
 | Phase 25.1 P01 | 6 | 2 tasks | 8 files |
 | Phase 25.1-parser-robustness-security-hardening P02 | 15 | 2 tasks | 2 files |
+| Phase 27 P03 | 6 | 2 tasks | 4 files |
 
 ## Session Continuity
 
-Last session: 2026-03-13T16:13:54Z
-Stopped at: Completed 27-02-PLAN.md (Phase 27 complete)
-Resume file: Next phase
+Last session: 2026-03-13T17:02:21.795Z
+Stopped at: Completed 27-03-PLAN.md (error message + caret test gap closure)
+Resume file: None

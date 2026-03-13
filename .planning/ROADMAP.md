@@ -94,7 +94,7 @@ Full details: [milestones/v0.5.1-ROADMAP.md](milestones/v0.5.1-ROADMAP.md)
 - [ ] **Phase 24: PK/FK Model** - Extend model structs with primary keys, table aliases, and relationship metadata
 - [x] **Phase 25: SQL Body Parser** - Parse TABLES/RELATIONSHIPS/DIMENSIONS/METRICS keyword clauses in DDL bodies (completed 2026-03-11)
 - [x] **Phase 26: PK/FK Join Resolution** - Synthesize JOIN ON clauses from PK/FK declarations with graph validation (completed 2026-03-13)
-- [ ] **Phase 27: Alias-Based Query Expansion** - Replace CTE flattening with direct FROM+JOIN expansion and qualified columns (gap closure in progress)
+- [x] **Phase 27: Alias-Based Query Expansion** - Replace CTE flattening with direct FROM+JOIN expansion and qualified columns (gap closure in progress) (completed 2026-03-13)
 - [ ] **Phase 28: Integration Testing & Documentation** - End-to-end validation and README update with new syntax
 
 ## Phase Details
@@ -170,7 +170,7 @@ Plans:
   3. The old `:=`/struct-literal DDL body parsing code is removed
   4. The CTE-based `_base` flattening expansion path is removed
   5. The ON-clause substring matching join heuristic is removed
-**Plans:** 3 plans (2 complete + 1 gap closure)
+**Plans:** 3/3 plans complete
 Plans:
 - [x] 27-01-PLAN.md -- EXP-05 qualified column ref verification + CLN-03 legacy join code removal
 - [x] 27-02-PLAN.md -- CLN-01 paren-body DDL parser removal + old test file cleanup
@@ -226,5 +226,5 @@ Phases execute in numeric order: 24 -> 25 -> 25.1 -> 26 -> 27 -> 28
 | 25. SQL Body Parser | v0.5.2 | 4/4 | Complete | 2026-03-12 |
 | 25.1. Parser Robustness & Security | 2/2 | Complete    | 2026-03-13 | - |
 | 26. PK/FK Join Resolution | v0.5.2 | Complete    | 2026-03-13 | 2026-03-13 |
-| 27. Alias-Based Query Expansion | 2/3 | Gap closure | 2026-03-13 | - |
+| 27. Alias-Based Query Expansion | 3/3 | Complete   | 2026-03-13 | - |
 | 28. Integration Testing & Docs | v0.5.2 | 0/? | Not started | - |
