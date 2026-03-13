@@ -10,6 +10,9 @@ Exercises all five crash vectors (CV-1 through CV-5) identified in the
 Phase 17.1 research. Each test function targets a specific crash vector
 and reports PASS, FAIL, CRASH, or TIMEOUT.
 
+Uses native CREATE SEMANTIC VIEW ... AS ... DDL syntax exclusively.
+Query interface (semantic_view() / explain_semantic_view()) is unchanged.
+
 Usage:
     python3 test/integration/test_vtab_crash.py
 
@@ -139,12 +142,10 @@ def test_cv1_basic_types():
         con.execute("INSERT INTO t1 VALUES (1, 'alice', 100), (2, 'bob', 200)")
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv1_basic',
-                tables := [{'alias': 't', 'table': 't1'}],
-                dimensions := [{'name': 'name', 'expr': 'name', 'source_table': 't'}],
-                metrics := [{'name': 'total', 'expr': 'sum(amount)', 'source_table': 't'},
-                            {'name': 'cnt', 'expr': 'count(*)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv1_basic AS
+            TABLES (t AS t1 PRIMARY KEY (id))
+            DIMENSIONS (t.name AS name)
+            METRICS (t.total AS sum(amount), t.cnt AS count(*))
         """)
 
         result = con.execute("""
@@ -172,11 +173,10 @@ def test_cv1_decimal_sum():
         con.execute("INSERT INTO t2 VALUES (1, 100.50), (2, 200.75), (3, 50.25)")
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv1_decimal',
-                tables := [{'alias': 't', 'table': 't2'}],
-                dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 't'}],
-                metrics := [{'name': 'total_amount', 'expr': 'sum(amount)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv1_decimal AS
+            TABLES (t AS t2 PRIMARY KEY (id))
+            DIMENSIONS (t.id AS id)
+            METRICS (t.total_amount AS sum(amount))
         """)
 
         # Query with sum(decimal) -- potential type mismatch
@@ -206,11 +206,10 @@ def test_cv1_date_trunc():
         """)
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv1_datetrunc',
-                tables := [{'alias': 't', 'table': 't3'}],
-                dimensions := [{'name': 'month', 'expr': "date_trunc('month', dt)", 'source_table': 't'}],
-                metrics := [{'name': 'cnt', 'expr': 'count(*)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv1_datetrunc AS
+            TABLES (t AS t3 PRIMARY KEY (id))
+            DIMENSIONS (t.month AS date_trunc('month', dt))
+            METRICS (t.cnt AS count(*))
         """)
 
         result = con.execute("""
@@ -247,15 +246,14 @@ def test_cv1_mixed_aggregates():
         """)
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv1_mixed',
-                tables := [{'alias': 't', 'table': 't4'}],
-                dimensions := [{'name': 'name', 'expr': 'name', 'source_table': 't'}],
-                metrics := [
-                    {'name': 'cnt', 'expr': 'count(*)', 'source_table': 't'},
-                    {'name': 'total_qty', 'expr': 'sum(quantity)', 'source_table': 't'},
-                    {'name': 'avg_amount', 'expr': 'avg(amount)', 'source_table': 't'},
-                    {'name': 'first_date', 'expr': 'min(dt)', 'source_table': 't'}
-                ]
+            CREATE SEMANTIC VIEW cv1_mixed AS
+            TABLES (t AS t4 PRIMARY KEY (id))
+            DIMENSIONS (t.name AS name)
+            METRICS (
+                t.cnt AS count(*),
+                t.total_qty AS sum(quantity),
+                t.avg_amount AS avg(amount),
+                t.first_date AS min(dt)
             )
         """)
 
@@ -307,17 +305,16 @@ def test_cv1_many_types():
         """)
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv1_many',
-                tables := [{'alias': 't', 'table': 't5'}],
-                dimensions := [{'name': 'label', 'expr': 'v', 'source_table': 't'}],
-                metrics := [
-                    {'name': 'cnt', 'expr': 'count(*)', 'source_table': 't'},
-                    {'name': 'sum_bi', 'expr': 'sum(bi)', 'source_table': 't'},
-                    {'name': 'avg_d', 'expr': 'avg(d)', 'source_table': 't'},
-                    {'name': 'sum_dec', 'expr': 'sum(dec)', 'source_table': 't'},
-                    {'name': 'min_dt', 'expr': 'min(dt)', 'source_table': 't'},
-                    {'name': 'max_ts', 'expr': 'max(ts)', 'source_table': 't'}
-                ]
+            CREATE SEMANTIC VIEW cv1_many AS
+            TABLES (t AS t5 PRIMARY KEY (ti))
+            DIMENSIONS (t.label AS v)
+            METRICS (
+                t.cnt AS count(*),
+                t.sum_bi AS sum(bi),
+                t.avg_d AS avg(d),
+                t.sum_dec AS sum(dec),
+                t.min_dt AS min(dt),
+                t.max_ts AS max(ts)
             )
         """)
 
@@ -349,11 +346,10 @@ def test_cv2_explicit_close():
         con.execute("INSERT INTO tc1 VALUES (1, 10), (2, 20)")
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv2_close',
-                tables := [{'alias': 't', 'table': 'tc1'}],
-                dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 't'}],
-                metrics := [{'name': 'total', 'expr': 'sum(val)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv2_close AS
+            TABLES (t AS tc1 PRIMARY KEY (id))
+            DIMENSIONS (t.id AS id)
+            METRICS (t.total AS sum(val))
         """)
 
         result = con.execute("""
@@ -382,11 +378,10 @@ def test_cv2_gc_collection():
         con.execute("INSERT INTO tc2 VALUES (1, 10), (2, 20)")
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv2_gc',
-                tables := [{'alias': 't', 'table': 'tc2'}],
-                dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 't'}],
-                metrics := [{'name': 'total', 'expr': 'sum(val)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv2_gc AS
+            TABLES (t AS tc2 PRIMARY KEY (id))
+            DIMENSIONS (t.id AS id)
+            METRICS (t.total AS sum(val))
         """)
 
         result = con.execute("""
@@ -414,12 +409,10 @@ def test_cv2_multiple_queries():
         con.execute("INSERT INTO tc3 VALUES (1, 10), (2, 20), (3, 30)")
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv2_multi',
-                tables := [{'alias': 't', 'table': 'tc3'}],
-                dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 't'}],
-                metrics := [{'name': 'total', 'expr': 'sum(val)', 'source_table': 't'},
-                            {'name': 'cnt', 'expr': 'count(*)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv2_multi AS
+            TABLES (t AS tc3 PRIMARY KEY (id))
+            DIMENSIONS (t.id AS id)
+            METRICS (t.total AS sum(val), t.cnt AS count(*))
         """)
 
         # Run multiple queries in sequence
@@ -458,11 +451,10 @@ def test_cv3_inmemory_bind():
         con.execute("INSERT INTO tb1 VALUES (1, 10.50), (2, 20.75)")
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv3_inmem',
-                tables := [{'alias': 't', 'table': 'tb1'}],
-                dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 't'}],
-                metrics := [{'name': 'total', 'expr': 'sum(val)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv3_inmem AS
+            TABLES (t AS tb1 PRIMARY KEY (id))
+            DIMENSIONS (t.id AS id)
+            METRICS (t.total AS sum(val))
         """)
 
         # This triggers bind() which runs LIMIT 0 on query_conn (CV-3)
@@ -489,11 +481,10 @@ def test_cv3_file_backed_bind():
             con.execute("INSERT INTO tb2 VALUES (1, 10.50), (2, 20.75)")
 
             con.execute("""
-                SELECT * FROM create_semantic_view('cv3_file',
-                    tables := [{'alias': 't', 'table': 'tb2'}],
-                    dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 't'}],
-                    metrics := [{'name': 'total', 'expr': 'sum(val)', 'source_table': 't'}]
-                )
+                CREATE SEMANTIC VIEW cv3_file AS
+                TABLES (t AS tb2 PRIMARY KEY (id))
+                DIMENSIONS (t.id AS id)
+                METRICS (t.total AS sum(val))
             """)
 
             result = con.execute("""
@@ -528,12 +519,10 @@ def test_cv4_large_result():
         """)
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv4_large',
-                tables := [{'alias': 't', 'table': 't_large'}],
-                dimensions := [{'name': 'category', 'expr': 'category', 'source_table': 't'}],
-                metrics := [{'name': 'total', 'expr': 'sum(val)', 'source_table': 't'},
-                            {'name': 'cnt', 'expr': 'count(*)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv4_large AS
+            TABLES (t AS t_large PRIMARY KEY (id))
+            DIMENSIONS (t.category AS category)
+            METRICS (t.total AS sum(val), t.cnt AS count(*))
         """)
 
         result = con.execute("""
@@ -559,11 +548,10 @@ def test_cv4_empty_result():
         # Don't insert any data
 
         con.execute("""
-            SELECT * FROM create_semantic_view('cv4_empty',
-                tables := [{'alias': 't', 'table': 't_empty'}],
-                dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 't'}],
-                metrics := [{'name': 'cnt', 'expr': 'count(*)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv4_empty AS
+            TABLES (t AS t_empty PRIMARY KEY (id))
+            DIMENSIONS (t.id AS id)
+            METRICS (t.cnt AS count(*))
         """)
 
         result = con.execute("""
@@ -598,11 +586,10 @@ def test_cv5_define_query_define_query():
 
         # Define view A
         con.execute("""
-            SELECT * FROM create_semantic_view('cv5_a',
-                tables := [{'alias': 't', 'table': 'ta'}],
-                dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 't'}],
-                metrics := [{'name': 'total', 'expr': 'sum(val)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv5_a AS
+            TABLES (t AS ta PRIMARY KEY (id))
+            DIMENSIONS (t.id AS id)
+            METRICS (t.total AS sum(val))
         """)
 
         # Query A
@@ -616,11 +603,10 @@ def test_cv5_define_query_define_query():
 
         # Define view B
         con.execute("""
-            SELECT * FROM create_semantic_view('cv5_b',
-                tables := [{'alias': 't', 'table': 'tb'}],
-                dimensions := [{'name': 'id', 'expr': 'id', 'source_table': 't'}],
-                metrics := [{'name': 'total', 'expr': 'sum(val)', 'source_table': 't'}]
-            )
+            CREATE SEMANTIC VIEW cv5_b AS
+            TABLES (t AS tb PRIMARY KEY (id))
+            DIMENSIONS (t.id AS id)
+            METRICS (t.total AS sum(val))
         """)
 
         # Query B

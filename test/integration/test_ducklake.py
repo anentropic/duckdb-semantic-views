@@ -10,14 +10,11 @@ Verifies that semantic_view works correctly against DuckLake-managed
 tables (which use the Iceberg table format under the hood). This proves
 the extension handles non-standard table sources end-to-end.
 
-Uses the API:
-  - create_semantic_view(name, tables, relationships, dimensions, metrics)
-  - semantic_view(name, dimensions := [...], metrics := [...])
-  - explain_semantic_view(name, ...)
-  - drop_semantic_view(name)
+Uses native CREATE SEMANTIC VIEW ... AS ... DDL syntax exclusively.
+Query interface (semantic_view() / explain_semantic_view()) is unchanged.
 
 Test cases:
-    1. Define semantic view over DuckLake/Iceberg table
+    1. Define semantic view over DuckLake/Iceberg table (native DDL)
     2. Query the DuckLake-backed semantic view with dimension
     3. Metrics-only query (global aggregate)
     4. Explain on DuckLake-backed view
@@ -132,17 +129,15 @@ def run_tests():
     try:
         con.execute(
             """
-            SELECT * FROM create_semantic_view(
-                'jaffle_orders',
-                tables := [{'alias': 'o', 'table': 'jaffle.raw_orders'}],
-                dimensions := [
-                    {'name': 'store_id', 'expr': 'store_id', 'source_table': 'o'},
-                    {'name': 'ordered_at',
-                     'expr': "date_trunc('day', ordered_at)",
-                     'source_table': 'o'}],
-                metrics := [
-                    {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'},
-                    {'name': 'total_revenue', 'expr': 'sum(order_total)', 'source_table': 'o'}]
+            CREATE SEMANTIC VIEW jaffle_orders AS
+            TABLES (o AS jaffle.raw_orders PRIMARY KEY (id))
+            DIMENSIONS (
+                o.store_id AS store_id,
+                o.ordered_at AS date_trunc('day', ordered_at)
+            )
+            METRICS (
+                o.order_count AS count(*),
+                o.total_revenue AS sum(order_total)
             )
             """
         )
@@ -277,7 +272,7 @@ def run_tests():
     print()
     print("Cleanup: dropping semantic view")
     try:
-        con.execute("SELECT * FROM drop_semantic_view('jaffle_orders')")
+        con.execute("DROP SEMANTIC VIEW jaffle_orders")
     except Exception:
         pass  # Best-effort cleanup
 

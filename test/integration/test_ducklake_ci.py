@@ -10,6 +10,9 @@ Verifies that semantic_view works correctly against DuckLake-managed
 tables using entirely inline synthetic data. No jaffle-shop data download
 or setup step required -- suitable for CI/CD environments.
 
+Uses native CREATE SEMANTIC VIEW ... AS ... DDL syntax exclusively.
+Query interface (semantic_view() / explain_semantic_view()) is unchanged.
+
 Creates a DuckLake catalog in a temp directory, inserts known synthetic
 rows, and asserts specific expected outputs (including typed BIGINT output
 and date dimension with date_trunc).
@@ -26,7 +29,7 @@ Exit codes:
     1 = test failure or setup error
 
 Test cases:
-    1. Define semantic view over DuckLake table (create_semantic_view API)
+    1. Define semantic view over DuckLake table (native DDL)
     2. Query with dimension (store_id)
     3. Global aggregate (order_count, total_revenue)
     4. Explain on DuckLake-backed view
@@ -157,18 +160,16 @@ def run_tests() -> None:
         try:
             con.execute(
                 """
-                SELECT * FROM create_semantic_view(
-                    'ci_orders',
-                    tables := [{'alias': 'o', 'table': 'jaffle.raw_orders'}],
-                    dimensions := [
-                        {'name': 'store_id', 'expr': 'store_id', 'source_table': 'o'},
-                        {'name': 'customer', 'expr': 'customer', 'source_table': 'o'},
-                        {'name': 'ordered_at', 'expr': "date_trunc('day', ordered_at)",
-                         'source_table': 'o'}],
-                    metrics := [
-                        {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'},
-                        {'name': 'total_revenue', 'expr': 'sum(order_total)',
-                         'source_table': 'o'}]
+                CREATE SEMANTIC VIEW ci_orders AS
+                TABLES (o AS jaffle.raw_orders PRIMARY KEY (id))
+                DIMENSIONS (
+                    o.store_id AS store_id,
+                    o.customer AS customer,
+                    o.ordered_at AS date_trunc('day', ordered_at)
+                )
+                METRICS (
+                    o.order_count AS count(*),
+                    o.total_revenue AS sum(order_total)
                 )
                 """
             )
@@ -316,7 +317,7 @@ def run_tests() -> None:
         print()
         print("Cleanup: dropping semantic view")
         try:
-            con.execute("SELECT * FROM drop_semantic_view('ci_orders')")
+            con.execute("DROP SEMANTIC VIEW ci_orders")
         except Exception:
             pass  # Best-effort cleanup
 
