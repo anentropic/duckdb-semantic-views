@@ -31,14 +31,14 @@ Requirements for SQL DDL syntax, PK/FK relationship model, and qualified column 
 - [x] **EXP-02**: JOIN ON clauses synthesized from PK/FK declarations
 - [x] **EXP-03**: Join ordering via topological sort of relationship graph
 - [x] **EXP-04**: Transitive join inclusion -- requesting dims from A and C auto-joins through B
-- [ ] **EXP-05**: Qualified column references (`alias.column`) work in generated SQL
+- [x] **EXP-05**: Qualified column references (`alias.column`) work in generated SQL
 - [x] **EXP-06**: Define-time validation: relationship graph must be a tree (error on diamonds/cycles)
 
 ### Cleanup
 
 - [ ] **CLN-01**: Remove old `:=`/struct literal DDL body parsing (no backward compat)
 - [x] **CLN-02**: Remove CTE-based `_base` flattening expansion path
-- [ ] **CLN-03**: Remove ON-clause substring matching join heuristic
+- [x] **CLN-03**: Remove ON-clause substring matching join heuristic
 
 ### Documentation
 
@@ -100,11 +100,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | EXP-02 | Phase 26 | Complete |
 | EXP-03 | Phase 26 | Complete |
 | EXP-04 | Phase 26 | Complete |
-| EXP-05 | Phase 27 | Pending |
+| EXP-05 | Phase 27 | Complete |
 | EXP-06 | Phase 26 | Complete |
 | CLN-01 | Phase 27 | Pending |
 | CLN-02 | Phase 26 | Complete |
-| CLN-03 | Phase 27 | Pending |
+| CLN-03 | Phase 27 | Complete |
 | DOC-01 | Phase 28 | Pending |
 
 **Coverage:**

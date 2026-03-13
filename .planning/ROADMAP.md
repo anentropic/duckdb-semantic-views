@@ -170,7 +170,7 @@ Plans:
   3. The old `:=`/struct-literal DDL body parsing code is removed
   4. The CTE-based `_base` flattening expansion path is removed
   5. The ON-clause substring matching join heuristic is removed
-**Plans:** 2 plans
+**Plans:** 1/2 plans executed
 Plans:
 - [ ] 27-01-PLAN.md -- EXP-05 qualified column ref verification + CLN-03 legacy join code removal
 - [ ] 27-02-PLAN.md -- CLN-01 paren-body DDL parser removal + old test file cleanup
@@ -225,5 +225,5 @@ Phases execute in numeric order: 24 -> 25 -> 25.1 -> 26 -> 27 -> 28
 | 25. SQL Body Parser | v0.5.2 | 4/4 | Complete | 2026-03-12 |
 | 25.1. Parser Robustness & Security | 2/2 | Complete    | 2026-03-13 | - |
 | 26. PK/FK Join Resolution | v0.5.2 | Complete    | 2026-03-13 | 2026-03-13 |
-| 27. Alias-Based Query Expansion | v0.5.2 | 0/2 | Not started | - |
+| 27. Alias-Based Query Expansion | 1/2 | In Progress|  | - |
 | 28. Integration Testing & Docs | v0.5.2 | 0/? | Not started | - |

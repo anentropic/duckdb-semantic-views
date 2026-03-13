@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
-status: completed
-stopped_at: Completed 26-02-PLAN.md (Phase 26 complete)
-last_updated: "2026-03-13T14:46:18.168Z"
-last_activity: 2026-03-13 -- Phase 26 Plan 02 complete (PK/FK join resolution + integration tests)
+status: in-progress
+stopped_at: Completed 27-01-PLAN.md
+last_updated: "2026-03-13T15:59:13Z"
+last_activity: 2026-03-13 -- Phase 27 Plan 01 complete (qualified refs verification + legacy join removal)
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 10
-  completed_plans: 8
-  percent: 46
+  completed_plans: 9
+  percent: 52
 ---
 
 # Project State
@@ -21,22 +21,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-09)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand -- the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 26 - PK/FK Join Resolution
+**Current focus:** Phase 27 - Alias-Based Query Expansion
 
 ## Current Position
 
-Phase: 26 (3 of 5 in v0.5.2) -- COMPLETE
-Plan: 2 of 2 in current phase (26-02 complete)
-Status: Phase 26 complete
-Last activity: 2026-03-13 -- Phase 26 Plan 02 complete (PK/FK join resolution + integration tests)
+Phase: 27 (4 of 5 in v0.5.2) -- IN PROGRESS
+Plan: 1 of 2 in current phase (27-01 complete)
+Status: Phase 27 Plan 01 complete
+Last activity: 2026-03-13 -- Phase 27 Plan 01 complete (qualified refs verification + legacy join removal)
 
-Progress: [█████░░░░░] 46%
+Progress: [█████░░░░░] 52%
 
 ## Performance Metrics
 
 **Velocity (v0.5.2, current):**
-- Plans completed: 5 (25-01, 25-02, 25-03, 26-01, 26-02); 25-04 verified; Phase 26 complete
+- Plans completed: 6 (25-01, 25-02, 25-03, 26-01, 26-02, 27-01); 25-04 verified; Phase 26 complete
 - Timeline: 2026-03-11 to 2026-03-13 (ongoing)
+- 27-01: 12 min / 2 tasks / 4 files
 - 26-02: 14 min / 2 tasks / 4 files
 - 26-01: 12 min / 2 tasks / 3 files
 - 25-01: 19 min / 3 tasks / 8 files
@@ -88,6 +89,9 @@ Recent decisions affecting current work:
 - [Phase 26-02]: CTE wrapper removed -- flat SELECT/FROM/JOIN pattern fixes table-qualified alias scoping for multi-table views
 - [Phase 26-02]: Bidirectional join lookup: expand finds Join structs by either from_alias or table to handle FK source and FK target aliases
 - [Phase 26-02]: LEFT JOIN is global for all definitions (PK/FK and legacy) per user decision
+- [Phase 27-01]: resolve_joins() and append_join_on_clause() deleted -- resolve_joins_pkfk() is sole join path
+- [Phase 27-01]: 11 legacy join unit tests deleted; phase4_query.test joined_orders updated to PK/FK DDL syntax
+- [Phase 27-01]: create_semantic_view() function-based DDL does not populate fk_columns/from_alias -- join resolution only works with native DDL
 
 ### Pending Todos
 
@@ -111,6 +115,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-13T14:38:03Z
-Stopped at: Completed 26-02-PLAN.md (Phase 26 complete)
-Resume file: Next phase TBD
+Last session: 2026-03-13T15:59:13Z
+Stopped at: Completed 27-01-PLAN.md
+Resume file: 27-02-PLAN.md
