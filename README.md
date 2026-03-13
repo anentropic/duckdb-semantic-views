@@ -4,7 +4,7 @@ A DuckDB extension that lets you define dimensions and metrics once, then query 
 
 Inspired by [Snowflake Semantic Views](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view), adapted for DuckDB as a loadable extension.
 
-v0.5.0 -- early-stage, not yet on the community registry.
+v0.5.2 -- early-stage, not yet on the community registry.
 
 ## How it works
 
@@ -12,160 +12,118 @@ You define a semantic view over one or more tables, declaring:
 
 - **Dimensions** -- columns or expressions to group by (region, category, `date_trunc('month', created_at)`, etc.)
 - **Metrics** -- aggregates (`sum(amount)`, `count(*)`, etc.)
-- **Relationships** -- join paths between tables, included only when needed
+- **Relationships** -- PK/FK join paths between tables, included only when the query needs them
 
-Then you query it by picking which dimensions and metrics you want. The extension figures out the SQL.
+Then you query by picking which dimensions and metrics you want. The extension generates the SQL -- SELECT, FROM, JOIN, GROUP BY -- and DuckDB executes it.
 
-## Loading
-
-```sql
-LOAD 'semantic_views';
-```
-
-Once published to the community registry (not yet):
-
-```sql
-INSTALL semantic_views FROM community;
-LOAD semantic_views;
-```
-
-## Defining a semantic view
-
-### Single table
+## Quick start
 
 ```sql
 CREATE TABLE orders (
     id INTEGER, region VARCHAR, category VARCHAR,
-    amount DECIMAL(10,2), created_at DATE
+    amount DECIMAL(10,2)
 );
 
-CREATE SEMANTIC VIEW orders (
-    tables := [{'alias': 'o', 'table': 'orders'}],
-    dimensions := [
-        {'name': 'region', 'expr': 'region', 'source_table': 'o'},
-        {'name': 'category', 'expr': 'category', 'source_table': 'o'},
-        {'name': 'order_month', 'expr': "date_trunc('month', created_at)", 'source_table': 'o'}
-    ],
-    metrics := [
-        {'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
-        {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}
-    ]
+CREATE SEMANTIC VIEW order_metrics AS
+TABLES (
+    o AS orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.category AS o.category
+)
+METRICS (
+    o.revenue AS sum(o.amount),
+    o.order_count AS count(*)
 );
-```
 
-### Multi-table joins
-
-```sql
-CREATE SEMANTIC VIEW order_analytics (
-    tables := [
-        {'alias': 'o', 'table': 'orders'},
-        {'alias': 'c', 'table': 'customers'}
-    ],
-    relationships := [
-        {'from_table': 'o', 'to_table': 'c',
-         'join_columns': [{'from': 'customer_id', 'to': 'id'}]}
-    ],
-    dimensions := [
-        {'name': 'region', 'expr': 'region', 'source_table': 'o'},
-        {'name': 'customer_tier', 'expr': 'tier', 'source_table': 'c'}
-    ],
-    metrics := [
-        {'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}
-    ]
-);
-```
-
-Only the tables needed for your requested dimensions/metrics get joined.
-
-## Querying
-
-```sql
--- Dimensions + metrics
--- Multiple of each
-SELECT * FROM semantic_view(
-    'orders',
+-- Pick any combination of dimensions and metrics
+SELECT * FROM semantic_view('order_metrics',
     dimensions := ['region', 'category'],
     metrics := ['revenue', 'order_count']
 );
 
--- Dimensions only (returns distinct values)
-SELECT * FROM semantic_view(
-    'orders',
+-- Dimensions only (distinct values)
+SELECT * FROM semantic_view('order_metrics',
     dimensions := ['region']
 );
 
 -- Metrics only (grand total)
-SELECT * FROM semantic_view(
-    'orders',
+SELECT * FROM semantic_view('order_metrics',
     metrics := ['revenue']
 );
 
 -- WHERE works on the result
-SELECT * FROM semantic_view(
-    'orders',
-    dimensions := ['region'],
-    metrics := ['revenue']
+SELECT * FROM semantic_view('order_metrics',
+    dimensions := ['region'], metrics := ['revenue']
+) WHERE region = 'East';
+```
+
+## Multi-table (PK/FK relationships)
+
+Define relationships between tables with PRIMARY KEY and REFERENCES. Only the tables needed for your requested dimensions and metrics get joined.
+
+```sql
+CREATE TABLE customers (id INTEGER, name VARCHAR, tier VARCHAR);
+CREATE TABLE products (id INTEGER, name VARCHAR, category VARCHAR);
+CREATE TABLE orders (
+    id INTEGER, customer_id INTEGER, product_id INTEGER,
+    amount DECIMAL(10,2), region VARCHAR
+);
+
+CREATE SEMANTIC VIEW analytics AS
+TABLES (
+    o AS orders PRIMARY KEY (id),
+    c AS customers PRIMARY KEY (id),
+    p AS products PRIMARY KEY (id)
 )
-WHERE region = 'EMEA';
+RELATIONSHIPS (
+    order_customer AS o(customer_id) REFERENCES c,
+    order_product AS o(product_id) REFERENCES p
+)
+DIMENSIONS (
+    c.customer_name AS c.name,
+    p.product_name AS p.name,
+    o.region AS o.region
+)
+METRICS (
+    o.revenue AS sum(o.amount),
+    o.order_count AS count(*)
+);
+
+-- Only customers table is joined (products not needed)
+SELECT * FROM semantic_view('analytics',
+    dimensions := ['customer_name'],
+    metrics := ['revenue']
+);
+
+-- Both customers and products tables are joined
+SELECT * FROM semantic_view('analytics',
+    dimensions := ['customer_name', 'product_name'],
+    metrics := ['revenue']
+);
+```
+
+See the generated SQL with `explain_semantic_view`:
+
+```sql
+SELECT * FROM explain_semantic_view('analytics',
+    dimensions := ['customer_name'],
+    metrics := ['revenue']
+);
 ```
 
 ## DDL reference
 
 ```sql
-CREATE OR REPLACE SEMANTIC VIEW orders (...);  -- overwrite an existing view
-CREATE SEMANTIC VIEW IF NOT EXISTS orders (...);  -- no-op if already exists
-DROP SEMANTIC VIEW orders;                      -- remove a view
-DROP SEMANTIC VIEW IF EXISTS orders;            -- no-op if not found
-DESCRIBE SEMANTIC VIEW orders;                  -- view metadata
-SHOW SEMANTIC VIEWS;                            -- list all semantic views
-```
-
-## Lifecycle example
-
-A complete create-query-inspect-drop workflow:
-
-```sql
-CREATE SEMANTIC VIEW orders (
-    tables := [{'alias': 'o', 'table': 'orders'}],
-    dimensions := [
-        {'name': 'region', 'expr': 'region', 'source_table': 'o'}
-    ],
-    metrics := [
-        {'name': 'revenue', 'expr': 'sum(amount)', 'source_table': 'o'}
-    ]
-);
-
-SELECT * FROM semantic_view('orders',
-    dimensions := ['region'], metrics := ['revenue']);
-
-DESCRIBE SEMANTIC VIEW orders;
-
+CREATE SEMANTIC VIEW name AS ...;
+CREATE OR REPLACE SEMANTIC VIEW name AS ...;
+CREATE SEMANTIC VIEW IF NOT EXISTS name AS ...;
+DROP SEMANTIC VIEW name;
+DROP SEMANTIC VIEW IF EXISTS name;
+DESCRIBE SEMANTIC VIEW name;
 SHOW SEMANTIC VIEWS;
-
-DROP SEMANTIC VIEW orders;
 ```
-
-## Explain
-
-See what SQL the extension generates:
-
-```sql
-SELECT * FROM explain_semantic_view(
-    'orders',
-    dimensions := ['region'],
-    metrics := ['revenue']
-);
-```
-
-Returns the expanded SQL and the DuckDB execution plan.
-
-## Function syntax
-
-The underlying function-based DDL interface is also available. The native DDL statements above are rewritten to these functions internally.
-
-- `create_semantic_view()`, `create_or_replace_semantic_view()`, `create_semantic_view_if_not_exists()`
-- `drop_semantic_view()`, `drop_semantic_view_if_exists()`
-- `list_semantic_views()`, `describe_semantic_view()`
 
 ## Building
 
@@ -179,7 +137,7 @@ just build     # debug build
 cargo test     # unit + property-based tests
 just test-sql  # SQL logic tests (needs just build first)
 just test-all  # everything
-just lint      # fmt + clippy + cargo-deny
+just lint       # fmt + clippy + cargo-deny
 ```
 
 ## License
