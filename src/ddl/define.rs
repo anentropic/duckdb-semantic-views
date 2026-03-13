@@ -113,6 +113,13 @@ impl VTab for DefineSemanticViewVTab {
         let mut parsed =
             parse_define_args_from_bind(bind).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
+        // Validate relationship graph before persisting (Phase 26).
+        // Catches cycles, diamonds, self-references, orphans, FK/PK mismatches,
+        // and unreachable source_table aliases at CREATE time.
+        // Legacy definitions (empty fk_columns) skip validation automatically.
+        crate::graph::validate_graph(&parsed.def)
+            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
         // Access the DefineState from extra_info.
         let state_ptr = bind.get_extra_info::<DefineState>();
         let state = unsafe { &*state_ptr };
@@ -263,6 +270,10 @@ impl VTab for DefineFromJsonVTab {
         // Deserialize the JSON into a SemanticViewDefinition.
         let mut def = crate::model::SemanticViewDefinition::from_json(&name, &json)
             .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
+        // Validate relationship graph before persisting (Phase 26).
+        // Same validation as DefineSemanticViewVTab -- both DDL paths check identically.
+        crate::graph::validate_graph(&def).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
         // Access the DefineState from extra_info.
         let state_ptr = bind.get_extra_info::<DefineState>();
