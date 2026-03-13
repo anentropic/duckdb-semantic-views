@@ -310,7 +310,7 @@ fn resolve_joins_pkfk(
     }
 }
 
-/// Expand a semantic view definition into a CTE-wrapped SQL query string.
+/// Expand a semantic view definition into a SQL query string with FROM/JOIN clauses.
 ///
 /// Takes a view name (for error messages), its definition, and a query request
 /// specifying which dimensions and metrics to include. Returns the generated SQL
