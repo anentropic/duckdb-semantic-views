@@ -42,7 +42,7 @@ Requirements for SQL DDL syntax, PK/FK relationship model, and qualified column 
 
 ### Documentation
 
-- [ ] **DOC-01**: README updated with new SQL DDL syntax reference, PK/FK relationship examples, and qualified column usage
+- [x] **DOC-01**: README updated with new SQL DDL syntax reference, PK/FK relationship examples, and qualified column usage
 
 ## Future Requirements
 
@@ -105,7 +105,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CLN-01 | Phase 27 | Complete |
 | CLN-02 | Phase 26 | Complete |
 | CLN-03 | Phase 27 | Complete |
-| DOC-01 | Phase 28 | Pending |
+| DOC-01 | Phase 28 | Complete |
 
 **Coverage:**
 - v0.5.2 requirements: 22 total

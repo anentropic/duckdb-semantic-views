@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: completed
-stopped_at: Completed 28-01-PLAN.md
-last_updated: "2026-03-13T18:23:53Z"
-last_activity: 2026-03-13 -- Phase 28 Plan 01 complete (function DDL source code removal)
+stopped_at: Completed 28-03-PLAN.md
+last_updated: "2026-03-13T18:47:00Z"
+last_activity: 2026-03-13 -- Phase 28 Plan 03 complete (E2E integration test + README rewrite)
 progress:
   total_phases: 6
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 13
-  completed_plans: 12
-  percent: 80
+  completed_plans: 13
+  percent: 100
 ---
 
 # Project State
@@ -25,18 +25,19 @@ See: .planning/PROJECT.md (updated 2026-03-09)
 
 ## Current Position
 
-Phase: 28 (5 of 5 in v0.5.2) -- In Progress
-Plan: 1 of 3 in current phase (28-01 complete)
-Status: Plan 28-01 complete (function DDL source code removal)
-Last activity: 2026-03-13 -- Phase 28 Plan 01 complete (function DDL source code removal)
+Phase: 28 (5 of 5 in v0.5.2) -- Complete
+Plan: 3 of 3 in current phase (all complete)
+Status: Phase 28 complete (E2E integration test + README rewrite)
+Last activity: 2026-03-13 -- Phase 28 Plan 03 complete (E2E integration test + README rewrite)
 
-Progress: [████████░░] 80%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity (v0.5.2, current):**
-- Plans completed: 9 (25-01, 25-02, 25-03, 26-01, 26-02, 27-01, 27-02, 27-03, 28-01); 25-04 verified; Phases 25, 25.1, 26, 27 complete
+- Plans completed: 10 (25-01, 25-02, 25-03, 26-01, 26-02, 27-01, 27-02, 27-03, 28-01, 28-03); 25-04 verified; Phases 25, 25.1, 26, 27, 28 complete
 - Timeline: 2026-03-11 to 2026-03-13 (ongoing)
+- 28-03: 20 min / 2 tasks / 3 files
 - 28-01: 18 min / 2 tasks / 4 files
 - 27-03: 6 min / 2 tasks / 4 files
 - 27-02: 12 min / 2 tasks / 7 files
@@ -101,6 +102,8 @@ Recent decisions affecting current work:
 - [Phase 27]: Error message says 'Expected AS keyword' without referencing old syntax that was never released
 - [Phase 28-01]: function_name() CREATE arms left as-is -- called before match rejects CREATE, so unreachable!() would panic
 - [Phase 28-01]: DefineSemanticViewVTab and parse_args.rs removed; only DefineFromJsonVTab path remains for CREATE operations
+- [Phase 28-03]: DESCRIBE serialization uses serde field names (table/from_alias/fk_columns/from_cols) not logical model names (from_table/to_table)
+- [Phase 28-03]: README: explain_semantic_view folded into multi-table section rather than separate section
 
 ### Pending Todos
 
@@ -125,6 +128,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-13T18:23:53Z
-Stopped at: Completed 28-01-PLAN.md
+Last session: 2026-03-13T18:47:00Z
+Stopped at: Completed 28-03-PLAN.md
 Resume file: None
