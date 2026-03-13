@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use crate::model::{Join, SemanticViewDefinition}; // TableRef accessed via def.tables
+use crate::graph::RelationshipGraph;
+use crate::model::{Join, SemanticViewDefinition, TableRef};
 
 /// Suggest the closest matching name from `available` using Levenshtein distance.
 ///
@@ -332,6 +333,98 @@ fn append_join_on_clause(sql: &mut String, join: &Join, def: &SemanticViewDefini
     }
 }
 
+/// Synthesize an ON clause from PK/FK column declarations (Phase 26).
+///
+/// Zips `join.fk_columns` with the referenced table's `pk_columns` to produce
+/// `from_alias.fk = to_alias.pk` pairs, joined by ` AND `.
+/// Uses `join.from_alias` for the FROM side and `join.table` for the TO side.
+fn synthesize_on_clause(join: &Join, tables: &[TableRef]) -> String {
+    let to_alias_lower = join.table.to_ascii_lowercase();
+    let pk_columns: &[String] = tables
+        .iter()
+        .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower)
+        .map_or(&[] as &[String], |t| &t.pk_columns);
+
+    let pairs: Vec<String> = join
+        .fk_columns
+        .iter()
+        .zip(pk_columns.iter())
+        .map(|(fk, pk)| {
+            format!(
+                "{}.{} = {}.{}",
+                quote_ident(&join.from_alias),
+                quote_ident(fk),
+                quote_ident(&join.table),
+                quote_ident(pk),
+            )
+        })
+        .collect();
+    pairs.join(" AND ")
+}
+
+/// Resolve which joins are needed using graph-based PK/FK resolution (Phase 26).
+///
+/// Builds a `RelationshipGraph` from the definition, collects needed table aliases
+/// from resolved dimensions and metrics, walks reverse edges to include transitive
+/// intermediaries, and returns aliases in topological order (root-outward).
+fn resolve_joins_pkfk(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&crate::model::Dimension],
+    resolved_mets: &[&crate::model::Metric],
+) -> Vec<String> {
+    let Ok(graph) = RelationshipGraph::from_definition(def) else {
+        return Vec::new(); // Graph was validated at define time
+    };
+
+    let root = &graph.root;
+
+    // Collect needed aliases from source_table fields (lowercased).
+    let mut needed: HashSet<String> = HashSet::new();
+    for dim in resolved_dims {
+        if let Some(ref st) = dim.source_table {
+            let alias = st.to_ascii_lowercase();
+            if alias != *root {
+                needed.insert(alias);
+            }
+        }
+    }
+    for met in resolved_mets {
+        if let Some(ref st) = met.source_table {
+            let alias = st.to_ascii_lowercase();
+            if alias != *root {
+                needed.insert(alias);
+            }
+        }
+    }
+
+    if needed.is_empty() {
+        return Vec::new();
+    }
+
+    // Walk reverse edges to include transitive intermediaries.
+    // For each needed alias, walk back to root adding all intermediate aliases.
+    let mut all_needed: HashSet<String> = needed.clone();
+    let mut to_visit: Vec<String> = needed.into_iter().collect();
+    while let Some(current) = to_visit.pop() {
+        if let Some(parents) = graph.reverse.get(&current) {
+            for parent in parents {
+                if parent != root && all_needed.insert(parent.clone()) {
+                    to_visit.push(parent.clone());
+                }
+            }
+        }
+    }
+
+    // Return aliases in topological order, filtering to only needed ones.
+    match graph.toposort() {
+        Ok(order) => order
+            .into_iter()
+            .filter(|alias| all_needed.contains(alias))
+            .collect(),
+        Err(_) => Vec::new(), // Should not happen — validated at define time
+    }
+}
+
 /// Expand a semantic view definition into a CTE-wrapped SQL query string.
 ///
 /// Takes a view name (for error messages), its definition, and a query request
@@ -403,8 +496,8 @@ pub fn expand(
         resolved_mets.push(met);
     }
 
-    // 4. Resolve which joins are needed.
-    let needed_joins = resolve_joins(&def.joins, &resolved_dims, &resolved_mets, def);
+    // 4. Detect PK/FK mode: any join with non-empty fk_columns.
+    let has_pkfk = def.joins.iter().any(|j| !j.fk_columns.is_empty());
 
     // 5. Build the base CTE.
     let mut sql = String::with_capacity(256);
@@ -418,22 +511,51 @@ pub fn expand(
     }
 
     // Include only the joins needed by requested dimensions/metrics.
-    for join in &needed_joins {
-        sql.push_str("\n    JOIN ");
-        sql.push_str(&quote_table_ref(&join.table));
-        // Emit AS "alias" when a tables entry matches this join table.
-        if !def.tables.is_empty() {
-            if let Some(tr) = def
+    if has_pkfk {
+        // Phase 26: Graph-based PK/FK join resolution.
+        let ordered_aliases = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets);
+        for alias in &ordered_aliases {
+            // Find the Join whose target (join.table) matches this alias.
+            let Some(join) = def
+                .joins
+                .iter()
+                .find(|j| j.table.to_ascii_lowercase() == *alias)
+            else {
+                continue;
+            };
+            // Find the TableRef for this alias to get the physical table name.
+            let table_ref = def
                 .tables
                 .iter()
-                .find(|t| t.table.eq_ignore_ascii_case(&join.table))
-            {
-                sql.push_str(" AS ");
-                sql.push_str(&quote_ident(&tr.alias));
-            }
+                .find(|t| t.alias.to_ascii_lowercase() == *alias);
+            let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
+            sql.push_str("\n    LEFT JOIN ");
+            sql.push_str(&quote_table_ref(physical_table));
+            sql.push_str(" AS ");
+            sql.push_str(&quote_ident(alias));
+            sql.push_str(" ON ");
+            sql.push_str(&synthesize_on_clause(join, &def.tables));
         }
-        sql.push_str(" ON ");
-        append_join_on_clause(&mut sql, join, def);
+    } else {
+        // Legacy path: resolve_joins + append_join_on_clause.
+        let needed_joins = resolve_joins(&def.joins, &resolved_dims, &resolved_mets, def);
+        for join in &needed_joins {
+            sql.push_str("\n    LEFT JOIN ");
+            sql.push_str(&quote_table_ref(&join.table));
+            // Emit AS "alias" when a tables entry matches this join table.
+            if !def.tables.is_empty() {
+                if let Some(tr) = def
+                    .tables
+                    .iter()
+                    .find(|t| t.table.eq_ignore_ascii_case(&join.table))
+                {
+                    sql.push_str(" AS ");
+                    sql.push_str(&quote_ident(&tr.alias));
+                }
+            }
+            sql.push_str(" ON ");
+            append_join_on_clause(&mut sql, join, def);
+        }
     }
 
     // Append filters as WHERE clause (each parenthesized, AND-composed).
