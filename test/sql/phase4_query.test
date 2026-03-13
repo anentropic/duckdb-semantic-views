@@ -10,11 +10,10 @@
 # exact precision formatting. INTEGER/BIGINT count metrics return typed I.
 # DATE time dimensions return typed D.
 #
-# NOTE: The CTE architecture (WITH "_base" AS (SELECT * ...)) flattens all
-# joined tables. Dimension and metric expressions must use UNQUALIFIED column
-# names (e.g., 'region' not 'o.region'). Table alias qualification applies
-# only to join ON clause generation (via join_columns) and source_table field
-# (for join resolution). This is consistent with the original semantic view design.
+# NOTE (Phase 27): PK/FK join resolution is the only join path. Dimension and
+# metric expressions use alias-qualified column names (e.g., 'o.region', 'c.tier').
+# Legacy join_columns definitions no longer produce JOINs in expanded SQL.
+# The joined_orders test below uses native CREATE SEMANTIC VIEW with PK/FK syntax.
 #
 # Requirements covered:
 #   TEST-03: Integration tests load the extension, create semantic views, run
@@ -132,25 +131,28 @@ EMEA	225.00
 # ============================================================
 
 # Define a view joining orders -> customers and orders -> products.
-# Expressions use UNQUALIFIED column names -- the CTE flattens joined tables.
-# source_table uses alias (e.g., 'c') for join resolution; expand.rs resolves
-# alias to physical name via def.tables and includes the join only when needed.
+# Phase 27: Uses native PK/FK DDL syntax (resolve_joins_pkfk is the only path).
+# Qualified column refs (o.region, c.tier, etc.) emit verbatim in generated SQL.
 statement ok
-SELECT * FROM create_semantic_view(
-    'joined_orders',
-    tables := [{'alias': 'o', 'table': 'test_orders'},
-     {'alias': 'c', 'table': 'test_customers'},
-     {'alias': 'p', 'table': 'test_products'}],
-    relationships := [{'from_table': 'o', 'to_table': 'c',
-      'join_columns': [{'from': 'customer_id', 'to': 'id'}]},
-     {'from_table': 'o', 'to_table': 'p',
-      'join_columns': [{'from': 'category', 'to': 'category'}]}],
-    dimensions := [{'name': 'region', 'expr': 'region', 'source_table': 'o'},
-     {'name': 'customer_tier', 'expr': 'tier', 'source_table': 'c'},
-     {'name': 'supplier', 'expr': 'supplier', 'source_table': 'p'}],
-    metrics := [{'name': 'total_revenue', 'expr': 'sum(amount)', 'source_table': 'o'},
-     {'name': 'order_count', 'expr': 'count(*)', 'source_table': 'o'}]
-);
+CREATE SEMANTIC VIEW joined_orders AS
+  TABLES (
+    o AS test_orders PRIMARY KEY (id),
+    c AS test_customers PRIMARY KEY (id),
+    p AS test_products PRIMARY KEY (category)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c,
+    order_to_product AS o(category) REFERENCES p
+  )
+  DIMENSIONS (
+    o.region AS o.region,
+    c.customer_tier AS c.tier,
+    p.supplier AS p.supplier
+  )
+  METRICS (
+    o.total_revenue AS sum(o.amount),
+    o.order_count AS count(*)
+  );
 
 # Query by customer_tier -- needs test_customers join only
 # gold: Alice(100+50) + Charlie(150) = 300, silver: Bob(200+75) = 275
@@ -311,7 +313,7 @@ statement ok
 SELECT * FROM drop_semantic_view('filtered_orders');
 
 statement ok
-SELECT * FROM drop_semantic_view('joined_orders');
+DROP SEMANTIC VIEW joined_orders;
 
 statement ok
 DROP TABLE test_orders;

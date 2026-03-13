@@ -156,84 +156,6 @@ pub fn quote_table_ref(table: &str) -> String {
         .join(".")
 }
 
-/// Resolve which declared joins are needed for the requested dimensions and metrics.
-///
-/// Collects `source_table` values from resolved dimensions and metrics, then
-/// resolves transitive dependencies using a fixed-point loop: if a needed join's
-/// ON clause mentions another declared join's table, that join is also included.
-/// Returns the subset of joins in their original declaration order.
-///
-/// Phase 11.1: if `def.tables` is non-empty, `source_table` may be an alias
-/// (e.g., `"c"` for `customers`). This function resolves aliases to physical table
-/// names using `def.tables` before matching against `join.table`.
-fn resolve_joins<'a>(
-    joins: &'a [Join],
-    resolved_dims: &[&crate::model::Dimension],
-    resolved_mets: &[&crate::model::Metric],
-    def: &SemanticViewDefinition,
-) -> Vec<&'a Join> {
-    // Helper: resolve a source_table value (may be alias or physical name) to physical table name.
-    let resolve_table_name = |st: &str| -> String {
-        if !def.tables.is_empty() {
-            // Try alias lookup first
-            if let Some(tr) = def.tables.iter().find(|t| t.alias.eq_ignore_ascii_case(st)) {
-                return tr.table.to_ascii_lowercase();
-            }
-        }
-        st.to_ascii_lowercase()
-    };
-
-    // 1. Collect directly-needed tables from source_table fields (case-insensitive).
-    let mut needed: HashSet<String> = HashSet::new();
-    for dim in resolved_dims {
-        if let Some(ref st) = dim.source_table {
-            needed.insert(resolve_table_name(st));
-        }
-    }
-    for met in resolved_mets {
-        if let Some(ref st) = met.source_table {
-            needed.insert(resolve_table_name(st));
-        }
-    }
-
-    if needed.is_empty() {
-        return Vec::new();
-    }
-
-    // 2. Fixed-point loop: resolve transitive dependencies.
-    //    If a needed join's ON clause references another declared join's table name,
-    //    add that table to the needed set too.
-    loop {
-        let mut changed = false;
-        for join in joins {
-            let table_lower = join.table.to_ascii_lowercase();
-            if needed.contains(&table_lower) {
-                // This join is needed — check if its ON clause references other join tables.
-                let on_lower = join.on.to_ascii_lowercase();
-                for other in joins {
-                    let other_lower = other.table.to_ascii_lowercase();
-                    if other_lower != table_lower
-                        && !needed.contains(&other_lower)
-                        && on_lower.contains(&other_lower)
-                    {
-                        needed.insert(other_lower);
-                        changed = true;
-                    }
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    // 3. Filter declared joins, preserving declaration order.
-    joins
-        .iter()
-        .filter(|j| needed.contains(&j.table.to_ascii_lowercase()))
-        .collect()
-}
-
 /// Look up a dimension by name using case-insensitive matching.
 ///
 /// Supports table-qualified names: if `name` contains a '.' (e.g., "o.region"),
@@ -293,43 +215,6 @@ fn find_metric<'a>(
         def.metrics
             .iter()
             .find(|m| m.name.eq_ignore_ascii_case(name))
-    }
-}
-
-/// Append the ON clause for a single JOIN to `sql`.
-///
-/// If `join.join_columns` is non-empty (Phase 11.1 format), generates
-/// `alias.col = alias.col AND ...` using alias lookup from `def.tables`.
-/// Otherwise falls back to the raw `join.on` string (legacy format).
-fn append_join_on_clause(sql: &mut String, join: &Join, def: &SemanticViewDefinition) {
-    if join.join_columns.is_empty() {
-        // Legacy: raw ON clause string (Phase 10 and earlier definitions).
-        sql.push_str(&join.on);
-    } else {
-        // Phase 11.1: generate ON clause from column-pair structs.
-        let to_alias = def
-            .tables
-            .iter()
-            .find(|t| t.table.eq_ignore_ascii_case(&join.table))
-            .map_or(join.table.as_str(), |t| t.alias.as_str());
-        let from_alias = def
-            .tables
-            .first()
-            .map_or(def.base_table.as_str(), |t| t.alias.as_str());
-        let on_parts: Vec<String> = join
-            .join_columns
-            .iter()
-            .map(|jc| {
-                format!(
-                    "{}.{} = {}.{}",
-                    quote_ident(from_alias),
-                    quote_ident(&jc.from),
-                    quote_ident(to_alias),
-                    quote_ident(&jc.to)
-                )
-            })
-            .collect();
-        sql.push_str(&on_parts.join(" AND "));
     }
 }
 
@@ -496,10 +381,7 @@ pub fn expand(
         resolved_mets.push(met);
     }
 
-    // 4. Detect PK/FK mode: any join with non-empty fk_columns.
-    let has_pkfk = def.joins.iter().any(|j| !j.fk_columns.is_empty());
-
-    // 5. Build the SELECT clause.
+    // 4. Build the SELECT clause.
     //    Dimensions-only (no metrics): SELECT DISTINCT, no GROUP BY.
     //    Metrics-only (no dimensions): SELECT (global aggregate), no GROUP BY.
     //    Both: SELECT with GROUP BY.
@@ -542,51 +424,27 @@ pub fn expand(
         sql.push_str(&quote_ident(&base_ref.alias));
     }
 
-    // Include only the joins needed by requested dimensions/metrics.
-    if has_pkfk {
-        // Phase 26: Graph-based PK/FK join resolution.
-        let ordered_aliases = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets);
-        for alias in &ordered_aliases {
-            // Find the Join involving this alias (either as FK target or FK source).
-            let Some(join) = def.joins.iter().find(|j| {
-                j.table.to_ascii_lowercase() == *alias
-                    || j.from_alias.to_ascii_lowercase() == *alias
-            }) else {
-                continue;
-            };
-            // Find the TableRef for this alias to get the physical table name.
-            let table_ref = def
-                .tables
-                .iter()
-                .find(|t| t.alias.to_ascii_lowercase() == *alias);
-            let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
-            sql.push_str("\nLEFT JOIN ");
-            sql.push_str(&quote_table_ref(physical_table));
-            sql.push_str(" AS ");
-            sql.push_str(&quote_ident(alias));
-            sql.push_str(" ON ");
-            sql.push_str(&synthesize_on_clause(join, &def.tables));
-        }
-    } else {
-        // Legacy path: resolve_joins + append_join_on_clause.
-        let needed_joins = resolve_joins(&def.joins, &resolved_dims, &resolved_mets, def);
-        for join in &needed_joins {
-            sql.push_str("\nLEFT JOIN ");
-            sql.push_str(&quote_table_ref(&join.table));
-            // Emit AS "alias" when a tables entry matches this join table.
-            if !def.tables.is_empty() {
-                if let Some(tr) = def
-                    .tables
-                    .iter()
-                    .find(|t| t.table.eq_ignore_ascii_case(&join.table))
-                {
-                    sql.push_str(" AS ");
-                    sql.push_str(&quote_ident(&tr.alias));
-                }
-            }
-            sql.push_str(" ON ");
-            append_join_on_clause(&mut sql, join, def);
-        }
+    // Join resolution via PK/FK graph (legacy resolve_joins removed in Phase 27).
+    let ordered_aliases = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets);
+    for alias in &ordered_aliases {
+        // Find the Join involving this alias (either as FK target or FK source).
+        let Some(join) = def.joins.iter().find(|j| {
+            j.table.to_ascii_lowercase() == *alias || j.from_alias.to_ascii_lowercase() == *alias
+        }) else {
+            continue;
+        };
+        // Find the TableRef for this alias to get the physical table name.
+        let table_ref = def
+            .tables
+            .iter()
+            .find(|t| t.alias.to_ascii_lowercase() == *alias);
+        let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
+        sql.push_str("\nLEFT JOIN ");
+        sql.push_str(&quote_table_ref(physical_table));
+        sql.push_str(" AS ");
+        sql.push_str(&quote_ident(alias));
+        sql.push_str(" ON ");
+        sql.push_str(&synthesize_on_clause(join, &def.tables));
     }
 
     // Append filters as WHERE clause (each parenthesized, AND-composed).
@@ -1167,43 +1025,11 @@ FROM \"orders\"";
             assert!(msg.contains("duplicate metric 'total_revenue'"));
         }
 
-        #[test]
-        fn test_join_included_when_dimension_needs_it() {
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![],
-                dimensions: vec![Dimension {
-                    name: "customer_name".to_string(),
-                    expr: "customers.name".to_string(),
-                    source_table: Some("customers".to_string()),
-
-                    output_type: None,
-                }],
-                metrics: vec![Metric {
-                    name: "total_revenue".to_string(),
-                    expr: "sum(amount)".to_string(),
-                    source_table: None,
-                    output_type: None,
-                }],
-                filters: vec![],
-                joins: vec![Join {
-                    table: "customers".to_string(),
-                    on: "orders.customer_id = customers.id".to_string(),
-                    from_cols: vec![],
-                    join_columns: vec![],
-                    ..Default::default()
-                }],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            let req = QueryRequest {
-                dimensions: vec!["customer_name".to_string()],
-                metrics: vec!["total_revenue".to_string()],
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            assert!(sql.contains("JOIN \"customers\" ON orders.customer_id = customers.id"));
-        }
+        // Legacy join tests (test_join_included_when_dimension_needs_it,
+        // test_join_included_when_metric_needs_it, test_transitive_join_resolution,
+        // test_joins_emitted_in_declaration_order, test_mixed_base_and_joined_dimensions,
+        // test_dot_qualified_join_table) removed in Phase 27 -- legacy resolve_joins deleted.
+        // PK/FK join resolution is now the only path; see phase26_pkfk_expand_tests.
 
         #[test]
         fn test_join_excluded_when_not_needed() {
@@ -1253,153 +1079,6 @@ FROM \"orders\"";
             assert!(
                 !sql.contains("JOIN"),
                 "JOIN should not appear when only base-table dims/metrics requested"
-            );
-        }
-
-        #[test]
-        fn test_join_included_when_metric_needs_it() {
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![],
-                dimensions: vec![Dimension {
-                    name: "region".to_string(),
-                    expr: "region".to_string(),
-                    source_table: None,
-
-                    output_type: None,
-                }],
-                metrics: vec![Metric {
-                    name: "customer_count".to_string(),
-                    expr: "count(distinct customers.id)".to_string(),
-                    source_table: Some("customers".to_string()),
-                    output_type: None,
-                }],
-                filters: vec![],
-                joins: vec![Join {
-                    table: "customers".to_string(),
-                    on: "orders.customer_id = customers.id".to_string(),
-                    from_cols: vec![],
-                    join_columns: vec![],
-                    ..Default::default()
-                }],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            let req = QueryRequest {
-                dimensions: vec!["region".to_string()],
-                metrics: vec!["customer_count".to_string()],
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            assert!(sql.contains("JOIN \"customers\" ON orders.customer_id = customers.id"));
-        }
-
-        #[test]
-        fn test_transitive_join_resolution() {
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![],
-                dimensions: vec![Dimension {
-                    name: "region_name".to_string(),
-                    expr: "regions.name".to_string(),
-                    source_table: Some("regions".to_string()),
-
-                    output_type: None,
-                }],
-                metrics: vec![Metric {
-                    name: "total_revenue".to_string(),
-                    expr: "sum(amount)".to_string(),
-                    source_table: None,
-                    output_type: None,
-                }],
-                filters: vec![],
-                joins: vec![
-                    Join {
-                        table: "customers".to_string(),
-                        on: "orders.customer_id = customers.id".to_string(),
-                        from_cols: vec![],
-                        join_columns: vec![],
-                        ..Default::default()
-                    },
-                    Join {
-                        table: "regions".to_string(),
-                        on: "customers.region_id = regions.id".to_string(),
-                        from_cols: vec![],
-                        join_columns: vec![],
-                        ..Default::default()
-                    },
-                ],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            let req = QueryRequest {
-                dimensions: vec!["region_name".to_string()],
-                metrics: vec!["total_revenue".to_string()],
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            // regions depends on customers (ON clause references customers), so both must be included
-            assert!(
-                sql.contains("JOIN \"customers\""),
-                "transitive dependency 'customers' must be included"
-            );
-            assert!(
-                sql.contains("JOIN \"regions\""),
-                "directly needed 'regions' must be included"
-            );
-        }
-
-        #[test]
-        fn test_joins_emitted_in_declaration_order() {
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![],
-                dimensions: vec![Dimension {
-                    name: "region_name".to_string(),
-                    expr: "regions.name".to_string(),
-                    source_table: Some("regions".to_string()),
-
-                    output_type: None,
-                }],
-                metrics: vec![Metric {
-                    name: "total_revenue".to_string(),
-                    expr: "sum(amount)".to_string(),
-                    source_table: None,
-                    output_type: None,
-                }],
-                filters: vec![],
-                joins: vec![
-                    Join {
-                        table: "customers".to_string(),
-                        on: "orders.customer_id = customers.id".to_string(),
-                        from_cols: vec![],
-                        join_columns: vec![],
-                        ..Default::default()
-                    },
-                    Join {
-                        table: "regions".to_string(),
-                        on: "customers.region_id = regions.id".to_string(),
-                        from_cols: vec![],
-                        join_columns: vec![],
-                        ..Default::default()
-                    },
-                ],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            let req = QueryRequest {
-                dimensions: vec!["region_name".to_string()],
-                metrics: vec!["total_revenue".to_string()],
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            let customers_pos = sql
-                .find("JOIN \"customers\"")
-                .expect("customers join missing");
-            let regions_pos = sql.find("JOIN \"regions\"").expect("regions join missing");
-            assert!(
-                customers_pos < regions_pos,
-                "customers must appear before regions (declaration order)"
             );
         }
 
@@ -1473,111 +1152,6 @@ FROM \"orders\"";
                 "dot-qualified base_table must be split and quoted: {sql}"
             );
         }
-
-        #[test]
-        fn test_dot_qualified_join_table() {
-            let def = SemanticViewDefinition {
-                base_table: "jaffle.raw_orders".to_string(),
-                tables: vec![],
-                dimensions: vec![Dimension {
-                    name: "customer_name".to_string(),
-                    expr: "customers.name".to_string(),
-                    source_table: Some("jaffle.raw_customers".to_string()),
-
-                    output_type: None,
-                }],
-                metrics: vec![Metric {
-                    name: "order_count".to_string(),
-                    expr: "count(*)".to_string(),
-                    source_table: None,
-                    output_type: None,
-                }],
-                filters: vec![],
-                joins: vec![Join {
-                    table: "jaffle.raw_customers".to_string(),
-                    on: "raw_orders.customer_id = raw_customers.id".to_string(),
-                    from_cols: vec![],
-                    join_columns: vec![],
-                    ..Default::default()
-                }],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            let req = QueryRequest {
-                dimensions: vec!["customer_name".to_string()],
-                metrics: vec!["order_count".to_string()],
-            };
-            let sql = expand("jaffle_orders", &def, &req).unwrap();
-            assert!(
-                sql.contains("JOIN \"jaffle\".\"raw_customers\""),
-                "dot-qualified join table must be split and quoted: {sql}"
-            );
-        }
-
-        #[test]
-        fn test_mixed_base_and_joined_dimensions() {
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![],
-                dimensions: vec![
-                    Dimension {
-                        name: "region".to_string(),
-                        expr: "region".to_string(),
-                        source_table: None,
-
-                        output_type: None,
-                    },
-                    Dimension {
-                        name: "customer_name".to_string(),
-                        expr: "customers.name".to_string(),
-                        source_table: Some("customers".to_string()),
-
-                        output_type: None,
-                    },
-                ],
-                metrics: vec![Metric {
-                    name: "total_revenue".to_string(),
-                    expr: "sum(amount)".to_string(),
-                    source_table: None,
-                    output_type: None,
-                }],
-                filters: vec![],
-                joins: vec![
-                    Join {
-                        table: "customers".to_string(),
-                        on: "orders.customer_id = customers.id".to_string(),
-                        from_cols: vec![],
-                        join_columns: vec![],
-                        ..Default::default()
-                    },
-                    Join {
-                        table: "products".to_string(),
-                        on: "orders.product_id = products.id".to_string(),
-                        from_cols: vec![],
-                        join_columns: vec![],
-                        ..Default::default()
-                    },
-                ],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            // Request base-table "region" AND joined "customer_name"
-            let req = QueryRequest {
-                dimensions: vec!["region".to_string(), "customer_name".to_string()],
-                metrics: vec!["total_revenue".to_string()],
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            assert!(
-                sql.contains("JOIN \"customers\""),
-                "customers join needed for customer_name"
-            );
-            assert!(
-                !sql.contains("JOIN \"products\""),
-                "products join NOT needed"
-            );
-        }
     }
 
     mod phase11_1_expand_tests {
@@ -1638,123 +1212,11 @@ FROM \"orders\"";
             }
         }
 
-        #[test]
-        fn join_columns_generates_on_clause() {
-            // Test A: single join_column pair generates alias-qualified ON clause
-            let def = def_with_join_columns();
-            let req = QueryRequest {
-                dimensions: vec!["tier".to_string()],
-                metrics: vec!["revenue".to_string()],
-            };
-            let sql = expand("sales_view", &def, &req).unwrap();
-            assert!(
-                sql.contains("JOIN \"customers\" AS \"c\" ON"),
-                "Must emit JOIN customers with alias: {sql}"
-            );
-            assert!(
-                sql.contains("\"o\".\"customer_id\" = \"c\".\"id\""),
-                "Must emit alias-qualified ON clause: {sql}"
-            );
-        }
-
-        #[test]
-        fn multi_column_join_generates_and_joined_on_clause() {
-            // Test B: two join_column pairs generate AND-joined ON clause
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![
-                    TableRef {
-                        alias: "o".to_string(),
-                        table: "orders".to_string(),
-                        ..Default::default()
-                    },
-                    TableRef {
-                        alias: "li".to_string(),
-                        table: "line_items".to_string(),
-                        ..Default::default()
-                    },
-                ],
-                dimensions: vec![crate::model::Dimension {
-                    name: "item".to_string(),
-                    expr: "li.item".to_string(),
-                    source_table: Some("li".to_string()),
-
-                    output_type: None,
-                }],
-                metrics: vec![],
-                filters: vec![],
-                joins: vec![crate::model::Join {
-                    table: "line_items".to_string(),
-                    on: String::new(),
-                    from_cols: vec![],
-                    join_columns: vec![
-                        JoinColumn {
-                            from: "order_id".to_string(),
-                            to: "order_id".to_string(),
-                        },
-                        JoinColumn {
-                            from: "rev".to_string(),
-                            to: "rev".to_string(),
-                        },
-                    ],
-                    ..Default::default()
-                }],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            let req = QueryRequest {
-                dimensions: vec!["item".to_string()],
-                metrics: vec![],
-            };
-            let sql = expand("mv", &def, &req).unwrap();
-            assert!(
-                sql.contains("\"o\".\"order_id\" = \"li\".\"order_id\""),
-                "Must emit first pair: {sql}"
-            );
-            assert!(sql.contains("AND"), "Must emit AND between pairs: {sql}");
-            assert!(
-                sql.contains("\"o\".\"rev\" = \"li\".\"rev\""),
-                "Must emit second pair: {sql}"
-            );
-        }
-
-        #[test]
-        fn join_with_empty_join_columns_falls_back_to_on_string() {
-            // Test C: empty join_columns → legacy on string used
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![],
-                dimensions: vec![crate::model::Dimension {
-                    name: "customer_name".to_string(),
-                    expr: "customers.name".to_string(),
-                    source_table: Some("customers".to_string()),
-
-                    output_type: None,
-                }],
-                metrics: vec![],
-                filters: vec![],
-                joins: vec![crate::model::Join {
-                    table: "customers".to_string(),
-                    on: "orders.customer_id = customers.id".to_string(),
-                    from_cols: vec![],
-                    join_columns: vec![],
-                    ..Default::default()
-                }],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            let req = QueryRequest {
-                dimensions: vec!["customer_name".to_string()],
-                metrics: vec![],
-            };
-            let sql = expand("test", &def, &req).unwrap();
-            assert!(
-                sql.contains("JOIN \"customers\" ON orders.customer_id = customers.id"),
-                "Must use legacy on string when join_columns is empty: {sql}"
-            );
-        }
+        // Legacy join_columns tests (join_columns_generates_on_clause,
+        // multi_column_join_generates_and_joined_on_clause,
+        // join_with_empty_join_columns_falls_back_to_on_string)
+        // removed in Phase 27 -- legacy join resolution deleted.
+        // PK/FK ON clause synthesis is tested in phase26_pkfk_expand_tests.
 
         #[test]
         fn table_qualified_dimension_lookup_with_matching_source_table() {
@@ -2192,106 +1654,9 @@ FROM \"orders\"";
             );
         }
 
-        #[test]
-        fn test_legacy_join_columns_still_works() {
-            // Phase 11.1 join_columns def should still expand correctly with LEFT JOIN
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![
-                    TableRef {
-                        alias: "o".to_string(),
-                        table: "orders".to_string(),
-                        ..Default::default()
-                    },
-                    TableRef {
-                        alias: "c".to_string(),
-                        table: "customers".to_string(),
-                        ..Default::default()
-                    },
-                ],
-                dimensions: vec![Dimension {
-                    name: "tier".to_string(),
-                    expr: "c.tier".to_string(),
-                    source_table: Some("c".to_string()),
-                    output_type: None,
-                }],
-                metrics: vec![Metric {
-                    name: "revenue".to_string(),
-                    expr: "sum(o.amount)".to_string(),
-                    source_table: Some("o".to_string()),
-                    output_type: None,
-                }],
-                filters: vec![],
-                joins: vec![Join {
-                    table: "customers".to_string(),
-                    on: String::new(),
-                    join_columns: vec![crate::model::JoinColumn {
-                        from: "customer_id".to_string(),
-                        to: "id".to_string(),
-                    }],
-                    ..Default::default()
-                }],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            let req = QueryRequest {
-                dimensions: vec!["tier".to_string()],
-                metrics: vec!["revenue".to_string()],
-            };
-            let sql = expand("test", &def, &req).unwrap();
-            assert!(
-                sql.contains("LEFT JOIN"),
-                "Legacy join_columns path must now emit LEFT JOIN: {sql}"
-            );
-            assert!(
-                sql.contains("\"o\".\"customer_id\" = \"c\".\"id\""),
-                "Legacy join_columns ON clause must still work: {sql}"
-            );
-        }
-
-        #[test]
-        fn test_legacy_on_string_still_works() {
-            // Phase 10 on-string def should still expand correctly with LEFT JOIN
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                tables: vec![],
-                dimensions: vec![Dimension {
-                    name: "customer_name".to_string(),
-                    expr: "customers.name".to_string(),
-                    source_table: Some("customers".to_string()),
-                    output_type: None,
-                }],
-                metrics: vec![Metric {
-                    name: "total_revenue".to_string(),
-                    expr: "sum(amount)".to_string(),
-                    source_table: None,
-                    output_type: None,
-                }],
-                filters: vec![],
-                joins: vec![Join {
-                    table: "customers".to_string(),
-                    on: "orders.customer_id = customers.id".to_string(),
-                    ..Default::default()
-                }],
-                facts: vec![],
-                column_type_names: vec![],
-                column_types_inferred: vec![],
-            };
-            let req = QueryRequest {
-                dimensions: vec!["customer_name".to_string()],
-                metrics: vec!["total_revenue".to_string()],
-            };
-            let sql = expand("test", &def, &req).unwrap();
-            assert!(
-                sql.contains("LEFT JOIN"),
-                "Legacy on-string path must now emit LEFT JOIN: {sql}"
-            );
-            assert!(
-                sql.contains("orders.customer_id = customers.id"),
-                "Legacy ON string must be preserved: {sql}"
-            );
-        }
+        // Legacy compat tests (test_legacy_join_columns_still_works,
+        // test_legacy_on_string_still_works) removed in Phase 27 --
+        // legacy join resolution deleted per no-backward-compat policy.
     }
 
     mod phase27_qualified_refs_tests {
