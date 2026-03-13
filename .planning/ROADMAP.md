@@ -91,28 +91,16 @@ Full details: [milestones/v0.5.1-ROADMAP.md](milestones/v0.5.1-ROADMAP.md)
 
 **Milestone Goal:** Replace function-call DDL body syntax with proper SQL keyword clauses (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS) and adopt Snowflake-style PK/FK relationship model with table aliases, eliminating ON-clause heuristics and enabling qualified column names.
 
-- [ ] **Phase 24: PK/FK Model** - Extend model structs with primary keys, table aliases, and relationship metadata
+- ~~Phase 24: PK/FK Model~~ - Cancelled (model work completed in Phase 25-01; DDL-06/MDL-01-05 closed as won't-do)
 - [x] **Phase 25: SQL Body Parser** - Parse TABLES/RELATIONSHIPS/DIMENSIONS/METRICS keyword clauses in DDL bodies (completed 2026-03-11)
 - [x] **Phase 26: PK/FK Join Resolution** - Synthesize JOIN ON clauses from PK/FK declarations with graph validation (completed 2026-03-13)
 - [x] **Phase 27: Alias-Based Query Expansion** - Replace CTE flattening with direct FROM+JOIN expansion and qualified columns (gap closure in progress) (completed 2026-03-13)
-- [ ] **Phase 28: Integration Testing & Documentation** - End-to-end validation and README update with new syntax
+- [ ] **Phase 28: Integration Testing & Documentation** - Function DDL removal, E2E validation, and README rewrite
 
 ## Phase Details
 
 ### Phase 24: PK/FK Model
-**Goal**: Semantic view definitions can represent tables with aliases, primary keys, and FK-based relationships
-**Depends on**: Nothing (first phase of v0.5.2)
-**Requirements**: MDL-01, MDL-02, MDL-03, MDL-04, MDL-05, DDL-06
-**Success Criteria** (what must be TRUE):
-  1. A `SemanticViewDefinition` created via `create_semantic_view()` stores table aliases, physical table names, and primary key columns per table
-  2. Relationships store source alias, FK columns, and target alias -- with PK columns inferred from the target table's declaration
-  3. Dimension and metric definitions carry a source table alias parsed from qualified `alias.name` syntax
-  4. Composite primary keys (multi-column) round-trip correctly through JSON serialization
-  5. All existing tests pass unchanged (serde defaults guarantee backward compat during transition)
-**Plans:** 2 plans
-Plans:
-- [ ] 24-01-PLAN.md -- Extend TableRef and Join structs with PK/FK fields and serde tests
-- [ ] 24-02-PLAN.md -- Update function DDL interface and migrate sqllogictest files
+**Status**: CANCELLED -- model struct work completed in Phase 25-01. Requirements DDL-06 and MDL-01 through MDL-05 closed as won't-do (function DDL interface being retired in Phase 28).
 
 ### Phase 25: SQL Body Parser
 **Goal**: Users can write `CREATE SEMANTIC VIEW` with SQL keyword clauses instead of function-call syntax
@@ -177,15 +165,19 @@ Plans:
 - [ ] 27-03-PLAN.md -- Gap closure: simplify error message + fix Python caret tests
 
 ### Phase 28: Integration Testing & Documentation
-**Goal**: The complete DDL-to-query pipeline is validated end-to-end and documented for users
-**Depends on**: Phase 24, Phase 25, Phase 26, Phase 27
+**Goal**: Function DDL retired, complete DDL-to-query pipeline validated end-to-end, and documented for users
+**Depends on**: Phase 25, Phase 26, Phase 27
 **Requirements**: DOC-01
 **Success Criteria** (what must be TRUE):
   1. A multi-table semantic view (3+ tables with PK/FK relationships) can be created with SQL DDL syntax and queried with correct results
-  2. The same semantic view definition works through both `CREATE SEMANTIC VIEW` DDL and `create_semantic_view()` function, producing identical query results
+  2. The function-based CREATE DDL interface (`create_semantic_view()` etc.) is removed; only native DDL remains
   3. `just test-all` passes (Rust unit tests, proptests, sqllogictest, DuckLake CI)
   4. README shows the new SQL DDL syntax with a worked PK/FK relationship example
-**Plans**: TBD
+**Plans:** 3 plans
+Plans:
+- [ ] 28-01-PLAN.md -- Remove function DDL source code (DefineSemanticViewVTab, parse_args.rs, lib.rs registrations)
+- [ ] 28-02-PLAN.md -- Rewrite/delete SQL and Python test files to use native DDL
+- [ ] 28-03-PLAN.md -- 3-table E2E integration test + README rewrite
 
 ## Progress
 
@@ -222,9 +214,9 @@ Phases execute in numeric order: 24 -> 25 -> 25.1 -> 26 -> 27 -> 28
 | 21. Error Location Reporting | v0.5.1 | 3/3 | Complete | 2026-03-09 |
 | 22. Documentation | v0.5.1 | 1/1 | Complete | 2026-03-09 |
 | 23. Parser Proptests + Caret Tests | v0.5.1 | 2/2 | Complete | 2026-03-09 |
-| 24. PK/FK Model | v0.5.2 | 0/2 | Not started | - |
+| 24. PK/FK Model | v0.5.2 | -- | Cancelled | - |
 | 25. SQL Body Parser | v0.5.2 | 4/4 | Complete | 2026-03-12 |
-| 25.1. Parser Robustness & Security | 2/2 | Complete    | 2026-03-13 | - |
-| 26. PK/FK Join Resolution | v0.5.2 | Complete    | 2026-03-13 | 2026-03-13 |
-| 27. Alias-Based Query Expansion | 3/3 | Complete    | 2026-03-13 | - |
-| 28. Integration Testing & Docs | v0.5.2 | 0/? | Not started | - |
+| 25.1. Parser Robustness & Security | v0.5.2 | 2/2 | Complete | 2026-03-13 |
+| 26. PK/FK Join Resolution | v0.5.2 | 2/2 | Complete | 2026-03-13 |
+| 27. Alias-Based Query Expansion | v0.5.2 | 3/3 | Complete | 2026-03-13 |
+| 28. Integration Testing & Docs | v0.5.2 | 0/3 | Not started | - |
