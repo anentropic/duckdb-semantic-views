@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [fuzz_json_parse, fuzz_sql_expand, fuzz_query_names]
+        target: [fuzz_json_parse, fuzz_sql_expand, fuzz_query_names, fuzz_ddl_parse]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
