@@ -95,7 +95,7 @@ Full details: [milestones/v0.5.1-ROADMAP.md](milestones/v0.5.1-ROADMAP.md)
 - [x] **Phase 25: SQL Body Parser** - Parse TABLES/RELATIONSHIPS/DIMENSIONS/METRICS keyword clauses in DDL bodies (completed 2026-03-11)
 - [x] **Phase 26: PK/FK Join Resolution** - Synthesize JOIN ON clauses from PK/FK declarations with graph validation (completed 2026-03-13)
 - [x] **Phase 27: Alias-Based Query Expansion** - Replace CTE flattening with direct FROM+JOIN expansion and qualified columns (gap closure in progress) (completed 2026-03-13)
-- [ ] **Phase 28: Integration Testing & Documentation** - Function DDL removal, E2E validation, and README rewrite
+- [x] **Phase 28: Integration Testing & Documentation** - Function DDL removal, E2E validation, and README rewrite (completed 2026-03-13)
 
 ## Phase Details
 
@@ -173,7 +173,7 @@ Plans:
   2. The function-based CREATE DDL interface (`create_semantic_view()` etc.) is removed; only native DDL remains
   3. `just test-all` passes (Rust unit tests, proptests, sqllogictest, DuckLake CI)
   4. README shows the new SQL DDL syntax with a worked PK/FK relationship example
-**Plans:** 2/3 plans executed
+**Plans:** 3/3 plans complete
 Plans:
 - [x] 28-01-PLAN.md -- Remove function DDL source code (DefineSemanticViewVTab, parse_args.rs, lib.rs registrations) (complete 2026-03-13)
 - [ ] 28-02-PLAN.md -- Rewrite/delete SQL and Python test files to use native DDL
@@ -219,4 +219,4 @@ Phases execute in numeric order: 24 -> 25 -> 25.1 -> 26 -> 27 -> 28
 | 25.1. Parser Robustness & Security | v0.5.2 | 2/2 | Complete | 2026-03-13 |
 | 26. PK/FK Join Resolution | v0.5.2 | 2/2 | Complete | 2026-03-13 |
 | 27. Alias-Based Query Expansion | v0.5.2 | 3/3 | Complete | 2026-03-13 |
-| 28. Integration Testing & Docs | 2/3 | In Progress|  | - |
+| 28. Integration Testing & Docs | 3/3 | Complete   | 2026-03-13 | - |
