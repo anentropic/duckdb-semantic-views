@@ -270,23 +270,19 @@ proptest! {
         }
     }
 
-    /// Property 3: SQL structure is valid (WITH, SELECT, FROM present; GROUP BY iff dims+metrics).
+    /// Property 3: SQL structure is valid (SELECT, FROM present; GROUP BY iff dims+metrics).
     #[test]
     fn sql_structure_valid(req in arb_query_request(&simple_definition())) {
         let def = simple_definition();
         let sql = expand("test", &def, &req).unwrap();
 
         prop_assert!(
-            sql.starts_with("WITH \"_base\" AS ("),
-            "SQL must start with CTE. SQL:\n{sql}"
+            sql.starts_with("SELECT"),
+            "SQL must start with SELECT. SQL:\n{sql}"
         );
         prop_assert!(
-            sql.contains("SELECT"),
-            "SQL must contain SELECT. SQL:\n{sql}"
-        );
-        prop_assert!(
-            sql.contains("FROM \"_base\""),
-            "SQL must contain FROM \"_base\". SQL:\n{sql}"
+            sql.contains("FROM \"orders\""),
+            "SQL must contain FROM base table. SQL:\n{sql}"
         );
         // GROUP BY only when BOTH dimensions and metrics are present.
         if !req.dimensions.is_empty() && !req.metrics.is_empty() {

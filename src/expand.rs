@@ -499,82 +499,15 @@ pub fn expand(
     // 4. Detect PK/FK mode: any join with non-empty fk_columns.
     let has_pkfk = def.joins.iter().any(|j| !j.fk_columns.is_empty());
 
-    // 5. Build the base CTE.
-    let mut sql = String::with_capacity(256);
-    sql.push_str("WITH \"_base\" AS (\n    SELECT *\n    FROM ");
-    sql.push_str(&quote_table_ref(&def.base_table));
-
-    // If tables aliases are declared (Phase 11.1), emit AS "alias" after the base table.
-    if let Some(base_ref) = def.tables.first() {
-        sql.push_str(" AS ");
-        sql.push_str(&quote_ident(&base_ref.alias));
-    }
-
-    // Include only the joins needed by requested dimensions/metrics.
-    if has_pkfk {
-        // Phase 26: Graph-based PK/FK join resolution.
-        let ordered_aliases = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets);
-        for alias in &ordered_aliases {
-            // Find the Join whose target (join.table) matches this alias.
-            let Some(join) = def
-                .joins
-                .iter()
-                .find(|j| j.table.to_ascii_lowercase() == *alias)
-            else {
-                continue;
-            };
-            // Find the TableRef for this alias to get the physical table name.
-            let table_ref = def
-                .tables
-                .iter()
-                .find(|t| t.alias.to_ascii_lowercase() == *alias);
-            let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
-            sql.push_str("\n    LEFT JOIN ");
-            sql.push_str(&quote_table_ref(physical_table));
-            sql.push_str(" AS ");
-            sql.push_str(&quote_ident(alias));
-            sql.push_str(" ON ");
-            sql.push_str(&synthesize_on_clause(join, &def.tables));
-        }
-    } else {
-        // Legacy path: resolve_joins + append_join_on_clause.
-        let needed_joins = resolve_joins(&def.joins, &resolved_dims, &resolved_mets, def);
-        for join in &needed_joins {
-            sql.push_str("\n    LEFT JOIN ");
-            sql.push_str(&quote_table_ref(&join.table));
-            // Emit AS "alias" when a tables entry matches this join table.
-            if !def.tables.is_empty() {
-                if let Some(tr) = def
-                    .tables
-                    .iter()
-                    .find(|t| t.table.eq_ignore_ascii_case(&join.table))
-                {
-                    sql.push_str(" AS ");
-                    sql.push_str(&quote_ident(&tr.alias));
-                }
-            }
-            sql.push_str(" ON ");
-            append_join_on_clause(&mut sql, join, def);
-        }
-    }
-
-    // Append filters as WHERE clause (each parenthesized, AND-composed).
-    if !def.filters.is_empty() {
-        sql.push_str("\n    WHERE ");
-        let filter_clauses: Vec<String> = def.filters.iter().map(|f| format!("({f})")).collect();
-        sql.push_str(&filter_clauses.join(" AND "));
-    }
-
-    sql.push_str("\n)");
-
-    // 6. Build the outer SELECT.
+    // 5. Build the SELECT clause.
     //    Dimensions-only (no metrics): SELECT DISTINCT, no GROUP BY.
     //    Metrics-only (no dimensions): SELECT (global aggregate), no GROUP BY.
     //    Both: SELECT with GROUP BY.
+    let mut sql = String::with_capacity(256);
     if !resolved_dims.is_empty() && resolved_mets.is_empty() {
-        sql.push_str("\nSELECT DISTINCT\n");
+        sql.push_str("SELECT DISTINCT\n");
     } else {
-        sql.push_str("\nSELECT\n");
+        sql.push_str("SELECT\n");
     }
 
     let mut select_items: Vec<String> = Vec::new();
@@ -599,10 +532,71 @@ pub fn expand(
     }
     sql.push_str(&select_items.join(",\n"));
 
-    // 7. FROM the base CTE.
-    sql.push_str("\nFROM \"_base\"");
+    // 6. FROM clause with base table.
+    sql.push_str("\nFROM ");
+    sql.push_str(&quote_table_ref(&def.base_table));
 
-    // 8. GROUP BY (only when both dimensions and metrics are present).
+    // If tables aliases are declared (Phase 11.1), emit AS "alias" after the base table.
+    if let Some(base_ref) = def.tables.first() {
+        sql.push_str(" AS ");
+        sql.push_str(&quote_ident(&base_ref.alias));
+    }
+
+    // Include only the joins needed by requested dimensions/metrics.
+    if has_pkfk {
+        // Phase 26: Graph-based PK/FK join resolution.
+        let ordered_aliases = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets);
+        for alias in &ordered_aliases {
+            // Find the Join involving this alias (either as FK target or FK source).
+            let Some(join) = def.joins.iter().find(|j| {
+                j.table.to_ascii_lowercase() == *alias
+                    || j.from_alias.to_ascii_lowercase() == *alias
+            }) else {
+                continue;
+            };
+            // Find the TableRef for this alias to get the physical table name.
+            let table_ref = def
+                .tables
+                .iter()
+                .find(|t| t.alias.to_ascii_lowercase() == *alias);
+            let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
+            sql.push_str("\nLEFT JOIN ");
+            sql.push_str(&quote_table_ref(physical_table));
+            sql.push_str(" AS ");
+            sql.push_str(&quote_ident(alias));
+            sql.push_str(" ON ");
+            sql.push_str(&synthesize_on_clause(join, &def.tables));
+        }
+    } else {
+        // Legacy path: resolve_joins + append_join_on_clause.
+        let needed_joins = resolve_joins(&def.joins, &resolved_dims, &resolved_mets, def);
+        for join in &needed_joins {
+            sql.push_str("\nLEFT JOIN ");
+            sql.push_str(&quote_table_ref(&join.table));
+            // Emit AS "alias" when a tables entry matches this join table.
+            if !def.tables.is_empty() {
+                if let Some(tr) = def
+                    .tables
+                    .iter()
+                    .find(|t| t.table.eq_ignore_ascii_case(&join.table))
+                {
+                    sql.push_str(" AS ");
+                    sql.push_str(&quote_ident(&tr.alias));
+                }
+            }
+            sql.push_str(" ON ");
+            append_join_on_clause(&mut sql, join, def);
+        }
+    }
+
+    // Append filters as WHERE clause (each parenthesized, AND-composed).
+    if !def.filters.is_empty() {
+        sql.push_str("\nWHERE ");
+        let filter_clauses: Vec<String> = def.filters.iter().map(|f| format!("({f})")).collect();
+        sql.push_str(&filter_clauses.join(" AND "));
+    }
+
+    // 7. GROUP BY (only when both dimensions and metrics are present).
     //    Use ordinal positions (GROUP BY 1, 2, ...) instead of expressions to avoid
     //    ambiguity when an expression matches its alias (e.g., `status AS "status"`).
     if !resolved_dims.is_empty() && !resolved_mets.is_empty() {
@@ -738,14 +732,10 @@ mod tests {
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
-WITH \"_base\" AS (
-    SELECT *
-    FROM \"orders\"
-)
 SELECT
     region AS \"region\",
     sum(amount) AS \"total_revenue\"
-FROM \"_base\"
+FROM \"orders\"
 GROUP BY
     1";
             assert_eq!(sql, expected);
@@ -760,16 +750,12 @@ GROUP BY
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
-WITH \"_base\" AS (
-    SELECT *
-    FROM \"orders\"
-)
 SELECT
     region AS \"region\",
     status AS \"status\",
     sum(amount) AS \"total_revenue\",
     count(*) AS \"order_count\"
-FROM \"_base\"
+FROM \"orders\"
 GROUP BY
     1,
     2";
@@ -785,13 +771,9 @@ GROUP BY
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
-WITH \"_base\" AS (
-    SELECT *
-    FROM \"orders\"
-)
 SELECT
     sum(amount) AS \"total_revenue\"
-FROM \"_base\"";
+FROM \"orders\"";
             assert_eq!(sql, expected);
         }
 
@@ -808,15 +790,11 @@ FROM \"_base\"";
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
-WITH \"_base\" AS (
-    SELECT *
-    FROM \"orders\"
-    WHERE (status = 'completed') AND (amount > 100)
-)
 SELECT
     region AS \"region\",
     sum(amount) AS \"total_revenue\"
-FROM \"_base\"
+FROM \"orders\"
+WHERE (status = 'completed') AND (amount > 100)
 GROUP BY
     1";
             assert_eq!(sql, expected);
@@ -832,15 +810,11 @@ GROUP BY
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
-WITH \"_base\" AS (
-    SELECT *
-    FROM \"orders\"
-    WHERE (status = 'completed')
-)
 SELECT
     region AS \"region\",
     sum(amount) AS \"total_revenue\"
-FROM \"_base\"
+FROM \"orders\"
+WHERE (status = 'completed')
 GROUP BY
     1";
             assert_eq!(sql, expected);
@@ -875,9 +849,8 @@ GROUP BY
                 metrics: vec!["cnt".to_string()],
             };
             let sql = expand("test", &def, &req).unwrap();
-            // Base table "select" must be quoted, CTE name is always "_base" quoted
+            // Base table "select" must be quoted
             assert!(sql.contains("FROM \"select\""));
-            assert!(sql.contains("\"_base\""));
         }
 
         #[test]
@@ -940,14 +913,10 @@ GROUP BY
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
-WITH \"_base\" AS (
-    SELECT *
-    FROM \"orders\"
-)
 SELECT DISTINCT
     region AS \"region\",
     status AS \"status\"
-FROM \"_base\"";
+FROM \"orders\"";
             assert_eq!(sql, expected);
         }
 
@@ -960,14 +929,10 @@ FROM \"_base\"";
             };
             let sql = expand("orders", &def, &req).unwrap();
             let expected = "\
-WITH \"_base\" AS (
-    SELECT *
-    FROM \"orders\"
-)
 SELECT
     sum(amount) AS \"total_revenue\",
     count(*) AS \"order_count\"
-FROM \"_base\"";
+FROM \"orders\"";
             assert_eq!(sql, expected);
         }
 
