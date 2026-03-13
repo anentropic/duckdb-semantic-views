@@ -113,6 +113,31 @@ SELECT * FROM explain_semantic_view('analytics',
 );
 ```
 
+```
+┌──────────────────────────────────────────────────────────────┐
+│                        explain_output                        │
+│                           varchar                            │
+├──────────────────────────────────────────────────────────────┤
+│ -- Semantic View: analytics                                  │
+│ -- Dimensions: customer_name                                 │
+│ -- Metrics: revenue                                          │
+│                                                              │
+│ -- Expanded SQL:                                             │
+│ SELECT                                                       │
+│     c.name AS "customer_name",                               │
+│     sum(o.amount) AS "revenue"                               │
+│ FROM "orders" AS "o"                                         │
+│ LEFT JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id" │
+│ GROUP BY                                                     │
+│     1                                                        │
+│                                                              │
+│ -- DuckDB Plan:                                              │
+│ ...                                                          │
+├──────────────────────────────────────────────────────────────┤
+│ 15+ rows                                                     │
+└──────────────────────────────────────────────────────────────┘
+```
+
 ## DDL reference
 
 ```sql

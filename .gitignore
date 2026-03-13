@@ -63,3 +63,6 @@ cpp/include/duckdb.cpp
 __pycache__/
 *.py[codz]
 *$py.class
+
+.opencode/
+.agents/
