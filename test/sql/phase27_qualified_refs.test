@@ -1,0 +1,82 @@
+# Phase 27: Qualified Column References (EXP-05)
+# Tests: alias.column expressions emit verbatim in SQL, end-to-end correctness
+
+require semantic_views
+
+# --- Setup: create test tables with p27_ prefix ---
+statement ok
+CREATE TABLE p27_customers (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO p27_customers VALUES (1, 'Alice'), (2, 'Bob');
+
+statement ok
+CREATE TABLE p27_orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10,2), region VARCHAR);
+
+statement ok
+INSERT INTO p27_orders VALUES (1, 1, 100.00, 'East'), (2, 1, 200.00, 'West'), (3, 2, 50.00, 'East'), (4, NULL, 75.00, 'North');
+
+# --- Test 1: Qualified column refs in DIMENSIONS and METRICS (EXP-05) ---
+statement ok
+CREATE SEMANTIC VIEW p27_sales AS
+  TABLES (
+    o AS p27_orders PRIMARY KEY (id),
+    c AS p27_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.customer_name AS c.name
+  )
+  METRICS (
+    o.total_amount AS sum(o.amount)
+  );
+
+# Query with qualified column refs: c.name and sum(o.amount) should resolve correctly
+query TR rowsort
+SELECT * FROM semantic_view('p27_sales', dimensions := ['customer_name'], metrics := ['total_amount']);
+----
+Alice	300.00
+Bob	50.00
+NULL	75.00
+
+# --- Test 2: Multiple qualified refs from different tables ---
+statement ok
+CREATE SEMANTIC VIEW p27_sales_multi AS
+  TABLES (
+    o AS p27_orders PRIMARY KEY (id),
+    c AS p27_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.customer_name AS c.name,
+    o.order_region AS o.region
+  )
+  METRICS (
+    o.total_amount AS sum(o.amount)
+  );
+
+# Query with both dims from different tables
+query TTR rowsort
+SELECT * FROM semantic_view('p27_sales_multi', dimensions := ['customer_name', 'order_region'], metrics := ['total_amount']);
+----
+Alice	East	100.00
+Alice	West	200.00
+Bob	East	50.00
+NULL	North	75.00
+
+# --- Cleanup ---
+statement ok
+DROP SEMANTIC VIEW p27_sales;
+
+statement ok
+DROP SEMANTIC VIEW p27_sales_multi;
+
+statement ok
+DROP TABLE p27_orders;
+
+statement ok
+DROP TABLE p27_customers;

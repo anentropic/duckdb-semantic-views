@@ -2293,4 +2293,143 @@ FROM \"orders\"";
             );
         }
     }
+
+    mod phase27_qualified_refs_tests {
+        use super::*;
+        use crate::model::{Dimension, Join, Metric, TableRef};
+
+        /// Build a 2-table PK/FK definition for qualified column ref testing.
+        fn qualified_ref_def() -> SemanticViewDefinition {
+            SemanticViewDefinition {
+                base_table: "p27_orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "p27_orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "p27_customers".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                ],
+                dimensions: vec![Dimension {
+                    name: "customer_name".to_string(),
+                    expr: "c.name".to_string(),
+                    source_table: Some("c".to_string()),
+                    output_type: None,
+                }],
+                metrics: vec![Metric {
+                    name: "total_amount".to_string(),
+                    expr: "sum(o.amount)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    ..Default::default()
+                }],
+                facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            }
+        }
+
+        #[test]
+        fn test_expand_qualified_column_refs_verbatim() {
+            // EXP-05: qualified column references (alias.column) in dimension/metric
+            // expressions must appear verbatim in generated SQL, not stripped or rewritten.
+            let def = qualified_ref_def();
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec!["total_amount".to_string()],
+            };
+            let sql = expand("p27_test", &def, &req).unwrap();
+
+            // The dimension expr "c.name" must appear verbatim in SELECT
+            assert!(
+                sql.contains("c.name AS"),
+                "Qualified dim expr 'c.name' must appear verbatim in SQL: {sql}"
+            );
+
+            // The metric expr "sum(o.amount)" must appear verbatim in SELECT
+            assert!(
+                sql.contains("sum(o.amount) AS"),
+                "Qualified metric expr 'sum(o.amount)' must appear verbatim in SQL: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_expand_multiple_qualified_refs_different_tables() {
+            // Multiple qualified refs from different tables resolve correctly
+            let def = SemanticViewDefinition {
+                base_table: "p27_orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "p27_orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "p27_customers".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                ],
+                dimensions: vec![
+                    Dimension {
+                        name: "customer_name".to_string(),
+                        expr: "c.name".to_string(),
+                        source_table: Some("c".to_string()),
+                        output_type: None,
+                    },
+                    Dimension {
+                        name: "order_region".to_string(),
+                        expr: "o.region".to_string(),
+                        source_table: Some("o".to_string()),
+                        output_type: None,
+                    },
+                ],
+                metrics: vec![Metric {
+                    name: "total_amount".to_string(),
+                    expr: "sum(o.amount)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    ..Default::default()
+                }],
+                facts: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string(), "order_region".to_string()],
+                metrics: vec!["total_amount".to_string()],
+            };
+            let sql = expand("p27_test", &def, &req).unwrap();
+
+            // Both qualified dim exprs must appear verbatim
+            assert!(
+                sql.contains("c.name AS"),
+                "Qualified dim expr 'c.name' must appear verbatim: {sql}"
+            );
+            assert!(
+                sql.contains("o.region AS"),
+                "Qualified dim expr 'o.region' must appear verbatim: {sql}"
+            );
+            assert!(
+                sql.contains("sum(o.amount) AS"),
+                "Qualified metric expr 'sum(o.amount)' must appear verbatim: {sql}"
+            );
+        }
+    }
 }
