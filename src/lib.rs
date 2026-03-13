@@ -1,6 +1,7 @@
 pub mod body_parser;
 pub mod catalog;
 pub mod expand;
+pub mod graph;
 pub mod model;
 pub mod parse;
 #[cfg(feature = "extension")]
