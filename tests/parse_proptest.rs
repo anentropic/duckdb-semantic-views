@@ -768,7 +768,36 @@ fn test_control_char_in_name() {
 
 /// Generate a valid SQL identifier for use in FACTS/HIERARCHIES entries.
 fn arb_identifier() -> impl Strategy<Value = String> {
-    proptest::string::string_regex("[a-z][a-z0-9_]{0,9}").unwrap()
+    proptest::string::string_regex("[a-z][a-z0-9_]{0,9}")
+        .unwrap()
+        .prop_filter("must not be a SQL keyword or start with AS", |s| {
+            let upper = s.to_ascii_uppercase();
+            // Reject identifiers that ARE or START WITH common SQL keywords
+            // that confuse the dot-qualified entry parser (e.g., "as_" looks
+            // like "AS" + "_" to the token splitter).
+            !matches!(
+                upper.as_str(),
+                "AS" | "BY"
+                    | "ON"
+                    | "IN"
+                    | "IS"
+                    | "OR"
+                    | "TO"
+                    | "IF"
+                    | "DO"
+                    | "REFERENCES"
+                    | "PRIMARY"
+                    | "KEY"
+                    | "MANY"
+                    | "ONE"
+                    | "SUM"
+                    | "COUNT"
+                    | "AVG"
+                    | "MIN"
+                    | "MAX"
+            ) && !upper.starts_with("AS_")
+                && !upper.starts_with("AS ")
+        })
 }
 
 /// Generate a simple SQL expression for fact entries.
