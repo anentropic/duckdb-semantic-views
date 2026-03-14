@@ -8,3 +8,4 @@ test/sql/phase28_e2e.test
 test/sql/phase29_facts_hierarchies.test
 test/sql/phase30_derived_metrics.test
 test/sql/phase31_fan_trap.test
+test/sql/phase32_role_playing.test

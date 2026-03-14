@@ -1,0 +1,241 @@
+# Phase 32: End-to-end integration test for role-playing dimensions
+# and USING RELATIONSHIPS expansion.
+# Tests that USING metrics generate scoped aliases, dimensions resolve
+# via co-queried metric USING context, and ambiguous paths are rejected.
+
+require semantic_views
+
+# ============================================================
+# Setup: create flights and airports tables with test data
+# ============================================================
+
+statement ok
+CREATE TABLE p32_airports (airport_code VARCHAR, city VARCHAR, country VARCHAR);
+
+statement ok
+INSERT INTO p32_airports VALUES
+    ('SFO', 'San Francisco', 'US'),
+    ('JFK', 'New York', 'US'),
+    ('LHR', 'London', 'UK');
+
+statement ok
+CREATE TABLE p32_flights (flight_id INTEGER, departure_code VARCHAR, arrival_code VARCHAR, carrier VARCHAR);
+
+statement ok
+INSERT INTO p32_flights VALUES
+    (1, 'SFO', 'JFK', 'AA'),
+    (2, 'JFK', 'LHR', 'BA'),
+    (3, 'LHR', 'SFO', 'AA');
+
+# ============================================================
+# Test 1 (ROLE-03): Define semantic view with role-playing pattern
+# and query city dimension with departure_count metric
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p32_flights_view AS
+  TABLES (
+    f AS p32_flights PRIMARY KEY (flight_id),
+    a AS p32_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+  )
+  DIMENSIONS (
+    a.city AS a.city,
+    a.country AS a.country,
+    f.carrier AS f.carrier
+  )
+  METRICS (
+    f.departure_count USING (dep_airport) AS COUNT(*),
+    f.arrival_count USING (arr_airport) AS COUNT(*),
+    total_flights AS departure_count + arrival_count
+  );
+
+# Query city (from airports, role-playing) + departure_count (USING dep_airport)
+# Departure cities: SFO=1 departure, JFK=1 departure, LHR=1 departure
+
+query TI rowsort
+SELECT * FROM semantic_view('p32_flights_view', dimensions := ['city'], metrics := ['departure_count']);
+----
+London	1
+New York	1
+San Francisco	1
+
+# ============================================================
+# Test 2: carrier dimension (non-ambiguous base table) with both
+# role-playing metrics -- both scoped JOINs emitted
+# ============================================================
+
+# Both departure_count and arrival_count are COUNT(*) on flights table.
+# USING only controls dimension alias resolution, not the metric aggregation.
+# AA: 2 flights, BA: 1 flight. Both metrics count the same rows.
+
+query TII rowsort
+SELECT * FROM semantic_view('p32_flights_view', dimensions := ['carrier'], metrics := ['departure_count', 'arrival_count']);
+----
+AA	2	2
+BA	1	1
+
+# ============================================================
+# Test 3 (JOIN-05): city dimension with derived metric total_flights
+# is ambiguous because total_flights references both USING paths
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('p32_flights_view', dimensions := ['city'], metrics := ['total_flights']);
+----
+ambiguous
+
+# ============================================================
+# Test 4: carrier dimension with derived metric total_flights
+# works because carrier is from base table (no ambiguity)
+# total_flights = departure_count + arrival_count = COUNT(*) + COUNT(*)
+# AA: 2 + 2 = 4; BA: 1 + 1 = 2
+# ============================================================
+
+query TI rowsort
+SELECT * FROM semantic_view('p32_flights_view', dimensions := ['carrier'], metrics := ['total_flights']);
+----
+AA	4
+BA	2
+
+# ============================================================
+# Test 5 (JOIN-04): USING references non-existent relationship
+# should produce define-time error
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p32_bad_using AS
+  TABLES (
+    f AS p32_flights PRIMARY KEY (flight_id),
+    a AS p32_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a
+  )
+  DIMENSIONS (
+    f.carrier AS f.carrier
+  )
+  METRICS (
+    f.bad_metric USING (nonexistent_rel) AS COUNT(*)
+  );
+----
+unknown relationship
+
+# ============================================================
+# Test 6: Metrics only (no dimensions) with departure_count
+# Scoped JOIN still emitted, global aggregate
+# Total flights = 3
+# ============================================================
+
+query I
+SELECT * FROM semantic_view('p32_flights_view', metrics := ['departure_count']);
+----
+3
+
+# ============================================================
+# Test 7: Backward compat -- standard semantic view (no role-playing)
+# still works unchanged
+# ============================================================
+
+statement ok
+CREATE TABLE p32_orders (id INTEGER, region VARCHAR, amount DOUBLE);
+
+statement ok
+INSERT INTO p32_orders VALUES (1, 'East', 100.0), (2, 'West', 200.0);
+
+statement ok
+CREATE SEMANTIC VIEW p32_orders_view AS
+  TABLES (
+    o AS p32_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+
+query TR rowsort
+SELECT * FROM semantic_view('p32_orders_view', dimensions := ['region'], metrics := ['revenue']);
+----
+East	100.0
+West	200.0
+
+# ============================================================
+# Test 8: Single relationship to airports (not role-playing)
+# city dimension resolves without USING (no ambiguity)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p32_single_rel AS
+  TABLES (
+    f AS p32_flights PRIMARY KEY (flight_id),
+    a AS p32_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a
+  )
+  DIMENSIONS (
+    a.city AS a.city,
+    f.carrier AS f.carrier
+  )
+  METRICS (
+    f.flight_count AS COUNT(*)
+  );
+
+# city resolves unambiguously (only one relationship to airports)
+# SFO->JFK departure: San Francisco=1, JFK->LHR: New York=1, LHR->SFO: London=1
+
+query TI rowsort
+SELECT * FROM semantic_view('p32_single_rel', dimensions := ['city'], metrics := ['flight_count']);
+----
+London	1
+New York	1
+San Francisco	1
+
+# ============================================================
+# Test 9: city dimension alone (no metrics) with role-playing
+# should produce ambiguity error
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('p32_flights_view', dimensions := ['city']);
+----
+ambiguous
+
+# ============================================================
+# Test 10: arrival_count metric with city dimension
+# Arrival cities: JFK=1 arrival, LHR=1 arrival, SFO=1 arrival
+# ============================================================
+
+query TI rowsort
+SELECT * FROM semantic_view('p32_flights_view', dimensions := ['city'], metrics := ['arrival_count']);
+----
+London	1
+New York	1
+San Francisco	1
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p32_flights_view;
+
+statement ok
+DROP SEMANTIC VIEW p32_orders_view;
+
+statement ok
+DROP SEMANTIC VIEW p32_single_rel;
+
+statement ok
+DROP TABLE p32_flights;
+
+statement ok
+DROP TABLE p32_airports;
+
+statement ok
+DROP TABLE p32_orders;
