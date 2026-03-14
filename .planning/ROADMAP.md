@@ -160,8 +160,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 31-01-PLAN.md -- Cardinality enum on Join model, parser extension for MANY TO ONE / ONE TO ONE / ONE TO MANY keywords
-- [ ] 31-02-PLAN.md -- Fan trap detection in expand.rs (ExpandError::FanTrap), end-to-end sqllogictest
+- [x] 31-01-PLAN.md -- Cardinality enum on Join model, parser extension for MANY TO ONE / ONE TO ONE / ONE TO MANY keywords
+- [x] 31-02-PLAN.md -- Fan trap detection in expand.rs (ExpandError::FanTrap), end-to-end sqllogictest
 
 ### Phase 32: Role-Playing Dimensions & USING RELATIONSHIPS
 **Goal**: Users can join the same physical table via multiple named relationships and select specific join paths per metric
@@ -175,7 +175,11 @@ Plans:
   5. Define-time validation rejects USING references to non-existent relationships
   6. Unit tests for diamond relaxation logic, USING parsing, relationship-scoped alias generation, ambiguity detection; proptests for USING clause parsing; sqllogictest for end-to-end role-playing pattern (flights/airports) and error cases; fuzz target for USING clause parsing
   7. `just test-all` passes
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 32-01-PLAN.md -- USING on Metric model, parser, diamond relaxation, define-time USING validation
+- [ ] 32-02-PLAN.md -- USING-aware expansion with scoped aliases, ambiguity detection, end-to-end sqllogictest
 
 ## Progress
 
@@ -219,5 +223,5 @@ Phases execute in numeric order: 29 -> 30 -> 31 -> 32
 | 28. Integration Testing & Docs | v0.5.2 | 3/3 | Complete | 2026-03-13 |
 | 29. FACTS Clause & Hierarchies | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 30. Derived Metrics | v0.5.3 | 2/2 | Complete | 2026-03-14 |
-| 31. Fan Trap Detection | 2/2 | Complete    | 2026-03-14 | - |
-| 32. Role-Playing & USING | v0.5.3 | 0/? | Not started | - |
+| 31. Fan Trap Detection | v0.5.3 | 2/2 | Complete | 2026-03-14 |
+| 32. Role-Playing & USING | v0.5.3 | 0/2 | Not started | - |
