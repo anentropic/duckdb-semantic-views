@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: completed
-stopped_at: Completed 30-02-PLAN.md
-last_updated: "2026-03-14T14:11:30.466Z"
-last_activity: 2026-03-14 -- Completed 30-02 (Derived metric expression inlining)
+stopped_at: Completed 31-01-PLAN.md
+last_updated: "2026-03-14T18:21:23Z"
+last_activity: 2026-03-14 -- Completed 31-01 (Cardinality model and parser)
 progress:
   total_phases: 4
   completed_phases: 2
   total_plans: 4
-  completed_plans: 4
-  percent: 50
+  completed_plans: 5
+  percent: 63
 ---
 
 # Project State
@@ -26,18 +26,18 @@ See: .planning/PROJECT.md (updated 2026-03-14)
 ## Current Position
 
 Phase: 31 (3 of 4 in v0.5.3) (Fan Trap Detection)
-Plan: 0 of 2 in current phase
-Status: Phase 30 complete, ready for Phase 31
-Last activity: 2026-03-14 -- Completed 30-02 (Derived metric expression inlining)
+Plan: 1 of 2 in current phase
+Status: Executing Phase 31 (Plan 01 complete)
+Last activity: 2026-03-14 -- Completed 31-01 (Cardinality model and parser)
 
-Progress: [=====.....] 50% (v0.5.3)
+Progress: [======....] 63% (v0.5.3)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4 (v0.5.3)
-- Average duration: 28min
-- Total execution time: 110min
+- Total plans completed: 5 (v0.5.3)
+- Average duration: 24min
+- Total execution time: 119min
 
 **By Phase:**
 
@@ -45,9 +45,10 @@ Progress: [=====.....] 50% (v0.5.3)
 |-------|-------|-------|----------|
 | 29 | 2 | 87min | 44min |
 | 30 | 2 | 23min | 12min |
+| 31 | 1 | 9min | 9min |
 
 **Recent Trend:**
-- Last 5 plans: 72min, 15min, 13min, 10min
+- Last 5 plans: 72min, 15min, 13min, 10min, 9min
 - Trend: improving
 
 *Updated after each plan completion*
@@ -75,6 +76,8 @@ Recent decisions affecting current work:
 - [30-02]: inline_derived_metrics resolves ALL metrics (base+derived) in one pass, replacing per-metric inline_facts
 - [30-02]: toposort_derived only considers derived-to-derived edges; base metric references are external
 - [30-02]: collect_derived_metric_source_tables walks dependency graph transitively for join resolution
+- [31-01]: Cardinality::is_default() + skip_serializing_if keeps serialized JSON backward-compatible
+- [31-01]: Token-split approach for to_alias/cardinality extraction (first token = alias, rest = cardinality)
 
 ### Pending Todos
 
@@ -90,5 +93,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-14
-Stopped at: Completed 30-02-PLAN.md
+Stopped at: Completed 31-01-PLAN.md
 Resume file: None

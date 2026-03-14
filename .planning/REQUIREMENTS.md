@@ -45,7 +45,7 @@ Requirements for advanced semantic modeling capabilities. Each maps to roadmap p
 
 ### Fan Trap Detection
 
-- [ ] **FAN-01**: Relationships can optionally declare cardinality type (one_to_one, one_to_many, many_to_one)
+- [x] **FAN-01**: Relationships can optionally declare cardinality type (one_to_one, one_to_many, many_to_one)
 - [ ] **FAN-02**: Query expansion warns when a metric aggregates across a one-to-many boundary that could inflate results
 - [ ] **FAN-03**: Fan trap warnings do not block query execution -- query succeeds with warning
 
@@ -102,7 +102,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DRV-03 | Phase 30 | Complete |
 | DRV-04 | Phase 30 | Complete |
 | DRV-05 | Phase 30 | Complete |
-| FAN-01 | Phase 31 | Pending |
+| FAN-01 | Phase 31 | Complete |
 | FAN-02 | Phase 31 | Pending |
 | FAN-03 | Phase 31 | Pending |
 | JOIN-01 | Phase 32 | Pending |
