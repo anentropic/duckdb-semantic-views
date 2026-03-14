@@ -1,10 +1,10 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.5.3
-milestone_name: Advanced Semantic Features
-status: active
-stopped_at: null
-last_updated: "2026-03-14T12:24:16.000Z"
+milestone: v0.1
+milestone_name: milestone
+status: completed
+stopped_at: Completed 29-02-PLAN.md (Phase 29 complete)
+last_updated: "2026-03-14T12:31:52.778Z"
 last_activity: 2026-03-14 -- Completed 29-02 (Fact inlining, DESCRIBE update, E2E tests)
 progress:
   total_phases: 4
