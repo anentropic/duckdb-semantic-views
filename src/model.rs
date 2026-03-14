@@ -48,6 +48,13 @@ pub struct Metric {
     /// If None, the inferred or fallback type is used.
     #[serde(default)]
     pub output_type: Option<String>,
+    /// Phase 32: Named relationships that this metric traverses.
+    /// When non-empty, the expansion engine uses these relationship names
+    /// to resolve which join path to follow (role-playing dimensions).
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub using_relationships: Vec<String>,
 }
 
 /// A named raw SQL column expression — a pre-aggregation fact, scoped to a table alias.
@@ -563,6 +570,53 @@ mod tests {
         }
     }
 
+    mod phase32_using_relationships_tests {
+        use super::*;
+
+        #[test]
+        fn metric_with_using_relationships_roundtrips() {
+            let met = Metric {
+                name: "departure_count".to_string(),
+                expr: "COUNT(*)".to_string(),
+                source_table: Some("f".to_string()),
+                output_type: None,
+                using_relationships: vec!["dep_airport".to_string()],
+            };
+            let json = serde_json::to_string(&met).unwrap();
+            assert!(json.contains("using_relationships"));
+            let rt: Metric = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.using_relationships, vec!["dep_airport"]);
+        }
+
+        #[test]
+        fn old_json_without_using_relationships_deserializes_with_empty_vec() {
+            // Backward compat: Phase 30 definitions don't have using_relationships
+            let json = r#"{"name":"revenue","expr":"SUM(amount)","source_table":"o"}"#;
+            let met: Metric = serde_json::from_str(json).unwrap();
+            assert!(
+                met.using_relationships.is_empty(),
+                "using_relationships should default to [] for old JSON"
+            );
+        }
+
+        #[test]
+        fn metric_with_empty_using_relationships_does_not_emit_field() {
+            // skip_serializing_if = "Vec::is_empty" means no using_relationships key in output
+            let met = Metric {
+                name: "revenue".to_string(),
+                expr: "SUM(amount)".to_string(),
+                source_table: Some("o".to_string()),
+                output_type: None,
+                using_relationships: vec![],
+            };
+            let json = serde_json::to_string(&met).unwrap();
+            assert!(
+                !json.contains("using_relationships"),
+                "Empty using_relationships should be omitted from JSON: {json}"
+            );
+        }
+    }
+
     mod phase12_model_tests {
         use super::*;
 
@@ -586,6 +640,7 @@ mod tests {
                 expr: "sum(amount)".to_string(),
                 source_table: None,
                 output_type: Some("DOUBLE".to_string()),
+                using_relationships: vec![],
             };
             let json = serde_json::to_string(&met).unwrap();
             let rt: Metric = serde_json::from_str(&json).unwrap();

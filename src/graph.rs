@@ -1060,6 +1060,7 @@ mod tests {
                     expr: format!("sum({})", name),
                     source_table: source.map(|s| s.to_string()),
                     output_type: None,
+                    using_relationships: vec![],
                 })
                 .collect(),
             filters: vec![],
@@ -1802,6 +1803,7 @@ mod tests {
                 expr: expr.to_string(),
                 source_table: Some(source.to_string()),
                 output_type: None,
+                using_relationships: vec![],
             });
         }
         for (name, expr) in derived_metrics {
@@ -1810,6 +1812,7 @@ mod tests {
                 expr: expr.to_string(),
                 source_table: None,
                 output_type: None,
+                using_relationships: vec![],
             });
         }
         SemanticViewDefinition {

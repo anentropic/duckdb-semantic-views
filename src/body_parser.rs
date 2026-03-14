@@ -317,7 +317,7 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
     let mut facts_raw: Vec<(String, String, String)> = Vec::new();
     let mut hierarchies: Vec<Hierarchy> = Vec::new();
     let mut dimensions_raw: Vec<(String, String, String)> = Vec::new();
-    let mut metrics_raw: Vec<(Option<String>, String, String)> = Vec::new();
+    let mut metrics_raw: Vec<(Option<String>, String, String, Vec<String>)> = Vec::new();
 
     for bound in &bounds {
         match bound.keyword {
@@ -365,11 +365,12 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
 
     let metrics = metrics_raw
         .into_iter()
-        .map(|(source_alias, bare_name, expr)| Metric {
+        .map(|(source_alias, bare_name, expr, using_rels)| Metric {
             name: bare_name,
             expr,
             source_table: source_alias,
             output_type: None,
+            using_relationships: using_rels,
         })
         .collect();
 
@@ -755,14 +756,17 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
 /// Parse the content inside METRICS (...) supporting both qualified and unqualified entries.
 ///
 /// Qualified entries have the form: `alias.name AS expr` (base metric).
+/// Qualified entries may include: `alias.name USING (rel1, rel2) AS expr` (Phase 32).
 /// Unqualified entries have the form: `name AS expr` (derived metric).
 ///
-/// Returns `Vec<(Option<source_alias>, bare_name, expr)>` where the Option is
-/// `Some(alias)` for qualified entries and `None` for unqualified (derived) entries.
+/// Returns `Vec<(Option<source_alias>, bare_name, expr, using_relationships)>` where:
+/// - Option is `Some(alias)` for qualified entries and `None` for unqualified (derived) entries
+/// - `using_relationships` is a `Vec<String>` of named relationships (empty if no USING clause)
+#[allow(clippy::type_complexity)]
 pub(crate) fn parse_metrics_clause(
     body: &str,
     base_offset: usize,
-) -> Result<Vec<(Option<String>, String, String)>, ParseError> {
+) -> Result<Vec<(Option<String>, String, String, Vec<String>)>, ParseError> {
     if body.trim().is_empty() {
         return Ok(vec![]);
     }
@@ -779,11 +783,15 @@ pub(crate) fn parse_metrics_clause(
     Ok(result)
 }
 
-/// Parse one METRICS entry: either `alias.name AS expr` (qualified) or `name AS expr` (derived).
+/// Parse one METRICS entry: either `alias.name [USING (...)] AS expr` (qualified)
+/// or `name AS expr` (derived).
+///
+/// Phase 32: If a USING clause is present, it must be on a qualified entry (has dot).
+/// USING on a derived metric (no dot) produces a `ParseError`.
 fn parse_single_metric_entry(
     entry: &str,
     entry_offset: usize,
-) -> Result<(Option<String>, String, String), ParseError> {
+) -> Result<(Option<String>, String, String, Vec<String>), ParseError> {
     let entry = entry.trim();
 
     // Check if entry contains a dot BEFORE the AS keyword -- if so, it's qualified.
@@ -813,11 +821,40 @@ fn parse_single_metric_entry(
         });
     }
 
+    // Check for USING keyword in before_as (case-insensitive, word boundary)
+    let upper_before = before_as.to_ascii_uppercase();
+    let using_pos = find_keyword_ci(&upper_before, "USING");
+    let mut using_relationships: Vec<String> = Vec::new();
+
+    // The name portion is before USING (or all of before_as if no USING)
+    let name_portion = if let Some(upos) = using_pos {
+        // Extract the parenthesized relationship list after USING
+        let after_using = before_as[upos + 5..].trim();
+        if !after_using.starts_with('(') {
+            return Err(ParseError {
+                message: format!("Expected '(' after USING in metric entry '{entry}'."),
+                position: Some(entry_offset + upos + 5),
+            });
+        }
+        let paren_content = extract_paren_content(after_using).ok_or_else(|| ParseError {
+            message: format!("Unclosed '(' after USING in metric entry '{entry}'."),
+            position: Some(entry_offset + upos + 5),
+        })?;
+        using_relationships = paren_content
+            .split(',')
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect();
+        before_as[..upos].trim()
+    } else {
+        before_as
+    };
+
     // Check for dot to distinguish qualified vs unqualified
-    if let Some(dot_pos) = before_as.find('.') {
+    if let Some(dot_pos) = name_portion.find('.') {
         // Qualified: alias.name
-        let source_alias = before_as[..dot_pos].trim().to_string();
-        let bare_name = before_as[dot_pos + 1..].trim().to_string();
+        let source_alias = name_portion[..dot_pos].trim().to_string();
+        let bare_name = name_portion[dot_pos + 1..].trim().to_string();
 
         if source_alias.is_empty() {
             return Err(ParseError {
@@ -834,11 +871,21 @@ fn parse_single_metric_entry(
             });
         }
 
-        Ok((Some(source_alias), bare_name, expr))
+        Ok((Some(source_alias), bare_name, expr, using_relationships))
     } else {
         // Unqualified: just name (derived metric)
-        let bare_name = before_as.to_string();
-        Ok((None, bare_name, expr))
+        // USING is not allowed on derived metrics
+        if !using_relationships.is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "USING clause not allowed on derived metric '{name_portion}'. \
+                     Only qualified metrics (alias.name) can use USING.",
+                ),
+                position: Some(entry_offset),
+            });
+        }
+        let bare_name = name_portion.to_string();
+        Ok((None, bare_name, expr, vec![]))
     }
 }
 
@@ -1857,5 +1904,77 @@ mod tests {
     fn parse_metrics_clause_empty_body() {
         let result = parse_metrics_clause("", 0).unwrap();
         assert_eq!(result.len(), 0, "Empty body must return empty vec");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_metrics_clause USING tests (Phase 32 -- role-playing dimensions)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_metrics_using_single_relationship() {
+        let result =
+            parse_metrics_clause("f.departure_count USING (dep_airport) AS COUNT(*)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, Some("f".to_string())); // source alias
+        assert_eq!(result[0].1, "departure_count"); // bare_name
+        assert_eq!(result[0].2, "COUNT(*)"); // expr
+        assert_eq!(result[0].3, vec!["dep_airport"]); // using_relationships
+    }
+
+    #[test]
+    fn parse_metrics_using_multiple_relationships() {
+        let result = parse_metrics_clause("f.met USING (rel1, rel2) AS SUM(x)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, Some("f".to_string()));
+        assert_eq!(result[0].1, "met");
+        assert_eq!(result[0].2, "SUM(x)");
+        assert_eq!(result[0].3, vec!["rel1", "rel2"]);
+    }
+
+    #[test]
+    fn parse_metrics_using_on_derived_produces_error() {
+        // Derived metric (no dot prefix) with USING -> ParseError
+        let result = parse_metrics_clause("derived_met USING (rel1) AS revenue - cost", 0);
+        assert!(
+            result.is_err(),
+            "USING on derived metric must produce error"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("USING") && err.message.contains("derived"),
+            "Error should mention USING and derived: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_metrics_without_using_backward_compat() {
+        // Metric without USING still parses correctly
+        let result = parse_metrics_clause("o.revenue AS SUM(o.amount)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, Some("o".to_string()));
+        assert_eq!(result[0].1, "revenue");
+        assert_eq!(result[0].2, "SUM(o.amount)");
+        assert!(result[0].3.is_empty(), "No USING -> empty relationships");
+    }
+
+    #[test]
+    fn parse_metrics_using_case_insensitive() {
+        let result =
+            parse_metrics_clause("f.departure_count using (dep_airport) AS COUNT(*)", 0).unwrap();
+        assert_eq!(result[0].3, vec!["dep_airport"]);
+
+        let result2 =
+            parse_metrics_clause("f.departure_count UsInG (dep_airport) AS COUNT(*)", 0).unwrap();
+        assert_eq!(result2[0].3, vec!["dep_airport"]);
+    }
+
+    #[test]
+    fn parse_keyword_body_with_using_metrics() {
+        let body = "AS TABLES (f AS flights PRIMARY KEY (id), a AS airports PRIMARY KEY (id)) RELATIONSHIPS (dep_airport AS f(dep_id) REFERENCES a, arr_airport AS f(arr_id) REFERENCES a) DIMENSIONS (a.name AS airport_name) METRICS (f.departure_count USING (dep_airport) AS COUNT(*))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.metrics.len(), 1);
+        assert_eq!(kb.metrics[0].name, "departure_count");
+        assert_eq!(kb.metrics[0].using_relationships, vec!["dep_airport"]);
     }
 }

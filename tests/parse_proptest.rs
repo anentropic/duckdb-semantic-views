@@ -1149,4 +1149,43 @@ proptest! {
             result.unwrap_err()
         );
     }
+
+    /// Metrics with USING clause containing random relationship names parse
+    /// successfully through the full DDL pipeline and produce valid JSON.
+    #[test]
+    fn metric_using_clause_roundtrip(
+        // Exclude names starting with "as" to avoid collision with the AS keyword parser
+        rel_name in proptest::string::string_regex("[b-z][a-z0-9_]{1,15}").unwrap(),
+        metric_name in proptest::string::string_regex("[b-z][a-z0-9_]{1,15}").unwrap(),
+        using_kw in arb_case_variant("using"),
+    ) {
+        // Build DDL with a USING clause on a metric
+        let ddl = format!(
+            "CREATE SEMANTIC VIEW v AS \
+             TABLES (f AS flights PRIMARY KEY (id), a AS airports PRIMARY KEY (id)) \
+             RELATIONSHIPS ({rel_name} AS f(airport_id) REFERENCES a) \
+             DIMENSIONS (a.name AS airport_name) \
+             METRICS (f.{metric_name} {using_kw} ({rel_name}) AS COUNT(*))"
+        );
+        let result = validate_and_rewrite(&ddl);
+        prop_assert!(
+            result.is_ok(),
+            "Failed to parse metric with USING clause (rel={}, met={}, kw={}): {:?}",
+            rel_name,
+            metric_name,
+            using_kw,
+            result.unwrap_err()
+        );
+        let sql = result.unwrap();
+        prop_assert!(
+            sql.is_some(),
+            "Expected Some(sql) for valid DDL with USING"
+        );
+        // The rewritten SQL should contain the metric name and using_relationships
+        let sql_str = sql.unwrap();
+        prop_assert!(
+            sql_str.contains("using_relationships"),
+            "Rewritten JSON should contain using_relationships: {sql_str}"
+        );
+    }
 }
