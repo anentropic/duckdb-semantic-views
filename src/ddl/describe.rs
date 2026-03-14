@@ -9,9 +9,9 @@ use crate::catalog::CatalogState;
 
 /// Bind-time data for `describe_semantic_view`: the parsed fields of one view.
 ///
-/// The JSON array fields (`dimensions`, `metrics`, `filters`, `joins`) are
-/// stored as their serialized JSON strings so they can be returned as VARCHAR
-/// columns without re-serializing at emit time.
+/// The JSON array fields (`dimensions`, `metrics`, `filters`, `joins`, `facts`,
+/// `hierarchies`) are stored as their serialized JSON strings so they can be
+/// returned as VARCHAR columns without re-serializing at emit time.
 pub struct DescribeBindData {
     name: String,
     base_table: String,
@@ -19,6 +19,8 @@ pub struct DescribeBindData {
     metrics: String,
     filters: String,
     joins: String,
+    facts: String,
+    hierarchies: String,
 }
 
 // SAFETY: all fields are `String`, which is `Send + Sync`.
@@ -37,12 +39,12 @@ unsafe impl Sync for DescribeInitData {}
 
 /// Table function that returns one row describing a named semantic view.
 ///
-/// Output schema:
+/// Output schema (8 columns):
 ///   `(name VARCHAR, base_table VARCHAR, dimensions VARCHAR, metrics VARCHAR,
-///     filters VARCHAR, joins VARCHAR)`
+///     filters VARCHAR, joins VARCHAR, facts VARCHAR, hierarchies VARCHAR)`
 ///
-/// The `dimensions`, `metrics`, `filters`, and `joins` columns contain the
-/// JSON-serialized arrays from the definition.
+/// The `dimensions`, `metrics`, `filters`, `joins`, `facts`, and `hierarchies`
+/// columns contain the JSON-serialized arrays from the definition.
 ///
 /// Takes one positional VARCHAR parameter: the view name.
 pub struct DescribeSemanticViewVTab;
@@ -65,6 +67,11 @@ impl VTab for DescribeSemanticViewVTab {
         bind.add_result_column("metrics", LogicalTypeHandle::from(LogicalTypeId::Varchar));
         bind.add_result_column("filters", LogicalTypeHandle::from(LogicalTypeId::Varchar));
         bind.add_result_column("joins", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("facts", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column(
+            "hierarchies",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
 
         // Read the name parameter.
         let name = bind.get_parameter(0).to_string();
@@ -88,6 +95,16 @@ impl VTab for DescribeSemanticViewVTab {
         let metrics = serde_json::to_string(&def["metrics"]).unwrap_or_else(|_| "[]".to_string());
         let filters = serde_json::to_string(&def["filters"]).unwrap_or_else(|_| "[]".to_string());
         let joins = serde_json::to_string(&def["joins"]).unwrap_or_else(|_| "[]".to_string());
+        let facts = if def["facts"].is_null() {
+            "[]".to_string()
+        } else {
+            serde_json::to_string(&def["facts"]).unwrap_or_else(|_| "[]".to_string())
+        };
+        let hierarchies = if def["hierarchies"].is_null() {
+            "[]".to_string()
+        } else {
+            serde_json::to_string(&def["hierarchies"]).unwrap_or_else(|_| "[]".to_string())
+        };
 
         Ok(DescribeBindData {
             name,
@@ -96,6 +113,8 @@ impl VTab for DescribeSemanticViewVTab {
             metrics,
             filters,
             joins,
+            facts,
+            hierarchies,
         })
     }
 
@@ -123,6 +142,8 @@ impl VTab for DescribeSemanticViewVTab {
         let metrics_vec = output.flat_vector(3);
         let filters_vec = output.flat_vector(4);
         let joins_vec = output.flat_vector(5);
+        let facts_vec = output.flat_vector(6);
+        let hierarchies_vec = output.flat_vector(7);
 
         name_vec.insert(0, bind_data.name.as_str());
         base_table_vec.insert(0, bind_data.base_table.as_str());
@@ -130,6 +151,8 @@ impl VTab for DescribeSemanticViewVTab {
         metrics_vec.insert(0, bind_data.metrics.as_str());
         filters_vec.insert(0, bind_data.filters.as_str());
         joins_vec.insert(0, bind_data.joins.as_str());
+        facts_vec.insert(0, bind_data.facts.as_str());
+        hierarchies_vec.insert(0, bind_data.hierarchies.as_str());
 
         output.set_len(1);
         Ok(())
