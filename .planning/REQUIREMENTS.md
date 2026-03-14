@@ -1,7 +1,7 @@
 # Requirements: DuckDB Semantic Views
 
 **Defined:** 2026-03-14
-**Core Value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand — the extension handles expansion, DuckDB handles execution.
+**Core Value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand -- the extension handles expansion, DuckDB handles execution.
 
 ## v0.5.3 Requirements
 
@@ -47,7 +47,7 @@ Requirements for advanced semantic modeling capabilities. Each maps to roadmap p
 
 - [ ] **FAN-01**: Relationships can optionally declare cardinality type (one_to_one, one_to_many, many_to_one)
 - [ ] **FAN-02**: Query expansion warns when a metric aggregates across a one-to-many boundary that could inflate results
-- [ ] **FAN-03**: Fan trap warnings do not block query execution — query succeeds with warning
+- [ ] **FAN-03**: Fan trap warnings do not block query execution -- query succeeds with warning
 
 ## Future Requirements
 
@@ -89,36 +89,36 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FACT-01 | — | Pending |
-| FACT-02 | — | Pending |
-| FACT-03 | — | Pending |
-| FACT-04 | — | Pending |
-| FACT-05 | — | Pending |
-| DRV-01 | — | Pending |
-| DRV-02 | — | Pending |
-| DRV-03 | — | Pending |
-| DRV-04 | — | Pending |
-| DRV-05 | — | Pending |
-| HIER-01 | — | Pending |
-| HIER-02 | — | Pending |
-| HIER-03 | — | Pending |
-| JOIN-01 | — | Pending |
-| JOIN-02 | — | Pending |
-| JOIN-03 | — | Pending |
-| JOIN-04 | — | Pending |
-| JOIN-05 | — | Pending |
-| ROLE-01 | — | Pending |
-| ROLE-02 | — | Pending |
-| ROLE-03 | — | Pending |
-| FAN-01 | — | Pending |
-| FAN-02 | — | Pending |
-| FAN-03 | — | Pending |
+| FACT-01 | Phase 29 | Pending |
+| FACT-02 | Phase 29 | Pending |
+| FACT-03 | Phase 29 | Pending |
+| FACT-04 | Phase 29 | Pending |
+| FACT-05 | Phase 29 | Pending |
+| HIER-01 | Phase 29 | Pending |
+| HIER-02 | Phase 29 | Pending |
+| HIER-03 | Phase 29 | Pending |
+| DRV-01 | Phase 30 | Pending |
+| DRV-02 | Phase 30 | Pending |
+| DRV-03 | Phase 30 | Pending |
+| DRV-04 | Phase 30 | Pending |
+| DRV-05 | Phase 30 | Pending |
+| FAN-01 | Phase 31 | Pending |
+| FAN-02 | Phase 31 | Pending |
+| FAN-03 | Phase 31 | Pending |
+| JOIN-01 | Phase 32 | Pending |
+| JOIN-02 | Phase 32 | Pending |
+| JOIN-03 | Phase 32 | Pending |
+| JOIN-04 | Phase 32 | Pending |
+| JOIN-05 | Phase 32 | Pending |
+| ROLE-01 | Phase 32 | Pending |
+| ROLE-02 | Phase 32 | Pending |
+| ROLE-03 | Phase 32 | Pending |
 
 **Coverage:**
 - v0.5.3 requirements: 24 total
-- Mapped to phases: 0
-- Unmapped: 24 ⚠️
+- Mapped to phases: 24
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-14*
-*Last updated: 2026-03-14 after initial definition*
+*Last updated: 2026-03-14 after roadmap creation*
