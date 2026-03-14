@@ -1,0 +1,271 @@
+# Phase 29: End-to-end integration test for FACTS and HIERARCHIES
+# Tests fact expression inlining, hierarchy metadata, DESCRIBE output,
+# and error cases for the full DDL->query->describe->drop lifecycle.
+
+require semantic_views
+
+# ============================================================
+# Setup: create physical tables with known data
+# ============================================================
+
+statement ok
+CREATE TABLE p29_orders (id INTEGER, customer_id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO p29_orders VALUES (1, 1, 'East'), (2, 2, 'West');
+
+statement ok
+CREATE TABLE p29_line_items (id INTEGER, order_id INTEGER, extended_price DECIMAL(10,2), discount DECIMAL(3,2), tax_rate DECIMAL(3,2));
+
+statement ok
+INSERT INTO p29_line_items VALUES
+    (1, 1, 100.00, 0.10, 0.05),
+    (2, 1, 200.00, 0.20, 0.08),
+    (3, 2, 150.00, 0.00, 0.10);
+
+statement ok
+CREATE TABLE p29_customers (id INTEGER, name VARCHAR, country VARCHAR, state VARCHAR, city VARCHAR);
+
+statement ok
+INSERT INTO p29_customers VALUES (1, 'Alice', 'US', 'NY', 'NYC'), (2, 'Bob', 'US', 'CA', 'LA');
+
+# ============================================================
+# Test 1: CREATE with FACTS and HIERARCHIES
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p29_analytics AS
+  TABLES (
+    o AS p29_orders PRIMARY KEY (id),
+    li AS p29_line_items PRIMARY KEY (id),
+    c AS p29_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o,
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  FACTS (
+    li.net_price AS li.extended_price * (1 - li.discount),
+    li.tax_amount AS li.net_price * li.tax_rate
+  )
+  HIERARCHIES (
+    geo AS (country, state, city)
+  )
+  DIMENSIONS (
+    o.region AS o.region,
+    c.country AS c.country,
+    c.state AS c.state,
+    c.city AS c.city
+  )
+  METRICS (
+    li.total_net AS SUM(li.net_price),
+    li.total_tax AS SUM(li.tax_amount)
+  );
+
+# ============================================================
+# Test 2: Query metric referencing a single fact (net_price)
+# Line item 1: 100 * (1 - 0.10) = 90.00
+# Line item 2: 200 * (1 - 0.20) = 160.00
+# Line item 3: 150 * (1 - 0.00) = 150.00
+# East (order 1, items 1+2): 90 + 160 = 250.00
+# West (order 2, item 3): 150.00
+# ============================================================
+
+query TR rowsort
+SELECT * FROM semantic_view('p29_analytics', dimensions := ['region'], metrics := ['total_net']);
+----
+East	250.00
+West	150.00
+
+# ============================================================
+# Test 3: Query metric with multi-level fact chain (tax_amount refs net_price)
+# tax_amount = net_price * tax_rate
+# Item 1: 90.00 * 0.05 = 4.50
+# Item 2: 160.00 * 0.08 = 12.80
+# Item 3: 150.00 * 0.10 = 15.00
+# East: 4.50 + 12.80 = 17.30
+# West: 15.00
+# ============================================================
+
+query TR rowsort
+SELECT * FROM semantic_view('p29_analytics', dimensions := ['region'], metrics := ['total_tax']);
+----
+East	17.30
+West	15.00
+
+# ============================================================
+# Test 4: Global aggregate -- no dimensions
+# total_net = 90 + 160 + 150 = 400.00
+# total_tax = 4.50 + 12.80 + 15.00 = 32.30
+# ============================================================
+
+query TT
+SELECT * FROM semantic_view('p29_analytics', metrics := ['total_net', 'total_tax']);
+----
+400.00	32.30
+
+# ============================================================
+# Test 5: DESCRIBE shows facts and hierarchies (8 columns)
+# ============================================================
+
+query TTTTTTTT
+DESCRIBE SEMANTIC VIEW p29_analytics;
+----
+p29_analytics	p29_orders	[{"expr":"o.region","name":"region","output_type":null,"source_table":"o"},{"expr":"c.country","name":"country","output_type":null,"source_table":"c"},{"expr":"c.state","name":"state","output_type":null,"source_table":"c"},{"expr":"c.city","name":"city","output_type":null,"source_table":"c"}]	[{"expr":"SUM(li.net_price)","name":"total_net","output_type":null,"source_table":"li"},{"expr":"SUM(li.tax_amount)","name":"total_tax","output_type":null,"source_table":"li"}]	[]	[{"fk_columns":["order_id"],"from_alias":"li","from_cols":[],"join_columns":[],"name":"li_to_order","table":"o"},{"fk_columns":["customer_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_customer","table":"c"}]	[{"expr":"li.extended_price * (1 - li.discount)","name":"net_price","source_table":"li"},{"expr":"li.net_price * li.tax_rate","name":"tax_amount","source_table":"li"}]	[{"levels":["country","state","city"],"name":"geo"}]
+
+# ============================================================
+# Test 6: Error -- fact cycle (two facts referencing each other)
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p29_cycle AS
+  TABLES (
+    o AS p29_orders PRIMARY KEY (id)
+  )
+  FACTS (
+    o.a AS o.b + 1,
+    o.b AS o.a + 1
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.total AS SUM(o.a)
+  );
+----
+cycle detected in facts
+
+# ============================================================
+# Test 7: Error -- fact self-reference
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p29_self_ref AS
+  TABLES (
+    o AS p29_orders PRIMARY KEY (id)
+  )
+  FACTS (
+    o.a AS o.a + 1
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.total AS SUM(o.a)
+  );
+----
+cycle detected in facts
+
+# ============================================================
+# Test 8: Error -- hierarchy references non-existent dimension
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p29_bad_hier AS
+  TABLES (
+    o AS p29_orders PRIMARY KEY (id)
+  )
+  HIERARCHIES (
+    geo AS (region, nonexistent_dim)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.total AS count(*)
+  );
+----
+unknown dimension
+
+# ============================================================
+# Test 9: Error -- facts source table not in TABLES
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p29_bad_source AS
+  TABLES (
+    o AS p29_orders PRIMARY KEY (id)
+  )
+  FACTS (
+    x.price AS x.amount
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.total AS count(*)
+  );
+----
+unknown source table
+
+# ============================================================
+# Test 10: FACTS without HIERARCHIES (hierarchies optional)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p29_facts_only AS
+  TABLES (
+    o AS p29_orders PRIMARY KEY (id)
+  )
+  FACTS (
+    o.flag AS CASE WHEN o.id > 1 THEN 1 ELSE 0 END
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.flagged AS SUM(o.flag)
+  );
+
+query TI rowsort
+SELECT * FROM semantic_view('p29_facts_only', dimensions := ['region'], metrics := ['flagged']);
+----
+East	0
+West	1
+
+statement ok
+DROP SEMANTIC VIEW p29_facts_only;
+
+# ============================================================
+# Test 11: HIERARCHIES without FACTS (facts optional)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p29_hier_only AS
+  TABLES (
+    c AS p29_customers PRIMARY KEY (id)
+  )
+  HIERARCHIES (
+    geo AS (country, city)
+  )
+  DIMENSIONS (
+    c.country AS c.country,
+    c.city AS c.city
+  )
+  METRICS (
+    c.cnt AS count(*)
+  );
+
+query TTTTTTTT
+DESCRIBE SEMANTIC VIEW p29_hier_only;
+----
+p29_hier_only	p29_customers	[{"expr":"c.country","name":"country","output_type":null,"source_table":"c"},{"expr":"c.city","name":"city","output_type":null,"source_table":"c"}]	[{"expr":"count(*)","name":"cnt","output_type":null,"source_table":"c"}]	[]	[]	[]	[{"levels":["country","city"],"name":"geo"}]
+
+statement ok
+DROP SEMANTIC VIEW p29_hier_only;
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p29_analytics;
+
+statement ok
+DROP TABLE p29_line_items;
+
+statement ok
+DROP TABLE p29_orders;
+
+statement ok
+DROP TABLE p29_customers;
