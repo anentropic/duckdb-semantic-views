@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::graph::RelationshipGraph;
-use crate::model::{Join, SemanticViewDefinition, TableRef};
+use crate::model::{Fact, Join, SemanticViewDefinition, TableRef};
 
 /// Suggest the closest matching name from `available` using Levenshtein distance.
 ///
@@ -310,6 +310,184 @@ fn resolve_joins_pkfk(
     }
 }
 
+/// Replace all word-boundary occurrences of `needle` in `haystack` with `replacement`.
+///
+/// A word boundary is defined as: the character before the match (if any) is NOT
+/// alphanumeric or underscore, AND the character after the match (if any) is NOT
+/// alphanumeric or underscore. This prevents `net_price` from matching inside
+/// `net_price_total` or `my_net_price`.
+///
+/// The matching is case-sensitive (fact names are identifiers).
+fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return haystack.to_string();
+    }
+
+    let h_bytes = haystack.as_bytes();
+    let n_bytes = needle.as_bytes();
+    let n_len = n_bytes.len();
+
+    let mut result = String::with_capacity(haystack.len());
+    let mut i = 0;
+
+    while i + n_len <= h_bytes.len() {
+        if &h_bytes[i..i + n_len] == n_bytes {
+            let before_ok = i == 0 || is_word_boundary_char(h_bytes[i - 1]);
+            let after_ok = i + n_len == h_bytes.len() || is_word_boundary_char(h_bytes[i + n_len]);
+            if before_ok && after_ok {
+                result.push_str(replacement);
+                i += n_len;
+                continue;
+            }
+        }
+        result.push(haystack[i..].chars().next().unwrap());
+        i += 1;
+    }
+    // Append remaining bytes that are shorter than needle
+    if i < haystack.len() {
+        result.push_str(&haystack[i..]);
+    }
+    result
+}
+
+/// Check if a byte is a word-boundary character (NOT alphanumeric or underscore).
+fn is_word_boundary_char(b: u8) -> bool {
+    !b.is_ascii_alphanumeric() && b != b'_'
+}
+
+/// Topologically sort facts by their inter-dependencies (leaf facts first).
+///
+/// Uses Kahn's algorithm. Returns indices into the `facts` slice in topological
+/// order (facts with no dependencies on other facts come first).
+///
+/// Returns `Err` if a cycle is detected (defensive — `validate_facts` should
+/// have already rejected cycles at CREATE time).
+fn toposort_facts(facts: &[Fact]) -> Result<Vec<usize>, String> {
+    let n = facts.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Build name -> index map (case-insensitive)
+    let name_to_idx: HashMap<String, usize> = facts
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.to_ascii_lowercase(), i))
+        .collect();
+
+    // Build adjacency: edges[i] = set of indices that fact i depends on
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n]; // dependents[dep] = facts that depend on dep
+
+    for (i, fact) in facts.iter().enumerate() {
+        let expr_lower = fact.expr.to_ascii_lowercase();
+        for (name, &dep_idx) in &name_to_idx {
+            if dep_idx == i {
+                continue; // skip self
+            }
+            // Check if this fact's expr references the other fact name using word boundary
+            let expr_bytes = expr_lower.as_bytes();
+            let name_bytes = name.as_bytes();
+            let name_len = name_bytes.len();
+            let mut pos = 0;
+            while pos + name_len <= expr_bytes.len() {
+                if &expr_bytes[pos..pos + name_len] == name_bytes {
+                    let before_ok = pos == 0 || is_word_boundary_char(expr_bytes[pos - 1]);
+                    let after_ok = pos + name_len == expr_bytes.len()
+                        || is_word_boundary_char(expr_bytes[pos + name_len]);
+                    if before_ok && after_ok {
+                        in_degree[i] += 1;
+                        dependents[dep_idx].push(i);
+                        break;
+                    }
+                }
+                pos += 1;
+            }
+        }
+    }
+
+    // Kahn's algorithm
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            queue.push_back(i);
+        }
+    }
+
+    let mut order = Vec::with_capacity(n);
+    while let Some(idx) = queue.pop_front() {
+        order.push(idx);
+        for &dep in &dependents[idx] {
+            in_degree[dep] -= 1;
+            if in_degree[dep] == 0 {
+                queue.push_back(dep);
+            }
+        }
+    }
+
+    if order.len() != n {
+        return Err("cycle detected in facts".to_string());
+    }
+
+    Ok(order)
+}
+
+/// Inline fact expressions into a metric expression.
+///
+/// Processes facts in topological order (leaf facts first), resolving each fact's
+/// expression by inlining any previously-resolved facts. Then applies all resolved
+/// facts to the input `expr`.
+///
+/// Each inlined fact expression is parenthesized to preserve operator precedence:
+/// `net_price = price * (1 - discount)` inlined into `SUM(net_price)` becomes
+/// `SUM((price * (1 - discount)))`.
+fn inline_facts(expr: &str, facts: &[Fact], topo_order: &[usize]) -> String {
+    if facts.is_empty() || topo_order.is_empty() {
+        return expr.to_string();
+    }
+
+    // Build resolved expressions in topological order
+    let mut resolved: HashMap<String, String> = HashMap::new();
+
+    for &idx in topo_order {
+        let fact = &facts[idx];
+        let mut resolved_expr = fact.expr.clone();
+
+        // Inline any already-resolved facts into this fact's expression
+        for (name, replacement) in &resolved {
+            // Try qualified form: source_table.name
+            if let Some(ref st) = fact.source_table {
+                let qualified = format!("{st}.{name}");
+                resolved_expr = replace_word_boundary(&resolved_expr, &qualified, replacement);
+            }
+            // Unqualified form
+            resolved_expr = replace_word_boundary(&resolved_expr, name, replacement);
+        }
+
+        // Store as parenthesized
+        let parenthesized = format!("({resolved_expr})");
+        resolved.insert(fact.name.clone(), parenthesized);
+    }
+
+    // Apply all resolved facts to the input expression
+    let mut result = expr.to_string();
+    // Process in topo order to ensure consistent replacement
+    for &idx in topo_order {
+        let fact = &facts[idx];
+        if let Some(replacement) = resolved.get(&fact.name) {
+            // Try qualified form first: source_table.name
+            if let Some(ref st) = fact.source_table {
+                let qualified = format!("{st}.{}", fact.name);
+                result = replace_word_boundary(&result, &qualified, replacement);
+            }
+            // Unqualified form
+            result = replace_word_boundary(&result, &fact.name, replacement);
+        }
+    }
+
+    result
+}
+
 /// Expand a semantic view definition into a SQL query string.
 ///
 /// Takes a view name (for error messages), its definition, and a query request
@@ -381,7 +559,10 @@ pub fn expand(
         resolved_mets.push(met);
     }
 
-    // 4. Build the SELECT clause.
+    // 4. Inline facts into metric expressions before building SELECT.
+    let topo_order = toposort_facts(&def.facts).unwrap_or_default();
+
+    // 5. Build the SELECT clause.
     //    Dimensions-only (no metrics): SELECT DISTINCT, no GROUP BY.
     //    Metrics-only (no dimensions): SELECT (global aggregate), no GROUP BY.
     //    Both: SELECT with GROUP BY.
@@ -404,11 +585,17 @@ pub fn expand(
         select_items.push(format!("    {} AS {}", final_expr, quote_ident(&dim.name)));
     }
     for met in &resolved_mets {
+        // Inline facts into the metric expression before building the SELECT item.
+        let resolved_expr = if def.facts.is_empty() {
+            met.expr.clone()
+        } else {
+            inline_facts(&met.expr, &def.facts, &topo_order)
+        };
         // If output_type is set, wrap the aggregate in CAST(... AS <type>).
         let final_expr = if let Some(ref type_str) = met.output_type {
-            format!("CAST({} AS {type_str})", met.expr)
+            format!("CAST({resolved_expr} AS {type_str})")
         } else {
-            met.expr.clone()
+            resolved_expr
         };
         select_items.push(format!("    {} AS {}", final_expr, quote_ident(&met.name)));
     }
@@ -1811,6 +1998,371 @@ FROM \"orders\"";
             assert!(
                 sql.contains("sum(o.amount) AS"),
                 "Qualified metric expr 'sum(o.amount)' must appear verbatim: {sql}"
+            );
+        }
+    }
+
+    mod phase29_fact_inlining_tests {
+        use super::*;
+        use crate::model::{Dimension, Fact, Metric};
+
+        // -------------------------------------------------------------------
+        // replace_word_boundary tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn replace_word_boundary_no_match() {
+            let result = replace_word_boundary("SUM(total)", "net_price", "(x)");
+            assert_eq!(result, "SUM(total)");
+        }
+
+        #[test]
+        fn replace_word_boundary_exact_match_in_function() {
+            let result =
+                replace_word_boundary("SUM(net_price)", "net_price", "(price * (1 - discount))");
+            assert_eq!(result, "SUM((price * (1 - discount)))");
+        }
+
+        #[test]
+        fn replace_word_boundary_no_substring_match_suffix() {
+            // "net_price" should NOT match in "net_price_total"
+            let result = replace_word_boundary("SUM(net_price_total)", "net_price", "(x)");
+            assert_eq!(result, "SUM(net_price_total)");
+        }
+
+        #[test]
+        fn replace_word_boundary_no_substring_match_prefix() {
+            // "net_price" should NOT match in "total_net_price_x"
+            let result = replace_word_boundary("total_net_price_x + 1", "net_price", "(x)");
+            assert_eq!(result, "total_net_price_x + 1");
+        }
+
+        #[test]
+        fn replace_word_boundary_match_with_addition() {
+            let result = replace_word_boundary("net_price + tax", "net_price", "(a + b)");
+            assert_eq!(result, "(a + b) + tax");
+        }
+
+        #[test]
+        fn replace_word_boundary_match_in_parens() {
+            let result = replace_word_boundary("(net_price)", "net_price", "(a)");
+            assert_eq!(result, "((a))");
+        }
+
+        #[test]
+        fn replace_word_boundary_entire_string() {
+            let result = replace_word_boundary("net_price", "net_price", "(a + b)");
+            assert_eq!(result, "(a + b)");
+        }
+
+        #[test]
+        fn replace_word_boundary_at_start() {
+            let result = replace_word_boundary("net_price * 2", "net_price", "(x)");
+            assert_eq!(result, "(x) * 2");
+        }
+
+        #[test]
+        fn replace_word_boundary_at_end() {
+            let result = replace_word_boundary("2 * net_price", "net_price", "(x)");
+            assert_eq!(result, "2 * (x)");
+        }
+
+        #[test]
+        fn replace_word_boundary_multiple_occurrences() {
+            let result = replace_word_boundary("net_price + net_price", "net_price", "(x)");
+            assert_eq!(result, "(x) + (x)");
+        }
+
+        #[test]
+        fn replace_word_boundary_empty_needle() {
+            let result = replace_word_boundary("abc", "", "x");
+            assert_eq!(result, "abc");
+        }
+
+        // -------------------------------------------------------------------
+        // toposort_facts tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn toposort_facts_empty() {
+            let order = toposort_facts(&[]).unwrap();
+            assert!(order.is_empty());
+        }
+
+        #[test]
+        fn toposort_facts_independent() {
+            let facts = vec![
+                Fact {
+                    name: "a".to_string(),
+                    expr: "x + 1".to_string(),
+                    source_table: None,
+                },
+                Fact {
+                    name: "b".to_string(),
+                    expr: "y + 2".to_string(),
+                    source_table: None,
+                },
+            ];
+            let order = toposort_facts(&facts).unwrap();
+            assert_eq!(order.len(), 2);
+            // Both are independent, order should contain both indices
+            assert!(order.contains(&0));
+            assert!(order.contains(&1));
+        }
+
+        #[test]
+        fn toposort_facts_chain() {
+            // b depends on a: a must come before b in topo order
+            let facts = vec![
+                Fact {
+                    name: "a".to_string(),
+                    expr: "price * qty".to_string(),
+                    source_table: None,
+                },
+                Fact {
+                    name: "b".to_string(),
+                    expr: "a * (1 - discount)".to_string(),
+                    source_table: None,
+                },
+            ];
+            let order = toposort_facts(&facts).unwrap();
+            assert_eq!(order.len(), 2);
+            let a_pos = order.iter().position(|&x| x == 0).unwrap();
+            let b_pos = order.iter().position(|&x| x == 1).unwrap();
+            assert!(a_pos < b_pos, "a (leaf) must come before b (depends on a)");
+        }
+
+        #[test]
+        fn toposort_facts_three_level_chain() {
+            // c depends on b, b depends on a
+            let facts = vec![
+                Fact {
+                    name: "a".to_string(),
+                    expr: "price".to_string(),
+                    source_table: None,
+                },
+                Fact {
+                    name: "b".to_string(),
+                    expr: "a * qty".to_string(),
+                    source_table: None,
+                },
+                Fact {
+                    name: "c".to_string(),
+                    expr: "b * tax".to_string(),
+                    source_table: None,
+                },
+            ];
+            let order = toposort_facts(&facts).unwrap();
+            assert_eq!(order.len(), 3);
+            let a_pos = order.iter().position(|&x| x == 0).unwrap();
+            let b_pos = order.iter().position(|&x| x == 1).unwrap();
+            let c_pos = order.iter().position(|&x| x == 2).unwrap();
+            assert!(a_pos < b_pos);
+            assert!(b_pos < c_pos);
+        }
+
+        // -------------------------------------------------------------------
+        // inline_facts tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn inline_facts_no_facts() {
+            let result = inline_facts("SUM(price)", &[], &[]);
+            assert_eq!(result, "SUM(price)");
+        }
+
+        #[test]
+        fn inline_facts_single_fact() {
+            let facts = vec![Fact {
+                name: "net_price".to_string(),
+                expr: "price * (1 - discount)".to_string(),
+                source_table: None,
+            }];
+            let order = toposort_facts(&facts).unwrap();
+            let result = inline_facts("SUM(net_price)", &facts, &order);
+            assert_eq!(result, "SUM((price * (1 - discount)))");
+        }
+
+        #[test]
+        fn inline_facts_multi_level() {
+            // fact a = price * qty
+            // fact b = a * (1 - discount)  -- depends on a
+            // metric expr: SUM(b)
+            // Expected: SUM(((price * qty) * (1 - discount)))
+            let facts = vec![
+                Fact {
+                    name: "a".to_string(),
+                    expr: "price * qty".to_string(),
+                    source_table: None,
+                },
+                Fact {
+                    name: "b".to_string(),
+                    expr: "a * (1 - discount)".to_string(),
+                    source_table: None,
+                },
+            ];
+            let order = toposort_facts(&facts).unwrap();
+            let result = inline_facts("SUM(b)", &facts, &order);
+            assert_eq!(result, "SUM(((price * qty) * (1 - discount)))");
+        }
+
+        #[test]
+        fn inline_facts_preserves_parenthesization() {
+            // fact = a + b, inlined into expr * fact -> expr * (a + b)
+            let facts = vec![Fact {
+                name: "total".to_string(),
+                expr: "a + b".to_string(),
+                source_table: None,
+            }];
+            let order = toposort_facts(&facts).unwrap();
+            let result = inline_facts("x * total", &facts, &order);
+            assert_eq!(result, "x * (a + b)");
+        }
+
+        #[test]
+        fn inline_facts_word_boundary_prevents_collision() {
+            // fact named "net_price" should NOT match "net_price_total"
+            let facts = vec![Fact {
+                name: "net_price".to_string(),
+                expr: "p * q".to_string(),
+                source_table: None,
+            }];
+            let order = toposort_facts(&facts).unwrap();
+            let result = inline_facts("SUM(net_price_total)", &facts, &order);
+            assert_eq!(
+                result, "SUM(net_price_total)",
+                "Word boundary must prevent matching"
+            );
+        }
+
+        #[test]
+        fn inline_facts_with_qualified_name_in_metric() {
+            // fact has source_table = "li", name = "net_price"
+            // metric expr references "li.net_price"
+            let facts = vec![Fact {
+                name: "net_price".to_string(),
+                expr: "li.price * (1 - li.discount)".to_string(),
+                source_table: Some("li".to_string()),
+            }];
+            let order = toposort_facts(&facts).unwrap();
+            let result = inline_facts("SUM(li.net_price)", &facts, &order);
+            assert_eq!(result, "SUM((li.price * (1 - li.discount)))");
+        }
+
+        // -------------------------------------------------------------------
+        // End-to-end expand() with facts
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn expand_with_facts_inlines_into_metric() {
+            let def = SemanticViewDefinition {
+                base_table: "line_items".to_string(),
+                tables: vec![],
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "region".to_string(),
+                    source_table: None,
+                    output_type: None,
+                }],
+                metrics: vec![Metric {
+                    name: "total_net".to_string(),
+                    expr: "SUM(net_price)".to_string(),
+                    source_table: None,
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![Fact {
+                    name: "net_price".to_string(),
+                    expr: "price * (1 - discount)".to_string(),
+                    source_table: None,
+                }],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["total_net".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("SUM((price * (1 - discount)))"),
+                "Fact inlining must resolve net_price in metric expr: {sql}"
+            );
+        }
+
+        #[test]
+        fn expand_without_facts_unchanged() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![],
+                dimensions: vec![],
+                metrics: vec![Metric {
+                    name: "total".to_string(),
+                    expr: "SUM(amount)".to_string(),
+                    source_table: None,
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["total".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("SUM(amount) AS"),
+                "Without facts, metric expr unchanged: {sql}"
+            );
+        }
+
+        #[test]
+        fn expand_multi_level_facts() {
+            // net_price = extended_price * (1 - discount)
+            // tax_amount = net_price * tax_rate
+            // Metric: SUM(tax_amount) -> SUM(((extended_price * (1 - discount)) * tax_rate))
+            let def = SemanticViewDefinition {
+                base_table: "line_items".to_string(),
+                tables: vec![],
+                dimensions: vec![],
+                metrics: vec![Metric {
+                    name: "total_tax".to_string(),
+                    expr: "SUM(tax_amount)".to_string(),
+                    source_table: None,
+                    output_type: None,
+                }],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![
+                    Fact {
+                        name: "net_price".to_string(),
+                        expr: "extended_price * (1 - discount)".to_string(),
+                        source_table: None,
+                    },
+                    Fact {
+                        name: "tax_amount".to_string(),
+                        expr: "net_price * tax_rate".to_string(),
+                        source_table: None,
+                    },
+                ],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["total_tax".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("SUM(((extended_price * (1 - discount)) * tax_rate))"),
+                "Multi-level fact chain must resolve correctly: {sql}"
             );
         }
     }
