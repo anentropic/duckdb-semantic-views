@@ -2366,4 +2366,449 @@ FROM \"orders\"";
             );
         }
     }
+
+    mod phase30_derived_metric_tests {
+        use super::*;
+        use crate::model::{Dimension, Fact, Join, Metric, TableRef};
+
+        // -------------------------------------------------------------------
+        // inline_derived_metrics unit tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn inline_derived_one_base_one_derived() {
+            // Base: revenue = SUM(amount), cost = SUM(unit_cost)
+            // Derived: profit = revenue - cost
+            // Expected: profit -> (SUM(amount)) - (SUM(unit_cost))
+            let metrics = vec![
+                Metric {
+                    name: "revenue".to_string(),
+                    expr: "SUM(amount)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                },
+                Metric {
+                    name: "cost".to_string(),
+                    expr: "SUM(unit_cost)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                },
+                Metric {
+                    name: "profit".to_string(),
+                    expr: "revenue - cost".to_string(),
+                    source_table: None,
+                    output_type: None,
+                },
+            ];
+            let resolved = inline_derived_metrics(&metrics, &[], &[]);
+            assert_eq!(
+                resolved.get("profit").unwrap(),
+                "(SUM(amount)) - (SUM(unit_cost))"
+            );
+        }
+
+        #[test]
+        fn inline_derived_stacked() {
+            // Base: revenue, cost
+            // Derived: profit = revenue - cost
+            // Derived: margin = profit / revenue * 100
+            let metrics = vec![
+                Metric {
+                    name: "revenue".to_string(),
+                    expr: "SUM(amount)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                },
+                Metric {
+                    name: "cost".to_string(),
+                    expr: "SUM(unit_cost)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                },
+                Metric {
+                    name: "profit".to_string(),
+                    expr: "revenue - cost".to_string(),
+                    source_table: None,
+                    output_type: None,
+                },
+                Metric {
+                    name: "margin".to_string(),
+                    expr: "profit / revenue * 100".to_string(),
+                    source_table: None,
+                    output_type: None,
+                },
+            ];
+            let resolved = inline_derived_metrics(&metrics, &[], &[]);
+            assert_eq!(
+                resolved.get("profit").unwrap(),
+                "(SUM(amount)) - (SUM(unit_cost))"
+            );
+            assert_eq!(
+                resolved.get("margin").unwrap(),
+                "((SUM(amount)) - (SUM(unit_cost))) / (SUM(amount)) * 100"
+            );
+        }
+
+        #[test]
+        fn inline_derived_with_facts() {
+            // Fact: net_price = extended_price * (1 - discount)
+            // Base: revenue = SUM(net_price)
+            // Derived: double_rev = revenue * 2
+            // Chain: fact -> base metric -> derived metric
+            let metrics = vec![
+                Metric {
+                    name: "revenue".to_string(),
+                    expr: "SUM(net_price)".to_string(),
+                    source_table: Some("li".to_string()),
+                    output_type: None,
+                },
+                Metric {
+                    name: "double_rev".to_string(),
+                    expr: "revenue * 2".to_string(),
+                    source_table: None,
+                    output_type: None,
+                },
+            ];
+            let facts = vec![Fact {
+                name: "net_price".to_string(),
+                expr: "extended_price * (1 - discount)".to_string(),
+                source_table: Some("li".to_string()),
+            }];
+            let topo_order = toposort_facts(&facts).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &facts, &topo_order);
+            assert_eq!(
+                resolved.get("revenue").unwrap(),
+                "SUM((extended_price * (1 - discount)))"
+            );
+            assert_eq!(
+                resolved.get("double_rev").unwrap(),
+                "(SUM((extended_price * (1 - discount)))) * 2"
+            );
+        }
+
+        #[test]
+        fn inline_derived_parenthesization_prevents_precedence_error() {
+            // profit = a - b, margin = profit / a
+            // Without parens: a - b / a (division before subtraction!)
+            // With parens: (a - b) / (a)
+            let metrics = vec![
+                Metric {
+                    name: "a".to_string(),
+                    expr: "SUM(x)".to_string(),
+                    source_table: Some("t".to_string()),
+                    output_type: None,
+                },
+                Metric {
+                    name: "b".to_string(),
+                    expr: "SUM(y)".to_string(),
+                    source_table: Some("t".to_string()),
+                    output_type: None,
+                },
+                Metric {
+                    name: "profit".to_string(),
+                    expr: "a - b".to_string(),
+                    source_table: None,
+                    output_type: None,
+                },
+                Metric {
+                    name: "margin".to_string(),
+                    expr: "profit / a".to_string(),
+                    source_table: None,
+                    output_type: None,
+                },
+            ];
+            let resolved = inline_derived_metrics(&metrics, &[], &[]);
+            // margin should be ((SUM(x)) - (SUM(y))) / (SUM(x))
+            // NOT (SUM(x)) - (SUM(y)) / (SUM(x))
+            assert_eq!(
+                resolved.get("margin").unwrap(),
+                "((SUM(x)) - (SUM(y))) / (SUM(x))"
+            );
+        }
+
+        #[test]
+        fn inline_derived_word_boundary_safety() {
+            // Metric named "revenue" must not match "revenue_total"
+            let metrics = vec![
+                Metric {
+                    name: "revenue".to_string(),
+                    expr: "SUM(amount)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                },
+                Metric {
+                    name: "revenue_total".to_string(),
+                    expr: "SUM(total)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                },
+                Metric {
+                    name: "derived".to_string(),
+                    expr: "revenue + revenue_total".to_string(),
+                    source_table: None,
+                    output_type: None,
+                },
+            ];
+            let resolved = inline_derived_metrics(&metrics, &[], &[]);
+            assert_eq!(
+                resolved.get("derived").unwrap(),
+                "(SUM(amount)) + (SUM(total))"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // expand() with derived metrics
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn expand_derived_metric_correct_sql() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![],
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "region".to_string(),
+                    source_table: None,
+                    output_type: None,
+                }],
+                metrics: vec![
+                    Metric {
+                        name: "revenue".to_string(),
+                        expr: "SUM(amount)".to_string(),
+                        source_table: Some("o".to_string()),
+                        output_type: None,
+                    },
+                    Metric {
+                        name: "cost".to_string(),
+                        expr: "SUM(unit_cost)".to_string(),
+                        source_table: Some("o".to_string()),
+                        output_type: None,
+                    },
+                    Metric {
+                        name: "profit".to_string(),
+                        expr: "revenue - cost".to_string(),
+                        source_table: None,
+                        output_type: None,
+                    },
+                ],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["profit".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("(SUM(amount)) - (SUM(unit_cost)) AS \"profit\""),
+                "Derived metric must expand to inlined expression: {sql}"
+            );
+            // Derived metric should NOT add extra GROUP BY entries
+            assert!(
+                sql.contains("GROUP BY\n    1"),
+                "GROUP BY should reference only the dimension: {sql}"
+            );
+        }
+
+        #[test]
+        fn expand_derived_only_no_base_metrics_requested() {
+            // Only request the derived metric -- JOINs for referenced base metrics
+            // must still be included.
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                    TableRef {
+                        alias: "li".to_string(),
+                        table: "line_items".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                ],
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "o.region".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                }],
+                metrics: vec![
+                    Metric {
+                        name: "revenue".to_string(),
+                        expr: "SUM(li.amount)".to_string(),
+                        source_table: Some("li".to_string()),
+                        output_type: None,
+                    },
+                    Metric {
+                        name: "cost".to_string(),
+                        expr: "SUM(li.unit_cost)".to_string(),
+                        source_table: Some("li".to_string()),
+                        output_type: None,
+                    },
+                    Metric {
+                        name: "profit".to_string(),
+                        expr: "revenue - cost".to_string(),
+                        source_table: None,
+                        output_type: None,
+                    },
+                ],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "li".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["id".to_string()],
+                    ..Default::default()
+                }],
+                facts: vec![],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["profit".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN \"line_items\" AS \"li\""),
+                "JOIN to li must be included for derived metric referencing li-based metrics: {sql}"
+            );
+            assert!(
+                sql.contains("(SUM(li.amount)) - (SUM(li.unit_cost)) AS \"profit\""),
+                "Derived metric expression must be inlined: {sql}"
+            );
+        }
+
+        #[test]
+        fn resolve_joins_includes_transitive_deps_from_derived() {
+            // Derived metric references base metrics from different tables --
+            // all those tables' joins must be included.
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                    TableRef {
+                        alias: "li".to_string(),
+                        table: "line_items".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                ],
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "o.region".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                }],
+                metrics: vec![
+                    Metric {
+                        name: "revenue".to_string(),
+                        expr: "SUM(li.amount)".to_string(),
+                        source_table: Some("li".to_string()),
+                        output_type: None,
+                    },
+                    Metric {
+                        name: "order_count".to_string(),
+                        expr: "COUNT(DISTINCT o.id)".to_string(),
+                        source_table: Some("o".to_string()),
+                        output_type: None,
+                    },
+                    Metric {
+                        name: "avg_order_value".to_string(),
+                        expr: "revenue / order_count".to_string(),
+                        source_table: None,
+                        output_type: None,
+                    },
+                ],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "li".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["order_id".to_string()],
+                    ..Default::default()
+                }],
+                facts: vec![],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["avg_order_value".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            // li must be joined because revenue (source_table=li) is referenced by avg_order_value
+            assert!(
+                sql.contains("LEFT JOIN \"line_items\" AS \"li\""),
+                "JOIN to li must be included for derived metric avg_order_value: {sql}"
+            );
+        }
+
+        #[test]
+        fn expand_derived_metric_with_facts_chain() {
+            // Fact: net_price = extended_price * (1 - discount)
+            // Base: revenue = SUM(net_price), cost = SUM(unit_cost)
+            // Derived: profit = revenue - cost
+            // Chain: fact -> base metric -> derived metric
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![],
+                dimensions: vec![],
+                metrics: vec![
+                    Metric {
+                        name: "revenue".to_string(),
+                        expr: "SUM(net_price)".to_string(),
+                        source_table: Some("li".to_string()),
+                        output_type: None,
+                    },
+                    Metric {
+                        name: "cost".to_string(),
+                        expr: "SUM(unit_cost)".to_string(),
+                        source_table: Some("li".to_string()),
+                        output_type: None,
+                    },
+                    Metric {
+                        name: "profit".to_string(),
+                        expr: "revenue - cost".to_string(),
+                        source_table: None,
+                        output_type: None,
+                    },
+                ],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![Fact {
+                    name: "net_price".to_string(),
+                    expr: "extended_price * (1 - discount)".to_string(),
+                    source_table: Some("li".to_string()),
+                }],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec!["profit".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            // profit = revenue - cost
+            // revenue = SUM(net_price) -> SUM((extended_price * (1 - discount)))
+            // cost = SUM(unit_cost) (unchanged)
+            // profit -> (SUM((extended_price * (1 - discount)))) - (SUM(unit_cost))
+            assert!(
+                sql.contains(
+                    "(SUM((extended_price * (1 - discount)))) - (SUM(unit_cost)) AS \"profit\""
+                ),
+                "Fact->base->derived chain must resolve correctly: {sql}"
+            );
+        }
+    }
 }
