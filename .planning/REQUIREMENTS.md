@@ -31,10 +31,10 @@ Requirements for advanced semantic modeling capabilities. Each maps to roadmap p
 
 ### Multiple Join Paths
 
-- [ ] **JOIN-01**: Multiple named relationships between the same table pair are accepted (diamond rejection relaxed when relationships are named)
-- [ ] **JOIN-02**: Metrics can declare `USING (relationship_name)` to select a specific join path
+- [x] **JOIN-01**: Multiple named relationships between the same table pair are accepted (diamond rejection relaxed when relationships are named)
+- [x] **JOIN-02**: Metrics can declare `USING (relationship_name)` to select a specific join path
 - [ ] **JOIN-03**: Expansion generates separate JOINs with relationship-scoped aliases when USING is specified
-- [ ] **JOIN-04**: Define-time validation rejects USING references to non-existent relationships
+- [x] **JOIN-04**: Define-time validation rejects USING references to non-existent relationships
 - [ ] **JOIN-05**: Querying a dimension from an ambiguous multi-path table without USING produces a clear error
 
 ### Role-Playing Dimensions
@@ -105,10 +105,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | FAN-01 | Phase 31 | Complete |
 | FAN-02 | Phase 31 | Complete |
 | FAN-03 | Phase 31 | Complete |
-| JOIN-01 | Phase 32 | Pending |
-| JOIN-02 | Phase 32 | Pending |
+| JOIN-01 | Phase 32 | Complete |
+| JOIN-02 | Phase 32 | Complete |
 | JOIN-03 | Phase 32 | Pending |
-| JOIN-04 | Phase 32 | Pending |
+| JOIN-04 | Phase 32 | Complete |
 | JOIN-05 | Phase 32 | Pending |
 | ROLE-01 | Phase 32 | Pending |
 | ROLE-02 | Phase 32 | Pending |

@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: completed
-stopped_at: Completed 31-02-PLAN.md
-last_updated: "2026-03-14T18:45:18.654Z"
-last_activity: 2026-03-14 -- Completed 31-02 (Fan trap detection logic and tests)
+stopped_at: Completed 32-01-PLAN.md
+last_updated: "2026-03-14T19:29:00Z"
+last_activity: 2026-03-14 -- Completed 32-01 (USING clause model, parser, and validation)
 progress:
   total_phases: 4
   completed_phases: 3
-  total_plans: 6
-  completed_plans: 6
-  percent: 75
+  total_plans: 8
+  completed_plans: 7
+  percent: 88
 ---
 
 # Project State
@@ -21,23 +21,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-14)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand -- the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 31 - Fan Trap Detection
+**Current focus:** Phase 32 - Role-Playing Dimensions and USING RELATIONSHIPS
 
 ## Current Position
 
-Phase: 31 (3 of 4 in v0.5.3) (Fan Trap Detection) -- COMPLETE
-Plan: 2 of 2 in current phase -- COMPLETE
-Status: Phase 31 complete, ready for Phase 32
-Last activity: 2026-03-14 -- Completed 31-02 (Fan trap detection logic and tests)
+Phase: 32 (4 of 4 in v0.5.3) (Role-Playing and USING)
+Plan: 1 of 2 in current phase -- COMPLETE
+Status: Plan 32-01 complete, ready for Plan 32-02
+Last activity: 2026-03-14 -- Completed 32-01 (USING clause model, parser, and validation)
 
-Progress: [========..] 75% (v0.5.3)
+Progress: [========..] 88% (v0.5.3)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6 (v0.5.3)
-- Average duration: 22min
-- Total execution time: 132min
+- Total plans completed: 7 (v0.5.3)
+- Average duration: 21min
+- Total execution time: 146min
 
 **By Phase:**
 
@@ -46,9 +46,10 @@ Progress: [========..] 75% (v0.5.3)
 | 29 | 2 | 87min | 44min |
 | 30 | 2 | 23min | 12min |
 | 31 | 2 | 22min | 11min |
+| 32 | 1 | 14min | 14min |
 
 **Recent Trend:**
-- Last 5 plans: 15min, 13min, 10min, 9min, 13min
+- Last 5 plans: 13min, 10min, 9min, 13min, 14min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -80,6 +81,10 @@ Recent decisions affecting current work:
 - [31-01]: Token-split approach for to_alias/cardinality extraction (first token = alias, rest = cardinality)
 - [31-02]: Tree path-finding via parent-walking + LCA for fan-out detection between metric and dimension sources
 - [31-02]: check_path_up/check_path_down return Option<ExpandError> (not Result) since they never fail internally
+- [32-01]: USING keyword parsed with find_keyword_ci for case-insensitive word-boundary matching
+- [32-01]: parse_metrics_clause returns 4-tuple (kept tuple pattern vs named struct)
+- [32-01]: check_no_diamonds takes &SemanticViewDefinition to inspect Join names for role-playing relaxation
+- [32-01]: validate_using_relationships checks 3 constraints: no USING on derived, name exists, originates from source
 
 ### Pending Todos
 
@@ -95,5 +100,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-14
-Stopped at: Completed 31-02-PLAN.md
+Stopped at: Completed 32-01-PLAN.md
 Resume file: None
