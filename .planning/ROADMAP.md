@@ -214,6 +214,6 @@ Phases execute in numeric order: 29 -> 30 -> 31 -> 32
 | 27. Alias-Based Query Expansion | v0.5.2 | 3/3 | Complete | 2026-03-13 |
 | 28. Integration Testing & Docs | v0.5.2 | 3/3 | Complete | 2026-03-13 |
 | 29. FACTS Clause & Hierarchies | v0.5.3 | 2/2 | Complete | 2026-03-14 |
-| 30. Derived Metrics | 2/2 | Complete   | 2026-03-14 | - |
+| 30. Derived Metrics | 2/2 | Complete    | 2026-03-14 | - |
 | 31. Fan Trap Detection | v0.5.3 | 0/? | Not started | - |
 | 32. Role-Playing & USING | v0.5.3 | 0/? | Not started | - |
