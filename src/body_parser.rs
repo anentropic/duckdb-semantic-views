@@ -562,10 +562,16 @@ fn find_keyword_ci(upper_text: &str, keyword: &str) -> Option<usize> {
     let mut i = 0;
     while i + kw_len <= text_len {
         if &upper_text[i..i + kw_len] == keyword {
-            // Check boundary: preceded by non-alpha (or start), followed by non-alpha (or end)
-            let before_ok = i == 0 || !upper_text.as_bytes()[i - 1].is_ascii_alphanumeric();
-            let after_ok = i + kw_len == text_len
-                || !upper_text.as_bytes()[i + kw_len].is_ascii_alphanumeric();
+            // Check boundary: preceded by non-identifier char (or start), followed by non-identifier char (or end).
+            // Underscore is a valid identifier character, so it must NOT count as a word boundary.
+            let before_ok = i == 0 || {
+                let c = upper_text.as_bytes()[i - 1];
+                !c.is_ascii_alphanumeric() && c != b'_'
+            };
+            let after_ok = i + kw_len == text_len || {
+                let c = upper_text.as_bytes()[i + kw_len];
+                !c.is_ascii_alphanumeric() && c != b'_'
+            };
             if before_ok && after_ok {
                 return Some(i);
             }
