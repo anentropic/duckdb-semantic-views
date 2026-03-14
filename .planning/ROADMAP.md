@@ -108,7 +108,7 @@ Full details: [milestones/v0.5.2-ROADMAP.md](milestones/v0.5.2-ROADMAP.md)
 
 - [x] **Phase 29: FACTS Clause & Hierarchies** - Named row-level sub-expressions and drill-down path metadata (completed 2026-03-14)
 - [x] **Phase 30: Derived Metrics** - Metric-on-metric composition with DAG resolution (completed 2026-03-14)
-- [ ] **Phase 31: Fan Trap Detection** - Blocking errors for one-to-many aggregation fan-out
+- [x] **Phase 31: Fan Trap Detection** - Blocking errors for one-to-many aggregation fan-out (completed 2026-03-14)
 - [ ] **Phase 32: Role-Playing Dimensions & USING RELATIONSHIPS** - Same table via multiple join paths with explicit path selection
 
 ## Phase Details
@@ -219,5 +219,5 @@ Phases execute in numeric order: 29 -> 30 -> 31 -> 32
 | 28. Integration Testing & Docs | v0.5.2 | 3/3 | Complete | 2026-03-13 |
 | 29. FACTS Clause & Hierarchies | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 30. Derived Metrics | v0.5.3 | 2/2 | Complete | 2026-03-14 |
-| 31. Fan Trap Detection | 1/2 | In Progress|  | - |
+| 31. Fan Trap Detection | 2/2 | Complete   | 2026-03-14 | - |
 | 32. Role-Playing & USING | v0.5.3 | 0/? | Not started | - |
