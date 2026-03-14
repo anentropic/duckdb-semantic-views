@@ -73,6 +73,15 @@ pub enum ExpandError {
         dimension_table: String,
         relationship_name: String,
     },
+    /// A dimension from a role-playing table is ambiguous because multiple
+    /// relationships reach that table and no co-queried metric provides USING
+    /// context to disambiguate.
+    AmbiguousPath {
+        view_name: String,
+        dimension_name: String,
+        dimension_table: String,
+        available_relationships: Vec<String>,
+    },
 }
 
 impl fmt::Display for ExpandError {
@@ -141,6 +150,21 @@ impl fmt::Display for ExpandError {
                      '{relationship_name}' (ONE TO MANY). This would inflate aggregation results. \
                      Remove the dimension, use a metric from the same table, or adjust the \
                      relationship cardinality."
+                )
+            }
+            Self::AmbiguousPath {
+                view_name,
+                dimension_name,
+                dimension_table,
+                available_relationships,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': dimension '{dimension_name}' is ambiguous -- \
+                     table '{dimension_table}' is reached via multiple relationships: [{}]. \
+                     Specify a metric with USING to disambiguate, or use a dimension from a \
+                     non-ambiguous table.",
+                    available_relationships.join(", ")
                 )
             }
         }
@@ -251,6 +275,15 @@ fn find_metric<'a>(
 /// `from_alias.fk = to_alias.pk` pairs, joined by ` AND `.
 /// Uses `join.from_alias` for the FROM side and `join.table` for the TO side.
 fn synthesize_on_clause(join: &Join, tables: &[TableRef]) -> String {
+    synthesize_on_clause_scoped(join, tables, &join.table)
+}
+
+/// Synthesize an ON clause with a potentially scoped alias on the PK (target) side.
+///
+/// Like `synthesize_on_clause`, but uses `to_alias` instead of `join.table` in the
+/// generated SQL. This supports role-playing dimensions where the same physical table
+/// appears multiple times with different scoped aliases (e.g., `a__dep_airport`).
+fn synthesize_on_clause_scoped(join: &Join, tables: &[TableRef], to_alias: &str) -> String {
     let to_alias_lower = join.table.to_ascii_lowercase();
     let pk_columns: &[String] = tables
         .iter()
@@ -266,7 +299,7 @@ fn synthesize_on_clause(join: &Join, tables: &[TableRef]) -> String {
                 "{}.{} = {}.{}",
                 quote_ident(&join.from_alias),
                 quote_ident(fk),
-                quote_ident(&join.table),
+                quote_ident(to_alias),
                 quote_ident(pk),
             )
         })
@@ -274,11 +307,172 @@ fn synthesize_on_clause(join: &Join, tables: &[TableRef]) -> String {
     pairs.join(" AND ")
 }
 
-/// Resolve which joins are needed using graph-based PK/FK resolution (Phase 26).
+/// Determine which relationships point to a given table alias in the definition.
+///
+/// Returns a list of relationship names that have `to_alias` as their target.
+/// Used for ambiguity detection: if a table is reached by multiple named relationships,
+/// dimensions from that table require USING context to disambiguate.
+fn relationships_to_table(def: &SemanticViewDefinition, target_alias: &str) -> Vec<String> {
+    let target_lower = target_alias.to_ascii_lowercase();
+    def.joins
+        .iter()
+        .filter(|j| !j.fk_columns.is_empty() && j.table.to_ascii_lowercase() == target_lower)
+        .filter_map(|j| j.name.clone())
+        .collect()
+}
+
+/// Determine the scoped alias for a dimension from a role-playing table.
+///
+/// Checks whether the dimension's `source_table` is reached by multiple relationships.
+/// If so, looks at co-queried metrics' `using_relationships` to determine which
+/// relationship (and thus which scoped alias) to use for the dimension.
+///
+/// Returns:
+/// - `Ok(None)` if the dimension's table is not a role-playing table (single or no relationship)
+/// - `Ok(Some(scoped_alias))` if exactly one USING path disambiguates
+/// - `Err(ExpandError::AmbiguousPath)` if ambiguous with no single USING context
+#[allow(clippy::result_large_err)]
+fn find_using_context(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    dim: &crate::model::Dimension,
+    resolved_mets: &[&crate::model::Metric],
+) -> Result<Option<String>, ExpandError> {
+    let Some(ref dim_table) = dim.source_table else {
+        return Ok(None); // No source table -> base table, no scoping needed
+    };
+    let dim_table_lower = dim_table.to_ascii_lowercase();
+
+    // Find all relationships pointing to this table
+    let rels = relationships_to_table(def, &dim_table_lower);
+    if rels.len() <= 1 {
+        return Ok(None); // Single or no relationship -> unambiguous, use bare alias
+    }
+
+    // Multiple relationships -> role-playing table. Look for USING context.
+    // Collect all USING relationships from co-queried metrics that target this table.
+    let mut using_rels_for_table: Vec<String> = Vec::new();
+    for met in resolved_mets {
+        for using_rel in &met.using_relationships {
+            // Check if this USING relationship targets our dimension's table
+            let using_rel_lower = using_rel.to_ascii_lowercase();
+            let targets_our_table = def.joins.iter().any(|j| {
+                j.name
+                    .as_ref()
+                    .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
+                    && j.table.to_ascii_lowercase() == dim_table_lower
+            });
+            if targets_our_table && !using_rels_for_table.contains(&using_rel_lower) {
+                using_rels_for_table.push(using_rel_lower);
+            }
+        }
+        // Also check derived metrics: walk their transitive dependencies
+        if met.source_table.is_none() {
+            let transitive_using = collect_derived_metric_using(met, &def.metrics);
+            for using_rel in transitive_using {
+                let using_rel_lower = using_rel.to_ascii_lowercase();
+                let targets_our_table = def.joins.iter().any(|j| {
+                    j.name
+                        .as_ref()
+                        .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
+                        && j.table.to_ascii_lowercase() == dim_table_lower
+                });
+                if targets_our_table && !using_rels_for_table.contains(&using_rel_lower) {
+                    using_rels_for_table.push(using_rel_lower);
+                }
+            }
+        }
+    }
+
+    if using_rels_for_table.len() == 1 {
+        // Exactly one USING path disambiguates -> return scoped alias
+        let scoped = format!("{dim_table_lower}__{}", using_rels_for_table[0]);
+        Ok(Some(scoped))
+    } else {
+        // Zero or multiple USING paths -> ambiguous
+        Err(ExpandError::AmbiguousPath {
+            view_name: view_name.to_string(),
+            dimension_name: dim.name.clone(),
+            dimension_table: dim_table_lower,
+            available_relationships: rels,
+        })
+    }
+}
+
+/// Collect `using_relationships` from all transitive base metrics referenced by a derived metric.
+fn collect_derived_metric_using(
+    met: &crate::model::Metric,
+    all_metrics: &[crate::model::Metric],
+) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = vec![met.name.to_ascii_lowercase()];
+
+    let name_map: HashMap<String, &crate::model::Metric> = all_metrics
+        .iter()
+        .map(|m| (m.name.to_ascii_lowercase(), m))
+        .collect();
+
+    let all_names: Vec<String> = all_metrics
+        .iter()
+        .map(|m| m.name.to_ascii_lowercase())
+        .collect();
+
+    while let Some(current_name) = stack.pop() {
+        if !visited.insert(current_name.clone()) {
+            continue;
+        }
+        let Some(current_met) = name_map.get(&current_name) else {
+            continue;
+        };
+
+        if current_met.source_table.is_some() {
+            // Base metric: collect its USING relationships
+            for rel in &current_met.using_relationships {
+                if !result.contains(rel) {
+                    result.push(rel.clone());
+                }
+            }
+        } else {
+            // Derived metric: find referenced metric names and push to stack
+            let expr_lower = current_met.expr.to_ascii_lowercase();
+            for name in &all_names {
+                if *name == current_name {
+                    continue;
+                }
+                let expr_bytes = expr_lower.as_bytes();
+                let name_bytes = name.as_bytes();
+                let name_len = name_bytes.len();
+                let mut pos = 0;
+                while pos + name_len <= expr_bytes.len() {
+                    if &expr_bytes[pos..pos + name_len] == name_bytes {
+                        let before_ok = pos == 0 || is_word_boundary_char(expr_bytes[pos - 1]);
+                        let after_ok = pos + name_len == expr_bytes.len()
+                            || is_word_boundary_char(expr_bytes[pos + name_len]);
+                        if before_ok && after_ok {
+                            stack.push(name.clone());
+                            break;
+                        }
+                    }
+                    pos += 1;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+/// Resolve which joins are needed using graph-based PK/FK resolution (Phase 26+32).
 ///
 /// Builds a `RelationshipGraph` from the definition, collects needed table aliases
 /// from resolved dimensions and metrics, walks reverse edges to include transitive
 /// intermediaries, and returns aliases in topological order (root-outward).
+///
+/// Phase 32: When metrics have `using_relationships`, generates scoped aliases
+/// (`{to_alias}__{rel_name}`) instead of bare aliases. Scoped aliases are placed
+/// after the corresponding bare alias position in topological order.
+#[allow(clippy::too_many_lines)]
 fn resolve_joins_pkfk(
     def: &SemanticViewDefinition,
     resolved_dims: &[&crate::model::Dimension],
@@ -290,26 +484,87 @@ fn resolve_joins_pkfk(
 
     let root = &graph.root;
 
-    // Collect needed aliases from source_table fields (lowercased).
+    // Phase 32: Collect scoped aliases from metrics with USING relationships.
+    let mut scoped_aliases: Vec<String> = Vec::new();
+    // Also track which bare aliases are role-playing (have multiple relationships).
+    let mut role_playing_bare_aliases: HashSet<String> = HashSet::new();
+
+    for met in resolved_mets {
+        if !met.using_relationships.is_empty() {
+            for using_rel in &met.using_relationships {
+                // Find the join for this relationship name
+                let using_rel_lower = using_rel.to_ascii_lowercase();
+                if let Some(join) = def.joins.iter().find(|j| {
+                    j.name
+                        .as_ref()
+                        .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
+                }) {
+                    let to_alias = join.table.to_ascii_lowercase();
+                    let scoped = format!("{to_alias}__{using_rel_lower}");
+                    if !scoped_aliases.contains(&scoped) {
+                        scoped_aliases.push(scoped);
+                    }
+                    role_playing_bare_aliases.insert(to_alias);
+                }
+            }
+        } else if met.source_table.is_none() {
+            // Derived metric: walk transitive USING relationships
+            let transitive_using = collect_derived_metric_using(met, &def.metrics);
+            for using_rel in transitive_using {
+                let using_rel_lower = using_rel.to_ascii_lowercase();
+                if let Some(join) = def.joins.iter().find(|j| {
+                    j.name
+                        .as_ref()
+                        .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
+                }) {
+                    let to_alias = join.table.to_ascii_lowercase();
+                    let scoped = format!("{to_alias}__{using_rel_lower}");
+                    if !scoped_aliases.contains(&scoped) {
+                        scoped_aliases.push(scoped);
+                    }
+                    role_playing_bare_aliases.insert(to_alias);
+                }
+            }
+        }
+    }
+
+    // Collect needed bare aliases from source_table fields (lowercased).
     let mut needed: HashSet<String> = HashSet::new();
     for dim in resolved_dims {
         if let Some(ref st) = dim.source_table {
             let alias = st.to_ascii_lowercase();
             if alias != *root {
-                needed.insert(alias);
+                // If this is a role-playing table, the dimension alias will be resolved
+                // via find_using_context() in expand(). Don't add the bare alias here;
+                // the scoped aliases are already tracked.
+                if !role_playing_bare_aliases.contains(&alias) {
+                    needed.insert(alias);
+                }
             }
         }
     }
     for met in resolved_mets {
-        if let Some(ref st) = met.source_table {
-            let alias = st.to_ascii_lowercase();
-            if alias != *root {
-                needed.insert(alias);
+        if met.using_relationships.is_empty() {
+            if let Some(ref st) = met.source_table {
+                let alias = st.to_ascii_lowercase();
+                if alias != *root {
+                    needed.insert(alias);
+                }
+            } else {
+                // Derived metric without direct USING: walk dependency graph for bare tables
+                let transitive_tables = collect_derived_metric_source_tables(met, &def.metrics);
+                for alias in transitive_tables {
+                    if alias != *root && !role_playing_bare_aliases.contains(&alias) {
+                        needed.insert(alias);
+                    }
+                }
             }
-        } else {
-            // Derived metric: walk dependency graph to find transitive source tables
-            let transitive_tables = collect_derived_metric_source_tables(met, &def.metrics);
-            for alias in transitive_tables {
+        }
+        // Metrics WITH using_relationships: their source_table is the base table
+        // (e.g., "f" for flights). Only add if it's not root.
+        if !met.using_relationships.is_empty() {
+            if let Some(ref st) = met.source_table {
+                let alias = st.to_ascii_lowercase();
                 if alias != *root {
                     needed.insert(alias);
                 }
@@ -317,12 +572,12 @@ fn resolve_joins_pkfk(
         }
     }
 
-    if needed.is_empty() {
+    // If no bare aliases or scoped aliases needed, return empty
+    if needed.is_empty() && scoped_aliases.is_empty() {
         return Vec::new();
     }
 
-    // Walk reverse edges to include transitive intermediaries.
-    // For each needed alias, walk back to root adding all intermediate aliases.
+    // Walk reverse edges to include transitive intermediaries for bare aliases.
     let mut all_needed: HashSet<String> = needed.clone();
     let mut to_visit: Vec<String> = needed.into_iter().collect();
     while let Some(current) = to_visit.pop() {
@@ -335,14 +590,21 @@ fn resolve_joins_pkfk(
         }
     }
 
-    // Return aliases in topological order, filtering to only needed ones.
-    match graph.toposort() {
-        Ok(order) => order
-            .into_iter()
-            .filter(|alias| all_needed.contains(alias))
-            .collect(),
-        Err(_) => Vec::new(), // Should not happen — validated at define time
-    }
+    // Build the result: bare aliases in topo order, then scoped aliases after.
+    let Ok(topo_order) = graph.toposort() else {
+        return Vec::new(); // Should not happen — validated at define time
+    };
+
+    let mut result: Vec<String> = topo_order
+        .into_iter()
+        .filter(|alias| all_needed.contains(alias))
+        .collect();
+
+    // Sort scoped aliases for deterministic output, then append
+    scoped_aliases.sort();
+    result.extend(scoped_aliases);
+
+    result
 }
 
 /// Replace all word-boundary occurrences of `needle` in `haystack` with `replacement`.
@@ -1053,6 +1315,14 @@ pub fn expand(
     // Phase 31: Check for fan traps before generating SQL.
     check_fan_traps(view_name, def, &resolved_dims, &resolved_mets)?;
 
+    // Phase 32: Pre-compute dimension scoped aliases for role-playing tables.
+    // Maps dimension index -> scoped alias (e.g., "a__dep_airport").
+    let mut dim_scoped_aliases: Vec<Option<String>> = Vec::with_capacity(resolved_dims.len());
+    for dim in &resolved_dims {
+        let scoped = find_using_context(view_name, def, dim, &resolved_mets)?;
+        dim_scoped_aliases.push(scoped);
+    }
+
     // 5. Build the SELECT clause.
     //    Dimensions-only (no metrics): SELECT DISTINCT, no GROUP BY.
     //    Metrics-only (no dimensions): SELECT (global aggregate), no GROUP BY.
@@ -1065,8 +1335,16 @@ pub fn expand(
     }
 
     let mut select_items: Vec<String> = Vec::new();
-    for dim in &resolved_dims {
-        let base_expr = dim.expr.clone();
+    for (i, dim) in resolved_dims.iter().enumerate() {
+        let mut base_expr = dim.expr.clone();
+        // Phase 32: If this dimension has a scoped alias, rewrite the expression.
+        if let Some(ref scoped) = dim_scoped_aliases[i] {
+            if let Some(ref st) = dim.source_table {
+                // Replace bare alias with scoped alias in expression
+                // e.g., "a.city" -> "a__dep_airport.city"
+                base_expr = replace_word_boundary(&base_expr, st, scoped);
+            }
+        }
         // If output_type is set, wrap the expression in CAST(... AS <type>).
         let final_expr = if let Some(ref type_str) = dim.output_type {
             format!("CAST({base_expr} AS {type_str})")
@@ -1102,26 +1380,54 @@ pub fn expand(
     }
 
     // Join resolution via PK/FK graph (legacy resolve_joins removed in Phase 27).
+    // Phase 32: ordered_aliases may contain scoped aliases like "a__dep_airport".
     let ordered_aliases = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets);
     for alias in &ordered_aliases {
-        // Find the Join involving this alias (either as FK target or FK source).
-        let Some(join) = def.joins.iter().find(|j| {
-            j.table.to_ascii_lowercase() == *alias || j.from_alias.to_ascii_lowercase() == *alias
-        }) else {
-            continue;
-        };
-        // Find the TableRef for this alias to get the physical table name.
-        let table_ref = def
-            .tables
-            .iter()
-            .find(|t| t.alias.to_ascii_lowercase() == *alias);
-        let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
-        sql.push_str("\nLEFT JOIN ");
-        sql.push_str(&quote_table_ref(physical_table));
-        sql.push_str(" AS ");
-        sql.push_str(&quote_ident(alias));
-        sql.push_str(" ON ");
-        sql.push_str(&synthesize_on_clause(join, &def.tables));
+        // Phase 32: Check if this is a scoped alias (contains "__").
+        if let Some(sep_pos) = alias.find("__") {
+            let rel_name = &alias[sep_pos + 2..];
+            // Find the Join by relationship name.
+            let Some(join) = def.joins.iter().find(|j| {
+                j.name
+                    .as_ref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(rel_name))
+            }) else {
+                continue;
+            };
+            // Find physical table name from the bare alias (before __).
+            let bare_alias = &alias[..sep_pos];
+            let table_ref = def
+                .tables
+                .iter()
+                .find(|t| t.alias.to_ascii_lowercase() == bare_alias);
+            let physical_table = table_ref.map_or(bare_alias, |t| t.table.as_str());
+            sql.push_str("\nLEFT JOIN ");
+            sql.push_str(&quote_table_ref(physical_table));
+            sql.push_str(" AS ");
+            sql.push_str(&quote_ident(alias));
+            sql.push_str(" ON ");
+            sql.push_str(&synthesize_on_clause_scoped(join, &def.tables, alias));
+        } else {
+            // Standard bare alias join (non-role-playing).
+            let Some(join) = def.joins.iter().find(|j| {
+                j.table.to_ascii_lowercase() == *alias
+                    || j.from_alias.to_ascii_lowercase() == *alias
+            }) else {
+                continue;
+            };
+            // Find the TableRef for this alias to get the physical table name.
+            let table_ref = def
+                .tables
+                .iter()
+                .find(|t| t.alias.to_ascii_lowercase() == *alias);
+            let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
+            sql.push_str("\nLEFT JOIN ");
+            sql.push_str(&quote_table_ref(physical_table));
+            sql.push_str(" AS ");
+            sql.push_str(&quote_ident(alias));
+            sql.push_str(" ON ");
+            sql.push_str(&synthesize_on_clause(join, &def.tables));
+        }
     }
 
     // Append filters as WHERE clause (each parenthesized, AND-composed).
