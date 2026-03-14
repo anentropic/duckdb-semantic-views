@@ -36,24 +36,26 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 - **Decision:** The `explain_semantic_view()` table function provides expanded SQL inspection as a workaround. Native `EXPLAIN FROM semantic_query(...)` would show the expanded SQL instead of the DuckDB physical plan, but this would require intercepting the EXPLAIN hook, which is not accessible from a loadable extension (Python DuckDB uses `-fvisibility=hidden`).
 - **Action:** The C++ shim was removed in v0.4.0 (it was a no-op stub). Native EXPLAIN interception remains architecturally blocked -- it would require DuckDB to expose EXPLAIN hooks via the C API or extension loading mechanism.
 
-### 6. ❓ ON-clause substring matching for join dependency detection
+### 6. ✅ ON-clause substring matching for join dependency detection — RESOLVED in v0.5.2
 
 - **Origin:** Phase 3, decision [03-02] on-clause-substring-matching
-- **Decision:** Transitive join dependency detection checks whether a table name appears as a substring in the ON clause of other joins. This is a sufficient heuristic for v0.1.0 where users declare joins in dependency order and ON clauses reference table names directly. It avoids the complexity of a full SQL parser for join clause analysis.
-- **Action:** If v0.2.0 supports more complex join patterns (subqueries in ON clauses, aliased references), this may need to be replaced with proper SQL parsing using `sqlparser-rs` or similar.
+- **Decision:** Transitive join dependency detection originally checked whether a table name appears as a substring in the ON clause of other joins.
+- **Resolution:** v0.5.2 Phase 26 replaced this with graph-based PK/FK join resolution (`src/graph.rs`). `RelationshipGraph` uses an adjacency list with reverse edges, Kahn's algorithm for topological sort, and `synthesize_on_clause()` to generate ON clauses from declared PK/FK columns. Phase 27 deleted the legacy `resolve_joins` code entirely — PK/FK graph resolution is now the only join path.
+- **Action:** None needed.
 
-### 7. ❓ Unqualified column names required in expressions
+### 7. ✅ Unqualified column names required in expressions — RESOLVED in v0.5.2
 
 - **Origin:** Phase 4, decision [04-03] unqualified-join-expressions
-- **Decision:** Dimension and metric expressions must use unqualified column names (e.g., `region` not `orders.region`) because the CTE-based expansion flattens all source tables into a single `_base` namespace. Qualified names would reference tables that do not exist in the CTE scope.
-- **Action:** If v0.2.0 changes the expansion strategy away from CTEs, qualified column names could be supported.
+- **Decision:** Dimension and metric expressions originally required unqualified column names because the CTE-based expansion flattened all source tables into a single `_base` namespace.
+- **Resolution:** v0.5.2 Phase 27 replaced CTE flattening with direct `FROM base AS alias LEFT JOIN ...` expansion. Dimension/metric expressions now use qualified column references (`alias.column`) which resolve correctly against the aliased tables. The `_base` CTE was removed entirely (CLN-02).
+- **Action:** None needed.
 
-### 8. ❓ Statement rewrite approach for native DDL (not custom grammar)
+### 8. ✅ Statement rewrite approach for native DDL — RESOLVED in v0.5.2
 
 - **Origin:** v0.5.0 Phase 16-17, parser extension spike
-- **Decision:** Native DDL (`CREATE SEMANTIC VIEW name (...)`) is implemented via DuckDB's parser hook fallback mechanism. The parse_function detects the `CREATE SEMANTIC VIEW` prefix, and the plan_function rewrites it to `SELECT * FROM create_semantic_view('name', ...)` which executes against the existing function-based DDL path. The DDL body uses DuckDB function-call syntax (`:=` named parameters with struct/list literals) because `rewrite_ddl` passes the body verbatim to the underlying function call. This means the "native DDL" is syntactic sugar over function calls, not a true SQL DDL syntax.
-- **Gap:** The phase 21 validation layer (`scan_clause_keywords`) can parse a conventional SQL-style body (`TABLES (...), DIMENSIONS (...), METRICS (...)`) but there is no translation layer to convert it into executable function-call syntax. A Snowflake-style SQL DDL grammar (without `:=` and struct literals) was the original intent but was never implemented.
-- **Action:** Next milestone (v0.6.0) — implement proper SQL DDL syntax parsing so that `CREATE SEMANTIC VIEW` accepts conventional SQL keyword syntax, not function-call syntax. The function-based interface remains as the internal execution target.
+- **Decision:** Native DDL (`CREATE SEMANTIC VIEW name (...)`) was originally implemented as syntactic sugar over function-call syntax (`:=` named parameters with struct/list literals).
+- **Resolution:** v0.5.2 Phase 25 ("SQL Body Parser") implemented a full SQL keyword body parser (`src/body_parser.rs`) that accepts conventional SQL syntax: `TABLES (...) RELATIONSHIPS (...) DIMENSIONS (...) METRICS (...)`. The translation layer in `src/parse.rs` (`rewrite_ddl_keyword_body()`) converts the parsed SQL body into the underlying function-based execution model. No `:=` parameters or struct literals required — pure SQL DDL grammar.
+- **Action:** None needed.
 
 ### 9. ✅ DDL connection isolation pattern
 
@@ -117,12 +119,10 @@ Constraints inherent to the current approach that affect users or maintainers.
 - **Current state:** Output columns are fully typed. The table function uses `duckdb_vector_reference_vector` to stream result chunks directly into output with zero copying. Type mismatches between bind-time inference and runtime (e.g., HUGEINT→BIGINT from optimizer changes, STRUCT/MAP→VARCHAR) are handled by `build_execution_sql`, which wraps the expanded SQL with explicit casts where needed.
 - **Impact:** None — consumers receive correctly typed output. No manual casting required.
 
-### 4. ❓ Unqualified column names required in expressions
+### 4. ✅ Unqualified column names required in expressions — RESOLVED in v0.5.2
 
-- **What:** Dimension and metric SQL expressions must use unqualified column names (e.g., `sum(revenue)` not `sum(orders.revenue)`).
-- **Why:** See Accepted Decision 7 above. The CTE-based expansion strategy flattens all tables into a single `_base` namespace.
-- **Impact:** Users defining semantic views over tables with identically-named columns must use aliases in the join ON clause or rename columns to disambiguate.
-- **Mitigation:** Error messages from DuckDB at query time identify ambiguous column references. The `explain_semantic_view()` function helps users debug expansion issues.
+- **What:** Dimension and metric SQL expressions originally required unqualified column names due to CTE-based `_base` flattening.
+- **Resolution:** See Accepted Decision 7. v0.5.2 Phase 27 replaced CTE flattening with direct `FROM base AS alias LEFT JOIN ...` expansion. Qualified column references (`alias.column`) now work correctly.
 
 ## Test Coverage Gaps
 
