@@ -33,15 +33,15 @@ Requirements for advanced semantic modeling capabilities. Each maps to roadmap p
 
 - [x] **JOIN-01**: Multiple named relationships between the same table pair are accepted (diamond rejection relaxed when relationships are named)
 - [x] **JOIN-02**: Metrics can declare `USING (relationship_name)` to select a specific join path
-- [ ] **JOIN-03**: Expansion generates separate JOINs with relationship-scoped aliases when USING is specified
+- [x] **JOIN-03**: Expansion generates separate JOINs with relationship-scoped aliases when USING is specified
 - [x] **JOIN-04**: Define-time validation rejects USING references to non-existent relationships
-- [ ] **JOIN-05**: Querying a dimension from an ambiguous multi-path table without USING produces a clear error
+- [x] **JOIN-05**: Querying a dimension from an ambiguous multi-path table without USING produces a clear error
 
 ### Role-Playing Dimensions
 
-- [ ] **ROLE-01**: Same physical table joined via different named relationships produces distinct aliases in expanded SQL
-- [ ] **ROLE-02**: Dimensions from a role-playing table resolve to the correct alias based on co-queried metric's USING
-- [ ] **ROLE-03**: Classic role-playing pattern works end-to-end (e.g., flights with departure/arrival airports)
+- [x] **ROLE-01**: Same physical table joined via different named relationships produces distinct aliases in expanded SQL
+- [x] **ROLE-02**: Dimensions from a role-playing table resolve to the correct alias based on co-queried metric's USING
+- [x] **ROLE-03**: Classic role-playing pattern works end-to-end (e.g., flights with departure/arrival airports)
 
 ### Fan Trap Detection
 
@@ -107,12 +107,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 | FAN-03 | Phase 31 | Complete |
 | JOIN-01 | Phase 32 | Complete |
 | JOIN-02 | Phase 32 | Complete |
-| JOIN-03 | Phase 32 | Pending |
+| JOIN-03 | Phase 32 | Complete |
 | JOIN-04 | Phase 32 | Complete |
-| JOIN-05 | Phase 32 | Pending |
-| ROLE-01 | Phase 32 | Pending |
-| ROLE-02 | Phase 32 | Pending |
-| ROLE-03 | Phase 32 | Pending |
+| JOIN-05 | Phase 32 | Complete |
+| ROLE-01 | Phase 32 | Complete |
+| ROLE-02 | Phase 32 | Complete |
+| ROLE-03 | Phase 32 | Complete |
 
 **Coverage:**
 - v0.5.3 requirements: 24 total

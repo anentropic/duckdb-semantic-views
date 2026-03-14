@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: completed
-stopped_at: Completed 32-01-PLAN.md
-last_updated: "2026-03-14T19:29:00Z"
-last_activity: 2026-03-14 -- Completed 32-01 (USING clause model, parser, and validation)
+stopped_at: Completed 32-02-PLAN.md
+last_updated: "2026-03-14T19:43:00Z"
+last_activity: 2026-03-14 -- Completed 32-02 (USING-aware expansion with scoped aliases)
 progress:
   total_phases: 4
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 8
-  completed_plans: 7
-  percent: 88
+  completed_plans: 8
+  percent: 100
 ---
 
 # Project State
@@ -26,18 +26,18 @@ See: .planning/PROJECT.md (updated 2026-03-14)
 ## Current Position
 
 Phase: 32 (4 of 4 in v0.5.3) (Role-Playing and USING)
-Plan: 1 of 2 in current phase -- COMPLETE
-Status: Plan 32-01 complete, ready for Plan 32-02
-Last activity: 2026-03-14 -- Completed 32-01 (USING clause model, parser, and validation)
+Plan: 2 of 2 in current phase -- COMPLETE
+Status: Phase 32 complete, v0.5.3 milestone complete
+Last activity: 2026-03-14 -- Completed 32-02 (USING-aware expansion with scoped aliases)
 
-Progress: [========..] 88% (v0.5.3)
+Progress: [==========] 100% (v0.5.3)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 7 (v0.5.3)
-- Average duration: 21min
-- Total execution time: 146min
+- Total plans completed: 8 (v0.5.3)
+- Average duration: 20min
+- Total execution time: 156min
 
 **By Phase:**
 
@@ -46,10 +46,10 @@ Progress: [========..] 88% (v0.5.3)
 | 29 | 2 | 87min | 44min |
 | 30 | 2 | 23min | 12min |
 | 31 | 2 | 22min | 11min |
-| 32 | 1 | 14min | 14min |
+| 32 | 2 | 24min | 12min |
 
 **Recent Trend:**
-- Last 5 plans: 13min, 10min, 9min, 13min, 14min
+- Last 5 plans: 10min, 9min, 13min, 14min, 10min
 - Trend: stable
 
 *Updated after each plan completion*
@@ -85,6 +85,10 @@ Recent decisions affecting current work:
 - [32-01]: parse_metrics_clause returns 4-tuple (kept tuple pattern vs named struct)
 - [32-01]: check_no_diamonds takes &SemanticViewDefinition to inspect Join names for role-playing relaxation
 - [32-01]: validate_using_relationships checks 3 constraints: no USING on derived, name exists, originates from source
+- [32-02]: Scoped aliases use {to_alias}__{rel_name} pattern for role-playing JOINs
+- [32-02]: USING only controls dimension alias resolution, not metric aggregation
+- [32-02]: AmbiguousPath requires exactly one USING path to disambiguate
+- [32-02]: Derived metrics inherit USING context transitively via collect_derived_metric_using
 
 ### Pending Todos
 
@@ -100,5 +104,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-14
-Stopped at: Completed 32-01-PLAN.md
+Stopped at: Completed 32-02-PLAN.md (v0.5.3 milestone complete)
 Resume file: None
