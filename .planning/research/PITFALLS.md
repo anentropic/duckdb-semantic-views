@@ -1,415 +1,473 @@
-# Domain Pitfalls -- SQL DDL Syntax & PK/FK Relationship Model (v0.5.2)
+# Domain Pitfalls -- Advanced Semantic Features (v0.5.3)
 
-**Domain:** Adding proper SQL DDL keyword syntax and Snowflake-style PK/FK relationship model to an existing DuckDB semantic views extension
-**Researched:** 2026-03-09
-**Context:** The extension already has a working DDL pipeline (parse -> detect -> rewrite -> execute via function calls), CTE-based expansion with ON-clause heuristic join resolution, dual DDL interface (function-based + native SQL), table aliases, join_columns FK pairs, and qualified column lookup. This research covers pitfalls specific to the v0.5.2 transition.
+**Domain:** Adding FACTS clause, derived metrics, hierarchies, fan trap detection, role-playing dimensions, semi-additive metrics (NON ADDITIVE BY), and multiple join paths (USING RELATIONSHIPS) to an existing DuckDB semantic views extension
+**Researched:** 2026-03-14
+**Context:** The extension is a SQL preprocessor (expansion only, no execution engine). It has a PK/FK relationship model with graph validation that currently rejects diamonds and cycles. Kahn's algorithm provides topological sort join ordering. `body_parser.rs` state machine parses DDL clauses. `RelationshipGraph` in `src/graph.rs` manages join resolution. All SQL is expanded and handed to DuckDB for execution. The `Fact` model struct exists but is not wired into the body parser or expansion engine.
 
 ---
 
 ## Critical Pitfalls
 
-Mistakes that cause rewrites, data corruption, or silent wrong results.
+Mistakes that cause rewrites, silent wrong results, or architectural dead ends.
 
-### C1: SQL DDL Keyword Parser Eats Function-Call DDL Body -- Backward Compatibility Break
+### C1: Derived Metrics Create Circular Dependencies That Infinite-Loop the Expansion Engine
 
 **What goes wrong:**
-The current `rewrite_ddl` function passes the CREATE body verbatim to the underlying function call: `CREATE SEMANTIC VIEW sales (dimensions := [...])` becomes `SELECT * FROM create_semantic_view('sales', dimensions := [...])`. The body uses DuckDB function-call syntax (`:=` named parameters, struct/list literals).
+Derived metrics reference other metrics by name (e.g., `profit = revenue - cost`). If the dependency chain contains a cycle (`A = B + 1`, `B = A - 1`), the expansion engine tries to resolve `A` by expanding `B`, which tries to expand `A`, producing infinite recursion or a stack overflow.
 
-When you add SQL keyword syntax (`TABLES (...) DIMENSIONS (...) METRICS (...)`), the parser must distinguish between the OLD function-call body and the NEW keyword body. If the new parser consumes ALL `CREATE SEMANTIC VIEW` statements and applies keyword parsing, it will break existing definitions that use `:=` syntax.
+The current `expand()` function in `expand.rs` resolves metrics by name lookup via `find_metric()`, which returns the `Metric.expr` string directly. There is no dependency resolution step. When a metric expression contains another metric name, the expansion engine must recognize the reference, look up the referenced metric, and substitute its expression. Without cycle detection, this substitution loops forever.
 
-The `TECH-DEBT.md` item #8 explicitly flags this: "The DDL body uses DuckDB function-call syntax because `rewrite_ddl` passes the body verbatim. A Snowflake-style SQL DDL grammar was the original intent but was never implemented."
+Snowflake's approach: derived metrics are scoped to the semantic view (not a logical table), and "you cannot use a derived metric in the expression for a regular metric, dimension, or fact. Only another derived metric can use a derived metric in its expression." This constraint prevents some cycles but does not eliminate derived-to-derived cycles.
+
+MetricFlow's approach: metrics are nodes in a DAG; the manifest parser validates the dependency graph at definition time.
 
 **Why it happens:**
-The temptation is to replace `parse_create_body` (which just extracts text between outer parens) with a keyword parser. But any stored definitions, documentation examples, and user scripts that use `:=` syntax will break immediately.
+The current metric model is flat -- each metric has `name`, `expr`, `source_table`, `output_type`. There is no concept of "this metric references that metric." Adding derived metrics means adding a dependency relationship between metrics, but without explicit dependency tracking, the system cannot detect cycles.
 
 **Consequences:**
-- All existing `CREATE SEMANTIC VIEW` statements stop working
-- Stored catalog definitions cannot be re-created from their JSON (the function-based path still works, but users lose the native DDL path for existing syntax)
-- Breaking change in a minor version, violating user trust
+- Stack overflow or infinite loop during `expand()` at query time
+- If protected by a recursion depth limit, the error message is confusing ("maximum recursion depth exceeded" instead of "circular metric dependency")
+- DuckDB process crash in the stack overflow case (no graceful recovery from stack overflow in a loadable extension)
 
 **Prevention:**
-- Detect which syntax variant the body uses BEFORE parsing. Heuristic: if the body contains `:=` at the top level (outside strings/brackets), it is function-call syntax -- pass verbatim. If the body starts with a known keyword (`TABLES`, `DIMENSIONS`, `METRICS`, `RELATIONSHIPS`) followed by `(`, it is keyword syntax -- parse and translate.
-- The detection must happen in `rewrite_ddl` or `validate_and_rewrite`, not deeper in the parser. The existing `scan_clause_keywords` function already scans for keyword presence -- extend it to also detect `:=` assignments.
-- During a transition period (v0.5.2), support BOTH body formats. Deprecate the `:=` format in documentation. Remove support in a later version (v0.7.0+) when backward compatibility is no longer needed.
-- **Test:** A sqllogictest that creates a view with OLD `:=` syntax, then queries it, MUST pass after the v0.5.2 parser changes.
-- **Confidence:** HIGH. This is the #1 backward compatibility risk. The codebase already has the detection infrastructure (`scan_clause_keywords` + `parse_create_body`).
+- At define time, build a metric dependency DAG. Parse each metric's expression for references to other metric names. Run topological sort (reuse Kahn's algorithm from `graph.rs`) on the metric DAG. Reject cycles with a clear error: "Circular metric dependency: revenue -> profit -> revenue."
+- At expansion time, expand metrics in topological order (leaf metrics first, derived metrics last). Each derived metric's expression has its input metrics already resolved to SQL expressions.
+- **Do NOT use recursive string substitution.** Instead, expand the dependency DAG into a layered SQL expression. For `profit = revenue - cost` where `revenue = SUM(o.amount)` and `cost = SUM(o.cost)`, the expanded SQL is `SUM(o.amount) - SUM(o.cost) AS "profit"`, not a recursive substitution.
+- The metric name detection in expressions is a parsing problem. Two approaches:
+  - (a) Require explicit syntax: `metric(revenue)` wrapper in expressions. This is unambiguous but verbose.
+  - (b) Match metric names as identifiers in the expression. This risks false positives if a column name matches a metric name.
+  - Recommendation: (a) explicit syntax, matching Snowflake's approach where derived metrics reference metrics by name without table qualification.
+- **Confidence:** HIGH. Cycle detection in DAGs is a solved problem. The existing `toposort()` in `graph.rs` already returns `Err` on cycles. The risk is in failing to detect metric references in expressions.
 
-**Phase assignment:** Must be the FIRST parser change. Build the syntax discriminator before implementing keyword parsing.
+**Detection:** Stack overflow during `expand()`. Query hangs indefinitely. Test: define `a AS metric(b) + 1`, `b AS metric(a) - 1`, expect define-time error.
+
+**Phase assignment:** Must be addressed in the derived metrics phase. Cycle detection at define time, topological expansion at query time.
 
 ---
 
-### C2: PK/FK Join Path Ambiguity -- Diamond Joins Produce Wrong Results Silently
+### C2: Fan Trap Produces Silently Inflated Metrics -- The Core Correctness Problem
 
 **What goes wrong:**
-The current ON-clause heuristic (`resolve_joins` in `expand.rs`) is simple: collect `source_table` values from requested dimensions/metrics, then do a fixed-point transitive closure over ON-clause substring matching. There is at most ONE path between any two tables because joins are declared linearly and matched by table name.
-
-With PK/FK relationships, you introduce a JOIN GRAPH where multiple paths can exist between two tables. Classic example (diamond):
+When a query joins tables across a one-to-many relationship and aggregates metrics from the "one" side, the join duplicates rows before aggregation. Example:
 
 ```
-       orders
-      /      \
-  customers  products
-      \      /
-       region
+orders (1) ---< line_items (many)
 ```
 
-If a dimension comes from `region`, should the join path go through `customers` or `products`? The PK/FK model does not answer this -- it only says edges exist, not which path to take. Cube.dev calls this the "diamond subgraph problem" and requires explicit `join_path` declarations to resolve it. Snowflake prohibits circular relationships entirely (even through transitive paths) and does not support self-referencing tables.
+Query: `dimensions := ['product_name'], metrics := ['order_count']` where `order_count = COUNT(*)` is on `orders` and `product_name` is on `line_items`. The LEFT JOIN duplicates each order row for every line item. `COUNT(*)` returns `total_line_items`, not `total_orders`.
+
+This is the most dangerous pitfall in semantic layer development because **the query succeeds with plausible-looking numbers**. There is no error, no warning -- just wrong results that may differ from the correct answer by 2-10x depending on data cardinality.
+
+The current extension generates a flat `FROM base LEFT JOIN ... GROUP BY` query. It has no awareness of join cardinality and no fan-out prevention.
 
 **Why it happens:**
-The current model has no graph -- it has a flat list of joins with table names. Moving to PK/FK creates an implicit directed graph (FK table -> PK table). When the graph has diamonds or multiple paths, the `resolve_joins` function's fixed-point loop will include ALL tables on ALL paths, producing a cartesian product or duplicate rows.
+The PK/FK relationship model declares structural connections but not cardinality direction (one-to-many vs many-to-one). Even if cardinality IS recorded, the expansion engine treats all joins equally -- it does not know that aggregating `orders.amount` after joining to `line_items` will inflate the sum.
+
+Cube.dev solves this with primary key-based deduplication: "When detected, Cube generates a deduplication query that evaluates all distinct primary keys within the multiplied measure's cube and then joins distinct primary keys to produce correct results." This requires (a) PKs declared on every table, (b) relationship cardinality declared, (c) metric-aware expansion that pre-aggregates before joining when needed.
 
 **Consequences:**
-- Aggregation metrics (SUM, COUNT) return inflated values because rows are duplicated across multiple join paths
-- The user sees no error -- the query executes successfully with wrong numbers
-- This is the "fan trap" in BI terminology: "measures are very hard to de-duplicate because SUM DISTINCT is semantically invalid"
+- SUM, COUNT, AVG metrics return inflated values
+- Users trust the numbers because the query runs successfully
+- The error is only caught when comparing against a known-correct baseline
+- Retroactive fix requires changing the expansion strategy, potentially breaking existing query results (if users have already adjusted to the inflated values)
 
-**Prevention:**
-- **Option A (recommended for v0.5.2): Require explicit join path per dimension/metric.** The `source_table` field already exists on `Dimension` and `Metric`. Require it to be set when the view has more than one join. The join resolver follows the SINGLE path from base table to the source table, not all possible paths.
-- **Option B: Disallow diamond graphs at define time.** At `CREATE SEMANTIC VIEW` validation, check that the FK graph is a tree (no cycles, no diamonds). Reject definitions where a table is reachable via multiple paths. This is what Snowflake does: "You cannot define circular relationships, even through transitive paths."
-- **Option C: Shortest-path resolution.** If multiple paths exist, pick the shortest (fewest hops). This is what Holistics does with its tier-based ranking. But shortest path may not be the semantically correct path.
-- **Recommendation:** Option B for v0.5.2 (simplest, matches Snowflake, prevents the problem entirely). Option A for a future version if multi-path support is needed.
-- **Validation algorithm:** At define time, build a directed graph from FK -> PK. Run DFS from each table. If any table is visited twice, reject with error: "Ambiguous join path: table 'X' is reachable via multiple paths. Remove one relationship to create a tree structure."
-- **Confidence:** HIGH. Diamond join problems are thoroughly documented in Cube.dev, dbt MetricFlow, Holistics, and Sisense. Every semantic layer has either solved or forbidden this.
+**Prevention (phased approach):**
+1. **Phase 1 -- Detection and warning (v0.5.3):** At define time, record relationship cardinality (which side has the PK = "one" side). At query time, detect when a metric's source table is on the "one" side of a join triggered by a dimension on the "many" side. Emit a WARNING (not an error) in the query result or via DuckDB's warning mechanism.
+2. **Phase 2 -- Pre-aggregation deduplication (future):** When fan-out is detected, generate a deduplication subquery:
+   ```sql
+   -- Instead of:
+   SELECT li.product_name, COUNT(*) AS order_count
+   FROM orders AS o LEFT JOIN line_items AS li ON ...
+   GROUP BY 1
 
-**Phase assignment:** Must be part of the define-time validation phase, BEFORE the expansion engine is changed. Reject bad graphs early.
+   -- Generate:
+   SELECT li.product_name, sub.order_count
+   FROM (SELECT o.id, COUNT(*) AS order_count FROM orders AS o GROUP BY o.id) AS sub
+   LEFT JOIN line_items AS li ON sub.id = li.order_id
+   GROUP BY 1
+   ```
+   This pre-aggregates the metric per PK before joining, eliminating fan-out.
+3. **Phase 3 -- Automatic strategy selection (future):** Based on cardinality metadata and requested dimensions/metrics, automatically choose between flat expansion (safe), pre-aggregation (fan-out detected), or separate-query-then-join (chasm trap detected).
+
+- **Confidence:** HIGH. Fan trap is the most-discussed pitfall in semantic layer literature. Every mature system (Cube.dev, Holistics, Sisense, MetricFlow) has a solution or explicit documentation.
+
+**Detection:** Compare `COUNT(*)` on base table alone vs with a one-to-many join included. If the count changes, fan-out is occurring. Test: create orders + line_items tables, define metric on orders, dimension on line_items, assert warning is emitted.
+
+**Phase assignment:** Fan trap detection phase. Warning is achievable in v0.5.3. Full deduplication is a future milestone.
 
 ---
 
-### C3: CTE Flat Namespace Breaks When Adding Qualified Columns
+### C3: Relaxing Diamond Rejection Breaks the Tree Invariant That Graph Validation Depends On
 
 **What goes wrong:**
-The current expansion strategy (`expand()` in `expand.rs`) creates a single `_base` CTE that joins all needed tables, then the outer SELECT references columns from `_base` using unqualified names. This is explicitly documented in `TECH-DEBT.md` item #7: "Dimension and metric expressions must use unqualified column names because the CTE-based expansion flattens all source tables into a single `_base` namespace."
+The current `RelationshipGraph.check_no_diamonds()` enforces that each non-root node has at most one parent. This tree invariant is assumed by:
+- `resolve_joins_pkfk()` which walks `reverse` edges to find the single path from any node back to the root
+- `synthesize_on_clause()` which finds THE join for an alias (not one of several)
+- `toposort()` which returns a single linear order (trees have a unique topological sort)
 
-When you add qualified column support (`orders.revenue`, `customers.name`), the expressions contain dot-qualified references. But after the CTE flattens everything into `_base`, there is no `orders` or `customers` alias in scope -- only `_base`. DuckDB will error: "Table 'orders' does not exist."
-
-This is the core architectural tension: the CTE strategy REQUIRES unqualified names, but qualified columns REQUIRE table aliases to be in scope.
+The v0.5.3 feature "multiple join paths (USING RELATIONSHIPS)" explicitly relaxes the diamond rejection to allow the same table to be reachable via multiple paths when the user disambiguates with `USING RELATIONSHIPS`. But the graph infrastructure ASSUMES no diamonds. Simply removing `check_no_diamonds()` without updating the consumers causes:
+- `resolve_joins_pkfk()` to follow one arbitrary path (whichever `reverse` edge it encounters first), ignoring the user's `USING RELATIONSHIPS` directive
+- `synthesize_on_clause()` to find the wrong join when multiple joins target the same alias
+- `toposort()` to produce a valid but potentially wrong ordering when multiple orderings are valid
 
 **Why it happens:**
-The CTE was designed for a flat namespace model. Qualified columns fundamentally need either (a) table aliases inside the CTE, or (b) no CTE at all.
+The tree invariant was a simplifying assumption that made the graph code correct and simple. Relaxing it requires upgrading every consumer of `RelationshipGraph` to handle DAGs (directed acyclic graphs with shared nodes), not just trees.
 
 **Consequences:**
-- Any expression using `alias.column` syntax fails at query time with DuckDB errors about missing tables
-- The error comes from DuckDB's SQL engine, not from the extension, so the error message is confusing
-- Partial fixes (string-replacing `alias.` with nothing) break for column names that contain dots or for expressions like `CASE WHEN orders.status = 'shipped' THEN orders.amount END`
+- Queries silently use the wrong join path, producing wrong results
+- The wrong path may join through tables that filter or multiply rows differently
+- No error is raised because the graph is still acyclic (diamonds are not cycles)
 
 **Prevention:**
-Two viable approaches:
+- Do NOT simply remove `check_no_diamonds()`. Instead:
+  1. Keep `check_no_diamonds()` as the DEFAULT validation
+  2. Add a new validation mode: `check_no_unresolved_diamonds()` which allows diamonds ONLY when every dimension/metric that traverses the diamond specifies `USING RELATIONSHIPS`
+  3. At query time, `resolve_joins_pkfk()` must accept a `path_hint: Option<Vec<String>>` parameter that specifies which relationship names to follow. When a path hint is provided, follow only those edges. When no hint is provided and multiple paths exist, return an error: "Ambiguous path to table 'X'. Use USING RELATIONSHIPS to specify the join path."
+- The `USING RELATIONSHIPS` clause must reference relationship NAMES (the `name` field on `Join`), not table aliases. Relationship names are already stored in `Join.name` (added in Phase 24).
+- Modify `toposort()` to return all valid topological orderings when the graph is a DAG (or return the ordering consistent with the selected path hints).
+- **Confidence:** HIGH. The code is small and well-structured. The changes are localized to `graph.rs` and `expand.rs`. But the surface area for bugs is large because every function that touches the graph must be reviewed.
 
-**Approach A: Keep CTE, emit aliases inside it (recommended).**
-The `_base` CTE already uses `AS "alias"` for table references when `def.tables` is non-empty (lines 415-418, 425-433 of `expand.rs`). Inside the CTE, DuckDB DOES have the aliases in scope. The problem is only in the OUTER SELECT, which references `_base.column`. Fix: move dimension/metric expressions INTO the CTE's SELECT list (as named columns), then the outer SELECT just references `_base."dim_name"` and `_base."met_name"` by their semantic names. The expressions execute inside the CTE where aliases are available.
+**Detection:** Define a diamond graph, query with ambiguous path, expect error. Define same graph with `USING RELATIONSHIPS`, expect correct path. Test both paths and verify different results.
+
+**Phase assignment:** Multiple join paths phase. Must be coordinated with graph validation changes.
+
+---
+
+### C4: Role-Playing Dimensions Require Duplicate Table Aliases, Breaking the Alias Uniqueness Assumption
+
+**What goes wrong:**
+Role-playing dimensions join the SAME physical table multiple times with different roles. Classic example: `orders` has `created_date`, `shipped_date`, `delivered_date`, all FK references to a `dates` table. The DDL needs:
 
 ```sql
--- Current (broken for qualified exprs):
-WITH "_base" AS (
-    SELECT *
-    FROM "orders" AS "o"
-    JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id"
+TABLES (
+    o AS orders PRIMARY KEY (id),
+    d_created AS dates PRIMARY KEY (date_id),
+    d_shipped AS dates PRIMARY KEY (date_id),
+    d_delivered AS dates PRIMARY KEY (date_id)
 )
-SELECT o.region AS "region"  -- ERROR: no "o" in scope
-FROM "_base"
-
--- Fixed: expressions inside CTE
-WITH "_base" AS (
-    SELECT "o"."region" AS "region", SUM("o"."amount") AS "revenue"
-    FROM "orders" AS "o"
-    JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id"
-    GROUP BY 1
-)
-SELECT "region", "revenue"
-FROM "_base"
 ```
 
-Wait -- moving aggregation INTO the CTE changes the semantics. Currently the CTE is `SELECT *` (all rows), and the outer query does `GROUP BY`. If aggregation moves into the CTE, the CTE must include the `GROUP BY`. This is a structural change to the expansion engine.
+The current `body_parser.rs` parses TABLES entries as `alias AS physical_table PRIMARY KEY (...)`. The `RelationshipGraph` uses `alias` as the node key. This part works -- different aliases for the same physical table are different nodes.
 
-**Approach B: Drop CTE entirely, use direct FROM/JOIN.**
-Generate a direct query without a CTE:
+BUT: the current code in several places uses `table` (physical table name) as a lookup key, not `alias`:
+- `resolve_joins_pkfk()` line 432: `j.table.to_ascii_lowercase() == *alias` -- this finds a join by matching the join's `table` field against the needed alias. For role-playing dims, the `table` field is `"dates"` for all three, but the needed alias is `"d_created"`. The lookup FAILS.
+- `synthesize_on_clause()` line 227: `t.alias.to_ascii_lowercase() == to_alias_lower` -- this correctly uses alias. But it is called with `join.table` as the target, not the alias.
+- `expand()` line 440: `t.alias.to_ascii_lowercase() == *alias` -- correct.
 
-```sql
-SELECT "o"."region" AS "region", SUM("o"."amount") AS "revenue"
-FROM "orders" AS "o"
-JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id"
-WHERE (filter1) AND (filter2)
-GROUP BY 1
-```
-
-This is simpler, keeps aliases in scope, and avoids the CTE abstraction layer. The downside: the current `LIMIT 0` type inference runs the expanded SQL -- changing the shape may affect type inference if any edge cases depend on the CTE structure.
-
-**Recommendation:** Approach B (drop CTE). The CTE was an early design decision that served its purpose for the flat-namespace model. Qualified columns are a fundamentally different model. Dropping the CTE simplifies the code and aligns with how Snowflake and Cube generate SQL.
-
-**Migration risk:** The `build_execution_sql` function wraps the expansion output in a subquery for type casting. This wrapping does not depend on CTE structure -- it wraps the entire SQL string. So Approach B should be compatible.
-
-**Confidence:** HIGH. The CTE-vs-direct tradeoff is well understood. The codebase has clear separation between expansion (SQL generation) and execution (type inference + vector reference), so the expansion can be changed without affecting execution.
-
-**Phase assignment:** Must be done BEFORE or ALONGSIDE qualified column support. Cannot add qualified columns to the current CTE structure without breakage.
-
----
-
-### C4: Stored Definitions with ON-Clause Format Cannot Use PK/FK Join Inference
-
-**What goes wrong:**
-Existing catalog definitions stored in `semantic_layer._definitions` use the old `Join` format with a raw `on` string field. The model already supports backward compatibility via serde defaults: old JSON without `join_columns` deserializes with an empty `join_columns` vec (tested in `join_old_on_format_backwards_compat`). But the NEW expansion engine using PK/FK join inference will not understand old ON-clause joins.
-
-If the expansion engine is changed to generate ON clauses from `join_columns` (FK/PK pairs) and falls back to the raw `on` string when `join_columns` is empty, this works. But if old definitions are NEVER migrated, the old heuristic transitive closure in `resolve_joins` (which uses `on_lower.contains(&other_lower)` for substring matching) must be kept forever.
+The confusion between `join.table` (which currently holds the TARGET ALIAS, not the physical table) and actual physical table names is a naming inconsistency in the model. For role-playing dims, `join.table` must hold the alias (e.g., `d_created`), and a SEPARATE field must hold the physical table (e.g., `dates`).
 
 **Why it happens:**
-The old `resolve_joins` function has TWO responsibilities: (1) determine which joins are needed (from `source_table` fields), and (2) resolve transitive dependencies via ON-clause substring matching. For PK/FK joins, responsibility #2 changes (transitive deps are resolved via the FK graph), but responsibility #1 stays the same.
-
-If you remove the substring-matching transitive closure and replace it with graph-based resolution, old definitions with only `on` strings and no `join_columns` will lose transitive dependency resolution entirely.
+In v0.5.2, `join.table` was overloaded to mean "the alias of the target table in the graph." This worked because there was a 1:1 mapping between aliases and physical tables. Role-playing dims break this assumption.
 
 **Consequences:**
-- Old definitions that relied on transitive join resolution silently stop including needed tables
-- Queries return wrong results (missing joins = missing data or cartesian products) with no error
+- Only one instance of the dates table is joined (the first one found)
+- Dimensions from other date roles reference the wrong join or fail with "unknown source table"
+- If by chance DuckDB finds the column in the wrong dates instance, results are silently wrong
 
 **Prevention:**
-- Keep BOTH resolution strategies in `resolve_joins`, selected by the presence of `join_columns`:
-  - If ALL joins have `join_columns` non-empty: use graph-based FK resolution
-  - If ANY join has only `on` string: use the old substring-matching transitive closure
-  - Do NOT mix strategies within a single definition
-- Add a define-time validation: if the definition uses the new SQL keyword syntax (which produces `join_columns`), require ALL joins to have `join_columns`. If using the old function-call syntax, all joins use `on` strings.
-- The `append_join_on_clause` function already handles both formats (lines 303-333 of `expand.rs`). The resolution strategy selection is the new piece.
-- **Confidence:** HIGH. The serde backward compat is already tested. The resolution strategy split is the gap.
+- The `Join` struct already has `from_alias` (FK source alias) and `table` (FK target alias). For role-playing dims, this is sufficient IF `table` truly holds the alias and the physical table is resolved from `def.tables`.
+- Review ALL code that reads `join.table` and verify it expects an alias, not a physical table name. The resolve + synthesize + expand pipeline must consistently use aliases.
+- Add explicit role-playing dimension tests: three FKs from orders to dates via different aliases, query each dimension independently and together, verify correct results.
+- Consider renaming `Join.table` to `Join.to_alias` for clarity. The physical table is always resolved via `def.tables.iter().find(|t| t.alias == join.to_alias).map(|t| t.table)`.
+- **Confidence:** HIGH. The model supports this, but the naming confusion between `table` and `alias` across the codebase is the risk. A systematic audit of all `join.table` references is required.
 
-**Phase assignment:** Expansion engine phase. Must be decided before `resolve_joins` is modified.
+**Detection:** Define a view with two FKs to the same physical table (dates), query dimensions from each role, verify they return different values. Test: `d_created.month` should show order creation months, `d_shipped.month` should show shipment months.
+
+**Phase assignment:** Role-playing dimensions phase. Must audit all `join.table` usages before implementation.
 
 ---
 
 ## Moderate Pitfalls
 
-### M1: SQL Keyword Parser Must Handle Nested Parentheses in Expressions
+### M1: FACTS Clause Introduces a New Namespace That Collides With Dimensions and Metrics
 
 **What goes wrong:**
-The new SQL DDL syntax uses keyword clauses:
+The FACTS clause defines named row-level sub-expressions (e.g., `unit_price AS (o.amount / o.quantity)`). These are pre-aggregation expressions that metrics can reference. The `Fact` struct already exists in `model.rs` with `name`, `expr`, `source_table`.
+
+The problem: fact names, dimension names, and metric names share the same user-facing namespace. If a user defines `revenue` as both a fact and a metric, which one wins? The current expansion engine resolves dimensions and metrics by name via `find_dimension()` and `find_metric()`. Facts need a THIRD lookup, and name collisions must be handled.
+
+Snowflake handles this by requiring table-qualified names for facts and metrics: `orders.revenue` (fact) vs `revenue` (derived metric). But within a single table scope, names must still be unique.
+
+**Why it happens:**
+The `Fact` struct was added in Phase 11 but never wired into the body parser or expansion engine. It sits dormant in the model. When activated, it introduces a new name resolution layer.
+
+**Consequences:**
+- Ambiguous name resolution: `SUM(revenue)` in a metric expression -- is `revenue` a column, a fact, or another metric?
+- If facts shadow column names, the user cannot reference the original column
+- If facts and metrics can share names, substitution order determines behavior (fragile)
+
+**Prevention:**
+- Enforce namespace uniqueness at define time: no fact may share a name with a dimension or metric in the same view. Error: "Name 'revenue' is already defined as a metric. Fact names must be unique across facts, dimensions, and metrics."
+- In metric expressions, facts are referenced by name and expanded BEFORE the metric expression is evaluated. Expansion order: (1) substitute fact references in metric expressions, (2) expand metric expressions into SQL.
+- Facts do NOT appear in query results. They are internal computation helpers. The user never requests `facts := [...]` in the query function.
+- **Confidence:** HIGH. Namespace collision is a standard parsing problem. The uniqueness check is simple.
+
+**Phase assignment:** FACTS clause phase. Uniqueness validation at define time.
+
+---
+
+### M2: Semi-Additive Metrics (NON ADDITIVE BY) Require Fundamentally Different SQL Expansion
+
+**What goes wrong:**
+A semi-additive metric like `account_balance NON ADDITIVE BY (date_dim)` means: "SUM this metric across all dimensions EXCEPT date; for date, take only the latest value." The current expansion engine generates a single `SELECT ... GROUP BY` query. Semi-additive metrics require a two-stage query:
+
+1. For each combination of additive dimensions, find the latest value of the non-additive dimension
+2. Then aggregate the metric using those latest values
+
+The SQL pattern (Snowflake's approach):
 ```sql
-CREATE SEMANTIC VIEW sales
-TABLES (
-    o AS orders PRIMARY KEY (order_id),
-    c AS customers PRIMARY KEY (customer_id)
+-- Stage 1: Find latest date per group
+WITH latest AS (
+    SELECT customer_id, MAX(date_id) AS latest_date
+    FROM balances
+    GROUP BY customer_id
 )
-DIMENSIONS (
-    region AS (c.region),
-    order_year AS (date_trunc('year', o.order_date))
-)
+-- Stage 2: Aggregate using only latest values
+SELECT b.customer_id, SUM(b.balance) AS total_balance
+FROM balances b
+JOIN latest l ON b.customer_id = l.customer_id AND b.date_id = l.latest_date
+GROUP BY 1
 ```
 
-Parsing this requires finding the boundaries of each clause. The naive approach (find `DIMENSIONS (` and match its closing `)`) breaks because expressions inside contain nested parentheses: `date_trunc('year', o.order_date)` has its own parentheses.
-
-The existing `scan_clause_keywords` and `validate_brackets` functions already handle bracket depth tracking and string literal escaping. But they scan for CLAUSE KEYWORDS, not for the BOUNDARIES of clause contents.
-
-**Prevention:**
-- Build the keyword parser on top of the existing bracket-tracking infrastructure in `parse.rs` (`validate_brackets`, `scan_clause_keywords`).
-- Parse clause boundaries by: (1) find keyword, (2) find the opening paren after the keyword, (3) track bracket depth until the matching close paren at depth 0.
-- Handle edge cases: string literals containing parentheses (`'hello (world)'`), nested function calls (`COALESCE(a, NULLIF(b, 0))`), array literals (`[1, 2, 3]`), struct literals (`{'key': 'value'}`).
-- The bracket validator already handles `()`, `[]`, `{}` nesting and single-quoted strings. Reuse it.
-- **Confidence:** HIGH. The infrastructure exists. The gap is using it for clause boundary detection rather than validation.
-
-**Phase assignment:** Parser implementation phase.
-
----
-
-### M2: PK/FK Validation Must Reject Self-References and Cycles
-
-**What goes wrong:**
-The PK/FK model creates a directed graph: each RELATIONSHIP declares `table_A (fk_col) REFERENCES table_B`. If a user accidentally creates a cycle (`A -> B -> C -> A`) or a self-reference (`A -> A`), the join resolution algorithm enters an infinite loop or produces nonsensical SQL.
-
-Snowflake explicitly prohibits both: "You cannot define circular relationships, even through transitive paths" and "currently, a table cannot reference itself."
+The current `expand()` function generates a single flat query. Adding a CTE or subquery for the "find latest" step requires structural changes to the expansion engine. This is NOT a matter of changing the metric expression -- it changes the query SHAPE.
 
 **Why it happens:**
-The define-time validation in the current system does not inspect the join graph topology. Joins are stored as a flat list and resolved at query time. With PK/FK, the graph must be validated at define time.
+The expansion engine treats all metrics uniformly: each metric is an aggregate expression in the SELECT list. Semi-additive metrics break this uniformity because they require row filtering (keep only latest per group) BEFORE aggregation.
 
 **Consequences:**
-- Cycles: infinite loop in transitive dependency resolution (the fixed-point loop in `resolve_joins` never converges)
-- Self-references: the join tries to join a table to itself without distinguishing the two instances, producing nonsensical results or DuckDB errors
+- If implemented as a simple aggregate expression, SUM(balance) sums ALL rows across ALL dates, producing wrong totals
+- The wrong result is typically much larger than the correct one (proportional to the number of time periods)
+- Users of balance/inventory/snapshot metrics get grossly inflated numbers
 
 **Prevention:**
-- At define time, build the FK directed graph and run cycle detection (DFS with a visited set).
-- Reject self-referencing relationships with a clear error: "Table 'employees' cannot reference itself. Self-joins require explicit aliases."
-- Reject cycles with: "Circular relationship detected: orders -> customers -> orders. Remove one relationship to break the cycle."
-- This validation runs in the `create_semantic_view` bind function, before persisting the definition.
-- **Confidence:** HIGH. Standard graph validation. DFS cycle detection is O(V+E) on a small graph.
+- Detect semi-additive metrics at expansion time. If the query includes dimensions that are listed in `NON ADDITIVE BY`, the metric is being aggregated across those dimensions -- the non-additive behavior applies.
+- If the query does NOT include the non-additive dimension, no special handling is needed (the metric is being aggregated across its non-additive dimension, which means "take latest" is exactly what the user wants).
+- Generate a two-stage SQL expansion:
+  - Inner: filter to latest value per group using `ROW_NUMBER() OVER (PARTITION BY [additive_dims] ORDER BY [non_additive_dim] DESC) = 1` or a MAX subquery
+  - Outer: aggregate normally
+- The `ROW_NUMBER` approach is simpler and handles ties deterministically (unlike MAX which may match multiple rows).
+- **Confidence:** MEDIUM. The SQL pattern is well-understood, but integrating it into the existing expansion engine requires architectural changes. The expansion engine currently outputs a single SQL string; semi-additive metrics need conditional query shape changes.
 
-**Phase assignment:** Define-time validation phase, alongside C2 (diamond detection).
+**Detection:** Define a balance metric with `NON ADDITIVE BY (date_dim)`. Query with and without `date_dim` in dimensions. Compare SUM results against hand-computed correct values. Test: with date_dim, SUM should be total of all date's balances; without date_dim, SUM should be total of only the latest date's balances per group.
+
+**Phase assignment:** Semi-additive metrics phase. Must modify the expansion engine to support conditional query shapes.
 
 ---
 
-### M3: Dual DDL Interface Desynchronization During Transition
+### M3: Hierarchies Are Metadata-Only Until a Drill-Down Query API Exists
 
 **What goes wrong:**
-The extension maintains two DDL interfaces: function-based (`create_semantic_view('name', ...)`) and native SQL (`CREATE SEMANTIC VIEW name (...)`). Both must produce identical JSON definitions in the catalog. During the v0.5.2 transition, the function-based path continues to accept `:=` syntax with raw struct/list literals, while the new SQL keyword path parses keyword clauses and translates them to JSON.
+Hierarchies define drill-down paths (e.g., `country -> region -> city`). They express a logical ordering of dimensions from coarse to fine. The current query API is `semantic_view('view', dimensions := [...], metrics := [...])` -- the user explicitly lists which dimensions to include. Hierarchies do not change query behavior; they only provide metadata about which dimensions relate to each other.
 
-If the translation logic has subtle differences (e.g., different handling of whitespace in expressions, different quoting of identifiers, different default values for optional fields), the same semantic view defined via two paths will produce different JSON, leading to different query behavior.
+The pitfall is over-engineering: building hierarchy-aware expansion logic when the only consumer is metadata display (`DESCRIBE SEMANTIC VIEW`). If hierarchies influence query behavior (e.g., automatically rolling up to the next level, or validating that drill-down paths are followed in order), the expansion engine becomes significantly more complex with no user-visible benefit until BI tools consume the hierarchy metadata.
 
 **Why it happens:**
-The two paths share the CATALOG and EXPANSION code but have different PARSING code. The function-based path receives pre-parsed DuckDB types (STRUCTs and LISTs from DuckDB's expression evaluator), while the SQL keyword path receives raw text that must be parsed by the extension.
+Hierarchies are a table-stakes feature in BI tools (Power BI, Tableau, Looker). The temptation is to build rich hierarchy support (level-based rollup, automatic aggregation at each level, parent-child hierarchy detection). But this extension is a SQL preprocessor, not a BI tool. The query interface is explicit: the user lists dimensions.
 
 **Consequences:**
-- A view created via SQL keywords produces different results than the same view created via function calls
-- Users report "the same definition gives different results" depending on how it was created
-- Debugging is extremely difficult because the difference is in the JSON, not in the SQL
+- Over-engineering: weeks of work on hierarchy-aware expansion that no query consumer uses
+- Complexity in the expansion engine that makes future changes harder
+- The hierarchy metadata could have shipped in a day as a define-time validation + DESCRIBE output
 
 **Prevention:**
-- Both paths MUST produce the same `SemanticViewDefinition` JSON. Add property-based tests:
-  - Generate a random valid definition
-  - Serialize it through the function-call path -> JSON
-  - Serialize it through the keyword path -> JSON
-  - Assert the JSON is identical (or semantically equivalent after normalization)
-- The SQL keyword parser's output should be a `SemanticViewDefinition` struct, not raw JSON. This forces the same model through both paths.
-- Add round-trip sqllogictests: create a view via keywords, describe it, create another view via functions with the same parameters, describe it, assert both descriptions match.
-- **Confidence:** HIGH. The risk is real but the mitigation (shared model struct) is architecturally sound and already in place.
+- Implement hierarchies as **metadata only** in v0.5.3:
+  - New `Hierarchy` struct: `name: String, levels: Vec<String>` (each level is a dimension name)
+  - Define-time validation: all levels must be valid dimension names in the same view
+  - DESCRIBE output: show hierarchy levels
+  - No query-time behavior change
+- Defer hierarchy-aware query behavior to a future milestone when BI tool integration provides a consumer.
+- **Confidence:** HIGH. Every semantic layer (Snowflake, dbt, Cube) treats hierarchies as metadata. None of them change query SQL based on hierarchy declarations.
 
-**Phase assignment:** Testing phase. Add cross-path equivalence tests after both parsers are implemented.
+**Detection:** If the expansion engine is being modified for hierarchy support, the scope has crept. Test: hierarchies should not appear in expanded SQL.
+
+**Phase assignment:** Hierarchies phase. Metadata-only implementation.
 
 ---
 
-### M4: Fan Trap -- Metrics Silently Double-Count Across One-to-Many Joins
+### M4: USING RELATIONSHIPS Requires a New Query API Parameter
 
 **What goes wrong:**
-When a metric (e.g., `SUM(amount)`) is defined on a table that is joined to another table via a one-to-many relationship, the join duplicates rows from the "one" side. The SUM then counts each row multiple times.
+The `USING RELATIONSHIPS` feature allows a metric or dimension to specify which join path to use when multiple paths exist. This disambiguation must flow from the metric/dimension definition through to the query expansion. But the current query function signature is:
 
-Example: `orders` (1) -> `line_items` (many). A metric `total_orders = COUNT(*)` on `orders` joined with a dimension from `line_items` will count each order N times (once per line item), inflating the count.
+```sql
+semantic_view('view', dimensions := [...], metrics := [...])
+```
 
-Cube.dev solves this by requiring `primary_key` declarations and generating deduplication subqueries. MetricFlow restricts fan-out joins based on entity types.
+Two scenarios need different handling:
+
+1. **Definition-time USING RELATIONSHIPS:** The metric definition specifies the path:
+   ```sql
+   METRICS (
+       customer_orders NON ADDITIVE BY (date_dim)
+           USING RELATIONSHIPS (order_to_customer)
+           AS COUNT(*)
+   )
+   ```
+   This is stored in the metric's definition and used automatically at expansion time. No query API change needed.
+
+2. **Query-time path override:** The user wants to specify a different path at query time (like Cube.dev's `joinHints`). This requires a new query parameter:
+   ```sql
+   semantic_view('view', dimensions := [...], metrics := [...],
+                 using_relationships := ['path_a', 'path_b'])
+   ```
+
+If the feature is designed with only definition-time paths but users need query-time overrides, the API must be extended later -- which is a breaking change if the parameter name or semantics conflict.
+
+**Prevention:**
+- For v0.5.3, implement definition-time `USING RELATIONSHIPS` only. Store the relationship path on the `Metric` and `Dimension` structs.
+- Design the struct field to be forward-compatible with query-time overrides: `using_relationships: Option<Vec<String>>` on `Metric`/`Dimension`.
+- Document that query-time path overrides are deferred. Do NOT add a query-time parameter in v0.5.3.
+- **Confidence:** HIGH. Snowflake's approach is definition-time only. Cube.dev's joinHints are a complexity that this extension should not need in v0.5.3.
+
+**Phase assignment:** Multiple join paths phase.
+
+---
+
+### M5: body_parser.rs Clause Ordering Must Be Extended Without Breaking Existing DDL
+
+**What goes wrong:**
+The current `CLAUSE_ORDER` in `body_parser.rs` is:
+```rust
+const CLAUSE_ORDER: &[&str] = &["tables", "relationships", "dimensions", "metrics"];
+```
+
+Adding `FACTS` requires inserting it into this ordering. Snowflake places FACTS before DIMENSIONS. The natural order is:
+```
+TABLES -> RELATIONSHIPS -> FACTS -> DIMENSIONS -> METRICS
+```
+
+But existing DDL that omits FACTS (which is optional) must continue to parse. The `find_clause_bounds()` function validates order by checking that each keyword's index in `CLAUSE_ORDER` is greater than the previous keyword's index. If FACTS is inserted at position 2, existing DDL with `TABLES -> DIMENSIONS -> METRICS` still works (indices 0, 3, 4 after insertion -- still increasing).
+
+The risk: if the ordering validation is implemented incorrectly (e.g., as a strict sequence rather than a subsequence check), adding FACTS breaks all existing DDL that skips it.
 
 **Why it happens:**
-The current expansion engine does a simple `JOIN` and then `GROUP BY` in the outer query. It does not detect or prevent fan-out.
+The current validation checks that keywords appear in the correct relative order. This is a subsequence check, not a strict sequence check. But extending `CLAUSE_KEYWORDS` and `CLAUSE_ORDER` with new entries is error-prone if the validation logic is not clearly documented.
 
 **Consequences:**
-- Metrics return inflated values with no error or warning
-- Users may not notice until comparing results against a known baseline
-- This is a fundamental correctness issue that cannot be fixed with post-processing
+- All existing `CREATE SEMANTIC VIEW` statements fail with "unexpected clause keyword" errors
+- Stored definitions cannot be recreated from their DDL
+- Regression in basic functionality
 
 **Prevention:**
-- **For v0.5.2:** Document the constraint: "Metrics and dimensions in the same query should reference the same table or tables joined via many-to-one relationships. Joining a metric's table to a dimension's table via one-to-many will inflate metric values."
-- **For v0.5.2:** At define time, if PK/FK is declared, record the relationship cardinality (one-to-many vs many-to-one based on which side has the PK). At query time, warn if a metric's source table is on the "one" side of a one-to-many join that was triggered by a dimension on the "many" side.
-- **For future:** Implement Cube-style deduplication: pre-aggregate the metric in a subquery keyed by the PK, then join the pre-aggregated result to the dimension table. This eliminates fan-out but adds complexity.
-- **Confidence:** MEDIUM. The problem is well-documented in the literature. The prevention for v0.5.2 is documentation + optional warning, not a full solution. A full solution requires metric-aware expansion.
+- Add FACTS, HIERARCHIES, and any other new clause keywords to `CLAUSE_KEYWORDS` and `CLAUSE_ORDER` in the correct position.
+- Verify that the ordering validation is a SUBSEQUENCE check (current keywords must appear in order, but gaps are allowed).
+- Add backward compatibility tests: create a view with `TABLES -> DIMENSIONS -> METRICS` (no FACTS, no RELATIONSHIPS), assert it still parses correctly after adding new keywords.
+- Add tests for every valid keyword ordering combination with optional clauses omitted.
+- **Confidence:** HIGH. The current validation logic is a subsequence check (line 239 of body_parser.rs uses `CLAUSE_ORDER.iter().position()` comparison). Adding new entries is safe IF the position is correct.
 
-**Phase assignment:** Documentation for v0.5.2. Full deduplication deferred to a future milestone.
+**Detection:** Existing sqllogictest DDL tests fail after adding new keywords. Test: run `just test-sql` after modifying `CLAUSE_KEYWORDS`.
+
+**Phase assignment:** First phase of any new clause addition. Must be the earliest parser change.
 
 ---
 
-### M5: Role-Playing Dimensions -- Same Table Joined Multiple Times With Different Meaning
+### M6: Derived Metrics Cannot Use the Same GROUP BY Strategy as Regular Metrics
 
 **What goes wrong:**
-A common data model pattern: an `orders` table has `created_date`, `shipped_date`, and `delivered_date`, all referencing a `dates` dimension table. The PK/FK model declares three relationships from `orders` to `dates`, each via a different FK column.
+Regular metrics are aggregate expressions (`SUM(amount)`, `COUNT(*)`). They appear directly in the SELECT list and the GROUP BY handles row grouping. Derived metrics combine other metrics: `profit = revenue - cost` where `revenue = SUM(amount)` and `cost = SUM(cost_amount)`.
 
-The current join model uses `join.table` as the key for join identity. Two joins to the same table (`dates`) are indistinguishable -- the second one overwrites the first in the `needed` set. Holistics calls this "role-playing dimensions" and flags it as a case where automatic path resolution fails.
+If the derived metric expression is naively expanded to `SUM(amount) - SUM(cost_amount)`, this works for simple arithmetic. But if a derived metric uses non-aggregated references (e.g., `margin = revenue / total_revenue` where `total_revenue` is a window function), the expansion must handle:
+- Mixing aggregate and window functions in the same SELECT
+- Ensuring the GROUP BY applies to the base aggregates but not to the window function
+- DuckDB's SQL semantics: you cannot reference an alias defined in the same SELECT list
+
+The current expansion generates ordinal GROUP BY (`GROUP BY 1, 2, ...`). This works for flat aggregates. Derived metrics that reference aliases from the same SELECT list require a subquery or CTE wrapping.
 
 **Why it happens:**
-The `Join` struct uses `table: String` as its primary identifier. The `resolve_joins` function deduplicates by `table_lower` in a `HashSet`. Two joins to the same table are treated as one.
+The expansion engine is designed for a flat SELECT/GROUP BY pattern. Derived metrics introduce expression dependencies within the SELECT list.
 
 **Consequences:**
-- Only one instance of the joined table is included in the SQL
-- Dimensions from other instances silently reference the wrong join, producing wrong results
-- No error is raised because the table name IS found in the join list
+- DuckDB error: "column X must appear in the GROUP BY clause or be used in an aggregate function"
+- Or: DuckDB error: "column alias X cannot be referenced in the same SELECT list"
+- The error comes from DuckDB, not from the extension, so the message is confusing
 
 **Prevention:**
-- Use the RELATIONSHIP NAME (or join alias) as the join identifier, not the table name. Snowflake's syntax requires naming each relationship: `orders_to_customers AS orders (o_custkey) REFERENCES customers`.
-- The current `TableRef` struct has `alias` and `table` fields. Extend `Join` (or its replacement) to include a `relationship_name` or `alias` field that distinguishes multiple joins to the same physical table.
-- At expansion time, use the relationship alias to emit `AS` clauses: `JOIN dates AS "created_dates" ON ...`, `JOIN dates AS "shipped_dates" ON ...`.
-- This requires `source_table` on dimensions/metrics to reference the RELATIONSHIP alias, not the physical table name.
-- **Confidence:** HIGH. Role-playing dimensions are a well-known pattern. The fix is aliasing, which the model already partially supports via `TableRef.alias`.
+- For v0.5.3, restrict derived metrics to arithmetic combinations of other metric expressions. The expansion substitutes the underlying aggregate expressions inline:
+  - `profit = revenue - cost` expands to `SUM(amount) - SUM(cost_amount) AS "profit"`
+  - This works because DuckDB evaluates `SUM(amount) - SUM(cost_amount)` as two aggregates with arithmetic
+- Reject derived metrics that reference non-aggregate expressions or use window functions. These require a two-pass expansion (inner query with GROUP BY, outer query with derived calculations).
+- Add define-time validation: a derived metric's resolved expression (after substituting all referenced metrics) must be a valid aggregate expression. If it contains non-aggregated column references, reject at define time.
+- **Confidence:** MEDIUM. Simple derived metrics (arithmetic on aggregates) work with inline substitution. Complex derived metrics (window functions, conditional aggregation) require architectural changes.
 
-**Phase assignment:** Model design phase. Must be addressed in the PK/FK model before implementation.
+**Detection:** Define `profit = revenue - cost`, expand, verify DuckDB accepts the SQL. Define `margin = revenue / SUM(revenue) OVER ()`, expect define-time rejection. Test both cases.
 
----
-
-### M6: LIMIT 0 Type Inference Breaks When Expansion Strategy Changes
-
-**What goes wrong:**
-The current define-time type inference runs `LIMIT 0` against the expanded SQL to discover column types. The expanded SQL uses the CTE structure (`WITH "_base" AS (...) SELECT ... FROM "_base" GROUP BY ...`). If the expansion strategy changes (C3: dropping CTE for direct FROM/JOIN), the SQL shape changes, and DuckDB may infer different types for the same expressions.
-
-Specific risks:
-- CTE wrapping can affect DuckDB's type coercion (e.g., integer promotion inside vs outside CTEs)
-- The `build_execution_sql` function wraps the expansion in a subquery and adds casts -- changing the inner SQL may invalidate the wrapper
-- Edge case: expressions that reference CTE aliases (e.g., `_base.column`) will fail after CTE removal
-
-**Prevention:**
-- Run type inference AFTER the expansion strategy is finalized. Do not mix old-style expansion with new-style type inference.
-- The `build_execution_sql` wrapping is independent of CTE structure -- it wraps the entire SQL. Verify this is still true after expansion changes.
-- Add sqllogictests that create views with all supported column types and verify query results after the expansion change.
-- **Confidence:** MEDIUM. Type inference is robust (VARCHAR fallback on any failure), but behavioral differences between CTE and non-CTE SQL in DuckDB are not well-documented.
-
-**Phase assignment:** Expansion engine phase, after C3 is resolved.
+**Phase assignment:** Derived metrics phase. Restrict to arithmetic-on-aggregates for v0.5.3.
 
 ---
 
 ## Minor Pitfalls
 
-### m1: SQL Keyword Parsing of Expressions Is Not Full SQL Parsing
+### m1: FACTS Expressions Must Be Expanded BEFORE Metric Expressions
 
 **What goes wrong:**
-The SQL keyword syntax includes expressions:
-```sql
-DIMENSIONS (
-    region AS (c.region),
-    year AS (date_trunc('year', o.order_date))
-)
-```
+Facts are named row-level sub-expressions: `unit_price AS (o.amount / o.quantity)`. A metric references a fact: `avg_unit_price AS AVG(unit_price)`. The expansion must substitute `unit_price` with `o.amount / o.quantity` BEFORE generating the metric SQL.
 
-The extension must extract the expression text (e.g., `c.region`, `date_trunc('year', o.order_date)`) from within the `DIMENSIONS (...)` clause. This is NOT full SQL parsing -- it is bracket-matching to find expression boundaries. But expressions can contain:
-- Commas inside function arguments: `COALESCE(a, b)` -- the comma is NOT an expression separator
-- Nested parentheses: `CAST(x AS DATE)`
-- String literals with special characters: `CASE WHEN status = 'it''s done' THEN 1 END`
-- `AS` keyword inside expressions: `CAST(x AS VARCHAR)` -- the `AS` is NOT the alias separator
+If the expansion order is wrong (metrics expanded before facts), the generated SQL contains `AVG(unit_price)` where `unit_price` is not a column -- DuckDB errors with "column unit_price does not exist."
 
 **Prevention:**
-- Use the same bracket-depth + string-literal tracking from `validate_brackets` to find expression boundaries.
-- Expression separators (commas) are only valid at depth 0 (outside all brackets).
-- The `AS` keyword is only an alias separator at depth 0, outside string literals.
-- Consider requiring expressions to be wrapped in parentheses: `region AS (c.region)`. This makes boundary detection unambiguous -- the expression is everything between the matched parens.
-- **Confidence:** HIGH. Bracket-depth parsing is already implemented. The edge cases are known.
+- Expansion order: (1) resolve facts by name in metric expressions, (2) expand metrics with substituted expressions, (3) generate SQL.
+- Facts are purely syntactic substitutions -- they do not change the query structure. Treat them like macros.
+- Use a simple string replacement or, better, an expression tree substitution that respects identifier boundaries (don't replace `unit_price` inside `unit_price_adjusted`).
+- **Confidence:** HIGH. Textual substitution is straightforward. Boundary-aware substitution prevents false positives.
 
-**Phase assignment:** Parser implementation phase.
+**Phase assignment:** FACTS clause phase.
 
 ---
 
-### m2: `tables` Field Empty for Legacy Definitions Breaks Qualified Column Resolution
+### m2: Hierarchy Levels Must Reference Existing Dimensions
 
 **What goes wrong:**
-Legacy definitions (created before v0.5.2) have `tables: []` in their JSON (serde default). If the qualified column resolution code (`find_dimension`, `find_metric`) assumes `tables` is non-empty and uses it for alias lookup, legacy definitions will fail to resolve ANY qualified column lookups -- the alias map is empty.
-
-Currently, `find_dimension` and `find_metric` already handle this: they try qualified lookup (alias match) first, then fall back to bare name. But if the qualified column support adds new code paths that bypass this fallback, legacy definitions break.
+A hierarchy `geo_hierarchy` defines levels `[country, region, city]`. If `city` is not defined as a dimension in the view, the hierarchy is invalid. But if validation only checks at define time and the user later removes `city` (via `CREATE OR REPLACE`), the hierarchy becomes dangling.
 
 **Prevention:**
-- All new code that accesses `def.tables` must handle the empty case.
-- Add a test: create a legacy definition (no `tables` field), query it with an unqualified dimension name, assert it works.
-- Consider: when `tables` is empty, populate it automatically from `base_table` and `joins[].table` with default aliases = table name. This normalization at load time eliminates the empty-tables edge case from all downstream code.
-- **Confidence:** HIGH. The existing code handles this. The risk is in NEW code that assumes `tables` is populated.
+- Validate hierarchy levels against dimension names at define time.
+- Since the extension uses `CREATE OR REPLACE` (not ALTER), every definition is complete -- there is no "remove a dimension while keeping the hierarchy." The hierarchy levels are validated against the same definition's dimensions.
+- **Confidence:** HIGH. Simple cross-reference validation.
 
-**Phase assignment:** Model migration phase.
+**Phase assignment:** Hierarchies phase.
 
 ---
 
-### m3: Semicolon Handling in Multi-Statement DDL
+### m3: NON ADDITIVE BY Dimension Names Must Match Dimension Definitions
 
 **What goes wrong:**
-DuckDB's parser extension splits multi-statement input on `;` before passing individual statements to the fallback parser. The current `rewrite_ddl` trims trailing semicolons. But if a SQL DDL body contains semicolons inside string literals (e.g., a filter expression `status != 'a;b'`), DuckDB may split the statement at the wrong place, sending a truncated statement to the parser hook.
-
-This is documented in the v0.5.0 PITFALLS as an existing known issue (citing DuckDB issue #18485). The new keyword syntax does not change this risk, but it does introduce more complex bodies where semicolons in string literals are more likely.
+`NON ADDITIVE BY (date_dim)` references a dimension by name. If `date_dim` is misspelled or does not exist in the view, the semi-additive behavior silently does not apply -- the metric is treated as fully additive, producing wrong results.
 
 **Prevention:**
-- The extension cannot control DuckDB's statement splitting. This is a DuckDB-level limitation.
-- Document: "Avoid semicolons in string literals within DDL bodies. If needed, use the function-based DDL interface."
-- This is a pre-existing issue, not new to v0.5.2.
-- **Confidence:** HIGH. Well-known DuckDB parser extension limitation.
+- Validate that every dimension name in `NON ADDITIVE BY` exists as a defined dimension in the same view. Error at define time: "NON ADDITIVE BY references unknown dimension 'date_dim'. Available: [order_date, ship_date]."
+- Use the existing `suggest_closest()` fuzzy matching for "did you mean?" suggestions.
+- **Confidence:** HIGH. Name validation with fuzzy suggestions is an existing pattern in the codebase.
 
-**Phase assignment:** Documentation only.
+**Phase assignment:** Semi-additive metrics phase.
 
 ---
 
-### m4: Keyword Name Collision Between TABLES Clause and DuckDB Keywords
+### m4: Relationship Names Must Be Unique and Explicitly Declared for USING RELATIONSHIPS
 
 **What goes wrong:**
-The SQL keyword syntax introduces `TABLES`, `DIMENSIONS`, `METRICS`, `RELATIONSHIPS`, `FACTS` as clause keywords. If a user chooses a view name or table alias that matches these keywords (e.g., `CREATE SEMANTIC VIEW tables TABLES (...)`), the parser may misidentify the view name as a clause keyword.
+`USING RELATIONSHIPS (order_to_customer)` references a relationship by name. The current `Join.name` field is `Option<String>` -- it is optional. If some relationships are unnamed, `USING RELATIONSHIPS` cannot reference them, and the user gets a confusing error.
 
 **Prevention:**
-- Parse view name FIRST (immediately after `CREATE SEMANTIC VIEW`), then parse clause keywords from the remainder.
-- The view name position is fixed: always immediately after the DDL prefix, before any clause keyword.
-- If the view name matches a clause keyword, it is still the view name -- clause keywords are only valid at the top level of the body, not in the name position.
-- Add tests for view names that match clause keywords: `CREATE SEMANTIC VIEW tables TABLES (...)`.
-- **Confidence:** HIGH. Positional parsing eliminates ambiguity.
+- If the view has diamonds (multiple paths), require ALL relationships to be named. Error at define time: "Relationship from 'o' to 'c' must have a name because the graph has multiple paths. Use: `rel_name AS o(fk_col) REFERENCES c`."
+- If the view has no diamonds, relationship names remain optional (backward compatible).
+- **Confidence:** HIGH. The `Join.name` field already exists. The validation is a conditional check.
 
-**Phase assignment:** Parser implementation phase.
+**Phase assignment:** Multiple join paths phase.
+
+---
+
+### m5: Serde Backward Compatibility for New Model Fields
+
+**What goes wrong:**
+Adding new fields to `Metric` (e.g., `using_relationships: Option<Vec<String>>`, `non_additive_by: Option<Vec<String>>`) or to `SemanticViewDefinition` (e.g., `hierarchies: Vec<Hierarchy>`) changes the JSON schema stored in `semantic_layer._definitions`. Old stored definitions without these fields must still deserialize correctly.
+
+**Prevention:**
+- All new fields must have `#[serde(default)]` and `#[serde(skip_serializing_if = "...")]` attributes, matching the existing pattern used for `facts`, `tables`, `pk_columns`, etc.
+- Add explicit backward compat tests: deserialize old JSON (without new fields) and verify defaults.
+- The existing `unknown_fields_are_allowed` test confirms that `deny_unknown_fields` is NOT set -- this is critical for forward compatibility (old code loading new JSON).
+- **Confidence:** HIGH. This is an established pattern in the codebase with existing tests.
+
+**Phase assignment:** Every phase that modifies the model.
 
 ---
 
@@ -417,43 +475,41 @@ The SQL keyword syntax introduces `TABLES`, `DIMENSIONS`, `METRICS`, `RELATIONSH
 
 | Phase Topic | Likely Pitfall | Mitigation |
 |-------------|---------------|------------|
-| SQL keyword parser | C1 (backward compat break), M1 (nested parens), m1 (expression parsing), m4 (keyword collisions) | Build syntax discriminator first; reuse bracket-depth tracking; positional parsing |
-| PK/FK model and validation | C2 (diamond joins), M2 (cycles/self-ref), M5 (role-playing dims) | Tree validation at define time; relationship aliases; reject diamonds/cycles |
-| Expansion engine changes | C3 (CTE breaks qualified cols), C4 (old ON-clause format), M6 (type inference shape) | Drop CTE for direct FROM/JOIN; keep dual resolution strategy; re-test type inference |
-| Dual interface maintenance | M3 (desynchronization) | Shared model struct; cross-path equivalence tests; property-based tests |
-| Fan-out prevention | M4 (silent double-counting) | Document constraint; optional warning; defer deduplication to future |
-| Legacy compatibility | m2 (empty tables field), C4 (old join format) | Handle empty tables; keep substring-matching for old definitions |
+| FACTS clause | M1 (namespace collision), m1 (expansion order) | Enforce unique names across facts/dims/metrics; substitute facts before metrics |
+| Derived metrics | C1 (circular deps), M6 (GROUP BY strategy) | Metric dependency DAG with cycle detection; restrict to arithmetic-on-aggregates |
+| Hierarchies | M3 (over-engineering), m2 (dangling levels) | Metadata-only implementation; validate levels against dimensions |
+| Fan trap detection | C2 (silent wrong results) | Record cardinality; detect and warn at query time |
+| Role-playing dimensions | C4 (alias vs table confusion) | Audit all `join.table` usages; add role-playing tests |
+| Semi-additive metrics | M2 (different SQL shape), m3 (dimension name validation) | Two-stage expansion with ROW_NUMBER; validate NON ADDITIVE BY names |
+| Multiple join paths | C3 (tree invariant), M4 (query API), m4 (relationship names) | Conditional diamond validation; definition-time paths only; require names when ambiguous |
+| All model changes | m5 (serde compat) | `#[serde(default)]` on all new fields; backward compat tests |
 
 ---
 
-## Research Notes
+## Sources
 
-**Confidence Assessment:**
-
-| Area | Confidence | Basis |
-|------|------------|-------|
-| Backward compat (C1) | HIGH | Direct code review of `rewrite_ddl`, `scan_clause_keywords`, TECH-DEBT.md item #8 |
-| Diamond join problem (C2) | HIGH | Cube.dev docs, Snowflake validation rules, Holistics path ambiguity docs, dbt MetricFlow join logic |
-| CTE vs qualified columns (C3) | HIGH | Direct analysis of `expand()` code, TECH-DEBT.md item #7 |
-| Stored definition compat (C4) | HIGH | Code review of serde defaults in model.rs, existing backward compat tests |
-| Fan trap / chasm trap (M4) | MEDIUM | Literature consensus (Cube, Sisense, datacadamia); v0.5.2 mitigation is documentation, not code |
-| Role-playing dimensions (M5) | HIGH | Holistics docs, Snowflake relationship naming; existing model already has aliases |
-
-**Sources consulted:**
-- [Cube.dev: Working with Joins](https://cube.dev/docs/product/data-modeling/concepts/working-with-joins) -- diamond subgraph detection, primary key requirement for fan/chasm trap prevention
-- [Cube.dev: Joins Reference](https://cube.dev/docs/reference/data-model/joins) -- relationship types, deduplication strategy
-- [Snowflake: How Snowflake validates semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules) -- circular relationship prohibition, self-reference prohibition
-- [Snowflake: CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- PK/FK syntax, relationship naming
-- [Snowflake: Semantic View Example](https://docs.snowflake.com/en/user-guide/views-semantic/example) -- TPC-H example with full PK/FK declarations
-- [dbt: MetricFlow Join Logic](https://docs.getdbt.com/docs/build/join-logic) -- multi-hop join limits, fan-out prevention via entity types
-- [Holistics: Path Ambiguity in Dataset](https://docs.holistics.io/docs/dataset-path-ambiguity) -- tiered path ranking, role-playing dimension handling
-- [datacadamia: Fan Trap Issue](https://www.datacadamia.com/data/type/cube/semantic/fan_trap) -- fan trap definition, measure deduplication challenge
-- [datacadamia: Chasm Trap Issue](https://datacadamia.com/data/type/cube/semantic/chasm_trap) -- chasm trap via multiple FK references
-- [Sisense: Chasm and Fan Traps](https://docs.sisense.com/main/SisenseLinux/chasm-and-fan-traps.htm) -- detection and resolution
-- [DuckDB: Runtime-Extensible SQL Parsers](https://duckdb.org/2024/11/22/runtime-extensible-parsers) -- parser hook fallback mechanism
+**Industry sources consulted:**
+- [Snowflake: CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- FACTS syntax, NON ADDITIVE BY, USING RELATIONSHIPS, derived metrics
+- [Snowflake: How Snowflake validates semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules) -- define-time vs query-time validation rules
+- [Snowflake: Derived metrics release note (Sep 2025)](https://docs.snowflake.com/en/release-notes/2025/other/2025-09-30-semantic-view-derived-metrics) -- derived metric constraints
+- [Snowflake: Semi-additive metrics release note (Mar 2026)](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY implementation
+- [Snowflake: Best practices for semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/best-practices-dev) -- column limits, security warnings
+- [Cube.dev: Joins Reference](https://cube.dev/docs/reference/data-model/joins) -- relationship types, PK requirement, fan/chasm trap deduplication, Dijkstra path resolution
+- [Cube.dev: Working with Joins](https://cube.dev/docs/product/data-modeling/concepts/working-with-joins) -- diamond subgraph handling, join hints, deduplication strategy
+- [dbt MetricFlow: DeepWiki](https://deepwiki.com/dbt-labs/metricflow) -- derived metric nodes, DataflowPlanBuilder, CombineAggregatedOutputsNode
+- [dbt: Build metrics intro](https://docs.getdbt.com/docs/build/build-metrics-intro) -- derived metric types, input_metrics pattern
+- [dbt: Join logic](https://docs.getdbt.com/docs/build/join-logic) -- multi-hop joins, entity-based fan-out prevention
+- [Kimball Group: Additive and Semi-Additive Facts](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/additive-semi-additive-non-additive-fact/) -- canonical definitions
+- [SQLBI: Semi-Additive Measures in DAX](https://www.sqlbi.com/articles/semi-additive-measures-in-dax/) -- implementation complexity
+- [datacadamia: Fan Trap Issue](https://www.datacadamia.com/data/type/cube/semantic/fan_trap) -- fan trap definition, deduplication challenge
+- [Holistics: Fan-out Issue](https://docs.holistics.io/docs/faqs/fan-out-issue) -- pre-aggregate-before-join deduplication strategy
 - [boring-semantic-layer: Issue #32](https://github.com/boringdata/boring-semantic-layer/issues/32) -- multiple joins to same dimension table
-- This project's `src/expand.rs` -- CTE construction, `resolve_joins`, `find_dimension`, `find_metric`, `append_join_on_clause`
-- This project's `src/parse.rs` -- DDL detection, rewriting, validation, bracket tracking
-- This project's `src/model.rs` -- `SemanticViewDefinition`, `Join`, `TableRef`, `JoinColumn`, serde defaults
-- This project's `src/catalog.rs` -- dual-store catalog, JSON validation
-- This project's `TECH-DEBT.md` -- items #6 (ON-clause heuristic), #7 (unqualified columns), #8 (statement rewrite syntax gap)
+- [LinkedIn: Hierarchies in star schemas](https://www.linkedin.com/advice/1/how-do-you-incorporate-hierarchies-drill-downs) -- hierarchy as metadata pattern
+
+**Codebase sources:**
+- `src/graph.rs` -- `RelationshipGraph`, `check_no_diamonds()`, `toposort()`, `validate_graph()`
+- `src/expand.rs` -- `expand()`, `resolve_joins_pkfk()`, `synthesize_on_clause()`, `find_dimension()`, `find_metric()`
+- `src/body_parser.rs` -- `CLAUSE_KEYWORDS`, `CLAUSE_ORDER`, `find_clause_bounds()`
+- `src/model.rs` -- `SemanticViewDefinition`, `Fact`, `Metric`, `Dimension`, `Join`, serde annotations
+- `TECH-DEBT.md` -- accepted decisions and deferred items
+- `.planning/PROJECT.md` -- project context and constraints

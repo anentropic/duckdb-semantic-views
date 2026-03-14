@@ -1,450 +1,659 @@
-# Feature Landscape: v0.5.2 SQL DDL & PK/FK Relationships
+# Feature Landscape: v0.5.3 Advanced Semantic Features
 
-**Domain:** DuckDB Rust extension -- proper SQL DDL grammar and Snowflake-style PK/FK relationship model
-**Researched:** 2026-03-09
-**Milestone:** v0.5.2 -- SQL DDL syntax + PK/FK join inference + qualified column references
-**Status:** Subsequent milestone research (v0.5.1 shipped 2026-03-09)
-**Overall confidence:** HIGH (Snowflake DDL grammar verified from official docs; existing parser hook architecture proven; internal model structs already contain `tables`, `join_columns`, `TableRef` fields)
+**Domain:** DuckDB Rust extension -- advanced semantic modeling capabilities
+**Researched:** 2026-03-14
+**Milestone:** v0.5.3 -- FACTS clause, derived metrics, hierarchies, fan trap detection, role-playing dimensions, semi-additive metrics, multiple join paths
+**Status:** Subsequent milestone research (v0.5.2 shipped 2026-03-13)
+**Overall confidence:** HIGH (Snowflake DDL grammar verified from official docs; Cube.dev patterns verified from official docs; dbt/MetricFlow patterns verified from official docs; existing codebase analyzed directly)
 
 ---
 
 ## Scope
 
-This document covers the feature surface for v0.5.2: replacing the function-call syntax inside `CREATE SEMANTIC VIEW` bodies with proper SQL keyword grammar (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS), adopting Snowflake-style PK/FK relationship declarations, and enabling qualified column references (`alias.column`) in dimension/metric expressions.
+This document covers the feature surface for v0.5.3: adding advanced semantic modeling capabilities to the existing DuckDB semantic views extension. Each feature is analyzed across Snowflake, Cube.dev, and dbt/MetricFlow to identify standard behavior, expected semantics, and edge cases.
 
 **What already exists (NOT in scope):**
 - 7 DDL verbs via parser hooks (CREATE, CREATE OR REPLACE, IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, SHOW)
-- Function-based DDL with STRUCT/LIST syntax (`create_semantic_view()`)
+- SQL keyword body syntax: TABLES, RELATIONSHIPS, DIMENSIONS, METRICS clauses
+- PK/FK relationship model with define-time graph validation (cycles, diamonds, orphans rejected)
+- Topological sort ordering and transitive join inclusion
+- Qualified column references (`alias.column`) in dimension/metric expressions
 - Query via `semantic_view('name', dimensions := [...], metrics := [...])`
-- CTE-based expansion engine with GROUP BY inference and join dependency resolution
-- Error location reporting with clause hints and character positions
-- Zero-copy typed output
+- `Fact` struct exists in model.rs (unused -- no parser or expansion support)
 
-**Focus:** New DDL body grammar, PK/FK model, join inference changes, qualified column reference support.
+**Focus:** Seven new features, their semantics across platforms, implementation complexity, and dependencies.
 
 ---
 
 ## Table Stakes
 
-Features users expect when they see `CREATE SEMANTIC VIEW` with SQL keyword clauses. Missing = the DDL feels like a half-measure over function calls.
+Features users expect from any semantic layer claiming "advanced modeling." Missing = the extension is a toy for single-fact-table aggregations.
 
-### T1: SQL Keyword TABLES Clause
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | `TABLES (alias AS physical_table PRIMARY KEY (col, ...), ...)` |
-| **Why Expected** | Current syntax requires `:=` and struct literals (`tables := [{alias: 'o', table: 'orders'}]`), which looks alien inside a DDL statement. Users writing SQL expect SQL syntax. Snowflake uses exactly this pattern. |
-| **Complexity** | **Medium** |
-| **Dependencies** | Parser rewrite in `parse.rs` (new body parser); `TableRef` model struct (exists); expansion engine must resolve aliases to physical tables |
-| **Notes** | PRIMARY KEY is declaration-only metadata -- not enforced at query time. It tells the relationship model which columns uniquely identify rows in this table. Snowflake also supports UNIQUE constraints; defer those. |
-
-**Snowflake reference syntax (verified from official docs):**
-```sql
-TABLES (
-    orders AS main.orders PRIMARY KEY (order_id),
-    customers AS main.customers PRIMARY KEY (customer_id),
-    line_items AS main.lineitem PRIMARY KEY (order_id, line_number)
-)
-```
-
-**Current internal model (already supports this):**
-```rust
-pub struct TableRef { pub alias: String, pub table: String }
-// PK columns need to be added to model
-```
-
-**Gap:** `TableRef` has no `primary_key` field. Need to add `pub primary_key: Vec<String>` to the model.
-
-### T2: SQL Keyword RELATIONSHIPS Clause with FK REFERENCES
+### T1: FACTS Clause (Named Row-Level Sub-Expressions)
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | `RELATIONSHIPS (alias(fk_col) REFERENCES other_alias(pk_col), ...)` |
-| **Why Expected** | Current relationships use either raw ON-clause strings (legacy v0.1.0) or `join_columns` struct lists. Neither reads like SQL. Snowflake's FK REFERENCES syntax is the standard pattern for declaring foreign keys in SQL. |
-| **Complexity** | **Medium** |
-| **Dependencies** | Parser rewrite in `parse.rs`; `Join` model struct (exists, has `join_columns: Vec<JoinColumn>`); expansion engine join resolution |
-| **Notes** | The relationship declares that `orders(customer_id)` references `customers(customer_id)`. The expansion engine generates `JOIN customers ON orders.customer_id = customers.customer_id`. This replaces the ON-clause substring matching heuristic (TECH-DEBT item 6). |
-
-**Snowflake reference syntax (verified from official docs):**
-```sql
-RELATIONSHIPS (
-    orders_to_customers AS
-        orders(customer_id) REFERENCES customers(customer_id),
-    line_items_to_orders AS
-        line_items(order_id) REFERENCES orders(order_id)
-)
-```
-
-**Current internal model (already supports column-pair joins):**
-```rust
-pub struct Join {
-    pub table: String,
-    pub on: String,           // legacy
-    pub from_cols: Vec<String>,  // Phase 11 (being replaced)
-    pub join_columns: Vec<JoinColumn>,  // Phase 11.1 (current)
-}
-pub struct JoinColumn { pub from: String, pub to: String }
-```
-
-**Gap:** The `Join` struct models a relationship from "this table" to "base_table". The FK REFERENCES model is directional: `from_alias(from_cols) REFERENCES to_alias(to_cols)`. Need to store both alias names explicitly. The current `join.table` holds the join target -- need a `from_table` alias too.
-
-### T3: SQL Keyword DIMENSIONS Clause
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | `DIMENSIONS (alias.dim_name AS sql_expr, ...)` |
-| **Why Expected** | Current syntax: `dimensions := [{name: 'region', expr: 'region', source_table: 'customers'}]`. Snowflake uses `table_alias.dimension_name AS expression`. The qualified prefix (`alias.name`) naturally encodes the source table. |
+| **Feature** | `FACTS (alias.fact_name AS sql_expr, ...)` -- named, unaggregated row-level expressions that metrics can reference |
+| **Why Expected** | Complex metrics like `SUM(price * (1 - discount))` are verbose and error-prone when repeated. Facts let you name the sub-expression once (`net_price AS price * (1 - discount)`) and reference it in metrics (`SUM(net_price)`). Snowflake, Cube.dev, and dbt all support this concept. |
 | **Complexity** | **Low-Medium** |
-| **Dependencies** | Parser rewrite; `Dimension` model struct (exists with `source_table` field) |
-| **Notes** | The `alias.name` prefix replaces the separate `source_table` field. Parser extracts the alias from the qualified name. Unqualified names default to the first/base table. |
+| **Dependencies** | Body parser (add FACTS clause). Expansion engine (inline fact expressions into metric SQL). Model (`Fact` struct already exists in `model.rs`). |
+| **Existing work** | `Fact` struct with `name`, `expr`, `source_table` fields already in `model.rs`. Never parsed or expanded -- purely structural scaffolding from Phase 11. |
 
-**Snowflake reference syntax (verified from official docs):**
+**How it works across platforms:**
+
+| Platform | Name | Semantics | Key Detail |
+|----------|------|-----------|------------|
+| Snowflake | FACTS | Row-level expressions that dimensions and metrics can reference | FACTS clause must appear before DIMENSIONS. Facts can reference other facts and dimensions. |
+| Cube.dev | `sql` on measures | Inline SQL expression | No separate "fact" concept -- measures contain their own expressions directly. |
+| dbt/MetricFlow | Measures | `expr` field on a measure definition | Measures are the equivalent -- a named expression with an aggregation type. |
+
+**Snowflake FACTS semantics (verified from official docs):**
+
 ```sql
-DIMENSIONS (
-    customers.customer_name AS c_name,
-    orders.order_date AS o_orderdate,
-    orders.order_year AS YEAR(o_orderdate)
+FACTS (
+  line_items.net_price AS l_extendedprice * (1 - l_discount),
+  line_items.line_item_id AS CONCAT(l_orderkey, '-', l_linenumber),
+  orders.count_line_items AS COUNT(line_items.line_item_id)
 )
 ```
 
-**Mapping to current model:** `customers.customer_name AS c_name` becomes `Dimension { name: "customer_name", expr: "c_name", source_table: Some("customers") }`. Note: In Snowflake, the expression references *physical column names* from the aliased table.
+**Expression reference rules (Snowflake):**
+- Facts CAN reference: physical columns from their source table, other facts, dimensions
+- Facts CANNOT reference: metrics (aggregate-level expressions)
+- Dimensions CAN reference: facts and physical columns
+- Metrics CAN reference: facts, dimensions, physical columns (wrapped in aggregation functions)
+- Derived metrics CAN reference: other metrics (see T2)
 
-### T4: SQL Keyword METRICS Clause
+**Implementation approach for this extension:**
+1. Add FACTS as a recognized clause keyword in `body_parser.rs` (between RELATIONSHIPS and DIMENSIONS in clause ordering)
+2. Parse fact definitions with same `alias.name AS expr` syntax as dimensions
+3. At expansion time, inline fact expressions into metric expressions via text substitution: if metric expr contains `fact_name`, replace with `(fact_expr)`
+4. Facts are row-level -- they appear in the expanded SQL as sub-expressions inside aggregation calls, NOT as separate SELECT columns
+
+**Edge cases:**
+- **Fact referencing fact:** `net_price AS price * (1 - discount)`, then `net_value AS net_price * quantity`. Requires topological resolution of fact references -- expand inner facts first.
+- **Fact and dimension with same name:** Ambiguous. Snowflake resolves by scoping: `table.fact_name` vs `table.dim_name`. Our extension should reject name collisions within the same source table scope.
+- **Fact without source_table:** Same defaulting as dimensions -- falls back to base table.
+- **COUNT in a fact:** Snowflake allows aggregate-level facts like `COUNT(line_items.line_item_id)`. This blurs the row-level boundary. For simplicity, initially restrict facts to row-level expressions and defer aggregate facts.
+
+**Confidence:** HIGH (Snowflake docs verified, model struct exists)
+
+---
+
+### T2: Derived Metrics (Metric Referencing Other Metrics)
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | `METRICS (alias.metric_name AS agg_expr, ...)` |
-| **Why Expected** | Same reasoning as dimensions. Current struct literal syntax is awkward in a DDL body. |
-| **Complexity** | **Low-Medium** |
-| **Dependencies** | Parser rewrite; `Metric` model struct (exists with `source_table` field) |
-| **Notes** | Same pattern as dimensions -- the qualified `alias.name` prefix encodes the source table. |
+| **Feature** | Metrics that combine other metrics without being scoped to a specific table. E.g., `profit AS revenue - cost` where `revenue` and `cost` are already-defined metrics. |
+| **Why Expected** | Derived metrics are universal across semantic layers. Without them, users must manually compute composite metrics in their query results, defeating the purpose of a semantic layer. |
+| **Complexity** | **Medium-High** |
+| **Dependencies** | Facts (T1) should be implemented first -- facts handle row-level composition, derived metrics handle aggregate-level composition. Expansion engine needs metric dependency resolution. |
 
-**Snowflake reference syntax (verified from official docs):**
+**How it works across platforms:**
+
+| Platform | Syntax | Semantics | Key Constraint |
+|----------|--------|-----------|----------------|
+| Snowflake | `metric_name AS metric_a + metric_b` (no table prefix) | Unscoped metric combining table-scoped metrics | Cannot use USING clause. Cannot be referenced by regular metrics. Only another derived metric can reference a derived metric. |
+| Cube.dev | Calculated measures | `sql` references other measures by name | Must resolve dependency DAG at compile time |
+| dbt/MetricFlow | `derived` metric type | `expr` + `input_metrics` list | Explicit input declaration; `expr` uses metric names as variables |
+
+**Snowflake derived metrics (verified from official docs):**
+
 ```sql
 METRICS (
-    customers.customer_count AS COUNT(c_custkey),
-    orders.order_average_value AS AVG(o_totalprice),
-    orders.total_revenue AS SUM(l_extendedprice * (1 - l_discount))
+  orders.total_revenue AS SUM(o.amount),
+  orders.total_cost AS SUM(o.cost),
+  profit AS orders.total_revenue - orders.total_cost,
+  margin AS profit / orders.total_revenue
 )
 ```
 
-### T5: PK/FK-Based JOIN Inference (Replaces ON-Clause Heuristic)
+**Key semantics:**
+1. **No table prefix** on derived metrics -- they are scoped to the semantic view, not a logical table
+2. **Cannot contain aggregation functions** -- they operate on already-aggregated values
+3. **Can stack:** `margin` references `profit` which references `total_revenue` and `total_cost`
+4. **Cannot be referenced by regular metrics, dimensions, or facts** -- only other derived metrics
+5. **No USING clause** on derived metrics -- relationship disambiguation is not supported
 
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | Expansion engine generates JOIN ON clauses from PK/FK declarations instead of ON-clause substring matching |
-| **Why Expected** | ON-clause substring matching (TECH-DEBT item 6) is a known fragility. PK/FK declarations make join semantics explicit and deterministic. Snowflake, Cube.dev, and Databricks all use explicit relationship declarations for join generation. |
-| **Complexity** | **Medium** |
-| **Dependencies** | TABLES clause PK declarations; RELATIONSHIPS FK declarations; `expand.rs` join generation rewrite |
-| **Notes** | Given `orders(customer_id) REFERENCES customers(customer_id)`, the engine generates `LEFT JOIN customers ON orders.customer_id = customers.customer_id`. Multi-column FKs produce AND-ed ON conditions. The join type is always LEFT JOIN (same as current). |
+**Implementation approach:**
+1. **Detection:** A metric without a `source_table` (or an explicit `derived: true` flag) is treated as derived
+2. **Dependency resolution:** Build a directed graph of metric references. Topological sort. Reject cycles.
+3. **Expansion:** Derived metrics expand to post-aggregation expressions in the SELECT clause. The SQL looks like:
 
-**Current join generation (from `expand.rs`):**
-- Uses `join.on` (raw SQL string) directly in the CTE
-- Dependency resolution via substring matching (`table_name` appears in `on` clause)
-- No PK/FK awareness
-
-**New join generation:**
-- Relationship declares `from_alias(from_cols) REFERENCES to_alias(to_cols)`
-- ON clause synthesized: `from_alias.from_col = to_alias.to_col` for each column pair
-- Dependency ordering from relationship graph (topological sort)
-- The `on` field becomes unused (backward compat for stored JSON only)
-
-### T6: Qualified Column References in Expressions
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | Dimension/metric expressions can use `alias.column` syntax (e.g., `SUM(orders.amount)`) |
-| **Why Expected** | TECH-DEBT item 7 documents that "unqualified column names required in expressions" because the CTE flattens everything into `_base`. Qualified names are the natural SQL pattern and Snowflake requires them. |
-| **Complexity** | **Medium-High** |
-| **Dependencies** | Table alias registry; expansion engine CTE rewrite |
-| **Notes** | This is the highest-complexity item because it requires changing the CTE expansion strategy. Currently: all tables are `SELECT *` into a single `_base` CTE, and expressions reference unqualified names. With qualified references, the expansion must either: (a) alias-prefix all columns in the CTE (e.g., `o.amount AS "orders.amount"`), or (b) use table aliases directly in the FROM clause instead of flattening. Option (b) is cleaner -- use `FROM base_table AS alias LEFT JOIN ... AS alias` and let expressions reference `alias.column` naturally. |
-
-**Current CTE pattern (from `expand.rs`):**
 ```sql
-WITH _base AS (
-    SELECT * FROM orders
-    LEFT JOIN customers ON orders.customer_id = customers.customer_id
-)
-SELECT region, SUM(amount) AS revenue FROM _base GROUP BY 1
-```
-
-**New pattern (table aliases in FROM, no flattening):**
-```sql
-SELECT c.region, SUM(o.amount) AS revenue
-FROM orders AS o
-LEFT JOIN customers AS c ON o.customer_id = c.customer_id
+SELECT
+  "c"."region" AS "region",
+  SUM("o"."amount") AS "total_revenue",
+  SUM("o"."cost") AS "total_cost",
+  (SUM("o"."amount") - SUM("o"."cost")) AS "profit",
+  ((SUM("o"."amount") - SUM("o"."cost")) / SUM("o"."amount")) AS "margin"
+FROM ...
 GROUP BY 1
 ```
 
-This is simpler SQL (no CTE wrapper needed when there is no ambiguity), supports qualified names naturally, and produces cleaner `EXPLAIN` output.
+Each derived metric's expression is expanded by substituting referenced metric names with their full aggregate expressions. This avoids a subquery/CTE layer.
+
+**Edge cases:**
+- **Derived metric references non-existent metric:** Define-time validation error with "did you mean" suggestion
+- **Circular derived metrics:** `a AS b + 1`, `b AS a - 1` -- detect via topological sort, reject at define time
+- **Division by zero in derived:** `margin AS profit / revenue` when `revenue = 0` -- user's responsibility; DuckDB produces NULL or Inf
+- **Derived metric with mixed source tables:** `profit AS orders.revenue - returns.refund_total` -- requires both tables joined. The expansion must include joins for all metrics referenced transitively.
+- **Query requesting only derived metric without its dependencies:** Must still compute the underlying metrics. The expansion engine resolves transitive metric dependencies, not just table joins.
+
+**Confidence:** HIGH (Snowflake docs verified, dbt/MetricFlow pattern verified)
+
+---
+
+### T3: Multiple Join Paths / USING RELATIONSHIPS (Relaxes Diamond Rejection)
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Allow multiple relationships between the same pair of tables. Metrics specify which relationship to use via `USING (relationship_name)`. Replaces the current diamond rejection. |
+| **Why Expected** | The "flights with departure_airport and arrival_airport" pattern is fundamental to real-world data modeling. The current extension rejects this as a diamond. Without USING, users cannot model role-playing dimensions at all. |
+| **Complexity** | **High** |
+| **Dependencies** | Relationship names (already parsed and stored as `Join.name`). Graph validation changes (relax `check_no_diamonds` when USING is specified). Expansion engine changes (select specific join path). Query syntax changes (USING in query request). |
+
+**How it works across platforms:**
+
+| Platform | Resolution Mechanism | Query-Time Syntax | Key Detail |
+|----------|---------------------|-------------------|------------|
+| Snowflake | `USING (relationship_name)` on metric definitions | Metrics carry their own relationship binding | Each relationship must originate from the metric's logical table. Cannot specify multi-hop paths. |
+| Cube.dev | Dijkstra shortest path + join hints / join paths | `joinHints` in REST API, `CROSS JOIN` in SQL API | Automatic disambiguation; explicit hints override |
+| dbt/MetricFlow | Explicit entity relationships with join paths | Join path specified in semantic model | Multiple paths handled via entity resolution |
+
+**Snowflake USING semantics (verified from official docs):**
+
+```sql
+RELATIONSHIPS (
+  flight_departure AS flights(departure_airport) REFERENCES airports,
+  flight_arrival AS flights(arrival_airport) REFERENCES airports
+)
+
+METRICS (
+  flights.departure_count USING (flight_departure) AS COUNT(flight_id),
+  flights.arrival_count USING (flight_arrival) AS COUNT(flight_id)
+)
+```
+
+**Key semantics:**
+1. **USING is on the metric definition, not the query.** The relationship binding is declared at CREATE time.
+2. **Multiple named relationships to the same target table are allowed** when each has a unique name
+3. **When querying without USING disambiguation, Snowflake errors:** "Multi-path relationship between... is not supported"
+4. **USING specifies direct relationships only** -- cannot specify multi-hop paths like `A -> B -> C`
+5. **Cannot use USING on derived metrics**
+
+**Implementation approach:**
+1. **Relax diamond rejection:** `check_no_diamonds()` should NOT reject when the diamond involves named relationships. Instead, store the multi-path information.
+2. **Add `using_relationships: Option<Vec<String>>` to `Metric` model struct** (serde default = None)
+3. **Body parser:** Parse `USING (rel_name, ...)` between metric name and `AS` keyword
+4. **At expansion time:** When a metric has `using_relationships`, use those specific named relationships for join resolution instead of the default graph walk
+5. **The same physical table gets joined multiple times with different aliases.** In the airports example: `LEFT JOIN airports AS airports_dep ON flights.departure_airport = airports_dep.airport_code LEFT JOIN airports AS airports_arr ON flights.arrival_airport = airports_arr.airport_code`
+
+**Edge cases:**
+- **USING references non-existent relationship:** Define-time validation error
+- **USING references relationship from wrong source table:** Error -- each USING relationship must originate from the metric's source table
+- **Dimension on the multi-path target table without USING:** Ambiguous. Snowflake errors. We should too: "dimension 'airports.city_name' is ambiguous; it is reachable via relationships 'flight_departure' and 'flight_arrival'"
+- **Multiple USING on same metric:** `USING (rel_a, rel_b)` -- joins through both paths simultaneously. Each provides a different join for the metric expression.
+- **Two metrics with different USING but same requested dimensions:** Both join paths must be included in the FROM clause with distinct aliases
+
+**This is the highest-complexity feature.** It touches: model, body parser, graph validation, expansion engine (join alias management), and potentially the query request format.
+
+**Confidence:** HIGH (Snowflake docs verified, flight/airports example is canonical)
 
 ---
 
 ## Differentiators
 
-Features that improve DX beyond Snowflake parity. Not expected, but valued.
+Features that improve DX beyond basic semantic layer parity. Not universally expected, but valued.
 
-| Feature | Value Proposition | Complexity | Dependencies | Notes |
-|---------|-------------------|------------|--------------|-------|
-| **Transitive relationship resolution** | If A references B and B references C, requesting dimensions from A and C automatically joins through B. Snowflake and Cube.dev both support this. | **Medium** | Relationship graph; topological sort | Already partially implemented (`collect_transitive_dependencies` in expand.rs). Needs to work with new PK/FK model. |
-| **Relationship naming** | `orders_to_customers AS orders(fk) REFERENCES customers(pk)` -- the name is informational/documentary. Snowflake supports optional names. | **Low** | Parser; stored but not used at query time | Low effort, good self-documentation. |
-| **Composite primary keys** | `PRIMARY KEY (order_id, line_number)` for junction tables. Snowflake supports this. | **Low** | Model: `Vec<String>` for PK columns | Already natural from the Vec representation. |
-| **Multi-column foreign keys** | `line_items(order_id, line_number) REFERENCES order_details(order_id, line_number)` | **Low** | Already supported by `join_columns: Vec<JoinColumn>` | The model already handles this. Parser needs to support the list. |
-| **Backward-compatible function syntax** | Keep `create_semantic_view()` with STRUCT/LIST args working alongside new SQL DDL | **Low** | No changes to existing path | The statement rewrite produces function calls. Old JSON still deserializes. |
-| **FACTS clause** | `FACTS (alias.fact_name AS raw_expr)` -- pre-aggregation facts that other expressions can reference. Snowflake has this. | **Medium** | `Fact` model struct (exists); parser; expansion | Already in the model. Snowflake uses FACTS as intermediate named expressions referenced by metrics. Useful for complex metrics like `SUM(line_items.price * (1 - line_items.discount))` -- define a fact `line_items.net_price AS price * (1 - discount)`, then `SUM(line_items.net_price)`. |
+### D1: Role-Playing Dimensions (Same Table Joined Via Different Relationships)
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | The same physical table (e.g., `airports`) can participate in multiple relationships with different semantic roles (e.g., departure airport vs arrival airport). Dimensions from that table are disambiguated by the relationship used to reach them. |
+| **Value Proposition** | Role-playing dimensions are the most common multi-path pattern. Supporting them makes the extension usable for real-world star schemas with date dimensions (order_date, ship_date, delivery_date all referencing the same `dates` table). |
+| **Complexity** | **High** (tightly coupled to T3: USING RELATIONSHIPS) |
+| **Dependencies** | T3 (multiple join paths) must be implemented first. Role-playing dimensions are a consequence of USING, not a separate mechanism. |
+
+**How it works across platforms:**
+
+| Platform | Approach | Key Detail |
+|----------|----------|------------|
+| Snowflake | Same table joined via multiple named relationships; metrics use USING to select path; dimensions inherit relationship context from their usage alongside metrics | Role-playing is modeled at the relationship + metric level, not the dimension level |
+| Power BI / SSAS | Explicit role-playing dimension concept; only one relationship "active" at a time; DAX uses `USERELATIONSHIP()` to switch | Different paradigm -- not directly applicable to SQL-based expansion |
+| Cube.dev | Not a first-class concept; handled via separate cubes wrapping the same table with different join definitions | Each "role" is a distinct cube with its own dimensions/measures |
+| Traditional data warehousing | Dimension table aliased multiple times in FROM clause | The standard SQL pattern: `JOIN dates AS order_date ON ..., JOIN dates AS ship_date ON ...` |
+
+**Implementation:**
+Role-playing dimensions are NOT a separate DDL construct. They emerge from the combination of:
+1. Multiple named relationships to the same table (T3)
+2. Metrics with USING clauses that select a specific relationship
+3. When a dimension from the multi-path target table is queried alongside a metric with USING, the dimension joins through the same relationship as the metric
+
+The expansion engine must:
+- Assign unique SQL aliases when the same physical table is joined multiple times: `airports AS "airports__flight_departure"` and `airports AS "airports__flight_arrival"`
+- Qualify dimension column references with the correct alias based on relationship context
+
+**Edge case:**
+- If the user queries a dimension from airports without any metric that has USING, the query is ambiguous and should error.
+- If the user queries two metrics with different USING, both pointing to the same target table, the target table gets two separate JOINs and two separate columns for the same dimension.
+
+**Confidence:** HIGH (standard pattern, Snowflake docs verified)
+
+---
+
+### D2: Fan Trap Detection and Warning
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Detect when a query crosses a one-to-many boundary in a way that could cause measure inflation (double-counting). Warn the user, but do not block the query. |
+| **Value Proposition** | Fan traps are the most common source of incorrect analytics results. Even a warning helps users avoid silent data corruption. Full auto-deduplication (like Cube.dev) is complex, but detection alone is valuable. |
+| **Complexity** | **Medium** |
+| **Dependencies** | Relationship cardinality declarations (new). Graph traversal (existing). |
+
+**How it works across platforms:**
+
+| Platform | Approach | Detail |
+|----------|----------|--------|
+| Cube.dev | **Auto-deduplication** -- detects fan/chasm traps at query time and generates dedup subqueries using PK-based `SELECT DISTINCT` before joining | Requires `primary_key: true` on a dimension. Fully automatic. |
+| Snowflake | **Granularity validation** -- validates that dimension entities have equal or lower granularity than metric entities | Prevents invalid grain combinations at query time |
+| dbt/MetricFlow | **Entity-based join graph** -- join paths enforce grain through entity relationships | Implicit fan trap prevention via entity resolution |
+
+**Fan trap definition:**
+A fan trap occurs when aggregating a metric from table A while joining to table B through a one-to-many relationship. The join inflates the rows from A, causing SUM/COUNT metrics to be overcounted.
+
+Example: `orders` (fact) JOIN `line_items` (one-to-many). If you SUM(orders.amount) while joining to line_items, each order row is duplicated per line item, inflating the sum.
+
+**Implementation approach (detection-only, not auto-dedup):**
+1. **Add relationship type metadata:** Extend `Join` model with `relationship_type: Option<String>` accepting `one_to_one`, `one_to_many`, `many_to_one`
+2. **At expansion time:** When a metric's source table is on the "one" side of a one-to-many join, and the query also includes dimensions from the "many" side, emit a warning: "metric 'total_order_amount' on table 'orders' may be inflated by the one-to-many relationship to 'line_items'"
+3. **Do NOT block the query.** The user may know what they are doing (e.g., they want the Cartesian product).
+
+**Why detection-only (not auto-dedup):**
+- Cube.dev's auto-dedup generates nested subqueries (`SELECT DISTINCT pk FROM fact JOIN dim ...`) that significantly change the query structure
+- This requires PK awareness at query time (we have PKs from the TABLES clause, so technically feasible)
+- But auto-dedup changes the semantics of the result -- it is not always what the user wants
+- Detection + warning is the 80/20: catches the mistake without surprising the user
+
+**Edge cases:**
+- **No relationship type declared:** Cannot detect fan traps. Skip silently.
+- **Chain of one-to-many:** `A -> B (1:M) -> C (1:M)` -- warn on any metric from A when dimensions from B or C are requested
+- **Metric on the "many" side:** `SUM(line_items.price)` -- no fan trap risk when joining to `orders` (many-to-one). Only warn when aggregating on the "one" side while traversing a "one-to-many" edge.
+
+**Confidence:** MEDIUM (Cube.dev auto-dedup pattern verified; detection-only is a simplified variant)
+
+---
+
+### D3: Hierarchies / Drill-Down Paths
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Named groupings of dimensions that define drill-down paths. E.g., `location: [country, region, city]`. Metadata-only -- does not change query expansion. |
+| **Value Proposition** | BI tools (Superset, Metabase, custom dashboards) can use hierarchy metadata to offer drill-down navigation. Without hierarchies, tools must guess the drill path. |
+| **Complexity** | **Low** |
+| **Dependencies** | None (additive metadata). |
+
+**How it works across platforms:**
+
+| Platform | Approach | Detail |
+|----------|----------|--------|
+| Cube.dev | `hierarchies` block with `levels` array | First-class concept. Cross-cube hierarchies supported (dimensions from joined cubes). |
+| Snowflake | No native hierarchy concept | Dimensions are flat. Hierarchies are implicit via naming conventions. |
+| dbt/MetricFlow | No native hierarchy concept | Flat dimension list. Hierarchy is a BI tool concern. |
+| SSAS / Power BI | First-class hierarchy object | Dimension attributes organized into levels |
+
+**Cube.dev hierarchies (verified from official docs):**
+
+```javascript
+hierarchies: {
+  location: {
+    title: 'User Location',
+    levels: [state, city]
+  }
+}
+```
+
+**Implementation approach:**
+1. **Model:** Add `Hierarchy` struct: `{ name: String, levels: Vec<String> }`. Add `hierarchies: Vec<Hierarchy>` to `SemanticViewDefinition`.
+2. **DDL syntax:**
+```sql
+HIERARCHIES (
+  location AS (country, region, city),
+  time AS (year, quarter, month)
+)
+```
+3. **Validation:** All level names must reference declared dimensions. Reject unknown dimension references.
+4. **Query expansion:** Hierarchies do NOT change expansion. They are metadata stored in the definition JSON and exposed via `DESCRIBE SEMANTIC VIEW`.
+5. **DESCRIBE output:** Add `hierarchies` column showing the hierarchy definitions.
+
+**Why this is a differentiator (not table stakes):**
+- Neither Snowflake nor dbt supports hierarchies natively
+- Cube.dev does, but it's a metadata concept, not a query concept
+- Most semantic layer users don't need hierarchies until they integrate with BI tools
+- Low complexity, pure metadata -- good candidate for "free" value add
+
+**Edge cases:**
+- **Dimension in multiple hierarchies:** Allowed. `month` can appear in both `fiscal_calendar` and `calendar` hierarchies.
+- **Empty hierarchy:** Reject -- a hierarchy with zero levels is meaningless.
+- **Hierarchy referencing non-existent dimension:** Define-time validation error.
+
+**Confidence:** HIGH (Cube.dev docs verified, straightforward metadata concept)
+
+---
+
+### D4: Semi-Additive Metrics (NON ADDITIVE BY)
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Mark a metric as non-additive across specific dimensions. E.g., `account_balance NON ADDITIVE BY (year, month, day) AS SUM(balance)` -- the metric should use the latest snapshot value for time dimensions rather than summing across all dates. |
+| **Value Proposition** | Account balances, inventory levels, and headcount are common metrics that are additive across some dimensions (e.g., customer) but not others (e.g., time). Without NON ADDITIVE BY, users get silently incorrect results. |
+| **Complexity** | **High** |
+| **Dependencies** | Body parser changes. Metric model changes. Expansion engine changes (window function SQL generation). |
+
+**How it works across platforms:**
+
+| Platform | Syntax | Semantics | SQL Generation |
+|----------|--------|-----------|----------------|
+| Snowflake | `NON ADDITIVE BY (dim1 DESC, dim2 DESC)` on metric | Rows sorted by non-additive dimensions; values from last rows aggregated | Not documented publicly; likely uses `QUALIFY ROW_NUMBER()` or `LAST_VALUE()` |
+| dbt/MetricFlow | `non_additive_dimension: { name: dim, window_choice: max }` on measure | Filter to `MAX(dim)` per group, then aggregate | Generates subquery with window function |
+| Cube.dev | `rollingWindow` or custom SQL | No first-class semi-additive concept | Manual SQL |
+
+**Snowflake NON ADDITIVE BY (verified from official docs):**
+
+```sql
+METRICS (
+  bank_accounts.m_account_balance
+    NON ADDITIVE BY (year_dim DESC NULLS FIRST, month_dim DESC NULLS FIRST, day_dim DESC NULLS FIRST)
+    AS SUM(balance)
+)
+```
+
+**Semantics:** For customer `cust-001` in 2024, instead of summing all daily balances (incorrect: 910), return the latest day's balance (correct: 210). The "latest" is determined by sorting DESC on the non-additive dimensions and taking the last row per group.
+
+**Implementation approach:**
+1. **Model:** Add `non_additive_by: Option<Vec<NonAdditiveDim>>` to `Metric` where `NonAdditiveDim { dimension: String, descending: bool, nulls_first: Option<bool> }`
+2. **Body parser:** Parse `NON ADDITIVE BY (dim1 [ASC|DESC] [NULLS FIRST|LAST], ...)` between metric name and `AS`
+3. **Expansion:** When a metric has `non_additive_by`, the expanded SQL wraps the metric in a subquery with a window function:
+
+```sql
+-- Instead of:
+SELECT customer_id, SUM(balance) AS account_balance FROM ...
+-- Generate:
+SELECT customer_id, SUM(balance) AS account_balance
+FROM (
+  SELECT *, ROW_NUMBER() OVER (
+    PARTITION BY customer_id
+    ORDER BY year DESC, month DESC, day DESC
+  ) AS _rn
+  FROM bank_accounts
+) WHERE _rn = 1
+GROUP BY customer_id
+```
+
+This filters to the latest snapshot per group before aggregating. The PARTITION BY includes all queried dimensions EXCEPT the non-additive ones.
+
+**Edge cases:**
+- **Non-additive dimension not in query:** If the user doesn't request `year_dim` in dimensions, the non-additive filter still applies but the window function partitions differently
+- **Multiple non-additive metrics with different dimensions:** Each needs its own subquery/CTE
+- **Non-additive dimension is from a different table:** The window function must be applied after the join but before aggregation -- requires a CTE or subquery layer
+- **Combined with derived metrics:** A derived metric referencing a semi-additive metric should work -- the semi-additive metric is already resolved before derivation
+
+**Why this is a differentiator (not table stakes):**
+- Snowflake only added this in March 2026 (preview)
+- Most semantic layers struggle with semi-additive metrics
+- The SQL generation is non-trivial (window function + subquery)
+- But the value for financial/inventory use cases is enormous
+
+**Confidence:** HIGH (Snowflake syntax verified, dbt pattern verified, SQL generation approach is standard)
 
 ---
 
 ## Anti-Features
 
-Features to explicitly NOT build in v0.5.2.
+Features to explicitly NOT build in v0.5.3.
 
 | Anti-Feature | Why Avoid | What to Do Instead |
 |--------------|-----------|-------------------|
-| **UNIQUE constraints on tables** | Snowflake supports `UNIQUE(col)` alongside `PRIMARY KEY`. Adds complexity for marginal value -- PK suffices for join inference. | Defer. PK is the join key. |
-| **ASOF / temporal relationships** | Snowflake (as of Feb 2026 preview) supports `ASOF` in REFERENCES and `BETWEEN start AND end EXCLUSIVE` for range joins. Complex temporal join semantics. | Defer to future milestone. Standard equi-joins cover 95% of use cases. |
-| **DISTINCT RANGE constraints** | Snowflake supports range-based constraints for slowly-changing dimension tables. Niche use case. | Defer. |
-| **NON ADDITIVE BY clause on metrics** | Snowflake allows `NON ADDITIVE BY (dimension)` to mark metrics that cannot be freely aggregated across certain dimensions. Requires query-time validation. | Defer. All metrics treated as additive for now. Document limitation. |
-| **Window function metrics** | Snowflake supports `metric AS window_function(metric) OVER (...)`. Requires special expansion that does not GROUP BY. | Defer to future milestone. |
-| **WITH SYNONYMS** | Snowflake supports `WITH SYNONYMS = ('alias1', 'alias2')` for AI/natural-language discovery. Not relevant for SQL-only DuckDB. | Not applicable. No AI query interface. |
-| **COMMENT on expressions** | Snowflake supports per-dimension/metric comments. Nice for documentation but no runtime effect. | Defer. Comments can be added later without breaking changes. |
-| **AI_SQL_GENERATION / AI_QUESTION_CATEGORIZATION** | Snowflake-specific AI integration directives. | Not applicable. |
-| **COPY GRANTS** | Snowflake permission model. DuckDB has no grant system for extension objects. | Not applicable. |
-| **PUBLIC/PRIVATE visibility** | Snowflake supports marking dimensions/metrics as PUBLIC or PRIVATE. No access control in DuckDB extensions. | Not applicable. |
-| **Automatic relationship type inference** | Snowflake's Autopilot infers one-to-many vs one-to-one from data cardinality. Adds query-time analysis overhead. | All joins are LEFT JOIN. The user declares the direction via FK REFERENCES. |
-| **Circular relationship detection** | Snowflake prohibits circular relationships and validates at CREATE time. | Validate at CREATE time -- but keep it simple: check the relationship graph is a DAG. Do NOT build complex cycle-detection beyond basic topological sort failure. |
-| **Multiple join paths between same tables** | Snowflake requires separate logical table entries for each path. Complex disambiguation. | Error if two relationships connect the same pair. Defer multi-path to future. |
-| **Cube.dev-style fan/chasm trap detection** | Cube detects fan traps (one-to-many causing double-counting) and generates deduplication subqueries. Requires primary key dedup logic. | Defer. Users are responsible for correct join topology. Document that metrics from many-side tables need care. |
-| **Databricks-style YAML definitions** | Databricks metric views use YAML, not SQL DDL. | SQL DDL first. YAML is out of scope per PROJECT.md. |
-| **Derived metrics (metric referencing metric)** | Snowflake supports metrics that reference other metrics. Requires expression dependency resolution. | Defer to future milestone (already noted in PROJECT.md Out of Scope). |
-| **Hierarchies / drill-down paths** | Dimensional hierarchies (country -> region -> city). | Defer to future milestone (already noted in PROJECT.md Out of Scope). |
-| **Qualified names in SEMANTIC_VIEW query syntax** | Snowflake allows `SEMANTIC_VIEW(... METRICS customer.order_count DIMENSIONS customer.name)` with qualified names in the query function too. | Defer. Keep `semantic_view('name', dimensions := ['region'], metrics := ['revenue'])` for now. Qualified query names are a separate concern. |
-
----
-
-## Detailed Design: DDL Body Grammar
-
-### Current State (v0.5.1)
-
-The DDL body uses DuckDB function-call syntax because `rewrite_ddl` passes it verbatim to the underlying `create_semantic_view()` function:
-
-```sql
-CREATE SEMANTIC VIEW tpch_analysis (
-    tables := [{alias: 'o', table: 'orders'}, {alias: 'c', table: 'customers'}],
-    relationships := [{from_table: 'o', to_table: 'c', join_columns: [{from: 'customer_id', to: 'id'}]}],
-    dimensions := [{name: 'region', expr: 'region', source_table: 'c'}],
-    metrics := [{name: 'revenue', expr: 'sum(amount)', source_table: 'o'}]
-)
-```
-
-### Target State (v0.5.2)
-
-Proper SQL keyword syntax inside the DDL body:
-
-```sql
-CREATE SEMANTIC VIEW tpch_analysis (
-    TABLES (
-        o AS orders PRIMARY KEY (order_id),
-        c AS customers PRIMARY KEY (customer_id)
-    )
-    RELATIONSHIPS (
-        o(customer_id) REFERENCES c(customer_id)
-    )
-    DIMENSIONS (
-        c.region AS c_region,
-        o.order_date AS o_orderdate
-    )
-    METRICS (
-        o.revenue AS SUM(o_totalprice),
-        o.item_count AS COUNT(*)
-    )
-)
-```
-
-### Parser Strategy
-
-The `rewrite_ddl` function currently passes the body verbatim to the function call. For v0.5.2, it must:
-
-1. **Parse** the SQL keyword body into structured data
-2. **Translate** into the existing `SemanticViewDefinition` model (or directly into the function-call syntax that `create_semantic_view()` expects)
-3. **Rewrite** to `SELECT * FROM create_semantic_view('name', tables := [...], ...)` with STRUCT/LIST literals
-
-This keeps the function-based DDL as the internal execution target while presenting SQL syntax to users. The parser is a translator, not a new execution path.
-
-**Alternative:** Parse directly into `SemanticViewDefinition` JSON and call a new internal function that accepts JSON. This avoids generating STRUCT/LIST literals. Simpler code generation, but adds a new code path.
-
-**Recommendation:** Translate to STRUCT/LIST function-call syntax. Reuses the proven `parse_args.rs` pipeline. No new execution path. The generated syntax is ugly but never user-facing.
-
-### Grammar Specification
-
-```
-body ::= clause { clause }
-clause ::= TABLES_clause | RELATIONSHIPS_clause | DIMENSIONS_clause | METRICS_clause
-
-TABLES_clause ::= 'TABLES' '(' table_def { ',' table_def } ')'
-table_def ::= alias 'AS' physical_table [ 'PRIMARY' 'KEY' '(' column { ',' column } ')' ]
-
-RELATIONSHIPS_clause ::= 'RELATIONSHIPS' '(' rel_def { ',' rel_def } ')'
-rel_def ::= [ rel_name 'AS' ] from_alias '(' column { ',' column } ')' 'REFERENCES' to_alias '(' column { ',' column } ')'
-
-DIMENSIONS_clause ::= 'DIMENSIONS' '(' dim_def { ',' dim_def } ')'
-dim_def ::= [ alias '.' ] dim_name 'AS' sql_expr
-
-METRICS_clause ::= 'METRICS' '(' metric_def { ',' metric_def } ')'
-metric_def ::= [ alias '.' ] metric_name 'AS' sql_expr
-```
-
-**Parsing complexity:** Medium. The grammar is LL(1) for clause detection. The tricky parts are: (a) sql_expr can contain parentheses, commas inside function calls, and string literals; (b) separating items within a clause requires tracking nesting depth.
-
-### Expression Parsing Challenge
-
-The `AS sql_expr` portion of dimensions and metrics is free-form SQL. The parser must find where one definition ends and the next begins. Strategy:
-
-- Items are comma-separated at depth 0 (outside any parentheses)
-- The parser tracks paren depth and string literal state
-- A comma at depth 0 separates items
-- The closing `)` of the clause ends the last item
-
-This is the same approach already used in `scan_clause_keywords` for bracket tracking.
-
----
-
-## Detailed Design: Expansion Engine Changes
-
-### Current CTE Flattening
-
-```rust
-// expand.rs: build_base_cte()
-// SELECT * FROM base_table LEFT JOIN t2 ON ... LEFT JOIN t3 ON ...
-```
-
-All tables merged into `_base` CTE. Expressions must use unqualified column names.
-
-### New Alias-Based FROM Clause
-
-With table aliases and PK/FK relationships, the expansion shifts from CTE flattening to alias-based JOINs:
-
-```sql
-SELECT c.c_region AS region, SUM(o.o_totalprice) AS revenue
-FROM orders AS o
-LEFT JOIN customers AS c ON o.customer_id = c.customer_id
-WHERE 1=1
-GROUP BY 1
-```
-
-**Benefits:**
-- Qualified column names work naturally (`o.amount`, `c.region`)
-- Simpler generated SQL (no CTE wrapper)
-- Cleaner EXPLAIN output
-- Column name ambiguity resolved by alias prefix
-
-**Backward compatibility:** Definitions created with v0.5.1 (using unqualified names and ON-clause strings) must still work. Detection: if `def.joins[i].on` is non-empty (legacy format), use the old CTE-based expansion. If `def.joins[i].join_columns` is populated and `def.tables` is non-empty, use the new alias-based expansion.
-
-### Join Dependency Resolution
-
-**Current:** Substring matching -- check if a table name appears in ON clauses of other joins.
-
-**New:** Relationship graph. Each relationship is a directed edge from FK table to PK table. Topological sort determines join order. When a query requests dimensions/metrics from tables A and C, and A->B->C in the relationship graph, all intermediate tables (B) are included in the JOIN chain.
-
-This is the transitive dependency resolution already sketched in `collect_transitive_dependencies`, but formalized with explicit graph edges from FK declarations.
-
----
-
-## Comparison: Snowflake vs Cube.dev vs Databricks
-
-| Aspect | Snowflake | Cube.dev | Databricks | This Extension (v0.5.2) |
-|--------|-----------|---------|------------|------------------------|
-| **Definition format** | SQL DDL | YAML/JS | YAML | SQL DDL |
-| **Table declarations** | `alias AS table PK(col)` | Implicit from cube name | `source: table` | `alias AS table PRIMARY KEY(col)` |
-| **Relationships** | `FK REFERENCES PK` | `joins: { sql, relationship }` | `ON` / `USING` | `FK REFERENCES PK` |
-| **Join inference** | Auto from PK/FK + cardinality | Dijkstra shortest path | Explicit ON/USING | From PK/FK declarations |
-| **Join type** | Inferred (one-to-one, many-to-one) | Always LEFT JOIN | Explicit (LEFT/INNER) | Always LEFT JOIN |
-| **Fan trap handling** | Granularity validation | Auto-dedup via PK | Not documented | Not handled (v0.5.2) |
-| **Qualified refs** | `alias.column` required | `CubeName.dimension` | `source.column` / `join.column` | `alias.column` supported |
-| **Metrics syntax** | `alias.name AS AGG(expr)` | `measures: { sql, type }` | `measures: [{ name, agg, expr }]` | `alias.name AS AGG(expr)` |
-| **Query syntax** | `SEMANTIC_VIEW(... METRICS ... DIMENSIONS ...)` | REST API / SQL API | `SELECT ... FROM metric_view(...)` | `semantic_view('name', dimensions := [...], metrics := [...])` |
-
-**Key takeaway:** Snowflake is the closest design reference. Cube.dev's Dijkstra join path selection is more sophisticated but requires a full graph model. Databricks uses YAML, which is out of scope. Adopt Snowflake's DDL grammar with simplifications (no UNIQUE, no ASOF, no visibility modifiers).
+| **Fan trap auto-deduplication** | Cube.dev's approach generates nested subqueries that change query semantics. Complex, surprising behavior. | Detection + warning only (D2). Users decide how to handle. Document the pattern. |
+| **Window function metrics** | Snowflake supports `metric AS window_function(metric) OVER (...)`. Requires fundamentally different expansion that does not GROUP BY. | Defer. Window functions are orthogonal to the aggregation model. |
+| **ASOF / temporal relationships** | Range-based joins for slowly-changing dimensions. Complex temporal join semantics. | Defer. Standard equi-joins cover 95% of use cases. |
+| **Cube.dev-style Dijkstra join path selection** | Automatic join path finding adds unpredictability. | Explicit USING RELATIONSHIPS is more deterministic and Snowflake-aligned. |
+| **Qualified names in query syntax** | `semantic_view('v', dimensions := ['customer.name'])` with dot-qualified dimension names in queries. | Defer. Keep flat dimension names in queries. Qualified names are a DDL concern. |
+| **Aggregate facts** | Snowflake allows `COUNT(line_items.id)` in FACTS -- blurs the row-level boundary. | Facts are row-level only. Aggregation belongs in METRICS. |
+| **COMMENT on expressions** | Snowflake supports per-dimension/metric/fact comments. Nice but no runtime effect. | Defer. Can be added later without breaking changes. |
+| **PUBLIC/PRIVATE visibility** | Snowflake marks expressions as PUBLIC or PRIVATE. No access control in DuckDB extensions. | Not applicable. |
+| **WITH SYNONYMS** | Snowflake supports synonyms for AI/natural-language discovery. | Not applicable for SQL-only DuckDB. |
+| **Pre-aggregation / materialization** | Deferred per PROJECT.md. | Out of scope. DuckDB handles execution. |
+| **Relationship type inference from data** | Snowflake Autopilot infers one-to-many vs one-to-one from cardinality. | Users declare relationship type explicitly (if D2 is implemented). |
+| **Cross-cube/cross-view hierarchies** | Cube.dev supports hierarchies referencing dimensions from joined cubes. | Keep hierarchies within a single semantic view's dimension space. |
+| **Fiscal calendar support** | ISO 8601 only per PROJECT.md constraints. | Document limitation. Users handle fiscal calendars in dimension expressions. |
 
 ---
 
 ## Feature Dependencies
 
 ```
-SQL Body Parser (new)
+T1: FACTS clause
   |
-  +-> TABLES clause parser --> TableRef + PK fields in model
-  |     |
-  |     +-> RELATIONSHIPS clause parser --> Join with FK REFERENCES in model
-  |           |
-  |           +-> PK/FK join inference in expand.rs (replaces ON-clause heuristic)
+  +-> T2: Derived Metrics (facts provide row-level composition;
+  |                        derived metrics provide aggregate-level composition)
   |
-  +-> DIMENSIONS clause parser --> Dimension with alias.name -> source_table
-  |     |
-  |     +-> Qualified column references in expand.rs
-  |           (requires alias-based FROM instead of CTE flattening)
-  |
-  +-> METRICS clause parser --> Metric with alias.name -> source_table
-        |
-        +-> Same qualified column support as dimensions
+  +-> D4: Semi-additive metrics (NON ADDITIVE BY references dimensions,
+                                  operates on metrics -- orthogonal to facts)
 
-Expansion engine rewrite
+T3: Multiple Join Paths (USING RELATIONSHIPS)
   |
-  +-> Alias-based FROM clause (replaces CTE _base flattening)
-  +-> PK/FK-based ON clause generation
-  +-> Topological sort for join ordering
-  +-> Backward compat: legacy ON-clause definitions still work
+  +-> D1: Role-Playing Dimensions (consequence of USING;
+  |                                same table joined via different relationships)
+  |
+  +-> D2: Fan Trap Detection (requires relationship cardinality metadata;
+                               can warn about one-to-many traversals)
+
+D3: Hierarchies (independent -- pure metadata, no dependencies)
 ```
 
-**Critical path:** SQL body parser -> model changes -> expansion engine rewrite. These are sequential dependencies.
-
-**Parallel work:** TABLES and RELATIONSHIPS parsers can be built together. DIMENSIONS and METRICS parsers are nearly identical and can share code.
+**Dependency ordering implications for phases:**
+1. **FACTS (T1)** has no dependencies and unblocks derived metrics
+2. **USING RELATIONSHIPS (T3)** has no feature dependencies but requires graph validation changes
+3. **Hierarchies (D3)** is fully independent
+4. **Derived Metrics (T2)** depends on T1 being designed (so metric expressions can reference facts)
+5. **Role-Playing Dimensions (D1)** depends on T3
+6. **Fan Trap Detection (D2)** depends on relationship type metadata (can be concurrent with T3)
+7. **Semi-Additive (D4)** is independent but complex -- save for last
 
 ---
 
-## MVP Recommendation
+## Detailed Design: Expression Reference Hierarchy
 
-### Wave 1: Model & Parser (Foundation)
+Understanding how expressions reference each other is critical for correct expansion ordering.
 
-1. **Extend model:** Add `primary_key: Vec<String>` to `TableRef`. Add `from_table: String` to `Join` (or refactor to a `Relationship` struct with `from_alias`, `from_cols`, `to_alias`, `to_cols`).
-2. **SQL body parser:** Parse TABLES, RELATIONSHIPS, DIMENSIONS, METRICS clauses from the DDL body into the model structs.
-3. **Translate to function-call syntax:** Generate the STRUCT/LIST literal form for `create_semantic_view()`.
-4. **Detect syntax variant:** If body starts with a clause keyword (`TABLES`, `DIMENSIONS`, etc.), use new parser. If body starts with `:=` argument syntax, use old verbatim passthrough. This provides backward compatibility.
+### Reference Rules (Snowflake-aligned)
 
-### Wave 2: Expansion Engine (Core Value)
+```
+Physical Columns (base)
+    |
+    v
+Facts (row-level named expressions)
+    |  - CAN reference: physical columns, other facts, dimensions
+    |  - CANNOT reference: metrics, derived metrics
+    |
+    v
+Dimensions (row-level attribute expressions)
+    |  - CAN reference: physical columns, facts
+    |  - CANNOT reference: metrics, derived metrics
+    |
+    v
+Metrics (aggregate expressions)
+    |  - CAN reference: physical columns, facts, dimensions (inside aggregation)
+    |  - CANNOT reference: other metrics, derived metrics
+    |
+    v
+Derived Metrics (post-aggregation expressions)
+       - CAN reference: other metrics, other derived metrics
+       - CANNOT reference: physical columns, facts, dimensions directly
+       - CANNOT use USING clause
+       - CANNOT contain aggregation functions
+```
 
-5. **Alias-based FROM generation:** Replace CTE flattening with `FROM base AS alias LEFT JOIN t2 AS alias2 ON ...` when table aliases exist.
-6. **PK/FK ON clause synthesis:** Generate `ON alias1.col = alias2.col` from relationship declarations.
-7. **Topological join ordering:** Order JOINs based on relationship graph.
-8. **Backward compat path:** Keep old CTE-based expansion for definitions without table aliases.
+### Expansion Order
 
-### Wave 3: Testing & Polish
+1. Resolve fact expressions (inline sub-facts first, topological order)
+2. Resolve dimension expressions (inline facts if referenced)
+3. Resolve metric expressions (inline facts if referenced)
+4. Resolve derived metric expressions (substitute metric expressions)
+5. Generate SQL: dimensions + metrics in SELECT, derived metrics as post-aggregation expressions
 
-9. **SQL logic tests:** New `.slt` files exercising SQL DDL syntax, multi-table joins, qualified column references.
-10. **Property-based tests:** Roundtrip parser tests (parse SQL -> model -> function-call syntax -> parse back).
-11. **Error messages:** Clause-aware errors for the new SQL grammar (line/column in DDL body).
+---
 
-**Defer from v0.5.2:** FACTS clause (model exists, parser can be added later), relationship naming (parse and store but ignore), ASOF/temporal joins, fan trap detection, derived metrics.
+## Detailed Design: Expansion SQL Patterns
+
+### Pattern A: Facts + Metrics (T1)
+
+**Definition:**
+```sql
+FACTS (li.net_price AS li.price * (1 - li.discount))
+METRICS (o.revenue AS SUM(li.net_price))
+```
+
+**Expanded SQL:**
+```sql
+SELECT SUM(("li"."price" * (1 - "li"."discount"))) AS "revenue"
+FROM "orders" AS "o"
+LEFT JOIN "line_items" AS "li" ON "li"."order_id" = "o"."id"
+```
+
+The fact `net_price` is inlined into the metric expression. Facts never appear as separate columns.
+
+### Pattern B: Derived Metrics (T2)
+
+**Definition:**
+```sql
+METRICS (
+  o.revenue AS SUM(o.amount),
+  o.cost AS SUM(o.expense),
+  profit AS o.revenue - o.cost
+)
+```
+
+**Expanded SQL:**
+```sql
+SELECT
+  SUM("o"."amount") AS "revenue",
+  SUM("o"."expense") AS "cost",
+  (SUM("o"."amount") - SUM("o"."expense")) AS "profit"
+FROM "orders" AS "o"
+GROUP BY 1
+```
+
+Derived metrics inline the referenced metrics' aggregate expressions.
+
+### Pattern C: USING RELATIONSHIPS / Role-Playing Dimensions (T3 + D1)
+
+**Definition:**
+```sql
+TABLES (
+  f AS flights PRIMARY KEY (flight_id),
+  a AS airports PRIMARY KEY (airport_code)
+)
+RELATIONSHIPS (
+  dep AS f(departure_airport) REFERENCES a,
+  arr AS f(arrival_airport) REFERENCES a
+)
+DIMENSIONS (
+  a.city AS a.city_name
+)
+METRICS (
+  f.departures USING (dep) AS COUNT(f.flight_id),
+  f.arrivals USING (arr) AS COUNT(f.flight_id)
+)
+```
+
+**Expanded SQL (querying departures + city):**
+```sql
+SELECT
+  "a__dep"."city_name" AS "city",
+  COUNT("f"."flight_id") AS "departures"
+FROM "flights" AS "f"
+LEFT JOIN "airports" AS "a__dep" ON "f"."departure_airport" = "a__dep"."airport_code"
+GROUP BY 1
+```
+
+The airports table is joined with alias `a__dep` (combining table alias with relationship name) to disambiguate.
+
+### Pattern D: Semi-Additive Metrics (D4)
+
+**Definition:**
+```sql
+METRICS (
+  b.balance NON ADDITIVE BY (date_dim DESC) AS SUM(b.balance)
+)
+```
+
+**Expanded SQL (querying balance by customer):**
+```sql
+SELECT
+  "b"."customer_id" AS "customer_id",
+  SUM("b"."balance") AS "balance"
+FROM (
+  SELECT *, ROW_NUMBER() OVER (
+    PARTITION BY "b"."customer_id"
+    ORDER BY "b"."date" DESC
+  ) AS "_rn"
+  FROM "bank_accounts" AS "b"
+) AS "b"
+WHERE "_rn" = 1
+GROUP BY 1
+```
 
 ---
 
 ## Complexity Assessment Summary
 
-| Feature | Complexity | Est. LOC | Risk |
-|---------|------------|----------|------|
-| Model changes (PK on TableRef, refactored Join) | Low | ~40 | Low -- additive fields with serde defaults |
-| SQL body parser (TABLES clause) | Medium | ~120 | Medium -- free-form table names, PK syntax |
-| SQL body parser (RELATIONSHIPS clause) | Medium | ~100 | Medium -- FK REFERENCES grammar |
-| SQL body parser (DIMENSIONS/METRICS clauses) | Medium | ~150 | Medium -- AS sql_expr boundary detection |
-| Syntax variant detection | Low | ~20 | Low -- check first token |
-| Translate to function-call syntax | Low-Medium | ~80 | Low -- string generation |
-| Alias-based FROM expansion | Medium-High | ~200 | **Medium-High** -- replaces core expansion, must maintain backward compat |
-| PK/FK ON clause synthesis | Low-Medium | ~60 | Low -- direct column-pair mapping |
-| Topological join ordering | Medium | ~80 | Low -- standard graph algorithm |
-| Backward compat for legacy definitions | Medium | ~60 | Medium -- dual-path expansion |
-| SQL logic tests (new syntax) | Low | ~150 | None |
-| Property-based tests (parser roundtrip) | Medium | ~100 | None |
-| **Total** | **Medium-High** | **~1160 lines** | **Medium** -- expansion engine rewrite is the riskiest piece |
+| Feature | Complexity | Est. LOC | Risk | Phase Order |
+|---------|------------|----------|------|-------------|
+| FACTS clause (T1) | Low-Medium | ~150 | Low -- model exists, parser pattern established | 1st |
+| Hierarchies (D3) | Low | ~100 | None -- pure metadata | 1st (parallel) |
+| Derived Metrics (T2) | Medium-High | ~250 | Medium -- dependency resolution, expression substitution | 2nd |
+| Fan Trap Detection (D2) | Medium | ~150 | Low -- detection only, no query changes | 2nd (parallel) |
+| USING RELATIONSHIPS (T3) | High | ~400 | **High** -- graph validation changes, multi-alias join expansion, relationship-scoped resolution | 3rd |
+| Role-Playing Dimensions (D1) | High (coupled to T3) | ~200 | **High** -- same-table multi-join alias management | 3rd (with T3) |
+| Semi-Additive NON ADDITIVE BY (D4) | High | ~300 | **High** -- window function subquery injection, changes expansion pipeline structure | 4th |
+| **Total** | **High** | **~1550 lines** | **Medium-High** | |
+
+---
+
+## MVP Recommendation
+
+### Wave 1: Low-Risk Foundations (estimated ~250 LOC)
+
+Build the features that have no dependencies and low risk:
+
+1. **FACTS clause (T1):** Parser + expansion inline. The model already exists. Re-use the DIMENSIONS parser pattern for `FACTS (alias.fact AS expr)`. Inline fact expressions at expansion time via text substitution.
+2. **Hierarchies (D3):** Model + parser + DESCRIBE. Pure metadata. New `HIERARCHIES` clause keyword. Store in definition JSON. Expose via DESCRIBE output.
+
+### Wave 2: Metric Composition (estimated ~400 LOC)
+
+Build features that compose with Wave 1:
+
+3. **Derived Metrics (T2):** Detect derived metrics (no source_table prefix). Build dependency DAG. Topological sort. Expand by inlining aggregate expressions. Define-time validation for cycles and unknown references.
+4. **Fan Trap Detection (D2):** Add optional `relationship_type` to relationship declarations. At expansion time, check for metrics aggregating across one-to-many boundaries. Emit warnings (not errors).
+
+### Wave 3: Multi-Path Joins (estimated ~600 LOC)
+
+The highest-complexity features:
+
+5. **USING RELATIONSHIPS + Role-Playing Dimensions (T3 + D1):** Relax diamond rejection for named relationships. Parse `USING (rel_name)` on metrics. Generate multi-alias JOINs. Relationship-scoped dimension resolution. This is the riskiest wave.
+
+### Wave 4: Semi-Additive (estimated ~300 LOC)
+
+6. **NON ADDITIVE BY (D4):** Parse `NON ADDITIVE BY (dim DESC, ...)` on metrics. Generate window function subquery at expansion time. Test with known snapshot data.
+
+### Deferral Rationale
+
+- **T3 + D1 before D4:** USING RELATIONSHIPS enables more use cases (role-playing dimensions are very common). Semi-additive is important but niche (financial/inventory only).
+- **T1 before T2:** Facts provide the row-level composition that derived metrics build upon. Derived metrics cannot be meaningfully tested without facts.
+- **D2 concurrent with T2:** Fan trap detection is independent of metric composition. Both can be developed in parallel.
+- **D3 anytime:** Hierarchies are pure metadata with zero risk. Can be built in any wave.
 
 ---
 
@@ -452,31 +661,40 @@ Expansion engine rewrite
 
 ### Snowflake Official Documentation (HIGH confidence)
 
-- [CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- full DDL grammar with TABLES, RELATIONSHIPS, DIMENSIONS, METRICS, FACTS clauses
-- [SEMANTIC_VIEW query syntax](https://docs.snowflake.com/en/sql-reference/constructs/semantic_view) -- SEMANTIC_VIEW() query clause with qualified dimension/metric references
-- [Overview of semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/overview) -- logical table / entity / relationship model
-- [Validation rules](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules) -- circular reference prohibition, expression scoping rules, PK/FK validation, granularity checks
-- [Using SQL commands for semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- complete worked examples with TPC-H data
-- [YAML specification](https://docs.snowflake.com/en/user-guide/views-semantic/semantic-view-yaml-spec) -- alternative definition format
-- [Querying semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/querying) -- qualified/unqualified name resolution, wildcard metrics
+- [CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- full DDL grammar including FACTS, NON ADDITIVE BY, USING clauses
+- [Using SQL commands for semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- worked examples of FACTS, derived metrics, USING RELATIONSHIPS, role-playing dimensions, NON ADDITIVE BY
+- [Semi-additive metrics release note (2026-03-05)](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY syntax and semantics
+- [Derived metrics release note (2025-09-30)](https://docs.snowflake.com/en/release-notes/2025/other/2025-09-30-semantic-view-derived-metrics) -- derived metric support announcement
+- [SEMANTIC_VIEW query syntax](https://docs.snowflake.com/en/sql-reference/constructs/semantic_view) -- query-time semantics
+- [Validation rules](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules) -- expression reference constraints, circular reference prohibition
+- [YAML specification](https://docs.snowflake.com/en/user-guide/views-semantic/semantic-view-yaml-spec) -- NON ADDITIVE BY YAML syntax, using_relationships YAML syntax
+- [Overview of semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/overview) -- expression hierarchy (facts vs dimensions vs metrics)
 
 ### Cube.dev Documentation (MEDIUM confidence)
 
-- [Joins between cubes](https://cube.dev/docs/product/data-modeling/concepts/working-with-joins) -- Dijkstra join path resolution, fan/chasm trap detection
-- [Joins reference](https://cube.dev/docs/product/data-modeling/reference/joins) -- `one_to_one`, `one_to_many`, `many_to_one` relationship types, LEFT JOIN default
-- [Cube reference](https://cube.dev/docs/product/data-modeling/reference/cube) -- `primary_key` requirement in dimensions for deduplication
-- [GitHub issue #1179](https://github.com/cube-js/cube/issues/1179) -- auto-adding joins via PK/FK (community request, not implemented)
+- [Joins between cubes](https://cube.dev/docs/product/data-modeling/concepts/working-with-joins) -- Dijkstra join path resolution, fan/chasm trap detection, diamond subgraph handling
+- [Joins reference](https://cube.dev/docs/reference/data-model/joins) -- relationship types (one_to_one, one_to_many, many_to_one), auto-dedup via PK, directed join graph
+- [Hierarchies reference](https://cube.dev/docs/product/data-modeling/reference/hierarchies) -- hierarchy syntax with levels array, cross-cube hierarchies, title/public options
+- [Cube.dev symmetric aggregation issue #7512](https://github.com/cube-js/cube/issues/7512) -- community discussion on fan trap handling
 
-### Databricks Documentation (MEDIUM confidence)
+### dbt / MetricFlow Documentation (MEDIUM confidence)
 
-- [Unity Catalog metric views](https://docs.databricks.com/aws/en/metric-views/) -- YAML-based semantic layer
-- [Model metric view data](https://docs.databricks.com/aws/en/metric-views/data-modeling/) -- dimensions, measures, joins, filters
-- [Use joins in metric views](https://docs.databricks.com/aws/en/metric-views/data-modeling/joins) -- ON/USING join syntax, star/snowflake schema support
+- [About MetricFlow](https://docs.getdbt.com/docs/build/about-metricflow) -- semantic layer architecture, semi-additive measures
+- [Build your metrics](https://docs.getdbt.com/docs/build/build-metrics-intro) -- metric types including derived
+- [Creating metrics](https://docs.getdbt.com/docs/build/metrics-overview) -- derived metric syntax (expr + input_metrics)
+- [Measures](https://docs.getdbt.com/docs/build/measures) -- non_additive_dimension configuration with window_choice
+
+### General Semantic Layer References (LOW confidence)
+
+- [Fan trap / chasm trap patterns](https://datacadamia.com/data/type/cube/semantic/fan_trap) -- general definition and detection approaches
+- [Role-playing dimensions pattern](https://www.starschema.co.uk/post/role-playing-dimensions) -- traditional data warehousing pattern
+- [Semantic Layer 2025 comparison](https://www.typedef.ai/resources/semantic-layer-metricflow-vs-snowflake-vs-databricks) -- MetricFlow vs Snowflake vs Databricks comparison
 
 ### Project Source Code (HIGH confidence -- direct analysis)
 
-- `src/model.rs` -- `TableRef`, `Join`, `JoinColumn`, `Dimension`, `Metric`, `Fact`, `SemanticViewDefinition`
-- `src/parse.rs` -- `scan_clause_keywords`, `validate_clauses`, `rewrite_ddl`, `DdlKind`
-- `src/expand.rs` -- CTE-based expansion, `collect_transitive_dependencies`, `suggest_closest`
-- `src/ddl/parse_args.rs` -- STRUCT/LIST argument extraction from DuckDB BindInfo
-- `TECH-DEBT.md` -- items 6 (ON-clause substring matching), 7 (unqualified column names), 8 (statement rewrite approach)
+- `src/model.rs` -- `Fact` struct (exists, unused), `Metric`/`Dimension`/`Join`/`TableRef` structs
+- `src/body_parser.rs` -- SQL keyword body parser (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS)
+- `src/expand.rs` -- expansion engine (no fact support, no derived metric support)
+- `src/graph.rs` -- `RelationshipGraph` with `check_no_diamonds()` (to be relaxed)
+- `test/sql/phase28_e2e.test` -- current end-to-end test pattern (reference for new tests)
+- `TECH-DEBT.md` -- resolved items 6-8 (ON-clause heuristic, unqualified names, statement rewrite)
