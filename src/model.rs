@@ -83,6 +83,20 @@ pub struct JoinColumn {
     pub to: String,
 }
 
+/// Cardinality of a relationship between two tables.
+///
+/// Declared after `REFERENCES <alias>` in the RELATIONSHIPS clause.
+/// Defaults to `ManyToOne` when omitted (most common FK pattern).
+/// Old stored JSON without a `cardinality` field deserializes as `ManyToOne`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum Cardinality {
+    #[default]
+    ManyToOne,
+    OneToOne,
+    OneToMany,
+}
+
 /// A JOIN relationship between the base table and another source table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -112,6 +126,11 @@ pub struct Join {
     /// In `order_to_customer AS o(customer_id) REFERENCES c`, this is `Some("order_to_customer")`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Phase 31: Cardinality of this relationship.
+    /// Defaults to `ManyToOne` when omitted in DDL (most common FK pattern).
+    /// Old stored JSON without this field deserializes as `ManyToOne`.
+    #[serde(default)]
+    pub cardinality: Cardinality,
 }
 
 /// Top-level definition of a semantic view.
@@ -461,6 +480,75 @@ mod tests {
                 !json.contains("hierarchies"),
                 "Empty hierarchies should be omitted from JSON: {json}"
             );
+        }
+    }
+
+    mod phase31_cardinality_tests {
+        use super::*;
+
+        #[test]
+        fn cardinality_serde_roundtrip() {
+            // All three variants serialize and deserialize correctly
+            for (variant, expected_json) in [
+                (Cardinality::ManyToOne, r#""ManyToOne""#),
+                (Cardinality::OneToOne, r#""OneToOne""#),
+                (Cardinality::OneToMany, r#""OneToMany""#),
+            ] {
+                let json = serde_json::to_string(&variant).unwrap();
+                assert_eq!(json, expected_json);
+                let rt: Cardinality = serde_json::from_str(&json).unwrap();
+                assert_eq!(rt, variant);
+            }
+        }
+
+        #[test]
+        fn join_with_cardinality_roundtrip() {
+            let join = Join {
+                table: "customers".to_string(),
+                from_alias: "o".to_string(),
+                fk_columns: vec!["customer_id".to_string()],
+                name: Some("order_to_customer".to_string()),
+                cardinality: Cardinality::OneToMany,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&join).unwrap();
+            assert!(json.contains(r#""cardinality":"OneToMany""#));
+            let rt: Join = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.cardinality, Cardinality::OneToMany);
+        }
+
+        #[test]
+        fn old_json_without_cardinality_defaults_to_many_to_one() {
+            // Backward compat: old JSON without cardinality field
+            let json = r#"{"table":"customers","on":"a.id=b.id"}"#;
+            let join: Join = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                join.cardinality,
+                Cardinality::ManyToOne,
+                "Missing cardinality must default to ManyToOne"
+            );
+        }
+
+        #[test]
+        fn definition_with_cardinality_joins_roundtrips() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![],
+                metrics: vec![],
+                joins: vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    name: Some("order_to_customer".to_string()),
+                    cardinality: Cardinality::OneToOne,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            let rt = SemanticViewDefinition::from_json("orders", &json).unwrap();
+            assert_eq!(rt.joins.len(), 1);
+            assert_eq!(rt.joins[0].cardinality, Cardinality::OneToOne);
         }
     }
 

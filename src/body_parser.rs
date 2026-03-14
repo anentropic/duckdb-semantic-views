@@ -3,7 +3,7 @@
 //! Parses: `AS TABLES (...) RELATIONSHIPS (...) DIMENSIONS (...) METRICS (...)`
 //! into a `SemanticViewDefinition`.
 
-use crate::model::{Dimension, Fact, Hierarchy, Join, Metric, TableRef};
+use crate::model::{Cardinality, Dimension, Fact, Hierarchy, Join, Metric, TableRef};
 use crate::parse::ParseError;
 
 /// Result of parsing the keyword body (everything after "AS").
@@ -695,6 +695,7 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
         from_alias: from_alias.to_string(),
         fk_columns,
         name: Some(rel_name.to_string()),
+        cardinality: Cardinality::default(),
         on: String::new(),
         from_cols: vec![],
         join_columns: vec![],
