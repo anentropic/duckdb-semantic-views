@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
-status: completed
-stopped_at: Completed 29-02-PLAN.md (Phase 29 complete)
-last_updated: "2026-03-14T12:31:52.778Z"
-last_activity: 2026-03-14 -- Completed 29-02 (Fact inlining, DESCRIBE update, E2E tests)
+status: in_progress
+stopped_at: Completed 30-01-PLAN.md
+last_updated: "2026-03-14T13:50:08.000Z"
+last_activity: 2026-03-14 -- Completed 30-01 (Derived metric parsing and validation)
 progress:
   total_phases: 4
   completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
-  percent: 10
+  total_plans: 4
+  completed_plans: 3
+  percent: 30
 ---
 
 # Project State
@@ -21,32 +21,33 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-14)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand -- the extension handles expansion, DuckDB handles execution.
-**Current focus:** Phase 29 - FACTS Clause & Hierarchies
+**Current focus:** Phase 30 - Derived Metrics
 
 ## Current Position
 
-Phase: 29 (1 of 4 in v0.5.3) (FACTS Clause & Hierarchies)
-Plan: 2 of 2 in current phase -- PHASE COMPLETE
-Status: Phase 29 complete, ready for Phase 30
-Last activity: 2026-03-14 -- Completed 29-02 (Fact inlining, DESCRIBE update, E2E tests)
+Phase: 30 (2 of 4 in v0.5.3) (Derived Metrics)
+Plan: 1 of 2 in current phase
+Status: Plan 30-01 complete, ready for 30-02
+Last activity: 2026-03-14 -- Completed 30-01 (Derived metric parsing and validation)
 
-Progress: [==........] 10% (v0.5.3)
+Progress: [===.......] 30% (v0.5.3)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2 (v0.5.3)
-- Average duration: 44min
-- Total execution time: 87min
+- Total plans completed: 3 (v0.5.3)
+- Average duration: 33min
+- Total execution time: 100min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 29 | 2 | 87min | 44min |
+| 30 | 1 | 13min | 13min |
 
 **Recent Trend:**
-- Last 5 plans: 72min, 15min
+- Last 5 plans: 72min, 15min, 13min
 - Trend: improving
 
 *Updated after each plan completion*
@@ -68,6 +69,9 @@ Recent decisions affecting current work:
 - [29-02]: Fact inlining uses own toposort_facts in expand.rs (not graph.rs) for index-based resolution
 - [29-02]: DESCRIBE extended to 8 columns with null-to-[] fallback for backward compat
 - [29-02]: Word-boundary replacement is case-sensitive (fact names are identifiers)
+- [30-01]: Separate parse_metrics_clause for METRICS (FACTS/DIMENSIONS unchanged)
+- [30-01]: Unknown ref detection via identifier extraction + SQL keyword skip list
+- [30-01]: validate_derived_metrics split into 4 helpers for clippy compliance
 
 ### Pending Todos
 
@@ -83,5 +87,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-14
-Stopped at: Completed 29-02-PLAN.md (Phase 29 complete)
+Stopped at: Completed 30-01-PLAN.md
 Resume file: None

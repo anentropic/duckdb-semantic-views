@@ -17,11 +17,11 @@ Requirements for advanced semantic modeling capabilities. Each maps to roadmap p
 
 ### Derived Metrics
 
-- [ ] **DRV-01**: User can declare derived metrics without a table prefix (`metric_name AS metric_a - metric_b`)
+- [x] **DRV-01**: User can declare derived metrics without a table prefix (`metric_name AS metric_a - metric_b`)
 - [ ] **DRV-02**: Derived metrics expand by inlining referenced metrics' aggregate expressions
 - [ ] **DRV-03**: Derived metrics can reference other derived metrics (stacking); expansion resolves in topological order
-- [ ] **DRV-04**: Define-time validation rejects derived metric cycles and references to non-existent metrics
-- [ ] **DRV-05**: Derived metrics cannot contain aggregation functions (define-time validation)
+- [x] **DRV-04**: Define-time validation rejects derived metric cycles and references to non-existent metrics
+- [x] **DRV-05**: Derived metrics cannot contain aggregation functions (define-time validation)
 
 ### Hierarchies
 
@@ -97,11 +97,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | HIER-01 | Phase 29 | Complete |
 | HIER-02 | Phase 29 | Complete |
 | HIER-03 | Phase 29 | Complete |
-| DRV-01 | Phase 30 | Pending |
+| DRV-01 | Phase 30 | Complete |
 | DRV-02 | Phase 30 | Pending |
 | DRV-03 | Phase 30 | Pending |
-| DRV-04 | Phase 30 | Pending |
-| DRV-05 | Phase 30 | Pending |
+| DRV-04 | Phase 30 | Complete |
+| DRV-05 | Phase 30 | Complete |
 | FAN-01 | Phase 31 | Pending |
 | FAN-02 | Phase 31 | Pending |
 | FAN-03 | Phase 31 | Pending |
