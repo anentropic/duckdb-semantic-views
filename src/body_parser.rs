@@ -317,7 +317,7 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
     let mut facts_raw: Vec<(String, String, String)> = Vec::new();
     let mut hierarchies: Vec<Hierarchy> = Vec::new();
     let mut dimensions_raw: Vec<(String, String, String)> = Vec::new();
-    let mut metrics_raw: Vec<(String, String, String)> = Vec::new();
+    let mut metrics_raw: Vec<(Option<String>, String, String)> = Vec::new();
 
     for bound in &bounds {
         match bound.keyword {
@@ -337,7 +337,7 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
                 dimensions_raw = parse_qualified_entries(bound.content, bound.content_offset)?;
             }
             "metrics" => {
-                metrics_raw = parse_qualified_entries(bound.content, bound.content_offset)?;
+                metrics_raw = parse_metrics_clause(bound.content, bound.content_offset)?;
             }
             _ => {}
         }
@@ -365,10 +365,10 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
 
     let metrics = metrics_raw
         .into_iter()
-        .map(|(alias, bare_name, expr)| Metric {
+        .map(|(source_alias, bare_name, expr)| Metric {
             name: bare_name,
             expr,
-            source_table: Some(alias),
+            source_table: source_alias,
             output_type: None,
         })
         .collect();
@@ -699,6 +699,96 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
         from_cols: vec![],
         join_columns: vec![],
     })
+}
+
+/// Parse the content inside METRICS (...) supporting both qualified and unqualified entries.
+///
+/// Qualified entries have the form: `alias.name AS expr` (base metric).
+/// Unqualified entries have the form: `name AS expr` (derived metric).
+///
+/// Returns `Vec<(Option<source_alias>, bare_name, expr)>` where the Option is
+/// `Some(alias)` for qualified entries and `None` for unqualified (derived) entries.
+pub(crate) fn parse_metrics_clause(
+    body: &str,
+    base_offset: usize,
+) -> Result<Vec<(Option<String>, String, String)>, ParseError> {
+    if body.trim().is_empty() {
+        return Ok(vec![]);
+    }
+
+    let entries = split_at_depth0_commas(body);
+    let mut result = Vec::new();
+
+    for (entry_start, entry) in entries {
+        let entry_offset = base_offset + entry_start;
+        let parsed = parse_single_metric_entry(entry, entry_offset)?;
+        result.push(parsed);
+    }
+
+    Ok(result)
+}
+
+/// Parse one METRICS entry: either `alias.name AS expr` (qualified) or `name AS expr` (derived).
+fn parse_single_metric_entry(
+    entry: &str,
+    entry_offset: usize,
+) -> Result<(Option<String>, String, String), ParseError> {
+    let entry = entry.trim();
+
+    // Check if entry contains a dot BEFORE the AS keyword -- if so, it's qualified.
+    // Find "AS" keyword first (case-insensitive, word boundary).
+    let upper = entry.to_ascii_uppercase();
+    let as_pos = find_keyword_ci(&upper, "AS").ok_or_else(|| ParseError {
+        message: format!(
+            "Expected 'AS' keyword in metric entry '{entry}'. Form: 'alias.name AS expr' or 'name AS expr'.",
+        ),
+        position: Some(entry_offset),
+    })?;
+
+    let before_as = entry[..as_pos].trim();
+    let expr = entry[as_pos + 2..].trim().to_string();
+
+    if expr.is_empty() {
+        return Err(ParseError {
+            message: format!("Missing expression after 'AS' in metric entry '{entry}'."),
+            position: Some(entry_offset + as_pos + 2),
+        });
+    }
+
+    if before_as.is_empty() {
+        return Err(ParseError {
+            message: format!("Missing metric name before 'AS' in entry '{entry}'."),
+            position: Some(entry_offset),
+        });
+    }
+
+    // Check for dot to distinguish qualified vs unqualified
+    if let Some(dot_pos) = before_as.find('.') {
+        // Qualified: alias.name
+        let source_alias = before_as[..dot_pos].trim().to_string();
+        let bare_name = before_as[dot_pos + 1..].trim().to_string();
+
+        if source_alias.is_empty() {
+            return Err(ParseError {
+                message: format!("Source alias before '.' is empty in metric entry '{entry}'."),
+                position: Some(entry_offset),
+            });
+        }
+        if bare_name.is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "Missing bare name between '.' and 'AS' in metric entry '{entry}'."
+                ),
+                position: Some(entry_offset + dot_pos + 1),
+            });
+        }
+
+        Ok((Some(source_alias), bare_name, expr))
+    } else {
+        // Unqualified: just name (derived metric)
+        let bare_name = before_as.to_string();
+        Ok((None, bare_name, expr))
+    }
 }
 
 /// Parse the content inside DIMENSIONS or METRICS (...).
@@ -1511,5 +1601,120 @@ mod tests {
         let result = parse_hierarchies_clause("geo as (country, state)", 0).unwrap();
         assert_eq!(result[0].name, "geo");
         assert_eq!(result[0].levels, vec!["country", "state"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_metrics_clause tests (Phase 30 -- derived metrics)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_metrics_clause_qualified_entry() {
+        let result = parse_metrics_clause("li.revenue AS SUM(li.amount)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, Some("li".to_string())); // source alias
+        assert_eq!(result[0].1, "revenue"); // bare_name
+        assert_eq!(result[0].2, "SUM(li.amount)"); // expr
+    }
+
+    #[test]
+    fn parse_metrics_clause_unqualified_entry() {
+        let result = parse_metrics_clause("profit AS revenue - cost", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, None); // no source alias (derived metric)
+        assert_eq!(result[0].1, "profit"); // bare_name
+        assert_eq!(result[0].2, "revenue - cost"); // expr
+    }
+
+    #[test]
+    fn parse_metrics_clause_mixed_entries() {
+        let result = parse_metrics_clause(
+            "li.revenue AS SUM(li.amount), profit AS revenue - cost, li.cost AS SUM(li.unit_cost)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 3);
+        // First: qualified
+        assert_eq!(result[0].0, Some("li".to_string()));
+        assert_eq!(result[0].1, "revenue");
+        assert_eq!(result[0].2, "SUM(li.amount)");
+        // Second: unqualified (derived)
+        assert_eq!(result[1].0, None);
+        assert_eq!(result[1].1, "profit");
+        assert_eq!(result[1].2, "revenue - cost");
+        // Third: qualified
+        assert_eq!(result[2].0, Some("li".to_string()));
+        assert_eq!(result[2].1, "cost");
+        assert_eq!(result[2].2, "SUM(li.unit_cost)");
+    }
+
+    #[test]
+    fn parse_metrics_clause_trailing_comma() {
+        let result = parse_metrics_clause("profit AS revenue - cost,", 0).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "Trailing comma must not produce extra entry"
+        );
+    }
+
+    #[test]
+    fn parse_metrics_clause_newline_separated() {
+        let result = parse_metrics_clause(
+            "\n  li.revenue AS SUM(li.amount),\n  profit AS revenue - cost\n",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, Some("li".to_string()));
+        assert_eq!(result[1].0, None);
+        assert_eq!(result[1].1, "profit");
+    }
+
+    #[test]
+    fn parse_keyword_body_with_derived_metrics() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS region) METRICS (o.revenue AS SUM(o.amount), profit AS revenue - cost)";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.metrics.len(), 2);
+        // First: qualified metric -> source_table: Some("o")
+        assert_eq!(kb.metrics[0].name, "revenue");
+        assert_eq!(kb.metrics[0].source_table.as_deref(), Some("o"));
+        assert_eq!(kb.metrics[0].expr, "SUM(o.amount)");
+        // Second: derived metric -> source_table: None
+        assert_eq!(kb.metrics[1].name, "profit");
+        assert!(kb.metrics[1].source_table.is_none());
+        assert_eq!(kb.metrics[1].expr, "revenue - cost");
+    }
+
+    #[test]
+    fn parse_keyword_body_only_derived_metrics() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) METRICS (profit AS revenue - cost, margin AS profit / revenue)";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.metrics.len(), 2);
+        assert!(kb.metrics[0].source_table.is_none());
+        assert!(kb.metrics[1].source_table.is_none());
+        assert_eq!(kb.metrics[0].name, "profit");
+        assert_eq!(kb.metrics[1].name, "margin");
+    }
+
+    #[test]
+    fn parse_qualified_entries_still_rejects_unqualified() {
+        // FACTS and DIMENSIONS still use parse_qualified_entries which requires alias.name
+        let result = parse_qualified_entries("revenue AS SUM(amount)", 0);
+        assert!(
+            result.is_err(),
+            "parse_qualified_entries must still reject unqualified entries (missing dot)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("alias") || err.message.contains("qualified"),
+            "Error should mention alias or qualified: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_metrics_clause_empty_body() {
+        let result = parse_metrics_clause("", 0).unwrap();
+        assert_eq!(result.len(), 0, "Empty body must return empty vec");
     }
 }
