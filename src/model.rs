@@ -62,6 +62,18 @@ pub struct Fact {
     pub source_table: Option<String>,
 }
 
+/// A named drill-down path through declared dimensions.
+/// Added in Phase 29 for the HIERARCHIES clause of CREATE SEMANTIC VIEW.
+///
+/// Example: `geo AS (country, state, city)` defines a hierarchy named "geo"
+/// whose levels are existing dimension names from coarsest to finest granularity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct Hierarchy {
+    pub name: String,
+    pub levels: Vec<String>,
+}
+
 /// A column-pair relationship entry for composite or single FK declarations.
 /// Used in the `relationships` DDL parameter's `join_columns` field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -125,6 +137,11 @@ pub struct SemanticViewDefinition {
     pub joins: Vec<Join>,
     #[serde(default)]
     pub facts: Vec<Fact>,
+    /// Phase 29: named drill-down paths through dimensions.
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hierarchies: Vec<Hierarchy>,
     /// Column names from DDL-time LIMIT 0 inference, parallel to `column_types_inferred`.
     /// Populated by `create_semantic_view` `invoke()`. Empty = no inference ran.
     /// Used by `bind()` to build a name→type map for subquery column lookups.
@@ -355,6 +372,7 @@ mod tests {
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                hierarchies: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -377,6 +395,71 @@ mod tests {
             assert!(
                 def.tables.is_empty(),
                 "tables should default to [] for old JSON without tables field"
+            );
+        }
+    }
+
+    mod phase29_hierarchy_tests {
+        use super::*;
+
+        #[test]
+        fn hierarchy_roundtrip_serialization() {
+            let h = Hierarchy {
+                name: "geo".to_string(),
+                levels: vec![
+                    "country".to_string(),
+                    "state".to_string(),
+                    "city".to_string(),
+                ],
+            };
+            let json = serde_json::to_string(&h).unwrap();
+            let rt: Hierarchy = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.name, "geo");
+            assert_eq!(rt.levels, vec!["country", "state", "city"]);
+        }
+
+        #[test]
+        fn definition_with_hierarchies_roundtrips() {
+            let json = r#"{
+                "base_table": "orders",
+                "dimensions": [{"name": "country", "expr": "country"}],
+                "metrics": [],
+                "hierarchies": [{"name": "geo", "levels": ["country", "state", "city"]}]
+            }"#;
+            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+            assert_eq!(def.hierarchies.len(), 1);
+            assert_eq!(def.hierarchies[0].name, "geo");
+            assert_eq!(def.hierarchies[0].levels, vec!["country", "state", "city"]);
+
+            // Roundtrip: serialize and re-parse
+            let re_json = serde_json::to_string(&def).unwrap();
+            let rt = SemanticViewDefinition::from_json("orders", &re_json).unwrap();
+            assert_eq!(rt.hierarchies.len(), 1);
+        }
+
+        #[test]
+        fn old_json_without_hierarchies_deserializes_with_empty_vec() {
+            let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+            assert!(
+                def.hierarchies.is_empty(),
+                "hierarchies should default to [] for old JSON without hierarchies field"
+            );
+        }
+
+        #[test]
+        fn definition_without_hierarchies_does_not_serialize_field() {
+            // skip_serializing_if = "Vec::is_empty" means no hierarchies key in output
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![],
+                metrics: vec![],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            assert!(
+                !json.contains("hierarchies"),
+                "Empty hierarchies should be omitted from JSON: {json}"
             );
         }
     }
@@ -420,6 +503,7 @@ mod tests {
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                hierarchies: vec![],
                 column_type_names: vec!["region".to_string(), "revenue".to_string()],
                 column_types_inferred: vec![17u32, 20u32],
             };

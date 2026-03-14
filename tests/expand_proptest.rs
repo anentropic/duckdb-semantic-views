@@ -57,6 +57,7 @@ fn simple_definition() -> SemanticViewDefinition {
         filters: vec!["status = 'active'".to_string()],
         joins: vec![],
         facts: vec![],
+        hierarchies: vec![],
         column_type_names: vec![],
         column_types_inferred: vec![],
     }
@@ -136,6 +137,7 @@ fn joined_definition() -> SemanticViewDefinition {
             },
         ],
         facts: vec![],
+        hierarchies: vec![],
         column_type_names: vec![],
         column_types_inferred: vec![],
     }

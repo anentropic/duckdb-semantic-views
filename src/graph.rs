@@ -396,6 +396,7 @@ mod tests {
                 .collect(),
             filters: vec![],
             facts: vec![],
+            hierarchies: vec![],
             column_type_names: vec![],
             column_types_inferred: vec![],
         }
@@ -630,6 +631,7 @@ mod tests {
             metrics: vec![],
             filters: vec![],
             facts: vec![],
+            hierarchies: vec![],
             column_type_names: vec![],
             column_types_inferred: vec![],
         };
