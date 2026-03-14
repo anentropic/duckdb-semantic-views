@@ -10,10 +10,10 @@ Requirements for advanced semantic modeling capabilities. Each maps to roadmap p
 ### Semantic Modeling (FACTS)
 
 - [x] **FACT-01**: User can declare named row-level expressions in a FACTS clause (`alias.fact_name AS sql_expr`)
-- [ ] **FACT-02**: Metric expressions can reference fact names; expansion inlines the fact expression with parenthesization
+- [x] **FACT-02**: Metric expressions can reference fact names; expansion inlines the fact expression with parenthesization
 - [x] **FACT-03**: Facts can reference other facts; expansion resolves in topological order
 - [x] **FACT-04**: Define-time validation rejects fact cycles and references to non-existent facts
-- [ ] **FACT-05**: DESCRIBE SEMANTIC VIEW shows facts alongside dimensions and metrics
+- [x] **FACT-05**: DESCRIBE SEMANTIC VIEW shows facts alongside dimensions and metrics
 
 ### Derived Metrics
 
@@ -27,7 +27,7 @@ Requirements for advanced semantic modeling capabilities. Each maps to roadmap p
 
 - [x] **HIER-01**: User can declare drill-down paths in a HIERARCHIES clause (`name AS (dim1, dim2, dim3)`)
 - [x] **HIER-02**: Define-time validation rejects hierarchies referencing non-existent dimensions
-- [ ] **HIER-03**: DESCRIBE SEMANTIC VIEW shows hierarchy definitions
+- [x] **HIER-03**: DESCRIBE SEMANTIC VIEW shows hierarchy definitions
 
 ### Multiple Join Paths
 
@@ -90,13 +90,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | FACT-01 | Phase 29 | Complete |
-| FACT-02 | Phase 29 | Pending |
+| FACT-02 | Phase 29 | Complete |
 | FACT-03 | Phase 29 | Complete |
 | FACT-04 | Phase 29 | Complete |
-| FACT-05 | Phase 29 | Pending |
+| FACT-05 | Phase 29 | Complete |
 | HIER-01 | Phase 29 | Complete |
 | HIER-02 | Phase 29 | Complete |
-| HIER-03 | Phase 29 | Pending |
+| HIER-03 | Phase 29 | Complete |
 | DRV-01 | Phase 30 | Pending |
 | DRV-02 | Phase 30 | Pending |
 | DRV-03 | Phase 30 | Pending |

@@ -4,14 +4,14 @@ milestone: v0.5.3
 milestone_name: Advanced Semantic Features
 status: active
 stopped_at: null
-last_updated: "2026-03-14T12:05:23.000Z"
-last_activity: 2026-03-14 -- Completed 29-01 (FACTS/HIERARCHIES parsing + validation)
+last_updated: "2026-03-14T12:24:16.000Z"
+last_activity: 2026-03-14 -- Completed 29-02 (Fact inlining, DESCRIBE update, E2E tests)
 progress:
   total_phases: 4
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 2
-  completed_plans: 1
-  percent: 5
+  completed_plans: 2
+  percent: 10
 ---
 
 # Project State
@@ -26,28 +26,28 @@ See: .planning/PROJECT.md (updated 2026-03-14)
 ## Current Position
 
 Phase: 29 (1 of 4 in v0.5.3) (FACTS Clause & Hierarchies)
-Plan: 1 of 2 in current phase
-Status: Executing
-Last activity: 2026-03-14 -- Completed 29-01 (FACTS/HIERARCHIES parsing + validation)
+Plan: 2 of 2 in current phase -- PHASE COMPLETE
+Status: Phase 29 complete, ready for Phase 30
+Last activity: 2026-03-14 -- Completed 29-02 (Fact inlining, DESCRIBE update, E2E tests)
 
-Progress: [=.........] 5% (v0.5.3)
+Progress: [==........] 10% (v0.5.3)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1 (v0.5.3)
-- Average duration: 72min
-- Total execution time: 72min
+- Total plans completed: 2 (v0.5.3)
+- Average duration: 44min
+- Total execution time: 87min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 29 | 1 | 72min | 72min |
+| 29 | 2 | 87min | 44min |
 
 **Recent Trend:**
-- Last 5 plans: 72min
-- Trend: baseline
+- Last 5 plans: 72min, 15min
+- Trend: improving
 
 *Updated after each plan completion*
 
@@ -65,6 +65,9 @@ Recent decisions affecting current work:
 - [29-01]: Hierarchies are pure metadata -- validated against dimensions, not used in expansion
 - [29-01]: Fact cycle detection uses Kahn's algorithm (same pattern as relationship graph)
 - [29-01]: Word-boundary matching for fact references avoids substring collisions
+- [29-02]: Fact inlining uses own toposort_facts in expand.rs (not graph.rs) for index-based resolution
+- [29-02]: DESCRIBE extended to 8 columns with null-to-[] fallback for backward compat
+- [29-02]: Word-boundary replacement is case-sensitive (fact names are identifiers)
 
 ### Pending Todos
 
@@ -80,5 +83,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-03-14
-Stopped at: Completed 29-01-PLAN.md
+Stopped at: Completed 29-02-PLAN.md (Phase 29 complete)
 Resume file: None
