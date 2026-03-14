@@ -55,7 +55,18 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Active
 
-(No active milestone — next milestone TBD via `/gsd:new-milestone`)
+## Current Milestone: v0.5.3 Advanced Semantic Features
+
+**Goal:** Add advanced semantic modeling capabilities — FACTS clause, derived metrics, hierarchies, fan trap detection, role-playing dimensions, semi-additive metrics, and multiple join paths.
+
+**Target features:**
+- FACTS clause (named row-level sub-expressions for metrics)
+- Derived metrics (metric referencing other metrics)
+- Hierarchies / drill-down paths
+- Fan trap detection and deduplication warnings
+- Role-playing dimensions (same table joined via different relationships)
+- Semi-additive metrics (NON ADDITIVE BY)
+- Multiple join paths (USING RELATIONSHIPS — relaxes diamond rejection)
 
 ## Shipped: v0.5.2 SQL DDL & PK/FK Relationships (2026-03-13)
 
@@ -128,4 +139,4 @@ Native `CREATE SEMANTIC VIEW` DDL syntax achieved via DuckDB parser extension ho
 | FROM+JOIN expansion replacing CTE flattening | Direct `FROM base LEFT JOIN t ON pk=fk` instead of `_base` CTE; enables qualified column refs | ✓ Good — correct scoping, cleaner SQL |
 
 ---
-*Last updated: 2026-03-13 after v0.5.2 milestone*
+*Last updated: 2026-03-14 after v0.5.3 milestone start*
