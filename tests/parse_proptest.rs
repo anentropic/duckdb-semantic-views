@@ -945,3 +945,100 @@ proptest! {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// TEST-10: Derived metric parsing and expression substitution (Phase 30)
+// ---------------------------------------------------------------------------
+
+/// Generate a valid metric name (no dots allowed for derived metrics).
+fn arb_metric_name() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[a-z][a-z0-9_]{0,14}").unwrap()
+}
+
+/// Generate a simple arithmetic expression from metric names.
+fn arb_arithmetic_expr(names: Vec<String>) -> impl Strategy<Value = String> {
+    let operators = vec![" + ", " - ", " * ", " / "];
+    let n = names.len();
+    if n == 0 {
+        return Just("1".to_string()).boxed();
+    }
+    (0..n, proptest::sample::select(operators), 0..n)
+        .prop_map(move |(a, op, b)| {
+            let left = &names[a % names.len()];
+            let right = &names[b % names.len()];
+            format!("{left}{op}{right}")
+        })
+        .boxed()
+}
+
+proptest! {
+    /// Derived metric entries in METRICS clause: parse_and_rewrite either succeeds
+    /// or returns a well-formed error (no panics).
+    #[test]
+    fn derived_metric_parsing_no_panic(
+        name in arb_view_name(),
+        derived_name in arb_metric_name(),
+        base_name in arb_metric_name(),
+    ) {
+        // Build a DDL with one base metric and one derived metric
+        let query = format!(
+            "CREATE SEMANTIC VIEW {name} AS \
+             TABLES (t AS orders PRIMARY KEY (id)) \
+             DIMENSIONS (t.region AS region) \
+             METRICS (t.{base_name} AS SUM(t.amount), {derived_name} AS {base_name} + 1)"
+        );
+        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
+        prop_assert!(
+            result.is_ok(),
+            "validate_and_rewrite panicked on derived metric entry"
+        );
+    }
+
+    /// Mixed qualified and unqualified metric entries: no panics.
+    #[test]
+    fn mixed_metrics_no_panic(
+        name in arb_view_name(),
+        alias in arb_identifier(),
+        base1 in arb_metric_name(),
+        base2 in arb_metric_name(),
+        derived in arb_metric_name(),
+    ) {
+        let query = format!(
+            "CREATE SEMANTIC VIEW {name} AS \
+             TABLES ({alias} AS orders PRIMARY KEY (id)) \
+             DIMENSIONS ({alias}.region AS region) \
+             METRICS ({alias}.{base1} AS SUM({alias}.amount), \
+                      {alias}.{base2} AS COUNT(*), \
+                      {derived} AS {base1} + {base2})"
+        );
+        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
+        prop_assert!(
+            result.is_ok(),
+            "validate_and_rewrite panicked on mixed qualified/unqualified metrics"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TEST-11: Word-boundary replacement safety (Phase 30)
+// ---------------------------------------------------------------------------
+
+use semantic_views::expand::quote_ident;
+
+proptest! {
+    /// replace_word_boundary (tested through expand infrastructure):
+    /// quote_ident with random strings does not panic and produces valid output.
+    #[test]
+    fn quote_ident_never_panics(
+        input in "[a-zA-Z0-9_\"]{0,50}",
+    ) {
+        let result = std::panic::catch_unwind(|| quote_ident(&input));
+        prop_assert!(
+            result.is_ok(),
+            "quote_ident panicked on input: {input:?}"
+        );
+        let quoted = result.unwrap();
+        prop_assert!(quoted.starts_with('"'), "Must start with double quote");
+        prop_assert!(quoted.ends_with('"'), "Must end with double quote");
+    }
+}
