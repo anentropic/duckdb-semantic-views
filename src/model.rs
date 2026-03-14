@@ -97,6 +97,16 @@ pub enum Cardinality {
     OneToMany,
 }
 
+impl Cardinality {
+    /// Returns `true` when the variant is the default (`ManyToOne`).
+    /// Used by `serde(skip_serializing_if)` to omit the field from JSON
+    /// when it matches the default, preserving backward-compatible output.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::ManyToOne)
+    }
+}
+
 /// A JOIN relationship between the base table and another source table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -129,7 +139,8 @@ pub struct Join {
     /// Phase 31: Cardinality of this relationship.
     /// Defaults to `ManyToOne` when omitted in DDL (most common FK pattern).
     /// Old stored JSON without this field deserializes as `ManyToOne`.
-    #[serde(default)]
+    /// Not serialized when `ManyToOne` to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Cardinality::is_default")]
     pub cardinality: Cardinality,
 }
 

@@ -1042,3 +1042,82 @@ proptest! {
         prop_assert!(quoted.ends_with('"'), "Must end with double quote");
     }
 }
+
+// ---------------------------------------------------------------------------
+// TEST-12: Relationship cardinality parsing (Phase 31)
+// ---------------------------------------------------------------------------
+
+/// Generate a random case variant of a cardinality keyword sequence.
+fn arb_cardinality_keyword() -> impl Strategy<Value = (String, &'static str)> {
+    prop_oneof![
+        arb_case_variant("many to one").prop_map(|s| (s, "ManyToOne")),
+        arb_case_variant("one to one").prop_map(|s| (s, "OneToOne")),
+        arb_case_variant("one to many").prop_map(|s| (s, "OneToMany")),
+    ]
+}
+
+/// Generate inter-keyword whitespace for cardinality tokens (1-4 spaces/tabs).
+fn arb_cardinality_ws() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[ \t]{1,4}").unwrap()
+}
+
+proptest! {
+    /// Relationship entries with random cardinality keywords (including case
+    /// variations and extra whitespace) parse successfully and produce the
+    /// correct cardinality variant and clean to_alias.
+    #[test]
+    fn relationship_cardinality_keyword_variants(
+        name in arb_view_name(),
+        alias_from in arb_identifier(),
+        alias_to in arb_identifier(),
+        fk_col in arb_identifier(),
+        (cardinality_kw, _expected_variant) in arb_cardinality_keyword(),
+        ws1 in arb_cardinality_ws(),
+    ) {
+        // Build: "relname AS from(fk) REFERENCES to MANY TO ONE"
+        // with variable whitespace between cardinality tokens
+        let cardinality_tokens: Vec<&str> = cardinality_kw.split_whitespace().collect();
+        let cardinality_str = cardinality_tokens.join(&ws1);
+        let input = format!(
+            "{name} AS {alias_from}({fk_col}) REFERENCES {alias_to} {cardinality_str}"
+        );
+
+        let ddl = format!(
+            "CREATE SEMANTIC VIEW v AS TABLES ({alias_from} AS orders PRIMARY KEY (id), {alias_to} AS customers PRIMARY KEY (id)) RELATIONSHIPS ({input}) DIMENSIONS ({alias_from}.r AS region) METRICS ({alias_from}.m AS SUM(amount))"
+        );
+        let result = validate_and_rewrite(&ddl);
+        prop_assert!(
+            result.is_ok(),
+            "Failed to parse relationship with cardinality '{}': {:?}",
+            cardinality_str,
+            result.unwrap_err()
+        );
+        prop_assert!(
+            result.unwrap().is_some(),
+            "Expected Some(sql) for valid DDL with cardinality"
+        );
+    }
+
+    /// Relationship entries without cardinality keywords parse successfully
+    /// and default to ManyToOne.
+    #[test]
+    fn relationship_no_cardinality_defaults(
+        name in arb_view_name(),
+        alias_from in arb_identifier(),
+        alias_to in arb_identifier(),
+        fk_col in arb_identifier(),
+    ) {
+        let input = format!(
+            "{name} AS {alias_from}({fk_col}) REFERENCES {alias_to}"
+        );
+        let ddl = format!(
+            "CREATE SEMANTIC VIEW v AS TABLES ({alias_from} AS orders PRIMARY KEY (id), {alias_to} AS customers PRIMARY KEY (id)) RELATIONSHIPS ({input}) DIMENSIONS ({alias_from}.r AS region) METRICS ({alias_from}.m AS SUM(amount))"
+        );
+        let result = validate_and_rewrite(&ddl);
+        prop_assert!(
+            result.is_ok(),
+            "Failed to parse relationship without cardinality: {:?}",
+            result.unwrap_err()
+        );
+    }
+}

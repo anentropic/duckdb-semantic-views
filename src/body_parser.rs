@@ -609,6 +609,53 @@ pub(crate) fn parse_relationships_clause(
 }
 
 /// Parse one RELATIONSHIPS entry: `rel_name AS from_alias(fk_cols) REFERENCES to_alias`
+/// Parse cardinality tokens after `REFERENCES <to_alias>`.
+///
+/// Accepts `["MANY", "TO", "ONE"]`, `["ONE", "TO", "ONE"]`, `["ONE", "TO", "MANY"]`
+/// (case-insensitive). An empty slice defaults to `ManyToOne`.
+/// Returns `Err` for unrecognized sequences.
+fn parse_cardinality_tokens(
+    tokens: &[&str],
+    rel_name: &str,
+    entry_offset: usize,
+) -> Result<Cardinality, ParseError> {
+    if tokens.is_empty() {
+        return Ok(Cardinality::ManyToOne);
+    }
+    if tokens.len() != 3 {
+        return Err(ParseError {
+            message: format!(
+                "Invalid cardinality in relationship '{rel_name}'. \
+                 Expected MANY TO ONE, ONE TO ONE, or ONE TO MANY.",
+            ),
+            position: Some(entry_offset),
+        });
+    }
+    let upper: Vec<String> = tokens.iter().map(|t| t.to_ascii_uppercase()).collect();
+    if upper[1] != "TO" {
+        return Err(ParseError {
+            message: format!(
+                "Invalid cardinality in relationship '{rel_name}'. \
+                 Expected MANY TO ONE, ONE TO ONE, or ONE TO MANY.",
+            ),
+            position: Some(entry_offset),
+        });
+    }
+    match (upper[0].as_str(), upper[2].as_str()) {
+        ("MANY", "ONE") => Ok(Cardinality::ManyToOne),
+        ("ONE", "ONE") => Ok(Cardinality::OneToOne),
+        ("ONE", "MANY") => Ok(Cardinality::OneToMany),
+        _ => Err(ParseError {
+            message: format!(
+                "Invalid cardinality '{} TO {}' in relationship '{rel_name}'. \
+                 Expected MANY TO ONE, ONE TO ONE, or ONE TO MANY.",
+                upper[0], upper[2],
+            ),
+            position: Some(entry_offset),
+        }),
+    }
+}
+
 fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<Join, ParseError> {
     let entry = entry.trim();
 
@@ -680,8 +727,9 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
         position: Some(entry_offset),
     })?;
 
-    let to_alias = after_paren[refs_pos + "REFERENCES".len()..].trim();
-    if to_alias.is_empty() {
+    let remaining_after_refs = after_paren[refs_pos + "REFERENCES".len()..].trim();
+    let tokens: Vec<&str> = remaining_after_refs.split_whitespace().collect();
+    if tokens.is_empty() {
         return Err(ParseError {
             message: format!(
                 "Expected target alias after REFERENCES in relationship '{rel_name}'.",
@@ -689,13 +737,15 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
             position: Some(entry_offset),
         });
     }
+    let to_alias = tokens[0];
+    let cardinality = parse_cardinality_tokens(&tokens[1..], rel_name, entry_offset)?;
 
     Ok(Join {
         table: to_alias.to_string(),
         from_alias: from_alias.to_string(),
         fk_columns,
         name: Some(rel_name.to_string()),
-        cardinality: Cardinality::default(),
+        cardinality,
         on: String::new(),
         from_cols: vec![],
         join_columns: vec![],
@@ -1160,6 +1210,96 @@ mod tests {
             err.message.contains("name") || err.message.contains("required"),
             "Error should mention name or required: {}",
             err.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_relationships_clause cardinality tests (Phase 31)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_relationship_with_many_to_one() {
+        let result = parse_relationships_clause(
+            "order_to_customer AS o(customer_id) REFERENCES c MANY TO ONE",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].table, "c");
+        assert_eq!(result[0].cardinality, Cardinality::ManyToOne);
+    }
+
+    #[test]
+    fn parse_relationship_with_one_to_one() {
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b ONE TO ONE", 0).unwrap();
+        assert_eq!(result[0].table, "b");
+        assert_eq!(result[0].cardinality, Cardinality::OneToOne);
+    }
+
+    #[test]
+    fn parse_relationship_with_one_to_many() {
+        let result =
+            parse_relationships_clause("rel AS a(fk) REFERENCES b ONE TO MANY", 0).unwrap();
+        assert_eq!(result[0].table, "b");
+        assert_eq!(result[0].cardinality, Cardinality::OneToMany);
+    }
+
+    #[test]
+    fn parse_relationship_without_cardinality_defaults() {
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b", 0).unwrap();
+        assert_eq!(result[0].table, "b");
+        assert_eq!(
+            result[0].cardinality,
+            Cardinality::ManyToOne,
+            "Missing cardinality should default to ManyToOne"
+        );
+    }
+
+    #[test]
+    fn parse_relationship_cardinality_case_insensitive() {
+        for input in [
+            "rel AS a(fk) REFERENCES b many to one",
+            "rel AS a(fk) REFERENCES b Many To One",
+            "rel AS a(fk) REFERENCES b MANY TO ONE",
+            "rel AS a(fk) REFERENCES b one to one",
+            "rel AS a(fk) REFERENCES b One To One",
+        ] {
+            let result = parse_relationships_clause(input, 0);
+            assert!(
+                result.is_ok(),
+                "Failed to parse case variant: {input}: {:?}",
+                result.unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn parse_relationship_invalid_cardinality_rejected() {
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b MANY TO MANY", 0);
+        assert!(result.is_err(), "MANY TO MANY should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("cardinality") || err.message.contains("MANY TO ONE"),
+            "Error should mention valid cardinality options: {}",
+            err.message
+        );
+
+        // Single junk word after to_alias
+        let result2 = parse_relationships_clause("rel AS a(fk) REFERENCES b FOO", 0);
+        assert!(
+            result2.is_err(),
+            "Invalid cardinality keyword 'FOO' should be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_relationship_to_alias_not_polluted_by_cardinality() {
+        // Ensure to_alias is just "b", not "b MANY TO ONE"
+        let result =
+            parse_relationships_clause("rel AS a(fk) REFERENCES b MANY TO ONE", 0).unwrap();
+        assert_eq!(
+            result[0].table, "b",
+            "to_alias must not include cardinality keywords"
         );
     }
 
