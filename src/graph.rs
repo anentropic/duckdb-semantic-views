@@ -143,13 +143,38 @@ impl RelationshipGraph {
     }
 
     /// Check that the relationship graph is a tree (each non-root node has
-    /// at most one parent).
+    /// at most one parent), with an exception for role-playing dimensions.
     ///
     /// Returns `Err` with diamond description if any node is reachable via
-    /// multiple paths.
-    pub fn check_no_diamonds(&self) -> Result<(), String> {
+    /// multiple paths, UNLESS all relationships pointing to that node are named
+    /// with distinct names (Phase 32: role-playing dimension support).
+    pub fn check_no_diamonds(&self, def: &SemanticViewDefinition) -> Result<(), String> {
         for (node, parents) in &self.reverse {
             if node != &self.root && parents.len() > 1 {
+                // Check if ALL relationships to this node are named with distinct names.
+                // If so, this is a role-playing pattern (e.g., flights -> airports via
+                // dep_airport and arr_airport) and should be allowed.
+                let joins_to_node: Vec<&crate::model::Join> = def
+                    .joins
+                    .iter()
+                    .filter(|j| !j.fk_columns.is_empty() && j.table.to_ascii_lowercase() == *node)
+                    .collect();
+
+                let all_named =
+                    !joins_to_node.is_empty() && joins_to_node.iter().all(|j| j.name.is_some());
+
+                if all_named {
+                    // Check all names are unique (case-insensitive)
+                    let mut seen_names = HashSet::new();
+                    let all_unique = joins_to_node.iter().all(|j| {
+                        let name_lower = j.name.as_ref().unwrap().to_ascii_lowercase();
+                        seen_names.insert(name_lower)
+                    });
+                    if all_unique {
+                        continue; // Role-playing: allow this diamond
+                    }
+                }
+
                 return Err(format!(
                     "diamond: two paths to '{}' via '{}' and '{}'",
                     node, parents[0], parents[1]
@@ -284,8 +309,8 @@ pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph,
     // 1. Cycle detection (Kahn's algorithm).
     let _topo_order = graph.toposort()?;
 
-    // 2. Diamond detection (multiple parents).
-    graph.check_no_diamonds()?;
+    // 2. Diamond detection (multiple parents, relaxed for named role-playing).
+    graph.check_no_diamonds(def)?;
 
     // 3. Orphan table detection.
     graph.check_no_orphans()?;
@@ -1008,6 +1033,77 @@ fn find_cycle_path(
     }
 
     path.join(" -> ")
+}
+
+// ---------------------------------------------------------------------------
+// USING relationship validation (Phase 32)
+// ---------------------------------------------------------------------------
+
+/// Validate that all `using_relationships` references on metrics are valid.
+///
+/// For each metric with non-empty `using_relationships`:
+/// 1. Derived metrics (`source_table` is None) must not have USING.
+/// 2. Each referenced relationship name must exist in `def.joins`.
+/// 3. Each referenced relationship must originate from the metric's `source_table`.
+///
+/// Returns `Ok(())` if all references are valid, `Err` with descriptive message otherwise.
+pub fn validate_using_relationships(def: &SemanticViewDefinition) -> Result<(), String> {
+    // Collect all named relationships for lookup
+    let named_rels: Vec<(&crate::model::Join, String)> = def
+        .joins
+        .iter()
+        .filter_map(|j| j.name.as_ref().map(|n| (j, n.to_ascii_lowercase())))
+        .collect();
+
+    let available_names: Vec<String> = named_rels.iter().map(|(_, n)| n.clone()).collect();
+
+    for metric in &def.metrics {
+        if metric.using_relationships.is_empty() {
+            continue;
+        }
+
+        // Check 1: derived metrics must not have USING
+        if metric.source_table.is_none() {
+            return Err(format!(
+                "USING clause not allowed on derived metric '{}'",
+                metric.name
+            ));
+        }
+
+        let metric_source = metric.source_table.as_ref().unwrap().to_ascii_lowercase();
+
+        for rel_name in &metric.using_relationships {
+            let rel_lower = rel_name.to_ascii_lowercase();
+
+            // Check 2: relationship must exist
+            let found = named_rels.iter().find(|(_, n)| *n == rel_lower);
+
+            match found {
+                None => {
+                    return Err(format!(
+                        "unknown relationship '{rel_name}' in USING clause of metric '{}'. \
+                         Available: [{}]",
+                        metric.name,
+                        available_names.join(", ")
+                    ));
+                }
+                Some((join, _)) => {
+                    // Check 3: relationship must originate from metric's source_table
+                    let from_lower = join.from_alias.to_ascii_lowercase();
+                    if from_lower != metric_source {
+                        return Err(format!(
+                            "relationship '{rel_name}' does not originate from table '{}' \
+                             (metric '{}')",
+                            metric.source_table.as_ref().unwrap(),
+                            metric.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1952,6 +2048,185 @@ mod tests {
         assert!(
             err.contains("duplicate metric name"),
             "Expected duplicate name error, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 32: Diamond relaxation and USING validation
+    // -----------------------------------------------------------------------
+
+    /// Helper to build a definition with named (or unnamed) joins for diamond tests.
+    fn make_def_with_named_joins(
+        tables: Vec<(&str, &str, Vec<&str>)>,
+        joins: Vec<(Option<&str>, &str, &str, Vec<&str>)>, // (name, from, to, fk_cols)
+        metrics: Vec<(&str, Option<&str>, Vec<&str>)>,     // (name, source, using_rels)
+    ) -> SemanticViewDefinition {
+        SemanticViewDefinition {
+            base_table: tables
+                .first()
+                .map(|(_, t, _)| t.to_string())
+                .unwrap_or_default(),
+            tables: tables
+                .iter()
+                .map(|(alias, table, pks)| TableRef {
+                    alias: alias.to_string(),
+                    table: table.to_string(),
+                    pk_columns: pks.iter().map(|s| s.to_string()).collect(),
+                })
+                .collect(),
+            joins: joins
+                .iter()
+                .map(|(name, from_alias, to_alias, fk_cols)| Join {
+                    table: to_alias.to_string(),
+                    from_alias: from_alias.to_string(),
+                    fk_columns: fk_cols.iter().map(|s| s.to_string()).collect(),
+                    name: name.map(|n| n.to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+            dimensions: vec![],
+            metrics: metrics
+                .iter()
+                .map(|(name, source, using_rels)| Metric {
+                    name: name.to_string(),
+                    expr: format!("COUNT(*)"),
+                    source_table: source.map(|s| s.to_string()),
+                    output_type: None,
+                    using_relationships: using_rels.iter().map(|s| s.to_string()).collect(),
+                })
+                .collect(),
+            filters: vec![],
+            facts: vec![],
+            hierarchies: vec![],
+            column_type_names: vec![],
+            column_types_inferred: vec![],
+        }
+    }
+
+    #[test]
+    fn diamond_two_named_relationships_accepted() {
+        // Two named relationships to same table should be accepted (role-playing)
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![
+                (Some("dep_airport"), "f", "a", vec!["dep_id"]),
+                (Some("arr_airport"), "f", "a", vec!["arr_id"]),
+            ],
+            vec![("flight_count", Some("f"), vec![])],
+        );
+        assert!(
+            validate_graph(&def).is_ok(),
+            "Two named relationships to same table should be accepted"
+        );
+    }
+
+    #[test]
+    fn diamond_two_unnamed_relationships_rejected() {
+        // Two unnamed relationships to same table should still be rejected
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![
+                (None, "f", "a", vec!["dep_id"]),
+                (None, "f", "a", vec!["arr_id"]),
+            ],
+            vec![("flight_count", Some("f"), vec![])],
+        );
+        let err = validate_graph(&def).unwrap_err();
+        assert!(
+            err.contains("diamond"),
+            "Unnamed diamonds should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn diamond_mixed_named_unnamed_rejected() {
+        // One named + one unnamed relationship to same table -> rejected
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![
+                (Some("dep_airport"), "f", "a", vec!["dep_id"]),
+                (None, "f", "a", vec!["arr_id"]),
+            ],
+            vec![("flight_count", Some("f"), vec![])],
+        );
+        let err = validate_graph(&def).unwrap_err();
+        assert!(
+            err.contains("diamond"),
+            "Mixed named/unnamed diamonds should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_using_valid_reference() {
+        // USING references existing named relationship -> Ok
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![
+                (Some("dep_airport"), "f", "a", vec!["dep_id"]),
+                (Some("arr_airport"), "f", "a", vec!["arr_id"]),
+            ],
+            vec![("departure_count", Some("f"), vec!["dep_airport"])],
+        );
+        assert!(
+            validate_using_relationships(&def).is_ok(),
+            "Valid USING reference should be accepted"
+        );
+    }
+
+    #[test]
+    fn validate_using_unknown_relationship_rejected() {
+        // USING references non-existent relationship -> Err with suggestion
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![(Some("dep_airport"), "f", "a", vec!["dep_id"])],
+            vec![("departure_count", Some("f"), vec!["nonexistent"])],
+        );
+        let err = validate_using_relationships(&def).unwrap_err();
+        assert!(
+            err.contains("unknown relationship") && err.contains("nonexistent"),
+            "Expected unknown relationship error, got: {err}"
+        );
+        assert!(
+            err.contains("dep_airport"),
+            "Error should list available relationships: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_using_wrong_source_table_rejected() {
+        // USING references relationship from wrong source table -> Err
+        let def = make_def_with_named_joins(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+                ("p", "passengers", vec!["id"]),
+            ],
+            vec![
+                (Some("dep_airport"), "f", "a", vec!["dep_id"]),
+                (Some("pax_to_flight"), "p", "f", vec!["flight_id"]),
+            ],
+            // Metric is on "p" but references "dep_airport" which originates from "f"
+            vec![("pax_count", Some("p"), vec!["dep_airport"])],
+        );
+        let err = validate_using_relationships(&def).unwrap_err();
+        assert!(
+            err.contains("does not originate"),
+            "Expected wrong source table error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_using_derived_metric_rejected() {
+        // USING on derived metric (source_table is None) -> Err
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![(Some("dep_airport"), "f", "a", vec!["dep_id"])],
+            vec![("derived_met", None, vec!["dep_airport"])],
+        );
+        let err = validate_using_relationships(&def).unwrap_err();
+        assert!(
+            err.contains("derived metric") && err.contains("USING"),
+            "Expected USING on derived metric error, got: {err}"
         );
     }
 }
