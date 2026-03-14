@@ -128,7 +128,7 @@ Full details: [milestones/v0.5.2-ROADMAP.md](milestones/v0.5.2-ROADMAP.md)
 **Plans**: 2 plans
 
 Plans:
-- [ ] 29-01-PLAN.md -- Parse FACTS/HIERARCHIES clauses, model wiring, and define-time validation
+- [x] 29-01-PLAN.md -- Parse FACTS/HIERARCHIES clauses, model wiring, and define-time validation
 - [ ] 29-02-PLAN.md -- Fact inlining in expansion, DESCRIBE output updates, end-to-end tests
 
 ### Phase 30: Derived Metrics
@@ -209,7 +209,7 @@ Phases execute in numeric order: 29 -> 30 -> 31 -> 32
 | 26. PK/FK Join Resolution | v0.5.2 | 2/2 | Complete | 2026-03-13 |
 | 27. Alias-Based Query Expansion | v0.5.2 | 3/3 | Complete | 2026-03-13 |
 | 28. Integration Testing & Docs | v0.5.2 | 3/3 | Complete | 2026-03-13 |
-| 29. FACTS Clause & Hierarchies | v0.5.3 | 0/2 | Not started | - |
+| 29. FACTS Clause & Hierarchies | v0.5.3 | 1/2 | In progress | - |
 | 30. Derived Metrics | v0.5.3 | 0/? | Not started | - |
 | 31. Fan Trap Detection | v0.5.3 | 0/? | Not started | - |
 | 32. Role-Playing & USING | v0.5.3 | 0/? | Not started | - |

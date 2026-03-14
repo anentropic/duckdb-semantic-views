@@ -9,10 +9,10 @@ Requirements for advanced semantic modeling capabilities. Each maps to roadmap p
 
 ### Semantic Modeling (FACTS)
 
-- [ ] **FACT-01**: User can declare named row-level expressions in a FACTS clause (`alias.fact_name AS sql_expr`)
+- [x] **FACT-01**: User can declare named row-level expressions in a FACTS clause (`alias.fact_name AS sql_expr`)
 - [ ] **FACT-02**: Metric expressions can reference fact names; expansion inlines the fact expression with parenthesization
-- [ ] **FACT-03**: Facts can reference other facts; expansion resolves in topological order
-- [ ] **FACT-04**: Define-time validation rejects fact cycles and references to non-existent facts
+- [x] **FACT-03**: Facts can reference other facts; expansion resolves in topological order
+- [x] **FACT-04**: Define-time validation rejects fact cycles and references to non-existent facts
 - [ ] **FACT-05**: DESCRIBE SEMANTIC VIEW shows facts alongside dimensions and metrics
 
 ### Derived Metrics
@@ -25,8 +25,8 @@ Requirements for advanced semantic modeling capabilities. Each maps to roadmap p
 
 ### Hierarchies
 
-- [ ] **HIER-01**: User can declare drill-down paths in a HIERARCHIES clause (`name AS (dim1, dim2, dim3)`)
-- [ ] **HIER-02**: Define-time validation rejects hierarchies referencing non-existent dimensions
+- [x] **HIER-01**: User can declare drill-down paths in a HIERARCHIES clause (`name AS (dim1, dim2, dim3)`)
+- [x] **HIER-02**: Define-time validation rejects hierarchies referencing non-existent dimensions
 - [ ] **HIER-03**: DESCRIBE SEMANTIC VIEW shows hierarchy definitions
 
 ### Multiple Join Paths
@@ -89,13 +89,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| FACT-01 | Phase 29 | Pending |
+| FACT-01 | Phase 29 | Complete |
 | FACT-02 | Phase 29 | Pending |
-| FACT-03 | Phase 29 | Pending |
-| FACT-04 | Phase 29 | Pending |
+| FACT-03 | Phase 29 | Complete |
+| FACT-04 | Phase 29 | Complete |
 | FACT-05 | Phase 29 | Pending |
-| HIER-01 | Phase 29 | Pending |
-| HIER-02 | Phase 29 | Pending |
+| HIER-01 | Phase 29 | Complete |
+| HIER-02 | Phase 29 | Complete |
 | HIER-03 | Phase 29 | Pending |
 | DRV-01 | Phase 30 | Pending |
 | DRV-02 | Phase 30 | Pending |
@@ -121,4 +121,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-03-14*
-*Last updated: 2026-03-14 after roadmap creation*
+*Last updated: 2026-03-14 after 29-01 completion*
