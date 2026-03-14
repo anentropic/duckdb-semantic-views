@@ -123,6 +123,10 @@ impl VTab for DefineFromJsonVTab {
         crate::graph::validate_hierarchies(&def)
             .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
+        // Validate derived metrics: cycles, unknown refs, aggregate prohibition (Phase 30).
+        crate::graph::validate_derived_metrics(&def)
+            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
         // Access the DefineState from extra_info.
         let state_ptr = bind.get_extra_info::<DefineState>();
         let state = unsafe { &*state_ptr };
