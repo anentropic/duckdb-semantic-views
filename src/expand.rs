@@ -3685,4 +3685,475 @@ FROM \"orders\"";
             );
         }
     }
+
+    mod phase32_role_playing_tests {
+        use super::*;
+        use crate::model::{Cardinality, Dimension, Join, Metric, TableRef};
+
+        /// Helper: build the flights/airports definition with two role-playing
+        /// relationships (dep_airport, arr_airport) to the same airports table.
+        fn flights_airports_def() -> SemanticViewDefinition {
+            SemanticViewDefinition {
+                base_table: "flights".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "f".to_string(),
+                        table: "flights".to_string(),
+                        pk_columns: vec!["flight_id".to_string()],
+                    },
+                    TableRef {
+                        alias: "a".to_string(),
+                        table: "airports".to_string(),
+                        pk_columns: vec!["airport_code".to_string()],
+                    },
+                ],
+                dimensions: vec![
+                    Dimension {
+                        name: "city".to_string(),
+                        expr: "a.city".to_string(),
+                        source_table: Some("a".to_string()),
+                        output_type: None,
+                    },
+                    Dimension {
+                        name: "country".to_string(),
+                        expr: "a.country".to_string(),
+                        source_table: Some("a".to_string()),
+                        output_type: None,
+                    },
+                    Dimension {
+                        name: "carrier".to_string(),
+                        expr: "f.carrier".to_string(),
+                        source_table: Some("f".to_string()),
+                        output_type: None,
+                    },
+                ],
+                metrics: vec![
+                    Metric {
+                        name: "departure_count".to_string(),
+                        expr: "COUNT(*)".to_string(),
+                        source_table: Some("f".to_string()),
+                        output_type: None,
+                        using_relationships: vec!["dep_airport".to_string()],
+                    },
+                    Metric {
+                        name: "arrival_count".to_string(),
+                        expr: "COUNT(*)".to_string(),
+                        source_table: Some("f".to_string()),
+                        output_type: None,
+                        using_relationships: vec!["arr_airport".to_string()],
+                    },
+                    Metric {
+                        name: "total_flights".to_string(),
+                        expr: "departure_count + arrival_count".to_string(),
+                        source_table: None,
+                        output_type: None,
+                        using_relationships: vec![],
+                    },
+                ],
+                filters: vec![],
+                joins: vec![
+                    Join {
+                        table: "a".to_string(),
+                        from_alias: "f".to_string(),
+                        fk_columns: vec!["departure_code".to_string()],
+                        name: Some("dep_airport".to_string()),
+                        cardinality: Cardinality::ManyToOne,
+                        ..Default::default()
+                    },
+                    Join {
+                        table: "a".to_string(),
+                        from_alias: "f".to_string(),
+                        fk_columns: vec!["arrival_code".to_string()],
+                        name: Some("arr_airport".to_string()),
+                        cardinality: Cardinality::ManyToOne,
+                        ..Default::default()
+                    },
+                ],
+                facts: vec![],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            }
+        }
+
+        #[test]
+        fn using_metric_generates_scoped_join_alias() {
+            // Metric with USING (dep_airport) generates JOIN with alias "a__dep_airport"
+            let def = flights_airports_def();
+            let req = QueryRequest {
+                dimensions: vec!["city".to_string()],
+                metrics: vec!["departure_count".to_string()],
+            };
+            let sql = expand("test_flights", &def, &req).unwrap();
+            assert!(
+                sql.contains("a__dep_airport"),
+                "Scoped alias a__dep_airport must appear: {sql}"
+            );
+            assert!(
+                sql.contains("LEFT JOIN \"airports\" AS \"a__dep_airport\""),
+                "LEFT JOIN with scoped alias must appear: {sql}"
+            );
+        }
+
+        #[test]
+        fn two_using_metrics_generate_two_scoped_joins() {
+            // Two metrics with different USING generate two separate LEFT JOINs
+            let def = flights_airports_def();
+            let req = QueryRequest {
+                dimensions: vec!["carrier".to_string()],
+                metrics: vec!["departure_count".to_string(), "arrival_count".to_string()],
+            };
+            let sql = expand("test_flights", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN \"airports\" AS \"a__dep_airport\""),
+                "dep_airport scoped JOIN must appear: {sql}"
+            );
+            assert!(
+                sql.contains("LEFT JOIN \"airports\" AS \"a__arr_airport\""),
+                "arr_airport scoped JOIN must appear: {sql}"
+            );
+        }
+
+        #[test]
+        fn dimension_rewritten_to_scoped_alias() {
+            // Dimension expression "a.city" rewritten to "a__dep_airport.city"
+            // when co-queried metric uses dep_airport
+            let def = flights_airports_def();
+            let req = QueryRequest {
+                dimensions: vec!["city".to_string()],
+                metrics: vec!["departure_count".to_string()],
+            };
+            let sql = expand("test_flights", &def, &req).unwrap();
+            assert!(
+                sql.contains("a__dep_airport.city"),
+                "Dimension must be rewritten to scoped alias: {sql}"
+            );
+        }
+
+        #[test]
+        fn ambiguous_dimension_without_using_produces_error() {
+            // Dimension from ambiguous table without any metric USING
+            // produces AmbiguousPath error
+            let def = flights_airports_def();
+            let req = QueryRequest {
+                dimensions: vec!["city".to_string()],
+                metrics: vec![],
+            };
+            let result = expand("test_flights", &def, &req);
+            assert!(result.is_err(), "Ambiguous dimension must produce error");
+            match result.unwrap_err() {
+                ExpandError::AmbiguousPath {
+                    view_name,
+                    dimension_name,
+                    dimension_table,
+                    available_relationships,
+                } => {
+                    assert_eq!(view_name, "test_flights");
+                    assert_eq!(dimension_name, "city");
+                    assert_eq!(dimension_table, "a");
+                    assert!(available_relationships.contains(&"dep_airport".to_string()));
+                    assert!(available_relationships.contains(&"arr_airport".to_string()));
+                }
+                other => panic!("Expected AmbiguousPath, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn ambiguous_path_error_lists_relationships() {
+            let err = ExpandError::AmbiguousPath {
+                view_name: "test_flights".to_string(),
+                dimension_name: "city".to_string(),
+                dimension_table: "a".to_string(),
+                available_relationships: vec!["dep_airport".to_string(), "arr_airport".to_string()],
+            };
+            let msg = format!("{err}");
+            assert!(msg.contains("test_flights"));
+            assert!(msg.contains("city"));
+            assert!(msg.contains("ambiguous"));
+            assert!(msg.contains("dep_airport"));
+            assert!(msg.contains("arr_airport"));
+        }
+
+        #[test]
+        fn non_ambiguous_single_relationship_works_without_using() {
+            // Single relationship to a table (no role-playing) works fine
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                ],
+                dimensions: vec![Dimension {
+                    name: "customer_name".to_string(),
+                    expr: "c.name".to_string(),
+                    source_table: Some("c".to_string()),
+                    output_type: None,
+                }],
+                metrics: vec![Metric {
+                    name: "revenue".to_string(),
+                    expr: "SUM(o.amount)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                    using_relationships: vec![],
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    name: Some("order_to_customer".to_string()),
+                    ..Default::default()
+                }],
+                facts: vec![],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec!["revenue".to_string()],
+            };
+            let result = expand("test", &def, &req);
+            assert!(
+                result.is_ok(),
+                "Single relationship must work without USING: {:?}",
+                result.err()
+            );
+        }
+
+        #[test]
+        fn base_table_dimension_works_unchanged() {
+            // Dimension from base table (no relationship needed) works unchanged
+            let def = flights_airports_def();
+            let req = QueryRequest {
+                dimensions: vec!["carrier".to_string()],
+                metrics: vec!["departure_count".to_string()],
+            };
+            let sql = expand("test_flights", &def, &req).unwrap();
+            assert!(
+                sql.contains("f.carrier AS \"carrier\""),
+                "Base table dimension must appear unchanged: {sql}"
+            );
+        }
+
+        #[test]
+        fn fan_trap_detection_works_with_using_paths() {
+            // Fan trap detection should still work with USING-scoped paths.
+            // Create a scenario with a ONE_TO_MANY edge that creates fan-out.
+            let def = SemanticViewDefinition {
+                base_table: "airports".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "a".to_string(),
+                        table: "airports".to_string(),
+                        pk_columns: vec!["airport_code".to_string()],
+                    },
+                    TableRef {
+                        alias: "f".to_string(),
+                        table: "flights".to_string(),
+                        pk_columns: vec!["flight_id".to_string()],
+                    },
+                ],
+                dimensions: vec![Dimension {
+                    name: "carrier".to_string(),
+                    expr: "f.carrier".to_string(),
+                    source_table: Some("f".to_string()),
+                    output_type: None,
+                }],
+                metrics: vec![Metric {
+                    name: "airport_count".to_string(),
+                    expr: "COUNT(*)".to_string(),
+                    source_table: Some("a".to_string()),
+                    output_type: None,
+                    using_relationships: vec![],
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "f".to_string(),
+                    from_alias: "a".to_string(),
+                    fk_columns: vec!["dep_code".to_string()],
+                    name: Some("dep_flights".to_string()),
+                    cardinality: Cardinality::OneToMany,
+                    ..Default::default()
+                }],
+                facts: vec![],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["carrier".to_string()],
+                metrics: vec!["airport_count".to_string()],
+            };
+            let result = expand("test", &def, &req);
+            assert!(result.is_err(), "Fan trap must still be detected");
+            match result.unwrap_err() {
+                ExpandError::FanTrap { .. } => {}
+                other => panic!("Expected FanTrap, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn derived_metric_with_two_using_resolves_both_joins() {
+            // Derived metric referencing two base metrics with different USING paths
+            // resolves both join paths
+            let def = flights_airports_def();
+            let req = QueryRequest {
+                dimensions: vec!["carrier".to_string()],
+                metrics: vec!["total_flights".to_string()],
+            };
+            let sql = expand("test_flights", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN \"airports\" AS \"a__dep_airport\""),
+                "Derived metric must resolve dep_airport join: {sql}"
+            );
+            assert!(
+                sql.contains("LEFT JOIN \"airports\" AS \"a__arr_airport\""),
+                "Derived metric must resolve arr_airport join: {sql}"
+            );
+        }
+
+        #[test]
+        fn metric_using_from_base_table_no_unnecessary_join() {
+            // Metric with USING from base table (no join needed) does not emit JOIN
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![TableRef {
+                    alias: "o".to_string(),
+                    table: "orders".to_string(),
+                    pk_columns: vec!["id".to_string()],
+                }],
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "o.region".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                }],
+                metrics: vec![Metric {
+                    name: "cnt".to_string(),
+                    expr: "COUNT(*)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                    using_relationships: vec![],
+                }],
+                filters: vec![],
+                joins: vec![],
+                facts: vec![],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["cnt".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                !sql.contains("JOIN"),
+                "No JOIN needed when everything is on base table: {sql}"
+            );
+        }
+
+        #[test]
+        fn backward_compat_no_using_expands_as_before() {
+            // Definition without any USING expands exactly as before (backward compat)
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                tables: vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                    },
+                ],
+                dimensions: vec![Dimension {
+                    name: "customer_name".to_string(),
+                    expr: "c.name".to_string(),
+                    source_table: Some("c".to_string()),
+                    output_type: None,
+                }],
+                metrics: vec![Metric {
+                    name: "revenue".to_string(),
+                    expr: "SUM(o.amount)".to_string(),
+                    source_table: Some("o".to_string()),
+                    output_type: None,
+                    using_relationships: vec![],
+                }],
+                filters: vec![],
+                joins: vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    name: Some("order_to_customer".to_string()),
+                    ..Default::default()
+                }],
+                facts: vec![],
+                hierarchies: vec![],
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            };
+            let req = QueryRequest {
+                dimensions: vec!["customer_name".to_string()],
+                metrics: vec!["revenue".to_string()],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN \"customers\" AS \"c\""),
+                "Non-USING definition must use bare alias: {sql}"
+            );
+            assert!(
+                sql.contains("c.name AS"),
+                "Dimension expr must use bare alias: {sql}"
+            );
+        }
+
+        #[test]
+        fn ambiguous_dimension_with_derived_metric_using_both_paths() {
+            // Derived metric total_flights uses both USING paths.
+            // City dimension from airports is ambiguous because both paths exist.
+            let def = flights_airports_def();
+            let req = QueryRequest {
+                dimensions: vec!["city".to_string()],
+                metrics: vec!["total_flights".to_string()],
+            };
+            let result = expand("test_flights", &def, &req);
+            assert!(
+                result.is_err(),
+                "City dimension must be ambiguous when derived metric uses both paths"
+            );
+            match result.unwrap_err() {
+                ExpandError::AmbiguousPath { .. } => {}
+                other => panic!("Expected AmbiguousPath, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn scoped_join_on_clause_uses_correct_fk_pk() {
+            // Verify the ON clause of scoped joins uses the correct FK/PK columns
+            let def = flights_airports_def();
+            let req = QueryRequest {
+                dimensions: vec!["city".to_string()],
+                metrics: vec!["departure_count".to_string()],
+            };
+            let sql = expand("test_flights", &def, &req).unwrap();
+            // ON clause for dep_airport: f.departure_code = a__dep_airport.airport_code
+            assert!(
+                sql.contains("\"f\".\"departure_code\" = \"a__dep_airport\".\"airport_code\""),
+                "Scoped JOIN ON clause must use correct FK/PK: {sql}"
+            );
+        }
+    }
 }
