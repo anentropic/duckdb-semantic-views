@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-03-14)
 Phase: 32 (4 of 4 in v0.5.3) (Role-Playing and USING)
 Plan: 2 of 2 in current phase -- COMPLETE
 Status: Phase 32 complete, v0.5.3 milestone complete
-Last activity: 2026-03-15 - Completed quick task 16: Add advanced_features.py example for v0.5.3
+Last activity: 2026-03-15 - Completed quick task 17: Update README.md with v0.5.3 features
 
 Progress: [==========] 100% (v0.5.3)
 
@@ -106,9 +106,10 @@ None yet.
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 16 | Add advanced_features.py example for v0.5.3 | 2026-03-15 | 7da34c6 | [16-add-a-new-file-under-examples-to-demo-th](./quick/16-add-a-new-file-under-examples-to-demo-th/) |
+| 17 | Update README.md with v0.5.3 features | 2026-03-15 | c07505a | [17-update-readme-md-with-v0-5-3-ddl-feature](./quick/17-update-readme-md-with-v0-5-3-ddl-feature/) |
 
 ## Session Continuity
 
-Last session: 2026-03-14
-Stopped at: Completed 32-02-PLAN.md (v0.5.3 milestone complete)
+Last session: 2026-03-15
+Stopped at: Completed quick task 17 (README.md v0.5.3 update)
 Resume file: None
