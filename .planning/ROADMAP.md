@@ -134,13 +134,13 @@ Full details: [milestones/v0.5.3-ROADMAP.md](milestones/v0.5.3-ROADMAP.md)
   1. User can declare `UNIQUE (col, ...)` on a table in the TABLES clause and the extension stores it in the model
   2. User omits explicit cardinality keywords from RELATIONSHIPS and the extension infers ONE-TO-ONE (when FK references PK/UNIQUE) or MANY-TO-ONE (when FK is bare) correctly
   3. User who writes `REFERENCES target` without column list gets automatic resolution to the target's PRIMARY KEY
-  4. Existing v0.5.3 definitions with explicit cardinality keywords continue to load and work (backward compatibility via serde defaults)
+  4. Old v0.5.3 definitions with explicit cardinality keywords are REJECTED on load with a clear error (breaking change -- users must recreate views)
   5. Fan trap detection correctly blocks fan-out scenarios using inferred cardinality values
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 33-01: TBD
-- [ ] 33-02: TBD
+- [ ] 33-01-PLAN.md -- Model + parser + inference (UNIQUE constraints, ref_columns, 2-variant Cardinality, REFERENCES(cols), cardinality inference)
+- [ ] 33-02-PLAN.md -- Validation + fan trap + tests (CARD-03/09 FK reference validation, fan trap adaptation, old-JSON guard, sqllogictest updates)
 
 ### Phase 34: DuckDB 1.5 Upgrade & LTS Branch
 **Goal**: Extension builds, loads, and passes all tests against both DuckDB 1.5.x (latest) and 1.4.x (Andium LTS), with CI running both versions
@@ -232,7 +232,7 @@ Phases execute in numeric order: 33 -> 34 -> 35 -> 36
 | 30. Derived Metrics | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 31. Fan Trap Detection | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 32. Role-Playing & USING | v0.5.3 | 2/2 | Complete | 2026-03-14 |
-| 33. UNIQUE & Cardinality Inference | v0.5.4 | 0/? | Not started | - |
+| 33. UNIQUE & Cardinality Inference | v0.5.4 | 0/2 | Not started | - |
 | 34. DuckDB 1.5 Upgrade & LTS Branch | v0.5.4 | 0/? | Not started | - |
 | 35. Documentation Site | v0.5.4 | 0/? | Not started | - |
 | 36. Registry Publishing & Maintainer Docs | v0.5.4 | 0/? | Not started | - |
