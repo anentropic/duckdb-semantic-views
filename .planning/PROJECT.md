@@ -62,7 +62,16 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Active
 
-(Next milestone requirements to be defined via `/gsd:new-milestone`)
+## Current Milestone: v0.5.4 Snowflake-Parity & Registry Publishing
+
+**Goal:** Align relationship model with Snowflake-style cardinality inference, support multiple DuckDB versions, publish to community extension registry, and ship proper documentation.
+
+**Target features:**
+- UNIQUE table constraint + Snowflake-style cardinality inference (remove explicit cardinality keywords)
+- Multi-version DuckDB support (main=latest, andium branch=1.4.x LTS)
+- Zensical documentation site on GitHub Pages
+- Community Extension registry publishing (description.yml + submission)
+- MAINTAINER.md updates for branching strategy and CE publishing
 
 ### Out of Scope
 
@@ -133,7 +142,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 | Scoped aliases for role-playing ({alias}__{rel_name}) | Double-underscore separator for uniqueness; aliases are quoted | ✓ Good — deterministic disambiguation |
 | Diamond relaxation for named relationships | Allow multiple paths when all relationships have unique names | ✓ Good — enables role-playing pattern |
 | USING controls dimension alias, not metric aggregation | COUNT(*) counts base rows regardless of USING path | ✓ Good — correct semantics |
-| Semi-additive metrics deferred to v0.5.4 | Only feature requiring expansion pipeline structural change | — Pending |
+| Semi-additive metrics deferred | Only feature requiring expansion pipeline structural change; deferred again from v0.5.4 | — Pending |
 
 ---
-*Last updated: 2026-03-15 after v0.5.3 milestone*
+*Last updated: 2026-03-15 after v0.5.4 milestone start*
