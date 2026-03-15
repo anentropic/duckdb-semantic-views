@@ -403,7 +403,13 @@ pub(crate) fn parse_tables_clause(
     Ok(result)
 }
 
-/// Parse a single TABLES clause entry: `alias AS physical_table PRIMARY KEY (col1, ...)`
+/// Parse a single TABLES clause entry.
+///
+/// Supports:
+/// - `alias AS physical_table PRIMARY KEY (cols) [UNIQUE (cols)]*`
+/// - `alias AS physical_table [UNIQUE (cols)]*`   (no PRIMARY KEY -- fact tables)
+/// - `alias AS physical_table`                    (bare -- no PK, no UNIQUE)
+#[allow(clippy::too_many_lines)]
 fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef, ParseError> {
     // Step 1: get alias (first whitespace-delimited token)
     let entry = entry.trim();
@@ -430,55 +436,122 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     // Step 3: find "PRIMARY KEY" (case-insensitive, any whitespace between words)
     let upper = after_as.to_ascii_uppercase();
     let pk_pos = find_primary_key(&upper);
-    if pk_pos.is_none() {
-        return Err(ParseError {
-            message: format!(
-                "Expected 'PRIMARY KEY' after table name in TABLES entry for alias '{alias}'.",
-            ),
-            position: Some(after_as_offset),
-        });
-    }
-    let (pk_start, pk_end) = pk_pos.unwrap();
-    let table_name = after_as[..pk_start].trim();
-    if table_name.is_empty() {
-        return Err(ParseError {
-            message: format!(
-                "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
-            ),
-            position: Some(after_as_offset),
-        });
-    }
 
-    // Step 4: parse "(col1, col2, ...)" after "PRIMARY KEY"
-    let after_pk = after_as[pk_end..].trim_start();
-    let after_pk_offset = after_as_offset + pk_end;
-    let _ = after_pk_offset; // offset tracked for future use
-
-    if !after_pk.starts_with('(') {
-        return Err(ParseError {
-            message: "Expected '(' after PRIMARY KEY in TABLES clause.".to_string(),
+    let (table_name, pk_columns, after_pk_text) = if let Some((pk_start, pk_end)) = pk_pos {
+        let table_name = after_as[..pk_start].trim();
+        if table_name.is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
+                ),
+                position: Some(after_as_offset),
+            });
+        }
+        let after_pk = after_as[pk_end..].trim_start();
+        if !after_pk.starts_with('(') {
+            return Err(ParseError {
+                message: "Expected '(' after PRIMARY KEY in TABLES clause.".to_string(),
+                position: Some(after_as_offset + pk_end),
+            });
+        }
+        let pk_body = extract_paren_content(after_pk).ok_or_else(|| ParseError {
+            message: "Unclosed '(' in PRIMARY KEY column list.".to_string(),
             position: Some(after_as_offset + pk_end),
-        });
+        })?;
+        let pk_columns: Vec<String> = pk_body
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        // Find position after closing paren
+        let close = after_pk.find(')').unwrap();
+        let remainder = &after_pk[close + 1..];
+        (table_name, pk_columns, remainder)
+    } else {
+        // No PRIMARY KEY -- fact table. Table name is before UNIQUE keyword (if any).
+        let unique_pos = find_unique(&upper);
+        let table_name = if let Some((u_start, _)) = unique_pos {
+            after_as[..u_start].trim()
+        } else {
+            after_as.trim()
+        };
+        if table_name.is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
+                ),
+                position: Some(after_as_offset),
+            });
+        }
+        let remainder = if let Some((u_start, _)) = unique_pos {
+            &after_as[u_start..]
+        } else {
+            ""
+        };
+        (table_name, vec![], remainder)
+    };
+
+    // Step 4: parse zero or more UNIQUE constraints from after_pk_text
+    let mut unique_constraints: Vec<Vec<String>> = Vec::new();
+    let mut remaining = after_pk_text;
+    loop {
+        let upper_remaining = remaining.to_ascii_uppercase();
+        if let Some((_u_start, u_end)) = find_unique(&upper_remaining) {
+            let after_unique_kw = remaining[u_end..].trim_start();
+            if !after_unique_kw.starts_with('(') {
+                return Err(ParseError {
+                    message: format!(
+                        "Expected '(' after UNIQUE keyword for table alias '{alias}'."
+                    ),
+                    position: Some(entry_offset),
+                });
+            }
+            let cols_str = extract_paren_content(after_unique_kw).ok_or_else(|| ParseError {
+                message: format!("Unclosed '(' in UNIQUE column list for table alias '{alias}'."),
+                position: Some(entry_offset),
+            })?;
+            let cols: Vec<String> = cols_str
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            unique_constraints.push(cols);
+            let close = after_unique_kw.find(')').unwrap();
+            remaining = &after_unique_kw[close + 1..];
+        } else {
+            break;
+        }
     }
-
-    // Find matching closing paren
-    let pk_body = extract_paren_content(after_pk).ok_or_else(|| ParseError {
-        message: "Unclosed '(' in PRIMARY KEY column list.".to_string(),
-        position: Some(after_as_offset + pk_end),
-    })?;
-
-    let pk_columns: Vec<String> = pk_body
-        .split(',')
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
-        .collect();
 
     Ok(TableRef {
         alias: alias.to_string(),
         table: table_name.to_string(),
         pk_columns,
-        unique_constraints: vec![],
+        unique_constraints,
     })
+}
+
+/// Find "UNIQUE" keyword with word-boundary matching in `upper_text`.
+/// Returns `(start, end)` byte offsets where start points at 'U' and end is past 'E'.
+fn find_unique(upper_text: &str) -> Option<(usize, usize)> {
+    let bytes = upper_text.as_bytes();
+    let kw = b"UNIQUE";
+    let kw_len = kw.len(); // 6
+    let mut i = 0;
+    while i + kw_len <= bytes.len() {
+        if &bytes[i..i + kw_len] == kw {
+            let before_ok =
+                i == 0 || { !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_' };
+            let after_ok = i + kw_len == bytes.len() || {
+                !bytes[i + kw_len].is_ascii_alphanumeric() && bytes[i + kw_len] != b'_'
+            };
+            if before_ok && after_ok {
+                return Some((i, i + kw_len));
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Extract content inside the outermost `(...)` of `s` (which must start with `(`).
@@ -616,65 +689,16 @@ pub(crate) fn parse_relationships_clause(
     Ok(result)
 }
 
-/// Parse one RELATIONSHIPS entry: `rel_name AS from_alias(fk_cols) REFERENCES to_alias`
-/// Parse cardinality tokens after `REFERENCES <to_alias>`.
+/// Parse one RELATIONSHIPS entry: `rel_name AS from_alias(fk_cols) REFERENCES to_alias[(ref_cols)]`
 ///
-/// Accepts `["MANY", "TO", "ONE"]`, `["ONE", "TO", "ONE"]`, `["ONE", "TO", "MANY"]`
-/// (case-insensitive). An empty slice defaults to `ManyToOne`.
-/// Returns `Err` for unrecognized sequences.
-fn parse_cardinality_tokens(
-    tokens: &[&str],
-    rel_name: &str,
-    entry_offset: usize,
-) -> Result<Cardinality, ParseError> {
-    if tokens.is_empty() {
-        return Ok(Cardinality::ManyToOne);
-    }
-    if tokens.len() != 3 {
-        return Err(ParseError {
-            message: format!(
-                "Invalid cardinality in relationship '{rel_name}'. \
-                 Expected MANY TO ONE, ONE TO ONE, or ONE TO MANY.",
-            ),
-            position: Some(entry_offset),
-        });
-    }
-    let upper: Vec<String> = tokens.iter().map(|t| t.to_ascii_uppercase()).collect();
-    if upper[1] != "TO" {
-        return Err(ParseError {
-            message: format!(
-                "Invalid cardinality in relationship '{rel_name}'. \
-                 Expected MANY TO ONE, ONE TO ONE, or ONE TO MANY.",
-            ),
-            position: Some(entry_offset),
-        });
-    }
-    match (upper[0].as_str(), upper[2].as_str()) {
-        ("MANY", "ONE") => Ok(Cardinality::ManyToOne),
-        ("ONE", "ONE") => Ok(Cardinality::OneToOne),
-        // OneToMany removed in Phase 33 -- reject
-        ("ONE", "MANY") => Err(ParseError {
-            message: format!(
-                "Unsupported cardinality 'ONE TO MANY' in relationship '{rel_name}'. \
-                 Cardinality is now inferred from PK/UNIQUE constraints; explicit keywords are no longer supported.",
-            ),
-            position: Some(entry_offset),
-        }),
-        _ => Err(ParseError {
-            message: format!(
-                "Invalid cardinality '{} TO {}' in relationship '{rel_name}'. \
-                 Expected MANY TO ONE, ONE TO ONE, or ONE TO MANY.",
-                upper[0], upper[2],
-            ),
-            position: Some(entry_offset),
-        }),
-    }
-}
-
+/// Phase 33: Cardinality keywords (MANY TO ONE, etc.) are no longer accepted.
+/// Cardinality is inferred from PK/UNIQUE constraints at parse time.
+/// Optional `REFERENCES target(col1, col2)` syntax stores explicit `ref_columns`.
+#[allow(clippy::too_many_lines)]
 fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<Join, ParseError> {
     let entry = entry.trim();
 
-    // Find "AS" keyword (case-insensitive) — relationship name is before it
+    // Find "AS" keyword (case-insensitive) -- relationship name is before it
     let upper = entry.to_ascii_uppercase();
     let as_pos = find_keyword_ci(&upper, "AS").ok_or_else(|| ParseError {
         message: format!(
@@ -743,25 +767,75 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
     })?;
 
     let remaining_after_refs = after_paren[refs_pos + "REFERENCES".len()..].trim();
-    let tokens: Vec<&str> = remaining_after_refs.split_whitespace().collect();
-    if tokens.is_empty() {
+
+    // Get target alias: may be followed by '(' for explicit ref columns
+    let (to_alias, after_to) = if remaining_after_refs.is_empty() {
         return Err(ParseError {
             message: format!(
                 "Expected target alias after REFERENCES in relationship '{rel_name}'.",
             ),
             position: Some(entry_offset),
         });
+    } else if let Some(paren_idx) = remaining_after_refs.find('(') {
+        let before_paren = remaining_after_refs[..paren_idx].trim_end();
+        if before_paren.contains(char::is_whitespace) {
+            // "target (col)" -- split at first whitespace
+            let (alias, rest) = split_first_token(remaining_after_refs);
+            (alias, rest.trim_start())
+        } else if before_paren.is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "Expected target alias after REFERENCES in relationship '{rel_name}'.",
+                ),
+                position: Some(entry_offset),
+            });
+        } else {
+            // "target(col)" -- alias is before '('
+            (before_paren, &remaining_after_refs[paren_idx..])
+        }
+    } else {
+        // No paren at all -- target alias is first token
+        let (alias, rest) = split_first_token(remaining_after_refs);
+        (alias, rest.trim_start())
+    };
+
+    // Parse optional ref_columns from REFERENCES target(col1, col2)
+    let (ref_columns, after_ref_cols) = if after_to.starts_with('(') {
+        let cols_str = extract_paren_content(after_to).ok_or_else(|| ParseError {
+            message: format!(
+                "Unclosed '(' in REFERENCES column list for relationship '{rel_name}'.",
+            ),
+            position: Some(entry_offset),
+        })?;
+        let cols: Vec<String> = cols_str
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        let close = after_to.find(')').unwrap();
+        (cols, after_to[close + 1..].trim())
+    } else {
+        (vec![], after_to)
+    };
+
+    // Reject any remaining tokens (old cardinality keywords or garbage)
+    if !after_ref_cols.is_empty() {
+        return Err(ParseError {
+            message: format!(
+                "Unexpected tokens after REFERENCES target in relationship '{rel_name}': '{after_ref_cols}'. \
+                 Cardinality is now inferred from PK/UNIQUE constraints; explicit keywords are no longer supported.",
+            ),
+            position: Some(entry_offset),
+        });
     }
-    let to_alias = tokens[0];
-    let cardinality = parse_cardinality_tokens(&tokens[1..], rel_name, entry_offset)?;
 
     Ok(Join {
         table: to_alias.to_string(),
         from_alias: from_alias.to_string(),
         fk_columns,
-        ref_columns: vec![],
+        ref_columns,
         name: Some(rel_name.to_string()),
-        cardinality,
+        cardinality: Cardinality::default(), // will be set by inference
         on: String::new(),
         from_cols: vec![],
         join_columns: vec![],
@@ -1220,15 +1294,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_tables_error_missing_primary_key() {
-        let result = parse_tables_clause("o AS orders", 0);
-        assert!(result.is_err(), "Expected error for missing PRIMARY KEY");
-        let err = result.unwrap_err();
-        assert!(
-            err.message.contains("PRIMARY KEY"),
-            "Error should mention PRIMARY KEY: {}",
-            err.message
-        );
+    fn parse_tables_without_primary_key_is_valid() {
+        // Phase 33: PRIMARY KEY is optional (fact tables)
+        let result = parse_tables_clause("o AS orders", 0).unwrap();
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "orders");
+        assert!(result[0].pk_columns.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1276,40 +1347,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_relationships_clause cardinality tests (Phase 31)
+    // Phase 33: Cardinality keyword rejection + REFERENCES(cols) + UNIQUE tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_relationship_with_many_to_one() {
-        let result = parse_relationships_clause(
-            "order_to_customer AS o(customer_id) REFERENCES c MANY TO ONE",
-            0,
-        )
-        .unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].table, "c");
-        assert_eq!(result[0].cardinality, Cardinality::ManyToOne);
-    }
-
-    #[test]
-    fn parse_relationship_with_one_to_one() {
-        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b ONE TO ONE", 0).unwrap();
-        assert_eq!(result[0].table, "b");
-        assert_eq!(result[0].cardinality, Cardinality::OneToOne);
-    }
-
-    #[test]
-    fn parse_relationship_with_one_to_many_rejected() {
-        // Phase 33: ONE TO MANY is no longer supported
-        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b ONE TO MANY", 0);
-        assert!(result.is_err(), "ONE TO MANY should be rejected");
-        let err = result.unwrap_err();
-        assert!(
-            err.message.contains("no longer supported"),
-            "Error should mention no longer supported: {}",
-            err.message
-        );
-    }
 
     #[test]
     fn parse_relationship_without_cardinality_defaults() {
@@ -1318,56 +1357,124 @@ mod tests {
         assert_eq!(
             result[0].cardinality,
             Cardinality::ManyToOne,
-            "Missing cardinality should default to ManyToOne"
+            "Cardinality should default to ManyToOne"
         );
     }
 
     #[test]
-    fn parse_relationship_cardinality_case_insensitive() {
+    fn old_cardinality_keywords_rejected() {
+        // Phase 33: All cardinality keywords are rejected
         for input in [
-            "rel AS a(fk) REFERENCES b many to one",
-            "rel AS a(fk) REFERENCES b Many To One",
             "rel AS a(fk) REFERENCES b MANY TO ONE",
-            "rel AS a(fk) REFERENCES b one to one",
-            "rel AS a(fk) REFERENCES b One To One",
+            "rel AS a(fk) REFERENCES b ONE TO ONE",
+            "rel AS a(fk) REFERENCES b ONE TO MANY",
         ] {
             let result = parse_relationships_clause(input, 0);
             assert!(
-                result.is_ok(),
-                "Failed to parse case variant: {input}: {:?}",
-                result.unwrap_err()
+                result.is_err(),
+                "Cardinality keyword should be rejected: {input}"
+            );
+            let err = result.unwrap_err();
+            assert!(
+                err.message.contains("no longer supported"),
+                "Error should mention no longer supported for '{input}': {}",
+                err.message
             );
         }
     }
 
     #[test]
-    fn parse_relationship_invalid_cardinality_rejected() {
-        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b MANY TO MANY", 0);
-        assert!(result.is_err(), "MANY TO MANY should be rejected");
+    fn trailing_text_after_references_rejected() {
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b garbage", 0);
+        assert!(result.is_err(), "Trailing text should be rejected");
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("cardinality") || err.message.contains("MANY TO ONE"),
-            "Error should mention valid cardinality options: {}",
+            err.message.contains("Unexpected tokens")
+                || err.message.contains("no longer supported"),
+            "Error should mention unexpected tokens: {}",
             err.message
-        );
-
-        // Single junk word after to_alias
-        let result2 = parse_relationships_clause("rel AS a(fk) REFERENCES b FOO", 0);
-        assert!(
-            result2.is_err(),
-            "Invalid cardinality keyword 'FOO' should be rejected"
         );
     }
 
     #[test]
-    fn parse_relationship_to_alias_not_polluted_by_cardinality() {
-        // Ensure to_alias is just "b", not "b MANY TO ONE"
-        let result =
-            parse_relationships_clause("rel AS a(fk) REFERENCES b MANY TO ONE", 0).unwrap();
-        assert_eq!(
-            result[0].table, "b",
-            "to_alias must not include cardinality keywords"
+    fn references_with_column_list() {
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b(id)", 0).unwrap();
+        assert_eq!(result[0].table, "b");
+        assert_eq!(result[0].ref_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn references_without_column_list() {
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b", 0).unwrap();
+        assert_eq!(result[0].table, "b");
+        assert!(
+            result[0].ref_columns.is_empty(),
+            "ref_columns should be empty when no explicit column list"
         );
+    }
+
+    #[test]
+    fn references_multi_column_list() {
+        let result =
+            parse_relationships_clause("rel AS a(fk1, fk2) REFERENCES b(col1, col2)", 0).unwrap();
+        assert_eq!(result[0].ref_columns, vec!["col1", "col2"]);
+    }
+
+    #[test]
+    fn references_target_no_space_before_paren() {
+        // target(col) with no space between alias and paren
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b(id)", 0).unwrap();
+        assert_eq!(result[0].table, "b");
+        assert_eq!(result[0].ref_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn references_target_space_before_paren() {
+        // target (col) with space between alias and paren
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b (id)", 0).unwrap();
+        assert_eq!(result[0].table, "b");
+        assert_eq!(result[0].ref_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn unique_constraint_parsing() {
+        let result = parse_tables_clause("o AS orders PRIMARY KEY (id) UNIQUE (email)", 0).unwrap();
+        assert_eq!(result[0].unique_constraints.len(), 1);
+        assert_eq!(result[0].unique_constraints[0], vec!["email"]);
+    }
+
+    #[test]
+    fn multiple_unique_constraints() {
+        let result = parse_tables_clause(
+            "o AS orders PRIMARY KEY (id) UNIQUE (email) UNIQUE (first_name, last_name)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result[0].unique_constraints.len(), 2);
+        assert_eq!(result[0].unique_constraints[0], vec!["email"]);
+        assert_eq!(
+            result[0].unique_constraints[1],
+            vec!["first_name", "last_name"]
+        );
+    }
+
+    #[test]
+    fn table_without_primary_key() {
+        let result = parse_tables_clause("f AS fact_table", 0).unwrap();
+        assert_eq!(result[0].alias, "f");
+        assert_eq!(result[0].table, "fact_table");
+        assert!(result[0].pk_columns.is_empty());
+        assert!(result[0].unique_constraints.is_empty());
+    }
+
+    #[test]
+    fn table_with_unique_no_pk() {
+        let result = parse_tables_clause("f AS fact_table UNIQUE (email)", 0).unwrap();
+        assert_eq!(result[0].alias, "f");
+        assert_eq!(result[0].table, "fact_table");
+        assert!(result[0].pk_columns.is_empty());
+        assert_eq!(result[0].unique_constraints.len(), 1);
+        assert_eq!(result[0].unique_constraints[0], vec!["email"]);
     }
 
     // -----------------------------------------------------------------------
