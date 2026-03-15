@@ -112,8 +112,18 @@ impl VTab for DefineFromJsonVTab {
         let mut def = crate::model::SemanticViewDefinition::from_json(&name, &json)
             .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
+        // Phase 33: Reject old-format JSON (pre-v0.5.4) that has FK columns but no ref_columns.
+        for join in &def.joins {
+            if !join.fk_columns.is_empty() && join.ref_columns.is_empty() {
+                return Err(Box::<dyn std::error::Error>::from(
+                    "This semantic view was created with an older version. \
+                     Please recreate it with the new DDL syntax.",
+                ));
+            }
+        }
+
         // Validate relationship graph before persisting (Phase 26).
-        // Catches cycles, diamonds, self-references, orphans, FK/PK mismatches.
+        // Catches cycles, diamonds, self-references, orphans, FK reference validation.
         crate::graph::validate_graph(&def).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
         // Validate facts: source table reachability, cycles, unknown refs (Phase 29).

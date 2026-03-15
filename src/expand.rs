@@ -147,9 +147,10 @@ impl fmt::Display for ExpandError {
                     "semantic view '{view_name}': fan trap detected -- metric '{metric_name}' \
                      (table '{metric_table}') would be duplicated when joined to dimension \
                      '{dimension_name}' (table '{dimension_table}') via relationship \
-                     '{relationship_name}' (ONE TO MANY). This would inflate aggregation results. \
-                     Remove the dimension, use a metric from the same table, or adjust the \
-                     relationship cardinality."
+                     '{relationship_name}' (many-to-one cardinality, inferred: FK is not PK/UNIQUE). \
+                     This would inflate aggregation results. \
+                     Remove the dimension, use a metric from the same table, or restructure the \
+                     relationship."
                 )
             }
             Self::AmbiguousPath {
@@ -283,17 +284,27 @@ fn synthesize_on_clause(join: &Join, tables: &[TableRef]) -> String {
 /// Like `synthesize_on_clause`, but uses `to_alias` instead of `join.table` in the
 /// generated SQL. This supports role-playing dimensions where the same physical table
 /// appears multiple times with different scoped aliases (e.g., `a__dep_airport`).
+///
+/// Phase 33: Prefers `join.ref_columns` (resolved during inference) over looking up
+/// `pk_columns` from the target table. Falls back to target PK for backward compat
+/// (legacy joins without `ref_columns`).
 fn synthesize_on_clause_scoped(join: &Join, tables: &[TableRef], to_alias: &str) -> String {
-    let to_alias_lower = join.table.to_ascii_lowercase();
-    let pk_columns: &[String] = tables
-        .iter()
-        .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower)
-        .map_or(&[] as &[String], |t| &t.pk_columns);
+    // Phase 33: Prefer ref_columns (resolved during inference).
+    // Fall back to target PK for backward compat (legacy joins without ref_columns).
+    let ref_cols: &[String] = if join.ref_columns.is_empty() {
+        let to_alias_lower = join.table.to_ascii_lowercase();
+        tables
+            .iter()
+            .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower)
+            .map_or(&[] as &[String], |t| &t.pk_columns)
+    } else {
+        &join.ref_columns
+    };
 
     let pairs: Vec<String> = join
         .fk_columns
         .iter()
-        .zip(pk_columns.iter())
+        .zip(ref_cols.iter())
         .map(|(fk, pk)| {
             format!(
                 "{}.{} = {}.{}",
@@ -3719,6 +3730,7 @@ FROM \"orders\"";
                         table: "o".to_string(),
                         from_alias: "li".to_string(),
                         fk_columns: vec!["order_id".to_string()],
+                        ref_columns: vec!["id".to_string()],
                         name: Some("li_to_order".to_string()),
                         cardinality: Cardinality::ManyToOne,
                         ..Default::default()
@@ -3727,6 +3739,7 @@ FROM \"orders\"";
                         table: "c".to_string(),
                         from_alias: "o".to_string(),
                         fk_columns: vec!["customer_id".to_string()],
+                        ref_columns: vec!["id".to_string()],
                         name: Some("order_to_customer".to_string()),
                         cardinality: Cardinality::ManyToOne,
                         ..Default::default()
@@ -3819,6 +3832,7 @@ FROM \"orders\"";
                     table: "d".to_string(),
                     from_alias: "o".to_string(),
                     fk_columns: vec!["detail_id".to_string()],
+                    ref_columns: vec!["id".to_string()],
                     name: Some("order_to_detail".to_string()),
                     cardinality: Cardinality::OneToOne,
                     ..Default::default()
@@ -3983,7 +3997,7 @@ FROM \"orders\"";
                 "Must contain 'fan trap detected'"
             );
             assert!(
-                msg.contains("ONE TO MANY"),
+                msg.contains("many-to-one cardinality"),
                 "Must describe the cardinality direction"
             );
         }
@@ -4061,6 +4075,7 @@ FROM \"orders\"";
                         table: "a".to_string(),
                         from_alias: "f".to_string(),
                         fk_columns: vec!["departure_code".to_string()],
+                        ref_columns: vec!["airport_code".to_string()],
                         name: Some("dep_airport".to_string()),
                         cardinality: Cardinality::ManyToOne,
                         ..Default::default()
@@ -4069,6 +4084,7 @@ FROM \"orders\"";
                         table: "a".to_string(),
                         from_alias: "f".to_string(),
                         fk_columns: vec!["arrival_code".to_string()],
+                        ref_columns: vec!["airport_code".to_string()],
                         name: Some("arr_airport".to_string()),
                         cardinality: Cardinality::ManyToOne,
                         ..Default::default()
@@ -4291,6 +4307,7 @@ FROM \"orders\"";
                     table: "a".to_string(),
                     from_alias: "f".to_string(),
                     fk_columns: vec!["dep_airport_code".to_string()],
+                    ref_columns: vec!["airport_code".to_string()],
                     name: Some("dep_flights".to_string()),
                     cardinality: Cardinality::ManyToOne,
                     ..Default::default()
