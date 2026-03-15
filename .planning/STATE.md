@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
 status: executing
-stopped_at: Completed 33-01-PLAN.md
-last_updated: "2026-03-15T18:30:00.000Z"
-last_activity: 2026-03-15 -- Phase 33 Plan 01 complete (model, parser, inference)
+stopped_at: Completed 33-02-PLAN.md
+last_updated: "2026-03-15T20:15:37.000Z"
+last_activity: 2026-03-15 -- Phase 33 Plan 02 complete (validation, fan trap, tests)
 progress:
   total_phases: 4
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 2
-  completed_plans: 1
-  percent: 12
+  completed_plans: 2
+  percent: 25
 ---
 
 # Project State
@@ -26,28 +26,28 @@ See: .planning/PROJECT.md (updated 2026-03-15)
 ## Current Position
 
 Phase: 33 (1 of 4 in v0.5.4) (UNIQUE Constraints & Cardinality Inference)
-Plan: 1 of 2 in current phase
-Status: Executing
-Last activity: 2026-03-15 -- Phase 33 Plan 01 complete (model, parser, inference)
+Plan: 2 of 2 in current phase (COMPLETE)
+Status: Phase Complete
+Last activity: 2026-03-15 -- Phase 33 Plan 02 complete (validation, fan trap, tests)
 
-Progress: [█░░░░░░░░░] 12%
+Progress: [██░░░░░░░░] 25%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1 (v0.5.4)
-- Average duration: 25min
-- Total execution time: 25min
+- Total plans completed: 2 (v0.5.4)
+- Average duration: 19min
+- Total execution time: 39min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 33 | 1/2 | 25min | 25min |
+| 33 | 2/2 | 39min | 19min |
 
 **Recent Trend:**
-- Last 5 plans: 33-01 (25min)
-- Trend: Starting
+- Last 5 plans: 33-01 (25min), 33-02 (14min)
+- Trend: Accelerating
 
 *Updated after each plan completion*
 
@@ -64,6 +64,9 @@ Recent decisions affecting current work:
 - [33-01]: Removed OneToMany variant entirely -- cardinality always from FK-side perspective
 - [33-01]: ref_columns resolved at parse time in infer_cardinality, not deferred to graph
 - [33-01]: Case-insensitive column matching via HashSet for PK/UNIQUE inference
+- [33-02]: Replaced check_fk_pk_counts with validate_fk_references using exact HashSet matching
+- [33-02]: ON clause synthesis prefers ref_columns, falls back to pk_columns for backward compat
+- [33-02]: Test 6 redesigned with p33_user_tokens table to avoid VARCHAR-to-INTEGER type mismatch
 
 ### Pending Todos
 
@@ -77,6 +80,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-15T18:30:00.000Z
-Stopped at: Completed 33-01-PLAN.md
-Resume file: .planning/phases/33-unique-constraints-cardinality-inference/33-01-SUMMARY.md
+Last session: 2026-03-15T20:15:37.000Z
+Stopped at: Completed 33-02-PLAN.md
+Resume file: .planning/phases/33-unique-constraints-cardinality-inference/33-02-SUMMARY.md

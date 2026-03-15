@@ -9,13 +9,13 @@
 
 - [x] **CARD-01**: TABLES clause supports `UNIQUE (col, ...)` constraint alongside existing `PRIMARY KEY (col)`
 - [x] **CARD-02**: A table can have one PRIMARY KEY and multiple UNIQUE constraints (composite allowed)
-- [ ] **CARD-03**: Referenced columns in RELATIONSHIPS must match a declared PRIMARY KEY or UNIQUE constraint on the target table -- error at define time if not
+- [x] **CARD-03**: Referenced columns in RELATIONSHIPS must match a declared PRIMARY KEY or UNIQUE constraint on the target table -- error at define time if not
 - [x] **CARD-04**: Cardinality inferred from constraints: FK column has PK/UNIQUE = one-to-one; FK column bare = many-to-one
 - [x] **CARD-05**: Explicit cardinality keywords (ONE TO MANY, MANY TO ONE, ONE TO ONE, MANY TO MANY) removed from parser
 - [x] **CARD-06**: ManyToMany variant removed from Cardinality enum
 - [x] **CARD-07**: `REFERENCES target` (no column list) resolves to target's PRIMARY KEY; `REFERENCES target(col)` resolves to matching PK or UNIQUE
-- [ ] **CARD-08**: Fan trap detection continues to work using inferred cardinality values
-- [ ] **CARD-09**: Composite FK referencing a subset of a composite PK is rejected -- only exact PK/UNIQUE match is valid
+- [x] **CARD-08**: Fan trap detection continues to work using inferred cardinality values
+- [x] **CARD-09**: Composite FK referencing a subset of a composite PK is rejected -- only exact PK/UNIQUE match is valid
 
 ### Multi-Version DuckDB
 
@@ -77,13 +77,13 @@
 |-------------|-------|--------|
 | CARD-01 | Phase 33 | Complete |
 | CARD-02 | Phase 33 | Complete |
-| CARD-03 | Phase 33 | Pending |
+| CARD-03 | Phase 33 | Complete |
 | CARD-04 | Phase 33 | Complete |
 | CARD-05 | Phase 33 | Complete |
 | CARD-06 | Phase 33 | Complete |
 | CARD-07 | Phase 33 | Complete |
-| CARD-08 | Phase 33 | Pending |
-| CARD-09 | Phase 33 | Pending |
+| CARD-08 | Phase 33 | Complete |
+| CARD-09 | Phase 33 | Complete |
 | DKDB-01 | Phase 34 | Pending |
 | DKDB-02 | Phase 34 | Pending |
 | DKDB-03 | Phase 34 | Pending |
