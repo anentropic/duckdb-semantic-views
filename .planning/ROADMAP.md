@@ -10,6 +10,7 @@
 - ✅ **v0.5.1 DDL Polish** -- Phases 19-23 (shipped 2026-03-09)
 - ✅ **v0.5.2 SQL DDL & PK/FK Relationships** -- Phases 24-28 (shipped 2026-03-13)
 - ✅ **v0.5.3 Advanced Semantic Features** -- Phases 29-32 (shipped 2026-03-15)
+- 🚧 **v0.5.4 Snowflake-Parity & Registry Publishing** -- Phases 33-36 (in progress)
 
 ## Phases
 
@@ -24,7 +25,7 @@
 - [x] Phase 6: Tech Debt Code Cleanup (1/1 plan) -- completed 2026-02-26
 - [x] Phase 7: Verification & Formal Closure (2/2 plans) -- completed 2026-02-27
 
-Full details: [milestones/v0.1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md)
+Full details: [milestones/v1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md)
 
 </details>
 
@@ -114,7 +115,83 @@ Full details: [milestones/v0.5.3-ROADMAP.md](milestones/v0.5.3-ROADMAP.md)
 
 </details>
 
+### v0.5.4 Snowflake-Parity & Registry Publishing (In Progress)
+
+**Milestone Goal:** Align the relationship model with Snowflake-style cardinality inference (UNIQUE constraints replace explicit cardinality keywords), support multiple DuckDB versions (1.5.x latest + 1.4.x LTS), ship a documentation site, and publish to the DuckDB Community Extension Registry.
+
+- [ ] **Phase 33: UNIQUE Constraints & Cardinality Inference** - Snowflake-aligned cardinality from PK/UNIQUE declarations
+- [ ] **Phase 34: DuckDB 1.5 Upgrade & LTS Branch** - Multi-version support with dual CI
+- [ ] **Phase 35: Documentation Site** - Zensical docs on GitHub Pages
+- [ ] **Phase 36: Registry Publishing & Maintainer Docs** - CE submission and MAINTAINER.md updates
+
+## Phase Details
+
+### Phase 33: UNIQUE Constraints & Cardinality Inference
+**Goal**: Users declare UNIQUE constraints on tables and the extension infers relationship cardinality automatically -- no explicit cardinality keywords needed
+**Depends on**: Phase 32 (v0.5.3 complete)
+**Requirements**: CARD-01, CARD-02, CARD-03, CARD-04, CARD-05, CARD-06, CARD-07, CARD-08, CARD-09
+**Success Criteria** (what must be TRUE):
+  1. User can declare `UNIQUE (col, ...)` on a table in the TABLES clause and the extension stores it in the model
+  2. User omits explicit cardinality keywords from RELATIONSHIPS and the extension infers ONE-TO-ONE (when FK references PK/UNIQUE) or MANY-TO-ONE (when FK is bare) correctly
+  3. User who writes `REFERENCES target` without column list gets automatic resolution to the target's PRIMARY KEY
+  4. Existing v0.5.3 definitions with explicit cardinality keywords continue to load and work (backward compatibility via serde defaults)
+  5. Fan trap detection correctly blocks fan-out scenarios using inferred cardinality values
+**Plans**: TBD
+
+Plans:
+- [ ] 33-01: TBD
+- [ ] 33-02: TBD
+
+### Phase 34: DuckDB 1.5 Upgrade & LTS Branch
+**Goal**: Extension builds, loads, and passes all tests against both DuckDB 1.5.x (latest) and 1.4.x (Andium LTS), with CI running both versions
+**Depends on**: Phase 33
+**Requirements**: DKDB-01, DKDB-02, DKDB-03, DKDB-04, DKDB-05, DKDB-06
+**Success Criteria** (what must be TRUE):
+  1. `just test-all` passes on main branch with DuckDB 1.5.x and duckdb-rs 1.10500.0
+  2. `just test-all` passes on andium branch with DuckDB 1.4.x and duckdb-rs 1.4.4
+  3. CI build matrix runs both DuckDB versions and reports results independently
+  4. `.duckdb-version` file on each branch correctly identifies its target DuckDB version
+  5. DuckDB Version Monitor checks for new releases of both latest and LTS lines
+**Plans**: TBD
+
+Plans:
+- [ ] 34-01: TBD
+- [ ] 34-02: TBD
+
+### Phase 35: Documentation Site
+**Goal**: Extension has a proper documentation site deployed to GitHub Pages with DDL reference, query guide, and examples
+**Depends on**: Phase 33 (needs stable DDL syntax for docs content)
+**Requirements**: DOCS-01, DOCS-02, DOCS-03, DOCS-04
+**Success Criteria** (what must be TRUE):
+  1. Running `zensical build` locally produces a complete static site from `docs/` directory
+  2. Pushing to main triggers GitHub Actions workflow that deploys updated docs to GitHub Pages
+  3. Documentation site includes getting started guide, DDL reference, query reference, clause-level pages, and examples
+  4. README contains a prominent link to the documentation site
+**Plans**: TBD
+
+Plans:
+- [ ] 35-01: TBD
+- [ ] 35-02: TBD
+
+### Phase 36: Registry Publishing & Maintainer Docs
+**Goal**: Extension is installable via `INSTALL semantic_views FROM community` and MAINTAINER.md covers the dual-branch workflow and CE update process
+**Depends on**: Phase 34 (needs dual-version builds), Phase 35 (needs docs site for CE page link)
+**Requirements**: CREG-01, CREG-02, CREG-03, CREG-04, CREG-05, MAINT-01, MAINT-02, MAINT-03
+**Success Criteria** (what must be TRUE):
+  1. `description.yml` exists with correct fields including `ref` (latest) and `andium` (LTS) commit hashes
+  2. PR to `duckdb/community-extensions` is submitted and the CE build pipeline passes
+  3. A fresh DuckDB instance can run `INSTALL semantic_views FROM community; LOAD semantic_views;` and execute a semantic view query
+  4. MAINTAINER.md documents the dual-branch strategy, CE registry update process, and DuckDB version bump procedure for both branches
+**Plans**: TBD
+
+Plans:
+- [ ] 36-01: TBD
+- [ ] 36-02: TBD
+
 ## Progress
+
+**Execution Order:**
+Phases execute in numeric order: 33 -> 34 -> 35 -> 36
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
@@ -155,3 +232,7 @@ Full details: [milestones/v0.5.3-ROADMAP.md](milestones/v0.5.3-ROADMAP.md)
 | 30. Derived Metrics | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 31. Fan Trap Detection | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 32. Role-Playing & USING | v0.5.3 | 2/2 | Complete | 2026-03-14 |
+| 33. UNIQUE & Cardinality Inference | v0.5.4 | 0/? | Not started | - |
+| 34. DuckDB 1.5 Upgrade & LTS Branch | v0.5.4 | 0/? | Not started | - |
+| 35. Documentation Site | v0.5.4 | 0/? | Not started | - |
+| 36. Registry Publishing & Maintainer Docs | v0.5.4 | 0/? | Not started | - |
