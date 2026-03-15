@@ -7,7 +7,10 @@
 // 2. FFI entry points (`sv_validate_ddl_rust`, `sv_rewrite_ddl_rust`)
 //    feature-gated on `extension`, with `catch_unwind` for panic safety.
 
+use std::collections::HashSet;
+
 use crate::body_parser::parse_keyword_body;
+use crate::model::{Cardinality, Join, TableRef};
 
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.
 pub const PARSE_NOT_OURS: u8 = 0;
@@ -453,7 +456,10 @@ fn rewrite_ddl_keyword_body(
     body_offset: usize, // byte offset of body_text[0] in original query
 ) -> Result<Option<String>, ParseError> {
     // 1. Call parse_keyword_body (body_text starts at "AS"; pass body_offset)
-    let keyword_body = parse_keyword_body(body_text, body_offset)?;
+    let mut keyword_body = parse_keyword_body(body_text, body_offset)?;
+
+    // Phase 33: Infer cardinality and resolve ref_columns before serialization.
+    infer_cardinality(&keyword_body.tables, &mut keyword_body.relationships)?;
 
     // 2. Construct SemanticViewDefinition from KeywordBody
     //    base_table = first table's physical table name (backward compat)
@@ -497,6 +503,110 @@ fn rewrite_ddl_keyword_body(
     Ok(Some(format!(
         "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 33: Cardinality inference
+// ---------------------------------------------------------------------------
+
+/// Infer cardinality for each relationship based on PK/UNIQUE constraints.
+/// Also resolves `ref_columns` (the columns on the target side of the FK reference).
+///
+/// Two checks per relationship:
+/// 1. Resolve `ref_columns`: if empty, use target's PK. If target has no PK, error.
+/// 2. Infer cardinality: if FK columns match PK/UNIQUE on the `from_alias` table,
+///    the relationship is `OneToOne`; otherwise `ManyToOne`.
+fn infer_cardinality(tables: &[TableRef], relationships: &mut [Join]) -> Result<(), ParseError> {
+    for join in relationships.iter_mut() {
+        if join.fk_columns.is_empty() {
+            continue;
+        }
+
+        let to_alias_lower = join.table.to_ascii_lowercase();
+        let from_alias_lower = join.from_alias.to_ascii_lowercase();
+
+        // Find target table (REFERENCES target)
+        let target = tables
+            .iter()
+            .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower);
+
+        // Find source table (from_alias side)
+        let source = tables
+            .iter()
+            .find(|t| t.alias.to_ascii_lowercase() == from_alias_lower);
+
+        // Step 1: Resolve ref_columns
+        if join.ref_columns.is_empty() {
+            // REFERENCES target (no column list) -> use target's PK
+            match target {
+                Some(t) if !t.pk_columns.is_empty() => {
+                    join.ref_columns.clone_from(&t.pk_columns);
+                }
+                Some(t) => {
+                    return Err(ParseError {
+                        message: format!(
+                            "Table '{}' has no PRIMARY KEY. \
+                             Specify referenced columns explicitly: REFERENCES {}(col).",
+                            t.alias, t.alias
+                        ),
+                        position: None,
+                    });
+                }
+                None => {
+                    // Target not found -- will be caught by graph validation later
+                }
+            }
+        }
+        // When ref_columns was set explicitly (REFERENCES target(cols)),
+        // validation against PK/UNIQUE on target happens in graph.rs (CARD-03).
+
+        // Step 2: FK column count must match ref column count
+        if !join.ref_columns.is_empty() && join.fk_columns.len() != join.ref_columns.len() {
+            let rel_name = join.name.as_deref().unwrap_or("?");
+            return Err(ParseError {
+                message: format!(
+                    "FK column count ({}) does not match referenced column count ({}) \
+                     in relationship '{rel_name}'.",
+                    join.fk_columns.len(),
+                    join.ref_columns.len(),
+                ),
+                position: None,
+            });
+        }
+
+        // Step 3: Infer cardinality from FK-side constraints (CARD-04)
+        if let Some(source) = source {
+            let fk_set: HashSet<String> = join
+                .fk_columns
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+
+            // Check against source PK
+            let pk_set: HashSet<String> = source
+                .pk_columns
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+
+            if !pk_set.is_empty() && fk_set == pk_set {
+                join.cardinality = Cardinality::OneToOne;
+            } else {
+                // Check against source UNIQUE constraints
+                let matches_unique = source.unique_constraints.iter().any(|uc| {
+                    let uc_set: HashSet<String> =
+                        uc.iter().map(|c| c.to_ascii_lowercase()).collect();
+                    fk_set == uc_set
+                });
+                join.cardinality = if matches_unique {
+                    Cardinality::OneToOne
+                } else {
+                    Cardinality::ManyToOne
+                };
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,6 +1350,169 @@ mod tests {
             let query = "DROP SEMANTIC VIEW v";
             let result = validate_and_rewrite(query).unwrap().unwrap();
             assert_eq!(result, "SELECT * FROM drop_semantic_view('v')");
+        }
+    }
+
+    // ===================================================================
+    // Phase 33: Cardinality inference tests
+    // ===================================================================
+
+    mod phase33_inference_tests {
+        use super::*;
+        use crate::model::{Cardinality, Join, TableRef};
+
+        fn make_table(alias: &str, pk: &[&str], unique: &[&[&str]]) -> TableRef {
+            TableRef {
+                alias: alias.to_string(),
+                table: alias.to_string(),
+                pk_columns: pk.iter().map(|s| (*s).to_string()).collect(),
+                unique_constraints: unique
+                    .iter()
+                    .map(|cols| cols.iter().map(|s| (*s).to_string()).collect())
+                    .collect(),
+            }
+        }
+
+        fn make_join(name: &str, from: &str, to: &str, fk: &[&str], ref_cols: &[&str]) -> Join {
+            Join {
+                name: Some(name.to_string()),
+                from_alias: from.to_string(),
+                table: to.to_string(),
+                fk_columns: fk.iter().map(|s| (*s).to_string()).collect(),
+                ref_columns: ref_cols.iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn resolves_ref_columns_to_target_pk() {
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("customers", &["cust_id"], &[]),
+            ];
+            let mut rels = vec![make_join("r", "orders", "customers", &["customer_id"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].ref_columns, vec!["cust_id"]);
+        }
+
+        #[test]
+        fn keeps_explicit_ref_columns() {
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("customers", &["cust_id"], &[&["email"]]),
+            ];
+            let mut rels = vec![make_join(
+                "r",
+                "orders",
+                "customers",
+                &["customer_email"],
+                &["email"],
+            )];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].ref_columns, vec!["email"]);
+        }
+
+        #[test]
+        fn error_when_target_has_no_pk_and_no_explicit_ref() {
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("events", &[], &[]), // no PK
+            ];
+            let mut rels = vec![make_join("r", "orders", "events", &["event_id"], &[])];
+            let err = infer_cardinality(&tables, &mut rels).unwrap_err();
+            assert!(
+                err.message.contains("no PRIMARY KEY"),
+                "Expected 'no PRIMARY KEY' error, got: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("REFERENCES events(col)"),
+                "Expected hint about explicit cols, got: {}",
+                err.message
+            );
+        }
+
+        #[test]
+        fn infers_one_to_one_from_pk_match() {
+            // orders PK is (id), FK is (id) -> OneToOne
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("customers", &["cust_id"], &[]),
+            ];
+            let mut rels = vec![make_join("r", "orders", "customers", &["id"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].cardinality, Cardinality::OneToOne);
+        }
+
+        #[test]
+        fn infers_one_to_one_from_unique_match() {
+            // orders has UNIQUE(email), FK is (email) -> OneToOne
+            let tables = vec![
+                make_table("orders", &["id"], &[&["email"]]),
+                make_table("customers", &["cust_id"], &[]),
+            ];
+            let mut rels = vec![make_join("r", "orders", "customers", &["email"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].cardinality, Cardinality::OneToOne);
+        }
+
+        #[test]
+        fn infers_many_to_one_when_fk_is_bare() {
+            // orders PK is (id), FK is (customer_id) -- doesn't match PK or UNIQUE
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("customers", &["cust_id"], &[]),
+            ];
+            let mut rels = vec![make_join("r", "orders", "customers", &["customer_id"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].cardinality, Cardinality::ManyToOne);
+        }
+
+        #[test]
+        fn case_insensitive_column_matching() {
+            // PK is (ID) uppercase, FK is (id) lowercase -> should still match OneToOne
+            let tables = vec![
+                make_table("orders", &["ID"], &[]),
+                make_table("customers", &["cust_id"], &[]),
+            ];
+            let mut rels = vec![make_join("r", "orders", "customers", &["id"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].cardinality, Cardinality::OneToOne);
+        }
+
+        #[test]
+        fn fk_ref_column_count_mismatch_error() {
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("customers", &["a", "b"], &[]),
+            ];
+            // FK has 1 col, target PK has 2 cols
+            let mut rels = vec![make_join("r", "orders", "customers", &["customer_id"], &[])];
+            let err = infer_cardinality(&tables, &mut rels).unwrap_err();
+            assert!(
+                err.message.contains("FK column count"),
+                "Expected FK column count error, got: {}",
+                err.message
+            );
+        }
+
+        #[test]
+        fn rewrite_produces_json_with_ref_columns_and_cardinality() {
+            let query = "CREATE SEMANTIC VIEW v AS \
+                         TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (cust_id)) \
+                         RELATIONSHIPS (r AS o(customer_id) REFERENCES c) \
+                         DIMENSIONS (o.region AS region) \
+                         METRICS (o.revenue AS SUM(amount))";
+            let result = validate_and_rewrite(query).unwrap().unwrap();
+            // The JSON should contain ref_columns resolved from target PK
+            assert!(
+                result.contains("ref_columns"),
+                "Expected ref_columns in JSON, got: {result}"
+            );
+            assert!(
+                result.contains("cust_id"),
+                "Expected target PK 'cust_id' in ref_columns, got: {result}"
+            );
         }
     }
 }
