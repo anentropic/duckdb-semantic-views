@@ -232,7 +232,7 @@ Phases execute in numeric order: 33 -> 34 -> 35 -> 36
 | 30. Derived Metrics | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 31. Fan Trap Detection | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 32. Role-Playing & USING | v0.5.3 | 2/2 | Complete | 2026-03-14 |
-| 33. UNIQUE & Cardinality Inference | 2/2 | Complete   | 2026-03-15 | - |
+| 33. UNIQUE & Cardinality Inference | 2/2 | Complete    | 2026-03-15 | - |
 | 34. DuckDB 1.5 Upgrade & LTS Branch | v0.5.4 | 0/? | Not started | - |
 | 35. Documentation Site | v0.5.4 | 0/? | Not started | - |
 | 36. Registry Publishing & Maintainer Docs | v0.5.4 | 0/? | Not started | - |
