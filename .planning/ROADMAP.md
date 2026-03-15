@@ -9,7 +9,7 @@
 - ✅ **v0.5.0 Parser Extension Spike** -- Phases 15-18 (shipped 2026-03-08)
 - ✅ **v0.5.1 DDL Polish** -- Phases 19-23 (shipped 2026-03-09)
 - ✅ **v0.5.2 SQL DDL & PK/FK Relationships** -- Phases 24-28 (shipped 2026-03-13)
-- **v0.5.3 Advanced Semantic Features** -- Phases 29-32 (in progress)
+- ✅ **v0.5.3 Advanced Semantic Features** -- Phases 29-32 (shipped 2026-03-15)
 
 ## Phases
 
@@ -102,73 +102,19 @@ Full details: [milestones/v0.5.2-ROADMAP.md](milestones/v0.5.2-ROADMAP.md)
 
 </details>
 
-### v0.5.3 Advanced Semantic Features (In Progress)
+<details>
+<summary>v0.5.3 Advanced Semantic Features (Phases 29-32) -- SHIPPED 2026-03-15</summary>
 
-**Milestone Goal:** Add advanced semantic modeling capabilities -- FACTS clause, derived metrics, hierarchies, fan trap detection, role-playing dimensions, and multiple join paths (USING RELATIONSHIPS).
+- [x] Phase 29: FACTS Clause & Hierarchies (2/2 plans) -- completed 2026-03-14
+- [x] Phase 30: Derived Metrics (2/2 plans) -- completed 2026-03-14
+- [x] Phase 31: Fan Trap Detection (2/2 plans) -- completed 2026-03-14
+- [x] Phase 32: Role-Playing Dimensions & USING RELATIONSHIPS (2/2 plans) -- completed 2026-03-14
 
-- [ ] **Phase 29: FACTS Clause & Hierarchies** - Named row-level sub-expressions and drill-down path metadata
-- [ ] **Phase 30: Derived Metrics** - Metric-on-metric composition with DAG resolution
-- [ ] **Phase 31: Fan Trap Detection** - Structural correctness warnings for one-to-many aggregation
-- [ ] **Phase 32: Role-Playing Dimensions & USING RELATIONSHIPS** - Same table via multiple join paths with explicit path selection
+Full details: [milestones/v0.5.3-ROADMAP.md](milestones/v0.5.3-ROADMAP.md)
 
-## Phase Details
-
-### Phase 29: FACTS Clause & Hierarchies
-**Goal**: Users can declare reusable row-level sub-expressions (facts) and drill-down paths (hierarchies) within semantic views
-**Depends on**: Phase 28 (v0.5.2 complete)
-**Requirements**: FACT-01, FACT-02, FACT-03, FACT-04, FACT-05, HIER-01, HIER-02, HIER-03
-**Success Criteria** (what must be TRUE):
-  1. User can declare a FACTS clause with named row-level expressions and reference them in metric expressions, producing correct query results
-  2. Facts that reference other facts resolve correctly through multi-level inlining with proper parenthesization (operator precedence preserved)
-  3. Defining a semantic view with fact cycles or references to non-existent facts produces a clear error at define time
-  4. User can declare a HIERARCHIES clause with drill-down paths, and DESCRIBE SEMANTIC VIEW shows both facts and hierarchies alongside dimensions and metrics
-  5. Defining a semantic view with a hierarchy referencing a non-existent dimension produces a clear error at define time
-  6. Unit tests for fact parsing, fact inlining, hierarchy validation; proptests for FACTS/HIERARCHIES clause parsing with adversarial input; sqllogictest for end-to-end FACTS+HIERARCHIES DDL and query; fuzz target for FACTS clause parsing
-  7. `just test-all` passes
-**Plans**: TBD
-
-### Phase 30: Derived Metrics
-**Goal**: Users can compose metrics from other metrics without writing raw aggregate expressions
-**Depends on**: Phase 29 (facts must be available for derived metrics to reference)
-**Requirements**: DRV-01, DRV-02, DRV-03, DRV-04, DRV-05
-**Success Criteria** (what must be TRUE):
-  1. User can declare a derived metric without a table prefix (e.g., `profit AS revenue - cost`) and query it alongside regular metrics, producing correct results
-  2. Derived metrics that reference other derived metrics (stacking) resolve correctly through multi-level inlining with word-boundary-safe substitution
-  3. Defining a semantic view with derived metric cycles, references to non-existent metrics, or aggregation functions inside a derived metric produces a clear error at define time
-  4. Unit tests for metric DAG construction, cycle detection, expression inlining with word-boundary safety; proptests for derived metric expression substitution edge cases; sqllogictest for end-to-end derived metrics with stacking and error cases
-  5. `just test-all` passes
-**Plans**: TBD
-
-### Phase 31: Fan Trap Detection
-**Goal**: Users receive warnings when query structure risks inflating aggregation results due to one-to-many fan-out
-**Depends on**: Phase 29 (needs relationship model, no dependency on derived metrics)
-**Requirements**: FAN-01, FAN-02, FAN-03
-**Success Criteria** (what must be TRUE):
-  1. User can optionally declare cardinality type (one_to_one, one_to_many, many_to_one) on relationships in the DDL
-  2. When a query aggregates a metric across a one-to-many boundary, expansion produces a warning message describing the fan trap risk
-  3. Fan trap warnings do not block query execution -- the query succeeds and returns results alongside the warning
-  4. Unit tests for cardinality parsing, fan trap graph analysis, warning generation; proptests for cardinality clause parsing; sqllogictest for end-to-end fan trap warning scenarios (with and without cardinality declarations)
-  5. `just test-all` passes
-**Plans**: TBD
-
-### Phase 32: Role-Playing Dimensions & USING RELATIONSHIPS
-**Goal**: Users can join the same physical table via multiple named relationships and select specific join paths per metric
-**Depends on**: Phase 31 (all simpler features stable before relaxing graph invariant)
-**Requirements**: JOIN-01, JOIN-02, JOIN-03, JOIN-04, JOIN-05, ROLE-01, ROLE-02, ROLE-03
-**Success Criteria** (what must be TRUE):
-  1. User can declare multiple named relationships between the same table pair without triggering diamond rejection
-  2. Metrics with `USING (relationship_name)` expand with the correct join path and relationship-scoped aliases in generated SQL
-  3. Querying a dimension from an ambiguous multi-path table without USING produces a clear error explaining which relationships are available
-  4. Classic role-playing pattern works end-to-end (e.g., flights with departure_airport and arrival_airport joining the same airports table via different relationships)
-  5. Define-time validation rejects USING references to non-existent relationships
-  6. Unit tests for diamond relaxation logic, USING parsing, relationship-scoped alias generation, ambiguity detection; proptests for USING clause parsing; sqllogictest for end-to-end role-playing pattern (flights/airports) and error cases; fuzz target for USING clause parsing
-  7. `just test-all` passes
-**Plans**: TBD
+</details>
 
 ## Progress
-
-**Execution Order:**
-Phases execute in numeric order: 29 -> 30 -> 31 -> 32
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
@@ -205,7 +151,7 @@ Phases execute in numeric order: 29 -> 30 -> 31 -> 32
 | 26. PK/FK Join Resolution | v0.5.2 | 2/2 | Complete | 2026-03-13 |
 | 27. Alias-Based Query Expansion | v0.5.2 | 3/3 | Complete | 2026-03-13 |
 | 28. Integration Testing & Docs | v0.5.2 | 3/3 | Complete | 2026-03-13 |
-| 29. FACTS Clause & Hierarchies | v0.5.3 | 0/? | Not started | - |
-| 30. Derived Metrics | v0.5.3 | 0/? | Not started | - |
-| 31. Fan Trap Detection | v0.5.3 | 0/? | Not started | - |
-| 32. Role-Playing & USING | v0.5.3 | 0/? | Not started | - |
+| 29. FACTS Clause & Hierarchies | v0.5.3 | 2/2 | Complete | 2026-03-14 |
+| 30. Derived Metrics | v0.5.3 | 2/2 | Complete | 2026-03-14 |
+| 31. Fan Trap Detection | v0.5.3 | 2/2 | Complete | 2026-03-14 |
+| 32. Role-Playing & USING | v0.5.3 | 2/2 | Complete | 2026-03-14 |

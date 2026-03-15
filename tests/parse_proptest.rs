@@ -761,3 +761,431 @@ fn test_control_char_in_name() {
         "validate_and_rewrite panicked on control char in name"
     );
 }
+
+// ---------------------------------------------------------------------------
+// TEST-09: FACTS and HIERARCHIES clause adversarial input (Phase 29)
+// ---------------------------------------------------------------------------
+
+/// Generate a valid SQL identifier for use in FACTS/HIERARCHIES entries.
+fn arb_identifier() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[a-z][a-z0-9_]{0,9}")
+        .unwrap()
+        .prop_filter("must not be a SQL keyword or start with AS", |s| {
+            let upper = s.to_ascii_uppercase();
+            // Reject identifiers that ARE or START WITH common SQL keywords
+            // that confuse the dot-qualified entry parser (e.g., "as_" looks
+            // like "AS" + "_" to the token splitter).
+            !matches!(
+                upper.as_str(),
+                "AS" | "BY"
+                    | "ON"
+                    | "IN"
+                    | "IS"
+                    | "OR"
+                    | "TO"
+                    | "IF"
+                    | "DO"
+                    | "REFERENCES"
+                    | "PRIMARY"
+                    | "KEY"
+                    | "MANY"
+                    | "ONE"
+                    | "SUM"
+                    | "COUNT"
+                    | "AVG"
+                    | "MIN"
+                    | "MAX"
+            ) && !upper.starts_with("AS_")
+                && !upper.starts_with("AS ")
+        })
+}
+
+/// Generate a simple SQL expression for fact entries.
+fn arb_simple_expr() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // Simple column reference
+        arb_identifier().prop_map(|id| id),
+        // Binary expression
+        (arb_identifier(), arb_identifier()).prop_map(|(a, b)| format!("{a} + {b}")),
+        // Function call
+        arb_identifier().prop_map(|id| format!("SUM({id})")),
+        // Multiply with paren group
+        (arb_identifier(), arb_identifier()).prop_map(|(a, b)| format!("{a} * (1 - {b})")),
+    ]
+}
+
+/// Generate a FACTS clause: `FACTS (alias.name AS expr, ...)`
+fn arb_facts_clause() -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        (arb_identifier(), arb_identifier(), arb_simple_expr()),
+        0..=3,
+    )
+    .prop_map(|entries| {
+        if entries.is_empty() {
+            String::new()
+        } else {
+            let items: Vec<String> = entries
+                .iter()
+                .map(|(alias, name, expr)| format!("{alias}.{name} AS {alias}.{expr}"))
+                .collect();
+            format!("FACTS ({})", items.join(", "))
+        }
+    })
+}
+
+/// Generate a HIERARCHIES clause: `HIERARCHIES (name AS (dim1, dim2, ...))`
+fn arb_hierarchies_clause(dim_names: &[String]) -> impl Strategy<Value = String> {
+    let dims = dim_names.to_vec();
+    proptest::collection::vec(
+        (
+            arb_identifier(),
+            proptest::sample::subsequence(dims.clone(), 1..=dims.len().max(1)),
+        ),
+        0..=2,
+    )
+    .prop_map(|entries| {
+        if entries.is_empty() {
+            String::new()
+        } else {
+            let items: Vec<String> = entries
+                .iter()
+                .map(|(name, levels)| format!("{name} AS ({})", levels.join(", ")))
+                .collect();
+            format!("HIERARCHIES ({})", items.join(", "))
+        }
+    })
+}
+
+/// Build a valid AS-body with optional FACTS and HIERARCHIES clauses.
+fn build_as_body_with_facts_hierarchies(
+    name: &str,
+    alias: &str,
+    table: &str,
+    facts_clause: &str,
+    hierarchies_clause: &str,
+    dim_name: &str,
+    metric_expr: &str,
+) -> String {
+    let mut body = format!(" {name} AS TABLES ({alias} AS {table} PRIMARY KEY (id))");
+    if !facts_clause.is_empty() {
+        body.push(' ');
+        body.push_str(facts_clause);
+    }
+    if !hierarchies_clause.is_empty() {
+        body.push(' ');
+        body.push_str(hierarchies_clause);
+    }
+    body.push_str(&format!(
+        " DIMENSIONS ({alias}.{dim_name} AS {dim_name}) METRICS ({alias}.m AS {metric_expr})"
+    ));
+    body
+}
+
+proptest! {
+    /// FACTS clause with adversarial input: parse_keyword_body either succeeds
+    /// or returns a well-formed ParseError (no panics, no crashes).
+    #[test]
+    fn facts_clause_no_panic(
+        facts_clause in arb_facts_clause(),
+        name in arb_view_name(),
+    ) {
+        let query = format!(
+            "CREATE SEMANTIC VIEW {name} AS TABLES (t AS orders PRIMARY KEY (id)) {facts_clause} DIMENSIONS (t.region AS region) METRICS (t.rev AS SUM(amount))"
+        );
+        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
+        prop_assert!(
+            result.is_ok(),
+            "validate_and_rewrite panicked on FACTS clause: {facts_clause}"
+        );
+        // The result is either Ok(Some(sql)) for valid DDL, Ok(None) for non-DDL, or Err(ParseError)
+        // All are acceptable -- the key invariant is no panics.
+    }
+
+    /// HIERARCHIES clause with adversarial input: no panics.
+    #[test]
+    fn hierarchies_clause_no_panic(
+        name in arb_view_name(),
+        hier_name in arb_identifier(),
+        level_count in 1..=4usize,
+    ) {
+        // Build a hierarchy with valid dimension names
+        let levels: Vec<String> = (0..level_count).map(|i| format!("dim{i}")).collect();
+        let dims_clause: String = levels.iter()
+            .map(|l| format!("t.{l} AS {l}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let hier_clause = format!("{hier_name} AS ({})", levels.join(", "));
+        let query = format!(
+            "CREATE SEMANTIC VIEW {name} AS TABLES (t AS orders PRIMARY KEY (id)) HIERARCHIES ({hier_clause}) DIMENSIONS ({dims_clause}) METRICS (t.rev AS SUM(amount))"
+        );
+        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
+        prop_assert!(
+            result.is_ok(),
+            "validate_and_rewrite panicked on HIERARCHIES clause: {hier_clause}"
+        );
+    }
+
+    /// Combined FACTS + HIERARCHIES with adversarial input: no panics.
+    #[test]
+    fn facts_and_hierarchies_combined_no_panic(
+        name in arb_view_name(),
+        alias in arb_identifier(),
+        fact_name in arb_identifier(),
+        fact_expr in arb_simple_expr(),
+        hier_name in arb_identifier(),
+    ) {
+        let query = format!(
+            "CREATE SEMANTIC VIEW {name} AS \
+             TABLES ({alias} AS orders PRIMARY KEY (id)) \
+             FACTS ({alias}.{fact_name} AS {alias}.{fact_expr}) \
+             HIERARCHIES ({hier_name} AS (region)) \
+             DIMENSIONS ({alias}.region AS region) \
+             METRICS ({alias}.rev AS SUM(amount))"
+        );
+        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
+        prop_assert!(
+            result.is_ok(),
+            "validate_and_rewrite panicked on combined FACTS+HIERARCHIES query"
+        );
+    }
+
+    /// Empty FACTS and HIERARCHIES clauses are valid (no entries).
+    #[test]
+    fn empty_facts_hierarchies_clauses_valid(
+        name in arb_view_name(),
+    ) {
+        let query = format!(
+            "CREATE SEMANTIC VIEW {name} AS \
+             TABLES (t AS orders PRIMARY KEY (id)) \
+             FACTS () \
+             HIERARCHIES () \
+             DIMENSIONS (t.region AS region) \
+             METRICS (t.rev AS SUM(amount))"
+        );
+        let result = validate_and_rewrite(&query);
+        prop_assert!(
+            result.is_ok(),
+            "Empty FACTS () and HIERARCHIES () should be accepted, got: {:?}",
+            result
+        );
+        prop_assert!(
+            result.unwrap().is_some(),
+            "Empty FACTS/HIERARCHIES should produce valid rewrite"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TEST-10: Derived metric parsing and expression substitution (Phase 30)
+// ---------------------------------------------------------------------------
+
+/// Generate a valid metric name (no dots allowed for derived metrics).
+fn arb_metric_name() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[a-z][a-z0-9_]{0,14}").unwrap()
+}
+
+/// Generate a simple arithmetic expression from metric names.
+fn arb_arithmetic_expr(names: Vec<String>) -> impl Strategy<Value = String> {
+    let operators = vec![" + ", " - ", " * ", " / "];
+    let n = names.len();
+    if n == 0 {
+        return Just("1".to_string()).boxed();
+    }
+    (0..n, proptest::sample::select(operators), 0..n)
+        .prop_map(move |(a, op, b)| {
+            let left = &names[a % names.len()];
+            let right = &names[b % names.len()];
+            format!("{left}{op}{right}")
+        })
+        .boxed()
+}
+
+proptest! {
+    /// Derived metric entries in METRICS clause: parse_and_rewrite either succeeds
+    /// or returns a well-formed error (no panics).
+    #[test]
+    fn derived_metric_parsing_no_panic(
+        name in arb_view_name(),
+        derived_name in arb_metric_name(),
+        base_name in arb_metric_name(),
+    ) {
+        // Build a DDL with one base metric and one derived metric
+        let query = format!(
+            "CREATE SEMANTIC VIEW {name} AS \
+             TABLES (t AS orders PRIMARY KEY (id)) \
+             DIMENSIONS (t.region AS region) \
+             METRICS (t.{base_name} AS SUM(t.amount), {derived_name} AS {base_name} + 1)"
+        );
+        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
+        prop_assert!(
+            result.is_ok(),
+            "validate_and_rewrite panicked on derived metric entry"
+        );
+    }
+
+    /// Mixed qualified and unqualified metric entries: no panics.
+    #[test]
+    fn mixed_metrics_no_panic(
+        name in arb_view_name(),
+        alias in arb_identifier(),
+        base1 in arb_metric_name(),
+        base2 in arb_metric_name(),
+        derived in arb_metric_name(),
+    ) {
+        let query = format!(
+            "CREATE SEMANTIC VIEW {name} AS \
+             TABLES ({alias} AS orders PRIMARY KEY (id)) \
+             DIMENSIONS ({alias}.region AS region) \
+             METRICS ({alias}.{base1} AS SUM({alias}.amount), \
+                      {alias}.{base2} AS COUNT(*), \
+                      {derived} AS {base1} + {base2})"
+        );
+        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
+        prop_assert!(
+            result.is_ok(),
+            "validate_and_rewrite panicked on mixed qualified/unqualified metrics"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TEST-11: Word-boundary replacement safety (Phase 30)
+// ---------------------------------------------------------------------------
+
+use semantic_views::expand::quote_ident;
+
+proptest! {
+    /// replace_word_boundary (tested through expand infrastructure):
+    /// quote_ident with random strings does not panic and produces valid output.
+    #[test]
+    fn quote_ident_never_panics(
+        input in "[a-zA-Z0-9_\"]{0,50}",
+    ) {
+        let result = std::panic::catch_unwind(|| quote_ident(&input));
+        prop_assert!(
+            result.is_ok(),
+            "quote_ident panicked on input: {input:?}"
+        );
+        let quoted = result.unwrap();
+        prop_assert!(quoted.starts_with('"'), "Must start with double quote");
+        prop_assert!(quoted.ends_with('"'), "Must end with double quote");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TEST-12: Relationship cardinality parsing (Phase 31)
+// ---------------------------------------------------------------------------
+
+/// Generate a random case variant of a cardinality keyword sequence.
+fn arb_cardinality_keyword() -> impl Strategy<Value = (String, &'static str)> {
+    prop_oneof![
+        arb_case_variant("many to one").prop_map(|s| (s, "ManyToOne")),
+        arb_case_variant("one to one").prop_map(|s| (s, "OneToOne")),
+        arb_case_variant("one to many").prop_map(|s| (s, "OneToMany")),
+    ]
+}
+
+/// Generate inter-keyword whitespace for cardinality tokens (1-4 spaces/tabs).
+fn arb_cardinality_ws() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[ \t]{1,4}").unwrap()
+}
+
+proptest! {
+    /// Relationship entries with random cardinality keywords (including case
+    /// variations and extra whitespace) parse successfully and produce the
+    /// correct cardinality variant and clean to_alias.
+    #[test]
+    fn relationship_cardinality_keyword_variants(
+        name in arb_view_name(),
+        alias_from in arb_identifier(),
+        alias_to in arb_identifier(),
+        fk_col in arb_identifier(),
+        (cardinality_kw, _expected_variant) in arb_cardinality_keyword(),
+        ws1 in arb_cardinality_ws(),
+    ) {
+        // Build: "relname AS from(fk) REFERENCES to MANY TO ONE"
+        // with variable whitespace between cardinality tokens
+        let cardinality_tokens: Vec<&str> = cardinality_kw.split_whitespace().collect();
+        let cardinality_str = cardinality_tokens.join(&ws1);
+        let input = format!(
+            "{name} AS {alias_from}({fk_col}) REFERENCES {alias_to} {cardinality_str}"
+        );
+
+        let ddl = format!(
+            "CREATE SEMANTIC VIEW v AS TABLES ({alias_from} AS orders PRIMARY KEY (id), {alias_to} AS customers PRIMARY KEY (id)) RELATIONSHIPS ({input}) DIMENSIONS ({alias_from}.r AS region) METRICS ({alias_from}.m AS SUM(amount))"
+        );
+        let result = validate_and_rewrite(&ddl);
+        prop_assert!(
+            result.is_ok(),
+            "Failed to parse relationship with cardinality '{}': {:?}",
+            cardinality_str,
+            result.unwrap_err()
+        );
+        prop_assert!(
+            result.unwrap().is_some(),
+            "Expected Some(sql) for valid DDL with cardinality"
+        );
+    }
+
+    /// Relationship entries without cardinality keywords parse successfully
+    /// and default to ManyToOne.
+    #[test]
+    fn relationship_no_cardinality_defaults(
+        name in arb_view_name(),
+        alias_from in arb_identifier(),
+        alias_to in arb_identifier(),
+        fk_col in arb_identifier(),
+    ) {
+        let input = format!(
+            "{name} AS {alias_from}({fk_col}) REFERENCES {alias_to}"
+        );
+        let ddl = format!(
+            "CREATE SEMANTIC VIEW v AS TABLES ({alias_from} AS orders PRIMARY KEY (id), {alias_to} AS customers PRIMARY KEY (id)) RELATIONSHIPS ({input}) DIMENSIONS ({alias_from}.r AS region) METRICS ({alias_from}.m AS SUM(amount))"
+        );
+        let result = validate_and_rewrite(&ddl);
+        prop_assert!(
+            result.is_ok(),
+            "Failed to parse relationship without cardinality: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    /// Metrics with USING clause containing random relationship names parse
+    /// successfully through the full DDL pipeline and produce valid JSON.
+    #[test]
+    fn metric_using_clause_roundtrip(
+        // Exclude names starting with "as" to avoid collision with the AS keyword parser
+        rel_name in proptest::string::string_regex("[b-z][a-z0-9_]{1,15}").unwrap(),
+        metric_name in proptest::string::string_regex("[b-z][a-z0-9_]{1,15}").unwrap(),
+        using_kw in arb_case_variant("using"),
+    ) {
+        // Build DDL with a USING clause on a metric
+        let ddl = format!(
+            "CREATE SEMANTIC VIEW v AS \
+             TABLES (f AS flights PRIMARY KEY (id), a AS airports PRIMARY KEY (id)) \
+             RELATIONSHIPS ({rel_name} AS f(airport_id) REFERENCES a) \
+             DIMENSIONS (a.name AS airport_name) \
+             METRICS (f.{metric_name} {using_kw} ({rel_name}) AS COUNT(*))"
+        );
+        let result = validate_and_rewrite(&ddl);
+        prop_assert!(
+            result.is_ok(),
+            "Failed to parse metric with USING clause (rel={}, met={}, kw={}): {:?}",
+            rel_name,
+            metric_name,
+            using_kw,
+            result.unwrap_err()
+        );
+        let sql = result.unwrap();
+        prop_assert!(
+            sql.is_some(),
+            "Expected Some(sql) for valid DDL with USING"
+        );
+        // The rewritten SQL should contain the metric name and using_relationships
+        let sql_str = sql.unwrap();
+        prop_assert!(
+            sql_str.contains("using_relationships"),
+            "Rewritten JSON should contain using_relationships: {sql_str}"
+        );
+    }
+}

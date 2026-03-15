@@ -1,5 +1,28 @@
 # Milestones
 
+## v0.5.3 Advanced Semantic Features (Shipped: 2026-03-15)
+
+**Phases completed:** 4 phases (29-32), 8 plans, 17 tasks
+**Source changes:** 126 files, +18,130 / -2,921 lines
+**Commits:** 66
+**Tests:** 441 Rust tests + 11 sqllogictest files + 6 DuckLake CI
+**Timeline:** 2 days (2026-03-13 → 2026-03-15)
+
+**Delivered:** Advanced semantic modeling capabilities — FACTS clause for named row-level sub-expressions, derived metrics with metric-on-metric composition, hierarchies for drill-down path metadata, cardinality-aware fan trap detection blocking inflated aggregation, role-playing dimensions via multiple named relationships with scoped aliases, and USING RELATIONSHIPS for explicit join path selection per metric.
+
+**Key accomplishments:**
+1. FACTS clause with DAG resolution via Kahn's algorithm and word-boundary-safe expression inlining
+2. HIERARCHIES clause as pure metadata with define-time validation against declared dimensions
+3. Derived metrics with stacked inlining, aggregate prohibition, and transitive join resolution
+4. Fan trap detection with LCA-based tree path analysis blocking one-to-many aggregation fan-out
+5. Role-playing dimensions with scoped aliases ({alias}__{rel_name}) for same table via multiple relationships
+6. USING RELATIONSHIPS for explicit join path selection with ambiguity detection and transitive inheritance
+
+**Requirements:** 24/24 satisfied
+**Audit:** Passed — all requirements triple-confirmed across VERIFICATION.md, SUMMARY.md, REQUIREMENTS.md. 2 minor tech debt items (approved FAN-02/03 deviation, proptest arb_view_name edge case).
+
+---
+
 ## v0.5.2 SQL DDL & PK/FK Relationships (Shipped: 2026-03-13)
 
 **Phases completed:** 5 active phases (24-28, Phase 24 cancelled), 14 plans

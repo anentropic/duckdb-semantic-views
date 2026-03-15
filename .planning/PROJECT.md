@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A DuckDB extension written in Rust that implements semantic views — a declarative layer for defining measures, dimensions, and relationships directly in DuckDB. Users register semantic views via native `CREATE SEMANTIC VIEW` DDL with SQL keyword clauses (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS), then query them with `FROM semantic_view('view', dimensions := [...], metrics := [...])`. The extension expands semantic view references into concrete SQL (with GROUP BY, JOINs from PK/FK declarations, typed output columns, and filters) and hands the result to DuckDB for execution.
+A DuckDB extension written in Rust that implements semantic views — a declarative layer for defining measures, dimensions, relationships, facts, hierarchies, and derived metrics directly in DuckDB. Users register semantic views via native `CREATE SEMANTIC VIEW` DDL with SQL keyword clauses (TABLES, RELATIONSHIPS, FACTS, HIERARCHIES, DIMENSIONS, METRICS), then query them with `FROM semantic_view('view', dimensions := [...], metrics := [...])`. The extension expands semantic view references into concrete SQL (with GROUP BY, JOINs from PK/FK declarations, typed output columns, fan trap detection, and role-playing dimension support) and hands the result to DuckDB for execution.
 
 The project targets open source release via the DuckDB community extension registry, filling a gap that exists in the ecosystem: Snowflake, Databricks, and Cube.dev all have semantic layers, but DuckDB has none.
 
@@ -52,56 +52,43 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - ✓ Qualified column references (`alias.column`) in dimension/metric expressions — v0.5.2
 - ✓ Function-based DDL retired; native DDL is sole interface — v0.5.2
 - ✓ Parser robustness: token-based DDL detection, adversarial input hardening, fuzz_ddl_parse target — v0.5.2
+- ✓ FACTS clause: named row-level sub-expressions with DAG validation and word-boundary-safe inlining — v0.5.3
+- ✓ HIERARCHIES clause: drill-down path metadata with define-time dimension validation — v0.5.3
+- ✓ Derived metrics: metric-on-metric composition with stacked inlining and aggregate prohibition — v0.5.3
+- ✓ Fan trap detection: cardinality-aware blocking errors for one-to-many aggregation fan-out — v0.5.3
+- ✓ Role-playing dimensions: same table via multiple named relationships with scoped aliases — v0.5.3
+- ✓ USING RELATIONSHIPS: explicit join path selection per metric with ambiguity detection — v0.5.3
+- ✓ DESCRIBE extended to 8 columns (facts + hierarchies) with backward-compatible null-to-[] fallback — v0.5.3
 
 ### Active
 
-## Current Milestone: v0.5.3 Advanced Semantic Features
-
-**Goal:** Add advanced semantic modeling capabilities — FACTS clause, derived metrics, hierarchies, fan trap detection, role-playing dimensions, semi-additive metrics, and multiple join paths.
-
-**Target features:**
-- FACTS clause (named row-level sub-expressions for metrics)
-- Derived metrics (metric referencing other metrics)
-- Hierarchies / drill-down paths
-- Fan trap detection and deduplication warnings
-- Role-playing dimensions (same table joined via different relationships)
-- Semi-additive metrics (NON ADDITIVE BY)
-- Multiple join paths (USING RELATIONSHIPS — relaxes diamond rejection)
-
-## Shipped: v0.5.2 SQL DDL & PK/FK Relationships (2026-03-13)
-
-SQL keyword body syntax (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS) replacing function-call DDL, Snowflake-style PK/FK relationship model with automatic JOIN ON synthesis, topological sort ordering, define-time graph validation, and qualified column references. Function-based DDL interface fully retired; native DDL is sole interface. 282 Rust tests + 7 sqllogictest + 6 DuckLake CI green.
-
-## Shipped: v0.5.1 DDL Polish (2026-03-09)
-
-Complete native DDL surface — all 7 DDL verbs (CREATE, CREATE OR REPLACE, CREATE IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, SHOW) via parser extension hooks. Error location reporting with clause-level hints, character positions, and "did you mean" suggestions.
-
-## Shipped: v0.5.0 Parser Extension Spike (2026-03-08)
-
-Native `CREATE SEMANTIC VIEW` DDL syntax achieved via DuckDB parser extension hooks. C++ shim compiled via `cc` crate against vendored DuckDB amalgamation.
+(Next milestone requirements to be defined via `/gsd:new-milestone`)
 
 ### Out of Scope
 
 - Pre-aggregation / materialization selection — deferred to future milestone
 - YAML definition format — SQL DDL first; YAML is a future path
-- Derived metrics (metric-on-metric, e.g., profit = revenue - cost) — future milestone
-- Hierarchies (drill-down paths, e.g., country → region → city) — future milestone
+- Fan trap auto-deduplication — changes query semantics; detection + blocking is the 80/20
+- Window function metrics — requires expansion without GROUP BY; orthogonal to aggregation model
+- ASOF / temporal relationships — complex temporal join semantics; standard equi-joins cover 95% of cases
+- Aggregate facts (COUNT in FACTS) — blurs row-level boundary; aggregation belongs in METRICS
 - Cross-view optimisation (sharing materialised tables across views) — non-goal by design
 - Custom query engine — DuckDB is the engine; the extension is a preprocessor only
 - BI tool HTTP API — not a DuckDB extension concern; Cube.dev handles this use case
 - Column-level security — beyond row-level filter scope; DuckDB handles column access
 - Fiscal calendar / Sunday-start weeks — ISO 8601 only for now
 - Backward compatibility for old DDL syntax — pre-release; finding the right design
-- Multiple join paths between same tables — error on diamonds; defer explicit paths
+- Cross-view hierarchies — keep hierarchies within single semantic view's dimension space
+- Cube.dev-style Dijkstra path selection — explicit USING is more deterministic and Snowflake-aligned
 
 ## Context
 
-**Shipped v0.5.2** — SQL keyword DDL body, PK/FK relationship model, graph-based join resolution, function DDL retired. Native DDL is sole interface.
+**Shipped v0.5.3** — FACTS clause, derived metrics, hierarchies, fan trap detection, role-playing dimensions, USING RELATIONSHIPS. All advanced semantic modeling features complete.
 **Tech stack:** Rust + C++ shim (vendored DuckDB amalgamation via cc crate), duckdb-rs 1.4.4, serde_json, strsim, proptest.
-**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern). Parser hook via C++ shim: `parse_function` fallback detects all 7 DDL forms, Rust `DdlKind` enum dispatches rewrite. DDL body parsed by `body_parser.rs` state machine into TableRef/Join/Dimension/Metric structs with PK/FK annotations. `RelationshipGraph` validates tree structure and topologically sorts joins. Expansion generates `FROM base AS alias LEFT JOIN t AS alias ON pk=fk` with qualified column references.
-**Tests:** 282+ total — Rust unit tests, property-based tests (proptest), sqllogictest integration tests (7), DuckLake CI tests (6), Python crash repro (13), Python caret tests (3), 4 fuzz targets.
+**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns, fan trap detection, and role-playing dimension support. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern). Parser hook via C++ shim: `parse_function` fallback detects all 7 DDL forms, Rust `DdlKind` enum dispatches rewrite. DDL body parsed by `body_parser.rs` state machine into TableRef/Join/Dimension/Metric/Fact/Hierarchy structs with PK/FK annotations and cardinality. `RelationshipGraph` validates tree structure and topologically sorts joins. Expansion generates `FROM base AS alias LEFT JOIN t AS alias ON pk=fk` with qualified column references, fact inlining, derived metric resolution, and USING-aware scoped aliases.
+**Tests:** 441 Rust tests + 11 sqllogictest files + 6 DuckLake CI tests + Python crash repro + Python caret tests + 4 fuzz targets.
 **Known limitations:** See TECH-DEBT.md at repo root for accepted decisions and deferred items.
-**Source LOC:** 8,217 Rust (src/).
+**Source LOC:** 13,451 Rust (src/).
 
 **Design research:** A detailed design doc lives in `_notes/semantic-views-duckdb-design-doc.md`. It covers prior art (Cube.dev internals, Snowflake semantic views, Databricks metric views), the two-phase architecture (expansion → pre-aggregation selection), and why `egg`/e-graph rewriting is not needed for this approach.
 
@@ -137,6 +124,16 @@ Native `CREATE SEMANTIC VIEW` DDL syntax achieved via DuckDB parser extension ho
 | Kahn's algorithm for topological sort | Naturally detects cycles via leftover nodes; simpler than DFS for relationship graphs | ✓ Good — clean implementation |
 | Function DDL retirement in v0.5.2 | Single interface reduces maintenance; native DDL is strictly superior | ✓ Good — -400 LOC removed, sole DDL path |
 | FROM+JOIN expansion replacing CTE flattening | Direct `FROM base LEFT JOIN t ON pk=fk` instead of `_base` CTE; enables qualified column refs | ✓ Good — correct scoping, cleaner SQL |
+| FACTS reuse parse_qualified_entries | Same alias.name AS expr pattern as dims/metrics; consistent syntax | ✓ Good — no new parser needed |
+| Hierarchies as pure metadata | Only validated against dimensions, not used in expansion | ✓ Good — clean separation of concerns |
+| Word-boundary matching for expression substitution | is_word_boundary_byte prevents substring collisions in fact/metric inlining | ✓ Good — correct identifier handling |
+| Fact/derived metric DAG via Kahn's algorithm | Same toposort pattern as relationship graph; naturally detects cycles | ✓ Good — consistent algorithm choice |
+| Fan trap detection as blocking error | User chose blocking errors over warnings for one-to-many fan-out | ✓ Good — safer default |
+| LCA-based tree path analysis for fan traps | Parent-walking + lowest common ancestor to check edge cardinalities | ✓ Good — correct graph analysis |
+| Scoped aliases for role-playing ({alias}__{rel_name}) | Double-underscore separator for uniqueness; aliases are quoted | ✓ Good — deterministic disambiguation |
+| Diamond relaxation for named relationships | Allow multiple paths when all relationships have unique names | ✓ Good — enables role-playing pattern |
+| USING controls dimension alias, not metric aggregation | COUNT(*) counts base rows regardless of USING path | ✓ Good — correct semantics |
+| Semi-additive metrics deferred to v0.5.4 | Only feature requiring expansion pipeline structural change | — Pending |
 
 ---
-*Last updated: 2026-03-14 after v0.5.3 milestone start*
+*Last updated: 2026-03-15 after v0.5.3 milestone*

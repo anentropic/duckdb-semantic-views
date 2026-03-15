@@ -4,7 +4,7 @@ A DuckDB extension that lets you define dimensions and metrics once, then query 
 
 Inspired by [Snowflake Semantic Views](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view), adapted for DuckDB as a loadable extension.
 
-v0.5.2 -- early-stage, not yet on the community registry.
+v0.5.3 -- early-stage, not yet on the community registry.
 
 ## How it works
 
@@ -138,10 +138,104 @@ SELECT * FROM explain_semantic_view('analytics',
 └──────────────────────────────────────────────────────────────┘
 ```
 
+## FACTS (reusable row-level expressions)
+
+Name common row-level calculations once and reference them in metrics. Facts are inlined into metric expressions at expansion time.
+
+```sql
+CREATE SEMANTIC VIEW sales AS
+TABLES (
+    li AS line_items PRIMARY KEY (id)
+)
+FACTS (
+    li.net_price AS li.extended_price * (1 - li.discount),
+    li.tax_amount AS li.net_price * li.tax_rate
+)
+DIMENSIONS (
+    li.region AS li.region
+)
+METRICS (
+    li.total_net AS SUM(li.net_price),
+    li.total_tax AS SUM(li.tax_amount)
+);
+```
+
+Facts can reference other facts -- the extension resolves them in dependency order.
+
+## Derived metrics (metric composition)
+
+Combine base metrics without table prefixes. The extension substitutes the underlying expressions.
+
+```sql
+METRICS (
+    li.revenue AS SUM(li.net_price),
+    li.cost    AS SUM(li.unit_cost),
+    profit     AS revenue - cost,
+    margin     AS profit / revenue * 100
+);
+```
+
+## Hierarchies (drill-down metadata)
+
+Define drill-down paths for dimension discovery. Hierarchies are pure metadata -- they document relationships between dimensions but don't affect query expansion.
+
+```sql
+HIERARCHIES (
+    geo AS (country, state, city)
+)
+```
+
+## Cardinality and fan trap detection
+
+Annotate relationship cardinality to catch queries that would inflate aggregates. If a query must traverse a one-to-many join to reach a dimension, the extension raises an error instead of returning incorrect results.
+
+```sql
+RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o MANY TO ONE,
+    order_to_customer AS o(customer_id) REFERENCES c MANY TO ONE
+)
+```
+
+Supported annotations: `ONE TO ONE`, `ONE TO MANY`, `MANY TO ONE` (default if omitted).
+
+## Role-playing dimensions (USING RELATIONSHIPS)
+
+When the same table is joined via multiple relationships (e.g., airports as both departure and arrival), use `USING` on metrics to select which join path to use.
+
+```sql
+CREATE SEMANTIC VIEW flight_analytics AS
+TABLES (
+    f AS flights PRIMARY KEY (flight_id),
+    a AS airports PRIMARY KEY (airport_code)
+)
+RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+)
+DIMENSIONS (
+    a.city    AS a.city,
+    f.carrier AS f.carrier
+)
+METRICS (
+    f.departures USING (dep_airport) AS COUNT(*),
+    f.arrivals   USING (arr_airport) AS COUNT(*)
+);
+```
+
+Without `USING`, queries that involve an ambiguous join path will error.
+
 ## DDL reference
 
 ```sql
-CREATE SEMANTIC VIEW name AS ...;
+-- Full clause order (FACTS, HIERARCHIES optional; DIMENSIONS, METRICS required)
+CREATE SEMANTIC VIEW name AS
+  TABLES (...)
+  RELATIONSHIPS (...)
+  FACTS (...)
+  HIERARCHIES (...)
+  DIMENSIONS (...)
+  METRICS (...);
+
 CREATE OR REPLACE SEMANTIC VIEW name AS ...;
 CREATE SEMANTIC VIEW IF NOT EXISTS name AS ...;
 DROP SEMANTIC VIEW name;

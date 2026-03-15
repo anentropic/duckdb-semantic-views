@@ -116,6 +116,21 @@ impl VTab for DefineFromJsonVTab {
         // Catches cycles, diamonds, self-references, orphans, FK/PK mismatches.
         crate::graph::validate_graph(&def).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
+        // Validate facts: source table reachability, cycles, unknown refs (Phase 29).
+        crate::graph::validate_facts(&def).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
+        // Validate hierarchies: unknown dimension levels (Phase 29).
+        crate::graph::validate_hierarchies(&def)
+            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
+        // Validate derived metrics: cycles, unknown refs, aggregate prohibition (Phase 30).
+        crate::graph::validate_derived_metrics(&def)
+            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
+        // Validate USING relationship references on metrics (Phase 32).
+        crate::graph::validate_using_relationships(&def)
+            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
         // Access the DefineState from extra_info.
         let state_ptr = bind.get_extra_info::<DefineState>();
         let state = unsafe { &*state_ptr };

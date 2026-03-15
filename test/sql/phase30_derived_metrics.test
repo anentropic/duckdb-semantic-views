@@ -1,0 +1,306 @@
+# Phase 30: End-to-end integration test for derived metrics
+# Tests derived metric expression inlining, stacking, facts+derived chain,
+# derived-only queries, DESCRIBE output, and error cases.
+
+require semantic_views
+
+# ============================================================
+# Setup: create physical tables with known data
+# ============================================================
+
+statement ok
+CREATE TABLE p30_orders (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO p30_orders VALUES (1, 'East'), (2, 'West');
+
+statement ok
+CREATE TABLE p30_line_items (id INTEGER, order_id INTEGER, extended_price DECIMAL(10,2), discount DECIMAL(3,2), unit_cost DECIMAL(10,2));
+
+statement ok
+INSERT INTO p30_line_items VALUES
+    (1, 1, 100.00, 0.10, 50.00),
+    (2, 1, 200.00, 0.20, 80.00),
+    (3, 2, 150.00, 0.00, 60.00);
+
+# ============================================================
+# Test 1: CREATE with derived metrics (profit = revenue - cost)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p30_sales AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id),
+    li AS p30_line_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    li.revenue AS SUM(li.extended_price),
+    li.cost AS SUM(li.unit_cost),
+    profit AS revenue - cost
+  );
+
+# ============================================================
+# Test 2: Basic derived metric query
+# East: SUM(100 + 200) - SUM(50 + 80) = 300 - 130 = 170.00
+# West: SUM(150) - SUM(60) = 150 - 60 = 90.00
+# ============================================================
+
+query TR rowsort
+SELECT * FROM semantic_view('p30_sales', dimensions := ['region'], metrics := ['profit']);
+----
+East	170.00
+West	90.00
+
+# ============================================================
+# Test 3: Derived metric alongside base metrics
+# East: revenue=300, cost=130, profit=170
+# West: revenue=150, cost=60, profit=90
+# ============================================================
+
+query TRRR rowsort
+SELECT * FROM semantic_view('p30_sales', dimensions := ['region'], metrics := ['revenue', 'cost', 'profit']);
+----
+East	300.00	130.00	170.00
+West	150.00	60.00	90.00
+
+# ============================================================
+# Test 4: Derived-only query (no base metrics requested)
+# profit must still work -- JOINs for referenced base metrics resolved
+# East: 170.00, West: 90.00
+# ============================================================
+
+query TR rowsort
+SELECT * FROM semantic_view('p30_sales', dimensions := ['region'], metrics := ['profit']);
+----
+East	170.00
+West	90.00
+
+# ============================================================
+# Test 5: Global aggregate with derived metric
+# Total revenue = 300 + 150 = 450.00
+# Total cost = 130 + 60 = 190.00
+# Total profit = 450 - 190 = 260.00
+# ============================================================
+
+query R
+SELECT * FROM semantic_view('p30_sales', metrics := ['profit']);
+----
+260.00
+
+# ============================================================
+# Test 6: Stacked derived metrics (margin = profit / revenue * 100)
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p30_sales;
+
+statement ok
+CREATE SEMANTIC VIEW p30_sales_v2 AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id),
+    li AS p30_line_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    li.revenue AS SUM(li.extended_price),
+    li.cost AS SUM(li.unit_cost),
+    profit AS revenue - cost,
+    margin AS profit / revenue * 100
+  );
+
+# East: profit=170, revenue=300, margin=170/300*100 = 56.666...
+# West: profit=90, revenue=150, margin=90/150*100 = 60.000...
+# Use approximate comparison via ROUND
+
+query TR rowsort
+SELECT * FROM semantic_view('p30_sales_v2', dimensions := ['region'], metrics := ['profit']);
+----
+East	170.00
+West	90.00
+
+query TR rowsort
+SELECT region, ROUND(margin, 2) FROM (
+  SELECT * FROM semantic_view('p30_sales_v2', dimensions := ['region'], metrics := ['margin'])
+);
+----
+East	56.67
+West	60.00
+
+# Both profit and margin together
+query TRR rowsort
+SELECT region, profit, ROUND(margin, 2) FROM (
+  SELECT * FROM semantic_view('p30_sales_v2', dimensions := ['region'], metrics := ['profit', 'margin'])
+);
+----
+East	170.00	56.67
+West	90.00	60.00
+
+# ============================================================
+# Test 7: Derived metrics with FACTS (fact -> base -> derived chain)
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p30_sales_v2;
+
+statement ok
+CREATE SEMANTIC VIEW p30_sales_facts AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id),
+    li AS p30_line_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o
+  )
+  FACTS (
+    li.net_price AS li.extended_price * (1 - li.discount)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    li.revenue AS SUM(li.net_price),
+    li.cost AS SUM(li.unit_cost),
+    profit AS revenue - cost
+  );
+
+# net_price: item1=90, item2=160, item3=150
+# East revenue: 90+160=250, cost: 50+80=130, profit: 250-130=120
+# West revenue: 150, cost: 60, profit: 150-60=90
+
+query TR rowsort
+SELECT * FROM semantic_view('p30_sales_facts', dimensions := ['region'], metrics := ['profit']);
+----
+East	120.00
+West	90.00
+
+# Verify base metric with fact inlining still works alongside derived
+query TRR rowsort
+SELECT * FROM semantic_view('p30_sales_facts', dimensions := ['region'], metrics := ['revenue', 'profit']);
+----
+East	250.00	120.00
+West	150.00	90.00
+
+# ============================================================
+# Test 8: DESCRIBE shows derived metrics with null source_table
+# ============================================================
+
+query TTTTTTTT
+DESCRIBE SEMANTIC VIEW p30_sales_facts;
+----
+p30_sales_facts	p30_orders	[{"expr":"o.region","name":"region","output_type":null,"source_table":"o"}]	[{"expr":"SUM(li.net_price)","name":"revenue","output_type":null,"source_table":"li"},{"expr":"SUM(li.unit_cost)","name":"cost","output_type":null,"source_table":"li"},{"expr":"revenue - cost","name":"profit","output_type":null,"source_table":null}]	[]	[{"fk_columns":["order_id"],"from_alias":"li","from_cols":[],"join_columns":[],"name":"li_to_order","table":"o"}]	[{"expr":"li.extended_price * (1 - li.discount)","name":"net_price","source_table":"li"}]	[]
+
+# ============================================================
+# Test 9: Error -- cycle in derived metrics
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p30_cycle AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.base AS SUM(o.id),
+    a AS b + 1,
+    b AS a + 1
+  );
+----
+cycle detected in derived metrics
+
+# ============================================================
+# Test 10: Error -- unknown metric reference
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p30_unknown_ref AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.revenue AS SUM(o.id),
+    profit AS revenue - nonexistent
+  );
+----
+unknown metric
+
+# ============================================================
+# Test 11: Error -- aggregate in derived metric
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p30_agg AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.revenue AS SUM(o.id),
+    bad AS SUM(revenue)
+  );
+----
+must not contain aggregate function
+
+# ============================================================
+# Test 12: Error -- single-word aggregate detection (COUNT, AVG)
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p30_count_agg AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.revenue AS SUM(o.id),
+    bad AS COUNT(revenue)
+  );
+----
+must not contain aggregate function
+
+statement error
+CREATE SEMANTIC VIEW p30_avg_agg AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.revenue AS SUM(o.id),
+    bad AS AVG(revenue)
+  );
+----
+must not contain aggregate function
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p30_sales_facts;
+
+statement ok
+DROP TABLE p30_line_items;
+
+statement ok
+DROP TABLE p30_orders;

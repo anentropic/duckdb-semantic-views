@@ -270,6 +270,57 @@
 
 ---
 
+## Milestone: v0.5.3 — Advanced Semantic Features
+
+**Shipped:** 2026-03-15
+**Phases:** 4 (29-32) | **Plans:** 8 | **Commits:** 66
+
+### What Was Built
+- FACTS clause: named row-level sub-expressions with DAG validation (Kahn's algorithm) and word-boundary-safe expression inlining
+- HIERARCHIES clause: drill-down path metadata validated against declared dimensions at define time
+- Derived metrics: metric-on-metric composition with stacked inlining, aggregate prohibition, and transitive join resolution
+- Fan trap detection: cardinality model (MANY TO ONE / ONE TO ONE / ONE TO MANY) with LCA-based tree path analysis blocking one-to-many aggregation fan-out
+- Role-playing dimensions: same table via multiple named relationships with scoped aliases ({alias}__{rel_name})
+- USING RELATIONSHIPS: explicit join path selection per metric with ambiguity detection and transitive USING inheritance
+- DESCRIBE extended to 8 columns (facts + hierarchies) with backward-compatible null-to-[] fallback
+
+### What Worked
+- Phase ordering (FACTS → derived → fan traps → USING) was correct — each phase built cleanly on prior work
+- Reusing established patterns (Kahn's algorithm, word-boundary matching, skip_serializing_if) accelerated implementation
+- TDD approach in Phases 31-32 — writing failing tests first caught semantic misunderstandings (e.g., USING controls dimension alias, not metric aggregation)
+- Fan trap deviation decision (blocking errors vs. warnings) was made during planning, not during implementation — clean execution
+- Semi-additive metrics deferral to v0.5.4 kept scope tight — only feature requiring structural pipeline change
+
+### What Was Inefficient
+- Phase 29 Plan 01 was the longest plan (72 min) due to adding hierarchies field to 23+ struct literals across the codebase
+- Pre-commit hook formatting failures required repeated re-staging (occurred in nearly every plan)
+- Proptest arb_identifier() generated SQL keywords (e.g., "as_") causing parser confusion — pre-existing issue that surfaced in Phase 31
+- Nyquist VALIDATION.md files created but not marked compliant (same pattern from prior milestones)
+
+### Patterns Established
+- Clause ordering in DDL: TABLES, RELATIONSHIPS, FACTS, HIERARCHIES, DIMENSIONS, METRICS
+- Fact inlining: toposort → resolve in order → parenthesize → apply to metric expressions
+- Derived metric resolution: inline_derived_metrics resolves ALL metrics (base + derived) in one pass
+- Cardinality model: skip_serializing_if with is_default() for backward-compatible enum defaults
+- Scoped alias pattern: {to_alias}__{rel_name} for role-playing JOINs with double-underscore separator
+- Diamond relaxation: allow multi-path when all relationships have unique names
+
+### Key Lessons
+1. Adding a new field to a widely-used struct (SemanticViewDefinition) creates a large blast radius of required changes — consider Default derive or builder pattern for future struct extensions
+2. Word-boundary matching (is_word_boundary_byte) is essential for expression inlining — naive string replacement causes substring collisions (e.g., "net_price" matching in "net_price_total")
+3. USING semantics must be clearly defined before implementation — "USING controls dimension alias resolution, not metric aggregation" was a crucial design insight
+4. Fan trap detection as blocking errors is safer than warnings — users don't read warnings
+5. Derived metrics need transitive dependency walking for both join resolution and USING context inheritance
+
+### Cost Observations
+- 66 commits in 2 days
+- 8 plans averaging 20 min each (156 min total execution)
+- Phase 29 was slowest (87 min, 2 plans) — structural model changes dominated
+- Phases 30-32 averaged 23 min each — patterns established in Phase 29 accelerated later phases
+- Notable: fastest milestone execution yet on a per-plan basis outside of Phase 29
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -283,6 +334,7 @@
 | v0.5.0 | 45 | 5 | Parser extension spike — native DDL via C++ shim + statement rewriting |
 | v0.5.1 | ~30 | 5 | DDL Polish — 7 DDL verbs, error location reporting, 33 parser PBTs + Python caret tests |
 | v0.5.2 | 89 | 5 | SQL DDL body + PK/FK relationships, graph validation, function DDL retired |
+| v0.5.3 | 66 | 4 | FACTS, derived metrics, hierarchies, fan traps, role-playing dims, USING |
 
 ### Cumulative Quality
 
@@ -294,6 +346,7 @@
 | v0.5.0 | 172 | 40 properties | 3 targets | 4 (SQLLogicTest + DuckLake CI + vector_reference + vtab_crash) |
 | v0.5.1 | 222+ | 73 properties (40 output + 33 parser) | 3 targets | 5 (+ Python caret integration) |
 | v0.5.2 | 282+ | 73+ properties | 4 targets | 7 sqllogictest + DuckLake CI + Python crash + caret |
+| v0.5.3 | 441 | 80+ properties | 4 targets | 11 sqllogictest + DuckLake CI + Python crash + caret |
 
 ### Top Lessons (Verified Across Milestones)
 

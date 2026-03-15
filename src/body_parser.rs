@@ -3,7 +3,7 @@
 //! Parses: `AS TABLES (...) RELATIONSHIPS (...) DIMENSIONS (...) METRICS (...)`
 //! into a `SemanticViewDefinition`.
 
-use crate::model::{Dimension, Join, Metric, TableRef};
+use crate::model::{Cardinality, Dimension, Fact, Hierarchy, Join, Metric, TableRef};
 use crate::parse::ParseError;
 
 /// Result of parsing the keyword body (everything after "AS").
@@ -11,17 +11,33 @@ use crate::parse::ParseError;
 pub struct KeywordBody {
     pub tables: Vec<TableRef>,
     pub relationships: Vec<Join>,
+    pub facts: Vec<Fact>,
+    pub hierarchies: Vec<Hierarchy>,
     pub dimensions: Vec<Dimension>,
     pub metrics: Vec<Metric>,
 }
 
 /// Known clause keywords for the AS-body scanner.
-const CLAUSE_KEYWORDS: &[&str] = &["tables", "relationships", "dimensions", "metrics"];
+const CLAUSE_KEYWORDS: &[&str] = &[
+    "tables",
+    "relationships",
+    "facts",
+    "hierarchies",
+    "dimensions",
+    "metrics",
+];
 
-/// Clause ordering — TABLES must be first, RELATIONSHIPS second (optional),
-/// DIMENSIONS third (optional), METRICS last (optional). At least one of
-/// DIMENSIONS or METRICS is required.
-const CLAUSE_ORDER: &[&str] = &["tables", "relationships", "dimensions", "metrics"];
+/// Clause ordering — TABLES must be first, then RELATIONSHIPS (optional),
+/// FACTS (optional), HIERARCHIES (optional), DIMENSIONS (optional),
+/// METRICS (optional). At least one of DIMENSIONS or METRICS is required.
+const CLAUSE_ORDER: &[&str] = &[
+    "tables",
+    "relationships",
+    "facts",
+    "hierarchies",
+    "dimensions",
+    "metrics",
+];
 
 /// Suggest the closest known clause keyword for a near-miss word.
 fn suggest_clause_keyword(word: &str) -> Option<&'static str> {
@@ -121,7 +137,7 @@ fn find_clause_bounds<'a>(
             let ch = bytes[i] as char;
             return Err(ParseError {
                 message: format!(
-                    "Unexpected character '{ch}' in AS body; expected a clause keyword (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS).",
+                    "Unexpected character '{ch}' in AS body; expected a clause keyword (TABLES, RELATIONSHIPS, FACTS, HIERARCHIES, DIMENSIONS, METRICS).",
                 ),
                 position: Some(base_offset + i),
             });
@@ -145,7 +161,7 @@ fn find_clause_bounds<'a>(
                 format!("Unknown clause keyword '{word}'; did you mean '{sug_upper}'?",)
             } else {
                 format!(
-                    "Unknown clause keyword '{word}'; expected one of TABLES, RELATIONSHIPS, DIMENSIONS, METRICS.",
+                    "Unknown clause keyword '{word}'; expected one of TABLES, RELATIONSHIPS, FACTS, HIERARCHIES, DIMENSIONS, METRICS.",
                 )
             };
             return Err(ParseError {
@@ -244,7 +260,7 @@ fn find_clause_bounds<'a>(
             let kw_upper = bound.keyword.to_ascii_uppercase();
             return Err(ParseError {
                 message: format!(
-                    "Clause '{kw_upper}' appears out of order; clauses must appear as: TABLES, RELATIONSHIPS (optional), DIMENSIONS (optional), METRICS (optional).",
+                    "Clause '{kw_upper}' appears out of order; clauses must appear as: TABLES, RELATIONSHIPS (optional), FACTS (optional), HIERARCHIES (optional), DIMENSIONS (optional), METRICS (optional).",
                 ),
                 position: None,
             });
@@ -298,8 +314,10 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
 
     let mut tables: Vec<TableRef> = Vec::new();
     let mut relationships: Vec<Join> = Vec::new();
+    let mut facts_raw: Vec<(String, String, String)> = Vec::new();
+    let mut hierarchies: Vec<Hierarchy> = Vec::new();
     let mut dimensions_raw: Vec<(String, String, String)> = Vec::new();
-    let mut metrics_raw: Vec<(String, String, String)> = Vec::new();
+    let mut metrics_raw: Vec<(Option<String>, String, String, Vec<String>)> = Vec::new();
 
     for bound in &bounds {
         match bound.keyword {
@@ -309,17 +327,32 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
             "relationships" => {
                 relationships = parse_relationships_clause(bound.content, bound.content_offset)?;
             }
+            "facts" => {
+                facts_raw = parse_qualified_entries(bound.content, bound.content_offset)?;
+            }
+            "hierarchies" => {
+                hierarchies = parse_hierarchies_clause(bound.content, bound.content_offset)?;
+            }
             "dimensions" => {
                 dimensions_raw = parse_qualified_entries(bound.content, bound.content_offset)?;
             }
             "metrics" => {
-                metrics_raw = parse_qualified_entries(bound.content, bound.content_offset)?;
+                metrics_raw = parse_metrics_clause(bound.content, bound.content_offset)?;
             }
             _ => {}
         }
     }
 
-    // Map qualified entries to Dimension / Metric structs
+    // Map qualified entries to Fact / Dimension / Metric structs
+    let facts = facts_raw
+        .into_iter()
+        .map(|(alias, bare_name, expr)| Fact {
+            name: bare_name,
+            expr,
+            source_table: Some(alias),
+        })
+        .collect();
+
     let dimensions = dimensions_raw
         .into_iter()
         .map(|(alias, bare_name, expr)| Dimension {
@@ -332,17 +365,20 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
 
     let metrics = metrics_raw
         .into_iter()
-        .map(|(alias, bare_name, expr)| Metric {
+        .map(|(source_alias, bare_name, expr, using_rels)| Metric {
             name: bare_name,
             expr,
-            source_table: Some(alias),
+            source_table: source_alias,
             output_type: None,
+            using_relationships: using_rels,
         })
         .collect();
 
     Ok(KeywordBody {
         tables,
         relationships,
+        facts,
+        hierarchies,
         dimensions,
         metrics,
     })
@@ -526,10 +562,16 @@ fn find_keyword_ci(upper_text: &str, keyword: &str) -> Option<usize> {
     let mut i = 0;
     while i + kw_len <= text_len {
         if &upper_text[i..i + kw_len] == keyword {
-            // Check boundary: preceded by non-alpha (or start), followed by non-alpha (or end)
-            let before_ok = i == 0 || !upper_text.as_bytes()[i - 1].is_ascii_alphanumeric();
-            let after_ok = i + kw_len == text_len
-                || !upper_text.as_bytes()[i + kw_len].is_ascii_alphanumeric();
+            // Check boundary: preceded by non-identifier char (or start), followed by non-identifier char (or end).
+            // Underscore is a valid identifier character, so it must NOT count as a word boundary.
+            let before_ok = i == 0 || {
+                let c = upper_text.as_bytes()[i - 1];
+                !c.is_ascii_alphanumeric() && c != b'_'
+            };
+            let after_ok = i + kw_len == text_len || {
+                let c = upper_text.as_bytes()[i + kw_len];
+                !c.is_ascii_alphanumeric() && c != b'_'
+            };
             if before_ok && after_ok {
                 return Some(i);
             }
@@ -574,6 +616,53 @@ pub(crate) fn parse_relationships_clause(
 }
 
 /// Parse one RELATIONSHIPS entry: `rel_name AS from_alias(fk_cols) REFERENCES to_alias`
+/// Parse cardinality tokens after `REFERENCES <to_alias>`.
+///
+/// Accepts `["MANY", "TO", "ONE"]`, `["ONE", "TO", "ONE"]`, `["ONE", "TO", "MANY"]`
+/// (case-insensitive). An empty slice defaults to `ManyToOne`.
+/// Returns `Err` for unrecognized sequences.
+fn parse_cardinality_tokens(
+    tokens: &[&str],
+    rel_name: &str,
+    entry_offset: usize,
+) -> Result<Cardinality, ParseError> {
+    if tokens.is_empty() {
+        return Ok(Cardinality::ManyToOne);
+    }
+    if tokens.len() != 3 {
+        return Err(ParseError {
+            message: format!(
+                "Invalid cardinality in relationship '{rel_name}'. \
+                 Expected MANY TO ONE, ONE TO ONE, or ONE TO MANY.",
+            ),
+            position: Some(entry_offset),
+        });
+    }
+    let upper: Vec<String> = tokens.iter().map(|t| t.to_ascii_uppercase()).collect();
+    if upper[1] != "TO" {
+        return Err(ParseError {
+            message: format!(
+                "Invalid cardinality in relationship '{rel_name}'. \
+                 Expected MANY TO ONE, ONE TO ONE, or ONE TO MANY.",
+            ),
+            position: Some(entry_offset),
+        });
+    }
+    match (upper[0].as_str(), upper[2].as_str()) {
+        ("MANY", "ONE") => Ok(Cardinality::ManyToOne),
+        ("ONE", "ONE") => Ok(Cardinality::OneToOne),
+        ("ONE", "MANY") => Ok(Cardinality::OneToMany),
+        _ => Err(ParseError {
+            message: format!(
+                "Invalid cardinality '{} TO {}' in relationship '{rel_name}'. \
+                 Expected MANY TO ONE, ONE TO ONE, or ONE TO MANY.",
+                upper[0], upper[2],
+            ),
+            position: Some(entry_offset),
+        }),
+    }
+}
+
 fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<Join, ParseError> {
     let entry = entry.trim();
 
@@ -645,8 +734,9 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
         position: Some(entry_offset),
     })?;
 
-    let to_alias = after_paren[refs_pos + "REFERENCES".len()..].trim();
-    if to_alias.is_empty() {
+    let remaining_after_refs = after_paren[refs_pos + "REFERENCES".len()..].trim();
+    let tokens: Vec<&str> = remaining_after_refs.split_whitespace().collect();
+    if tokens.is_empty() {
         return Err(ParseError {
             message: format!(
                 "Expected target alias after REFERENCES in relationship '{rel_name}'.",
@@ -654,16 +744,155 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
             position: Some(entry_offset),
         });
     }
+    let to_alias = tokens[0];
+    let cardinality = parse_cardinality_tokens(&tokens[1..], rel_name, entry_offset)?;
 
     Ok(Join {
         table: to_alias.to_string(),
         from_alias: from_alias.to_string(),
         fk_columns,
         name: Some(rel_name.to_string()),
+        cardinality,
         on: String::new(),
         from_cols: vec![],
         join_columns: vec![],
     })
+}
+
+/// Parse the content inside METRICS (...) supporting both qualified and unqualified entries.
+///
+/// Qualified entries have the form: `alias.name AS expr` (base metric).
+/// Qualified entries may include: `alias.name USING (rel1, rel2) AS expr` (Phase 32).
+/// Unqualified entries have the form: `name AS expr` (derived metric).
+///
+/// Returns `Vec<(Option<source_alias>, bare_name, expr, using_relationships)>` where:
+/// - Option is `Some(alias)` for qualified entries and `None` for unqualified (derived) entries
+/// - `using_relationships` is a `Vec<String>` of named relationships (empty if no USING clause)
+#[allow(clippy::type_complexity)]
+pub(crate) fn parse_metrics_clause(
+    body: &str,
+    base_offset: usize,
+) -> Result<Vec<(Option<String>, String, String, Vec<String>)>, ParseError> {
+    if body.trim().is_empty() {
+        return Ok(vec![]);
+    }
+
+    let entries = split_at_depth0_commas(body);
+    let mut result = Vec::new();
+
+    for (entry_start, entry) in entries {
+        let entry_offset = base_offset + entry_start;
+        let parsed = parse_single_metric_entry(entry, entry_offset)?;
+        result.push(parsed);
+    }
+
+    Ok(result)
+}
+
+/// Parse one METRICS entry: either `alias.name [USING (...)] AS expr` (qualified)
+/// or `name AS expr` (derived).
+///
+/// Phase 32: If a USING clause is present, it must be on a qualified entry (has dot).
+/// USING on a derived metric (no dot) produces a `ParseError`.
+fn parse_single_metric_entry(
+    entry: &str,
+    entry_offset: usize,
+) -> Result<(Option<String>, String, String, Vec<String>), ParseError> {
+    let entry = entry.trim();
+
+    // Check if entry contains a dot BEFORE the AS keyword -- if so, it's qualified.
+    // Find "AS" keyword first (case-insensitive, word boundary).
+    let upper = entry.to_ascii_uppercase();
+    let as_pos = find_keyword_ci(&upper, "AS").ok_or_else(|| ParseError {
+        message: format!(
+            "Expected 'AS' keyword in metric entry '{entry}'. Form: 'alias.name AS expr' or 'name AS expr'.",
+        ),
+        position: Some(entry_offset),
+    })?;
+
+    let before_as = entry[..as_pos].trim();
+    let expr = entry[as_pos + 2..].trim().to_string();
+
+    if expr.is_empty() {
+        return Err(ParseError {
+            message: format!("Missing expression after 'AS' in metric entry '{entry}'."),
+            position: Some(entry_offset + as_pos + 2),
+        });
+    }
+
+    if before_as.is_empty() {
+        return Err(ParseError {
+            message: format!("Missing metric name before 'AS' in entry '{entry}'."),
+            position: Some(entry_offset),
+        });
+    }
+
+    // Check for USING keyword in before_as (case-insensitive, word boundary)
+    let upper_before = before_as.to_ascii_uppercase();
+    let using_pos = find_keyword_ci(&upper_before, "USING");
+    let mut using_relationships: Vec<String> = Vec::new();
+
+    // The name portion is before USING (or all of before_as if no USING)
+    let name_portion = if let Some(upos) = using_pos {
+        // Extract the parenthesized relationship list after USING
+        let after_using = before_as[upos + 5..].trim();
+        if !after_using.starts_with('(') {
+            return Err(ParseError {
+                message: format!("Expected '(' after USING in metric entry '{entry}'."),
+                position: Some(entry_offset + upos + 5),
+            });
+        }
+        let paren_content = extract_paren_content(after_using).ok_or_else(|| ParseError {
+            message: format!("Unclosed '(' after USING in metric entry '{entry}'."),
+            position: Some(entry_offset + upos + 5),
+        })?;
+        using_relationships = paren_content
+            .split(',')
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect();
+        before_as[..upos].trim()
+    } else {
+        before_as
+    };
+
+    // Check for dot to distinguish qualified vs unqualified
+    if let Some(dot_pos) = name_portion.find('.') {
+        // Qualified: alias.name
+        let source_alias = name_portion[..dot_pos].trim().to_string();
+        let bare_name = name_portion[dot_pos + 1..].trim().to_string();
+
+        if source_alias.is_empty() {
+            return Err(ParseError {
+                message: format!("Source alias before '.' is empty in metric entry '{entry}'."),
+                position: Some(entry_offset),
+            });
+        }
+        if bare_name.is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "Missing bare name between '.' and 'AS' in metric entry '{entry}'."
+                ),
+                position: Some(entry_offset + dot_pos + 1),
+            });
+        }
+
+        Ok((Some(source_alias), bare_name, expr, using_relationships))
+    } else {
+        // Unqualified: just name (derived metric)
+        // USING is not allowed on derived metrics
+        if !using_relationships.is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "USING clause not allowed on derived metric '{name_portion}'. \
+                     Only qualified metrics (alias.name) can use USING.",
+                ),
+                position: Some(entry_offset),
+            });
+        }
+        let bare_name = name_portion.to_string();
+        Ok((None, bare_name, expr, vec![]))
+    }
 }
 
 /// Parse the content inside DIMENSIONS or METRICS (...).
@@ -740,6 +969,90 @@ fn parse_single_qualified_entry(
     }
 
     Ok((source_alias, bare_name, expr))
+}
+
+/// Parse the content inside HIERARCHIES (...).
+/// Returns `Vec<Hierarchy>`.
+///
+/// Each entry has the form: `name AS (dim1, dim2, dim3)`
+pub(crate) fn parse_hierarchies_clause(
+    body: &str,
+    base_offset: usize,
+) -> Result<Vec<Hierarchy>, ParseError> {
+    if body.trim().is_empty() {
+        return Ok(vec![]);
+    }
+
+    let entries = split_at_depth0_commas(body);
+    let mut result = Vec::new();
+
+    for (entry_start, entry) in entries {
+        let entry_offset = base_offset + entry_start;
+        let hierarchy = parse_single_hierarchy_entry(entry, entry_offset)?;
+        result.push(hierarchy);
+    }
+
+    Ok(result)
+}
+
+/// Parse one HIERARCHIES entry: `name AS (dim1, dim2, dim3)`
+fn parse_single_hierarchy_entry(entry: &str, entry_offset: usize) -> Result<Hierarchy, ParseError> {
+    let entry = entry.trim();
+
+    // Find "AS" keyword (case-insensitive, word boundary)
+    let upper = entry.to_ascii_uppercase();
+    let as_pos = find_keyword_ci(&upper, "AS").ok_or_else(|| ParseError {
+        message: format!(
+            "Expected 'AS' keyword in hierarchy entry '{entry}'. Form: 'name AS (dim1, dim2, ...)'.",
+        ),
+        position: Some(entry_offset),
+    })?;
+
+    let name = entry[..as_pos].trim().to_string();
+    if name.is_empty() {
+        return Err(ParseError {
+            message: format!("Missing hierarchy name before 'AS' in entry '{entry}'."),
+            position: Some(entry_offset),
+        });
+    }
+
+    let after_as = entry[as_pos + 2..].trim();
+    let after_as_offset = entry_offset + entry.len() - entry[as_pos + 2..].len();
+    let _ = after_as_offset;
+
+    // Expect '(' after AS
+    if !after_as.starts_with('(') {
+        return Err(ParseError {
+            message: format!(
+                "Expected '(' after AS in hierarchy entry '{name}'. Form: 'name AS (dim1, dim2, ...)'.",
+            ),
+            position: Some(entry_offset + as_pos + 2),
+        });
+    }
+
+    // Extract parenthesized content
+    let paren_content = extract_paren_content(after_as).ok_or_else(|| ParseError {
+        message: format!("Unclosed '(' in hierarchy entry '{name}'."),
+        position: Some(entry_offset + as_pos + 2),
+    })?;
+
+    // Split levels at commas, trim each
+    let levels: Vec<String> = paren_content
+        .split(',')
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if levels.is_empty() {
+        return Err(ParseError {
+            message: format!(
+                "Hierarchy '{name}' has no levels; at least one dimension level is required.",
+            ),
+            position: Some(entry_offset),
+        });
+    }
+
+    Ok(Hierarchy { name, levels })
 }
 
 #[cfg(test)]
@@ -950,6 +1263,96 @@ mod tests {
             err.message.contains("name") || err.message.contains("required"),
             "Error should mention name or required: {}",
             err.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_relationships_clause cardinality tests (Phase 31)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_relationship_with_many_to_one() {
+        let result = parse_relationships_clause(
+            "order_to_customer AS o(customer_id) REFERENCES c MANY TO ONE",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].table, "c");
+        assert_eq!(result[0].cardinality, Cardinality::ManyToOne);
+    }
+
+    #[test]
+    fn parse_relationship_with_one_to_one() {
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b ONE TO ONE", 0).unwrap();
+        assert_eq!(result[0].table, "b");
+        assert_eq!(result[0].cardinality, Cardinality::OneToOne);
+    }
+
+    #[test]
+    fn parse_relationship_with_one_to_many() {
+        let result =
+            parse_relationships_clause("rel AS a(fk) REFERENCES b ONE TO MANY", 0).unwrap();
+        assert_eq!(result[0].table, "b");
+        assert_eq!(result[0].cardinality, Cardinality::OneToMany);
+    }
+
+    #[test]
+    fn parse_relationship_without_cardinality_defaults() {
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b", 0).unwrap();
+        assert_eq!(result[0].table, "b");
+        assert_eq!(
+            result[0].cardinality,
+            Cardinality::ManyToOne,
+            "Missing cardinality should default to ManyToOne"
+        );
+    }
+
+    #[test]
+    fn parse_relationship_cardinality_case_insensitive() {
+        for input in [
+            "rel AS a(fk) REFERENCES b many to one",
+            "rel AS a(fk) REFERENCES b Many To One",
+            "rel AS a(fk) REFERENCES b MANY TO ONE",
+            "rel AS a(fk) REFERENCES b one to one",
+            "rel AS a(fk) REFERENCES b One To One",
+        ] {
+            let result = parse_relationships_clause(input, 0);
+            assert!(
+                result.is_ok(),
+                "Failed to parse case variant: {input}: {:?}",
+                result.unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn parse_relationship_invalid_cardinality_rejected() {
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b MANY TO MANY", 0);
+        assert!(result.is_err(), "MANY TO MANY should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("cardinality") || err.message.contains("MANY TO ONE"),
+            "Error should mention valid cardinality options: {}",
+            err.message
+        );
+
+        // Single junk word after to_alias
+        let result2 = parse_relationships_clause("rel AS a(fk) REFERENCES b FOO", 0);
+        assert!(
+            result2.is_err(),
+            "Invalid cardinality keyword 'FOO' should be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_relationship_to_alias_not_polluted_by_cardinality() {
+        // Ensure to_alias is just "b", not "b MANY TO ONE"
+        let result =
+            parse_relationships_clause("rel AS a(fk) REFERENCES b MANY TO ONE", 0).unwrap();
+        assert_eq!(
+            result[0].table, "b",
+            "to_alias must not include cardinality keywords"
         );
     }
 
@@ -1191,5 +1594,393 @@ mod tests {
         assert_eq!(kb.relationships[0].name.as_deref(), Some("ord_to_cust"));
         assert_eq!(kb.dimensions[0].name, "region");
         assert_eq!(kb.metrics[0].expr, "sum(amount)");
+    }
+
+    // -----------------------------------------------------------------------
+    // FACTS clause tests (Phase 29)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_keyword_body_with_facts_single() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) FACTS (o.net_price AS o.price * (1 - o.discount)) DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.facts.len(), 1);
+        assert_eq!(kb.facts[0].name, "net_price");
+        assert_eq!(kb.facts[0].expr, "o.price * (1 - o.discount)");
+        assert_eq!(kb.facts[0].source_table.as_deref(), Some("o"));
+    }
+
+    #[test]
+    fn parse_keyword_body_with_facts_multiple() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) FACTS (o.net_price AS o.price * (1 - o.discount), o.tax_amount AS o.price * o.tax_rate) DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.facts.len(), 2);
+        assert_eq!(kb.facts[0].name, "net_price");
+        assert_eq!(kb.facts[1].name, "tax_amount");
+    }
+
+    #[test]
+    fn parse_keyword_body_with_facts_trailing_comma() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) FACTS (o.net_price AS o.price * (1 - o.discount),) DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(
+            kb.facts.len(),
+            1,
+            "Trailing comma must not produce extra entry"
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_with_empty_facts() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) FACTS () DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert!(
+            kb.facts.is_empty(),
+            "Empty FACTS clause must produce empty vec"
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_without_facts_still_works() {
+        // Backward compat: DDL without FACTS clause must still work
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert!(kb.facts.is_empty());
+        assert!(kb.hierarchies.is_empty());
+    }
+
+    #[test]
+    fn parse_keyword_body_fact_without_source_table_rejected() {
+        // Facts reuse parse_qualified_entries which requires alias.name format
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) FACTS (net_price AS price * discount) DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount))";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_err(),
+            "Fact without source table prefix must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HIERARCHIES clause tests (Phase 29)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_keyword_body_with_hierarchies_single() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) HIERARCHIES (geo AS (country, state, city)) DIMENSIONS (o.country AS country, o.state AS state, o.city AS city) METRICS (o.rev AS SUM(amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.hierarchies.len(), 1);
+        assert_eq!(kb.hierarchies[0].name, "geo");
+        assert_eq!(kb.hierarchies[0].levels, vec!["country", "state", "city"]);
+    }
+
+    #[test]
+    fn parse_keyword_body_with_hierarchies_single_level() {
+        // Hierarchy with just one level must be accepted
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) HIERARCHIES (simple AS (region)) DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.hierarchies.len(), 1);
+        assert_eq!(kb.hierarchies[0].levels, vec!["region"]);
+    }
+
+    #[test]
+    fn parse_keyword_body_with_empty_hierarchies() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) HIERARCHIES () DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert!(
+            kb.hierarchies.is_empty(),
+            "Empty HIERARCHIES clause must produce empty vec"
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_hierarchy_without_parens_rejected() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) HIERARCHIES (geo AS country) DIMENSIONS (o.country AS country) METRICS (o.rev AS SUM(amount))";
+        let result = parse_keyword_body(body, 0);
+        assert!(result.is_err(), "Hierarchy without parens must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("'('"),
+            "Error should mention '(': {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_hierarchy_with_empty_parens_rejected() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) HIERARCHIES (geo AS ()) DIMENSIONS (o.country AS country) METRICS (o.rev AS SUM(amount))";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_err(),
+            "Hierarchy with empty parens must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_with_facts_and_hierarchies() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) FACTS (o.net_price AS o.price * (1 - o.discount)) HIERARCHIES (geo AS (country, state, city)) DIMENSIONS (o.country AS country, o.state AS state, o.city AS city) METRICS (o.rev AS SUM(net_price))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.facts.len(), 1);
+        assert_eq!(kb.hierarchies.len(), 1);
+        assert_eq!(kb.dimensions.len(), 3);
+        assert_eq!(kb.metrics.len(), 1);
+    }
+
+    #[test]
+    fn parse_keyword_body_facts_after_dimensions_rejected() {
+        // FACTS must come before DIMENSIONS (order: tables, relationships, facts, hierarchies, dimensions, metrics)
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS region) FACTS (o.net_price AS price) METRICS (o.rev AS SUM(amount))";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_err(),
+            "FACTS after DIMENSIONS must be rejected (wrong order)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("out of order"),
+            "Error should mention out of order: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_hierarchies_after_dimensions_rejected() {
+        // HIERARCHIES must come before DIMENSIONS
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS region) HIERARCHIES (geo AS (region)) METRICS (o.rev AS SUM(amount))";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_err(),
+            "HIERARCHIES after DIMENSIONS must be rejected (wrong order)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("out of order"),
+            "Error should mention out of order: {}",
+            err.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_hierarchies_clause unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_hierarchies_clause_empty_body() {
+        let result = parse_hierarchies_clause("", 0).unwrap();
+        assert_eq!(result.len(), 0, "Empty body must return empty vec");
+    }
+
+    #[test]
+    fn parse_hierarchies_clause_single() {
+        let result = parse_hierarchies_clause("geo AS (country, state, city)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "geo");
+        assert_eq!(result[0].levels, vec!["country", "state", "city"]);
+    }
+
+    #[test]
+    fn parse_hierarchies_clause_multiple() {
+        let result = parse_hierarchies_clause(
+            "geo AS (country, state, city), time AS (year, quarter, month)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "geo");
+        assert_eq!(result[1].name, "time");
+        assert_eq!(result[1].levels, vec!["year", "quarter", "month"]);
+    }
+
+    #[test]
+    fn parse_hierarchies_clause_lowercase_as() {
+        let result = parse_hierarchies_clause("geo as (country, state)", 0).unwrap();
+        assert_eq!(result[0].name, "geo");
+        assert_eq!(result[0].levels, vec!["country", "state"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_metrics_clause tests (Phase 30 -- derived metrics)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_metrics_clause_qualified_entry() {
+        let result = parse_metrics_clause("li.revenue AS SUM(li.amount)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, Some("li".to_string())); // source alias
+        assert_eq!(result[0].1, "revenue"); // bare_name
+        assert_eq!(result[0].2, "SUM(li.amount)"); // expr
+    }
+
+    #[test]
+    fn parse_metrics_clause_unqualified_entry() {
+        let result = parse_metrics_clause("profit AS revenue - cost", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, None); // no source alias (derived metric)
+        assert_eq!(result[0].1, "profit"); // bare_name
+        assert_eq!(result[0].2, "revenue - cost"); // expr
+    }
+
+    #[test]
+    fn parse_metrics_clause_mixed_entries() {
+        let result = parse_metrics_clause(
+            "li.revenue AS SUM(li.amount), profit AS revenue - cost, li.cost AS SUM(li.unit_cost)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 3);
+        // First: qualified
+        assert_eq!(result[0].0, Some("li".to_string()));
+        assert_eq!(result[0].1, "revenue");
+        assert_eq!(result[0].2, "SUM(li.amount)");
+        // Second: unqualified (derived)
+        assert_eq!(result[1].0, None);
+        assert_eq!(result[1].1, "profit");
+        assert_eq!(result[1].2, "revenue - cost");
+        // Third: qualified
+        assert_eq!(result[2].0, Some("li".to_string()));
+        assert_eq!(result[2].1, "cost");
+        assert_eq!(result[2].2, "SUM(li.unit_cost)");
+    }
+
+    #[test]
+    fn parse_metrics_clause_trailing_comma() {
+        let result = parse_metrics_clause("profit AS revenue - cost,", 0).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "Trailing comma must not produce extra entry"
+        );
+    }
+
+    #[test]
+    fn parse_metrics_clause_newline_separated() {
+        let result = parse_metrics_clause(
+            "\n  li.revenue AS SUM(li.amount),\n  profit AS revenue - cost\n",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, Some("li".to_string()));
+        assert_eq!(result[1].0, None);
+        assert_eq!(result[1].1, "profit");
+    }
+
+    #[test]
+    fn parse_keyword_body_with_derived_metrics() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS region) METRICS (o.revenue AS SUM(o.amount), profit AS revenue - cost)";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.metrics.len(), 2);
+        // First: qualified metric -> source_table: Some("o")
+        assert_eq!(kb.metrics[0].name, "revenue");
+        assert_eq!(kb.metrics[0].source_table.as_deref(), Some("o"));
+        assert_eq!(kb.metrics[0].expr, "SUM(o.amount)");
+        // Second: derived metric -> source_table: None
+        assert_eq!(kb.metrics[1].name, "profit");
+        assert!(kb.metrics[1].source_table.is_none());
+        assert_eq!(kb.metrics[1].expr, "revenue - cost");
+    }
+
+    #[test]
+    fn parse_keyword_body_only_derived_metrics() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) METRICS (profit AS revenue - cost, margin AS profit / revenue)";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.metrics.len(), 2);
+        assert!(kb.metrics[0].source_table.is_none());
+        assert!(kb.metrics[1].source_table.is_none());
+        assert_eq!(kb.metrics[0].name, "profit");
+        assert_eq!(kb.metrics[1].name, "margin");
+    }
+
+    #[test]
+    fn parse_qualified_entries_still_rejects_unqualified() {
+        // FACTS and DIMENSIONS still use parse_qualified_entries which requires alias.name
+        let result = parse_qualified_entries("revenue AS SUM(amount)", 0);
+        assert!(
+            result.is_err(),
+            "parse_qualified_entries must still reject unqualified entries (missing dot)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("alias") || err.message.contains("qualified"),
+            "Error should mention alias or qualified: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_metrics_clause_empty_body() {
+        let result = parse_metrics_clause("", 0).unwrap();
+        assert_eq!(result.len(), 0, "Empty body must return empty vec");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_metrics_clause USING tests (Phase 32 -- role-playing dimensions)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_metrics_using_single_relationship() {
+        let result =
+            parse_metrics_clause("f.departure_count USING (dep_airport) AS COUNT(*)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, Some("f".to_string())); // source alias
+        assert_eq!(result[0].1, "departure_count"); // bare_name
+        assert_eq!(result[0].2, "COUNT(*)"); // expr
+        assert_eq!(result[0].3, vec!["dep_airport"]); // using_relationships
+    }
+
+    #[test]
+    fn parse_metrics_using_multiple_relationships() {
+        let result = parse_metrics_clause("f.met USING (rel1, rel2) AS SUM(x)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, Some("f".to_string()));
+        assert_eq!(result[0].1, "met");
+        assert_eq!(result[0].2, "SUM(x)");
+        assert_eq!(result[0].3, vec!["rel1", "rel2"]);
+    }
+
+    #[test]
+    fn parse_metrics_using_on_derived_produces_error() {
+        // Derived metric (no dot prefix) with USING -> ParseError
+        let result = parse_metrics_clause("derived_met USING (rel1) AS revenue - cost", 0);
+        assert!(
+            result.is_err(),
+            "USING on derived metric must produce error"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("USING") && err.message.contains("derived"),
+            "Error should mention USING and derived: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_metrics_without_using_backward_compat() {
+        // Metric without USING still parses correctly
+        let result = parse_metrics_clause("o.revenue AS SUM(o.amount)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, Some("o".to_string()));
+        assert_eq!(result[0].1, "revenue");
+        assert_eq!(result[0].2, "SUM(o.amount)");
+        assert!(result[0].3.is_empty(), "No USING -> empty relationships");
+    }
+
+    #[test]
+    fn parse_metrics_using_case_insensitive() {
+        let result =
+            parse_metrics_clause("f.departure_count using (dep_airport) AS COUNT(*)", 0).unwrap();
+        assert_eq!(result[0].3, vec!["dep_airport"]);
+
+        let result2 =
+            parse_metrics_clause("f.departure_count UsInG (dep_airport) AS COUNT(*)", 0).unwrap();
+        assert_eq!(result2[0].3, vec!["dep_airport"]);
+    }
+
+    #[test]
+    fn parse_keyword_body_with_using_metrics() {
+        let body = "AS TABLES (f AS flights PRIMARY KEY (id), a AS airports PRIMARY KEY (id)) RELATIONSHIPS (dep_airport AS f(dep_id) REFERENCES a, arr_airport AS f(arr_id) REFERENCES a) DIMENSIONS (a.name AS airport_name) METRICS (f.departure_count USING (dep_airport) AS COUNT(*))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.metrics.len(), 1);
+        assert_eq!(kb.metrics[0].name, "departure_count");
+        assert_eq!(kb.metrics[0].using_relationships, vec!["dep_airport"]);
     }
 }

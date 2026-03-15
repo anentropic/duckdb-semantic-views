@@ -48,6 +48,13 @@ pub struct Metric {
     /// If None, the inferred or fallback type is used.
     #[serde(default)]
     pub output_type: Option<String>,
+    /// Phase 32: Named relationships that this metric traverses.
+    /// When non-empty, the expansion engine uses these relationship names
+    /// to resolve which join path to follow (role-playing dimensions).
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub using_relationships: Vec<String>,
 }
 
 /// A named raw SQL column expression — a pre-aggregation fact, scoped to a table alias.
@@ -62,6 +69,18 @@ pub struct Fact {
     pub source_table: Option<String>,
 }
 
+/// A named drill-down path through declared dimensions.
+/// Added in Phase 29 for the HIERARCHIES clause of CREATE SEMANTIC VIEW.
+///
+/// Example: `geo AS (country, state, city)` defines a hierarchy named "geo"
+/// whose levels are existing dimension names from coarsest to finest granularity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct Hierarchy {
+    pub name: String,
+    pub levels: Vec<String>,
+}
+
 /// A column-pair relationship entry for composite or single FK declarations.
 /// Used in the `relationships` DDL parameter's `join_columns` field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -69,6 +88,30 @@ pub struct Fact {
 pub struct JoinColumn {
     pub from: String,
     pub to: String,
+}
+
+/// Cardinality of a relationship between two tables.
+///
+/// Declared after `REFERENCES <alias>` in the RELATIONSHIPS clause.
+/// Defaults to `ManyToOne` when omitted (most common FK pattern).
+/// Old stored JSON without a `cardinality` field deserializes as `ManyToOne`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum Cardinality {
+    #[default]
+    ManyToOne,
+    OneToOne,
+    OneToMany,
+}
+
+impl Cardinality {
+    /// Returns `true` when the variant is the default (`ManyToOne`).
+    /// Used by `serde(skip_serializing_if)` to omit the field from JSON
+    /// when it matches the default, preserving backward-compatible output.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::ManyToOne)
+    }
 }
 
 /// A JOIN relationship between the base table and another source table.
@@ -100,6 +143,12 @@ pub struct Join {
     /// In `order_to_customer AS o(customer_id) REFERENCES c`, this is `Some("order_to_customer")`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Phase 31: Cardinality of this relationship.
+    /// Defaults to `ManyToOne` when omitted in DDL (most common FK pattern).
+    /// Old stored JSON without this field deserializes as `ManyToOne`.
+    /// Not serialized when `ManyToOne` to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Cardinality::is_default")]
+    pub cardinality: Cardinality,
 }
 
 /// Top-level definition of a semantic view.
@@ -125,6 +174,11 @@ pub struct SemanticViewDefinition {
     pub joins: Vec<Join>,
     #[serde(default)]
     pub facts: Vec<Fact>,
+    /// Phase 29: named drill-down paths through dimensions.
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hierarchies: Vec<Hierarchy>,
     /// Column names from DDL-time LIMIT 0 inference, parallel to `column_types_inferred`.
     /// Populated by `create_semantic_view` `invoke()`. Empty = no inference ran.
     /// Used by `bind()` to build a name→type map for subquery column lookups.
@@ -355,6 +409,7 @@ mod tests {
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                hierarchies: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -377,6 +432,187 @@ mod tests {
             assert!(
                 def.tables.is_empty(),
                 "tables should default to [] for old JSON without tables field"
+            );
+        }
+    }
+
+    mod phase29_hierarchy_tests {
+        use super::*;
+
+        #[test]
+        fn hierarchy_roundtrip_serialization() {
+            let h = Hierarchy {
+                name: "geo".to_string(),
+                levels: vec![
+                    "country".to_string(),
+                    "state".to_string(),
+                    "city".to_string(),
+                ],
+            };
+            let json = serde_json::to_string(&h).unwrap();
+            let rt: Hierarchy = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.name, "geo");
+            assert_eq!(rt.levels, vec!["country", "state", "city"]);
+        }
+
+        #[test]
+        fn definition_with_hierarchies_roundtrips() {
+            let json = r#"{
+                "base_table": "orders",
+                "dimensions": [{"name": "country", "expr": "country"}],
+                "metrics": [],
+                "hierarchies": [{"name": "geo", "levels": ["country", "state", "city"]}]
+            }"#;
+            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+            assert_eq!(def.hierarchies.len(), 1);
+            assert_eq!(def.hierarchies[0].name, "geo");
+            assert_eq!(def.hierarchies[0].levels, vec!["country", "state", "city"]);
+
+            // Roundtrip: serialize and re-parse
+            let re_json = serde_json::to_string(&def).unwrap();
+            let rt = SemanticViewDefinition::from_json("orders", &re_json).unwrap();
+            assert_eq!(rt.hierarchies.len(), 1);
+        }
+
+        #[test]
+        fn old_json_without_hierarchies_deserializes_with_empty_vec() {
+            let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+            assert!(
+                def.hierarchies.is_empty(),
+                "hierarchies should default to [] for old JSON without hierarchies field"
+            );
+        }
+
+        #[test]
+        fn definition_without_hierarchies_does_not_serialize_field() {
+            // skip_serializing_if = "Vec::is_empty" means no hierarchies key in output
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![],
+                metrics: vec![],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            assert!(
+                !json.contains("hierarchies"),
+                "Empty hierarchies should be omitted from JSON: {json}"
+            );
+        }
+    }
+
+    mod phase31_cardinality_tests {
+        use super::*;
+
+        #[test]
+        fn cardinality_serde_roundtrip() {
+            // All three variants serialize and deserialize correctly
+            for (variant, expected_json) in [
+                (Cardinality::ManyToOne, r#""ManyToOne""#),
+                (Cardinality::OneToOne, r#""OneToOne""#),
+                (Cardinality::OneToMany, r#""OneToMany""#),
+            ] {
+                let json = serde_json::to_string(&variant).unwrap();
+                assert_eq!(json, expected_json);
+                let rt: Cardinality = serde_json::from_str(&json).unwrap();
+                assert_eq!(rt, variant);
+            }
+        }
+
+        #[test]
+        fn join_with_cardinality_roundtrip() {
+            let join = Join {
+                table: "customers".to_string(),
+                from_alias: "o".to_string(),
+                fk_columns: vec!["customer_id".to_string()],
+                name: Some("order_to_customer".to_string()),
+                cardinality: Cardinality::OneToMany,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&join).unwrap();
+            assert!(json.contains(r#""cardinality":"OneToMany""#));
+            let rt: Join = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.cardinality, Cardinality::OneToMany);
+        }
+
+        #[test]
+        fn old_json_without_cardinality_defaults_to_many_to_one() {
+            // Backward compat: old JSON without cardinality field
+            let json = r#"{"table":"customers","on":"a.id=b.id"}"#;
+            let join: Join = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                join.cardinality,
+                Cardinality::ManyToOne,
+                "Missing cardinality must default to ManyToOne"
+            );
+        }
+
+        #[test]
+        fn definition_with_cardinality_joins_roundtrips() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![],
+                metrics: vec![],
+                joins: vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    name: Some("order_to_customer".to_string()),
+                    cardinality: Cardinality::OneToOne,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            let rt = SemanticViewDefinition::from_json("orders", &json).unwrap();
+            assert_eq!(rt.joins.len(), 1);
+            assert_eq!(rt.joins[0].cardinality, Cardinality::OneToOne);
+        }
+    }
+
+    mod phase32_using_relationships_tests {
+        use super::*;
+
+        #[test]
+        fn metric_with_using_relationships_roundtrips() {
+            let met = Metric {
+                name: "departure_count".to_string(),
+                expr: "COUNT(*)".to_string(),
+                source_table: Some("f".to_string()),
+                output_type: None,
+                using_relationships: vec!["dep_airport".to_string()],
+            };
+            let json = serde_json::to_string(&met).unwrap();
+            assert!(json.contains("using_relationships"));
+            let rt: Metric = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.using_relationships, vec!["dep_airport"]);
+        }
+
+        #[test]
+        fn old_json_without_using_relationships_deserializes_with_empty_vec() {
+            // Backward compat: Phase 30 definitions don't have using_relationships
+            let json = r#"{"name":"revenue","expr":"SUM(amount)","source_table":"o"}"#;
+            let met: Metric = serde_json::from_str(json).unwrap();
+            assert!(
+                met.using_relationships.is_empty(),
+                "using_relationships should default to [] for old JSON"
+            );
+        }
+
+        #[test]
+        fn metric_with_empty_using_relationships_does_not_emit_field() {
+            // skip_serializing_if = "Vec::is_empty" means no using_relationships key in output
+            let met = Metric {
+                name: "revenue".to_string(),
+                expr: "SUM(amount)".to_string(),
+                source_table: Some("o".to_string()),
+                output_type: None,
+                using_relationships: vec![],
+            };
+            let json = serde_json::to_string(&met).unwrap();
+            assert!(
+                !json.contains("using_relationships"),
+                "Empty using_relationships should be omitted from JSON: {json}"
             );
         }
     }
@@ -404,6 +640,7 @@ mod tests {
                 expr: "sum(amount)".to_string(),
                 source_table: None,
                 output_type: Some("DOUBLE".to_string()),
+                using_relationships: vec![],
             };
             let json = serde_json::to_string(&met).unwrap();
             let rt: Metric = serde_json::from_str(&json).unwrap();
@@ -420,6 +657,7 @@ mod tests {
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
+                hierarchies: vec![],
                 column_type_names: vec!["region".to_string(), "revenue".to_string()],
                 column_types_inferred: vec![17u32, 20u32],
             };
