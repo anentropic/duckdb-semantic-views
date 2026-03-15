@@ -1,10 +1,11 @@
 ---
 phase: 30
 slug: derived-metrics
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: complete
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-03-14
+audited: 2026-03-15
 ---
 
 # Phase 30 — Validation Strategy
@@ -38,20 +39,20 @@ created: 2026-03-14
 
 | Task ID | Plan | Wave | Requirement | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|-----------|-------------------|-------------|--------|
-| 30-01-01 | 01 | 1 | DRV-01 | unit | `cargo test body_parser::tests::parse_derived_metric` | ❌ W0 | ⬜ pending |
-| 30-01-02 | 01 | 1 | DRV-01 | unit | `cargo test body_parser::tests::parse_mixed_metrics` | ❌ W0 | ⬜ pending |
-| 30-01-03 | 01 | 1 | DRV-01 | unit | `cargo test model::tests::derived_metric_no_source_table` | ❌ W0 | ⬜ pending |
-| 30-02-01 | 02 | 1 | DRV-04 | unit | `cargo test graph::tests::derived_metric_cycle` | ❌ W0 | ⬜ pending |
-| 30-02-02 | 02 | 1 | DRV-04 | unit | `cargo test graph::tests::derived_metric_unknown_ref` | ❌ W0 | ⬜ pending |
-| 30-02-03 | 02 | 1 | DRV-05 | unit | `cargo test graph::tests::derived_metric_has_aggregate` | ❌ W0 | ⬜ pending |
-| 30-02-04 | 02 | 1 | DRV-05 | unit | `cargo test graph::tests::derived_metric_no_aggregate_ok` | ❌ W0 | ⬜ pending |
-| 30-03-01 | 03 | 2 | DRV-02 | unit | `cargo test expand::tests::inline_derived_metric` | ❌ W0 | ⬜ pending |
-| 30-03-02 | 03 | 2 | DRV-02 | unit | `cargo test expand::tests::facts_then_derived` | ❌ W0 | ⬜ pending |
-| 30-03-03 | 03 | 2 | DRV-03 | unit | `cargo test expand::tests::derived_metric_stacking` | ❌ W0 | ⬜ pending |
-| 30-03-04 | 03 | 2 | ALL | unit | `cargo test expand::tests::derived_metric_join_resolution` | ❌ W0 | ⬜ pending |
-| 30-04-01 | 04 | 3 | ALL | sqllogictest | `just test-sql` | ❌ W0 | ⬜ pending |
-| 30-04-02 | 04 | 3 | ALL | proptest | `cargo test body_parser::tests::proptest_derived_metric` | ❌ W0 | ⬜ pending |
-| 30-04-03 | 04 | 3 | ALL | sqllogictest | `just test-sql` (DESCRIBE) | ❌ W0 | ⬜ pending |
+| 30-01-01 | 01 | 1 | DRV-01 | unit | `cargo test parse_metrics_clause` | src/body_parser.rs | ✅ green |
+| 30-01-02 | 01 | 1 | DRV-01 | unit | `cargo test parse_keyword_body_with_derived` | src/body_parser.rs | ✅ green |
+| 30-01-03 | 01 | 1 | DRV-01 | unit | `cargo test parse_keyword_body_only_derived` | src/body_parser.rs | ✅ green |
+| 30-02-01 | 02 | 1 | DRV-04 | unit | `cargo test validate_derived_metrics_cycle` | src/graph.rs | ✅ green |
+| 30-02-02 | 02 | 1 | DRV-04 | unit | `cargo test validate_derived_metrics_unknown` | src/graph.rs | ✅ green |
+| 30-02-03 | 02 | 1 | DRV-05 | unit | `cargo test contains_aggregate` | src/graph.rs | ✅ green |
+| 30-02-04 | 02 | 1 | DRV-05 | unit | `cargo test validate_derived_metrics_aggregate` | src/graph.rs | ✅ green |
+| 30-03-01 | 03 | 2 | DRV-02 | unit | `cargo test inline_derived` | src/expand.rs | ✅ green |
+| 30-03-02 | 03 | 2 | DRV-02 | unit | `cargo test expand_derived_metric_with_facts` | src/expand.rs | ✅ green |
+| 30-03-03 | 03 | 2 | DRV-03 | unit | `cargo test inline_derived_stacked` | src/expand.rs | ✅ green |
+| 30-03-04 | 03 | 2 | ALL | unit | `cargo test resolve_joins_includes_transitive` | src/expand.rs | ✅ green |
+| 30-04-01 | 04 | 3 | ALL | sqllogictest | `just test-sql` | test/sql/phase30_derived_metrics.test | ✅ green |
+| 30-04-02 | 04 | 3 | ALL | proptest | `cargo test derived_metric_parsing_no_panic` | tests/parse_proptest.rs | ✅ green |
+| 30-04-03 | 04 | 3 | ALL | sqllogictest | `just test-sql` (DESCRIBE) | test/sql/phase30_derived_metrics.test | ✅ green |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -59,15 +60,27 @@ created: 2026-03-14
 
 ## Wave 0 Requirements
 
-- [ ] `test/sql/phase30_derived_metrics.test` — end-to-end derived metrics DDL, query, stacking, error cases
-- [ ] Unit tests for mixed qualified/unqualified metric parsing in body_parser.rs
-- [ ] Unit tests for derived metric inlining (single-level, multi-level stacking) in expand.rs
-- [ ] Unit tests for cycle detection, unknown reference, aggregate rejection in graph.rs
-- [ ] Unit tests for join resolution with derived metrics
-- [ ] Proptest for derived metric expression substitution edge cases
-- [ ] Update TEST_LIST with phase30_derived_metrics.test
+- [x] `test/sql/phase30_derived_metrics.test` — end-to-end derived metrics DDL, query, stacking, error cases
+- [x] Unit tests for mixed qualified/unqualified metric parsing in body_parser.rs
+- [x] Unit tests for derived metric inlining (single-level, multi-level stacking) in expand.rs
+- [x] Unit tests for cycle detection, unknown reference, aggregate rejection in graph.rs
+- [x] Unit tests for join resolution with derived metrics
+- [x] Proptest for derived metric expression substitution edge cases
+- [x] Update TEST_LIST with phase30_derived_metrics.test
 
-*Existing infrastructure covers framework and fixture needs.*
+*All Wave 0 requirements satisfied during phase execution.*
+
+---
+
+## Test Coverage Summary
+
+| Layer | Count | Files |
+|-------|-------|-------|
+| Unit (body_parser.rs) | 10 parse_metrics_clause tests | src/body_parser.rs |
+| Unit (graph.rs) | 16 validate/aggregate/extract tests | src/graph.rs |
+| Unit (expand.rs) | 8 inline_derived/toposort/collect tests | src/expand.rs |
+| Proptest | 3 adversarial derived metric generators | tests/parse_proptest.rs |
+| sqllogictest | 12 end-to-end cases | test/sql/phase30_derived_metrics.test |
 
 ---
 
@@ -79,11 +92,21 @@ created: 2026-03-14
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 30s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency < 30s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** complete
+
+---
+
+## Validation Audit 2026-03-15
+
+| Metric | Count |
+|--------|-------|
+| Gaps found | 0 |
+| Resolved | 0 |
+| Escalated | 0 |
