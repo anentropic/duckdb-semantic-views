@@ -6,6 +6,7 @@ on:
       - main
       - 'release/*'
       - 'gsd/*'
+      - 'milestone/*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

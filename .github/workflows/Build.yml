@@ -6,6 +6,7 @@ on:
       - main
       - 'release/*'
       - 'gsd/*'
+      - 'milestone/*'
   workflow_dispatch:
 
 concurrency:

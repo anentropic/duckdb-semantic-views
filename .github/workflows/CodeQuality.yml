@@ -6,6 +6,7 @@ on:
       - main
       - 'release/*'
       - 'gsd/*'
+      - 'milestone/*'
   pull_request:
 
 concurrency:
