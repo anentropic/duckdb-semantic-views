@@ -1129,6 +1129,7 @@ mod tests {
                     alias: alias.to_string(),
                     table: table.to_string(),
                     pk_columns: pks.iter().map(|s| s.to_string()).collect(),
+                    unique_constraints: vec![],
                 })
                 .collect(),
             joins: joins
@@ -1385,6 +1386,7 @@ mod tests {
                 alias: "o".to_string(),
                 table: "orders".to_string(),
                 pk_columns: vec![],
+                unique_constraints: vec![],
             }],
             joins: vec![Join {
                 table: "customers".to_string(),
@@ -1518,6 +1520,7 @@ mod tests {
                     alias: alias.to_string(),
                     table: table.to_string(),
                     pk_columns: vec!["id".to_string()],
+                    unique_constraints: vec![],
                 })
                 .collect(),
             facts: facts
@@ -1917,6 +1920,7 @@ mod tests {
                 alias: "o".to_string(),
                 table: "orders".to_string(),
                 pk_columns: vec!["id".to_string()],
+                unique_constraints: vec![],
             }],
             metrics,
             dimensions: vec![],
@@ -2072,6 +2076,7 @@ mod tests {
                     alias: alias.to_string(),
                     table: table.to_string(),
                     pk_columns: pks.iter().map(|s| s.to_string()).collect(),
+                    unique_constraints: vec![],
                 })
                 .collect(),
             joins: joins

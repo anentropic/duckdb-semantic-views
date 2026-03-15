@@ -12,6 +12,12 @@ pub struct TableRef {
     /// Not serialized when empty to preserve backward-compatible JSON.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pk_columns: Vec<String>,
+    /// UNIQUE constraints on this table. Each inner Vec is one constraint's column list.
+    /// A table can have zero or more UNIQUE constraints (composite allowed).
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unique_constraints: Vec<Vec<String>>,
 }
 
 /// A named SQL column expression used as a dimension.
@@ -92,16 +98,16 @@ pub struct JoinColumn {
 
 /// Cardinality of a relationship between two tables.
 ///
-/// Declared after `REFERENCES <alias>` in the RELATIONSHIPS clause.
-/// Defaults to `ManyToOne` when omitted (most common FK pattern).
-/// Old stored JSON without a `cardinality` field deserializes as `ManyToOne`.
+/// Inferred from PK/UNIQUE constraints at define time (Phase 33).
+/// `ManyToOne`: FK columns on the from-side table are bare (no PK/UNIQUE match).
+/// `OneToOne`: FK columns on the from-side table match a PK or UNIQUE constraint.
+/// Defaults to `ManyToOne` when deserialized from JSON without this field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum Cardinality {
     #[default]
     ManyToOne,
     OneToOne,
-    OneToMany,
 }
 
 impl Cardinality {
@@ -139,6 +145,13 @@ pub struct Join {
     /// In `order_to_customer AS o(customer_id) REFERENCES c`, this is `["customer_id"]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fk_columns: Vec<String>,
+    /// Phase 33: Resolved referenced columns on the target table.
+    /// Populated during inference: either the target's PK or the explicit UNIQUE columns.
+    /// Used by `synthesize_on_clause` to generate ON clause.
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ref_columns: Vec<String>,
     /// Phase 24: Optional relationship name for multi-table FK declarations.
     /// In `order_to_customer AS o(customer_id) REFERENCES c`, this is `Some("order_to_customer")`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -506,11 +519,10 @@ mod tests {
 
         #[test]
         fn cardinality_serde_roundtrip() {
-            // All three variants serialize and deserialize correctly
+            // Both variants serialize and deserialize correctly
             for (variant, expected_json) in [
                 (Cardinality::ManyToOne, r#""ManyToOne""#),
                 (Cardinality::OneToOne, r#""OneToOne""#),
-                (Cardinality::OneToMany, r#""OneToMany""#),
             ] {
                 let json = serde_json::to_string(&variant).unwrap();
                 assert_eq!(json, expected_json);
@@ -526,13 +538,13 @@ mod tests {
                 from_alias: "o".to_string(),
                 fk_columns: vec!["customer_id".to_string()],
                 name: Some("order_to_customer".to_string()),
-                cardinality: Cardinality::OneToMany,
+                cardinality: Cardinality::OneToOne,
                 ..Default::default()
             };
             let json = serde_json::to_string(&join).unwrap();
-            assert!(json.contains(r#""cardinality":"OneToMany""#));
+            assert!(json.contains(r#""cardinality":"OneToOne""#));
             let rt: Join = serde_json::from_str(&json).unwrap();
-            assert_eq!(rt.cardinality, Cardinality::OneToMany);
+            assert_eq!(rt.cardinality, Cardinality::OneToOne);
         }
 
         #[test]
@@ -544,6 +556,16 @@ mod tests {
                 join.cardinality,
                 Cardinality::ManyToOne,
                 "Missing cardinality must default to ManyToOne"
+            );
+        }
+
+        #[test]
+        fn old_json_with_one_to_many_is_rejected() {
+            // Phase 33: OneToMany variant removed -- old JSON with it must fail
+            let result = serde_json::from_str::<Cardinality>(r#""OneToMany""#);
+            assert!(
+                result.is_err(),
+                "OneToMany should be an unknown variant after Phase 33"
             );
         }
 
@@ -699,6 +721,116 @@ mod tests {
                 def.column_types_inferred.is_empty(),
                 "column_types_inferred should default to []"
             );
+        }
+    }
+
+    mod phase33_model_tests {
+        use super::*;
+
+        #[test]
+        fn table_ref_with_unique_constraints_roundtrip() {
+            let tr = TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                pk_columns: vec!["id".to_string()],
+                unique_constraints: vec![
+                    vec!["email".to_string()],
+                    vec!["first_name".to_string(), "last_name".to_string()],
+                ],
+            };
+            let json = serde_json::to_string(&tr).unwrap();
+            assert!(json.contains("unique_constraints"));
+            let rt: TableRef = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.unique_constraints.len(), 2);
+            assert_eq!(rt.unique_constraints[0], vec!["email"]);
+            assert_eq!(rt.unique_constraints[1], vec!["first_name", "last_name"]);
+        }
+
+        #[test]
+        fn old_json_without_unique_constraints_deserializes() {
+            // Backward compat: old JSON without unique_constraints field
+            let json = r#"{"alias":"o","table":"orders","pk_columns":["id"]}"#;
+            let tr: TableRef = serde_json::from_str(json).unwrap();
+            assert!(
+                tr.unique_constraints.is_empty(),
+                "unique_constraints should default to [] for old JSON"
+            );
+        }
+
+        #[test]
+        fn join_with_ref_columns_roundtrip() {
+            let join = Join {
+                table: "c".to_string(),
+                from_alias: "o".to_string(),
+                fk_columns: vec!["customer_id".to_string()],
+                ref_columns: vec!["id".to_string()],
+                name: Some("o_to_c".to_string()),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&join).unwrap();
+            assert!(json.contains("ref_columns"));
+            let rt: Join = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.ref_columns, vec!["id"]);
+        }
+
+        #[test]
+        fn old_json_without_ref_columns_deserializes() {
+            // Backward compat: old JSON without ref_columns field
+            let json = r#"{"table":"customers","on":"a.id=b.id"}"#;
+            let join: Join = serde_json::from_str(json).unwrap();
+            assert!(
+                join.ref_columns.is_empty(),
+                "ref_columns should default to [] for old JSON"
+            );
+        }
+
+        #[test]
+        fn empty_unique_constraints_not_serialized() {
+            let tr = TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                pk_columns: vec!["id".to_string()],
+                unique_constraints: vec![],
+            };
+            let json = serde_json::to_string(&tr).unwrap();
+            assert!(
+                !json.contains("unique_constraints"),
+                "Empty unique_constraints should be omitted from JSON: {json}"
+            );
+        }
+
+        #[test]
+        fn empty_ref_columns_not_serialized() {
+            let join = Join {
+                table: "c".to_string(),
+                from_alias: "o".to_string(),
+                fk_columns: vec!["customer_id".to_string()],
+                ref_columns: vec![],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&join).unwrap();
+            assert!(
+                !json.contains("ref_columns"),
+                "Empty ref_columns should be omitted from JSON: {json}"
+            );
+        }
+
+        #[test]
+        fn table_ref_without_pk_is_valid() {
+            let tr = TableRef {
+                alias: "f".to_string(),
+                table: "fact_table".to_string(),
+                pk_columns: vec![],
+                unique_constraints: vec![],
+            };
+            assert_eq!(tr.alias, "f");
+            assert_eq!(tr.table, "fact_table");
+            assert!(tr.pk_columns.is_empty());
+            // Roundtrip through JSON
+            let json = serde_json::to_string(&tr).unwrap();
+            let rt: TableRef = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.alias, "f");
+            assert!(rt.pk_columns.is_empty());
         }
     }
 }

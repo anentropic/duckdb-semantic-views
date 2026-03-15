@@ -477,6 +477,7 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
         alias: alias.to_string(),
         table: table_name.to_string(),
         pk_columns,
+        unique_constraints: vec![],
     })
 }
 
@@ -651,7 +652,14 @@ fn parse_cardinality_tokens(
     match (upper[0].as_str(), upper[2].as_str()) {
         ("MANY", "ONE") => Ok(Cardinality::ManyToOne),
         ("ONE", "ONE") => Ok(Cardinality::OneToOne),
-        ("ONE", "MANY") => Ok(Cardinality::OneToMany),
+        // OneToMany removed in Phase 33 -- reject
+        ("ONE", "MANY") => Err(ParseError {
+            message: format!(
+                "Unsupported cardinality 'ONE TO MANY' in relationship '{rel_name}'. \
+                 Cardinality is now inferred from PK/UNIQUE constraints; explicit keywords are no longer supported.",
+            ),
+            position: Some(entry_offset),
+        }),
         _ => Err(ParseError {
             message: format!(
                 "Invalid cardinality '{} TO {}' in relationship '{rel_name}'. \
@@ -751,6 +759,7 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
         table: to_alias.to_string(),
         from_alias: from_alias.to_string(),
         fk_columns,
+        ref_columns: vec![],
         name: Some(rel_name.to_string()),
         cardinality,
         on: String::new(),
@@ -1290,11 +1299,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_relationship_with_one_to_many() {
-        let result =
-            parse_relationships_clause("rel AS a(fk) REFERENCES b ONE TO MANY", 0).unwrap();
-        assert_eq!(result[0].table, "b");
-        assert_eq!(result[0].cardinality, Cardinality::OneToMany);
+    fn parse_relationship_with_one_to_many_rejected() {
+        // Phase 33: ONE TO MANY is no longer supported
+        let result = parse_relationships_clause("rel AS a(fk) REFERENCES b ONE TO MANY", 0);
+        assert!(result.is_err(), "ONE TO MANY should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("no longer supported"),
+            "Error should mention no longer supported: {}",
+            err.message
+        );
     }
 
     #[test]
