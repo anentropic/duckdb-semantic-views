@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-03-14)
 Phase: 32 (4 of 4 in v0.5.3) (Role-Playing and USING)
 Plan: 2 of 2 in current phase -- COMPLETE
 Status: Phase 32 complete, v0.5.3 milestone complete
-Last activity: 2026-03-14 -- Completed 32-02 (USING-aware expansion with scoped aliases)
+Last activity: 2026-03-15 - Completed quick task 16: Add advanced_features.py example for v0.5.3
 
 Progress: [==========] 100% (v0.5.3)
 
@@ -100,6 +100,12 @@ None yet.
 - [Phase 30]: Facts must be parenthesized when inlined to preserve operator precedence
 - [Phase 32]: Diamond rejection relaxation must be atomic with USING-aware expansion
 - [Phase 32]: Dimension-USING scope inheritance needs design decision during planning
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 16 | Add advanced_features.py example for v0.5.3 | 2026-03-15 | 7da34c6 | [16-add-a-new-file-under-examples-to-demo-th](./quick/16-add-a-new-file-under-examples-to-demo-th/) |
 
 ## Session Continuity
 
