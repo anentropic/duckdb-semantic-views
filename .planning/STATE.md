@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
-status: planning
-stopped_at: Phase 33 context gathered
-last_updated: "2026-03-15T19:07:47.698Z"
-last_activity: 2026-03-15 -- Roadmap created for v0.5.4
+status: executing
+stopped_at: Completed 33-01-PLAN.md
+last_updated: "2026-03-15T18:30:00.000Z"
+last_activity: 2026-03-15 -- Phase 33 Plan 01 complete (model, parser, inference)
 progress:
   total_phases: 4
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 0
+  total_plans: 2
+  completed_plans: 1
+  percent: 12
 ---
 
 # Project State
@@ -26,28 +26,28 @@ See: .planning/PROJECT.md (updated 2026-03-15)
 ## Current Position
 
 Phase: 33 (1 of 4 in v0.5.4) (UNIQUE Constraints & Cardinality Inference)
-Plan: 0 of ? in current phase
-Status: Ready to plan
-Last activity: 2026-03-15 -- Roadmap created for v0.5.4
+Plan: 1 of 2 in current phase
+Status: Executing
+Last activity: 2026-03-15 -- Phase 33 Plan 01 complete (model, parser, inference)
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█░░░░░░░░░] 12%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 0 (v0.5.4)
-- Average duration: -
-- Total execution time: -
+- Total plans completed: 1 (v0.5.4)
+- Average duration: 25min
+- Total execution time: 25min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| - | - | - | - |
+| 33 | 1/2 | 25min | 25min |
 
 **Recent Trend:**
-- Last 5 plans: -
-- Trend: -
+- Last 5 plans: 33-01 (25min)
+- Trend: Starting
 
 *Updated after each plan completion*
 
@@ -61,6 +61,9 @@ Recent decisions affecting current work:
 - [v0.5.4 roadmap]: Cardinality inference before DuckDB upgrade -- do not mix feature changes with version changes
 - [v0.5.4 roadmap]: Separate branches for dual-version support (main=1.5.x, andium=1.4.x) -- Cargo.toml version pin makes single-branch impractical
 - [v0.5.4 roadmap]: Registry publishing last -- depends on stable code, dual builds, and docs
+- [33-01]: Removed OneToMany variant entirely -- cardinality always from FK-side perspective
+- [33-01]: ref_columns resolved at parse time in infer_cardinality, not deferred to graph
+- [33-01]: Case-insensitive column matching via HashSet for PK/UNIQUE inference
 
 ### Pending Todos
 
@@ -74,6 +77,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-15T19:07:47.696Z
-Stopped at: Phase 33 context gathered
-Resume file: .planning/phases/33-unique-constraints-cardinality-inference/33-CONTEXT.md
+Last session: 2026-03-15T18:30:00.000Z
+Stopped at: Completed 33-01-PLAN.md
+Resume file: .planning/phases/33-unique-constraints-cardinality-inference/33-01-SUMMARY.md
