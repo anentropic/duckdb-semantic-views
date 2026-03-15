@@ -1,609 +1,460 @@
-# Feature Landscape: v0.5.3 Advanced Semantic Features
+# Feature Landscape: v0.5.4 Snowflake-Parity & Registry Publishing
 
-**Domain:** DuckDB Rust extension -- advanced semantic modeling capabilities
-**Researched:** 2026-03-14
-**Milestone:** v0.5.3 -- FACTS clause, derived metrics, hierarchies, fan trap detection, role-playing dimensions, semi-additive metrics, multiple join paths
-**Status:** Subsequent milestone research (v0.5.2 shipped 2026-03-13)
-**Overall confidence:** HIGH (Snowflake DDL grammar verified from official docs; Cube.dev patterns verified from official docs; dbt/MetricFlow patterns verified from official docs; existing codebase analyzed directly)
+**Domain:** DuckDB Rust extension -- Snowflake-style cardinality inference, multi-version support, documentation, and community extension registry publishing
+**Researched:** 2026-03-15
+**Milestone:** v0.5.4 -- UNIQUE constraint + cardinality inference, multi-version DuckDB support, Zensical docs site, CE registry publishing
+**Status:** Subsequent milestone research (v0.5.3 shipped 2026-03-15)
+**Overall confidence:** HIGH (Snowflake DDL grammar verified from official docs; DuckDB CE registry format verified from live description.yml files; DuckDB release cycle docs verified; Zensical verified from GitHub)
 
 ---
 
 ## Scope
 
-This document covers the feature surface for v0.5.3: adding advanced semantic modeling capabilities to the existing DuckDB semantic views extension. Each feature is analyzed across Snowflake, Cube.dev, and dbt/MetricFlow to identify standard behavior, expected semantics, and edge cases.
+This document covers the feature surface for v0.5.4: aligning with Snowflake's constraint-based cardinality inference, supporting multiple DuckDB versions (1.4.x LTS and 1.5.x latest), publishing to the DuckDB community extension registry, and shipping a documentation site.
 
-**What already exists (NOT in scope):**
-- 7 DDL verbs via parser hooks (CREATE, CREATE OR REPLACE, IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, SHOW)
-- SQL keyword body syntax: TABLES, RELATIONSHIPS, DIMENSIONS, METRICS clauses
-- PK/FK relationship model with define-time graph validation (cycles, diamonds, orphans rejected)
-- Topological sort ordering and transitive join inclusion
-- Qualified column references (`alias.column`) in dimension/metric expressions
-- Query via `semantic_view('name', dimensions := [...], metrics := [...])`
-- `Fact` struct exists in model.rs (unused -- no parser or expansion support)
+**What already exists (NOT in scope for research):**
+- Full native CREATE SEMANTIC VIEW DDL with TABLES, RELATIONSHIPS, FACTS, HIERARCHIES, DIMENSIONS, METRICS
+- PK/FK relationship model with explicit `ONE TO MANY` / `MANY TO ONE` / `ONE TO ONE` cardinality keywords
+- Fan trap detection, role-playing dimensions, USING RELATIONSHIPS, derived metrics
+- `PRIMARY KEY (col)` on TABLES clause, FK REFERENCES in RELATIONSHIPS
+- Build.yml using `duckdb/extension-ci-tools` reusable workflow (v1.4.4)
+- DuckDB Version Monitor CI workflow
+- 441 tests, 13.5K LOC
 
-**Focus:** Seven new features, their semantics across platforms, implementation complexity, and dependencies.
+**Focus:** Four feature areas and their interactions, complexity, and implementation sequencing.
 
 ---
 
 ## Table Stakes
 
-Features users expect from any semantic layer claiming "advanced modeling." Missing = the extension is a toy for single-fact-table aggregations.
+Features that must ship before v0.5.4 can be considered a viable public release on the community extension registry.
 
-### T1: FACTS Clause (Named Row-Level Sub-Expressions)
+### T1: UNIQUE Table Constraint + Snowflake-Style Cardinality Inference
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | `FACTS (alias.fact_name AS sql_expr, ...)` -- named, unaggregated row-level expressions that metrics can reference |
-| **Why Expected** | Complex metrics like `SUM(price * (1 - discount))` are verbose and error-prone when repeated. Facts let you name the sub-expression once (`net_price AS price * (1 - discount)`) and reference it in metrics (`SUM(net_price)`). Snowflake, Cube.dev, and dbt all support this concept. |
-| **Complexity** | **Low-Medium** |
-| **Dependencies** | Body parser (add FACTS clause). Expansion engine (inline fact expressions into metric SQL). Model (`Fact` struct already exists in `model.rs`). |
-| **Existing work** | `Fact` struct with `name`, `expr`, `source_table` fields already in `model.rs`. Never parsed or expanded -- purely structural scaffolding from Phase 11. |
+| **Feature** | Add `UNIQUE (col)` constraint to TABLES clause. Infer relationship cardinality from PK/UNIQUE declarations instead of requiring explicit `ONE TO MANY` / `MANY TO ONE` keywords. |
+| **Why Expected** | Snowflake's semantic views infer cardinality from constraints. Explicit cardinality keywords are verbose and error-prone. Users already declare PK; UNIQUE is the natural companion for cardinality inference. This removes a significant syntax burden and aligns with Snowflake semantics. |
+| **Complexity** | **Medium** |
+| **Dependencies** | Body parser (add UNIQUE to TABLES clause grammar). Model (`TableRef` needs `unique_columns`). Graph module (infer cardinality from constraint metadata). Backward compat (existing explicit cardinality must still work during transition). |
 
-**How it works across platforms:**
+**How Snowflake handles cardinality inference (verified from official docs):**
 
-| Platform | Name | Semantics | Key Detail |
-|----------|------|-----------|------------|
-| Snowflake | FACTS | Row-level expressions that dimensions and metrics can reference | FACTS clause must appear before DIMENSIONS. Facts can reference other facts and dimensions. |
-| Cube.dev | `sql` on measures | Inline SQL expression | No separate "fact" concept -- measures contain their own expressions directly. |
-| dbt/MetricFlow | Measures | `expr` field on a measure definition | Measures are the equivalent -- a named expression with an aggregation type. |
+Snowflake's cardinality rules work as follows:
 
-**Snowflake FACTS semantics (verified from official docs):**
+1. **TABLES clause** declares `PRIMARY KEY (col)` and/or `UNIQUE (col)` per logical table
+2. **RELATIONSHIPS clause** uses `table_a(fk_col) REFERENCES table_b` -- the referenced columns must be a PRIMARY KEY or UNIQUE constraint on `table_b`
+3. **Cardinality is inferred from the data characteristics of the FK column:**
+   - If multiple rows in the FK table share the same FK value --> **many-to-one** relationship
+   - If each row in the FK table has a unique FK value --> **one-to-one** relationship
+4. **No explicit cardinality keywords exist** in Snowflake semantic views. There is no `ONE TO MANY` or `MANY TO ONE` syntax.
+5. **Many-to-many is NOT supported.** Snowflake only recognizes many-to-one and one-to-one relationships.
+6. **Self-references are prohibited.** "A table cannot reference itself."
+
+**Snowflake TABLES syntax with UNIQUE (verified from official DDL grammar):**
 
 ```sql
-FACTS (
-  line_items.net_price AS l_extendedprice * (1 - l_discount),
-  line_items.line_item_id AS CONCAT(l_orderkey, '-', l_linenumber),
-  orders.count_line_items AS COUNT(line_items.line_item_id)
+TABLES (
+  region AS schema.REGION PRIMARY KEY (r_regionkey),
+  product AS schema.PRODUCTS PRIMARY KEY (product_id) UNIQUE (service_id),
+  combo AS schema.COMBO_TABLE PRIMARY KEY (id) UNIQUE (area_id, product_id) UNIQUE (service_id)
 )
 ```
 
-**Expression reference rules (Snowflake):**
-- Facts CAN reference: physical columns from their source table, other facts, dimensions
-- Facts CANNOT reference: metrics (aggregate-level expressions)
-- Dimensions CAN reference: facts and physical columns
-- Metrics CAN reference: facts, dimensions, physical columns (wrapped in aggregation functions)
-- Derived metrics CAN reference: other metrics (see T2)
+Key grammar points:
+- A table can have ONE `PRIMARY KEY` and MULTIPLE `UNIQUE` constraints
+- Both can be composite (multiple columns)
+- "If you already identified a column as a primary key column (by using PRIMARY KEY), do not add the UNIQUE clause for that column"
 
-**Implementation approach for this extension:**
-1. Add FACTS as a recognized clause keyword in `body_parser.rs` (between RELATIONSHIPS and DIMENSIONS in clause ordering)
-2. Parse fact definitions with same `alias.name AS expr` syntax as dimensions
-3. At expansion time, inline fact expressions into metric expressions via text substitution: if metric expr contains `fact_name`, replace with `(fact_expr)`
-4. Facts are row-level -- they appear in the expanded SQL as sub-expressions inside aggregation calls, NOT as separate SELECT columns
-
-**Edge cases:**
-- **Fact referencing fact:** `net_price AS price * (1 - discount)`, then `net_value AS net_price * quantity`. Requires topological resolution of fact references -- expand inner facts first.
-- **Fact and dimension with same name:** Ambiguous. Snowflake resolves by scoping: `table.fact_name` vs `table.dim_name`. Our extension should reject name collisions within the same source table scope.
-- **Fact without source_table:** Same defaulting as dimensions -- falls back to base table.
-- **COUNT in a fact:** Snowflake allows aggregate-level facts like `COUNT(line_items.line_item_id)`. This blurs the row-level boundary. For simplicity, initially restrict facts to row-level expressions and defer aggregate facts.
-
-**Confidence:** HIGH (Snowflake docs verified, model struct exists)
-
----
-
-### T2: Derived Metrics (Metric Referencing Other Metrics)
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | Metrics that combine other metrics without being scoped to a specific table. E.g., `profit AS revenue - cost` where `revenue` and `cost` are already-defined metrics. |
-| **Why Expected** | Derived metrics are universal across semantic layers. Without them, users must manually compute composite metrics in their query results, defeating the purpose of a semantic layer. |
-| **Complexity** | **Medium-High** |
-| **Dependencies** | Facts (T1) should be implemented first -- facts handle row-level composition, derived metrics handle aggregate-level composition. Expansion engine needs metric dependency resolution. |
-
-**How it works across platforms:**
-
-| Platform | Syntax | Semantics | Key Constraint |
-|----------|--------|-----------|----------------|
-| Snowflake | `metric_name AS metric_a + metric_b` (no table prefix) | Unscoped metric combining table-scoped metrics | Cannot use USING clause. Cannot be referenced by regular metrics. Only another derived metric can reference a derived metric. |
-| Cube.dev | Calculated measures | `sql` references other measures by name | Must resolve dependency DAG at compile time |
-| dbt/MetricFlow | `derived` metric type | `expr` + `input_metrics` list | Explicit input declaration; `expr` uses metric names as variables |
-
-**Snowflake derived metrics (verified from official docs):**
-
-```sql
-METRICS (
-  orders.total_revenue AS SUM(o.amount),
-  orders.total_cost AS SUM(o.cost),
-  profit AS orders.total_revenue - orders.total_cost,
-  margin AS profit / orders.total_revenue
-)
-```
-
-**Key semantics:**
-1. **No table prefix** on derived metrics -- they are scoped to the semantic view, not a logical table
-2. **Cannot contain aggregation functions** -- they operate on already-aggregated values
-3. **Can stack:** `margin` references `profit` which references `total_revenue` and `total_cost`
-4. **Cannot be referenced by regular metrics, dimensions, or facts** -- only other derived metrics
-5. **No USING clause** on derived metrics -- relationship disambiguation is not supported
-
-**Implementation approach:**
-1. **Detection:** A metric without a `source_table` (or an explicit `derived: true` flag) is treated as derived
-2. **Dependency resolution:** Build a directed graph of metric references. Topological sort. Reject cycles.
-3. **Expansion:** Derived metrics expand to post-aggregation expressions in the SELECT clause. The SQL looks like:
-
-```sql
-SELECT
-  "c"."region" AS "region",
-  SUM("o"."amount") AS "total_revenue",
-  SUM("o"."cost") AS "total_cost",
-  (SUM("o"."amount") - SUM("o"."cost")) AS "profit",
-  ((SUM("o"."amount") - SUM("o"."cost")) / SUM("o"."amount")) AS "margin"
-FROM ...
-GROUP BY 1
-```
-
-Each derived metric's expression is expanded by substituting referenced metric names with their full aggregate expressions. This avoids a subquery/CTE layer.
-
-**Edge cases:**
-- **Derived metric references non-existent metric:** Define-time validation error with "did you mean" suggestion
-- **Circular derived metrics:** `a AS b + 1`, `b AS a - 1` -- detect via topological sort, reject at define time
-- **Division by zero in derived:** `margin AS profit / revenue` when `revenue = 0` -- user's responsibility; DuckDB produces NULL or Inf
-- **Derived metric with mixed source tables:** `profit AS orders.revenue - returns.refund_total` -- requires both tables joined. The expansion must include joins for all metrics referenced transitively.
-- **Query requesting only derived metric without its dependencies:** Must still compute the underlying metrics. The expansion engine resolves transitive metric dependencies, not just table joins.
-
-**Confidence:** HIGH (Snowflake docs verified, dbt/MetricFlow pattern verified)
-
----
-
-### T3: Multiple Join Paths / USING RELATIONSHIPS (Relaxes Diamond Rejection)
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | Allow multiple relationships between the same pair of tables. Metrics specify which relationship to use via `USING (relationship_name)`. Replaces the current diamond rejection. |
-| **Why Expected** | The "flights with departure_airport and arrival_airport" pattern is fundamental to real-world data modeling. The current extension rejects this as a diamond. Without USING, users cannot model role-playing dimensions at all. |
-| **Complexity** | **High** |
-| **Dependencies** | Relationship names (already parsed and stored as `Join.name`). Graph validation changes (relax `check_no_diamonds` when USING is specified). Expansion engine changes (select specific join path). Query syntax changes (USING in query request). |
-
-**How it works across platforms:**
-
-| Platform | Resolution Mechanism | Query-Time Syntax | Key Detail |
-|----------|---------------------|-------------------|------------|
-| Snowflake | `USING (relationship_name)` on metric definitions | Metrics carry their own relationship binding | Each relationship must originate from the metric's logical table. Cannot specify multi-hop paths. |
-| Cube.dev | Dijkstra shortest path + join hints / join paths | `joinHints` in REST API, `CROSS JOIN` in SQL API | Automatic disambiguation; explicit hints override |
-| dbt/MetricFlow | Explicit entity relationships with join paths | Join path specified in semantic model | Multiple paths handled via entity resolution |
-
-**Snowflake USING semantics (verified from official docs):**
+**Snowflake REFERENCES resolution (verified from official docs):**
 
 ```sql
 RELATIONSHIPS (
-  flight_departure AS flights(departure_airport) REFERENCES airports,
-  flight_arrival AS flights(arrival_airport) REFERENCES airports
-)
-
-METRICS (
-  flights.departure_count USING (flight_departure) AS COUNT(flight_id),
-  flights.arrival_count USING (flight_arrival) AS COUNT(flight_id)
+  nation (n_regionkey) REFERENCES region,          -- references region's PRIMARY KEY
+  orders (o_custkey) REFERENCES customer,          -- references customer's PRIMARY KEY
+  detail (service_id) REFERENCES product(service_id) -- references product's UNIQUE(service_id)
 )
 ```
 
-**Key semantics:**
-1. **USING is on the metric definition, not the query.** The relationship binding is declared at CREATE time.
-2. **Multiple named relationships to the same target table are allowed** when each has a unique name
-3. **When querying without USING disambiguation, Snowflake errors:** "Multi-path relationship between... is not supported"
-4. **USING specifies direct relationships only** -- cannot specify multi-hop paths like `A -> B -> C`
-5. **Cannot use USING on derived metrics**
+When `REFERENCES table_alias` omits the column list, it resolves to the target table's PRIMARY KEY. When `REFERENCES table_alias(col)` specifies columns, they must match a declared UNIQUE or PRIMARY KEY constraint.
 
-**Implementation approach:**
-1. **Relax diamond rejection:** `check_no_diamonds()` should NOT reject when the diamond involves named relationships. Instead, store the multi-path information.
-2. **Add `using_relationships: Option<Vec<String>>` to `Metric` model struct** (serde default = None)
-3. **Body parser:** Parse `USING (rel_name, ...)` between metric name and `AS` keyword
-4. **At expansion time:** When a metric has `using_relationships`, use those specific named relationships for join resolution instead of the default graph walk
-5. **The same physical table gets joined multiple times with different aliases.** In the airports example: `LEFT JOIN airports AS airports_dep ON flights.departure_airport = airports_dep.airport_code LEFT JOIN airports AS airports_arr ON flights.arrival_airport = airports_arr.airport_code`
+**Cardinality inference algorithm (our implementation):**
+
+Since DuckDB semantic views are a preprocessor (we do not query the data at define time), we cannot infer cardinality from actual data like Snowflake does. Instead, we infer from **constraint declarations**:
+
+| FK column constraint | Referenced constraint | Inferred cardinality |
+|---------------------|----------------------|---------------------|
+| No constraint (bare column) | PRIMARY KEY | **Many-to-one** (default FK pattern) |
+| UNIQUE or PRIMARY KEY | PRIMARY KEY | **One-to-one** |
+| No constraint | UNIQUE | **Many-to-one** |
+| UNIQUE or PRIMARY KEY | UNIQUE | **One-to-one** |
+
+This is the correct inference because:
+- If the FK column has a UNIQUE/PK constraint, each FK value appears at most once --> one-to-one
+- If the FK column has no uniqueness constraint, multiple rows can share the same FK value --> many-to-one
+- One-to-many is the inverse of many-to-one (from the perspective of the referenced table looking back)
+
+**What this replaces:**
+
+Currently, the extension uses explicit cardinality keywords after REFERENCES:
+
+```sql
+-- Current (v0.5.3) syntax:
+RELATIONSHIPS (
+  order_to_customer AS o(customer_id) REFERENCES c ONE TO MANY
+)
+
+-- New (v0.5.4) syntax (Snowflake-aligned):
+RELATIONSHIPS (
+  order_to_customer AS o(customer_id) REFERENCES c
+  -- Cardinality inferred: o.customer_id has no UNIQUE --> many-to-one from o to c
+)
+```
+
+**Migration strategy:**
+- Phase 1: Add UNIQUE to TABLES. Add inference logic. Keep explicit keywords working (backward compat).
+- Phase 2: Deprecation warning when explicit keywords are used.
+- Phase 3 (future): Remove explicit keywords entirely.
+
+For v0.5.4, **both syntaxes should work.** Explicit keywords override inference when provided. This prevents a breaking change before registry publishing.
 
 **Edge cases:**
-- **USING references non-existent relationship:** Define-time validation error
-- **USING references relationship from wrong source table:** Error -- each USING relationship must originate from the metric's source table
-- **Dimension on the multi-path target table without USING:** Ambiguous. Snowflake errors. We should too: "dimension 'airports.city_name' is ambiguous; it is reachable via relationships 'flight_departure' and 'flight_arrival'"
-- **Multiple USING on same metric:** `USING (rel_a, rel_b)` -- joins through both paths simultaneously. Each provides a different join for the metric expression.
-- **Two metrics with different USING but same requested dimensions:** Both join paths must be included in the FROM clause with distinct aliases
+- **No PK/UNIQUE on referenced table:** Error at define time. "table 'x' is referenced in a relationship but has no PRIMARY KEY or UNIQUE constraint"
+- **FK column references UNIQUE, not PK:** Valid. UNIQUE columns are equally valid as reference targets.
+- **Composite FK referencing composite UNIQUE:** Must match column count and names. Error if mismatch.
+- **Explicit cardinality contradicts inference:** Honor the explicit keyword (user knows better than inference). Log a warning.
+- **Stored JSON backward compatibility:** Old definitions without UNIQUE metadata must continue loading. `unique_columns` defaults to empty Vec (serde default).
 
-**This is the highest-complexity feature.** It touches: model, body parser, graph validation, expansion engine (join alias management), and potentially the query request format.
+**Confidence:** HIGH (Snowflake DDL grammar verified, inference rules derived from constraint semantics)
 
-**Confidence:** HIGH (Snowflake docs verified, flight/airports example is canonical)
+---
+
+### T2: Community Extension Registry Publishing
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Submit `description.yml` to `duckdb/community-extensions` repository. Pass CI build. Get listed at `duckdb.org/community_extensions/extensions/semantic_views`. |
+| **Why Expected** | The extension claims to fill a gap in DuckDB's ecosystem. Being in the registry makes it installable via `INSTALL semantic_views FROM community;` and discoverable. Without registry presence, adoption is near zero. |
+| **Complexity** | **Low-Medium** (mostly configuration, not code) |
+| **Dependencies** | Multi-version DuckDB support (T3) for the `andium` field. Build pipeline must pass on all required platforms. Excluded platforms must be declared. |
+
+**What a successful Rust extension submission looks like (verified from live `rusty_quack` descriptor):**
+
+```yaml
+extension:
+  name: semantic_views
+  description: Semantic views for DuckDB - declarative dimensions, metrics, and relationships
+  version: 0.5.4
+  language: Rust
+  build: cargo
+  license: MIT
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_rtools;windows_amd64_mingw;linux_amd64_musl"
+  requires_toolchains: "rust;python3"
+  maintainers:
+    - paulbouwer
+
+repo:
+  github: paulbouwer/duckdb-semantic-views
+  andium: <commit_hash_for_1.4.x_LTS>
+  ref: <commit_hash_for_latest>
+
+docs:
+  hello_world: |
+    -- Create a semantic view
+    CREATE SEMANTIC VIEW sales AS
+      TABLES (o AS orders PRIMARY KEY (id))
+      DIMENSIONS (o.region AS o.region)
+      METRICS (o.revenue AS SUM(o.amount));
+    -- Query it
+    FROM semantic_view('sales', dimensions := ['region'], metrics := ['revenue']);
+  extended_description: |
+    Semantic views provide a declarative layer for DuckDB that lets you define
+    dimensions, metrics, relationships, facts, and hierarchies once, then query
+    with any combination without writing GROUP BY or JOIN logic by hand.
+```
+
+**Key fields explained:**
+- `build: cargo` -- tells the CE build system to use `cargo build` instead of `cmake`
+- `excluded_platforms` -- WASM not supported (parser hooks need C++ shim), musl not supported (linking issues), mingw not supported (CC compilation)
+- `requires_toolchains: "rust;python3"` -- Rust for the extension, Python3 for test tooling
+- `repo.ref` -- git commit hash for the latest DuckDB version build (currently 1.5.0)
+- `repo.andium` -- git commit hash for the 1.4.x LTS build (named after the LTS codename)
+
+**Release process (verified from UPDATING.md):**
+1. Extension is built whenever the descriptor is updated (targets latest stable DuckDB)
+2. Extension is rebuilt when a new DuckDB version releases (all CE extensions rebuilt)
+3. The `andium` field provides the commit for the 1.4.x LTS line -- extensions are built for both
+4. After LTS EOL (September 2026), the `andium` field is removed
+
+**Review criteria (from documentation + community observations):**
+- Extension must be public, open-source, hosted on GitHub
+- `description.yml` must have all required fields
+- Build must succeed on all non-excluded platforms
+- CI auto-detects added functions, types, settings by comparing DuckDB catalog before/after load
+- No formal code review -- the build pipeline is the gatekeeper
+- Documentation page auto-generated from `docs.hello_world` and `docs.extended_description`
+
+**What must be ready before submission:**
+1. Build passes on: `linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`, `windows_amd64`
+2. Extension loads cleanly: `INSTALL 'path/to/semantic_views.duckdb_extension'; LOAD semantic_views;`
+3. `hello_world` example works end-to-end
+4. No secrets or credentials in the repository
+5. MIT license file present
+
+**Confidence:** HIGH (verified from live `rusty_quack` descriptor and UPDATING.md)
+
+---
+
+### T3: Multi-Version DuckDB Support (Andium LTS + Latest)
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Support both DuckDB 1.4.x (Andium LTS, EOL Sep 2026) and DuckDB 1.5.x (Variegata, latest). Ship extension binaries for both. |
+| **Why Expected** | DuckDB 1.4.x is the LTS release -- many production users stay on LTS. The community extension registry uses the `andium` field to build for LTS. Without LTS support, users on 1.4.x cannot install the extension. |
+| **Complexity** | **Medium-High** |
+| **Dependencies** | CI/CD changes (two build targets). Cargo.toml dependency management (duckdb crate version). Potential code changes if APIs differ between 1.4 and 1.5. Feature flags or conditional compilation. |
+
+**DuckDB release cycle (verified from official docs):**
+
+| Version | Codename | Type | Release | EOL |
+|---------|----------|------|---------|-----|
+| 1.4.0 | Andium | LTS | Sep 2025 | Sep 2026 |
+| 1.4.3 | Andium | LTS patch | Dec 2025 | Sep 2026 |
+| 1.5.0 | Variegata | Latest | Mar 2026 | Next release |
+| 2.0 | (planned) | Next major | Sep 2026 | TBD |
+
+**Extension versioning model (verified from DuckDB docs):**
+
+The extension uses `C_STRUCT_UNSTABLE` ABI, which means:
+- Extension binary is pinned to an exact DuckDB version
+- Not binary-compatible across DuckDB minor versions
+- Each DuckDB version needs its own build
+
+The "Stable C API" (`C_STRUCT` ABI) would provide binary compatibility across versions, but our extension uses parser hooks via C++ shim which requires the unstable API.
+
+**Branching strategy for multi-version support (verified from UPDATING.md):**
+
+The community extension registry expects:
+- `repo.ref` -- commit hash targeting latest stable (1.5.x)
+- `repo.andium` -- commit hash targeting LTS (1.4.x)
+
+Two approaches for maintaining both:
+
+**Approach A: Separate branches (recommended by DuckDB docs)**
+- `main` branch targets latest (DuckDB 1.5.x, `duckdb = "=1.5.0"` in Cargo.toml)
+- `v1.4-andium` branch targets LTS (DuckDB 1.4.x, `duckdb = "=1.4.4"` in Cargo.toml)
+- `description.yml` uses `ref: <main commit>` and `andium: <andium branch commit>`
+- Bug fixes applied to both branches (cherry-pick or merge)
+
+**Approach B: Cargo feature flags (more complex, not standard)**
+- Single branch with conditional compilation: `#[cfg(feature = "duckdb14")]`
+- Separate Cargo.toml profiles or workspace members
+- Not recommended -- the DuckDB crate version pin (`= 1.4.4`) is a hard dependency
+
+**Recommendation: Approach A (separate branches).**
+
+The current project already has a DuckDB Version Monitor CI that detects new releases. The workflow needs updating to:
+1. Check both latest AND LTS releases
+2. Maintain the andium branch alongside main
+3. The `description.yml` provides commit hashes for both
+
+**DuckDB 1.5.0 changes relevant to this extension:**
+- **PEG parser (experimental, opt-in):** DuckDB 1.5.0 ships an experimental PEG parser that allows extensions to extend the SQL grammar at runtime. This could eventually replace our C++ shim approach for parser hooks. However, it is opt-in (`enable_peg_parser()`) and not the default, so the current `parse_function` fallback approach must remain the primary mechanism.
+- **No breaking C API changes identified** in the 1.4 --> 1.5 transition (based on available release notes).
+- **The `duckdb-rs` crate** needs a version compatible with 1.5.0 (check crates.io for `duckdb = "=1.5.0"` availability).
+
+**What needs to happen:**
+1. Create `v1.4-andium` branch from current main (which targets 1.4.4)
+2. Bump main to DuckDB 1.5.x (update `Cargo.toml`, `.duckdb-version`, `Build.yml`)
+3. Verify build and tests pass on both versions
+4. Update Build.yml to run both `duckdb-stable-build` (1.5.x) and `duckdb-next-build` (main)
+5. Create `description.yml` with both `ref` and `andium` hashes
+
+**Confidence:** HIGH (verified from UPDATING.md, DuckDB release cycle docs, and live descriptor examples)
+
+---
+
+### T4: Documentation Site (Zensical on GitHub Pages)
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Ship a documentation site at `<user>.github.io/duckdb-semantic-views/` using Zensical (the successor to MkDocs Material). Covers: getting started, DDL reference, query reference, examples, architecture overview. |
+| **Why Expected** | The current documentation is a README.md. For a community extension targeting the registry, users need proper documentation with search, navigation, and examples. A GitHub Pages site is free and standard for open-source projects. |
+| **Complexity** | **Low-Medium** (content writing, not code) |
+| **Dependencies** | None (independent of all other features). Content draws from existing README, MAINTAINER.md, examples/, and design doc. |
+
+**Why Zensical (verified from GitHub and official site):**
+
+Zensical is the successor to Material for MkDocs, built by the same team (squidfunk). It was created because MkDocs has been unmaintained since August 2024.
+
+| Criterion | Zensical | MkDocs Material | Docusaurus |
+|-----------|----------|-----------------|------------|
+| Markdown-native | Yes | Yes | Yes (MDX) |
+| Search | Built-in | Built-in | Built-in |
+| GitHub Pages deploy | Native GH Actions | Native GH Actions | Requires custom setup |
+| Maintenance | Active (2025-2026) | Unmaintained since Aug 2024 | Active |
+| Python dependency | Yes (pip install) | Yes (pip install) | Node.js |
+| Familiar to DuckDB community | Very (DuckDB docs use MkDocs conventions) | Yes | Less so |
+| Config compatibility | MkDocs Material compatible | Native | Different config |
+
+**Use Zensical** because it is the maintained successor to the tool the DuckDB ecosystem already uses, requires minimal setup, and deploys to GitHub Pages with a single workflow.
+
+**Documentation structure for a DuckDB extension:**
+
+The community extension page at `duckdb.org/community_extensions/extensions/semantic_views` is auto-generated from `description.yml`. The extension's own docs site should cover what the CE page cannot:
+
+```
+docs/
+  index.md              -- Overview + quick start
+  getting-started.md    -- Installation, first semantic view, first query
+  reference/
+    ddl.md              -- CREATE/DROP/DESCRIBE/SHOW syntax reference
+    query.md            -- semantic_view() function reference
+    clauses/
+      tables.md         -- TABLES clause (PK, UNIQUE)
+      relationships.md  -- RELATIONSHIPS clause (FK REFERENCES, cardinality)
+      facts.md          -- FACTS clause
+      hierarchies.md    -- HIERARCHIES clause
+      dimensions.md     -- DIMENSIONS clause
+      metrics.md        -- METRICS clause (USING, derived)
+  examples/
+    basic.md            -- Single table, dims + metrics
+    multi-table.md      -- Star schema with joins
+    role-playing.md     -- Airports/flights pattern
+    fan-traps.md        -- What fan traps are, how detection works
+    tpch.md             -- TPC-H worked example
+  architecture.md       -- How the extension works (preprocessor model)
+  contributing.md       -- Developer guide (from MAINTAINER.md)
+```
+
+**GitHub Pages deployment workflow:**
+
+```yaml
+name: Deploy Documentation
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**', 'zensical.yml']
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install zensical
+      - run: zensical build
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+```
+
+**What well-documented DuckDB extensions look like (from community extension pages):**
+- Auto-generated: function list, type list, settings list, download metrics
+- Manually provided: description, hello_world example, extended_description
+- Best extensions (e.g., h3, shellfs) have dedicated external documentation sites linked from the CE page
+
+**Confidence:** HIGH (Zensical verified from GitHub, GH Pages deployment is standard)
 
 ---
 
 ## Differentiators
 
-Features that improve DX beyond basic semantic layer parity. Not universally expected, but valued.
+Features that improve the extension beyond minimum registry requirements.
 
-### D1: Role-Playing Dimensions (Same Table Joined Via Different Relationships)
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | The same physical table (e.g., `airports`) can participate in multiple relationships with different semantic roles (e.g., departure airport vs arrival airport). Dimensions from that table are disambiguated by the relationship used to reach them. |
-| **Value Proposition** | Role-playing dimensions are the most common multi-path pattern. Supporting them makes the extension usable for real-world star schemas with date dimensions (order_date, ship_date, delivery_date all referencing the same `dates` table). |
-| **Complexity** | **High** (tightly coupled to T3: USING RELATIONSHIPS) |
-| **Dependencies** | T3 (multiple join paths) must be implemented first. Role-playing dimensions are a consequence of USING, not a separate mechanism. |
-
-**How it works across platforms:**
-
-| Platform | Approach | Key Detail |
-|----------|----------|------------|
-| Snowflake | Same table joined via multiple named relationships; metrics use USING to select path; dimensions inherit relationship context from their usage alongside metrics | Role-playing is modeled at the relationship + metric level, not the dimension level |
-| Power BI / SSAS | Explicit role-playing dimension concept; only one relationship "active" at a time; DAX uses `USERELATIONSHIP()` to switch | Different paradigm -- not directly applicable to SQL-based expansion |
-| Cube.dev | Not a first-class concept; handled via separate cubes wrapping the same table with different join definitions | Each "role" is a distinct cube with its own dimensions/measures |
-| Traditional data warehousing | Dimension table aliased multiple times in FROM clause | The standard SQL pattern: `JOIN dates AS order_date ON ..., JOIN dates AS ship_date ON ...` |
-
-**Implementation:**
-Role-playing dimensions are NOT a separate DDL construct. They emerge from the combination of:
-1. Multiple named relationships to the same table (T3)
-2. Metrics with USING clauses that select a specific relationship
-3. When a dimension from the multi-path target table is queried alongside a metric with USING, the dimension joins through the same relationship as the metric
-
-The expansion engine must:
-- Assign unique SQL aliases when the same physical table is joined multiple times: `airports AS "airports__flight_departure"` and `airports AS "airports__flight_arrival"`
-- Qualify dimension column references with the correct alias based on relationship context
-
-**Edge case:**
-- If the user queries a dimension from airports without any metric that has USING, the query is ambiguous and should error.
-- If the user queries two metrics with different USING, both pointing to the same target table, the target table gets two separate JOINs and two separate columns for the same dimension.
-
-**Confidence:** HIGH (standard pattern, Snowflake docs verified)
-
----
-
-### D2: Fan Trap Detection and Warning
+### D1: MAINTAINER.md Updates for Branching Strategy and CE Publishing
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Detect when a query crosses a one-to-many boundary in a way that could cause measure inflation (double-counting). Warn the user, but do not block the query. |
-| **Value Proposition** | Fan traps are the most common source of incorrect analytics results. Even a warning helps users avoid silent data corruption. Full auto-deduplication (like Cube.dev) is complex, but detection alone is valuable. |
-| **Complexity** | **Medium** |
-| **Dependencies** | Relationship cardinality declarations (new). Graph traversal (existing). |
-
-**How it works across platforms:**
-
-| Platform | Approach | Detail |
-|----------|----------|--------|
-| Cube.dev | **Auto-deduplication** -- detects fan/chasm traps at query time and generates dedup subqueries using PK-based `SELECT DISTINCT` before joining | Requires `primary_key: true` on a dimension. Fully automatic. |
-| Snowflake | **Granularity validation** -- validates that dimension entities have equal or lower granularity than metric entities | Prevents invalid grain combinations at query time |
-| dbt/MetricFlow | **Entity-based join graph** -- join paths enforce grain through entity relationships | Implicit fan trap prevention via entity resolution |
-
-**Fan trap definition:**
-A fan trap occurs when aggregating a metric from table A while joining to table B through a one-to-many relationship. The join inflates the rows from A, causing SUM/COUNT metrics to be overcounted.
-
-Example: `orders` (fact) JOIN `line_items` (one-to-many). If you SUM(orders.amount) while joining to line_items, each order row is duplicated per line item, inflating the sum.
-
-**Implementation approach (detection-only, not auto-dedup):**
-1. **Add relationship type metadata:** Extend `Join` model with `relationship_type: Option<String>` accepting `one_to_one`, `one_to_many`, `many_to_one`
-2. **At expansion time:** When a metric's source table is on the "one" side of a one-to-many join, and the query also includes dimensions from the "many" side, emit a warning: "metric 'total_order_amount' on table 'orders' may be inflated by the one-to-many relationship to 'line_items'"
-3. **Do NOT block the query.** The user may know what they are doing (e.g., they want the Cartesian product).
-
-**Why detection-only (not auto-dedup):**
-- Cube.dev's auto-dedup generates nested subqueries (`SELECT DISTINCT pk FROM fact JOIN dim ...`) that significantly change the query structure
-- This requires PK awareness at query time (we have PKs from the TABLES clause, so technically feasible)
-- But auto-dedup changes the semantics of the result -- it is not always what the user wants
-- Detection + warning is the 80/20: catches the mistake without surprising the user
-
-**Edge cases:**
-- **No relationship type declared:** Cannot detect fan traps. Skip silently.
-- **Chain of one-to-many:** `A -> B (1:M) -> C (1:M)` -- warn on any metric from A when dimensions from B or C are requested
-- **Metric on the "many" side:** `SUM(line_items.price)` -- no fan trap risk when joining to `orders` (many-to-one). Only warn when aggregating on the "one" side while traversing a "one-to-many" edge.
-
-**Confidence:** MEDIUM (Cube.dev auto-dedup pattern verified; detection-only is a simplified variant)
-
----
-
-### D3: Hierarchies / Drill-Down Paths
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | Named groupings of dimensions that define drill-down paths. E.g., `location: [country, region, city]`. Metadata-only -- does not change query expansion. |
-| **Value Proposition** | BI tools (Superset, Metabase, custom dashboards) can use hierarchy metadata to offer drill-down navigation. Without hierarchies, tools must guess the drill path. |
+| **Feature** | Update MAINTAINER.md with: multi-version branching workflow, CE registry update process, how to cut an LTS patch, how to bump to a new DuckDB version for both branches. |
+| **Value Proposition** | The extension is pre-release and the user is not deeply familiar with Rust/C++. Clear contributor documentation prevents the extension from becoming unmaintainable after initial publishing. |
 | **Complexity** | **Low** |
-| **Dependencies** | None (additive metadata). |
+| **Dependencies** | T2 (CE registry) and T3 (multi-version) must be implemented first so the docs reflect reality. |
 
-**How it works across platforms:**
-
-| Platform | Approach | Detail |
-|----------|----------|--------|
-| Cube.dev | `hierarchies` block with `levels` array | First-class concept. Cross-cube hierarchies supported (dimensions from joined cubes). |
-| Snowflake | No native hierarchy concept | Dimensions are flat. Hierarchies are implicit via naming conventions. |
-| dbt/MetricFlow | No native hierarchy concept | Flat dimension list. Hierarchy is a BI tool concern. |
-| SSAS / Power BI | First-class hierarchy object | Dimension attributes organized into levels |
-
-**Cube.dev hierarchies (verified from official docs):**
-
-```javascript
-hierarchies: {
-  location: {
-    title: 'User Location',
-    levels: [state, city]
-  }
-}
-```
-
-**Implementation approach:**
-1. **Model:** Add `Hierarchy` struct: `{ name: String, levels: Vec<String> }`. Add `hierarchies: Vec<Hierarchy>` to `SemanticViewDefinition`.
-2. **DDL syntax:**
-```sql
-HIERARCHIES (
-  location AS (country, region, city),
-  time AS (year, quarter, month)
-)
-```
-3. **Validation:** All level names must reference declared dimensions. Reject unknown dimension references.
-4. **Query expansion:** Hierarchies do NOT change expansion. They are metadata stored in the definition JSON and exposed via `DESCRIBE SEMANTIC VIEW`.
-5. **DESCRIBE output:** Add `hierarchies` column showing the hierarchy definitions.
-
-**Why this is a differentiator (not table stakes):**
-- Neither Snowflake nor dbt supports hierarchies natively
-- Cube.dev does, but it's a metadata concept, not a query concept
-- Most semantic layer users don't need hierarchies until they integrate with BI tools
-- Low complexity, pure metadata -- good candidate for "free" value add
-
-**Edge cases:**
-- **Dimension in multiple hierarchies:** Allowed. `month` can appear in both `fiscal_calendar` and `calendar` hierarchies.
-- **Empty hierarchy:** Reject -- a hierarchy with zero levels is meaningless.
-- **Hierarchy referencing non-existent dimension:** Define-time validation error.
-
-**Confidence:** HIGH (Cube.dev docs verified, straightforward metadata concept)
+**Confidence:** HIGH (documentation task, no technical risk)
 
 ---
 
-### D4: Semi-Additive Metrics (NON ADDITIVE BY)
+### D2: TPC-H Worked Example
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Mark a metric as non-additive across specific dimensions. E.g., `account_balance NON ADDITIVE BY (year, month, day) AS SUM(balance)` -- the metric should use the latest snapshot value for time dimensions rather than summing across all dates. |
-| **Value Proposition** | Account balances, inventory levels, and headcount are common metrics that are additive across some dimensions (e.g., customer) but not others (e.g., time). Without NON ADDITIVE BY, users get silently incorrect results. |
-| **Complexity** | **High** |
-| **Dependencies** | Body parser changes. Metric model changes. Expansion engine changes (window function SQL generation). |
+| **Feature** | A TPC-H-based semantic view definition demonstrating all features (multi-table joins, facts, derived metrics, hierarchies, fan trap awareness). Ship as `examples/tpch.py` and document on the docs site. |
+| **Value Proposition** | TPC-H is the universal analytics benchmark. A worked example against it demonstrates credibility and gives users a copy-paste starting point. Snowflake's own semantic view docs use TPC-H as the canonical example. |
+| **Complexity** | **Low** |
+| **Dependencies** | All DDL features from v0.5.3 already exist. Just needs writing. |
 
-**How it works across platforms:**
+**Confidence:** HIGH (TPC-H is well-understood, all features already implemented)
 
-| Platform | Syntax | Semantics | SQL Generation |
-|----------|--------|-----------|----------------|
-| Snowflake | `NON ADDITIVE BY (dim1 DESC, dim2 DESC)` on metric | Rows sorted by non-additive dimensions; values from last rows aggregated | Not documented publicly; likely uses `QUALIFY ROW_NUMBER()` or `LAST_VALUE()` |
-| dbt/MetricFlow | `non_additive_dimension: { name: dim, window_choice: max }` on measure | Filter to `MAX(dim)` per group, then aggregate | Generates subquery with window function |
-| Cube.dev | `rollingWindow` or custom SQL | No first-class semi-additive concept | Manual SQL |
+---
 
-**Snowflake NON ADDITIVE BY (verified from official docs):**
+### D3: PEG Parser Investigation (Future-Proofing)
 
-```sql
-METRICS (
-  bank_accounts.m_account_balance
-    NON ADDITIVE BY (year_dim DESC NULLS FIRST, month_dim DESC NULLS FIRST, day_dim DESC NULLS FIRST)
-    AS SUM(balance)
-)
-```
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Investigate DuckDB 1.5.0's experimental PEG parser for grammar extension support. Determine if it can replace the current C++ shim for `CREATE SEMANTIC VIEW` parsing. |
+| **Value Proposition** | The C++ shim compiles the full DuckDB amalgamation (~20MB binary size). If the PEG parser allows native grammar extensions via the C API, the shim could be eliminated, dramatically reducing binary size and build complexity. |
+| **Complexity** | **Research only** -- no implementation in v0.5.4 |
+| **Dependencies** | DuckDB 1.5.0 support (T3). PEG parser is opt-in and experimental. |
 
-**Semantics:** For customer `cust-001` in 2024, instead of summing all daily balances (incorrect: 910), return the latest day's balance (correct: 210). The "latest" is determined by sorting DESC on the non-additive dimensions and taking the last row per group.
+**Current state (verified from DuckDB 1.5.0 release notes and GitHub):**
+- PEG parser is opt-in via `enable_peg_parser()` setting
+- Already used for auto-complete suggestions
+- Grammar extension support for extensions is a stated goal
+- NOT the default parser -- the traditional YACC parser remains default
+- Experimental status means API may change
 
-**Implementation approach:**
-1. **Model:** Add `non_additive_by: Option<Vec<NonAdditiveDim>>` to `Metric` where `NonAdditiveDim { dimension: String, descending: bool, nulls_first: Option<bool> }`
-2. **Body parser:** Parse `NON ADDITIVE BY (dim1 [ASC|DESC] [NULLS FIRST|LAST], ...)` between metric name and `AS`
-3. **Expansion:** When a metric has `non_additive_by`, the expanded SQL wraps the metric in a subquery with a window function:
+**Recommendation:** Do NOT depend on PEG parser for v0.5.4. Keep the C++ shim. File a tech debt item to revisit when PEG parser becomes default (likely DuckDB 2.0, Sep 2026).
 
-```sql
--- Instead of:
-SELECT customer_id, SUM(balance) AS account_balance FROM ...
--- Generate:
-SELECT customer_id, SUM(balance) AS account_balance
-FROM (
-  SELECT *, ROW_NUMBER() OVER (
-    PARTITION BY customer_id
-    ORDER BY year DESC, month DESC, day DESC
-  ) AS _rn
-  FROM bank_accounts
-) WHERE _rn = 1
-GROUP BY customer_id
-```
-
-This filters to the latest snapshot per group before aggregating. The PARTITION BY includes all queried dimensions EXCEPT the non-additive ones.
-
-**Edge cases:**
-- **Non-additive dimension not in query:** If the user doesn't request `year_dim` in dimensions, the non-additive filter still applies but the window function partitions differently
-- **Multiple non-additive metrics with different dimensions:** Each needs its own subquery/CTE
-- **Non-additive dimension is from a different table:** The window function must be applied after the join but before aggregation -- requires a CTE or subquery layer
-- **Combined with derived metrics:** A derived metric referencing a semi-additive metric should work -- the semi-additive metric is already resolved before derivation
-
-**Why this is a differentiator (not table stakes):**
-- Snowflake only added this in March 2026 (preview)
-- Most semantic layers struggle with semi-additive metrics
-- The SQL generation is non-trivial (window function + subquery)
-- But the value for financial/inventory use cases is enormous
-
-**Confidence:** HIGH (Snowflake syntax verified, dbt pattern verified, SQL generation approach is standard)
+**Confidence:** MEDIUM (PEG parser exists but is experimental; grammar extension API not fully documented)
 
 ---
 
 ## Anti-Features
 
-Features to explicitly NOT build in v0.5.3.
+Features to explicitly NOT build in v0.5.4.
 
 | Anti-Feature | Why Avoid | What to Do Instead |
 |--------------|-----------|-------------------|
-| **Fan trap auto-deduplication** | Cube.dev's approach generates nested subqueries that change query semantics. Complex, surprising behavior. | Detection + warning only (D2). Users decide how to handle. Document the pattern. |
-| **Window function metrics** | Snowflake supports `metric AS window_function(metric) OVER (...)`. Requires fundamentally different expansion that does not GROUP BY. | Defer. Window functions are orthogonal to the aggregation model. |
-| **ASOF / temporal relationships** | Range-based joins for slowly-changing dimensions. Complex temporal join semantics. | Defer. Standard equi-joins cover 95% of use cases. |
-| **Cube.dev-style Dijkstra join path selection** | Automatic join path finding adds unpredictability. | Explicit USING RELATIONSHIPS is more deterministic and Snowflake-aligned. |
-| **Qualified names in query syntax** | `semantic_view('v', dimensions := ['customer.name'])` with dot-qualified dimension names in queries. | Defer. Keep flat dimension names in queries. Qualified names are a DDL concern. |
-| **Aggregate facts** | Snowflake allows `COUNT(line_items.id)` in FACTS -- blurs the row-level boundary. | Facts are row-level only. Aggregation belongs in METRICS. |
-| **COMMENT on expressions** | Snowflake supports per-dimension/metric/fact comments. Nice but no runtime effect. | Defer. Can be added later without breaking changes. |
-| **PUBLIC/PRIVATE visibility** | Snowflake marks expressions as PUBLIC or PRIVATE. No access control in DuckDB extensions. | Not applicable. |
-| **WITH SYNONYMS** | Snowflake supports synonyms for AI/natural-language discovery. | Not applicable for SQL-only DuckDB. |
-| **Pre-aggregation / materialization** | Deferred per PROJECT.md. | Out of scope. DuckDB handles execution. |
-| **Relationship type inference from data** | Snowflake Autopilot infers one-to-many vs one-to-one from cardinality. | Users declare relationship type explicitly (if D2 is implemented). |
-| **Cross-cube/cross-view hierarchies** | Cube.dev supports hierarchies referencing dimensions from joined cubes. | Keep hierarchies within a single semantic view's dimension space. |
-| **Fiscal calendar support** | ISO 8601 only per PROJECT.md constraints. | Document limitation. Users handle fiscal calendars in dimension expressions. |
+| **Remove explicit cardinality keywords** | Breaking change before registry debut. Users with existing definitions using `ONE TO MANY` would break. | Support both syntaxes. Inference is the default; explicit overrides inference. Deprecation in future milestone. |
+| **Many-to-many relationship support** | Snowflake does not support it. The current extension's `Cardinality` enum does not include `ManyToMany`. Adding it requires bridge table patterns that complicate fan trap detection. | Document as not supported. Recommend bridge table decomposition pattern. |
+| **PEG parser migration** | Experimental, opt-in, API may change. Premature to depend on it. | File TECH-DEBT.md item. Revisit at DuckDB 2.0. |
+| **Stable C API migration** | Would provide binary compatibility across versions. But parser hooks require C++ shim which uses unstable API. Migration would require DuckDB to expose parser hooks via stable C API. | Stay on `C_STRUCT_UNSTABLE`. Use two-branch strategy for multi-version. |
+| **Semi-additive metrics (NON ADDITIVE BY)** | Deferred from v0.5.3. Requires structural changes to the expansion pipeline (window function subquery injection). Adds complexity before registry debut. | Defer to v0.5.5+. Document as planned. |
+| **Pre-aggregation / materialization** | Out of scope per PROJECT.md. | DuckDB handles execution. Document as non-goal. |
+| **YAML definition format** | Adds second definition path. SQL DDL is the sole interface. | Defer. SQL DDL first; YAML is a future path. |
+| **Data-driven cardinality inference** | Snowflake counts distinct values at query time to determine one-to-one vs many-to-one. We are a preprocessor -- no query execution at define time. | Use constraint-based inference (UNIQUE/PK declarations). Document that inference is from constraints, not data. |
+| **WASM support** | Parser hooks require C++ shim compilation which is not compatible with WASM targets. | Exclude `wasm_mvp;wasm_eh;wasm_threads` in `description.yml`. |
+| **Windows Arm64 / MinGW** | Build toolchain complexity for Rust + C++ cross-compilation. | Exclude `windows_arm64;windows_amd64_mingw` in `description.yml`. |
 
 ---
 
 ## Feature Dependencies
 
 ```
-T1: FACTS clause
+T1: UNIQUE + Cardinality Inference
   |
-  +-> T2: Derived Metrics (facts provide row-level composition;
-  |                        derived metrics provide aggregate-level composition)
+  +-(informs)-> T2: CE Registry Publishing (description.yml uses correct semantics)
+
+T3: Multi-Version DuckDB Support (1.4.x + 1.5.x)
   |
-  +-> D4: Semi-additive metrics (NON ADDITIVE BY references dimensions,
-                                  operates on metrics -- orthogonal to facts)
+  +-(required by)-> T2: CE Registry Publishing (andium field needs LTS branch)
 
-T3: Multiple Join Paths (USING RELATIONSHIPS)
+T4: Documentation Site (Zensical)
+  |  (independent -- can be built in parallel)
+
+T2: CE Registry Publishing
   |
-  +-> D1: Role-Playing Dimensions (consequence of USING;
-  |                                same table joined via different relationships)
-  |
-  +-> D2: Fan Trap Detection (requires relationship cardinality metadata;
-                               can warn about one-to-many traversals)
+  +-(required by)-> D1: MAINTAINER.md Updates (docs must reflect reality)
 
-D3: Hierarchies (independent -- pure metadata, no dependencies)
+D2: TPC-H Example (independent -- depends only on v0.5.3 features)
+D3: PEG Parser Investigation (independent research -- no implementation)
 ```
 
-**Dependency ordering implications for phases:**
-1. **FACTS (T1)** has no dependencies and unblocks derived metrics
-2. **USING RELATIONSHIPS (T3)** has no feature dependencies but requires graph validation changes
-3. **Hierarchies (D3)** is fully independent
-4. **Derived Metrics (T2)** depends on T1 being designed (so metric expressions can reference facts)
-5. **Role-Playing Dimensions (D1)** depends on T3
-6. **Fan Trap Detection (D2)** depends on relationship type metadata (can be concurrent with T3)
-7. **Semi-Additive (D4)** is independent but complex -- save for last
-
----
-
-## Detailed Design: Expression Reference Hierarchy
-
-Understanding how expressions reference each other is critical for correct expansion ordering.
-
-### Reference Rules (Snowflake-aligned)
-
-```
-Physical Columns (base)
-    |
-    v
-Facts (row-level named expressions)
-    |  - CAN reference: physical columns, other facts, dimensions
-    |  - CANNOT reference: metrics, derived metrics
-    |
-    v
-Dimensions (row-level attribute expressions)
-    |  - CAN reference: physical columns, facts
-    |  - CANNOT reference: metrics, derived metrics
-    |
-    v
-Metrics (aggregate expressions)
-    |  - CAN reference: physical columns, facts, dimensions (inside aggregation)
-    |  - CANNOT reference: other metrics, derived metrics
-    |
-    v
-Derived Metrics (post-aggregation expressions)
-       - CAN reference: other metrics, other derived metrics
-       - CANNOT reference: physical columns, facts, dimensions directly
-       - CANNOT use USING clause
-       - CANNOT contain aggregation functions
-```
-
-### Expansion Order
-
-1. Resolve fact expressions (inline sub-facts first, topological order)
-2. Resolve dimension expressions (inline facts if referenced)
-3. Resolve metric expressions (inline facts if referenced)
-4. Resolve derived metric expressions (substitute metric expressions)
-5. Generate SQL: dimensions + metrics in SELECT, derived metrics as post-aggregation expressions
-
----
-
-## Detailed Design: Expansion SQL Patterns
-
-### Pattern A: Facts + Metrics (T1)
-
-**Definition:**
-```sql
-FACTS (li.net_price AS li.price * (1 - li.discount))
-METRICS (o.revenue AS SUM(li.net_price))
-```
-
-**Expanded SQL:**
-```sql
-SELECT SUM(("li"."price" * (1 - "li"."discount"))) AS "revenue"
-FROM "orders" AS "o"
-LEFT JOIN "line_items" AS "li" ON "li"."order_id" = "o"."id"
-```
-
-The fact `net_price` is inlined into the metric expression. Facts never appear as separate columns.
-
-### Pattern B: Derived Metrics (T2)
-
-**Definition:**
-```sql
-METRICS (
-  o.revenue AS SUM(o.amount),
-  o.cost AS SUM(o.expense),
-  profit AS o.revenue - o.cost
-)
-```
-
-**Expanded SQL:**
-```sql
-SELECT
-  SUM("o"."amount") AS "revenue",
-  SUM("o"."expense") AS "cost",
-  (SUM("o"."amount") - SUM("o"."expense")) AS "profit"
-FROM "orders" AS "o"
-GROUP BY 1
-```
-
-Derived metrics inline the referenced metrics' aggregate expressions.
-
-### Pattern C: USING RELATIONSHIPS / Role-Playing Dimensions (T3 + D1)
-
-**Definition:**
-```sql
-TABLES (
-  f AS flights PRIMARY KEY (flight_id),
-  a AS airports PRIMARY KEY (airport_code)
-)
-RELATIONSHIPS (
-  dep AS f(departure_airport) REFERENCES a,
-  arr AS f(arrival_airport) REFERENCES a
-)
-DIMENSIONS (
-  a.city AS a.city_name
-)
-METRICS (
-  f.departures USING (dep) AS COUNT(f.flight_id),
-  f.arrivals USING (arr) AS COUNT(f.flight_id)
-)
-```
-
-**Expanded SQL (querying departures + city):**
-```sql
-SELECT
-  "a__dep"."city_name" AS "city",
-  COUNT("f"."flight_id") AS "departures"
-FROM "flights" AS "f"
-LEFT JOIN "airports" AS "a__dep" ON "f"."departure_airport" = "a__dep"."airport_code"
-GROUP BY 1
-```
-
-The airports table is joined with alias `a__dep` (combining table alias with relationship name) to disambiguate.
-
-### Pattern D: Semi-Additive Metrics (D4)
-
-**Definition:**
-```sql
-METRICS (
-  b.balance NON ADDITIVE BY (date_dim DESC) AS SUM(b.balance)
-)
-```
-
-**Expanded SQL (querying balance by customer):**
-```sql
-SELECT
-  "b"."customer_id" AS "customer_id",
-  SUM("b"."balance") AS "balance"
-FROM (
-  SELECT *, ROW_NUMBER() OVER (
-    PARTITION BY "b"."customer_id"
-    ORDER BY "b"."date" DESC
-  ) AS "_rn"
-  FROM "bank_accounts" AS "b"
-) AS "b"
-WHERE "_rn" = 1
-GROUP BY 1
-```
+**Critical path:** T3 (multi-version) --> T2 (CE publishing)
+**Parallel work:** T1 (UNIQUE/inference), T4 (docs), D2 (TPC-H example)
 
 ---
 
@@ -611,49 +462,46 @@ GROUP BY 1
 
 | Feature | Complexity | Est. LOC | Risk | Phase Order |
 |---------|------------|----------|------|-------------|
-| FACTS clause (T1) | Low-Medium | ~150 | Low -- model exists, parser pattern established | 1st |
-| Hierarchies (D3) | Low | ~100 | None -- pure metadata | 1st (parallel) |
-| Derived Metrics (T2) | Medium-High | ~250 | Medium -- dependency resolution, expression substitution | 2nd |
-| Fan Trap Detection (D2) | Medium | ~150 | Low -- detection only, no query changes | 2nd (parallel) |
-| USING RELATIONSHIPS (T3) | High | ~400 | **High** -- graph validation changes, multi-alias join expansion, relationship-scoped resolution | 3rd |
-| Role-Playing Dimensions (D1) | High (coupled to T3) | ~200 | **High** -- same-table multi-join alias management | 3rd (with T3) |
-| Semi-Additive NON ADDITIVE BY (D4) | High | ~300 | **High** -- window function subquery injection, changes expansion pipeline structure | 4th |
-| **Total** | **High** | **~1550 lines** | **Medium-High** | |
+| T1: UNIQUE + Cardinality Inference | Medium | ~250 | Low-Medium -- additive change, backward compatible | 1st |
+| T3: Multi-Version DuckDB Support | Medium-High | ~50 code, ~200 config | Medium -- DuckDB 1.5 API compatibility unknown until tested | 1st (parallel) |
+| T4: Documentation Site (Zensical) | Low-Medium | ~0 code, ~2000 words content | Low -- configuration + writing | 2nd (parallel) |
+| T2: CE Registry Publishing | Low-Medium | ~0 code, ~50 config | Medium -- first submission, build pipeline unknown | 3rd (depends on T3) |
+| D1: MAINTAINER.md Updates | Low | ~500 words | None | 4th (after T2/T3) |
+| D2: TPC-H Worked Example | Low | ~100 code | None | Anytime |
+| D3: PEG Parser Investigation | Research only | 0 | None | Anytime |
+| **Total** | **Medium** | **~300 LOC + ~3000 words + ~250 config** | **Medium** | |
 
 ---
 
 ## MVP Recommendation
 
-### Wave 1: Low-Risk Foundations (estimated ~250 LOC)
+### Phase 1: Foundations (UNIQUE inference + DuckDB 1.5 compatibility)
 
-Build the features that have no dependencies and low risk:
+Build the two features that must exist before registry submission:
 
-1. **FACTS clause (T1):** Parser + expansion inline. The model already exists. Re-use the DIMENSIONS parser pattern for `FACTS (alias.fact AS expr)`. Inline fact expressions at expansion time via text substitution.
-2. **Hierarchies (D3):** Model + parser + DESCRIBE. Pure metadata. New `HIERARCHIES` clause keyword. Store in definition JSON. Expose via DESCRIBE output.
+1. **UNIQUE + Cardinality Inference (T1):** Add `UNIQUE (col)` to TABLES grammar. Add `unique_columns: Vec<Vec<String>>` to `TableRef`. Implement inference logic in graph module. Keep explicit cardinality keywords working. Update existing tests.
 
-### Wave 2: Metric Composition (estimated ~400 LOC)
+2. **Multi-Version DuckDB (T3):** Create `v1.4-andium` branch from current main. Bump main to DuckDB 1.5.x. Verify build + tests on both. Update Build.yml with dual workflow targets.
 
-Build features that compose with Wave 1:
+### Phase 2: Documentation + Example (parallel with Phase 1)
 
-3. **Derived Metrics (T2):** Detect derived metrics (no source_table prefix). Build dependency DAG. Topological sort. Expand by inlining aggregate expressions. Define-time validation for cycles and unknown references.
-4. **Fan Trap Detection (D2):** Add optional `relationship_type` to relationship declarations. At expansion time, check for metrics aggregating across one-to-many boundaries. Emit warnings (not errors).
+3. **Documentation Site (T4):** Set up Zensical project structure. Write core content pages. Configure GitHub Pages deployment workflow. Link from README.
 
-### Wave 3: Multi-Path Joins (estimated ~600 LOC)
+4. **TPC-H Worked Example (D2):** Write `examples/tpch.py` demonstrating multi-table semantic view against TPC-H data.
 
-The highest-complexity features:
+### Phase 3: Registry Submission
 
-5. **USING RELATIONSHIPS + Role-Playing Dimensions (T3 + D1):** Relax diamond rejection for named relationships. Parse `USING (rel_name)` on metrics. Generate multi-alias JOINs. Relationship-scoped dimension resolution. This is the riskiest wave.
+5. **CE Registry Publishing (T2):** Create `description.yml`. Submit PR to `duckdb/community-extensions`. Monitor build pipeline. Fix any platform-specific failures. Verify the auto-generated documentation page.
 
-### Wave 4: Semi-Additive (estimated ~300 LOC)
-
-6. **NON ADDITIVE BY (D4):** Parse `NON ADDITIVE BY (dim DESC, ...)` on metrics. Generate window function subquery at expansion time. Test with known snapshot data.
+6. **MAINTAINER.md Updates (D1):** Document the dual-branch workflow, CE update process, and version bump procedures.
 
 ### Deferral Rationale
 
-- **T3 + D1 before D4:** USING RELATIONSHIPS enables more use cases (role-playing dimensions are very common). Semi-additive is important but niche (financial/inventory only).
-- **T1 before T2:** Facts provide the row-level composition that derived metrics build upon. Derived metrics cannot be meaningfully tested without facts.
-- **D2 concurrent with T2:** Fan trap detection is independent of metric composition. Both can be developed in parallel.
-- **D3 anytime:** Hierarchies are pure metadata with zero risk. Can be built in any wave.
+- **T1 before T2:** UNIQUE inference should be in place before the first public release. It is a syntax improvement that affects the "hello world" example in the descriptor.
+- **T3 before T2:** The `andium` field in `description.yml` requires the LTS branch to exist. Without it, LTS users cannot install the extension.
+- **T4 parallel with T1/T3:** Documentation does not depend on code changes. Content can be written from existing features.
+- **D3 is research only:** PEG parser investigation informs future milestones, not v0.5.4 implementation.
+- **Semi-additive metrics deferred again:** The expansion pipeline structural change is too risky before the first public release. Better to ship a stable, well-documented subset first.
 
 ---
 
@@ -661,40 +509,43 @@ The highest-complexity features:
 
 ### Snowflake Official Documentation (HIGH confidence)
 
-- [CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- full DDL grammar including FACTS, NON ADDITIVE BY, USING clauses
-- [Using SQL commands for semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- worked examples of FACTS, derived metrics, USING RELATIONSHIPS, role-playing dimensions, NON ADDITIVE BY
-- [Semi-additive metrics release note (2026-03-05)](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY syntax and semantics
-- [Derived metrics release note (2025-09-30)](https://docs.snowflake.com/en/release-notes/2025/other/2025-09-30-semantic-view-derived-metrics) -- derived metric support announcement
-- [SEMANTIC_VIEW query syntax](https://docs.snowflake.com/en/sql-reference/constructs/semantic_view) -- query-time semantics
-- [Validation rules](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules) -- expression reference constraints, circular reference prohibition
-- [YAML specification](https://docs.snowflake.com/en/user-guide/views-semantic/semantic-view-yaml-spec) -- NON ADDITIVE BY YAML syntax, using_relationships YAML syntax
-- [Overview of semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/overview) -- expression hierarchy (facts vs dimensions vs metrics)
+- [CREATE SEMANTIC VIEW DDL grammar](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- TABLES clause with PRIMARY KEY and UNIQUE, RELATIONSHIPS with REFERENCES, no explicit cardinality keywords
+- [Using SQL commands for semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- UNIQUE interaction with REFERENCES, cardinality inference from PK/UNIQUE declarations
+- [Validation rules](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules) -- Referenced columns must be PK or UNIQUE; many-to-one vs one-to-one from FK value uniqueness; self-references prohibited; circular relationships prohibited
+- [Semantic view YAML specification](https://docs.snowflake.com/en/user-guide/views-semantic/semantic-view-yaml-spec) -- Relationship types automatically inferred, no explicit join_type or relationship_type
+- [Semantic view overview](https://docs.snowflake.com/en/user-guide/views-semantic/overview) -- Transitive cardinality inference across relationship chains
+- [Querying semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/querying) -- Dimension granularity must be equal or lower than metric granularity
+- [Semantic view example (TPC-H)](https://docs.snowflake.com/en/user-guide/views-semantic/example) -- Full worked example with PRIMARY KEY on all tables, no UNIQUE needed for standard FK pattern
 
-### Cube.dev Documentation (MEDIUM confidence)
+### DuckDB Community Extension Registry (HIGH confidence)
 
-- [Joins between cubes](https://cube.dev/docs/product/data-modeling/concepts/working-with-joins) -- Dijkstra join path resolution, fan/chasm trap detection, diamond subgraph handling
-- [Joins reference](https://cube.dev/docs/reference/data-model/joins) -- relationship types (one_to_one, one_to_many, many_to_one), auto-dedup via PK, directed join graph
-- [Hierarchies reference](https://cube.dev/docs/product/data-modeling/reference/hierarchies) -- hierarchy syntax with levels array, cross-cube hierarchies, title/public options
-- [Cube.dev symmetric aggregation issue #7512](https://github.com/cube-js/cube/issues/7512) -- community discussion on fan trap handling
+- [Community extension documentation](https://duckdb.org/community_extensions/documentation) -- description.yml format, submission process
+- [Community extension development guide](https://duckdb.org/community_extensions/development) -- build system, platform support, testing
+- [Community extension FAQ](https://duckdb.org/community_extensions/faq) -- licensing, review criteria
+- [rusty_quack descriptor (live)](https://github.com/duckdb/community-extensions/blob/main/extensions/rusty_quack/description.yml) -- Rust extension example with `build: cargo`, `andium` field, excluded platforms
+- [shellfs descriptor (live)](https://github.com/duckdb/community-extensions/blob/main/extensions/shellfs/description.yml) -- C++ extension with `andium` field
+- [UPDATING.md](https://github.com/duckdb/community-extensions/blob/main/UPDATING.md) -- Dual-branch strategy, `ref` + `ref_next`/`andium` system, release process
+- [Rust extension template](https://github.com/duckdb/extension-template-rs) -- Build pipeline, CI workflow, platform targets
 
-### dbt / MetricFlow Documentation (MEDIUM confidence)
+### DuckDB Release Cycle (HIGH confidence)
 
-- [About MetricFlow](https://docs.getdbt.com/docs/build/about-metricflow) -- semantic layer architecture, semi-additive measures
-- [Build your metrics](https://docs.getdbt.com/docs/build/build-metrics-intro) -- metric types including derived
-- [Creating metrics](https://docs.getdbt.com/docs/build/metrics-overview) -- derived metric syntax (expr + input_metrics)
-- [Measures](https://docs.getdbt.com/docs/build/measures) -- non_additive_dimension configuration with window_choice
+- [Release cycle documentation](https://duckdb.org/docs/stable/dev/release_cycle) -- LTS schedule, version naming, extension categories
+- [Extension versioning](https://duckdb.org/docs/stable/extensions/versioning_of_extensions) -- Stable vs unstable API, binary compatibility, versioning tiers
+- [DuckDB 1.5.0 announcement](https://duckdb.org/2026/03/09/announcing-duckdb-150) -- PEG parser, VARIANT type, GEOMETRY built-in
+- [DuckDB 1.4.0 LTS announcement](https://duckdb.org/2025/09/16/announcing-duckdb-140) -- Andium LTS, 1 year support, community vs extended support
 
-### General Semantic Layer References (LOW confidence)
+### Zensical Documentation (MEDIUM confidence)
 
-- [Fan trap / chasm trap patterns](https://datacadamia.com/data/type/cube/semantic/fan_trap) -- general definition and detection approaches
-- [Role-playing dimensions pattern](https://www.starschema.co.uk/post/role-playing-dimensions) -- traditional data warehousing pattern
-- [Semantic Layer 2025 comparison](https://www.typedef.ai/resources/semantic-layer-metricflow-vs-snowflake-vs-databricks) -- MetricFlow vs Snowflake vs Databricks comparison
+- [Zensical GitHub repository](https://github.com/zensical/zensical) -- Successor to MkDocs Material, by same team (squidfunk)
+- [Zensical blog announcement](https://squidfunk.github.io/mkdocs-material/blog/2025/11/05/zensical/) -- Created because MkDocs unmaintained since Aug 2024
+- [Zensical setup guide](https://zensical.org/docs/create-your-site/) -- Configuration, GitHub Pages deployment
+- [Zensical publish guide](https://zensical.org/docs/publish-your-site/) -- GitHub Actions workflow for deployment
 
 ### Project Source Code (HIGH confidence -- direct analysis)
 
-- `src/model.rs` -- `Fact` struct (exists, unused), `Metric`/`Dimension`/`Join`/`TableRef` structs
-- `src/body_parser.rs` -- SQL keyword body parser (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS)
-- `src/expand.rs` -- expansion engine (no fact support, no derived metric support)
-- `src/graph.rs` -- `RelationshipGraph` with `check_no_diamonds()` (to be relaxed)
-- `test/sql/phase28_e2e.test` -- current end-to-end test pattern (reference for new tests)
-- `TECH-DEBT.md` -- resolved items 6-8 (ON-clause heuristic, unqualified names, statement rewrite)
+- `src/model.rs` -- `TableRef.pk_columns`, `Cardinality` enum (ManyToOne/OneToOne/OneToMany), `Join.cardinality`
+- `src/body_parser.rs` -- TABLES clause parser (PRIMARY KEY parsing exists, UNIQUE not yet)
+- `src/graph.rs` -- `RelationshipGraph`, cardinality tracking, fan trap detection
+- `Cargo.toml` -- `duckdb = "=1.4.4"` version pin, feature flags
+- `.github/workflows/Build.yml` -- extension-ci-tools@v1.4.4, single-version build
+- `.github/workflows/DuckDBVersionMonitor.yml` -- automated version detection

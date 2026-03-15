@@ -1,554 +1,566 @@
-# Architecture: Advanced Semantic Features Integration
+# Architecture: v0.5.4 Snowflake-Parity & Registry Publishing
 
-**Domain:** DuckDB semantic views extension -- FACTS, derived metrics, hierarchies, fan traps, role-playing dimensions, semi-additive metrics, multiple join paths
-**Researched:** 2026-03-14
-**Confidence:** HIGH (codebase analysis + Snowflake CREATE SEMANTIC VIEW reference + Cube.dev/MetricFlow patterns)
+**Domain:** DuckDB semantic views extension -- UNIQUE constraints, cardinality inference, multi-version DuckDB, CE registry publishing
+**Researched:** 2026-03-15
+**Confidence:** HIGH (direct codebase analysis, Snowflake official docs, DuckDB extension-ci-tools docs)
 
-## Recommended Architecture
+## Executive Summary
 
-The seven features integrate as modifications to three existing subsystems (body_parser, graph, expand) plus two new subsystems (metric_resolver, fan_detection). No changes needed to the FFI layer, catalog, DDL pipeline, or query table function.
+v0.5.4 introduces four architectural changes: (1) UNIQUE table constraints with Snowflake-style cardinality inference replacing explicit keywords, (2) multi-version DuckDB support for v1.4.4 and v1.5.0, (3) documentation site, and (4) community extension registry publishing. Features 1 and 2 are the only code-affecting changes. Feature 1 modifies three existing subsystems (body_parser, model, graph) and one expansion function (check_fan_traps). Feature 2 requires build system and CI changes, plus potential C++ shim adjustments for DuckDB 1.5.0 ABI. Features 3 and 4 are infrastructure-only.
 
-### Architecture Principle: Expansion-Only
+### Architecture Principle: Expansion-Only (Unchanged)
 
-All seven features remain within the "expansion-only" preprocessor model. The extension generates SQL; DuckDB executes it. No new connections, no new table functions, no changes to the query pipeline. Every feature translates to different SQL output from `expand()`.
+All code changes remain within the "expansion-only" preprocessor model. UNIQUE constraints and cardinality inference are define-time metadata changes. The expansion pipeline, query table function, FFI layer, and catalog persistence are unaffected.
 
-### Component Map (New + Modified)
+## Feature 1: UNIQUE Constraints + Cardinality Inference
+
+### Current State
+
+The current TABLES and RELATIONSHIPS syntax:
+
+```sql
+TABLES (
+  o AS orders PRIMARY KEY (id),
+  c AS customers PRIMARY KEY (id)
+)
+RELATIONSHIPS (
+  order_to_customer AS o(customer_id) REFERENCES c MANY TO ONE
+)
+```
+
+Cardinality is explicitly declared after REFERENCES with `MANY TO ONE`, `ONE TO ONE`, or `ONE TO MANY` keywords. The default when omitted is `ManyToOne` (most common FK pattern).
+
+### Target State (Snowflake-Aligned)
+
+```sql
+TABLES (
+  o AS orders PRIMARY KEY (id),
+  c AS customers PRIMARY KEY (id) UNIQUE (email)
+)
+RELATIONSHIPS (
+  order_to_customer AS o(customer_id) REFERENCES c
+)
+```
+
+Cardinality is INFERRED from PK/UNIQUE declarations. Explicit keywords are removed. The UNIQUE constraint is a new table-level annotation.
+
+### Component Changes
+
+#### 1. model.rs -- Add `unique_keys` to `TableRef`
+
+**Modification:** Add a new field to the existing `TableRef` struct.
+
+```rust
+pub struct TableRef {
+    pub alias: String,
+    pub table: String,
+    pub pk_columns: Vec<String>,
+    /// UNIQUE constraint columns for this table.
+    /// Multiple UNIQUE constraints are supported (each is a Vec of columns).
+    /// Snowflake: "If you already identified a column as a primary key column,
+    /// do not add the UNIQUE clause for that column."
+    /// Old stored JSON without this field deserializes with empty Vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unique_keys: Vec<Vec<String>>,
+}
+```
+
+**Rationale for `Vec<Vec<String>>`:** A table may have multiple UNIQUE constraints (e.g., `UNIQUE (email)` and `UNIQUE (phone, country_code)`). Each inner Vec is one constraint covering one or more columns. This matches Snowflake's syntax where multiple UNIQUE clauses are allowed per table.
+
+**Serialization:** `skip_serializing_if = "Vec::is_empty"` ensures backward compatibility -- old definitions without UNIQUE produce identical JSON. Old JSON without the field deserializes to `vec![]` via `#[serde(default)]`.
+
+**Impact on `Cardinality` enum:** The enum itself (`ManyToOne`, `OneToOne`, `OneToMany`) is UNCHANGED. Only the source of the value changes from explicit parse to inference.
+
+#### 2. body_parser.rs -- Parse UNIQUE in TABLES Entries
+
+**Modification to `parse_single_table_entry()`:** Currently parses `alias AS table PRIMARY KEY (cols)`. Must also parse optional `UNIQUE (cols)` clause(s) after PRIMARY KEY.
+
+```
+Current: alias AS table PRIMARY KEY (col1, col2)
+New:     alias AS table PRIMARY KEY (col1) [UNIQUE (col2, col3)] [UNIQUE (col4)]
+```
+
+**Implementation approach:** After extracting `pk_columns` from `PRIMARY KEY (...)`, check if the remaining text contains one or more `UNIQUE (...)` blocks. Parse each UNIQUE block the same way as PRIMARY KEY -- extract parenthesized comma-separated column names.
+
+**Parser changes (specific):**
+
+1. After the PRIMARY KEY `extract_paren_content()` call at line ~465 of body_parser.rs, consume the rest of the entry text.
+2. In a loop, find the next occurrence of `UNIQUE` keyword (using `find_keyword_ci` with `"UNIQUE"`).
+3. For each `UNIQUE` found, extract the parenthesized content and add to `unique_keys: Vec<Vec<String>>`.
+4. If remaining text after PK contains non-whitespace and non-UNIQUE content, emit a parse error.
+
+**Validation at parse time:**
+- PK columns must not appear in any UNIQUE constraint (Snowflake rule: "do not add UNIQUE for primary key columns").
+- Empty UNIQUE column list is rejected.
+- Duplicate UNIQUE constraints (same column set) are rejected.
+
+#### 3. body_parser.rs -- Remove Explicit Cardinality from RELATIONSHIPS
+
+**Modification to `parse_single_relationship_entry()` and `parse_cardinality_tokens()`:**
+
+**Strategy: Deprecation with backward compat.**
+
+Option A (recommended): **Remove** `parse_cardinality_tokens()` entirely. If any tokens remain after `REFERENCES <to_alias>`, emit a parse error with a helpful message: "Explicit cardinality keywords (MANY TO ONE, etc.) are no longer supported. Cardinality is inferred from PRIMARY KEY and UNIQUE constraints in TABLES."
+
+Option B (gradual): Keep `parse_cardinality_tokens()` but emit a deprecation warning. Infer cardinality from PK/UNIQUE anyway and verify it matches explicit declaration.
+
+**Recommendation: Option A.** This is a pre-release extension (v0.x). Breaking changes are expected. Removing the keywords simplifies the syntax and aligns with Snowflake. Old stored JSON with explicit `cardinality` fields still deserializes correctly via serde defaults -- only the DDL surface changes.
+
+#### 4. graph.rs -- Infer Cardinality at Validation Time
+
+**This is the core architectural decision: WHERE does inference happen?**
+
+**Recommendation: Post-parse, in `validate_graph()` (define-time).**
+
+**Rationale:**
+- The parser (`body_parser.rs`) should not need to cross-reference TABLES and RELATIONSHIPS. It parses each clause independently.
+- Cardinality inference requires knowing BOTH sides of the relationship: the FK-declaring side's constraints AND the referenced side's constraints.
+- `validate_graph()` already has access to the full `SemanticViewDefinition` with both `tables` and `joins`.
+- This follows the existing pattern: graph validation is a post-parse step in `define.rs bind()`.
+
+**Inference algorithm (new function in graph.rs):**
+
+```rust
+/// Infer cardinality for each relationship from PK/UNIQUE constraints.
+///
+/// Called after parsing, before graph validation. Mutates joins in place.
+///
+/// Rules (Snowflake-aligned):
+/// 1. The REFERENCES target column(s) MUST be covered by a PRIMARY KEY or
+///    UNIQUE constraint on the referenced table. If not: error.
+/// 2. If FK-declaring side also has PK or UNIQUE covering the FK columns:
+///    -> OneToOne (both sides are unique, so the mapping is bijective)
+/// 3. Otherwise:
+///    -> ManyToOne (many FK rows map to one PK/UNIQUE row)
+/// 4. OneToMany is the REVERSE of ManyToOne. Since relationships are always
+///    declared from FK side -> PK side, OneToMany only occurs when the
+///    FROM side has PK/UNIQUE on the FK columns AND the TO side does NOT.
+///    This is unusual (it means the "FK" side is actually the unique side)
+///    and would typically indicate the relationship direction is reversed.
+///    Treat this as ManyToOne from the declared direction.
+///
+/// Note: OneToMany as explicitly declared by users in v0.5.3 meant "from
+/// the FROM side's perspective, one row maps to many on the TO side."
+/// Under inference, this case is detected when the TO side has no PK/UNIQUE
+/// covering the referenced columns -- which is an ERROR (references must
+/// point to PK or UNIQUE columns).
+pub fn infer_cardinality(def: &mut SemanticViewDefinition) -> Result<(), String> {
+    // ...
+}
+```
+
+**Detailed inference logic:**
+
+For each relationship `rel_name AS from_alias(fk_cols) REFERENCES to_alias`:
+
+1. Look up `to_alias` in `def.tables`. Get its `pk_columns` and `unique_keys`.
+2. Check if `fk_cols` are "covered" by the referenced table's PK or any UNIQUE:
+   - "Covered" means the FK column set is a subset of (or equal to) the PK column set or any UNIQUE column set.
+   - If the relationship specifies explicit referenced columns (currently not in syntax but implied by PK), the FK columns map 1:1 to PK columns (already validated by `check_fk_pk_counts()`).
+   - If NOT covered: **error** -- "Relationship 'rel_name' references table 'to_alias' but the referenced columns are not covered by PRIMARY KEY or UNIQUE. Add a UNIQUE constraint or adjust the relationship."
+3. If covered by PK or UNIQUE on the TO side (mandatory by step 2), check the FROM side:
+   - Look up `from_alias` in `def.tables`. Get its `pk_columns` and `unique_keys`.
+   - If the FROM side's `fk_cols` are covered by its own PK or any UNIQUE: **OneToOne**.
+   - Otherwise: **ManyToOne**.
+
+**Why OneToMany disappears:** In Snowflake's model, relationships always go from FK side (many) to PK/UNIQUE side (one). The "one to many" direction is simply the reverse traversal of a many-to-one edge. The expansion engine already handles this: `check_fan_traps()` checks BOTH directions on the tree path. A `ManyToOne` edge traversed from PK->FK direction IS the "one to many" fan-out case, which is what fan trap detection catches.
+
+**Wait -- what about existing OneToMany usage in v0.5.3?** The v0.5.3 fan trap tests explicitly create `OneToMany` cardinality. Under inference, these cases work as follows:
+- If the user declares `o(customer_id) REFERENCES c` where `c` has `PRIMARY KEY (id)`, inference produces `ManyToOne`.
+- If the user declares `c(id) REFERENCES o` where `o` does NOT have the referenced columns as PK/UNIQUE, that is an error (references must target PK/UNIQUE).
+- The fan trap detection code in `expand.rs` currently checks edge direction. A `ManyToOne` edge from `o->c` means: traversing `o->c` is safe (many go to one), traversing `c->o` is fan-out. This is semantically IDENTICAL to `OneToMany` on a reverse edge. The existing detection logic works correctly because it checks both `(from, to)` and `(to, from)` lookups in `card_map`.
+
+**Specific changes in expand.rs check_fan_traps():**
+
+The `card_map` construction (lines 1014-1029) uses `j.cardinality` directly. After inference, `j.cardinality` will be either `ManyToOne` or `OneToOne` (never `OneToMany`). The fan trap check at lines 1082-1092 calls `check_path_up()` and `check_path_down()`. These already handle bidirectional traversal:
+- Walking from child to parent (up): a `ManyToOne` edge is safe in this direction.
+- Walking from parent to child (down): a `ManyToOne` edge is FAN-OUT in this direction (one parent maps to many children).
+
+So the existing logic naturally handles the case where `OneToMany` is removed as a variant, because fan-out is detected by DIRECTION of traversal relative to the `ManyToOne` edge. **No changes needed in `check_fan_traps()` itself** -- only the inference step that populates `cardinality` on each `Join`.
+
+**Should `Cardinality::OneToMany` be removed from the enum?**
+
+**Recommendation: YES, remove it.** Under inference, `OneToMany` cannot be produced (it would require the TO side to lack PK/UNIQUE, which is an error). Removing it simplifies the model. However, old stored JSON with `"cardinality": "OneToMany"` must still deserialize. Two options:
+
+- **Option A (recommended):** Keep the enum variant but mark it `#[deprecated]` and have serde deserialize it as `ManyToOne` (with a note that the relationship direction is reversed). Actually, better: keep the three-variant enum for backward compat but never produce `OneToMany` from the inference path. `check_fan_traps()` already handles all three variants correctly.
+
+- **Option B:** Remove the variant, add a custom deserializer that maps `"OneToMany"` to `ManyToOne`. This breaks the semantic meaning of old definitions.
+
+**Final recommendation: Keep `OneToMany` in the enum for serde compatibility. The inference function never produces it. Fan trap detection already handles all three. No code changes needed in expand.rs.**
+
+#### 5. define.rs -- Wire Inference Into Validation Chain
+
+**Modification:** Call `infer_cardinality()` before `validate_graph()`.
+
+```rust
+// In DefineFromJsonVTab::bind():
+
+// Step 1: Infer cardinality from PK/UNIQUE constraints (v0.5.4).
+crate::graph::infer_cardinality(&mut def)
+    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
+// Step 2: Validate relationship graph (existing).
+crate::graph::validate_graph(&def)
+    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+
+// Step 3+: existing validations unchanged...
+```
+
+**Important:** `def` must be `mut` for inference to write cardinality values onto `Join` structs. Currently `def` is constructed from `from_json()` and then passed to validations. The mutation happens before any validation, so the flow is clean.
+
+#### 6. Validation: Referenced Columns Must Be PK/UNIQUE
+
+This is a NEW validation that does not exist in v0.5.3. Currently `check_fk_pk_counts()` only verifies that the FK column COUNT matches the PK column COUNT. It does not verify that the referenced table's PK/UNIQUE actually exists.
+
+Under Snowflake-style inference, the referenced side MUST have PK or UNIQUE covering the referenced columns. This validation naturally falls out of the `infer_cardinality()` function (step 2 above produces an error if not covered).
+
+### Data Flow: UNIQUE + Inference
 
 ```
 DDL Input
   |
   v
-body_parser.rs  [MODIFY] -- add FACTS/HIERARCHIES clause parsing
+body_parser.rs
+  |  parse_single_table_entry()  -> TableRef { pk_columns, unique_keys }
+  |  parse_single_relationship_entry() -> Join { cardinality: ManyToOne (default) }
+  |  (no explicit cardinality keywords parsed)
   |
   v
-model.rs        [MODIFY] -- add Hierarchy, NON_ADDITIVE_BY, USING relationships, derived flag
+define.rs bind()
   |
   v
-graph.rs        [MODIFY] -- relax diamond rejection, support named relationships, role-playing
+graph::infer_cardinality(&mut def)
+  |  For each Join:
+  |    1. Check TO side has PK/UNIQUE covering referenced cols -> error if not
+  |    2. Check FROM side has PK/UNIQUE covering FK cols -> OneToOne if yes, ManyToOne if no
+  |    3. Write inferred cardinality onto Join.cardinality
   |
   v
-metric_resolver [NEW]    -- topological sort of metric dependencies, derived expansion
+graph::validate_graph(&def)    (existing, unchanged)
+  |  check_fk_pk_counts()      (existing, now also covered by inference)
+  |  check_no_diamonds()       (existing, unchanged)
+  |  check_no_orphans()        (existing, unchanged)
   |
   v
-fan_detection   [NEW]    -- detect fan-out risk from graph + metric source analysis
+Stored as JSON               (Join.cardinality serialized as before)
   |
   v
-expand.rs       [MODIFY] -- facts substitution, derived metric expansion, semi-additive SQL,
-                            USING relationship join path selection, hierarchy metadata
+expand.rs                    (reads Join.cardinality, unchanged)
+  |  check_fan_traps()        (uses cardinality from Join, unchanged)
+  |  resolve_joins_pkfk()     (unchanged)
   |
   v
-define.rs       [MODIFY] -- wire new validation (fan warning, metric DAG cycles)
+Final SQL
 ```
 
-### Component Boundaries
+## Feature 2: Multi-Version DuckDB Support
 
-| Component | Responsibility | Communicates With |
-|-----------|---------------|-------------------|
-| `body_parser.rs` | Parse FACTS/HIERARCHIES clauses, NON ADDITIVE BY, USING, derived metric syntax | model.rs (produces structs) |
-| `model.rs` | Data structures: Hierarchy, metric additivity, relationship names, derived flag | All consumers |
-| `graph.rs` | Named relationships, multi-path support (relaxed diamond check), role-playing table aliases | expand.rs, define.rs, fan_detection |
-| `metric_resolver.rs` (NEW) | Resolve derived metric dependency DAG, topological order, cycle detection | expand.rs |
-| `fan_detection.rs` (NEW) | Detect fan-out risk from graph topology + requested metrics, emit warnings | define.rs, expand.rs |
-| `expand.rs` | Generate SQL with facts substitution, derived subqueries, semi-additive window functions, USING-based join path selection | query pipeline (unchanged) |
-| `define.rs` | Wire fan trap warnings and metric DAG validation at CREATE time | graph.rs, metric_resolver, fan_detection |
+### Current State
 
-### Data Flow
+- Cargo.toml pins `duckdb = "=1.4.4"` and `libduckdb-sys = "=1.4.4"`
+- `.duckdb-version` file contains `v1.4.4`
+- Build.yml uses `extension-ci-tools@v1.4.4`
+- C++ shim compiled against DuckDB 1.4.4 amalgamation (`cpp/include/duckdb.hpp`)
+- DuckDB 1.5.0 released 2026-03-09 (6 days ago)
+- duckdb-rs 1.5.0 crate appears to be available
+
+### Multi-Version Strategy
+
+DuckDB extension binaries are **version-pinned** -- a binary built for v1.4.4 cannot load in v1.5.0. The extension-ci-tools repository maintains separate branches per DuckDB version (v1.4.4, v1.5.0). Multi-version support means building and distributing SEPARATE binaries for each supported DuckDB version.
+
+**Recommendation: Git branching, NOT conditional compilation.**
+
+#### Why NOT `#[cfg]` Conditional Compilation
+
+Conditional compilation (`#[cfg(duckdb_version = "1.4")]`) is the wrong abstraction here because:
+
+1. **The Rust code is identical across versions.** The semantic views extension uses the DuckDB C API (via duckdb-rs) and C++ API (via amalgamation). The Rust business logic (parsing, model, graph, expand) does not depend on DuckDB version.
+
+2. **Version differences are in dependencies, not in code paths.** The only things that change between v1.4.4 and v1.5.0 are:
+   - `Cargo.toml`: `duckdb = "=1.4.4"` vs `duckdb = "=1.5.0"`
+   - `Cargo.toml`: `libduckdb-sys = "=1.4.4"` vs `libduckdb-sys = "=1.5.0"`
+   - `.duckdb-version`: `v1.4.4` vs `v1.5.0`
+   - `cpp/include/duckdb.hpp` and `cpp/include/duckdb.cpp`: amalgamation files matching the target version
+   - Build.yml: `extension-ci-tools@v1.4.4` vs `extension-ci-tools@v1.5.0`
+
+3. **If the C API changes between versions** (e.g., DuckDB 1.5.0 adds a new PEG parser that changes `ParserExtension` behavior), the fix would be in the C++ shim (`shim.cpp`), not in Rust code behind `#[cfg]` flags. And the duckdb-rs/libduckdb-sys crate would handle Rust-side API changes.
+
+4. **The DuckDB community extension ecosystem uses separate branches per version.** This is the established pattern: extension-ci-tools has `v1.4.4` and `v1.5.0` branches. Fighting this pattern adds complexity for no benefit.
+
+#### Recommended Branch Strategy
 
 ```
-CREATE SEMANTIC VIEW sales_analysis AS
-  TABLES (...)
-  RELATIONSHIPS (
-    sale_date AS o(order_date) REFERENCES d(date_key),
-    ship_date AS o(ship_date) REFERENCES d(date_key)   -- role-playing
-  )
-  FACTS (
-    o.line_total AS o.quantity * o.unit_price
-  )
-  HIERARCHIES (
-    geo AS c.country, c.region, c.city
-  )
-  DIMENSIONS (...)
-  METRICS (
-    o.revenue AS SUM(o.line_total),                     -- references fact
-    o.cost AS SUM(o.unit_cost * o.quantity),
-    profit AS o.revenue - o.cost,                       -- derived metric
-    o.latest_balance NON ADDITIVE BY (date_dim) AS SUM(o.balance)  -- semi-additive
-  )
-
-                            body_parser.rs
-                                 |
-                    parses into model structs
-                                 |
-                         define.rs (bind)
-                        /        |        \
-              graph.rs    metric_resolver  fan_detection
-             (validates    (validates       (warns if
-              named         metric DAG,     fan-out risk
-              rels,         no cycles)      detected)
-              multi-path)
-                                 |
-                           stored as JSON
-                                 |
-                     semantic_view('sales_analysis',
-                       dimensions := ['region'],
-                       metrics := ['profit'])
-                                 |
-                            expand.rs
-                        /       |        \
-              resolve_joins  resolve_derived  build_semi_additive
-              (uses USING    (topo-sort       (window function
-               named path)   metric deps)     for NON ADDITIVE)
-                                 |
-                        Final SQL string
-                                 |
-                       DuckDB executes (unchanged)
+main                  -> latest DuckDB (1.5.0), primary development
+  |
+  +-- v1.4.x          -> DuckDB 1.4.4 LTS backport branch
 ```
 
-## Feature-by-Feature Integration
+**Workflow:**
+1. All new feature development happens on `main` targeting DuckDB 1.5.0.
+2. After each milestone, cherry-pick or merge fixes to `v1.4.x` branch.
+3. CI builds both branches. Each produces separate extension binaries.
+4. Community extension registry submission includes both versions.
 
-### 1. FACTS Clause
+**What lives on the `v1.4.x` branch:**
+- Identical Rust source code (same `src/` directory)
+- `Cargo.toml` with `duckdb = "=1.4.4"`, `libduckdb-sys = "=1.4.4"`
+- DuckDB 1.4.4 amalgamation in `cpp/include/`
+- `.duckdb-version` set to `v1.4.4`
+- Build.yml targeting `extension-ci-tools@v1.4.4`
 
-**What:** Named row-level sub-expressions scoped to a table alias. Referenced in metric expressions instead of raw column math.
+### C++ Shim ABI Considerations
 
-**Model change:** `Fact` struct already exists in `model.rs` (scaffolded in Phase 11). No model change needed.
+The C++ shim (`cpp/src/shim.cpp`) uses these DuckDB C++ types:
+- `ParserExtension` (parse_function, plan_function)
+- `ParserExtensionParseResult`
+- `ParserExtensionParseData`
+- `ParserExtensionPlanResult`
+- `TableFunction`
+- `FunctionData`, `GlobalTableFunctionState`
+- `ClientContext`, `TableFunctionBindInput`, `TableFunctionInput`
+- `DataChunk`
+- `DBConfig`, `DatabaseWrapper`
+- `LogicalType::VARCHAR`
+- `Value`, `StringValue`
 
-**Parser change:** Add `"facts"` to `CLAUSE_KEYWORDS` and `CLAUSE_ORDER` in `body_parser.rs`. Parse entries as `alias.name AS sql_expr` with optional PRIVATE modifier. Insert between RELATIONSHIPS and DIMENSIONS in clause order.
+**DuckDB 1.5.0 risk: PEG parser.** DuckDB 1.5.0 ships an experimental PEG parser (disabled by default, opt-in via `CALL enable_peg_parser()`). The traditional parser and `ParserExtension` hooks are **still the default** in 1.5.0. The PEG parser "allows extensions to extend the grammar" but the mechanism may differ from `ParserExtension`.
 
-**Expansion change:** Before metric expansion, scan metric expressions for fact references (`fact_name` or `alias.fact_name`). Replace each reference with the fact's `expr` (parenthesized). This is pure text substitution on the expression string before it enters the SELECT clause.
+**Action items:**
+1. Build against DuckDB 1.5.0 amalgamation and verify `shim.cpp` compiles without changes.
+2. Test that parser hooks work as before (CREATE SEMANTIC VIEW, DROP, DESCRIBE, SHOW).
+3. Test with PEG parser enabled (`CALL enable_peg_parser()`) to see if extension hooks still fire.
+4. If PEG parser breaks the hooks: document incompatibility, recommend keeping PEG parser disabled.
 
-**Graph change:** None. Facts are row-level expressions, not join-affecting.
+**Likely outcome:** The 1.5.0 transition should be smooth. The `ParserExtension` API is the same C++ interface. The amalgamation compilation may need the existing Windows patching logic updated (new `#include` patterns), but the macOS/Linux path should be unchanged.
 
-**Validation:** At define time, verify fact `source_table` aliases exist in the TABLES clause (reuse `check_source_tables_reachable` pattern). Verify no circular references between facts.
+### CI Architecture for Dual-Version Builds
 
-**SQL output example:**
-```sql
--- FACT: o.line_total AS o.quantity * o.unit_price
--- METRIC: o.revenue AS SUM(o.line_total)
--- Expanded:
-SELECT SUM(("o"."quantity" * "o"."unit_price")) AS "revenue"
+#### Current CI Structure
+
+```
+Build.yml
+  |
+  +-- duckdb-stable-build (v1.4.4)
+       uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
 ```
 
-**Complexity:** Low. Model exists. Parser is a new clause variant following existing patterns. Expansion is string substitution.
+#### Proposed CI Structure
 
-### 2. Derived Metrics
-
-**What:** Metrics that reference other metrics by name. E.g., `profit AS revenue - cost`. Snowflake syntax: derived metrics omit the `table_alias.` prefix.
-
-**Model change:** Add `is_derived: bool` flag to `Metric` struct (or infer from absence of `source_table`). Derived metrics have no `source_table` -- they are computed post-aggregation.
-
-**New component: `metric_resolver.rs`**
-- Build a directed dependency graph: derived metric -> referenced metrics
-- Topological sort to determine evaluation order
-- Detect cycles (error at define time)
-- At expand time, resolve leaf metrics first, then compose derived metrics from their results
-
-**Expansion change:** This is the most architecturally significant feature. Derived metrics cannot appear in the same GROUP BY query as their constituent metrics -- they must be computed AFTER aggregation. Two strategies:
-
-**Strategy A (Recommended): Expression inlining**
-If derived metric `profit = revenue - cost`, and `revenue = SUM(o.amount)`, `cost = SUM(o.unit_cost * o.quantity)`, inline to produce:
-```sql
-SELECT
-    SUM("o"."amount") AS "revenue",
-    SUM("o"."unit_cost" * "o"."quantity") AS "cost",
-    SUM("o"."amount") - SUM("o"."unit_cost" * "o"."quantity") AS "profit"
 ```
-This works when derived metrics are simple arithmetic over aggregates from the same GROUP BY grain.
+Build.yml
+  |
+  +-- duckdb-latest-build (v1.5.0) -- runs on main branch
+  |    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.0
+  |
+  +-- duckdb-lts-build (v1.4.4) -- runs on v1.4.x branch
+       uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
 
-**Strategy B: Subquery wrapping**
-When derived metrics reference metrics from different join paths (cross-path derived metrics), use a CTE or subquery:
-```sql
-WITH _base AS (
-  SELECT region, SUM(amount) AS revenue, SUM(cost) AS cost
-  FROM ...
-  GROUP BY region
-)
-SELECT region, revenue, cost, revenue - cost AS profit FROM _base
+DuckDBVersionMonitor.yml
+  |
+  +-- Now monitors for new DuckDB releases on BOTH branches
+  +-- Opens PRs against main (latest) and v1.4.x (LTS)
 ```
 
-Strategy A is simpler, covers 90% of cases, and avoids changing the single-query expansion model. Strategy B is needed only for cross-path derived metrics (which interact with USING RELATIONSHIPS).
+**Alternatively (simpler):** Keep Build.yml on `main` targeting v1.5.0 only. The `v1.4.x` branch has its own Build.yml targeting v1.4.4. Each branch is self-contained. The DuckDB Version Monitor only watches `main`.
 
-**Recommendation:** Implement Strategy A first. Add Strategy B only if cross-path derived metrics are scoped in.
+**Recommendation: Keep it simple.** Each branch owns its own Build.yml with the appropriate version. No matrix builds across versions. The `v1.4.x` branch is a backport branch with minimal maintenance.
 
-**Complexity:** Medium. Requires new module, DAG construction, cycle detection. But expansion change is modest for Strategy A.
+### Cargo.toml Changes for v1.5.0
 
-### 3. Hierarchies / Drill-Down Paths
-
-**What:** Named ordered lists of dimensions representing drill-down paths (e.g., `geo AS country, region, city`). Metadata-only -- does not change SQL generation. Used by BI tools and DESCRIBE output.
-
-**Model change:** Add `Hierarchy` struct to `model.rs`:
-```rust
-pub struct Hierarchy {
-    pub name: String,
-    pub levels: Vec<String>,  // dimension names in drill-down order
-}
-```
-Add `pub hierarchies: Vec<Hierarchy>` to `SemanticViewDefinition`.
-
-**Parser change:** Add `"hierarchies"` to `CLAUSE_KEYWORDS` and `CLAUSE_ORDER`. Parse entries as `name AS dim1, dim2, dim3`. Place after FACTS, before DIMENSIONS.
-
-**Expansion change:** None. Hierarchies are metadata. They do not affect SQL generation.
-
-**Validation:** At define time, verify all dimension names referenced in hierarchy levels exist in the DIMENSIONS clause.
-
-**DESCRIBE change:** Include hierarchies in `describe_semantic_view` output (new rows or new section).
-
-**Complexity:** Low. Metadata-only feature. No expansion changes.
-
-### 4. Fan Trap Detection
-
-**What:** Detect when a query might produce inflated aggregation results due to one-to-many fan-out across join paths. Emit a warning (not an error) at define time or query time.
-
-**New component: `fan_detection.rs`**
-
-**Detection algorithm:**
-1. From the `RelationshipGraph`, identify relationship cardinality. Currently the graph has edges but no cardinality annotation. Since PK/FK relationships are inherently many-to-one (FK side has many rows pointing to PK side), the graph edges encode directionality: `from_alias` (FK side, many) -> `to_alias` (PK side, one).
-2. A fan trap occurs when two one-to-many paths diverge from a common ancestor, and metrics from BOTH branches are aggregated together. In graph terms: node A has edges to B and C (A is parent of both), and metrics reference columns from both B and C.
-3. At define time: analyze the graph for "fan patterns" -- nodes with 2+ children where metrics span multiple children.
-4. At query time (in `expand`): check if the requested metrics come from tables that fan out from a common ancestor.
-
-**Warning, not error:** Fan traps are sometimes intentional (e.g., COUNT DISTINCT avoids double-counting). Emit a diagnostic warning, not a hard error.
-
-**Integration points:**
-- `define.rs`: call `detect_fan_traps(&def, &graph)` after graph validation, store warnings in definition metadata
-- `expand.rs`: optionally re-check at query time for the specific requested dimension/metric combination
-
-**Model change:** Add optional `warnings: Vec<String>` to definition (or return from define as side-channel).
-
-**Complexity:** Medium. The graph analysis is straightforward (BFS from root, track descendants per branch). The challenge is accurately determining when fan-out WILL produce incorrect results vs. when it is safe (COUNT DISTINCT, MAX, MIN are fan-safe; SUM, COUNT, AVG are not).
-
-### 5. Role-Playing Dimensions
-
-**What:** Same physical table joined via different relationships to serve different roles. E.g., a `dates` table joined as both `order_date` and `ship_date`.
-
-**Snowflake syntax:**
-```sql
-RELATIONSHIPS (
-  sale_date AS orders(order_date_key) REFERENCES dates(date_key),
-  ship_date AS orders(ship_date_key) REFERENCES dates(date_key)
-)
+```toml
+[dependencies]
+duckdb = { version = "=1.5.0", default-features = false }
+libduckdb-sys = "=1.5.0"
 ```
 
-**Model change:** The `Join` struct already has a `name: Option<String>` field (Phase 24). This is the relationship name. For role-playing, multiple `Join` entries reference the same physical table (`dates`) but with different `from_alias` FK columns and different relationship names.
+**Risk:** If `duckdb-rs` 1.5.0 has breaking API changes (renamed methods, changed traits), the Rust code may need updates. Check the `duckdb-rs` changelog before upgrading.
 
-The key change: each role-playing instance needs its OWN table alias. The `dates` table appears twice in the join with different aliases (e.g., `sale_date` and `ship_date` are both aliases for `dates`).
+**build.rs changes:** The Windows patching logic in `patch_duckdb_cpp_for_windows()` checks for specific string markers in `duckdb.cpp`. DuckDB 1.5.0 may have different line numbers or patterns. The patching is already defensive (emits a `cargo:warning` if markers are not found), so it degrades gracefully.
 
-**Graph change:** The current `RelationshipGraph` uses `table.to_ascii_lowercase()` (the join target alias) as the node identifier. For role-playing, TWO joins target the same physical table but with different relationship names. The graph must:
-1. Allow multiple edges to the same physical table (currently rejected as "diamond")
-2. Use the RELATIONSHIP NAME as the disambiguating key, not just the table alias
-3. Relax `check_no_diamonds()` to allow diamonds where relationships are explicitly named
+## Feature 3: Documentation Site
 
-**Implementation approach:**
-- The TABLES clause declares each role-playing alias as a separate logical table:
-  ```sql
-  TABLES (
-    o AS orders PRIMARY KEY (id),
-    sale_date AS dates PRIMARY KEY (date_key),
-    ship_date AS dates PRIMARY KEY (date_key)
-  )
-  ```
-- Each gets its own alias in the graph (already supported -- `sale_date` and `ship_date` are different aliases)
-- Relationships connect `o` -> `sale_date` and `o` -> `ship_date`
-- Dimensions scoped to `sale_date.year` vs `ship_date.year` resolve to different join paths
+**Architecture impact: NONE.** This is a static site (likely Zensical on GitHub Pages) generated from markdown. No code changes.
 
-**Graph change (specific):** Actually, if role-playing aliases are declared as separate TABLES entries, the current graph already handles this correctly -- `sale_date` and `ship_date` are different nodes, different aliases, no diamond. The diamond check only fires when TWO relationships point to the SAME alias, which role-playing avoids by using distinct aliases.
+**Build integration:** Add a GitHub Actions workflow that builds the docs site and deploys to GitHub Pages on push to `main`.
 
-**Expansion change:** Minimal. The expansion already generates `LEFT JOIN "dates" AS "sale_date"` and `LEFT JOIN "dates" AS "ship_date"` from separate graph nodes. Each has its own ON clause via PK/FK synthesis.
+## Feature 4: Community Extension Registry Publishing
 
-**Complexity:** Low. The existing architecture handles this naturally via alias-per-role in TABLES. No new code needed in graph.rs -- just documentation and examples showing the pattern. The body_parser already supports multiple TABLES entries pointing to the same physical table.
+**Architecture impact: MINIMAL.** Requires:
+1. A `description.yml` file in the repo root (already partially exists via the extension template).
+2. A PR to `duckdb/community-extensions` repository.
+3. Verification that the extension loads correctly via `INSTALL semantic_views FROM community; LOAD semantic_views;`.
 
-### 6. Semi-Additive Metrics (NON ADDITIVE BY)
+**description.yml considerations:**
+- `extension.version` is a freeform string (not enforced scheme).
+- The build must produce artifacts matching the expected layout (handled by extension-ci-tools).
+- Multi-version: may need separate description.yml per DuckDB version, or the CE infrastructure handles version routing.
 
-**What:** Metrics that should not be summed across specific dimensions. Instead of SUM across the non-additive dimension, take the LAST value (latest snapshot). Snowflake takes the last row when sorted by the non-additive dimensions.
+## Component Boundaries (v0.5.4 Summary)
 
-**Model change:** Add to `Metric`:
-```rust
-pub struct NonAdditiveSpec {
-    pub dimensions: Vec<String>,
-    pub sort_order: Vec<SortDirection>,  // ASC/DESC per dimension
-}
-
-pub enum SortDirection {
-    Asc,
-    Desc,  // default: take latest
-}
-```
-Add `pub non_additive_by: Option<NonAdditiveSpec>` to `Metric`.
-
-**Parser change:** Parse `NON ADDITIVE BY (dim1 [ASC|DESC], dim2 [ASC|DESC])` after the metric name, before `AS`. Follows Snowflake syntax exactly.
-
-**Expansion change:** This is the most complex SQL generation change. When a semi-additive metric is requested:
-
-1. If the query includes ALL non-additive dimensions in its GROUP BY, the metric behaves normally (additive aggregation is safe because the non-additive dimensions are already grouped).
-
-2. If the query OMITS some non-additive dimensions, the expansion must:
-   a. Use a window function to identify the "latest" row per group
-   b. Then aggregate only those latest rows
-
-**SQL generation pattern:**
-```sql
--- Semi-additive: latest_balance NON ADDITIVE BY (date_dim DESC)
--- Query: dimensions=[region], metrics=[latest_balance]
-
--- Step 1: Rank rows within each group by the non-additive dimension
--- Step 2: Filter to rank=1 (latest)
--- Step 3: Aggregate the filtered rows
-
-SELECT
-    "region",
-    SUM("balance") AS "latest_balance"
-FROM (
-    SELECT
-        "o"."region",
-        "o"."balance",
-        ROW_NUMBER() OVER (
-            PARTITION BY "o"."region"
-            ORDER BY "o"."date_dim" DESC
-        ) AS "_rn"
-    FROM "orders" AS "o"
-) AS "_semi"
-WHERE "_rn" = 1
-GROUP BY 1
-```
-
-When MULTIPLE semi-additive metrics with different `NON ADDITIVE BY` specs are requested in the same query, each needs its own subquery. This significantly complicates the single-query expansion model.
-
-**Recommendation:** Start with single semi-additive metric per query. If multiple are needed, use CTE-based approach:
-```sql
-WITH _semi_balance AS (
-    SELECT region, balance,
-        ROW_NUMBER() OVER (PARTITION BY region ORDER BY date_dim DESC) AS _rn
-    FROM orders
-),
-_semi_inventory AS (
-    SELECT region, inventory,
-        ROW_NUMBER() OVER (PARTITION BY region ORDER BY snapshot_date DESC) AS _rn
-    FROM warehouses
-)
-SELECT
-    b.region,
-    SUM(b.balance) AS latest_balance,
-    SUM(i.inventory) AS latest_inventory
-FROM _semi_balance b
-JOIN _semi_inventory i ON b.region = i.region
-WHERE b._rn = 1 AND i._rn = 1
-GROUP BY 1
-```
-
-**Complexity:** High. Requires subquery wrapping, which changes the fundamental expansion pattern from single flat SELECT to potentially nested CTEs. The interaction with other joins adds further complexity.
-
-### 7. Multiple Join Paths (USING RELATIONSHIPS)
-
-**What:** Allow diamonds in the relationship graph when the user explicitly names relationships and specifies which path to use per metric via `USING (relationship_name)`.
-
-**Model change:** Add `pub using_relationships: Option<Vec<String>>` to `Metric`. When present, specifies which named relationships to traverse for this metric's join resolution.
-
-**Parser change:** Parse `USING (rel1, rel2)` after metric name, before `AS`. Follows Snowflake syntax.
-
-**Graph change:** This is the main architectural change to `graph.rs`:
-1. `check_no_diamonds()` must be relaxed: diamonds are allowed when ALL relationships involved are named (have `name: Some(...)`)
-2. New validation: when diamonds exist, every metric that touches tables reachable via multiple paths MUST have a `USING` clause to disambiguate
-3. `RelationshipGraph` needs to support path-specific traversal: "find the path from root to table X using only relationships R1, R2, R3"
-
-**Expansion change:** `resolve_joins_pkfk` currently walks reverse edges unconditionally. With USING:
-1. Filter the graph edges to only those whose relationship name is in the metric's `USING` list
-2. Resolve joins using only the filtered subgraph
-3. Different metrics in the same query might use different join paths -- this means the FROM clause could need multiple join instances of the same table
-
-**Interaction with role-playing:** Role-playing dimensions are a special case of multiple join paths. If the user declares `sale_date` and `ship_date` as separate aliases, no diamond exists and no USING is needed. USING is needed when the same alias is reachable via multiple named relationships.
-
-**Complexity:** High. Changes the fundamental assumption in graph.rs (tree structure). Requires per-metric join resolution instead of per-query. The expansion must handle different metrics needing different join paths in the same query -- potentially requiring subquery-per-metric with a final join.
+| Component | Change Type | What Changes | Risk |
+|-----------|------------|--------------|------|
+| `model.rs` | MODIFY | Add `unique_keys: Vec<Vec<String>>` to `TableRef` | Low -- additive serde field |
+| `body_parser.rs` | MODIFY | Parse UNIQUE in TABLES; remove cardinality keywords from RELATIONSHIPS | Medium -- two parser changes |
+| `graph.rs` | MODIFY | Add `infer_cardinality()` function | Medium -- new inference logic |
+| `define.rs` | MODIFY | Wire `infer_cardinality()` before `validate_graph()` | Low -- one new call |
+| `expand.rs` | NONE | Reads `Join.cardinality` as before | None |
+| `shim.cpp` | VERIFY | May need recompile against 1.5.0 amalgamation | Low-Medium |
+| `build.rs` | VERIFY | Windows patches may need updating for 1.5.0 | Low |
+| `Cargo.toml` | MODIFY | Version pin update to 1.5.0 | Low |
+| `.duckdb-version` | MODIFY | Update to v1.5.0 | None |
+| `Build.yml` | MODIFY | Update extension-ci-tools tag | Low |
+| `description.yml` | NEW | CE registry descriptor | None |
 
 ## Patterns to Follow
 
-### Pattern 1: Clause Extension in body_parser.rs
+### Pattern 1: Post-Parse Inference (New)
 
-**What:** Adding new clauses (FACTS, HIERARCHIES) to the keyword body parser.
-**When:** Any new DDL clause.
+**What:** Compute derived metadata from parsed structures before validation.
+**When:** When a property depends on cross-referencing multiple parsed clauses.
 **Example:**
+
 ```rust
-// 1. Add to CLAUSE_KEYWORDS
-const CLAUSE_KEYWORDS: &[&str] = &[
-    "tables", "relationships", "facts", "hierarchies", "dimensions", "metrics"
-];
+// In define.rs bind(), AFTER parsing, BEFORE validation:
+let mut def = SemanticViewDefinition::from_json(&name, &json)?;
 
-// 2. Add to CLAUSE_ORDER (defines valid ordering)
-const CLAUSE_ORDER: &[&str] = &[
-    "tables", "relationships", "facts", "hierarchies", "dimensions", "metrics"
-];
+// Infer cardinality from PK/UNIQUE (v0.5.4)
+graph::infer_cardinality(&mut def)?;
 
-// 3. Add parse function following existing pattern (parse_tables_clause, parse_relationships_clause)
-fn parse_facts_clause(content: &str, offset: usize) -> Result<Vec<Fact>, ParseError> {
-    // Split at depth-0 commas, parse each entry
-}
-
-// 4. Add to KeywordBody struct
-pub struct KeywordBody {
-    pub tables: Vec<TableRef>,
-    pub relationships: Vec<Join>,
-    pub facts: Vec<Fact>,          // NEW
-    pub hierarchies: Vec<Hierarchy>, // NEW
-    pub dimensions: Vec<Dimension>,
-    pub metrics: Vec<Metric>,
-}
+// Validate graph (existing)
+graph::validate_graph(&def)?;
 ```
 
-### Pattern 2: Define-Time Validation Chain
+**Why this pattern:** The parser should not need context from other clauses. Inference is a semantic pass that runs after syntactic parsing is complete. This separates concerns: body_parser.rs handles syntax, graph.rs handles semantics.
 
-**What:** New validations run at CREATE time in define.rs bind().
-**When:** Any feature that can detect errors before query time.
+### Pattern 2: Backward-Compatible Serde Fields
+
+**What:** Adding new optional fields to serialized structs without breaking old JSON.
+**When:** Any model.rs struct change.
 **Example:**
+
 ```rust
-// In define.rs bind():
-// 1. Existing: validate_graph(&def)?
-// 2. NEW: validate metric DAG
-metric_resolver::validate_metric_dag(&def)?;
-// 3. NEW: detect fan traps (warning, not error)
-let warnings = fan_detection::detect_fan_traps(&def, &graph);
-// 4. NEW: validate hierarchy dimension references
-validate_hierarchies(&def)?;
+#[serde(default, skip_serializing_if = "Vec::is_empty")]
+pub unique_keys: Vec<Vec<String>>,
 ```
 
-### Pattern 3: Expression Substitution in expand.rs
+**Rules:**
+- Always use `#[serde(default)]` for new fields.
+- Use `skip_serializing_if` to avoid bloating JSON for definitions that don't use the feature.
+- Write a test verifying old JSON without the field deserializes correctly.
 
-**What:** Replace symbolic names in metric expressions with their underlying SQL.
-**When:** Facts (name -> expr), derived metrics (metric name -> aggregate expr).
+### Pattern 3: Helpful Error Messages for Syntax Changes
+
+**What:** When removing syntax, provide a clear migration message.
+**When:** Breaking DDL changes.
 **Example:**
+
 ```rust
-fn substitute_facts(expr: &str, facts: &[Fact], tables: &[TableRef]) -> String {
-    let mut result = expr.to_string();
-    for fact in facts {
-        // Replace fact references with their expressions
-        // Handle both qualified (alias.fact_name) and unqualified (fact_name)
-        let qualified = format!("{}.{}", fact.source_table.as_deref().unwrap_or(""), &fact.name);
-        result = result.replace(&qualified, &format!("({})", fact.expr));
-        result = result.replace(&fact.name, &format!("({})", fact.expr));
-    }
-    result
+// If tokens remain after REFERENCES <to_alias>:
+if !remaining_tokens.is_empty() {
+    return Err(ParseError {
+        message: format!(
+            "Unexpected tokens after REFERENCES target in relationship '{rel_name}': \
+             '{}'. Explicit cardinality (MANY TO ONE, etc.) is no longer supported; \
+             cardinality is inferred from PRIMARY KEY and UNIQUE constraints in TABLES.",
+            remaining_tokens.join(" ")
+        ),
+        position: Some(entry_offset),
+    });
 }
 ```
 
 ## Anti-Patterns to Avoid
 
-### Anti-Pattern 1: Per-Metric Subqueries When Unnecessary
+### Anti-Pattern 1: Conditional Compilation for DuckDB Versions
 
-**What:** Generating a separate subquery for each metric and joining them.
-**Why bad:** Extremely verbose SQL, poor DuckDB query plan, unnecessary complexity.
-**Instead:** Use expression inlining for derived metrics when all constituent metrics share the same GROUP BY grain. Only use subqueries when semi-additive or cross-path metrics force it.
+**What:** Using `#[cfg(duckdb_14)]` or `#[cfg(duckdb_15)]` to handle version differences.
+**Why bad:** The Rust code is version-independent. Differences are in dependencies and amalgamation, not code paths. `#[cfg]` flags create maintenance burden and untestable code paths.
+**Instead:** Use separate git branches per DuckDB version. Each branch has its own Cargo.toml and amalgamation files.
 
-### Anti-Pattern 2: Modifying the Query Table Function
+### Anti-Pattern 2: Runtime Version Detection
 
-**What:** Adding new parameters to `semantic_view()` for USING, hierarchies, etc.
-**Why bad:** The table function signature is the public API. Adding parameters creates breaking changes and complexity.
-**Instead:** Encode all behavior in the definition (CREATE time). The query function should remain `semantic_view('name', dimensions := [...], metrics := [...])`. USING is declared per-metric in the definition, not per-query.
+**What:** Checking DuckDB version at runtime and branching behavior.
+**Why bad:** Extension binaries are already version-pinned. They can only load in the exact DuckDB version they were compiled for. Runtime detection is redundant.
+**Instead:** Rely on compile-time version pinning via Cargo.toml and amalgamation.
 
-### Anti-Pattern 3: Eager Diamond Rejection Without Named Relationships
+### Anti-Pattern 3: Inference During Parsing
 
-**What:** Keeping the current `check_no_diamonds()` unconditionally.
-**Why bad:** Blocks role-playing dimensions and legitimate multi-path schemas.
-**Instead:** Relax to: diamonds allowed when all paths are named and all affected metrics have USING clauses.
+**What:** Having `parse_single_relationship_entry()` look up TABLES to infer cardinality.
+**Why bad:** Creates coupling between parser and model. The parser operates on text; inference operates on structured data. Mixing them makes both harder to test and maintain.
+**Instead:** Parse produces `Join` with default `ManyToOne`. Inference updates it with correct value in a separate pass.
 
-### Anti-Pattern 4: Runtime Graph Construction
+### Anti-Pattern 4: Removing Cardinality from the Serialized Model
 
-**What:** Building the relationship graph at query time.
-**Why bad:** The graph is static per definition. Building it every query wastes CPU.
-**Instead:** Build and validate at CREATE time. At query time, deserialize and traverse the pre-validated graph.
+**What:** Removing the `cardinality` field from `Join` in the JSON representation.
+**Why bad:** Breaks backward compatibility with stored definitions. Forces re-inference every time a definition is loaded.
+**Instead:** Keep `cardinality` in JSON. Inference writes the value at define time. At query time, the stored value is read directly with no re-inference needed.
 
 ## Suggested Build Order
 
-Build order is driven by dependencies between features and increasing complexity.
+Build order is driven by dependencies and risk.
 
-### Phase 1: FACTS Clause + Hierarchies (Low Complexity, No Graph Changes)
+### Phase 1: UNIQUE Parsing + Cardinality Inference
 
-**FACTS:**
-1. Add `"facts"` to `CLAUSE_KEYWORDS` and `CLAUSE_ORDER` in body_parser.rs
-2. Add `parse_facts_clause()` following existing clause patterns
-3. Wire into `KeywordBody` and `parse_keyword_body()`
-4. In expand.rs, add `substitute_facts()` called before metric expression expansion
-5. In define.rs, validate fact source_table aliases exist
+**Scope:** model.rs, body_parser.rs, graph.rs, define.rs changes for UNIQUE + inference.
+**Dependencies:** None (self-contained).
+**Tests:** Unit tests for UNIQUE parsing, inference logic, backward compat serde, fan trap detection with inferred cardinality.
 
-**Hierarchies:**
-1. Add `Hierarchy` struct to model.rs
-2. Add `"hierarchies"` to clause keywords/order in body_parser.rs
-3. Add `parse_hierarchies_clause()` parser
-4. Validate hierarchy level references exist in dimensions
-5. Include in DESCRIBE output
+**Sub-steps:**
+1. Add `unique_keys` to `TableRef` in model.rs + serde tests.
+2. Parse UNIQUE in `parse_single_table_entry()` in body_parser.rs + parser tests.
+3. Remove explicit cardinality parsing from `parse_single_relationship_entry()` + error message for old syntax.
+4. Implement `infer_cardinality()` in graph.rs + unit tests.
+5. Wire inference into define.rs bind chain.
+6. Update all existing tests that use explicit cardinality keywords.
+7. Update sqllogictest files for new syntax.
 
-**Why first:** Both are low-risk. FACTS is needed by derived metrics. Hierarchies are metadata-only. Neither touches graph.rs or changes SQL structure.
+### Phase 2: DuckDB 1.5.0 Upgrade
 
-### Phase 2: Derived Metrics (Medium Complexity, New Module)
+**Scope:** Cargo.toml, .duckdb-version, amalgamation files, Build.yml, potential shim.cpp changes.
+**Dependencies:** Phase 1 should be complete (don't mix feature changes with version changes).
 
-1. Create `src/metric_resolver.rs`
-2. Build metric dependency DAG from metric expressions
-3. Topological sort + cycle detection
-4. At expand time, determine if derived metric can be inlined (Strategy A) or needs subquery (Strategy B)
-5. Implement Strategy A (expression inlining) for same-grain derived metrics
-6. Wire metric DAG validation into define.rs
+**Sub-steps:**
+1. Update Cargo.toml to `duckdb = "=1.5.0"`, `libduckdb-sys = "=1.5.0"`.
+2. Download DuckDB 1.5.0 amalgamation (`duckdb.hpp`, `duckdb.cpp`).
+3. Run `cargo test` -- fix any duckdb-rs API changes.
+4. Run `just build` -- verify shim.cpp compiles against 1.5.0 amalgamation.
+5. Run `just test-sql` -- verify all sqllogictest pass.
+6. Test with PEG parser enabled.
+7. Update Build.yml to `extension-ci-tools@v1.5.0`.
+8. Create `v1.4.x` backport branch from pre-upgrade commit.
 
-**Why second:** Depends on FACTS (derived metrics may reference facts). Does not depend on graph changes. Medium complexity but high value.
+### Phase 3: Documentation Site
 
-### Phase 3: Role-Playing Dimensions (Low Complexity, Documentation)
+**Scope:** GitHub Pages setup, markdown content, deployment workflow.
+**Dependencies:** None (can run in parallel with Phase 1 or 2).
 
-1. Document the pattern: separate TABLES aliases for each role
-2. Add integration tests showing role-playing with current architecture
-3. Verify graph.rs handles separate aliases correctly (it should already)
-4. Add examples to README
+### Phase 4: Community Extension Registry Publishing
 
-**Why third:** Likely already works with existing architecture. Needs verification and documentation, not new code.
+**Scope:** description.yml, PR to duckdb/community-extensions, LOAD verification.
+**Dependencies:** Phase 2 (need builds for current DuckDB version).
 
-### Phase 4: Fan Trap Detection (Medium Complexity, New Module)
-
-1. Create `src/fan_detection.rs`
-2. Implement graph analysis: find nodes with 2+ child branches
-3. Cross-reference with metric source_table assignments
-4. Classify aggregate types (SUM/COUNT = fan-unsafe, COUNT DISTINCT/MAX/MIN = fan-safe)
-5. Emit warnings at define time
-6. Optionally re-check at query time for specific metric combination
-
-**Why fourth:** Does not block other features. Can be added independently. Warning-only means no breaking changes.
-
-### Phase 5: Semi-Additive Metrics (High Complexity, Expansion Changes)
-
-1. Add `NonAdditiveSpec` to model.rs Metric struct
-2. Parse `NON ADDITIVE BY (dim [ASC|DESC])` in body_parser.rs
-3. In expand.rs, detect semi-additive metrics in the request
-4. Generate subquery with ROW_NUMBER() window function
-5. Wrap the main query to filter on _rn = 1 before final aggregation
-6. Handle interaction with regular metrics in the same query
-
-**Why fifth:** Highest complexity expansion change. Changes SQL output structure from flat SELECT to nested subquery. Should be built after simpler features are stable.
-
-### Phase 6: Multiple Join Paths / USING RELATIONSHIPS (High Complexity, Graph Changes)
-
-1. Parse `USING (rel_name)` on metrics in body_parser.rs
-2. Add `using_relationships: Option<Vec<String>>` to Metric model
-3. Relax `check_no_diamonds()` in graph.rs: allow diamonds when relationships are named
-4. Add validation: metrics touching diamond paths must have USING
-5. Modify `resolve_joins_pkfk()` in expand.rs to filter by relationship name
-6. Handle per-metric join path differences in SQL generation
-
-**Why last:** Most complex graph change. Relaxes a fundamental invariant (tree structure). Should be built last when all other features are stable.
+**Sub-steps:**
+1. Create `description.yml` with correct metadata.
+2. Test local `INSTALL` and `LOAD` against built extension binary.
+3. Open PR to duckdb/community-extensions.
+4. Monitor CI in the community-extensions repo.
 
 ## Scalability Considerations
 
-| Concern | At current scale (5-10 tables) | At 50 tables | At 100+ tables |
-|---------|-------------------------------|--------------|----------------|
-| Graph validation | Instant | Instant (Kahn's is O(V+E)) | Instant |
-| Metric DAG resolution | Instant | <1ms for 100 metrics | May need caching |
-| Fan trap detection | Instant | O(V*E) acceptable | Consider memoization |
-| Semi-additive subquery nesting | Single subquery | Multiple CTEs | May need query splitting |
-| USING path resolution | Single traversal | Multiple per metric | Consider pre-computed paths |
-
-All features operate at definition time or expansion time, not execution time. DuckDB handles execution optimization. The extension's overhead is string manipulation and graph traversal, which is negligible compared to query execution.
+| Concern | Impact | Notes |
+|---------|--------|-------|
+| UNIQUE constraints per table | Negligible | Linear scan of unique_keys during inference; tables count is small (< 20) |
+| Inference pass | O(J * T) where J=joins, T=tables | Both are small; no concern |
+| Backport branch maintenance | Low | Only Cargo.toml and amalgamation differ; Rust code is shared |
+| PEG parser compatibility | Unknown | DuckDB 1.5.0 PEG parser is experimental and off by default; monitor for future impact |
 
 ## Sources
 
-- [Snowflake CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- PRIMARY reference for DDL syntax, FACTS, NON ADDITIVE BY, USING, role-playing (HIGH confidence)
-- [Snowflake Semantic View SQL Examples](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- Role-playing dimensions, derived metrics examples (HIGH confidence)
-- [Snowflake Semantic View Validation Rules](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules) -- Graph constraints, circular relationship prevention, multi-path rules (HIGH confidence)
-- [Snowflake Semi-Additive Metrics Release (March 2026)](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY is a recent Snowflake addition (HIGH confidence)
-- [MetricFlow / DeepWiki](https://deepwiki.com/dbt-labs/metricflow) -- Derived metric architecture, DAG-based resolution, subquery generation (MEDIUM confidence)
-- [Cube.dev Measures Reference](https://cube.dev/docs/reference/data-model/measures) -- Measure composition patterns, rolling windows, multi-stage (MEDIUM confidence)
-- [Cube.dev Non-Additivity Guide](https://cube.dev/docs/guides/recipes/query-acceleration/non-additivity) -- Non-additive measure strategies (MEDIUM confidence)
-- [Fan Trap - Datacadamia](https://www.datacadamia.com/data/type/cube/semantic/fan_trap) -- Fan trap definition and resolution (MEDIUM confidence)
-- [Sisense Chasm and Fan Traps](https://docs.sisense.com/main/SisenseLinux/chasm-and-fan-traps.htm) -- Fan trap detection via alias/context (MEDIUM confidence)
-- [Kimball Semi-Additive Facts](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/additive-semi-additive-non-additive-fact/) -- Canonical definition of additivity (HIGH confidence)
+- [Snowflake CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- UNIQUE constraint syntax, cardinality inference rules (HIGH confidence)
+- [Snowflake Semantic View SQL Guide](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- Relationship definition syntax, PK/UNIQUE requirement for references (HIGH confidence)
+- [DuckDB 1.5.0 Announcement](https://duckdb.org/2026/03/09/announcing-duckdb-150) -- PEG parser, experimental status, backward compat (HIGH confidence)
+- [DuckDB Extension Versioning](https://duckdb.org/docs/stable/extensions/versioning_of_extensions) -- Version-pinned binaries, no cross-version compat (HIGH confidence)
+- [DuckDB Extension CI Tools](https://github.com/duckdb/extension-ci-tools/) -- Branch-per-version strategy, v1.4.4 and v1.5.0 branches (HIGH confidence)
+- [DuckDB Community Extensions Development](https://duckdb.org/community_extensions/development) -- description.yml, submission process (HIGH confidence)
+- [DuckDB Community Extensions Updating](https://github.com/duckdb/community-extensions/blob/main/UPDATING.md) -- Multi-version support for latest 2 DuckDB versions (HIGH confidence)
+- [duckdb-rs crate](https://crates.io/crates/duckdb) -- Rust binding versions, feature flags (HIGH confidence)
