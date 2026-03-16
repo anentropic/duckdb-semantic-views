@@ -148,15 +148,15 @@ Plans:
 **Requirements**: DKDB-01, DKDB-02, DKDB-03, DKDB-04, DKDB-05, DKDB-06
 **Success Criteria** (what must be TRUE):
   1. `just test-all` passes on main branch with DuckDB 1.5.x and duckdb-rs 1.10500.0
-  2. `just test-all` passes on andium branch with DuckDB 1.4.x and duckdb-rs 1.4.4
+  2. `just test-all` passes on duckdb/1.4.x branch with DuckDB 1.4.x and duckdb-rs 1.4.4
   3. CI build matrix runs both DuckDB versions and reports results independently
   4. `.duckdb-version` file on each branch correctly identifies its target DuckDB version
   5. DuckDB Version Monitor checks for new releases of both latest and LTS lines
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 34-01: TBD
-- [ ] 34-02: TBD
+- [ ] 34-01-PLAN.md -- Upgrade to DuckDB 1.5.0 (version pins, amalgamation, C++ compat, test suite, PEG smoke test)
+- [ ] 34-02-PLAN.md -- LTS branch + CI + Version Monitor (duckdb/1.4.x branch, CI workflow updates, dual-track monitoring)
 
 ### Phase 35: Documentation Site
 **Goal**: Extension has a proper documentation site deployed to GitHub Pages with DDL reference, query guide, and examples
@@ -232,7 +232,7 @@ Phases execute in numeric order: 33 -> 34 -> 35 -> 36
 | 30. Derived Metrics | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 31. Fan Trap Detection | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 32. Role-Playing & USING | v0.5.3 | 2/2 | Complete | 2026-03-14 |
-| 33. UNIQUE & Cardinality Inference | 2/2 | Complete    | 2026-03-15 | - |
-| 34. DuckDB 1.5 Upgrade & LTS Branch | v0.5.4 | 0/? | Not started | - |
+| 33. UNIQUE & Cardinality Inference | v0.5.4 | 2/2 | Complete | 2026-03-15 |
+| 34. DuckDB 1.5 Upgrade & LTS Branch | v0.5.4 | 0/2 | Not started | - |
 | 35. Documentation Site | v0.5.4 | 0/? | Not started | - |
 | 36. Registry Publishing & Maintainer Docs | v0.5.4 | 0/? | Not started | - |
