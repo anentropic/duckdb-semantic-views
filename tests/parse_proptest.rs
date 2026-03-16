@@ -833,54 +833,6 @@ fn arb_facts_clause() -> impl Strategy<Value = String> {
     })
 }
 
-/// Generate a HIERARCHIES clause: `HIERARCHIES (name AS (dim1, dim2, ...))`
-fn arb_hierarchies_clause(dim_names: &[String]) -> impl Strategy<Value = String> {
-    let dims = dim_names.to_vec();
-    proptest::collection::vec(
-        (
-            arb_identifier(),
-            proptest::sample::subsequence(dims.clone(), 1..=dims.len().max(1)),
-        ),
-        0..=2,
-    )
-    .prop_map(|entries| {
-        if entries.is_empty() {
-            String::new()
-        } else {
-            let items: Vec<String> = entries
-                .iter()
-                .map(|(name, levels)| format!("{name} AS ({})", levels.join(", ")))
-                .collect();
-            format!("HIERARCHIES ({})", items.join(", "))
-        }
-    })
-}
-
-/// Build a valid AS-body with optional FACTS and HIERARCHIES clauses.
-fn build_as_body_with_facts_hierarchies(
-    name: &str,
-    alias: &str,
-    table: &str,
-    facts_clause: &str,
-    hierarchies_clause: &str,
-    dim_name: &str,
-    metric_expr: &str,
-) -> String {
-    let mut body = format!(" {name} AS TABLES ({alias} AS {table} PRIMARY KEY (id))");
-    if !facts_clause.is_empty() {
-        body.push(' ');
-        body.push_str(facts_clause);
-    }
-    if !hierarchies_clause.is_empty() {
-        body.push(' ');
-        body.push_str(hierarchies_clause);
-    }
-    body.push_str(&format!(
-        " DIMENSIONS ({alias}.{dim_name} AS {dim_name}) METRICS ({alias}.m AS {metric_expr})"
-    ));
-    body
-}
-
 proptest! {
     /// FACTS clause with adversarial input: parse_keyword_body either succeeds
     /// or returns a well-formed ParseError (no panics, no crashes).
@@ -982,22 +934,6 @@ proptest! {
 /// Generate a valid metric name (no dots allowed for derived metrics).
 fn arb_metric_name() -> impl Strategy<Value = String> {
     proptest::string::string_regex("[a-z][a-z0-9_]{0,14}").unwrap()
-}
-
-/// Generate a simple arithmetic expression from metric names.
-fn arb_arithmetic_expr(names: Vec<String>) -> impl Strategy<Value = String> {
-    let operators = vec![" + ", " - ", " * ", " / "];
-    let n = names.len();
-    if n == 0 {
-        return Just("1".to_string()).boxed();
-    }
-    (0..n, proptest::sample::select(operators), 0..n)
-        .prop_map(move |(a, op, b)| {
-            let left = &names[a % names.len()];
-            let right = &names[b % names.len()];
-            format!("{left}{op}{right}")
-        })
-        .boxed()
 }
 
 proptest! {
