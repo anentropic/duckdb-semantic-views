@@ -233,6 +233,6 @@ Phases execute in numeric order: 33 -> 34 -> 35 -> 36
 | 31. Fan Trap Detection | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 32. Role-Playing & USING | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 33. UNIQUE & Cardinality Inference | v0.5.4 | 2/2 | Complete | 2026-03-15 |
-| 34. DuckDB 1.5 Upgrade & LTS Branch | v0.5.4 | 0/2 | Not started | - |
+| 34. DuckDB 1.5 Upgrade & LTS Branch | 1/2 | In Progress|  | - |
 | 35. Documentation Site | v0.5.4 | 0/? | Not started | - |
 | 36. Registry Publishing & Maintainer Docs | v0.5.4 | 0/? | Not started | - |

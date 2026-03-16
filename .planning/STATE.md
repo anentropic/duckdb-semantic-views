@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
-status: completed
-stopped_at: Phase 34 context gathered
-last_updated: "2026-03-15T23:47:12.945Z"
-last_activity: 2026-03-15 -- Phase 33 Plan 02 complete (validation, fan trap, tests)
+status: executing
+stopped_at: Completed 34-01-PLAN.md
+last_updated: "2026-03-16T12:00:00Z"
+last_activity: 2026-03-16 -- Phase 34 Plan 01 complete (DuckDB 1.5.0 upgrade)
 progress:
   total_phases: 4
   completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
-  percent: 25
+  total_plans: 4
+  completed_plans: 3
+  percent: 50
 ---
 
 # Project State
@@ -21,33 +21,34 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-15)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Phase 33 - UNIQUE Constraints & Cardinality Inference
+**Current focus:** Phase 34 - DuckDB 1.5 Upgrade & LTS Branch
 
 ## Current Position
 
-Phase: 33 (1 of 4 in v0.5.4) (UNIQUE Constraints & Cardinality Inference)
-Plan: 2 of 2 in current phase (COMPLETE)
-Status: Phase Complete
-Last activity: 2026-03-15 -- Phase 33 Plan 02 complete (validation, fan trap, tests)
+Phase: 34 (2 of 4 in v0.5.4) (DuckDB 1.5 Upgrade & LTS Branch)
+Plan: 1 of 2 in current phase (Plan 01 COMPLETE)
+Status: Executing
+Last activity: 2026-03-16 -- Phase 34 Plan 01 complete (DuckDB 1.5.0 upgrade)
 
-Progress: [██░░░░░░░░] 25%
+Progress: [█████░░░░░] 50%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2 (v0.5.4)
-- Average duration: 19min
-- Total execution time: 39min
+- Total plans completed: 3 (v0.5.4)
+- Average duration: 43min
+- Total execution time: 129min
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 33 | 2/2 | 39min | 19min |
+| 34 | 1/2 | 90min | 90min |
 
 **Recent Trend:**
-- Last 5 plans: 33-01 (25min), 33-02 (14min)
-- Trend: Accelerating
+- Last 5 plans: 33-01 (25min), 33-02 (14min), 34-01 (90min)
+- Trend: Version upgrade plans take longer due to investigation
 
 *Updated after each plan completion*
 
@@ -67,6 +68,10 @@ Recent decisions affecting current work:
 - [33-02]: Replaced check_fk_pk_counts with validate_fk_references using exact HashSet matching
 - [33-02]: ON clause synthesis prefers ref_columns, falls back to pk_columns for backward compat
 - [33-02]: Test 6 redesigned with p33_user_tokens table to avoid VARCHAR-to-INTEGER type mismatch
+- [34-01]: Separate TU with compat header (not combined TU) -- libpg_query macros in duckdb.cpp break shim code
+- [34-01]: ODR compliance requires verbatim constructor match in compat header including ParserOverrideResult(std::exception&)
+- [34-01]: Per-process sqllogictest execution for DuckDB 1.5.0 parser extension lifecycle compatibility
+- [34-01]: date_trunc returns TIMESTAMP in DuckDB 1.5.0 -- updated all test assertions
 
 ### Pending Todos
 
@@ -74,12 +79,12 @@ None yet.
 
 ### Blockers/Concerns
 
-- [Research]: DuckDB 1.5.0 amalgamation compatibility with shim.cpp is untested -- must build-first in Phase 34
 - [Research]: CE registry build pipeline for hybrid Rust+C++ is untested -- submit draft PR early in Phase 36
-- [Research]: duckdb-rs 1.10500.0 may have breaking API changes -- investigate during Phase 34 planning
+- [RESOLVED 34-01]: DuckDB 1.5.0 amalgamation compatibility with shim.cpp -- fixed via parser_extension_compat.hpp
+- [RESOLVED 34-01]: duckdb-rs 1.10500.0 API changes -- no breaking changes, all 467 Rust tests pass
 
 ## Session Continuity
 
-Last session: 2026-03-15T23:47:12.942Z
-Stopped at: Phase 34 context gathered
-Resume file: .planning/phases/34-duckdb-1-5-upgrade-lts-branch/34-CONTEXT.md
+Last session: 2026-03-16T12:00:00Z
+Stopped at: Completed 34-01-PLAN.md
+Resume file: .planning/phases/34-duckdb-1-5-upgrade-lts-branch/34-01-SUMMARY.md
