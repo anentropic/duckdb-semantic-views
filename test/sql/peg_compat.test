@@ -1,0 +1,100 @@
+# PEG parser compatibility smoke test for DuckDB 1.5.0+.
+#
+# DuckDB 1.5.0 introduced an opt-in PEG parser (CALL enable_peg_parser()).
+# The semantic_views extension uses Bison-era parser_extensions hooks for DDL
+# interception (CREATE/ALTER/DROP/DESCRIBE/SHOW SEMANTIC VIEW). The PEG parser
+# does NOT consult parser_extensions, so DDL fails under PEG. However, querying
+# existing semantic views via semantic_view() table function works fine under
+# PEG because table functions are standard SQL.
+#
+# This test documents the expected behavior:
+#   1. DDL works under the default Bison parser
+#   2. DDL fails under PEG parser with "Parser Error"
+#   3. Querying existing views works under PEG parser
+#   4. DDL works again after disabling PEG parser
+#
+# Requirements covered:
+#   DKDB-05: PEG parser compatibility documented
+
+require semantic_views
+
+# ============================================================
+# 1. Setup -- create test data
+# ============================================================
+
+statement ok
+CREATE TABLE peg_test_data (id INTEGER, val DOUBLE);
+
+statement ok
+INSERT INTO peg_test_data VALUES (1, 10.0), (2, 20.0);
+
+# ============================================================
+# 2. Bison parser (default): DDL and query work
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW peg_bison_test AS
+TABLES (t AS peg_test_data PRIMARY KEY (id))
+DIMENSIONS (t.dim_id AS t.id)
+METRICS (t.total_val AS SUM(t.val))
+
+query IR
+SELECT * FROM semantic_view('peg_bison_test', dimensions := ['dim_id'], metrics := ['total_val']) ORDER BY dim_id;
+----
+1	10.0
+2	20.0
+
+# ============================================================
+# 3. Enable PEG parser: DDL fails, queries work
+# ============================================================
+
+statement ok
+CALL enable_peg_parser();
+
+# DDL fails: PEG parser does not consult parser_extensions fallback hooks
+statement error
+CREATE SEMANTIC VIEW peg_fail_test AS
+TABLES (t2 AS peg_test_data PRIMARY KEY (id))
+DIMENSIONS (t2.dim_id AS t2.id)
+METRICS (t2.total_val AS SUM(t2.val))
+----
+Parser Error
+
+# Querying existing views works: semantic_view() is a standard table function
+query IR
+SELECT * FROM semantic_view('peg_bison_test', dimensions := ['dim_id'], metrics := ['total_val']) ORDER BY dim_id;
+----
+1	10.0
+2	20.0
+
+# ============================================================
+# 4. Disable PEG parser: DDL works again
+# ============================================================
+
+statement ok
+CALL disable_peg_parser();
+
+statement ok
+CREATE SEMANTIC VIEW peg_restored_test AS
+TABLES (t3 AS peg_test_data PRIMARY KEY (id))
+DIMENSIONS (t3.dim_id AS t3.id)
+METRICS (t3.total_val AS SUM(t3.val))
+
+query IR
+SELECT * FROM semantic_view('peg_restored_test', dimensions := ['dim_id'], metrics := ['total_val']) ORDER BY dim_id;
+----
+1	10.0
+2	20.0
+
+# ============================================================
+# 5. Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW peg_bison_test;
+
+statement ok
+DROP SEMANTIC VIEW peg_restored_test;
+
+statement ok
+DROP TABLE peg_test_data;

@@ -93,10 +93,35 @@ TEST_RUNNER_FILE_LIST_RELEASE := $(TEST_RUNNER) --test-dir test/sql --file-list 
 # Override base.Makefile test targets to patch runner before tests.
 # SKIP_TESTS platforms (musl, mingw) resolve to tests_skipped before reaching these
 # targets, so patch-runner is never called on those platforms — which is correct.
+#
+# DuckDB 1.5.0 changed parser extension lifecycle (ExtensionCallbackManager).
+# Running all test files in a single sqllogictest process causes a segfault
+# when the runner creates/destroys multiple databases sequentially. Work around
+# by running each test file in a separate process. Each test passes in isolation.
 test_extension_debug_internal: patch-runner
 	@echo "Running DEBUG tests.."
-	@$(TEST_RUNNER_FILE_LIST_DEBUG)
+	@FAILED=0; \
+	TOTAL=0; \
+	while IFS= read -r testfile; do \
+		TOTAL=$$((TOTAL + 1)); \
+		if ! $(TEST_RUNNER) --test-dir test/sql --file-list /dev/stdin $(EXTRA_EXTENSIONS_PARAM) --external-extension build/debug/$(EXTENSION_NAME).duckdb_extension <<< "$$testfile"; then \
+			echo "FAILED: $$testfile"; \
+			FAILED=$$((FAILED + 1)); \
+		fi; \
+	done < $(TEST_LIST_PATH); \
+	echo "$$TOTAL tests run, $$FAILED failed"; \
+	[ $$FAILED -eq 0 ]
 
 test_extension_release_internal: patch-runner
 	@echo "Running RELEASE tests.."
-	@$(TEST_RUNNER_FILE_LIST_RELEASE)
+	@FAILED=0; \
+	TOTAL=0; \
+	while IFS= read -r testfile; do \
+		TOTAL=$$((TOTAL + 1)); \
+		if ! $(TEST_RUNNER) --test-dir test/sql --file-list /dev/stdin $(EXTRA_EXTENSIONS_PARAM) --external-extension build/release/$(EXTENSION_NAME).duckdb_extension <<< "$$testfile"; then \
+			echo "FAILED: $$testfile"; \
+			FAILED=$$((FAILED + 1)); \
+		fi; \
+	done < $(TEST_LIST_PATH); \
+	echo "$$TOTAL tests run, $$FAILED failed"; \
+	[ $$FAILED -eq 0 ]

@@ -10,3 +10,4 @@ test/sql/phase30_derived_metrics.test
 test/sql/phase31_fan_trap.test
 test/sql/phase32_role_playing.test
 test/sql/phase33_cardinality_inference.test
+test/sql/peg_compat.test
