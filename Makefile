@@ -22,20 +22,35 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 # Rust owns the entry point (semantic_views_init_c_api), C++ helper registers hooks.
 UNSTABLE_C_API_FLAG=--abi-type C_STRUCT_UNSTABLE
 
-# Auto-download DuckDB amalgamation (gitignored, ~25MB) if not present.
+# Auto-download DuckDB amalgamation (gitignored, ~25MB) if not present or wrong version.
 # CI checks out the repo without these files; local devs fetch via `just update-headers`.
 # The version comes from .duckdb-version via TARGET_DUCKDB_VERSION.
+# A versioned cache under .amalgamation/<version>/ survives branch switches.
 AMALGAMATION_URL=https://github.com/duckdb/duckdb/releases/download/$(TARGET_DUCKDB_VERSION)/libduckdb-src.zip
+AMALGAMATION_CACHE=.amalgamation/$(TARGET_DUCKDB_VERSION)
 
-cpp/include/duckdb.cpp:
-	@echo "Downloading DuckDB $(TARGET_DUCKDB_VERSION) amalgamation..."
-	@mkdir -p cpp/include
-	@curl -sL -o /tmp/libduckdb-src.zip "$(AMALGAMATION_URL)"
-	@unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d cpp/include/
-	@rm -f /tmp/libduckdb-src.zip
-	@echo "Downloaded cpp/include/duckdb.{hpp,cpp}"
-
-ensure_amalgamation: cpp/include/duckdb.cpp
+# Check installed amalgamation matches TARGET_DUCKDB_VERSION; fetch/copy if not.
+.PHONY: ensure_amalgamation
+ensure_amalgamation:
+	@INSTALLED=$$(grep -m1 '#define DUCKDB_VERSION' cpp/include/duckdb.hpp 2>/dev/null | sed 's/.*"\(.*\)"/\1/'); \
+	if [ "$$INSTALLED" = "$(TARGET_DUCKDB_VERSION)" ]; then \
+		exit 0; \
+	fi; \
+	echo "Amalgamation version mismatch (have=$${INSTALLED:-none}, want=$(TARGET_DUCKDB_VERSION))"; \
+	if [ -f "$(AMALGAMATION_CACHE)/duckdb.cpp" ]; then \
+		echo "Restoring from cache $(AMALGAMATION_CACHE)/..."; \
+	else \
+		echo "Downloading DuckDB $(TARGET_DUCKDB_VERSION) amalgamation..."; \
+		mkdir -p "$(AMALGAMATION_CACHE)"; \
+		curl -sL -o /tmp/libduckdb-src.zip "$(AMALGAMATION_URL)"; \
+		unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d "$(AMALGAMATION_CACHE)/"; \
+		rm -f /tmp/libduckdb-src.zip; \
+		echo "Cached $(AMALGAMATION_CACHE)/duckdb.{hpp,cpp}"; \
+	fi; \
+	mkdir -p cpp/include; \
+	cp "$(AMALGAMATION_CACHE)/duckdb.hpp" cpp/include/duckdb.hpp; \
+	cp "$(AMALGAMATION_CACHE)/duckdb.cpp" cpp/include/duckdb.cpp; \
+	echo "Installed cpp/include/duckdb.{hpp,cpp} ($(TARGET_DUCKDB_VERSION))"
 
 configure: venv platform extension_version
 

@@ -59,6 +59,9 @@ dbt/
 cpp/include/duckdb.hpp
 cpp/include/duckdb.cpp
 
+# Versioned amalgamation cache (populated by build/update-headers, survives branch switches)
+.amalgamation/
+
 # Python artifacts
 __pycache__/
 *.py[codz]

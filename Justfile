@@ -49,6 +49,18 @@ fmt:
 coverage:
     cargo llvm-cov nextest --fail-under-lines 80
 
+# Ensure the Python venv's duckdb pip package matches .duckdb-version.
+# Called automatically by test recipes that use the venv runner.
+[private]
+_ensure-test-deps:
+    @VER=$(cat .duckdb-version | sed 's/^v//'); \
+    INSTALLED=$(configure/venv/bin/python -c "import duckdb; print(duckdb.__version__)" 2>/dev/null || echo ""); \
+    if [ "$INSTALLED" = "$VER" ]; then \
+      exit 0; \
+    fi; \
+    echo "duckdb pip version mismatch (have=${INSTALLED:-none}, want=$VER), reinstalling..."; \
+    configure/venv/bin/pip install -q "duckdb==$VER"
+
 # Run SQL logic tests for Phase 2 DDL via the SQLLogicTest runner.
 #
 # There is no standalone DuckDB CLI available in this project; SQL logic tests
@@ -59,7 +71,7 @@ coverage:
 #
 # The test/sql/phase2_ddl.test file exercises the full DDL round-trip:
 #   define_semantic_view, list_semantic_views, describe_semantic_view, drop_semantic_view.
-test-sql: build
+test-sql: build _ensure-test-deps
     make test_debug
 
 # Download jaffle-shop data and create DuckLake/Iceberg catalog for integration tests.
@@ -76,7 +88,7 @@ test-ducklake: setup-ducklake build
 # Run DuckLake CI integration test (uses inline synthetic data, no setup required).
 # Tests semantic_view against an in-memory DuckLake catalog with known synthetic rows.
 # Set SEMANTIC_VIEWS_EXTENSION_PATH to override the extension path (default: build/debug/).
-test-ducklake-ci:
+test-ducklake-ci: _ensure-test-deps
     uv run test/integration/test_ducklake_ci.py
 
 # Run Python vtab crash reproduction tests against the built extension.
@@ -93,7 +105,8 @@ test-caret: build
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
-test-all: test-rust test-sql test-ducklake-ci test-vtab-crash test-caret
+# _ensure-test-deps runs early to catch pip version mismatches before slow builds.
+test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret
 
 # Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
 fuzz target="fuzz_json_parse" time="300":
@@ -111,14 +124,25 @@ fuzz-cmin target="fuzz_json_parse":
 
 # Re-fetch vendored DuckDB amalgamation (duckdb.hpp + duckdb.cpp) from GitHub release.
 # Run after DuckDB version bump. Version is read from .duckdb-version.
+# Downloads to .amalgamation/<version>/ cache, then copies to cpp/include/.
 update-headers:
-    @VER=$$(cat .duckdb-version); \
-    echo "Fetching DuckDB $${VER} amalgamation..."; \
-    curl -sL -o /tmp/libduckdb-src.zip \
-      "https://github.com/duckdb/duckdb/releases/download/$${VER}/libduckdb-src.zip"; \
-    unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d cpp/include/; \
-    rm /tmp/libduckdb-src.zip; \
-    echo "Updated cpp/include/duckdb.{hpp,cpp} to $${VER}"
+    @VER=$(cat .duckdb-version); \
+    CACHE=".amalgamation/$VER"; \
+    if [ -f "$CACHE/duckdb.cpp" ]; then \
+      echo "Cache hit: $CACHE/duckdb.hpp+cpp"; \
+    else \
+      echo "Fetching DuckDB $VER amalgamation..."; \
+      mkdir -p "$CACHE"; \
+      curl -sL -o /tmp/libduckdb-src.zip \
+        "https://github.com/duckdb/duckdb/releases/download/$VER/libduckdb-src.zip"; \
+      unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d "$CACHE/"; \
+      rm /tmp/libduckdb-src.zip; \
+      echo "Cached $CACHE/duckdb.hpp+cpp"; \
+    fi; \
+    mkdir -p cpp/include; \
+    cp "$CACHE/duckdb.hpp" cpp/include/duckdb.hpp; \
+    cp "$CACHE/duckdb.cpp" cpp/include/duckdb.cpp; \
+    echo "Installed cpp/include/duckdb.hpp+cpp ($VER)"
 
 # Clean build artifacts
 clean:
