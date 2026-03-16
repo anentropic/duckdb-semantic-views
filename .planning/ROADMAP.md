@@ -120,7 +120,7 @@ Full details: [milestones/v0.5.3-ROADMAP.md](milestones/v0.5.3-ROADMAP.md)
 **Milestone Goal:** Align the relationship model with Snowflake-style cardinality inference (UNIQUE constraints replace explicit cardinality keywords), support multiple DuckDB versions (1.5.x latest + 1.4.x LTS), ship a documentation site, and publish to the DuckDB Community Extension Registry.
 
 - [x] **Phase 33: UNIQUE Constraints & Cardinality Inference** - Snowflake-aligned cardinality from PK/UNIQUE declarations (completed 2026-03-15)
-- [ ] **Phase 34: DuckDB 1.5 Upgrade & LTS Branch** - Multi-version support with dual CI
+- [x] **Phase 34: DuckDB 1.5 Upgrade & LTS Branch** - Multi-version support with dual CI (completed 2026-03-16)
 - [ ] **Phase 35: Documentation Site** - Zensical docs on GitHub Pages
 - [ ] **Phase 36: Registry Publishing & Maintainer Docs** - CE submission and MAINTAINER.md updates
 
@@ -233,6 +233,6 @@ Phases execute in numeric order: 33 -> 34 -> 35 -> 36
 | 31. Fan Trap Detection | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 32. Role-Playing & USING | v0.5.3 | 2/2 | Complete | 2026-03-14 |
 | 33. UNIQUE & Cardinality Inference | v0.5.4 | 2/2 | Complete | 2026-03-15 |
-| 34. DuckDB 1.5 Upgrade & LTS Branch | 1/2 | In Progress|  | - |
+| 34. DuckDB 1.5 Upgrade & LTS Branch | 2/2 | Complete   | 2026-03-16 | - |
 | 35. Documentation Site | v0.5.4 | 0/? | Not started | - |
 | 36. Registry Publishing & Maintainer Docs | v0.5.4 | 0/? | Not started | - |

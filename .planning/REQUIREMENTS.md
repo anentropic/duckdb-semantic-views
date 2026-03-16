@@ -20,11 +20,11 @@
 ### Multi-Version DuckDB
 
 - [x] **DKDB-01**: Extension builds and all tests pass against DuckDB 1.5.x (latest)
-- [ ] **DKDB-02**: Extension builds and all tests pass against DuckDB 1.4.x (Andium LTS)
-- [ ] **DKDB-03**: `andium` branch maintained for 1.4.x LTS compatibility
-- [ ] **DKDB-04**: Build.yml runs CI for both DuckDB versions
+- [x] **DKDB-02**: Extension builds and all tests pass against DuckDB 1.4.x (Andium LTS)
+- [x] **DKDB-03**: `andium` branch maintained for 1.4.x LTS compatibility
+- [x] **DKDB-04**: Build.yml runs CI for both DuckDB versions
 - [x] **DKDB-05**: `.duckdb-version` on main tracks latest; `.duckdb-version` on andium tracks LTS
-- [ ] **DKDB-06**: DuckDB Version Monitor updated to check both latest and LTS releases
+- [x] **DKDB-06**: DuckDB Version Monitor updated to check both latest and LTS releases
 
 ### Documentation Site
 
@@ -85,11 +85,11 @@
 | CARD-08 | Phase 33 | Complete |
 | CARD-09 | Phase 33 | Complete |
 | DKDB-01 | Phase 34 | Complete |
-| DKDB-02 | Phase 34 | Pending |
-| DKDB-03 | Phase 34 | Pending |
-| DKDB-04 | Phase 34 | Pending |
+| DKDB-02 | Phase 34 | Complete |
+| DKDB-03 | Phase 34 | Complete |
+| DKDB-04 | Phase 34 | Complete |
 | DKDB-05 | Phase 34 | Complete |
-| DKDB-06 | Phase 34 | Pending |
+| DKDB-06 | Phase 34 | Complete |
 | DOCS-01 | Phase 35 | Pending |
 | DOCS-02 | Phase 35 | Pending |
 | DOCS-03 | Phase 35 | Pending |
