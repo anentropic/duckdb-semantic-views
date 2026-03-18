@@ -256,7 +256,7 @@ just build     # debug build
 cargo test     # unit + property-based tests
 just test-sql  # SQL logic tests (needs just build first)
 just test-all  # everything
-just lint       # fmt + clippy + cargo-deny
+just lint      # fmt + clippy + cargo-deny
 ```
 
 ## License
