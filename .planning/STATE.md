@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-03-15)
 Phase: 34 (2 of 4 in v0.5.4) (DuckDB 1.5 Upgrade & LTS Branch) -- COMPLETE
 Plan: 2 of 2 in current phase (Plan 02 COMPLETE)
 Status: Phase Complete
-Last activity: 2026-03-16 -- Phase 34 Plan 02 complete (CI, LTS branch, Version Monitor)
+Last activity: 2026-03-18 - Completed quick task 260318-fzu: remove HIERARCHIES syntax, no backward compat considerations needed
 
 Progress: [███████░░░] 75%
 
@@ -86,6 +86,12 @@ None yet.
 - [Research]: CE registry build pipeline for hybrid Rust+C++ is untested -- submit draft PR early in Phase 36
 - [RESOLVED 34-01]: DuckDB 1.5.0 amalgamation compatibility with shim.cpp -- fixed via parser_extension_compat.hpp
 - [RESOLVED 34-01]: duckdb-rs 1.10500.0 API changes -- no breaking changes, all 467 Rust tests pass
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260318-fzu | remove HIERARCHIES syntax, no backward compat considerations needed | 2026-03-18 | 72fb69d | [260318-fzu-remove-hierarchies-syntax-no-backward-co](./quick/260318-fzu-remove-hierarchies-syntax-no-backward-co/) |
 
 ## Session Continuity
 
