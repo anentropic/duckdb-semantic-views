@@ -129,10 +129,6 @@ impl VTab for DefineFromJsonVTab {
         // Validate facts: source table reachability, cycles, unknown refs (Phase 29).
         crate::graph::validate_facts(&def).map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
-        // Validate hierarchies: unknown dimension levels (Phase 29).
-        crate::graph::validate_hierarchies(&def)
-            .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-
         // Validate derived metrics: cycles, unknown refs, aggregate prohibition (Phase 30).
         crate::graph::validate_derived_metrics(&def)
             .map_err(|e| Box::<dyn std::error::Error>::from(e))?;

@@ -477,7 +477,6 @@ fn rewrite_ddl_keyword_body(
         joins: keyword_body.relationships,
         filters: vec![],
         facts: keyword_body.facts,
-        hierarchies: keyword_body.hierarchies,
         column_type_names: vec![],
         column_types_inferred: vec![],
     };

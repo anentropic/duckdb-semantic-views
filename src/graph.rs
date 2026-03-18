@@ -586,48 +586,6 @@ fn check_fact_cycles(
 }
 
 // ---------------------------------------------------------------------------
-// Hierarchy validation (Phase 29)
-// ---------------------------------------------------------------------------
-
-/// Validate hierarchies in a semantic view definition.
-///
-/// Checks that every level name in each hierarchy matches a declared dimension name
-/// (case-insensitive). Uses `suggest_closest` for fuzzy error suggestions.
-///
-/// Returns `Ok(())` if valid, `Err` with descriptive message otherwise.
-pub fn validate_hierarchies(def: &SemanticViewDefinition) -> Result<(), String> {
-    if def.hierarchies.is_empty() {
-        return Ok(());
-    }
-
-    let dim_names_lower: HashSet<String> = def
-        .dimensions
-        .iter()
-        .map(|d| d.name.to_ascii_lowercase())
-        .collect();
-    let dim_names_display: Vec<String> = def.dimensions.iter().map(|d| d.name.clone()).collect();
-
-    for hierarchy in &def.hierarchies {
-        for level in &hierarchy.levels {
-            let level_lower = level.to_ascii_lowercase();
-            if !dim_names_lower.contains(&level_lower) {
-                let suggestion = suggest_closest(&level_lower, &dim_names_display);
-                let mut msg = format!(
-                    "unknown dimension '{}' in hierarchy '{}'",
-                    level, hierarchy.name
-                );
-                if let Some(s) = suggestion {
-                    let _ = write!(msg, "; did you mean '{s}'?");
-                }
-                return Err(msg);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Derived metric validation (Phase 30)
 // ---------------------------------------------------------------------------
 
@@ -1203,7 +1161,7 @@ mod tests {
                 .collect(),
             filters: vec![],
             facts: vec![],
-            hierarchies: vec![],
+
             column_type_names: vec![],
             column_types_inferred: vec![],
         }
@@ -1439,7 +1397,7 @@ mod tests {
             metrics: vec![],
             filters: vec![],
             facts: vec![],
-            hierarchies: vec![],
+
             column_type_names: vec![],
             column_types_inferred: vec![],
         };
@@ -1576,7 +1534,7 @@ mod tests {
             metrics: vec![],
             filters: vec![],
             joins: vec![],
-            hierarchies: vec![],
+
             column_type_names: vec![],
             column_types_inferred: vec![],
         }
@@ -1754,132 +1712,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 29: validate_hierarchies tests
-    // -----------------------------------------------------------------------
-
-    use crate::model::Hierarchy;
-
-    #[test]
-    fn validate_hierarchies_empty_returns_ok() {
-        let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
-            hierarchies: vec![],
-            ..Default::default()
-        };
-        assert!(validate_hierarchies(&def).is_ok());
-    }
-
-    #[test]
-    fn validate_hierarchies_valid_hierarchy() {
-        let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
-            dimensions: vec![
-                Dimension {
-                    name: "country".to_string(),
-                    expr: "country".to_string(),
-                    ..Default::default()
-                },
-                Dimension {
-                    name: "state".to_string(),
-                    expr: "state".to_string(),
-                    ..Default::default()
-                },
-                Dimension {
-                    name: "city".to_string(),
-                    expr: "city".to_string(),
-                    ..Default::default()
-                },
-            ],
-            hierarchies: vec![Hierarchy {
-                name: "geo".to_string(),
-                levels: vec![
-                    "country".to_string(),
-                    "state".to_string(),
-                    "city".to_string(),
-                ],
-            }],
-            ..Default::default()
-        };
-        assert!(
-            validate_hierarchies(&def).is_ok(),
-            "Valid hierarchy should be accepted"
-        );
-    }
-
-    #[test]
-    fn validate_hierarchies_unknown_dimension() {
-        let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
-            dimensions: vec![Dimension {
-                name: "country".to_string(),
-                expr: "country".to_string(),
-                ..Default::default()
-            }],
-            hierarchies: vec![Hierarchy {
-                name: "geo".to_string(),
-                levels: vec!["country".to_string(), "state".to_string()],
-            }],
-            ..Default::default()
-        };
-        let err = validate_hierarchies(&def).unwrap_err();
-        assert!(
-            err.contains("unknown dimension"),
-            "Expected unknown dimension error, got: {err}"
-        );
-        assert!(
-            err.contains("state") && err.contains("geo"),
-            "Error should mention the unknown dim and hierarchy name, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_hierarchies_unknown_dimension_fuzzy_suggestion() {
-        let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
-            dimensions: vec![Dimension {
-                name: "country".to_string(),
-                expr: "country".to_string(),
-                ..Default::default()
-            }],
-            hierarchies: vec![Hierarchy {
-                name: "geo".to_string(),
-                levels: vec!["contry".to_string()], // typo
-            }],
-            ..Default::default()
-        };
-        let err = validate_hierarchies(&def).unwrap_err();
-        assert!(
-            err.contains("unknown dimension"),
-            "Expected unknown dimension error, got: {err}"
-        );
-        assert!(
-            err.contains("did you mean"),
-            "Expected fuzzy suggestion, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_hierarchies_case_insensitive() {
-        let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
-            dimensions: vec![Dimension {
-                name: "Country".to_string(),
-                expr: "country".to_string(),
-                ..Default::default()
-            }],
-            hierarchies: vec![Hierarchy {
-                name: "geo".to_string(),
-                levels: vec!["country".to_string()], // lowercase ref to uppercase dim
-            }],
-            ..Default::default()
-        };
-        assert!(
-            validate_hierarchies(&def).is_ok(),
-            "Case-insensitive matching should work"
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // Phase 30: contains_aggregate_function tests
     // -----------------------------------------------------------------------
 
@@ -1968,7 +1800,7 @@ mod tests {
             filters: vec![],
             joins: vec![],
             facts: vec![],
-            hierarchies: vec![],
+
             column_type_names: vec![],
             column_types_inferred: vec![],
         }
@@ -2143,7 +1975,7 @@ mod tests {
                 .collect(),
             filters: vec![],
             facts: vec![],
-            hierarchies: vec![],
+
             column_type_names: vec![],
             column_types_inferred: vec![],
         }
@@ -2294,7 +2126,7 @@ mod tests {
                 metrics: vec![],
                 filters: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }

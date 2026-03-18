@@ -763,10 +763,10 @@ fn test_control_char_in_name() {
 }
 
 // ---------------------------------------------------------------------------
-// TEST-09: FACTS and HIERARCHIES clause adversarial input (Phase 29)
+// TEST-09: FACTS clause adversarial input (Phase 29)
 // ---------------------------------------------------------------------------
 
-/// Generate a valid SQL identifier for use in FACTS/HIERARCHIES entries.
+/// Generate a valid SQL identifier for use in FACTS entries.
 fn arb_identifier() -> impl Strategy<Value = String> {
     proptest::string::string_regex("[a-z][a-z0-9_]{0,9}")
         .unwrap()
@@ -853,76 +853,27 @@ proptest! {
         // All are acceptable -- the key invariant is no panics.
     }
 
-    /// HIERARCHIES clause with adversarial input: no panics.
+    /// Empty FACTS clause is valid (no entries).
     #[test]
-    fn hierarchies_clause_no_panic(
-        name in arb_view_name(),
-        hier_name in arb_identifier(),
-        level_count in 1..=4usize,
-    ) {
-        // Build a hierarchy with valid dimension names
-        let levels: Vec<String> = (0..level_count).map(|i| format!("dim{i}")).collect();
-        let dims_clause: String = levels.iter()
-            .map(|l| format!("t.{l} AS {l}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let hier_clause = format!("{hier_name} AS ({})", levels.join(", "));
-        let query = format!(
-            "CREATE SEMANTIC VIEW {name} AS TABLES (t AS orders PRIMARY KEY (id)) HIERARCHIES ({hier_clause}) DIMENSIONS ({dims_clause}) METRICS (t.rev AS SUM(amount))"
-        );
-        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
-        prop_assert!(
-            result.is_ok(),
-            "validate_and_rewrite panicked on HIERARCHIES clause: {hier_clause}"
-        );
-    }
-
-    /// Combined FACTS + HIERARCHIES with adversarial input: no panics.
-    #[test]
-    fn facts_and_hierarchies_combined_no_panic(
-        name in arb_view_name(),
-        alias in arb_identifier(),
-        fact_name in arb_identifier(),
-        fact_expr in arb_simple_expr(),
-        hier_name in arb_identifier(),
-    ) {
-        let query = format!(
-            "CREATE SEMANTIC VIEW {name} AS \
-             TABLES ({alias} AS orders PRIMARY KEY (id)) \
-             FACTS ({alias}.{fact_name} AS {alias}.{fact_expr}) \
-             HIERARCHIES ({hier_name} AS (region)) \
-             DIMENSIONS ({alias}.region AS region) \
-             METRICS ({alias}.rev AS SUM(amount))"
-        );
-        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
-        prop_assert!(
-            result.is_ok(),
-            "validate_and_rewrite panicked on combined FACTS+HIERARCHIES query"
-        );
-    }
-
-    /// Empty FACTS and HIERARCHIES clauses are valid (no entries).
-    #[test]
-    fn empty_facts_hierarchies_clauses_valid(
+    fn empty_facts_clause_valid(
         name in arb_view_name(),
     ) {
         let query = format!(
             "CREATE SEMANTIC VIEW {name} AS \
              TABLES (t AS orders PRIMARY KEY (id)) \
              FACTS () \
-             HIERARCHIES () \
              DIMENSIONS (t.region AS region) \
              METRICS (t.rev AS SUM(amount))"
         );
         let result = validate_and_rewrite(&query);
         prop_assert!(
             result.is_ok(),
-            "Empty FACTS () and HIERARCHIES () should be accepted, got: {:?}",
+            "Empty FACTS () should be accepted, got: {:?}",
             result
         );
         prop_assert!(
             result.unwrap().is_some(),
-            "Empty FACTS/HIERARCHIES should produce valid rewrite"
+            "Empty FACTS should produce valid rewrite"
         );
     }
 }

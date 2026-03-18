@@ -1549,7 +1549,7 @@ mod tests {
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -1674,7 +1674,7 @@ GROUP BY
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -1709,7 +1709,7 @@ GROUP BY
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -1794,7 +1794,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -1928,7 +1928,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2050,7 +2050,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2088,7 +2088,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2125,7 +2125,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2196,7 +2196,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -2298,7 +2298,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2329,7 +2329,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2360,7 +2360,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2431,7 +2431,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -2498,7 +2498,7 @@ FROM \"orders\"";
                     },
                 ],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -2559,7 +2559,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2710,7 +2710,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -2788,7 +2788,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3090,7 +3090,7 @@ FROM \"orders\"";
                     expr: "price * (1 - discount)".to_string(),
                     source_table: None,
                 }],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3121,7 +3121,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3166,7 +3166,7 @@ FROM \"orders\"";
                         source_table: None,
                     },
                 ],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3428,7 +3428,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3505,7 +3505,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3581,7 +3581,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3637,7 +3637,7 @@ FROM \"orders\"";
                     expr: "extended_price * (1 - discount)".to_string(),
                     source_table: Some("li".to_string()),
                 }],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3746,7 +3746,7 @@ FROM \"orders\"";
                     },
                 ],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -3838,7 +3838,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3893,7 +3893,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -4091,7 +4091,7 @@ FROM \"orders\"";
                     },
                 ],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -4236,7 +4236,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -4313,7 +4313,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -4376,7 +4376,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -4432,7 +4432,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
