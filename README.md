@@ -175,16 +175,6 @@ METRICS (
 );
 ```
 
-## Hierarchies (drill-down metadata)
-
-Define drill-down paths for dimension discovery. Hierarchies are pure metadata -- they document relationships between dimensions but don't affect query expansion.
-
-```sql
-HIERARCHIES (
-    geo AS (country, state, city)
-)
-```
-
 ## Cardinality and fan trap detection
 
 Annotate relationship cardinality to catch queries that would inflate aggregates. If a query must traverse a one-to-many join to reach a dimension, the extension raises an error instead of returning incorrect results.
@@ -227,12 +217,11 @@ Without `USING`, queries that involve an ambiguous join path will error.
 ## DDL reference
 
 ```sql
--- Full clause order (FACTS, HIERARCHIES optional; DIMENSIONS, METRICS required)
+-- Full clause order (FACTS optional; DIMENSIONS, METRICS required)
 CREATE SEMANTIC VIEW name AS
   TABLES (...)
   RELATIONSHIPS (...)
   FACTS (...)
-  HIERARCHIES (...)
   DIMENSIONS (...)
   METRICS (...);
 

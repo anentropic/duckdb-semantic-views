@@ -93,11 +93,11 @@ METRICS (
     s.total AS SUM(val)
 )
 
-# Valid DESCRIBE still works (8 columns: name, base_table, dimensions, metrics, filters, joins, facts, hierarchies)
-query TTTTTTTT
+# Valid DESCRIBE still works (7 columns: name, base_table, dimensions, metrics, filters, joins, facts)
+query TTTTTTT
 DESCRIBE SEMANTIC VIEW err_valid;
 ----
-err_valid	err_source	[{"expr":"id","name":"id","output_type":null,"source_table":"s"}]	[{"expr":"SUM(val)","name":"total","output_type":null,"source_table":"s"}]	[]	[]	[]	[]
+err_valid	err_source	[{"expr":"id","name":"id","output_type":null,"source_table":"s"}]	[{"expr":"SUM(val)","name":"total","output_type":null,"source_table":"s"}]	[]	[]	[]
 
 # Normal SQL unaffected
 query I

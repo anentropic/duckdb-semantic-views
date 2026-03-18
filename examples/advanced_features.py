@@ -8,7 +8,6 @@ uv run examples/advanced_features.py
 
 Demonstrates v0.5.3 advanced semantic features:
   - FACTS: reusable row-level expressions with chaining
-  - HIERARCHIES: drill-down path metadata
   - Derived metrics: metric-on-metric composition
   - Cardinality annotations and fan trap detection
   - Role-playing dimensions with USING RELATIONSHIPS
@@ -69,9 +68,6 @@ CREATE SEMANTIC VIEW sales AS
     li.net_price AS li.extended_price * (1 - li.discount),
     li.tax_amount AS li.net_price * li.tax_rate
   )
-  HIERARCHIES (
-    geo AS (country, state, city)
-  )
   DIMENSIONS (
     o.region  AS o.region,
     c.country AS c.country,
@@ -103,23 +99,10 @@ for row in con.execute("""
     print(f"  {row[0]}: total_net={row[1]}, total_tax={row[2]}")
 
 # ============================================================
-# Section 3: HIERARCHIES -- Drill-down paths (metadata)
+# Section 3: Derived metrics -- Metric-on-metric composition
 # ============================================================
 
-print("\n=== Section 3: HIERARCHIES -- Drill-down path metadata ===")
-
-# Hierarchies are metadata -- they document drill-down paths
-# but don't affect query execution.
-rows = con.execute("DESCRIBE SEMANTIC VIEW sales").fetchall()
-# Column index 7 contains hierarchies JSON
-print(f"\nHierarchies metadata: {rows[0][7]}")
-print("  (Documents the geo drill path: country -> state -> city)")
-
-# ============================================================
-# Section 4: Derived metrics -- Metric-on-metric composition
-# ============================================================
-
-print("\n=== Section 4: Derived metrics -- Metric-on-metric composition ===")
+print("\n=== Section 3: Derived metrics -- Metric-on-metric composition ===")
 
 con.execute("DROP SEMANTIC VIEW sales")
 con.execute("""
@@ -180,10 +163,10 @@ result = con.execute("""
 print(f"  profit={result[0]}")
 
 # ============================================================
-# Section 5: Fan trap detection -- Cardinality-aware safety
+# Section 4: Fan trap detection -- Cardinality-aware safety
 # ============================================================
 
-print("\n=== Section 5: Fan trap detection -- Cardinality-aware safety ===")
+print("\n=== Section 4: Fan trap detection -- Cardinality-aware safety ===")
 
 con.execute("DROP SEMANTIC VIEW sales")
 con.execute("""
@@ -232,10 +215,10 @@ except Exception as e:
     print("   which would inflate the count.)")
 
 # ============================================================
-# Section 6: Role-playing dimensions with USING RELATIONSHIPS
+# Section 5: Role-playing dimensions with USING RELATIONSHIPS
 # ============================================================
 
-print("\n=== Section 6: Role-playing dimensions with USING RELATIONSHIPS ===")
+print("\n=== Section 5: Role-playing dimensions with USING RELATIONSHIPS ===")
 
 con.execute("DROP SEMANTIC VIEW fan_trap_demo")
 
@@ -333,10 +316,10 @@ for row in con.execute("""
     print(f"  {row[0]}: {row[1]}")
 
 # ============================================================
-# Section 7: EXPLAIN -- See the generated SQL for role-playing
+# Section 6: EXPLAIN -- See the generated SQL for role-playing
 # ============================================================
 
-print("\n=== Section 7: EXPLAIN -- Generated SQL with scoped aliases ===")
+print("\n=== Section 6: EXPLAIN -- Generated SQL with scoped aliases ===")
 
 for row in con.execute("""
     SELECT * FROM explain_semantic_view('flight_analytics',
@@ -347,10 +330,10 @@ for row in con.execute("""
     print(f"  {row[0]}")
 
 # ============================================================
-# Section 8: DESCRIBE -- Full metadata view
+# Section 7: DESCRIBE -- Full metadata view
 # ============================================================
 
-print("\n=== Section 8: DESCRIBE -- Full metadata view ===")
+print("\n=== Section 7: DESCRIBE -- Full metadata view ===")
 
 for row in con.execute("DESCRIBE SEMANTIC VIEW flight_analytics").fetchall():
     print(f"  view: {row[0]}")
