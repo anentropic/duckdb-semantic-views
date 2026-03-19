@@ -79,7 +79,7 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-None yet.
+- [ ] Investigate WASM build strategy (extension vs custom DuckDB build) — `.planning/todos/pending/2026-03-19-investigate-wasm-build-strategy.md`
 
 ### Blockers/Concerns
 
