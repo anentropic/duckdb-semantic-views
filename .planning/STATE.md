@@ -81,6 +81,7 @@ Recent decisions affecting current work:
 
 - [ ] Investigate WASM build strategy (extension vs custom DuckDB build) — `.planning/todos/pending/2026-03-19-investigate-wasm-build-strategy.md`
 - [ ] Explore dbt semantic layer integration via DuckDB — `.planning/todos/pending/2026-03-19-explore-dbt-semantic-layer-integration-via-duckdb.md`
+- [ ] Pre-aggregation materializations with query-driven suggestions — `.planning/todos/pending/2026-03-19-pre-aggregation-materializations-with-query-driven-suggestions.md`
 
 ### Blockers/Concerns
 
