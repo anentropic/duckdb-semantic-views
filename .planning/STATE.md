@@ -80,6 +80,7 @@ Recent decisions affecting current work:
 ### Pending Todos
 
 - [ ] Investigate WASM build strategy (extension vs custom DuckDB build) — `.planning/todos/pending/2026-03-19-investigate-wasm-build-strategy.md`
+- [ ] Explore dbt semantic layer integration via DuckDB — `.planning/todos/pending/2026-03-19-explore-dbt-semantic-layer-integration-via-duckdb.md`
 
 ### Blockers/Concerns
 
