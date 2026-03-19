@@ -163,10 +163,11 @@ Plans:
 **Depends on**: Phase 33 (needs stable DDL syntax for docs content)
 **Requirements**: DOCS-01, DOCS-02, DOCS-03, DOCS-04
 **Success Criteria** (what must be TRUE):
-  1. Running `zensical build` locally produces a complete static site from `docs/` directory
+  1. Running `mkdocs build` locally produces a complete static site from `docs/` directory
   2. Pushing to main triggers GitHub Actions workflow that deploys updated docs to GitHub Pages
   3. Documentation site includes getting started guide, DDL reference, query reference, clause-level pages, and examples
   4. README contains a prominent link to the documentation site
+**Framework**: mkdocs-material (MkDocs + Material for MkDocs theme)
 **Plans**: TBD
 
 Plans:
