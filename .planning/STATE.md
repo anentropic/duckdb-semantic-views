@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-03-15)
 Phase: 34 (2 of 4 in v0.5.4) (DuckDB 1.5 Upgrade & LTS Branch) -- COMPLETE
 Plan: 2 of 2 in current phase (Plan 02 COMPLETE)
 Status: Phase Complete
-Last activity: 2026-03-18 - Completed quick task 260318-fzu: remove HIERARCHIES syntax, no backward compat considerations needed
+Last activity: 2026-03-20 - Completed quick task 260320-ekj: Fix Windows CI /dev/stdin → mktemp
 
 Progress: [███████░░░] 75%
 
@@ -94,6 +94,7 @@ Recent decisions affecting current work:
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 260318-fzu | remove HIERARCHIES syntax, no backward compat considerations needed | 2026-03-18 | 72fb69d | [260318-fzu-remove-hierarchies-syntax-no-backward-co](./quick/260318-fzu-remove-hierarchies-syntax-no-backward-co/) |
+| 260320-ekj | Fix Windows CI: replace /dev/stdin with temp file in per-process sqllogictest loop | 2026-03-20 | fc8d582 | [260320-ekj-fix-windows-ci-replace-dev-stdin-with-te](./quick/260320-ekj-fix-windows-ci-replace-dev-stdin-with-te/) |
 
 ## Session Continuity
 
