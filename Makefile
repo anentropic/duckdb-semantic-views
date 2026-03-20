@@ -113,17 +113,22 @@ TEST_RUNNER_FILE_LIST_RELEASE := $(TEST_RUNNER) --test-dir test/sql --file-list 
 # Running all test files in a single sqllogictest process causes a segfault
 # when the runner creates/destroys multiple databases sequentially. Work around
 # by running each test file in a separate process. Each test passes in isolation.
+# Uses mktemp instead of /dev/stdin because the Python sqllogictest runner
+# resolves /dev/stdin to /proc/self/fd/0, which doesn't exist on Windows.
 test_extension_debug_internal: patch-runner
 	@echo "Running DEBUG tests.."
 	@FAILED=0; \
 	TOTAL=0; \
+	TMPLIST=$$(mktemp); \
 	while IFS= read -r testfile; do \
 		TOTAL=$$((TOTAL + 1)); \
-		if ! $(TEST_RUNNER) --test-dir test/sql --file-list /dev/stdin $(EXTRA_EXTENSIONS_PARAM) --external-extension build/debug/$(EXTENSION_NAME).duckdb_extension <<< "$$testfile"; then \
+		echo "$$testfile" > "$$TMPLIST"; \
+		if ! $(TEST_RUNNER) --test-dir test/sql --file-list "$$TMPLIST" $(EXTRA_EXTENSIONS_PARAM) --external-extension build/debug/$(EXTENSION_NAME).duckdb_extension; then \
 			echo "FAILED: $$testfile"; \
 			FAILED=$$((FAILED + 1)); \
 		fi; \
 	done < $(TEST_LIST_PATH); \
+	rm -f "$$TMPLIST"; \
 	echo "$$TOTAL tests run, $$FAILED failed"; \
 	[ $$FAILED -eq 0 ]
 
@@ -131,12 +136,15 @@ test_extension_release_internal: patch-runner
 	@echo "Running RELEASE tests.."
 	@FAILED=0; \
 	TOTAL=0; \
+	TMPLIST=$$(mktemp); \
 	while IFS= read -r testfile; do \
 		TOTAL=$$((TOTAL + 1)); \
-		if ! $(TEST_RUNNER) --test-dir test/sql --file-list /dev/stdin $(EXTRA_EXTENSIONS_PARAM) --external-extension build/release/$(EXTENSION_NAME).duckdb_extension <<< "$$testfile"; then \
+		echo "$$testfile" > "$$TMPLIST"; \
+		if ! $(TEST_RUNNER) --test-dir test/sql --file-list "$$TMPLIST" $(EXTRA_EXTENSIONS_PARAM) --external-extension build/release/$(EXTENSION_NAME).duckdb_extension; then \
 			echo "FAILED: $$testfile"; \
 			FAILED=$$((FAILED + 1)); \
 		fi; \
 	done < $(TEST_LIST_PATH); \
+	rm -f "$$TMPLIST"; \
 	echo "$$TOTAL tests run, $$FAILED failed"; \
 	[ $$FAILED -eq 0 ]
