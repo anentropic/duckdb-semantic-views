@@ -116,10 +116,10 @@ SELECT * FROM explain_semantic_view('analytics',
 ```
 
 ```
-┌──────────────────────────────────────────────────────────────┐
+┌────────────────────────────────────────────────────────────────┐
 │                        explain_output                        │
 │                           varchar                            │
-├──────────────────────────────────────────────────────────────┤
+├────────────────────────────────────────────────────────────────┤
 │ -- Semantic View: analytics                                  │
 │ -- Dimensions: customer_name                                 │
 │ -- Metrics: revenue                                          │
@@ -135,9 +135,9 @@ SELECT * FROM explain_semantic_view('analytics',
 │                                                              │
 │ -- DuckDB Plan:                                              │
 │ ...                                                          │
-├──────────────────────────────────────────────────────────────┤
+├────────────────────────────────────────────────────────────────┤
 │ 15+ rows                                                     │
-└──────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ## FACTS (reusable row-level expressions)
@@ -253,7 +253,7 @@ just build     # debug build
 cargo test     # unit + property-based tests
 just test-sql  # SQL logic tests (needs just build first)
 just test-all  # everything
-just lint       # fmt + clippy + cargo-deny
+just lint      # fmt + clippy + cargo-deny
 ```
 
 ## License
