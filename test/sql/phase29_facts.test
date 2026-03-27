@@ -1,5 +1,5 @@
-# Phase 29: End-to-end integration test for FACTS and HIERARCHIES
-# Tests fact expression inlining, hierarchy metadata, DESCRIBE output,
+# Phase 29: End-to-end integration test for FACTS
+# Tests fact expression inlining, DESCRIBE output,
 # and error cases for the full DDL->query->describe->drop lifecycle.
 
 require semantic_views
@@ -30,7 +30,7 @@ statement ok
 INSERT INTO p29_customers VALUES (1, 'Alice', 'US', 'NY', 'NYC'), (2, 'Bob', 'US', 'CA', 'LA');
 
 # ============================================================
-# Test 1: CREATE with FACTS and HIERARCHIES
+# Test 1: CREATE with FACTS
 # ============================================================
 
 statement ok
@@ -47,9 +47,6 @@ CREATE SEMANTIC VIEW p29_analytics AS
   FACTS (
     li.net_price AS li.extended_price * (1 - li.discount),
     li.tax_amount AS li.net_price * li.tax_rate
-  )
-  HIERARCHIES (
-    geo AS (country, state, city)
   )
   DIMENSIONS (
     o.region AS o.region,
@@ -105,13 +102,13 @@ SELECT * FROM semantic_view('p29_analytics', metrics := ['total_net', 'total_tax
 400.00	32.30
 
 # ============================================================
-# Test 5: DESCRIBE shows facts and hierarchies (8 columns)
+# Test 5: DESCRIBE shows facts (7 columns)
 # ============================================================
 
-query TTTTTTTT
+query TTTTTTT
 DESCRIBE SEMANTIC VIEW p29_analytics;
 ----
-p29_analytics	p29_orders	[{"expr":"o.region","name":"region","output_type":null,"source_table":"o"},{"expr":"c.country","name":"country","output_type":null,"source_table":"c"},{"expr":"c.state","name":"state","output_type":null,"source_table":"c"},{"expr":"c.city","name":"city","output_type":null,"source_table":"c"}]	[{"expr":"SUM(li.net_price)","name":"total_net","output_type":null,"source_table":"li"},{"expr":"SUM(li.tax_amount)","name":"total_tax","output_type":null,"source_table":"li"}]	[]	[{"fk_columns":["order_id"],"from_alias":"li","from_cols":[],"join_columns":[],"name":"li_to_order","table":"o"},{"fk_columns":["customer_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_customer","table":"c"}]	[{"expr":"li.extended_price * (1 - li.discount)","name":"net_price","source_table":"li"},{"expr":"li.net_price * li.tax_rate","name":"tax_amount","source_table":"li"}]	[{"levels":["country","state","city"],"name":"geo"}]
+p29_analytics	p29_orders	[{"expr":"o.region","name":"region","output_type":null,"source_table":"o"},{"expr":"c.country","name":"country","output_type":null,"source_table":"c"},{"expr":"c.state","name":"state","output_type":null,"source_table":"c"},{"expr":"c.city","name":"city","output_type":null,"source_table":"c"}]	[{"expr":"SUM(li.net_price)","name":"total_net","output_type":null,"source_table":"li"},{"expr":"SUM(li.tax_amount)","name":"total_tax","output_type":null,"source_table":"li"}]	[]	[{"fk_columns":["order_id"],"from_alias":"li","from_cols":[],"join_columns":[],"name":"li_to_order","ref_columns":["id"],"table":"o"},{"fk_columns":["customer_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_customer","ref_columns":["id"],"table":"c"}]	[{"expr":"li.extended_price * (1 - li.discount)","name":"net_price","source_table":"li"},{"expr":"li.net_price * li.tax_rate","name":"tax_amount","source_table":"li"}]
 
 # ============================================================
 # Test 6: Error -- fact cycle (two facts referencing each other)
@@ -157,28 +154,7 @@ CREATE SEMANTIC VIEW p29_self_ref AS
 cycle detected in facts
 
 # ============================================================
-# Test 8: Error -- hierarchy references non-existent dimension
-# ============================================================
-
-statement error
-CREATE SEMANTIC VIEW p29_bad_hier AS
-  TABLES (
-    o AS p29_orders PRIMARY KEY (id)
-  )
-  HIERARCHIES (
-    geo AS (region, nonexistent_dim)
-  )
-  DIMENSIONS (
-    o.region AS o.region
-  )
-  METRICS (
-    o.total AS count(*)
-  );
-----
-unknown dimension
-
-# ============================================================
-# Test 9: Error -- facts source table not in TABLES
+# Test 8: Error -- facts source table not in TABLES
 # ============================================================
 
 statement error
@@ -199,7 +175,7 @@ CREATE SEMANTIC VIEW p29_bad_source AS
 unknown source table
 
 # ============================================================
-# Test 10: FACTS without HIERARCHIES (hierarchies optional)
+# Test 9: FACTS without other optional clauses
 # ============================================================
 
 statement ok
@@ -225,34 +201,6 @@ West	1
 
 statement ok
 DROP SEMANTIC VIEW p29_facts_only;
-
-# ============================================================
-# Test 11: HIERARCHIES without FACTS (facts optional)
-# ============================================================
-
-statement ok
-CREATE SEMANTIC VIEW p29_hier_only AS
-  TABLES (
-    c AS p29_customers PRIMARY KEY (id)
-  )
-  HIERARCHIES (
-    geo AS (country, city)
-  )
-  DIMENSIONS (
-    c.country AS c.country,
-    c.city AS c.city
-  )
-  METRICS (
-    c.cnt AS count(*)
-  );
-
-query TTTTTTTT
-DESCRIBE SEMANTIC VIEW p29_hier_only;
-----
-p29_hier_only	p29_customers	[{"expr":"c.country","name":"country","output_type":null,"source_table":"c"},{"expr":"c.city","name":"city","output_type":null,"source_table":"c"}]	[{"expr":"count(*)","name":"cnt","output_type":null,"source_table":"c"}]	[]	[]	[]	[{"levels":["country","city"],"name":"geo"}]
-
-statement ok
-DROP SEMANTIC VIEW p29_hier_only;
 
 # ============================================================
 # Cleanup

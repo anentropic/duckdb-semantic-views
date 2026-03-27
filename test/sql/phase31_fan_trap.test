@@ -1,6 +1,7 @@
-# Phase 31: End-to-end integration test for fan trap detection
-# Tests that queries crossing one-to-many boundaries are blocked with
-# descriptive errors, while safe queries succeed normally.
+# Phase 31/33: End-to-end integration test for fan trap detection
+# Tests that queries crossing fan-out boundaries (reverse ManyToOne) are blocked
+# with descriptive errors, while safe queries succeed normally.
+# Phase 33: Cardinality keywords removed; cardinality inferred from PK/UNIQUE.
 
 require semantic_views
 
@@ -30,7 +31,9 @@ statement ok
 INSERT INTO p31_customers VALUES (10, 'Alice', 'Enterprise'), (20, 'Bob', 'SMB');
 
 # ============================================================
-# Test 1: DDL with MANY TO ONE cardinality keywords
+# Test 1: DDL with inferred cardinality (no keywords)
+# li(order_id) REFERENCES o -> ManyToOne (order_id not PK/UNIQUE on li)
+# o(customer_id) REFERENCES c -> ManyToOne (customer_id not PK/UNIQUE on o)
 # ============================================================
 
 statement ok
@@ -41,8 +44,8 @@ CREATE SEMANTIC VIEW p31_sales AS
     c AS p31_customers PRIMARY KEY (id)
   )
   RELATIONSHIPS (
-    li_to_order AS li(order_id) REFERENCES o MANY TO ONE,
-    order_to_customer AS o(customer_id) REFERENCES c MANY TO ONE
+    li_to_order AS li(order_id) REFERENCES o,
+    order_to_customer AS o(customer_id) REFERENCES c
   )
   DIMENSIONS (
     o.region AS o.region,
@@ -56,7 +59,7 @@ CREATE SEMANTIC VIEW p31_sales AS
 
 # ============================================================
 # Test 2: Safe query -- metric from li, dimension from o
-# li.revenue (from li) + o.region (from o): li->o is MANY TO ONE, safe
+# li.revenue (from li) + o.region (from o): li->o is ManyToOne, safe
 # East: SUM(100 + 200) = 300, West: SUM(150) = 150
 # ============================================================
 
@@ -69,7 +72,7 @@ West	150.0
 # ============================================================
 # Test 3: Fan trap -- metric from o, dimension from li (blocked)
 # o.order_count (from o) + li.status (from li):
-# o->li is reverse of li->o MANY TO ONE = fan-out
+# o->li is reverse of li->o ManyToOne = fan-out
 # ============================================================
 
 statement error
@@ -90,55 +93,12 @@ Enterprise	300.0
 SMB	150.0
 
 # ============================================================
-# Test 5: DDL with explicit ONE TO MANY
-# Uses li(order_id) REFERENCES o ONE TO MANY to declare the relationship
-# is ONE TO MANY from li's perspective (li has many rows per o row).
-# This is semantically equivalent to MANY TO ONE from o's perspective.
-# But with ONE TO MANY declared, li->o forward is fan-out.
+# Test 5: OneToOne inferred (FK matches PK on from-side -> always safe)
+# o(id) REFERENCES d: id is PK on o -> OneToOne inferred
 # ============================================================
 
 statement ok
 DROP SEMANTIC VIEW p31_sales;
-
-statement ok
-CREATE SEMANTIC VIEW p31_otm AS
-  TABLES (
-    o AS p31_orders PRIMARY KEY (id),
-    li AS p31_line_items PRIMARY KEY (id)
-  )
-  RELATIONSHIPS (
-    li_to_order AS li(order_id) REFERENCES o ONE TO MANY
-  )
-  DIMENSIONS (
-    o.region AS o.region,
-    li.status AS li.status
-  )
-  METRICS (
-    li.revenue AS SUM(li.extended_price),
-    o.order_count AS COUNT(*)
-  );
-
-# ONE TO MANY forward: li->o is fan-out. metric from li + dim from o = blocked
-
-statement error
-SELECT * FROM semantic_view('p31_otm', dimensions := ['region'], metrics := ['revenue']);
-----
-fan trap detected
-
-# ONE TO MANY reverse: o->li is safe. metric from o + dim from li = allowed
-
-query TR rowsort
-SELECT * FROM semantic_view('p31_otm', dimensions := ['status'], metrics := ['order_count']);
-----
-pending	1
-shipped	2
-
-# ============================================================
-# Test 6: DDL with ONE TO ONE (always safe)
-# ============================================================
-
-statement ok
-DROP SEMANTIC VIEW p31_otm;
 
 statement ok
 CREATE TABLE p31_order_details (id INTEGER, note VARCHAR);
@@ -153,7 +113,7 @@ CREATE SEMANTIC VIEW p31_oto AS
     d AS p31_order_details PRIMARY KEY (id)
   )
   RELATIONSHIPS (
-    order_detail AS o(id) REFERENCES d ONE TO ONE
+    order_detail AS o(id) REFERENCES d
   )
   DIMENSIONS (
     o.region AS o.region,
@@ -164,7 +124,7 @@ CREATE SEMANTIC VIEW p31_oto AS
     d.detail_count AS COUNT(*)
   );
 
-# Both directions safe with ONE TO ONE
+# Both directions safe with OneToOne
 
 query TR rowsort
 SELECT * FROM semantic_view('p31_oto', dimensions := ['note'], metrics := ['order_count']);
@@ -179,7 +139,7 @@ East	1
 West	1
 
 # ============================================================
-# Test 7: Default cardinality (no keyword = MANY TO ONE)
+# Test 6: Default cardinality (no keyword = inferred ManyToOne)
 # ============================================================
 
 statement ok
@@ -203,7 +163,7 @@ CREATE SEMANTIC VIEW p31_default AS
     o.order_count AS COUNT(*)
   );
 
-# Default = MANY TO ONE: li->o is safe, o->li is fan-out
+# Inferred ManyToOne: li->o is safe, o->li is fan-out
 
 query TR rowsort
 SELECT * FROM semantic_view('p31_default', dimensions := ['region'], metrics := ['revenue']);
@@ -217,7 +177,7 @@ SELECT * FROM semantic_view('p31_default', dimensions := ['status'], metrics := 
 fan trap detected
 
 # ============================================================
-# Test 8: Fan trap with derived metric
+# Test 7: Fan trap with derived metric
 # ============================================================
 
 statement ok
@@ -230,7 +190,7 @@ CREATE SEMANTIC VIEW p31_derived AS
     li AS p31_line_items PRIMARY KEY (id)
   )
   RELATIONSHIPS (
-    li_to_order AS li(order_id) REFERENCES o MANY TO ONE
+    li_to_order AS li(order_id) REFERENCES o
   )
   DIMENSIONS (
     o.region AS o.region,
@@ -261,40 +221,11 @@ East	150.0
 West	150.0
 
 # ============================================================
-# Test 9: Case-insensitive cardinality keywords
-# ============================================================
-
-statement ok
-DROP SEMANTIC VIEW p31_derived;
-
-statement ok
-CREATE SEMANTIC VIEW p31_case AS
-  TABLES (
-    o AS p31_orders PRIMARY KEY (id),
-    li AS p31_line_items PRIMARY KEY (id)
-  )
-  RELATIONSHIPS (
-    li_to_order AS li(order_id) REFERENCES o many to one
-  )
-  DIMENSIONS (
-    o.region AS o.region
-  )
-  METRICS (
-    li.revenue AS SUM(li.extended_price)
-  );
-
-query TR rowsort
-SELECT * FROM semantic_view('p31_case', dimensions := ['region'], metrics := ['revenue']);
-----
-East	300.0
-West	150.0
-
-# ============================================================
 # Cleanup
 # ============================================================
 
 statement ok
-DROP SEMANTIC VIEW p31_case;
+DROP SEMANTIC VIEW p31_derived;
 
 statement ok
 DROP TABLE p31_order_details;

@@ -215,29 +215,70 @@ impl RelationshipGraph {
     }
 }
 
-/// Check FK column count matches PK column count for each relationship.
-fn check_fk_pk_counts(def: &SemanticViewDefinition) -> Result<(), String> {
+/// Phase 33: Validate that FK referenced columns match a declared PK or UNIQUE
+/// constraint on the target table. Replaces the old `check_fk_pk_counts`.
+///
+/// For each join with non-empty `fk_columns` and non-empty `ref_columns`:
+/// - Checks `ref_columns` against target's `pk_columns` (exact set match)
+/// - Checks `ref_columns` against each of target's `unique_constraints` (exact set match)
+/// - Rejects if neither matches (CARD-03/CARD-09: exact match required, subsets rejected)
+fn validate_fk_references(def: &SemanticViewDefinition) -> Result<(), String> {
     for join in &def.joins {
-        if join.fk_columns.is_empty() {
+        if join.fk_columns.is_empty() || join.ref_columns.is_empty() {
             continue;
         }
         let to_alias_lower = join.table.to_ascii_lowercase();
-        if let Some(table_ref) = def
+        let target = def
             .tables
             .iter()
-            .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower)
-        {
-            if !table_ref.pk_columns.is_empty()
-                && join.fk_columns.len() != table_ref.pk_columns.len()
-            {
-                return Err(format!(
-                    "FK column count ({}) does not match PK column count ({}) on table '{}'",
-                    join.fk_columns.len(),
-                    table_ref.pk_columns.len(),
-                    join.table,
-                ));
-            }
+            .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower);
+        let Some(target) = target else { continue };
+
+        let ref_set: HashSet<String> = join
+            .ref_columns
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+
+        // Check PK
+        let pk_set: HashSet<String> = target
+            .pk_columns
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        if !pk_set.is_empty() && ref_set == pk_set {
+            continue; // Valid: matches PK
         }
+
+        // Check UNIQUE constraints
+        let matches_unique = target.unique_constraints.iter().any(|uc| {
+            let uc_set: HashSet<String> = uc.iter().map(|c| c.to_ascii_lowercase()).collect();
+            ref_set == uc_set
+        });
+        if matches_unique {
+            continue; // Valid: matches a UNIQUE constraint
+        }
+
+        // Neither matches -- build error
+        let rel_name = join.name.as_deref().unwrap_or("?");
+        let ref_cols = join.ref_columns.join(", ");
+        let mut available = Vec::new();
+        if !target.pk_columns.is_empty() {
+            available.push(format!("PK({})", target.pk_columns.join(", ")));
+        }
+        for uc in &target.unique_constraints {
+            available.push(format!("UNIQUE({})", uc.join(", ")));
+        }
+        let available_str = if available.is_empty() {
+            "none declared".to_string()
+        } else {
+            available.join(", ")
+        };
+        return Err(format!(
+            "FK ({ref_cols}) in relationship '{rel_name}' does not match any PRIMARY KEY or \
+             UNIQUE constraint on table '{}'. Available: {available_str}.",
+            target.alias
+        ));
     }
     Ok(())
 }
@@ -315,8 +356,8 @@ pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph,
     // 3. Orphan table detection.
     graph.check_no_orphans()?;
 
-    // 4. FK/PK column count matching.
-    check_fk_pk_counts(def)?;
+    // 4. FK reference validation (Phase 33: replaces FK/PK count check).
+    validate_fk_references(def)?;
 
     // 5. Source table reachability.
     check_source_tables_reachable(def, &graph)?;
@@ -539,48 +580,6 @@ fn check_fact_cycles(
         }
 
         return Err("cycle detected in facts".to_string());
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Hierarchy validation (Phase 29)
-// ---------------------------------------------------------------------------
-
-/// Validate hierarchies in a semantic view definition.
-///
-/// Checks that every level name in each hierarchy matches a declared dimension name
-/// (case-insensitive). Uses `suggest_closest` for fuzzy error suggestions.
-///
-/// Returns `Ok(())` if valid, `Err` with descriptive message otherwise.
-pub fn validate_hierarchies(def: &SemanticViewDefinition) -> Result<(), String> {
-    if def.hierarchies.is_empty() {
-        return Ok(());
-    }
-
-    let dim_names_lower: HashSet<String> = def
-        .dimensions
-        .iter()
-        .map(|d| d.name.to_ascii_lowercase())
-        .collect();
-    let dim_names_display: Vec<String> = def.dimensions.iter().map(|d| d.name.clone()).collect();
-
-    for hierarchy in &def.hierarchies {
-        for level in &hierarchy.levels {
-            let level_lower = level.to_ascii_lowercase();
-            if !dim_names_lower.contains(&level_lower) {
-                let suggestion = suggest_closest(&level_lower, &dim_names_display);
-                let mut msg = format!(
-                    "unknown dimension '{}' in hierarchy '{}'",
-                    level, hierarchy.name
-                );
-                if let Some(s) = suggestion {
-                    let _ = write!(msg, "; did you mean '{s}'?");
-                }
-                return Err(msg);
-            }
-        }
     }
 
     Ok(())
@@ -1129,6 +1128,7 @@ mod tests {
                     alias: alias.to_string(),
                     table: table.to_string(),
                     pk_columns: pks.iter().map(|s| s.to_string()).collect(),
+                    unique_constraints: vec![],
                 })
                 .collect(),
             joins: joins
@@ -1161,7 +1161,7 @@ mod tests {
                 .collect(),
             filters: vec![],
             facts: vec![],
-            hierarchies: vec![],
+
             column_type_names: vec![],
             column_types_inferred: vec![],
         }
@@ -1266,25 +1266,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FK/PK count mismatch
+    // FK reference validation (Phase 33: replaces FK/PK count check)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn fk_pk_count_mismatch() {
-        // join has 2 FK columns but referenced table has 1 PK column
+    fn fk_ref_validation_skipped_when_no_ref_columns() {
+        // Phase 33: validate_fk_references skips joins with empty ref_columns
+        // (the make_def helper produces joins without ref_columns).
         let def = make_def(
             vec![
                 ("o", "orders", vec!["id"]),
                 ("c", "customers", vec!["id"]), // 1 PK
             ],
-            vec![("o", "c", vec!["customer_id", "extra_col"])], // 2 FK
+            vec![("o", "c", vec!["customer_id", "extra_col"])], // 2 FK, no ref_columns
             vec![],
             vec![],
         );
-        let err = validate_graph(&def).unwrap_err();
         assert!(
-            err.contains("FK column count") && err.contains("PK column count"),
-            "expected count mismatch error, got: {err}"
+            validate_graph(&def).is_ok(),
+            "joins without ref_columns should skip FK reference validation"
         );
     }
 
@@ -1385,6 +1385,7 @@ mod tests {
                 alias: "o".to_string(),
                 table: "orders".to_string(),
                 pk_columns: vec![],
+                unique_constraints: vec![],
             }],
             joins: vec![Join {
                 table: "customers".to_string(),
@@ -1396,7 +1397,7 @@ mod tests {
             metrics: vec![],
             filters: vec![],
             facts: vec![],
-            hierarchies: vec![],
+
             column_type_names: vec![],
             column_types_inferred: vec![],
         };
@@ -1518,6 +1519,7 @@ mod tests {
                     alias: alias.to_string(),
                     table: table.to_string(),
                     pk_columns: vec!["id".to_string()],
+                    unique_constraints: vec![],
                 })
                 .collect(),
             facts: facts
@@ -1532,7 +1534,7 @@ mod tests {
             metrics: vec![],
             filters: vec![],
             joins: vec![],
-            hierarchies: vec![],
+
             column_type_names: vec![],
             column_types_inferred: vec![],
         }
@@ -1710,132 +1712,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 29: validate_hierarchies tests
-    // -----------------------------------------------------------------------
-
-    use crate::model::Hierarchy;
-
-    #[test]
-    fn validate_hierarchies_empty_returns_ok() {
-        let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
-            hierarchies: vec![],
-            ..Default::default()
-        };
-        assert!(validate_hierarchies(&def).is_ok());
-    }
-
-    #[test]
-    fn validate_hierarchies_valid_hierarchy() {
-        let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
-            dimensions: vec![
-                Dimension {
-                    name: "country".to_string(),
-                    expr: "country".to_string(),
-                    ..Default::default()
-                },
-                Dimension {
-                    name: "state".to_string(),
-                    expr: "state".to_string(),
-                    ..Default::default()
-                },
-                Dimension {
-                    name: "city".to_string(),
-                    expr: "city".to_string(),
-                    ..Default::default()
-                },
-            ],
-            hierarchies: vec![Hierarchy {
-                name: "geo".to_string(),
-                levels: vec![
-                    "country".to_string(),
-                    "state".to_string(),
-                    "city".to_string(),
-                ],
-            }],
-            ..Default::default()
-        };
-        assert!(
-            validate_hierarchies(&def).is_ok(),
-            "Valid hierarchy should be accepted"
-        );
-    }
-
-    #[test]
-    fn validate_hierarchies_unknown_dimension() {
-        let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
-            dimensions: vec![Dimension {
-                name: "country".to_string(),
-                expr: "country".to_string(),
-                ..Default::default()
-            }],
-            hierarchies: vec![Hierarchy {
-                name: "geo".to_string(),
-                levels: vec!["country".to_string(), "state".to_string()],
-            }],
-            ..Default::default()
-        };
-        let err = validate_hierarchies(&def).unwrap_err();
-        assert!(
-            err.contains("unknown dimension"),
-            "Expected unknown dimension error, got: {err}"
-        );
-        assert!(
-            err.contains("state") && err.contains("geo"),
-            "Error should mention the unknown dim and hierarchy name, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_hierarchies_unknown_dimension_fuzzy_suggestion() {
-        let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
-            dimensions: vec![Dimension {
-                name: "country".to_string(),
-                expr: "country".to_string(),
-                ..Default::default()
-            }],
-            hierarchies: vec![Hierarchy {
-                name: "geo".to_string(),
-                levels: vec!["contry".to_string()], // typo
-            }],
-            ..Default::default()
-        };
-        let err = validate_hierarchies(&def).unwrap_err();
-        assert!(
-            err.contains("unknown dimension"),
-            "Expected unknown dimension error, got: {err}"
-        );
-        assert!(
-            err.contains("did you mean"),
-            "Expected fuzzy suggestion, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_hierarchies_case_insensitive() {
-        let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
-            dimensions: vec![Dimension {
-                name: "Country".to_string(),
-                expr: "country".to_string(),
-                ..Default::default()
-            }],
-            hierarchies: vec![Hierarchy {
-                name: "geo".to_string(),
-                levels: vec!["country".to_string()], // lowercase ref to uppercase dim
-            }],
-            ..Default::default()
-        };
-        assert!(
-            validate_hierarchies(&def).is_ok(),
-            "Case-insensitive matching should work"
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // Phase 30: contains_aggregate_function tests
     // -----------------------------------------------------------------------
 
@@ -1917,13 +1793,14 @@ mod tests {
                 alias: "o".to_string(),
                 table: "orders".to_string(),
                 pk_columns: vec!["id".to_string()],
+                unique_constraints: vec![],
             }],
             metrics,
             dimensions: vec![],
             filters: vec![],
             joins: vec![],
             facts: vec![],
-            hierarchies: vec![],
+
             column_type_names: vec![],
             column_types_inferred: vec![],
         }
@@ -2072,6 +1949,7 @@ mod tests {
                     alias: alias.to_string(),
                     table: table.to_string(),
                     pk_columns: pks.iter().map(|s| s.to_string()).collect(),
+                    unique_constraints: vec![],
                 })
                 .collect(),
             joins: joins
@@ -2097,7 +1975,7 @@ mod tests {
                 .collect(),
             filters: vec![],
             facts: vec![],
-            hierarchies: vec![],
+
             column_type_names: vec![],
             column_types_inferred: vec![],
         }
@@ -2228,5 +2106,229 @@ mod tests {
             err.contains("derived metric") && err.contains("USING"),
             "Expected USING on derived metric error, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 33: FK reference validation (CARD-03, CARD-09)
+    // -----------------------------------------------------------------------
+
+    mod phase33_fk_reference_tests {
+        use super::*;
+        use crate::model::{Join, TableRef};
+
+        /// Build a minimal definition for FK reference validation testing.
+        fn make_fk_ref_def(tables: Vec<TableRef>, joins: Vec<Join>) -> SemanticViewDefinition {
+            SemanticViewDefinition {
+                base_table: tables.first().map(|t| t.table.clone()).unwrap_or_default(),
+                tables,
+                joins,
+                dimensions: vec![],
+                metrics: vec![],
+                filters: vec![],
+                facts: vec![],
+
+                column_type_names: vec![],
+                column_types_inferred: vec![],
+            }
+        }
+
+        #[test]
+        fn fk_matches_pk_passes() {
+            let def = make_fk_ref_def(
+                vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
+                    },
+                ],
+                vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    ref_columns: vec!["id".to_string()],
+                    name: Some("o_to_c".to_string()),
+                    ..Default::default()
+                }],
+            );
+            assert!(
+                validate_fk_references(&def).is_ok(),
+                "FK matching PK should pass"
+            );
+        }
+
+        #[test]
+        fn fk_matches_unique_passes() {
+            let def = make_fk_ref_def(
+                vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![vec!["email".to_string()]],
+                    },
+                ],
+                vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_email".to_string()],
+                    ref_columns: vec!["email".to_string()],
+                    name: Some("o_to_c".to_string()),
+                    ..Default::default()
+                }],
+            );
+            assert!(
+                validate_fk_references(&def).is_ok(),
+                "FK matching UNIQUE should pass"
+            );
+        }
+
+        #[test]
+        fn fk_no_match_errors_with_available() {
+            let def = make_fk_ref_def(
+                vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![vec!["email".to_string()]],
+                    },
+                ],
+                vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_name".to_string()],
+                    ref_columns: vec!["name".to_string()],
+                    name: Some("o_to_c".to_string()),
+                    ..Default::default()
+                }],
+            );
+            let err = validate_fk_references(&def).unwrap_err();
+            assert!(
+                err.contains("does not match any PRIMARY KEY or UNIQUE constraint"),
+                "Expected FK reference error, got: {err}"
+            );
+            assert!(err.contains("PK(id)"), "Should list PK: {err}");
+            assert!(err.contains("UNIQUE(email)"), "Should list UNIQUE: {err}");
+        }
+
+        #[test]
+        fn composite_fk_subset_rejected() {
+            // CARD-09: FK refs (id) but PK is (id, email) -> rejected (not exact match)
+            let def = make_fk_ref_def(
+                vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        pk_columns: vec!["id".to_string(), "email".to_string()],
+                        unique_constraints: vec![],
+                    },
+                ],
+                vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    ref_columns: vec!["id".to_string()],
+                    name: Some("o_to_c".to_string()),
+                    ..Default::default()
+                }],
+            );
+            let err = validate_fk_references(&def).unwrap_err();
+            assert!(
+                err.contains("does not match any PRIMARY KEY or UNIQUE constraint"),
+                "Subset FK should be rejected: {err}"
+            );
+        }
+
+        #[test]
+        fn case_insensitive_matching() {
+            // Columns differ in case but should match
+            let def = make_fk_ref_def(
+                vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        pk_columns: vec!["ID".to_string()],
+                        unique_constraints: vec![],
+                    },
+                ],
+                vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    ref_columns: vec!["id".to_string()], // lowercase vs uppercase PK
+                    name: Some("o_to_c".to_string()),
+                    ..Default::default()
+                }],
+            );
+            assert!(
+                validate_fk_references(&def).is_ok(),
+                "Case-insensitive column matching should work"
+            );
+        }
+
+        #[test]
+        fn empty_ref_columns_skipped() {
+            // Old-format joins with empty ref_columns should be skipped
+            let def = make_fk_ref_def(
+                vec![
+                    TableRef {
+                        alias: "o".to_string(),
+                        table: "orders".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
+                    },
+                    TableRef {
+                        alias: "c".to_string(),
+                        table: "customers".to_string(),
+                        pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
+                    },
+                ],
+                vec![Join {
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    ref_columns: vec![], // empty = skip validation
+                    name: Some("o_to_c".to_string()),
+                    ..Default::default()
+                }],
+            );
+            assert!(
+                validate_fk_references(&def).is_ok(),
+                "Empty ref_columns should skip validation"
+            );
+        }
     }
 }

@@ -1,4 +1,9 @@
+pub mod alter;
 pub mod define;
 pub mod describe;
 pub mod drop;
 pub mod list;
+pub mod show_dims;
+pub mod show_dims_for_metric;
+pub mod show_facts;
+pub mod show_metrics;

@@ -12,6 +12,12 @@ pub struct TableRef {
     /// Not serialized when empty to preserve backward-compatible JSON.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pk_columns: Vec<String>,
+    /// UNIQUE constraints on this table. Each inner Vec is one constraint's column list.
+    /// A table can have zero or more UNIQUE constraints (composite allowed).
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unique_constraints: Vec<Vec<String>>,
 }
 
 /// A named SQL column expression used as a dimension.
@@ -69,18 +75,6 @@ pub struct Fact {
     pub source_table: Option<String>,
 }
 
-/// A named drill-down path through declared dimensions.
-/// Added in Phase 29 for the HIERARCHIES clause of CREATE SEMANTIC VIEW.
-///
-/// Example: `geo AS (country, state, city)` defines a hierarchy named "geo"
-/// whose levels are existing dimension names from coarsest to finest granularity.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-pub struct Hierarchy {
-    pub name: String,
-    pub levels: Vec<String>,
-}
-
 /// A column-pair relationship entry for composite or single FK declarations.
 /// Used in the `relationships` DDL parameter's `join_columns` field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -92,16 +86,16 @@ pub struct JoinColumn {
 
 /// Cardinality of a relationship between two tables.
 ///
-/// Declared after `REFERENCES <alias>` in the RELATIONSHIPS clause.
-/// Defaults to `ManyToOne` when omitted (most common FK pattern).
-/// Old stored JSON without a `cardinality` field deserializes as `ManyToOne`.
+/// Inferred from PK/UNIQUE constraints at define time (Phase 33).
+/// `ManyToOne`: FK columns on the from-side table are bare (no PK/UNIQUE match).
+/// `OneToOne`: FK columns on the from-side table match a PK or UNIQUE constraint.
+/// Defaults to `ManyToOne` when deserialized from JSON without this field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum Cardinality {
     #[default]
     ManyToOne,
     OneToOne,
-    OneToMany,
 }
 
 impl Cardinality {
@@ -139,6 +133,13 @@ pub struct Join {
     /// In `order_to_customer AS o(customer_id) REFERENCES c`, this is `["customer_id"]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fk_columns: Vec<String>,
+    /// Phase 33: Resolved referenced columns on the target table.
+    /// Populated during inference: either the target's PK or the explicit UNIQUE columns.
+    /// Used by `synthesize_on_clause` to generate ON clause.
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ref_columns: Vec<String>,
     /// Phase 24: Optional relationship name for multi-table FK declarations.
     /// In `order_to_customer AS o(customer_id) REFERENCES c`, this is `Some("order_to_customer")`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,11 +175,6 @@ pub struct SemanticViewDefinition {
     pub joins: Vec<Join>,
     #[serde(default)]
     pub facts: Vec<Fact>,
-    /// Phase 29: named drill-down paths through dimensions.
-    /// Old stored JSON without this field deserializes with empty Vec.
-    /// Not serialized when empty to preserve backward-compatible JSON.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hierarchies: Vec<Hierarchy>,
     /// Column names from DDL-time LIMIT 0 inference, parallel to `column_types_inferred`.
     /// Populated by `create_semantic_view` `invoke()`. Empty = no inference ran.
     /// Used by `bind()` to build a name→type map for subquery column lookups.
@@ -191,6 +187,28 @@ pub struct SemanticViewDefinition {
     /// `bind()` builds a name→type `HashMap` from both vecs to look up requested columns by name.
     #[serde(default)]
     pub column_types_inferred: Vec<u32>,
+}
+
+/// Parse a `DuckDB` LIST-of-VARCHAR string representation into column names.
+///
+/// `duckdb_value_varchar` renders a `VARCHAR[]` value as `[col1, col2]`.
+/// This helper strips the brackets and splits on `, `.
+///
+/// Examples: `"[id]"` -> `["id"]`, `"[a, b]"` -> `["a", "b"]`, `"[]"` -> `[]`.
+#[allow(dead_code)]
+pub(crate) fn parse_constraint_columns(s: &str) -> Vec<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Vec::new();
+    }
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    inner.split(", ").map(|c| c.trim().to_string()).collect()
 }
 
 impl SemanticViewDefinition {
@@ -267,6 +285,40 @@ mod tests {
         let def = SemanticViewDefinition::from_json("orders", json).unwrap();
         assert_eq!(def.dimensions[0].source_table.as_deref(), Some("customers"));
         assert_eq!(def.metrics[0].source_table.as_deref(), Some("line_items"));
+    }
+
+    mod constraint_column_parsing_tests {
+        use super::*;
+
+        #[test]
+        fn parse_constraint_columns_single() {
+            assert_eq!(parse_constraint_columns("[id]"), vec!["id"]);
+        }
+
+        #[test]
+        fn parse_constraint_columns_composite() {
+            assert_eq!(
+                parse_constraint_columns("[first_name, last_name]"),
+                vec!["first_name", "last_name"]
+            );
+        }
+
+        #[test]
+        fn parse_constraint_columns_empty_brackets() {
+            let result: Vec<String> = parse_constraint_columns("[]");
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn parse_constraint_columns_empty_string() {
+            let result: Vec<String> = parse_constraint_columns("");
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn parse_constraint_columns_whitespace() {
+            assert_eq!(parse_constraint_columns("[ a , b ]"), vec!["a", "b"]);
+        }
     }
 
     mod phase11_model_tests {
@@ -409,7 +461,7 @@ mod tests {
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -436,81 +488,15 @@ mod tests {
         }
     }
 
-    mod phase29_hierarchy_tests {
-        use super::*;
-
-        #[test]
-        fn hierarchy_roundtrip_serialization() {
-            let h = Hierarchy {
-                name: "geo".to_string(),
-                levels: vec![
-                    "country".to_string(),
-                    "state".to_string(),
-                    "city".to_string(),
-                ],
-            };
-            let json = serde_json::to_string(&h).unwrap();
-            let rt: Hierarchy = serde_json::from_str(&json).unwrap();
-            assert_eq!(rt.name, "geo");
-            assert_eq!(rt.levels, vec!["country", "state", "city"]);
-        }
-
-        #[test]
-        fn definition_with_hierarchies_roundtrips() {
-            let json = r#"{
-                "base_table": "orders",
-                "dimensions": [{"name": "country", "expr": "country"}],
-                "metrics": [],
-                "hierarchies": [{"name": "geo", "levels": ["country", "state", "city"]}]
-            }"#;
-            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
-            assert_eq!(def.hierarchies.len(), 1);
-            assert_eq!(def.hierarchies[0].name, "geo");
-            assert_eq!(def.hierarchies[0].levels, vec!["country", "state", "city"]);
-
-            // Roundtrip: serialize and re-parse
-            let re_json = serde_json::to_string(&def).unwrap();
-            let rt = SemanticViewDefinition::from_json("orders", &re_json).unwrap();
-            assert_eq!(rt.hierarchies.len(), 1);
-        }
-
-        #[test]
-        fn old_json_without_hierarchies_deserializes_with_empty_vec() {
-            let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
-            assert!(
-                def.hierarchies.is_empty(),
-                "hierarchies should default to [] for old JSON without hierarchies field"
-            );
-        }
-
-        #[test]
-        fn definition_without_hierarchies_does_not_serialize_field() {
-            // skip_serializing_if = "Vec::is_empty" means no hierarchies key in output
-            let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
-                dimensions: vec![],
-                metrics: vec![],
-                ..Default::default()
-            };
-            let json = serde_json::to_string(&def).unwrap();
-            assert!(
-                !json.contains("hierarchies"),
-                "Empty hierarchies should be omitted from JSON: {json}"
-            );
-        }
-    }
-
     mod phase31_cardinality_tests {
         use super::*;
 
         #[test]
         fn cardinality_serde_roundtrip() {
-            // All three variants serialize and deserialize correctly
+            // Both variants serialize and deserialize correctly
             for (variant, expected_json) in [
                 (Cardinality::ManyToOne, r#""ManyToOne""#),
                 (Cardinality::OneToOne, r#""OneToOne""#),
-                (Cardinality::OneToMany, r#""OneToMany""#),
             ] {
                 let json = serde_json::to_string(&variant).unwrap();
                 assert_eq!(json, expected_json);
@@ -526,13 +512,13 @@ mod tests {
                 from_alias: "o".to_string(),
                 fk_columns: vec!["customer_id".to_string()],
                 name: Some("order_to_customer".to_string()),
-                cardinality: Cardinality::OneToMany,
+                cardinality: Cardinality::OneToOne,
                 ..Default::default()
             };
             let json = serde_json::to_string(&join).unwrap();
-            assert!(json.contains(r#""cardinality":"OneToMany""#));
+            assert!(json.contains(r#""cardinality":"OneToOne""#));
             let rt: Join = serde_json::from_str(&json).unwrap();
-            assert_eq!(rt.cardinality, Cardinality::OneToMany);
+            assert_eq!(rt.cardinality, Cardinality::OneToOne);
         }
 
         #[test]
@@ -544,6 +530,16 @@ mod tests {
                 join.cardinality,
                 Cardinality::ManyToOne,
                 "Missing cardinality must default to ManyToOne"
+            );
+        }
+
+        #[test]
+        fn old_json_with_one_to_many_is_rejected() {
+            // Phase 33: OneToMany variant removed -- old JSON with it must fail
+            let result = serde_json::from_str::<Cardinality>(r#""OneToMany""#);
+            assert!(
+                result.is_err(),
+                "OneToMany should be an unknown variant after Phase 33"
             );
         }
 
@@ -657,7 +653,7 @@ mod tests {
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec!["region".to_string(), "revenue".to_string()],
                 column_types_inferred: vec![17u32, 20u32],
             };
@@ -699,6 +695,116 @@ mod tests {
                 def.column_types_inferred.is_empty(),
                 "column_types_inferred should default to []"
             );
+        }
+    }
+
+    mod phase33_model_tests {
+        use super::*;
+
+        #[test]
+        fn table_ref_with_unique_constraints_roundtrip() {
+            let tr = TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                pk_columns: vec!["id".to_string()],
+                unique_constraints: vec![
+                    vec!["email".to_string()],
+                    vec!["first_name".to_string(), "last_name".to_string()],
+                ],
+            };
+            let json = serde_json::to_string(&tr).unwrap();
+            assert!(json.contains("unique_constraints"));
+            let rt: TableRef = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.unique_constraints.len(), 2);
+            assert_eq!(rt.unique_constraints[0], vec!["email"]);
+            assert_eq!(rt.unique_constraints[1], vec!["first_name", "last_name"]);
+        }
+
+        #[test]
+        fn old_json_without_unique_constraints_deserializes() {
+            // Backward compat: old JSON without unique_constraints field
+            let json = r#"{"alias":"o","table":"orders","pk_columns":["id"]}"#;
+            let tr: TableRef = serde_json::from_str(json).unwrap();
+            assert!(
+                tr.unique_constraints.is_empty(),
+                "unique_constraints should default to [] for old JSON"
+            );
+        }
+
+        #[test]
+        fn join_with_ref_columns_roundtrip() {
+            let join = Join {
+                table: "c".to_string(),
+                from_alias: "o".to_string(),
+                fk_columns: vec!["customer_id".to_string()],
+                ref_columns: vec!["id".to_string()],
+                name: Some("o_to_c".to_string()),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&join).unwrap();
+            assert!(json.contains("ref_columns"));
+            let rt: Join = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.ref_columns, vec!["id"]);
+        }
+
+        #[test]
+        fn old_json_without_ref_columns_deserializes() {
+            // Backward compat: old JSON without ref_columns field
+            let json = r#"{"table":"customers","on":"a.id=b.id"}"#;
+            let join: Join = serde_json::from_str(json).unwrap();
+            assert!(
+                join.ref_columns.is_empty(),
+                "ref_columns should default to [] for old JSON"
+            );
+        }
+
+        #[test]
+        fn empty_unique_constraints_not_serialized() {
+            let tr = TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                pk_columns: vec!["id".to_string()],
+                unique_constraints: vec![],
+            };
+            let json = serde_json::to_string(&tr).unwrap();
+            assert!(
+                !json.contains("unique_constraints"),
+                "Empty unique_constraints should be omitted from JSON: {json}"
+            );
+        }
+
+        #[test]
+        fn empty_ref_columns_not_serialized() {
+            let join = Join {
+                table: "c".to_string(),
+                from_alias: "o".to_string(),
+                fk_columns: vec!["customer_id".to_string()],
+                ref_columns: vec![],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&join).unwrap();
+            assert!(
+                !json.contains("ref_columns"),
+                "Empty ref_columns should be omitted from JSON: {json}"
+            );
+        }
+
+        #[test]
+        fn table_ref_without_pk_is_valid() {
+            let tr = TableRef {
+                alias: "f".to_string(),
+                table: "fact_table".to_string(),
+                pk_columns: vec![],
+                unique_constraints: vec![],
+            };
+            assert_eq!(tr.alias, "f");
+            assert_eq!(tr.table, "fact_table");
+            assert!(tr.pk_columns.is_empty());
+            // Roundtrip through JSON
+            let json = serde_json::to_string(&tr).unwrap();
+            let rt: TableRef = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.alias, "f");
+            assert!(rt.pk_columns.is_empty());
         }
     }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
-# dependencies = ["duckdb==1.4.4"]
-# requires-python = ">=3.9"
+# dependencies = ["duckdb==1.5.0"]
+# requires-python = ">=3.10"
 # ///
 """
 Systematic Python crash reproduction test for the semantic_views extension.

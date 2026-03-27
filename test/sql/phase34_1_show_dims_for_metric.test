@@ -1,0 +1,190 @@
+# Phase 34.1: SHOW SEMANTIC DIMENSIONS FOR METRIC
+# Tests fan-trap-aware dimension filtering for a given metric.
+
+require semantic_views
+
+# ============================================================
+# Setup: single-table view (all dims reachable for any metric)
+# ============================================================
+
+statement ok
+CREATE TABLE p34fm_sales (id INTEGER PRIMARY KEY, product VARCHAR, amount DECIMAL(10,2), region VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW simple_sv AS
+  TABLES (
+    s AS p34fm_sales PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    s.product AS s.product,
+    s.region AS s.region
+  )
+  METRICS (
+    s.total AS SUM(s.amount)
+  )
+
+# ============================================================
+# Test 1: Single-table view -- all dims reachable
+# ============================================================
+
+query TTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN simple_sv FOR METRIC total
+----
+simple_sv	product	s.product	s	(empty)
+simple_sv	region	s.region	s	(empty)
+
+# ============================================================
+# Setup: multi-table view with fan trap potential
+# ============================================================
+# Schema:
+#   customers <- orders <- line_items
+#   c.id (PK)    o.id (PK)   li.id (PK)
+#                o(customer_id) REFS c  (ManyToOne)
+#                              li(order_id) REFS o  (ManyToOne)
+#
+# Tree structure (root = c):
+#   c
+#   |-- o (via o->c FK, ManyToOne)
+#       |-- li (via li->o FK, ManyToOne)
+# ============================================================
+
+statement ok
+CREATE TABLE p34fm_customers (id INTEGER PRIMARY KEY, name VARCHAR, country VARCHAR);
+
+statement ok
+CREATE TABLE p34fm_orders (id INTEGER PRIMARY KEY, customer_id INTEGER, total DECIMAL(10,2));
+
+statement ok
+CREATE TABLE p34fm_line_items (id INTEGER PRIMARY KEY, order_id INTEGER, qty INTEGER, price DECIMAL(10,2));
+
+statement ok
+CREATE SEMANTIC VIEW star_sv AS
+  TABLES (
+    c AS p34fm_customers PRIMARY KEY (id),
+    o AS p34fm_orders PRIMARY KEY (id),
+    li AS p34fm_line_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_customer AS o(customer_id) REFERENCES c,
+    item_order AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    c.customer_name AS c.name,
+    c.customer_country AS c.country,
+    li.item_qty AS li.qty
+  )
+  METRICS (
+    o.order_total AS SUM(o.total),
+    li.line_item_sum AS SUM(li.price * li.qty)
+  )
+
+# ============================================================
+# Test 2: order_total metric (source: o)
+# - customer_name (source: c): path o->c, ManyToOne forward = safe. INCLUDED.
+# - customer_country (source: c): same path. INCLUDED.
+# - item_qty (source: li): path o->li, reverse of li->o ManyToOne = fan-out. EXCLUDED.
+# ============================================================
+
+query TTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN star_sv FOR METRIC order_total
+----
+star_sv	customer_country	c.country	c	(empty)
+star_sv	customer_name	c.name	c	(empty)
+
+# ============================================================
+# Test 3: line_item_sum metric (source: li)
+# - customer_name (source: c): path li->o->c, both ManyToOne forward = safe. INCLUDED.
+# - customer_country (source: c): same path. INCLUDED.
+# - item_qty (source: li): same table. INCLUDED.
+# ============================================================
+
+query TTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN star_sv FOR METRIC line_item_sum
+----
+star_sv	customer_country	c.country	c	(empty)
+star_sv	customer_name	c.name	c	(empty)
+star_sv	item_qty	li.qty	li	(empty)
+
+# ============================================================
+# Test 4: Non-existent metric
+# ============================================================
+
+statement error
+SHOW SEMANTIC DIMENSIONS IN star_sv FOR METRIC nonexistent
+----
+metric 'nonexistent' not found in semantic view 'star_sv'
+
+# ============================================================
+# Test 5: Non-existent view
+# ============================================================
+
+statement error
+SHOW SEMANTIC DIMENSIONS IN nonexistent_sv FOR METRIC something
+----
+semantic view 'nonexistent_sv' does not exist
+
+# ============================================================
+# Setup: derived metric test
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW star_sv
+
+statement ok
+CREATE SEMANTIC VIEW derived_sv AS
+  TABLES (
+    c AS p34fm_customers PRIMARY KEY (id),
+    o AS p34fm_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.customer_name AS c.name
+  )
+  METRICS (
+    o.order_total AS SUM(o.total),
+    double_total AS order_total * 2
+  )
+
+# ============================================================
+# Test 6: Derived metric -- inherits source table from order_total (o)
+# double_total derives from order_total (source: o).
+# customer_name (source: c): path o->c, ManyToOne forward = safe. INCLUDED.
+# ============================================================
+
+query TTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN derived_sv FOR METRIC double_total
+----
+derived_sv	customer_name	c.name	c	(empty)
+
+# ============================================================
+# Test 7: Case insensitivity
+# ============================================================
+
+query TTTTT rowsort
+show semantic dimensions in derived_sv for metric order_total
+----
+derived_sv	customer_name	c.name	c	(empty)
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW simple_sv
+
+statement ok
+DROP SEMANTIC VIEW derived_sv
+
+statement ok
+DROP TABLE p34fm_line_items
+
+statement ok
+DROP TABLE p34fm_orders
+
+statement ok
+DROP TABLE p34fm_customers
+
+statement ok
+DROP TABLE p34fm_sales

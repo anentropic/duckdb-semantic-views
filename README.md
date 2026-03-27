@@ -1,10 +1,12 @@
 # DuckDB Semantic Views
 
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://anentropic.github.io/duckdb-semantic-views/)
+
 A DuckDB extension that lets you define dimensions and metrics once, then query them in any combination. The extension writes the GROUP BY and JOIN logic for you.
 
 Inspired by [Snowflake Semantic Views](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view), adapted for DuckDB as a loadable extension.
 
-v0.5.3 -- early-stage, not yet on the community registry.
+v0.5.4 -- early-stage, not yet on the community registry.
 
 ## How it works
 
@@ -175,16 +177,6 @@ METRICS (
 );
 ```
 
-## Hierarchies (drill-down metadata)
-
-Define drill-down paths for dimension discovery. Hierarchies are pure metadata -- they document relationships between dimensions but don't affect query expansion.
-
-```sql
-HIERARCHIES (
-    geo AS (country, state, city)
-)
-```
-
 ## Cardinality and fan trap detection
 
 Annotate relationship cardinality to catch queries that would inflate aggregates. If a query must traverse a one-to-many join to reach a dimension, the extension raises an error instead of returning incorrect results.
@@ -227,12 +219,11 @@ Without `USING`, queries that involve an ambiguous join path will error.
 ## DDL reference
 
 ```sql
--- Full clause order (FACTS, HIERARCHIES optional; DIMENSIONS, METRICS required)
+-- Full clause order (FACTS optional; DIMENSIONS, METRICS required)
 CREATE SEMANTIC VIEW name AS
   TABLES (...)
   RELATIONSHIPS (...)
   FACTS (...)
-  HIERARCHIES (...)
   DIMENSIONS (...)
   METRICS (...);
 
@@ -243,6 +234,12 @@ DROP SEMANTIC VIEW IF EXISTS name;
 DESCRIBE SEMANTIC VIEW name;
 SHOW SEMANTIC VIEWS;
 ```
+
+## Documentation
+
+Full documentation: [anentropic.github.io/duckdb-semantic-views](https://anentropic.github.io/duckdb-semantic-views/)
+
+Includes getting started tutorial, DDL and query reference, how-to guides for advanced features (FACTS, derived metrics, role-playing dimensions, fan traps), and architecture explanation.
 
 ## Building
 

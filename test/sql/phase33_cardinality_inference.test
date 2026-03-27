@@ -1,0 +1,690 @@
+# Phase 33: End-to-end test for UNIQUE constraints and cardinality inference
+# Tests CARD-01 through CARD-09: UNIQUE parsing, cardinality inference,
+# FK/PK/UNIQUE validation, fan trap with inferred cardinality, DESCRIBE output.
+
+require semantic_views
+
+# ============================================================
+# Setup: physical tables
+# ============================================================
+
+statement ok
+CREATE TABLE p33_customers (id INTEGER, email VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO p33_customers VALUES (1, 'alice@test.com', 'Alice'), (2, 'bob@test.com', 'Bob');
+
+statement ok
+CREATE TABLE p33_orders (id INTEGER, customer_id INTEGER, region VARCHAR, amount DOUBLE);
+
+statement ok
+INSERT INTO p33_orders VALUES (1, 1, 'East', 100.0), (2, 2, 'West', 200.0), (3, 1, 'East', 50.0);
+
+statement ok
+CREATE TABLE p33_line_items (id INTEGER, order_id INTEGER, price DOUBLE, status VARCHAR);
+
+statement ok
+INSERT INTO p33_line_items VALUES (1, 1, 40.0, 'shipped'), (2, 1, 60.0, 'pending'), (3, 2, 200.0, 'shipped'), (4, 3, 50.0, 'shipped');
+
+statement ok
+CREATE TABLE p33_profiles (user_id INTEGER, bio VARCHAR);
+
+statement ok
+INSERT INTO p33_profiles VALUES (1, 'Engineer'), (2, 'Designer');
+
+# ============================================================
+# Test 1 (CARD-01, CARD-02): UNIQUE constraints in TABLES clause
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_basic AS
+  TABLES (
+    c AS p33_customers PRIMARY KEY (id) UNIQUE (email),
+    o AS p33_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+
+query TR rowsort
+SELECT * FROM semantic_view('p33_basic', dimensions := ['name'], metrics := ['revenue']);
+----
+Alice	150.0
+Bob	200.0
+
+statement ok
+DROP SEMANTIC VIEW p33_basic;
+
+# ============================================================
+# Test 2 (CARD-02): Multiple UNIQUE constraints on one table
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_multi_unique AS
+  TABLES (
+    c AS p33_customers PRIMARY KEY (id) UNIQUE (email) UNIQUE (name),
+    o AS p33_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+
+query TR rowsort
+SELECT * FROM semantic_view('p33_multi_unique', dimensions := ['name'], metrics := ['revenue']);
+----
+Alice	150.0
+Bob	200.0
+
+statement ok
+DROP SEMANTIC VIEW p33_multi_unique;
+
+# ============================================================
+# Test 3 (CARD-03): FK must reference PK or UNIQUE on target -- error
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p33_bad_ref AS
+  TABLES (
+    c AS p33_customers PRIMARY KEY (id) UNIQUE (email),
+    o AS p33_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c(name)
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+----
+does not match any PRIMARY KEY or UNIQUE constraint
+
+# ============================================================
+# Test 4 (CARD-04): Cardinality inferred -- ManyToOne (bare FK)
+# Fan trap: metric from o, dim from li -- o->li is reverse ManyToOne = fan-out
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_infer_many AS
+  TABLES (
+    o AS p33_orders PRIMARY KEY (id),
+    li AS p33_line_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.region AS o.region,
+    li.status AS li.status
+  )
+  METRICS (
+    li.revenue AS SUM(li.price),
+    o.order_count AS COUNT(*)
+  );
+
+# Safe: li->o forward ManyToOne
+query TR rowsort
+SELECT * FROM semantic_view('p33_infer_many', dimensions := ['region'], metrics := ['revenue']);
+----
+East	150.0
+West	200.0
+
+# Fan trap: o->li reverse ManyToOne = fan-out
+statement error
+SELECT * FROM semantic_view('p33_infer_many', dimensions := ['status'], metrics := ['order_count']);
+----
+fan trap detected
+
+statement ok
+DROP SEMANTIC VIEW p33_infer_many;
+
+# ============================================================
+# Test 5 (CARD-04): OneToOne inferred -- FK matches PK on from-side
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_infer_oto AS
+  TABLES (
+    c AS p33_customers PRIMARY KEY (id),
+    p AS p33_profiles PRIMARY KEY (user_id)
+  )
+  RELATIONSHIPS (
+    customer_profile AS c(id) REFERENCES p(user_id)
+  )
+  DIMENSIONS (
+    c.name AS c.name,
+    p.bio AS p.bio
+  )
+  METRICS (
+    c.customer_count AS COUNT(*),
+    p.profile_count AS COUNT(*)
+  );
+
+# OneToOne: both directions safe
+query TI rowsort
+SELECT * FROM semantic_view('p33_infer_oto', dimensions := ['bio'], metrics := ['customer_count']);
+----
+Designer	1
+Engineer	1
+
+query TI rowsort
+SELECT * FROM semantic_view('p33_infer_oto', dimensions := ['name'], metrics := ['profile_count']);
+----
+Alice	1
+Bob	1
+
+statement ok
+DROP SEMANTIC VIEW p33_infer_oto;
+
+# ============================================================
+# Test 6 (CARD-04): OneToOne from UNIQUE match on from-side
+# Uses a UNIQUE constraint (not PK) that the FK column matches.
+# ============================================================
+
+statement ok
+CREATE TABLE p33_user_tokens (token_id INTEGER, user_id INTEGER, token VARCHAR);
+
+statement ok
+INSERT INTO p33_user_tokens VALUES (1, 1, 'tok_a'), (2, 2, 'tok_b');
+
+statement ok
+CREATE SEMANTIC VIEW p33_infer_oto_unique AS
+  TABLES (
+    t AS p33_user_tokens PRIMARY KEY (token_id) UNIQUE (user_id),
+    c AS p33_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    token_to_customer AS t(user_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.name AS c.name,
+    t.token AS t.token
+  )
+  METRICS (
+    c.customer_count AS COUNT(*)
+  );
+
+# user_id is UNIQUE on t -> OneToOne, both directions safe
+query TI rowsort
+SELECT * FROM semantic_view('p33_infer_oto_unique', dimensions := ['token'], metrics := ['customer_count']);
+----
+tok_a	1
+tok_b	1
+
+statement ok
+DROP SEMANTIC VIEW p33_infer_oto_unique;
+
+statement ok
+DROP TABLE p33_user_tokens;
+
+# ============================================================
+# Test 7 (CARD-05): Explicit cardinality keywords rejected
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p33_explicit_card AS
+  TABLES (
+    o AS p33_orders PRIMARY KEY (id),
+    li AS p33_line_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o MANY TO ONE
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    li.revenue AS SUM(li.price)
+  );
+----
+no longer supported
+
+# ============================================================
+# Test 8 (CARD-07): REFERENCES target (no col) -> resolves to PK
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_ref_pk AS
+  TABLES (
+    c AS p33_customers PRIMARY KEY (id),
+    o AS p33_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+
+query TR rowsort
+SELECT * FROM semantic_view('p33_ref_pk', dimensions := ['name'], metrics := ['revenue']);
+----
+Alice	150.0
+Bob	200.0
+
+statement ok
+DROP SEMANTIC VIEW p33_ref_pk;
+
+# ============================================================
+# Test 9 (CARD-07): REFERENCES target(col) -> explicit column
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_ref_explicit AS
+  TABLES (
+    c AS p33_customers PRIMARY KEY (id) UNIQUE (email),
+    o AS p33_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c(id)
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+
+query TR rowsort
+SELECT * FROM semantic_view('p33_ref_explicit', dimensions := ['name'], metrics := ['revenue']);
+----
+Alice	150.0
+Bob	200.0
+
+statement ok
+DROP SEMANTIC VIEW p33_ref_explicit;
+
+# ============================================================
+# Test 10 (CARD-07): REFERENCES target with no PK on target -> error
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p33_no_pk_target AS
+  TABLES (
+    f AS p33_line_items,
+    o AS p33_orders
+  )
+  RELATIONSHIPS (
+    li_to_order AS f(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    f.status AS f.status
+  )
+  METRICS (
+    f.revenue AS SUM(f.price)
+  );
+----
+has no PRIMARY KEY
+
+# ============================================================
+# Test 11 (CARD-08): Fan trap with inferred cardinality -- chain
+# li->o->c all ManyToOne. Metric from c, dim from li via o reverse = fan-out
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_chain AS
+  TABLES (
+    o AS p33_orders PRIMARY KEY (id),
+    li AS p33_line_items PRIMARY KEY (id),
+    c AS p33_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o,
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.name AS c.name,
+    li.status AS li.status
+  )
+  METRICS (
+    li.revenue AS SUM(li.price),
+    c.cust_count AS COUNT(*)
+  );
+
+# Safe: li->o->c is ManyToOne chain
+query TR rowsort
+SELECT * FROM semantic_view('p33_chain', dimensions := ['name'], metrics := ['revenue']);
+----
+Alice	150.0
+Bob	200.0
+
+# Fan trap: c->o->li requires reverse traversal of ManyToOne edges
+statement error
+SELECT * FROM semantic_view('p33_chain', dimensions := ['status'], metrics := ['cust_count']);
+----
+fan trap detected
+
+statement ok
+DROP SEMANTIC VIEW p33_chain;
+
+# ============================================================
+# Test 12 (CARD-09): Composite FK subset rejected
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p33_subset AS
+  TABLES (
+    c AS p33_customers PRIMARY KEY (id, email),
+    o AS p33_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c(id)
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+----
+does not match any PRIMARY KEY or UNIQUE constraint
+
+# ============================================================
+# Test 13: DESCRIBE shows UNIQUE and inferred cardinality
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_describe AS
+  TABLES (
+    c AS p33_customers PRIMARY KEY (id) UNIQUE (email),
+    o AS p33_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+
+# DESCRIBE should not error and should return one row
+query I
+SELECT COUNT(*) FROM describe_semantic_view('p33_describe');
+----
+1
+
+statement ok
+DROP SEMANTIC VIEW p33_describe;
+
+# ============================================================
+# Test 14: Fact table without PRIMARY KEY
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_fact AS
+  TABLES (
+    f AS p33_line_items,
+    o AS p33_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS f(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    f.revenue AS SUM(f.price)
+  );
+
+query TR rowsort
+SELECT * FROM semantic_view('p33_fact', dimensions := ['region'], metrics := ['revenue']);
+----
+East	150.0
+West	200.0
+
+statement ok
+DROP SEMANTIC VIEW p33_fact;
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP TABLE p33_profiles;
+
+statement ok
+DROP TABLE p33_line_items;
+
+statement ok
+DROP TABLE p33_orders;
+
+statement ok
+DROP TABLE p33_customers;
+
+# ============================================================
+# PK-Optional Tests: PRIMARY KEY resolved from DuckDB catalog
+# ============================================================
+
+# ============================================================
+# PKOpt Test 1: PK from catalog -- basic
+# Physical table has PRIMARY KEY constraint, TABLES clause omits it.
+# ============================================================
+
+statement ok
+CREATE TABLE p33_pkopt_customers (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO p33_pkopt_customers VALUES (1, 'Alice'), (2, 'Bob');
+
+statement ok
+CREATE TABLE p33_pkopt_orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount DOUBLE);
+
+statement ok
+INSERT INTO p33_pkopt_orders VALUES (1, 1, 100.0), (2, 2, 200.0), (3, 1, 50.0);
+
+statement ok
+CREATE SEMANTIC VIEW p33_pkopt_basic AS
+  TABLES (
+    c AS p33_pkopt_customers,
+    o AS p33_pkopt_orders
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+
+query TR rowsort
+SELECT * FROM semantic_view('p33_pkopt_basic', dimensions := ['name'], metrics := ['revenue']);
+----
+Alice	150.0
+Bob	200.0
+
+statement ok
+DROP SEMANTIC VIEW p33_pkopt_basic;
+
+# ============================================================
+# PKOpt Test 2: PK from catalog -- composite PK
+# ============================================================
+
+statement ok
+CREATE TABLE p33_pkopt_shipments (order_id INTEGER, line_id INTEGER, status VARCHAR, PRIMARY KEY (order_id, line_id));
+
+statement ok
+INSERT INTO p33_pkopt_shipments VALUES (1, 1, 'shipped'), (1, 2, 'pending'), (2, 1, 'shipped');
+
+statement ok
+CREATE TABLE p33_pkopt_ship_details (ship_order_id INTEGER, ship_line_id INTEGER, carrier VARCHAR);
+
+statement ok
+INSERT INTO p33_pkopt_ship_details VALUES (1, 1, 'UPS'), (1, 2, 'FedEx'), (2, 1, 'DHL');
+
+statement ok
+CREATE SEMANTIC VIEW p33_pkopt_composite AS
+  TABLES (
+    s AS p33_pkopt_shipments,
+    d AS p33_pkopt_ship_details PRIMARY KEY (ship_order_id, ship_line_id)
+  )
+  RELATIONSHIPS (
+    detail_to_shipment AS d(ship_order_id, ship_line_id) REFERENCES s
+  )
+  DIMENSIONS (
+    s.status AS s.status
+  )
+  METRICS (
+    d.carrier_count AS COUNT(*)
+  );
+
+query TI rowsort
+SELECT * FROM semantic_view('p33_pkopt_composite', dimensions := ['status'], metrics := ['carrier_count']);
+----
+pending	1
+shipped	2
+
+statement ok
+DROP SEMANTIC VIEW p33_pkopt_composite;
+
+statement ok
+DROP TABLE p33_pkopt_ship_details;
+
+statement ok
+DROP TABLE p33_pkopt_shipments;
+
+# ============================================================
+# PKOpt Test 3: Explicit PK in TABLES still works
+# Both physical table PK and DDL PK present -- DDL PK takes precedence.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_pkopt_explicit AS
+  TABLES (
+    c AS p33_pkopt_customers PRIMARY KEY (id),
+    o AS p33_pkopt_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+
+query TR rowsort
+SELECT * FROM semantic_view('p33_pkopt_explicit', dimensions := ['name'], metrics := ['revenue']);
+----
+Alice	150.0
+Bob	200.0
+
+statement ok
+DROP SEMANTIC VIEW p33_pkopt_explicit;
+
+# ============================================================
+# PKOpt Test 4: No catalog PK -- error at CREATE time
+# Physical table has no PK constraint. TABLES clause omits PK.
+# Catalog lookup finds nothing. Error fires during CREATE.
+# ============================================================
+
+statement ok
+CREATE TABLE p33_pkopt_logs (msg VARCHAR, ts TIMESTAMP);
+
+statement error
+CREATE SEMANTIC VIEW p33_pkopt_log_source AS
+  TABLES (
+    o AS p33_pkopt_orders,
+    l AS p33_pkopt_logs
+  )
+  RELATIONSHIPS (
+    order_to_log AS o(id) REFERENCES l
+  )
+  DIMENSIONS (
+    o.amount AS o.amount
+  )
+  METRICS (
+    o.order_count AS COUNT(*)
+  );
+----
+has no PRIMARY KEY
+
+statement ok
+DROP TABLE p33_pkopt_logs;
+
+# ============================================================
+# PKOpt Test 5: Mixed -- some with PK in DDL, some from catalog
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_pkopt_mixed AS
+  TABLES (
+    c AS p33_pkopt_customers,
+    o AS p33_pkopt_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+
+query TR rowsort
+SELECT * FROM semantic_view('p33_pkopt_mixed', dimensions := ['name'], metrics := ['revenue']);
+----
+Alice	150.0
+Bob	200.0
+
+statement ok
+DROP SEMANTIC VIEW p33_pkopt_mixed;
+
+# ============================================================
+# PKOpt Test 6: DESCRIBE shows correct cardinality after catalog PK
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p33_pkopt_describe AS
+  TABLES (
+    c AS p33_pkopt_customers,
+    o AS p33_pkopt_orders
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    o.revenue AS SUM(o.amount)
+  );
+
+query I
+SELECT COUNT(*) FROM describe_semantic_view('p33_pkopt_describe');
+----
+1
+
+statement ok
+DROP SEMANTIC VIEW p33_pkopt_describe;
+
+# ============================================================
+# PKOpt Cleanup
+# ============================================================
+
+statement ok
+DROP TABLE p33_pkopt_orders;
+
+statement ok
+DROP TABLE p33_pkopt_customers;

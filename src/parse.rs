@@ -7,7 +7,10 @@
 // 2. FFI entry points (`sv_validate_ddl_rust`, `sv_rewrite_ddl_rust`)
 //    feature-gated on `extension`, with `catch_unwind` for panic safety.
 
+use std::collections::HashSet;
+
 use crate::body_parser::parse_keyword_body;
+use crate::model::{Cardinality, Join, TableRef};
 
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.
 pub const PARSE_NOT_OURS: u8 = 0;
@@ -18,7 +21,7 @@ pub const PARSE_DETECTED: u8 = 1;
 // DdlKind enum and detection
 // ---------------------------------------------------------------------------
 
-/// The 7 supported DDL statement forms for semantic views.
+/// The 9 supported DDL statement forms for semantic views.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DdlKind {
     Create,
@@ -28,6 +31,11 @@ pub enum DdlKind {
     DropIfExists,
     Describe,
     Show,
+    AlterRename,
+    AlterRenameIfExists,
+    ShowDimensions,
+    ShowMetrics,
+    ShowFacts,
 }
 
 /// Match a fixed sequence of keyword tokens at the start of `input`, tolerating
@@ -110,9 +118,29 @@ fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
     if let Some(n) = match_keyword_prefix(b, &[b"drop", b"semantic", b"view"]) {
         return Some((DdlKind::Drop, n));
     }
+    // ALTER SEMANTIC VIEW IF EXISTS (5 keywords) -- before ALTER SEMANTIC VIEW
+    if let Some(n) = match_keyword_prefix(b, &[b"alter", b"semantic", b"view", b"if", b"exists"]) {
+        return Some((DdlKind::AlterRenameIfExists, n));
+    }
+    // ALTER SEMANTIC VIEW (3 keywords)
+    if let Some(n) = match_keyword_prefix(b, &[b"alter", b"semantic", b"view"]) {
+        return Some((DdlKind::AlterRename, n));
+    }
     // DESCRIBE SEMANTIC VIEW (3 keywords)
     if let Some(n) = match_keyword_prefix(b, &[b"describe", b"semantic", b"view"]) {
         return Some((DdlKind::Describe, n));
+    }
+    // SHOW SEMANTIC DIMENSIONS (3 keywords) -- before SHOW SEMANTIC VIEWS
+    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"dimensions"]) {
+        return Some((DdlKind::ShowDimensions, n));
+    }
+    // SHOW SEMANTIC METRICS (3 keywords)
+    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"metrics"]) {
+        return Some((DdlKind::ShowMetrics, n));
+    }
+    // SHOW SEMANTIC FACTS (3 keywords)
+    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"facts"]) {
+        return Some((DdlKind::ShowFacts, n));
     }
     // SHOW SEMANTIC VIEWS (3 keywords)
     if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"views"]) {
@@ -124,7 +152,7 @@ fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
 
 /// Detect the DDL kind from a query string.
 ///
-/// Returns `Some(DdlKind)` if the query matches one of the 7 semantic view
+/// Returns `Some(DdlKind)` if the query matches one of the 9 semantic view
 /// DDL prefixes, `None` otherwise. Uses longest-first ordering to avoid
 /// prefix overlap (e.g. "create or replace semantic view" before
 /// "create semantic view").
@@ -139,7 +167,7 @@ pub fn detect_ddl_kind(query: &str) -> Option<DdlKind> {
 
 /// Detect whether a query is any semantic view DDL statement.
 ///
-/// Returns `PARSE_DETECTED` for all 7 DDL forms, `PARSE_NOT_OURS` otherwise.
+/// Returns `PARSE_DETECTED` for all 9 DDL forms, `PARSE_NOT_OURS` otherwise.
 /// Handles case variations, leading/trailing whitespace, and trailing semicolons.
 #[must_use]
 pub fn detect_semantic_view_ddl(query: &str) -> u8 {
@@ -187,14 +215,221 @@ fn function_name(kind: DdlKind) -> &'static str {
         DdlKind::DropIfExists => "drop_semantic_view_if_exists",
         DdlKind::Describe => "describe_semantic_view",
         DdlKind::Show => "list_semantic_views",
+        DdlKind::AlterRename => "alter_semantic_view_rename",
+        DdlKind::AlterRenameIfExists => "alter_semantic_view_rename_if_exists",
+        DdlKind::ShowDimensions => "show_semantic_dimensions",
+        DdlKind::ShowMetrics => "show_semantic_metrics",
+        DdlKind::ShowFacts => "show_semantic_facts",
     }
 }
 
-/// Rewrite a name-only or no-args semantic view DDL statement to its function call.
+// rewrite_show_dims_for_metric removed in Phase 34.1.1 -- absorbed into parse_show_filter_clauses.
+
+// ---------------------------------------------------------------------------
+// SHOW SEMANTIC filter clause helpers (Phase 34.1.1)
+// ---------------------------------------------------------------------------
+
+/// Extract a single-quoted string from `input`, starting at position 0.
+/// Returns `(extracted_content, bytes_consumed)` where `bytes_consumed` includes
+/// the opening and closing quotes.
+///
+/// Handles SQL-style escaping: `''` inside quotes represents a literal `'`.
+fn extract_quoted_string(input: &str) -> Result<(String, usize), String> {
+    let bytes = input.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'\'' {
+        return Err("Expected single-quoted string".to_string());
+    }
+    let mut pos = 1;
+    let mut result = String::new();
+    while pos < bytes.len() {
+        if bytes[pos] == b'\'' {
+            if pos + 1 < bytes.len() && bytes[pos + 1] == b'\'' {
+                // Escaped quote: '' -> '
+                result.push('\'');
+                pos += 2;
+            } else {
+                // End of string
+                return Ok((result, pos + 1));
+            }
+        } else {
+            result.push(bytes[pos] as char);
+            pos += 1;
+        }
+    }
+    Err("Unterminated single-quoted string".to_string())
+}
+
+/// Build optional WHERE and LIMIT suffix for a SHOW rewrite.
+///
+/// LIKE maps to `name ILIKE '<escaped>'` (case-insensitive).
+/// STARTS WITH maps to `name LIKE '<escaped>%'` (case-sensitive).
+/// Both conditions combined with AND. LIMIT appended last.
+fn build_filter_suffix(
+    like_pattern: Option<&str>,
+    starts_with: Option<&str>,
+    limit: Option<u64>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(pattern) = like_pattern {
+        let escaped = pattern.replace('\'', "''");
+        parts.push(format!("name ILIKE '{escaped}'"));
+    }
+    if let Some(prefix) = starts_with {
+        let escaped = prefix.replace('\'', "''");
+        parts.push(format!("name LIKE '{escaped}%'"));
+    }
+    let mut suffix = String::new();
+    if !parts.is_empty() {
+        suffix.push_str(" WHERE ");
+        suffix.push_str(&parts.join(" AND "));
+    }
+    if let Some(n) = limit {
+        use std::fmt::Write;
+        let _ = write!(suffix, " LIMIT {n}");
+    }
+    suffix
+}
+
+/// Parsed filter clauses from a SHOW SEMANTIC command.
+struct ShowClauses<'a> {
+    like_pattern: Option<String>,
+    in_view: Option<&'a str>,
+    for_metric: Option<&'a str>,
+    starts_with: Option<String>,
+    limit: Option<u64>,
+}
+
+/// Parse optional SHOW SEMANTIC filter clauses from text after the prefix.
+///
+/// Clause order (Snowflake): LIKE, IN, FOR METRIC, STARTS WITH, LIMIT.
+fn parse_show_filter_clauses<'a>(
+    after_prefix: &'a str,
+    kind: DdlKind,
+) -> Result<ShowClauses<'a>, String> {
+    let mut rest = after_prefix.trim();
+    let mut like_pattern: Option<String> = None;
+    let mut in_view: Option<&'a str> = None;
+    let mut for_metric: Option<&'a str> = None;
+    let mut starts_with: Option<String> = None;
+    let mut limit: Option<u64> = None;
+
+    let entity = match kind {
+        DdlKind::Show => "VIEWS",
+        DdlKind::ShowDimensions => "DIMENSIONS",
+        DdlKind::ShowMetrics => "METRICS",
+        _ => "FACTS",
+    };
+
+    // 1. Check for LIKE keyword
+    if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("LIKE") {
+        // Ensure it's followed by whitespace (not just a prefix match)
+        if rest.len() == 4 || rest.as_bytes()[4].is_ascii_whitespace() {
+            rest = rest[4..].trim_start();
+            let (pattern, consumed) = extract_quoted_string(rest)?;
+            like_pattern = Some(pattern);
+            rest = rest[consumed..].trim_start();
+        }
+    }
+
+    // 2. Check for IN keyword
+    if rest.len() >= 2
+        && rest[..2].eq_ignore_ascii_case("IN")
+        && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
+    {
+        if kind == DdlKind::Show {
+            return Err("IN is not valid for SHOW SEMANTIC VIEWS (no scoping view)".to_string());
+        }
+        rest = rest[2..].trim_start();
+        if rest.is_empty() {
+            return Err("Missing view name after IN".to_string());
+        }
+        let name_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        // Safety: we need to return a reference into the original after_prefix.
+        // Since rest is a subslice of after_prefix, &rest[..name_end] is valid.
+        in_view = Some(&rest[..name_end]);
+        rest = rest[name_end..].trim_start();
+    }
+
+    // 3. Check for FOR METRIC (only for ShowDimensions)
+    if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case("FOR") {
+        if kind != DdlKind::ShowDimensions {
+            return Err(format!(
+                "FOR METRIC is only valid for SHOW SEMANTIC DIMENSIONS, not SHOW SEMANTIC {entity}"
+            ));
+        }
+        rest = rest[3..].trim_start();
+        if rest.len() < 6 || !rest[..6].eq_ignore_ascii_case("METRIC") {
+            return Err(
+                "Expected FOR METRIC after view name. \
+                 Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]".to_string()
+            );
+        }
+        rest = rest[6..].trim_start();
+        if rest.is_empty() {
+            return Err("Missing metric name after FOR METRIC".to_string());
+        }
+        let name_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        for_metric = Some(&rest[..name_end]);
+        rest = rest[name_end..].trim_start();
+    }
+
+    // 4. Check for STARTS WITH
+    if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case("STARTS") {
+        rest = rest[6..].trim_start();
+        if rest.len() < 4 || !rest[..4].eq_ignore_ascii_case("WITH") {
+            return Err(format!(
+                "Expected STARTS WITH. \
+                 Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
+            ));
+        }
+        rest = rest[4..].trim_start();
+        let (prefix, consumed) = extract_quoted_string(rest)?;
+        starts_with = Some(prefix);
+        rest = rest[consumed..].trim_start();
+    }
+
+    // 5. Check for LIMIT
+    if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("LIMIT") {
+        rest = rest[5..].trim_start();
+        let token_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        let n: u64 = token
+            .parse()
+            .map_err(|_| format!("LIMIT must be a positive integer, got: '{token}'"))?;
+        limit = Some(n);
+        rest = rest[token_end..].trim_start();
+    }
+
+    // 6. If any text remains, error with usage hint
+    if !rest.is_empty() {
+        let usage = if kind == DdlKind::ShowDimensions {
+            format!(
+                "Unexpected tokens: '{rest}'. \
+                 Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
+            )
+        } else {
+            format!(
+                "Unexpected tokens: '{rest}'. \
+                 Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
+            )
+        };
+        return Err(usage);
+    }
+
+    Ok(ShowClauses {
+        like_pattern,
+        in_view,
+        for_metric,
+        starts_with,
+        limit,
+    })
+}
+
+/// Rewrite a name-only or SHOW semantic view DDL statement to its function call.
 ///
 /// Handles only:
 /// - Name-only (DROP, DESCRIBE): `SELECT * FROM fn('name')`
-/// - No-args (SHOW): `SELECT * FROM list_semantic_views()`
+/// - SHOW forms: `SELECT * FROM list_semantic_views()` with optional LIKE/STARTS WITH/LIMIT
 ///
 /// CREATE forms must go through `validate_and_rewrite` -> `rewrite_ddl_keyword_body`.
 fn rewrite_ddl(query: &str) -> Result<String, String> {
@@ -217,8 +452,68 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
             let safe_name = name.replace('\'', "''");
             Ok(format!("SELECT * FROM {fn_name}('{safe_name}')"))
         }
-        // No-args form
-        DdlKind::Show => Ok(format!("SELECT * FROM {fn_name}()")),
+        // SHOW SEMANTIC VIEWS/DIMENSIONS/METRICS/FACTS: optional LIKE/IN/FOR METRIC/STARTS WITH/LIMIT
+        DdlKind::Show | DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
+            let after_prefix = trimmed[plen..].trim();
+            let clauses = parse_show_filter_clauses(after_prefix, kind)?;
+
+            // Validate FOR METRIC requires IN
+            if clauses.for_metric.is_some() && clauses.in_view.is_none() {
+                return Err("FOR METRIC requires IN view_name".to_string());
+            }
+
+            // Build base SELECT
+            let base = if let Some(view_name) = clauses.in_view {
+                let safe_name = view_name.replace('\'', "''");
+                if let Some(metric_name) = clauses.for_metric {
+                    let safe_metric = metric_name.replace('\'', "''");
+                    format!(
+                        "SELECT * FROM show_semantic_dimensions_for_metric('{safe_name}', '{safe_metric}')"
+                    )
+                } else {
+                    format!("SELECT * FROM {fn_name}('{safe_name}')")
+                }
+            } else {
+                let all_fn = match kind {
+                    DdlKind::Show => "list_semantic_views",
+                    DdlKind::ShowDimensions => "show_semantic_dimensions_all",
+                    DdlKind::ShowMetrics => "show_semantic_metrics_all",
+                    DdlKind::ShowFacts => "show_semantic_facts_all",
+                    _ => unreachable!(),
+                };
+                format!("SELECT * FROM {all_fn}()")
+            };
+
+            // Append filter suffix
+            let suffix = build_filter_suffix(
+                clauses.like_pattern.as_deref(),
+                clauses.starts_with.as_deref(),
+                clauses.limit,
+            );
+            Ok(format!("{base}{suffix}"))
+        }
+        // ALTER RENAME: two-argument form
+        DdlKind::AlterRename | DdlKind::AlterRenameIfExists => {
+            let after_prefix = trimmed[plen..].trim();
+            let name_end = after_prefix
+                .find(|c: char| c.is_whitespace())
+                .ok_or("Missing view name after ALTER SEMANTIC VIEW")?;
+            let old_name = &after_prefix[..name_end];
+            let rest = after_prefix[name_end..].trim();
+            let rest_upper = rest.to_ascii_uppercase();
+            if !rest_upper.starts_with("RENAME TO") {
+                return Err("Expected RENAME TO after view name".to_string());
+            }
+            let new_name = rest["RENAME TO".len()..].trim();
+            if new_name.is_empty() {
+                return Err("Missing new name after RENAME TO".to_string());
+            }
+            let safe_old = old_name.replace('\'', "''");
+            let safe_new = new_name.replace('\'', "''");
+            Ok(format!(
+                "SELECT * FROM {fn_name}('{safe_old}', '{safe_new}')"
+            ))
+        }
     }
 }
 
@@ -255,11 +550,51 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
             }
             Ok(Some(name.to_string()))
         }
-        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe => {
+        DdlKind::Drop
+        | DdlKind::DropIfExists
+        | DdlKind::Describe
+        | DdlKind::AlterRename
+        | DdlKind::AlterRenameIfExists => {
             let name = extract_name_only(trimmed, plen)?;
             Ok(Some(name))
         }
         DdlKind::Show => Ok(None),
+        DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
+            let after_prefix = trimmed[plen..].trim();
+            if after_prefix.is_empty() {
+                return Ok(None); // Cross-view form, no specific name
+            }
+            let mut rest = after_prefix;
+            // Skip LIKE clause if present (LIKE appears before IN)
+            if rest.len() >= 4
+                && rest[..4].eq_ignore_ascii_case("LIKE")
+                && (rest.len() == 4 || rest.as_bytes()[4].is_ascii_whitespace())
+            {
+                rest = rest[4..].trim_start();
+                // Skip the quoted string
+                if let Ok((_pattern, consumed)) = extract_quoted_string(rest) {
+                    rest = rest[consumed..].trim_start();
+                } else {
+                    return Ok(None);
+                }
+            }
+            // Check for IN keyword
+            if rest.len() >= 2
+                && rest[..2].eq_ignore_ascii_case("IN")
+                && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
+            {
+                let after_in = rest[2..].trim();
+                if after_in.is_empty() {
+                    return Ok(None);
+                }
+                let name_end = after_in
+                    .find(|c: char| c.is_whitespace())
+                    .unwrap_or(after_in.len());
+                Ok(Some(after_in[..name_end].to_string()))
+            } else {
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -279,7 +614,7 @@ pub struct ParseError {
     pub position: Option<usize>,
 }
 
-/// The 7 DDL prefixes used for near-miss detection.
+/// The 9 DDL prefixes used for near-miss detection.
 const DDL_PREFIXES: &[&str] = &[
     "create semantic view",
     "create or replace semantic view",
@@ -288,6 +623,12 @@ const DDL_PREFIXES: &[&str] = &[
     "drop semantic view if exists",
     "describe semantic view",
     "show semantic views",
+    "alter semantic view",
+    "alter semantic view if exists",
+    "show semantic dimensions",
+    "show semantic dimensions for metric",
+    "show semantic metrics",
+    "show semantic facts",
 ];
 
 /// Detect near-miss DDL prefixes using fuzzy matching.
@@ -378,6 +719,48 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
             message: e,
             position: None,
         }),
+        // SHOW SEMANTIC DIMENSIONS/METRICS/FACTS: optional IN view_name
+        DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
+            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+                message: e,
+                position: Some(trim_offset + plen),
+            })
+        }
+        // ALTER RENAME forms: validate old_name RENAME TO new_name
+        DdlKind::AlterRename | DdlKind::AlterRenameIfExists => {
+            let after_prefix = trimmed_no_semi[plen..].trim();
+            if after_prefix.is_empty() {
+                return Err(ParseError {
+                    message: "Missing view name after ALTER SEMANTIC VIEW.".to_string(),
+                    position: Some(trim_offset + plen),
+                });
+            }
+            let name_end = after_prefix
+                .find(|c: char| c.is_whitespace())
+                .ok_or_else(|| ParseError {
+                    message: "Expected RENAME TO after view name.".to_string(),
+                    position: Some(trim_offset + plen + after_prefix.len()),
+                })?;
+            let rest = after_prefix[name_end..].trim();
+            let rest_upper = rest.to_ascii_uppercase();
+            if !rest_upper.starts_with("RENAME TO") {
+                return Err(ParseError {
+                    message: "Expected RENAME TO after view name. ALTER SEMANTIC VIEW only supports RENAME TO.".to_string(),
+                    position: Some(trim_offset + plen + name_end),
+                });
+            }
+            let new_name_str = rest["RENAME TO".len()..].trim();
+            if new_name_str.is_empty() {
+                return Err(ParseError {
+                    message: "Missing new name after RENAME TO.".to_string(),
+                    position: Some(trim_offset + plen + after_prefix.len()),
+                });
+            }
+            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+                message: e,
+                position: Some(trim_offset + plen),
+            })
+        }
     }
 }
 
@@ -453,7 +836,10 @@ fn rewrite_ddl_keyword_body(
     body_offset: usize, // byte offset of body_text[0] in original query
 ) -> Result<Option<String>, ParseError> {
     // 1. Call parse_keyword_body (body_text starts at "AS"; pass body_offset)
-    let keyword_body = parse_keyword_body(body_text, body_offset)?;
+    let mut keyword_body = parse_keyword_body(body_text, body_offset)?;
+
+    // Phase 33: Infer cardinality and resolve ref_columns before serialization.
+    infer_cardinality(&keyword_body.tables, &mut keyword_body.relationships)?;
 
     // 2. Construct SemanticViewDefinition from KeywordBody
     //    base_table = first table's physical table name (backward compat)
@@ -471,7 +857,6 @@ fn rewrite_ddl_keyword_body(
         joins: keyword_body.relationships,
         filters: vec![],
         facts: keyword_body.facts,
-        hierarchies: keyword_body.hierarchies,
         column_type_names: vec![],
         column_types_inferred: vec![],
     };
@@ -497,6 +882,111 @@ fn rewrite_ddl_keyword_body(
     Ok(Some(format!(
         "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 33: Cardinality inference
+// ---------------------------------------------------------------------------
+
+/// Infer cardinality for each relationship based on PK/UNIQUE constraints.
+/// Also resolves `ref_columns` (the columns on the target side of the FK reference).
+///
+/// Two checks per relationship:
+/// 1. Resolve `ref_columns`: if empty, use target's PK. If target has no PK, error.
+/// 2. Infer cardinality: if FK columns match PK/UNIQUE on the `from_alias` table,
+///    the relationship is `OneToOne`; otherwise `ManyToOne`.
+pub(crate) fn infer_cardinality(
+    tables: &[TableRef],
+    relationships: &mut [Join],
+) -> Result<(), ParseError> {
+    for join in relationships.iter_mut() {
+        if join.fk_columns.is_empty() {
+            continue;
+        }
+
+        let to_alias_lower = join.table.to_ascii_lowercase();
+        let from_alias_lower = join.from_alias.to_ascii_lowercase();
+
+        // Find target table (REFERENCES target)
+        let target = tables
+            .iter()
+            .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower);
+
+        // Find source table (from_alias side)
+        let source = tables
+            .iter()
+            .find(|t| t.alias.to_ascii_lowercase() == from_alias_lower);
+
+        // Step 1: Resolve ref_columns
+        if join.ref_columns.is_empty() {
+            // REFERENCES target (no column list) -> use target's PK
+            match target {
+                Some(t) if !t.pk_columns.is_empty() => {
+                    join.ref_columns.clone_from(&t.pk_columns);
+                }
+                Some(_) => {
+                    // Target has no PK declared in DDL -- defer resolution.
+                    // At bind time, `resolve_pk_from_catalog` will attempt to
+                    // fill in pk_columns from the DuckDB catalog. If that also
+                    // fails, `infer_cardinality` is re-run and this branch
+                    // will be reached again (now as an error).
+                    continue;
+                }
+                None => {
+                    // Target not found -- will be caught by graph validation later
+                }
+            }
+        }
+        // When ref_columns was set explicitly (REFERENCES target(cols)),
+        // validation against PK/UNIQUE on target happens in graph.rs (CARD-03).
+
+        // Step 2: FK column count must match ref column count
+        if !join.ref_columns.is_empty() && join.fk_columns.len() != join.ref_columns.len() {
+            let rel_name = join.name.as_deref().unwrap_or("?");
+            return Err(ParseError {
+                message: format!(
+                    "FK column count ({}) does not match referenced column count ({}) \
+                     in relationship '{rel_name}'.",
+                    join.fk_columns.len(),
+                    join.ref_columns.len(),
+                ),
+                position: None,
+            });
+        }
+
+        // Step 3: Infer cardinality from FK-side constraints (CARD-04)
+        if let Some(source) = source {
+            let fk_set: HashSet<String> = join
+                .fk_columns
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+
+            // Check against source PK
+            let pk_set: HashSet<String> = source
+                .pk_columns
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+
+            if !pk_set.is_empty() && fk_set == pk_set {
+                join.cardinality = Cardinality::OneToOne;
+            } else {
+                // Check against source UNIQUE constraints
+                let matches_unique = source.unique_constraints.iter().any(|uc| {
+                    let uc_set: HashSet<String> =
+                        uc.iter().map(|c| c.to_ascii_lowercase()).collect();
+                    fk_set == uc_set
+                });
+                join.cardinality = if matches_unique {
+                    Cardinality::OneToOne
+                } else {
+                    Cardinality::ManyToOne
+                };
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,6 +1730,403 @@ mod tests {
             let query = "DROP SEMANTIC VIEW v";
             let result = validate_and_rewrite(query).unwrap().unwrap();
             assert_eq!(result, "SELECT * FROM drop_semantic_view('v')");
+        }
+    }
+
+    // ===================================================================
+    // Phase 33: Cardinality inference tests
+    // ===================================================================
+
+    mod phase33_inference_tests {
+        use super::*;
+        use crate::model::{Cardinality, Join, TableRef};
+
+        fn make_table(alias: &str, pk: &[&str], unique: &[&[&str]]) -> TableRef {
+            TableRef {
+                alias: alias.to_string(),
+                table: alias.to_string(),
+                pk_columns: pk.iter().map(|s| (*s).to_string()).collect(),
+                unique_constraints: unique
+                    .iter()
+                    .map(|cols| cols.iter().map(|s| (*s).to_string()).collect())
+                    .collect(),
+            }
+        }
+
+        fn make_join(name: &str, from: &str, to: &str, fk: &[&str], ref_cols: &[&str]) -> Join {
+            Join {
+                name: Some(name.to_string()),
+                from_alias: from.to_string(),
+                table: to.to_string(),
+                fk_columns: fk.iter().map(|s| (*s).to_string()).collect(),
+                ref_columns: ref_cols.iter().map(|s| (*s).to_string()).collect(),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn resolves_ref_columns_to_target_pk() {
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("customers", &["cust_id"], &[]),
+            ];
+            let mut rels = vec![make_join("r", "orders", "customers", &["customer_id"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].ref_columns, vec!["cust_id"]);
+        }
+
+        #[test]
+        fn keeps_explicit_ref_columns() {
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("customers", &["cust_id"], &[&["email"]]),
+            ];
+            let mut rels = vec![make_join(
+                "r",
+                "orders",
+                "customers",
+                &["customer_email"],
+                &["email"],
+            )];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].ref_columns, vec!["email"]);
+        }
+
+        #[test]
+        fn skips_when_target_has_no_pk_and_no_explicit_ref() {
+            // When target has no PK, infer_cardinality is tolerant: it skips
+            // the join (leaves ref_columns empty) instead of erroring.
+            // At bind time, resolve_pk_from_catalog will attempt catalog lookup.
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("events", &[], &[]), // no PK
+            ];
+            let mut rels = vec![make_join("r", "orders", "events", &["event_id"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert!(
+                rels[0].ref_columns.is_empty(),
+                "ref_columns should remain empty when target has no PK"
+            );
+        }
+
+        #[test]
+        fn infers_one_to_one_from_pk_match() {
+            // orders PK is (id), FK is (id) -> OneToOne
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("customers", &["cust_id"], &[]),
+            ];
+            let mut rels = vec![make_join("r", "orders", "customers", &["id"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].cardinality, Cardinality::OneToOne);
+        }
+
+        #[test]
+        fn infers_one_to_one_from_unique_match() {
+            // orders has UNIQUE(email), FK is (email) -> OneToOne
+            let tables = vec![
+                make_table("orders", &["id"], &[&["email"]]),
+                make_table("customers", &["cust_id"], &[]),
+            ];
+            let mut rels = vec![make_join("r", "orders", "customers", &["email"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].cardinality, Cardinality::OneToOne);
+        }
+
+        #[test]
+        fn infers_many_to_one_when_fk_is_bare() {
+            // orders PK is (id), FK is (customer_id) -- doesn't match PK or UNIQUE
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("customers", &["cust_id"], &[]),
+            ];
+            let mut rels = vec![make_join("r", "orders", "customers", &["customer_id"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].cardinality, Cardinality::ManyToOne);
+        }
+
+        #[test]
+        fn case_insensitive_column_matching() {
+            // PK is (ID) uppercase, FK is (id) lowercase -> should still match OneToOne
+            let tables = vec![
+                make_table("orders", &["ID"], &[]),
+                make_table("customers", &["cust_id"], &[]),
+            ];
+            let mut rels = vec![make_join("r", "orders", "customers", &["id"], &[])];
+            infer_cardinality(&tables, &mut rels).unwrap();
+            assert_eq!(rels[0].cardinality, Cardinality::OneToOne);
+        }
+
+        #[test]
+        fn fk_ref_column_count_mismatch_error() {
+            let tables = vec![
+                make_table("orders", &["id"], &[]),
+                make_table("customers", &["a", "b"], &[]),
+            ];
+            // FK has 1 col, target PK has 2 cols
+            let mut rels = vec![make_join("r", "orders", "customers", &["customer_id"], &[])];
+            let err = infer_cardinality(&tables, &mut rels).unwrap_err();
+            assert!(
+                err.message.contains("FK column count"),
+                "Expected FK column count error, got: {}",
+                err.message
+            );
+        }
+
+        #[test]
+        fn rewrite_produces_json_with_ref_columns_and_cardinality() {
+            let query = "CREATE SEMANTIC VIEW v AS \
+                         TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (cust_id)) \
+                         RELATIONSHIPS (r AS o(customer_id) REFERENCES c) \
+                         DIMENSIONS (o.region AS region) \
+                         METRICS (o.revenue AS SUM(amount))";
+            let result = validate_and_rewrite(query).unwrap().unwrap();
+            // The JSON should contain ref_columns resolved from target PK
+            assert!(
+                result.contains("ref_columns"),
+                "Expected ref_columns in JSON, got: {result}"
+            );
+            assert!(
+                result.contains("cust_id"),
+                "Expected target PK 'cust_id' in ref_columns, got: {result}"
+            );
+        }
+    }
+
+    // ===================================================================
+    // Phase 34.1.1: SHOW SEMANTIC filter clause tests
+    // ===================================================================
+
+    mod phase34_1_1_show_filter_tests {
+        use super::*;
+
+        // --- extract_quoted_string tests ---
+
+        #[test]
+        fn test_extract_quoted_string_normal() {
+            let (s, n) = extract_quoted_string("'hello'").unwrap();
+            assert_eq!(s, "hello");
+            assert_eq!(n, 7);
+        }
+
+        #[test]
+        fn test_extract_quoted_string_escaped_quotes() {
+            let (s, n) = extract_quoted_string("'O''Brien'").unwrap();
+            assert_eq!(s, "O'Brien");
+            assert_eq!(n, 10);
+        }
+
+        #[test]
+        fn test_extract_quoted_string_empty() {
+            let (s, n) = extract_quoted_string("''").unwrap();
+            assert_eq!(s, "");
+            assert_eq!(n, 2);
+        }
+
+        #[test]
+        fn test_extract_quoted_string_unterminated() {
+            let result = extract_quoted_string("'unterminated");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_extract_quoted_string_no_opening_quote() {
+            let result = extract_quoted_string("no_quote");
+            assert!(result.is_err());
+        }
+
+        // --- build_filter_suffix tests ---
+
+        #[test]
+        fn test_build_filter_suffix_like_only() {
+            assert_eq!(
+                build_filter_suffix(Some("%rev%"), None, None),
+                " WHERE name ILIKE '%rev%'"
+            );
+        }
+
+        #[test]
+        fn test_build_filter_suffix_starts_with_only() {
+            assert_eq!(
+                build_filter_suffix(None, Some("total"), None),
+                " WHERE name LIKE 'total%'"
+            );
+        }
+
+        #[test]
+        fn test_build_filter_suffix_limit_only() {
+            assert_eq!(build_filter_suffix(None, None, Some(5)), " LIMIT 5");
+        }
+
+        #[test]
+        fn test_build_filter_suffix_all_three() {
+            assert_eq!(
+                build_filter_suffix(Some("%x%"), Some("a"), Some(10)),
+                " WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 10"
+            );
+        }
+
+        #[test]
+        fn test_build_filter_suffix_none() {
+            assert_eq!(build_filter_suffix(None, None, None), "");
+        }
+
+        #[test]
+        fn test_build_filter_suffix_reescapes_quotes() {
+            assert_eq!(
+                build_filter_suffix(Some("O'Brien"), None, None),
+                " WHERE name ILIKE 'O''Brien'"
+            );
+        }
+
+        // --- rewrite_ddl SHOW with filter clauses ---
+
+        #[test]
+        fn test_rewrite_show_dims_like_cross_view() {
+            let sql = rewrite_ddl("SHOW SEMANTIC DIMENSIONS LIKE '%rev%'").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM show_semantic_dimensions_all() WHERE name ILIKE '%rev%'"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_dims_like_in_starts_with_limit() {
+            let sql =
+                rewrite_ddl("SHOW SEMANTIC DIMENSIONS LIKE '%c%' IN v STARTS WITH 'cust' LIMIT 2")
+                    .unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM show_semantic_dimensions('v') WHERE name ILIKE '%c%' AND name LIKE 'cust%' LIMIT 2"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_metrics_starts_with_limit() {
+            let sql = rewrite_ddl("SHOW SEMANTIC METRICS STARTS WITH 'total' LIMIT 1").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM show_semantic_metrics_all() WHERE name LIKE 'total%' LIMIT 1"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_facts_limit() {
+            let sql = rewrite_ddl("SHOW SEMANTIC FACTS LIMIT 10").unwrap();
+            assert_eq!(sql, "SELECT * FROM show_semantic_facts_all() LIMIT 10");
+        }
+
+        #[test]
+        fn test_rewrite_show_dims_for_metric_with_all_clauses() {
+            let sql = rewrite_ddl(
+                "SHOW SEMANTIC DIMENSIONS LIKE '%x%' IN v FOR METRIC m STARTS WITH 'a' LIMIT 3",
+            )
+            .unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM show_semantic_dimensions_for_metric('v', 'm') WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 3"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_dims_like_after_in_error() {
+            let result = rewrite_ddl("SHOW SEMANTIC DIMENSIONS IN v LIKE '%x%'");
+            assert!(result.is_err(), "LIKE after IN should error");
+        }
+
+        #[test]
+        fn test_rewrite_show_metrics_limit_non_numeric() {
+            let result = rewrite_ddl("SHOW SEMANTIC METRICS LIMIT abc");
+            assert!(result.is_err(), "Non-numeric LIMIT should error");
+        }
+
+        #[test]
+        fn test_rewrite_show_for_metric_on_metrics_error() {
+            let result = rewrite_ddl("SHOW SEMANTIC METRICS IN v FOR METRIC m");
+            assert!(result.is_err(), "FOR METRIC on SHOW METRICS should error");
+        }
+
+        // --- extract_ddl_name with LIKE ---
+
+        #[test]
+        fn test_extract_ddl_name_like_before_in() {
+            let result = extract_ddl_name("SHOW SEMANTIC DIMENSIONS LIKE '%x%' IN v").unwrap();
+            assert_eq!(result, Some("v".to_string()));
+        }
+
+        #[test]
+        fn test_extract_ddl_name_like_cross_view() {
+            let result = extract_ddl_name("SHOW SEMANTIC DIMENSIONS LIKE '%x%'").unwrap();
+            assert_eq!(result, None);
+        }
+
+        // --- Case insensitivity ---
+
+        #[test]
+        fn test_rewrite_show_case_insensitive() {
+            let sql = rewrite_ddl("show semantic dimensions like '%x%' in v").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM show_semantic_dimensions('v') WHERE name ILIKE '%x%'"
+            );
+        }
+
+        // --- SHOW SEMANTIC VIEWS with filter clauses ---
+
+        #[test]
+        fn test_rewrite_show_views_like() {
+            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS LIKE '%prod%'").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM list_semantic_views() WHERE name ILIKE '%prod%'"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_views_starts_with_limit() {
+            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITH 'sales' LIMIT 5").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM list_semantic_views() WHERE name LIKE 'sales%' LIMIT 5"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_views_all_clauses() {
+            let sql =
+                rewrite_ddl("SHOW SEMANTIC VIEWS LIKE '%x%' STARTS WITH 'a' LIMIT 3").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM list_semantic_views() WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 3"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_views_in_error() {
+            let result = rewrite_ddl("SHOW SEMANTIC VIEWS IN some_view");
+            assert!(
+                result.is_err(),
+                "IN should be rejected for SHOW SEMANTIC VIEWS"
+            );
+            let err = result.unwrap_err();
+            assert!(err.contains("IN is not valid"), "got: {err}");
+        }
+
+        #[test]
+        fn test_rewrite_show_views_for_metric_error() {
+            let result = rewrite_ddl("SHOW SEMANTIC VIEWS FOR METRIC m");
+            assert!(
+                result.is_err(),
+                "FOR METRIC should be rejected for SHOW SEMANTIC VIEWS"
+            );
+            let err = result.unwrap_err();
+            assert!(err.contains("FOR METRIC is only valid"), "got: {err}");
+        }
+
+        #[test]
+        fn test_rewrite_show_views_no_clauses_regression() {
+            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS").unwrap();
+            assert_eq!(sql, "SELECT * FROM list_semantic_views()");
         }
     }
 }

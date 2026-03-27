@@ -170,13 +170,13 @@ Charlie	225.00
 
 # ============================================================
 # Test 9: DESCRIBE verification -- returns expected metadata
-# 8 columns: name, base_table, dimensions, metrics, filters, joins, facts, hierarchies
+# 7 columns: name, base_table, dimensions, metrics, filters, joins, facts
 # ============================================================
 
-query TTTTTTTT
+query TTTTTTT
 DESCRIBE SEMANTIC VIEW p28_analytics;
 ----
-p28_analytics	p28_orders	[{"expr":"c.name","name":"customer_name","output_type":null,"source_table":"c"},{"expr":"p.name","name":"product_name","output_type":null,"source_table":"p"},{"expr":"o.region","name":"region","output_type":null,"source_table":"o"},{"expr":"c.tier","name":"tier","output_type":null,"source_table":"c"}]	[{"expr":"sum(o.amount)","name":"total_revenue","output_type":null,"source_table":"o"},{"expr":"count(*)","name":"order_count","output_type":null,"source_table":"o"}]	[]	[{"fk_columns":["customer_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_customer","table":"c"},{"fk_columns":["product_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_product","table":"p"}]	[]	[]
+p28_analytics	p28_orders	[{"expr":"c.name","name":"customer_name","output_type":null,"source_table":"c"},{"expr":"p.name","name":"product_name","output_type":null,"source_table":"p"},{"expr":"o.region","name":"region","output_type":null,"source_table":"o"},{"expr":"c.tier","name":"tier","output_type":null,"source_table":"c"}]	[{"expr":"sum(o.amount)","name":"total_revenue","output_type":null,"source_table":"o"},{"expr":"count(*)","name":"order_count","output_type":null,"source_table":"o"}]	[]	[{"fk_columns":["customer_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_customer","ref_columns":["id"],"table":"c"},{"fk_columns":["product_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_product","ref_columns":["id"],"table":"p"}]	[]
 
 # ============================================================
 # Test 10: Error case -- unknown dimension

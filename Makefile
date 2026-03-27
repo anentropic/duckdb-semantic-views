@@ -22,20 +22,35 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 # Rust owns the entry point (semantic_views_init_c_api), C++ helper registers hooks.
 UNSTABLE_C_API_FLAG=--abi-type C_STRUCT_UNSTABLE
 
-# Auto-download DuckDB amalgamation (gitignored, ~25MB) if not present.
+# Auto-download DuckDB amalgamation (gitignored, ~25MB) if not present or wrong version.
 # CI checks out the repo without these files; local devs fetch via `just update-headers`.
 # The version comes from .duckdb-version via TARGET_DUCKDB_VERSION.
+# A versioned cache under .amalgamation/<version>/ survives branch switches.
 AMALGAMATION_URL=https://github.com/duckdb/duckdb/releases/download/$(TARGET_DUCKDB_VERSION)/libduckdb-src.zip
+AMALGAMATION_CACHE=.amalgamation/$(TARGET_DUCKDB_VERSION)
 
-cpp/include/duckdb.cpp:
-	@echo "Downloading DuckDB $(TARGET_DUCKDB_VERSION) amalgamation..."
-	@mkdir -p cpp/include
-	@curl -sL -o /tmp/libduckdb-src.zip "$(AMALGAMATION_URL)"
-	@unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d cpp/include/
-	@rm -f /tmp/libduckdb-src.zip
-	@echo "Downloaded cpp/include/duckdb.{hpp,cpp}"
-
-ensure_amalgamation: cpp/include/duckdb.cpp
+# Check installed amalgamation matches TARGET_DUCKDB_VERSION; fetch/copy if not.
+.PHONY: ensure_amalgamation
+ensure_amalgamation:
+	@INSTALLED=$$(grep -m1 '#define DUCKDB_VERSION' cpp/include/duckdb.hpp 2>/dev/null | sed 's/.*"\(.*\)"/\1/'); \
+	if [ "$$INSTALLED" = "$(TARGET_DUCKDB_VERSION)" ]; then \
+		exit 0; \
+	fi; \
+	echo "Amalgamation version mismatch (have=$${INSTALLED:-none}, want=$(TARGET_DUCKDB_VERSION))"; \
+	if [ -f "$(AMALGAMATION_CACHE)/duckdb.cpp" ]; then \
+		echo "Restoring from cache $(AMALGAMATION_CACHE)/..."; \
+	else \
+		echo "Downloading DuckDB $(TARGET_DUCKDB_VERSION) amalgamation..."; \
+		mkdir -p "$(AMALGAMATION_CACHE)"; \
+		curl -sL -o /tmp/libduckdb-src.zip "$(AMALGAMATION_URL)"; \
+		unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d "$(AMALGAMATION_CACHE)/"; \
+		rm -f /tmp/libduckdb-src.zip; \
+		echo "Cached $(AMALGAMATION_CACHE)/duckdb.{hpp,cpp}"; \
+	fi; \
+	mkdir -p cpp/include; \
+	cp "$(AMALGAMATION_CACHE)/duckdb.hpp" cpp/include/duckdb.hpp; \
+	cp "$(AMALGAMATION_CACHE)/duckdb.cpp" cpp/include/duckdb.cpp; \
+	echo "Installed cpp/include/duckdb.{hpp,cpp} ($(TARGET_DUCKDB_VERSION))"
 
 configure: venv platform extension_version
 
@@ -93,10 +108,43 @@ TEST_RUNNER_FILE_LIST_RELEASE := $(TEST_RUNNER) --test-dir test/sql --file-list 
 # Override base.Makefile test targets to patch runner before tests.
 # SKIP_TESTS platforms (musl, mingw) resolve to tests_skipped before reaching these
 # targets, so patch-runner is never called on those platforms — which is correct.
+#
+# DuckDB 1.5.0 changed parser extension lifecycle (ExtensionCallbackManager).
+# Running all test files in a single sqllogictest process causes a segfault
+# when the runner creates/destroys multiple databases sequentially. Work around
+# by running each test file in a separate process. Each test passes in isolation.
+# Uses mktemp instead of /dev/stdin because the Python sqllogictest runner
+# resolves /dev/stdin to /proc/self/fd/0, which doesn't exist on Windows.
 test_extension_debug_internal: patch-runner
 	@echo "Running DEBUG tests.."
-	@$(TEST_RUNNER_FILE_LIST_DEBUG)
+	@FAILED=0; \
+	TOTAL=0; \
+	TMPLIST=$$(mktemp); \
+	while IFS= read -r testfile; do \
+		TOTAL=$$((TOTAL + 1)); \
+		echo "$$testfile" > "$$TMPLIST"; \
+		if ! $(TEST_RUNNER) --test-dir test/sql --file-list "$$TMPLIST" $(EXTRA_EXTENSIONS_PARAM) --external-extension build/debug/$(EXTENSION_NAME).duckdb_extension; then \
+			echo "FAILED: $$testfile"; \
+			FAILED=$$((FAILED + 1)); \
+		fi; \
+	done < $(TEST_LIST_PATH); \
+	rm -f "$$TMPLIST"; \
+	echo "$$TOTAL tests run, $$FAILED failed"; \
+	[ $$FAILED -eq 0 ]
 
 test_extension_release_internal: patch-runner
 	@echo "Running RELEASE tests.."
-	@$(TEST_RUNNER_FILE_LIST_RELEASE)
+	@FAILED=0; \
+	TOTAL=0; \
+	TMPLIST=$$(mktemp); \
+	while IFS= read -r testfile; do \
+		TOTAL=$$((TOTAL + 1)); \
+		echo "$$testfile" > "$$TMPLIST"; \
+		if ! $(TEST_RUNNER) --test-dir test/sql --file-list "$$TMPLIST" $(EXTRA_EXTENSIONS_PARAM) --external-extension build/release/$(EXTENSION_NAME).duckdb_extension; then \
+			echo "FAILED: $$testfile"; \
+			FAILED=$$((FAILED + 1)); \
+		fi; \
+	done < $(TEST_LIST_PATH); \
+	rm -f "$$TMPLIST"; \
+	echo "$$TOTAL tests run, $$FAILED failed"; \
+	[ $$FAILED -eq 0 ]

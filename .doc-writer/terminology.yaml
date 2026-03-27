@@ -1,0 +1,84 @@
+version: 1
+
+source_terms:
+  - canonical: "SemanticViewDefinition"
+    variants: []
+    source: "struct SemanticViewDefinition in src/model.rs"
+  - canonical: "TableRef"
+    variants: []
+    source: "struct TableRef in src/model.rs"
+  - canonical: "Dimension"
+    variants: []
+    source: "struct Dimension in src/model.rs"
+  - canonical: "Metric"
+    variants: []
+    source: "struct Metric in src/model.rs"
+  - canonical: "Fact"
+    variants: []
+    source: "struct Fact in src/model.rs"
+  - canonical: "Join"
+    variants: []
+    source: "struct Join in src/model.rs"
+  - canonical: "Cardinality"
+    variants: []
+    source: "enum Cardinality in src/model.rs (ManyToOne, OneToOne)"
+  - canonical: "ExpandError"
+    variants: []
+    source: "enum ExpandError in src/expand.rs"
+  - canonical: "QueryError"
+    variants: []
+    source: "enum QueryError in src/query/error.rs"
+  - canonical: "semantic_view()"
+    variants: []
+    source: "table function registered in src/lib.rs"
+  - canonical: "explain_semantic_view()"
+    variants: []
+    source: "table function registered in src/lib.rs"
+  - canonical: "list_semantic_views()"
+    variants: []
+    source: "table function registered in src/lib.rs (ListSemanticViewsVTab)"
+  - canonical: "describe_semantic_view()"
+    variants: []
+    source: "table function registered in src/lib.rs (DescribeSemanticViewVTab)"
+
+proper_nouns:
+  - canonical: "DuckDB"
+    variants: []
+  - canonical: "Snowflake"
+    variants: []
+  - canonical: "Postgres"
+    variants: []
+  - canonical: "Iceberg"
+    variants: []
+  - canonical: "Parquet"
+    variants: []
+  - canonical: "Cortex Analyst"
+    variants: []
+
+project_terms:
+  - canonical: "semantic view"
+    variants: []
+  - canonical: "DuckDB Semantic Views"
+    variants: []
+  - canonical: "base table"
+    variants: []
+  - canonical: "derived metric"
+    variants: []
+  - canonical: "role-playing dimension"
+    variants: []
+  - canonical: "fan trap"
+    variants: []
+  - canonical: "define time"
+    variants: ["define-time"]
+  - canonical: "query time"
+    variants: ["query-time"]
+  - canonical: "expansion time"
+    variants: []
+  - canonical: "many-to-one"
+    variants: []
+  - canonical: "one-to-one"
+    variants: []
+  - canonical: "one-to-many"
+    variants: []
+
+overrides: {}

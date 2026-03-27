@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # /// script
-# dependencies = ["duckdb==1.4.4"]
-# requires-python = ">=3.9"
+# dependencies = ["duckdb==1.5.0"]
+# requires-python = ">=3.10"
 # ///
 """
 uv run examples/advanced_features.py
 
 Demonstrates v0.5.3 advanced semantic features:
   - FACTS: reusable row-level expressions with chaining
-  - HIERARCHIES: drill-down path metadata
   - Derived metrics: metric-on-metric composition
   - Cardinality annotations and fan trap detection
   - Role-playing dimensions with USING RELATIONSHIPS
@@ -62,15 +61,12 @@ CREATE SEMANTIC VIEW sales AS
     c AS customers PRIMARY KEY (id)
   )
   RELATIONSHIPS (
-    li_to_order AS li(order_id) REFERENCES o MANY TO ONE,
-    order_to_customer AS o(customer_id) REFERENCES c MANY TO ONE
+    li_to_order AS li(order_id) REFERENCES o,
+    order_to_customer AS o(customer_id) REFERENCES c
   )
   FACTS (
     li.net_price AS li.extended_price * (1 - li.discount),
     li.tax_amount AS li.net_price * li.tax_rate
-  )
-  HIERARCHIES (
-    geo AS (country, state, city)
   )
   DIMENSIONS (
     o.region  AS o.region,
@@ -103,23 +99,10 @@ for row in con.execute("""
     print(f"  {row[0]}: total_net={row[1]}, total_tax={row[2]}")
 
 # ============================================================
-# Section 3: HIERARCHIES -- Drill-down paths (metadata)
+# Section 3: Derived metrics -- Metric-on-metric composition
 # ============================================================
 
-print("\n=== Section 3: HIERARCHIES -- Drill-down path metadata ===")
-
-# Hierarchies are metadata -- they document drill-down paths
-# but don't affect query execution.
-rows = con.execute("DESCRIBE SEMANTIC VIEW sales").fetchall()
-# Column index 7 contains hierarchies JSON
-print(f"\nHierarchies metadata: {rows[0][7]}")
-print("  (Documents the geo drill path: country -> state -> city)")
-
-# ============================================================
-# Section 4: Derived metrics -- Metric-on-metric composition
-# ============================================================
-
-print("\n=== Section 4: Derived metrics -- Metric-on-metric composition ===")
+print("\n=== Section 3: Derived metrics -- Metric-on-metric composition ===")
 
 con.execute("DROP SEMANTIC VIEW sales")
 con.execute("""
@@ -130,8 +113,8 @@ CREATE SEMANTIC VIEW sales AS
     c AS customers PRIMARY KEY (id)
   )
   RELATIONSHIPS (
-    li_to_order AS li(order_id) REFERENCES o MANY TO ONE,
-    order_to_customer AS o(customer_id) REFERENCES c MANY TO ONE
+    li_to_order AS li(order_id) REFERENCES o,
+    order_to_customer AS o(customer_id) REFERENCES c
   )
   FACTS (
     li.net_price AS li.extended_price * (1 - li.discount)
@@ -180,10 +163,10 @@ result = con.execute("""
 print(f"  profit={result[0]}")
 
 # ============================================================
-# Section 5: Fan trap detection -- Cardinality-aware safety
+# Section 4: Fan trap detection -- Cardinality-aware safety
 # ============================================================
 
-print("\n=== Section 5: Fan trap detection -- Cardinality-aware safety ===")
+print("\n=== Section 4: Fan trap detection -- Cardinality-aware safety ===")
 
 con.execute("DROP SEMANTIC VIEW sales")
 con.execute("""
@@ -193,7 +176,7 @@ CREATE SEMANTIC VIEW fan_trap_demo AS
     li AS line_items PRIMARY KEY (id)
   )
   RELATIONSHIPS (
-    li_to_order AS li(order_id) REFERENCES o MANY TO ONE
+    li_to_order AS li(order_id) REFERENCES o
   )
   DIMENSIONS (
     o.region     AS o.region,
@@ -205,8 +188,8 @@ CREATE SEMANTIC VIEW fan_trap_demo AS
   );
 """)
 
-# Safe query: li.revenue with o.region -- li->o is MANY TO ONE (safe direction)
-print("\nSafe query (revenue by region, MANY TO ONE direction):")
+# Safe query: li.revenue with o.region -- li->o is many-to-one (safe direction)
+print("\nSafe query (revenue by region, many-to-one direction):")
 for row in con.execute("""
     SELECT * FROM semantic_view('fan_trap_demo',
         dimensions := ['region'],
@@ -216,7 +199,7 @@ for row in con.execute("""
     print(f"  {row[0]}: revenue={row[1]}")
 
 # Fan trap: o.order_count with li.price_tier
-# Traversing o->li is ONE TO MANY (fan-out) -- would inflate the count!
+# Traversing o->li is one-to-many (fan-out) -- would inflate the count!
 print("\nFan trap query (order_count by price_tier -- blocked!):")
 try:
     con.execute("""
@@ -228,14 +211,14 @@ try:
 except Exception as e:
     print(f"  Error: {e}")
     print("  (order_count is from orders, but price_tier requires joining")
-    print("   line_items. Traversing orders->line_items is ONE TO MANY,")
+    print("   line_items. Traversing orders->line_items is one-to-many,")
     print("   which would inflate the count.)")
 
 # ============================================================
-# Section 6: Role-playing dimensions with USING RELATIONSHIPS
+# Section 5: Role-playing dimensions with USING RELATIONSHIPS
 # ============================================================
 
-print("\n=== Section 6: Role-playing dimensions with USING RELATIONSHIPS ===")
+print("\n=== Section 5: Role-playing dimensions with USING RELATIONSHIPS ===")
 
 con.execute("DROP SEMANTIC VIEW fan_trap_demo")
 
@@ -333,10 +316,10 @@ for row in con.execute("""
     print(f"  {row[0]}: {row[1]}")
 
 # ============================================================
-# Section 7: EXPLAIN -- See the generated SQL for role-playing
+# Section 6: EXPLAIN -- See the generated SQL for role-playing
 # ============================================================
 
-print("\n=== Section 7: EXPLAIN -- Generated SQL with scoped aliases ===")
+print("\n=== Section 6: EXPLAIN -- Generated SQL with scoped aliases ===")
 
 for row in con.execute("""
     SELECT * FROM explain_semantic_view('flight_analytics',
@@ -347,10 +330,10 @@ for row in con.execute("""
     print(f"  {row[0]}")
 
 # ============================================================
-# Section 8: DESCRIBE -- Full metadata view
+# Section 7: DESCRIBE -- Full metadata view
 # ============================================================
 
-print("\n=== Section 8: DESCRIBE -- Full metadata view ===")
+print("\n=== Section 7: DESCRIBE -- Full metadata view ===")
 
 for row in con.execute("DESCRIBE SEMANTIC VIEW flight_analytics").fetchall():
     print(f"  view: {row[0]}")

@@ -1,5 +1,25 @@
 # Milestones
 
+## v0.5.4 Snowflake-Parity & Registry Publishing (Shipped: 2026-03-27)
+
+**Phases completed:** 6 phases, 12 plans, 25 tasks
+
+**Key accomplishments:**
+
+- UNIQUE constraints on TableRef, ref_columns on Join, two-variant Cardinality enum, and PK/UNIQUE-based cardinality inference at parse time
+- FK reference validation (CARD-03/09) via PK/UNIQUE set matching, fan trap with inferred cardinality, ON clause using ref_columns, old-JSON guard, and 14-test phase33 sqllogictest
+- Full DuckDB 1.5.0 upgrade: version pins, C++ parser extension compat header, ParserExtension::Register API migration, per-process test runner, PEG parser compatibility test
+- CI updated for DuckDB 1.5.0 with extension-ci-tools@v1.5.0, duckdb/1.4.x LTS branch created with v1.4.4 pins, Version Monitor rewritten for dual-track latest+LTS monitoring
+- ALTER SEMANTIC VIEW ... RENAME TO DDL with parser detection, catalog mutation, persistence, and 8 sqllogictest scenarios
+- Three SHOW commands with parser detection, VTab implementations for single-view and cross-view introspection, 6 registered table functions, and sqllogictest coverage
+- Fan-trap-aware SHOW SEMANTIC DIMENSIONS FOR METRIC via LCA path analysis reusing expand.rs graph helpers
+- LIKE/STARTS WITH/LIMIT clause parsing for all SHOW SEMANTIC commands via parser-level WHERE/LIMIT injection
+- GitHub Pages deployment workflow with Sphinx -W validation, PR build checks, and README documentation link
+- CE description.yml with self-contained native DDL hello_world, LICENSE fixed from BSD-3-Clause to MIT, Cargo.toml bumped to 0.5.4
+- Updated MAINTAINER.md with multi-branch strategy, CE registry publishing process, native DDL examples; created examples/snowflake_parity.py demonstrating v0.5.4 features
+
+---
+
 ## v0.5.3 Advanced Semantic Features (Shipped: 2026-03-15)
 
 **Phases completed:** 4 phases (29-32), 8 plans, 17 tasks
@@ -11,6 +31,7 @@
 **Delivered:** Advanced semantic modeling capabilities — FACTS clause for named row-level sub-expressions, derived metrics with metric-on-metric composition, hierarchies for drill-down path metadata, cardinality-aware fan trap detection blocking inflated aggregation, role-playing dimensions via multiple named relationships with scoped aliases, and USING RELATIONSHIPS for explicit join path selection per metric.
 
 **Key accomplishments:**
+
 1. FACTS clause with DAG resolution via Kahn's algorithm and word-boundary-safe expression inlining
 2. HIERARCHIES clause as pure metadata with define-time validation against declared dimensions
 3. Derived metrics with stacked inlining, aggregate prohibition, and transitive join resolution
@@ -34,6 +55,7 @@
 **Delivered:** SQL keyword body syntax (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS) replacing function-call DDL, Snowflake-style PK/FK relationship model with automatic JOIN ON synthesis, topological sort ordering, define-time graph validation, and qualified column references. Function-based DDL interface fully retired; native DDL is sole interface.
 
 **Key accomplishments:**
+
 1. SQL keyword body parser with state-machine clause boundary detection for TABLES, RELATIONSHIPS, DIMENSIONS, METRICS
 2. Parser robustness hardening: token-based DDL detection, adversarial input safety, fuzz_ddl_parse target
 3. RelationshipGraph module with Kahn's algorithm toposort, diamond/cycle detection, define-time validation
@@ -56,6 +78,7 @@
 **Delivered:** Complete native DDL surface — all 7 DDL verbs (CREATE, CREATE OR REPLACE, CREATE IF NOT EXISTS, DROP, DROP IF EXISTS, DESCRIBE, SHOW) via parser extension hooks. Error location reporting with clause-level hints, character positions, and "did you mean" suggestions. 33 property-based tests for parser module + Python caret integration tests through full extension pipeline.
 
 **Key accomplishments:**
+
 1. Empirically confirmed all 7 DDL prefixes trigger parser fallback hook — full native DDL scope validated
 2. `DdlKind` enum with multi-prefix detection/rewrite for DROP, CREATE OR REPLACE, IF NOT EXISTS, DESCRIBE, SHOW
 3. C++ result-forwarding pipeline with dynamic column schemas per DDL form (DESCRIBE: 6 cols, SHOW: 2 cols)
@@ -78,6 +101,7 @@
 **Delivered:** Native `CREATE SEMANTIC VIEW` DDL syntax via DuckDB parser extension hooks. C++ shim compiled via `cc` crate against vendored DuckDB amalgamation, with Rust FFI trampoline for statement detection and rewriting. Extension preserves full backward compatibility with function-based DDL.
 
 **Key accomplishments:**
+
 1. Vendored DuckDB amalgamation + cc crate C++ build pipeline for parser hook compilation
 2. C_STRUCT entry point + C++ helper for parser hook registration (Option A — CPP entry rejected due to `-fvisibility=hidden`)
 3. Rust FFI parse function with `catch_unwind` panic safety and C++ trampoline for `CREATE SEMANTIC VIEW` detection
@@ -88,6 +112,7 @@
 **Requirements:** 18/18 functionally satisfied (5 had verification documentation gap, resolved by downstream phases)
 
 **Known Gaps:**
+
 - Phase 15 VERIFICATION.md was retroactively created (gaps confirmed resolved by Phase 16-18 work)
 - Nyquist compliance: all 5 phases have VALIDATION.md but none formally marked `nyquist_compliant: true`
 
@@ -104,6 +129,7 @@
 **Delivered:** Replaced binary-read dispatch with zero-copy vector references. The table function now streams result chunks directly into output via `duckdb_vector_reference_vector`, eliminating ~600 lines of per-type read/write code. Type mismatches (HUGEINT→BIGINT, STRUCT/MAP→VARCHAR) handled at SQL generation time via `build_execution_sql` cast wrapper. Streaming is chunk-by-chunk instead of collect-all-then-write.
 
 **Key changes:**
+
 1. Zero-copy vector transfer — `duckdb_vector_reference_vector` shares buffer ownership between source and output chunks
 2. Streaming execution — chunks processed one at a time via `StreamingState` with `Mutex`, reducing peak memory
 3. SQL-time type casting — `build_execution_sql` wraps expanded SQL with explicit casts for mismatched columns
@@ -125,6 +151,7 @@
 **Delivered:** Typed DDL interface with Snowflake-aligned STRUCT/LIST syntax, time dimension support with granularity coarsening, DuckDB-native catalog persistence via pragma_query_t, typed output columns with binary-read dispatch, and DuckLake CI integration.
 
 **Key accomplishments:**
+
 1. C++ shim infrastructure — cc crate build with vendored DuckDB headers, feature-gated compilation, symbol visibility
 2. Time dimensions — date_trunc codegen with granularity coarsening (day/week/month/year) and per-query override
 3. pragma_query_t catalog persistence — transactional DuckDB-native storage, sidecar file fully eliminated
@@ -134,6 +161,7 @@
 
 **Requirements:** 14/16 satisfied
 **Known gaps:**
+
 - DDL-01 (`CREATE SEMANTIC VIEW` native syntax) — architecturally impossible: Python DuckDB compiles C++ with `-fvisibility=hidden`, hiding all parser hook symbols
 - DDL-02 (`DROP SEMANTIC VIEW` native syntax) — same root cause as DDL-01
 
@@ -149,6 +177,7 @@
 **Delivered:** A fully functional DuckDB extension in Rust implementing semantic views — users define dimensions, metrics, joins, and filters once, then query with `FROM view(dimensions := [...], metrics := [...])` without writing GROUP BY or JOIN logic by hand.
 
 **Key accomplishments:**
+
 1. Loadable DuckDB extension in Rust with multi-platform CI (5 targets) and automated DuckDB version monitoring
 2. Function-based DDL (define/drop/list/describe) with sidecar-file persistence across restarts
 3. Pure Rust expansion engine with GROUP BY inference, join dependency resolution, and identifier quoting
@@ -160,4 +189,3 @@
 **Audit:** Passed with tech debt — all requirements met, 15 deferred items documented
 
 ---
-

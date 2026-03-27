@@ -1,0 +1,20 @@
+html.light {
+    --syntax-light-name-tag: #1d9240;
+}
+.sy-head-brand {
+    font-family: var(--sy-f-heading);
+    font-size: 1.2rem;
+}
+.globaltoc > ul > li > .reference.internal {
+    font-weight: 600;
+}
+/* .sy-head-links li.link > a {
+    font-weight: 600;
+} */
+div.localtoc > h3 {
+    font-family: var(--sy-f-text);
+    font-weight: 600;
+}
+.toctree-wrapper > ul > li > .reference.internal {
+    font-weight: 600;
+}

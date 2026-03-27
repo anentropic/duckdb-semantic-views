@@ -321,6 +321,55 @@
 
 ---
 
+## Milestone: v0.5.4 — Snowflake-Parity & Registry Publishing
+
+**Shipped:** 2026-03-27
+**Phases:** 6 (33-36, including 34.1, 34.1.1 inserted) | **Plans:** 12 | **Commits:** 117
+
+### What Was Built
+- Snowflake-style cardinality inference: UNIQUE constraints + PK/FK matching replaces explicit keywords; two-variant Cardinality enum
+- DuckDB 1.5.0 upgrade with parser_extension_compat.hpp, per-process test runner, LTS branch (duckdb/1.4.x)
+- DDL surface parity: ALTER SEMANTIC VIEW RENAME TO, 6 SHOW SEMANTIC commands (DIMS/METRICS/FACTS single+cross-view, FOR METRIC fan-trap-aware)
+- SHOW command filtering: LIKE, STARTS WITH, LIMIT clause parsing via WHERE/LIMIT injection
+- Sphinx + Shibuya documentation site on GitHub Pages with CI/CD and PR build checks
+- CE registry readiness: description.yml, MIT license, MAINTAINER.md with multi-branch workflow, snowflake_parity.py example
+
+### What Worked
+- Integration checker at milestone audit found 3 real bugs in example files (wrong IF EXISTS position, removed cardinality keywords) — valuable safety net
+- Phase 34.1 and 34.1.1 decimal insertions for urgent Snowflake DDL parity — clean scope additions without disrupting main roadmap
+- Parser-level SHOW filtering (WHERE/LIMIT injection) — zero VTab changes needed, single implementation covers all 4 SHOW kinds
+- Documentation site shipped separately from code (Phase 35) — clean dependency on stable DDL syntax before writing docs
+- Phase 36 Plan 03 designed as non-autonomous with human-action gates — correct for CE submission which requires human GitHub action
+
+### What Was Inefficient
+- Phase 34 never received a VERIFICATION.md — same gap pattern from v0.5.0 Phase 15; caught during milestone audit
+- Nyquist VALIDATION.md files created for all 6 phases but none completed until retroactive audit (same recurring pattern)
+- Example files (advanced_features.py) not updated when Phase 33 removed cardinality keywords — regression not caught until integration checker
+- 2 inserted phases (34.1, 34.1.1) expanded a 4-phase milestone to 6 — scope creep from Snowflake comparison analysis
+
+### Patterns Established
+- parser_extension_compat.hpp for DuckDB version-specific type re-declarations
+- Per-process sqllogictest execution for parser extension lifecycle compatibility
+- VTab pair pattern: single-view (1 param) + cross-view (0 params) sharing bind/init types
+- Parser-level filter clause injection (LIKE→ILIKE, STARTS WITH→LIKE prefix%, LIMIT) for SHOW commands
+- PLACEHOLDER_COMMIT_SHA workflow for CE submission (replaced after squash-merge)
+
+### Key Lessons
+1. Integration checkers at milestone boundary catch cross-phase bugs that phase-level verification misses — examples not updated after breaking model changes
+2. Decimal phase insertion (34.1, 34.1.1) works well but increases milestone scope — consider whether insertions should trigger scope review
+3. DuckDB 1.5.0 moved types from headers to .cpp — compat headers must match exactly including ALL constructors (ODR violations cause segfaults)
+4. Non-autonomous plans with human-action gates are the correct pattern for external-dependency work (CE submission)
+5. Nyquist validation needs a completion gate in execute-phase, not just file creation — 10th consecutive milestone with this gap
+
+### Cost Observations
+- 117 commits in 13 days
+- 12 plans, 5 quick tasks
+- Phase 34 Plan 01 was longest (90 min) — DuckDB version upgrade with C++ compat investigation
+- Phase 36 plans were fastest (4-5 min each) — documentation and config only
+- Notable: integration checker agent cost ~122K tokens but found 3 real bugs
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -335,6 +384,7 @@
 | v0.5.1 | ~30 | 5 | DDL Polish — 7 DDL verbs, error location reporting, 33 parser PBTs + Python caret tests |
 | v0.5.2 | 89 | 5 | SQL DDL body + PK/FK relationships, graph validation, function DDL retired |
 | v0.5.3 | 66 | 4 | FACTS, derived metrics, hierarchies, fan traps, role-playing dims, USING |
+| v0.5.4 | 117 | 6 | Cardinality inference, DuckDB 1.5.0, DDL parity, SHOW filtering, docs site, CE readiness |
 
 ### Cumulative Quality
 
@@ -347,6 +397,7 @@
 | v0.5.1 | 222+ | 73 properties (40 output + 33 parser) | 3 targets | 5 (+ Python caret integration) |
 | v0.5.2 | 282+ | 73+ properties | 4 targets | 7 sqllogictest + DuckLake CI + Python crash + caret |
 | v0.5.3 | 441 | 80+ properties | 4 targets | 11 sqllogictest + DuckLake CI + Python crash + caret |
+| v0.5.4 | 482 | 80+ properties | 4 targets | 18 sqllogictest + DuckLake CI + Python crash + caret + 22 infra assertions |
 
 ### Top Lessons (Verified Across Milestones)
 

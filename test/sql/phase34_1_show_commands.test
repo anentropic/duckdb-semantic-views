@@ -1,0 +1,151 @@
+# Phase 34.1: SHOW SEMANTIC DIMENSIONS / METRICS / FACTS
+
+require semantic_views
+
+# ============================================================
+# Setup: create two semantic views
+# ============================================================
+
+statement ok
+CREATE TABLE p34s_customers (id INTEGER PRIMARY KEY, name VARCHAR, region VARCHAR);
+
+statement ok
+CREATE TABLE p34s_orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount DECIMAL(10,2), order_date DATE);
+
+statement ok
+CREATE SEMANTIC VIEW orders_sv AS
+  TABLES (
+    c AS p34s_customers PRIMARY KEY (id),
+    o AS p34s_orders PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    orders_to_customers AS o(customer_id) REFERENCES c
+  )
+  FACTS (
+    o.raw_amount AS o.amount
+  )
+  DIMENSIONS (
+    c.customer_name AS c.name,
+    c.region AS c.region,
+    o.order_date AS o.order_date
+  )
+  METRICS (
+    o.total_amount AS SUM(o.amount),
+    o.order_count AS COUNT(o.id)
+  )
+
+statement ok
+CREATE TABLE p34s_products (id INTEGER PRIMARY KEY, product_name VARCHAR, price DECIMAL(10,2));
+
+statement ok
+CREATE SEMANTIC VIEW products_sv AS
+  TABLES (
+    p AS p34s_products PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    p.product_name AS p.product_name
+  )
+  METRICS (
+    p.avg_price AS AVG(p.price)
+  )
+
+# ============================================================
+# Test 1: SHOW SEMANTIC DIMENSIONS IN (single view)
+# ============================================================
+
+query TTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN orders_sv
+----
+orders_sv	customer_name	c.name	c	(empty)
+orders_sv	order_date	o.order_date	o	(empty)
+orders_sv	region	c.region	c	(empty)
+
+# ============================================================
+# Test 2: SHOW SEMANTIC DIMENSIONS (cross-view)
+# ============================================================
+
+query TTTTT rowsort
+SHOW SEMANTIC DIMENSIONS
+----
+orders_sv	customer_name	c.name	c	(empty)
+orders_sv	order_date	o.order_date	o	(empty)
+orders_sv	region	c.region	c	(empty)
+products_sv	product_name	p.product_name	p	(empty)
+
+# ============================================================
+# Test 3: SHOW SEMANTIC METRICS IN (single view)
+# ============================================================
+
+query TTTTT rowsort
+SHOW SEMANTIC METRICS IN orders_sv
+----
+orders_sv	order_count	COUNT(o.id)	o	(empty)
+orders_sv	total_amount	SUM(o.amount)	o	(empty)
+
+# ============================================================
+# Test 4: SHOW SEMANTIC METRICS (cross-view)
+# ============================================================
+
+query TTTTT rowsort
+SHOW SEMANTIC METRICS
+----
+orders_sv	order_count	COUNT(o.id)	o	(empty)
+orders_sv	total_amount	SUM(o.amount)	o	(empty)
+products_sv	avg_price	AVG(p.price)	p	(empty)
+
+# ============================================================
+# Test 5: SHOW SEMANTIC FACTS IN (single view)
+# ============================================================
+
+query TTTT rowsort
+SHOW SEMANTIC FACTS IN orders_sv
+----
+orders_sv	raw_amount	o.amount	o
+
+# ============================================================
+# Test 6: SHOW SEMANTIC FACTS (cross-view, includes view with no facts)
+# ============================================================
+
+query TTTT rowsort
+SHOW SEMANTIC FACTS
+----
+orders_sv	raw_amount	o.amount	o
+
+# ============================================================
+# Test 7: Non-existent view
+# ============================================================
+
+statement error
+SHOW SEMANTIC DIMENSIONS IN nonexistent_view
+----
+does not exist
+
+# ============================================================
+# Test 8: Case insensitivity
+# ============================================================
+
+query TTTTT rowsort
+show semantic dimensions in orders_sv
+----
+orders_sv	customer_name	c.name	c	(empty)
+orders_sv	order_date	o.order_date	o	(empty)
+orders_sv	region	c.region	c	(empty)
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW orders_sv
+
+statement ok
+DROP SEMANTIC VIEW products_sv
+
+statement ok
+DROP TABLE p34s_orders
+
+statement ok
+DROP TABLE p34s_customers
+
+statement ok
+DROP TABLE p34s_products

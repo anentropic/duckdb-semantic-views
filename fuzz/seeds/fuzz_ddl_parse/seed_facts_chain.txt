@@ -1,0 +1,1 @@
+CREATE SEMANTIC VIEW v AS TABLES (o AS orders PRIMARY KEY (id)) FACTS (o.net_price AS o.price * (1 - o.discount), o.tax AS o.net_price * o.tax_rate) DIMENSIONS (o.country AS country, o.state AS state, o.city AS city) METRICS (o.total AS SUM(net_price))

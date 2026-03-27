@@ -162,6 +162,28 @@ pub fn catalog_delete_if_exists(state: &CatalogState, name: &str) {
     state.write().unwrap().remove(name);
 }
 
+/// Rename a semantic view in the in-memory catalog.
+///
+/// Atomically removes the old name and inserts the new name.
+/// Returns an error if `old_name` does not exist or `new_name` already exists.
+pub fn catalog_rename(
+    state: &CatalogState,
+    old_name: &str,
+    new_name: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut guard = state.write().unwrap();
+    let json = guard
+        .remove(old_name)
+        .ok_or_else(|| format!("semantic view '{old_name}' does not exist"))?;
+    if guard.contains_key(new_name) {
+        // Rollback: put the old entry back
+        guard.insert(old_name.to_string(), json);
+        return Err(format!("semantic view '{new_name}' already exists").into());
+    }
+    guard.insert(new_name.to_string(), json);
+    Ok(())
+}
+
 /// FFI-callable catalog mutation functions.
 ///
 /// These functions are gated on the `extension` feature so they are not included in
@@ -419,6 +441,43 @@ mod tests {
         // Should not panic or error
         catalog_delete_if_exists(&state, "nonexistent");
         assert!(state.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_moves_entry() {
+        let con = in_memory_con();
+        let state = init_catalog(&con, ":memory:").unwrap();
+        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+        catalog_insert(&state, "orders", json).unwrap();
+        catalog_rename(&state, "orders", "sales").unwrap();
+        let guard = state.read().unwrap();
+        assert!(!guard.contains_key("orders"));
+        assert_eq!(guard.get("sales").map(String::as_str), Some(json));
+    }
+
+    #[test]
+    fn rename_nonexistent_is_error() {
+        let con = in_memory_con();
+        let state = init_catalog(&con, ":memory:").unwrap();
+        let result = catalog_rename(&state, "nonexistent", "something");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("does not exist"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn rename_to_existing_is_error() {
+        let con = in_memory_con();
+        let state = init_catalog(&con, ":memory:").unwrap();
+        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+        catalog_insert(&state, "orders", json).unwrap();
+        catalog_insert(&state, "sales", json).unwrap();
+        let result = catalog_rename(&state, "orders", "sales");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("already exists"), "unexpected: {msg}");
+        // Verify old entry was rolled back
+        assert!(state.read().unwrap().contains_key("orders"));
     }
 
     #[test]

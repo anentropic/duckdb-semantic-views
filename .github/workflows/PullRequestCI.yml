@@ -7,6 +7,7 @@ on:
       - 'release/*'
       - 'gsd/*'
       - 'milestone/*'
+      - 'duckdb/*'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,13 +16,13 @@ concurrency:
 jobs:
   linux-fast-check:
     name: Build and test (Linux x86_64)
-    # IMPORTANT: The @tag below must match the version in .duckdb-version (currently v1.4.4).
+    # IMPORTANT: The @tag below must match the version in .duckdb-version (currently v1.5.0).
     # GitHub Actions 'uses:' does not support dynamic values, so update this manually
     # whenever .duckdb-version changes.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.0
     with:
-      duckdb_version: v1.4.4
-      ci_tools_version: v1.4.4
+      duckdb_version: v1.5.0
+      ci_tools_version: v1.5.0
       extension_name: semantic_views
       extra_toolchains: 'rust;python3'
       # Only Linux x86_64 for fast PR feedback — full matrix runs on main/release branches.
@@ -56,3 +57,20 @@ jobs:
         run: uv run test/integration/test_ducklake_ci.py
         env:
           SEMANTIC_VIEWS_EXTENSION_PATH: target/debug/semantic_views.duckdb_extension
+
+  docs-check:
+    name: Docs build check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Build docs (warnings as errors)
+        run: uv run --project docs sphinx-build -b html -W docs docs/_build/html

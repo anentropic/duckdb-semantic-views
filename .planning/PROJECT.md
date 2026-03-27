@@ -60,18 +60,16 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - ✓ USING RELATIONSHIPS: explicit join path selection per metric with ambiguity detection — v0.5.3
 - ✓ DESCRIBE extended to 8 columns (facts + hierarchies) with backward-compatible null-to-[] fallback — v0.5.3
 
+- ✓ UNIQUE table constraint + Snowflake-style cardinality inference (remove explicit cardinality keywords) — v0.5.4
+- ✓ Multi-version DuckDB support (main=1.5.x latest, duckdb/1.4.x LTS) with dual CI — v0.5.4
+- ✓ DDL surface parity with Snowflake: ALTER SEMANTIC VIEW RENAME TO, SHOW SEMANTIC DIMENSIONS/METRICS/FACTS, FOR METRIC (fan-trap-aware) — v0.5.4
+- ✓ SHOW command filtering: LIKE, STARTS WITH, LIMIT on all SHOW SEMANTIC commands — v0.5.4
+- ✓ Sphinx + Shibuya documentation site on GitHub Pages with CI/CD — v0.5.4
+- ✓ Community Extension registry descriptor + MAINTAINER.md with multi-branch workflow — v0.5.4
+
 ### Active
 
-## Current Milestone: v0.5.4 Snowflake-Parity & Registry Publishing
-
-**Goal:** Align relationship model with Snowflake-style cardinality inference, support multiple DuckDB versions, publish to community extension registry, and ship proper documentation.
-
-**Target features:**
-- UNIQUE table constraint + Snowflake-style cardinality inference (remove explicit cardinality keywords)
-- Multi-version DuckDB support (main=latest, andium branch=1.4.x LTS)
-- Zensical documentation site on GitHub Pages
-- Community Extension registry publishing (description.yml + submission)
-- MAINTAINER.md updates for branching strategy and CE publishing
+(Next milestone not yet planned — run `/gsd:new-milestone` to start)
 
 ### Out of Scope
 
@@ -92,12 +90,12 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ## Context
 
-**Shipped v0.5.3** — FACTS clause, derived metrics, hierarchies, fan trap detection, role-playing dimensions, USING RELATIONSHIPS. All advanced semantic modeling features complete.
-**Tech stack:** Rust + C++ shim (vendored DuckDB amalgamation via cc crate), duckdb-rs 1.4.4, serde_json, strsim, proptest.
-**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns, fan trap detection, and role-playing dimension support. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern). Parser hook via C++ shim: `parse_function` fallback detects all 7 DDL forms, Rust `DdlKind` enum dispatches rewrite. DDL body parsed by `body_parser.rs` state machine into TableRef/Join/Dimension/Metric/Fact/Hierarchy structs with PK/FK annotations and cardinality. `RelationshipGraph` validates tree structure and topologically sorts joins. Expansion generates `FROM base AS alias LEFT JOIN t AS alias ON pk=fk` with qualified column references, fact inlining, derived metric resolution, and USING-aware scoped aliases.
-**Tests:** 441 Rust tests + 11 sqllogictest files + 6 DuckLake CI tests + Python crash repro + Python caret tests + 4 fuzz targets.
+**Shipped v0.5.4** — Snowflake-parity cardinality inference, DuckDB 1.5.0 + LTS dual-version support, DDL surface parity (ALTER, 6 SHOW commands with filtering), documentation site, CE registry readiness.
+**Tech stack:** Rust + C++ shim (vendored DuckDB amalgamation via cc crate), duckdb-rs 1.10500.0 (DuckDB 1.5.0), serde_json, strsim, proptest.
+**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns, fan trap detection, and role-playing dimension support. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with separate connection (write-first pattern). Parser hook via C++ shim with `parser_extension_compat.hpp`: `parse_function` fallback detects all DDL forms (CREATE, DROP, ALTER, DESCRIBE, SHOW variants), Rust `DdlKind` enum dispatches rewrite. DDL body parsed by `body_parser.rs` state machine into TableRef/Join/Dimension/Metric/Fact structs with PK/FK/UNIQUE annotations and inferred cardinality. `RelationshipGraph` validates tree structure and topologically sorts joins. Expansion generates `FROM base AS alias LEFT JOIN t AS alias ON pk=fk` with qualified column references, fact inlining, derived metric resolution, and USING-aware scoped aliases.
+**Tests:** 482 Rust tests + 18 sqllogictest files + 6 DuckLake CI tests + Python crash repro + Python caret tests + 4 fuzz targets + 22 infra assertions.
 **Known limitations:** See TECH-DEBT.md at repo root for accepted decisions and deferred items.
-**Source LOC:** 13,451 Rust (src/).
+**Source LOC:** 15,786 Rust (src/).
 
 **Design research:** A detailed design doc lives in `_notes/semantic-views-duckdb-design-doc.md`. It covers prior art (Cube.dev internals, Snowflake semantic views, Databricks metric views), the two-phase architecture (expansion → pre-aggregation selection), and why `egg`/e-graph rewriting is not needed for this approach.
 
@@ -143,6 +141,12 @@ A DuckDB user can define a semantic view once and query it with any combination 
 | Diamond relaxation for named relationships | Allow multiple paths when all relationships have unique names | ✓ Good — enables role-playing pattern |
 | USING controls dimension alias, not metric aggregation | COUNT(*) counts base rows regardless of USING path | ✓ Good — correct semantics |
 | Semi-additive metrics deferred | Only feature requiring expansion pipeline structural change; deferred again from v0.5.4 | — Pending |
+| Snowflake-style cardinality inference | UNIQUE constraints + PK/FK matching replaces explicit cardinality keywords; two-variant enum (ManyToOne/OneToOne) | ✓ Good — cleaner model, aligns with Snowflake |
+| Separate TU with compat header for DuckDB 1.5.0 | parser_extension_compat.hpp re-declares types moved from duckdb.hpp to duckdb.cpp | ✓ Good — avoids libpg_query macro pollution |
+| Per-process sqllogictest execution | DuckDB 1.5.0 parser extension lifecycle causes segfaults in multi-database processes | ✓ Good — necessary workaround |
+| Parser-level SHOW filtering | WHERE/LIMIT injection into generated SQL vs VTab-level filtering | ✓ Good — zero VTab changes needed |
+| MIT license (replacing BSD-3-Clause) | Simpler, more permissive, matches Cargo.toml canonical license | ✓ Good — cleaner for CE submission |
+| PLACEHOLDER_COMMIT_SHA in description.yml | Replaced with real SHA after squash-merge to main | ✓ Good — correct workflow for CE submission |
 
 ---
-*Last updated: 2026-03-15 after v0.5.4 milestone start*
+*Last updated: 2026-03-27 after v0.5.4 milestone completion*

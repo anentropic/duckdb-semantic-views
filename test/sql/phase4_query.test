@@ -301,14 +301,14 @@ METRICS (
     e.total_count AS sum(e.event_count)
 )
 
-# date_trunc('month', DATE) returns DATE values.
+# date_trunc('month', DATE) returns TIMESTAMP in DuckDB >= 1.5.0.
 # SQLLogicTest does not support the 'D' specifier; 'T' reads any column as text.
 # The metric total_count is sum(INTEGER) = BIGINT (typed I).
 query TI rowsort
 FROM semantic_view('typed_date_test', dimensions := ['event_date'], metrics := ['total_count'])
 ----
-2024-01-01	5
-2024-02-01	3
+2024-01-01 00:00:00	5
+2024-02-01 00:00:00	3
 
 statement ok
 DROP SEMANTIC VIEW typed_date_test;

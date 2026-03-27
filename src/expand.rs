@@ -147,9 +147,10 @@ impl fmt::Display for ExpandError {
                     "semantic view '{view_name}': fan trap detected -- metric '{metric_name}' \
                      (table '{metric_table}') would be duplicated when joined to dimension \
                      '{dimension_name}' (table '{dimension_table}') via relationship \
-                     '{relationship_name}' (ONE TO MANY). This would inflate aggregation results. \
-                     Remove the dimension, use a metric from the same table, or adjust the \
-                     relationship cardinality."
+                     '{relationship_name}' (many-to-one cardinality, inferred: FK is not PK/UNIQUE). \
+                     This would inflate aggregation results. \
+                     Remove the dimension, use a metric from the same table, or restructure the \
+                     relationship."
                 )
             }
             Self::AmbiguousPath {
@@ -283,17 +284,27 @@ fn synthesize_on_clause(join: &Join, tables: &[TableRef]) -> String {
 /// Like `synthesize_on_clause`, but uses `to_alias` instead of `join.table` in the
 /// generated SQL. This supports role-playing dimensions where the same physical table
 /// appears multiple times with different scoped aliases (e.g., `a__dep_airport`).
+///
+/// Phase 33: Prefers `join.ref_columns` (resolved during inference) over looking up
+/// `pk_columns` from the target table. Falls back to target PK for backward compat
+/// (legacy joins without `ref_columns`).
 fn synthesize_on_clause_scoped(join: &Join, tables: &[TableRef], to_alias: &str) -> String {
-    let to_alias_lower = join.table.to_ascii_lowercase();
-    let pk_columns: &[String] = tables
-        .iter()
-        .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower)
-        .map_or(&[] as &[String], |t| &t.pk_columns);
+    // Phase 33: Prefer ref_columns (resolved during inference).
+    // Fall back to target PK for backward compat (legacy joins without ref_columns).
+    let ref_cols: &[String] = if join.ref_columns.is_empty() {
+        let to_alias_lower = join.table.to_ascii_lowercase();
+        tables
+            .iter()
+            .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower)
+            .map_or(&[] as &[String], |t| &t.pk_columns)
+    } else {
+        &join.ref_columns
+    };
 
     let pairs: Vec<String> = join
         .fk_columns
         .iter()
-        .zip(pk_columns.iter())
+        .zip(ref_cols.iter())
         .map(|(fk, pk)| {
             format!(
                 "{}.{} = {}.{}",
@@ -922,7 +933,7 @@ fn inline_derived_metrics(
 
 /// Collect source tables needed by a derived metric by walking the metric
 /// dependency graph transitively.
-fn collect_derived_metric_source_tables(
+pub(crate) fn collect_derived_metric_source_tables(
     met: &crate::model::Metric,
     all_metrics: &[crate::model::Metric],
 ) -> Vec<String> {
@@ -995,7 +1006,6 @@ fn collect_derived_metric_source_tables(
 /// For an edge `(from_alias, to_alias)` with cardinality:
 /// - `ManyToOne`: from->to is safe (many go to one), to->from is fan-out
 /// - `OneToOne`: both directions are safe
-/// - `OneToMany`: from->to is fan-out, to->from is safe
 #[allow(clippy::result_large_err)]
 fn check_fan_traps(
     view_name: &str,
@@ -1099,7 +1109,7 @@ fn check_fan_traps(
 
 /// Walk from `node` to the root through the parent map, returning the chain
 /// including `node` itself. The last element is the root.
-fn ancestors_to_root(node: &str, parent_map: &HashMap<String, String>) -> Vec<String> {
+pub(crate) fn ancestors_to_root(node: &str, parent_map: &HashMap<String, String>) -> Vec<String> {
     let mut chain = vec![node.to_string()];
     let mut current = node.to_string();
     while let Some(parent) = parent_map.get(&current) {
@@ -1149,25 +1159,14 @@ fn check_path_up(
         // Determine which direction this edge goes in the card_map.
         // The graph stores edges as from_alias -> to_alias (FK -> PK).
         // So either (current, parent) or (parent, current) is in the map.
-        if let Some((card, rel_name)) = card_map.get(&(current.clone(), parent.clone())) {
+        if let Some((_card, _rel_name)) = card_map.get(&(current.clone(), parent.clone())) {
             // Edge is current -> parent (current has FK pointing to parent)
             // Walking current -> parent: this is the forward direction of the edge.
-            // ManyToOne forward = safe, OneToMany forward = fan-out, OneToOne = safe
-            if *card == Cardinality::OneToMany {
-                let met_table = met.source_table.as_deref().unwrap_or(&current);
-                return Some(ExpandError::FanTrap {
-                    view_name: view_name.to_string(),
-                    metric_name: met.name.clone(),
-                    metric_table: met_table.to_string(),
-                    dimension_name: dim.name.clone(),
-                    dimension_table: dim.source_table.as_deref().unwrap_or("").to_string(),
-                    relationship_name: rel_name.clone(),
-                });
-            }
+            // ManyToOne forward = safe, OneToOne = safe -- no fan-out possible going forward
         } else if let Some((card, rel_name)) = card_map.get(&(parent.clone(), current.clone())) {
             // Edge is parent -> current (parent has FK pointing to current)
             // Walking current -> parent means traversing this edge in REVERSE.
-            // ManyToOne reverse = fan-out, OneToMany reverse = safe, OneToOne = safe
+            // ManyToOne reverse = fan-out, OneToOne = safe
             if *card == Cardinality::ManyToOne {
                 let met_table = met.source_table.as_deref().unwrap_or(&current);
                 return Some(ExpandError::FanTrap {
@@ -1201,25 +1200,14 @@ fn check_path_down(
         let a = &window[0];
         let b = &window[1];
         // Walking a -> b (downward in the tree, away from root)
-        if let Some((card, rel_name)) = card_map.get(&(a.clone(), b.clone())) {
+        if let Some((_card, _rel_name)) = card_map.get(&(a.clone(), b.clone())) {
             // Edge is a -> b (a has FK pointing to b)
             // Walking a -> b: forward direction
-            // ManyToOne forward = safe, OneToMany forward = fan-out, OneToOne = safe
-            if *card == Cardinality::OneToMany {
-                let met_table = met.source_table.as_deref().unwrap_or("").to_string();
-                return Some(ExpandError::FanTrap {
-                    view_name: view_name.to_string(),
-                    metric_name: met.name.clone(),
-                    metric_table: met_table,
-                    dimension_name: dim.name.clone(),
-                    dimension_table: dim.source_table.as_deref().unwrap_or("").to_string(),
-                    relationship_name: rel_name.clone(),
-                });
-            }
+            // ManyToOne forward = safe, OneToOne = safe -- no fan-out possible going forward
         } else if let Some((card, rel_name)) = card_map.get(&(b.clone(), a.clone())) {
             // Edge is b -> a (b has FK pointing to a)
             // Walking a -> b means traversing this edge in REVERSE.
-            // ManyToOne reverse = fan-out, OneToMany reverse = safe, OneToOne = safe
+            // ManyToOne reverse = fan-out, OneToOne = safe
             if *card == Cardinality::ManyToOne {
                 let met_table = met.source_table.as_deref().unwrap_or("").to_string();
                 return Some(ExpandError::FanTrap {
@@ -1561,7 +1549,7 @@ mod tests {
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -1686,7 +1674,7 @@ GROUP BY
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -1721,7 +1709,7 @@ GROUP BY
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -1806,7 +1794,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -1940,7 +1928,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2062,7 +2050,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2100,7 +2088,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2137,7 +2125,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2208,7 +2196,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -2310,7 +2298,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2341,7 +2329,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2372,7 +2360,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2405,11 +2393,13 @@ FROM \"orders\"";
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![
@@ -2441,7 +2431,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -2456,16 +2446,19 @@ FROM \"orders\"";
                         alias: "li".to_string(),
                         table: "line_items".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![
@@ -2505,7 +2498,7 @@ FROM \"orders\"";
                     },
                 ],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -2536,11 +2529,13 @@ FROM \"orders\"";
                         alias: "a".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "b".to_string(),
                         table: "details".to_string(),
                         pk_columns: vec!["pk1".to_string(), "pk2".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![Dimension {
@@ -2564,7 +2559,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -2685,11 +2680,13 @@ FROM \"orders\"";
                         alias: "o".to_string(),
                         table: "p27_orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "p27_customers".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![Dimension {
@@ -2713,7 +2710,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -2753,11 +2750,13 @@ FROM \"orders\"";
                         alias: "o".to_string(),
                         table: "p27_orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "p27_customers".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![
@@ -2789,7 +2788,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3091,7 +3090,7 @@ FROM \"orders\"";
                     expr: "price * (1 - discount)".to_string(),
                     source_table: None,
                 }],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3122,7 +3121,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3167,7 +3166,7 @@ FROM \"orders\"";
                         source_table: None,
                     },
                 ],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3429,7 +3428,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3460,11 +3459,13 @@ FROM \"orders\"";
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "li".to_string(),
                         table: "line_items".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![Dimension {
@@ -3504,7 +3505,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3534,11 +3535,13 @@ FROM \"orders\"";
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "li".to_string(),
                         table: "line_items".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![Dimension {
@@ -3578,7 +3581,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3634,7 +3637,7 @@ FROM \"orders\"";
                     expr: "extended_price * (1 - discount)".to_string(),
                     source_table: Some("li".to_string()),
                 }],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3670,16 +3673,19 @@ FROM \"orders\"";
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "li".to_string(),
                         table: "line_items".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![
@@ -3724,6 +3730,7 @@ FROM \"orders\"";
                         table: "o".to_string(),
                         from_alias: "li".to_string(),
                         fk_columns: vec!["order_id".to_string()],
+                        ref_columns: vec!["id".to_string()],
                         name: Some("li_to_order".to_string()),
                         cardinality: Cardinality::ManyToOne,
                         ..Default::default()
@@ -3732,13 +3739,14 @@ FROM \"orders\"";
                         table: "c".to_string(),
                         from_alias: "o".to_string(),
                         fk_columns: vec!["customer_id".to_string()],
+                        ref_columns: vec!["id".to_string()],
                         name: Some("order_to_customer".to_string()),
                         cardinality: Cardinality::ManyToOne,
                         ..Default::default()
                     },
                 ],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -3797,11 +3805,13 @@ FROM \"orders\"";
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "d".to_string(),
                         table: "details".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![Dimension {
@@ -3822,12 +3832,13 @@ FROM \"orders\"";
                     table: "d".to_string(),
                     from_alias: "o".to_string(),
                     fk_columns: vec!["detail_id".to_string()],
+                    ref_columns: vec!["id".to_string()],
                     name: Some("order_to_detail".to_string()),
                     cardinality: Cardinality::OneToOne,
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3882,7 +3893,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -3986,7 +3997,7 @@ FROM \"orders\"";
                 "Must contain 'fan trap detected'"
             );
             assert!(
-                msg.contains("ONE TO MANY"),
+                msg.contains("many-to-one cardinality"),
                 "Must describe the cardinality direction"
             );
         }
@@ -4006,11 +4017,13 @@ FROM \"orders\"";
                         alias: "f".to_string(),
                         table: "flights".to_string(),
                         pk_columns: vec!["flight_id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "a".to_string(),
                         table: "airports".to_string(),
                         pk_columns: vec!["airport_code".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![
@@ -4062,6 +4075,7 @@ FROM \"orders\"";
                         table: "a".to_string(),
                         from_alias: "f".to_string(),
                         fk_columns: vec!["departure_code".to_string()],
+                        ref_columns: vec!["airport_code".to_string()],
                         name: Some("dep_airport".to_string()),
                         cardinality: Cardinality::ManyToOne,
                         ..Default::default()
@@ -4070,13 +4084,14 @@ FROM \"orders\"";
                         table: "a".to_string(),
                         from_alias: "f".to_string(),
                         fk_columns: vec!["arrival_code".to_string()],
+                        ref_columns: vec!["airport_code".to_string()],
                         name: Some("arr_airport".to_string()),
                         cardinality: Cardinality::ManyToOne,
                         ..Default::default()
                     },
                 ],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             }
@@ -4190,11 +4205,13 @@ FROM \"orders\"";
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![Dimension {
@@ -4219,7 +4236,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -4253,19 +4270,23 @@ FROM \"orders\"";
         #[test]
         fn fan_trap_detection_works_with_using_paths() {
             // Fan trap detection should still work with USING-scoped paths.
-            // Create a scenario with a ONE_TO_MANY edge that creates fan-out.
+            // Create a scenario with a ManyToOne edge traversed in reverse (fan-out).
+            // flights(dep_airport_code) -> airports: ManyToOne
+            // Metric on airports, dimension on flights -> traverses ManyToOne in reverse = fan-out
             let def = SemanticViewDefinition {
-                base_table: "airports".to_string(),
+                base_table: "flights".to_string(),
                 tables: vec![
-                    TableRef {
-                        alias: "a".to_string(),
-                        table: "airports".to_string(),
-                        pk_columns: vec!["airport_code".to_string()],
-                    },
                     TableRef {
                         alias: "f".to_string(),
                         table: "flights".to_string(),
                         pk_columns: vec!["flight_id".to_string()],
+                        unique_constraints: vec![],
+                    },
+                    TableRef {
+                        alias: "a".to_string(),
+                        table: "airports".to_string(),
+                        pk_columns: vec!["airport_code".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![Dimension {
@@ -4283,15 +4304,16 @@ FROM \"orders\"";
                 }],
                 filters: vec![],
                 joins: vec![Join {
-                    table: "f".to_string(),
-                    from_alias: "a".to_string(),
-                    fk_columns: vec!["dep_code".to_string()],
+                    table: "a".to_string(),
+                    from_alias: "f".to_string(),
+                    fk_columns: vec!["dep_airport_code".to_string()],
+                    ref_columns: vec!["airport_code".to_string()],
                     name: Some("dep_flights".to_string()),
-                    cardinality: Cardinality::OneToMany,
+                    cardinality: Cardinality::ManyToOne,
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -4336,6 +4358,7 @@ FROM \"orders\"";
                     alias: "o".to_string(),
                     table: "orders".to_string(),
                     pk_columns: vec!["id".to_string()],
+                    unique_constraints: vec![],
                 }],
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
@@ -4353,7 +4376,7 @@ FROM \"orders\"";
                 filters: vec![],
                 joins: vec![],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };
@@ -4378,11 +4401,13 @@ FROM \"orders\"";
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
+                        unique_constraints: vec![],
                     },
                 ],
                 dimensions: vec![Dimension {
@@ -4407,7 +4432,7 @@ FROM \"orders\"";
                     ..Default::default()
                 }],
                 facts: vec![],
-                hierarchies: vec![],
+
                 column_type_names: vec![],
                 column_types_inferred: vec![],
             };

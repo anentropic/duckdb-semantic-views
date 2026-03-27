@@ -195,10 +195,10 @@ West	150.00	90.00
 # Test 8: DESCRIBE shows derived metrics with null source_table
 # ============================================================
 
-query TTTTTTTT
+query TTTTTTT
 DESCRIBE SEMANTIC VIEW p30_sales_facts;
 ----
-p30_sales_facts	p30_orders	[{"expr":"o.region","name":"region","output_type":null,"source_table":"o"}]	[{"expr":"SUM(li.net_price)","name":"revenue","output_type":null,"source_table":"li"},{"expr":"SUM(li.unit_cost)","name":"cost","output_type":null,"source_table":"li"},{"expr":"revenue - cost","name":"profit","output_type":null,"source_table":null}]	[]	[{"fk_columns":["order_id"],"from_alias":"li","from_cols":[],"join_columns":[],"name":"li_to_order","table":"o"}]	[{"expr":"li.extended_price * (1 - li.discount)","name":"net_price","source_table":"li"}]	[]
+p30_sales_facts	p30_orders	[{"expr":"o.region","name":"region","output_type":null,"source_table":"o"}]	[{"expr":"SUM(li.net_price)","name":"revenue","output_type":null,"source_table":"li"},{"expr":"SUM(li.unit_cost)","name":"cost","output_type":null,"source_table":"li"},{"expr":"revenue - cost","name":"profit","output_type":null,"source_table":null}]	[]	[{"fk_columns":["order_id"],"from_alias":"li","from_cols":[],"join_columns":[],"name":"li_to_order","ref_columns":["id"],"table":"o"}]	[{"expr":"li.extended_price * (1 - li.discount)","name":"net_price","source_table":"li"}]
 
 # ============================================================
 # Test 9: Error -- cycle in derived metrics

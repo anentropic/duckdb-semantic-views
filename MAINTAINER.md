@@ -11,6 +11,7 @@ Everything a contributor needs to build, test, fuzz, and publish the DuckDB Sema
 - [Testing](#testing)
 - [Loading the Extension](#loading-the-extension)
 - [Updating the DuckDB Version Pin](#updating-the-duckdb-version-pin)
+- [Multi-Version Branching Strategy](#multi-version-branching-strategy)
 - [Fuzzing](#fuzzing)
 - [Publishing to Community Extension Registry](#publishing-to-community-extension-registry)
 - [Worked Examples](#worked-examples)
@@ -38,7 +39,7 @@ You do **not** need to install DuckDB separately. The build system downloads the
 From zero to a working extension in five commands:
 
 ```bash
-git clone --recurse-submodules https://github.com/paul-rl/duckdb-semantic-views.git
+git clone --recurse-submodules https://github.com/anentropic/duckdb-semantic-views.git
 cd duckdb-semantic-views
 just setup          # installs dev tools (cargo-nextest, cargo-deny, cargo-llvm-cov), downloads DuckDB test binary
 just build          # builds the debug extension (.duckdb_extension file)
@@ -54,22 +55,27 @@ After `just build`, the extension binary is at `build/debug/semantic_views.duckd
 
 ```
 src/
-├── lib.rs                     # Extension entrypoint -- registers all functions with DuckDB at load time
-├── model.rs                   # Data types: SemanticViewDefinition, Dimension, Metric, Join
-│                              #   Handles JSON parsing/validation via serde
-├── catalog.rs                 # In-memory catalog (HashMap) + sidecar file persistence
+├── lib.rs                     # Extension entrypoint -- registers functions and parser hook with DuckDB
+├── model.rs                   # Data types: SemanticViewDefinition, Dimension, Metric, Fact, etc.
+│                              #   Handles validation and semantic model representation
+├── catalog.rs                 # In-memory catalog (HashMap) + pragma_query_t persistence
 │                              #   Manages the semantic_layer._definitions table
 ├── expand.rs                  # SQL generation engine -- turns definitions + query requests into SQL
 │                              #   Pure Rust, no DuckDB dependency at runtime
-├── ddl/                       # DDL functions (only compiled for the extension build)
+├── body_parser.rs             # DDL body parser -- state machine for TABLES/RELATIONSHIPS/FACTS/
+│                              #   HIERARCHIES/DIMENSIONS/METRICS clauses
+├── ddl_kind.rs                # DdlKind enum -- all DDL statement variants (CREATE, DROP, ALTER, etc.)
+├── parser_trampoline.rs       # Rust FFI trampoline for parser hook -- detects and parses DDL statements
+├── ddl/                       # DDL execution (only compiled for the extension build)
 │   ├── mod.rs                 #   Module declarations
-│   ├── define.rs              #   define_semantic_view() -- scalar function, creates a view
-│   ├── drop.rs                #   drop_semantic_view() -- scalar function, removes a view
-│   ├── list.rs                #   list_semantic_views() -- table function, lists all views
-│   └── describe.rs            #   describe_semantic_view() -- table function, shows view details
+│   ├── create.rs              #   CREATE SEMANTIC VIEW execution
+│   ├── drop.rs                #   DROP SEMANTIC VIEW execution
+│   ├── alter.rs               #   ALTER SEMANTIC VIEW execution
+│   ├── show.rs                #   SHOW SEMANTIC VIEWS / DIMENSIONS / METRICS / FACTS
+│   └── describe.rs            #   DESCRIBE SEMANTIC VIEW
 └── query/                     # Query interface (only compiled for the extension build)
     ├── mod.rs                 #   Module declarations
-    ├── table_function.rs      #   semantic_query() -- the main table function (FFI-heavy)
+    ├── table_function.rs      #   semantic_view() -- the main table function (FFI-heavy)
     ├── explain.rs             #   explain_semantic_view() -- shows expanded SQL and EXPLAIN plan
     └── error.rs               #   Query-specific error types
 
@@ -103,28 +109,23 @@ test/
 A semantic query goes through these stages:
 
 ```
-1. User calls define_semantic_view('orders', '{"base_table":"orders", ...}')
-   └── JSON string -> model.rs (SemanticViewDefinition::from_json) -> catalog.rs (HashMap + sidecar file)
+1. User runs CREATE SEMANTIC VIEW shop AS TABLES (...) DIMENSIONS (...) METRICS (...)
+   └── Parser hook (C++ shim) -> Rust trampoline -> body_parser.rs -> catalog.rs (persist via pragma_query_t)
 
-2. User calls semantic_query('orders', dimensions := ['region'], metrics := ['revenue'])
+2. User calls semantic_view('shop', dimensions := ['region'], metrics := ['revenue'])
    └── catalog.rs (lookup definition) -> expand.rs (generate SQL) -> DuckDB (execute SQL) -> results
 ```
 
 The key insight: `expand.rs` is pure Rust that converts a `SemanticViewDefinition` plus a `QueryRequest` into a SQL string. DuckDB handles all actual data processing. The generated SQL looks like:
 
 ```sql
-WITH "_base" AS (
-    SELECT *
-    FROM "orders"
-    JOIN "customers" ON orders.customer_id = customers.id
-    WHERE (status = 'active')
-)
 SELECT
-    region AS "region",
-    sum(amount) AS "revenue"
-FROM "_base"
+    "o"."region" AS "region",
+    SUM("o"."amount") AS "revenue"
+FROM "orders" AS "o"
+LEFT JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id"
 GROUP BY
-    region
+    "o"."region"
 ```
 
 ### Feature Flag Split
@@ -140,14 +141,15 @@ This split exists because DuckDB loadable extensions cannot be tested as standal
 
 The `ddl/` and `query/` modules are gated behind `#[cfg(feature = "extension")]` -- they are excluded from `cargo test` compilation because they use DuckDB APIs only available in the extension build.
 
-### Sidecar Persistence
+### Catalog Persistence
 
-DuckDB holds execution locks during scalar function `invoke()`. This means the extension cannot execute SQL from within `define_semantic_view` or `drop_semantic_view` -- it would deadlock. Instead:
+DDL statements (CREATE, DROP, ALTER SEMANTIC VIEW) are detected by the parser hook and routed through a dedicated DDL connection (`persist_conn`) that avoids lock conflicts with the main execution connection. The catalog uses `pragma_query_t` for persistence:
 
-1. **During invoke:** The in-memory HashMap is updated, then serialized to a sidecar file (`<db>.semantic_views`) using plain filesystem I/O.
-2. **On next load:** `init_catalog()` reads the sidecar and syncs its contents into the `semantic_layer._definitions` DuckDB table.
+1. **During DDL:** The parser hook detects the statement, the Rust trampoline parses it, and the DDL handler executes via a separate connection to avoid deadlock.
+2. **Persistence:** Definitions are stored in the `semantic_layer._definitions` table via `pragma_query_t` (write-first pattern).
+3. **On load:** `init_catalog()` reads the definitions table and populates the in-memory HashMap.
 
-This bridge pattern ensures definitions persist across restarts without requiring SQL execution during invoke.
+The sidecar file approach was eliminated in v0.2.0 in favor of transactional catalog persistence.
 
 ## Building
 
@@ -220,7 +222,7 @@ just setup-ducklake   # downloads jaffle-shop data, creates DuckLake catalog (id
 just test-iceberg     # runs the integration test
 ```
 
-This test verifies that `semantic_query` works against DuckLake-managed Iceberg tables with real data (the jaffle-shop dataset).
+This test verifies that `semantic_view()` works against DuckLake-managed Iceberg tables with real data (the jaffle-shop dataset).
 
 ## Loading the Extension
 
@@ -243,48 +245,58 @@ con = duckdb.connect()
 con.install_extension('build/debug/semantic_views.duckdb_extension', force_install=True)
 con.load_extension('semantic_views')
 
-# Create a test table
+# Create sample data
 con.execute("""
-    CREATE TABLE orders AS
-    SELECT * FROM (VALUES
-        ('US', 'completed', 100.0),
-        ('US', 'completed', 200.0),
-        ('EU', 'completed', 150.0),
-        ('EU', 'pending',    50.0)
-    ) AS t(region, status, amount)
+CREATE TABLE orders (
+    id INTEGER, region VARCHAR, status VARCHAR, amount DECIMAL(10,2)
+);
+INSERT INTO orders VALUES
+    (1, 'US', 'completed', 100.00),
+    (2, 'US', 'completed', 200.00),
+    (3, 'EU', 'completed', 150.00),
+    (4, 'EU', 'pending',    50.00);
 """)
 
-# Define a semantic view
+# Define a semantic view (native DDL)
 con.execute("""
-    SELECT define_semantic_view('orders', '{
-        "base_table": "orders",
-        "dimensions": [
-            {"name": "region", "expr": "region"},
-            {"name": "status", "expr": "status"}
-        ],
-        "metrics": [
-            {"name": "revenue", "expr": "sum(amount)"},
-            {"name": "order_count", "expr": "count(*)"}
-        ],
-        "filters": ["status = ''completed''"]
-    }')
+CREATE SEMANTIC VIEW shop AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (
+    o.region AS o.region,
+    o.status AS o.status
+  )
+  METRICS (
+    o.revenue     AS SUM(o.amount),
+    o.order_count AS COUNT(*)
+  );
 """)
 
-# Query it -- the extension generates the GROUP BY and WHERE for you
+# Query with any dimension/metric combination
 result = con.execute("""
-    FROM semantic_query('orders', dimensions := ['region'], metrics := ['revenue'])
+    SELECT * FROM semantic_view('shop',
+        dimensions := ['region'],
+        metrics := ['revenue']
+    ) ORDER BY region
 """).fetchall()
 print(result)
-# [('EU', '150.0'), ('US', '300.0')]
+# [('EU', Decimal('200.00')), ('US', Decimal('300.00'))]
 
-# See what SQL the extension generates
-con.execute("FROM explain_semantic_view('orders', dimensions := ['region'], metrics := ['revenue'])").fetchall()
+# See the generated SQL
+con.execute("""
+    SELECT * FROM explain_semantic_view('shop',
+        dimensions := ['region'],
+        metrics := ['revenue']
+    )
+""").fetchall()
 
-# List all defined views
-con.execute("FROM list_semantic_views()").fetchall()
+# List all views
+con.execute("SHOW SEMANTIC VIEWS").fetchall()
+
+# Describe a view
+con.execute("DESCRIBE SEMANTIC VIEW shop").fetchall()
 
 # Remove a view
-con.execute("SELECT * FROM drop_semantic_view('orders')")
+con.execute("DROP SEMANTIC VIEW shop")
 ```
 
 For release builds, change the path to `build/release/semantic_views.duckdb_extension`.
@@ -333,6 +345,50 @@ The DuckDB version is pinned in a single source of truth: **`.duckdb-version`** 
 6. Commit all files together.
 
 The `DuckDBVersionMonitor` workflow automates all of this: it checks for new DuckDB releases weekly, updates `.duckdb-version` and all derived locations, then opens a PR. If the build passes, the PR bumps the version. If it fails, the PR tags `@copilot` to attempt an automated fix.
+
+### Bumping DuckDB on the LTS Branch
+
+The `duckdb/1.4.x` branch follows the same process but targets LTS releases:
+
+1. Check out the LTS branch: `git checkout duckdb/1.4.x`
+2. Update `.duckdb-version` to the new LTS version (e.g., `v1.4.5`)
+3. Update `Cargo.toml`: `duckdb = { version = "=1.4.5", ... }` and `libduckdb-sys = "=1.4.5"`
+4. Update Python PEP 723 headers and CI workflow files (same sed/search as main)
+5. Run `just build && just test-all`
+6. The Cargo.toml `version` field on LTS uses build metadata: `0.5.4+duckdb1.4`
+
+The DuckDB Version Monitor has separate jobs for latest (`check-latest`) and LTS (`check-lts`)
+that automate this process on their respective branches.
+
+## Multi-Version Branching Strategy
+
+The extension supports two DuckDB version tracks via separate branches:
+
+| Branch | DuckDB Version | Purpose | Version Format |
+|--------|---------------|---------|----------------|
+| `main` | Latest (currently 1.5.x) | Primary development, CE registry `ref` | `0.5.4` |
+| `duckdb/1.4.x` | 1.4.x (Andium LTS) | LTS compatibility | `0.5.4+duckdb1.4` |
+
+### Development Workflow
+
+1. **New features**: Develop on milestone branches (e.g., `milestone/v0.5.4`), squash-merge to `main`
+2. **Cherry-pick to LTS**: After main is stable, cherry-pick relevant commits to `duckdb/1.4.x`
+3. **Version bumps**: Each branch tracks its own DuckDB version in `.duckdb-version`
+
+### Syncing Changes Between Branches
+
+```bash
+# Cherry-pick a commit from main to LTS
+git checkout duckdb/1.4.x
+git cherry-pick <commit-sha>
+# Resolve any DuckDB API differences (e.g., parser_extension_compat.hpp)
+just test-all
+```
+
+### CI Coverage
+
+Both branches run the full Build.yml pipeline on push. The DuckDB Version Monitor
+checks for new releases of both the latest and LTS version lines (weekly, Monday 09:00 UTC).
 
 ## Fuzzing
 
@@ -429,164 +485,115 @@ gh run download <run-id> --repo anentropic/duckdb-semantic-views --name crash-fu
 
 ## Publishing to Community Extension Registry
 
-To publish the extension to the [DuckDB Community Extension Registry](https://duckdb.org/community_extensions/development):
+The extension is published to the [DuckDB Community Extension Registry](https://duckdb.org/community_extensions/development).
 
-### One-Time Setup
+### description.yml
 
-1. Fork the [duckdb/community-extensions](https://github.com/duckdb/community-extensions) repository.
+The registry descriptor lives at `description.yml` in the repo root. It specifies the extension
+metadata, build configuration, and hello_world example that appears on the CE page.
 
-2. Create `extensions/semantic_views/description.yml`:
+Key fields:
+| Field | Value | Notes |
+|-------|-------|-------|
+| `name` | `semantic_views` | Must match the LOAD name |
+| `language` / `build` | `Rust` / `cargo` | CE pipeline runs `cargo build` |
+| `license` | `MIT` | Must match LICENSE file |
+| `excluded_platforms` | semicolon-separated | Platforms we cannot support (WASM, musl, mingw, etc.) |
+| `requires_toolchains` | `rust;python3` | Build-time dependencies for CE CI |
+| `ref` | 40-char commit SHA | Points to main branch commit to build from |
 
+### Submitting a New Release
+
+1. Complete the milestone on the milestone branch
+2. Squash-merge to `main` and tag the release (e.g., `v0.5.4`)
+3. Copy the merge commit SHA: `git rev-parse HEAD` (on main)
+4. Update `description.yml`: set `ref` to the new SHA, update `version`
+5. Fork [duckdb/community-extensions](https://github.com/duckdb/community-extensions) (or update existing fork)
+6. Copy `description.yml` to `extensions/semantic_views/description.yml` in the fork
+7. Submit a PR to `duckdb/community-extensions`
+8. Wait for the CE build pipeline to pass (builds across all non-excluded platforms)
+9. After merge, the extension is installable via:
+   ```sql
+   INSTALL semantic_views FROM community;
+   LOAD semantic_views;
+   ```
+
+### Adding LTS Support
+
+To publish builds for DuckDB 1.4.x (Andium LTS), add the `andium` field to `description.yml`:
 ```yaml
-extension:
-  name: semantic_views
-  description: Semantic views -- a declarative layer for dimensions, measures, and relationships
-  version: 0.1.0
-  language: Rust
-  build: cargo
-  license: MIT
-  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_rtools;windows_amd64_mingw;linux_amd64_musl"
-  requires_toolchains: "rust;python3"
-  maintainers:
-    - paul-rl
-
 repo:
-  github: paul-rl/duckdb-semantic-views
-  ref: <commit-sha-of-release>
-
-docs:
-  hello_world: |
-    SELECT define_semantic_view('demo', '{"base_table":"demo","dimensions":[{"name":"x","expr":"x"}],"metrics":[{"name":"total","expr":"sum(y)"}]}');
-    FROM semantic_query('demo', dimensions := ['x'], metrics := ['total']);
-  extended_description: |
-    Semantic views let you define dimensions, metrics, joins, and filters once,
-    then query with any combination. The extension handles GROUP BY, JOIN, and
-    filter composition automatically.
+  github: anentropic/duckdb-semantic-views
+  ref: <main-branch-sha>
+  andium: <duckdb-1.4.x-branch-sha>
 ```
-
-3. Submit a PR to `duckdb/community-extensions`.
-
-### Field Reference
-
-| Field | Maps To |
-|-------|---------|
-| `name` | The extension name used in `LOAD semantic_views` |
-| `language` / `build` | `Rust` / `cargo` -- tells the registry to use `cargo build` |
-| `excluded_platforms` | Platforms we don't support (WASM, musl, mingw) -- matches our CI `exclude_archs` |
-| `requires_toolchains` | `rust;python3` -- the registry CI needs these to build |
-| `ref` | The Git commit SHA to build from -- update this for each new release |
-
-### Subsequent Releases
-
-For new versions, update the `ref` field in `description.yml` to the new release commit SHA and submit a PR.
+The CE pipeline will build from `andium` SHA against DuckDB 1.4.x.
 
 ## Worked Examples
 
-### Adding a New DDL Function
+### Adding a New DDL Statement
 
-Suppose you want to add a `rename_semantic_view(old_name, new_name)` function.
+Suppose you want to add an `ALTER SEMANTIC VIEW old_name RENAME TO new_name` statement.
 
-**1. Create the implementation file:**
+Since v0.5.2, DDL is handled via parser hooks -- the C++ shim detects `CREATE/DROP/ALTER/SHOW/DESCRIBE SEMANTIC VIEW` prefixes and routes them through the Rust FFI trampoline. New DDL statements follow the same pattern.
 
-Create `src/ddl/rename.rs`:
+**1. Add the DDL kind:**
+
+In `src/ddl_kind.rs`, extend the `DdlKind` enum:
 
 ```rust
-use duckdb::vscalar::{BindInfo, DataChunk, InitInfo, LogicalType, ScalarParams, VScalar};
-
-use crate::catalog::{CatalogState, write_sidecar};
-
-pub struct RenameState {
-    pub catalog: CatalogState,
-    pub db_path: std::sync::Arc<str>,
-}
-
-pub struct RenameSemanticView;
-
-impl VScalar for RenameSemanticView {
-    type State = RenameState;
-
-    fn invoke(state: &Self::State, input: &DataChunk, output: &mut dyn ScalarParams) {
-        // Read old_name and new_name from input parameters
-        // Look up old_name in catalog, insert under new_name, remove old_name
-        // Write sidecar to persist the change
-        todo!()
-    }
-
-    fn parameters() -> Option<Vec<LogicalType>> {
-        Some(vec![LogicalType::new_varchar(), LogicalType::new_varchar()])
-    }
-
-    fn return_type() -> LogicalType {
-        LogicalType::new_varchar()
-    }
+pub enum DdlKind {
+    Create { or_replace: bool, if_not_exists: bool },
+    Drop { if_exists: bool },
+    Describe,
+    Show,
+    AlterRename { if_exists: bool, new_name: String },  // <-- add this
 }
 ```
 
-**2. Register in `src/ddl/mod.rs`:**
+**2. Update the parser trampoline:**
 
-```rust
-pub mod define;
-pub mod describe;
-pub mod drop;
-pub mod list;
-pub mod rename;   // <-- add this
-```
+In `src/parser_trampoline.rs`, add detection for the `ALTER SEMANTIC VIEW` prefix and parse the `RENAME TO` clause.
 
-**3. Register in `src/lib.rs` (inside `init_extension`):**
-
-```rust
-con.register_scalar_function_with_state::<RenameSemanticView>(
-    "rename_semantic_view",
-    &RenameState {
-        catalog: catalog_state.clone(),
-        db_path: db_path.clone(),
-    },
-)?;
-```
-
-Note the `#[cfg(feature = "extension")]` gate on the `ddl` module -- the new function is automatically excluded from `cargo test` compilation.
-
-**4. Add a SQL logic test:**
+**3. Add a SQL logic test:**
 
 Create or extend a file in `test/sql/`:
 
 ```
 statement ok
-SELECT define_semantic_view('original', '{"base_table":"t","dimensions":[],"metrics":[]}');
+CREATE SEMANTIC VIEW original AS
+  TABLES (t AS my_table PRIMARY KEY (id))
+  DIMENSIONS (t.x AS t.x)
+  METRICS (t.total AS SUM(t.y));
 
 statement ok
-SELECT rename_semantic_view('original', 'renamed');
+ALTER SEMANTIC VIEW original RENAME TO renamed
 
 query I
-FROM list_semantic_views()
+SHOW SEMANTIC VIEWS
 ----
 renamed
+
+statement ok
+DROP SEMANTIC VIEW renamed
 ```
 
-**5. Update this architecture section** to include `rename.rs` in the source tree.
+**4. Update this architecture section** to document the new DDL kind.
 
 ### Adding a New Metric Type
 
 Suppose you want to add a `window` metric type that generates a window function instead of an aggregate.
 
-**1. Update `src/model.rs`:**
+**1. Update the body parser:**
 
-Add an optional field to the `Metric` struct:
+In `src/body_parser.rs`, extend the METRICS clause parsing to accept a `WINDOW` keyword modifier:
 
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-pub struct Metric {
-    pub name: String,
-    pub expr: String,
-    #[serde(default)]
-    pub source_table: Option<String>,
-    #[serde(default)]
-    pub metric_type: Option<String>,  // "aggregate" (default) or "window"
-}
+```sql
+METRICS (
+    o.running_total WINDOW AS SUM(o.amount),
+    o.revenue AS SUM(o.amount)
+)
 ```
-
-Because `metric_type` uses `#[serde(default)]` and `Option<String>`, existing JSON definitions without the field will deserialize correctly with `None` (treated as aggregate).
 
 **2. Update `src/expand.rs`:**
 
@@ -594,7 +601,7 @@ In the `expand()` function, modify the SELECT item generation to handle window m
 
 ```rust
 for met in &resolved_mets {
-    let item = if met.metric_type.as_deref() == Some("window") {
+    let item = if met.is_window {
         format!("    {} OVER () AS {}", met.expr, quote_ident(&met.name))
     } else {
         format!("    {} AS {}", met.expr, quote_ident(&met.name))
@@ -603,35 +610,25 @@ for met in &resolved_mets {
 }
 ```
 
-**3. Add unit tests in `src/expand.rs`:**
+**3. Add unit tests:**
 
 ```rust
 #[test]
 fn test_window_metric_type() {
-    let def = SemanticViewDefinition {
-        base_table: "orders".to_string(),
-        dimensions: vec![Dimension { name: "region".to_string(), expr: "region".to_string(), source_table: None }],
-        metrics: vec![Metric {
-            name: "running_total".to_string(),
-            expr: "sum(amount)".to_string(),
-            source_table: None,
-            metric_type: Some("window".to_string()),
-        }],
-        filters: vec![],
-        joins: vec![],
-    };
-    let req = QueryRequest {
-        dimensions: vec!["region".to_string()],
-        metrics: vec!["running_total".to_string()],
-    };
-    let sql = expand("orders", &def, &req).unwrap();
-    assert!(sql.contains("sum(amount) OVER () AS \"running_total\""));
+    // Parse a DDL body with WINDOW metric modifier
+    let body = r#"
+        TABLES (o AS orders PRIMARY KEY (id))
+        DIMENSIONS (o.region AS o.region)
+        METRICS (o.running_total WINDOW AS SUM(o.amount))
+    "#;
+    let def = parse_body(body).unwrap();
+    assert!(def.metrics[0].is_window);
 }
 ```
 
-**4. Add a proptest property** (in the existing proptest section of `expand.rs`) to verify that `expand()` never panics with arbitrary metric_type values.
+**4. Add a proptest property** to verify that `expand()` never panics with arbitrary metric configurations.
 
-**5. Update fuzz seed corpus:** If the JSON schema changes (new fields), add a seed file to `fuzz/corpus/fuzz_json_parse/` with the new field so the fuzzer starts from a valid example.
+**5. Update fuzz targets:** Add a seed file to `fuzz/corpus/fuzz_ddl_parse/` with the new WINDOW modifier so the fuzzer starts from a valid example.
 
 ## Troubleshooting
 

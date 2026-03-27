@@ -1,0 +1,154 @@
+# Phase 34.1: ALTER SEMANTIC VIEW ... RENAME TO
+#
+# Verifies ALTER SEMANTIC VIEW RENAME TO DDL support:
+#   DDL-01: ALTER SEMANTIC VIEW old RENAME TO new renames the view
+#   DDL-02: ALTER SEMANTIC VIEW IF EXISTS missing RENAME TO x is a no-op
+#
+# Requirements covered:
+#   DDL-01, DDL-02
+
+require semantic_views
+
+# ============================================================
+# Setup: create tables and views for rename testing
+# ============================================================
+
+statement ok
+CREATE TABLE p34_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), customer_id INTEGER);
+
+statement ok
+INSERT INTO p34_orders VALUES (1, 100.00, 10), (2, 200.00, 20);
+
+statement ok
+CREATE SEMANTIC VIEW sales_view AS
+  TABLES (
+    orders AS p34_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    orders.order_id AS id
+  )
+  METRICS (
+    orders.total_amount AS SUM(amount)
+  )
+
+# ============================================================
+# Test 1: Basic RENAME
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW sales_view RENAME TO revenue_view
+
+# Verify old name is gone
+statement error
+DESCRIBE SEMANTIC VIEW sales_view
+----
+does not exist
+
+# Verify new name appears in SHOW
+query TT
+SHOW SEMANTIC VIEWS
+----
+revenue_view	p34_orders
+
+# Verify query works under new name
+query IR rowsort
+SELECT * FROM semantic_view('revenue_view', dimensions := ['order_id'], metrics := ['total_amount']);
+----
+1	100.00
+2	200.00
+
+# ============================================================
+# Test 2: RENAME back
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW revenue_view RENAME TO sales_view
+
+query TT
+SHOW SEMANTIC VIEWS
+----
+sales_view	p34_orders
+
+# ============================================================
+# Test 3: RENAME non-existent (error)
+# ============================================================
+
+statement error
+ALTER SEMANTIC VIEW nonexistent_view RENAME TO something
+----
+does not exist
+
+# ============================================================
+# Test 4: IF EXISTS on non-existent (no-op)
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW IF EXISTS nonexistent_view RENAME TO something
+
+# ============================================================
+# Test 5: RENAME to existing name (error)
+# ============================================================
+
+statement ok
+CREATE TABLE p34_products (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW products_view AS
+  TABLES (
+    prods AS p34_products PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    prods.id AS product_id
+  )
+  METRICS (
+    prods.product_count AS COUNT(id)
+  )
+
+statement error
+ALTER SEMANTIC VIEW sales_view RENAME TO products_view
+----
+already exists
+
+# ============================================================
+# Test 6: Missing RENAME TO (error)
+# ============================================================
+
+statement error
+ALTER SEMANTIC VIEW sales_view
+----
+Expected RENAME TO
+
+# ============================================================
+# Test 7: Missing new name (error)
+# ============================================================
+
+statement error
+ALTER SEMANTIC VIEW sales_view RENAME TO
+----
+Missing new name
+
+# ============================================================
+# Test 8: Case insensitive DDL
+# ============================================================
+
+statement ok
+alter semantic view sales_view rename to my_sales
+
+statement ok
+ALTER SEMANTIC VIEW my_sales RENAME TO sales_view
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW sales_view
+
+statement ok
+DROP SEMANTIC VIEW products_view
+
+statement ok
+DROP TABLE p34_orders
+
+statement ok
+DROP TABLE p34_products

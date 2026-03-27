@@ -181,27 +181,19 @@ fn patch_duckdb_cpp_for_windows() -> String {
 
     // --- Patch 1: after the first <windows.h> include (DLL loading helpers block) ---
     //
-    // Original context (duckdb.cpp ~line 25363-25372):
-    //   #if defined(_WIN32)
-    //   #include <windows.h> // Must come first
-    //   #include <libloaderapi.h>
-    //   #include <strsafe.h>
-    //   #else
-    //   #include <dlfcn.h>
+    // DuckDB <= 1.4.x had two separate <windows.h> includes. The first was in a
+    // DLL loading helpers block, marked by "// Platform-specific helpers". DuckDB 1.5.0
+    // consolidated to a single <windows.h> include (handled by Patch 2 below), so
+    // this patch is expected to be a no-op for DuckDB >= 1.5.0.
+    //
+    // Original context (DuckDB 1.4.x duckdb.cpp ~line 25363-25372):
     //   #endif // defined(_WIN32)
     //
     //   // Platform-specific helpers        <-- patch inserted before this
-    //
-    // After this include, GetObject and interface may be defined by windows.h.
-    // They need to be undefined before ComplexJSON::GetObject (~line 36327)
-    // and ObjectCache::GetObject (~line 37656) are compiled.
     let win32_undef_block = "\
         // Undefine Windows macros that conflict with DuckDB C++ identifiers.\n\
         // GetObject (wingdi.h) -> clashes with ComplexJSON::GetObject, ObjectCache::GetObject\n\
         // interface (objbase.h) -> clashes with MultiFileReader 'interface' variable names\n\
-        // These follow the same pattern as DuckDB's own CreateDirectory/MoveFile/RemoveDirectory\n\
-        // undefs later in this file. Needed because NOGDI/WIN32_LEAN_AND_MEAN do not reliably\n\
-        // suppress these macros across all Windows SDK configurations.\n\
         #if defined(_WIN32)\n\
         #  ifdef GetObject\n\
         #    undef GetObject\n\
@@ -218,11 +210,7 @@ fn patch_duckdb_cpp_for_windows() -> String {
     let content = if content.contains(patch1_before) {
         content.replace(patch1_before, &patch1_after)
     } else {
-        println!(
-            "cargo:warning=duckdb.cpp Win32 patch 1 skipped: expected marker not found. \
-                  This may indicate a DuckDB version change — verify GetObject/interface macros \
-                  are not causing build failures."
-        );
+        // Expected for DuckDB >= 1.5.0 where the first windows.h include was removed.
         content
     };
 

@@ -288,10 +288,15 @@ mod extension {
     use crate::{
         catalog::init_catalog,
         ddl::{
+            alter::{AlterRenameState, AlterRenameVTab},
             define::{DefineFromJsonVTab, DefineState},
             describe::DescribeSemanticViewVTab,
             drop::{DropSemanticViewVTab, DropState},
             list::ListSemanticViewsVTab,
+            show_dims::{ShowSemanticDimensionsAllVTab, ShowSemanticDimensionsVTab},
+            show_dims_for_metric::ShowDimensionsForMetricVTab,
+            show_facts::{ShowSemanticFactsAllVTab, ShowSemanticFactsVTab},
+            show_metrics::{ShowSemanticMetricsAllVTab, ShowSemanticMetricsVTab},
         },
         query::explain::ExplainSemanticViewVTab,
         query::table_function::{QueryState, SemanticViewVTab},
@@ -349,9 +354,18 @@ mod extension {
         // Register create_semantic_view_from_json(name, json) -- target for native DDL.
         // The native DDL path (CREATE SEMANTIC VIEW ... AS ...) rewrites to a call to
         // these _from_json table functions. Three variants cover the 3 CREATE forms.
+        // Create a dedicated connection for catalog queries (duckdb_constraints() lookups).
+        // Always created for both file-backed and in-memory databases.
+        let mut catalog_conn: ffi::duckdb_connection = ptr::null_mut();
+        let rc = unsafe { ffi::duckdb_connect(db_handle, &mut catalog_conn) };
+        if rc != ffi::DuckDBSuccess {
+            return Err("Failed to create catalog connection for PK resolution".into());
+        }
+
         let define_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
+            catalog_conn,
             or_replace: false,
             if_not_exists: false,
         };
@@ -363,6 +377,7 @@ mod extension {
         let define_or_replace_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
+            catalog_conn,
             or_replace: true,
             if_not_exists: false,
         };
@@ -374,6 +389,7 @@ mod extension {
         let define_if_not_exists_state = DefineState {
             catalog: catalog_state.clone(),
             persist_conn,
+            catalog_conn,
             or_replace: false,
             if_not_exists: true,
         };
@@ -404,6 +420,28 @@ mod extension {
             &drop_if_exists_state,
         )?;
 
+        // Register alter_semantic_view_rename(old, new) table function.
+        let alter_state = AlterRenameState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            if_exists: false,
+        };
+        con.register_table_function_with_extra_info::<AlterRenameVTab, _>(
+            "alter_semantic_view_rename",
+            &alter_state,
+        )?;
+
+        // Register alter_semantic_view_rename_if_exists(old, new) table function.
+        let alter_if_exists_state = AlterRenameState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            if_exists: true,
+        };
+        con.register_table_function_with_extra_info::<AlterRenameVTab, _>(
+            "alter_semantic_view_rename_if_exists",
+            &alter_if_exists_state,
+        )?;
+
         // Register table DDL read functions (list_semantic_views, describe_semantic_view).
         con.register_table_function_with_extra_info::<ListSemanticViewsVTab, _>(
             "list_semantic_views",
@@ -411,6 +449,42 @@ mod extension {
         )?;
         con.register_table_function_with_extra_info::<DescribeSemanticViewVTab, _>(
             "describe_semantic_view",
+            &catalog_state,
+        )?;
+
+        // SHOW SEMANTIC DIMENSIONS
+        con.register_table_function_with_extra_info::<ShowSemanticDimensionsVTab, _>(
+            "show_semantic_dimensions",
+            &catalog_state,
+        )?;
+        con.register_table_function_with_extra_info::<ShowSemanticDimensionsAllVTab, _>(
+            "show_semantic_dimensions_all",
+            &catalog_state,
+        )?;
+
+        // SHOW SEMANTIC DIMENSIONS FOR METRIC
+        con.register_table_function_with_extra_info::<ShowDimensionsForMetricVTab, _>(
+            "show_semantic_dimensions_for_metric",
+            &catalog_state,
+        )?;
+
+        // SHOW SEMANTIC METRICS
+        con.register_table_function_with_extra_info::<ShowSemanticMetricsVTab, _>(
+            "show_semantic_metrics",
+            &catalog_state,
+        )?;
+        con.register_table_function_with_extra_info::<ShowSemanticMetricsAllVTab, _>(
+            "show_semantic_metrics_all",
+            &catalog_state,
+        )?;
+
+        // SHOW SEMANTIC FACTS
+        con.register_table_function_with_extra_info::<ShowSemanticFactsVTab, _>(
+            "show_semantic_facts",
+            &catalog_state,
+        )?;
+        con.register_table_function_with_extra_info::<ShowSemanticFactsAllVTab, _>(
+            "show_semantic_facts_all",
             &catalog_state,
         )?;
 

@@ -1,1 +1,0 @@
-CREATE SEMANTIC VIEW v AS TABLES (o AS orders PRIMARY KEY (id)) HIERARCHIES (geo AS (country, state, city)) DIMENSIONS (o.country AS country, o.state AS state, o.city AS city) METRICS (o.rev AS SUM(amount))

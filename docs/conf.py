@@ -1,0 +1,116 @@
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
+
+# Opinionated defaults for Sphinx + Shibuya theme projects
+# Source: based on Shibuya official docs and sphinx-autoapi best practices
+# Template variables: {project_name}, {author_name}, {copyright_year}, {github_url}
+# Used by /doc-writer:setup when no conf.py exists in the project
+
+# -- Project metadata -------------------------------------------------------
+
+project = "DuckDB Semantic Views"
+author = "Anentropic"
+copyright = "2026, Anentropic"
+
+# -- Path exclusions ----------------------------------------------------------
+
+exclude_patterns = ["_build", ".venv"]
+
+# -- Extensions --------------------------------------------------------------
+
+extensions = [
+    "sphinx_design",
+    "sphinx.ext.githubpages",
+]
+
+# -- Shibuya theme -----------------------------------------------------------
+
+html_theme = "shibuya"
+html_theme_options = {
+    "accent_color": "orange",
+    "color_mode": "auto",
+    "github_url": "https://github.com/anentropic/duckdb-semantic-views",
+    "toctree_maxdepth": 3,
+    "toctree_titles_only": True,
+    "nav_links": [
+        {"title": "Overview", "url": "index"},
+        {
+            "title": "Tutorials",
+            "url": "tutorials/index",
+            "children": [
+                {
+                    "title": "Getting Started",
+                    "url": "tutorials/getting-started",
+                    "summary": "Install the extension and run your first query in 5 minutes",
+                },
+                {
+                    "title": "Multi-Table Semantic Views",
+                    "url": "tutorials/multi-table",
+                    "summary": "Model multi-table schemas with relationships",
+                },
+            ],
+        },
+        {
+            "title": "How-To Guides",
+            "url": "how-to/index",
+            "children": [
+                {
+                    "title": "FACTS",
+                    "url": "how-to/facts",
+                    "summary": "Define reusable row-level expressions referenced in metrics",
+                },
+                {
+                    "title": "Derived Metrics",
+                    "url": "how-to/derived-metrics",
+                    "summary": "Compose metrics from other metrics using arithmetic",
+                },
+                {
+                    "title": "Role-Playing Dimensions",
+                    "url": "how-to/role-playing-dimensions",
+                    "summary": "Join the same table multiple times with distinct aliases",
+                },
+                {
+                    "title": "Fan Traps",
+                    "url": "how-to/fan-traps",
+                    "summary": "Detect and resolve aggregation inflation from one-to-many joins",
+                },
+                {
+                    "title": "Data Sources",
+                    "url": "how-to/data-sources",
+                    "summary": "Connect CSV, Parquet, Iceberg, and database tables to semantic views",
+                },
+            ],
+        },
+        {
+            "title": "Explanation",
+            "url": "explanation/index",
+            "children": [
+                {
+                    "title": "Semantic Views vs Regular Views",
+                    "url": "explanation/semantic-views-vs-regular-views",
+                    "summary": "What semantic views add beyond standard SQL views",
+                },
+                {
+                    "title": "Snowflake Comparison",
+                    "url": "explanation/snowflake-comparison",
+                    "summary": "Feature comparison with Snowflake SQL DDL semantic views",
+                },
+            ],
+        },
+        {"title": "Reference", "url": "reference/index"},
+    ],
+}
+html_css_files = [
+    'css/s-layer.css',
+]
+
+html_static_path = ["_static"]
+templates_path = ["_templates"]
+
+
+def setup(app):
+    from _ext.sqlgrammar_lexer import SqlGrammarLexer
+
+    app.add_lexer("sqlgrammar", SqlGrammarLexer)

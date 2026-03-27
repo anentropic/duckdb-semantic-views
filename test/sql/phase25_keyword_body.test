@@ -80,11 +80,11 @@ METRICS (
     o.total_revenue AS SUM(revenue)
 )
 
-# DDL-07: DESCRIBE works -- returns 8 VARCHAR columns
-query TTTTTTTT
+# DDL-07: DESCRIBE works -- returns 7 VARCHAR columns
+query TTTTTTT
 DESCRIBE SEMANTIC VIEW p25_orders_view
 ----
-p25_orders_view	p25_orders	[{"expr":"region","name":"region","output_type":null,"source_table":"o"}]	[{"expr":"SUM(revenue)","name":"total_revenue","output_type":null,"source_table":"o"}]	[]	[]	[]	[]
+p25_orders_view	p25_orders	[{"expr":"region","name":"region","output_type":null,"source_table":"o"}]	[{"expr":"SUM(revenue)","name":"total_revenue","output_type":null,"source_table":"o"}]	[]	[]	[]
 
 # DDL-07: SHOW works -- returns view name and base_table for all current views
 query TT rowsort

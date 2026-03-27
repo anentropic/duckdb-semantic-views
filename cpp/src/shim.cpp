@@ -8,8 +8,12 @@
 // All DuckDB C++ symbols are provided by compiling duckdb.cpp (the amalgamation
 // source) alongside this file. Symbol visibility on the cdylib restricts exports
 // to just the Rust entry point, so these definitions stay internal to the binary.
+//
+// DuckDB 1.5.0 moved the parser extension type declarations from duckdb.hpp into
+// duckdb.cpp. The compat header re-declares them so this translation unit can use
+// them. See cpp/include/parser_extension_compat.hpp for details.
 
-#include "duckdb.hpp"
+#include "parser_extension_compat.hpp"
 
 using namespace duckdb;
 
@@ -274,12 +278,14 @@ extern "C" {
                 db_handle->internal_ptr);
             auto &db = *wrapper->database->instance;
 
-            // Register parser extension
+            // Register parser extension.
+            // DuckDB 1.5.0 moved parser extension registration from direct
+            // vector push_back to ParserExtension::Register(config, ext).
             ParserExtension ext;
             ext.parse_function = sv_parse_stub;
             ext.plan_function = sv_plan_function;
             auto &config = DBConfig::GetConfig(db);
-            config.parser_extensions.push_back(ext);
+            ParserExtension::Register(config, ext);
 
             return true;
         } catch (const std::exception &e) {
