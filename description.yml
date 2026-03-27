@@ -12,7 +12,7 @@ extension:
 
 repo:
   github: anentropic/duckdb-semantic-views
-  ref: PLACEHOLDER_COMMIT_SHA
+  ref: 1b72e84cf2c926fcd79c51a7ff6a17bd7f3f96c8
 
 docs:
   hello_world: |
