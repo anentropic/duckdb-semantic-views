@@ -19,7 +19,7 @@ jobs:
     # IMPORTANT: The @tag below must match the version in .duckdb-version (currently v1.5.0).
     # GitHub Actions 'uses:' does not support dynamic values, so update this manually
     # whenever .duckdb-version changes.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.0
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.1
     with:
       duckdb_version: v1.5.0
       ci_tools_version: v1.5.0
@@ -33,7 +33,7 @@ jobs:
     name: DuckLake integration test (Linux x86_64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -62,9 +62,9 @@ jobs:
     name: Docs build check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
