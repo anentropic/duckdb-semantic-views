@@ -41,7 +41,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build extension
-        run: make debug
+        run: make configure debug
 
       - name: Install uv
         run: pip install uv
