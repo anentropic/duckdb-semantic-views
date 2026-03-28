@@ -73,3 +73,4 @@ docs/.venv/
 
 .opencode/
 .agents/
+.claude/
