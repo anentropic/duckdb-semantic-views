@@ -40,7 +40,7 @@ arbitrary = { version = "1", optional = true, features = ["derive"] }
 cc = { version = "1", optional = true }
 
 [dev-dependencies]
-proptest = "1.9"
+proptest = "1.11"
 
 [dev-dependencies.cargo-husky]
 version = "1"
