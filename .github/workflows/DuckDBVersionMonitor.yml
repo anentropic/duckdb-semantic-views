@@ -13,7 +13,7 @@ jobs:
     name: Check for new DuckDB latest release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: main
           submodules: recursive
@@ -40,7 +40,7 @@ jobs:
 
       - name: Install just
         if: steps.latest.outputs.is_new == 'true'
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v3
 
       - name: Install Rust stable
         if: steps.latest.outputs.is_new == 'true'
@@ -90,7 +90,7 @@ jobs:
 
       - name: Open version-bump PR (build passed)
         if: steps.latest.outputs.is_new == 'true' && steps.build.outcome == 'success'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           base: main
@@ -110,7 +110,7 @@ jobs:
 
       - name: Open breakage PR (build failed)
         if: steps.latest.outputs.is_new == 'true' && steps.build.outcome == 'failure'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           base: main
@@ -134,7 +134,7 @@ jobs:
     name: Check for new DuckDB LTS release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: duckdb/1.4.x
           submodules: recursive
@@ -162,7 +162,7 @@ jobs:
 
       - name: Install just
         if: steps.lts.outputs.is_new == 'true'
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v3
 
       - name: Install Rust stable
         if: steps.lts.outputs.is_new == 'true'
@@ -203,7 +203,7 @@ jobs:
 
       - name: Open LTS version-bump PR (build passed)
         if: steps.lts.outputs.is_new == 'true' && steps.build.outcome == 'success'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           base: duckdb/1.4.x
@@ -223,7 +223,7 @@ jobs:
 
       - name: Open LTS breakage PR (build failed)
         if: steps.lts.outputs.is_new == 'true' && steps.build.outcome == 'failure'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           base: duckdb/1.4.x
