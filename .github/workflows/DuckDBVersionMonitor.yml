@@ -70,6 +70,15 @@ jobs:
           find . -name '*.py' -not -path './extension-ci-tools/*' -not -path './.venv/*' -exec \
             sed -i "s/duckdb==[0-9.]*/duckdb==$DDB_VER/" {} \;
 
+          # Update BuildAll.yml and BuildQuick.yml hardcoded duckdb_version / ci_tools_version
+          NEW_VER=$(echo "${{ steps.latest.outputs.latest }}" | sed 's/v//')
+          for f in .github/workflows/BuildAll.yml .github/workflows/BuildQuick.yml; do
+            sed -i "s/duckdb_version: v[0-9.]*/duckdb_version: ${{ steps.latest.outputs.latest }}/" "$f"
+            sed -i "s/ci_tools_version: v[0-9.]*/ci_tools_version: ${{ steps.latest.outputs.latest }}/" "$f"
+            sed -i "s|extension-ci-tools/\.github/workflows/_extension_distribution\.yml@v[0-9.]*|extension-ci-tools/.github/workflows/_extension_distribution.yml@${{ steps.latest.outputs.latest }}|" "$f"
+            sed -i "s/(currently v[0-9.]*)/(currently ${{ steps.latest.outputs.latest }})/" "$f"
+          done
+
           # Download new amalgamation
           just update-headers
 
@@ -182,6 +191,16 @@ jobs:
           # Update Python PEP 723 headers
           find . -name '*.py' -not -path './extension-ci-tools/*' -not -path './.venv/*' -exec \
             sed -i "s/duckdb==[0-9.]*/duckdb==$LTS_VER/" {} \;
+
+          # Update BuildAll.yml and BuildQuick.yml hardcoded duckdb_version / ci_tools_version
+          for f in .github/workflows/BuildAll.yml .github/workflows/BuildQuick.yml; do
+            if [ -f "$f" ]; then
+              sed -i "s/duckdb_version: v[0-9.]*/duckdb_version: ${{ steps.lts.outputs.latest }}/" "$f"
+              sed -i "s/ci_tools_version: v[0-9.]*/ci_tools_version: ${{ steps.lts.outputs.latest }}/" "$f"
+              sed -i "s|extension-ci-tools/\.github/workflows/_extension_distribution\.yml@v[0-9.]*|extension-ci-tools/.github/workflows/_extension_distribution.yml@${{ steps.lts.outputs.latest }}|" "$f"
+              sed -i "s/(currently v[0-9.]*)/(currently ${{ steps.lts.outputs.latest }})/" "$f"
+            fi
+          done
 
           # Download new amalgamation
           just update-headers
