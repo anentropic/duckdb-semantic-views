@@ -73,10 +73,12 @@ jobs:
           # Update BuildAll.yml and BuildQuick.yml hardcoded duckdb_version / ci_tools_version
           NEW_VER=$(echo "${{ steps.latest.outputs.latest }}" | sed 's/v//')
           for f in .github/workflows/BuildAll.yml .github/workflows/BuildQuick.yml; do
-            sed -i "s/duckdb_version: v[0-9.]*/duckdb_version: ${{ steps.latest.outputs.latest }}/" "$f"
-            sed -i "s/ci_tools_version: v[0-9.]*/ci_tools_version: ${{ steps.latest.outputs.latest }}/" "$f"
-            sed -i "s|extension-ci-tools/\.github/workflows/_extension_distribution\.yml@v[0-9.]*|extension-ci-tools/.github/workflows/_extension_distribution.yml@${{ steps.latest.outputs.latest }}|" "$f"
-            sed -i "s/(currently v[0-9.]*)/(currently ${{ steps.latest.outputs.latest }})/" "$f"
+            if [ -f "$f" ]; then
+              sed -i "s/duckdb_version: v[0-9.]*/duckdb_version: ${{ steps.latest.outputs.latest }}/" "$f"
+              sed -i "s/ci_tools_version: v[0-9.]*/ci_tools_version: ${{ steps.latest.outputs.latest }}/" "$f"
+              sed -i "s|extension-ci-tools/\.github/workflows/_extension_distribution\.yml@v[0-9.]*|extension-ci-tools/.github/workflows/_extension_distribution.yml@${{ steps.latest.outputs.latest }}|" "$f"
+              sed -i "s/(currently v[0-9.]*)/(currently ${{ steps.latest.outputs.latest }})/" "$f"
+            fi
           done
 
           # Download new amalgamation
@@ -143,12 +145,24 @@ jobs:
     name: Check for new DuckDB LTS release
     runs-on: ubuntu-latest
     steps:
+      - name: Check if LTS branch exists
+        id: branch_check
+        run: |
+          if git ls-remote --exit-code --heads "https://github.com/${{ github.repository }}.git" duckdb/1.4.x >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Branch duckdb/1.4.x does not exist — skipping LTS check."
+          fi
+
       - uses: actions/checkout@v6
+        if: steps.branch_check.outputs.exists == 'true'
         with:
           ref: duckdb/1.4.x
           submodules: recursive
 
       - name: Get latest DuckDB 1.4.x release
+        if: steps.branch_check.outputs.exists == 'true'
         id: lts
         run: |
           # Query all releases, filter for v1.4.* tags, take the newest
