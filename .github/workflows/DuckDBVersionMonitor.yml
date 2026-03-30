@@ -87,7 +87,7 @@ jobs:
       - name: Build and test against new DuckDB version
         if: steps.latest.outputs.is_new == 'true'
         id: build
-        run: make configure && make test_release
+        run: make configure && make release && make test_release
         continue-on-error: true
 
       - name: Run DuckLake integration test
@@ -222,7 +222,7 @@ jobs:
       - name: Build and test against new LTS version
         if: steps.lts.outputs.is_new == 'true'
         id: build
-        run: make configure && make test_release
+        run: make configure && make release && make test_release
         continue-on-error: true
 
       - name: Run DuckLake integration test
