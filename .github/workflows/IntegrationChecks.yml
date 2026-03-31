@@ -2,6 +2,11 @@ name: Integration Checks
 
 on:
   push:
+    tags-ignore:
+      - '**'
+    branches:
+      - '**'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

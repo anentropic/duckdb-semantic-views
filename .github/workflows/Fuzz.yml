@@ -1,9 +1,10 @@
 name: Fuzz
 on:
   push:
+    tags-ignore:
+      - '**'
     branches:
-      - main
-      - 'duckdb/*'
+      - '**'
     paths:
       - 'src/**'
       - 'fuzz/**'
