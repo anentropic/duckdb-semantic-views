@@ -121,9 +121,12 @@ Recent decisions affecting current work:
 | 260321-i40 | Custom Pygments lexer for SQL grammar syntax highlighting in reference docs | 2026-03-21 | fb672de | | [260321-i40-custom-pygments-lexer-for-sql-grammar-sy](./quick/260321-i40-custom-pygments-lexer-for-sql-grammar-sy/) |
 | 260322-1zx | Make PRIMARY KEY optional in TABLES clause via catalog metadata lookup | 2026-03-22 | d09e4cc | Verified | [260322-1zx-make-primary-key-optional-by-referring-t](./quick/260322-1zx-make-primary-key-optional-by-referring-t/) |
 | 260322-s2y | Add LIKE/STARTS WITH/LIMIT filtering to SHOW SEMANTIC VIEWS | 2026-03-22 | 285c3bc | Verified | [260322-s2y-add-like-starts-with-limit-filtering-to-](./quick/260322-s2y-add-like-starts-with-limit-filtering-to-/) |
+| 260329-frb | Sync DuckDBVersionMonitor with current build workflows | 2026-03-29 | eef265b | | [260329-frb-sync-duckdbversionmonitor-yml-with-curre](./quick/260329-frb-sync-duckdbversionmonitor-yml-with-curre/) |
+| 260331-ta2 | Add justfile release recipe for CE registry publishing | 2026-03-31 | 0390bab | | [260331-ta2-write-a-justfile-recipe-for-the-release-](./quick/260331-ta2-write-a-justfile-recipe-for-the-release-/) |
 
 ## Session Continuity
 
+Last activity: 2026-03-31 - Completed quick task 260331-ta2: release recipe
 Last session: 2026-03-27T10:34:09.249Z
 Stopped at: Completed 36-02-PLAN.md
 Resume file: None
