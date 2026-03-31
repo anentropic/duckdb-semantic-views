@@ -157,3 +157,65 @@ docs-build:
 # Serve docs locally with live-reload (http://127.0.0.1:8000)
 docs-serve:
     uv run --project docs sphinx-autobuild docs docs/_build/html
+
+# NOTE: sed -i '' is macOS-specific (BSD sed). This matches the dev environment (darwin).
+# Set CE_REPO env var to override the CE fork path (default: ~/Documents/Dev/Sources/community-extensions).
+# Automate CE registry release: update description.yml, copy to CE fork, open PR
+release:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # --- Precondition checks ---
+    BRANCH=$(git branch --show-current)
+    if [ "$BRANCH" != "main" ]; then
+      echo "ERROR: must be on 'main' branch (currently on '$BRANCH')" >&2
+      exit 1
+    fi
+    if ! command -v gh &>/dev/null; then
+      echo "ERROR: 'gh' CLI not found. Install: https://cli.github.com/" >&2
+      exit 1
+    fi
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+      echo "ERROR: working tree is not clean. Commit or stash changes first." >&2
+      exit 1
+    fi
+    # --- Extract values ---
+    SHA=$(git rev-parse HEAD)
+    VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+    if [ -z "$VERSION" ]; then
+      echo "ERROR: could not extract version from Cargo.toml" >&2
+      exit 1
+    fi
+    echo "Releasing v$VERSION (ref: $SHA)"
+    # --- Update description.yml in this repo ---
+    sed -i '' "s/^  ref: .*/  ref: $SHA/" description.yml
+    sed -i '' "s/^  version: .*/  version: $VERSION/" description.yml
+    git add description.yml
+    git commit -m "chore: update description.yml for v$VERSION release"
+    echo "Committed description.yml update"
+    # --- Copy to CE fork and open PR ---
+    CE_REPO="${CE_REPO:-$HOME/Documents/Dev/Sources/community-extensions}"
+    if [ ! -d "$CE_REPO" ]; then
+      echo "ERROR: CE fork directory not found at '$CE_REPO'" >&2
+      echo "  Clone your fork of duckdb/community-extensions there, or set CE_REPO env var." >&2
+      exit 1
+    fi
+    mkdir -p "$CE_REPO/extensions/semantic_views"
+    cp description.yml "$CE_REPO/extensions/semantic_views/description.yml"
+    echo "Copied description.yml to CE fork"
+    cd "$CE_REPO"
+    git checkout semantic-views
+    git add extensions/semantic_views/description.yml
+    git commit -m "Update semantic_views to v$VERSION"
+    git push origin semantic-views
+    echo "Pushed to CE fork"
+    PR_URL=$(gh pr create \
+      --repo duckdb/community-extensions \
+      --head anentropic:semantic-views \
+      --base main \
+      --title "Update semantic_views to v$VERSION" \
+      --body "Update semantic_views extension to v$VERSION (ref: $SHA)")
+    echo ""
+    echo "=== Release Summary ==="
+    echo "  Version: v$VERSION"
+    echo "  SHA:     $SHA"
+    echo "  PR:      $PR_URL"
