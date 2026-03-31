@@ -180,7 +180,7 @@ release:
     fi
     # --- Extract values ---
     SHA=$(git rev-parse HEAD)
-    VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+    VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
     if [ -z "$VERSION" ]; then
       echo "ERROR: could not extract version from Cargo.toml" >&2
       exit 1
