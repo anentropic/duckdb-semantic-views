@@ -46,30 +46,6 @@ When ``LIKE`` and ``STARTS WITH`` are both present, a view must satisfy both con
    Clause order is enforced. ``LIKE`` must come before ``STARTS WITH``, and ``STARTS WITH`` must come before ``LIMIT``. Placing clauses out of order produces a syntax error.
 
 
-.. _ref-show-unsupported:
-
-Unsupported Clauses
-===================
-
-``SHOW SEMANTIC VIEWS`` operates at the view level, so scoping clauses that target contents within a view are not valid:
-
-``IN <name>``
-   Not supported. ``SHOW SEMANTIC VIEWS`` already returns all views, so there is no parent scope to filter by. Using ``IN`` produces an error:
-
-   .. code-block:: text
-
-      IN is not valid for SHOW SEMANTIC VIEWS (no scoping view)
-
-   To list the dimensions, metrics, or facts inside a specific view, use :ref:`SHOW SEMANTIC DIMENSIONS IN <ref-show-semantic-dimensions>`, :ref:`SHOW SEMANTIC METRICS IN <ref-show-semantic-metrics>`, or :ref:`SHOW SEMANTIC FACTS IN <ref-show-semantic-facts>` instead.
-
-``FOR METRIC <metric_name>``
-   Not supported. ``FOR METRIC`` applies only to :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>`, where it filters dimensions reachable from a specific metric. Using ``FOR METRIC`` with ``SHOW SEMANTIC VIEWS`` produces an error:
-
-   .. code-block:: text
-
-      FOR METRIC is only valid for SHOW SEMANTIC DIMENSIONS, not SHOW SEMANTIC VIEWS
-
-
 .. _ref-show-output:
 
 Output Columns

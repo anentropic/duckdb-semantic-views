@@ -11,7 +11,7 @@ Renames an existing semantic view. The view definition, including all tables, re
 
 .. note::
 
-   ``ALTER SEMANTIC VIEW`` currently supports only the ``RENAME TO`` operation. Additional alter operations (adding or removing columns, modifying expressions) are not yet available.
+   ``ALTER SEMANTIC VIEW`` only supports the ``RENAME TO`` operation. For other operations use ``CREATE OR REPLACE SEMANTIC VIEW ...``.
 
 
 .. _ref-alter-syntax:
@@ -120,7 +120,3 @@ After the rename, queries must use the new name:
 .. code-block:: sql
 
    alter semantic view sales_view rename to revenue_view;
-
-.. warning::
-
-   Snowflake's ``ALTER SEMANTIC VIEW`` supports additional operations beyond ``RENAME TO``, including ``ADD``, ``DROP``, and ``ALTER`` for individual entities (dimensions, metrics, facts, relationships). This extension currently supports only ``RENAME TO``.
