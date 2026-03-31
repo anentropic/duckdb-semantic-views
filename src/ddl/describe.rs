@@ -9,7 +9,7 @@ use crate::catalog::CatalogState;
 
 /// Bind-time data for `describe_semantic_view`: the parsed fields of one view.
 ///
-/// The JSON array fields (`dimensions`, `metrics`, `filters`, `joins`, `facts`)
+/// The JSON array fields (`dimensions`, `metrics`, `joins`, `facts`)
 /// are stored as their serialized JSON strings so they can be
 /// returned as VARCHAR columns without re-serializing at emit time.
 pub struct DescribeBindData {
@@ -17,7 +17,6 @@ pub struct DescribeBindData {
     base_table: String,
     dimensions: String,
     metrics: String,
-    filters: String,
     joins: String,
     facts: String,
 }
@@ -38,11 +37,11 @@ unsafe impl Sync for DescribeInitData {}
 
 /// Table function that returns one row describing a named semantic view.
 ///
-/// Output schema (7 columns):
+/// Output schema (6 columns):
 ///   `(name VARCHAR, base_table VARCHAR, dimensions VARCHAR, metrics VARCHAR,
-///     filters VARCHAR, joins VARCHAR, facts VARCHAR)`
+///     joins VARCHAR, facts VARCHAR)`
 ///
-/// The `dimensions`, `metrics`, `filters`, `joins`, and `facts`
+/// The `dimensions`, `metrics`, `joins`, and `facts`
 /// columns contain the JSON-serialized arrays from the definition.
 ///
 /// Takes one positional VARCHAR parameter: the view name.
@@ -64,7 +63,6 @@ impl VTab for DescribeSemanticViewVTab {
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         );
         bind.add_result_column("metrics", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("filters", LogicalTypeHandle::from(LogicalTypeId::Varchar));
         bind.add_result_column("joins", LogicalTypeHandle::from(LogicalTypeId::Varchar));
         bind.add_result_column("facts", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
@@ -88,7 +86,6 @@ impl VTab for DescribeSemanticViewVTab {
         let dimensions =
             serde_json::to_string(&def["dimensions"]).unwrap_or_else(|_| "[]".to_string());
         let metrics = serde_json::to_string(&def["metrics"]).unwrap_or_else(|_| "[]".to_string());
-        let filters = serde_json::to_string(&def["filters"]).unwrap_or_else(|_| "[]".to_string());
         let joins = serde_json::to_string(&def["joins"]).unwrap_or_else(|_| "[]".to_string());
         let facts = if def["facts"].is_null() {
             "[]".to_string()
@@ -101,7 +98,6 @@ impl VTab for DescribeSemanticViewVTab {
             base_table,
             dimensions,
             metrics,
-            filters,
             joins,
             facts,
         })
@@ -129,15 +125,13 @@ impl VTab for DescribeSemanticViewVTab {
         let base_table_vec = output.flat_vector(1);
         let dimensions_vec = output.flat_vector(2);
         let metrics_vec = output.flat_vector(3);
-        let filters_vec = output.flat_vector(4);
-        let joins_vec = output.flat_vector(5);
-        let facts_vec = output.flat_vector(6);
+        let joins_vec = output.flat_vector(4);
+        let facts_vec = output.flat_vector(5);
 
         name_vec.insert(0, bind_data.name.as_str());
         base_table_vec.insert(0, bind_data.base_table.as_str());
         dimensions_vec.insert(0, bind_data.dimensions.as_str());
         metrics_vec.insert(0, bind_data.metrics.as_str());
-        filters_vec.insert(0, bind_data.filters.as_str());
         joins_vec.insert(0, bind_data.joins.as_str());
         facts_vec.insert(0, bind_data.facts.as_str());
 

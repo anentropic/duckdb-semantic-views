@@ -49,7 +49,6 @@ fn fixed_definition() -> SemanticViewDefinition {
                 ..Default::default()
             },
         ],
-        filters: vec!["status = 'active'".to_string()],
         ..Default::default()
     }
 }

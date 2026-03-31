@@ -1159,7 +1159,7 @@ mod tests {
                     using_relationships: vec![],
                 })
                 .collect(),
-            filters: vec![],
+
             facts: vec![],
 
             column_type_names: vec![],
@@ -1395,7 +1395,7 @@ mod tests {
             }],
             dimensions: vec![],
             metrics: vec![],
-            filters: vec![],
+
             facts: vec![],
 
             column_type_names: vec![],
@@ -1532,7 +1532,7 @@ mod tests {
                 .collect(),
             dimensions: vec![],
             metrics: vec![],
-            filters: vec![],
+
             joins: vec![],
 
             column_type_names: vec![],
@@ -1797,7 +1797,7 @@ mod tests {
             }],
             metrics,
             dimensions: vec![],
-            filters: vec![],
+
             joins: vec![],
             facts: vec![],
 
@@ -1973,7 +1973,7 @@ mod tests {
                     using_relationships: using_rels.iter().map(|s| s.to_string()).collect(),
                 })
                 .collect(),
-            filters: vec![],
+
             facts: vec![],
 
             column_type_names: vec![],
@@ -2124,7 +2124,6 @@ mod tests {
                 joins,
                 dimensions: vec![],
                 metrics: vec![],
-                filters: vec![],
                 facts: vec![],
 
                 column_type_names: vec![],

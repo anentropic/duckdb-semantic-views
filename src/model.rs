@@ -156,7 +156,7 @@ pub struct Join {
 ///
 /// Stored as JSON in `semantic_layer._definitions`.
 /// Required fields: `base_table`, `dimensions`, `metrics`.
-/// Optional fields: `filters` (defaults to []), `joins` (defaults to []), `facts` (defaults to []).
+/// Optional fields: `joins` (defaults to []), `facts` (defaults to []).
 /// Note: `deny_unknown_fields` is intentionally NOT set — old stored JSON with extra
 /// fields (e.g., from future schema changes) must still load without error.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -169,8 +169,6 @@ pub struct SemanticViewDefinition {
     pub tables: Vec<TableRef>,
     pub dimensions: Vec<Dimension>,
     pub metrics: Vec<Metric>,
-    #[serde(default)]
-    pub filters: Vec<String>,
     #[serde(default)]
     pub joins: Vec<Join>,
     #[serde(default)]
@@ -239,7 +237,6 @@ mod tests {
         assert_eq!(def.base_table, "orders");
         assert_eq!(def.dimensions.len(), 1);
         assert_eq!(def.metrics.len(), 1);
-        assert!(def.filters.is_empty());
         assert!(def.joins.is_empty());
     }
 
@@ -258,7 +255,6 @@ mod tests {
     fn optional_fields_default_to_empty() {
         let json = r#"{"base_table": "t", "dimensions": [], "metrics": []}"#;
         let def = SemanticViewDefinition::from_json("test", json).unwrap();
-        assert!(def.filters.is_empty());
         assert!(def.joins.is_empty());
     }
 
@@ -458,7 +454,7 @@ mod tests {
                 }],
                 dimensions: vec![],
                 metrics: vec![],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -650,7 +646,7 @@ mod tests {
                 tables: vec![],
                 dimensions: vec![],
                 metrics: vec![],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 

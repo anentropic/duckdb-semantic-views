@@ -57,7 +57,7 @@ fn simple_definition() -> SemanticViewDefinition {
                 using_relationships: vec![],
             },
         ],
-        filters: vec!["status = 'active'".to_string()],
+
         joins: vec![],
         facts: vec![],
 
@@ -125,7 +125,7 @@ fn joined_definition() -> SemanticViewDefinition {
                 using_relationships: vec![],
             },
         ],
-        filters: vec!["status = 'active'".to_string()],
+
         joins: vec![
             Join {
                 table: "customers".to_string(),
@@ -342,22 +342,7 @@ proptest! {
         }
     }
 
-    /// Property 5: Filters are always present regardless of dimension/metric selection.
-    #[test]
-    fn filters_always_present(req in arb_query_request(&simple_definition())) {
-        let def = simple_definition();
-        let sql = expand("test", &def, &req).unwrap();
-
-        for filter in &def.filters {
-            let f: &str = filter;
-            prop_assert!(
-                sql.contains(f),
-                "Filter '{}' must always be present in SQL. SQL:\n{}", f, sql
-            );
-        }
-    }
-
-    /// Property 6: Global aggregate (empty dimensions) has no GROUP BY but includes metric expr.
+    /// Property 5: Global aggregate (empty dimensions) has no GROUP BY but includes metric expr.
     #[test]
     fn global_aggregate_no_group_by(
         _dummy in Just(QueryRequest {

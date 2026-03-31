@@ -192,7 +192,7 @@ Use :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` to see the full d
 
    DESCRIBE SEMANTIC VIEW shop;
 
-The output shows the view name, base table, and JSON arrays for dimensions, metrics, filters, joins, and facts.
+The output shows the view name, base table, and JSON arrays for dimensions, metrics, joins, and facts.
 
 
 .. _tutorial-mt-update:

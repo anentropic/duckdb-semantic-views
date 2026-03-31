@@ -1418,13 +1418,6 @@ pub fn expand(
         }
     }
 
-    // Append filters as WHERE clause (each parenthesized, AND-composed).
-    if !def.filters.is_empty() {
-        sql.push_str("\nWHERE ");
-        let filter_clauses: Vec<String> = def.filters.iter().map(|f| format!("({f})")).collect();
-        sql.push_str(&filter_clauses.join(" AND "));
-    }
-
     // 7. GROUP BY (only when both dimensions and metrics are present).
     //    Use ordinal positions (GROUP BY 1, 2, ...) instead of expressions to avoid
     //    ambiguity when an expression matches its alias (e.g., `status AS "status"`).
@@ -1546,7 +1539,7 @@ mod tests {
                         using_relationships: vec![],
                     },
                 ],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -1610,49 +1603,6 @@ FROM \"orders\"";
         }
 
         #[test]
-        fn test_filters_and_composed() {
-            let mut def = orders_view();
-            def.filters = vec![
-                "status = 'completed'".to_string(),
-                "amount > 100".to_string(),
-            ];
-            let req = QueryRequest {
-                dimensions: vec!["region".to_string()],
-                metrics: vec!["total_revenue".to_string()],
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            let expected = "\
-SELECT
-    region AS \"region\",
-    sum(amount) AS \"total_revenue\"
-FROM \"orders\"
-WHERE (status = 'completed') AND (amount > 100)
-GROUP BY
-    1";
-            assert_eq!(sql, expected);
-        }
-
-        #[test]
-        fn test_single_filter() {
-            let mut def = orders_view();
-            def.filters = vec!["status = 'completed'".to_string()];
-            let req = QueryRequest {
-                dimensions: vec!["region".to_string()],
-                metrics: vec!["total_revenue".to_string()],
-            };
-            let sql = expand("orders", &def, &req).unwrap();
-            let expected = "\
-SELECT
-    region AS \"region\",
-    sum(amount) AS \"total_revenue\"
-FROM \"orders\"
-WHERE (status = 'completed')
-GROUP BY
-    1";
-            assert_eq!(sql, expected);
-        }
-
-        #[test]
         fn test_identifier_quoting() {
             let def = SemanticViewDefinition {
                 base_table: "select".to_string(),
@@ -1671,7 +1621,7 @@ GROUP BY
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -1706,7 +1656,7 @@ GROUP BY
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -1791,7 +1741,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -1925,7 +1875,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -2041,7 +1991,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "customers".to_string(),
                     on: "orders.customer_id = customers.id".to_string(),
@@ -2085,7 +2035,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -2122,7 +2072,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -2184,7 +2134,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![crate::model::Join {
                     table: "customers".to_string(),
                     on: String::new(),
@@ -2295,7 +2245,7 @@ FROM \"orders\"";
                     output_type: Some("BIGINT".to_string()),
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -2326,7 +2276,7 @@ FROM \"orders\"";
                     output_type: Some("INTEGER".to_string()),
                 }],
                 metrics: vec![],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -2357,7 +2307,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -2423,7 +2373,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "c".to_string(),
                     from_alias: "o".to_string(),
@@ -2482,7 +2432,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![
                     Join {
                         table: "o".to_string(),
@@ -2551,7 +2501,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "b".to_string(),
                     from_alias: "a".to_string(),
@@ -2702,7 +2652,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "c".to_string(),
                     from_alias: "o".to_string(),
@@ -2780,7 +2730,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "c".to_string(),
                     from_alias: "o".to_string(),
@@ -3083,7 +3033,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![Fact {
                     name: "net_price".to_string(),
@@ -3118,7 +3068,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -3152,7 +3102,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![
                     Fact {
@@ -3425,7 +3375,7 @@ FROM \"orders\"";
                         using_relationships: vec![],
                     },
                 ],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -3497,7 +3447,7 @@ FROM \"orders\"";
                         using_relationships: vec![],
                     },
                 ],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "o".to_string(),
                     from_alias: "li".to_string(),
@@ -3573,7 +3523,7 @@ FROM \"orders\"";
                         using_relationships: vec![],
                     },
                 ],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "o".to_string(),
                     from_alias: "li".to_string(),
@@ -3630,7 +3580,7 @@ FROM \"orders\"";
                         using_relationships: vec![],
                     },
                 ],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![Fact {
                     name: "net_price".to_string(),
@@ -3724,7 +3674,7 @@ FROM \"orders\"";
                         using_relationships: vec![],
                     },
                 ],
-                filters: vec![],
+
                 joins: vec![
                     Join {
                         table: "o".to_string(),
@@ -3827,7 +3777,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "d".to_string(),
                     from_alias: "o".to_string(),
@@ -3890,7 +3840,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -4069,7 +4019,7 @@ FROM \"orders\"";
                         using_relationships: vec![],
                     },
                 ],
-                filters: vec![],
+
                 joins: vec![
                     Join {
                         table: "a".to_string(),
@@ -4227,7 +4177,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "c".to_string(),
                     from_alias: "o".to_string(),
@@ -4302,7 +4252,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "a".to_string(),
                     from_alias: "f".to_string(),
@@ -4373,7 +4323,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![],
                 facts: vec![],
 
@@ -4423,7 +4373,7 @@ FROM \"orders\"";
                     output_type: None,
                     using_relationships: vec![],
                 }],
-                filters: vec![],
+
                 joins: vec![Join {
                     table: "c".to_string(),
                     from_alias: "o".to_string(),

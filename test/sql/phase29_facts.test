@@ -102,13 +102,13 @@ SELECT * FROM semantic_view('p29_analytics', metrics := ['total_net', 'total_tax
 400.00	32.30
 
 # ============================================================
-# Test 5: DESCRIBE shows facts (7 columns)
+# Test 5: DESCRIBE shows facts (6 columns)
 # ============================================================
 
-query TTTTTTT
+query TTTTTT
 DESCRIBE SEMANTIC VIEW p29_analytics;
 ----
-p29_analytics	p29_orders	[{"expr":"o.region","name":"region","output_type":null,"source_table":"o"},{"expr":"c.country","name":"country","output_type":null,"source_table":"c"},{"expr":"c.state","name":"state","output_type":null,"source_table":"c"},{"expr":"c.city","name":"city","output_type":null,"source_table":"c"}]	[{"expr":"SUM(li.net_price)","name":"total_net","output_type":null,"source_table":"li"},{"expr":"SUM(li.tax_amount)","name":"total_tax","output_type":null,"source_table":"li"}]	[]	[{"fk_columns":["order_id"],"from_alias":"li","from_cols":[],"join_columns":[],"name":"li_to_order","ref_columns":["id"],"table":"o"},{"fk_columns":["customer_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_customer","ref_columns":["id"],"table":"c"}]	[{"expr":"li.extended_price * (1 - li.discount)","name":"net_price","source_table":"li"},{"expr":"li.net_price * li.tax_rate","name":"tax_amount","source_table":"li"}]
+p29_analytics	p29_orders	[{"expr":"o.region","name":"region","output_type":null,"source_table":"o"},{"expr":"c.country","name":"country","output_type":null,"source_table":"c"},{"expr":"c.state","name":"state","output_type":null,"source_table":"c"},{"expr":"c.city","name":"city","output_type":null,"source_table":"c"}]	[{"expr":"SUM(li.net_price)","name":"total_net","output_type":null,"source_table":"li"},{"expr":"SUM(li.tax_amount)","name":"total_tax","output_type":null,"source_table":"li"}]	[{"fk_columns":["order_id"],"from_alias":"li","from_cols":[],"join_columns":[],"name":"li_to_order","ref_columns":["id"],"table":"o"},{"fk_columns":["customer_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_customer","ref_columns":["id"],"table":"c"}]	[{"expr":"li.extended_price * (1 - li.discount)","name":"net_price","source_table":"li"},{"expr":"li.net_price * li.tax_rate","name":"tax_amount","source_table":"li"}]
 
 # ============================================================
 # Test 6: Error -- fact cycle (two facts referencing each other)

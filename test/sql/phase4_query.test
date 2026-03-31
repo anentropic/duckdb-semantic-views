@@ -17,7 +17,7 @@
 #   TEST-03: Integration tests load the extension, create semantic views, run
 #            real DuckDB SQL queries, and assert correct results
 #   QUERY-01: semantic_view with named array parameters returns correct results
-#   QUERY-02: User WHERE clauses compose with view filters
+#   QUERY-02: User WHERE clauses filter query results
 #   QUERY-03: SELECT * returns all requested dimensions and metrics
 #   DDL-04: Native DDL interface
 #   DDL-06: semantic_view function name (renamed from semantic_query)
@@ -107,7 +107,7 @@ EMEA	electronics	175.00	2
 # 3. Scenario 2: WHERE composition (QUERY-02)
 # ============================================================
 
-# Define a view with no built-in filter (filters via WHERE on query result)
+# Define a view and apply WHERE on the query result
 statement ok
 CREATE SEMANTIC VIEW filtered_orders AS
 TABLES (

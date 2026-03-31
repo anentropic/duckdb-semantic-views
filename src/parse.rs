@@ -855,7 +855,6 @@ fn rewrite_ddl_keyword_body(
         dimensions: keyword_body.dimensions,
         metrics: keyword_body.metrics,
         joins: keyword_body.relationships,
-        filters: vec![],
         facts: keyword_body.facts,
         column_type_names: vec![],
         column_types_inferred: vec![],

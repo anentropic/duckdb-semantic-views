@@ -34,7 +34,7 @@ Parameters
 Output Columns
 ==============
 
-The result is a single row with 7 VARCHAR columns:
+The result is a single row with 6 VARCHAR columns:
 
 .. list-table::
    :header-rows: 1
@@ -55,9 +55,6 @@ The result is a single row with 7 VARCHAR columns:
    * - ``metrics``
      - VARCHAR
      - JSON array of metric definitions. Each entry has ``name``, ``expr``, ``source_table``, ``output_type``, and optionally ``using_relationships`` fields.
-   * - ``filters``
-     - VARCHAR
-     - JSON array of filter expressions (currently always ``[]``).
    * - ``joins``
      - VARCHAR
      - JSON array of relationship definitions. Each entry has ``table``, ``from_alias``, ``fk_columns``, ``name``, ``cardinality``, and optionally ``ref_columns`` fields.
@@ -77,13 +74,13 @@ Examples
 
 .. code-block:: text
 
-   ┌───────────────┬────────────┬─────────────────────────────────────┬─────────────────────┬─────────┬───────┬───────┐
-   │     name      │ base_table │             dimensions              │       metrics       │ filters │ joins │ facts │
-   ├───────────────┼────────────┼─────────────────────────────────────┼─────────────────────┼─────────┼───────┼───────┤
-   │ order_metrics │ orders     │ [{"expr":"o.region","name":"region" │ [{"expr":"SUM(o.amo │ []      │ []    │ []    │
-   │               │            │ ,"output_type":null,"source_table": │ unt)","name":"reven │         │       │       │
-   │               │            │ "o"}]                               │ ue",...}]           │         │       │       │
-   └───────────────┴────────────┴─────────────────────────────────────┴─────────────────────┴─────────┴───────┴───────┘
+   ┌───────────────┬────────────┬─────────────────────────────────────┬─────────────────────┬───────┬───────┐
+   │     name      │ base_table │             dimensions              │       metrics       │ joins │ facts │
+   ├───────────────┼────────────┼─────────────────────────────────────┼─────────────────────┼───────┼───────┤
+   │ order_metrics │ orders     │ [{"expr":"o.region","name":"region" │ [{"expr":"SUM(o.amo │ []    │ []    │
+   │               │            │ ,"output_type":null,"source_table": │ unt)","name":"reven │       │       │
+   │               │            │ "o"}]                               │ ue",...}]           │       │       │
+   └───────────────┴────────────┴─────────────────────────────────────┴─────────────────────┴───────┴───────┘
 
 .. tip::
 
