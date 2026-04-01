@@ -1,5 +1,7 @@
 # DuckDB Semantic Views — Project Instructions
 
+If in doubt about SQL syntax or behaviour refer to what Snowflake semantic views does.
+
 ## Quality Gate
 
 **All phases must pass the full test suite before verification can be marked complete.**
