@@ -5,7 +5,7 @@ use duckdb::{
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
 };
 use libduckdb_sys as ffi;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 
 use crate::catalog::{catalog_insert, catalog_upsert, CatalogState};
 
@@ -46,26 +46,13 @@ unsafe impl Sync for DefineState {}
 ///
 /// Returns Ok(()) on success, Err on failure.
 fn persist_define(conn: ffi::duckdb_connection, name: &str, json: &str) -> Result<(), String> {
-    // Escape single quotes to prevent SQL injection / breakage
-    let safe_name = name.replace('\'', "''");
-    let safe_json = json.replace('\'', "''");
-    let sql = format!(
-        "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES ('{}', '{}')",
-        safe_name, safe_json
-    );
-    let c_sql = CString::new(sql).map_err(|_| "SQL contains null byte".to_string())?;
     unsafe {
-        let mut result: ffi::duckdb_result = std::mem::zeroed();
-        let state = ffi::duckdb_query(conn, c_sql.as_ptr(), &mut result);
-        let success = state == ffi::DuckDBSuccess;
-        ffi::duckdb_destroy_result(&mut result);
-        if success {
-            Ok(())
-        } else {
-            Err(format!(
-                "failed to persist semantic view '{name}' to catalog table"
-            ))
-        }
+        super::persist::execute_parameterized(
+            conn,
+            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES ($1, $2)",
+            &[name, json],
+        )
+        .map_err(|e| format!("failed to persist semantic view '{name}' to catalog table: {e}"))
     }
 }
 
@@ -235,6 +222,35 @@ impl VTab for DefineFromJsonVTab {
         crate::graph::validate_using_relationships(&def)
             .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
 
+        // Capture metadata: timestamp, database_name, schema_name.
+        // Uses catalog_conn which is always available (file-backed AND in-memory).
+        let metadata_sql = "SELECT strftime(now(), '%Y-%m-%dT%H:%M:%SZ'), \
+                            current_database(), current_schema()";
+        let metadata_result = unsafe {
+            crate::query::table_function::execute_sql_raw(state.catalog_conn, metadata_sql)
+        };
+        if let Ok(mut result) = metadata_result {
+            unsafe {
+                let ts_ptr = ffi::duckdb_value_varchar(&mut result, 0, 0);
+                if !ts_ptr.is_null() {
+                    def.created_on = Some(CStr::from_ptr(ts_ptr).to_string_lossy().into_owned());
+                    ffi::duckdb_free(ts_ptr as *mut std::ffi::c_void);
+                }
+                let db_ptr = ffi::duckdb_value_varchar(&mut result, 1, 0);
+                if !db_ptr.is_null() {
+                    def.database_name = Some(CStr::from_ptr(db_ptr).to_string_lossy().into_owned());
+                    ffi::duckdb_free(db_ptr as *mut std::ffi::c_void);
+                }
+                let schema_ptr = ffi::duckdb_value_varchar(&mut result, 2, 0);
+                if !schema_ptr.is_null() {
+                    def.schema_name =
+                        Some(CStr::from_ptr(schema_ptr).to_string_lossy().into_owned());
+                    ffi::duckdb_free(schema_ptr as *mut std::ffi::c_void);
+                }
+                ffi::duckdb_destroy_result(&mut result);
+            }
+        }
+
         // DDL-time type inference (file-backed databases only).
         // Runs LIMIT 0 on the expanded SQL via the persist connection.
         if let Some(conn) = state.persist_conn {
@@ -252,6 +268,50 @@ impl VTab for DefineFromJsonVTab {
                         .iter()
                         .map(|t| crate::query::table_function::normalize_type_id(*t as u32))
                         .collect();
+                }
+            }
+        }
+
+        // Fact type inference: use typeof(expr) to determine fact output types.
+        // Best-effort -- if typeof() fails, output_type stays None (graceful degradation).
+        if !def.facts.is_empty() {
+            let alias_to_table: std::collections::HashMap<String, String> = def
+                .tables
+                .iter()
+                .map(|t| (t.alias.to_ascii_lowercase(), t.table.clone()))
+                .collect();
+
+            let type_conn = state.persist_conn.unwrap_or(state.catalog_conn);
+
+            for fact in &mut def.facts {
+                let alias = fact.source_table.as_deref().unwrap_or("");
+                let table_name = fact
+                    .source_table
+                    .as_ref()
+                    .and_then(|a| alias_to_table.get(&a.to_ascii_lowercase()).cloned())
+                    .unwrap_or_else(|| def.base_table.clone());
+
+                // Include AS alias so expressions like `li.price` resolve correctly.
+                let from_clause = if alias.is_empty() {
+                    format!("\"{}\"", table_name.replace('"', "\"\""))
+                } else {
+                    format!("\"{}\" AS {}", table_name.replace('"', "\"\""), alias)
+                };
+                let sql = format!("SELECT typeof({}) FROM {} LIMIT 1", fact.expr, from_clause);
+                if let Ok(mut result) =
+                    unsafe { crate::query::table_function::execute_sql_raw(type_conn, &sql) }
+                {
+                    let row_count = unsafe { ffi::duckdb_row_count(&mut result) };
+                    if row_count > 0 {
+                        let val_ptr = unsafe { ffi::duckdb_value_varchar(&mut result, 0, 0) };
+                        if !val_ptr.is_null() {
+                            let type_name =
+                                unsafe { CStr::from_ptr(val_ptr).to_string_lossy().into_owned() };
+                            unsafe { ffi::duckdb_free(val_ptr as *mut std::ffi::c_void) };
+                            fact.output_type = Some(type_name);
+                        }
+                    }
+                    unsafe { ffi::duckdb_destroy_result(&mut result) };
                 }
             }
         }

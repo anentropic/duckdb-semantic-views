@@ -7,16 +7,18 @@ use duckdb::{
 };
 
 use crate::catalog::CatalogState;
-use crate::expand::{ancestors_to_root, collect_derived_metric_source_tables, suggest_closest};
+use crate::expand::{ancestors_to_root, collect_derived_metric_source_tables};
 use crate::graph::RelationshipGraph;
 use crate::model::{Cardinality, Dimension, SemanticViewDefinition};
+use crate::util::suggest_closest;
 
 /// A single row in the SHOW SEMANTIC DIMENSIONS FOR METRIC output.
+///
+/// 4 Snowflake-aligned columns: table_name, name, data_type, required.
+/// The `required` column is a constant FALSE (BOOLEAN), emitted separately.
 struct ShowDimForMetricRow {
-    semantic_view_name: String,
+    table_name: String,
     name: String,
-    expr: String,
-    source_table: String,
     data_type: String,
 }
 
@@ -25,7 +27,7 @@ pub struct ShowDimsForMetricBindData {
     rows: Vec<ShowDimForMetricRow>,
 }
 
-// SAFETY: all fields are owned `Vec<ShowDimForMetricRow>` (String fields), which is `Send + Sync`.
+// SAFETY: all fields are owned `Vec<ShowDimForMetricRow>` (String fields only), which is `Send + Sync`.
 unsafe impl Send for ShowDimsForMetricBindData {}
 unsafe impl Sync for ShowDimsForMetricBindData {}
 
@@ -155,6 +157,8 @@ fn is_dimension_reachable_for_metric(
 ///
 /// Takes two VARCHAR parameters (view name, metric name).
 /// Returns only dimensions that are fan-trap-safe for the given metric.
+///
+/// Output schema: table_name VARCHAR, name VARCHAR, data_type VARCHAR, required BOOLEAN.
 pub struct ShowDimensionsForMetricVTab;
 
 impl VTab for ShowDimensionsForMetricVTab {
@@ -162,18 +166,14 @@ impl VTab for ShowDimensionsForMetricVTab {
     type InitData = ShowDimsForMetricInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        // Declare 5-column output schema (same as SHOW DIMS)
+        // Declare 4-column output schema: table_name, name, data_type, required (BOOLEAN)
         bind.add_result_column(
-            "semantic_view_name",
+            "table_name",
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         );
         bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("expr", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column(
-            "source_table",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
         bind.add_result_column("data_type", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("required", LogicalTypeHandle::from(LogicalTypeId::Boolean));
 
         let view_name = bind.get_parameter(0).to_string();
         let metric_name = bind.get_parameter(1).to_string();
@@ -227,16 +227,23 @@ impl VTab for ShowDimensionsForMetricVTab {
                 .collect()
         };
 
+        let alias_map = def.alias_to_table_map();
+
         // If no joins, all dimensions are reachable (single-table view)
         let rows = if def.joins.is_empty() {
             def.dimensions
                 .iter()
-                .map(|d| ShowDimForMetricRow {
-                    semantic_view_name: view_name.clone(),
-                    name: d.name.clone(),
-                    expr: d.expr.clone(),
-                    source_table: d.source_table.clone().unwrap_or_default(),
-                    data_type: d.output_type.clone().unwrap_or_default(),
+                .map(|d| {
+                    let table_name = d
+                        .source_table
+                        .as_ref()
+                        .and_then(|a| alias_map.get(a).cloned())
+                        .unwrap_or_default();
+                    ShowDimForMetricRow {
+                        table_name,
+                        name: d.name.clone(),
+                        data_type: d.output_type.clone().unwrap_or_default(),
+                    }
                 })
                 .collect()
         } else {
@@ -274,12 +281,17 @@ impl VTab for ShowDimensionsForMetricVTab {
                 .filter(|d| {
                     is_dimension_reachable_for_metric(d, &met_tables, &parent_map, &card_map)
                 })
-                .map(|d| ShowDimForMetricRow {
-                    semantic_view_name: view_name.clone(),
-                    name: d.name.clone(),
-                    expr: d.expr.clone(),
-                    source_table: d.source_table.clone().unwrap_or_default(),
-                    data_type: d.output_type.clone().unwrap_or_default(),
+                .map(|d| {
+                    let table_name = d
+                        .source_table
+                        .as_ref()
+                        .and_then(|a| alias_map.get(a).cloned())
+                        .unwrap_or_default();
+                    ShowDimForMetricRow {
+                        table_name,
+                        name: d.name.clone(),
+                        data_type: d.output_type.clone().unwrap_or_default(),
+                    }
                 })
                 .collect()
         };
@@ -309,19 +321,23 @@ impl VTab for ShowDimensionsForMetricVTab {
         let bind_data = func.get_bind_data();
         let n = bind_data.rows.len();
 
-        let sv_vec = output.flat_vector(0);
+        let table_vec = output.flat_vector(0);
         let name_vec = output.flat_vector(1);
-        let expr_vec = output.flat_vector(2);
-        let source_vec = output.flat_vector(3);
-        let type_vec = output.flat_vector(4);
+        let type_vec = output.flat_vector(2);
+        let mut req_vec = output.flat_vector(3);
 
         for (i, row) in bind_data.rows.iter().enumerate() {
-            sv_vec.insert(i, row.semantic_view_name.as_str());
+            table_vec.insert(i, row.table_name.as_str());
             name_vec.insert(i, row.name.as_str());
-            expr_vec.insert(i, row.expr.as_str());
-            source_vec.insert(i, row.source_table.as_str());
             type_vec.insert(i, row.data_type.as_str());
         }
+
+        // Write boolean column: constant FALSE for all rows
+        let req_slice = req_vec.as_mut_slice::<bool>();
+        for i in 0..n {
+            req_slice[i] = false;
+        }
+
         output.set_len(n);
         Ok(())
     }

@@ -1,0 +1,75 @@
+# Phase 42: File-backed persistence round-trip test (TIDY-06).
+#
+# Verifies that semantic view definitions persist across database restart
+# via the parameterized prepared statement persistence layer. Exercises
+# CREATE, SHOW, DROP across a restart boundary.
+#
+# NOTE: This test is EXCLUDED from test/sql/TEST_LIST because the Python
+# sqllogictest runner cannot reload an external extension after the
+# `restart` directive in a file-backed database: the extension's
+# init_catalog SQL runs during LOAD, which may conflict with the runner's
+# DB-level lock held during restart.
+#
+# Run manually: sqllogictest test/sql/phase42_persistence.test
+#
+# Related: test/sql/phase2_restart.test (original persistence test)
+# Requirements covered: TIDY-06
+
+require semantic_views
+
+require notwindows
+
+load __TEST_DIR__/phase42_persist.db
+
+# Idempotent cleanup from previous run
+statement ok
+DROP SEMANTIC VIEW IF EXISTS persist_roundtrip;
+
+# Create backing table
+statement ok
+CREATE TABLE events (type VARCHAR, n INTEGER);
+
+# Define a semantic view (exercises persist_define with parameterized INSERT)
+statement ok
+CREATE SEMANTIC VIEW persist_roundtrip AS
+TABLES (
+    e AS events PRIMARY KEY (type)
+)
+DIMENSIONS (
+    e.type AS event_type
+)
+METRICS (
+    e.n AS event_count count(*)
+)
+
+# Verify it is present before restart
+query T rowsort
+SELECT name FROM list_semantic_views();
+----
+persist_roundtrip
+
+restart
+
+# After restart the extension is reloaded; init_catalog loads from
+# semantic_layer._definitions (DuckDB table, persisted via WAL).
+# The view defined before restart must be present.
+query T rowsort
+SELECT name FROM list_semantic_views();
+----
+persist_roundtrip
+
+# Verify SHOW SEMANTIC DIMENSIONS works after restart
+query TTTTTT
+SHOW SEMANTIC DIMENSIONS IN persist_roundtrip;
+----
+memory	main	persist_roundtrip	events	event_type	(empty)
+
+# Drop the view (exercises persist_drop with parameterized DELETE)
+statement ok
+DROP SEMANTIC VIEW persist_roundtrip;
+
+# Verify it's gone
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+0

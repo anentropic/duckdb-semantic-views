@@ -58,7 +58,7 @@ impl fmt::Display for QueryError {
                 )?;
                 write!(
                     f,
-                    " Run FROM describe_semantic_view('{view_name}') to see available dimensions and metrics."
+                    " Run DESCRIBE SEMANTIC VIEW {view_name} to see available dimensions and metrics."
                 )
             }
             Self::ExpandFailed { source } => {

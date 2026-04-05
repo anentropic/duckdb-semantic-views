@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 
 use crate::body_parser::parse_keyword_body;
+use crate::errors::ParseError;
 use crate::model::{Cardinality, Join, TableRef};
 
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.
@@ -602,18 +603,6 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
 // Validation layer: ParseError, detect_near_miss, validate_and_rewrite
 // ---------------------------------------------------------------------------
 
-/// Error from DDL validation with an optional byte offset into the original query.
-///
-/// The `position` field, when present, is a 0-based byte offset into the
-/// original query string (before any trimming). `DuckDB` uses this to render
-/// a caret (`^`) under the error location.
-#[derive(Debug)]
-pub struct ParseError {
-    pub message: String,
-    /// Byte offset into the original query string.
-    pub position: Option<usize>,
-}
-
 /// The 9 DDL prefixes used for near-miss detection.
 const DDL_PREFIXES: &[&str] = &[
     "create semantic view",
@@ -858,6 +847,9 @@ fn rewrite_ddl_keyword_body(
         facts: keyword_body.facts,
         column_type_names: vec![],
         column_types_inferred: vec![],
+        created_on: None,
+        database_name: None,
+        schema_name: None,
     };
 
     // 3. Serialize to JSON

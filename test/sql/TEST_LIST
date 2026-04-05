@@ -14,4 +14,6 @@ test/sql/phase34_1_alter_rename.test
 test/sql/phase34_1_show_commands.test
 test/sql/phase34_1_show_dims_for_metric.test
 test/sql/phase34_1_1_show_filtering.test
+test/sql/phase39_metadata_storage.test
+test/sql/phase41_describe.test
 test/sql/peg_compat.test

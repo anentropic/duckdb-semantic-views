@@ -1,11 +1,13 @@
 pub mod body_parser;
 pub mod catalog;
+pub mod errors;
 pub mod expand;
 pub mod graph;
 pub mod model;
 pub mod parse;
 #[cfg(feature = "extension")]
 pub mod query;
+pub mod util;
 
 /// Test helpers for integration tests.
 ///
@@ -605,5 +607,28 @@ mod extension {
         }
 
         init_result.unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Guard that `duckdb_value` (used by `value_raw_ptr` transmute in
+    /// `query/table_function.rs`) remains pointer-sized. The full layout
+    /// check against `duckdb::vtab::Value` requires the `extension` feature
+    /// (which enables `duckdb/vscalar`) and is validated during extension
+    /// builds via `just build`.
+    #[test]
+    fn duckdb_value_is_pointer_sized() {
+        use libduckdb_sys as ffi;
+        assert_eq!(
+            std::mem::size_of::<ffi::duckdb_value>(),
+            std::mem::size_of::<*mut std::ffi::c_void>(),
+            "duckdb_value is no longer pointer-sized -- value_raw_ptr transmute may be broken"
+        );
+        assert_eq!(
+            std::mem::align_of::<ffi::duckdb_value>(),
+            std::mem::align_of::<*mut std::ffi::c_void>(),
+            "duckdb_value alignment changed -- value_raw_ptr transmute may be broken"
+        );
     }
 }

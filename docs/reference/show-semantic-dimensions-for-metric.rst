@@ -71,30 +71,27 @@ When ``LIKE`` and ``STARTS WITH`` are both present, a dimension must satisfy bot
 Output Columns
 ==============
 
-Returns one row per reachable dimension with 5 columns (same schema as :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>`):
+Returns one row per reachable dimension with 4 columns:
 
 .. list-table::
    :header-rows: 1
-   :widths: 22 12 66
+   :widths: 18 12 70
 
    * - Column
      - Type
      - Description
-   * - ``semantic_view_name``
+   * - ``table_name``
      - VARCHAR
-     - The semantic view name.
+     - The physical table name the dimension is scoped to.
    * - ``name``
      - VARCHAR
      - The dimension name.
-   * - ``expr``
-     - VARCHAR
-     - The SQL expression defining the dimension.
-   * - ``source_table``
-     - VARCHAR
-     - The table alias the dimension is scoped to.
    * - ``data_type``
      - VARCHAR
      - The inferred data type of the dimension. Empty string if not resolved.
+   * - ``required``
+     - BOOLEAN
+     - Always ``false``. Reserved for future Snowflake parity.
 
 
 .. _ref-show-dims-for-metric-filtering:
@@ -136,12 +133,12 @@ Examples
 
 .. code-block:: text
 
-   ┌──────────────────────┬─────────┬───────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name    │ expr      │ source_table │ data_type │
-   ├──────────────────────┼─────────┼───────────┼──────────────┼───────────┤
-   │ simple_sales         │ product │ s.product │ s            │           │
-   │ simple_sales         │ region  │ s.region  │ s            │           │
-   └──────────────────────┴─────────┴───────────┴──────────────┴───────────┘
+   ┌────────────┬─────────┬───────────┬──────────┐
+   │ table_name │ name    │ data_type │ required │
+   ├────────────┼─────────┼───────────┼──────────┤
+   │ sales      │ product │           │ false    │
+   │ sales      │ region  │           │ false    │
+   └────────────┴─────────┴───────────┴──────────┘
 
 With a single table, there are no joins, so every dimension is safe for every metric.
 
@@ -171,7 +168,7 @@ Consider a three-table schema: ``customers <- orders <- line_items``, where orde
        li.line_item_sum AS SUM(li.price * li.qty)
    );
 
-For ``order_total`` (source table: ``o``), the path to ``c`` is many-to-one (safe), but the path to ``li`` is one-to-many (fan-out). The ``item_qty`` dimension from ``li`` is excluded:
+For ``order_total`` (source table: ``orders``), the path to ``customers`` is many-to-one (safe), but the path to ``line_items`` is one-to-many (fan-out). The ``item_qty`` dimension from ``line_items`` is excluded:
 
 .. code-block:: sql
 
@@ -179,14 +176,14 @@ For ``order_total`` (source table: ``o``), the path to ``c`` is many-to-one (saf
 
 .. code-block:: text
 
-   ┌──────────────────────┬──────────────────┬───────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name             │ expr      │ source_table │ data_type │
-   ├──────────────────────┼──────────────────┼───────────┼──────────────┼───────────┤
-   │ star_sv              │ customer_country │ c.country │ c            │           │
-   │ star_sv              │ customer_name    │ c.name    │ c            │           │
-   └──────────────────────┴──────────────────┴───────────┴──────────────┴───────────┘
+   ┌────────────┬──────────────────┬───────────┬──────────┐
+   │ table_name │ name             │ data_type │ required │
+   ├────────────┼──────────────────┼───────────┼──────────┤
+   │ customers  │ customer_country │           │ false    │
+   │ customers  │ customer_name    │           │ false    │
+   └────────────┴──────────────────┴───────────┴──────────┘
 
-For ``line_item_sum`` (source table: ``li``), the path from ``li`` to ``o`` to ``c`` is all many-to-one (safe), and ``item_qty`` is on the same table. All three dimensions are included:
+For ``line_item_sum`` (source table: ``line_items``), the path from ``line_items`` to ``orders`` to ``customers`` is all many-to-one (safe), and ``item_qty`` is on the same table. All three dimensions are included:
 
 .. code-block:: sql
 
@@ -194,17 +191,17 @@ For ``line_item_sum`` (source table: ``li``), the path from ``li`` to ``o`` to `
 
 .. code-block:: text
 
-   ┌──────────────────────┬──────────────────┬───────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name             │ expr      │ source_table │ data_type │
-   ├──────────────────────┼──────────────────┼───────────┼──────────────┼───────────┤
-   │ star_sv              │ customer_country │ c.country │ c            │           │
-   │ star_sv              │ customer_name    │ c.name    │ c            │           │
-   │ star_sv              │ item_qty         │ li.qty    │ li           │           │
-   └──────────────────────┴──────────────────┴───────────┴──────────────┴───────────┘
+   ┌────────────┬──────────────────┬───────────┬──────────┐
+   │ table_name │ name             │ data_type │ required │
+   ├────────────┼──────────────────┼───────────┼──────────┤
+   │ customers  │ customer_country │           │ false    │
+   │ customers  │ customer_name    │           │ false    │
+   │ line_items │ item_qty         │           │ false    │
+   └────────────┴──────────────────┴───────────┴──────────┘
 
 **Filter safe dimensions with LIKE (case-insensitive):**
 
-After fan trap filtering, narrow results further by name pattern. For ``total_amount`` in a view where the safe dimensions are ``customer_name``, ``region``, and ``order_date``, use ``LIKE`` to find only dimensions containing "gio":
+After fan trap filtering, narrow results further by name pattern:
 
 .. code-block:: sql
 
@@ -212,11 +209,11 @@ After fan trap filtering, narrow results further by name pattern. For ``total_am
 
 .. code-block:: text
 
-   ┌──────────────────────┬────────┬──────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name   │ expr     │ source_table │ data_type │
-   ├──────────────────────┼────────┼──────────┼──────────────┼───────────┤
-   │ filter_sv            │ region │ c.region │ c            │           │
-   └──────────────────────┴────────┴──────────┴──────────────┴───────────┘
+   ┌────────────┬────────┬───────────┬──────────┐
+   │ table_name │ name   │ data_type │ required │
+   ├────────────┼────────┼───────────┼──────────┤
+   │ customers  │ region │           │ false    │
+   └────────────┴────────┴───────────┴──────────┘
 
 **Filter safe dimensions with STARTS WITH (case-sensitive):**
 
@@ -226,11 +223,11 @@ After fan trap filtering, narrow results further by name pattern. For ``total_am
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────────┬────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name          │ expr   │ source_table │ data_type │
-   ├──────────────────────┼───────────────┼────────┼──────────────┼───────────┤
-   │ filter_sv            │ customer_name │ c.name │ c            │           │
-   └──────────────────────┴───────────────┴────────┴──────────────┴───────────┘
+   ┌────────────┬───────────────┬───────────┬──────────┐
+   │ table_name │ name          │ data_type │ required │
+   ├────────────┼───────────────┼───────────┼──────────┤
+   │ customers  │ customer_name │           │ false    │
+   └────────────┴───────────────┴───────────┴──────────┘
 
 **Limit safe dimensions:**
 
@@ -240,13 +237,13 @@ After fan trap filtering, narrow results further by name pattern. For ``total_am
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────────┬──────────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name          │ expr         │ source_table │ data_type │
-   ├──────────────────────┼───────────────┼──────────────┼──────────────┼───────────┤
-   │ filter_sv            │ customer_name │ c.name       │ c            │           │
-   │ filter_sv            │ order_date    │ o.order_date │ o            │           │
-   │ filter_sv            │ region        │ c.region     │ c            │           │
-   └──────────────────────┴───────────────┴──────────────┴──────────────┴───────────┘
+   ┌────────────┬───────────────┬───────────┬──────────┐
+   │ table_name │ name          │ data_type │ required │
+   ├────────────┼───────────────┼───────────┼──────────┤
+   │ customers  │ customer_name │           │ false    │
+   │ customers  │ region        │           │ false    │
+   │ orders     │ order_date    │           │ false    │
+   └────────────┴───────────────┴───────────┴──────────┘
 
 **Derived metrics inherit source tables:**
 
@@ -272,13 +269,13 @@ After fan trap filtering, narrow results further by name pattern. For ``total_am
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────────┬────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name          │ expr   │ source_table │ data_type │
-   ├──────────────────────┼───────────────┼────────┼──────────────┼───────────┤
-   │ derived_sv           │ customer_name │ c.name │ c            │           │
-   └──────────────────────┴───────────────┴────────┴──────────────┴───────────┘
+   ┌────────────┬───────────────┬───────────┬──────────┐
+   │ table_name │ name          │ data_type │ required │
+   ├────────────┼───────────────┼───────────┼──────────┤
+   │ customers  │ customer_name │           │ false    │
+   └────────────┴───────────────┴───────────┴──────────┘
 
-The derived metric ``double_total`` depends on ``order_total`` (source: ``o``). The extension traces this dependency and applies the same reachability rules as if querying ``order_total`` directly.
+The derived metric ``double_total`` depends on ``order_total`` (source: ``orders``). The extension traces this dependency and applies the same reachability rules as if querying ``order_total`` directly.
 
 **Error: metric not found:**
 

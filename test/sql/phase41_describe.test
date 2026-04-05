@@ -1,0 +1,276 @@
+# Phase 41: DESCRIBE SEMANTIC VIEW -- Snowflake-aligned property-per-row format
+# Tests: DESC-01 through DESC-07
+
+require semantic_views
+
+# ============================================================
+# Setup: create physical tables
+# ============================================================
+
+statement ok
+CREATE TABLE p41_customers (id INTEGER, name VARCHAR(50), email VARCHAR(100), country VARCHAR(30));
+
+statement ok
+CREATE TABLE p41_orders (id INTEGER, customer_id INTEGER, region VARCHAR(20), amount DECIMAL(10,2), order_date DATE);
+
+statement ok
+CREATE TABLE p41_line_items (id INTEGER, order_id INTEGER, product VARCHAR, quantity INTEGER, price DECIMAL(10,2));
+
+# ============================================================
+# Test 1: Simple view -- TABLE + DIMENSION + METRIC
+# (DESC-01, DESC-02, DESC-04, DESC-06)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p41_simple AS
+  TABLES (o AS p41_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+
+# 5-column output: object_kind, object_name, parent_entity, property, property_value
+query TTTTT
+DESCRIBE SEMANTIC VIEW p41_simple;
+----
+TABLE	p41_orders	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p41_orders	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p41_orders	(empty)	BASE_TABLE_NAME	p41_orders
+TABLE	p41_orders	(empty)	PRIMARY_KEY	["id"]
+DIMENSION	region	p41_orders	TABLE	p41_orders
+DIMENSION	region	p41_orders	EXPRESSION	o.region
+DIMENSION	region	p41_orders	DATA_TYPE	(empty)
+METRIC	total	p41_orders	TABLE	p41_orders
+METRIC	total	p41_orders	EXPRESSION	SUM(o.amount)
+METRIC	total	p41_orders	DATA_TYPE	(empty)
+
+# ============================================================
+# Test 2: Multi-table view with relationships (DESC-03)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p41_multi AS
+  TABLES (
+    o AS p41_orders PRIMARY KEY (id),
+    c AS p41_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    o.region AS o.region,
+    c.customer_name AS c.name
+  )
+  METRICS (
+    o.total_revenue AS SUM(o.amount)
+  )
+
+# TABLE rows for o (4) + TABLE rows for c (4) + RELATIONSHIP (4) + DIMENSION (3+3) + METRIC (3) = 21 rows
+query TTTTT
+DESCRIBE SEMANTIC VIEW p41_multi;
+----
+TABLE	p41_orders	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p41_orders	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p41_orders	(empty)	BASE_TABLE_NAME	p41_orders
+TABLE	p41_orders	(empty)	PRIMARY_KEY	["id"]
+TABLE	p41_customers	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p41_customers	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p41_customers	(empty)	BASE_TABLE_NAME	p41_customers
+TABLE	p41_customers	(empty)	PRIMARY_KEY	["id"]
+RELATIONSHIP	order_to_customer	p41_orders	TABLE	p41_orders
+RELATIONSHIP	order_to_customer	p41_orders	REF_TABLE	p41_customers
+RELATIONSHIP	order_to_customer	p41_orders	FOREIGN_KEY	["customer_id"]
+RELATIONSHIP	order_to_customer	p41_orders	REF_KEY	["id"]
+DIMENSION	region	p41_orders	TABLE	p41_orders
+DIMENSION	region	p41_orders	EXPRESSION	o.region
+DIMENSION	region	p41_orders	DATA_TYPE	(empty)
+DIMENSION	customer_name	p41_customers	TABLE	p41_customers
+DIMENSION	customer_name	p41_customers	EXPRESSION	c.name
+DIMENSION	customer_name	p41_customers	DATA_TYPE	(empty)
+METRIC	total_revenue	p41_orders	TABLE	p41_orders
+METRIC	total_revenue	p41_orders	EXPRESSION	SUM(o.amount)
+METRIC	total_revenue	p41_orders	DATA_TYPE	(empty)
+
+# ============================================================
+# Test 3: Facts (DESC-05)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p41_facts AS
+  TABLES (
+    o AS p41_orders PRIMARY KEY (id),
+    li AS p41_line_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o
+  )
+  FACTS (
+    li.net_price AS li.price * li.quantity
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.total_net AS SUM(li.net_price)
+  )
+
+query TTTTT
+DESCRIBE SEMANTIC VIEW p41_facts;
+----
+TABLE	p41_orders	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p41_orders	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p41_orders	(empty)	BASE_TABLE_NAME	p41_orders
+TABLE	p41_orders	(empty)	PRIMARY_KEY	["id"]
+TABLE	p41_line_items	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p41_line_items	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p41_line_items	(empty)	BASE_TABLE_NAME	p41_line_items
+TABLE	p41_line_items	(empty)	PRIMARY_KEY	["id"]
+RELATIONSHIP	li_to_order	p41_line_items	TABLE	p41_line_items
+RELATIONSHIP	li_to_order	p41_line_items	REF_TABLE	p41_orders
+RELATIONSHIP	li_to_order	p41_line_items	FOREIGN_KEY	["order_id"]
+RELATIONSHIP	li_to_order	p41_line_items	REF_KEY	["id"]
+FACT	net_price	p41_line_items	TABLE	p41_line_items
+FACT	net_price	p41_line_items	EXPRESSION	li.price * li.quantity
+FACT	net_price	p41_line_items	DATA_TYPE	(empty)
+DIMENSION	region	p41_orders	TABLE	p41_orders
+DIMENSION	region	p41_orders	EXPRESSION	o.region
+DIMENSION	region	p41_orders	DATA_TYPE	(empty)
+METRIC	total_net	p41_orders	TABLE	p41_orders
+METRIC	total_net	p41_orders	EXPRESSION	SUM(li.net_price)
+METRIC	total_net	p41_orders	DATA_TYPE	(empty)
+
+# ============================================================
+# Test 4: Derived metrics (DESC-07)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p41_derived AS
+  TABLES (o AS p41_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (
+    o.revenue AS SUM(o.amount),
+    profit AS revenue * 0.3
+  )
+
+# revenue is METRIC (has TABLE row, parent_entity=o)
+# profit is DERIVED_METRIC (no TABLE row, parent_entity empty)
+query TTTTT
+DESCRIBE SEMANTIC VIEW p41_derived;
+----
+TABLE	p41_orders	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p41_orders	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p41_orders	(empty)	BASE_TABLE_NAME	p41_orders
+TABLE	p41_orders	(empty)	PRIMARY_KEY	["id"]
+DIMENSION	region	p41_orders	TABLE	p41_orders
+DIMENSION	region	p41_orders	EXPRESSION	o.region
+DIMENSION	region	p41_orders	DATA_TYPE	(empty)
+METRIC	revenue	p41_orders	TABLE	p41_orders
+METRIC	revenue	p41_orders	EXPRESSION	SUM(o.amount)
+METRIC	revenue	p41_orders	DATA_TYPE	(empty)
+DERIVED_METRIC	profit	(empty)	EXPRESSION	revenue * 0.3
+DERIVED_METRIC	profit	(empty)	DATA_TYPE	(empty)
+
+# ============================================================
+# Test 5: Table without PRIMARY KEY (Pitfall 3)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p41_nopk AS
+  TABLES (o AS p41_orders)
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+
+# Only 3 TABLE properties (no PRIMARY_KEY row)
+query TTTTT
+DESCRIBE SEMANTIC VIEW p41_nopk;
+----
+TABLE	p41_orders	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p41_orders	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p41_orders	(empty)	BASE_TABLE_NAME	p41_orders
+DIMENSION	region	p41_orders	TABLE	p41_orders
+DIMENSION	region	p41_orders	EXPRESSION	o.region
+DIMENSION	region	p41_orders	DATA_TYPE	(empty)
+METRIC	total	p41_orders	TABLE	p41_orders
+METRIC	total	p41_orders	EXPRESSION	SUM(o.amount)
+METRIC	total	p41_orders	DATA_TYPE	(empty)
+
+# ============================================================
+# Test 6: Error case -- nonexistent view
+# ============================================================
+
+statement error
+DESCRIBE SEMANTIC VIEW p41_nonexistent;
+----
+does not exist
+
+# ============================================================
+# Test 7: Case insensitivity
+# ============================================================
+
+query TTTTT
+describe semantic view p41_simple;
+----
+TABLE	p41_orders	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p41_orders	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p41_orders	(empty)	BASE_TABLE_NAME	p41_orders
+TABLE	p41_orders	(empty)	PRIMARY_KEY	["id"]
+DIMENSION	region	p41_orders	TABLE	p41_orders
+DIMENSION	region	p41_orders	EXPRESSION	o.region
+DIMENSION	region	p41_orders	DATA_TYPE	(empty)
+METRIC	total	p41_orders	TABLE	p41_orders
+METRIC	total	p41_orders	EXPRESSION	SUM(o.amount)
+METRIC	total	p41_orders	DATA_TYPE	(empty)
+
+# ============================================================
+# Test 8: COUNT(*) verification
+# ============================================================
+
+# Simple view with PK: 4 TABLE + 3 DIM + 3 METRIC = 10 rows
+query I
+SELECT COUNT(*) FROM describe_semantic_view('p41_simple');
+----
+10
+
+# No-PK view: 3 TABLE + 3 DIM + 3 METRIC = 9 rows
+query I
+SELECT COUNT(*) FROM describe_semantic_view('p41_nopk');
+----
+9
+
+# Multi-table view: 4+4 TABLE + 4 REL + 3+3 DIM + 3 METRIC = 21 rows
+query I
+SELECT COUNT(*) FROM describe_semantic_view('p41_multi');
+----
+21
+
+# Derived metrics view: 4 TABLE + 3 DIM + 3 METRIC + 2 DERIVED = 12 rows
+query I
+SELECT COUNT(*) FROM describe_semantic_view('p41_derived');
+----
+12
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p41_simple;
+
+statement ok
+DROP SEMANTIC VIEW p41_multi;
+
+statement ok
+DROP SEMANTIC VIEW p41_facts;
+
+statement ok
+DROP SEMANTIC VIEW p41_derived;
+
+statement ok
+DROP SEMANTIC VIEW p41_nopk;
+
+statement ok
+DROP TABLE p41_line_items;
+
+statement ok
+DROP TABLE p41_orders;
+
+statement ok
+DROP TABLE p41_customers;

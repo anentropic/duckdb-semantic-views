@@ -7,7 +7,7 @@
 SHOW SEMANTIC DIMENSIONS
 ==========================
 
-Lists dimensions registered in one or all semantic views. Each row describes a single dimension with its name, expression, source table, and inferred data type.
+Lists dimensions registered in one or all semantic views. Each row describes a single dimension with its name, source table, and inferred data type.
 
 
 .. _ref-show-dims-syntax:
@@ -73,7 +73,7 @@ When ``LIKE`` and ``STARTS WITH`` are both present, a dimension must satisfy bot
 Output Columns
 ==============
 
-Returns one row per dimension with 5 columns:
+Returns one row per dimension with 6 columns:
 
 .. list-table::
    :header-rows: 1
@@ -82,25 +82,24 @@ Returns one row per dimension with 5 columns:
    * - Column
      - Type
      - Description
+   * - ``database_name``
+     - VARCHAR
+     - The DuckDB database containing the semantic view.
+   * - ``schema_name``
+     - VARCHAR
+     - The DuckDB schema containing the semantic view.
    * - ``semantic_view_name``
      - VARCHAR
      - The semantic view this dimension belongs to.
+   * - ``table_name``
+     - VARCHAR
+     - The physical table name the dimension is scoped to. Empty string if no source table is associated.
    * - ``name``
      - VARCHAR
      - The dimension name as declared in the ``DIMENSIONS`` clause.
-   * - ``expr``
-     - VARCHAR
-     - The SQL expression defining the dimension (e.g., ``c.name``, ``date_trunc('month', o.ordered_at)``).
-   * - ``source_table``
-     - VARCHAR
-     - The table alias the dimension is scoped to. Empty string if no source table is associated.
    * - ``data_type``
      - VARCHAR
-     - The inferred data type of the dimension. Empty string if the type has not been resolved.
-
-.. note::
-
-   The ``data_type`` column is populated only when the extension can infer the output type from the underlying physical table. Computed expressions may show an empty data type.
+     - Reserved for future use. Currently always an empty string for dimensions.
 
 
 .. _ref-show-dims-examples:
@@ -118,13 +117,15 @@ Given a semantic view ``orders_sv`` with three dimensions:
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────────┬──────────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name          │ expr         │ source_table │ data_type │
-   ├──────────────────────┼───────────────┼──────────────┼──────────────┼───────────┤
-   │ orders_sv            │ customer_name │ c.name       │ c            │           │
-   │ orders_sv            │ order_date    │ o.order_date │ o            │           │
-   │ orders_sv            │ region        │ c.region     │ c            │           │
-   └──────────────────────┴───────────────┴──────────────┴──────────────┴───────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────────┬───────────────┬───────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name     │ name          │ data_type │
+   ├───────────────┼─────────────┼──────────────────────┼────────────────┼───────────────┼───────────┤
+   │ memory        │ main        │ orders_sv            │ customers      │ customer_name │           │
+   │ memory        │ main        │ orders_sv            │ orders         │ order_date    │           │
+   │ memory        │ main        │ orders_sv            │ customers      │ region        │           │
+   └───────────────┴─────────────┴──────────────────────┴────────────────┴───────────────┴───────────┘
+
+The ``table_name`` column shows the actual physical table name, not the alias used in the DDL.
 
 **List dimensions across all views:**
 
@@ -134,14 +135,14 @@ Given a semantic view ``orders_sv`` with three dimensions:
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────────┬────────────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name          │ expr           │ source_table │ data_type │
-   ├──────────────────────┼───────────────┼────────────────┼──────────────┼───────────┤
-   │ orders_sv            │ customer_name │ c.name         │ c            │           │
-   │ orders_sv            │ order_date    │ o.order_date   │ o            │           │
-   │ orders_sv            │ region        │ c.region       │ c            │           │
-   │ products_sv          │ product_name  │ p.product_name │ p            │           │
-   └──────────────────────┴───────────────┴────────────────┴──────────────┴───────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────────┬───────────────┬───────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name     │ name          │ data_type │
+   ├───────────────┼─────────────┼──────────────────────┼────────────────┼───────────────┼───────────┤
+   │ memory        │ main        │ orders_sv            │ customers      │ customer_name │           │
+   │ memory        │ main        │ orders_sv            │ orders         │ order_date    │           │
+   │ memory        │ main        │ orders_sv            │ customers      │ region        │           │
+   │ memory        │ main        │ products_sv          │ products       │ product_name  │           │
+   └───────────────┴─────────────┴──────────────────────┴────────────────┴───────────────┴───────────┘
 
 Results are sorted by ``semantic_view_name`` then ``name``.
 
@@ -155,12 +156,12 @@ Find all dimensions whose name contains "name", across all views:
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────────┬────────────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name          │ expr           │ source_table │ data_type │
-   ├──────────────────────┼───────────────┼────────────────┼──────────────┼───────────┤
-   │ orders_sv            │ customer_name │ c.name         │ c            │           │
-   │ products_sv          │ product_name  │ p.product_name │ p            │           │
-   └──────────────────────┴───────────────┴────────────────┴──────────────┴───────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────────┬───────────────┬───────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name     │ name          │ data_type │
+   ├───────────────┼─────────────┼──────────────────────┼────────────────┼───────────────┼───────────┤
+   │ memory        │ main        │ orders_sv            │ customers      │ customer_name │           │
+   │ memory        │ main        │ products_sv          │ products       │ product_name  │           │
+   └───────────────┴─────────────┴──────────────────────┴────────────────┴───────────────┴───────────┘
 
 Because ``LIKE`` is case-insensitive, ``LIKE '%NAME%'`` produces the same results.
 
@@ -172,11 +173,11 @@ Because ``LIKE`` is case-insensitive, ``LIKE '%NAME%'`` produces the same result
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────────┬────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name          │ expr   │ source_table │ data_type │
-   ├──────────────────────┼───────────────┼────────┼──────────────┼───────────┤
-   │ orders_sv            │ customer_name │ c.name │ c            │           │
-   └──────────────────────┴───────────────┴────────┴──────────────┴───────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬───────────────┬───────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name          │ data_type │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼───────────────┼───────────┤
+   │ memory        │ main        │ orders_sv            │ customers  │ customer_name │           │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴───────────────┴───────────┘
 
 **Filter by prefix with STARTS WITH (case-sensitive):**
 
@@ -188,11 +189,11 @@ Find dimensions whose name starts with "customer":
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────────┬────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name          │ expr   │ source_table │ data_type │
-   ├──────────────────────┼───────────────┼────────┼──────────────┼───────────┤
-   │ orders_sv            │ customer_name │ c.name │ c            │           │
-   └──────────────────────┴───────────────┴────────┴──────────────┴───────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬───────────────┬───────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name          │ data_type │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼───────────────┼───────────┤
+   │ memory        │ main        │ orders_sv            │ customers  │ customer_name │           │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴───────────────┴───────────┘
 
 ``STARTS WITH`` is case-sensitive. ``STARTS WITH 'Customer'`` would return no results because the dimension is named ``customer_name`` (lowercase).
 
@@ -204,12 +205,12 @@ Find dimensions whose name starts with "customer":
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────────┬──────────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name          │ expr         │ source_table │ data_type │
-   ├──────────────────────┼───────────────┼──────────────┼──────────────┼───────────┤
-   │ orders_sv            │ customer_name │ c.name       │ c            │           │
-   │ orders_sv            │ order_date    │ o.order_date │ o            │           │
-   └──────────────────────┴───────────────┴──────────────┴──────────────┴───────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────────┬───────────────┬───────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name     │ name          │ data_type │
+   ├───────────────┼─────────────┼──────────────────────┼────────────────┼───────────────┼───────────┤
+   │ memory        │ main        │ orders_sv            │ customers      │ customer_name │           │
+   │ memory        │ main        │ orders_sv            │ orders         │ order_date    │           │
+   └───────────────┴─────────────┴──────────────────────┴────────────────┴───────────────┴───────────┘
 
 **Combine multiple clauses:**
 
@@ -221,11 +222,11 @@ All optional clauses can be combined, following the required order (``LIKE``, ``
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────────┬────────┬──────────────┬───────────┐
-   │ semantic_view_name   │ name          │ expr   │ source_table │ data_type │
-   ├──────────────────────┼───────────────┼────────┼──────────────┼───────────┤
-   │ orders_sv            │ customer_name │ c.name │ c            │           │
-   └──────────────────────┴───────────────┴────────┴──────────────┴───────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬───────────────┬───────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name          │ data_type │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼───────────────┼───────────┤
+   │ memory        │ main        │ orders_sv            │ customers  │ customer_name │           │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴───────────────┴───────────┘
 
 The dimension ``customer_name`` matches both ``LIKE '%name%'`` (contains "name") and ``STARTS WITH 'cust'`` (begins with "cust").
 

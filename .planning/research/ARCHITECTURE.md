@@ -1,566 +1,510 @@
-# Architecture: v0.5.4 Snowflake-Parity & Registry Publishing
+# Architecture: v0.5.5 SHOW/DESCRIBE Alignment & Module Refactoring
 
-**Domain:** DuckDB semantic views extension -- UNIQUE constraints, cardinality inference, multi-version DuckDB, CE registry publishing
-**Researched:** 2026-03-15
-**Confidence:** HIGH (direct codebase analysis, Snowflake official docs, DuckDB extension-ci-tools docs)
+**Domain:** DuckDB semantic views extension -- Snowflake-aligned output formats + module directory refactoring
+**Researched:** 2026-04-01
+**Confidence:** HIGH (direct codebase analysis, Snowflake official docs verified via WebFetch)
 
 ## Executive Summary
 
-v0.5.4 introduces four architectural changes: (1) UNIQUE table constraints with Snowflake-style cardinality inference replacing explicit keywords, (2) multi-version DuckDB support for v1.4.4 and v1.5.0, (3) documentation site, and (4) community extension registry publishing. Features 1 and 2 are the only code-affecting changes. Feature 1 modifies three existing subsystems (body_parser, model, graph) and one expansion function (check_fan_traps). Feature 2 requires build system and CI changes, plus potential C++ shim adjustments for DuckDB 1.5.0 ABI. Features 3 and 4 are infrastructure-only.
+v0.5.5 has two independent work streams: (1) aligning all 6 SHOW/DESCRIBE output formats with Snowflake's column schemas, and (2) splitting the two largest modules (expand.rs at 4,490 lines, graph.rs at 2,502 lines) into module directories. These streams are architecturally independent -- output format changes touch ddl/ VTab files and the catalog/model layer, while the refactoring touches expand.rs, graph.rs, and their import sites. This independence enables parallel development or strict sequencing (refactoring first) without conflict.
 
-### Architecture Principle: Expansion-Only (Unchanged)
+The SHOW/DESCRIBE alignment is a schema-breaking change to 6 VTab implementations. Snowflake's output format differs significantly from the current implementation: DESCRIBE uses a property-per-row format (5 columns: object_kind, object_name, parent_entity, property, property_value) instead of the current single-row-per-view format. SHOW commands need additional columns (database_name, schema_name, synonyms, comment) and must drop the `expr` column that Snowflake does not expose. A `created_on` timestamp must be stored at define time, requiring a catalog schema migration.
 
-All code changes remain within the "expansion-only" preprocessor model. UNIQUE constraints and cardinality inference are define-time metadata changes. The expansion pipeline, query table function, FFI layer, and catalog persistence are unaffected.
+The module refactoring is a zero-behavior-change restructuring that breaks two circular dependencies and splits monoliths into single-responsibility files. The key insight is that `suggest_closest` (Levenshtein utility) and `replace_word_boundary` (string substitution) are pure utilities with no semantic dependency on expansion -- extracting them to `util.rs` breaks the `expand <-> graph` cycle cleanly.
 
-## Feature 1: UNIQUE Constraints + Cardinality Inference
+## Recommended Architecture
 
-### Current State
+### Work Stream 1: SHOW/DESCRIBE Snowflake Alignment
 
-The current TABLES and RELATIONSHIPS syntax:
+#### Current vs Target: DESCRIBE SEMANTIC VIEW
 
-```sql
-TABLES (
-  o AS orders PRIMARY KEY (id),
-  c AS customers PRIMARY KEY (id)
-)
-RELATIONSHIPS (
-  order_to_customer AS o(customer_id) REFERENCES c MANY TO ONE
-)
+**Current** (single row, 6 columns):
+```
+| name | base_table | dimensions | metrics | joins | facts |
+| sales | orders | [{...}] | [{...}] | [{...}] | [{...}] |
 ```
 
-Cardinality is explicitly declared after REFERENCES with `MANY TO ONE`, `ONE TO ONE`, or `ONE TO MANY` keywords. The default when omitted is `ManyToOne` (most common FK pattern).
-
-### Target State (Snowflake-Aligned)
-
-```sql
-TABLES (
-  o AS orders PRIMARY KEY (id),
-  c AS customers PRIMARY KEY (id) UNIQUE (email)
-)
-RELATIONSHIPS (
-  order_to_customer AS o(customer_id) REFERENCES c
-)
+**Target** (Snowflake property-per-row, 5 columns):
+```
+| object_kind | object_name | parent_entity | property | property_value |
+| NULL | NULL | NULL | COMMENT | ... |
+| TABLE | orders | NULL | BASE_TABLE_NAME | orders |
+| TABLE | orders | NULL | PRIMARY_KEY | ["order_id"] |
+| DIMENSION | region | orders | EXPRESSION | o.region |
+| DIMENSION | region | orders | DATA_TYPE | VARCHAR |
+| METRIC | revenue | orders | EXPRESSION | SUM(o.amount) |
+| METRIC | revenue | orders | DATA_TYPE | DOUBLE |
+| RELATIONSHIP | orders_to_customers | orders | FOREIGN_KEY | ["o_custkey"] |
+| RELATIONSHIP | orders_to_customers | orders | REF_TABLE | customers |
+| RELATIONSHIP | orders_to_customers | orders | REF_KEY | ["c_custkey"] |
+| FACT | is_returned | orders | EXPRESSION | o.status = 'returned' |
 ```
 
-Cardinality is INFERRED from PK/UNIQUE declarations. Explicit keywords are removed. The UNIQUE constraint is a new table-level annotation.
+This is the most significant schema change. The current `DescribeSemanticViewVTab` emits 1 row with JSON blob columns. The new format emits N rows (one per property per object), where each semantic view element generates multiple rows (one per property). This better matches Snowflake and is more queryable -- users can `WHERE object_kind = 'DIMENSION'` to filter.
 
-### Component Changes
+**Implementation approach:** Rebuild `describe.rs` entirely. The `DescribeBindData` struct changes from 6 string fields to a `Vec<DescribeRow>` where each row has the 5 Snowflake columns. The `func()` emitter loops over rows like the SHOW VTabs already do. Parse the stored JSON into `SemanticViewDefinition`, then iterate tables, relationships, dimensions, metrics, facts to generate property rows.
 
-#### 1. model.rs -- Add `unique_keys` to `TableRef`
+#### Current vs Target: SHOW SEMANTIC VIEWS
 
-**Modification:** Add a new field to the existing `TableRef` struct.
-
-```rust
-pub struct TableRef {
-    pub alias: String,
-    pub table: String,
-    pub pk_columns: Vec<String>,
-    /// UNIQUE constraint columns for this table.
-    /// Multiple UNIQUE constraints are supported (each is a Vec of columns).
-    /// Snowflake: "If you already identified a column as a primary key column,
-    /// do not add the UNIQUE clause for that column."
-    /// Old stored JSON without this field deserializes with empty Vec.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unique_keys: Vec<Vec<String>>,
-}
+**Current** (2 columns):
+```
+| name | base_table |
 ```
 
-**Rationale for `Vec<Vec<String>>`:** A table may have multiple UNIQUE constraints (e.g., `UNIQUE (email)` and `UNIQUE (phone, country_code)`). Each inner Vec is one constraint covering one or more columns. This matches Snowflake's syntax where multiple UNIQUE clauses are allowed per table.
-
-**Serialization:** `skip_serializing_if = "Vec::is_empty"` ensures backward compatibility -- old definitions without UNIQUE produce identical JSON. Old JSON without the field deserializes to `vec![]` via `#[serde(default)]`.
-
-**Impact on `Cardinality` enum:** The enum itself (`ManyToOne`, `OneToOne`, `OneToMany`) is UNCHANGED. Only the source of the value changes from explicit parse to inference.
-
-#### 2. body_parser.rs -- Parse UNIQUE in TABLES Entries
-
-**Modification to `parse_single_table_entry()`:** Currently parses `alias AS table PRIMARY KEY (cols)`. Must also parse optional `UNIQUE (cols)` clause(s) after PRIMARY KEY.
-
+**Snowflake target** (8 columns):
 ```
-Current: alias AS table PRIMARY KEY (col1, col2)
-New:     alias AS table PRIMARY KEY (col1) [UNIQUE (col2, col3)] [UNIQUE (col4)]
+| created_on | name | kind | database_name | schema_name | comment | owner | owner_role_type |
 ```
 
-**Implementation approach:** After extracting `pk_columns` from `PRIMARY KEY (...)`, check if the remaining text contains one or more `UNIQUE (...)` blocks. Parse each UNIQUE block the same way as PRIMARY KEY -- extract parenthesized comma-separated column names.
-
-**Parser changes (specific):**
-
-1. After the PRIMARY KEY `extract_paren_content()` call at line ~465 of body_parser.rs, consume the rest of the entry text.
-2. In a loop, find the next occurrence of `UNIQUE` keyword (using `find_keyword_ci` with `"UNIQUE"`).
-3. For each `UNIQUE` found, extract the parenthesized content and add to `unique_keys: Vec<Vec<String>>`.
-4. If remaining text after PK contains non-whitespace and non-UNIQUE content, emit a parse error.
-
-**Validation at parse time:**
-- PK columns must not appear in any UNIQUE constraint (Snowflake rule: "do not add UNIQUE for primary key columns").
-- Empty UNIQUE column list is rejected.
-- Duplicate UNIQUE constraints (same column set) are rejected.
-
-#### 3. body_parser.rs -- Remove Explicit Cardinality from RELATIONSHIPS
-
-**Modification to `parse_single_relationship_entry()` and `parse_cardinality_tokens()`:**
-
-**Strategy: Deprecation with backward compat.**
-
-Option A (recommended): **Remove** `parse_cardinality_tokens()` entirely. If any tokens remain after `REFERENCES <to_alias>`, emit a parse error with a helpful message: "Explicit cardinality keywords (MANY TO ONE, etc.) are no longer supported. Cardinality is inferred from PRIMARY KEY and UNIQUE constraints in TABLES."
-
-Option B (gradual): Keep `parse_cardinality_tokens()` but emit a deprecation warning. Infer cardinality from PK/UNIQUE anyway and verify it matches explicit declaration.
-
-**Recommendation: Option A.** This is a pre-release extension (v0.x). Breaking changes are expected. Removing the keywords simplifies the syntax and aligns with Snowflake. Old stored JSON with explicit `cardinality` fields still deserializes correctly via serde defaults -- only the DDL surface changes.
-
-#### 4. graph.rs -- Infer Cardinality at Validation Time
-
-**This is the core architectural decision: WHERE does inference happen?**
-
-**Recommendation: Post-parse, in `validate_graph()` (define-time).**
-
-**Rationale:**
-- The parser (`body_parser.rs`) should not need to cross-reference TABLES and RELATIONSHIPS. It parses each clause independently.
-- Cardinality inference requires knowing BOTH sides of the relationship: the FK-declaring side's constraints AND the referenced side's constraints.
-- `validate_graph()` already has access to the full `SemanticViewDefinition` with both `tables` and `joins`.
-- This follows the existing pattern: graph validation is a post-parse step in `define.rs bind()`.
-
-**Inference algorithm (new function in graph.rs):**
-
-```rust
-/// Infer cardinality for each relationship from PK/UNIQUE constraints.
-///
-/// Called after parsing, before graph validation. Mutates joins in place.
-///
-/// Rules (Snowflake-aligned):
-/// 1. The REFERENCES target column(s) MUST be covered by a PRIMARY KEY or
-///    UNIQUE constraint on the referenced table. If not: error.
-/// 2. If FK-declaring side also has PK or UNIQUE covering the FK columns:
-///    -> OneToOne (both sides are unique, so the mapping is bijective)
-/// 3. Otherwise:
-///    -> ManyToOne (many FK rows map to one PK/UNIQUE row)
-/// 4. OneToMany is the REVERSE of ManyToOne. Since relationships are always
-///    declared from FK side -> PK side, OneToMany only occurs when the
-///    FROM side has PK/UNIQUE on the FK columns AND the TO side does NOT.
-///    This is unusual (it means the "FK" side is actually the unique side)
-///    and would typically indicate the relationship direction is reversed.
-///    Treat this as ManyToOne from the declared direction.
-///
-/// Note: OneToMany as explicitly declared by users in v0.5.3 meant "from
-/// the FROM side's perspective, one row maps to many on the TO side."
-/// Under inference, this case is detected when the TO side has no PK/UNIQUE
-/// covering the referenced columns -- which is an ERROR (references must
-/// point to PK or UNIQUE columns).
-pub fn infer_cardinality(def: &mut SemanticViewDefinition) -> Result<(), String> {
-    // ...
-}
+**Our target** (subset -- no owner/ACL in DuckDB extensions):
+```
+| created_on | name | kind | database_name | schema_name | comment |
 ```
 
-**Detailed inference logic:**
+`kind` is always `SEMANTIC_VIEW`. `comment` is currently not stored (always empty string initially, or add COMMENT support later). `database_name` and `schema_name` come from DuckDB context at bind time. `created_on` requires storing a timestamp at define time.
 
-For each relationship `rel_name AS from_alias(fk_cols) REFERENCES to_alias`:
+#### Current vs Target: SHOW SEMANTIC DIMENSIONS / METRICS
 
-1. Look up `to_alias` in `def.tables`. Get its `pk_columns` and `unique_keys`.
-2. Check if `fk_cols` are "covered" by the referenced table's PK or any UNIQUE:
-   - "Covered" means the FK column set is a subset of (or equal to) the PK column set or any UNIQUE column set.
-   - If the relationship specifies explicit referenced columns (currently not in syntax but implied by PK), the FK columns map 1:1 to PK columns (already validated by `check_fk_pk_counts()`).
-   - If NOT covered: **error** -- "Relationship 'rel_name' references table 'to_alias' but the referenced columns are not covered by PRIMARY KEY or UNIQUE. Add a UNIQUE constraint or adjust the relationship."
-3. If covered by PK or UNIQUE on the TO side (mandatory by step 2), check the FROM side:
-   - Look up `from_alias` in `def.tables`. Get its `pk_columns` and `unique_keys`.
-   - If the FROM side's `fk_cols` are covered by its own PK or any UNIQUE: **OneToOne**.
-   - Otherwise: **ManyToOne**.
-
-**Why OneToMany disappears:** In Snowflake's model, relationships always go from FK side (many) to PK/UNIQUE side (one). The "one to many" direction is simply the reverse traversal of a many-to-one edge. The expansion engine already handles this: `check_fan_traps()` checks BOTH directions on the tree path. A `ManyToOne` edge traversed from PK->FK direction IS the "one to many" fan-out case, which is what fan trap detection catches.
-
-**Wait -- what about existing OneToMany usage in v0.5.3?** The v0.5.3 fan trap tests explicitly create `OneToMany` cardinality. Under inference, these cases work as follows:
-- If the user declares `o(customer_id) REFERENCES c` where `c` has `PRIMARY KEY (id)`, inference produces `ManyToOne`.
-- If the user declares `c(id) REFERENCES o` where `o` does NOT have the referenced columns as PK/UNIQUE, that is an error (references must target PK/UNIQUE).
-- The fan trap detection code in `expand.rs` currently checks edge direction. A `ManyToOne` edge from `o->c` means: traversing `o->c` is safe (many go to one), traversing `c->o` is fan-out. This is semantically IDENTICAL to `OneToMany` on a reverse edge. The existing detection logic works correctly because it checks both `(from, to)` and `(to, from)` lookups in `card_map`.
-
-**Specific changes in expand.rs check_fan_traps():**
-
-The `card_map` construction (lines 1014-1029) uses `j.cardinality` directly. After inference, `j.cardinality` will be either `ManyToOne` or `OneToOne` (never `OneToMany`). The fan trap check at lines 1082-1092 calls `check_path_up()` and `check_path_down()`. These already handle bidirectional traversal:
-- Walking from child to parent (up): a `ManyToOne` edge is safe in this direction.
-- Walking from parent to child (down): a `ManyToOne` edge is FAN-OUT in this direction (one parent maps to many children).
-
-So the existing logic naturally handles the case where `OneToMany` is removed as a variant, because fan-out is detected by DIRECTION of traversal relative to the `ManyToOne` edge. **No changes needed in `check_fan_traps()` itself** -- only the inference step that populates `cardinality` on each `Join`.
-
-**Should `Cardinality::OneToMany` be removed from the enum?**
-
-**Recommendation: YES, remove it.** Under inference, `OneToMany` cannot be produced (it would require the TO side to lack PK/UNIQUE, which is an error). Removing it simplifies the model. However, old stored JSON with `"cardinality": "OneToMany"` must still deserialize. Two options:
-
-- **Option A (recommended):** Keep the enum variant but mark it `#[deprecated]` and have serde deserialize it as `ManyToOne` (with a note that the relationship direction is reversed). Actually, better: keep the three-variant enum for backward compat but never produce `OneToMany` from the inference path. `check_fan_traps()` already handles all three variants correctly.
-
-- **Option B:** Remove the variant, add a custom deserializer that maps `"OneToMany"` to `ManyToOne`. This breaks the semantic meaning of old definitions.
-
-**Final recommendation: Keep `OneToMany` in the enum for serde compatibility. The inference function never produces it. Fan trap detection already handles all three. No code changes needed in expand.rs.**
-
-#### 5. define.rs -- Wire Inference Into Validation Chain
-
-**Modification:** Call `infer_cardinality()` before `validate_graph()`.
-
-```rust
-// In DefineFromJsonVTab::bind():
-
-// Step 1: Infer cardinality from PK/UNIQUE constraints (v0.5.4).
-crate::graph::infer_cardinality(&mut def)
-    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-
-// Step 2: Validate relationship graph (existing).
-crate::graph::validate_graph(&def)
-    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-
-// Step 3+: existing validations unchanged...
+**Current** (5 columns):
+```
+| semantic_view_name | name | expr | source_table | data_type |
 ```
 
-**Important:** `def` must be `mut` for inference to write cardinality values onto `Join` structs. Currently `def` is constructed from `from_json()` and then passed to validations. The mutation happens before any validation, so the flow is clean.
-
-#### 6. Validation: Referenced Columns Must Be PK/UNIQUE
-
-This is a NEW validation that does not exist in v0.5.3. Currently `check_fk_pk_counts()` only verifies that the FK column COUNT matches the PK column COUNT. It does not verify that the referenced table's PK/UNIQUE actually exists.
-
-Under Snowflake-style inference, the referenced side MUST have PK or UNIQUE covering the referenced columns. This validation naturally falls out of the `infer_cardinality()` function (step 2 above produces an error if not covered).
-
-### Data Flow: UNIQUE + Inference
-
+**Snowflake target** (8 columns):
 ```
-DDL Input
-  |
-  v
-body_parser.rs
-  |  parse_single_table_entry()  -> TableRef { pk_columns, unique_keys }
-  |  parse_single_relationship_entry() -> Join { cardinality: ManyToOne (default) }
-  |  (no explicit cardinality keywords parsed)
-  |
-  v
-define.rs bind()
-  |
-  v
-graph::infer_cardinality(&mut def)
-  |  For each Join:
-  |    1. Check TO side has PK/UNIQUE covering referenced cols -> error if not
-  |    2. Check FROM side has PK/UNIQUE covering FK cols -> OneToOne if yes, ManyToOne if no
-  |    3. Write inferred cardinality onto Join.cardinality
-  |
-  v
-graph::validate_graph(&def)    (existing, unchanged)
-  |  check_fk_pk_counts()      (existing, now also covered by inference)
-  |  check_no_diamonds()       (existing, unchanged)
-  |  check_no_orphans()        (existing, unchanged)
-  |
-  v
-Stored as JSON               (Join.cardinality serialized as before)
-  |
-  v
-expand.rs                    (reads Join.cardinality, unchanged)
-  |  check_fan_traps()        (uses cardinality from Join, unchanged)
-  |  resolve_joins_pkfk()     (unchanged)
-  |
-  v
-Final SQL
+| database_name | schema_name | semantic_view_name | table_name | name | data_type | synonyms | comment |
 ```
 
-## Feature 2: Multi-Version DuckDB Support
+Key changes: (a) drop `expr` (Snowflake does not expose expressions in SHOW output), (b) rename `source_table` to `table_name`, (c) add `database_name`, `schema_name`, `synonyms`, `comment` columns, (d) reorder columns to match Snowflake.
 
-### Current State
+#### Current vs Target: SHOW SEMANTIC FACTS
 
-- Cargo.toml pins `duckdb = "=1.4.4"` and `libduckdb-sys = "=1.4.4"`
-- `.duckdb-version` file contains `v1.4.4`
-- Build.yml uses `extension-ci-tools@v1.4.4`
-- C++ shim compiled against DuckDB 1.4.4 amalgamation (`cpp/include/duckdb.hpp`)
-- DuckDB 1.5.0 released 2026-03-09 (6 days ago)
-- duckdb-rs 1.5.0 crate appears to be available
+Same pattern as dimensions/metrics but facts have no `data_type` in current output. Snowflake SHOW SEMANTIC FACTS likely follows the same 8-column schema as dimensions/metrics (with data_type for facts).
 
-### Multi-Version Strategy
+#### Current vs Target: SHOW SEMANTIC DIMENSIONS FOR METRIC
 
-DuckDB extension binaries are **version-pinned** -- a binary built for v1.4.4 cannot load in v1.5.0. The extension-ci-tools repository maintains separate branches per DuckDB version (v1.4.4, v1.5.0). Multi-version support means building and distributing SEPARATE binaries for each supported DuckDB version.
-
-**Recommendation: Git branching, NOT conditional compilation.**
-
-#### Why NOT `#[cfg]` Conditional Compilation
-
-Conditional compilation (`#[cfg(duckdb_version = "1.4")]`) is the wrong abstraction here because:
-
-1. **The Rust code is identical across versions.** The semantic views extension uses the DuckDB C API (via duckdb-rs) and C++ API (via amalgamation). The Rust business logic (parsing, model, graph, expand) does not depend on DuckDB version.
-
-2. **Version differences are in dependencies, not in code paths.** The only things that change between v1.4.4 and v1.5.0 are:
-   - `Cargo.toml`: `duckdb = "=1.4.4"` vs `duckdb = "=1.5.0"`
-   - `Cargo.toml`: `libduckdb-sys = "=1.4.4"` vs `libduckdb-sys = "=1.5.0"`
-   - `.duckdb-version`: `v1.4.4` vs `v1.5.0`
-   - `cpp/include/duckdb.hpp` and `cpp/include/duckdb.cpp`: amalgamation files matching the target version
-   - Build.yml: `extension-ci-tools@v1.4.4` vs `extension-ci-tools@v1.5.0`
-
-3. **If the C API changes between versions** (e.g., DuckDB 1.5.0 adds a new PEG parser that changes `ParserExtension` behavior), the fix would be in the C++ shim (`shim.cpp`), not in Rust code behind `#[cfg]` flags. And the duckdb-rs/libduckdb-sys crate would handle Rust-side API changes.
-
-4. **The DuckDB community extension ecosystem uses separate branches per version.** This is the established pattern: extension-ci-tools has `v1.4.4` and `v1.5.0` branches. Fighting this pattern adds complexity for no benefit.
-
-#### Recommended Branch Strategy
-
+**Current** (5 columns):
 ```
-main                  -> latest DuckDB (1.5.0), primary development
-  |
-  +-- v1.4.x          -> DuckDB 1.4.4 LTS backport branch
+| semantic_view_name | name | expr | source_table | data_type |
 ```
 
-**Workflow:**
-1. All new feature development happens on `main` targeting DuckDB 1.5.0.
-2. After each milestone, cherry-pick or merge fixes to `v1.4.x` branch.
-3. CI builds both branches. Each produces separate extension binaries.
-4. Community extension registry submission includes both versions.
-
-**What lives on the `v1.4.x` branch:**
-- Identical Rust source code (same `src/` directory)
-- `Cargo.toml` with `duckdb = "=1.4.4"`, `libduckdb-sys = "=1.4.4"`
-- DuckDB 1.4.4 amalgamation in `cpp/include/`
-- `.duckdb-version` set to `v1.4.4`
-- Build.yml targeting `extension-ci-tools@v1.4.4`
-
-### C++ Shim ABI Considerations
-
-The C++ shim (`cpp/src/shim.cpp`) uses these DuckDB C++ types:
-- `ParserExtension` (parse_function, plan_function)
-- `ParserExtensionParseResult`
-- `ParserExtensionParseData`
-- `ParserExtensionPlanResult`
-- `TableFunction`
-- `FunctionData`, `GlobalTableFunctionState`
-- `ClientContext`, `TableFunctionBindInput`, `TableFunctionInput`
-- `DataChunk`
-- `DBConfig`, `DatabaseWrapper`
-- `LogicalType::VARCHAR`
-- `Value`, `StringValue`
-
-**DuckDB 1.5.0 risk: PEG parser.** DuckDB 1.5.0 ships an experimental PEG parser (disabled by default, opt-in via `CALL enable_peg_parser()`). The traditional parser and `ParserExtension` hooks are **still the default** in 1.5.0. The PEG parser "allows extensions to extend the grammar" but the mechanism may differ from `ParserExtension`.
-
-**Action items:**
-1. Build against DuckDB 1.5.0 amalgamation and verify `shim.cpp` compiles without changes.
-2. Test that parser hooks work as before (CREATE SEMANTIC VIEW, DROP, DESCRIBE, SHOW).
-3. Test with PEG parser enabled (`CALL enable_peg_parser()`) to see if extension hooks still fire.
-4. If PEG parser breaks the hooks: document incompatibility, recommend keeping PEG parser disabled.
-
-**Likely outcome:** The 1.5.0 transition should be smooth. The `ParserExtension` API is the same C++ interface. The amalgamation compilation may need the existing Windows patching logic updated (new `#include` patterns), but the macOS/Linux path should be unchanged.
-
-### CI Architecture for Dual-Version Builds
-
-#### Current CI Structure
-
+**Snowflake target** (6 columns):
 ```
-Build.yml
-  |
-  +-- duckdb-stable-build (v1.4.4)
-       uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
+| table_name | name | data_type | required | synonyms | comment |
 ```
 
-#### Proposed CI Structure
+Key changes: (a) drop `expr`, `source_table` renamed to `table_name`, (b) add `required` boolean column (whether metric mandates this dimension), (c) add `synonyms`, `comment`, (d) remove `semantic_view_name` (single-view-only command).
+
+### Work Stream 2: Module Directory Refactoring
+
+#### Target Module Structure
 
 ```
-Build.yml
-  |
-  +-- duckdb-latest-build (v1.5.0) -- runs on main branch
-  |    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.0
-  |
-  +-- duckdb-lts-build (v1.4.4) -- runs on v1.4.x branch
-       uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
-
-DuckDBVersionMonitor.yml
-  |
-  +-- Now monitors for new DuckDB releases on BOTH branches
-  +-- Opens PRs against main (latest) and v1.4.x (LTS)
+src/
+  expand/
+    mod.rs          - pub fn expand(), QueryRequest, ExpandError re-exports
+    validate.rs     - request validation, duplicate checks
+    resolve.rs      - find_dimension, find_metric resolution
+    facts.rs        - toposort_facts, inline_facts, toposort_derived, inline_derived_metrics
+    fan_trap.rs     - check_fan_traps, ancestors_to_root
+    role_playing.rs - find_using_context, dim_scoped_aliases
+    join_resolver.rs - resolve_joins_pkfk, synthesize_on_clause
+    sql_gen.rs      - SELECT/FROM/JOIN/WHERE/GROUP BY assembly, quote_ident, quote_table_ref
+  graph/
+    mod.rs          - RelationshipGraph struct, from_definition, toposort, check_no_diamonds, check_no_orphans
+    relationship.rs - validate_graph (orchestrator calling graph methods)
+    facts.rs        - validate_facts, find_fact_references
+    derived_metrics.rs - validate_derived_metrics, contains_aggregate_function
+    using.rs        - validate_using_relationships
+  util.rs           - suggest_closest, replace_word_boundary (NEW)
+  errors.rs         - ParseError (NEW, extracted from parse.rs)
 ```
 
-**Alternatively (simpler):** Keep Build.yml on `main` targeting v1.5.0 only. The `v1.4.x` branch has its own Build.yml targeting v1.4.4. Each branch is self-contained. The DuckDB Version Monitor only watches `main`.
+#### Dependency Graph After Refactoring
 
-**Recommendation: Keep it simple.** Each branch owns its own Build.yml with the appropriate version. No matrix builds across versions. The `v1.4.x` branch is a backport branch with minimal maintenance.
-
-### Cargo.toml Changes for v1.5.0
-
-```toml
-[dependencies]
-duckdb = { version = "=1.5.0", default-features = false }
-libduckdb-sys = "=1.5.0"
+```
+errors.rs     <- parse.rs, body_parser.rs  (breaks parse <-> body_parser cycle)
+util.rs       <- expand/*, graph/*, ddl/show_dims_for_metric.rs  (breaks expand <-> graph cycle)
+model.rs      <- expand/*, graph/*, catalog.rs, parse.rs, body_parser.rs, ddl/*, query/*
+graph/mod.rs  <- expand/fan_trap.rs, expand/join_resolver.rs, ddl/define.rs, ddl/show_dims_for_metric.rs
+expand/mod.rs <- query/table_function.rs, query/explain.rs, query/error.rs, ddl/define.rs
+catalog.rs    <- ddl/define.rs, ddl/drop.rs, ddl/list.rs, ddl/describe.rs, query/table_function.rs
 ```
 
-**Risk:** If `duckdb-rs` 1.5.0 has breaking API changes (renamed methods, changed traits), the Rust code may need updates. Check the `duckdb-rs` changelog before upgrading.
+All arrows flow one direction. No circular dependencies.
 
-**build.rs changes:** The Windows patching logic in `patch_duckdb_cpp_for_windows()` checks for specific string markers in `duckdb.cpp`. DuckDB 1.5.0 may have different line numbers or patterns. The patching is already defensive (emits a `cargo:warning` if markers are not found), so it degrades gracefully.
+### Component Boundaries
 
-## Feature 3: Documentation Site
+| Component | Responsibility | Communicates With |
+|-----------|---------------|-------------------|
+| `util.rs` (NEW) | String similarity (Levenshtein), word-boundary replacement | None (leaf module) |
+| `errors.rs` (NEW) | `ParseError` struct with byte-offset position | None (leaf module) |
+| `expand/mod.rs` | Public API: `expand()`, `QueryRequest`, `ExpandError` | `expand/*` submodules, `graph/mod.rs`, `model.rs` |
+| `expand/validate.rs` | Request validation (empty check, duplicate dims/metrics) | `model.rs`, `util.rs` |
+| `expand/resolve.rs` | Dimension/metric name resolution | `model.rs`, `util.rs` |
+| `expand/facts.rs` | Fact DAG toposort, expression inlining, derived metric resolution | `model.rs`, `util.rs` |
+| `expand/fan_trap.rs` | Cardinality-aware fan trap detection + `ancestors_to_root` | `model.rs`, `graph/mod.rs` |
+| `expand/role_playing.rs` | USING RELATIONSHIPS + scoped aliases | `model.rs` |
+| `expand/join_resolver.rs` | PK/FK join resolution, ON clause synthesis | `model.rs`, `graph/mod.rs` |
+| `expand/sql_gen.rs` | SQL string assembly, identifier quoting | `model.rs` |
+| `graph/mod.rs` | `RelationshipGraph` struct + construction | `model.rs` |
+| `graph/relationship.rs` | Graph validation orchestrator | `graph/mod.rs`, `model.rs`, `util.rs` |
+| `graph/facts.rs` | Fact reference detection + validation | `model.rs`, `util.rs` |
+| `graph/derived_metrics.rs` | Derived metric validation, aggregate detection | `model.rs`, `util.rs` |
+| `graph/using.rs` | USING RELATIONSHIPS validation | `model.rs`, `util.rs` |
+| `catalog.rs` | In-memory cache + `_definitions` table persistence | `model.rs` |
+| `ddl/describe.rs` | DESCRIBE SEMANTIC VIEW (property-per-row format) | `catalog.rs`, `model.rs` |
+| `ddl/list.rs` | SHOW SEMANTIC VIEWS | `catalog.rs`, `model.rs` |
+| `ddl/show_dims.rs` | SHOW SEMANTIC DIMENSIONS | `catalog.rs`, `model.rs` |
+| `ddl/show_metrics.rs` | SHOW SEMANTIC METRICS | `catalog.rs`, `model.rs` |
+| `ddl/show_facts.rs` | SHOW SEMANTIC FACTS | `catalog.rs`, `model.rs` |
+| `ddl/show_dims_for_metric.rs` | SHOW SEMANTIC DIMS FOR METRIC | `catalog.rs`, `model.rs`, `graph/mod.rs`, `util.rs` |
 
-**Architecture impact: NONE.** This is a static site (likely Zensical on GitHub Pages) generated from markdown. No code changes.
+### Data Flow
 
-**Build integration:** Add a GitHub Actions workflow that builds the docs site and deploys to GitHub Pages on push to `main`.
+**SHOW/DESCRIBE flow:**
+```
+DDL SQL -> parse.rs (detect_ddl_prefix) -> rewrite to SELECT * FROM vtab_fn(...)
+-> DuckDB calls VTab::bind() -> catalog.read().get(name) -> JSON string
+-> SemanticViewDefinition::from_json() -> collect rows from definition
+-> VTab::func() -> emit rows into DataChunkHandle
+```
 
-## Feature 4: Community Extension Registry Publishing
-
-**Architecture impact: MINIMAL.** Requires:
-1. A `description.yml` file in the repo root (already partially exists via the extension template).
-2. A PR to `duckdb/community-extensions` repository.
-3. Verification that the extension loads correctly via `INSTALL semantic_views FROM community; LOAD semantic_views;`.
-
-**description.yml considerations:**
-- `extension.version` is a freeform string (not enforced scheme).
-- The build must produce artifacts matching the expected layout (handled by extension-ci-tools).
-- Multi-version: may need separate description.yml per DuckDB version, or the CE infrastructure handles version routing.
-
-## Component Boundaries (v0.5.4 Summary)
-
-| Component | Change Type | What Changes | Risk |
-|-----------|------------|--------------|------|
-| `model.rs` | MODIFY | Add `unique_keys: Vec<Vec<String>>` to `TableRef` | Low -- additive serde field |
-| `body_parser.rs` | MODIFY | Parse UNIQUE in TABLES; remove cardinality keywords from RELATIONSHIPS | Medium -- two parser changes |
-| `graph.rs` | MODIFY | Add `infer_cardinality()` function | Medium -- new inference logic |
-| `define.rs` | MODIFY | Wire `infer_cardinality()` before `validate_graph()` | Low -- one new call |
-| `expand.rs` | NONE | Reads `Join.cardinality` as before | None |
-| `shim.cpp` | VERIFY | May need recompile against 1.5.0 amalgamation | Low-Medium |
-| `build.rs` | VERIFY | Windows patches may need updating for 1.5.0 | Low |
-| `Cargo.toml` | MODIFY | Version pin update to 1.5.0 | Low |
-| `.duckdb-version` | MODIFY | Update to v1.5.0 | None |
-| `Build.yml` | MODIFY | Update extension-ci-tools tag | Low |
-| `description.yml` | NEW | CE registry descriptor | None |
+**New data needed for SHOW/DESCRIBE alignment:**
+```
+created_on:     stored in catalog at define time (new field in JSON or new DB column)
+database_name:  extracted from DuckDB connection context at bind time
+schema_name:    extracted from DuckDB connection context at bind time
+comment:        stored in definition (empty string initially; support COMMENT ON later)
+synonyms:       stored in definition (empty array initially; support SYNONYMS later)
+required:       computed at bind time from metric definition (FOR METRIC command only)
+```
 
 ## Patterns to Follow
 
-### Pattern 1: Post-Parse Inference (New)
+### Pattern 1: Module Directory with Re-exports
 
-**What:** Compute derived metadata from parsed structures before validation.
-**When:** When a property depends on cross-referencing multiple parsed clauses.
-**Example:**
+**What:** Convert `foo.rs` to `foo/mod.rs` that re-exports the public API, with internal submodules for each responsibility.
 
+**When:** A single file exceeds ~500 lines and contains 3+ distinct responsibilities.
+
+**Example (expand/mod.rs):**
 ```rust
-// In define.rs bind(), AFTER parsing, BEFORE validation:
-let mut def = SemanticViewDefinition::from_json(&name, &json)?;
+mod validate;
+mod resolve;
+mod facts;
+mod fan_trap;
+mod role_playing;
+mod join_resolver;
+mod sql_gen;
 
-// Infer cardinality from PK/UNIQUE (v0.5.4)
-graph::infer_cardinality(&mut def)?;
+// Re-export public API -- external callers see no change
+pub use self::validate::QueryRequest;
+pub use self::resolve::ExpandError;
+pub use self::sql_gen::{quote_ident, quote_table_ref};
 
-// Validate graph (existing)
-graph::validate_graph(&def)?;
+// The main expand function orchestrates submodules
+pub fn expand(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    request: &QueryRequest,
+) -> Result<String, ExpandError> {
+    validate::check_request(request, view_name)?;
+    let dims = resolve::resolve_dimensions(request, def, view_name)?;
+    let mets = resolve::resolve_metrics(request, def, view_name)?;
+    // ... orchestrate pipeline steps
+}
+
+// Re-export internal items needed by ddl/show_dims_for_metric.rs
+pub(crate) use self::fan_trap::ancestors_to_root;
+pub(crate) use self::facts::collect_derived_metric_source_tables;
 ```
 
-**Why this pattern:** The parser should not need context from other clauses. Inference is a semantic pass that runs after syntactic parsing is complete. This separates concerns: body_parser.rs handles syntax, graph.rs handles semantics.
+**Why:** External callers (`query/table_function.rs`, `ddl/define.rs`) see the same `crate::expand::expand`, `crate::expand::QueryRequest` paths. Zero breaking changes to import sites. Internal complexity is hidden.
 
-### Pattern 2: Backward-Compatible Serde Fields
+### Pattern 2: Leaf Utility Module
 
-**What:** Adding new optional fields to serialized structs without breaking old JSON.
-**When:** Any model.rs struct change.
-**Example:**
+**What:** Extract pure functions with no domain dependencies into a shared utility module.
 
+**When:** A function is imported across module boundaries and creates a circular dependency.
+
+**Example (util.rs):**
 ```rust
-#[serde(default, skip_serializing_if = "Vec::is_empty")]
-pub unique_keys: Vec<Vec<String>>,
-```
+/// Suggest the closest matching name using Levenshtein distance.
+/// Returns Some(name) if edit distance <= 3.
+pub fn suggest_closest(name: &str, available: &[String]) -> Option<String> {
+    // ... (moved from expand.rs, unchanged)
+}
 
-**Rules:**
-- Always use `#[serde(default)]` for new fields.
-- Use `skip_serializing_if` to avoid bloating JSON for definitions that don't use the feature.
-- Write a test verifying old JSON without the field deserializes correctly.
-
-### Pattern 3: Helpful Error Messages for Syntax Changes
-
-**What:** When removing syntax, provide a clear migration message.
-**When:** Breaking DDL changes.
-**Example:**
-
-```rust
-// If tokens remain after REFERENCES <to_alias>:
-if !remaining_tokens.is_empty() {
-    return Err(ParseError {
-        message: format!(
-            "Unexpected tokens after REFERENCES target in relationship '{rel_name}': \
-             '{}'. Explicit cardinality (MANY TO ONE, etc.) is no longer supported; \
-             cardinality is inferred from PRIMARY KEY and UNIQUE constraints in TABLES.",
-            remaining_tokens.join(" ")
-        ),
-        position: Some(entry_offset),
-    });
+/// Replace all word-boundary-delimited occurrences of needle with replacement.
+pub(crate) fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) -> String {
+    // ... (moved from expand.rs, unchanged)
 }
 ```
 
+**Why:** Breaks `expand <-> graph` circular dependency. Both modules import from `util` instead of each other. The dependency graph becomes a clean DAG.
+
+### Pattern 3: Property-Per-Row VTab Output
+
+**What:** Emit N rows per entity, one per property, instead of one row with all properties.
+
+**When:** Aligning with Snowflake's DESCRIBE output format.
+
+**Example (describe.rs new pattern):**
+```rust
+struct DescribeRow {
+    object_kind: Option<String>,   // NULL, TABLE, DIMENSION, METRIC, etc.
+    object_name: Option<String>,
+    parent_entity: Option<String>,
+    property: String,
+    property_value: String,
+}
+
+fn collect_describe_rows(def: &SemanticViewDefinition) -> Vec<DescribeRow> {
+    let mut rows = Vec::new();
+    // Semantic view-level properties
+    rows.push(DescribeRow {
+        object_kind: None, object_name: None, parent_entity: None,
+        property: "COMMENT".into(), property_value: "".into(),
+    });
+    // Table-level properties
+    for table in &def.tables {
+        rows.push(DescribeRow {
+            object_kind: Some("TABLE".into()),
+            object_name: Some(table.alias.clone()),
+            parent_entity: None,
+            property: "BASE_TABLE_NAME".into(),
+            property_value: table.table.clone(),
+        });
+        if !table.pk_columns.is_empty() {
+            rows.push(DescribeRow {
+                object_kind: Some("TABLE".into()),
+                object_name: Some(table.alias.clone()),
+                parent_entity: None,
+                property: "PRIMARY_KEY".into(),
+                property_value: format!("{:?}", table.pk_columns),
+            });
+        }
+    }
+    // Dimension properties (EXPRESSION + DATA_TYPE per dimension)
+    for dim in &def.dimensions {
+        let parent = dim.source_table.clone().unwrap_or_else(|| {
+            def.tables.first().map(|t| t.alias.clone()).unwrap_or_default()
+        });
+        rows.push(DescribeRow {
+            object_kind: Some("DIMENSION".into()),
+            object_name: Some(dim.name.clone()),
+            parent_entity: Some(parent.clone()),
+            property: "EXPRESSION".into(),
+            property_value: dim.expr.clone(),
+        });
+        if let Some(ref dt) = dim.output_type {
+            rows.push(DescribeRow {
+                object_kind: Some("DIMENSION".into()),
+                object_name: Some(dim.name.clone()),
+                parent_entity: Some(parent),
+                property: "DATA_TYPE".into(),
+                property_value: dt.clone(),
+            });
+        }
+    }
+    // ... metrics, relationships, facts similarly
+    rows
+}
+```
+
+### Pattern 4: Catalog Schema Migration for created_on
+
+**What:** Add a `created_on` timestamp field to stored definitions.
+
+**When:** SHOW SEMANTIC VIEWS needs a `created_on` column.
+
+**Approach:** Store `created_on` as an ISO 8601 string inside the JSON definition. At define time, inject `Utc::now()` (or DuckDB's `current_timestamp`). For backward compatibility, existing definitions without `created_on` get a fallback value (e.g., empty string or epoch).
+
+```rust
+// In model.rs
+pub struct SemanticViewDefinition {
+    // ... existing fields
+    #[serde(default)]
+    pub created_on: Option<String>,  // ISO 8601 timestamp, None for pre-v0.5.5 defs
+}
+```
+
+**Why not a new DB column?** The `_definitions` table stores `(name VARCHAR, definition VARCHAR)`. Adding a column requires ALTER TABLE migration logic. Embedding `created_on` in the JSON definition is simpler and backward-compatible -- `serde(default)` handles missing fields automatically. The tradeoff is that the timestamp is not independently queryable via SQL on the catalog table, but SHOW SEMANTIC VIEWS is the user-facing query path.
+
+### Pattern 5: Database/Schema Context from DuckDB
+
+**What:** Extract `database_name` and `schema_name` from DuckDB connection context at VTab bind time.
+
+**Approach:** Execute `SELECT current_database(), current_schema()` via the query connection, or use pragmas. Since VTab bind has access to `BindInfo` which provides `get_extra_info<CatalogState>()`, the database/schema can be injected as additional context alongside the catalog state.
+
+Alternative: Store `database_name` and `schema_name` in the JSON definition at define time (same approach as `created_on`). This is simpler and avoids runtime SQL execution during bind.
+
+**Recommendation:** Store in JSON at define time. Simpler, deterministic, no bind-time SQL needed. If the database/schema changes after creation (unlikely for extension-managed objects), the stored values reflect creation context (which matches Snowflake behavior).
+
 ## Anti-Patterns to Avoid
 
-### Anti-Pattern 1: Conditional Compilation for DuckDB Versions
+### Anti-Pattern 1: Big-Bang Refactoring
 
-**What:** Using `#[cfg(duckdb_14)]` or `#[cfg(duckdb_15)]` to handle version differences.
-**Why bad:** The Rust code is version-independent. Differences are in dependencies and amalgamation, not code paths. `#[cfg]` flags create maintenance burden and untestable code paths.
-**Instead:** Use separate git branches per DuckDB version. Each branch has its own Cargo.toml and amalgamation files.
+**What:** Trying to do the module split and output format changes in a single commit.
 
-### Anti-Pattern 2: Runtime Version Detection
+**Why bad:** If tests break, you cannot tell whether the issue is from the refactoring (should be behavior-preserving) or the output format change (intentionally changes behavior). Debugging is 2x harder.
 
-**What:** Checking DuckDB version at runtime and branching behavior.
-**Why bad:** Extension binaries are already version-pinned. They can only load in the exact DuckDB version they were compiled for. Runtime detection is redundant.
-**Instead:** Rely on compile-time version pinning via Cargo.toml and amalgamation.
+**Instead:** Refactoring first, then output format changes. Each phase should pass `just test-all` independently.
 
-### Anti-Pattern 3: Inference During Parsing
+### Anti-Pattern 2: Changing Public API During Module Split
 
-**What:** Having `parse_single_relationship_entry()` look up TABLES to infer cardinality.
-**Why bad:** Creates coupling between parser and model. The parser operates on text; inference operates on structured data. Mixing them makes both harder to test and maintain.
-**Instead:** Parse produces `Join` with default `ManyToOne`. Inference updates it with correct value in a separate pass.
+**What:** Renaming functions, changing signatures, or reorganizing the public API while splitting files.
 
-### Anti-Pattern 4: Removing Cardinality from the Serialized Model
+**Why bad:** Creates unnecessary churn in import sites. Every caller must be updated simultaneously. Increases merge conflict surface.
 
-**What:** Removing the `cardinality` field from `Join` in the JSON representation.
-**Why bad:** Breaks backward compatibility with stored definitions. Forces re-inference every time a definition is loaded.
-**Instead:** Keep `cardinality` in JSON. Inference writes the value at define time. At query time, the stored value is read directly with no re-inference needed.
+**Instead:** The `expand/mod.rs` re-exports everything at the same `crate::expand::*` paths. All existing `use crate::expand::{expand, suggest_closest, QueryRequest}` statements continue to work unchanged. Internal reorganization is invisible to callers.
 
-## Suggested Build Order
+### Anti-Pattern 3: Mixing VTab Schema Changes with Logic Changes
 
-Build order is driven by dependencies and risk.
+**What:** Changing output columns AND changing the data collection logic (e.g., fan trap filtering in show_dims_for_metric) in the same phase.
 
-### Phase 1: UNIQUE Parsing + Cardinality Inference
+**Why bad:** If a sqllogictest fails, unclear whether the column schema is wrong or the data logic is wrong.
 
-**Scope:** model.rs, body_parser.rs, graph.rs, define.rs changes for UNIQUE + inference.
-**Dependencies:** None (self-contained).
-**Tests:** Unit tests for UNIQUE parsing, inference logic, backward compat serde, fan trap detection with inferred cardinality.
+**Instead:** Change output columns first (schema alignment), verify all tests pass, then make any logic changes (e.g., adding `required` boolean computation).
 
-**Sub-steps:**
-1. Add `unique_keys` to `TableRef` in model.rs + serde tests.
-2. Parse UNIQUE in `parse_single_table_entry()` in body_parser.rs + parser tests.
-3. Remove explicit cardinality parsing from `parse_single_relationship_entry()` + error message for old syntax.
-4. Implement `infer_cardinality()` in graph.rs + unit tests.
-5. Wire inference into define.rs bind chain.
-6. Update all existing tests that use explicit cardinality keywords.
-7. Update sqllogictest files for new syntax.
+### Anti-Pattern 4: Using DuckDB Timestamps for created_on
 
-### Phase 2: DuckDB 1.5.0 Upgrade
+**What:** Calling DuckDB's `current_timestamp` during VTab bind to populate `created_on`.
 
-**Scope:** Cargo.toml, .duckdb-version, amalgamation files, Build.yml, potential shim.cpp changes.
-**Dependencies:** Phase 1 should be complete (don't mix feature changes with version changes).
+**Why bad:** Bind happens at query time, not define time. The timestamp would reflect when SHOW was run, not when the view was created.
 
-**Sub-steps:**
-1. Update Cargo.toml to `duckdb = "=1.5.0"`, `libduckdb-sys = "=1.5.0"`.
-2. Download DuckDB 1.5.0 amalgamation (`duckdb.hpp`, `duckdb.cpp`).
-3. Run `cargo test` -- fix any duckdb-rs API changes.
-4. Run `just build` -- verify shim.cpp compiles against 1.5.0 amalgamation.
-5. Run `just test-sql` -- verify all sqllogictest pass.
-6. Test with PEG parser enabled.
-7. Update Build.yml to `extension-ci-tools@v1.5.0`.
-8. Create `v1.4.x` backport branch from pre-upgrade commit.
-
-### Phase 3: Documentation Site
-
-**Scope:** GitHub Pages setup, markdown content, deployment workflow.
-**Dependencies:** None (can run in parallel with Phase 1 or 2).
-
-### Phase 4: Community Extension Registry Publishing
-
-**Scope:** description.yml, PR to duckdb/community-extensions, LOAD verification.
-**Dependencies:** Phase 2 (need builds for current DuckDB version).
-
-**Sub-steps:**
-1. Create `description.yml` with correct metadata.
-2. Test local `INSTALL` and `LOAD` against built extension binary.
-3. Open PR to duckdb/community-extensions.
-4. Monitor CI in the community-extensions repo.
+**Instead:** Capture the timestamp in the define path (ddl/define.rs) and store it in the JSON definition.
 
 ## Scalability Considerations
 
-| Concern | Impact | Notes |
-|---------|--------|-------|
-| UNIQUE constraints per table | Negligible | Linear scan of unique_keys during inference; tables count is small (< 20) |
-| Inference pass | O(J * T) where J=joins, T=tables | Both are small; no concern |
-| Backport branch maintenance | Low | Only Cargo.toml and amalgamation differ; Rust code is shared |
-| PEG parser compatibility | Unknown | DuckDB 1.5.0 PEG parser is experimental and off by default; monitor for future impact |
+Not applicable for this milestone -- the changes are structural (module organization) and schema-level (output formats). No performance-sensitive paths are modified. The expansion pipeline, which is the hot path, is only touched by the refactoring (file reorganization), not by behavioral changes.
+
+## Recommended Build Order
+
+The sequencing below minimizes risk by establishing the refactored module structure first (behavior-preserving), then making schema changes on top of the clean structure.
+
+### Phase A: Extract Shared Utilities (C3 + C5)
+
+**New files:** `src/util.rs`, `src/errors.rs`
+**Modified files:** `src/lib.rs` (add `mod util; mod errors;`), `src/expand.rs`, `src/graph.rs`, `src/parse.rs`, `src/body_parser.rs`, `src/ddl/show_dims_for_metric.rs`
+**Risk:** LOW -- moving 2 functions and 1 struct to new files, updating import paths.
+**Validation:** `just test-all` must pass. Zero behavior change.
+
+Steps:
+1. Create `src/util.rs` with `suggest_closest` and `replace_word_boundary` (copy from expand.rs).
+2. Create `src/errors.rs` with `ParseError` (copy from parse.rs).
+3. Update `expand.rs`: remove `suggest_closest` and `replace_word_boundary` definitions, add `use crate::util::{suggest_closest, replace_word_boundary};`
+4. Update `graph.rs`: change `use crate::expand::suggest_closest` to `use crate::util::suggest_closest;`
+5. Update `parse.rs`: remove `ParseError` definition, add `pub use crate::errors::ParseError;` (re-export for backward compat).
+6. Update `body_parser.rs`: change `use crate::parse::ParseError` to `use crate::errors::ParseError;`
+7. Update `show_dims_for_metric.rs`: change `use crate::expand::suggest_closest` to `use crate::util::suggest_closest;`
+8. Run `just test-all`.
+
+### Phase B: Split expand.rs into expand/ Module Directory (C1)
+
+**New directory:** `src/expand/`
+**New files:** `mod.rs`, `validate.rs`, `resolve.rs`, `facts.rs`, `fan_trap.rs`, `role_playing.rs`, `join_resolver.rs`, `sql_gen.rs`
+**Deleted file:** `src/expand.rs` (replaced by `src/expand/mod.rs`)
+**Modified files:** `src/lib.rs` (no change -- `mod expand;` works for both file and directory)
+**Risk:** MEDIUM -- largest refactoring step; 4,490 lines across 8 files. Tests in expand.rs must be distributed to submodules.
+**Validation:** `just test-all` must pass. Zero behavior change. All `use crate::expand::*` paths must still resolve.
+
+Key decisions:
+- Tests stay with the code they test (e.g., fan trap tests go in `fan_trap.rs`).
+- `mod.rs` contains only the `expand()` orchestrator function and re-exports.
+- `pub(crate)` functions like `ancestors_to_root` and `collect_derived_metric_source_tables` are re-exported from `mod.rs` for `ddl/show_dims_for_metric.rs`.
+
+### Phase C: Split graph.rs into graph/ Module Directory (C2)
+
+**New directory:** `src/graph/`
+**New files:** `mod.rs`, `relationship.rs`, `facts.rs`, `derived_metrics.rs`, `using.rs`
+**Deleted file:** `src/graph.rs` (replaced by `src/graph/mod.rs`)
+**Risk:** MEDIUM -- 2,502 lines across 5 files. Simpler than expand/ split because graph functions are more self-contained.
+**Validation:** `just test-all` must pass. Zero behavior change.
+
+### Phase D: Catalog Schema + created_on Timestamp
+
+**Modified files:** `src/model.rs` (add `created_on`, `database_name`, `schema_name` fields), `src/ddl/define.rs` (inject timestamp/context at define time)
+**Risk:** LOW -- additive changes only. `serde(default)` ensures backward compatibility.
+**Validation:** Existing tests pass (old JSON without new fields deserializes correctly). New unit tests for timestamp injection.
+
+### Phase E: SHOW SEMANTIC VIEWS Alignment
+
+**Modified file:** `src/ddl/list.rs`
+**Schema change:** 2 columns -> 6 columns (created_on, name, kind, database_name, schema_name, comment)
+**Risk:** MEDIUM -- breaks existing sqllogictest expectations for SHOW SEMANTIC VIEWS output.
+**Validation:** Update sqllogictest files, run `just test-all`.
+
+### Phase F: SHOW SEMANTIC DIMENSIONS / METRICS / FACTS Alignment
+
+**Modified files:** `src/ddl/show_dims.rs`, `src/ddl/show_metrics.rs`, `src/ddl/show_facts.rs`
+**Schema change:** Current 5 columns -> 8 columns (database_name, schema_name, semantic_view_name, table_name, name, data_type, synonyms, comment). Drop `expr`.
+**Risk:** MEDIUM -- three files with parallel changes, all break existing test expectations.
+**Validation:** Update sqllogictest files, run `just test-all`.
+
+### Phase G: SHOW SEMANTIC DIMENSIONS FOR METRIC Alignment
+
+**Modified file:** `src/ddl/show_dims_for_metric.rs`
+**Schema change:** 5 columns -> 6 columns (table_name, name, data_type, required, synonyms, comment). Drop `expr`, `semantic_view_name`. Add `required` boolean.
+**Risk:** MEDIUM -- the `required` column computation is new logic (currently Snowflake uses it for window function PARTITION BY EXCLUDING; we can default to `false` initially since we don't support window metrics).
+**Validation:** Update sqllogictest, run `just test-all`.
+
+### Phase H: DESCRIBE SEMANTIC VIEW Alignment
+
+**Modified file:** `src/ddl/describe.rs`
+**Schema change:** 6 columns (single row) -> 5 columns (N rows, property-per-row format). Complete rewrite.
+**Risk:** HIGH -- most complex output format change. Largest delta from current behavior. Many test expectations change.
+**Validation:** Comprehensive new sqllogictest cases, run `just test-all`.
+
+### Phase Ordering Rationale
+
+1. **A before B/C:** Utility extraction (5 min) breaks circular deps, making the module splits cleaner.
+2. **B before C:** expand.rs is larger and has more external consumers; splitting it first reduces risk for the graph split.
+3. **A-C before D-H:** Refactoring is behavior-preserving; do it first while the test suite is stable. Output format changes intentionally break tests.
+4. **D before E-H:** Catalog schema changes (created_on, database_name, schema_name) must exist before SHOW VTabs can emit those columns.
+5. **E before F-G:** SHOW SEMANTIC VIEWS is the simplest SHOW command (list.rs is 101 lines). Proves the pattern before tackling the larger SHOW files.
+6. **F before G:** SHOW DIMENSIONS/METRICS/FACTS are structurally identical. Do them together, then the more complex FOR METRIC variant.
+7. **H last:** DESCRIBE is the most radical format change (single row to N rows). Do it after all SHOW commands are proven.
+
+## Integration Points
+
+### New Components
+| Component | Type | Purpose |
+|-----------|------|---------|
+| `src/util.rs` | New module | Shared string utilities (suggest_closest, replace_word_boundary) |
+| `src/errors.rs` | New module | Shared ParseError struct |
+| `src/expand/` | Directory (replaces file) | Module directory for expansion pipeline |
+| `src/graph/` | Directory (replaces file) | Module directory for graph validation |
+
+### Modified Components
+| Component | Change Type | What Changes |
+|-----------|-------------|--------------|
+| `src/model.rs` | Additive fields | `created_on`, `database_name`, `schema_name` on SemanticViewDefinition |
+| `src/ddl/define.rs` | Additive logic | Inject timestamp + context at define time |
+| `src/ddl/list.rs` | Schema change | 2 columns -> 6 columns (Snowflake SHOW SEMANTIC VIEWS format) |
+| `src/ddl/show_dims.rs` | Schema change | 5 columns -> 8 columns (drop expr, add db/schema/synonyms/comment) |
+| `src/ddl/show_metrics.rs` | Schema change | 5 columns -> 8 columns (same as dims) |
+| `src/ddl/show_facts.rs` | Schema change | 4 columns -> 8 columns (add db/schema/data_type/synonyms/comment) |
+| `src/ddl/show_dims_for_metric.rs` | Schema change | 5 columns -> 6 columns (drop expr/sv_name, add required/synonyms/comment) |
+| `src/ddl/describe.rs` | Full rewrite | Single-row 6-column -> N-row 5-column property-per-row format |
+| `src/parse.rs` | Import path | ParseError re-export from errors.rs |
+| `src/body_parser.rs` | Import path | ParseError import from errors.rs |
+
+### Unchanged Components
+| Component | Why Unchanged |
+|-----------|---------------|
+| `src/query/table_function.rs` | Query path unaffected by SHOW/DESCRIBE changes |
+| `src/query/explain.rs` | Uses expand::expand, which is only reorganized not changed |
+| `shim.cpp` | C++ FFI layer unaffected |
+| `src/catalog.rs` | Schema (`name, definition`) unchanged; new fields go in JSON |
 
 ## Sources
 
-- [Snowflake CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- UNIQUE constraint syntax, cardinality inference rules (HIGH confidence)
-- [Snowflake Semantic View SQL Guide](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- Relationship definition syntax, PK/UNIQUE requirement for references (HIGH confidence)
-- [DuckDB 1.5.0 Announcement](https://duckdb.org/2026/03/09/announcing-duckdb-150) -- PEG parser, experimental status, backward compat (HIGH confidence)
-- [DuckDB Extension Versioning](https://duckdb.org/docs/stable/extensions/versioning_of_extensions) -- Version-pinned binaries, no cross-version compat (HIGH confidence)
-- [DuckDB Extension CI Tools](https://github.com/duckdb/extension-ci-tools/) -- Branch-per-version strategy, v1.4.4 and v1.5.0 branches (HIGH confidence)
-- [DuckDB Community Extensions Development](https://duckdb.org/community_extensions/development) -- description.yml, submission process (HIGH confidence)
-- [DuckDB Community Extensions Updating](https://github.com/duckdb/community-extensions/blob/main/UPDATING.md) -- Multi-version support for latest 2 DuckDB versions (HIGH confidence)
-- [duckdb-rs crate](https://crates.io/crates/duckdb) -- Rust binding versions, feature flags (HIGH confidence)
+- [Snowflake SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- output columns: created_on, name, kind, database_name, schema_name, comment, owner, owner_role_type
+- [Snowflake DESCRIBE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view) -- property-per-row format with 5 columns: object_kind, object_name, parent_entity, property, property_value
+- [Snowflake SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- 8 columns: database_name, schema_name, semantic_view_name, table_name, name, data_type, synonyms, comment
+- [Snowflake SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics) -- same 8 columns as dimensions
+- [Snowflake SHOW SEMANTIC DIMENSIONS FOR METRIC](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions-for-metric) -- 6 columns: table_name, name, data_type, required, synonyms, comment
+- [Rust module system: Separating Modules into Different Files](https://doc.rust-lang.org/book/ch07-05-separating-modules-into-different-files.html) -- official Rust book on module directories
+- Direct codebase analysis of all 6 VTab files, expand.rs (4,490 lines), graph.rs (2,502 lines), parse.rs, catalog.rs, model.rs, and import graph

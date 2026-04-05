@@ -170,13 +170,50 @@ Charlie	225.00
 
 # ============================================================
 # Test 9: DESCRIBE verification -- returns expected metadata
-# 6 columns: name, base_table, dimensions, metrics, joins, facts
+# 5 columns: object_kind, object_name, parent_entity, property, property_value
 # ============================================================
 
-query TTTTTT
+query TTTTT
 DESCRIBE SEMANTIC VIEW p28_analytics;
 ----
-p28_analytics	p28_orders	[{"expr":"c.name","name":"customer_name","output_type":null,"source_table":"c"},{"expr":"p.name","name":"product_name","output_type":null,"source_table":"p"},{"expr":"o.region","name":"region","output_type":null,"source_table":"o"},{"expr":"c.tier","name":"tier","output_type":null,"source_table":"c"}]	[{"expr":"sum(o.amount)","name":"total_revenue","output_type":null,"source_table":"o"},{"expr":"count(*)","name":"order_count","output_type":null,"source_table":"o"}]	[{"fk_columns":["customer_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_customer","ref_columns":["id"],"table":"c"},{"fk_columns":["product_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_product","ref_columns":["id"],"table":"p"}]	[]
+TABLE	p28_orders	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p28_orders	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p28_orders	(empty)	BASE_TABLE_NAME	p28_orders
+TABLE	p28_orders	(empty)	PRIMARY_KEY	["id"]
+TABLE	p28_customers	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p28_customers	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p28_customers	(empty)	BASE_TABLE_NAME	p28_customers
+TABLE	p28_customers	(empty)	PRIMARY_KEY	["id"]
+TABLE	p28_products	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p28_products	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p28_products	(empty)	BASE_TABLE_NAME	p28_products
+TABLE	p28_products	(empty)	PRIMARY_KEY	["id"]
+RELATIONSHIP	order_to_customer	p28_orders	TABLE	p28_orders
+RELATIONSHIP	order_to_customer	p28_orders	REF_TABLE	p28_customers
+RELATIONSHIP	order_to_customer	p28_orders	FOREIGN_KEY	["customer_id"]
+RELATIONSHIP	order_to_customer	p28_orders	REF_KEY	["id"]
+RELATIONSHIP	order_to_product	p28_orders	TABLE	p28_orders
+RELATIONSHIP	order_to_product	p28_orders	REF_TABLE	p28_products
+RELATIONSHIP	order_to_product	p28_orders	FOREIGN_KEY	["product_id"]
+RELATIONSHIP	order_to_product	p28_orders	REF_KEY	["id"]
+DIMENSION	customer_name	p28_customers	TABLE	p28_customers
+DIMENSION	customer_name	p28_customers	EXPRESSION	c.name
+DIMENSION	customer_name	p28_customers	DATA_TYPE	(empty)
+DIMENSION	product_name	p28_products	TABLE	p28_products
+DIMENSION	product_name	p28_products	EXPRESSION	p.name
+DIMENSION	product_name	p28_products	DATA_TYPE	(empty)
+DIMENSION	region	p28_orders	TABLE	p28_orders
+DIMENSION	region	p28_orders	EXPRESSION	o.region
+DIMENSION	region	p28_orders	DATA_TYPE	(empty)
+DIMENSION	tier	p28_customers	TABLE	p28_customers
+DIMENSION	tier	p28_customers	EXPRESSION	c.tier
+DIMENSION	tier	p28_customers	DATA_TYPE	(empty)
+METRIC	total_revenue	p28_orders	TABLE	p28_orders
+METRIC	total_revenue	p28_orders	EXPRESSION	sum(o.amount)
+METRIC	total_revenue	p28_orders	DATA_TYPE	(empty)
+METRIC	order_count	p28_orders	TABLE	p28_orders
+METRIC	order_count	p28_orders	EXPRESSION	count(*)
+METRIC	order_count	p28_orders	DATA_TYPE	(empty)
 
 # ============================================================
 # Test 10: Error case -- unknown dimension

@@ -44,20 +44,20 @@ METRICS (
 )
 
 # Verify it is present before restart
-query TT rowsort
-SELECT name, base_table FROM list_semantic_views();
+query T rowsort
+SELECT name FROM list_semantic_views();
 ----
-restart_test	events
+restart_test
 
 restart
 
 # After restart the extension is reloaded; init_catalog loads from
 # semantic_layer._definitions (DuckDB table, persisted via WAL).
 # The view defined before restart must be present.
-query TT rowsort
-SELECT name, base_table FROM list_semantic_views();
+query T rowsort
+SELECT name FROM list_semantic_views();
 ----
-restart_test	events
+restart_test
 
 # PERSIST-02: CREATE SEMANTIC VIEW DDL writes via an independent
 # persist_conn (separate from the main connection). This means the write to

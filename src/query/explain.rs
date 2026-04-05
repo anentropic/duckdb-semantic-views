@@ -6,8 +6,9 @@ use duckdb::{
 };
 use libduckdb_sys as ffi;
 
-use crate::expand::{expand, suggest_closest, QueryRequest};
+use crate::expand::{expand, QueryRequest};
 use crate::model::SemanticViewDefinition;
+use crate::util::suggest_closest;
 
 use super::error::QueryError;
 use super::table_function::{

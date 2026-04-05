@@ -63,6 +63,9 @@ fn simple_definition() -> SemanticViewDefinition {
 
         column_type_names: vec![],
         column_types_inferred: vec![],
+        created_on: None,
+        database_name: None,
+        schema_name: None,
     }
 }
 
@@ -146,6 +149,9 @@ fn joined_definition() -> SemanticViewDefinition {
 
         column_type_names: vec![],
         column_types_inferred: vec![],
+        created_on: None,
+        database_name: None,
+        schema_name: None,
     }
 }
 

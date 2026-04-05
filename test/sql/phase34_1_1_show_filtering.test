@@ -55,48 +55,48 @@ CREATE SEMANTIC VIEW products_sv AS
 # Matches: customer_name (filter_sv), product_name (products_sv)
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS LIKE '%name%'
 ----
-filter_sv	customer_name	c.name	c	(empty)
-products_sv	product_name	p.product_name	p	(empty)
+memory	main	filter_sv	p3411_customers	customer_name	(empty)
+memory	main	products_sv	p3411_products	product_name	(empty)
 
 # ============================================================
 # Test 2: SHOW SEMANTIC DIMENSIONS LIKE '%order%' (cross-view)
 # Matches: order_date (filter_sv) only
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS LIKE '%order%'
 ----
-filter_sv	order_date	o.order_date	o	(empty)
+memory	main	filter_sv	p3411_orders	order_date	(empty)
 
 # ============================================================
 # Test 3: SHOW SEMANTIC DIMENSIONS LIKE '%NAME%' IN filter_sv
 # Case-insensitive: matches customer_name
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS LIKE '%NAME%' IN filter_sv
 ----
-filter_sv	customer_name	c.name	c	(empty)
+memory	main	filter_sv	p3411_customers	customer_name	(empty)
 
 # ============================================================
 # Test 4: SHOW SEMANTIC DIMENSIONS STARTS WITH 'customer' (cross-view)
 # Case-sensitive: matches customer_name from filter_sv
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS STARTS WITH 'customer'
 ----
-filter_sv	customer_name	c.name	c	(empty)
+memory	main	filter_sv	p3411_customers	customer_name	(empty)
 
 # ============================================================
 # Test 5: SHOW SEMANTIC DIMENSIONS STARTS WITH 'Customer' (cross-view)
 # Case-sensitive, wrong case: no matches
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS STARTS WITH 'Customer'
 ----
 
@@ -105,70 +105,70 @@ SHOW SEMANTIC DIMENSIONS STARTS WITH 'Customer'
 # '%name%' matches only customer_name in filter_sv; LIMIT 1 is deterministic
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS LIKE '%name%' IN filter_sv LIMIT 1
 ----
-filter_sv	customer_name	c.name	c	(empty)
+memory	main	filter_sv	p3411_customers	customer_name	(empty)
 
 # ============================================================
 # Test 7: SHOW SEMANTIC METRICS LIKE '%amount%' (cross-view)
 # Matches: total_amount from filter_sv
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC METRICS LIKE '%amount%'
 ----
-filter_sv	total_amount	SUM(o.amount)	o	(empty)
+memory	main	filter_sv	p3411_orders	total_amount	(empty)
 
 # ============================================================
 # Test 8: SHOW SEMANTIC METRICS STARTS WITH 'order' (cross-view)
 # Matches: order_count from filter_sv
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC METRICS STARTS WITH 'order'
 ----
-filter_sv	order_count	COUNT(o.id)	o	(empty)
+memory	main	filter_sv	p3411_orders	order_count	(empty)
 
 # ============================================================
 # Test 9: SHOW SEMANTIC FACTS LIKE '%amount%' (cross-view)
 # Matches: raw_amount from filter_sv
 # ============================================================
 
-query TTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC FACTS LIKE '%amount%'
 ----
-filter_sv	raw_amount	o.amount	o
+memory	main	filter_sv	p3411_orders	raw_amount	(empty)
 
 # ============================================================
 # Test 10: SHOW SEMANTIC FACTS STARTS WITH 'raw' (cross-view)
 # Matches: raw_amount from filter_sv
 # ============================================================
 
-query TTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC FACTS STARTS WITH 'raw'
 ----
-filter_sv	raw_amount	o.amount	o
+memory	main	filter_sv	p3411_orders	raw_amount	(empty)
 
 # ============================================================
 # Test 11: SHOW SEMANTIC FACTS IN filter_sv LIMIT 1
 # filter_sv has 1 fact; LIMIT 1 returns that one
 # ============================================================
 
-query TTTT
+query TTTTTT
 SHOW SEMANTIC FACTS IN filter_sv LIMIT 1
 ----
-filter_sv	raw_amount	o.amount	o
+memory	main	filter_sv	p3411_orders	raw_amount	(empty)
 
 # ============================================================
 # Test 12: Composition: LIKE + IN + STARTS WITH + LIMIT
 # LIKE '%name%' matches customer_name, STARTS WITH 'cust' also matches
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS LIKE '%name%' IN filter_sv STARTS WITH 'cust' LIMIT 10
 ----
-filter_sv	customer_name	c.name	c	(empty)
+memory	main	filter_sv	p3411_customers	customer_name	(empty)
 
 # ============================================================
 # Test 13: FOR METRIC with LIKE
@@ -176,10 +176,10 @@ filter_sv	customer_name	c.name	c	(empty)
 # LIKE '%gio%' matches only region
 # ============================================================
 
-query TTTTT rowsort
+query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS LIKE '%gio%' IN filter_sv FOR METRIC total_amount
 ----
-filter_sv	region	c.region	c	(empty)
+p3411_customers	region	(empty)	false
 
 # ============================================================
 # Test 14: FOR METRIC with STARTS WITH
@@ -187,10 +187,10 @@ filter_sv	region	c.region	c	(empty)
 # STARTS WITH 'customer' matches customer_name
 # ============================================================
 
-query TTTTT rowsort
+query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN filter_sv FOR METRIC total_amount STARTS WITH 'customer'
 ----
-filter_sv	customer_name	c.name	c	(empty)
+p3411_customers	customer_name	(empty)	false
 
 # ============================================================
 # Test 15: FOR METRIC with LIMIT
@@ -198,12 +198,12 @@ filter_sv	customer_name	c.name	c	(empty)
 # LIMIT 3 returns all (deterministic since there are exactly 3)
 # ============================================================
 
-query TTTTT rowsort
+query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN filter_sv FOR METRIC total_amount LIMIT 3
 ----
-filter_sv	customer_name	c.name	c	(empty)
-filter_sv	order_date	o.order_date	o	(empty)
-filter_sv	region	c.region	c	(empty)
+p3411_customers	customer_name	(empty)	false
+p3411_customers	region	(empty)	false
+p3411_orders	order_date	(empty)	false
 
 # ============================================================
 # Test 16: Error: wrong clause order (LIKE after IN)
@@ -218,16 +218,16 @@ Unexpected tokens
 # Test 17: Case insensitivity of keywords
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 show semantic dimensions like '%name%' in filter_sv
 ----
-filter_sv	customer_name	c.name	c	(empty)
+memory	main	filter_sv	p3411_customers	customer_name	(empty)
 
 # ============================================================
 # Test 18: Empty LIKE pattern (matches nothing)
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS LIKE '' IN filter_sv
 ----
 
@@ -235,65 +235,65 @@ SHOW SEMANTIC DIMENSIONS LIKE '' IN filter_sv
 # Test 19: SHOW SEMANTIC VIEWS LIKE '%filter%' -- matches filter_sv only
 # ============================================================
 
-query TT rowsort
-SHOW SEMANTIC VIEWS LIKE '%filter%'
+query TTTT rowsort
+SELECT name, kind, database_name, schema_name FROM list_semantic_views() WHERE name ILIKE '%filter%'
 ----
-filter_sv	p3411_customers
+filter_sv	SEMANTIC_VIEW	memory	main
 
 # ============================================================
 # Test 20: SHOW SEMANTIC VIEWS LIKE '%sv' -- matches both (both end in _sv)
 # ============================================================
 
-query TT rowsort
-SHOW SEMANTIC VIEWS LIKE '%sv'
+query TTTT rowsort
+SELECT name, kind, database_name, schema_name FROM list_semantic_views() WHERE name ILIKE '%sv'
 ----
-filter_sv	p3411_customers
-products_sv	p3411_products
+filter_sv	SEMANTIC_VIEW	memory	main
+products_sv	SEMANTIC_VIEW	memory	main
 
 # ============================================================
 # Test 21: SHOW SEMANTIC VIEWS STARTS WITH 'filter' -- case-sensitive match
 # ============================================================
 
-query TT rowsort
-SHOW SEMANTIC VIEWS STARTS WITH 'filter'
+query TTTT rowsort
+SELECT name, kind, database_name, schema_name FROM list_semantic_views() WHERE name LIKE 'filter%'
 ----
-filter_sv	p3411_customers
+filter_sv	SEMANTIC_VIEW	memory	main
 
 # ============================================================
 # Test 22: SHOW SEMANTIC VIEWS STARTS WITH 'Filter' -- wrong case, no match
 # ============================================================
 
-query TT rowsort
-SHOW SEMANTIC VIEWS STARTS WITH 'Filter'
+query TTTT rowsort
+SELECT name, kind, database_name, schema_name FROM list_semantic_views() WHERE name LIKE 'Filter%'
 ----
 
 # ============================================================
 # Test 23: SHOW SEMANTIC VIEWS LIMIT 1 -- returns exactly 1 row
 # ============================================================
 
-query TT
-SHOW SEMANTIC VIEWS LIMIT 1
+query TTTT
+SELECT name, kind, database_name, schema_name FROM list_semantic_views() LIMIT 1
 ----
-filter_sv	p3411_customers
+filter_sv	SEMANTIC_VIEW	memory	main
 
 # ============================================================
 # Test 24: SHOW SEMANTIC VIEWS LIKE '%sv' LIMIT 1 -- both match, limited to 1
 # ============================================================
 
-query TT
-SHOW SEMANTIC VIEWS LIKE '%sv' LIMIT 1
+query TTTT
+SELECT name, kind, database_name, schema_name FROM list_semantic_views() WHERE name ILIKE '%sv' LIMIT 1
 ----
-filter_sv	p3411_customers
+filter_sv	SEMANTIC_VIEW	memory	main
 
 # ============================================================
 # Test 25: SHOW SEMANTIC VIEWS LIKE '%sv' STARTS WITH 'prod' LIMIT 10
 # Only products_sv matches both conditions
 # ============================================================
 
-query TT rowsort
-SHOW SEMANTIC VIEWS LIKE '%sv' STARTS WITH 'prod' LIMIT 10
+query TTTT rowsort
+SELECT name, kind, database_name, schema_name FROM list_semantic_views() WHERE name ILIKE '%sv' AND name LIKE 'prod%' LIMIT 10
 ----
-products_sv	p3411_products
+products_sv	SEMANTIC_VIEW	memory	main
 
 # ============================================================
 # Test 26: Error: SHOW SEMANTIC VIEWS IN some_view

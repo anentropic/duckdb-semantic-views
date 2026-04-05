@@ -1,433 +1,280 @@
-# Technology Stack: v0.5.4 Additions
+# Technology Stack
 
-**Project:** DuckDB Semantic Views
-**Researched:** 2026-03-15
-**Focus:** Multi-version DuckDB support, CE registry publishing, Zensical docs, duckdb-rs upgrade
+**Project:** DuckDB Semantic Views v0.5.5 -- SHOW/DESCRIBE Alignment & Refactoring
+**Researched:** 2026-04-01
+**Scope:** Stack additions/changes for Snowflake-aligned output formats + module refactoring
 
-## Recommended Stack Changes
+## Key Finding: No New Dependencies Required
 
-### 1. DuckDB Version Support (1.4.x LTS + 1.5.x)
+This milestone requires **zero new crates**. All capabilities are available through the existing stack:
 
-| Item | Current (v0.5.3) | v0.5.4 Target | Why |
-|------|-------------------|---------------|-----|
-| DuckDB | v1.4.4 only | v1.5.0 (main) + v1.4.4 (andium) | 1.5.0 released 2026-03-09; 1.4 LTS supported through 2026-09 |
-| extension-ci-tools | `@v1.4.4` | `@v1.5.0` (main) + `@v1.4.4` (andium) | Dual workflow strategy per UPDATING.md |
-| .duckdb-version | v1.4.4 | v1.5.0 | Main branch tracks latest stable |
+- Timestamps: DuckDB's `now()` via SQL, stored as VARCHAR in JSON, rendered as VARCHAR in VTab output
+- Database/schema names: DuckDB's `current_database()` / `current_schema()` via existing `execute_sql_raw` pattern
+- Module refactoring: Pure Rust file reorganization, no library involvement
+- DESCRIBE restructuring: serde_json (already a dependency) for JSON-to-row flattening
 
-**Confidence:** HIGH -- verified via GitHub API (extension-ci-tools has both `v1.5.0` tag and `v1.5-variegata` branch).
+## Current Stack (Unchanged)
 
-#### DuckDB 1.5.0 "Variegata" -- Key Changes for This Extension
+### Core Dependencies
+| Technology | Version | Purpose | Status for v0.5.5 |
+|------------|---------|---------|-------------------|
+| duckdb (Rust) | =1.10500.0 | DuckDB C API bindings, VTab trait, `LogicalTypeId` | No change needed |
+| libduckdb-sys | =1.10500.0 | Raw FFI bindings (`duckdb_query`, `duckdb_value_varchar`) | No change needed |
+| serde | 1.x | Derive `Serialize`/`Deserialize` on model types | No change needed |
+| serde_json | 1.x | JSON serialization of `SemanticViewDefinition` | No change needed -- used more heavily for DESCRIBE restructuring |
+| strsim | 0.11 | Levenshtein distance for "did you mean?" suggestions | No change needed; moves to `util.rs` during refactor |
+| cc | 1.x (optional) | C++ shim compilation for extension builds | No change needed |
 
-**Released:** 2026-03-09 ([announcement](https://duckdb.org/2026/03/09/announcing-duckdb-150))
+### Dev Dependencies
+| Technology | Version | Purpose | Status for v0.5.5 |
+|------------|---------|---------|-------------------|
+| proptest | 1.11 | Property-based testing | No change needed |
+| cargo-husky | 1.x | Git hooks | No change needed |
 
-Changes relevant to this extension:
+## What's Needed and How It's Addressed
 
-1. **New `parser_override_function_t` hook** ([PR #19126](https://github.com/duckdb/duckdb/pull/19126)): DuckDB 1.5 introduces a new parser extension hook that runs *before* the built-in parser (unlike our `parse_function` which runs *after* the built-in parser fails). This is opt-in via `SET allow_parser_override_extension = true` ([PR #19181](https://github.com/duckdb/duckdb/pull/19181)). **Our extension does NOT need this** -- our existing `parse_function` fallback mechanism is preserved and unchanged. The new hook is used by the PEG parser, not by statement-intercepting extensions.
+### 1. Storing `created_on` Timestamps
 
-2. **Experimental PEG parser** (disabled by default): A new parser based on Parser Expression Grammars is available opt-in. When disabled (the default), the existing YACC parser + `parse_function` fallback chain works identically to 1.4. **No impact on our extension.**
+**Need:** SHOW SEMANTIC VIEWS must include a `created_on` column matching Snowflake's format.
 
-3. **C API additions**: New C API functions for file system access ([PR #19086](https://github.com/duckdb/duckdb/pull/19086)), config options ([PR #19473](https://github.com/duckdb/duckdb/pull/19473)), and table descriptions ([PR #19334](https://github.com/duckdb/duckdb/pull/19334)). None of these affect our existing API surface.
+**Approach:** Store as ISO 8601 VARCHAR string in the `SemanticViewDefinition` JSON.
 
-4. **VARIANT type**: Native support for semi-structured data. Not relevant to semantic views.
+**Why VARCHAR, not a timestamp type:**
+- The timestamp is **metadata about the definition**, not query data. It flows through the JSON persistence layer (`semantic_layer._definitions.definition` column), not the typed query pipeline.
+- The VTab output for SHOW commands already uses all-VARCHAR columns (established pattern in `list.rs`, `show_dims.rs`, `show_metrics.rs`, `show_facts.rs`). Adding one more VARCHAR column is consistent.
+- DuckDB's `now()` returns `TIMESTAMPTZ` which `duckdb_value_varchar` renders as a human-readable string (e.g., `2026-04-01 10:30:00.000-07`). We capture this at define time and store it verbatim.
+- No `chrono` crate needed. No `std::time::SystemTime` needed. No C API timestamp conversion functions needed.
 
-5. **ABI unchanged**: `C_STRUCT_UNSTABLE` still works the same way -- binaries are tied to exact DuckDB version. No ABI type changes.
-
-**Bottom line:** DuckDB 1.5.0 is expected to be a **low-risk upgrade** for this extension. The parser hook mechanism we use (`parse_function` fallback) is unchanged. The main work is version-bumping, rebuilding the amalgamation, testing, and potentially fixing any C++ API changes in `shim.cpp` (internal symbol names, include paths, struct layouts).
-
-**Confidence:** MEDIUM -- the `parse_function` fallback mechanism is well-established and unlikely to break, but the amalgamation compilation (`duckdb.cpp`) may have internal structural changes that affect our Windows `build.rs` patches (line number offsets, `#include` reorganization). Manual testing is required.
-
-#### Multi-Version Build Strategy
-
-Per [UPDATING.md](https://github.com/duckdb/community-extensions/blob/main/UPDATING.md), the standard pattern for supporting two DuckDB versions is:
-
-```yaml
-# Build.yml -- add a second job for andium (LTS)
-duckdb-stable-build:
-  uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.0
-  with:
-    duckdb_version: v1.5.0
-    ci_tools_version: v1.5.0
-    extension_name: semantic_views
-    extra_toolchains: 'rust;python3'
-
-duckdb-andium-build:
-  uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
-  with:
-    duckdb_version: v1.4.4
-    ci_tools_version: v1.4.4
-    extension_name: semantic_views
-    extra_toolchains: 'rust;python3'
+**Implementation pattern (uses existing `execute_sql_raw`):**
+```rust
+// In define.rs bind(), before serializing the definition:
+let timestamp_sql = "SELECT now()::VARCHAR";
+let ts = unsafe { execute_sql_raw(state.catalog_conn, timestamp_sql) };
+// Extract varchar from row 0, col 0 with duckdb_value_varchar
+def.created_on = Some(timestamp_string);
 ```
 
-**Branch strategy options:**
-- **Option A (recommended): Single branch, dual CI.** Main branch compiles against both versions. `.duckdb-version` tracks latest (v1.5.0). CI downloads the v1.4.4 amalgamation separately for the andium build. This matches the extension template pattern.
-- **Option B: Two branches.** Separate `main` (1.5.x) and `v1.4-andium` branches. More maintenance burden. Only needed if APIs diverge significantly.
-
-Recommend **Option A** because the `parse_function` API is unchanged between 1.4 and 1.5.
-
-### 2. duckdb-rs Crate Upgrade
-
-| Item | Current | v0.5.4 Target | Why |
-|------|---------|---------------|-----|
-| `duckdb` crate | `=1.4.4` | `=1.10500.0` (for 1.5.0 build) | New versioning scheme |
-| `libduckdb-sys` | `=1.4.4` | `=1.10500.0` or remove | Must match duckdb crate |
-
-**CRITICAL: duckdb-rs changed its versioning scheme.** ([Release notes](https://github.com/duckdb/duckdb-rs/releases/tag/v1.10500.0), published 2026-03-11)
-
-Starting with DuckDB 1.5.0, the crate version encodes the DuckDB version in the second semver component: `1.MAJOR_MINOR_PATCH.x`. DuckDB v1.5.0 maps to crate version `1.10500.x`.
-
-**Key changes in duckdb-rs 1.10500.0:**
-- Upgraded to Rust edition 2024, Arrow 57, bundled DuckDB v1.5.0
-- `rust_decimal::Decimal` support for `FromSql`, `ToSql`, and `Appender`
-- `Params` implemented for tuples (up to arity 16)
-- Loadable extensions need only a single `duckdb` crate dependency (eliminates `libduckdb-sys` as separate dep)
-- Fix: cloned database handles keep original `db` handle alive
-- Fix: chrono datetime writes normalized to UTC
-
-**Impact on our Cargo.toml:**
-```toml
-# For v1.5.0 builds:
-[dependencies]
-duckdb = { version = "=1.10500.0", default-features = false }
-# libduckdb-sys may no longer be needed as a direct dependency
+**Model change:**
+```rust
+// In model.rs, add to SemanticViewDefinition:
+#[serde(default)]
+pub created_on: Option<String>,
 ```
 
-**For dual-version support**, the Cargo.toml must track the version being built. Since `C_STRUCT_UNSTABLE` binaries are version-pinned anyway, and CI builds are separate jobs, the simplest approach is:
-- Main branch Cargo.toml targets `=1.10500.0` (DuckDB 1.5.0)
-- The andium CI job uses extension-ci-tools `@v1.4.4` which handles the amalgamation download independently
-- `cargo test` (bundled mode) tests against whichever version Cargo.toml specifies
+The `Option<String>` with `#[serde(default)]` ensures backward-compatible deserialization of existing stored definitions (they get `None`, displayed as empty string in SHOW output).
 
-**Confidence:** HIGH -- verified via [GitHub releases](https://github.com/duckdb/duckdb-rs/releases) and [crates.io](https://crates.io/crates/duckdb).
+**Confidence:** HIGH -- `execute_sql_raw` + `duckdb_value_varchar` is the exact pattern already used in `define.rs` for PK resolution via `duckdb_constraints()`. DuckDB's `now()` is documented to return `TIMESTAMPTZ` (verified: [DuckDB timestamptz docs](https://duckdb.org/docs/current/sql/functions/timestamptz)).
 
-### 3. Community Extension Registry (description.yml)
+### 2. Retrieving `database_name` and `schema_name`
 
-| Item | Value | Source |
-|------|-------|--------|
-| Registry repo | `duckdb/community-extensions` | [GitHub](https://github.com/duckdb/community-extensions) |
-| Submission | PR adding `extensions/semantic_views/description.yml` | [Docs](https://duckdb.org/community_extensions/documentation) |
-| Reference impl | `rusty_quack` (Rust extension, `build: cargo`) | [description.yml](https://github.com/duckdb/community-extensions/blob/main/extensions/rusty_quack/description.yml) |
+**Need:** SHOW SEMANTIC VIEWS/DIMENSIONS/METRICS/FACTS must include `database_name` and `schema_name` columns.
 
-**Exact description.yml format for this extension:**
+**Approach:** Query at runtime via `SELECT current_database(), current_schema()` using existing `execute_sql_raw`.
 
-```yaml
-extension:
-  name: semantic_views
-  description: Declarative semantic layer for dimensions, metrics, and relationships in DuckDB
-  version: 0.5.4
-  language: Rust
-  build: cargo
-  license: MIT
-  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_rtools;windows_amd64_mingw;linux_amd64_musl"
-  requires_toolchains: "rust;python3"
-  maintainers:
-    - <github-username>
+**Why runtime, not stored:**
+- Database and schema names are **context-dependent**. The same `.duckdb` file can be attached under different names. Storing the name at define time would be wrong if the database is later attached with a different alias.
+- `current_database()` returns `'memory'` for in-memory databases and the database name for file-backed databases. `current_schema()` returns `'main'` by default. Both are documented DuckDB utility functions (verified: [DuckDB utility functions](https://duckdb.org/docs/stable/sql/functions/utility.md)).
+- The existing code already uses `current_database()` in `define.rs:113` for catalog PK lookups, confirming this pattern works within the extension.
 
-repo:
-  github: <owner>/duckdb-semantic-views
-  andium: <commit-hash-for-v1.4.4-build>
-  ref: <commit-hash-for-v1.5.0-build>
+**Connection choice:** Use `catalog_conn` (available in `DefineState`) for SHOW commands that access it via `extra_info`. For VTab functions that only have `CatalogState`, either:
+- (a) Cache the values at extension init time and inject alongside `CatalogState`, or
+- (b) Add a `catalog_conn` to the SHOW VTabs' extra_info (same pattern as `DefineState`)
 
-docs:
-  hello_world: |
-    CREATE SEMANTIC VIEW sales_metrics (
-      TABLES (
-        orders AS o PRIMARY KEY (order_id)
-      )
-      DIMENSIONS (
-        region := o.region,
-        order_date := o.order_date
-      )
-      METRICS (
-        total_revenue := SUM(o.amount),
-        order_count := COUNT(*)
-      )
-    );
-    FROM semantic_view('sales_metrics',
-      dimensions := ['region'],
-      metrics := ['total_revenue', 'order_count']
-    );
-  extended_description: |
-    The semantic_views extension implements a declarative semantic layer for DuckDB.
-    Define dimensions, metrics, relationships, facts, and hierarchies once with
-    `CREATE SEMANTIC VIEW` DDL, then query with any combination using the
-    `semantic_view()` table function. The extension handles GROUP BY, JOINs from
-    PK/FK declarations, fan trap detection, and typed output automatically.
+**Recommendation: option (a).** Query `current_database()` / `current_schema()` once at init time, store as a `DbContext { database_name: String, schema_name: String }` struct alongside the `CatalogState` Arc. This avoids adding a raw connection handle to every SHOW VTab. The values don't change during an extension session.
+
+**Injection mechanism:** Create a shared state struct that combines `CatalogState` + `DbContext`:
+```rust
+pub struct ShowState {
+    pub catalog: CatalogState,
+    pub database_name: String,
+    pub schema_name: String,
+}
+```
+Register SHOW VTabs with `ShowState` as extra_info instead of bare `CatalogState`.
+
+**Confidence:** HIGH -- `current_database()` and `current_schema()` are already used in this codebase (`define.rs:113`).
+
+### 3. DESCRIBE Restructuring to Property-Per-Row Format
+
+**Need:** DESCRIBE SEMANTIC VIEW must output Snowflake's 5-column format: `(object_kind, object_name, parent_entity, property, property_value)`.
+
+**Approach:** Iterate over the deserialized `SemanticViewDefinition` and emit one row per property.
+
+**No new technology needed:**
+- `serde_json::Value` is already used in `describe.rs:81` for parsing stored JSON
+- The new format is just a different row-emission pattern in the VTab `func()` callback
+- Each TABLE, DIMENSION, METRIC, FACT, RELATIONSHIP becomes multiple rows (one per property)
+
+**Snowflake property rows (target from [DESCRIBE docs](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view)):**
+
+| object_kind | object_name | parent_entity | property | property_value |
+|-------------|-------------|---------------|----------|----------------|
+| NULL | NULL | NULL | COMMENT | (empty) |
+| TABLE | orders | NULL | BASE_TABLE_NAME | orders |
+| TABLE | orders | NULL | PRIMARY_KEY | id |
+| DIMENSION | region | orders | EXPRESSION | o.region |
+| DIMENSION | region | orders | DATA_TYPE | VARCHAR |
+| METRIC | revenue | orders | EXPRESSION | SUM(o.amount) |
+| METRIC | revenue | orders | DATA_TYPE | DOUBLE |
+| FACT | amount | orders | EXPRESSION | o.amount |
+| RELATIONSHIP | orders_customers | NULL | TABLE | customers |
+| RELATIONSHIP | orders_customers | NULL | FOREIGN_KEY | customer_id |
+
+**Row count estimate:** A typical semantic view with 3 tables, 5 dimensions, 3 metrics, 2 facts, 2 relationships produces ~35-45 rows. DuckDB VTab output chunks are 2048 rows, so this fits in one chunk. No pagination logic needed.
+
+**Confidence:** HIGH -- pure Rust iteration over existing model types. No API calls needed.
+
+### 4. SHOW SEMANTIC DIMENSIONS/METRICS/FACTS Column Schema Changes
+
+**Need:** Align output columns with Snowflake's schema.
+
+**Snowflake target columns (verified from [SHOW DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions), [SHOW METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics), [SHOW FACTS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-facts)):**
+- SHOW SEMANTIC DIMENSIONS: `database_name, schema_name, semantic_view_name, table_name, name, data_type, synonyms, comment`
+- SHOW SEMANTIC METRICS: same column set
+- SHOW SEMANTIC FACTS: same column set
+- SHOW SEMANTIC DIMENSIONS FOR METRIC ([docs](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions-for-metric)): `table_name, name, data_type, required, synonyms, comment`
+
+**Changes from current schema:**
+
+| Change | Current | Target | Impact |
+|--------|---------|--------|--------|
+| ADD | -- | `database_name` (col 0) | New column from `ShowState.database_name` |
+| ADD | -- | `schema_name` (col 1) | New column from `ShowState.schema_name` |
+| KEEP | `semantic_view_name` (col 0) | `semantic_view_name` (col 2) | Position shift |
+| RENAME | `source_table` | `table_name` | Aligns with Snowflake naming |
+| KEEP | `name` | `name` | Unchanged |
+| KEEP | `data_type` | `data_type` | Unchanged |
+| ADD | -- | `synonyms` | Empty string (future-proofing) |
+| ADD | -- | `comment` | Empty string (future-proofing) |
+| REMOVE | `expr` | -- | Snowflake does not expose raw expressions in SHOW |
+| ADD (FOR METRIC only) | -- | `required` | Boolean as VARCHAR `'true'`/`'false'` |
+
+**Breaking change note:** Removing `expr` and reordering columns is a breaking change for SHOW output consumers. This is acceptable because the extension is pre-1.0 (`v0.5.x`).
+
+**Confidence:** HIGH -- column schema changes are pure VTab output modifications.
+
+### 5. SHOW SEMANTIC VIEWS Column Schema Changes
+
+**Need:** Expand from 2 columns `(name, base_table)` to Snowflake-aligned schema.
+
+**Snowflake target columns (verified from [SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views)):**
+
+| Column | Source | Notes |
+|--------|--------|-------|
+| `created_on` | `def.created_on` from JSON | `Option<String>`, empty for pre-v0.5.5 views |
+| `name` | HashMap key | Already available |
+| `kind` | Literal `"SEMANTIC_VIEW"` | Hardcoded constant |
+| `database_name` | `ShowState.database_name` | From init-time cache |
+| `schema_name` | `ShowState.schema_name` | From init-time cache |
+| `comment` | Empty string | Future-proofing, no comment support yet |
+
+**Snowflake also has:** `owner`, `owner_role_type`, `extension` -- these are Snowflake-specific RBAC columns. We omit them (DuckDB extensions don't have owner/role concepts).
+
+**Confidence:** HIGH.
+
+### 6. Module Refactoring (expand.rs -> expand/, graph.rs -> graph/)
+
+**Need:** Split 4,440-line `expand.rs` and 2,333-line `graph.rs` into module directories.
+
+**Rust module style:** Use `mod.rs` style (not modern `expand.rs` + `expand/` style) because:
+- The codebase already uses `mod.rs` for `ddl/mod.rs` and `query/mod.rs`
+- Consistency within the project outweighs the general community preference for modern style
+- The files are being removed entirely (replaced by directories), not split into a file + directory pair
+- Verified: Rust reference confirms `mod.rs` is fully supported in edition 2021 ([Rust module docs](https://doc.rust-lang.org/book/ch07-05-separating-modules-into-different-files.html))
+
+**File transformations:**
+```
+BEFORE:                    AFTER:
+src/expand.rs (4,440)  ->  src/expand/mod.rs (public API + re-exports)
+                            src/expand/validate.rs
+                            src/expand/resolve.rs
+                            src/expand/facts.rs
+                            src/expand/fan_trap.rs
+                            src/expand/role_playing.rs
+                            src/expand/join_resolver.rs
+                            src/expand/sql_gen.rs
+
+src/graph.rs (2,333)   ->  src/graph/mod.rs (RelationshipGraph + re-exports)
+                            src/graph/relationship.rs
+                            src/graph/facts.rs
+                            src/graph/hierarchies.rs
+                            src/graph/derived_metrics.rs
+                            src/graph/using.rs
+
+NEW:
+src/util.rs                 (suggest_closest, replace_word_boundary)
+src/errors.rs               (ParseError -- breaks parse<->body_parser cycle)
 ```
 
-**Field reference (verified from [rusty_quack](https://github.com/duckdb/community-extensions/blob/main/extensions/rusty_quack/description.yml) and [PRQL](https://github.com/duckdb/community-extensions/blob/main/extensions/prql/description.yml)):**
+**No `lib.rs` changes needed** for `expand` and `graph` module declarations. `pub mod expand;` resolves to `expand/mod.rs` automatically. Same for `pub mod graph;`. Two new lines added for `pub mod util;` and `pub mod errors;`.
 
-| Field | Required | Notes |
-|-------|----------|-------|
-| `extension.name` | Yes | Lowercase, only `[a-z0-9_-]` |
-| `extension.description` | Yes | Short one-liner |
-| `extension.version` | Yes | Freeform string (SemVer recommended) |
-| `extension.language` | Yes | `Rust` for us (not `C++`) |
-| `extension.build` | Yes | `cargo` for Rust extensions |
-| `extension.license` | Yes | SPDX identifier |
-| `extension.excluded_platforms` | Recommended | Semicolon-separated platform list |
-| `extension.requires_toolchains` | Recommended | `"rust;python3"` for Rust+amalgamation builds |
-| `extension.maintainers` | Yes | List of GitHub usernames |
-| `repo.github` | Yes | `owner/repo` format |
-| `repo.ref` | Yes | Commit hash for latest stable build (v1.5.0) |
-| `repo.andium` | Recommended | Commit hash for LTS build (v1.4.x) |
-| `docs.hello_world` | Recommended | SQL example for auto-generated docs page |
-| `docs.extended_description` | Recommended | Markdown description for docs page |
+**Dependency cycle resolution:**
+- Current: `expand.rs` exports `suggest_closest` -> `graph.rs` imports it. `graph.rs` exports `RelationshipGraph` -> `expand.rs` imports it. Circular dependency.
+- Fix: Extract `suggest_closest` and `replace_word_boundary` to new `src/util.rs`. Both `expand/` and `graph/` import from `util`. Clean DAG.
+- Current: `body_parser.rs` imports `parse::ParseError`. `parse.rs` imports `body_parser::parse_keyword_body`. Bidirectional.
+- Fix: Extract `ParseError` to new `src/errors.rs`. Both `parse.rs` and `body_parser.rs` import from `errors`. Clean DAG.
 
-**Key insight from rusty_quack:** The `andium` field (named after the v1.4 LTS codename) is used instead of `ref_next` for LTS-version pinning. The `ref` field points to the commit for the latest stable (1.5.x), while `andium` points to the commit compatible with 1.4.x LTS. When the next LTS ships, this field name will change to the new codename.
+**Re-export strategy for backward compatibility:** `expand/mod.rs` re-exports all public items so that external callers (`use crate::expand::expand`, `use crate::expand::QueryRequest`) continue to work without path changes. Same for `graph/mod.rs`.
 
-**Confidence:** HIGH -- directly verified from two real Rust extension descriptors in the community-extensions repo.
-
-### 4. Zensical Documentation Site
-
-| Item | Value | Source |
-|------|-------|--------|
-| Tool | Zensical | [GitHub](https://github.com/zensical/zensical) |
-| Version | 0.0.27 (latest as of 2026-03-13) | [Releases](https://github.com/zensical/zensical/releases) |
-| Install | `pip install zensical` | [PyPI](https://pypi.org/project/zensical/) |
-| Config | `zensical.toml` (TOML, not YAML) | [Docs](https://zensical.org/docs/setup/basics/) |
-| Content | Markdown in `docs/` directory | Standard SSG pattern |
-| Build | `zensical build --clean` | Outputs to `site/` directory |
-| Deploy | GitHub Actions to GitHub Pages | Built-in bootstrap workflow |
-
-**What Zensical is:** A modern static site generator built by the Material for MkDocs team (squidfunk). It replaces MkDocs with a Rust+Python hybrid that understands `mkdocs.yml` config but uses TOML natively. It provides the same Material for MkDocs look and feel with better performance, TOML configuration (no indentation errors), and an upcoming module system for extensibility.
-
-**Project structure for this extension:**
-
-```
-docs/
-  index.md              # Landing page
-  getting-started.md    # Installation + first semantic view
-  ddl-reference.md      # Full DDL syntax reference
-  query-reference.md    # semantic_view() function reference
-  examples/             # Worked examples
-  changelog.md          # Version history
-zensical.toml           # Site configuration
-```
-
-**Minimal zensical.toml:**
-
-```toml
-[project]
-site_name = "DuckDB Semantic Views"
-site_description = "Declarative semantic layer for DuckDB"
-site_url = "https://<owner>.github.io/duckdb-semantic-views/"
-copyright = "Copyright &copy; 2026 The authors"
-
-[project.theme]
-language = "en"
-features = [
-    "content.code.copy",
-    "content.code.annotate",
-    "navigation.footer",
-    "navigation.indexes",
-    "navigation.instant",
-    "navigation.sections",
-    "navigation.top",
-    "search.highlight",
-]
-
-[[project.theme.palette]]
-scheme = "default"
-toggle.icon = "lucide/sun"
-toggle.name = "Switch to dark mode"
-
-[[project.theme.palette]]
-scheme = "slate"
-toggle.icon = "lucide/moon"
-toggle.name = "Switch to light mode"
-```
-
-**GitHub Pages deployment workflow (from Zensical's official bootstrap template):**
-
-```yaml
-# .github/workflows/Docs.yml
-name: Documentation
-on:
-  push:
-    branches: [main]
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-jobs:
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/configure-pages@v5
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: 3.x
-      - run: pip install zensical
-      - run: zensical build --clean
-      - uses: actions/upload-pages-artifact@v4
-        with:
-          path: site
-      - uses: actions/deploy-pages@v4
-        id: deployment
-```
-
-This is the official Zensical bootstrap workflow from the [project template](https://github.com/zensical/zensical/blob/master/python/zensical/bootstrap/.github/workflows/docs.yml). Alternatively, the community [cssnr/zensical-action@v1](https://github.com/cssnr/zensical-action) wraps this into a single step but adds an unnecessary abstraction layer.
-
-**Confidence:** HIGH -- verified from Zensical's own bootstrap template and official documentation.
+**Confidence:** HIGH -- pure file reorganization. The architecture document (`_notes/architecture.md`) already specifies the exact split. No functional changes.
 
 ## Alternatives Considered
 
 | Category | Recommended | Alternative | Why Not |
 |----------|-------------|-------------|---------|
-| Doc site | Zensical | MkDocs Material | Zensical is the successor by the same team; TOML config is cleaner; actively developed |
-| Doc site | Zensical | mdBook | Rust ecosystem default, but less polished for user docs; no search, no dark mode toggle, weaker nav |
-| Doc deploy | GitHub Pages (built-in) | Cloudflare Pages | Unnecessary complexity for an OSS project already on GitHub |
-| CE registry | Direct PR to duckdb/community-extensions | Self-hosted distribution | CE registry is the standard; self-hosting fragments the ecosystem |
-| Multi-version | Single branch + dual CI | Two branches | APIs are compatible; two branches doubles maintenance for no benefit |
-| Doc deploy action | Official bootstrap workflow | cssnr/zensical-action@v1 | Community action adds unnecessary indirection; official workflow is 8 lines |
+| Timestamp storage | VARCHAR in JSON via `now()` SQL | `chrono` crate | Adds a dependency for one `now()` call. DuckDB already provides `now()`. Over-engineering. |
+| Timestamp storage | VARCHAR in JSON via `now()` SQL | `std::time::SystemTime` | Would give Rust-local time, not DuckDB transaction time. Semantically different. |
+| Timestamp storage | VARCHAR in JSON via `now()` SQL | Separate `created_on` column in `_definitions` table | Schema migration needed for the DuckDB catalog table. Storing in JSON avoids ALTER TABLE and is backward-compatible via `serde(default)`. |
+| DB/schema retrieval | Init-time cache in `ShowState` | Store at define time | Wrong semantics -- database name can change if `.duckdb` file is re-attached under different name. |
+| DB/schema retrieval | Init-time cache in `ShowState` | Per-query SQL call | Unnecessary overhead. DB/schema names don't change during an extension session. |
+| DB/schema retrieval | Init-time cache in `ShowState` | Add `catalog_conn` to all SHOW VTabs | More complex wiring; raw connection handles require unsafe. Cache is simpler. |
+| Module style | `mod.rs` (directory) | Modern `expand.rs` + `expand/` | Inconsistent with existing `ddl/mod.rs` and `query/mod.rs` pattern in this codebase. |
+| DESCRIBE format | Property-per-row | Keep current JSON-blob columns | Doesn't align with Snowflake. JSON blobs are not queryable with SQL WHERE clauses. |
+| `expr` in SHOW | Remove (Snowflake alignment) | Keep alongside Snowflake columns | Snowflake doesn't expose `expr` in SHOW; keeping it diverges. DESCRIBE now exposes it via property rows. |
 
 ## What NOT to Add
 
-| Item | Why Not |
-|------|---------|
-| `duckdb-extension-framework` crate | Experimental, not used by rusty_quack or our extension; adds unnecessary abstraction over working FFI |
-| `quack-rs` crate | Utility crate for Rust extensions; our extension already has a working FFI layer |
-| Stable C API migration (`C_STRUCT` from `C_STRUCT_UNSTABLE`) | Our extension uses C++ parser hooks (`ParserExtension`, `DBConfig`) which are not exposed through the stable C API. We MUST use `C_STRUCT_UNSTABLE` until DuckDB stabilizes parser extension hooks in the C API. |
-| PEG parser `parser_override_function_t` | Our fallback `parse_function` works correctly; `parser_override_function_t` is designed for full parser replacements (like PEG), not for intercepting specific DDL forms |
-| Separate `libduckdb-sys` dep (for 1.5 build) | duckdb-rs 1.10500.0 eliminates the need for separate `libduckdb-sys` in loadable extensions |
-| Rust edition 2024 upgrade | duckdb-rs 1.10500.0 uses edition 2024, but our crate can stay on 2021 -- editions are per-crate and interoperate. Upgrade is optional, not required. |
+| Technology | Why Not |
+|------------|---------|
+| `chrono` crate | One timestamp per CREATE -- `now()` via SQL is sufficient |
+| `time` crate | Same reason as `chrono` |
+| `uuid` crate | No UUID generation needed |
+| `thiserror` crate | Error types are simple string-based; extracting `ParseError` to `errors.rs` doesn't require derive macros |
+| `anyhow` crate | Extension code needs typed errors, not erased errors |
+| Schema migration framework | No schema changes to `_definitions` table -- `created_on` lives inside the JSON column |
+| New C API functions | No `duckdb_from_timestamp` or `duckdb_to_timestamp` needed -- VARCHAR storage avoids timestamp type conversion entirely |
+| `LogicalTypeId::Timestamp` in SHOW VTabs | All SHOW output columns are VARCHAR (consistent with Snowflake and existing pattern) |
 
-## Version Matrix
+## Catalog Schema: No Migration Required
 
-| Component | v1.4.x (andium/LTS) | v1.5.x (main) |
-|-----------|---------------------|---------------|
-| DuckDB | v1.4.4 | v1.5.0 |
-| extension-ci-tools workflow tag | `@v1.4.4` | `@v1.5.0` |
-| extension-ci-tools branch | `v1.4-andium` | `v1.5-variegata` |
-| duckdb-rs crate | `=1.4.4` | `=1.10500.0` |
-| libduckdb-sys | `=1.4.4` | (bundled in duckdb crate) |
-| Amalgamation source | DuckDB v1.4.4 release | DuckDB v1.5.0 release |
-| ABI | C_STRUCT_UNSTABLE | C_STRUCT_UNSTABLE |
-| Rust edition | 2021 | 2021 (keep; 2024 optional) |
+The `semantic_layer._definitions` table currently has 2 columns: `(name VARCHAR PRIMARY KEY, definition VARCHAR)`. The `created_on` timestamp is stored **inside** the JSON `definition` column as a new field, not as a separate table column. `#[serde(default)]` on the `Option<String>` field ensures backward-compatible deserialization of existing stored definitions.
 
-## CI Workflow Changes Required
+For the `database_name` and `schema_name` values, they are queried at runtime and never persisted. **No schema migration needed for either feature.**
 
-### Build.yml
+## Integration Points Summary
 
-Add a second job for the andium LTS build:
-
-```yaml
-duckdb-stable-build:
-  name: Build extension binaries (v1.5.0)
-  uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.0
-  with:
-    duckdb_version: v1.5.0
-    ci_tools_version: v1.5.0
-    extension_name: semantic_views
-    extra_toolchains: 'rust;python3'
-    exclude_archs: 'linux_amd64_musl;linux_arm64_musl;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-
-duckdb-andium-build:
-  name: Build extension binaries (v1.4.4 LTS)
-  uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
-  with:
-    duckdb_version: v1.4.4
-    ci_tools_version: v1.4.4
-    extension_name: semantic_views
-    extra_toolchains: 'rust;python3'
-    exclude_archs: 'linux_amd64_musl;linux_arm64_musl;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
-```
-
-### PullRequestCI.yml
-
-Add andium build to PR checks (can be Linux-only for speed):
-
-```yaml
-linux-fast-check:
-  name: Build and test (v1.5.0, Linux x86_64)
-  uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.0
-  with:
-    duckdb_version: v1.5.0
-    ci_tools_version: v1.5.0
-    # ... same as current but with v1.5.0
-
-linux-andium-check:
-  name: Build and test (v1.4.4 LTS, Linux x86_64)
-  uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
-  with:
-    duckdb_version: v1.4.4
-    ci_tools_version: v1.4.4
-    # ... same as current
-```
-
-### DuckDBVersionMonitor.yml
-
-Needs updating to handle the multi-version world:
-- Track latest stable (1.5.x) AND latest LTS patch (1.4.x)
-- The `repos/duckdb/duckdb/releases/latest` API now returns v1.5.0
-- Need a separate check for LTS releases (filter by `v1.4.*` pattern)
-
-### New: Docs.yml
-
-Add the Zensical documentation deployment workflow (see section 4 above).
-
-## DuckDB Version Monitor Update
-
-The existing `DuckDBVersionMonitor.yml` workflow checks `repos/duckdb/duckdb/releases/latest` which now returns v1.5.0. This workflow needs updating to:
-1. Track both the latest stable AND the latest LTS patch (v1.4.x)
-2. Not trigger a bump PR when the "latest" changes from 1.4.4 to 1.5.0 (that is an expected migration, not a breakage)
-3. Check for LTS patches via `gh api repos/duckdb/duckdb/releases --jq '[.[] | select(.tag_name | startswith("v1.4"))] | first | .tag_name'`
-
-## Cargo.toml Changes
-
-```toml
-# Cargo.toml for v0.5.4 (targeting DuckDB 1.5.0 as primary)
-[package]
-name = "semantic_views"
-version = "0.5.4"
-edition = "2021"
-
-[dependencies]
-duckdb = { version = "=1.10500.0", default-features = false }
-# libduckdb-sys dropped as direct dependency (bundled in duckdb 1.10500.0)
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-strsim = "0.11"
-arbitrary = { version = "1", optional = true, features = ["derive"] }
-
-[build-dependencies]
-cc = { version = "1", optional = true }
-
-[dev-dependencies]
-proptest = "1.9"
-```
-
-**Note:** The andium CI build (v1.4.4) may need a way to override the duckdb crate version. Options:
-- **Cargo.toml patch section** in CI (fragile)
-- **Conditional compilation** via feature flag (complex)
-- **Simplest: let extension-ci-tools handle it** -- the CE registry build system uses its own amalgamation download and does not depend on the duckdb crate version for extension builds. The `duckdb` crate is only used for `cargo test` (bundled mode), not for cdylib builds. The CI extension build uses `--no-default-features --features extension` which uses `loadable-extension` stubs, not bundled DuckDB.
-
-This means the Cargo.toml duckdb version only affects `cargo test`, and CI extension builds work regardless of the pinned crate version. **The andium build should work without Cargo.toml changes** because extension-ci-tools downloads its own DuckDB source.
-
-**Confidence:** MEDIUM -- this needs validation. The `libduckdb-sys` crate version may matter for type definitions even in `loadable-extension` mode. If so, a feature-flag approach would be needed.
+| Feature | Existing Code Touched | New Code |
+|---------|----------------------|----------|
+| `created_on` | `model.rs` (add field), `define.rs` (capture timestamp) | None |
+| `database_name`/`schema_name` | `lib.rs` init (query + cache), `list.rs`, `show_dims.rs`, `show_metrics.rs`, `show_facts.rs`, `show_dims_for_metric.rs` (use `ShowState`) | `ShowState` struct (likely in `catalog.rs` or new shared module) |
+| DESCRIBE restructure | `describe.rs` (rewrite VTab output) | None |
+| SHOW column changes | `list.rs`, `show_dims.rs`, `show_metrics.rs`, `show_facts.rs`, `show_dims_for_metric.rs` | None |
+| expand/ split | Delete `expand.rs`, create `expand/` directory | `expand/mod.rs` + 7 submodules |
+| graph/ split | Delete `graph.rs`, create `graph/` directory | `graph/mod.rs` + 5 submodules |
+| util.rs extraction | Remove `suggest_closest` from `expand.rs`, update imports in `graph.rs` | `src/util.rs` |
+| errors.rs extraction | Remove `ParseError` from `parse.rs`, update imports in `body_parser.rs` | `src/errors.rs` |
 
 ## Sources
 
-- [DuckDB 1.5.0 "Variegata" announcement](https://duckdb.org/2026/03/09/announcing-duckdb-150) -- HIGH confidence
-- [DuckDB v1.5.0 GitHub release](https://github.com/duckdb/duckdb/releases/tag/v1.5.0) -- HIGH confidence
-- [extension-ci-tools releases](https://github.com/duckdb/extension-ci-tools/releases) -- HIGH confidence (verified v1.5.0 tag + v1.5-variegata branch exist via GitHub API)
-- [duckdb-rs v1.10500.0 release notes](https://github.com/duckdb/duckdb-rs/releases/tag/v1.10500.0) -- HIGH confidence
-- [rusty_quack description.yml](https://github.com/duckdb/community-extensions/blob/main/extensions/rusty_quack/description.yml) -- HIGH confidence (canonical Rust CE example, fetched raw)
-- [PRQL description.yml](https://github.com/duckdb/community-extensions/blob/main/extensions/prql/description.yml) -- HIGH confidence (Rust toolchain CE example, fetched raw)
-- [Community Extensions UPDATING.md](https://github.com/duckdb/community-extensions/blob/main/UPDATING.md) -- HIGH confidence (fetched raw, dual-version strategy documented)
-- [Community Extensions documentation](https://duckdb.org/community_extensions/documentation) -- HIGH confidence
-- [DuckDB versioning of extensions](https://duckdb.org/docs/stable/extensions/versioning_of_extensions) -- HIGH confidence
-- [Zensical GitHub](https://github.com/zensical/zensical) -- HIGH confidence
-- [Zensical PyPI](https://pypi.org/project/zensical/) -- HIGH confidence
-- [Zensical documentation](https://zensical.org/docs/) -- HIGH confidence
-- [Zensical bootstrap workflow](https://github.com/zensical/zensical/blob/master/python/zensical/bootstrap/.github/workflows/docs.yml) -- HIGH confidence (fetched raw)
-- [Zensical bootstrap config](https://github.com/zensical/zensical/blob/master/python/zensical/bootstrap/zensical.toml) -- HIGH confidence (fetched raw)
-- [cssnr/zensical-action](https://github.com/cssnr/zensical-action) -- MEDIUM confidence (community action, not official)
-- [parser_override_function_t PR](https://github.com/duckdb/duckdb/pull/19126) -- HIGH confidence (read PR description)
-- [Parser override opt-in PR](https://github.com/duckdb/duckdb/pull/19181) -- HIGH confidence (read PR description)
-- [DuckDB release cycle](https://duckdb.org/docs/stable/dev/release_cycle) -- HIGH confidence
-- [Guidance on Rust extensions (Issue #54)](https://github.com/duckdb/community-extensions/issues/54) -- MEDIUM confidence
+- [DuckDB Timestamp with Time Zone Functions](https://duckdb.org/docs/current/sql/functions/timestamptz) -- `now()`, `current_timestamp`, `get_current_timestamp()` all return TIMESTAMPTZ (HIGH confidence)
+- [DuckDB Utility Functions](https://duckdb.org/docs/stable/sql/functions/utility.md) -- `current_database()`, `current_schema()` (HIGH confidence)
+- [Snowflake SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- output column schema: `created_on, name, kind, database_name, schema_name, comment, owner, owner_role_type, extension` (HIGH confidence)
+- [Snowflake DESCRIBE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view) -- property-per-row format: `object_kind, object_name, parent_entity, property, property_value` (HIGH confidence)
+- [Snowflake SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- output: `database_name, schema_name, semantic_view_name, table_name, name, data_type, synonyms, comment` (HIGH confidence)
+- [Snowflake SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics) -- same column layout as dimensions (HIGH confidence)
+- [Snowflake SHOW SEMANTIC FACTS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-facts) -- same column layout as dimensions (HIGH confidence)
+- [Snowflake SHOW SEMANTIC DIMENSIONS FOR METRIC](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions-for-metric) -- adds `required` boolean column (HIGH confidence)
+- [duckdb-rs LogicalTypeId docs](https://docs.rs/duckdb/1.10500.0/duckdb/core/enum.LogicalTypeId.html) -- Timestamp, TimestampTZ variants available but not needed (HIGH confidence)
+- [Rust module system -- Separating Modules into Files](https://doc.rust-lang.org/book/ch07-05-separating-modules-into-different-files.html) -- `mod.rs` directory pattern (HIGH confidence)
+- [Architecture notes](_notes/architecture.md) -- existing refactoring proposals C1-C6 (internal, HIGH confidence)
+- Existing codebase: `define.rs:113` already uses `current_database()` via SQL (HIGH confidence, verified by reading source)

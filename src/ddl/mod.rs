@@ -3,6 +3,7 @@ pub mod define;
 pub mod describe;
 pub mod drop;
 pub mod list;
+pub mod persist;
 pub mod show_dims;
 pub mod show_dims_for_metric;
 pub mod show_facts;

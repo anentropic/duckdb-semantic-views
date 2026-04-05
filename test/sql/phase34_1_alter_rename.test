@@ -45,10 +45,10 @@ DESCRIBE SEMANTIC VIEW sales_view
 does not exist
 
 # Verify new name appears in SHOW
-query TT
-SHOW SEMANTIC VIEWS
+query T
+SELECT name FROM list_semantic_views()
 ----
-revenue_view	p34_orders
+revenue_view
 
 # Verify query works under new name
 query IR rowsort
@@ -64,10 +64,10 @@ SELECT * FROM semantic_view('revenue_view', dimensions := ['order_id'], metrics 
 statement ok
 ALTER SEMANTIC VIEW revenue_view RENAME TO sales_view
 
-query TT
-SHOW SEMANTIC VIEWS
+query T
+SELECT name FROM list_semantic_views()
 ----
-sales_view	p34_orders
+sales_view
 
 # ============================================================
 # Test 3: RENAME non-existent (error)

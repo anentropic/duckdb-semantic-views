@@ -7,7 +7,7 @@
 SHOW SEMANTIC FACTS
 =====================
 
-Lists facts (named row-level expressions) registered in one or all semantic views. Each row describes a single fact with its name, expression, and source table. Views that have no facts defined return no rows.
+Lists facts (named row-level expressions) registered in one or all semantic views. Each row describes a single fact with its name, source table, and inferred data type. Views that have no facts defined return no rows.
 
 
 .. _ref-show-facts-syntax:
@@ -73,7 +73,7 @@ When ``LIKE`` and ``STARTS WITH`` are both present, a fact must satisfy both con
 Output Columns
 ==============
 
-Returns one row per fact with 4 columns:
+Returns one row per fact with 6 columns:
 
 .. list-table::
    :header-rows: 1
@@ -82,22 +82,24 @@ Returns one row per fact with 4 columns:
    * - Column
      - Type
      - Description
+   * - ``database_name``
+     - VARCHAR
+     - The DuckDB database containing the semantic view.
+   * - ``schema_name``
+     - VARCHAR
+     - The DuckDB schema containing the semantic view.
    * - ``semantic_view_name``
      - VARCHAR
      - The semantic view this fact belongs to.
+   * - ``table_name``
+     - VARCHAR
+     - The physical table name the fact is scoped to.
    * - ``name``
      - VARCHAR
      - The fact name as declared in the ``FACTS`` clause.
-   * - ``expr``
+   * - ``data_type``
      - VARCHAR
-     - The row-level SQL expression defining the fact (e.g., ``li.extended_price * (1 - li.discount)``).
-   * - ``source_table``
-     - VARCHAR
-     - The table alias the fact is scoped to.
-
-.. note::
-
-   Unlike :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` and :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>`, the facts output does not include a ``data_type`` column. Facts are row-level expressions that are inlined into metrics at expansion time, so their output type depends on the context in which they are used.
+     - The inferred data type (via ``typeof`` when the underlying table contains data). Empty string if the type has not been resolved.
 
 
 .. _ref-show-facts-examples:
@@ -107,7 +109,7 @@ Examples
 
 **List facts for a single view:**
 
-Given a semantic view ``orders_sv`` with one fact:
+Given a semantic view ``orders_sv`` with one fact on a table that contains data:
 
 .. code-block:: sql
 
@@ -115,11 +117,13 @@ Given a semantic view ``orders_sv`` with one fact:
 
 .. code-block:: text
 
-   ┌──────────────────────┬────────────┬──────────┬──────────────┐
-   │ semantic_view_name   │ name       │ expr     │ source_table │
-   ├──────────────────────┼────────────┼──────────┼──────────────┤
-   │ orders_sv            │ raw_amount │ o.amount │ o            │
-   └──────────────────────┴────────────┴──────────┴──────────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬────────────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type      │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼────────────────┤
+   │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │ DECIMAL(10,2)  │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┘
+
+The ``data_type`` column is inferred at define time using DuckDB's ``typeof`` function on the underlying table. When the table contains data, the type is resolved from the expression (e.g. ``DECIMAL(10,2)``). When the table is empty at define time, ``data_type`` is an empty string.
 
 **List facts across all views:**
 
@@ -131,11 +135,11 @@ Views with no facts are omitted. If only ``orders_sv`` has a ``FACTS`` clause:
 
 .. code-block:: text
 
-   ┌──────────────────────┬────────────┬──────────┬──────────────┐
-   │ semantic_view_name   │ name       │ expr     │ source_table │
-   ├──────────────────────┼────────────┼──────────┼──────────────┤
-   │ orders_sv            │ raw_amount │ o.amount │ o            │
-   └──────────────────────┴────────────┴──────────┴──────────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬────────────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type      │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼────────────────┤
+   │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │ DECIMAL(10,2)  │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┘
 
 **Filter by pattern with LIKE (case-insensitive):**
 
@@ -147,11 +151,11 @@ Find all facts whose name contains "amount":
 
 .. code-block:: text
 
-   ┌──────────────────────┬────────────┬──────────┬──────────────┐
-   │ semantic_view_name   │ name       │ expr     │ source_table │
-   ├──────────────────────┼────────────┼──────────┼──────────────┤
-   │ orders_sv            │ raw_amount │ o.amount │ o            │
-   └──────────────────────┴────────────┴──────────┴──────────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬───────────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type     │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼───────────────┤
+   │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │ DECIMAL(10,2) │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴───────────────┘
 
 Because ``LIKE`` is case-insensitive, ``LIKE '%AMOUNT%'`` produces the same results.
 
@@ -165,11 +169,11 @@ Find facts whose name starts with "raw":
 
 .. code-block:: text
 
-   ┌──────────────────────┬────────────┬──────────┬──────────────┐
-   │ semantic_view_name   │ name       │ expr     │ source_table │
-   ├──────────────────────┼────────────┼──────────┼──────────────┤
-   │ orders_sv            │ raw_amount │ o.amount │ o            │
-   └──────────────────────┴────────────┴──────────┴──────────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬───────────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type     │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼───────────────┤
+   │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │ DECIMAL(10,2) │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴───────────────┘
 
 ``STARTS WITH`` is case-sensitive. ``STARTS WITH 'Raw'`` would return no results because the fact is named ``raw_amount`` (lowercase).
 
@@ -181,11 +185,11 @@ Find facts whose name starts with "raw":
 
 .. code-block:: text
 
-   ┌──────────────────────┬────────────┬──────────┬──────────────┐
-   │ semantic_view_name   │ name       │ expr     │ source_table │
-   ├──────────────────────┼────────────┼──────────┼──────────────┤
-   │ orders_sv            │ raw_amount │ o.amount │ o            │
-   └──────────────────────┴────────────┴──────────┴──────────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬───────────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type     │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼───────────────┤
+   │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │ DECIMAL(10,2) │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴───────────────┘
 
 **Chained facts:**
 
@@ -212,14 +216,14 @@ Facts can reference other facts. Consider a view with two chained facts:
 
 .. code-block:: text
 
-   ┌──────────────────────┬────────────┬──────────────────────────────────────────┬──────────────┐
-   │ semantic_view_name   │ name       │ expr                                     │ source_table │
-   ├──────────────────────┼────────────┼──────────────────────────────────────────┼──────────────┤
-   │ tpch_analysis        │ net_price  │ li.extended_price * (1 - li.discount)    │ li           │
-   │ tpch_analysis        │ tax_amount │ li.net_price * li.tax_rate               │ li           │
-   └──────────────────────┴────────────┴──────────────────────────────────────────┴──────────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬────────────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type      │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼────────────────┤
+   │ memory        │ main        │ tpch_analysis        │ line_items │ net_price  │ DECIMAL(18,4)  │
+   │ memory        │ main        │ tpch_analysis        │ line_items │ tax_amount │                │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┘
 
-The ``expr`` column shows each fact's expression as declared. The extension resolves chained references (``li.net_price`` in ``tax_amount``) at query expansion time.
+``net_price`` has a resolved ``data_type`` because its expression (``li.extended_price * (1 - li.discount)``) uses physical columns. ``tax_amount`` is blank because its expression references another fact (``li.net_price``), which ``typeof`` cannot resolve from a table scan. The extension resolves chained references at query expansion time.
 
 **Filter chained facts with STARTS WITH:**
 
@@ -229,11 +233,11 @@ The ``expr`` column shows each fact's expression as declared. The extension reso
 
 .. code-block:: text
 
-   ┌──────────────────────┬───────────┬───────────────────────────────────────┬──────────────┐
-   │ semantic_view_name   │ name      │ expr                                  │ source_table │
-   ├──────────────────────┼───────────┼───────────────────────────────────────┼──────────────┤
-   │ tpch_analysis        │ net_price │ li.extended_price * (1 - li.discount) │ li           │
-   └──────────────────────┴───────────┴───────────────────────────────────────┴──────────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬───────────┬────────────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name      │ data_type      │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼───────────┼────────────────┤
+   │ memory        │ main        │ tpch_analysis        │ line_items │ net_price │ DECIMAL(18,4)  │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴───────────┴────────────────┘
 
 **Error: view does not exist:**
 

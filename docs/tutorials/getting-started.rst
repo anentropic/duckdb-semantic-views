@@ -45,13 +45,6 @@ Install the Extension
          con.execute("INSTALL semantic_views FROM community")
          con.execute("LOAD semantic_views")
 
-.. note::
-
-   The extension is in pre-release. If it is not yet on the community registry, you
-   can build from source and load the binary directly. See the
-   `project repository <https://github.com/anentropic/duckdb-semantic-views>`_ for
-   build instructions.
-
 
 .. _tutorial-gs-create-table:
 
@@ -110,15 +103,15 @@ Verify the view was created:
 
    SHOW SEMANTIC VIEWS;
 
-You should see:
+You should see the view listed with its metadata:
 
 .. code-block:: text
 
-   ┌───────────────┬────────────┐
-   │     name      │ base_table │
-   ├───────────────┼────────────┤
-   │ order_metrics │ orders     │
-   └───────────────┴────────────┘
+   ┌─────────────────────┬───────────────┬───────────────┬───────────────┬─────────────┐
+   │     created_on      │     name      │     kind      │ database_name │ schema_name │
+   ├─────────────────────┼───────────────┼───────────────┼───────────────┼─────────────┤
+   │ 2026-04-01T12:00:00 │ order_metrics │ SEMANTIC_VIEW │ memory        │ main        │
+   └─────────────────────┴───────────────┴───────────────┴───────────────┴─────────────┘
 
 
 .. _tutorial-gs-query:

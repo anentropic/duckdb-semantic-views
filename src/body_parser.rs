@@ -3,8 +3,8 @@
 //! Parses: `AS TABLES (...) RELATIONSHIPS (...) DIMENSIONS (...) METRICS (...)`
 //! into a `SemanticViewDefinition`.
 
+use crate::errors::ParseError;
 use crate::model::{Cardinality, Dimension, Fact, Join, Metric, TableRef};
-use crate::parse::ParseError;
 
 /// Result of parsing the keyword body (everything after "AS").
 #[derive(Debug)]
@@ -331,6 +331,7 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
             name: bare_name,
             expr,
             source_table: Some(alias),
+            output_type: None,
         })
         .collect();
 
@@ -443,7 +444,8 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty())
             .collect();
-        // Find position after closing paren
+        // SAFETY: extract_paren_content succeeded above (returned Some), confirming
+        // balanced parens exist. The closing ')' must be present in after_pk.
         let close = after_pk.find(')').unwrap();
         let remainder = &after_pk[close + 1..];
         (table_name, pk_columns, remainder)
@@ -496,6 +498,8 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
                 .filter(|c| !c.is_empty())
                 .collect();
             unique_constraints.push(cols);
+            // SAFETY: extract_paren_content succeeded above (returned Some), confirming
+            // balanced parens exist. The closing ')' must be present in after_unique_kw.
             let close = after_unique_kw.find(')').unwrap();
             remaining = &after_unique_kw[close + 1..];
         } else {
@@ -792,6 +796,8 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty())
             .collect();
+        // SAFETY: extract_paren_content succeeded above (returned Some), confirming
+        // balanced parens exist. The closing ')' must be present in after_to.
         let close = after_to.find(')').unwrap();
         (cols, after_to[close + 1..].trim())
     } else {

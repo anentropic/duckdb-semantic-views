@@ -5,7 +5,6 @@ use duckdb::{
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
 };
 use libduckdb_sys as ffi;
-use std::ffi::CString;
 
 use crate::catalog::{catalog_rename, CatalogState};
 
@@ -28,30 +27,19 @@ unsafe impl Sync for AlterRenameState {}
 /// Persist a rename in `semantic_layer._definitions` using the separate
 /// persist_conn: DELETE old row, INSERT new row with updated name.
 fn persist_rename(conn: ffi::duckdb_connection, old_name: &str, new_name: &str, json: &str) {
-    let safe_old = old_name.replace('\'', "''");
-    let safe_new = new_name.replace('\'', "''");
-    let safe_json = json.replace('\'', "''");
-
-    // Delete old row
-    let delete_sql = format!("DELETE FROM semantic_layer._definitions WHERE name = '{safe_old}'");
-    if let Ok(c_sql) = CString::new(delete_sql) {
-        unsafe {
-            let mut result: ffi::duckdb_result = std::mem::zeroed();
-            ffi::duckdb_query(conn, c_sql.as_ptr(), &mut result);
-            ffi::duckdb_destroy_result(&mut result);
-        }
-    }
-
-    // Insert new row
-    let insert_sql = format!(
-        "INSERT INTO semantic_layer._definitions (name, definition) VALUES ('{safe_new}', '{safe_json}')"
-    );
-    if let Ok(c_sql) = CString::new(insert_sql) {
-        unsafe {
-            let mut result: ffi::duckdb_result = std::mem::zeroed();
-            ffi::duckdb_query(conn, c_sql.as_ptr(), &mut result);
-            ffi::duckdb_destroy_result(&mut result);
-        }
+    unsafe {
+        // Delete old row
+        let _ = super::persist::execute_parameterized(
+            conn,
+            "DELETE FROM semantic_layer._definitions WHERE name = $1",
+            &[old_name],
+        );
+        // Insert new row
+        let _ = super::persist::execute_parameterized(
+            conn,
+            "INSERT INTO semantic_layer._definitions (name, definition) VALUES ($1, $2)",
+            &[new_name, json],
+        );
     }
 }
 

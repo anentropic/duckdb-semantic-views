@@ -9,11 +9,15 @@ use crate::catalog::CatalogState;
 use crate::model::SemanticViewDefinition;
 
 /// A single row in the SHOW SEMANTIC METRICS output.
+///
+/// 6 Snowflake-aligned columns: database_name, schema_name, semantic_view_name,
+/// table_name, name, data_type.
 struct ShowMetricRow {
+    database_name: String,
+    schema_name: String,
     semantic_view_name: String,
+    table_name: String,
     name: String,
-    expr: String,
-    source_table: String,
     data_type: String,
 }
 
@@ -35,18 +39,25 @@ pub struct ShowMetricsInitData {
 unsafe impl Send for ShowMetricsInitData {}
 unsafe impl Sync for ShowMetricsInitData {}
 
-/// Helper: declare the 5-column output schema for metrics.
+/// Helper: declare the 6-column output schema for metrics.
 fn bind_output_columns(bind: &BindInfo) {
+    bind.add_result_column(
+        "database_name",
+        LogicalTypeHandle::from(LogicalTypeId::Varchar),
+    );
+    bind.add_result_column(
+        "schema_name",
+        LogicalTypeHandle::from(LogicalTypeId::Varchar),
+    );
     bind.add_result_column(
         "semantic_view_name",
         LogicalTypeHandle::from(LogicalTypeId::Varchar),
     );
-    bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-    bind.add_result_column("expr", LogicalTypeHandle::from(LogicalTypeId::Varchar));
     bind.add_result_column(
-        "source_table",
+        "table_name",
         LogicalTypeHandle::from(LogicalTypeId::Varchar),
     );
+    bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
     bind.add_result_column("data_type", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 }
 
@@ -55,14 +66,25 @@ fn collect_metrics(view_name: &str, json: &str) -> Vec<ShowMetricRow> {
     let Ok(def) = SemanticViewDefinition::from_json(view_name, json) else {
         return Vec::new();
     };
+    let db_name = def.database_name.clone().unwrap_or_default();
+    let sch_name = def.schema_name.clone().unwrap_or_default();
+    let alias_map = def.alias_to_table_map();
     def.metrics
         .iter()
-        .map(|m| ShowMetricRow {
-            semantic_view_name: view_name.to_string(),
-            name: m.name.clone(),
-            expr: m.expr.clone(),
-            source_table: m.source_table.clone().unwrap_or_default(),
-            data_type: m.output_type.clone().unwrap_or_default(),
+        .map(|m| {
+            let table_name = m
+                .source_table
+                .as_ref()
+                .and_then(|a| alias_map.get(a).cloned())
+                .unwrap_or_default();
+            ShowMetricRow {
+                database_name: db_name.clone(),
+                schema_name: sch_name.clone(),
+                semantic_view_name: view_name.to_string(),
+                table_name,
+                name: m.name.clone(),
+                data_type: m.output_type.clone().unwrap_or_default(),
+            }
         })
         .collect()
 }
@@ -83,17 +105,19 @@ fn emit_rows(
     let bind_data = func.get_bind_data();
     let n = bind_data.rows.len();
 
-    let sv_vec = output.flat_vector(0);
-    let name_vec = output.flat_vector(1);
-    let expr_vec = output.flat_vector(2);
-    let source_vec = output.flat_vector(3);
-    let type_vec = output.flat_vector(4);
+    let db_name_vec = output.flat_vector(0);
+    let sch_name_vec = output.flat_vector(1);
+    let sv_vec = output.flat_vector(2);
+    let table_vec = output.flat_vector(3);
+    let name_vec = output.flat_vector(4);
+    let type_vec = output.flat_vector(5);
 
     for (i, row) in bind_data.rows.iter().enumerate() {
+        db_name_vec.insert(i, row.database_name.as_str());
+        sch_name_vec.insert(i, row.schema_name.as_str());
         sv_vec.insert(i, row.semantic_view_name.as_str());
+        table_vec.insert(i, row.table_name.as_str());
         name_vec.insert(i, row.name.as_str());
-        expr_vec.insert(i, row.expr.as_str());
-        source_vec.insert(i, row.source_table.as_str());
         type_vec.insert(i, row.data_type.as_str());
     }
     output.set_len(n);

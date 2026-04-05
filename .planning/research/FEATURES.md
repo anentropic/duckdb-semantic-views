@@ -1,507 +1,419 @@
-# Feature Landscape: v0.5.4 Snowflake-Parity & Registry Publishing
+# Feature Landscape: v0.5.5 SHOW/DESCRIBE Alignment & Refactoring
 
-**Domain:** DuckDB Rust extension -- Snowflake-style cardinality inference, multi-version support, documentation, and community extension registry publishing
-**Researched:** 2026-03-15
-**Milestone:** v0.5.4 -- UNIQUE constraint + cardinality inference, multi-version DuckDB support, Zensical docs site, CE registry publishing
-**Status:** Subsequent milestone research (v0.5.3 shipped 2026-03-15)
-**Overall confidence:** HIGH (Snowflake DDL grammar verified from official docs; DuckDB CE registry format verified from live description.yml files; DuckDB release cycle docs verified; Zensical verified from GitHub)
+**Domain:** DuckDB Rust extension -- Snowflake-aligned SHOW/DESCRIBE output formats + module directory refactoring
+**Researched:** 2026-04-01
+**Milestone:** v0.5.5 -- Align all 6 SHOW/DESCRIBE output formats with Snowflake; split expand.rs and graph.rs into module directories
+**Status:** Subsequent milestone research (v0.5.4 shipped 2026-03-27)
+**Overall confidence:** HIGH (Snowflake output schemas verified from official docs for all 6 commands; existing codebase analyzed directly)
 
 ---
 
 ## Scope
 
-This document covers the feature surface for v0.5.4: aligning with Snowflake's constraint-based cardinality inference, supporting multiple DuckDB versions (1.4.x LTS and 1.5.x latest), publishing to the DuckDB community extension registry, and shipping a documentation site.
+This document covers the feature surface for v0.5.5: restructuring DESCRIBE to Snowflake's property-per-row format, aligning all SHOW command column schemas, adding `created_on`/`database_name`/`schema_name` metadata, and splitting the two largest modules into clean directories.
 
 **What already exists (NOT in scope for research):**
-- Full native CREATE SEMANTIC VIEW DDL with TABLES, RELATIONSHIPS, FACTS, HIERARCHIES, DIMENSIONS, METRICS
-- PK/FK relationship model with explicit `ONE TO MANY` / `MANY TO ONE` / `ONE TO ONE` cardinality keywords
-- Fan trap detection, role-playing dimensions, USING RELATIONSHIPS, derived metrics
-- `PRIMARY KEY (col)` on TABLES clause, FK REFERENCES in RELATIONSHIPS
-- Build.yml using `duckdb/extension-ci-tools` reusable workflow (v1.4.4)
-- DuckDB Version Monitor CI workflow
-- 441 tests, 13.5K LOC
+- DESCRIBE SEMANTIC VIEW: 6 columns (name, base_table, dimensions JSON, metrics JSON, joins JSON, facts JSON), single row
+- SHOW SEMANTIC VIEWS: 2 columns (name, base_table)
+- SHOW SEMANTIC DIMENSIONS: 5 columns (semantic_view_name, name, expr, source_table, data_type)
+- SHOW SEMANTIC METRICS: 5 columns (same pattern)
+- SHOW SEMANTIC FACTS: 4 columns (semantic_view_name, name, expr, source_table -- no data_type)
+- SHOW SEMANTIC DIMENSIONS FOR METRIC: 5 columns (same as SHOW DIMS)
+- LIKE, STARTS WITH, LIMIT filtering on all SHOW commands
+- 482 tests, 15.8K LOC
+- expand.rs (4,440 lines), graph.rs (2,333 lines)
 
-**Focus:** Four feature areas and their interactions, complexity, and implementation sequencing.
+**Focus:** Output format alignment, metadata storage changes, `required` column semantics, and module decomposition.
 
 ---
 
 ## Table Stakes
 
-Features that must ship before v0.5.4 can be considered a viable public release on the community extension registry.
+Features users expect. Missing = output format diverges from Snowflake alignment goal.
 
-### T1: UNIQUE Table Constraint + Snowflake-Style Cardinality Inference
+### T1: DESCRIBE SEMANTIC VIEW -- Property-Per-Row Format
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Add `UNIQUE (col)` constraint to TABLES clause. Infer relationship cardinality from PK/UNIQUE declarations instead of requiring explicit `ONE TO MANY` / `MANY TO ONE` keywords. |
-| **Why Expected** | Snowflake's semantic views infer cardinality from constraints. Explicit cardinality keywords are verbose and error-prone. Users already declare PK; UNIQUE is the natural companion for cardinality inference. This removes a significant syntax burden and aligns with Snowflake semantics. |
-| **Complexity** | **Medium** |
-| **Dependencies** | Body parser (add UNIQUE to TABLES clause grammar). Model (`TableRef` needs `unique_columns`). Graph module (infer cardinality from constraint metadata). Backward compat (existing explicit cardinality must still work during transition). |
+| **Feature** | Restructure DESCRIBE output from 1 row with 6 JSON blob columns to N rows with 5 columns: `object_kind`, `object_name`, `parent_entity`, `property`, `property_value` |
+| **Why Expected** | This is the core format change. Snowflake's DESCRIBE returns one row per property, enabling SELECT/WHERE filtering on individual properties. The current JSON blob format requires client-side JSON parsing. |
+| **Complexity** | **Medium** -- complete rewrite of `DescribeSemanticViewVTab` |
+| **Dependencies** | None -- self-contained rewrite of `src/ddl/describe.rs` |
 
-**How Snowflake handles cardinality inference (verified from official docs):**
+**Snowflake's exact schema (verified from official docs):**
 
-Snowflake's cardinality rules work as follows:
+| Column | Type | Description |
+|--------|------|-------------|
+| `object_kind` | VARCHAR | Type of object: TABLE, RELATIONSHIP, DIMENSION, FACT, METRIC, DERIVED_METRIC, or NULL (view-level) |
+| `object_name` | VARCHAR | Name of the dimension, fact, metric, logical table, or relationship |
+| `parent_entity` | VARCHAR | Parent table name for dims/facts/metrics/relationships; NULL for tables/derived metrics/view-level |
+| `property` | VARCHAR | Property name (TABLE, EXPRESSION, DATA_TYPE, PRIMARY_KEY, FOREIGN_KEY, REF_TABLE, REF_KEY, etc.) |
+| `property_value` | VARCHAR | Property value as string |
 
-1. **TABLES clause** declares `PRIMARY KEY (col)` and/or `UNIQUE (col)` per logical table
-2. **RELATIONSHIPS clause** uses `table_a(fk_col) REFERENCES table_b` -- the referenced columns must be a PRIMARY KEY or UNIQUE constraint on `table_b`
-3. **Cardinality is inferred from the data characteristics of the FK column:**
-   - If multiple rows in the FK table share the same FK value --> **many-to-one** relationship
-   - If each row in the FK table has a unique FK value --> **one-to-one** relationship
-4. **No explicit cardinality keywords exist** in Snowflake semantic views. There is no `ONE TO MANY` or `MANY TO ONE` syntax.
-5. **Many-to-many is NOT supported.** Snowflake only recognizes many-to-one and one-to-one relationships.
-6. **Self-references are prohibited.** "A table cannot reference itself."
+**Properties to emit per object_kind (our extension's subset):**
 
-**Snowflake TABLES syntax with UNIQUE (verified from official DDL grammar):**
+| object_kind | Properties | Source in Model |
+|-------------|-----------|-----------------|
+| TABLE | BASE_TABLE_NAME, PRIMARY_KEY | `TableRef.table`, `TableRef.pk_columns` joined by comma |
+| TABLE | BASE_TABLE_DATABASE_NAME, BASE_TABLE_SCHEMA_NAME | Stored metadata (see T5 below) |
+| RELATIONSHIP | TABLE, REF_TABLE, FOREIGN_KEY, REF_KEY | `Join.from_alias`, `Join.table`, `Join.fk_columns`, `Join.pk_columns` |
+| DIMENSION | TABLE, EXPRESSION, DATA_TYPE | `Dimension.source_table`, `Dimension.expr`, `Dimension.output_type` |
+| FACT | TABLE, EXPRESSION, DATA_TYPE | `Fact.source_table`, `Fact.expr`, (fact type if available) |
+| METRIC | TABLE, EXPRESSION, DATA_TYPE | `Metric.source_table`, `Metric.expr`, `Metric.output_type` |
+| DERIVED_METRIC | EXPRESSION, DATA_TYPE | `Metric.expr` (no TABLE -- derived metrics reference other metrics) |
 
-```sql
-TABLES (
-  region AS schema.REGION PRIMARY KEY (r_regionkey),
-  product AS schema.PRODUCTS PRIMARY KEY (product_id) UNIQUE (service_id),
-  combo AS schema.COMBO_TABLE PRIMARY KEY (id) UNIQUE (area_id, product_id) UNIQUE (service_id)
-)
-```
+**Properties we skip (per user decision or N/A):**
+- COMMENT, SYNONYMS (user decided: no NULL placeholders)
+- ACCESS_MODIFIER (DuckDB has no RBAC)
+- CONSTRAINT (not implemented -- PK expressed as TABLE property)
+- CUSTOM_INSTRUCTIONS (Snowflake Cortex AI specific)
+- Cortex Search Service properties (Snowflake specific)
 
-Key grammar points:
-- A table can have ONE `PRIMARY KEY` and MULTIPLE `UNIQUE` constraints
-- Both can be composite (multiple columns)
-- "If you already identified a column as a primary key column (by using PRIMARY KEY), do not add the UNIQUE clause for that column"
+**parent_entity mapping:**
+- TABLE: NULL (tables are top-level)
+- RELATIONSHIP: NULL (relationships reference two tables, not one parent)
+- DIMENSION: `source_table` (the logical table this dim belongs to)
+- FACT: `source_table` (the logical table this fact belongs to)
+- METRIC: `source_table` (the logical table this metric belongs to)
+- DERIVED_METRIC: NULL (no table association)
 
-**Snowflake REFERENCES resolution (verified from official docs):**
+**Row ordering:** View-level properties first (if any), then TABLEs, then RELATIONSHIPs, then DIMENSIONs, then FACTs, then METRICs. Within each group, alphabetical by object_name, then by property name.
 
-```sql
-RELATIONSHIPS (
-  nation (n_regionkey) REFERENCES region,          -- references region's PRIMARY KEY
-  orders (o_custkey) REFERENCES customer,          -- references customer's PRIMARY KEY
-  detail (service_id) REFERENCES product(service_id) -- references product's UNIQUE(service_id)
-)
-```
+**Row count estimate:** A typical view with 2 tables, 1 relationship, 5 dims, 3 facts, 4 metrics produces ~48 rows. Comfortably within DuckDB's 2048-row chunk size.
 
-When `REFERENCES table_alias` omits the column list, it resolves to the target table's PRIMARY KEY. When `REFERENCES table_alias(col)` specifies columns, they must match a declared UNIQUE or PRIMARY KEY constraint.
+**Implementation pattern:** The bind function parses the stored JSON into `SemanticViewDefinition`, walks each component in order, emits one row per property into a `Vec<DescribeRow>`, and the func callback emits them. Same pattern as existing SHOW commands.
 
-**Cardinality inference algorithm (our implementation):**
-
-Since DuckDB semantic views are a preprocessor (we do not query the data at define time), we cannot infer cardinality from actual data like Snowflake does. Instead, we infer from **constraint declarations**:
-
-| FK column constraint | Referenced constraint | Inferred cardinality |
-|---------------------|----------------------|---------------------|
-| No constraint (bare column) | PRIMARY KEY | **Many-to-one** (default FK pattern) |
-| UNIQUE or PRIMARY KEY | PRIMARY KEY | **One-to-one** |
-| No constraint | UNIQUE | **Many-to-one** |
-| UNIQUE or PRIMARY KEY | UNIQUE | **One-to-one** |
-
-This is the correct inference because:
-- If the FK column has a UNIQUE/PK constraint, each FK value appears at most once --> one-to-one
-- If the FK column has no uniqueness constraint, multiple rows can share the same FK value --> many-to-one
-- One-to-many is the inverse of many-to-one (from the perspective of the referenced table looking back)
-
-**What this replaces:**
-
-Currently, the extension uses explicit cardinality keywords after REFERENCES:
-
-```sql
--- Current (v0.5.3) syntax:
-RELATIONSHIPS (
-  order_to_customer AS o(customer_id) REFERENCES c ONE TO MANY
-)
-
--- New (v0.5.4) syntax (Snowflake-aligned):
-RELATIONSHIPS (
-  order_to_customer AS o(customer_id) REFERENCES c
-  -- Cardinality inferred: o.customer_id has no UNIQUE --> many-to-one from o to c
-)
-```
-
-**Migration strategy:**
-- Phase 1: Add UNIQUE to TABLES. Add inference logic. Keep explicit keywords working (backward compat).
-- Phase 2: Deprecation warning when explicit keywords are used.
-- Phase 3 (future): Remove explicit keywords entirely.
-
-For v0.5.4, **both syntaxes should work.** Explicit keywords override inference when provided. This prevents a breaking change before registry publishing.
-
-**Edge cases:**
-- **No PK/UNIQUE on referenced table:** Error at define time. "table 'x' is referenced in a relationship but has no PRIMARY KEY or UNIQUE constraint"
-- **FK column references UNIQUE, not PK:** Valid. UNIQUE columns are equally valid as reference targets.
-- **Composite FK referencing composite UNIQUE:** Must match column count and names. Error if mismatch.
-- **Explicit cardinality contradicts inference:** Honor the explicit keyword (user knows better than inference). Log a warning.
-- **Stored JSON backward compatibility:** Old definitions without UNIQUE metadata must continue loading. `unique_columns` defaults to empty Vec (serde default).
-
-**Confidence:** HIGH (Snowflake DDL grammar verified, inference rules derived from constraint semantics)
+**Confidence:** HIGH (schema verified from [DESCRIBE SEMANTIC VIEW docs](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view))
 
 ---
 
-### T2: Community Extension Registry Publishing
+### T2: SHOW SEMANTIC VIEWS -- Expanded Column Schema
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Submit `description.yml` to `duckdb/community-extensions` repository. Pass CI build. Get listed at `duckdb.org/community_extensions/extensions/semantic_views`. |
-| **Why Expected** | The extension claims to fill a gap in DuckDB's ecosystem. Being in the registry makes it installable via `INSTALL semantic_views FROM community;` and discoverable. Without registry presence, adoption is near zero. |
-| **Complexity** | **Low-Medium** (mostly configuration, not code) |
-| **Dependencies** | Multi-version DuckDB support (T3) for the `andium` field. Build pipeline must pass on all required platforms. Excluded platforms must be declared. |
+| **Feature** | Expand from 2 columns (name, base_table) to 5 columns: `created_on`, `name`, `kind`, `database_name`, `schema_name` |
+| **Why Expected** | Snowflake returns 8 columns; our subset drops owner/role/extension/comment columns that have no DuckDB equivalent. The remaining 5 provide essential metadata for programmatic consumption. |
+| **Complexity** | **Medium** -- requires metadata storage changes (T5) + rewrite of `ListSemanticViewsVTab` |
+| **Dependencies** | T5 (created_on + database_name + schema_name storage) |
 
-**What a successful Rust extension submission looks like (verified from live `rusty_quack` descriptor):**
+**Target schema:**
 
-```yaml
-extension:
-  name: semantic_views
-  description: Semantic views for DuckDB - declarative dimensions, metrics, and relationships
-  version: 0.5.4
-  language: Rust
-  build: cargo
-  license: MIT
-  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_rtools;windows_amd64_mingw;linux_amd64_musl"
-  requires_toolchains: "rust;python3"
-  maintainers:
-    - paulbouwer
+| Column | Type | Source |
+|--------|------|--------|
+| `created_on` | TIMESTAMP | Stored at define time (see T5) |
+| `name` | VARCHAR | Already available |
+| `kind` | VARCHAR | Constant: 'SEMANTIC_VIEW' |
+| `database_name` | VARCHAR | Stored at define time (see T5) |
+| `schema_name` | VARCHAR | Stored at define time (see T5) |
 
-repo:
-  github: paulbouwer/duckdb-semantic-views
-  andium: <commit_hash_for_1.4.x_LTS>
-  ref: <commit_hash_for_latest>
+**What changes from current:**
+- ADD: `created_on`, `kind`, `database_name`, `schema_name`
+- DROP: `base_table` (this information moves to DESCRIBE as TABLE properties)
 
-docs:
-  hello_world: |
-    -- Create a semantic view
-    CREATE SEMANTIC VIEW sales AS
-      TABLES (o AS orders PRIMARY KEY (id))
-      DIMENSIONS (o.region AS o.region)
-      METRICS (o.revenue AS SUM(o.amount));
-    -- Query it
-    FROM semantic_view('sales', dimensions := ['region'], metrics := ['revenue']);
-  extended_description: |
-    Semantic views provide a declarative layer for DuckDB that lets you define
-    dimensions, metrics, relationships, facts, and hierarchies once, then query
-    with any combination without writing GROUP BY or JOIN logic by hand.
-```
+**Breaking change:** Users currently referencing `base_table` from SHOW SEMANTIC VIEWS must switch to DESCRIBE. This is acceptable for a pre-1.0 extension.
 
-**Key fields explained:**
-- `build: cargo` -- tells the CE build system to use `cargo build` instead of `cmake`
-- `excluded_platforms` -- WASM not supported (parser hooks need C++ shim), musl not supported (linking issues), mingw not supported (CC compilation)
-- `requires_toolchains: "rust;python3"` -- Rust for the extension, Python3 for test tooling
-- `repo.ref` -- git commit hash for the latest DuckDB version build (currently 1.5.0)
-- `repo.andium` -- git commit hash for the 1.4.x LTS build (named after the LTS codename)
-
-**Release process (verified from UPDATING.md):**
-1. Extension is built whenever the descriptor is updated (targets latest stable DuckDB)
-2. Extension is rebuilt when a new DuckDB version releases (all CE extensions rebuilt)
-3. The `andium` field provides the commit for the 1.4.x LTS line -- extensions are built for both
-4. After LTS EOL (September 2026), the `andium` field is removed
-
-**Review criteria (from documentation + community observations):**
-- Extension must be public, open-source, hosted on GitHub
-- `description.yml` must have all required fields
-- Build must succeed on all non-excluded platforms
-- CI auto-detects added functions, types, settings by comparing DuckDB catalog before/after load
-- No formal code review -- the build pipeline is the gatekeeper
-- Documentation page auto-generated from `docs.hello_world` and `docs.extended_description`
-
-**What must be ready before submission:**
-1. Build passes on: `linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`, `windows_amd64`
-2. Extension loads cleanly: `INSTALL 'path/to/semantic_views.duckdb_extension'; LOAD semantic_views;`
-3. `hello_world` example works end-to-end
-4. No secrets or credentials in the repository
-5. MIT license file present
-
-**Confidence:** HIGH (verified from live `rusty_quack` descriptor and UPDATING.md)
+**Confidence:** HIGH (schema verified from [SHOW SEMANTIC VIEWS docs](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views))
 
 ---
 
-### T3: Multi-Version DuckDB Support (Andium LTS + Latest)
+### T3: SHOW SEMANTIC DIMENSIONS/METRICS/FACTS -- Aligned Column Schema
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Support both DuckDB 1.4.x (Andium LTS, EOL Sep 2026) and DuckDB 1.5.x (Variegata, latest). Ship extension binaries for both. |
-| **Why Expected** | DuckDB 1.4.x is the LTS release -- many production users stay on LTS. The community extension registry uses the `andium` field to build for LTS. Without LTS support, users on 1.4.x cannot install the extension. |
-| **Complexity** | **Medium-High** |
-| **Dependencies** | CI/CD changes (two build targets). Cargo.toml dependency management (duckdb crate version). Potential code changes if APIs differ between 1.4 and 1.5. Feature flags or conditional compilation. |
+| **Feature** | Align all three SHOW commands from 5/4 columns to 6 columns: `database_name`, `schema_name`, `semantic_view_name`, `table_name`, `name`, `data_type` |
+| **Why Expected** | Snowflake uses an 8-column schema (adding synonyms, comment). Our subset drops those two per user decision but must include the remaining 6. |
+| **Complexity** | **Low** -- additive column changes + column rename + column removal |
+| **Dependencies** | T5 (database_name + schema_name storage) |
 
-**DuckDB release cycle (verified from official docs):**
+**Target schema (same for all three commands):**
 
-| Version | Codename | Type | Release | EOL |
-|---------|----------|------|---------|-----|
-| 1.4.0 | Andium | LTS | Sep 2025 | Sep 2026 |
-| 1.4.3 | Andium | LTS patch | Dec 2025 | Sep 2026 |
-| 1.5.0 | Variegata | Latest | Mar 2026 | Next release |
-| 2.0 | (planned) | Next major | Sep 2026 | TBD |
+| Column | Type | Source |
+|--------|------|--------|
+| `database_name` | VARCHAR | Stored at define time |
+| `schema_name` | VARCHAR | Stored at define time |
+| `semantic_view_name` | VARCHAR | Already available |
+| `table_name` | VARCHAR | Currently `source_table` -- renamed |
+| `name` | VARCHAR | Already available |
+| `data_type` | VARCHAR | Already available for dims/metrics; needs addition for facts |
 
-**Extension versioning model (verified from DuckDB docs):**
+**What changes from current:**
+- ADD: `database_name`, `schema_name` (prepended)
+- RENAME: `source_table` to `table_name`
+- DROP: `expr` (user decision: implementation detail, available via DESCRIBE EXPRESSION property)
+- ADD to FACTS: `data_type` (Snowflake includes it; current facts output omits it)
 
-The extension uses `C_STRUCT_UNSTABLE` ABI, which means:
-- Extension binary is pinned to an exact DuckDB version
-- Not binary-compatible across DuckDB minor versions
-- Each DuckDB version needs its own build
+**Breaking change:** `expr` column removal and `source_table` rename. Acceptable for pre-1.0.
 
-The "Stable C API" (`C_STRUCT` ABI) would provide binary compatibility across versions, but our extension uses parser hooks via C++ shim which requires the unstable API.
+**SHOW SEMANTIC FACTS data_type:** Facts currently have no `output_type` field in the model. The `Fact` struct stores `name`, `expr`, and `source_table` only. Adding `data_type` to facts requires either:
+1. Adding `output_type: Option<String>` to the `Fact` struct and populating it during type inference (same as dims/metrics)
+2. Emitting empty string for facts without type info
 
-**Branching strategy for multi-version support (verified from UPDATING.md):**
+Option 1 is cleaner and consistent with dims/metrics. Facts are row-level expressions with deterministic types, so LIMIT 0 inference can resolve them.
 
-The community extension registry expects:
-- `repo.ref` -- commit hash targeting latest stable (1.5.x)
-- `repo.andium` -- commit hash targeting LTS (1.4.x)
-
-Two approaches for maintaining both:
-
-**Approach A: Separate branches (recommended by DuckDB docs)**
-- `main` branch targets latest (DuckDB 1.5.x, `duckdb = "=1.5.0"` in Cargo.toml)
-- `v1.4-andium` branch targets LTS (DuckDB 1.4.x, `duckdb = "=1.4.4"` in Cargo.toml)
-- `description.yml` uses `ref: <main commit>` and `andium: <andium branch commit>`
-- Bug fixes applied to both branches (cherry-pick or merge)
-
-**Approach B: Cargo feature flags (more complex, not standard)**
-- Single branch with conditional compilation: `#[cfg(feature = "duckdb14")]`
-- Separate Cargo.toml profiles or workspace members
-- Not recommended -- the DuckDB crate version pin (`= 1.4.4`) is a hard dependency
-
-**Recommendation: Approach A (separate branches).**
-
-The current project already has a DuckDB Version Monitor CI that detects new releases. The workflow needs updating to:
-1. Check both latest AND LTS releases
-2. Maintain the andium branch alongside main
-3. The `description.yml` provides commit hashes for both
-
-**DuckDB 1.5.0 changes relevant to this extension:**
-- **PEG parser (experimental, opt-in):** DuckDB 1.5.0 ships an experimental PEG parser that allows extensions to extend the SQL grammar at runtime. This could eventually replace our C++ shim approach for parser hooks. However, it is opt-in (`enable_peg_parser()`) and not the default, so the current `parse_function` fallback approach must remain the primary mechanism.
-- **No breaking C API changes identified** in the 1.4 --> 1.5 transition (based on available release notes).
-- **The `duckdb-rs` crate** needs a version compatible with 1.5.0 (check crates.io for `duckdb = "=1.5.0"` availability).
-
-**What needs to happen:**
-1. Create `v1.4-andium` branch from current main (which targets 1.4.4)
-2. Bump main to DuckDB 1.5.x (update `Cargo.toml`, `.duckdb-version`, `Build.yml`)
-3. Verify build and tests pass on both versions
-4. Update Build.yml to run both `duckdb-stable-build` (1.5.x) and `duckdb-next-build` (main)
-5. Create `description.yml` with both `ref` and `andium` hashes
-
-**Confidence:** HIGH (verified from UPDATING.md, DuckDB release cycle docs, and live descriptor examples)
+**Confidence:** HIGH (schemas verified from [SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions), [SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics), [SHOW SEMANTIC FACTS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-facts))
 
 ---
 
-### T4: Documentation Site (Zensical on GitHub Pages)
+### T4: SHOW SEMANTIC DIMENSIONS FOR METRIC -- Aligned with `required` Column
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Ship a documentation site at `<user>.github.io/duckdb-semantic-views/` using Zensical (the successor to MkDocs Material). Covers: getting started, DDL reference, query reference, examples, architecture overview. |
-| **Why Expected** | The current documentation is a README.md. For a community extension targeting the registry, users need proper documentation with search, navigation, and examples. A GitHub Pages site is free and standard for open-source projects. |
-| **Complexity** | **Low-Medium** (content writing, not code) |
-| **Dependencies** | None (independent of all other features). Content draws from existing README, MAINTAINER.md, examples/, and design doc. |
+| **Feature** | Align from 5 columns to 4 columns: `table_name`, `name`, `data_type`, `required` |
+| **Why Expected** | Snowflake's FOR METRIC output has 6 columns (adding synonyms, comment); our subset drops those two. The `required` column is Snowflake-specific and meaningful. |
+| **Complexity** | **Medium** -- column changes are simple, but `required` semantics need a design decision |
+| **Dependencies** | None beyond existing fan-trap filtering logic |
 
-**Why Zensical (verified from GitHub and official site):**
+**Target schema:**
 
-Zensical is the successor to Material for MkDocs, built by the same team (squidfunk). It was created because MkDocs has been unmaintained since August 2024.
+| Column | Type | Source |
+|--------|------|--------|
+| `table_name` | VARCHAR | Currently `source_table` -- renamed |
+| `name` | VARCHAR | Already available |
+| `data_type` | VARCHAR | Already available |
+| `required` | BOOLEAN | New -- see analysis below |
 
-| Criterion | Zensical | MkDocs Material | Docusaurus |
-|-----------|----------|-----------------|------------|
-| Markdown-native | Yes | Yes | Yes (MDX) |
-| Search | Built-in | Built-in | Built-in |
-| GitHub Pages deploy | Native GH Actions | Native GH Actions | Requires custom setup |
-| Maintenance | Active (2025-2026) | Unmaintained since Aug 2024 | Active |
-| Python dependency | Yes (pip install) | Yes (pip install) | Node.js |
-| Familiar to DuckDB community | Very (DuckDB docs use MkDocs conventions) | Yes | Less so |
-| Config compatibility | MkDocs Material compatible | Native | Different config |
+**What changes from current:**
+- DROP: `semantic_view_name` (scoped to single view by the command itself)
+- DROP: `expr` (consistent with other SHOW commands)
+- RENAME: `source_table` to `table_name`
+- ADD: `required` BOOLEAN column
 
-**Use Zensical** because it is the maintained successor to the tool the DuckDB ecosystem already uses, requires minimal setup, and deploys to GitHub Pages with a single workflow.
+**The `required` column -- what Snowflake does (verified from official docs):**
 
-**Documentation structure for a DuckDB extension:**
+In Snowflake, `required` is TRUE when a metric's definition includes a `PARTITION BY EXCLUDING` clause naming that dimension. This means the metric (typically a window function metric) cannot be computed without grouping by that dimension.
 
-The community extension page at `duckdb.org/community_extensions/extensions/semantic_views` is auto-generated from `description.yml`. The extension's own docs site should cover what the CE page cannot:
+**The `required` column -- what this extension should do:**
 
-```
-docs/
-  index.md              -- Overview + quick start
-  getting-started.md    -- Installation, first semantic view, first query
-  reference/
-    ddl.md              -- CREATE/DROP/DESCRIBE/SHOW syntax reference
-    query.md            -- semantic_view() function reference
-    clauses/
-      tables.md         -- TABLES clause (PK, UNIQUE)
-      relationships.md  -- RELATIONSHIPS clause (FK REFERENCES, cardinality)
-      facts.md          -- FACTS clause
-      hierarchies.md    -- HIERARCHIES clause
-      dimensions.md     -- DIMENSIONS clause
-      metrics.md        -- METRICS clause (USING, derived)
-  examples/
-    basic.md            -- Single table, dims + metrics
-    multi-table.md      -- Star schema with joins
-    role-playing.md     -- Airports/flights pattern
-    fan-traps.md        -- What fan traps are, how detection works
-    tpch.md             -- TPC-H worked example
-  architecture.md       -- How the extension works (preprocessor model)
-  contributing.md       -- Developer guide (from MAINTAINER.md)
-```
+This extension does not support `PARTITION BY EXCLUDING` (that is a window function metric feature, out of scope per PROJECT.md). Since only aggregate metrics are supported, no dimension is ever structurally required -- any subset of fan-trap-safe dimensions is valid.
 
-**GitHub Pages deployment workflow:**
+**Decision: `required` = constant FALSE for all rows.**
 
-```yaml
-name: Deploy Documentation
-on:
-  push:
-    branches: [main]
-    paths: ['docs/**', 'zensical.yml']
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: pip install zensical
-      - run: zensical build
-      - uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./site
-```
+Rationale:
+- Honest: no dimension is structurally required for aggregate metrics
+- Snowflake-compatible: the column exists in the schema
+- Future-proof: when window function metrics are added, `required` gains real meaning via `PARTITION BY EXCLUDING`
+- No false requirements: avoids confusing users into thinking they *must* include certain dimensions
 
-**What well-documented DuckDB extensions look like (from community extension pages):**
-- Auto-generated: function list, type list, settings list, download metrics
-- Manually provided: description, hello_world example, extended_description
-- Best extensions (e.g., h3, shellfs) have dedicated external documentation sites linked from the CE page
+Alternative considered and rejected: "infer required from fan-trap safety" -- this conflates "available" (what FOR METRIC already filters to) with "required" (what the metric definition demands). These are different concepts.
 
-**Confidence:** HIGH (Zensical verified from GitHub, GH Pages deployment is standard)
+**Confidence:** HIGH (schema and semantics verified from [SHOW SEMANTIC DIMENSIONS FOR METRIC docs](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions-for-metric))
+
+---
+
+### T5: Metadata Storage -- created_on, database_name, schema_name
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Store `created_on` timestamp, `database_name`, and `schema_name` at define time in the catalog JSON. Surface in SHOW/DESCRIBE output. |
+| **Why Expected** | Prerequisite for T2 and T3. Without stored metadata, SHOW commands cannot populate these columns. |
+| **Complexity** | **Medium** -- model change, catalog write-path change, migration for existing definitions |
+| **Dependencies** | None -- foundational change that others depend on |
+
+**Implementation approach:**
+
+1. **New fields in `SemanticViewDefinition`:**
+   ```rust
+   #[serde(default)]
+   pub created_on: Option<String>,   // ISO 8601: "2026-04-01T12:34:56Z"
+   #[serde(default)]
+   pub database_name: Option<String>,
+   #[serde(default)]
+   pub schema_name: Option<String>,
+   ```
+
+2. **Set at define time:** In the `catalog_insert` / `catalog_insert_or_replace` paths, populate before JSON serialization.
+
+3. **Timestamp source:** Use `std::time::SystemTime` formatted to ISO 8601. Avoids adding `chrono` as a dependency. Second precision is sufficient for display.
+   ```rust
+   use std::time::{SystemTime, UNIX_EPOCH};
+   let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+   // Format: "2026-04-01T12:34:56Z"
+   ```
+
+4. **database_name source:** The `db_path` string passed through extension init. For `:memory:` databases, use `"memory"`. For file-backed databases, extract the database name (typically the filename without extension, matching DuckDB's `current_database()` behavior).
+
+5. **schema_name source:** Always `"semantic_layer"` -- definitions live in the `semantic_layer._definitions` table. This is the schema context where the semantic view metadata resides.
+
+6. **Migration for existing definitions:** Old stored JSON without these fields deserializes as `None` via `#[serde(default)]`. SHOW output renders NULL for `created_on` on old definitions. `database_name` and `schema_name` can be backfilled at load time from the current DuckDB context.
+
+**Alternative considered and rejected:** Querying DuckDB `SELECT current_database()` at bind time instead of storing. This avoids model changes but is incorrect when a database is re-attached under a different alias. Storing at define time is the correct approach.
+
+**Confidence:** HIGH (straightforward model extension; `#[serde(default)]` migration pattern already used for `facts`, `tables`, `column_type_names`)
+
+---
+
+### T6: Module Directory Refactoring -- expand.rs and graph.rs
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Split `expand.rs` (4,440 lines) into `expand/` module directory and `graph.rs` (2,333 lines) into `graph/` module directory. Extract shared `util.rs` and `errors.rs`. |
+| **Why Expected** | These are the two largest files in the codebase. `graph.rs` is targeted for future PyO3/Maturin extraction. Module directories establish clean boundaries. |
+| **Complexity** | **Medium-High** -- mechanical but high-volume; must preserve all 482 tests |
+| **Dependencies** | None -- pure refactoring, no behavior changes |
+
+**Current state:**
+- `expand.rs`: 4,440 lines -- query expansion, SQL generation, fact inlining, derived metric resolution, USING relationship scoping, type inference
+- `graph.rs`: 2,333 lines -- `RelationshipGraph`, topological sort, fan trap detection, parent/child maps, cardinality tracking, cycle/diamond validation
+
+**Suggested decomposition for expand/:**
+| File | Contents | Approx Lines |
+|------|----------|--------------|
+| `expand/mod.rs` | Public API re-exports, `SemanticExpander` struct | ~200 |
+| `expand/sql_gen.rs` | `build_execution_sql`, FROM/JOIN clause generation, GROUP BY | ~800 |
+| `expand/fact_inlining.rs` | Fact expression substitution, word-boundary matching, DAG resolution | ~600 |
+| `expand/metric_resolution.rs` | Derived metric inlining, `collect_derived_metric_source_tables`, stacking | ~500 |
+| `expand/using_relationships.rs` | USING clause handling, scoped alias generation, ambiguity detection | ~400 |
+| `expand/type_inference.rs` | LIMIT 0 type inference, type map construction, cast wrapping | ~500 |
+| `expand/helpers.rs` | `suggest_closest`, `ancestors_to_root`, shared utilities | ~300 |
+| `expand/tests.rs` or inline `#[cfg(test)]` | Test modules (likely the largest chunk) | ~1,100 |
+
+**Suggested decomposition for graph/:**
+| File | Contents | Approx Lines |
+|------|----------|--------------|
+| `graph/mod.rs` | Public API re-exports, `RelationshipGraph` struct | ~200 |
+| `graph/builder.rs` | `from_definition()`, adjacency list construction, reverse edges | ~400 |
+| `graph/validation.rs` | Cycle detection, diamond detection, tree structure validation | ~400 |
+| `graph/toposort.rs` | Kahn's algorithm, topological ordering | ~300 |
+| `graph/fan_trap.rs` | Fan trap detection, LCA path analysis, cardinality edge checking | ~400 |
+| `graph/join_synthesis.rs` | `synthesize_on_clause()`, PK/FK matching, ON clause generation | ~300 |
+| `graph/tests.rs` or inline `#[cfg(test)]` | Test modules | ~330 |
+
+**Shared extractions:**
+- `util.rs`: `suggest_closest()` (strsim fuzzy matching) -- currently in `expand.rs` but used by `show_dims_for_metric.rs` too
+- `errors.rs`: Common error types if circular dependencies exist between expand/ and graph/
+
+**Key constraint:** `show_dims_for_metric.rs` imports `ancestors_to_root` and `collect_derived_metric_source_tables` from `expand.rs`. After splitting, these must remain accessible -- either via `expand::helpers` re-export or by moving to a shared `util.rs`.
+
+**Risk:** Module boundary decisions may need adjustment during implementation if hidden coupling surfaces. The test suite (482 tests) is the safety net.
+
+**Confidence:** HIGH (straightforward mechanical refactoring with a comprehensive test suite)
 
 ---
 
 ## Differentiators
 
-Features that improve the extension beyond minimum registry requirements.
+Features that set the product apart. Not expected, but valued.
 
-### D1: MAINTAINER.md Updates for Branching Strategy and CE Publishing
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | Update MAINTAINER.md with: multi-version branching workflow, CE registry update process, how to cut an LTS patch, how to bump to a new DuckDB version for both branches. |
-| **Value Proposition** | The extension is pre-release and the user is not deeply familiar with Rust/C++. Clear contributor documentation prevents the extension from becoming unmaintainable after initial publishing. |
-| **Complexity** | **Low** |
-| **Dependencies** | T2 (CE registry) and T3 (multi-version) must be implemented first so the docs reflect reality. |
-
-**Confidence:** HIGH (documentation task, no technical risk)
-
----
-
-### D2: TPC-H Worked Example
+### D1: Hierarchies in DESCRIBE Output
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | A TPC-H-based semantic view definition demonstrating all features (multi-table joins, facts, derived metrics, hierarchies, fan trap awareness). Ship as `examples/tpch.py` and document on the docs site. |
-| **Value Proposition** | TPC-H is the universal analytics benchmark. A worked example against it demonstrates credibility and gives users a copy-paste starting point. Snowflake's own semantic view docs use TPC-H as the canonical example. |
-| **Complexity** | **Low** |
-| **Dependencies** | All DDL features from v0.5.3 already exist. Just needs writing. |
+| **Feature** | Emit HIERARCHY as an `object_kind` in DESCRIBE with a DIMENSIONS property listing the drill path |
+| **Value Proposition** | Snowflake does not have a `SHOW SEMANTIC HIERARCHIES` command. Exposing hierarchy metadata via DESCRIBE makes it discoverable. |
+| **Complexity** | Low -- hierarchies already in model, just needs property emission |
+| **Dependencies** | T1 (DESCRIBE rewrite must be done first) |
 
-**Confidence:** HIGH (TPC-H is well-understood, all features already implemented)
+Not in Snowflake's schema, but the extension already supports hierarchies and they should be visible somewhere. DESCRIBE is the natural home. Emit as:
+- object_kind: `HIERARCHY`
+- object_name: hierarchy name
+- parent_entity: NULL
+- property: `DIMENSIONS`
+- property_value: comma-separated dimension names in drill order
 
----
-
-### D3: PEG Parser Investigation (Future-Proofing)
+### D2: TERSE Mode for SHOW SEMANTIC VIEWS
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Investigate DuckDB 1.5.0's experimental PEG parser for grammar extension support. Determine if it can replace the current C++ shim for `CREATE SEMANTIC VIEW` parsing. |
-| **Value Proposition** | The C++ shim compiles the full DuckDB amalgamation (~20MB binary size). If the PEG parser allows native grammar extensions via the C API, the shim could be eliminated, dramatically reducing binary size and build complexity. |
-| **Complexity** | **Research only** -- no implementation in v0.5.4 |
-| **Dependencies** | DuckDB 1.5.0 support (T3). PEG parser is opt-in and experimental. |
+| **Feature** | Support `SHOW TERSE SEMANTIC VIEWS` returning only 3 columns: created_on, name, kind |
+| **Value Proposition** | Snowflake supports TERSE mode; useful for scripting where full metadata is not needed |
+| **Complexity** | Medium -- requires parser to detect TERSE keyword |
+| **Dependencies** | T2 (SHOW VIEWS alignment) |
 
-**Current state (verified from DuckDB 1.5.0 release notes and GitHub):**
-- PEG parser is opt-in via `enable_peg_parser()` setting
-- Already used for auto-complete suggestions
-- Grammar extension support for extensions is a stated goal
-- NOT the default parser -- the traditional YACC parser remains default
-- Experimental status means API may change
+**Recommendation: Defer.** Adds parser complexity for marginal value. The standard SHOW output is only 5 columns.
 
-**Recommendation:** Do NOT depend on PEG parser for v0.5.4. Keep the C++ shim. File a tech debt item to revisit when PEG parser becomes default (likely DuckDB 2.0, Sep 2026).
+### D3: Lexicographic Sort by (database, schema, name)
 
-**Confidence:** MEDIUM (PEG parser exists but is experimental; grammar extension API not fully documented)
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Sort all SHOW output lexicographically by database_name, schema_name, then object name |
+| **Value Proposition** | Matches Snowflake's documented ordering guarantee |
+| **Complexity** | Low -- already sorted by name; add database/schema as prefix sort keys |
+| **Dependencies** | T5 (database_name + schema_name must be available) |
+
+Trivial to implement since there is only one database and schema context. The sort effectively remains by name only, but the code should be structured to support multi-database scenarios if they ever arise.
 
 ---
 
 ## Anti-Features
 
-Features to explicitly NOT build in v0.5.4.
+Features to explicitly NOT build in v0.5.5.
 
 | Anti-Feature | Why Avoid | What to Do Instead |
 |--------------|-----------|-------------------|
-| **Remove explicit cardinality keywords** | Breaking change before registry debut. Users with existing definitions using `ONE TO MANY` would break. | Support both syntaxes. Inference is the default; explicit overrides inference. Deprecation in future milestone. |
-| **Many-to-many relationship support** | Snowflake does not support it. The current extension's `Cardinality` enum does not include `ManyToMany`. Adding it requires bridge table patterns that complicate fan trap detection. | Document as not supported. Recommend bridge table decomposition pattern. |
-| **PEG parser migration** | Experimental, opt-in, API may change. Premature to depend on it. | File TECH-DEBT.md item. Revisit at DuckDB 2.0. |
-| **Stable C API migration** | Would provide binary compatibility across versions. But parser hooks require C++ shim which uses unstable API. Migration would require DuckDB to expose parser hooks via stable C API. | Stay on `C_STRUCT_UNSTABLE`. Use two-branch strategy for multi-version. |
-| **Semi-additive metrics (NON ADDITIVE BY)** | Deferred from v0.5.3. Requires structural changes to the expansion pipeline (window function subquery injection). Adds complexity before registry debut. | Defer to v0.5.5+. Document as planned. |
-| **Pre-aggregation / materialization** | Out of scope per PROJECT.md. | DuckDB handles execution. Document as non-goal. |
-| **YAML definition format** | Adds second definition path. SQL DDL is the sole interface. | Defer. SQL DDL first; YAML is a future path. |
-| **Data-driven cardinality inference** | Snowflake counts distinct values at query time to determine one-to-one vs many-to-one. We are a preprocessor -- no query execution at define time. | Use constraint-based inference (UNIQUE/PK declarations). Document that inference is from constraints, not data. |
-| **WASM support** | Parser hooks require C++ shim compilation which is not compatible with WASM targets. | Exclude `wasm_mvp;wasm_eh;wasm_threads` in `description.yml`. |
-| **Windows Arm64 / MinGW** | Build toolchain complexity for Rust + C++ cross-compilation. | Exclude `windows_arm64;windows_amd64_mingw` in `description.yml`. |
+| `comment` / `synonyms` columns with NULL placeholders | User explicitly decided against NULL placeholder columns. They add visual noise without value until comments/synonyms are first-class features. | Omit entirely. Add columns when comments/synonyms become a DDL feature. |
+| `owner` / `owner_role_type` columns in SHOW VIEWS | DuckDB has no RBAC model. These are Snowflake-specific. | Omit. Not applicable to DuckDB extensions. |
+| `access_modifier` property in DESCRIBE | Snowflake PRIVATE/PUBLIC access; DuckDB has no access control. | Omit. All objects are implicitly public. |
+| `extension` column in SHOW VIEWS | Snowflake-specific column for semantic view extensions (a Snowflake concept). | Omit. Not applicable. |
+| CONSTRAINT object_kind in DESCRIBE | Snowflake uses constraints for time-range boundaries (START_COLUMN/END_COLUMN). | Omit. PK/UNIQUE expressed as TABLE properties. |
+| CUSTOM_INSTRUCTIONS object_kind | Snowflake Cortex AI integration. | Omit entirely. |
+| Cortex Search Service dimension properties | Snowflake-specific AI/search integration. | Omit entirely. |
+| `SHOW COLUMNS` command | Snowflake has a separate SHOW COLUMNS returning dims/facts/metrics with a `kind` column. | Not needed. SHOW SEMANTIC DIMENSIONS/METRICS/FACTS already covers this. Avoid duplicate interfaces. |
+| `IN ACCOUNT / IN DATABASE` scoping | Snowflake scopes SHOW across databases/accounts. DuckDB extension operates in a single database. | Omit. `IN semantic_view_name` is the only meaningful scope. |
+| `SHOW TERSE SEMANTIC VIEWS` | Adds parser complexity for marginal scripting benefit. | Defer to future milestone. |
 
 ---
 
 ## Feature Dependencies
 
 ```
-T1: UNIQUE + Cardinality Inference
+T5: Metadata storage (created_on, database_name, schema_name)
   |
-  +-(informs)-> T2: CE Registry Publishing (description.yml uses correct semantics)
-
-T3: Multi-Version DuckDB Support (1.4.x + 1.5.x)
+  +--> T2: SHOW SEMANTIC VIEWS (uses stored created_on, database_name, schema_name)
   |
-  +-(required by)-> T2: CE Registry Publishing (andium field needs LTS branch)
+  +--> T3: SHOW SEMANTIC DIMENSIONS/METRICS/FACTS (uses stored database_name, schema_name)
 
-T4: Documentation Site (Zensical)
-  |  (independent -- can be built in parallel)
+T1: DESCRIBE property-per-row rewrite (independent, no prerequisites)
 
-T2: CE Registry Publishing
-  |
-  +-(required by)-> D1: MAINTAINER.md Updates (docs must reflect reality)
+T4: SHOW DIMS FOR METRIC alignment (independent, no prerequisites)
 
-D2: TPC-H Example (independent -- depends only on v0.5.3 features)
-D3: PEG Parser Investigation (independent research -- no implementation)
+T6: Module directory refactoring (independent, no prerequisites)
+    (But should be done BEFORE or AFTER the SHOW/DESCRIBE changes, not during,
+     to avoid merge conflicts in the same files being restructured)
+
+Fact data_type (needed by T3 for SHOW FACTS)
+  +--> Requires `output_type` field added to Fact model
+  +--> Requires type inference update to populate fact types
 ```
 
-**Critical path:** T3 (multi-version) --> T2 (CE publishing)
-**Parallel work:** T1 (UNIQUE/inference), T4 (docs), D2 (TPC-H example)
+**Critical insight:** T6 (module refactoring) should be either the first or last phase. Doing it mid-milestone while SHOW/DESCRIBE files are also changing creates merge complexity. Recommend doing it first since it does not change behavior and provides a cleaner code structure for the subsequent SHOW/DESCRIBE changes.
 
 ---
 
 ## Complexity Assessment Summary
 
-| Feature | Complexity | Est. LOC | Risk | Phase Order |
-|---------|------------|----------|------|-------------|
-| T1: UNIQUE + Cardinality Inference | Medium | ~250 | Low-Medium -- additive change, backward compatible | 1st |
-| T3: Multi-Version DuckDB Support | Medium-High | ~50 code, ~200 config | Medium -- DuckDB 1.5 API compatibility unknown until tested | 1st (parallel) |
-| T4: Documentation Site (Zensical) | Low-Medium | ~0 code, ~2000 words content | Low -- configuration + writing | 2nd (parallel) |
-| T2: CE Registry Publishing | Low-Medium | ~0 code, ~50 config | Medium -- first submission, build pipeline unknown | 3rd (depends on T3) |
-| D1: MAINTAINER.md Updates | Low | ~500 words | None | 4th (after T2/T3) |
-| D2: TPC-H Worked Example | Low | ~100 code | None | Anytime |
-| D3: PEG Parser Investigation | Research only | 0 | None | Anytime |
-| **Total** | **Medium** | **~300 LOC + ~3000 words + ~250 config** | **Medium** | |
+| Feature | Complexity | Est. LOC Delta | Risk | Phase Order |
+|---------|------------|----------------|------|-------------|
+| T6: Module refactoring (expand/, graph/) | Medium-High | ~0 net (reorganization) | Low (test suite as safety net) | 1st |
+| T5: Metadata storage (created_on, db, schema) | Medium | ~80 (model + catalog) | Low (proven #[serde(default)] pattern) | 2nd |
+| T1: DESCRIBE property-per-row | Medium | ~150 (complete rewrite of describe.rs) | Low-Medium (new output format) | 3rd |
+| T2: SHOW VIEWS alignment | Low-Medium | ~60 (rewrite list.rs) | Low | 4th |
+| T3: SHOW DIMS/METRICS/FACTS alignment | Low | ~80 (column changes across 3 files) | Low | 5th |
+| T4: SHOW DIMS FOR METRIC alignment | Medium | ~40 (column changes + required) | Low | 6th |
+| D1: Hierarchies in DESCRIBE | Low | ~30 | None | With T1 |
+| **Total** | **Medium** | **~440 LOC delta** | **Low-Medium** | |
 
 ---
 
 ## MVP Recommendation
 
-### Phase 1: Foundations (UNIQUE inference + DuckDB 1.5 compatibility)
+Prioritize:
 
-Build the two features that must exist before registry submission:
+1. **T6: Module directory refactoring** -- do first while no other changes are in flight. Provides clean structure for subsequent work. Test suite validates correctness.
 
-1. **UNIQUE + Cardinality Inference (T1):** Add `UNIQUE (col)` to TABLES grammar. Add `unique_columns: Vec<Vec<String>>` to `TableRef`. Implement inference logic in graph module. Keep explicit cardinality keywords working. Update existing tests.
+2. **T5: Metadata storage at define time** -- prerequisite for multiple SHOW changes. Small, foundational change that unblocks T2 and T3. Include fact `output_type` addition here too.
 
-2. **Multi-Version DuckDB (T3):** Create `v1.4-andium` branch from current main. Bump main to DuckDB 1.5.x. Verify build + tests on both. Update Build.yml with dual workflow targets.
+3. **T1: DESCRIBE property-per-row rewrite** -- the largest structural change. Independent of SHOW changes. Should be done before SHOW changes so DESCRIBE becomes the canonical place to find `expr` values (which are being dropped from SHOW).
 
-### Phase 2: Documentation + Example (parallel with Phase 1)
+4. **T2: SHOW SEMANTIC VIEWS alignment** -- uses new stored fields. Establishes the pattern for remaining SHOW changes.
 
-3. **Documentation Site (T4):** Set up Zensical project structure. Write core content pages. Configure GitHub Pages deployment workflow. Link from README.
+5. **T3: SHOW DIMS/METRICS/FACTS alignment** -- mechanical column changes following the pattern established in T2.
 
-4. **TPC-H Worked Example (D2):** Write `examples/tpch.py` demonstrating multi-table semantic view against TPC-H data.
+6. **T4: SHOW DIMS FOR METRIC alignment with `required` column** -- last because the `required` semantics are the most nuanced decision (constant FALSE).
 
-### Phase 3: Registry Submission
-
-5. **CE Registry Publishing (T2):** Create `description.yml`. Submit PR to `duckdb/community-extensions`. Monitor build pipeline. Fix any platform-specific failures. Verify the auto-generated documentation page.
-
-6. **MAINTAINER.md Updates (D1):** Document the dual-branch workflow, CE update process, and version bump procedures.
-
-### Deferral Rationale
-
-- **T1 before T2:** UNIQUE inference should be in place before the first public release. It is a syntax improvement that affects the "hello world" example in the descriptor.
-- **T3 before T2:** The `andium` field in `description.yml` requires the LTS branch to exist. Without it, LTS users cannot install the extension.
-- **T4 parallel with T1/T3:** Documentation does not depend on code changes. Content can be written from existing features.
-- **D3 is research only:** PEG parser investigation informs future milestones, not v0.5.4 implementation.
-- **Semi-additive metrics deferred again:** The expansion pipeline structural change is too risky before the first public release. Better to ship a stable, well-documented subset first.
+Defer:
+- **D2: TERSE mode** -- parser complexity for marginal value. Future milestone.
+- **D3: Lexicographic sort** -- trivially correct already (single database/schema). Can fold into T2/T3 if desired.
+- **D1: Hierarchies in DESCRIBE** -- fold into T1 if scope allows, otherwise defer.
 
 ---
 
@@ -509,43 +421,24 @@ Build the two features that must exist before registry submission:
 
 ### Snowflake Official Documentation (HIGH confidence)
 
-- [CREATE SEMANTIC VIEW DDL grammar](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- TABLES clause with PRIMARY KEY and UNIQUE, RELATIONSHIPS with REFERENCES, no explicit cardinality keywords
-- [Using SQL commands for semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- UNIQUE interaction with REFERENCES, cardinality inference from PK/UNIQUE declarations
-- [Validation rules](https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules) -- Referenced columns must be PK or UNIQUE; many-to-one vs one-to-one from FK value uniqueness; self-references prohibited; circular relationships prohibited
-- [Semantic view YAML specification](https://docs.snowflake.com/en/user-guide/views-semantic/semantic-view-yaml-spec) -- Relationship types automatically inferred, no explicit join_type or relationship_type
-- [Semantic view overview](https://docs.snowflake.com/en/user-guide/views-semantic/overview) -- Transitive cardinality inference across relationship chains
-- [Querying semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/querying) -- Dimension granularity must be equal or lower than metric granularity
-- [Semantic view example (TPC-H)](https://docs.snowflake.com/en/user-guide/views-semantic/example) -- Full worked example with PRIMARY KEY on all tables, no UNIQUE needed for standard FK pattern
-
-### DuckDB Community Extension Registry (HIGH confidence)
-
-- [Community extension documentation](https://duckdb.org/community_extensions/documentation) -- description.yml format, submission process
-- [Community extension development guide](https://duckdb.org/community_extensions/development) -- build system, platform support, testing
-- [Community extension FAQ](https://duckdb.org/community_extensions/faq) -- licensing, review criteria
-- [rusty_quack descriptor (live)](https://github.com/duckdb/community-extensions/blob/main/extensions/rusty_quack/description.yml) -- Rust extension example with `build: cargo`, `andium` field, excluded platforms
-- [shellfs descriptor (live)](https://github.com/duckdb/community-extensions/blob/main/extensions/shellfs/description.yml) -- C++ extension with `andium` field
-- [UPDATING.md](https://github.com/duckdb/community-extensions/blob/main/UPDATING.md) -- Dual-branch strategy, `ref` + `ref_next`/`andium` system, release process
-- [Rust extension template](https://github.com/duckdb/extension-template-rs) -- Build pipeline, CI workflow, platform targets
-
-### DuckDB Release Cycle (HIGH confidence)
-
-- [Release cycle documentation](https://duckdb.org/docs/stable/dev/release_cycle) -- LTS schedule, version naming, extension categories
-- [Extension versioning](https://duckdb.org/docs/stable/extensions/versioning_of_extensions) -- Stable vs unstable API, binary compatibility, versioning tiers
-- [DuckDB 1.5.0 announcement](https://duckdb.org/2026/03/09/announcing-duckdb-150) -- PEG parser, VARIANT type, GEOMETRY built-in
-- [DuckDB 1.4.0 LTS announcement](https://duckdb.org/2025/09/16/announcing-duckdb-140) -- Andium LTS, 1 year support, community vs extended support
-
-### Zensical Documentation (MEDIUM confidence)
-
-- [Zensical GitHub repository](https://github.com/zensical/zensical) -- Successor to MkDocs Material, by same team (squidfunk)
-- [Zensical blog announcement](https://squidfunk.github.io/mkdocs-material/blog/2025/11/05/zensical/) -- Created because MkDocs unmaintained since Aug 2024
-- [Zensical setup guide](https://zensical.org/docs/create-your-site/) -- Configuration, GitHub Pages deployment
-- [Zensical publish guide](https://zensical.org/docs/publish-your-site/) -- GitHub Actions workflow for deployment
+- [DESCRIBE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view) -- Property-per-row format, 5-column schema, object_kind/property combinations, parent_entity rules
+- [SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- 8-column schema (created_on, name, kind, database_name, schema_name, comment, owner, owner_role_type), TERSE mode, filtering
+- [SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- 8-column schema (database_name, schema_name, semantic_view_name, table_name, name, data_type, synonyms, comment)
+- [SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics) -- Same 8-column schema as dimensions
+- [SHOW SEMANTIC FACTS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-facts) -- Same 8-column schema; facts DO have data_type
+- [SHOW SEMANTIC DIMENSIONS FOR METRIC](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions-for-metric) -- 6-column schema (table_name, name, data_type, required, synonyms, comment); `required` = TRUE when PARTITION BY EXCLUDING names the dimension
+- [Using SQL commands for semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- Complete command listing, SHOW COLUMNS as alternative
 
 ### Project Source Code (HIGH confidence -- direct analysis)
 
-- `src/model.rs` -- `TableRef.pk_columns`, `Cardinality` enum (ManyToOne/OneToOne/OneToMany), `Join.cardinality`
-- `src/body_parser.rs` -- TABLES clause parser (PRIMARY KEY parsing exists, UNIQUE not yet)
-- `src/graph.rs` -- `RelationshipGraph`, cardinality tracking, fan trap detection
-- `Cargo.toml` -- `duckdb = "=1.4.4"` version pin, feature flags
-- `.github/workflows/Build.yml` -- extension-ci-tools@v1.4.4, single-version build
-- `.github/workflows/DuckDBVersionMonitor.yml` -- automated version detection
+- `src/ddl/describe.rs` -- Current 6-column single-row DescribeSemanticViewVTab (146 lines)
+- `src/ddl/list.rs` -- Current 2-column ListSemanticViewsVTab (102 lines)
+- `src/ddl/show_dims.rs` -- Current 5-column ShowSemanticDimensionsVTab (199 lines)
+- `src/ddl/show_metrics.rs` -- Current 5-column ShowSemanticMetricsVTab (201 lines)
+- `src/ddl/show_facts.rs` -- Current 4-column ShowSemanticFactsVTab (194 lines)
+- `src/ddl/show_dims_for_metric.rs` -- Current 5-column ShowDimensionsForMetricVTab (336 lines)
+- `src/model.rs` -- SemanticViewDefinition struct, Dimension/Metric/Fact/Join/TableRef structs
+- `src/catalog.rs` -- CatalogState (HashMap<String, String>), init_catalog, catalog_insert
+- `src/expand.rs` -- 4,440 lines, query expansion engine
+- `src/graph.rs` -- 2,333 lines, relationship graph and validation
+- `TECH-DEBT.md` -- Item 12: DDL pipeline uses all-VARCHAR result forwarding (relevant to output type decisions)

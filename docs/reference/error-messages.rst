@@ -191,7 +191,7 @@ Empty request
 .. code-block:: text
 
    semantic view '<name>': specify at least dimensions := [...] or metrics := [...].
-   Run FROM describe_semantic_view('<name>') to see available dimensions and metrics.
+   Run DESCRIBE SEMANTIC VIEW <name> to see available dimensions and metrics.
 
 **Cause:** Neither ``dimensions`` nor ``metrics`` was specified in the query.
 

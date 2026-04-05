@@ -11,6 +11,7 @@
 - ✅ **v0.5.2 SQL DDL & PK/FK Relationships** -- Phases 24-28 (shipped 2026-03-13)
 - ✅ **v0.5.3 Advanced Semantic Features** -- Phases 29-32 (shipped 2026-03-15)
 - ✅ **v0.5.4 Snowflake-Parity & Registry Publishing** -- Phases 33-36 (shipped 2026-03-27)
+- ✅ **v0.5.5 SHOW/DESCRIBE Alignment & Refactoring** -- Phases 37-42 (shipped 2026-04-05)
 
 ## Phases
 
@@ -128,3 +129,28 @@ Full details: [milestones/v0.5.3-ROADMAP.md](milestones/v0.5.3-ROADMAP.md)
 Full details: [milestones/v0.5.4-ROADMAP.md](milestones/v0.5.4-ROADMAP.md)
 
 </details>
+
+<details>
+<summary>v0.5.5 SHOW/DESCRIBE Alignment & Refactoring (Phases 37-42) -- SHIPPED 2026-04-05</summary>
+
+- [x] Phase 37: Extract Shared Utilities (1/1 plan) -- completed 2026-04-01
+- [x] Phase 38: Module Directory Splits (2/2 plans) -- completed 2026-04-01
+- [x] Phase 39: Metadata Storage (1/1 plan) -- completed 2026-04-02
+- [x] Phase 40: SHOW Command Alignment (2/2 plans) -- completed 2026-04-02
+- [x] Phase 41: DESCRIBE Rewrite (2/2 plans) -- completed 2026-04-02
+- [x] Phase 42: Refactor & Test Reorg (3/3 plans) -- completed 2026-04-05
+
+Full details: [milestones/v0.5.5-ROADMAP.md](milestones/v0.5.5-ROADMAP.md)
+
+</details>
+
+## Progress
+
+| Phase | Milestone | Plans Complete | Status | Completed |
+|-------|-----------|----------------|--------|-----------|
+| 37. Extract Shared Utilities | v0.5.5 | 1/1 | Complete | 2026-04-01 |
+| 38. Module Directory Splits | v0.5.5 | 2/2 | Complete | 2026-04-01 |
+| 39. Metadata Storage | v0.5.5 | 1/1 | Complete | 2026-04-02 |
+| 40. SHOW Command Alignment | v0.5.5 | 2/2 | Complete | 2026-04-02 |
+| 41. DESCRIBE Rewrite | v0.5.5 | 2/2 | Complete | 2026-04-02 |
+| 42. Refactor & Test Reorg | v0.5.5 | 3/3 | Complete | 2026-04-05 |

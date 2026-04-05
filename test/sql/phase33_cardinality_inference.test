@@ -415,11 +415,11 @@ CREATE SEMANTIC VIEW p33_describe AS
     o.revenue AS SUM(o.amount)
   );
 
-# DESCRIBE should not error and should return one row
+# DESCRIBE should not error -- 8 TABLE + 4 REL + 3 DIM + 3 METRIC = 18 rows
 query I
 SELECT COUNT(*) FROM describe_semantic_view('p33_describe');
 ----
-1
+18
 
 statement ok
 DROP SEMANTIC VIEW p33_describe;
@@ -671,10 +671,11 @@ CREATE SEMANTIC VIEW p33_pkopt_describe AS
     o.revenue AS SUM(o.amount)
   );
 
+# 8 TABLE (PK auto-detected from catalog) + 4 REL + 3 DIM + 3 METRIC = 18 rows
 query I
 SELECT COUNT(*) FROM describe_semantic_view('p33_pkopt_describe');
 ----
-1
+18
 
 statement ok
 DROP SEMANTIC VIEW p33_pkopt_describe;

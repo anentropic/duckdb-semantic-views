@@ -1,0 +1,153 @@
+# Phase 39: Metadata Storage - verify created_on, database_name, schema_name, fact output_type
+
+require semantic_views
+
+# ============================================================
+# Setup: create table and semantic view
+# ============================================================
+
+statement ok
+CREATE TABLE p39_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), qty INTEGER);
+
+statement ok
+CREATE SEMANTIC VIEW p39_sv AS
+  TABLES (
+    o AS p39_orders PRIMARY KEY (id)
+  )
+  FACTS (
+    o.unit_price AS o.amount / o.qty
+  )
+  DIMENSIONS (
+    o.order_id AS o.id
+  )
+  METRICS (
+    o.total_amount AS SUM(o.amount)
+  )
+
+# ============================================================
+# Test 1: Query the view to ensure it works with new fields
+# ============================================================
+
+# Insert data so the query returns results
+statement ok
+INSERT INTO p39_orders VALUES (1, 100.50, 2), (2, 200.00, 4);
+
+query IR
+SELECT * FROM semantic_view('p39_sv', dimensions := ['order_id'], metrics := ['total_amount'])
+----
+1	100.50
+2	200.00
+
+# ============================================================
+# Test 2: Drop and recreate to verify roundtrip through catalog
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p39_sv
+
+statement ok
+CREATE SEMANTIC VIEW p39_sv AS
+  TABLES (
+    o AS p39_orders PRIMARY KEY (id)
+  )
+  FACTS (
+    o.unit_price AS o.amount / o.qty
+  )
+  DIMENSIONS (
+    o.order_id AS o.id
+  )
+  METRICS (
+    o.total_amount AS SUM(o.amount)
+  )
+
+# Verify query still works after recreate
+query IR
+SELECT * FROM semantic_view('p39_sv', dimensions := ['order_id'], metrics := ['total_amount'])
+----
+1	100.50
+2	200.00
+
+# ============================================================
+# Test 3: CREATE OR REPLACE preserves metadata capture
+# ============================================================
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW p39_sv AS
+  TABLES (
+    o AS p39_orders PRIMARY KEY (id)
+  )
+  FACTS (
+    o.unit_price AS o.amount / o.qty
+  )
+  DIMENSIONS (
+    o.order_id AS o.id
+  )
+  METRICS (
+    o.total_amount AS SUM(o.amount)
+  )
+
+# Verify query still works after replace
+query IR
+SELECT * FROM semantic_view('p39_sv', dimensions := ['order_id'], metrics := ['total_amount'])
+----
+1	100.50
+2	200.00
+
+# ============================================================
+# Test 4: SHOW SEMANTIC FACTS populates data_type from typeof inference
+# (tables have data, so typeof(o.amount / o.qty) succeeds)
+# ============================================================
+
+query TTTTTT
+SHOW SEMANTIC FACTS IN p39_sv;
+----
+memory	main	p39_sv	p39_orders	unit_price	DOUBLE
+
+# ============================================================
+# Test 5: SHOW SEMANTIC DIMENSIONS resolves alias to table name
+# ============================================================
+
+query TTTTTT
+SHOW SEMANTIC DIMENSIONS IN p39_sv;
+----
+memory	main	p39_sv	p39_orders	order_id	(empty)
+
+# ============================================================
+# Test 6: SHOW SEMANTIC METRICS resolves alias to table name
+# ============================================================
+
+query TTTTTT
+SHOW SEMANTIC METRICS IN p39_sv;
+----
+memory	main	p39_sv	p39_orders	total_amount	(empty)
+
+# ============================================================
+# Test 7: DESCRIBE shows actual table names and fact data_type
+# ============================================================
+
+query TTTTT
+DESCRIBE SEMANTIC VIEW p39_sv;
+----
+TABLE	p39_orders	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p39_orders	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p39_orders	(empty)	BASE_TABLE_NAME	p39_orders
+TABLE	p39_orders	(empty)	PRIMARY_KEY	["id"]
+FACT	unit_price	p39_orders	TABLE	p39_orders
+FACT	unit_price	p39_orders	EXPRESSION	o.amount / o.qty
+FACT	unit_price	p39_orders	DATA_TYPE	DOUBLE
+DIMENSION	order_id	p39_orders	TABLE	p39_orders
+DIMENSION	order_id	p39_orders	EXPRESSION	o.id
+DIMENSION	order_id	p39_orders	DATA_TYPE	(empty)
+METRIC	total_amount	p39_orders	TABLE	p39_orders
+METRIC	total_amount	p39_orders	EXPRESSION	SUM(o.amount)
+METRIC	total_amount	p39_orders	DATA_TYPE	(empty)
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p39_sv
+
+statement ok
+DROP TABLE p39_orders

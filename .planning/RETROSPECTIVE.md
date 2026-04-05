@@ -370,6 +370,53 @@
 
 ---
 
+## Milestone: v0.5.5 — SHOW/DESCRIBE Alignment & Refactoring
+
+**Shipped:** 2026-04-05
+**Phases:** 6 | **Plans:** 11 | **Commits:** 71
+
+### What Was Built
+- Extracted util.rs and errors.rs leaf modules, breaking expand<->graph and parse<->body_parser circular dependencies
+- Split expand.rs (4,299 lines) into 7 submodules and graph.rs (2,333 lines) into 5 submodules — module directories with mod.rs re-exports
+- Added created_on, database_name, schema_name metadata fields captured at define time, with backward-compatible deserialization
+- Aligned all SHOW commands to Snowflake column schemas (5-col VIEWS, 6-col DIMS/METRICS/FACTS, 4-col DIMS FOR METRIC)
+- Rewrote DESCRIBE to property-per-row format (5 VARCHAR columns, 6 object kinds)
+- Hardened persistence: TOCTOU fix with single write locks, parameterized prepared statements
+
+### What Worked
+- Refactoring-first phase ordering — behavior-preserving splits (37-38) created stable foundation for feature work (39-41)
+- Module directory pattern with pub(super) — clean internal API boundaries without exposing internals
+- Phase 42 as explicit code review follow-up — addressed findings that accumulated during feature phases
+- Parallel phase execution where dependencies allowed (40 and 41 both depended on 39, not each other)
+- Milestone audit before completion caught TIDY checkbox paperwork and missing SUMMARY.md files
+
+### What Was Inefficient
+- Phase 42 executed without producing SUMMARY.md files (3 plans) — paperwork gap carried to audit
+- REQUIREMENTS.md TIDY checkboxes not updated during Phase 42 execution — required bulk fix at milestone close
+- Phase 39 took 107min (longest plan) — metadata capture via DuckDB SQL functions required more investigation than expected
+- VALIDATION.md nyquist_compliant frontmatter never flipped to true across any phase — persistent process gap
+
+### Patterns Established
+- Module directory decomposition pattern: mod.rs re-exports, submodules use pub(super), test blocks distributed to submodules
+- Leaf module extraction for breaking circular dependencies (shared types/functions with zero intra-crate imports)
+- Define-time metadata capture via DuckDB SQL functions (now(), current_database(), current_schema())
+- Property-per-row VTab pattern for DESCRIBE (DescribeRow struct with bind-time collection)
+- Parameterized prepared statements via execute_parameterized helper
+
+### Key Lessons
+1. Behavior-preserving refactoring phases should always precede feature phases that depend on the refactored code — Phase 37-38 made 39-41 much smoother
+2. Module splits of 4,000+ line files are safe when you preserve the exact public API surface and move tests to their correct submodules
+3. DuckDB SQL functions (now(), typeof()) are the right way to capture metadata at define time — Rust SystemTime would give different semantics
+4. Property-per-row format is more flexible than JSON blobs for introspection VTabs — easier to filter, sort, and extend
+5. Code review phases (like Phase 42) are valuable for catching accumulated issues, but should produce SUMMARY.md files like any other phase
+
+### Cost Observations
+- 71 commits in 5 days (2026-04-01 → 2026-04-05)
+- 11 plans, 68 files modified, +6,785 / -5,086 lines (net +1,699)
+- Notable: Phase 39 (metadata storage) was disproportionately slow at 107min vs 5-32min for other plans
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -385,6 +432,7 @@
 | v0.5.2 | 89 | 5 | SQL DDL body + PK/FK relationships, graph validation, function DDL retired |
 | v0.5.3 | 66 | 4 | FACTS, derived metrics, hierarchies, fan traps, role-playing dims, USING |
 | v0.5.4 | 117 | 6 | Cardinality inference, DuckDB 1.5.0, DDL parity, SHOW filtering, docs site, CE readiness |
+| v0.5.5 | 71 | 6 | Module refactoring, Snowflake-aligned SHOW/DESCRIBE, metadata storage, persistence hardening |
 
 ### Cumulative Quality
 
@@ -398,6 +446,7 @@
 | v0.5.2 | 282+ | 73+ properties | 4 targets | 7 sqllogictest + DuckLake CI + Python crash + caret |
 | v0.5.3 | 441 | 80+ properties | 4 targets | 11 sqllogictest + DuckLake CI + Python crash + caret |
 | v0.5.4 | 482 | 80+ properties | 4 targets | 18 sqllogictest + DuckLake CI + Python crash + caret + 22 infra assertions |
+| v0.5.5 | 487 | 80+ properties | 4 targets | 19 sqllogictest + DuckLake CI + Python crash + caret + 22 infra assertions |
 
 ### Top Lessons (Verified Across Milestones)
 

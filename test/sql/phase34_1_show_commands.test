@@ -53,63 +53,63 @@ CREATE SEMANTIC VIEW products_sv AS
 # Test 1: SHOW SEMANTIC DIMENSIONS IN (single view)
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN orders_sv
 ----
-orders_sv	customer_name	c.name	c	(empty)
-orders_sv	order_date	o.order_date	o	(empty)
-orders_sv	region	c.region	c	(empty)
+memory	main	orders_sv	p34s_customers	customer_name	(empty)
+memory	main	orders_sv	p34s_customers	region	(empty)
+memory	main	orders_sv	p34s_orders	order_date	(empty)
 
 # ============================================================
 # Test 2: SHOW SEMANTIC DIMENSIONS (cross-view)
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS
 ----
-orders_sv	customer_name	c.name	c	(empty)
-orders_sv	order_date	o.order_date	o	(empty)
-orders_sv	region	c.region	c	(empty)
-products_sv	product_name	p.product_name	p	(empty)
+memory	main	orders_sv	p34s_customers	customer_name	(empty)
+memory	main	orders_sv	p34s_customers	region	(empty)
+memory	main	orders_sv	p34s_orders	order_date	(empty)
+memory	main	products_sv	p34s_products	product_name	(empty)
 
 # ============================================================
 # Test 3: SHOW SEMANTIC METRICS IN (single view)
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC METRICS IN orders_sv
 ----
-orders_sv	order_count	COUNT(o.id)	o	(empty)
-orders_sv	total_amount	SUM(o.amount)	o	(empty)
+memory	main	orders_sv	p34s_orders	order_count	(empty)
+memory	main	orders_sv	p34s_orders	total_amount	(empty)
 
 # ============================================================
 # Test 4: SHOW SEMANTIC METRICS (cross-view)
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC METRICS
 ----
-orders_sv	order_count	COUNT(o.id)	o	(empty)
-orders_sv	total_amount	SUM(o.amount)	o	(empty)
-products_sv	avg_price	AVG(p.price)	p	(empty)
+memory	main	orders_sv	p34s_orders	order_count	(empty)
+memory	main	orders_sv	p34s_orders	total_amount	(empty)
+memory	main	products_sv	p34s_products	avg_price	(empty)
 
 # ============================================================
 # Test 5: SHOW SEMANTIC FACTS IN (single view)
 # ============================================================
 
-query TTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC FACTS IN orders_sv
 ----
-orders_sv	raw_amount	o.amount	o
+memory	main	orders_sv	p34s_orders	raw_amount	(empty)
 
 # ============================================================
 # Test 6: SHOW SEMANTIC FACTS (cross-view, includes view with no facts)
 # ============================================================
 
-query TTTT rowsort
+query TTTTTT rowsort
 SHOW SEMANTIC FACTS
 ----
-orders_sv	raw_amount	o.amount	o
+memory	main	orders_sv	p34s_orders	raw_amount	(empty)
 
 # ============================================================
 # Test 7: Non-existent view
@@ -124,12 +124,12 @@ does not exist
 # Test 8: Case insensitivity
 # ============================================================
 
-query TTTTT rowsort
+query TTTTTT rowsort
 show semantic dimensions in orders_sv
 ----
-orders_sv	customer_name	c.name	c	(empty)
-orders_sv	order_date	o.order_date	o	(empty)
-orders_sv	region	c.region	c	(empty)
+memory	main	orders_sv	p34s_customers	customer_name	(empty)
+memory	main	orders_sv	p34s_customers	region	(empty)
+memory	main	orders_sv	p34s_orders	order_date	(empty)
 
 # ============================================================
 # Cleanup

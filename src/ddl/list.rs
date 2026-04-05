@@ -6,16 +6,27 @@ use duckdb::{
 };
 
 use crate::catalog::CatalogState;
+use crate::model::SemanticViewDefinition;
+
+/// A single row in the SHOW SEMANTIC VIEWS output.
+struct ListRow {
+    created_on: String,
+    name: String,
+    kind: String,
+    database_name: String,
+    schema_name: String,
+}
 
 /// Bind-time snapshot of all registered semantic views.
 ///
 /// Populated once at bind time by reading the in-memory catalog.
-/// Stored as a `Vec<(name, base_table)>` — one entry per view.
+/// Stored as a `Vec<ListRow>` — one entry per view with 5 Snowflake-aligned columns:
+/// created_on, name, kind, database_name, schema_name.
 pub struct ListBindData {
-    rows: Vec<(String, String)>,
+    rows: Vec<ListRow>,
 }
 
-// SAFETY: `Vec<(String, String)>` is `Send + Sync`.
+// SAFETY: `Vec<ListRow>` contains only `String` fields, which are `Send + Sync`.
 unsafe impl Send for ListBindData {}
 unsafe impl Sync for ListBindData {}
 
@@ -28,8 +39,9 @@ pub struct ListInitData {
 unsafe impl Send for ListInitData {}
 unsafe impl Sync for ListInitData {}
 
-/// Table function that returns `(name VARCHAR, base_table VARCHAR)` — one row
-/// per registered semantic view.
+/// Table function that returns 5 columns: `(created_on VARCHAR, name VARCHAR,
+/// kind VARCHAR, database_name VARCHAR, schema_name VARCHAR)` — one row per
+/// registered semantic view.
 ///
 /// Takes no parameters.  State is injected via
 /// `register_table_function_with_extra_info`.
@@ -40,9 +52,18 @@ impl VTab for ListSemanticViewsVTab {
     type InitData = ListInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
         bind.add_result_column(
-            "base_table",
+            "created_on",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
+        bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column("kind", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column(
+            "database_name",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
+        bind.add_result_column(
+            "schema_name",
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         );
 
@@ -54,14 +75,25 @@ impl VTab for ListSemanticViewsVTab {
 
         let mut rows = Vec::with_capacity(guard.len());
         for (name, json) in guard.iter() {
-            let base_table = serde_json::from_str::<serde_json::Value>(json)
-                .ok()
-                .and_then(|v| v["base_table"].as_str().map(str::to_string))
-                .unwrap_or_default();
-            rows.push((name.clone(), base_table));
+            let def = SemanticViewDefinition::from_json(name, json).ok();
+            let (created_on, database_name, schema_name) = match &def {
+                Some(d) => (
+                    d.created_on.clone().unwrap_or_default(),
+                    d.database_name.clone().unwrap_or_default(),
+                    d.schema_name.clone().unwrap_or_default(),
+                ),
+                None => (String::new(), String::new(), String::new()),
+            };
+            rows.push(ListRow {
+                created_on,
+                name: name.clone(),
+                kind: "SEMANTIC_VIEW".to_string(),
+                database_name,
+                schema_name,
+            });
         }
-        // Sort for deterministic output order.
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        // Sort by name for deterministic output order.
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
 
         Ok(ListBindData { rows })
     }
@@ -85,11 +117,17 @@ impl VTab for ListSemanticViewsVTab {
         let bind_data = func.get_bind_data();
         let n = bind_data.rows.len();
 
-        let name_vec = output.flat_vector(0);
-        let base_table_vec = output.flat_vector(1);
-        for (i, (name, base_table)) in bind_data.rows.iter().enumerate() {
-            name_vec.insert(i, name.as_str());
-            base_table_vec.insert(i, base_table.as_str());
+        let created_on_vec = output.flat_vector(0);
+        let name_vec = output.flat_vector(1);
+        let kind_vec = output.flat_vector(2);
+        let db_name_vec = output.flat_vector(3);
+        let sch_name_vec = output.flat_vector(4);
+        for (i, row) in bind_data.rows.iter().enumerate() {
+            created_on_vec.insert(i, row.created_on.as_str());
+            name_vec.insert(i, row.name.as_str());
+            kind_vec.insert(i, row.kind.as_str());
+            db_name_vec.insert(i, row.database_name.as_str());
+            sch_name_vec.insert(i, row.schema_name.as_str());
         }
         output.set_len(n);
         Ok(())

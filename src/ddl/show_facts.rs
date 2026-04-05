@@ -9,11 +9,16 @@ use crate::catalog::CatalogState;
 use crate::model::SemanticViewDefinition;
 
 /// A single row in the SHOW SEMANTIC FACTS output.
+///
+/// 6 Snowflake-aligned columns: database_name, schema_name, semantic_view_name,
+/// table_name, name, data_type.
 struct ShowFactRow {
+    database_name: String,
+    schema_name: String,
     semantic_view_name: String,
+    table_name: String,
     name: String,
-    expr: String,
-    source_table: String,
+    data_type: String,
 }
 
 /// Bind-time data: pre-collected fact rows.
@@ -34,18 +39,26 @@ pub struct ShowFactsInitData {
 unsafe impl Send for ShowFactsInitData {}
 unsafe impl Sync for ShowFactsInitData {}
 
-/// Helper: declare the 4-column output schema for facts (no data_type).
+/// Helper: declare the 6-column output schema for facts.
 fn bind_output_columns(bind: &BindInfo) {
+    bind.add_result_column(
+        "database_name",
+        LogicalTypeHandle::from(LogicalTypeId::Varchar),
+    );
+    bind.add_result_column(
+        "schema_name",
+        LogicalTypeHandle::from(LogicalTypeId::Varchar),
+    );
     bind.add_result_column(
         "semantic_view_name",
         LogicalTypeHandle::from(LogicalTypeId::Varchar),
     );
-    bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-    bind.add_result_column("expr", LogicalTypeHandle::from(LogicalTypeId::Varchar));
     bind.add_result_column(
-        "source_table",
+        "table_name",
         LogicalTypeHandle::from(LogicalTypeId::Varchar),
     );
+    bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+    bind.add_result_column("data_type", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 }
 
 /// Helper: collect fact rows for a single view.
@@ -53,13 +66,25 @@ fn collect_facts(view_name: &str, json: &str) -> Vec<ShowFactRow> {
     let Ok(def) = SemanticViewDefinition::from_json(view_name, json) else {
         return Vec::new();
     };
+    let db_name = def.database_name.clone().unwrap_or_default();
+    let sch_name = def.schema_name.clone().unwrap_or_default();
+    let alias_map = def.alias_to_table_map();
     def.facts
         .iter()
-        .map(|f| ShowFactRow {
-            semantic_view_name: view_name.to_string(),
-            name: f.name.clone(),
-            expr: f.expr.clone(),
-            source_table: f.source_table.clone().unwrap_or_default(),
+        .map(|f| {
+            let table_name = f
+                .source_table
+                .as_ref()
+                .and_then(|a| alias_map.get(a).cloned())
+                .unwrap_or_default();
+            ShowFactRow {
+                database_name: db_name.clone(),
+                schema_name: sch_name.clone(),
+                semantic_view_name: view_name.to_string(),
+                table_name,
+                name: f.name.clone(),
+                data_type: f.output_type.clone().unwrap_or_default(),
+            }
         })
         .collect()
 }
@@ -78,16 +103,20 @@ fn emit_rows(
     let bind_data = func.get_bind_data();
     let n = bind_data.rows.len();
 
-    let sv_vec = output.flat_vector(0);
-    let name_vec = output.flat_vector(1);
-    let expr_vec = output.flat_vector(2);
-    let source_vec = output.flat_vector(3);
+    let db_name_vec = output.flat_vector(0);
+    let sch_name_vec = output.flat_vector(1);
+    let sv_vec = output.flat_vector(2);
+    let table_vec = output.flat_vector(3);
+    let name_vec = output.flat_vector(4);
+    let type_vec = output.flat_vector(5);
 
     for (i, row) in bind_data.rows.iter().enumerate() {
+        db_name_vec.insert(i, row.database_name.as_str());
+        sch_name_vec.insert(i, row.schema_name.as_str());
         sv_vec.insert(i, row.semantic_view_name.as_str());
+        table_vec.insert(i, row.table_name.as_str());
         name_vec.insert(i, row.name.as_str());
-        expr_vec.insert(i, row.expr.as_str());
-        source_vec.insert(i, row.source_table.as_str());
+        type_vec.insert(i, row.data_type.as_str());
     }
     output.set_len(n);
     Ok(())

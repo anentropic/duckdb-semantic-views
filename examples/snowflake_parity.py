@@ -168,12 +168,12 @@ print("\nSHOW SEMANTIC FACTS IN shop:")
 for row in con.execute("SHOW SEMANTIC FACTS IN shop").fetchall():
     print(f"  {row}")
 
-# Filter dimensions with LIKE
-print("\nSHOW SEMANTIC DIMENSIONS IN shop LIKE '%customer%':")
-for row in con.execute("SHOW SEMANTIC DIMENSIONS IN shop LIKE '%customer%'").fetchall():
+# Filter dimensions with LIKE (LIKE clause comes before IN)
+print("\nSHOW SEMANTIC DIMENSIONS LIKE '%customer%' IN shop:")
+for row in con.execute("SHOW SEMANTIC DIMENSIONS LIKE '%customer%' IN shop").fetchall():
     print(f"  {row}")
 
-# Filter metrics with STARTS WITH
+# Filter metrics with STARTS WITH (IN comes before STARTS WITH)
 print("\nSHOW SEMANTIC METRICS IN shop STARTS WITH 'total':")
 for row in con.execute("SHOW SEMANTIC METRICS IN shop STARTS WITH 'total'").fetchall():
     print(f"  {row}")

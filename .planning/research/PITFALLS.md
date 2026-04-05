@@ -1,397 +1,229 @@
-# Domain Pitfalls -- Snowflake-Parity & Registry Publishing (v0.5.4)
+# Domain Pitfalls -- SHOW/DESCRIBE Alignment & Module Refactoring (v0.5.5)
 
-**Domain:** Removing explicit cardinality keywords in favor of Snowflake-style inference from PK/UNIQUE constraints, supporting multiple DuckDB versions, publishing to the community extension registry, and shipping a documentation site
-**Researched:** 2026-03-15
-**Context:** The extension has 441 tests, uses C_STRUCT_UNSTABLE ABI, compiles a vendored DuckDB amalgamation via cc crate, and stores semantic view definitions as JSON in `semantic_layer._definitions`. Cardinality (MANY TO ONE / ONE TO ONE / ONE TO MANY) is declared explicitly in RELATIONSHIPS and stored in the `Join.cardinality` field. Fan trap detection in `expand.rs` depends on `Cardinality` enum values to block inflated aggregation.
+**Domain:** Snowflake-aligned SHOW/DESCRIBE output formats + module refactoring in DuckDB Rust extension
+**Researched:** 2026-04-01
+**Context:** The extension has 482 tests (Rust unit, proptest, sqllogictest, DuckLake CI), 15,786 LOC, stores semantic view definitions as JSON in `semantic_layer._definitions`, and uses a C++ shim that dynamically forwards VTab output columns as all-VARCHAR. The C++ shim reads `duckdb_column_count()` and `duckdb_column_name()` at runtime from the underlying Rust VTab result, so column count/name changes propagate automatically -- but test assertions do not.
 
 ---
 
 ## Critical Pitfalls
 
-Mistakes that cause rewrites, data loss, silent wrong results, or registry rejection.
+Mistakes that cause rewrites, test suite failures, or breaking changes.
 
-### C1: Removing Cardinality Keywords Breaks Stored Definitions That Explicitly Declare Them
+### C1: C++ Shim Schema Forwarding Is Transparent but Tests Are Rigid
 
-**What goes wrong:**
-Existing semantic view definitions created with v0.5.3 may contain explicit cardinality declarations like `MANY TO ONE` or `ONE TO MANY` in their RELATIONSHIPS clause. These are stored as JSON in `semantic_layer._definitions` with `"cardinality": "OneToMany"` in the `Join` object. The `Cardinality` enum in `model.rs` has three variants: `ManyToOne` (default), `OneToOne`, `OneToMany`.
+**What goes wrong:** The C++ `sv_ddl_bind` (shim.cpp:134-201) dynamically reads column count and names from the result of executing rewritten DDL SQL. It declares ALL output columns as VARCHAR. When you change the output schema of any VTab that feeds a DDL command (e.g., adding `created_on`, `database_name`, `schema_name`, `kind` to `ListSemanticViewsVTab`, or restructuring DESCRIBE to property-per-row format), the C++ side picks up the new schema automatically. **However**, sqllogictest assertions are column-count-sensitive. The `query TTTTT` prefix specifies expected column types and count. Every `.test` file that asserts SHOW or DESCRIBE output must be updated atomically with the schema change.
 
-If the v0.5.4 DDL parser rejects cardinality keywords (because inference replaces them), and a user tries to `CREATE OR REPLACE` a view by copying their existing DDL, the parser errors on `MANY TO ONE`. Worse, if the `Cardinality` enum is removed from the model, old stored JSON with `"cardinality": "OneToMany"` fails to deserialize, making existing views unloadable.
+**Why it happens:** The C++ shim is schema-agnostic (good), but the test harness is schema-rigid (by design). Changing the VTab output columns in Rust without simultaneously updating every `.test` file that references those commands creates a guaranteed test failure across the entire sqllogictest suite.
 
-The current serde configuration uses `#[serde(default, skip_serializing_if = "Cardinality::is_default")]` on `Join.cardinality`. This means:
-- `ManyToOne` is not serialized (omitted from JSON) -- safe
-- `OneToOne` and `OneToMany` ARE serialized -- these will break if the enum is removed
-
-**Why it happens:**
-The natural instinct is to remove the old code path when replacing it with inference. But stored JSON persists across extension upgrades. Users who defined views with explicit cardinality in v0.5.3 have JSON containing the enum values.
-
-**Consequences:**
-- Extension fails to load existing views on startup (`init_catalog` crashes deserializing old JSON)
-- User cannot recreate views from saved DDL that includes cardinality keywords
-- Silent data corruption if cardinality defaults to `ManyToOne` when the stored value was `OneToMany` -- fan trap detection stops working for those relationships
+**Consequences:** All 18 sqllogictest files run per-process (one DuckDB per file due to parser extension lifecycle segfault workaround). A single column-count mismatch in one file fails that file's entire test run. If SHOW SEMANTIC DIMENSIONS changes from 5 columns (`TTTTT`) to 8 columns (`TTTTTTTT`), every test asserting that schema breaks.
 
 **Prevention:**
-- Keep the `Cardinality` enum in `model.rs` with all three variants and the `#[serde(default)]` annotation. Old JSON must always deserialize.
-- In the body parser, make cardinality keywords OPTIONAL but still ACCEPTED. Parse them if present, ignore them if absent (inference fills in the value). This is backward compatible: old DDL with `MANY TO ONE` still parses, new DDL without it also parses.
-- At define time, if explicit cardinality is provided AND UNIQUE/PK inference would produce a different result, emit a warning (not an error) that the explicit cardinality overrides inference. This catches mismatches without breaking existing definitions.
-- Add a new `unique_columns: Vec<String>` field to `TableRef` (with `#[serde(default, skip_serializing_if = "Vec::is_empty")]`) for UNIQUE constraint declarations. Inference uses both `pk_columns` and `unique_columns`.
-- Do NOT remove the `parse_cardinality_tokens()` function in `body_parser.rs`. Keep it, but make it a fallback after inference. The parser should try inference first (from PK/UNIQUE on referenced table), then accept explicit override.
-- **Confidence:** HIGH. The backward compatibility pattern is well-established in the codebase (see `Join.on`, `Join.from_cols`, `Join.join_columns` -- three generations of join format coexist via serde defaults).
+1. Identify ALL test files referencing each changed command before coding: `phase34_1_show_commands.test`, `phase34_1_show_filtering.test`, `phase34_1_show_dims_for_metric.test`, `phase20_extended_ddl.test` (DESCRIBE assertions).
+2. Change VTab output columns and ALL corresponding test expectations in the same commit.
+3. Run `just test-all` (not just `cargo test`) after every schema change -- sqllogictest catches column-count mismatches that Rust unit tests never see.
 
-**Detection:** Load a database with v0.5.3-created views containing `OneToMany` cardinality. Verify they deserialize correctly. Verify fan trap detection still works. Test: create a view with `ONE TO MANY` in v0.5.3 format, upgrade extension, verify `DESCRIBE` still shows correct information.
+**Detection:** `just test-sql` fails with "expected N columns but got M" errors. These are obvious once you look for them but easy to miss if you only run `cargo test`.
 
-**Phase assignment:** Cardinality inference phase. Must be the FIRST thing addressed before any parser changes.
+**Phase assignment:** Every phase that changes output columns. Must be a hard rule: VTab + tests = atomic.
 
 ---
 
-### C2: DuckDB 1.5 Uses Different Amalgamation Layout, Breaking the cc Crate Build
+### C2: Backward-Incompatible JSON Deserialization When Adding `created_on`
 
-**What goes wrong:**
-The extension compiles the DuckDB amalgamation (`duckdb.cpp` + `duckdb.hpp`) via the `cc` crate in `build.rs`. The amalgamation is downloaded from `https://github.com/duckdb/duckdb/releases/download/vX.Y.Z/libduckdb-src.zip`. DuckDB 1.5.0 was released on 2026-03-09.
+**What goes wrong:** Adding a `created_on` field to `SemanticViewDefinition` is safe for deserialization if done correctly (`#[serde(default)]` handles missing fields). But the catalog persistence table (`semantic_layer._definitions`) stores raw JSON strings. Existing stored JSON from v0.5.4 databases will not contain `created_on`. If any code path assumes `created_on` is always populated (e.g., `.unwrap()` on it), it will panic on views created before the upgrade.
 
-Between DuckDB minor versions, the amalgamation can change in ways that break the build:
-1. **New C++ includes or removed headers** -- the `build.rs` Windows patching (`patch_duckdb_cpp_for_windows`) searches for specific string markers like `#endif // defined(_WIN32)\n\n// Platform-specific helpers`. If DuckDB 1.5 rearranges these markers, the patch silently fails (it prints a `cargo:warning` but continues), and the Windows build breaks with `GetObject` / `interface` macro conflicts.
-2. **New system library dependencies** -- DuckDB 1.4.4 required `rstrtmgr.lib` on Windows (added to `build.rs`). DuckDB 1.5 may require additional system libraries.
-3. **C++ symbol signature changes** -- `shim.cpp` calls specific DuckDB C++ constructors and methods (`ParserExtension`, `TableFunction`, `CreateScalarFunctionInfo`). If any internal C++ API changes signatures, the shim fails to compile.
-4. **The `duckdb-rs` crate may not have a 1.5 release yet** -- as of 2026-03-15, the latest `duckdb` crate on crates.io is 1.4.4. The extension pins `duckdb = "=1.4.4"`. A 1.5 version of the crate must exist before the extension can target DuckDB 1.5.
+**Why it happens:** The project has a deliberate "no `deny_unknown_fields`" policy on `SemanticViewDefinition` (see model.rs line 160-161 comment). This means new fields can be added without breaking deserialization of old JSON. But the policy protects against deserialization failure, not against code that assumes the new field is populated.
 
-**Why it happens:**
-DuckDB explicitly does NOT guarantee ABI or API stability across minor versions. The amalgamation is a single-file dump of the entire DuckDB codebase (~300K lines). Any internal refactor can change string patterns, add includes, or modify class signatures. The `C_STRUCT_UNSTABLE` ABI type means the extension binary is strictly tied to one DuckDB version.
-
-**Consequences:**
-- Build failure on one or more platforms (most likely Windows due to the patching logic)
-- Compilation of `shim.cpp` fails with cryptic C++ errors about undefined or changed symbols
-- Cargo.toml cannot pin `duckdb = "=1.5.0"` if the crate does not exist yet
-- CI turns red on the DuckDB 1.5 branch with no obvious fix
+**Consequences:** Views defined before the `created_on` field was added will have `created_on: None`. If SHOW SEMANTIC VIEWS renders `created_on` by calling `.unwrap()`, it panics at query time -- a runtime crash, not a compile-time error.
 
 **Prevention:**
-- Do NOT attempt to support DuckDB 1.5 until `duckdb-rs` 1.5.x is published on crates.io. Check `https://crates.io/crates/duckdb` before starting.
-- Create a separate branch (e.g., `duckdb-1.5`) for the 1.5 port. Keep main on 1.4.4 until 1.5 builds cleanly on all platforms.
-- Download the DuckDB 1.5 amalgamation and diff against 1.4.4's `duckdb.hpp` to identify C++ API changes in `ParserExtension`, `TableFunction`, and related classes BEFORE writing any code.
-- Test the `patch_duckdb_cpp_for_windows()` function with the 1.5 amalgamation. If markers have moved, update the patch.
-- Run `make release` on all three platforms (Linux, macOS, Windows) as the first step of the 1.5 port. Do not write features until the build is green.
-- DuckDB 1.5 release notes mention "Parser override functionality with opt-in mechanism" which could affect the parser extension hooks in `shim.cpp`. Investigate `parser_override_function_t` as a possible replacement for or change to the `parse_function` fallback hook.
-- **Confidence:** MEDIUM. The specific breakages depend on what changed between DuckDB 1.4.4 and 1.5.0, which requires hands-on investigation. The general risk pattern is HIGH confidence (every DuckDB version bump has broken something historically).
+1. Add `created_on` as `Option<String>` with `#[serde(default)]` and `#[serde(skip_serializing_if = "Option::is_none")]` to match the existing pattern used by `pk_columns`, `unique_constraints`, etc.
+2. In SHOW SEMANTIC VIEWS output, render `None` as empty string (`""`) -- never unwrap.
+3. Write a test that deserializes old-format JSON (without `created_on`) and confirms the VTab emits a row without panicking.
+4. Do NOT add a schema migration to `init_catalog` to backfill `created_on` into stored JSON -- it is unnecessary and risky. Old views simply show blank timestamps.
+5. Store `created_on` inside the JSON definition, not as a separate SQL column in `semantic_layer._definitions`. The JSON approach requires zero schema migration, works with existing `catalog_insert`/`catalog_upsert`, and aligns with how all other definition fields are stored.
 
-**Detection:** `make release` fails on any platform. `cargo test` fails with link errors or missing symbols. The DuckDB Version Monitor CI workflow opens a PR when 1.5.0 is detected.
+**Detection:** If you `.unwrap()` on a `None` `created_on`, `cargo test` will catch it if any test loads a JSON fixture without the field. Existing test fixtures naturally lack the field, so this pitfall is self-detecting if you test against existing fixtures.
 
-**Phase assignment:** Multi-version DuckDB support phase. Must be a standalone phase before any feature work on the 1.5 branch.
+**Phase assignment:** Must be addressed in the phase that adds `created_on` to the model. The field addition and its consumers must be reviewed together.
 
 ---
 
-### C3: Community Extension Registry Requires CMake-Compatible Build, Not Pure Cargo
+### C3: DESCRIBE Restructuring Is a Complete Rewrite, Not an Incremental Change
 
-**What goes wrong:**
-The community extension CI builds extensions using the `duckdb/extension-ci-tools` reusable workflows. The build system delegates to Make targets defined in `extension-ci-tools/makefiles/`. For Rust extensions, the `rust.Makefile` delegates compilation to `cargo build` and then runs a post-build script to append a binary footer converting the shared library into a loadable DuckDB extension.
+**What goes wrong:** The current DESCRIBE returns a single row with 6 VARCHAR columns (`name`, `base_table`, `dimensions`, `metrics`, `joins`, `facts`). Snowflake's DESCRIBE returns multiple rows in a property-per-row format with 5 columns (`object_kind`, `object_name`, `parent_entity`, `property`, `property_value`). This is not a column rename -- it is a fundamentally different output structure. Every consumer of DESCRIBE output must be rewritten: the VTab bind, the VTab func, the bind data struct, the init data struct, and every test.
 
-The critical discovery: the community extension registry's CI runs the build using its OWN infrastructure, not the extension's CI. When you submit `description.yml`, the registry CI clones your repo, runs `make release`, and builds for all platforms. If your build has any dependency that is not handled by the standard `make configure && make release` flow, the registry build fails.
-
-Specific risks for this extension:
-1. **Amalgamation download** -- the `Makefile` downloads `libduckdb-src.zip` from GitHub Releases. The registry CI may not have network access during build, or the download URL may be blocked. The `ensure_amalgamation` target must succeed.
-2. **`UNSTABLE_C_API_FLAG`** -- the Makefile overrides this to `--abi-type C_STRUCT_UNSTABLE`. The registry CI must respect this override. If the registry's build scripts reset it, the extension is built with the wrong ABI type.
-3. **Platform exclusions** -- the extension excludes `wasm_mvp`, `wasm_eh`, `wasm_threads`, `windows_amd64_mingw`, `linux_amd64_musl`, and `linux_arm64_musl` in the Build.yml workflow. The `description.yml` must declare the SAME exclusions via `excluded_platforms`, or the registry CI attempts to build for platforms that will fail.
-4. **Rust toolchain** -- the registry CI must have Rust installed. The `description.yml` must include `requires_toolchains: [rust, python3]` (matching the `extra_toolchains` in Build.yml and the `rusty_quack` precedent).
-5. **`cc` crate compilation time** -- the amalgamation compilation takes 2-5 minutes. The registry CI may have a build timeout that this exceeds, especially on arm64 where compilation is slower.
-6. **`extension-ci-tools` version mismatch** -- the submodule in the repo points to v1.4.4. The registry CI may use a different version. The `description.yml` `repo.ref` must point to a commit where the submodule is consistent.
-
-**Why it happens:**
-The extension's own CI (Build.yml) is customized with `exclude_archs`, `extra_toolchains`, and specific version pinning. The registry CI uses the `description.yml` to configure these same parameters, but the mapping between Build.yml parameters and description.yml fields is not documented and easy to get wrong.
+**Why it happens:** The original DESCRIBE was designed for quick inspection, not Snowflake compatibility. The Snowflake format is more powerful (queryable with RESULT_SCAN/pipe operator, filterable by object_kind) but radically different.
 
 **Consequences:**
-- Registry CI build fails, PR is rejected
-- Build succeeds on some platforms but fails on others (e.g., Windows due to `rstrtmgr.lib`, wasm due to Rust)
-- Extension is published but crashes on load due to wrong ABI type
-- Extension is published for platforms where it was never tested
+1. `DescribeSemanticViewVTab` must be completely rewritten (not incrementally modified).
+2. The sqllogictest `phase20_extended_ddl.test` asserts the current 6-column schema -- must be rewritten.
+3. Any Python examples or documentation that reference DESCRIBE output format must be updated.
+4. The `DescribeBindData` struct changes from holding scalar strings to holding a `Vec<PropertyRow>`.
+5. The VTab changes from emitting 1 row to emitting potentially 100+ rows for complex views.
 
 **Prevention:**
-- Study the `rusty_quack` extension's `description.yml` as a template. It uses: `language: rust`, `build: cargo`, `excluded_platforms: [wasm_mvp, wasm_eh, wasm_threads, windows_amd64_rtools, windows_amd64_mingw, linux_amd64_musl]`, `requires_toolchains: [rust, python3]`.
-- Mirror the `exclude_archs` from Build.yml into `excluded_platforms` in `description.yml`. Add `windows_arm64` which is in Build.yml but not in rusty_quack's exclusions (this extension has Windows-specific `rstrtmgr` linking that needs testing on arm64).
-- Before submitting to the registry, test the full build locally using the same Make targets the registry would use: `make configure && make release && make test_release`.
-- The `description.yml` `repo.ref` should be a tagged release commit (e.g., `v0.5.4`), not a branch. Tags are immutable; branches are not.
-- Verify the `UNSTABLE_C_API_FLAG` override in the Makefile is applied AFTER the include of `base.Makefile` (it currently is -- line 23). If `extension-ci-tools` changes the include order, this breaks.
-- **Confidence:** MEDIUM. The `rusty_quack` precedent proves Rust extensions can be published, but this extension is more complex (C++ shim, amalgamation download, platform-specific linking). The specific failure modes depend on registry CI internals.
+1. Plan DESCRIBE restructuring as a discrete, atomic phase -- do not interleave it with other changes.
+2. Write the new DESCRIBE VTab as a clean replacement, not an incremental edit. The old code provides no reusable structure.
+3. Build a helper function (e.g., `build_describe_rows(&SemanticViewDefinition) -> Vec<PropertyRow>`) that is unit-testable independently of the VTab machinery.
+4. Update the example Python files (`basic_ddl_and_query.py`, `advanced_features.py`) if they print DESCRIBE output.
 
-**Detection:** Submit a draft PR to `duckdb/community-extensions` with `description.yml` and monitor CI output. Fix failures iteratively. Do NOT wait until all other v0.5.4 work is complete to test the submission -- do a dry run early.
+**Detection:** `just test-sql` failure on any test file asserting DESCRIBE output.
 
-**Phase assignment:** Registry publishing phase. Should be attempted BEFORE the documentation phase so CI issues can be resolved without time pressure.
+**Phase assignment:** Dedicated DESCRIBE restructuring phase. Do not combine with SHOW column changes.
 
 ---
 
-### C4: Cardinality Inference From PK/UNIQUE Produces Wrong Results for Composite Keys and Partial Key References
+### C4: Module Refactoring Breaks `use crate::expand::` Import Paths Across 10+ Files
 
-**What goes wrong:**
-Snowflake's cardinality inference works as follows: if the FK references columns that are declared as PRIMARY KEY or UNIQUE on the target table, the relationship is MANY-TO-ONE (many FK rows point to one unique target row). If the FK columns match the PK of the source table AND the target is PK/UNIQUE, the relationship is ONE-TO-ONE.
+**What goes wrong:** When splitting `expand.rs` (4,490 lines, 99 tests) into `expand/mod.rs` + submodules, every `use crate::expand::` import across the codebase must resolve to the new module structure. Rust's module system means `expand::suggest_closest` must either be re-exported from `expand/mod.rs` or callers must change to the new path. Same for `expand::ExpandError`, `expand::QueryRequest`, `expand::expand()`.
 
-The inference logic needs to handle several edge cases:
+**Why it happens:** Rust module refactoring is not purely structural -- it changes the public API surface. Moving a function from `expand.rs` to `expand/resolve.rs` means it is now at `crate::expand::resolve::function_name` unless explicitly re-exported via `pub use` in `expand/mod.rs`.
 
-1. **Composite primary keys** -- a table has `PRIMARY KEY (customer_id, product_id)`. A relationship references only `customer_id`. Since `customer_id` alone is NOT the full PK, it is not unique. The relationship should be treated as MANY-TO-MANY (or at least "unknown cardinality"), not MANY-TO-ONE. If the inference naively checks "is `customer_id` part of a PK?" and returns MANY-TO-ONE, fan trap detection is disabled for a relationship that DOES produce fan-out.
-
-2. **UNIQUE subset of PK** -- a table declares `PRIMARY KEY (id)` and also `UNIQUE (email)`. A relationship references `email`. This IS a valid many-to-one relationship (email is unique). The inference must check BOTH pk_columns AND unique_columns, not just pk_columns.
-
-3. **Self-referential relationships** -- the current `RelationshipGraph::from_definition()` rejects self-references (`from == to`). But a table can have a self-referential FK (e.g., `employee(manager_id) REFERENCES employee(id)` for an org chart). If cardinality inference is applied to self-referential relationships, and the extension later supports them, the inference logic must handle the case where from_alias and to_alias refer to the same physical table with different aliases.
-
-4. **No PK or UNIQUE declared on target** -- if the target table has no PK and no UNIQUE columns, cardinality cannot be inferred. The extension must either: (a) default to MANY-TO-ONE (current behavior, matches existing serde default), (b) require explicit cardinality, or (c) reject the relationship. Option (a) is dangerous because MANY-TO-ONE disables fan trap detection for that path -- if the actual cardinality is ONE-TO-MANY, metrics will be silently inflated.
-
-5. **FK columns reference non-PK, non-UNIQUE columns** -- `o(status) REFERENCES s` where `s.status` is neither PK nor UNIQUE. This is a valid join but cardinality is unknown. Should the inference produce an error, a warning, or a default?
-
-**Why it happens:**
-Snowflake can get away with simple inference because it validates constraints at query optimization time (with the RELY property). DuckDB actually enforces PK/UNIQUE constraints, but the semantic views extension doesn't query DuckDB's constraint metadata -- it only knows what the user declares in the DDL. The inference operates on DDL declarations, not on actual table metadata.
-
-**Consequences:**
-- Silent fan-out: inference says MANY-TO-ONE but actual data has duplicates in the "unique" column
-- Fan trap detection disabled for relationships that should trigger it
-- Wrong results with no error or warning
+**Consequences:** If re-exports are missed, compilation fails with "unresolved import" errors. These are caught at compile time (good) but can cascade to many files:
+- `graph.rs` imports `expand::suggest_closest`
+- `query/table_function.rs` imports `expand::expand` and `expand::QueryRequest`
+- `query/explain.rs` imports from `expand`
+- `query/error.rs` imports from `expand`
+- All 99 tests in `expand.rs` must move to the correct submodule or a shared `tests.rs`
 
 **Prevention:**
-- Inference rule: a relationship is MANY-TO-ONE if and only if the referenced columns on the target table EXACTLY match either the full `pk_columns` or a declared `unique_columns` set. Partial matches (subset of composite PK) are NOT sufficient.
-- Inference rule: a relationship is ONE-TO-ONE if the FK columns on the source table ALSO exactly match the source table's `pk_columns` or a `unique_columns` set, AND the target columns match the target's PK/UNIQUE.
-- Inference rule: if neither condition is met, cardinality is UNKNOWN. In this case, require explicit cardinality or default to a safe value. Recommendation: default to MANY-TO-ONE (matches current behavior and Snowflake convention) but emit a define-time warning: "Cardinality of relationship 'X' could not be inferred. Defaulting to MANY TO ONE. Declare UNIQUE on the target table's referenced columns to enable inference."
-- Add `unique_columns: Vec<Vec<String>>` to `TableRef` (a list of UNIQUE constraints, each being a list of column names). A single table can have multiple UNIQUE constraints.
-- Self-referential relationships: defer to a future milestone. The current rejection in `graph.rs` is correct for tree-structured graphs.
-- **Confidence:** HIGH. The inference rules are well-defined. The risk is in incomplete edge case handling.
+1. **Re-export everything from `expand/mod.rs`** during the initial split. The `mod.rs` file should contain `pub use` for every public item that was previously accessible as `crate::expand::X`. Preserve the external API before changing it.
+2. Use `cargo test` continuously during the split -- it catches unresolved imports immediately.
+3. Extract `suggest_closest` and `replace_word_boundary` to `src/util.rs` FIRST (breaking the circular dependency) before splitting `expand.rs` into a module directory. This isolates the most dangerous change.
+4. Do the `graph.rs` split AFTER `expand.rs` because `graph.rs` has fewer external dependents.
 
-**Detection:** Test with composite PK where FK references a subset. Verify fan trap detection still triggers. Test with UNIQUE column reference. Test with no PK/UNIQUE on target.
+**Detection:** `cargo test` -- Rust compilation errors are immediate and precise. The risk is not silent breakage but cascading fix-up across many files.
 
-**Phase assignment:** Cardinality inference phase. The inference rules must be defined and tested BEFORE removing the explicit cardinality syntax.
+**Phase assignment:** Module refactoring phase. Must happen in a specific order: util.rs extraction -> expand/ split -> graph/ split.
 
 ---
 
 ## Moderate Pitfalls
 
-### M1: Multi-Version Support Requires Two CI Pipelines, Two Cargo.toml Versions, and Careful Branch Management
+### M1: Circular Dependency During Incremental Refactoring
 
-**What goes wrong:**
-Supporting DuckDB 1.4.x and 1.5.x simultaneously means maintaining two build configurations:
-- `duckdb = "=1.4.4"` with amalgamation v1.4.4 on the main/LTS branch
-- `duckdb = "=1.5.0"` with amalgamation v1.5.0 on the latest branch
-
-If these are maintained on separate branches, every feature change must be cherry-picked or merged across branches. If maintained with cargo feature flags, `Cargo.toml` becomes complex and `cargo test` can only test one version at a time.
-
-The `extension-ci-tools` repository supports this: "each branch targets a specific version of DuckDB" and "the aim is to support the latest 2 DuckDB versions." The extension submodule `extension-ci-tools` must be updated to the appropriate tag on each branch.
-
-**Why it happens:**
-DuckDB's rapid release cycle (1.4.4 in January 2026, 1.5.0 in March 2026) means the extension must track two moving targets. Feature development happens on one branch while the other requires backports.
-
-**Consequences:**
-- Features diverge between branches, users get different behavior depending on DuckDB version
-- Bug fixes must be applied twice (once per branch)
-- CI costs double (two full build matrices)
-- Cherry-pick conflicts accumulate over time
+**What goes wrong:** The current codebase has a known circular dependency: `expand.rs` exports `suggest_closest` which `graph.rs` imports (line 13), while `expand.rs` imports `graph::RelationshipGraph` (line 4). During refactoring, if you split `expand.rs` into submodules before extracting `suggest_closest` to `util.rs`, you may create a temporary state where `graph/` submodules import from `expand/` submodules and vice versa, making the dependency graph harder to reason about.
 
 **Prevention:**
-- Use the `extension-ci-tools` branching convention: `main` branch targets the latest DuckDB version, a long-lived branch (e.g., `andium` or `lts-1.4`) targets the previous version.
-- Feature development happens on `main` (latest DuckDB). Backports to the LTS branch are done selectively for bug fixes only, not new features.
-- The `Makefile` and `Build.yml` already read `.duckdb-version` as the single source of truth. Each branch sets this file to its target version.
-- Do NOT try to support both versions from a single branch with feature flags. The amalgamation is a 300K-line file that differs between versions -- conditional compilation is impractical.
-- Pin `extension-ci-tools` submodule to the correct tag on each branch (e.g., `v1.4.4` on LTS, `v1.5.0` on main).
-- Consider whether multi-version support is worth the maintenance cost. If the target audience (community extension users) always uses the latest DuckDB, a single-version strategy is simpler. The LTS branch can be created but not actively maintained until there is demand.
-- **Confidence:** MEDIUM. The branching strategy is standard, but the execution overhead is significant for a solo-maintained project.
+1. Extract `util.rs` (containing `suggest_closest` and `replace_word_boundary`) FIRST -- this is a small, well-bounded extraction.
+2. Update `graph.rs` to import from `crate::util` instead of `crate::expand`.
+3. Verify `cargo test` passes.
+4. THEN proceed with the `expand/` module split.
+5. THEN proceed with the `graph/` module split.
 
-**Detection:** Feature drift between branches. CI failures on the LTS branch after changes to main. Cherry-pick conflicts.
+The order must be: break the cycle, then split the modules.
 
-**Phase assignment:** Multi-version DuckDB support phase. Should define the branching strategy BEFORE creating the second branch.
+**Phase assignment:** First step of the refactoring phase. Single commit.
 
 ---
 
-### M2: The `description.yml` `build: cargo` vs `build: cmake` Choice Affects Platform Support
+### M2: DuckDB Database/Schema Name Retrieval in Extension Context
 
-**What goes wrong:**
-The community extension registry supports two build types: `cmake` (default, used by C++ extensions) and `cargo` (used by Rust extensions like `rusty_quack`). The current extension uses `make release` which delegates to `cargo build`, matching the `cargo` build type.
+**What goes wrong:** Snowflake's SHOW output includes `database_name` and `schema_name`. In DuckDB, the equivalent metadata comes from `current_database()` / `current_schema()` SQL functions. But these SQL functions cannot be called from within a VTab `bind()` because the ClientContext lock is held. The extension already has a `persist_conn` and `query_conn` for this purpose, but the SHOW VTab implementations (list.rs, show_dims.rs, etc.) only access `CatalogState` via `extra_info` -- they have no connection handle.
 
-However, the extension ALSO compiles C++ code via the `cc` crate (the DuckDB amalgamation + shim.cpp). This is unusual for a "Rust" extension -- it is a hybrid. The `cargo` build type in the registry CI may not install C++ build tools on all platforms. If the registry CI for `build: cargo` only provides Rust toolchain and not a C++ compiler, the `cc` crate compilation of `duckdb.cpp` fails.
-
-The `rusty_quack` extension is a pure Rust extension (no C++ shim). This extension is NOT pure Rust -- it has a C++ component compiled via `cc`.
-
-**Why it happens:**
-The `cc` crate automatically finds C++ compilers on most platforms (it delegates to the system compiler). But in a CI environment, the compiler must be explicitly installed. The registry CI for `build: cargo` may assume no C++ compilation is needed.
-
-**Consequences:**
-- Registry build fails with "C++ compiler not found" on some platforms
-- The extension cannot be published despite building locally and in its own CI
+**Why it happens:** The existing SHOW VTabs were designed to only need the in-memory catalog. Adding database/schema metadata requires either: (a) storing the database/schema name at init time, or (b) passing an additional connection to the VTab via extra_info for metadata queries.
 
 **Prevention:**
-- Test the registry build early by submitting a draft `description.yml` and monitoring CI.
-- If `build: cargo` does not provide C++ tools, investigate whether `build: cmake` is needed instead. This would require adding a `CMakeLists.txt` that invokes `cargo build` and the `cc` crate handles the C++ compilation internally.
-- Alternatively, check if `requires_toolchains` can request both `rust` and a C++ toolchain. The `extra_toolchains` parameter in Build.yml already requests `rust;python3`. The registry may support additional toolchains.
-- As a last resort, examine whether the C++ shim can be pre-compiled or the amalgamation can be vendored in the repository (rather than downloaded at build time). This trades binary size in the repo for build reliability.
-- **Confidence:** LOW. This depends on the registry CI's internal configuration for `build: cargo` extensions. No documentation exists for hybrid Rust+C++ builds. Verification requires actually submitting to the registry.
+1. At `init_catalog` time (or extension init), query `SELECT current_database(), current_schema()` and store the results alongside the catalog state. Create a new wrapper struct (e.g., `ExtensionState { catalog: CatalogState, database_name: String, schema_name: String }`).
+2. Pass this enriched state through `extra_info` to the VTabs.
+3. Do NOT try to execute SQL from within a VTab `bind()` on the main connection -- it will deadlock silently.
+4. For in-memory databases, `current_database()` returns `'memory'` and `current_schema()` returns `'main'` -- these are correct values to display.
 
-**Detection:** Registry CI build log shows `cc` crate errors or missing C++ compiler.
+**Detection:** If you try to call `duckdb_query` on the main connection from within `bind()`, the process will hang (deadlock) rather than error. This is silent and hard to debug.
 
-**Phase assignment:** Registry publishing phase. Must be validated early.
+**Phase assignment:** SHOW SEMANTIC VIEWS column expansion phase. Must precede the VTab changes that need the data.
 
 ---
 
-### M3: Zensical Documentation Site Has No `gh-deploy` Command -- Must Use GitHub Actions
+### M3: Dropping `expr` Column from SHOW SEMANTIC DIMENSIONS/METRICS/FACTS
 
-**What goes wrong:**
-Zensical (the documentation static site generator from the Material for MkDocs team) does NOT have an `gh-deploy` command like MkDocs. MkDocs users are accustomed to running `mkdocs gh-deploy` to push built docs to the `gh-pages` branch. Zensical requires a GitHub Actions workflow that builds the site and deploys via the `actions/deploy-pages` action.
-
-If the deployment workflow is misconfigured:
-1. **Missing permissions** -- the workflow needs `pages: write` and `id-token: write` permissions. Without these, the deployment silently fails with a 403.
-2. **Base URL mismatch** -- if the site is deployed at `https://user.github.io/repo/` (project page, not user page), the `site_url` in configuration must include the `/repo/` prefix. Without it, all internal links and asset paths are broken (CSS missing, links 404).
-3. **Caching issues** -- Zensical's documentation explicitly warns: "Caching on CI systems is not recommended at the moment as the caching functionality will undergo revisions."
-4. **Branch configuration** -- GitHub Pages must be configured to use "GitHub Actions" as the source (not a branch). The repository Settings > Pages > Source must be changed from the default.
-
-**Why it happens:**
-Zensical is new (first release 2025) and the deployment model differs from MkDocs. Documentation on GitHub Pages deployment is available but sparse. The migration path from MkDocs to Zensical is documented, but this project starts fresh.
-
-**Consequences:**
-- Documentation site shows a 404 or blank page
-- Internal links broken, CSS missing (base URL issue)
-- Deployment workflow runs but does not actually publish
-- Site content is stale because caching prevents updates
+**What goes wrong:** The current SHOW SEMANTIC DIMENSIONS has 5 columns: `semantic_view_name`, `name`, `expr`, `source_table`, `data_type`. Snowflake's equivalent has 8 columns: `database_name`, `schema_name`, `semantic_view_name`, `table_name`, `name`, `data_type`, `synonyms`, `comment`. Snowflake does NOT expose `expr` in SHOW output (expressions are visible in DESCRIBE via the `EXPRESSION` property). Dropping `expr` from SHOW output removes information that users may rely on for debugging.
 
 **Prevention:**
-- Start with Zensical's official GitHub Actions workflow template (available in the `zensical new` project scaffolding). Do not write the workflow from scratch.
-- Set `site_url` to `https://username.github.io/duckdb-semantic-views/` (with trailing slash and repo name).
-- Configure GitHub Pages source to "GitHub Actions" in repository settings BEFORE the first workflow run.
-- Do NOT enable caching in the CI workflow (per Zensical's recommendation).
-- Test locally with `zensical serve` before pushing. Verify the site renders correctly at `http://localhost:8000/`.
-- Verify the deployment by checking the Pages URL immediately after the first workflow run.
-- **Confidence:** HIGH. GitHub Pages deployment is well-documented. The pitfalls are all avoidable with correct configuration.
+1. Drop `expr` from SHOW output to align with Snowflake. DESCRIBE (in property-per-row format) still exposes expressions via the `EXPRESSION` property.
+2. Add `database_name` and `schema_name` as the first two columns (matching Snowflake column order).
+3. For `synonyms` and `comment`: Snowflake has these; DuckDB semantic views do not support them yet. Emit empty strings for these columns to maintain schema compatibility.
+4. Rename `source_table` to `table_name` to match Snowflake naming.
+5. Document the column changes in release notes -- users scripting against SHOW output will break.
 
-**Detection:** 404 on the Pages URL. Missing CSS (blank white page with unstyled text). Broken internal links.
+**Detection:** Any test or script that references `expr` in SHOW output or uses column positions will fail.
 
-**Phase assignment:** Documentation site phase. Low risk if the official template is followed.
+**Phase assignment:** SHOW DIMS/METRICS/FACTS alignment phase. Must update all three SHOW commands together for consistency.
 
 ---
 
-### M4: DuckDB 1.5 Parser Override May Conflict With or Replace the `parse_function` Fallback Hook
+### M4: `parse.rs` Error Type Extraction Order Matters
 
-**What goes wrong:**
-DuckDB 1.5.0 release notes mention "Parser override functionality with opt-in mechanism." The current extension uses `parse_function` (a parser fallback hook) registered in `shim.cpp` to intercept `CREATE SEMANTIC VIEW` statements. If DuckDB 1.5 introduces a new `parser_override_function_t` mechanism that changes how parser hooks work, the existing `parse_function` registration may:
-1. Stop being called (if DuckDB changes the fallback hook dispatch)
-2. Be called with different arguments or return type expectations
-3. Conflict with the new parser override mechanism
+**What goes wrong:** `body_parser.rs` imports `parse::ParseError`. If you extract `ParseError` to `errors.rs` before splitting `expand.rs`/`graph.rs`, the extraction is clean. If you do it after or interleaved, you have to update import paths twice -- once for the initial extraction, and again when the modules that use it are restructured.
 
-The `shim.cpp` C++ code directly references DuckDB internal C++ classes (`ParserExtension`, `ParserExtensionInfo`, etc.). If these classes change in 1.5, the shim fails to compile.
+**Prevention:** Extract `ParseError` to `errors.rs` at the same time as extracting `suggest_closest` to `util.rs`. Both are "break the dependency cycle" changes that should happen in a single preparatory phase before any module directory splitting.
 
-**Why it happens:**
-Parser extension hooks are internal DuckDB C++ API, not part of the stable C API. They are accessed via the statically-linked amalgamation, which means the extension is tightly coupled to the exact DuckDB version's internal class layout.
+**Phase assignment:** Same initial refactoring step as M1.
 
-**Consequences:**
-- The extension compiles but `CREATE SEMANTIC VIEW` is not recognized (hook not called)
-- The extension fails to compile (`shim.cpp` references removed or renamed classes)
-- The extension crashes at runtime due to ABI mismatch in parser extension vtable
+---
+
+### M5: Test Migration Is the Largest Work Item
+
+**What goes wrong:** The codebase has 482 tests. Module refactoring affects the location and import paths of tests embedded within the refactored files. Schema changes to SHOW/DESCRIBE affect sqllogictest assertions. The actual code changes (adding columns, restructuring output) are straightforward, but migrating every affected test is labor-intensive and error-prone.
+
+**Why it happens:** Tests for `expand.rs` (99 unit tests) and `graph.rs` (numerous tests) are embedded at the bottom of each file with `#[cfg(test)] mod tests { ... }`. When splitting into module directories, these tests must move to the correct submodule (close to the code they test). Each moved test must have its `use` imports updated.
 
 **Prevention:**
-- Before writing any DuckDB 1.5 code, read the 1.5 amalgamation's `ParserExtension` class definition and compare to 1.4.4's. Check if `parse_function` still exists and has the same signature.
-- Search the DuckDB 1.5 source for `parser_override` to understand the new mechanism. It may be a C API alternative to the C++ `parse_function` hook -- potentially a path to moving away from the C++ shim entirely.
-- If the new parser override is available via the C API, investigate migrating from the C++ `parse_function` hook to the C API `parser_override`. This would eliminate the need for the amalgamation compilation, dramatically reducing build time and binary size.
-- If migration is not feasible in v0.5.4, verify the existing hook still works and document the investigation results for a future milestone.
-- **Confidence:** MEDIUM. The release notes mention parser override but do not detail whether it replaces or supplements `parse_function`. Investigation required.
+1. For module splits: keep `#[cfg(test)] mod tests` blocks in each submodule file. Move tests with the function they test, not to a central `tests.rs`.
+2. For sqllogictest: identify all affected `.test` files upfront and update them in the same commit as the schema change.
+3. Run `just test-all` after every individual refactoring step -- do not batch multiple changes before testing.
+4. Consider keeping a `expand/tests.rs` for integration-style tests that exercise the full `expand()` pipeline, while unit tests for individual functions live in their respective submodules.
 
-**Detection:** `CREATE SEMANTIC VIEW` silently falls through to DuckDB's native parser (error: "Parser Error: syntax error at or near 'SEMANTIC'"). Or: `shim.cpp` fails to compile.
+**Detection:** `cargo test` for Rust test migration errors. `just test-sql` for sqllogictest assertion failures. `just test-all` catches both.
 
-**Phase assignment:** Multi-version DuckDB support phase. Must be investigated as part of the DuckDB 1.5 port.
+**Phase assignment:** Embedded in every phase. Budget time for test migration in each phase estimate.
 
 ---
 
 ## Minor Pitfalls
 
-### m1: UNIQUE Constraint Syntax Must Be Parsed Without Breaking Existing TABLES Clause
+### N1: VTab Chunk Size on Large DESCRIBE Output
 
-**What goes wrong:**
-The current TABLES clause syntax is:
-```sql
-TABLES (
-    o AS orders PRIMARY KEY (id),
-    c AS customers PRIMARY KEY (customer_id)
-)
-```
+**What goes wrong:** The current VTab pattern uses `init_data.done.swap(true)` to emit all rows in a single `func()` call. The Snowflake property-per-row DESCRIBE format can produce 100+ rows for complex views. The DuckDB standard vector size is 2048, so this is unlikely to be a problem in practice, but the pattern should handle it.
 
-Adding UNIQUE support extends this to:
-```sql
-TABLES (
-    o AS orders PRIMARY KEY (id) UNIQUE (email),
-    c AS customers PRIMARY KEY (customer_id) UNIQUE (customer_id, region)
-)
-```
-
-The body parser's `parse_tables_clause()` function must handle:
-- `PRIMARY KEY` followed by `UNIQUE` (new)
-- `PRIMARY KEY` without `UNIQUE` (existing, backward compatible)
-- `UNIQUE` without `PRIMARY KEY` (questionable -- should this be allowed?)
-- Multiple `UNIQUE` constraints on a single table (e.g., `UNIQUE (email) UNIQUE (phone)`)
-
-If the parser tokenization is not careful, `UNIQUE` could be consumed as part of the PK column list or as a table alias.
-
-**Prevention:**
-- After parsing `PRIMARY KEY (...)`, check for the `UNIQUE` keyword. If present, parse `UNIQUE (...)`. If not, continue to the next entry.
-- Disallow `UNIQUE` without `PRIMARY KEY`. A table must have a PK for relationship resolution to work. UNIQUE-only tables are an edge case that can be deferred.
-- Allow multiple `UNIQUE` clauses per table. Store as `unique_constraints: Vec<Vec<String>>` on `TableRef`.
-- Add backward compatibility tests: existing DDL without UNIQUE must parse identically.
-- **Confidence:** HIGH. Token-based parsing is an established pattern in `body_parser.rs`.
-
-**Phase assignment:** Cardinality inference phase.
+**Prevention:** Implement proper chunked emission in the DESCRIBE VTab: track an offset in `InitData`, emit up to chunk size rows per `func()` call, return `set_len(0)` when offset >= total rows. The existing SHOW VTabs also use single-emission; flag this as tech debt for future scalability.
 
 ---
 
-### m2: The `description.yml` Extension Name Must Be Lowercase and Match the Binary Name
+### N2: `#[serde(skip_serializing_if)]` Inconsistency on `created_on`
 
-**What goes wrong:**
-The community extension registry requires `extension.name` to be lowercase with only letters, numbers, hyphens, and underscores. The current extension name is `semantic_views` (lowercase with underscore) which is valid. But the name in `description.yml` must EXACTLY match:
-- The Makefile's `EXTENSION_NAME=semantic_views`
-- The binary output filename (e.g., `semantic_views.duckdb_extension`)
-- The `LOAD semantic_views` command users will type
+**What goes wrong:** If you forget `skip_serializing_if` on `created_on` and always serialize `created_on: null`, old definitions re-serialized through `catalog_upsert` will gain the new field. This is harmless (serde handles null gracefully) but creates unnecessary JSON churn in stored definitions.
 
-If there is a mismatch (e.g., `description.yml` says `semantic-views` with a hyphen but the binary is `semantic_views` with an underscore), the extension installs but fails to load.
-
-**Prevention:**
-- Use `semantic_views` (underscore) consistently everywhere.
-- Verify the name in `description.yml`, `Cargo.toml` `[package].name`, `Makefile` `EXTENSION_NAME`, and `build.rs` symbol visibility list all match.
-- **Confidence:** HIGH. Simple consistency check.
-
-**Phase assignment:** Registry publishing phase. Validation step in the description.yml creation.
+**Prevention:** Follow the existing pattern in `TableRef` (model.rs lines 13, 19): use `#[serde(default, skip_serializing_if = "Option::is_none")]` for the new field.
 
 ---
 
-### m3: The `duckdb_constraints()` Function May Not Expose Full Constraint Metadata
+### N3: FOR METRIC `required` Column Semantics
 
-**What goes wrong:**
-If a future version of cardinality inference needs to query ACTUAL database constraints (not just DDL declarations), DuckDB's `duckdb_constraints()` function is the API. However, this function has known limitations: the `constraint_text` column for foreign keys may not include the referenced table or the referenced constraint. Issue #4024 in the DuckDB repo discusses missing FK reference information.
+**What goes wrong:** Snowflake's `SHOW SEMANTIC DIMENSIONS FOR METRIC` includes a `required` boolean column for window function metrics with `PARTITION BY EXCLUDING`. DuckDB semantic views do not support window function metrics yet, so `required` is always `false`. If you add the column now, it must always emit `false`.
 
-For the v0.5.4 approach (inference from DDL declarations, not from database metadata), this is not a blocker. But if the design later evolves to "infer cardinality by querying the actual database schema," the metadata API may be insufficient.
-
-**Prevention:**
-- For v0.5.4, infer cardinality ONLY from DDL declarations (PK/UNIQUE in the TABLES clause). Do not query `duckdb_constraints()` or `information_schema`.
-- Document this as a design decision: the semantic view is self-contained. Constraint information comes from the DDL, not from the underlying tables.
-- This aligns with Snowflake's approach: "PRIMARY KEY, UNIQUE, and FOREIGN KEY constraints are not enforced and are mainly used for data modeling purposes." The DDL declares intent, not enforcement.
-- **Confidence:** HIGH. The DDL-only approach is simpler and more portable.
-
-**Phase assignment:** Cardinality inference phase. Design decision to document.
+**Prevention:** Add `required` as a BOOLEAN column, always emit `false`, add a code comment: "Always false until window function metrics are implemented."
 
 ---
 
-### m4: Documentation Site Content Must Not Duplicate README.md
+### N4: Forgetting to `git rm` Old Files When Creating Module Directories
 
-**What goes wrong:**
-The README.md contains DDL syntax reference, worked examples, and a feature overview. The documentation site will contain similar content. If both are maintained separately, they diverge. Users find different information depending on where they look.
+**What goes wrong:** When converting `expand.rs` to `expand/mod.rs`, if both files exist in the source tree, the Rust compiler emits an ambiguity error. Git may retain the old file if not explicitly removed.
 
 **Prevention:**
-- Use the documentation site as the canonical source. The README.md should be a brief overview with a link to the documentation site for full reference.
-- Alternatively, use Zensical's ability to include markdown files: reference the README.md content from the documentation site to avoid duplication.
-- Define a clear boundary: README.md = quick start + installation. Documentation site = full reference + examples + API docs.
-- **Confidence:** HIGH. Standard documentation hygiene.
-
-**Phase assignment:** Documentation site phase.
+1. `git rm src/expand.rs` when creating `src/expand/mod.rs`.
+2. `git rm src/graph.rs` when creating `src/graph/mod.rs`.
+3. Verify with `ls src/expand*` and `ls src/graph*` that no orphan files remain.
 
 ---
 
-### m5: Extension Version String in `description.yml` vs `Cargo.toml`
+### N5: Renaming `source_table` to `table_name` in Output but Not Struct Field
 
-**What goes wrong:**
-The `description.yml` requires an `extension.version` field. The `Cargo.toml` has `version = "0.5.0"`. The DuckDB community extension versioning docs say: "v0.y.z = pre-release/unstable; v1+ = stable API commitment." The extension version in `description.yml` is a freeform string with no enforced scheme.
+**What goes wrong:** Snowflake uses `table_name` where the current code uses `source_table` as both the struct field name AND the output column name. If you rename only the output column (in `bind_output_columns`) but not the struct field, the code works but the naming inconsistency confuses contributors.
 
-If the version in `description.yml` does not match `Cargo.toml`, or if the version scheme creates user confusion (is this extension v0.5.4 or v1.0.0?), the registry listing looks unprofessional.
-
-**Prevention:**
-- Update `Cargo.toml` version to `0.5.4` when shipping the milestone.
-- Set `description.yml` `extension.version` to `0.5.4` (matching Cargo.toml).
-- Keep using `0.x.y` versioning until the API is considered stable. The `v0.y.z` convention in the DuckDB ecosystem signals pre-release, which is appropriate.
-- **Confidence:** HIGH. Version alignment is a trivial check.
-
-**Phase assignment:** Registry publishing phase. Part of the `description.yml` creation.
+**Prevention:** Rename the output column to `table_name` to match Snowflake. Keep the internal struct field name (`source_table`) because it matches the DDL syntax. Add a comment explaining the mapping.
 
 ---
 
@@ -399,52 +231,26 @@ If the version in `description.yml` does not match `Cargo.toml`, or if the versi
 
 | Phase Topic | Likely Pitfall | Mitigation |
 |-------------|---------------|------------|
-| Cardinality inference | C1 (stored definition compat), C4 (composite PK edge cases), m1 (parser syntax), m3 (metadata API) | Keep enum + parser backward compat; exact PK/UNIQUE match for inference; DDL-only approach |
-| Multi-version DuckDB | C2 (amalgamation build), M1 (branch management), M4 (parser override conflict) | Wait for duckdb-rs 1.5; separate branch; diff amalgamation before coding |
-| CE registry publishing | C3 (build system), M2 (cargo vs cmake), m2 (name consistency), m5 (version alignment) | Mirror rusty_quack description.yml; test submission early; verify name consistency |
-| Documentation site | M3 (Zensical deployment), m4 (README duplication) | Use official workflow template; set correct base URL; define content boundary |
-| All model changes | C1 (serde backward compat) | `#[serde(default)]` on all new fields; keep old enum variants; backward compat tests |
-
----
+| Extract util.rs + errors.rs | M1 (circular deps), M4 (error type order) | Do this FIRST before any module splits. Single commit, verify with `cargo test`. |
+| Split expand.rs into expand/ | C4 (import path breakage), M5 (test migration) | Re-export everything from mod.rs. Move tests with functions. Run `cargo test` after each file move. |
+| Split graph.rs into graph/ | C4 (same pattern) | Smaller surface area than expand. Same re-export strategy. |
+| Add created_on to model | C2 (JSON backward compat) | `Option<String>` with `#[serde(default)]`. Test with old JSON fixtures. Store in JSON, not SQL column. |
+| Add database_name/schema_name | M2 (connection access deadlock) | Query at init time, store in enriched state struct. |
+| SHOW SEMANTIC VIEWS column changes | C1 (test sync), M3 (column removal) | Atomic VTab + test update. Document breaking change. |
+| SHOW SEMANTIC DIMS/METRICS/FACTS changes | C1 (test sync), M3 (same) | All three commands updated together for consistency. |
+| DESCRIBE restructuring | C3 (complete rewrite) | Discrete phase. New VTab from scratch. |
+| SHOW DIMS FOR METRIC required column | N3 (always false) | Add column, emit false, comment the limitation. |
 
 ## Sources
 
-**Official documentation:**
-- [DuckDB: Versioning of Extensions](https://duckdb.org/docs/stable/extensions/versioning_of_extensions) -- C_STRUCT vs C_STRUCT_UNSTABLE ABI types, version compatibility model
-- [DuckDB: Community Extension Documentation](https://duckdb.org/community_extensions/documentation) -- description.yml requirements, build types, platform exclusions
-- [DuckDB: Community Extension Development](https://duckdb.org/community_extensions/development) -- build system, CI, testing requirements
-- [DuckDB: Constraints](https://duckdb.org/docs/stable/sql/constraints) -- PRIMARY KEY, UNIQUE, FOREIGN KEY enforcement and limitations
-- [DuckDB: Announcing DuckDB 1.5.0](https://duckdb.org/2026/03/09/announcing-duckdb-150) -- release notes, parser override mention, C API enhancements
-- [DuckDB: Announcing DuckDB 1.4.4 LTS](https://duckdb.org/2026/01/26/announcing-duckdb-144) -- LTS release context
-- [DuckDB: Release Calendar](https://duckdb.org/release_calendar) -- release cadence
-
-**GitHub sources:**
-- [duckdb/community-extensions](https://github.com/duckdb/community-extensions) -- registry repo structure and submission process
-- [duckdb/community-extensions#54: Rust extension guidance](https://github.com/duckdb/community-extensions/issues/54) -- pitfalls developing Rust extensions
-- [duckdb/extension-template-rs](https://github.com/duckdb/extension-template-rs) -- Rust extension template, Make-based build
-- [duckdb/extension-ci-tools](https://github.com/duckdb/extension-ci-tools/) -- reusable CI workflows, multi-version branching
-- [duckdb/duckdb#14992: Bump Extension C API to stable](https://github.com/duckdb/duckdb/pull/14992) -- C_STRUCT stabilization, function lifecycle
-- [rusty_quack description.yml](https://github.com/duckdb/community-extensions/blob/main/extensions/rusty_quack/description.yml) -- reference Rust extension submission (via raw.githubusercontent.com)
-- [duckdb/duckdb releases](https://github.com/duckdb/duckdb/releases) -- DuckDB 1.5.0 release details
-
-**Snowflake documentation:**
-- [Snowflake: CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- UNIQUE/PK-based cardinality inference, relationship syntax
-- [Snowflake: Using SQL commands to create and manage semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- PK/UNIQUE inference mechanism, relationship types
-- [Snowflake: Overview of Constraints](https://docs.snowflake.com/en/sql-reference/constraints-overview) -- constraints as metadata (not enforced), RELY property
-
-**Zensical documentation:**
-- [Zensical: Create your site](https://zensical.org/docs/create-your-site/) -- setup process
-- [Zensical: Publish your site](https://zensical.org/docs/publish-your-site/) -- GitHub Pages deployment via Actions
-- [Zensical: FAQ](https://zensical.org/docs/community/faqs/) -- no gh-deploy command, caching warnings
-- [Zensical GitHub repo](https://github.com/zensical/zensical) -- project overview
-
-**Codebase sources:**
-- `src/model.rs` -- `Cardinality` enum, `Join.cardinality` field, `TableRef.pk_columns`, serde annotations
-- `src/body_parser.rs` -- `parse_cardinality_tokens()`, `CLAUSE_KEYWORDS`, `CLAUSE_ORDER`, `parse_tables_clause()`
-- `src/expand.rs` -- `check_fan_traps()`, `card_map` construction from `Join.cardinality`
-- `src/graph.rs` -- `RelationshipGraph::from_definition()`, self-reference check, diamond validation
-- `build.rs` -- amalgamation compilation, `patch_duckdb_cpp_for_windows()`, symbol visibility
-- `Makefile` -- `UNSTABLE_C_API_FLAG`, `ensure_amalgamation`, Make targets
-- `.github/workflows/Build.yml` -- `exclude_archs`, `extra_toolchains`, `duckdb_version` pinning
-- `Cargo.toml` -- `duckdb = "=1.4.4"`, `cc` optional build dependency
-- `TECH-DEBT.md` -- DuckDB version pinning, C_STRUCT_UNSTABLE evaluation, amalgamation compilation
+- Snowflake [SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- output columns: created_on, name, kind, database_name, schema_name, comment, owner, owner_role_type (HIGH confidence)
+- Snowflake [DESCRIBE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view) -- property-per-row format: object_kind, object_name, parent_entity, property, property_value (HIGH confidence)
+- Snowflake [SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- columns: database_name, schema_name, semantic_view_name, table_name, name, data_type, synonyms, comment (HIGH confidence)
+- Snowflake [SHOW SEMANTIC DIMENSIONS FOR METRIC](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions-for-metric) -- adds `required` boolean column (HIGH confidence)
+- Snowflake [SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics) -- same 8-column schema as SHOW SEMANTIC DIMENSIONS (HIGH confidence)
+- Snowflake [SHOW SEMANTIC FACTS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-facts) -- same 8-column schema as SHOW SEMANTIC DIMENSIONS (HIGH confidence)
+- Codebase: `cpp/src/shim.cpp` sv_ddl_bind (lines 134-201) -- dynamic column forwarding (HIGH confidence, direct code inspection)
+- Codebase: `src/model.rs` SemanticViewDefinition serde attributes (HIGH confidence, direct code inspection)
+- Codebase: `src/catalog.rs` init_catalog, CatalogState type alias (HIGH confidence, direct code inspection)
+- Codebase: `_notes/architecture.md` C1-C6 refactoring proposals (HIGH confidence, project documentation)
+- Codebase: TECH-DEBT.md item 12 -- DDL pipeline all-VARCHAR forwarding (HIGH confidence, project documentation)

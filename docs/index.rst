@@ -1,5 +1,5 @@
 .. meta::
-   :description: A declarative DuckDB extension that lets you define dimensions and metrics once, then query any combination without writing JOIN or GROUP BY logic
+   :description: A DuckDB extension that brings Snowflake-style semantic views to DuckDB -- define dimensions and metrics as DDL, query any combination with a table function
 
 .. _overview:
 
@@ -7,51 +7,51 @@
 DuckDB Semantic Views
 ========================
 
-Define dimensions and metrics once, then query them in any combination. The extension writes the GROUP BY and JOIN logic for you.
+A `Semantic Layer <https://www.databricks.com/blog/what-is-a-semantic-layer>`_ sits between your raw tables and the people querying them. Instead of everyone writing their own ``SUM(amount)`` and hoping they ``GROUP BY`` the same columns, you define each metric and dimension once, in one place. Analysts pick the ones they want; the system assembles the SQL.
 
-DuckDB Semantic Views is a loadable DuckDB extension that implements a declarative semantic layer. You declare tables, relationships, dimensions, and metrics using native SQL DDL, then query any combination with a table function. The extension generates the correct SQL (SELECT, FROM, JOIN, GROUP BY) and DuckDB executes it.
+Snowflake and Databricks, along with dbt Cloud, Cube.dev and others, all ship semantic layers in different forms. Snowflake has `Semantic Views <https://docs.snowflake.com/en/user-guide/views-semantic/overview>`_, Databricks calls them `Metric Views <https://docs.databricks.com/aws/en/metric-views/>`_, both as a SQL syntax sugar for a special kind of flexible view-like interface over aggregated metrics and dimensions. This extension brings the same idea to DuckDB, using DDL syntax modeled closely on Snowflake's ``CREATE SEMANTIC VIEW``.
 
 .. grid:: 1 2 3 3
    :gutter: 3
 
-   .. grid-item-card:: Getting Started
+   .. grid-item-card:: Getting started
       :link: tutorial-getting-started
       :link-type: ref
 
-      Install the extension, create your first semantic view, and run your first query in 5 minutes.
+      Install the extension, create your first semantic view, and run a query in 5 minutes.
 
-   .. grid-item-card:: Multi-Table Semantic Views
+   .. grid-item-card:: Multi-table semantic views
       :link: tutorial-multi-table
       :link-type: ref
 
-      Learn to model relationships between tables and query across them.
+      Model relationships between tables and query across them.
 
-   .. grid-item-card:: DDL Reference
+   .. grid-item-card:: DDL reference
       :link: ref-create-semantic-view
       :link-type: ref
 
-      Full syntax reference for ``CREATE SEMANTIC VIEW`` and all DDL statements.
+      Full syntax for ``CREATE SEMANTIC VIEW`` and related DDL.
 
 .. grid:: 1 2 3 3
    :gutter: 3
 
-   .. grid-item-card:: How-To Guides
+   .. grid-item-card:: How-to guides
       :link: how-to-guides
       :link-type: ref
 
-      Task-oriented guides for FACTS, derived metrics, role-playing dimensions, fan traps, and data sources.
+      FACTS, derived metrics, role-playing dimensions, fan traps, data sources.
 
-   .. grid-item-card:: Concepts
-      :link: explanation
+   .. grid-item-card:: Snowflake comparison
+      :link: explanation-snowflake
       :link-type: ref
 
-      Understand how semantic views differ from regular views and how they compare to Snowflake.
+      Feature-by-feature comparison with Snowflake's ``CREATE SEMANTIC VIEW``.
 
-   .. grid-item-card:: Query Reference
+   .. grid-item-card:: Query reference
       :link: ref-semantic-view-function
       :link-type: ref
 
-      Full reference for the ``semantic_view()`` and ``explain_semantic_view()`` query functions.
+      Reference for ``semantic_view()`` and ``explain_semantic_view()``.
 
 
 .. toctree::

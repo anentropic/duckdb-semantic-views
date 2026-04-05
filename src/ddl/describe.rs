@@ -5,28 +5,33 @@ use duckdb::{
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
 };
 
-use crate::catalog::CatalogState;
+use std::collections::HashMap;
 
-/// Bind-time data for `describe_semantic_view`: the parsed fields of one view.
+use crate::catalog::CatalogState;
+use crate::model::SemanticViewDefinition;
+
+/// A single property row in the DESCRIBE output.
 ///
-/// The JSON array fields (`dimensions`, `metrics`, `joins`, `facts`)
-/// are stored as their serialized JSON strings so they can be
-/// returned as VARCHAR columns without re-serializing at emit time.
-pub struct DescribeBindData {
-    name: String,
-    base_table: String,
-    dimensions: String,
-    metrics: String,
-    joins: String,
-    facts: String,
+/// Each row represents one property of one object in the semantic view.
+/// Output schema: `(object_kind, object_name, parent_entity, property, property_value)`.
+struct DescribeRow {
+    object_kind: String,
+    object_name: String,
+    parent_entity: String,
+    property: String,
+    property_value: String,
 }
 
-// SAFETY: all fields are `String`, which is `Send + Sync`.
+/// Bind-time data for `describe_semantic_view`: pre-collected property rows.
+pub struct DescribeBindData {
+    rows: Vec<DescribeRow>,
+}
+
+// SAFETY: all fields are owned `String` inside `Vec`, which is `Send + Sync`.
 unsafe impl Send for DescribeBindData {}
 unsafe impl Sync for DescribeBindData {}
 
-/// Init data for `describe_semantic_view`: tracks whether the single row has
-/// been emitted.
+/// Init data for `describe_semantic_view`: tracks whether rows have been emitted.
 pub struct DescribeInitData {
     done: AtomicBool,
 }
@@ -35,14 +40,278 @@ pub struct DescribeInitData {
 unsafe impl Send for DescribeInitData {}
 unsafe impl Sync for DescribeInitData {}
 
-/// Table function that returns one row describing a named semantic view.
+/// Format column names as a JSON array: `["col1","col2"]`.
+/// Matches Snowflake format: no spaces after commas.
+fn format_json_array(items: &[String]) -> String {
+    let quoted: Vec<String> = items.iter().map(|s| format!("\"{s}\"")).collect();
+    format!("[{}]", quoted.join(","))
+}
+
+/// Collect TABLE property rows from the definition.
 ///
-/// Output schema (6 columns):
-///   `(name VARCHAR, base_table VARCHAR, dimensions VARCHAR, metrics VARCHAR,
-///     joins VARCHAR, facts VARCHAR)`
+/// Each table alias emits: `BASE_TABLE_DATABASE_NAME`, `BASE_TABLE_SCHEMA_NAME`,
+/// `BASE_TABLE_NAME`, and optionally `PRIMARY_KEY` (only when non-empty).
+fn collect_table_rows(def: &SemanticViewDefinition, rows: &mut Vec<DescribeRow>) {
+    let db_name = def.database_name.clone().unwrap_or_default();
+    let sch_name = def.schema_name.clone().unwrap_or_default();
+
+    // Handle legacy definitions with empty tables vec.
+    if def.tables.is_empty() {
+        let obj_name = def.base_table.clone();
+        rows.push(DescribeRow {
+            object_kind: "TABLE".to_string(),
+            object_name: obj_name.clone(),
+            parent_entity: String::new(),
+            property: "BASE_TABLE_DATABASE_NAME".to_string(),
+            property_value: db_name.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: "TABLE".to_string(),
+            object_name: obj_name.clone(),
+            parent_entity: String::new(),
+            property: "BASE_TABLE_SCHEMA_NAME".to_string(),
+            property_value: sch_name.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: "TABLE".to_string(),
+            object_name: obj_name,
+            parent_entity: String::new(),
+            property: "BASE_TABLE_NAME".to_string(),
+            property_value: def.base_table.clone(),
+        });
+        return;
+    }
+
+    for table in &def.tables {
+        let obj_name = table.table.clone();
+
+        rows.push(DescribeRow {
+            object_kind: "TABLE".to_string(),
+            object_name: obj_name.clone(),
+            parent_entity: String::new(),
+            property: "BASE_TABLE_DATABASE_NAME".to_string(),
+            property_value: db_name.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: "TABLE".to_string(),
+            object_name: obj_name.clone(),
+            parent_entity: String::new(),
+            property: "BASE_TABLE_SCHEMA_NAME".to_string(),
+            property_value: sch_name.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: "TABLE".to_string(),
+            object_name: obj_name.clone(),
+            parent_entity: String::new(),
+            property: "BASE_TABLE_NAME".to_string(),
+            property_value: table.table.clone(),
+        });
+        if !table.pk_columns.is_empty() {
+            rows.push(DescribeRow {
+                object_kind: "TABLE".to_string(),
+                object_name: obj_name,
+                parent_entity: String::new(),
+                property: "PRIMARY_KEY".to_string(),
+                property_value: format_json_array(&table.pk_columns),
+            });
+        }
+    }
+}
+
+/// Collect RELATIONSHIP property rows from the definition.
 ///
-/// The `dimensions`, `metrics`, `joins`, and `facts`
-/// columns contain the JSON-serialized arrays from the definition.
+/// Each named join emits: `TABLE`, `REF_TABLE`, `FOREIGN_KEY`, `REF_KEY`.
+/// Unnamed/legacy joins are skipped.
+fn collect_relationship_rows(
+    def: &SemanticViewDefinition,
+    alias_map: &HashMap<String, String>,
+    rows: &mut Vec<DescribeRow>,
+) {
+    for join in &def.joins {
+        let rel_name = match &join.name {
+            Some(n) => n.clone(),
+            None => continue, // skip unnamed legacy joins
+        };
+        if join.from_alias.is_empty() {
+            continue; // skip legacy joins without from_alias
+        }
+        let from_table = alias_map
+            .get(&join.from_alias)
+            .cloned()
+            .unwrap_or_else(|| join.from_alias.clone());
+        let ref_table = alias_map
+            .get(&join.table)
+            .cloned()
+            .unwrap_or_else(|| join.table.clone());
+
+        rows.push(DescribeRow {
+            object_kind: "RELATIONSHIP".to_string(),
+            object_name: rel_name.clone(),
+            parent_entity: from_table.clone(),
+            property: "TABLE".to_string(),
+            property_value: from_table.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: "RELATIONSHIP".to_string(),
+            object_name: rel_name.clone(),
+            parent_entity: from_table.clone(),
+            property: "REF_TABLE".to_string(),
+            property_value: ref_table,
+        });
+        rows.push(DescribeRow {
+            object_kind: "RELATIONSHIP".to_string(),
+            object_name: rel_name.clone(),
+            parent_entity: from_table.clone(),
+            property: "FOREIGN_KEY".to_string(),
+            property_value: format_json_array(&join.fk_columns),
+        });
+        rows.push(DescribeRow {
+            object_kind: "RELATIONSHIP".to_string(),
+            object_name: rel_name,
+            parent_entity: from_table,
+            property: "REF_KEY".to_string(),
+            property_value: format_json_array(&join.ref_columns),
+        });
+    }
+}
+
+/// Collect FACT property rows from the definition.
+///
+/// Each fact emits: `TABLE`, `EXPRESSION`, `DATA_TYPE`.
+fn collect_fact_rows(
+    def: &SemanticViewDefinition,
+    base_table: &str,
+    alias_map: &HashMap<String, String>,
+    rows: &mut Vec<DescribeRow>,
+) {
+    for fact in &def.facts {
+        let parent = fact
+            .source_table
+            .as_ref()
+            .and_then(|a| alias_map.get(a).cloned())
+            .unwrap_or_else(|| base_table.to_string());
+
+        rows.push(DescribeRow {
+            object_kind: "FACT".to_string(),
+            object_name: fact.name.clone(),
+            parent_entity: parent.clone(),
+            property: "TABLE".to_string(),
+            property_value: parent.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: "FACT".to_string(),
+            object_name: fact.name.clone(),
+            parent_entity: parent.clone(),
+            property: "EXPRESSION".to_string(),
+            property_value: fact.expr.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: "FACT".to_string(),
+            object_name: fact.name.clone(),
+            parent_entity: parent,
+            property: "DATA_TYPE".to_string(),
+            property_value: fact.output_type.clone().unwrap_or_default(),
+        });
+    }
+}
+
+/// Collect DIMENSION property rows from the definition.
+///
+/// Each dimension emits: `TABLE`, `EXPRESSION`, `DATA_TYPE`.
+fn collect_dimension_rows(
+    def: &SemanticViewDefinition,
+    base_table: &str,
+    alias_map: &HashMap<String, String>,
+    rows: &mut Vec<DescribeRow>,
+) {
+    for dim in &def.dimensions {
+        let parent = dim
+            .source_table
+            .as_ref()
+            .and_then(|a| alias_map.get(a).cloned())
+            .unwrap_or_else(|| base_table.to_string());
+
+        rows.push(DescribeRow {
+            object_kind: "DIMENSION".to_string(),
+            object_name: dim.name.clone(),
+            parent_entity: parent.clone(),
+            property: "TABLE".to_string(),
+            property_value: parent.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: "DIMENSION".to_string(),
+            object_name: dim.name.clone(),
+            parent_entity: parent.clone(),
+            property: "EXPRESSION".to_string(),
+            property_value: dim.expr.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: "DIMENSION".to_string(),
+            object_name: dim.name.clone(),
+            parent_entity: parent,
+            property: "DATA_TYPE".to_string(),
+            property_value: dim.output_type.clone().unwrap_or_default(),
+        });
+    }
+}
+
+/// Collect METRIC and DERIVED_METRIC property rows from the definition.
+///
+/// Metrics with `source_table: Some(...)` emit as METRIC (TABLE, EXPRESSION, DATA_TYPE).
+/// Metrics with `source_table: None` emit as DERIVED_METRIC (EXPRESSION, DATA_TYPE only).
+fn collect_metric_rows(
+    def: &SemanticViewDefinition,
+    base_table: &str,
+    alias_map: &HashMap<String, String>,
+    rows: &mut Vec<DescribeRow>,
+) {
+    for metric in &def.metrics {
+        let is_derived = metric.source_table.is_none();
+        let object_kind = if is_derived {
+            "DERIVED_METRIC"
+        } else {
+            "METRIC"
+        };
+        let parent = if is_derived {
+            String::new()
+        } else {
+            metric
+                .source_table
+                .as_ref()
+                .and_then(|a| alias_map.get(a).cloned())
+                .unwrap_or_else(|| base_table.to_string())
+        };
+
+        if !is_derived {
+            rows.push(DescribeRow {
+                object_kind: object_kind.to_string(),
+                object_name: metric.name.clone(),
+                parent_entity: parent.clone(),
+                property: "TABLE".to_string(),
+                property_value: parent.clone(),
+            });
+        }
+        rows.push(DescribeRow {
+            object_kind: object_kind.to_string(),
+            object_name: metric.name.clone(),
+            parent_entity: parent.clone(),
+            property: "EXPRESSION".to_string(),
+            property_value: metric.expr.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: object_kind.to_string(),
+            object_name: metric.name.clone(),
+            parent_entity: parent,
+            property: "DATA_TYPE".to_string(),
+            property_value: metric.output_type.clone().unwrap_or_default(),
+        });
+    }
+}
+
+/// Table function: Snowflake-aligned DESCRIBE SEMANTIC VIEW.
+///
+/// Returns property-per-row output with 5 VARCHAR columns:
+///   `(object_kind, object_name, parent_entity, property, property_value)`
 ///
 /// Takes one positional VARCHAR parameter: the view name.
 pub struct DescribeSemanticViewVTab;
@@ -52,19 +321,24 @@ impl VTab for DescribeSemanticViewVTab {
     type InitData = DescribeInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        // Declare output columns — all VARCHAR (RESEARCH.md Pitfall 6).
-        bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        // Declare 5 output columns — all VARCHAR.
         bind.add_result_column(
-            "base_table",
+            "object_kind",
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         );
         bind.add_result_column(
-            "dimensions",
+            "object_name",
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         );
-        bind.add_result_column("metrics", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("joins", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("facts", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column(
+            "parent_entity",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
+        bind.add_result_column("property", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column(
+            "property_value",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
 
         // Read the name parameter.
         let name = bind.get_parameter(0).to_string();
@@ -77,30 +351,26 @@ impl VTab for DescribeSemanticViewVTab {
             .get(&name)
             .ok_or_else(|| format!("semantic view '{name}' does not exist"))?;
 
-        // Parse the stored JSON to extract individual fields.
-        let def: serde_json::Value = serde_json::from_str(json_str)?;
+        // Parse the stored JSON into the model.
+        let def = SemanticViewDefinition::from_json(&name, json_str)?;
 
-        let base_table = def["base_table"].as_str().unwrap_or("").to_string();
+        // Build alias→table map and compute base table name for entries with source_table: None.
+        let alias_map = def.alias_to_table_map();
+        let base_table = def
+            .tables
+            .first()
+            .map(|t| t.table.clone())
+            .unwrap_or_else(|| def.base_table.clone());
 
-        // Re-serialize the array fields back to JSON strings for the VARCHAR columns.
-        let dimensions =
-            serde_json::to_string(&def["dimensions"]).unwrap_or_else(|_| "[]".to_string());
-        let metrics = serde_json::to_string(&def["metrics"]).unwrap_or_else(|_| "[]".to_string());
-        let joins = serde_json::to_string(&def["joins"]).unwrap_or_else(|_| "[]".to_string());
-        let facts = if def["facts"].is_null() {
-            "[]".to_string()
-        } else {
-            serde_json::to_string(&def["facts"]).unwrap_or_else(|_| "[]".to_string())
-        };
+        // Collect rows in definition order: tables, relationships, facts, dimensions, metrics.
+        let mut rows = Vec::new();
+        collect_table_rows(&def, &mut rows);
+        collect_relationship_rows(&def, &alias_map, &mut rows);
+        collect_fact_rows(&def, &base_table, &alias_map, &mut rows);
+        collect_dimension_rows(&def, &base_table, &alias_map, &mut rows);
+        collect_metric_rows(&def, &base_table, &alias_map, &mut rows);
 
-        Ok(DescribeBindData {
-            name,
-            base_table,
-            dimensions,
-            metrics,
-            joins,
-            facts,
-        })
+        Ok(DescribeBindData { rows })
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
@@ -120,26 +390,49 @@ impl VTab for DescribeSemanticViewVTab {
         }
 
         let bind_data = func.get_bind_data();
+        let n = bind_data.rows.len();
 
-        let name_vec = output.flat_vector(0);
-        let base_table_vec = output.flat_vector(1);
-        let dimensions_vec = output.flat_vector(2);
-        let metrics_vec = output.flat_vector(3);
-        let joins_vec = output.flat_vector(4);
-        let facts_vec = output.flat_vector(5);
+        let kind_vec = output.flat_vector(0);
+        let name_vec = output.flat_vector(1);
+        let parent_vec = output.flat_vector(2);
+        let prop_vec = output.flat_vector(3);
+        let val_vec = output.flat_vector(4);
 
-        name_vec.insert(0, bind_data.name.as_str());
-        base_table_vec.insert(0, bind_data.base_table.as_str());
-        dimensions_vec.insert(0, bind_data.dimensions.as_str());
-        metrics_vec.insert(0, bind_data.metrics.as_str());
-        joins_vec.insert(0, bind_data.joins.as_str());
-        facts_vec.insert(0, bind_data.facts.as_str());
+        for (i, row) in bind_data.rows.iter().enumerate() {
+            kind_vec.insert(i, row.object_kind.as_str());
+            name_vec.insert(i, row.object_name.as_str());
+            parent_vec.insert(i, row.parent_entity.as_str());
+            prop_vec.insert(i, row.property.as_str());
+            val_vec.insert(i, row.property_value.as_str());
+        }
 
-        output.set_len(1);
+        output.set_len(n);
         Ok(())
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_json_array_single() {
+        assert_eq!(format_json_array(&["id".to_string()]), r#"["id"]"#);
+    }
+
+    #[test]
+    fn format_json_array_multiple() {
+        let cols = vec!["first_name".to_string(), "last_name".to_string()];
+        assert_eq!(format_json_array(&cols), r#"["first_name","last_name"]"#);
+    }
+
+    #[test]
+    fn format_json_array_empty() {
+        let cols: Vec<String> = vec![];
+        assert_eq!(format_json_array(&cols), "[]");
     }
 }

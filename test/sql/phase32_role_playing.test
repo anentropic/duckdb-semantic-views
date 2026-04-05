@@ -219,6 +219,69 @@ New York	1
 San Francisco	1
 
 # ============================================================
+# Test 11: SHOW SEMANTIC DIMENSIONS resolves aliases to table names
+# ============================================================
+
+query TTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN p32_flights_view;
+----
+memory	main	p32_flights_view	p32_airports	city	(empty)
+memory	main	p32_flights_view	p32_airports	country	(empty)
+memory	main	p32_flights_view	p32_flights	carrier	(empty)
+
+# ============================================================
+# Test 12: SHOW SEMANTIC METRICS resolves aliases to table names
+# ============================================================
+
+query TTTTTT rowsort
+SHOW SEMANTIC METRICS IN p32_flights_view;
+----
+memory	main	p32_flights_view	(empty)	total_flights	(empty)
+memory	main	p32_flights_view	p32_flights	arrival_count	(empty)
+memory	main	p32_flights_view	p32_flights	departure_count	(empty)
+
+# ============================================================
+# Test 13: DESCRIBE shows actual table names for role-playing view
+# ============================================================
+
+query TTTTT
+DESCRIBE SEMANTIC VIEW p32_flights_view;
+----
+TABLE	p32_flights	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p32_flights	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p32_flights	(empty)	BASE_TABLE_NAME	p32_flights
+TABLE	p32_flights	(empty)	PRIMARY_KEY	["flight_id"]
+TABLE	p32_airports	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p32_airports	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p32_airports	(empty)	BASE_TABLE_NAME	p32_airports
+TABLE	p32_airports	(empty)	PRIMARY_KEY	["airport_code"]
+RELATIONSHIP	dep_airport	p32_flights	TABLE	p32_flights
+RELATIONSHIP	dep_airport	p32_flights	REF_TABLE	p32_airports
+RELATIONSHIP	dep_airport	p32_flights	FOREIGN_KEY	["departure_code"]
+RELATIONSHIP	dep_airport	p32_flights	REF_KEY	["airport_code"]
+RELATIONSHIP	arr_airport	p32_flights	TABLE	p32_flights
+RELATIONSHIP	arr_airport	p32_flights	REF_TABLE	p32_airports
+RELATIONSHIP	arr_airport	p32_flights	FOREIGN_KEY	["arrival_code"]
+RELATIONSHIP	arr_airport	p32_flights	REF_KEY	["airport_code"]
+DIMENSION	city	p32_airports	TABLE	p32_airports
+DIMENSION	city	p32_airports	EXPRESSION	a.city
+DIMENSION	city	p32_airports	DATA_TYPE	(empty)
+DIMENSION	country	p32_airports	TABLE	p32_airports
+DIMENSION	country	p32_airports	EXPRESSION	a.country
+DIMENSION	country	p32_airports	DATA_TYPE	(empty)
+DIMENSION	carrier	p32_flights	TABLE	p32_flights
+DIMENSION	carrier	p32_flights	EXPRESSION	f.carrier
+DIMENSION	carrier	p32_flights	DATA_TYPE	(empty)
+METRIC	departure_count	p32_flights	TABLE	p32_flights
+METRIC	departure_count	p32_flights	EXPRESSION	COUNT(*)
+METRIC	departure_count	p32_flights	DATA_TYPE	(empty)
+METRIC	arrival_count	p32_flights	TABLE	p32_flights
+METRIC	arrival_count	p32_flights	EXPRESSION	COUNT(*)
+METRIC	arrival_count	p32_flights	DATA_TYPE	(empty)
+DERIVED_METRIC	total_flights	(empty)	EXPRESSION	departure_count + arrival_count
+DERIVED_METRIC	total_flights	(empty)	DATA_TYPE	(empty)
+
+# ============================================================
 # Cleanup
 # ============================================================
 

@@ -1,5 +1,20 @@
 # Milestones
 
+## v0.5.5 SHOW/DESCRIBE Alignment & Refactoring (Shipped: 2026-04-05)
+
+**Phases completed:** 6 phases, 11 plans, 12 tasks
+
+**Key accomplishments:**
+
+- Two leaf modules (util.rs, errors.rs) extracted to break expand<->graph and parse<->body_parser circular dependencies with zero behavior changes across 482 tests
+- Split expand.rs (4,299 lines) into 7 single-responsibility submodules with 86 tests distributed to correct locations, zero behavior changes
+- Split src/graph.rs (2,333 lines) into 5 single-responsibility submodules with mod.rs re-exports, preserving exact public API and all 59 tests
+- Snowflake-aligned column schemas for all 4 SHOW SEMANTIC VTabs: list.rs (5-col), show_dims/metrics/facts.rs (6-col each), with expr and source_table columns removed
+- 4-column SHOW DIMS FOR METRIC with BOOLEAN required column, plus all 5 sqllogictest files updated for new SHOW command schemas across the full test suite
+- Snowflake-aligned property-per-row DESCRIBE SEMANTIC VIEW with 5 VARCHAR columns, 6 object kinds, and comprehensive sqllogictest coverage
+
+---
+
 ## v0.5.4 Snowflake-Parity & Registry Publishing (Shipped: 2026-03-27)
 
 **Phases completed:** 6 phases, 12 plans, 25 tasks

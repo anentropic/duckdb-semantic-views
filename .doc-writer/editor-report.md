@@ -1,68 +1,160 @@
 # Editor Report
 
-**Generated:** 2026-03-25
-**Files reviewed:** 11
-**Changes made:** 3
-  - BLOCKING: 0
-  - SUGGESTION: 3
-  - NITPICK: 0
+**Generated:** 2026-04-02
+**Files reviewed:** 6 (new pages) + 14 (existing pages scanned for terminology)
+**Changes made:** 9
+  - BLOCKING: 3
+  - SUGGESTION: 0
+  - NITPICK: 6
 
 ## Summary
 
-`docs/explanation/snowflake-comparison.rst` is well-structured and technically accurate overall. Two targeted fixes were applied to the page: the schema-scope limitation for automatic PK resolution was made explicit (the list-table and a new note admonition), and the internal HTML comment block was stripped. The explanation index description was also corrected to remove a misleading reference to Cortex Analyst.
+The 6 new reference pages are well-written, accurate against source code, and maintain consistent terminology with the rest of the documentation. No AI-writing patterns detected and no type blur found. The only substantive issues are accuracy mismatches in 3 existing pages whose output examples and descriptions were not updated to reflect the v0.5.5 schema changes documented by these new pages.
 
 ---
 
-## docs/explanation/snowflake-comparison.rst
+## docs/reference/show-semantic-views.rst
+
+### BLOCKING
+
+*No blocking issues.*
 
 ### SUGGESTION
 
+*No suggestions.*
+
+### NITPICK
+
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Key Differences / Primary Key Declarations | The list-table's "Catalog PK available?" cell read "Yes" for native DuckDB tables with a `PRIMARY KEY` constraint, implying automatic resolution for all native tables. Source code at `src/ddl/define.rs` line 114 confirms the catalog query hard-codes `schema_name = 'main'`, so tables in non-default schemas are not resolved automatically. The Author's notes flagged this as a known limitation. | Changed the cell to "Yes (main schema only)" and added a `.. note::` admonition below the table stating that automatic resolution applies only to the `main` schema. |
-| Post-processing | Internal HTML comment block (lines 287-310, `<!-- INTERNAL NOTES FOR EDITOR ... -->`) was present in the source file and needed to be stripped before publication. | Removed the entire comment block and collapsed trailing blank lines. |
+| Full file | Internal notes stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (lines 201-223) |
 
 ---
 
-## docs/explanation/index.rst
+## docs/reference/show-semantic-dimensions.rst
+
+### BLOCKING
+
+*No blocking issues.*
 
 ### SUGGESTION
 
+*No suggestions.*
+
+### NITPICK
+
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Page list, line 10 | Description read: "Feature-by-feature comparison with Snowflake Cortex Analyst semantic views and where this extension diverges." The phrase "Cortex Analyst semantic views" is inaccurate: the comparison page targets Snowflake's SQL DDL interface only, not Cortex Analyst. The comparison page itself opens with a `.. note::` admonition clarifying this distinction, and `context.md` explicitly states all comparisons must target the SQL DDL interface. | Changed to: "Feature-by-feature comparison with Snowflake's SQL DDL semantic views and where this extension diverges." |
+| Full file | Internal notes stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (lines 262-285) |
 
 ---
 
-## Pass Results by Pass
+## docs/reference/show-semantic-metrics.rst
 
-### Pass 1: Terminology Consistency
+### BLOCKING
 
-Scanned all documentation files in `docs/` (excluding `.venv`). No terminology variants requiring normalization were found in `snowflake-comparison.rst` or any other scanned file. All occurrences of proper nouns (DuckDB, Snowflake, Iceberg, Parquet, Postgres, Cortex Analyst) and project terms (semantic view, derived metric, base table, fan trap) matched canonical forms from `terminology.yaml`. No updates to `terminology.yaml` required.
+*No blocking issues.*
 
-### Pass 2: Diataxis Type Integrity
+### SUGGESTION
 
-Page is classified as `explanation` (per Author's internal notes, reference used: `skills/diataxis/references/explanation.md`). Content is correctly understanding-oriented: it maps concepts between platforms, calls out behavioral differences, and explains the reasoning behind design choices (e.g., why explicit `PRIMARY KEY` is needed for external sources). No blur signals detected.
+*No suggestions.*
 
-The illustrative code examples in the Primary Key Declarations section are appropriate for explanation (they show two cases side by side to build understanding, not instruct through a sequential task). The "Features Not Yet Supported" table informs scope understanding rather than directing action. No changes required on the target page.
+### NITPICK
 
-One cross-type finding in `docs/explanation/index.rst`: the page description conflated the SQL DDL interface with Cortex Analyst, contradicting the comparison page's explicit scope. Fixed (see above).
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Full file | Internal notes stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (lines 245-268) |
 
-### Pass 3: Humanizer
+---
 
-No AI-writing patterns detected in `snowflake-comparison.rst`. The prose is direct and professional with no em dashes in prose, significance inflation, copula avoidance, filler phrases, or AI vocabulary. No changes required.
+## docs/reference/show-semantic-facts.rst
 
-### Pass 4: Cross-Reference Linking
+### BLOCKING
 
-`api_reference` is set to `manual` in `config.yaml`. All inline code mentions in prose that refer to public API symbols are already linked via `:ref:` syntax:
+*No blocking issues.*
 
-- `:ref:\`semantic_view() <ref-semantic-view-function>\`` -- already linked (appears in Concept Mapping table, Query Interface section, and Features Not Yet Supported table)
-- `:ref:\`fan trap detection <howto-fan-traps>\`` -- already linked in Cardinality Inference section
+### SUGGESTION
 
-No unlinked public API symbols found in prose. Pass complete with no changes to the target file.
+*No suggestions.*
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Full file | Internal notes stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (lines 275-299) |
+
+---
+
+## docs/reference/show-semantic-dimensions-for-metric.rst
+
+### BLOCKING
+
+*No blocking issues.*
+
+### SUGGESTION
+
+*No suggestions.*
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Full file | Internal notes stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (lines 305-328) |
+
+---
+
+## docs/reference/describe-semantic-view.rst
+
+### BLOCKING
+
+*No blocking issues.*
+
+### SUGGESTION
+
+*No suggestions.*
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Full file | Internal notes stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (lines 418-446) |
+
+---
+
+## docs/tutorials/getting-started.rst (NOT EDITED -- existing page)
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Query the Semantic View (line 110-121) | Accuracy mismatch: SHOW SEMANTIC VIEWS output shows old 2-column format (`name`, `base_table`). As of v0.5.5, the output has 5 columns: `created_on`, `name`, `kind`, `database_name`, `schema_name`. The example output and surrounding prose need updating. | Author should update the SHOW SEMANTIC VIEWS example output and text to reflect the new 5-column schema. |
+
+---
+
+## docs/tutorials/multi-table.rst (NOT EDITED -- existing page)
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Describe the View (line 193-195) | Accuracy mismatch: prose says "The output shows the view name, base table, and JSON arrays for dimensions, metrics, joins, and facts." This describes the pre-0.5.5 single-row JSON format. DESCRIBE SEMANTIC VIEW now returns a multi-row property-per-row format with 5 VARCHAR columns (`object_kind`, `object_name`, `parent_entity`, `property`, `property_value`). | Author should update the description and consider adding an example output showing the new property-per-row format. |
+
+---
+
+## docs/reference/error-messages.rst (NOT EDITED -- existing page)
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Empty request (line 193-194) | Accuracy mismatch: error message shows `Run FROM describe_semantic_view('<name>') to see available dimensions and metrics.` but the source code (`src/query/error.rs` line 61) now says `Run DESCRIBE SEMANTIC VIEW {view_name} to see available dimensions and metrics.` (without `FROM` prefix, using DDL syntax instead of function syntax). | Author should update the error message text to match the current source code. |
 
 ---
 
 ## Terminology Changes
 
-No terminology changes required. Existing term map in `.doc-writer/terminology.yaml` is consistent with all scanned documentation files.
+No terminology changes were needed. All 6 new pages use terms consistent with the existing terminology map and the rest of the documentation.
+
+| Term | Before | After | Authority |
+|------|--------|-------|-----------|
+| *(none)* | | | |

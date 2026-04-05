@@ -73,6 +73,11 @@ pub struct Fact {
     /// Which table alias this fact is scoped to.
     #[serde(default)]
     pub source_table: Option<String>,
+    /// Optional output type for this fact, used by SHOW FACTS `data_type` column.
+    /// Populated at define time via type inference when possible.
+    /// Old stored JSON without this field deserializes to None.
+    #[serde(default)]
+    pub output_type: Option<String>,
 }
 
 /// A column-pair relationship entry for composite or single FK declarations.
@@ -185,6 +190,48 @@ pub struct SemanticViewDefinition {
     /// `bind()` builds a name→type `HashMap` from both vecs to look up requested columns by name.
     #[serde(default)]
     pub column_types_inferred: Vec<u32>,
+    /// ISO 8601 timestamp of when this semantic view was created.
+    /// Captured at define time via `DuckDB` `now()`.
+    /// Old stored JSON without this field deserializes to None.
+    #[serde(default)]
+    pub created_on: Option<String>,
+    /// Database name from the connection context at define time.
+    /// Old stored JSON without this field deserializes to None.
+    #[serde(default)]
+    pub database_name: Option<String>,
+    /// Schema name from the connection context at define time.
+    /// Old stored JSON without this field deserializes to None.
+    #[serde(default)]
+    pub schema_name: Option<String>,
+}
+
+impl SemanticViewDefinition {
+    /// Build a mapping from table alias to actual table name.
+    ///
+    /// Used by SHOW/DESCRIBE `VTabs` to resolve the stored alias (e.g. `"o"`)
+    /// to the real table name (e.g. `"orders"`).
+    #[must_use]
+    pub fn alias_to_table_map(&self) -> std::collections::HashMap<String, String> {
+        self.tables
+            .iter()
+            .map(|t| (t.alias.clone(), t.table.clone()))
+            .collect()
+    }
+
+    /// Iterate over inferred column types as (name, `duckdb_type`) pairs.
+    ///
+    /// Zips `column_type_names` and `column_types_inferred`, which are parallel
+    /// vectors populated by DDL-time LIMIT 0 inference. Returns an empty
+    /// iterator if inference did not run (both vecs empty).
+    ///
+    /// This method makes the parallel-vector invariant explicit: callers get
+    /// typed pairs rather than indexing two vecs manually.
+    pub fn inferred_types(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.column_type_names
+            .iter()
+            .map(String::as_str)
+            .zip(self.column_types_inferred.iter().copied())
+    }
 }
 
 /// Parse a `DuckDB` LIST-of-VARCHAR string representation into column names.
@@ -460,6 +507,9 @@ mod tests {
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
+                created_on: None,
+                database_name: None,
+                schema_name: None,
             };
             let json = serde_json::to_string(&def).unwrap();
             assert!(
@@ -652,6 +702,9 @@ mod tests {
 
                 column_type_names: vec!["region".to_string(), "revenue".to_string()],
                 column_types_inferred: vec![17u32, 20u32],
+                created_on: None,
+                database_name: None,
+                schema_name: None,
             };
             let json = serde_json::to_string(&def).unwrap();
             let rt: SemanticViewDefinition = serde_json::from_str(&json).unwrap();
@@ -801,6 +854,69 @@ mod tests {
             let rt: TableRef = serde_json::from_str(&json).unwrap();
             assert_eq!(rt.alias, "f");
             assert!(rt.pk_columns.is_empty());
+        }
+    }
+
+    mod phase39_metadata_tests {
+        use super::*;
+
+        #[test]
+        fn created_on_roundtrip() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![],
+                metrics: vec![],
+                created_on: Some("2026-04-01T12:00:00Z".to_string()),
+                database_name: Some("mydb".to_string()),
+                schema_name: Some("main".to_string()),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            let rt = SemanticViewDefinition::from_json("orders", &json).unwrap();
+            assert_eq!(rt.created_on.as_deref(), Some("2026-04-01T12:00:00Z"));
+            assert_eq!(rt.database_name.as_deref(), Some("mydb"));
+            assert_eq!(rt.schema_name.as_deref(), Some("main"));
+        }
+
+        #[test]
+        fn old_json_without_metadata_fields_deserializes() {
+            let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+            assert!(
+                def.created_on.is_none(),
+                "created_on should default to None"
+            );
+            assert!(
+                def.database_name.is_none(),
+                "database_name should default to None"
+            );
+            assert!(
+                def.schema_name.is_none(),
+                "schema_name should default to None"
+            );
+        }
+
+        #[test]
+        fn fact_output_type_roundtrip() {
+            let fact = Fact {
+                name: "rev".to_string(),
+                expr: "amount".to_string(),
+                source_table: Some("orders".to_string()),
+                output_type: Some("DECIMAL(10,2)".to_string()),
+            };
+            let json = serde_json::to_string(&fact).unwrap();
+            let rt: Fact = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.output_type.as_deref(), Some("DECIMAL(10,2)"));
+        }
+
+        #[test]
+        fn old_fact_json_without_output_type_deserializes() {
+            let json = r#"{"name":"rev","expr":"amount","source_table":"orders"}"#;
+            let fact: Fact = serde_json::from_str(json).unwrap();
+            assert!(
+                fact.output_type.is_none(),
+                "output_type should default to None"
+            );
         }
     }
 }

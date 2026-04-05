@@ -102,13 +102,56 @@ SELECT * FROM semantic_view('p29_analytics', metrics := ['total_net', 'total_tax
 400.00	32.30
 
 # ============================================================
-# Test 5: DESCRIBE shows facts (6 columns)
+# Test 5: DESCRIBE shows facts (5 columns, property-per-row)
 # ============================================================
 
-query TTTTTT
+query TTTTT
 DESCRIBE SEMANTIC VIEW p29_analytics;
 ----
-p29_analytics	p29_orders	[{"expr":"o.region","name":"region","output_type":null,"source_table":"o"},{"expr":"c.country","name":"country","output_type":null,"source_table":"c"},{"expr":"c.state","name":"state","output_type":null,"source_table":"c"},{"expr":"c.city","name":"city","output_type":null,"source_table":"c"}]	[{"expr":"SUM(li.net_price)","name":"total_net","output_type":null,"source_table":"li"},{"expr":"SUM(li.tax_amount)","name":"total_tax","output_type":null,"source_table":"li"}]	[{"fk_columns":["order_id"],"from_alias":"li","from_cols":[],"join_columns":[],"name":"li_to_order","ref_columns":["id"],"table":"o"},{"fk_columns":["customer_id"],"from_alias":"o","from_cols":[],"join_columns":[],"name":"order_to_customer","ref_columns":["id"],"table":"c"}]	[{"expr":"li.extended_price * (1 - li.discount)","name":"net_price","source_table":"li"},{"expr":"li.net_price * li.tax_rate","name":"tax_amount","source_table":"li"}]
+TABLE	p29_orders	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p29_orders	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p29_orders	(empty)	BASE_TABLE_NAME	p29_orders
+TABLE	p29_orders	(empty)	PRIMARY_KEY	["id"]
+TABLE	p29_line_items	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p29_line_items	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p29_line_items	(empty)	BASE_TABLE_NAME	p29_line_items
+TABLE	p29_line_items	(empty)	PRIMARY_KEY	["id"]
+TABLE	p29_customers	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p29_customers	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p29_customers	(empty)	BASE_TABLE_NAME	p29_customers
+TABLE	p29_customers	(empty)	PRIMARY_KEY	["id"]
+RELATIONSHIP	li_to_order	p29_line_items	TABLE	p29_line_items
+RELATIONSHIP	li_to_order	p29_line_items	REF_TABLE	p29_orders
+RELATIONSHIP	li_to_order	p29_line_items	FOREIGN_KEY	["order_id"]
+RELATIONSHIP	li_to_order	p29_line_items	REF_KEY	["id"]
+RELATIONSHIP	order_to_customer	p29_orders	TABLE	p29_orders
+RELATIONSHIP	order_to_customer	p29_orders	REF_TABLE	p29_customers
+RELATIONSHIP	order_to_customer	p29_orders	FOREIGN_KEY	["customer_id"]
+RELATIONSHIP	order_to_customer	p29_orders	REF_KEY	["id"]
+FACT	net_price	p29_line_items	TABLE	p29_line_items
+FACT	net_price	p29_line_items	EXPRESSION	li.extended_price * (1 - li.discount)
+FACT	net_price	p29_line_items	DATA_TYPE	DECIMAL(18,4)
+FACT	tax_amount	p29_line_items	TABLE	p29_line_items
+FACT	tax_amount	p29_line_items	EXPRESSION	li.net_price * li.tax_rate
+FACT	tax_amount	p29_line_items	DATA_TYPE	(empty)
+DIMENSION	region	p29_orders	TABLE	p29_orders
+DIMENSION	region	p29_orders	EXPRESSION	o.region
+DIMENSION	region	p29_orders	DATA_TYPE	(empty)
+DIMENSION	country	p29_customers	TABLE	p29_customers
+DIMENSION	country	p29_customers	EXPRESSION	c.country
+DIMENSION	country	p29_customers	DATA_TYPE	(empty)
+DIMENSION	state	p29_customers	TABLE	p29_customers
+DIMENSION	state	p29_customers	EXPRESSION	c.state
+DIMENSION	state	p29_customers	DATA_TYPE	(empty)
+DIMENSION	city	p29_customers	TABLE	p29_customers
+DIMENSION	city	p29_customers	EXPRESSION	c.city
+DIMENSION	city	p29_customers	DATA_TYPE	(empty)
+METRIC	total_net	p29_line_items	TABLE	p29_line_items
+METRIC	total_net	p29_line_items	EXPRESSION	SUM(li.net_price)
+METRIC	total_net	p29_line_items	DATA_TYPE	(empty)
+METRIC	total_tax	p29_line_items	TABLE	p29_line_items
+METRIC	total_tax	p29_line_items	EXPRESSION	SUM(li.tax_amount)
+METRIC	total_tax	p29_line_items	DATA_TYPE	(empty)
 
 # ============================================================
 # Test 6: Error -- fact cycle (two facts referencing each other)

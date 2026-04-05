@@ -10,8 +10,9 @@ use duckdb::{
 use libduckdb_sys as ffi;
 
 use crate::catalog::CatalogState;
-use crate::expand::{expand, suggest_closest, QueryRequest};
+use crate::expand::{expand, QueryRequest};
 use crate::model::SemanticViewDefinition;
+use crate::util::suggest_closest;
 
 use super::error::QueryError;
 
@@ -455,10 +456,8 @@ impl VTab for SemanticViewVTab {
         //    Fallback path: run LIMIT 0 at bind time (in-memory DB or inference failed at DDL time).
         //    Full fallback: derive names from definition, all VARCHAR.
         let type_map: HashMap<String, u32> = def
-            .column_type_names
-            .iter()
-            .zip(def.column_types_inferred.iter())
-            .map(|(name, &t)| (name.to_ascii_lowercase(), normalize_type_id(t)))
+            .inferred_types()
+            .map(|(name, t)| (name.to_ascii_lowercase(), normalize_type_id(t)))
             .collect();
 
         let (column_names, column_type_ids) = if !type_map.is_empty() {
@@ -808,3 +807,20 @@ pub(crate) unsafe fn read_varchar_from_vector(
 
     String::from_utf8_lossy(bytes).into_owned()
 }
+
+// Compile-time layout guard: fails `just build` (extension feature) if
+// duckdb::vtab::Value size diverges from ffi::duckdb_value. This catches
+// transmute breakage in value_raw_ptr at compile time rather than runtime.
+// A runtime test is not possible because `cargo test` uses the `bundled`
+// feature (no vtab module) and `cargo test --features extension` conflicts
+// with loadable-extension stubs.
+const _: () = {
+    assert!(
+        std::mem::size_of::<Value>() == std::mem::size_of::<ffi::duckdb_value>(),
+        "Value size changed -- value_raw_ptr transmute is broken"
+    );
+    assert!(
+        std::mem::align_of::<Value>() == std::mem::align_of::<ffi::duckdb_value>(),
+        "Value alignment changed -- value_raw_ptr transmute is broken"
+    );
+};

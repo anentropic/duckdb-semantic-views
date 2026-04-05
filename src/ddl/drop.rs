@@ -5,7 +5,6 @@ use duckdb::{
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
 };
 use libduckdb_sys as ffi;
-use std::ffi::CString;
 
 use crate::catalog::{catalog_delete, catalog_delete_if_exists, CatalogState};
 
@@ -29,17 +28,12 @@ unsafe impl Sync for DropState {}
 /// Returns Ok(()) always -- silently ignores SQL errors (the row may not exist
 /// in the table for in-memory sessions where it was never persisted).
 fn persist_drop(conn: ffi::duckdb_connection, name: &str) {
-    let safe_name = name.replace('\'', "''");
-    let sql = format!(
-        "DELETE FROM semantic_layer._definitions WHERE name = '{}'",
-        safe_name
-    );
-    if let Ok(c_sql) = CString::new(sql) {
-        unsafe {
-            let mut result: ffi::duckdb_result = std::mem::zeroed();
-            ffi::duckdb_query(conn, c_sql.as_ptr(), &mut result);
-            ffi::duckdb_destroy_result(&mut result);
-        }
+    unsafe {
+        let _ = super::persist::execute_parameterized(
+            conn,
+            "DELETE FROM semantic_layer._definitions WHERE name = $1",
+            &[name],
+        );
     }
 }
 

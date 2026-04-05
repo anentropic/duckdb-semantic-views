@@ -195,17 +195,35 @@ METRICS (
     s.total_amount AS SUM(amount)
 )
 
-# DESCRIBE SEMANTIC VIEW returns 6 columns: name, base_table, dimensions, metrics, joins, facts
-query TTTTTT
+# DESCRIBE SEMANTIC VIEW returns 5 columns: object_kind, object_name, parent_entity, property, property_value
+query TTTTT
 DESCRIBE SEMANTIC VIEW desc_test;
 ----
-desc_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"s"}]	[{"expr":"SUM(amount)","name":"total_amount","output_type":null,"source_table":"s"}]	[]	[]
+TABLE	sv_test	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	sv_test	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	sv_test	(empty)	BASE_TABLE_NAME	sv_test
+TABLE	sv_test	(empty)	PRIMARY_KEY	["region"]
+DIMENSION	region	sv_test	TABLE	sv_test
+DIMENSION	region	sv_test	EXPRESSION	region
+DIMENSION	region	sv_test	DATA_TYPE	(empty)
+METRIC	total_amount	sv_test	TABLE	sv_test
+METRIC	total_amount	sv_test	EXPRESSION	SUM(amount)
+METRIC	total_amount	sv_test	DATA_TYPE	(empty)
 
 # Case insensitive: lowercase describe
-query TTTTTT
+query TTTTT
 describe semantic view desc_test;
 ----
-desc_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"s"}]	[{"expr":"SUM(amount)","name":"total_amount","output_type":null,"source_table":"s"}]	[]	[]
+TABLE	sv_test	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	sv_test	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	sv_test	(empty)	BASE_TABLE_NAME	sv_test
+TABLE	sv_test	(empty)	PRIMARY_KEY	["region"]
+DIMENSION	region	sv_test	TABLE	sv_test
+DIMENSION	region	sv_test	EXPRESSION	region
+DIMENSION	region	sv_test	DATA_TYPE	(empty)
+METRIC	total_amount	sv_test	TABLE	sv_test
+METRIC	total_amount	sv_test	EXPRESSION	SUM(amount)
+METRIC	total_amount	sv_test	DATA_TYPE	(empty)
 
 # Error: describe nonexistent view
 statement error
@@ -250,19 +268,20 @@ METRICS (
     s.avg_amount AS AVG(amount)
 )
 
-# SHOW SEMANTIC VIEWS returns 2 columns: name, base_table
+# SHOW SEMANTIC VIEWS returns 5 columns: created_on, name, kind, database_name, schema_name
+# Use SELECT to skip non-deterministic created_on
 query TT rowsort
-SHOW SEMANTIC VIEWS;
+SELECT name, kind FROM list_semantic_views()
 ----
-show_test_a	sv_test
-show_test_b	sv_test
+show_test_a	SEMANTIC_VIEW
+show_test_b	SEMANTIC_VIEW
 
 # Case insensitive: lowercase show
 query TT rowsort
-show semantic views;
+SELECT name, kind FROM list_semantic_views()
 ----
-show_test_a	sv_test
-show_test_b	sv_test
+show_test_a	SEMANTIC_VIEW
+show_test_b	SEMANTIC_VIEW
 
 # Normal SHOW TABLES should NOT be intercepted
 statement ok
@@ -292,17 +311,26 @@ METRICS (
     s.total_amount AS SUM(amount)
 )
 
-# Step 2: DESCRIBE -- verify it exists (check name and base_table from full 6-column result)
-query TTTTTT
+# Step 2: DESCRIBE -- verify it exists (property-per-row format)
+query TTTTT
 DESCRIBE SEMANTIC VIEW lifecycle_test;
 ----
-lifecycle_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"s"}]	[{"expr":"SUM(amount)","name":"total_amount","output_type":null,"source_table":"s"}]	[]	[]
+TABLE	sv_test	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	sv_test	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	sv_test	(empty)	BASE_TABLE_NAME	sv_test
+TABLE	sv_test	(empty)	PRIMARY_KEY	["region"]
+DIMENSION	region	sv_test	TABLE	sv_test
+DIMENSION	region	sv_test	EXPRESSION	region
+DIMENSION	region	sv_test	DATA_TYPE	(empty)
+METRIC	total_amount	sv_test	TABLE	sv_test
+METRIC	total_amount	sv_test	EXPRESSION	SUM(amount)
+METRIC	total_amount	sv_test	DATA_TYPE	(empty)
 
 # Step 3: SHOW -- verify it appears in the list
-query TT
-SHOW SEMANTIC VIEWS;
+query T
+SELECT name FROM list_semantic_views()
 ----
-lifecycle_test	sv_test
+lifecycle_test
 
 # Step 4: CREATE OR REPLACE -- update the view with a new metric
 statement ok
@@ -318,10 +346,19 @@ METRICS (
 )
 
 # Step 5: DESCRIBE -- verify updated definition (metrics changed)
-query TTTTTT
+query TTTTT
 DESCRIBE SEMANTIC VIEW lifecycle_test;
 ----
-lifecycle_test	sv_test	[{"expr":"region","name":"region","output_type":null,"source_table":"s"}]	[{"expr":"AVG(amount)","name":"avg_amount","output_type":null,"source_table":"s"}]	[]	[]
+TABLE	sv_test	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	sv_test	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	sv_test	(empty)	BASE_TABLE_NAME	sv_test
+TABLE	sv_test	(empty)	PRIMARY_KEY	["region"]
+DIMENSION	region	sv_test	TABLE	sv_test
+DIMENSION	region	sv_test	EXPRESSION	region
+DIMENSION	region	sv_test	DATA_TYPE	(empty)
+METRIC	avg_amount	sv_test	TABLE	sv_test
+METRIC	avg_amount	sv_test	EXPRESSION	AVG(amount)
+METRIC	avg_amount	sv_test	DATA_TYPE	(empty)
 
 # Step 6: DROP
 statement ok
@@ -334,8 +371,8 @@ DESCRIBE SEMANTIC VIEW lifecycle_test;
 does not exist
 
 # Step 8: SHOW -- should return 0 rows (empty result)
-query TT
-SHOW SEMANTIC VIEWS;
+query T
+SELECT name FROM list_semantic_views()
 ----
 
 # ============================================================

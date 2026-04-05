@@ -227,8 +227,17 @@ In Snowflake, you can write standard SQL against a semantic view and the system 
        metrics := ['revenue']
    );
 
-   -- Snowflake: direct SQL (not supported in DuckDB extension)
-   -- SELECT region, revenue FROM analytics;
+   -- Snowflake: equivalent SEMANTIC_VIEW clause
+   SELECT * FROM SEMANTIC_VIEW('analytics',
+       DIMENSIONS 'region'
+       METRICS 'revenue'
+   );
+
+   -- Snowflake: direct SQL with AGG view-defined aggregate function
+   -- (NOT currently supported in duckdb-semantic-views)
+   SELECT region, AGG(revenue)
+   FROM analytics
+   GROUP BY region;
 
 
 Cardinality Inference
@@ -284,7 +293,7 @@ The following Snowflake ``CREATE SEMANTIC VIEW`` features are not yet implemente
 A Note on Snowflake's YAML Spec
 ================================
 
-Snowflake's YAML-based semantic view definition (``CREATE SEMANTIC VIEW FROM YAML``) is a separate interface designed for Cortex Analyst, Snowflake's AI SQL generation layer. The YAML spec includes concepts that do not exist in the SQL DDL:
+Snowflake's `YAML-based semantic view definition <https://docs.snowflake.com/en/user-guide/views-semantic/semantic-view-yaml-spec>`_ (``CREATE SEMANTIC VIEW FROM YAML``) is a separate interface designed for Cortex Analyst, Snowflake's AI SQL generation layer. The YAML spec includes concepts that do not exist in the SQL DDL:
 
 - ``time_dimensions`` with granularity controls (the SQL DDL uses regular dimensions with ``date_trunc()``)
 - ``custom_instructions`` for AI prompt tuning

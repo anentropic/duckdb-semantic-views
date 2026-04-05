@@ -335,9 +335,17 @@ for row in con.execute("""
 
 print("\n=== Section 7: DESCRIBE -- Full metadata view ===")
 
-for row in con.execute("DESCRIBE SEMANTIC VIEW flight_analytics").fetchall():
-    print(f"  view: {row[0]}")
-    print(f"  base_table: {row[1]}")
-    print(f"  dimensions: {row[2]}")
-    print(f"  metrics: {row[3]}")
-    print(f"  relationships: {row[5]}")
+# DESCRIBE returns one row per property: (object_kind, object_name, parent_entity, property, property_value)
+rows = con.execute("DESCRIBE SEMANTIC VIEW flight_analytics").fetchall()
+
+# Group by object kind for readable output
+from collections import defaultdict
+by_kind = defaultdict(list)
+for row in rows:
+    by_kind[row[0]].append(row)
+
+for kind in ['TABLE', 'RELATIONSHIP', 'DIMENSION', 'METRIC', 'DERIVED_METRIC']:
+    if kind in by_kind:
+        print(f"\n  {kind}s:")
+        for r in by_kind[kind]:
+            print(f"    {r[1]}.{r[3]} = {r[4]}")

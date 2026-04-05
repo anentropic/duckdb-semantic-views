@@ -80,18 +80,27 @@ METRICS (
     o.total_revenue AS SUM(revenue)
 )
 
-# DDL-07: DESCRIBE works -- returns 6 VARCHAR columns
-query TTTTTT
+# DDL-07: DESCRIBE works -- returns 5 VARCHAR columns (property-per-row)
+query TTTTT
 DESCRIBE SEMANTIC VIEW p25_orders_view
 ----
-p25_orders_view	p25_orders	[{"expr":"region","name":"region","output_type":null,"source_table":"o"}]	[{"expr":"SUM(revenue)","name":"total_revenue","output_type":null,"source_table":"o"}]	[]	[]
+TABLE	p25_orders	(empty)	BASE_TABLE_DATABASE_NAME	memory
+TABLE	p25_orders	(empty)	BASE_TABLE_SCHEMA_NAME	main
+TABLE	p25_orders	(empty)	BASE_TABLE_NAME	p25_orders
+TABLE	p25_orders	(empty)	PRIMARY_KEY	["o_orderkey"]
+DIMENSION	region	p25_orders	TABLE	p25_orders
+DIMENSION	region	p25_orders	EXPRESSION	region
+DIMENSION	region	p25_orders	DATA_TYPE	(empty)
+METRIC	total_revenue	p25_orders	TABLE	p25_orders
+METRIC	total_revenue	p25_orders	EXPRESSION	SUM(revenue)
+METRIC	total_revenue	p25_orders	DATA_TYPE	(empty)
 
-# DDL-07: SHOW works -- returns view name and base_table for all current views
+# DDL-07: SHOW works -- returns view name and kind for all current views
 query TT rowsort
-SHOW SEMANTIC VIEWS
+SELECT name, kind FROM list_semantic_views()
 ----
-p25_oc_view	p25_orders
-p25_orders_view	p25_orders
+p25_oc_view	SEMANTIC_VIEW
+p25_orders_view	SEMANTIC_VIEW
 
 # DDL-07: DROP works
 statement ok

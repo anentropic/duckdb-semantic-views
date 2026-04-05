@@ -100,21 +100,14 @@ pub fn catalog_insert(
     // Validate JSON before writing — fail fast, nothing written on invalid input
     SemanticViewDefinition::from_json(name, json).map_err(Box::<dyn std::error::Error>::from)?;
 
-    // Check for duplicate before modifying state
-    {
-        let guard = state.read().unwrap();
-        if guard.contains_key(name) {
-            return Err(format!(
-                "semantic view '{name}' already exists; use CREATE OR REPLACE SEMANTIC VIEW to overwrite"
-            )
-            .into());
-        }
+    let mut guard = state.write().unwrap();
+    if guard.contains_key(name) {
+        return Err(format!(
+            "semantic view '{name}' already exists; use CREATE OR REPLACE SEMANTIC VIEW to overwrite"
+        )
+        .into());
     }
-
-    state
-        .write()
-        .unwrap()
-        .insert(name.to_string(), json.to_string());
+    guard.insert(name.to_string(), json.to_string());
     Ok(())
 }
 
@@ -125,14 +118,11 @@ pub fn catalog_delete(
     state: &CatalogState,
     name: &str,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    {
-        let guard = state.read().unwrap();
-        if !guard.contains_key(name) {
-            return Err(format!("semantic view '{name}' does not exist").into());
-        }
+    let mut guard = state.write().unwrap();
+    if !guard.contains_key(name) {
+        return Err(format!("semantic view '{name}' does not exist").into());
     }
-
-    state.write().unwrap().remove(name);
+    guard.remove(name);
     Ok(())
 }
 
