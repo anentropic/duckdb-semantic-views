@@ -6,8 +6,6 @@ A DuckDB extension that lets you define dimensions and metrics once, then query 
 
 Inspired by [Snowflake Semantic Views](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view), adapted for DuckDB as a loadable extension.
 
-v0.5.4 -- early-stage, not yet on the community registry.
-
 ## How it works
 
 You define a semantic view over one or more tables, declaring:
@@ -116,10 +114,10 @@ SELECT * FROM explain_semantic_view('analytics',
 ```
 
 ```
-┌────────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────┐
 │                        explain_output                        │
 │                           varchar                            │
-├────────────────────────────────────────────────────────────────┤
+├──────────────────────────────────────────────────────────────┤
 │ -- Semantic View: analytics                                  │
 │ -- Dimensions: customer_name                                 │
 │ -- Metrics: revenue                                          │
@@ -135,9 +133,9 @@ SELECT * FROM explain_semantic_view('analytics',
 │                                                              │
 │ -- DuckDB Plan:                                              │
 │ ...                                                          │
-├────────────────────────────────────────────────────────────────┤
+├──────────────────────────────────────────────────────────────┤
 │ 15+ rows                                                     │
-└────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## FACTS (reusable row-level expressions)
