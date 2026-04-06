@@ -97,8 +97,8 @@ test/
     └── test_ducklake.py       #   DuckLake/Iceberg integration test
 
 .github/workflows/             # CI pipelines
-├── PullRequestCI.yml          #   Fast PR checks (Linux x86_64 only)
-├── MainDistributionPipeline.yml  # Full 5-platform build on main/release
+├── BuildQuick.yml             #   Fast PR checks (Linux x86_64 only)
+├── BuildAll.yml               #   Full 5-platform build on main
 ├── CodeQuality.yml            #   Formatting, linting, coverage
 ├── DuckDBVersionMonitor.yml   #   Weekly check for new DuckDB releases
 └── Fuzz.yml                   #   Fuzzing on push to main, with crash reporting
@@ -311,40 +311,72 @@ The DuckDB version is pinned in a single source of truth: **`.duckdb-version`** 
 | `Makefile` | Reads `.duckdb-version` via `$(shell cat .duckdb-version)` |
 | `Cargo.toml` | `duckdb` and `libduckdb-sys` `"=X.Y.Z"` — updated by monitor workflow |
 | `test/**/*.py`, `configure/*.py` | PEP 723 `"duckdb==X.Y.Z"` — updated by monitor workflow |
-| `.github/workflows/PullRequestCI.yml` | `duckdb_version: vX.Y.Z` — updated by monitor workflow |
-| `.github/workflows/MainDistributionPipeline.yml` | `duckdb_version: vX.Y.Z` — updated by monitor workflow |
+| `.github/workflows/BuildAll.yml` | `uses:` tag, `duckdb_version`, `ci_tools_version` — updated by monitor workflow |
+| `.github/workflows/BuildQuick.yml` | `uses:` tag, `duckdb_version`, `ci_tools_version` — updated by monitor workflow |
 
 ### Steps to Update Manually
 
+Replace `X.Y.Z` below with the target DuckDB version (e.g., `1.5.1`). The duckdb-rs crate version encodes the DuckDB version as `1.1XY0Z.0` (e.g., DuckDB 1.5.1 = crate 1.10501.0).
+
 1. Update `.duckdb-version`:
    ```
-   v1.5.0
+   vX.Y.Z
    ```
 
-2. Update `Cargo.toml`:
+2. Update `Cargo.toml` (using the encoded crate version):
    ```toml
-   duckdb = { version = "=1.5.0", default-features = false }
-   libduckdb-sys = "=1.5.0"
+   duckdb = { version = "=1.1XY0Z.0", default-features = false }
+   libduckdb-sys = "=1.1XY0Z.0"
    ```
 
 3. Update Python PEP 723 headers (all `# dependencies = ["duckdb==..."]` lines):
    ```bash
-   find . -name '*.py' -exec grep -l 'duckdb==' {} \; | xargs sed -i '' 's/duckdb==[^"]*/duckdb==1.5.0/g'
+   find . -name '*.py' -exec grep -l 'duckdb==' {} \; | xargs sed -i '' 's/duckdb==[^"]*/duckdb==X.Y.Z/g'
    ```
 
-4. Update both CI workflow files (search for `duckdb_version:`):
+4. Update both CI workflow files (`BuildAll.yml` and `BuildQuick.yml`) — the `uses:` tag, `duckdb_version`, and `ci_tools_version`:
    ```yaml
-   duckdb_version: v1.5.0
+   uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@vX.Y.Z
+   ...
+     duckdb_version: vX.Y.Z
+     ci_tools_version: vX.Y.Z
    ```
 
-5. Build and run all tests:
+5. Download the new amalgamation, build, and run all tests:
    ```bash
-   just build && just test-all
+   just update-headers && just build && just test-all
    ```
 
 6. Commit all files together.
 
-The `DuckDBVersionMonitor` workflow automates all of this: it checks for new DuckDB releases weekly, updates `.duckdb-version` and all derived locations, then opens a PR. If the build passes, the PR bumps the version. If it fails, the PR tags `@copilot` to attempt an automated fix.
+The `DuckDBVersionMonitor` workflow automates all of this: it checks for new DuckDB releases weekly, updates `.duckdb-version` and all derived locations (including CI workflow files), then opens a PR. If the build passes, the PR bumps the version. If it fails, the PR tags `@copilot` to attempt an automated fix.
+
+### Version Monitor PAT
+
+The version monitor workflow needs a fine-grained Personal Access Token (PAT) stored as a repository secret named `VERSION_MONITOR_PAT`. This is required because GitHub's default `GITHUB_TOKEN` lacks the `workflow` scope, so it cannot push changes to files under `.github/workflows/`.
+
+**Creating the PAT:**
+
+1. Go to [github.com/settings/personal-access-tokens](https://github.com/settings/personal-access-tokens) (Settings > Developer settings > Fine-grained tokens)
+2. Click "Generate new token"
+3. Set a descriptive name (e.g., `duckdb-semantic-views version monitor`)
+4. Set expiration (recommend 1 year — add a calendar reminder to rotate)
+5. Under **Repository access**, select "Only select repositories" and choose `anentropic/duckdb-semantic-views`
+6. Under **Permissions**, grant:
+   - **Contents:** Read and write
+   - **Pull requests:** Read and write
+   - **Workflows:** Read and write
+7. Click "Generate token" and copy the value
+
+**Saving as a repository secret:**
+
+1. Go to the repo Settings > Secrets and variables > Actions
+2. Click "New repository secret"
+3. Name: `VERSION_MONITOR_PAT`
+4. Value: paste the token
+5. Click "Add secret"
+
+If the PAT expires or is revoked, the version monitor will fall back to `GITHUB_TOKEN` and skip workflow file updates (logging a warning). The PR body will note the manual step required.
 
 ### Bumping DuckDB on the LTS Branch
 
@@ -711,8 +743,8 @@ Do **not** set a directory-level nightly override (`rustup override set nightly`
 
 | Workflow | Trigger | What It Does |
 |----------|---------|--------------|
-| **PullRequestCI** | Pull requests to `main` | Fast feedback: builds and tests on Linux x86_64 only. Uses the DuckDB extension CI tools reusable workflow. |
-| **MainDistributionPipeline** | Push to `main` or `release/*` | Full build across 5 platforms: Linux x86_64, Linux arm64, macOS x86_64, macOS arm64, Windows x86_64. Excluded: WASM, musl, mingw variants. |
+| **BuildQuick** | Push to non-main branches | Fast feedback: builds and tests on Linux x86_64 only. Uses the DuckDB extension CI tools reusable workflow. |
+| **BuildAll** | Push to `main` | Full build across 5 platforms: Linux x86_64, Linux arm64, macOS x86_64, macOS arm64, Windows x86_64. Excluded: WASM, musl, mingw variants. |
 | **CodeQuality** | Push to `main`/`release/*` and PRs | Runs `cargo fmt --check`, `cargo clippy`, `cargo-deny` (license/advisory audit), and coverage check (80% minimum line coverage via `cargo-llvm-cov`). |
 | **DuckDBVersionMonitor** | Weekly (Monday 09:00 UTC) | Queries the DuckDB GitHub API for the latest release. If newer than the current pin, updates all four version locations, builds, and tests. Opens a version-bump PR on success or a breakage PR (tagging `@copilot`) on failure. |
 | **Fuzz** | Push to `main` | Runs all three fuzz targets for 10 minutes each. Detects crashes by checking for artifact files (not exit codes). Uploads crash artifacts, opens a GitHub issue, and fails the job on any crash. |

@@ -59,6 +59,9 @@ dbt/
 cpp/include/duckdb.hpp
 cpp/include/duckdb.cpp
 
+# Extension build output (populated by just build / make release)
+build/
+
 # Versioned amalgamation cache (populated by build/update-headers, survives branch switches)
 .amalgamation/
 

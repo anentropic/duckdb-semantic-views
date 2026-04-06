@@ -25,39 +25,53 @@ pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); FAILURES+=("$1"); }
 
 # ---------------------------------------------------------------------------
-# DKDB-01 / DKDB-05: .duckdb-version on main tracks latest (v1.5.0)
+# DKDB-01 / DKDB-05: .duckdb-version exists and has a valid version
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== DKDB-01/05: .duckdb-version tracks DuckDB 1.5.0 ==="
+echo "=== DKDB-01/05: .duckdb-version exists and is consistent ==="
 
 if [[ -f ".duckdb-version" ]]; then
   pass ".duckdb-version file exists"
-  VERSION=$(cat .duckdb-version | tr -d '[:space:]')
-  if [[ "$VERSION" == "v1.5.0" ]]; then
-    pass ".duckdb-version contains 'v1.5.0' (got: $VERSION)"
+  EXPECTED_VER=$(cat .duckdb-version | tr -d '[:space:]')
+  if [[ "$EXPECTED_VER" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    pass ".duckdb-version has valid format (got: $EXPECTED_VER)"
   else
-    fail ".duckdb-version should be 'v1.5.0' but got '$VERSION'"
+    fail ".duckdb-version has invalid format (got: '$EXPECTED_VER', expected vX.Y.Z)"
   fi
 else
   fail ".duckdb-version file does not exist"
+  EXPECTED_VER=""
+fi
+
+# Derive the expected duckdb-rs crate version from .duckdb-version
+# DuckDB 1.X.Y -> duckdb-rs 1.1XY00.0 (e.g., 1.5.0 -> 1.10500.0, 1.5.1 -> 1.10501.0)
+if [[ -n "$EXPECTED_VER" ]]; then
+  MAJOR=$(echo "$EXPECTED_VER" | sed 's/v//' | cut -d. -f1)
+  MINOR=$(echo "$EXPECTED_VER" | sed 's/v//' | cut -d. -f2)
+  PATCH=$(echo "$EXPECTED_VER" | sed 's/v//' | cut -d. -f3)
+  EXPECTED_CRATE="${MAJOR}.1$(printf '%02d' "$MINOR")$(printf '%02d' "$PATCH").0"
 fi
 
 # ---------------------------------------------------------------------------
-# DKDB-01: Cargo.toml pins duckdb-rs at =1.10500.0 (DuckDB 1.5.0 encoding)
+# DKDB-01: Cargo.toml pins duckdb-rs consistently with .duckdb-version
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== DKDB-01: Cargo.toml duckdb-rs pin encodes DuckDB 1.5.0 ==="
+echo "=== DKDB-01: Cargo.toml duckdb-rs pin matches .duckdb-version ==="
 
-if grep -q 'version = "=1\.10500\.0"' Cargo.toml; then
-  pass "Cargo.toml: duckdb crate pinned at =1.10500.0"
-else
-  fail "Cargo.toml: duckdb crate not pinned at =1.10500.0 (expected '=1.10500.0')"
-fi
+if [[ -n "$EXPECTED_CRATE" ]]; then
+  if grep -q "version = \"=$EXPECTED_CRATE\"" Cargo.toml; then
+    pass "Cargo.toml: duckdb crate pinned at =$EXPECTED_CRATE"
+  else
+    fail "Cargo.toml: duckdb crate not pinned at =$EXPECTED_CRATE"
+  fi
 
-if grep -q 'libduckdb-sys = "=1\.10500\.0"' Cargo.toml; then
-  pass "Cargo.toml: libduckdb-sys pinned at =1.10500.0"
+  if grep -q "libduckdb-sys = \"=$EXPECTED_CRATE\"" Cargo.toml; then
+    pass "Cargo.toml: libduckdb-sys pinned at =$EXPECTED_CRATE"
+  else
+    fail "Cargo.toml: libduckdb-sys not pinned at =$EXPECTED_CRATE"
+  fi
 else
-  fail "Cargo.toml: libduckdb-sys not pinned at =1.10500.0 (expected '=1.10500.0')"
+  fail "Cargo.toml: cannot check pins (no valid .duckdb-version)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -97,38 +111,36 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# DKDB-04: Build.yml CI config references DuckDB 1.5.0 and duckdb/* triggers
+# DKDB-04: BuildAll.yml CI config references .duckdb-version consistently
 # ---------------------------------------------------------------------------
 echo ""
-echo "=== DKDB-04: Build.yml references DuckDB 1.5.0 and duckdb/* triggers ==="
+echo "=== DKDB-04: BuildAll.yml references .duckdb-version consistently ==="
 
-BUILD_YML=".github/workflows/Build.yml"
+BUILD_YML=".github/workflows/BuildAll.yml"
 
 if [[ -f "$BUILD_YML" ]]; then
   pass "$BUILD_YML exists"
 
-  if grep -q "'duckdb/\*'" "$BUILD_YML" || grep -q '"duckdb/\*"' "$BUILD_YML" || grep -qF "- 'duckdb/*'" "$BUILD_YML"; then
-    pass "$BUILD_YML: on.push.branches includes 'duckdb/*' trigger"
-  else
-    fail "$BUILD_YML: on.push.branches missing 'duckdb/*' trigger"
-  fi
+  if [[ -n "$EXPECTED_VER" ]]; then
+    if grep -q "@$EXPECTED_VER" "$BUILD_YML"; then
+      pass "$BUILD_YML: uses extension-ci-tools@$EXPECTED_VER"
+    else
+      fail "$BUILD_YML: does not reference @$EXPECTED_VER"
+    fi
 
-  if grep -q '@v1\.5\.0' "$BUILD_YML"; then
-    pass "$BUILD_YML: uses extension-ci-tools@v1.5.0"
-  else
-    fail "$BUILD_YML: does not reference @v1.5.0"
-  fi
+    if grep -q "duckdb_version: $EXPECTED_VER" "$BUILD_YML"; then
+      pass "$BUILD_YML: duckdb_version is $EXPECTED_VER"
+    else
+      fail "$BUILD_YML: duckdb_version is not $EXPECTED_VER"
+    fi
 
-  if grep -q 'duckdb_version: v1\.5\.0' "$BUILD_YML"; then
-    pass "$BUILD_YML: duckdb_version is v1.5.0"
+    if grep -q "ci_tools_version: $EXPECTED_VER" "$BUILD_YML"; then
+      pass "$BUILD_YML: ci_tools_version is $EXPECTED_VER"
+    else
+      fail "$BUILD_YML: ci_tools_version is not $EXPECTED_VER"
+    fi
   else
-    fail "$BUILD_YML: duckdb_version is not v1.5.0"
-  fi
-
-  if grep -q 'ci_tools_version: v1\.5\.0' "$BUILD_YML"; then
-    pass "$BUILD_YML: ci_tools_version is v1.5.0"
-  else
-    fail "$BUILD_YML: ci_tools_version is not v1.5.0"
+    fail "$BUILD_YML: cannot check versions (no valid .duckdb-version)"
   fi
 else
   fail "$BUILD_YML does not exist"
