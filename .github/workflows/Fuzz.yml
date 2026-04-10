@@ -57,7 +57,7 @@ jobs:
 
       - name: Open issue on crash
         if: steps.check.outputs.crash_found == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.issues.create({
