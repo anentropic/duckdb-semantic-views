@@ -536,19 +536,30 @@ Key fields:
 
 ### Submitting a New Release
 
+The `just release` recipe automates steps 3-7 below:
+
 1. Complete the milestone on the milestone branch
 2. Squash-merge to `main` and tag the release (e.g., `v0.5.4`)
-3. Copy the merge commit SHA: `git rev-parse HEAD` (on main)
-4. Update `description.yml`: set `ref` to the new SHA, update `version`
-5. Fork [duckdb/community-extensions](https://github.com/duckdb/community-extensions) (or update existing fork)
-6. Copy `description.yml` to `extensions/semantic_views/description.yml` in the fork
-7. Submit a PR to `duckdb/community-extensions`
-8. Wait for the CE build pipeline to pass (builds across all non-excluded platforms)
-9. After merge, the extension is installable via:
-   ```sql
-   INSTALL semantic_views FROM community;
-   LOAD semantic_views;
-   ```
+3. Run `just release`
+
+This will:
+- Verify you're on `main` with a clean working tree and `gh` CLI installed
+- Extract the version from `Cargo.toml` and the current commit SHA
+- Update `description.yml` with the new `ref` and `version`, and commit
+- Copy `description.yml` to the CE fork (default: `~/Documents/Dev/Sources/community-extensions`, override with `CE_REPO` env var)
+- Check out the `semantic-views` branch, commit, push, and open a PR to `duckdb/community-extensions`
+
+**Prerequisites:**
+- A fork of [duckdb/community-extensions](https://github.com/duckdb/community-extensions) cloned locally
+- The `gh` CLI authenticated with permissions to create PRs
+
+**After running:**
+- Wait for the CE build pipeline to pass (builds across all non-excluded platforms)
+- After merge, the extension is installable via:
+  ```sql
+  INSTALL semantic_views FROM community;
+  LOAD semantic_views;
+  ```
 
 ### Adding LTS Support
 
