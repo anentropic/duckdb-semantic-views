@@ -13,8 +13,8 @@ struct NameFuzzInput {
 fuzz_target!(|input: NameFuzzInput| {
     let def = fixed_definition();
     let req = QueryRequest {
-        dimensions: input.dim_names,
-        metrics: input.metric_names,
+        dimensions: input.dim_names.into_iter().map(Into::into).collect(),
+        metrics: input.metric_names.into_iter().map(Into::into).collect(),
         facts: vec![],
     };
     if let Ok(sql) = expand("fuzz_view", &def, &req) {

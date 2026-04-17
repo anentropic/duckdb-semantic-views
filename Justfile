@@ -108,6 +108,13 @@ test-caret: build
 # _ensure-test-deps runs early to catch pip version mismatches before slow builds.
 test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret
 
+# Check that fuzz targets compile (requires nightly)
+check-fuzz:
+    cargo +nightly check --manifest-path fuzz/Cargo.toml
+
+# Run the full CI suite locally (lint + test + fuzz check)
+ci: lint test-all check-fuzz
+
 # Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
 fuzz target="fuzz_json_parse" time="300":
     cargo +nightly fuzz run {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{time}}

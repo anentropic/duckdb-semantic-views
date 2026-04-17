@@ -177,7 +177,7 @@ fn find_clause_bounds<'a>(
         } else {
             let msg = if let Some(sug) = suggest_clause_keyword(word) {
                 let sug_upper = sug.to_ascii_uppercase();
-                format!("Unknown clause keyword '{word}'; did you mean '{sug_upper}'?",)
+                format!("Unknown clause keyword '{word}'; did you mean '{sug_upper}'?")
             } else {
                 format!(
                     "Unknown clause keyword '{word}'; expected one of TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS.",
@@ -1135,7 +1135,7 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
     // Extract fk_columns from parenthesized list
     let paren_content =
         extract_paren_content(&after_as[paren_pos..]).ok_or_else(|| ParseError {
-            message: format!("Unclosed '(' in FK column list for relationship '{rel_name}'.",),
+            message: format!("Unclosed '(' in FK column list for relationship '{rel_name}'."),
             position: Some(entry_offset),
         })?;
 
@@ -1157,7 +1157,7 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
     let after_paren = after_as[close_paren_pos..].trim_start();
     let upper_after = after_paren.to_ascii_uppercase();
     let refs_pos = find_keyword_ci(&upper_after, "REFERENCES").ok_or_else(|| ParseError {
-        message: format!("Expected 'REFERENCES' after FK columns in relationship '{rel_name}'.",),
+        message: format!("Expected 'REFERENCES' after FK columns in relationship '{rel_name}'."),
         position: Some(entry_offset),
     })?;
 
