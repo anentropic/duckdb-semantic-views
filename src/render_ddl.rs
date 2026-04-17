@@ -153,12 +153,19 @@ fn emit_window_expr(out: &mut String, ws: &crate::model::WindowSpec) {
 
     // OVER clause
     out.push_str(" OVER (");
-    if !ws.excluding_dims.is_empty() {
+    let has_partition = if !ws.excluding_dims.is_empty() {
         out.push_str("PARTITION BY EXCLUDING ");
         out.push_str(&ws.excluding_dims.join(", "));
-    }
+        true
+    } else if !ws.partition_dims.is_empty() {
+        out.push_str("PARTITION BY ");
+        out.push_str(&ws.partition_dims.join(", "));
+        true
+    } else {
+        false
+    };
     if !ws.order_by.is_empty() {
-        if !ws.excluding_dims.is_empty() {
+        if has_partition {
             out.push(' ');
         }
         out.push_str("ORDER BY ");
@@ -179,7 +186,7 @@ fn emit_window_expr(out: &mut String, ws: &crate::model::WindowSpec) {
         }
     }
     if let Some(ref frame) = ws.frame_clause {
-        if !ws.excluding_dims.is_empty() || !ws.order_by.is_empty() {
+        if has_partition || !ws.order_by.is_empty() {
             out.push(' ');
         }
         out.push_str(frame);
@@ -692,6 +699,7 @@ mod tests {
                 inner_metric: "total_qty".to_string(),
                 extra_args: vec![],
                 excluding_dims: vec!["region".to_string()],
+                partition_dims: vec![],
                 order_by: vec![WindowOrderBy {
                     expr: "month".to_string(),
                     order: SortOrder::Asc,
@@ -723,6 +731,7 @@ mod tests {
                 inner_metric: "total_qty".to_string(),
                 extra_args: vec![],
                 excluding_dims: vec!["region".to_string()],
+                partition_dims: vec![],
                 order_by: vec![WindowOrderBy {
                     expr: "month".to_string(),
                     order: SortOrder::Desc,
@@ -762,6 +771,7 @@ mod tests {
                 inner_metric: "total_qty".to_string(),
                 extra_args: vec![],
                 excluding_dims: vec!["region".to_string()],
+                partition_dims: vec![],
                 order_by: vec![WindowOrderBy {
                     expr: "region".to_string(),
                     order: SortOrder::Asc,
@@ -787,5 +797,55 @@ mod tests {
         };
         let ddl2 = render_create_ddl("rt", &def2).unwrap();
         assert_eq!(ddl1, ddl2, "Round-trip DDL should be identical");
+    }
+
+    #[test]
+    fn test_window_spec_partition_by_explicit() {
+        use crate::body_parser::parse_keyword_body;
+        use crate::model::{NullsOrder, SortOrder, WindowOrderBy, WindowSpec};
+
+        let mut def = minimal_def();
+        def.dimensions.push(Dimension {
+            name: "month".to_string(),
+            expr: "o.month".to_string(),
+            source_table: Some("o".to_string()),
+            ..Default::default()
+        });
+        def.metrics.push(Metric {
+            name: "avg_rev".to_string(),
+            expr: "AVG(revenue) OVER (PARTITION BY region ORDER BY month)".to_string(),
+            source_table: Some("o".to_string()),
+            window_spec: Some(WindowSpec {
+                window_function: "AVG".to_string(),
+                inner_metric: "revenue".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["region".to_string()],
+                order_by: vec![WindowOrderBy {
+                    expr: "month".to_string(),
+                    order: SortOrder::Asc,
+                    nulls: NullsOrder::Last,
+                }],
+                frame_clause: None,
+            }),
+            ..Default::default()
+        });
+        let ddl = render_create_ddl("test", &def).unwrap();
+        assert!(
+            ddl.contains("PARTITION BY region"),
+            "DDL should contain PARTITION BY region: {ddl}"
+        );
+        assert!(
+            !ddl.contains("EXCLUDING"),
+            "DDL should not contain EXCLUDING: {ddl}"
+        );
+
+        // Round-trip: parse the generated DDL and re-render
+        let as_pos = ddl.find(" AS\n").unwrap();
+        let body = format!("AS {}", &ddl[as_pos + 4..]);
+        let kb = parse_keyword_body(&body, 0).expect("Round-trip parse should succeed");
+        let ws = kb.metrics[1].window_spec.as_ref().unwrap();
+        assert!(ws.excluding_dims.is_empty());
+        assert_eq!(ws.partition_dims, vec!["region"]);
     }
 }
