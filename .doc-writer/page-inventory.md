@@ -1,271 +1,39 @@
-# Page Inventory -- v0.5.5 SHOW/DESCRIBE Schema Updates
+# Page Inventory -- PARTITION BY Content Refresh
 
-**Generated:** 2026-04-02
-**Type:** Content update pass (6 existing reference pages with outdated column schemas)
-
-## Pages Requiring Updates
-
-These 6 existing reference pages have outdated output schemas from the v0.5.5 SHOW/DESCRIBE alignment work. Each page needs its Output Columns section rewritten and all example output tables updated to match the new column schemas verified against source code.
-
-| # | Type | Title | Key Sections to Update | File Path |
-|---|------|-------|------------------------|-----------|
-| 1 | reference | SHOW SEMANTIC VIEWS | Output Columns, all Examples | `docs/reference/show-semantic-views.rst` |
-| 2 | reference | SHOW SEMANTIC DIMENSIONS | Output Columns, note about data_type, all Examples | `docs/reference/show-semantic-dimensions.rst` |
-| 3 | reference | SHOW SEMANTIC METRICS | Output Columns, derived metrics note, all Examples | `docs/reference/show-semantic-metrics.rst` |
-| 4 | reference | SHOW SEMANTIC FACTS | Output Columns, remove "no data_type" note, all Examples | `docs/reference/show-semantic-facts.rst` |
-| 5 | reference | SHOW SEMANTIC DIMENSIONS FOR METRIC | Output Columns, "same schema" cross-ref, Fan Trap Filtering examples, all Examples | `docs/reference/show-semantic-dimensions-for-metric.rst` |
-| 6 | reference | DESCRIBE SEMANTIC VIEW | Meta description, page intro, Output Columns (complete replacement), JSON tip, all Examples | `docs/reference/describe-semantic-view.rst` |
-
-## Detailed Change Specifications
-
-### Page 1: SHOW SEMANTIC VIEWS (`docs/reference/show-semantic-views.rst`)
-
-**Schema change:** 2 columns -> 5 columns.
-
-Old columns: `name` (VARCHAR), `base_table` (VARCHAR)
-
-New columns (verified from `src/ddl/list.rs` lines 56-68):
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `created_on` | VARCHAR | Timestamp when the semantic view was created. |
-| `name` | VARCHAR | The semantic view name. |
-| `kind` | VARCHAR | Always `SEMANTIC_VIEW`. |
-| `database_name` | VARCHAR | The DuckDB database containing the view (e.g., `memory`). |
-| `schema_name` | VARCHAR | The DuckDB schema containing the view (e.g., `main`). |
-
-**Sections to update:**
-- **Output Columns:** Replace "2 columns" table with 5-column table above.
-- **All example output tables:** Change from 2-column (`name | base_table`) to 5-column format. The `created_on` column is a non-deterministic timestamp, so examples should either show a realistic timestamp placeholder or demonstrate with `SELECT name, kind, database_name, schema_name FROM (SHOW SEMANTIC VIEWS);` to skip it.
-- **Prose:** Any reference to `base_table` column must be removed.
+**Generated:** 2026-04-13
+**Source:** Codebase scan verifying `PARTITION BY` (non-excluding) coverage across 7 flagged pages
+**Branch:** gsd/v0.6.0-snowflake-sql-ddl-parity
+**Scan method:** Each flagged page read in full, then compared against source code in body_parser.rs (line 1571: plain PARTITION BY parsing), model.rs (lines 114-134: WindowSpec.partition_dims field), expand/window.rs (lines 68-76: PARTITION BY dim validation, lines 247-252: explicit partition expansion), ddl/describe.rs (lines 442-444: PARTITION BY rendering in WINDOW_SPEC), ddl/show_dims_for_metric.rs (lines 221-228: partition_dims in required set), expand/types.rs (lines 245-256: "PARTITION BY" reason string in error message), render_ddl.rs (lines 160-162: GET_DDL PARTITION BY rendering).
 
 ---
 
-### Page 2: SHOW SEMANTIC DIMENSIONS (`docs/reference/show-semantic-dimensions.rst`)
+## Content Refresh
 
-**Schema change:** 5 columns -> 6 columns.
+For each flagged page, the current page content was read and compared against the corresponding source code. Pages with real discrepancies list specific changes needed. Pages that are still accurate note "no changes needed."
 
-Old columns: `semantic_view_name`, `name`, `expr`, `source_table`, `data_type`
-
-New columns (verified from `src/ddl/show_dims.rs` lines 44-62):
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `database_name` | VARCHAR | The DuckDB database containing the semantic view. |
-| `schema_name` | VARCHAR | The DuckDB schema containing the semantic view. |
-| `semantic_view_name` | VARCHAR | The semantic view this dimension belongs to. |
-| `table_name` | VARCHAR | The physical table name the dimension is scoped to (resolved from alias to actual table name). Empty string if no source table. |
-| `name` | VARCHAR | The dimension name as declared in the DIMENSIONS clause. |
-| `data_type` | VARCHAR | The inferred data type. Empty string if not resolved. |
-
-**Key behavioral changes:**
-- `expr` column removed -- dimension expressions are no longer exposed in SHOW output.
-- `source_table` renamed to `table_name` and now shows the actual physical table name (e.g., `customers`) instead of the DDL alias (e.g., `c`). This is resolved via `alias_to_table_map()`.
-- New `database_name` and `schema_name` columns prepended.
-
-**Sections to update:**
-- **Page intro:** Remove mention of "expression" from "name, expression, source table, and inferred data type" description.
-- **Output Columns:** Replace 5-column table with 6-column table above.
-- **Note about `data_type`:** Keep the note but verify it still applies (it does -- computed expressions may still show empty data type).
-- **All example output tables:** Change to 6-column format. Replace alias values (`c`, `o`, `li`, `p`) in old `source_table` column with actual table names (`customers`, `orders`, `line_items`, `products`) in new `table_name` column. Remove `expr` column from all outputs.
-
-Test-verified example output (from `test/sql/phase39_metadata_storage.test` line 112):
-```
-memory  main  p39_sv  p39_orders  order_id  (empty)
-```
-
----
-
-### Page 3: SHOW SEMANTIC METRICS (`docs/reference/show-semantic-metrics.rst`)
-
-**Schema change:** Same as DIMENSIONS -- 5 columns -> 6 columns.
-
-Old columns: `semantic_view_name`, `name`, `expr`, `source_table`, `data_type`
-
-New columns (verified from `src/ddl/show_metrics.rs` lines 44-62, identical schema to show_dims.rs):
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `database_name` | VARCHAR | The DuckDB database containing the semantic view. |
-| `schema_name` | VARCHAR | The DuckDB schema containing the semantic view. |
-| `semantic_view_name` | VARCHAR | The semantic view this metric belongs to. |
-| `table_name` | VARCHAR | The physical table name the metric is scoped to. Empty string for derived metrics. |
-| `name` | VARCHAR | The metric name as declared in the METRICS clause. |
-| `data_type` | VARCHAR | The inferred data type. Empty string if not resolved. |
-
-**Key behavioral changes (same as DIMENSIONS, plus):**
-- Derived metrics show empty `table_name` (was empty `source_table`).
-- `expr` column removed -- the example showing derived metric expressions (`revenue - cost`, `profit / revenue * 100`) must be reworked. Derived metrics are now only distinguishable from base metrics by their empty `table_name`.
-
-**Sections to update:**
-- **Page intro:** Remove "aggregate expression" from description.
-- **Output Columns:** Replace with 6-column table.
-- **Derived metrics example:** Rework to show how derived metrics appear without `expr` column (empty `table_name` is the distinguishing feature).
-- **All example output tables:** 6-column format, aliases -> actual table names, remove `expr` column.
-
-Test-verified example output (from `test/sql/phase39_metadata_storage.test` line 122):
-```
-memory  main  p39_sv  p39_orders  total_amount  (empty)
-```
-
----
-
-### Page 4: SHOW SEMANTIC FACTS (`docs/reference/show-semantic-facts.rst`)
-
-**Schema change:** 4 columns -> 6 columns.
-
-Old columns: `semantic_view_name`, `name`, `expr`, `source_table`
-
-New columns (verified from `src/ddl/show_facts.rs` lines 44-62, identical schema to show_dims.rs):
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `database_name` | VARCHAR | The DuckDB database containing the semantic view. |
-| `schema_name` | VARCHAR | The DuckDB schema containing the semantic view. |
-| `semantic_view_name` | VARCHAR | The semantic view this fact belongs to. |
-| `table_name` | VARCHAR | The physical table name the fact is scoped to. |
-| `name` | VARCHAR | The fact name as declared in the FACTS clause. |
-| `data_type` | VARCHAR | The inferred data type (via typeof when table data exists). Empty string if not resolved. |
-
-**Key behavioral changes:**
-- `expr` column removed.
-- `source_table` renamed to `table_name` (actual table name, not alias).
-- **`data_type` column ADDED.** Facts now have data type inference. The old note stating "Unlike SHOW SEMANTIC DIMENSIONS and SHOW SEMANTIC METRICS, the facts output does not include a `data_type` column" is **now incorrect** and must be removed.
-- All three SHOW commands (DIMENSIONS, METRICS, FACTS) now share the exact same 6-column schema.
-
-Test-verified example with data_type populated (from `test/sql/phase39_metadata_storage.test` line 104):
-```
-memory  main  p39_sv  p39_orders  unit_price  DOUBLE
-```
-
-**Sections to update:**
-- **Page intro:** Update description to mention data type.
-- **Output Columns:** Replace 4-column table with 6-column table.
-- **Remove the `.. note::` block** about facts not having `data_type`.
-- **All example output tables:** 6-column format, aliases -> actual table names, add data_type column (empty or populated).
-
----
-
-### Page 5: SHOW SEMANTIC DIMENSIONS FOR METRIC (`docs/reference/show-semantic-dimensions-for-metric.rst`)
-
-**Schema change:** Completely restructured -- 5 columns -> 4 columns.
-
-Old columns: `semantic_view_name`, `name`, `expr`, `source_table`, `data_type` (same as SHOW DIMS)
-
-New columns (verified from `src/ddl/show_dims_for_metric.rs` lines 169-177):
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `table_name` | VARCHAR | The physical table name the dimension is scoped to. |
-| `name` | VARCHAR | The dimension name. |
-| `data_type` | VARCHAR | The inferred data type. Empty string if not resolved. |
-| `required` | BOOLEAN | Always `false`. Reserved for future Snowflake parity. |
-
-**Key behavioral changes:**
-- `semantic_view_name` column removed (redundant -- the view is already specified in the IN clause).
-- `expr` column removed.
-- `source_table` renamed to `table_name` (actual table name).
-- New `required` BOOLEAN column added (constant `false` for all rows).
-- **No longer shares schema with SHOW SEMANTIC DIMENSIONS.** The existing note "same schema as SHOW SEMANTIC DIMENSIONS" and the `(same schema as ...)` parenthetical in Output Columns must be removed.
-
-Test-verified example output (from `test/sql/phase34_1_show_dims_for_metric.test` lines 31-34):
-```
-p34fm_sales  product  (empty)  false
-p34fm_sales  region   (empty)  false
-```
-
-Multi-table fan-trap filtered output (lines 89-92):
-```
-p34fm_customers  customer_country  (empty)  false
-p34fm_customers  customer_name     (empty)  false
-```
-
-**Sections to update:**
-- **Output Columns:** Replace 5-column table with 4-column table. Remove "same schema" cross-reference.
-- **All example output tables:** 4-column format with `table_name`, `name`, `data_type`, `required`. Replace aliases with actual table names. Add `false` in required column for every row.
-- **Fan Trap Filtering section:** The explanation of fan-trap logic remains unchanged (it is behavioral, not schema-related). Only the example outputs within this section need column updates.
-- **Derived metrics example:** Update output columns.
-
----
-
-### Page 6: DESCRIBE SEMANTIC VIEW (`docs/reference/describe-semantic-view.rst`)
-
-**Schema change:** Complete format change -- single-row JSON blob -> multi-row property-per-row.
-
-Old format: 1 row with 6 VARCHAR columns containing JSON arrays (`name`, `base_table`, `dimensions`, `metrics`, `joins`, `facts`)
-
-New format (verified from `src/ddl/describe.rs` lines 325-341): Multiple rows with 5 VARCHAR columns:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `object_kind` | VARCHAR | The type of object: `TABLE`, `RELATIONSHIP`, `FACT`, `DIMENSION`, `METRIC`, or `DERIVED_METRIC`. |
-| `object_name` | VARCHAR | The name of the object (table name, relationship name, dimension/fact/metric name). |
-| `parent_entity` | VARCHAR | The parent table for this object. Empty string for TABLE objects and DERIVED_METRIC objects. |
-| `property` | VARCHAR | The property name being described. |
-| `property_value` | VARCHAR | The property value. |
-
-**Object kinds and their properties** (verified from `src/ddl/describe.rs`):
-
-- **TABLE** (lines 86-118): `BASE_TABLE_DATABASE_NAME`, `BASE_TABLE_SCHEMA_NAME`, `BASE_TABLE_NAME`, `PRIMARY_KEY` (only emitted when PK declared; value is JSON array like `["id"]`)
-- **RELATIONSHIP** (lines 147-175): `TABLE`, `REF_TABLE`, `FOREIGN_KEY` (JSON array), `REF_KEY` (JSON array)
-- **FACT** (lines 194-216): `TABLE`, `EXPRESSION`, `DATA_TYPE`
-- **DIMENSION** (lines 235-255): `TABLE`, `EXPRESSION`, `DATA_TYPE`
-- **METRIC** (lines 285-308): `TABLE`, `EXPRESSION`, `DATA_TYPE`
-- **DERIVED_METRIC** (lines 270-308): `EXPRESSION`, `DATA_TYPE` only (no TABLE property)
-
-**Rows appear in definition order:** TABLEs, then RELATIONSHIPs, then FACTs, then DIMENSIONs, then METRICs/DERIVED_METRICs.
-
-Test-verified example (from `test/sql/phase41_describe.test` lines 31-43, simple single-table view):
-```
-TABLE       p41_orders  (empty)     BASE_TABLE_DATABASE_NAME  memory
-TABLE       p41_orders  (empty)     BASE_TABLE_SCHEMA_NAME    main
-TABLE       p41_orders  (empty)     BASE_TABLE_NAME           p41_orders
-TABLE       p41_orders  (empty)     PRIMARY_KEY               ["id"]
-DIMENSION   region      p41_orders  TABLE                     p41_orders
-DIMENSION   region      p41_orders  EXPRESSION                o.region
-DIMENSION   region      p41_orders  DATA_TYPE                 (empty)
-METRIC      total       p41_orders  TABLE                     p41_orders
-METRIC      total       p41_orders  EXPRESSION                SUM(o.amount)
-METRIC      total       p41_orders  DATA_TYPE                 (empty)
-```
-
-Test-verified example with derived metrics (lines 155-169):
-```
-...
-METRIC          revenue  p41_orders  TABLE       p41_orders
-METRIC          revenue  p41_orders  EXPRESSION  SUM(o.amount)
-METRIC          revenue  p41_orders  DATA_TYPE   (empty)
-DERIVED_METRIC  profit   (empty)     EXPRESSION  revenue * 0.3
-DERIVED_METRIC  profit   (empty)     DATA_TYPE   (empty)
-```
-
-**Sections requiring complete rewrite:**
-- **Meta description:** Change from "single-row JSON result" to "property-per-row format showing each object and its properties".
-- **Page intro:** Change from "Returns the definition of a semantic view as a single-row result set" to describe multi-row property-per-row output.
-- **Output Columns:** Complete replacement with 5-column table above, plus the object kinds and properties breakdown.
-- **Tip about JSON parsing:** Remove entirely. The old tip about `json_extract` on JSON blob columns is no longer relevant. Replace with guidance on filtering by `object_kind`: `SELECT * FROM (DESCRIBE SEMANTIC VIEW sv) WHERE object_kind = 'DIMENSION';`
-- **All examples:** Complete replacement showing multi-row property-per-row output. Show examples for: simple single-table view, multi-table view with relationships, view with facts, view with derived metrics.
+| # | Type | Title | Key Sections | File Path |
+|---|------|-------|--------------|-----------|
+| 1 | (refresh) | How to Use Window Function Metrics | **Stale -- major gap.** (a) Page title section "PARTITION BY EXCLUDING" (line 47) covers only EXCLUDING semantics with no mention of plain `PARTITION BY dim_name [, ...]`. Source at body_parser.rs:1571 parses plain PARTITION BY, model.rs:126-127 stores it in `partition_dims`, expand/window.rs:247-252 uses it directly. Need new section "PARTITION BY (Explicit)" explaining that explicit dims are used as-is (no dynamic computation), contrasting with EXCLUDING's dynamic behavior. (b) "Required Dimensions" section (line 113) says only "PARTITION BY EXCLUDING and ORDER BY" -- must add PARTITION BY as a third source of required dimensions (expand/window.rs:68-76 validates partition_dims). (c) Error message example (line 122) shows only the EXCLUDING reason string -- must add example showing "PARTITION BY" reason. (d) First example (line 28) uses only EXCLUDING -- need an additional example showing plain PARTITION BY syntax. (e) Introductory paragraph and meta description mention only EXCLUDING. | docs/how-to/window-metrics.rst |
+| 2 | (refresh) | CREATE SEMANTIC VIEW | **Stale -- syntax gap.** (a) Syntax grammar at line 59 shows only `PARTITION BY EXCLUDING <dim_name> [, ...]` inside OVER clause. Missing `PARTITION BY <dim_name> [, <dim_name> ...]` variant. The two are mutually exclusive in the grammar (body_parser.rs:1546 tries EXCLUDING first, falls back to plain PARTITION BY at 1571). (b) Window metric description at line 293 says "PARTITION BY EXCLUDING specifies which dimensions to exclude" with no mention of plain PARTITION BY. Need additional paragraph explaining plain PARTITION BY uses listed dims directly as the partition set. (c) Validation rules at line 319 mention "EXCLUDING dimension names must match declared dimensions" but not "PARTITION BY dimension names must match declared dimensions" (body_parser validates both). | docs/reference/create-semantic-view.rst |
+| 3 | (refresh) | DESCRIBE SEMANTIC VIEW | **Stale -- minor gap.** WINDOW_SPEC property row at line 188 uses example `AVG(total_qty) OVER (PARTITION BY EXCLUDING date ORDER BY date)` showing only the EXCLUDING format. Source at describe.rs:442-444 renders plain `PARTITION BY dim1, dim2` when `partition_dims` is non-empty. The description "Reconstructed OVER clause string" is not wrong, but the only example shows EXCLUDING. Need to expand the example or add a second example showing plain PARTITION BY format (e.g., `AVG(total_qty) OVER (PARTITION BY store ORDER BY date)`). | docs/reference/describe-semantic-view.rst |
+| 4 | (refresh) | SHOW SEMANTIC DIMENSIONS FOR METRIC | **Stale -- description gap.** (a) `required` column description at line 96 says "TRUE if the dimension is referenced in a window metric's EXCLUDING or ORDER BY clause" -- missing PARTITION BY. Source at show_dims_for_metric.rs:221-228 includes `partition_dims` in the required set alongside `excluding_dims` and `order_by`. Must update to "EXCLUDING, PARTITION BY, or ORDER BY." (b) Introductory text at line 12 says "EXCLUDING or ORDER BY clauses" -- same fix needed. (c) Fan Trap Filtering section at line 111 says "Dimensions referenced in the EXCLUDING or ORDER BY clauses are marked required = TRUE" -- same fix. (d) Window metric example at line 204 only shows EXCLUDING; consider adding or noting that plain PARTITION BY dims are also marked required. (e) Tip at line 243 only mentions EXCLUDING as a source of required=TRUE. | docs/reference/show-semantic-dimensions-for-metric.rst |
+| 5 | (refresh) | Error Messages | **Stale -- missing reason value.** "Window metric required dimension missing" section at line 452 describes `<reason>` as coming from "EXCLUDING or ORDER BY clause." Source at expand/window.rs:75 produces `"PARTITION BY"` as a distinct reason string (separate from "PARTITION BY EXCLUDING" at line 64 and "ORDER BY" at line 86). The documented error format `(used in <reason>)` is correct, but the explanation of possible reason values is incomplete. Must add "PARTITION BY" to the list of possible reasons and note that it occurs when a metric uses explicit PARTITION BY rather than EXCLUDING. | docs/reference/error-messages.rst |
+| 6 | (refresh) | Snowflake Comparison | **Stale -- incomplete feature mapping.** (a) Concept mapping row at line 58 says "OVER clause with PARTITION BY EXCLUDING" for both Snowflake and DuckDB. DuckDB now supports both PARTITION BY EXCLUDING and plain PARTITION BY. Update to "OVER clause with PARTITION BY / PARTITION BY EXCLUDING." (b) "Semi-Additive and Window Metrics" section at line 319 only shows EXCLUDING in the code example and behavioral differences. Need to mention that DuckDB supports both partitioning modes and explain the semantic difference (EXCLUDING = dynamic, PARTITION BY = explicit). (c) No entry in behavioral differences noting that plain PARTITION BY is a DuckDB-specific extension vs Snowflake (verify against Snowflake docs whether they also support non-EXCLUDING PARTITION BY). | docs/explanation/snowflake-comparison.rst |
+| 7 | (refresh) | How to Use FACTS for Reusable Row-Level Logic | **No changes needed.** Content accurately describes current fact behavior: defining facts in FACTS clause, fact chaining, multi-table scoping, querying facts directly (v0.6.0), metadata annotations, verifying with explain_semantic_view(), and troubleshooting. All code examples use correct syntax matching source. All error messages match source. The `facts := [...]` query mode, PRIVATE access modifier, and wildcard exclusion are documented. No PARTITION BY-related content is relevant to this page. | docs/how-to/facts.rst |
 
 ---
 
 ## API Reference Status
 
-- **Type:** Manual reference pages (`api_reference: manual` in config.yaml)
-- **Status:** All 6 pages exist and need content updates only (no new pages)
+**Manual reference.** `api_reference: "manual"` is set in config.yaml. This project exposes a SQL interface (not a programmatic API), so reference pages are hand-authored. Inline code mentions in prose use plain `code` formatting without links.
 
 ## Audience Targeting
 
-All 6 pages target the single configured persona: **Data engineers exploring semantic views** (intermediate skill level). These are SQL reference pages -- the audience knows SQL and DuckDB basics, needs accurate column schemas and realistic output examples.
+All pages target the single configured persona: **Data engineers exploring semantic views** (intermediate skill level). SQL fluency and DuckDB basics are assumed. Semantic view concepts, DDL syntax, and modeling patterns are always explained.
 
-## Coverage Gaps
+## Summary
 
-- **Non-reference pages:** Other documentation pages (tutorials, how-to guides) that show SHOW or DESCRIBE output may also contain outdated examples. A broader audit after these 6 pages are updated is recommended.
-- **Version markers:** Consider adding `.. versionchanged:: 0.5.5` admonitions to each page to mark the schema changes for readers upgrading from earlier versions.
-- **error-messages.rst:** Error messages for these commands have not changed in v0.5.5, so that page does not need updating for this pass.
-
-## Notes
-
-- The existing reference pages use `sqlgrammar` as the code-block language for syntax sections.
-- Pages use `:ref:` labels with `ref-` prefix for cross-referencing.
-- The SHOW SEMANTIC DIMENSIONS FOR METRIC page (page 5) has extensive fan-trap filtering examples that need column updates but the behavioral explanation of fan-trap logic remains correct.
-- All column schemas were verified against the actual Rust source code (`src/ddl/*.rs`) and integration test expected output (`test/sql/phase39_metadata_storage.test`, `test/sql/phase41_describe.test`, `test/sql/phase34_1_show_dims_for_metric.test`).
+- **6 pages have real discrepancies** related to the missing `PARTITION BY` (non-excluding) documentation. The gap is consistent across all affected pages: every reference to window metric partitioning mentions only EXCLUDING, despite the source code fully supporting explicit PARTITION BY since phase 48.
+- **1 page (facts.rst) is accurate** and needs no changes.
+- The discrepancies range from major (window-metrics.rst needs a new section and multiple updates) to minor (describe-semantic-view.rst needs an additional example).
+- The core semantic difference that must be documented everywhere: `PARTITION BY EXCLUDING` is dynamic (computes partition as "all queried dims minus excluded"), while plain `PARTITION BY` is explicit (uses exactly the listed dims as the partition set, regardless of other queried dims).

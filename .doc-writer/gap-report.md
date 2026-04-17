@@ -1,58 +1,41 @@
 # Gap Report
 
-**Generated:** 2026-04-02
+**Generated:** 2026-04-13
 **Source root:** src/
 **Language:** rust
-**Total undocumented symbols:** 0 (user-facing)
+**Total undocumented symbols:** 0
+**Potentially stale pages:** 7
 
-## Coverage Assessment
+## Undocumented Symbols
 
-All user-facing SQL DDL verbs and table functions are documented:
+All v0.6.0 features (phases 43-48) now have dedicated doc pages:
 
-| Feature | Doc Page |
-|---|---|
-| CREATE SEMANTIC VIEW | `docs/reference/create-semantic-view.rst` |
-| ALTER SEMANTIC VIEW ... RENAME TO | `docs/reference/alter-semantic-view.rst` |
-| DROP SEMANTIC VIEW | `docs/reference/drop-semantic-view.rst` |
-| DESCRIBE SEMANTIC VIEW | `docs/reference/describe-semantic-view.rst` |
-| SHOW SEMANTIC VIEWS [LIKE/STARTS WITH/LIMIT] | `docs/reference/show-semantic-views.rst` |
-| SHOW SEMANTIC DIMENSIONS [LIKE/IN/STARTS WITH/LIMIT] | `docs/reference/show-semantic-dimensions.rst` |
-| SHOW SEMANTIC METRICS [LIKE/IN/STARTS WITH/LIMIT] | `docs/reference/show-semantic-metrics.rst` |
-| SHOW SEMANTIC FACTS [LIKE/IN/STARTS WITH/LIMIT] | `docs/reference/show-semantic-facts.rst` |
-| SHOW SEMANTIC DIMENSIONS ... FOR METRIC | `docs/reference/show-semantic-dimensions-for-metric.rst` |
-| semantic_view() table function | `docs/reference/semantic-view-function.rst` |
-| explain_semantic_view() | `docs/reference/explain-semantic-view-function.rst` |
-| Error messages reference | `docs/reference/error-messages.rst` |
+- Metadata annotations -> `docs/how-to/metadata-annotations.rst` (new)
+- SHOW COLUMNS -> `docs/reference/show-columns-semantic-view.rst` (new)
+- GET_DDL -> `docs/reference/get-ddl.rst` (new)
+- Wildcard selection -> `docs/how-to/wildcard-selection.rst` (new)
+- Queryable facts -> `docs/how-to/query-facts.rst` (new)
+- Semi-additive metrics -> `docs/how-to/semi-additive-metrics.rst` (new)
+- Window function metrics -> `docs/how-to/window-metrics.rst` (new)
 
-## Outdated Documentation (v0.5.5 Breaking Changes)
+Reference pages (create-semantic-view, alter-semantic-view, semantic-view-function, show-semantic-views, show-semantic-dimensions, show-semantic-metrics, show-semantic-facts, show-semantic-dimensions-for-metric, describe-semantic-view, error-messages, snowflake-comparison) have been updated in working tree.
 
-6 existing reference pages have **outdated column schemas** from the v0.5.5 SHOW/DESCRIBE
-alignment work. These pages describe the OLD output format:
+No exported user-facing features remain undocumented at the page level.
 
-### docs/reference/describe-semantic-view.rst
-- **Was:** single-row JSON blob with 6 columns (name, base_table, dimensions, metrics, joins, facts)
-- **Now:** property-per-row format with 5 columns (object_kind, object_name, parent_entity, property, property_value)
+## Potentially Stale Pages
 
-### docs/reference/show-semantic-views.rst
-- **Was:** 2 columns (name, base_table)
-- **Now:** 5 columns (created_on, name, kind, database_name, schema_name)
+7 doc pages have known content gaps where the page text does not match current source code behavior:
 
-### docs/reference/show-semantic-dimensions.rst
-- **Was:** 5 columns (semantic_view_name, name, expr, source_table, data_type)
-- **Now:** 6 columns (database_name, schema_name, semantic_view_name, table_name, name, data_type)
-
-### docs/reference/show-semantic-metrics.rst
-- Same column changes as SHOW SEMANTIC DIMENSIONS
-
-### docs/reference/show-semantic-facts.rst
-- Same column changes as SHOW SEMANTIC DIMENSIONS
-
-### docs/reference/show-semantic-dimensions-for-metric.rst
-- **Was:** 5 columns (semantic_view_name, name, expr, source_table, data_type)
-- **Now:** 4 columns (table_name, name, data_type, required BOOLEAN)
+- `docs/how-to/window-metrics.rst` (new, untracked) — only documents `PARTITION BY EXCLUDING`; plain `PARTITION BY <dim>` is fully implemented (body_parser.rs:1571, expand/window.rs:247) but not mentioned anywhere in the page. The "PARTITION BY EXCLUDING" section heading and all examples exclusively use EXCLUDING. Semantic difference: EXCLUDING is dynamic (all queried dims minus excluded), PARTITION BY is explicit (exact dims listed).
+- `docs/reference/create-semantic-view.rst` (modified) — syntax diagram line 59 shows only `PARTITION BY EXCLUDING`; missing `PARTITION BY <dim_name> [, ...]` variant. The description at line 293 only explains EXCLUDING semantics.
+- `docs/reference/describe-semantic-view.rst` (modified) — verify window_spec display includes PARTITION BY (non-excluding) format in describe output
+- `docs/reference/show-semantic-dimensions-for-metric.rst` (modified) — verify "required" column description covers PARTITION BY dims (not just EXCLUDING and ORDER BY)
+- `docs/reference/error-messages.rst` (modified) — verify window metric required dimension error covers PARTITION BY reason string (code uses "PARTITION BY" as reason at expand/window.rs:75)
+- `docs/explanation/snowflake-comparison.rst` (modified) — verify window metrics comparison mentions both partitioning modes
+- `docs/how-to/facts.rst` (modified, 2026-03-27) — source last modified 2026-04-12; coarse staleness signal, verify content matches current fact query behavior
 
 ## Note
 
-The scanner output includes internal Rust structs (`ShowFactsBindData`, `AlterRenameVTab`,
-etc.). These are implementation details, not user-facing API surface. Since
-`api_reference: "manual"` is set, these are excluded from gap tracking.
+The scanner output includes internal Rust structs (VTab bindings, graph validators, etc.).
+These are implementation details. Since `api_reference: "manual"` is set, they are excluded
+from gap tracking. The substantive gap is content accuracy within existing pages, not missing pages.
