@@ -47,19 +47,52 @@ Concept Mapping
      - ``METRICS`` clause
    * - Reusable row-level expressions
      - ``FACTS`` clause
-     - ``FACTS`` clause
+     - ``FACTS`` clause (queryable via ``facts := [...]``)
    * - Metric composition
      - Derived metrics (metric referencing other metrics)
      - Derived metrics (same pattern)
+   * - Semi-additive metrics
+     - ``SEMI ADDITIVE`` / ``NON ADDITIVE BY``
+     - ``NON ADDITIVE BY`` (see :ref:`howto-semi-additive`)
+   * - Window function metrics
+     - ``OVER`` clause with ``PARTITION BY EXCLUDING``
+     - ``OVER`` clause with ``PARTITION BY EXCLUDING`` (see :ref:`howto-window-metrics`)
+   * - Metadata annotations
+     - ``COMMENT``, ``WITH SYNONYMS``
+     - ``COMMENT``, ``WITH SYNONYMS`` (see :ref:`howto-metadata-annotations`)
+   * - Access modifiers
+     - ``PRIVATE`` / ``PUBLIC``
+     - ``PRIVATE`` / ``PUBLIC`` on metrics and facts
    * - Query interface
      - Direct SQL with semantic resolution
      - :ref:`semantic_view() <ref-semantic-view-function>` table function
+   * - Wildcard selection
+     - ``alias.*`` in query parameters
+     - ``alias.*`` in ``dimensions``, ``metrics``, ``facts`` parameters (see :ref:`howto-wildcard-selection`)
    * - View inspection
      - ``DESCRIBE SEMANTIC VIEW``
      - ``DESCRIBE SEMANTIC VIEW``
    * - List views
      - ``SHOW SEMANTIC VIEWS``
      - ``SHOW SEMANTIC VIEWS``
+   * - Terse view listing
+     - ``SHOW TERSE SEMANTIC VIEWS``
+     - ``SHOW TERSE SEMANTIC VIEWS``
+   * - Column listing
+     - ``SHOW COLUMNS IN SEMANTIC VIEW``
+     - :ref:`SHOW COLUMNS IN SEMANTIC VIEW <ref-show-columns>`
+   * - Filter by scope
+     - ``IN SCHEMA`` / ``IN DATABASE``
+     - ``IN SCHEMA`` / ``IN DATABASE`` on SHOW commands
+   * - Retrieve DDL text
+     - ``GET_DDL('SEMANTIC_VIEW', ...)``
+     - :ref:`GET_DDL('SEMANTIC_VIEW', ...) <ref-get-ddl>`
+   * - Alter a view
+     - ``ALTER SEMANTIC VIEW``
+     - :ref:`ALTER SEMANTIC VIEW <ref-alter-semantic-view>` (RENAME TO, SET COMMENT, UNSET COMMENT)
+   * - Drop a view
+     - ``DROP SEMANTIC VIEW``
+     - :ref:`DROP SEMANTIC VIEW <ref-drop-semantic-view>`
 
 
 .. _explanation-sf-syntax:
@@ -263,6 +296,52 @@ Both systems support ``USING`` on metrics to select which relationship path a me
    )
 
 
+Facts Query Mode
+----------------
+
+.. versionadded:: 0.6.0
+
+Both systems allow facts to be queried directly as row-level columns. In Snowflake, facts appear in the ``SEMANTIC_VIEW()`` query function. In DuckDB Semantic Views, use the ``facts`` parameter:
+
+.. code-block:: sql
+
+   -- DuckDB: query facts as row-level columns
+   SELECT * FROM semantic_view('analytics',
+       dimensions := ['region'],
+       facts := ['net_price']
+   );
+
+.. warning::
+
+   In both systems, facts and metrics cannot be combined in the same query. Use ``facts := [...]`` OR ``metrics := [...]``, not both.
+
+
+Semi-Additive and Window Metrics
+---------------------------------
+
+.. versionadded:: 0.6.0
+
+Both systems support semi-additive metrics (``NON ADDITIVE BY``) and window function metrics (``OVER`` with ``PARTITION BY EXCLUDING``). The syntax is aligned:
+
+.. code-block:: sql
+
+   -- Semi-additive: last balance per account, summed across customers
+   METRICS (
+       a.balance NON ADDITIVE BY (date_dim) AS SUM(a.amount)
+   )
+
+   -- Window: rolling average excluding region from partition
+   METRICS (
+       o.avg_qty AS AVG(total_qty) OVER (PARTITION BY EXCLUDING region ORDER BY month)
+   )
+
+The behavioral differences are:
+
+- ``NON ADDITIVE BY`` dimensions must be declared in the view's ``DIMENSIONS`` clause. Snowflake validates against its own catalog.
+- Window metrics and ``NON ADDITIVE BY`` cannot be combined on the same metric (mutually exclusive).
+- Window metrics cannot be mixed with aggregate metrics in the same query.
+
+
 .. _explanation-sf-not-supported:
 
 Features Not Yet Supported
@@ -276,10 +355,6 @@ The following Snowflake ``CREATE SEMANTIC VIEW`` features are not yet implemente
 
    * - Snowflake Feature
      - Status
-   * - Semi-additive metrics (``SEMI ADDITIVE``)
-     - Deferred; requires expansion pipeline changes
-   * - Window function metrics
-     - Not planned; DuckDB handles these in regular SQL
    * - Direct SQL query interface
      - Not planned; :ref:`semantic_view() <ref-semantic-view-function>` table function is the query interface
    * - Column-level security

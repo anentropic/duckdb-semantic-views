@@ -1,0 +1,157 @@
+# Phase 46: Wildcard Selection (table_alias.*)
+# Tests WILD-01 (dimension wildcard), WILD-02 (metric wildcard),
+# WILD-03 (PRIVATE exclusion), facts parameter, mutual exclusion.
+
+require semantic_views
+
+# ============================================================
+# Setup: orders + line_items tables
+# ============================================================
+
+statement ok
+CREATE TABLE p46_orders (id INTEGER PRIMARY KEY, region VARCHAR, status VARCHAR, order_date DATE);
+
+statement ok
+INSERT INTO p46_orders VALUES
+    (1, 'US', 'shipped', '2024-01-01'),
+    (2, 'EU', 'pending', '2024-01-02'),
+    (3, 'US', 'shipped', '2024-01-03');
+
+statement ok
+CREATE TABLE p46_line_items (id INTEGER PRIMARY KEY, order_id INTEGER, product VARCHAR, quantity INTEGER, price DECIMAL(10,2), discount DECIMAL(5,2));
+
+statement ok
+INSERT INTO p46_line_items VALUES
+    (1, 1, 'Widget', 10, 100.00, 0.10),
+    (2, 1, 'Gadget', 5, 50.00, 0.00),
+    (3, 2, 'Widget', 3, 100.00, 0.05),
+    (4, 3, 'Gadget', 7, 50.00, 0.15);
+
+# ============================================================
+# Setup: semantic view with multi-table, PRIVATE metrics
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p46_analytics AS
+TABLES (
+    o AS p46_orders PRIMARY KEY (id),
+    li AS p46_line_items PRIMARY KEY (id)
+)
+RELATIONSHIPS (
+    li_to_o AS li(order_id) REFERENCES o
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.status AS o.status,
+    o.order_date AS o.order_date,
+    li.product AS li.product
+)
+METRICS (
+    o.order_count AS count(*),
+    li.total_quantity AS sum(li.quantity),
+    PRIVATE li.raw_revenue AS sum(li.price * li.quantity),
+    li.net_revenue AS sum(li.price * li.quantity * (1 - li.discount))
+);
+
+# ============================================================
+# WILD-01: Dimension wildcard
+# ============================================================
+
+# o.* should expand to region, status, order_date (all dims on table o)
+query TTTI
+FROM semantic_view('p46_analytics', dimensions := ['o.*'], metrics := ['o.order_count'])
+ORDER BY region, order_date;
+----
+EU	pending	2024-01-02	1
+US	shipped	2024-01-01	1
+US	shipped	2024-01-03	1
+
+# li.* should expand to product only
+query TI
+FROM semantic_view('p46_analytics', dimensions := ['li.*'], metrics := ['li.total_quantity'])
+ORDER BY product;
+----
+Gadget	12
+Widget	13
+
+# ============================================================
+# WILD-02: Metric wildcard
+# ============================================================
+
+# li.* in metrics should expand to total_quantity and net_revenue (raw_revenue is PRIVATE)
+query TIR
+FROM semantic_view('p46_analytics', dimensions := ['o.region'], metrics := ['li.*'])
+ORDER BY region;
+----
+EU	3	285.0000
+US	22	1447.5000
+
+# ============================================================
+# WILD-03: PRIVATE exclusion
+# ============================================================
+
+# Verify PRIVATE metric raw_revenue is NOT included in li.* wildcard
+# The query above returns 3 columns (region + 2 metrics), not 4
+
+# ============================================================
+# Mixed wildcard + explicit: deduplication
+# ============================================================
+
+# Explicit name + wildcard that includes same name: deduplication
+# region is explicit, o.* adds status and order_date (region deduped)
+query TTTI
+FROM semantic_view('p46_analytics', dimensions := ['region', 'o.*'], metrics := ['o.order_count'])
+ORDER BY region, status, order_date;
+----
+EU	pending	2024-01-02	1
+US	shipped	2024-01-01	1
+US	shipped	2024-01-03	1
+
+# ============================================================
+# Error cases
+# ============================================================
+
+# Unknown alias
+statement error
+FROM semantic_view('p46_analytics', dimensions := ['nonexistent.*'], metrics := ['o.order_count']);
+----
+unknown table alias 'nonexistent'
+
+# Bare wildcard (unqualified *)
+statement error
+FROM semantic_view('p46_analytics', dimensions := ['*'], metrics := ['o.order_count']);
+----
+unqualified wildcard
+
+# ============================================================
+# explain_semantic_view with wildcards
+# ============================================================
+
+# Verify explain works with wildcards (just check it returns rows)
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p46_analytics', dimensions := ['o.*'], metrics := ['o.order_count'])
+WHERE explain_output LIKE '%region%';
+----
+true
+
+# ============================================================
+# facts/metrics mutual exclusion
+# ============================================================
+
+statement error
+FROM semantic_view('p46_analytics', dimensions := ['o.region'], metrics := ['o.order_count'], facts := ['f1']);
+----
+cannot combine facts and metrics
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p46_analytics;
+
+statement ok
+DROP TABLE p46_line_items;
+
+statement ok
+DROP TABLE p46_orders;

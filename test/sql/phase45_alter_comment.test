@@ -1,0 +1,161 @@
+# Phase 45: ALTER SEMANTIC VIEW SET/UNSET COMMENT
+#
+# Verifies ALTER SEMANTIC VIEW SET COMMENT and UNSET COMMENT DDL support:
+#   ALT-01: ALTER SEMANTIC VIEW v SET COMMENT = 'text' sets the comment
+#   ALT-02: ALTER SEMANTIC VIEW v UNSET COMMENT removes the comment
+#
+# Requirements covered:
+#   ALT-01, ALT-02
+
+require semantic_views
+
+# ============================================================
+# Setup: create tables and a semantic view with a comment
+# ============================================================
+
+statement ok
+CREATE TABLE p45_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), region VARCHAR);
+
+statement ok
+INSERT INTO p45_orders VALUES (1, 100.00, 'US'), (2, 200.00, 'EU');
+
+statement ok
+CREATE SEMANTIC VIEW p45_sv
+  COMMENT = 'Initial comment'
+AS
+  TABLES (
+    o AS p45_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.total AS SUM(o.amount)
+  )
+
+# Verify initial comment is visible
+query TTTTT
+SELECT name, kind, database_name, schema_name, comment FROM list_semantic_views()
+----
+p45_sv	SEMANTIC_VIEW	memory	main	Initial comment
+
+# ============================================================
+# Test 1: SET COMMENT changes the comment
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW p45_sv SET COMMENT = 'Updated comment'
+
+query TTTTT
+SELECT name, kind, database_name, schema_name, comment FROM list_semantic_views()
+----
+p45_sv	SEMANTIC_VIEW	memory	main	Updated comment
+
+# Verify DESCRIBE shows the new comment
+query TTTTT
+SELECT * FROM describe_semantic_view('p45_sv') WHERE property = 'COMMENT' AND object_kind = '';
+----
+(empty)	(empty)	(empty)	COMMENT	Updated comment
+
+# ============================================================
+# Test 2: SET COMMENT overwrites existing comment
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW p45_sv SET COMMENT = 'Second update'
+
+query TTTTT
+SELECT name, kind, database_name, schema_name, comment FROM list_semantic_views()
+----
+p45_sv	SEMANTIC_VIEW	memory	main	Second update
+
+# ============================================================
+# Test 3: UNSET COMMENT removes the comment
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW p45_sv UNSET COMMENT
+
+query TTTTT
+SELECT name, kind, database_name, schema_name, comment FROM list_semantic_views()
+----
+p45_sv	SEMANTIC_VIEW	memory	main	(empty)
+
+# ============================================================
+# Test 4: SET COMMENT with escaped single quotes
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW p45_sv SET COMMENT = 'it''s escaped'
+
+query TTTTT
+SELECT name, kind, database_name, schema_name, comment FROM list_semantic_views()
+----
+p45_sv	SEMANTIC_VIEW	memory	main	it's escaped
+
+# ============================================================
+# Test 5: IF EXISTS on nonexistent view (SET COMMENT) -- no-op
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW IF EXISTS nonexistent_view SET COMMENT = 'noop'
+
+# ============================================================
+# Test 6: IF EXISTS on nonexistent view (UNSET COMMENT) -- no-op
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW IF EXISTS nonexistent_view UNSET COMMENT
+
+# ============================================================
+# Test 7: Non-IF EXISTS on nonexistent view (SET COMMENT) -- error
+# ============================================================
+
+statement error
+ALTER SEMANTIC VIEW nonexistent_view SET COMMENT = 'fail'
+----
+does not exist
+
+# ============================================================
+# Test 8: Non-IF EXISTS on nonexistent view (UNSET COMMENT) -- error
+# ============================================================
+
+statement error
+ALTER SEMANTIC VIEW nonexistent_view UNSET COMMENT
+----
+does not exist
+
+# ============================================================
+# Test 9: Query still works after SET/UNSET COMMENT
+# ============================================================
+
+query TR rowsort
+SELECT * FROM semantic_view('p45_sv', dimensions := ['region'], metrics := ['total']);
+----
+EU	200.00
+US	100.00
+
+# ============================================================
+# Test 10: Case insensitive DDL
+# ============================================================
+
+statement ok
+alter semantic view p45_sv set comment = 'lowercase test'
+
+query TTTTT
+SELECT name, kind, database_name, schema_name, comment FROM list_semantic_views()
+----
+p45_sv	SEMANTIC_VIEW	memory	main	lowercase test
+
+statement ok
+alter semantic view p45_sv unset comment
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p45_sv
+
+statement ok
+DROP TABLE p45_orders

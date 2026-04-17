@@ -100,7 +100,9 @@ pub fn catalog_insert(
     // Validate JSON before writing — fail fast, nothing written on invalid input
     SemanticViewDefinition::from_json(name, json).map_err(Box::<dyn std::error::Error>::from)?;
 
-    let mut guard = state.write().unwrap();
+    let mut guard = state
+        .write()
+        .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
     if guard.contains_key(name) {
         return Err(format!(
             "semantic view '{name}' already exists; use CREATE OR REPLACE SEMANTIC VIEW to overwrite"
@@ -118,7 +120,9 @@ pub fn catalog_delete(
     state: &CatalogState,
     name: &str,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut guard = state.write().unwrap();
+    let mut guard = state
+        .write()
+        .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
     if !guard.contains_key(name) {
         return Err(format!("semantic view '{name}' does not exist").into());
     }
@@ -140,7 +144,7 @@ pub fn catalog_upsert(
     SemanticViewDefinition::from_json(name, json).map_err(Box::<dyn std::error::Error>::from)?;
     state
         .write()
-        .unwrap()
+        .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
         .insert(name.to_string(), json.to_string());
     Ok(())
 }
@@ -149,7 +153,9 @@ pub fn catalog_upsert(
 ///
 /// Unlike `catalog_delete`, this silently succeeds when the view does not exist.
 pub fn catalog_delete_if_exists(state: &CatalogState, name: &str) {
-    state.write().unwrap().remove(name);
+    if let Ok(mut guard) = state.write() {
+        guard.remove(name);
+    }
 }
 
 /// Rename a semantic view in the in-memory catalog.
@@ -161,7 +167,9 @@ pub fn catalog_rename(
     old_name: &str,
     new_name: &str,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut guard = state.write().unwrap();
+    let mut guard = state
+        .write()
+        .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
     let json = guard
         .remove(old_name)
         .ok_or_else(|| format!("semantic view '{old_name}' does not exist"))?;
@@ -201,13 +209,16 @@ mod ffi_catalog {
         name_ptr: *const c_char,
         json_ptr: *const c_char,
     ) -> i32 {
-        let Some(state) = catalog_ptr.as_ref() else {
-            return -1;
-        };
-        let (Some(name), Some(json)) = (str_from_ptr(name_ptr), str_from_ptr(json_ptr)) else {
-            return -1;
-        };
-        catalog_insert(state, name, json).map(|_| 0).unwrap_or(-1)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(state) = catalog_ptr.as_ref() else {
+                return -1;
+            };
+            let (Some(name), Some(json)) = (str_from_ptr(name_ptr), str_from_ptr(json_ptr)) else {
+                return -1;
+            };
+            catalog_insert(state, name, json).map(|_| 0).unwrap_or(-1)
+        }));
+        result.unwrap_or(-1)
     }
 
     /// Upsert a semantic view in the in-memory catalog.
@@ -218,13 +229,16 @@ mod ffi_catalog {
         name_ptr: *const c_char,
         json_ptr: *const c_char,
     ) -> i32 {
-        let Some(state) = catalog_ptr.as_ref() else {
-            return -1;
-        };
-        let (Some(name), Some(json)) = (str_from_ptr(name_ptr), str_from_ptr(json_ptr)) else {
-            return -1;
-        };
-        catalog_upsert(state, name, json).map(|_| 0).unwrap_or(-1)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(state) = catalog_ptr.as_ref() else {
+                return -1;
+            };
+            let (Some(name), Some(json)) = (str_from_ptr(name_ptr), str_from_ptr(json_ptr)) else {
+                return -1;
+            };
+            catalog_upsert(state, name, json).map(|_| 0).unwrap_or(-1)
+        }));
+        result.unwrap_or(-1)
     }
 
     /// Delete a semantic view from the in-memory catalog.
@@ -234,13 +248,16 @@ mod ffi_catalog {
         catalog_ptr: *const CatalogState,
         name_ptr: *const c_char,
     ) -> i32 {
-        let Some(state) = catalog_ptr.as_ref() else {
-            return -1;
-        };
-        let Some(name) = str_from_ptr(name_ptr) else {
-            return -1;
-        };
-        catalog_delete(state, name).map(|_| 0).unwrap_or(-1)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(state) = catalog_ptr.as_ref() else {
+                return -1;
+            };
+            let Some(name) = str_from_ptr(name_ptr) else {
+                return -1;
+            };
+            catalog_delete(state, name).map(|_| 0).unwrap_or(-1)
+        }));
+        result.unwrap_or(-1)
     }
 
     /// Delete a semantic view if it exists; silently succeeds if absent.
@@ -250,14 +267,17 @@ mod ffi_catalog {
         catalog_ptr: *const CatalogState,
         name_ptr: *const c_char,
     ) -> i32 {
-        let Some(state) = catalog_ptr.as_ref() else {
-            return -1;
-        };
-        let Some(name) = str_from_ptr(name_ptr) else {
-            return -1;
-        };
-        catalog_delete_if_exists(state, name);
-        0
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(state) = catalog_ptr.as_ref() else {
+                return -1;
+            };
+            let Some(name) = str_from_ptr(name_ptr) else {
+                return -1;
+            };
+            catalog_delete_if_exists(state, name);
+            0
+        }));
+        result.unwrap_or(-1)
     }
 }
 
@@ -453,6 +473,89 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("does not exist"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn catalog_insert_poisoned_lock_returns_error() {
+        let state: CatalogState = Arc::new(RwLock::new(HashMap::new()));
+        // Poison the lock by panicking in a write guard
+        let state_clone = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state_clone.write().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        // Lock is now poisoned
+        let result = catalog_insert(
+            &state,
+            "test",
+            r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#,
+        );
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("poisoned"),
+            "Expected poisoned error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn catalog_delete_poisoned_lock_returns_error() {
+        let state: CatalogState = Arc::new(RwLock::new(HashMap::new()));
+        let state_clone = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state_clone.write().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        let result = catalog_delete(&state, "test");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("poisoned"));
+    }
+
+    #[test]
+    fn catalog_upsert_poisoned_lock_returns_error() {
+        let state: CatalogState = Arc::new(RwLock::new(HashMap::new()));
+        let state_clone = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state_clone.write().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        let result = catalog_upsert(
+            &state,
+            "test",
+            r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("poisoned"));
+    }
+
+    #[test]
+    fn catalog_delete_if_exists_poisoned_lock_does_not_panic() {
+        let state: CatalogState = Arc::new(RwLock::new(HashMap::new()));
+        let state_clone = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state_clone.write().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        // Should not panic — silently ignores poisoned lock
+        catalog_delete_if_exists(&state, "test");
+    }
+
+    #[test]
+    fn catalog_rename_poisoned_lock_returns_error() {
+        let state: CatalogState = Arc::new(RwLock::new(HashMap::new()));
+        let state_clone = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state_clone.write().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        let result = catalog_rename(&state, "old", "new");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("poisoned"));
     }
 
     #[test]

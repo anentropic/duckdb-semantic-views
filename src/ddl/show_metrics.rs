@@ -6,12 +6,13 @@ use duckdb::{
 };
 
 use crate::catalog::CatalogState;
+use crate::ddl::describe::format_json_array;
 use crate::model::SemanticViewDefinition;
 
 /// A single row in the SHOW SEMANTIC METRICS output.
 ///
-/// 6 Snowflake-aligned columns: database_name, schema_name, semantic_view_name,
-/// table_name, name, data_type.
+/// 8 Snowflake-aligned columns: database_name, schema_name, semantic_view_name,
+/// table_name, name, data_type, synonyms, comment.
 struct ShowMetricRow {
     database_name: String,
     schema_name: String,
@@ -19,6 +20,8 @@ struct ShowMetricRow {
     table_name: String,
     name: String,
     data_type: String,
+    synonyms: String,
+    comment: String,
 }
 
 /// Bind-time data: pre-collected metric rows.
@@ -39,7 +42,7 @@ pub struct ShowMetricsInitData {
 unsafe impl Send for ShowMetricsInitData {}
 unsafe impl Sync for ShowMetricsInitData {}
 
-/// Helper: declare the 6-column output schema for metrics.
+/// Helper: declare the 8-column output schema for metrics.
 fn bind_output_columns(bind: &BindInfo) {
     bind.add_result_column(
         "database_name",
@@ -59,6 +62,8 @@ fn bind_output_columns(bind: &BindInfo) {
     );
     bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
     bind.add_result_column("data_type", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+    bind.add_result_column("synonyms", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+    bind.add_result_column("comment", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 }
 
 /// Helper: collect metric rows for a single view.
@@ -84,6 +89,8 @@ fn collect_metrics(view_name: &str, json: &str) -> Vec<ShowMetricRow> {
                 table_name,
                 name: m.name.clone(),
                 data_type: m.output_type.clone().unwrap_or_default(),
+                synonyms: format_json_array(&m.synonyms),
+                comment: m.comment.clone().unwrap_or_default(),
             }
         })
         .collect()
@@ -111,6 +118,8 @@ fn emit_rows(
     let table_vec = output.flat_vector(3);
     let name_vec = output.flat_vector(4);
     let type_vec = output.flat_vector(5);
+    let syn_vec = output.flat_vector(6);
+    let cmt_vec = output.flat_vector(7);
 
     for (i, row) in bind_data.rows.iter().enumerate() {
         db_name_vec.insert(i, row.database_name.as_str());
@@ -119,6 +128,8 @@ fn emit_rows(
         table_vec.insert(i, row.table_name.as_str());
         name_vec.insert(i, row.name.as_str());
         type_vec.insert(i, row.data_type.as_str());
+        syn_vec.insert(i, row.synonyms.as_str());
+        cmt_vec.insert(i, row.comment.as_str());
     }
     output.set_len(n);
     Ok(())
@@ -138,20 +149,26 @@ impl VTab for ShowSemanticMetricsVTab {
     type InitData = ShowMetricsInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        bind_output_columns(bind);
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            bind_output_columns(bind);
 
-        let view_name = bind.get_parameter(0).to_string();
-        let state_ptr = bind.get_extra_info::<CatalogState>();
-        let guard = unsafe { (*state_ptr).read().expect("catalog RwLock poisoned") };
+            let view_name = bind.get_parameter(0).to_string();
+            let state_ptr = bind.get_extra_info::<CatalogState>();
+            let guard = unsafe {
+                (*state_ptr)
+                    .read()
+                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
+            };
 
-        let json = guard
-            .get(&view_name)
-            .ok_or_else(|| format!("semantic view '{view_name}' does not exist"))?;
+            let json = guard
+                .get(&view_name)
+                .ok_or_else(|| format!("semantic view '{view_name}' does not exist"))?;
 
-        let mut rows = collect_metrics(&view_name, json);
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
+            let mut rows = collect_metrics(&view_name, json);
+            rows.sort_by(|a, b| a.name.cmp(&b.name));
 
-        Ok(ShowMetricsBindData { rows })
+            Ok(ShowMetricsBindData { rows })
+        }))
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
@@ -186,23 +203,28 @@ impl VTab for ShowSemanticMetricsAllVTab {
     type InitData = ShowMetricsInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        bind_output_columns(bind);
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            bind_output_columns(bind);
 
-        let state_ptr = bind.get_extra_info::<CatalogState>();
-        let guard = unsafe { (*state_ptr).read().expect("catalog RwLock poisoned") };
+            let state_ptr = bind.get_extra_info::<CatalogState>();
+            let guard = unsafe {
+                (*state_ptr)
+                    .read()
+                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
+            };
 
-        let mut rows = Vec::new();
-        for (name, json) in guard.iter() {
-            rows.extend(collect_metrics(name, json));
-        }
-        // Sort by (semantic_view_name, name) for deterministic output.
-        rows.sort_by(|a, b| {
-            a.semantic_view_name
-                .cmp(&b.semantic_view_name)
-                .then_with(|| a.name.cmp(&b.name))
-        });
+            let mut rows = Vec::new();
+            for (name, json) in guard.iter() {
+                rows.extend(collect_metrics(name, json));
+            }
+            rows.sort_by(|a, b| {
+                a.semantic_view_name
+                    .cmp(&b.semantic_view_name)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
 
-        Ok(ShowMetricsBindData { rows })
+            Ok(ShowMetricsBindData { rows })
+        }))
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {

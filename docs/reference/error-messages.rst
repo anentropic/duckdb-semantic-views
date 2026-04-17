@@ -163,6 +163,111 @@ Circular fact or metric references
 **Fix:** Break the cycle by removing or restructuring the circular reference.
 
 
+NON ADDITIVE BY dimension not found
+------------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   NON ADDITIVE BY dimension '<dim>' on metric '<name>' does not match any
+   declared dimension. Did you mean '<suggestion>'?
+
+**Cause:** A ``NON ADDITIVE BY`` clause references a dimension name that does not exist in the view's ``DIMENSIONS`` clause.
+
+**Fix:** Check the dimension name against the declared dimensions. The error suggests close matches when available.
+
+
+Window metric inner metric not found
+-------------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   Window metric '<name>': inner metric '<inner>' not found in semantic view
+   metrics. Did you mean '<suggestion>'?
+
+**Cause:** A window function metric wraps another metric (e.g., ``AVG(total_qty) OVER (...)``), but the inner metric ``total_qty`` does not exist in the ``METRICS`` clause.
+
+**Fix:** Ensure the inner metric is declared before the window metric. The error suggests close matches.
+
+
+Window metric EXCLUDING dimension not found
+--------------------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   Window metric '<name>': EXCLUDING dimension '<dim>' not found in semantic
+   view dimensions. Did you mean '<suggestion>'?
+
+**Cause:** A window metric's ``PARTITION BY EXCLUDING`` clause references a dimension that does not exist.
+
+**Fix:** Check the dimension name. The error suggests close matches. All dimensions in ``EXCLUDING`` must be declared in the view's ``DIMENSIONS`` clause.
+
+
+Window metric PARTITION BY dimension not found
+-----------------------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   Window metric '<name>': PARTITION BY dimension '<dim>' not found in semantic
+   view dimensions. Did you mean '<suggestion>'?
+
+**Cause:** A window metric's ``PARTITION BY`` clause (without ``EXCLUDING``) references a dimension that does not exist in the view's ``DIMENSIONS`` clause.
+
+**Fix:** Check the dimension name. The error suggests close matches. All dimensions in ``PARTITION BY`` must be declared in the view's ``DIMENSIONS`` clause.
+
+
+Window metric ORDER BY dimension not found
+-------------------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   Window metric '<name>': ORDER BY dimension '<dim>' not found in semantic
+   view dimensions. Did you mean '<suggestion>'?
+
+**Cause:** A window metric's ``ORDER BY`` clause references a dimension that does not exist in the view's ``DIMENSIONS`` clause.
+
+**Fix:** Check the dimension name. The error suggests close matches.
+
+
+OVER and NON ADDITIVE BY conflict
+-----------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   Cannot combine OVER clause with NON ADDITIVE BY on metric '<name>'.
+   Use one or the other.
+
+**Cause:** A metric definition includes both a window function ``OVER (...)`` clause and a ``NON ADDITIVE BY (...)`` clause. These are mutually exclusive features.
+
+**Fix:** Use either ``NON ADDITIVE BY`` (for semi-additive snapshot aggregation) or ``OVER`` (for window functions), not both on the same metric.
+
+
+OVER clause not allowed on derived metric
+-------------------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   OVER clause not allowed on derived metric '<name>'. Only qualified metrics
+   (alias.name) can use OVER.
+
+**Cause:** A derived metric (one without a table alias) has an ``OVER`` clause. Window metrics require a qualified name (``alias.metric_name``) because they need a source table for join resolution.
+
+**Fix:** Add a table alias to the metric name: change ``my_metric AS AVG(total) OVER (...)`` to ``alias.my_metric AS AVG(total) OVER (...)``.
+
+
 .. _ref-err-query:
 
 Query Errors (semantic_view)
@@ -190,12 +295,13 @@ Empty request
 
 .. code-block:: text
 
-   semantic view '<name>': specify at least dimensions := [...] or metrics := [...].
-   Run DESCRIBE SEMANTIC VIEW <name> to see available dimensions and metrics.
+   semantic view '<name>': specify at least dimensions := [...], metrics := [...],
+   or facts := [...].
+   Run DESCRIBE SEMANTIC VIEW <name> to see available dimensions, metrics, and facts.
 
-**Cause:** Neither ``dimensions`` nor ``metrics`` was specified in the query.
+**Cause:** Neither ``dimensions``, ``metrics``, nor ``facts`` was specified in the query.
 
-**Fix:** Add at least one of ``dimensions := [...]`` or ``metrics := [...]``.
+**Fix:** Add at least one of ``dimensions := [...]``, ``metrics := [...]``, or ``facts := [...]``.
 
 
 Unknown dimension
@@ -268,18 +374,160 @@ Ambiguous dimension path
 **Fix:** See :ref:`howto-role-playing`. Add a metric with ``USING (<rel_name>)`` to disambiguate, or use a dimension from a table that is not a role-playing target.
 
 
-SQL execution failed
+Private metric
+--------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   semantic view '<view>': metric '<name>' is private and cannot be queried
+   directly. Private metrics can only be used in derived metric expressions.
+
+**Cause:** A metric marked ``PRIVATE`` was requested in the ``metrics := [...]`` list.
+
+**Fix:** Private metrics exist for internal composition only. Query a public derived metric that uses the private metric, or recreate the view without the ``PRIVATE`` keyword. See :ref:`howto-metadata-annotations`.
+
+
+Private fact
+------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   semantic view '<view>': fact '<name>' is private and cannot be queried
+   directly. Private facts can only be used in derived expressions.
+
+**Cause:** A fact marked ``PRIVATE`` was requested in the ``facts := [...]`` list.
+
+**Fix:** Remove the ``PRIVATE`` keyword from the fact to make it queryable, or reference the fact only from metric expressions.
+
+
+Cannot combine facts and metrics
+----------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   semantic view '<view>': cannot combine facts and metrics in the same query.
+   Use facts := [...] OR metrics := [...], not both.
+
+**Cause:** The query includes both ``facts := [...]`` and ``metrics := [...]``. Facts are row-level expressions; metrics are aggregated. These modes are mutually exclusive.
+
+**Fix:** Run two separate queries -- one for facts and one for metrics.
+
+
+Unknown fact
+------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   semantic view '<view>': unknown fact '<name>'. Available: [<list>].
+   Did you mean '<suggestion>'?
+
+**Cause:** A requested fact name does not match any fact in the view's ``FACTS`` clause.
+
+**Fix:** Check the fact name against declared facts. The error suggests close matches.
+
+
+Duplicate fact
+--------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   semantic view '<view>': duplicate fact '<name>'
+
+**Cause:** The same fact name appears more than once in the ``facts := [...]`` list.
+
+**Fix:** Remove the duplicate from the ``facts`` list.
+
+
+Incompatible table paths for facts
+------------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   semantic view '<view>': fact query references objects from incompatible
+   table paths -- tables '<table_a>' and '<table_b>' are not on the same
+   root-to-leaf path in the relationship tree
+
+**Cause:** A fact query combines facts and dimensions from tables that are on different branches of the relationship tree. All objects in a fact query must be on the same root-to-leaf path.
+
+**Fix:** Restrict the query to facts and dimensions from tables that share a direct path in the relationship tree.
+
+
+Window and aggregate metric mixing
+------------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   semantic view '<view>': cannot mix window function metrics [<window_metrics>]
+   with aggregate metrics [<aggregate_metrics>] in the same query
+
+**Cause:** The query requests both window function metrics and standard aggregate metrics. These produce different result shapes (row-level vs. grouped) and cannot be combined.
+
+**Fix:** Run separate queries for window metrics and aggregate metrics.
+
+
+Window metric required dimension missing
+------------------------------------------
+
+.. versionadded:: 0.6.0
+
+.. code-block:: text
+
+   semantic view '<view>': window function metric '<metric>' requires
+   dimension '<dim>' to be included in the query (used in <reason>)
+
+**Cause:** A window function metric references a dimension in its ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clause, but that dimension was not included in the query's ``dimensions := [...]`` list. The ``<reason>`` value indicates which clause requires the dimension (``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY``).
+
+**Fix:** Add the required dimension to the query. Use :ref:`SHOW SEMANTIC DIMENSIONS FOR METRIC <ref-show-dims-for-metric>` to see which dimensions are required (``required = TRUE``) for a window metric.
+
+
+.. _ref-err-wildcard:
+
+Wildcard Errors
+================
+
+.. versionadded:: 0.6.0
+
+These errors occur when using ``alias.*`` wildcard patterns in ``dimensions``, ``metrics``, or ``facts`` parameters.
+
+
+Unqualified wildcard
 --------------------
 
 .. code-block:: text
 
-   SQL execution failed: <duckdb_error>
-   Expanded SQL:
-   <generated_sql>
+   unqualified wildcard '*' is not supported. Use table_alias.* to select
+   all items for a specific table.
 
-**Cause:** The generated SQL failed when DuckDB executed it. Common causes include dropped tables, column name changes, or type incompatibilities.
+**Cause:** A bare ``*`` was used without a table alias prefix.
 
-**Fix:** Check that the underlying tables still exist and their schemas match the semantic view definition. Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to inspect the generated SQL.
+**Fix:** Use ``alias.*`` instead of ``*``. For example: ``dimensions := ['o.*']`` to select all dimensions from the ``o`` table alias.
+
+
+Unknown table alias in wildcard
+---------------------------------
+
+.. code-block:: text
+
+   unknown table alias '<alias>' in wildcard '<alias>.*'. Available aliases:
+   [<list>]
+
+**Cause:** The table alias in a wildcard expression does not match any alias declared in the view's ``TABLES`` clause.
+
+**Fix:** Check the alias name against the declared table aliases. The error lists all available aliases.
 
 
 .. _ref-err-near-miss:

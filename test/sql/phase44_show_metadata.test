@@ -1,0 +1,144 @@
+# Phase 44: SHOW metadata columns (SHOW-01)
+# Tests that SHOW SEMANTIC DIMENSIONS/METRICS/FACTS include synonyms and comment columns,
+# and that SHOW SEMANTIC VIEWS includes comment column.
+
+require semantic_views
+
+# ============================================================
+# Setup: create tables and semantic views with metadata annotations
+# ============================================================
+
+statement ok
+CREATE TABLE p44s_orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount DECIMAL(10,2), order_date DATE);
+
+statement ok
+CREATE TABLE p44s_customers (id INTEGER PRIMARY KEY, name VARCHAR, region VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW annotated_sv
+  COMMENT = 'Sales analysis view'
+AS
+  TABLES (
+    o AS p44s_orders PRIMARY KEY (id),
+    c AS p44s_customers PRIMARY KEY (id)
+      COMMENT = 'Customer dimension table'
+      WITH SYNONYMS = ('clients', 'buyers')
+  )
+  RELATIONSHIPS (
+    orders_to_customers AS o(customer_id) REFERENCES c
+  )
+  FACTS (
+    o.raw_amount AS o.amount
+      COMMENT = 'Raw order amount'
+      WITH SYNONYMS = ('order_value', 'sale_amount')
+  )
+  DIMENSIONS (
+    c.customer_name AS c.name
+      COMMENT = 'Customer full name'
+      WITH SYNONYMS = ('client_name'),
+    c.region AS c.region,
+    o.order_date AS o.order_date
+      COMMENT = 'Date of order'
+  )
+  METRICS (
+    o.total_amount AS SUM(o.amount)
+      COMMENT = 'Total sales amount'
+      WITH SYNONYMS = ('total_sales', 'revenue'),
+    o.order_count AS COUNT(o.id)
+  )
+
+# Also create a plain view without annotations
+statement ok
+CREATE SEMANTIC VIEW plain_sv AS
+  TABLES (
+    o AS p44s_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.order_date AS o.order_date
+  )
+  METRICS (
+    o.total AS SUM(o.amount)
+  )
+
+# ============================================================
+# Test 1: SHOW SEMANTIC DIMENSIONS IN annotated_sv — verify synonyms and comment
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN annotated_sv
+----
+memory	main	annotated_sv	p44s_customers	customer_name	(empty)	["client_name"]	Customer full name
+memory	main	annotated_sv	p44s_customers	region	(empty)	[]	(empty)
+memory	main	annotated_sv	p44s_orders	order_date	(empty)	[]	Date of order
+
+# ============================================================
+# Test 2: SHOW SEMANTIC METRICS IN annotated_sv — verify synonyms and comment
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC METRICS IN annotated_sv
+----
+memory	main	annotated_sv	p44s_orders	order_count	(empty)	[]	(empty)
+memory	main	annotated_sv	p44s_orders	total_amount	(empty)	["total_sales","revenue"]	Total sales amount
+
+# ============================================================
+# Test 3: SHOW SEMANTIC FACTS IN annotated_sv — verify synonyms and comment
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC FACTS IN annotated_sv
+----
+memory	main	annotated_sv	p44s_orders	raw_amount	(empty)	["order_value","sale_amount"]	Raw order amount
+
+# ============================================================
+# Test 4: SHOW SEMANTIC VIEWS — verify comment column (6 columns total)
+# Select specific columns to avoid timestamp instability
+# ============================================================
+
+query TTTTT rowsort
+SELECT name, kind, database_name, schema_name, comment FROM list_semantic_views()
+----
+annotated_sv	SEMANTIC_VIEW	memory	main	Sales analysis view
+plain_sv	SEMANTIC_VIEW	memory	main	(empty)
+
+# ============================================================
+# Test 5: Cross-view SHOW SEMANTIC DIMENSIONS — metadata from multiple views
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS
+----
+memory	main	annotated_sv	p44s_customers	customer_name	(empty)	["client_name"]	Customer full name
+memory	main	annotated_sv	p44s_customers	region	(empty)	[]	(empty)
+memory	main	annotated_sv	p44s_orders	order_date	(empty)	[]	Date of order
+memory	main	plain_sv	p44s_orders	order_date	(empty)	[]	(empty)
+
+# ============================================================
+# Test 6: Plain view dims/metrics/facts have empty synonyms and comment
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN plain_sv
+----
+memory	main	plain_sv	p44s_orders	order_date	(empty)	[]	(empty)
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC METRICS IN plain_sv
+----
+memory	main	plain_sv	p44s_orders	total	(empty)	[]	(empty)
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW annotated_sv
+
+statement ok
+DROP SEMANTIC VIEW plain_sv
+
+statement ok
+DROP TABLE p44s_orders
+
+statement ok
+DROP TABLE p44s_customers

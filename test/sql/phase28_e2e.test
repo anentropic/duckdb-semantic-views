@@ -211,9 +211,11 @@ DIMENSION	tier	p28_customers	DATA_TYPE	(empty)
 METRIC	total_revenue	p28_orders	TABLE	p28_orders
 METRIC	total_revenue	p28_orders	EXPRESSION	sum(o.amount)
 METRIC	total_revenue	p28_orders	DATA_TYPE	(empty)
+METRIC	total_revenue	p28_orders	ACCESS_MODIFIER	PUBLIC
 METRIC	order_count	p28_orders	TABLE	p28_orders
 METRIC	order_count	p28_orders	EXPRESSION	count(*)
 METRIC	order_count	p28_orders	DATA_TYPE	(empty)
+METRIC	order_count	p28_orders	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================
 # Test 10: Error case -- unknown dimension

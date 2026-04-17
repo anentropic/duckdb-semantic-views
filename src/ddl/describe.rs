@@ -8,7 +8,7 @@ use duckdb::{
 use std::collections::HashMap;
 
 use crate::catalog::CatalogState;
-use crate::model::SemanticViewDefinition;
+use crate::model::{AccessModifier, SemanticViewDefinition};
 
 /// A single property row in the DESCRIBE output.
 ///
@@ -42,7 +42,7 @@ unsafe impl Sync for DescribeInitData {}
 
 /// Format column names as a JSON array: `["col1","col2"]`.
 /// Matches Snowflake format: no spaces after commas.
-fn format_json_array(items: &[String]) -> String {
+pub(crate) fn format_json_array(items: &[String]) -> String {
     let quoted: Vec<String> = items.iter().map(|s| format!("\"{s}\"")).collect();
     format!("[{}]", quoted.join(","))
 }
@@ -109,10 +109,28 @@ fn collect_table_rows(def: &SemanticViewDefinition, rows: &mut Vec<DescribeRow>)
         if !table.pk_columns.is_empty() {
             rows.push(DescribeRow {
                 object_kind: "TABLE".to_string(),
-                object_name: obj_name,
+                object_name: obj_name.clone(),
                 parent_entity: String::new(),
                 property: "PRIMARY_KEY".to_string(),
                 property_value: format_json_array(&table.pk_columns),
+            });
+        }
+        if let Some(ref comment) = table.comment {
+            rows.push(DescribeRow {
+                object_kind: "TABLE".to_string(),
+                object_name: obj_name.clone(),
+                parent_entity: String::new(),
+                property: "COMMENT".to_string(),
+                property_value: comment.clone(),
+            });
+        }
+        if !table.synonyms.is_empty() {
+            rows.push(DescribeRow {
+                object_kind: "TABLE".to_string(),
+                object_name: obj_name,
+                parent_entity: String::new(),
+                property: "SYNONYMS".to_string(),
+                property_value: format_json_array(&table.synonyms),
             });
         }
     }
@@ -208,9 +226,37 @@ fn collect_fact_rows(
         rows.push(DescribeRow {
             object_kind: "FACT".to_string(),
             object_name: fact.name.clone(),
-            parent_entity: parent,
+            parent_entity: parent.clone(),
             property: "DATA_TYPE".to_string(),
             property_value: fact.output_type.clone().unwrap_or_default(),
+        });
+        if let Some(ref comment) = fact.comment {
+            rows.push(DescribeRow {
+                object_kind: "FACT".to_string(),
+                object_name: fact.name.clone(),
+                parent_entity: parent.clone(),
+                property: "COMMENT".to_string(),
+                property_value: comment.clone(),
+            });
+        }
+        if !fact.synonyms.is_empty() {
+            rows.push(DescribeRow {
+                object_kind: "FACT".to_string(),
+                object_name: fact.name.clone(),
+                parent_entity: parent.clone(),
+                property: "SYNONYMS".to_string(),
+                property_value: format_json_array(&fact.synonyms),
+            });
+        }
+        rows.push(DescribeRow {
+            object_kind: "FACT".to_string(),
+            object_name: fact.name.clone(),
+            parent_entity: parent,
+            property: "ACCESS_MODIFIER".to_string(),
+            property_value: match fact.access {
+                AccessModifier::Public => "PUBLIC".to_string(),
+                AccessModifier::Private => "PRIVATE".to_string(),
+            },
         });
     }
 }
@@ -248,10 +294,28 @@ fn collect_dimension_rows(
         rows.push(DescribeRow {
             object_kind: "DIMENSION".to_string(),
             object_name: dim.name.clone(),
-            parent_entity: parent,
+            parent_entity: parent.clone(),
             property: "DATA_TYPE".to_string(),
             property_value: dim.output_type.clone().unwrap_or_default(),
         });
+        if let Some(ref comment) = dim.comment {
+            rows.push(DescribeRow {
+                object_kind: "DIMENSION".to_string(),
+                object_name: dim.name.clone(),
+                parent_entity: parent.clone(),
+                property: "COMMENT".to_string(),
+                property_value: comment.clone(),
+            });
+        }
+        if !dim.synonyms.is_empty() {
+            rows.push(DescribeRow {
+                object_kind: "DIMENSION".to_string(),
+                object_name: dim.name.clone(),
+                parent_entity: parent,
+                property: "SYNONYMS".to_string(),
+                property_value: format_json_array(&dim.synonyms),
+            });
+        }
     }
 }
 
@@ -301,10 +365,119 @@ fn collect_metric_rows(
         rows.push(DescribeRow {
             object_kind: object_kind.to_string(),
             object_name: metric.name.clone(),
-            parent_entity: parent,
+            parent_entity: parent.clone(),
             property: "DATA_TYPE".to_string(),
             property_value: metric.output_type.clone().unwrap_or_default(),
         });
+        if let Some(ref comment) = metric.comment {
+            rows.push(DescribeRow {
+                object_kind: object_kind.to_string(),
+                object_name: metric.name.clone(),
+                parent_entity: parent.clone(),
+                property: "COMMENT".to_string(),
+                property_value: comment.clone(),
+            });
+        }
+        if !metric.synonyms.is_empty() {
+            rows.push(DescribeRow {
+                object_kind: object_kind.to_string(),
+                object_name: metric.name.clone(),
+                parent_entity: parent.clone(),
+                property: "SYNONYMS".to_string(),
+                property_value: format_json_array(&metric.synonyms),
+            });
+        }
+        rows.push(DescribeRow {
+            object_kind: object_kind.to_string(),
+            object_name: metric.name.clone(),
+            parent_entity: parent.clone(),
+            property: "ACCESS_MODIFIER".to_string(),
+            property_value: match metric.access {
+                AccessModifier::Public => "PUBLIC".to_string(),
+                AccessModifier::Private => "PRIVATE".to_string(),
+            },
+        });
+        if !metric.non_additive_by.is_empty() {
+            let na_value = metric
+                .non_additive_by
+                .iter()
+                .map(|na| {
+                    let mut s = na.dimension.clone();
+                    match na.order {
+                        crate::model::SortOrder::Desc => s.push_str(" DESC"),
+                        crate::model::SortOrder::Asc => {}
+                    }
+                    match na.nulls {
+                        crate::model::NullsOrder::First => s.push_str(" NULLS FIRST"),
+                        crate::model::NullsOrder::Last => {}
+                    }
+                    s
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            rows.push(DescribeRow {
+                object_kind: object_kind.to_string(),
+                object_name: metric.name.clone(),
+                parent_entity: parent.clone(),
+                property: "NON_ADDITIVE_BY".to_string(),
+                property_value: na_value,
+            });
+        }
+        if let Some(ref ws) = metric.window_spec {
+            let mut ws_value = format!("{}({})", ws.window_function, ws.inner_metric);
+            if !ws.extra_args.is_empty() {
+                // Rewrite to include extra args: e.g., LAG(metric, 30)
+                ws_value = format!(
+                    "{}({}, {})",
+                    ws.window_function,
+                    ws.inner_metric,
+                    ws.extra_args.join(", ")
+                );
+            }
+            ws_value.push_str(" OVER (");
+            let has_partition = if !ws.excluding_dims.is_empty() {
+                ws_value.push_str("PARTITION BY EXCLUDING ");
+                ws_value.push_str(&ws.excluding_dims.join(", "));
+                true
+            } else if !ws.partition_dims.is_empty() {
+                ws_value.push_str("PARTITION BY ");
+                ws_value.push_str(&ws.partition_dims.join(", "));
+                true
+            } else {
+                false
+            };
+            if !ws.order_by.is_empty() {
+                if has_partition {
+                    ws_value.push(' ');
+                }
+                ws_value.push_str("ORDER BY ");
+                let ob_strs: Vec<String> = ws
+                    .order_by
+                    .iter()
+                    .map(|ob| {
+                        let mut s = ob.expr.clone();
+                        match ob.order {
+                            crate::model::SortOrder::Desc => s.push_str(" DESC"),
+                            crate::model::SortOrder::Asc => {}
+                        }
+                        match ob.nulls {
+                            crate::model::NullsOrder::First => s.push_str(" NULLS FIRST"),
+                            crate::model::NullsOrder::Last => {}
+                        }
+                        s
+                    })
+                    .collect();
+                ws_value.push_str(&ob_strs.join(", "));
+            }
+            ws_value.push(')');
+            rows.push(DescribeRow {
+                object_kind: object_kind.to_string(),
+                object_name: metric.name.clone(),
+                parent_entity: parent,
+                property: "WINDOW_SPEC".to_string(),
+                property_value: ws_value,
+            });
+        }
     }
 }
 
@@ -321,56 +494,71 @@ impl VTab for DescribeSemanticViewVTab {
     type InitData = DescribeInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        // Declare 5 output columns — all VARCHAR.
-        bind.add_result_column(
-            "object_kind",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
-        bind.add_result_column(
-            "object_name",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
-        bind.add_result_column(
-            "parent_entity",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
-        bind.add_result_column("property", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column(
-            "property_value",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            // Declare 5 output columns — all VARCHAR.
+            bind.add_result_column(
+                "object_kind",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column(
+                "object_name",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column(
+                "parent_entity",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column("property", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column(
+                "property_value",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
 
-        // Read the name parameter.
-        let name = bind.get_parameter(0).to_string();
+            // Read the name parameter.
+            let name = bind.get_parameter(0).to_string();
 
-        // Access the shared catalog state injected via extra_info.
-        let state_ptr = bind.get_extra_info::<CatalogState>();
-        let guard = unsafe { (*state_ptr).read().expect("catalog RwLock poisoned") };
+            // Access the shared catalog state injected via extra_info.
+            let state_ptr = bind.get_extra_info::<CatalogState>();
+            let guard = unsafe {
+                (*state_ptr)
+                    .read()
+                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
+            };
 
-        let json_str = guard
-            .get(&name)
-            .ok_or_else(|| format!("semantic view '{name}' does not exist"))?;
+            let json_str = guard
+                .get(&name)
+                .ok_or_else(|| format!("semantic view '{name}' does not exist"))?;
 
-        // Parse the stored JSON into the model.
-        let def = SemanticViewDefinition::from_json(&name, json_str)?;
+            // Parse the stored JSON into the model.
+            let def = SemanticViewDefinition::from_json(&name, json_str)?;
 
-        // Build alias→table map and compute base table name for entries with source_table: None.
-        let alias_map = def.alias_to_table_map();
-        let base_table = def
-            .tables
-            .first()
-            .map(|t| t.table.clone())
-            .unwrap_or_else(|| def.base_table.clone());
+            // Build alias->table map and compute base table name.
+            let alias_map = def.alias_to_table_map();
+            let base_table = def
+                .tables
+                .first()
+                .map(|t| t.table.clone())
+                .unwrap_or_else(|| def.base_table.clone());
 
-        // Collect rows in definition order: tables, relationships, facts, dimensions, metrics.
-        let mut rows = Vec::new();
-        collect_table_rows(&def, &mut rows);
-        collect_relationship_rows(&def, &alias_map, &mut rows);
-        collect_fact_rows(&def, &base_table, &alias_map, &mut rows);
-        collect_dimension_rows(&def, &base_table, &alias_map, &mut rows);
-        collect_metric_rows(&def, &base_table, &alias_map, &mut rows);
+            // Collect rows in definition order.
+            let mut rows = Vec::new();
+            if let Some(ref comment) = def.comment {
+                rows.push(DescribeRow {
+                    object_kind: String::new(),
+                    object_name: String::new(),
+                    parent_entity: String::new(),
+                    property: "COMMENT".to_string(),
+                    property_value: comment.clone(),
+                });
+            }
+            collect_table_rows(&def, &mut rows);
+            collect_relationship_rows(&def, &alias_map, &mut rows);
+            collect_fact_rows(&def, &base_table, &alias_map, &mut rows);
+            collect_dimension_rows(&def, &base_table, &alias_map, &mut rows);
+            collect_metric_rows(&def, &base_table, &alias_map, &mut rows);
 
-        Ok(DescribeBindData { rows })
+            Ok(DescribeBindData { rows })
+        }))
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
@@ -434,5 +622,86 @@ mod tests {
     fn format_json_array_empty() {
         let cols: Vec<String> = vec![];
         assert_eq!(format_json_array(&cols), "[]");
+    }
+
+    #[test]
+    fn window_spec_property_row_emitted() {
+        use crate::model::{
+            AccessModifier, Dimension, Metric, NullsOrder, SortOrder, TableRef, WindowOrderBy,
+            WindowSpec,
+        };
+        let def = SemanticViewDefinition {
+            base_table: "orders".to_string(),
+            tables: vec![TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                pk_columns: vec!["id".to_string()],
+                ..Default::default()
+            }],
+            dimensions: vec![Dimension {
+                name: "region".to_string(),
+                expr: "o.region".to_string(),
+                source_table: Some("o".to_string()),
+                ..Default::default()
+            }],
+            metrics: vec![
+                Metric {
+                    name: "total_qty".to_string(),
+                    expr: "SUM(o.qty)".to_string(),
+                    source_table: Some("o".to_string()),
+                    access: AccessModifier::Public,
+                    ..Default::default()
+                },
+                Metric {
+                    name: "avg_qty".to_string(),
+                    expr: "AVG(total_qty) OVER (PARTITION BY EXCLUDING region ORDER BY region)"
+                        .to_string(),
+                    source_table: Some("o".to_string()),
+                    access: AccessModifier::Public,
+                    window_spec: Some(WindowSpec {
+                        window_function: "AVG".to_string(),
+                        inner_metric: "total_qty".to_string(),
+                        extra_args: vec![],
+                        excluding_dims: vec!["region".to_string()],
+                        partition_dims: vec![],
+                        order_by: vec![WindowOrderBy {
+                            expr: "region".to_string(),
+                            order: SortOrder::Desc,
+                            nulls: NullsOrder::First,
+                        }],
+                        frame_clause: None,
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let alias_map = def.alias_to_table_map();
+        let mut rows = Vec::new();
+        collect_metric_rows(&def, "orders", &alias_map, &mut rows);
+
+        // Find the WINDOW_SPEC row
+        let ws_row = rows
+            .iter()
+            .find(|r| r.property == "WINDOW_SPEC")
+            .expect("Should have WINDOW_SPEC row");
+        assert_eq!(ws_row.object_name, "avg_qty");
+        assert!(
+            ws_row
+                .property_value
+                .contains("AVG(total_qty) OVER (PARTITION BY EXCLUDING region"),
+            "WINDOW_SPEC value should contain parsed spec: {}",
+            ws_row.property_value
+        );
+
+        // Regular metric should NOT have WINDOW_SPEC
+        let total_rows: Vec<&DescribeRow> = rows
+            .iter()
+            .filter(|r| r.object_name == "total_qty" && r.property == "WINDOW_SPEC")
+            .collect();
+        assert!(
+            total_rows.is_empty(),
+            "Regular metric should not have WINDOW_SPEC row"
+        );
     }
 }

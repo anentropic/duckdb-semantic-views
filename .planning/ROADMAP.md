@@ -12,6 +12,7 @@
 - ✅ **v0.5.3 Advanced Semantic Features** -- Phases 29-32 (shipped 2026-03-15)
 - ✅ **v0.5.4 Snowflake-Parity & Registry Publishing** -- Phases 33-36 (shipped 2026-03-27)
 - ✅ **v0.5.5 SHOW/DESCRIBE Alignment & Refactoring** -- Phases 37-42 (shipped 2026-04-05)
+- ✅ **v0.6.0 Snowflake SQL DDL Parity** -- Phases 43-50 (shipped 2026-04-14)
 
 ## Phases
 
@@ -144,13 +145,31 @@ Full details: [milestones/v0.5.5-ROADMAP.md](milestones/v0.5.5-ROADMAP.md)
 
 </details>
 
+<details>
+<summary>v0.6.0 Snowflake SQL DDL Parity (Phases 43-50) -- SHIPPED 2026-04-14</summary>
+
+- [x] Phase 43: Metadata Foundation (2/2 plans) -- completed 2026-04-10
+- [x] Phase 44: SHOW/DESCRIBE Metadata Surface + Enhancements (2/2 plans) -- completed 2026-04-11
+- [x] Phase 45: ALTER COMMENT + GET_DDL (2/2 plans) -- completed 2026-04-11
+- [x] Phase 46: Wildcard Selection + Queryable FACTS (2/2 plans) -- completed 2026-04-12
+- [x] Phase 47: Semi-Additive Metrics (2/2 plans) -- completed 2026-04-12
+- [x] Phase 48: Window Function Metrics (2/2 plans) -- completed 2026-04-12
+- [x] Phase 49: Security & Correctness Hardening (2/2 plans) -- completed 2026-04-14
+- [x] Phase 50: Code Quality & Test Coverage (2/2 plans) -- completed 2026-04-14
+
+Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
+
+</details>
+
 ## Progress
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 37. Extract Shared Utilities | v0.5.5 | 1/1 | Complete | 2026-04-01 |
-| 38. Module Directory Splits | v0.5.5 | 2/2 | Complete | 2026-04-01 |
-| 39. Metadata Storage | v0.5.5 | 1/1 | Complete | 2026-04-02 |
-| 40. SHOW Command Alignment | v0.5.5 | 2/2 | Complete | 2026-04-02 |
-| 41. DESCRIBE Rewrite | v0.5.5 | 2/2 | Complete | 2026-04-02 |
-| 42. Refactor & Test Reorg | v0.5.5 | 3/3 | Complete | 2026-04-05 |
+| 43. Metadata Foundation | v0.6.0 | 2/2 | Complete | 2026-04-10 |
+| 44. SHOW/DESCRIBE Metadata Surface + Enhancements | v0.6.0 | 2/2 | Complete | 2026-04-11 |
+| 45. ALTER COMMENT + GET_DDL | v0.6.0 | 2/2 | Complete | 2026-04-11 |
+| 46. Wildcard Selection + Queryable FACTS | v0.6.0 | 2/2 | Complete | 2026-04-12 |
+| 47. Semi-Additive Metrics | v0.6.0 | 2/2 | Complete | 2026-04-12 |
+| 48. Window Function Metrics | v0.6.0 | 2/2 | Complete | 2026-04-12 |
+| 49. Security & Correctness Hardening | v0.6.0 | 2/2 | Complete | 2026-04-14 |
+| 50. Code Quality & Test Coverage | v0.6.0 | 2/2 | Complete | 2026-04-14 |

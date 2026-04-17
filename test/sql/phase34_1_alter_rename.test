@@ -116,7 +116,7 @@ already exists
 statement error
 ALTER SEMANTIC VIEW sales_view
 ----
-Expected RENAME TO
+Missing ALTER operation
 
 # ============================================================
 # Test 7: Missing new name (error)

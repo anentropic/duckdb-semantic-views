@@ -1,0 +1,200 @@
+# Phase 47: Semi-additive metrics
+# Tests SEMI-01 through SEMI-05: NON ADDITIVE BY parsing, snapshot queries,
+# effectively-regular behavior, mixed metrics, fan trap interaction
+
+require semantic_views
+
+# ========================================
+# Setup: accounts + customers tables
+# ========================================
+
+statement ok
+CREATE TABLE p47_customers (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO p47_customers VALUES (1, 'Alice'), (2, 'Bob');
+
+statement ok
+CREATE TABLE p47_accounts (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER,
+    report_date DATE,
+    balance DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO p47_accounts VALUES
+    (1, 1, '2024-01-01', 100.00),
+    (2, 1, '2024-01-02', 150.00),
+    (3, 1, '2024-01-03', 200.00),
+    (4, 2, '2024-01-01', 300.00),
+    (5, 2, '2024-01-02', 250.00);
+
+# ========================================
+# Test 1: Basic semi-additive metric DDL
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW p47_account_view AS
+TABLES (
+    a AS p47_accounts PRIMARY KEY (id),
+    c AS p47_customers PRIMARY KEY (id)
+)
+RELATIONSHIPS (
+    acct_cust AS a(customer_id) REFERENCES c
+)
+DIMENSIONS (
+    c.customer_name AS c.name,
+    a.report_date AS a.report_date
+)
+METRICS (
+    a.total_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+)
+
+# ========================================
+# Test 2: Query semi-additive metric (NA dim NOT in query)
+# Latest balance per customer (snapshot at most recent date)
+# Alice: latest is 2024-01-03 -> 200.00
+# Bob: latest is 2024-01-02 -> 250.00
+# ========================================
+
+query TR
+SELECT * FROM semantic_view('p47_account_view', dimensions := ['customer_name'], metrics := ['total_balance']) ORDER BY 1;
+----
+Alice	200.00
+Bob	250.00
+
+# ========================================
+# Test 3: Semi-additive with NA dim IN query
+# When report_date IS in dims, metric acts as regular
+# (Snowflake semantics: no snapshot filtering when NA dim is queried)
+# All rows returned with their actual balance values
+# ========================================
+
+query TTR
+SELECT * FROM semantic_view('p47_account_view', dimensions := ['customer_name', 'report_date'], metrics := ['total_balance']) ORDER BY 1, 2;
+----
+Alice	2024-01-01	100.00
+Alice	2024-01-02	150.00
+Alice	2024-01-03	200.00
+Bob	2024-01-01	300.00
+Bob	2024-01-02	250.00
+
+# ========================================
+# Test 4: NON ADDITIVE BY validation
+# Reference nonexistent dimension -> error
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW p47_bad_na AS
+TABLES (a AS p47_accounts PRIMARY KEY (id))
+DIMENSIONS (a.report_date AS a.report_date)
+METRICS (a.total_balance NON ADDITIVE BY (nonexistent_dim) AS SUM(a.balance))
+----
+does not match any declared dimension
+
+# ========================================
+# Test 5: Mixed regular + semi-additive metrics
+# row_count: counts ALL rows per customer (regular)
+# total_balance: latest snapshot only (semi-additive, report_date not in query)
+# Alice: 3 rows, latest balance = 200.00
+# Bob: 2 rows, latest balance = 250.00
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW p47_mixed_view AS
+TABLES (
+    a AS p47_accounts PRIMARY KEY (id),
+    c AS p47_customers PRIMARY KEY (id)
+)
+RELATIONSHIPS (
+    acct_cust AS a(customer_id) REFERENCES c
+)
+DIMENSIONS (
+    c.customer_name AS c.name,
+    a.report_date AS a.report_date
+)
+METRICS (
+    a.row_count AS COUNT(*),
+    a.total_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+)
+
+query TIR
+SELECT * FROM semantic_view('p47_mixed_view', dimensions := ['customer_name'], metrics := ['row_count', 'total_balance']) ORDER BY 1;
+----
+Alice	3	200.00
+Bob	2	250.00
+
+# ========================================
+# Test 6: GET_DDL round-trip with NON ADDITIVE BY
+# ========================================
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p47_account_view') LIKE '%NON ADDITIVE BY%';
+----
+true
+
+# ========================================
+# Test 7: DESCRIBE shows NON_ADDITIVE_BY
+# ========================================
+
+query TTTTT
+SELECT * FROM describe_semantic_view('p47_account_view') WHERE property = 'NON_ADDITIVE_BY';
+----
+METRIC	total_balance	p47_accounts	NON_ADDITIVE_BY	report_date DESC NULLS FIRST
+
+# ========================================
+# Test 8: Global aggregate (no dims)
+# Uses single-entity data to ensure deterministic result.
+# With no partition and ORDER BY report_date DESC,
+# rn=1 is the row with 2024-01-03 (balance=200.00).
+# SUM of that single snapshot row = 200.00.
+# ========================================
+
+statement ok
+CREATE TABLE p47_single_acct (
+    id INTEGER PRIMARY KEY,
+    report_date DATE,
+    balance DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO p47_single_acct VALUES
+    (1, '2024-01-01', 100.00),
+    (2, '2024-01-02', 150.00),
+    (3, '2024-01-03', 200.00);
+
+statement ok
+CREATE SEMANTIC VIEW p47_global_view AS
+TABLES (a AS p47_single_acct PRIMARY KEY (id))
+DIMENSIONS (a.report_date AS a.report_date)
+METRICS (
+    a.latest_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+)
+
+query R
+SELECT * FROM semantic_view('p47_global_view', metrics := ['latest_balance']);
+----
+200.00
+
+# ========================================
+# Cleanup
+# ========================================
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p47_global_view;
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p47_mixed_view;
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p47_account_view;
+
+statement ok
+DROP TABLE IF EXISTS p47_single_acct;
+
+statement ok
+DROP TABLE IF EXISTS p47_accounts;
+
+statement ok
+DROP TABLE IF EXISTS p47_customers;

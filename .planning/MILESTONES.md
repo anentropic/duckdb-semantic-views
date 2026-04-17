@@ -1,5 +1,31 @@
 # Milestones
 
+## v0.6.0 Snowflake SQL DDL Parity (Shipped: 2026-04-14)
+
+**Phases completed:** 8 phases (43-50), 16 plans, 35 tasks
+**Source changes:** 166 files, +35,682 / -4,023 lines
+**Commits:** 114
+**Tests:** 705 Rust tests + 32 sqllogictest files + 6 DuckLake CI
+**Timeline:** 10 days (2026-04-05 → 2026-04-14)
+
+**Delivered:** Closed all remaining feature gaps against Snowflake's SQL DDL semantic views -- metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC), ALTER DDL, GET_DDL round-trip, semi-additive metrics, window function metrics, queryable FACTS, wildcard selection, and introspection enhancements. Plus security hardening and code quality improvements.
+
+**Key accomplishments:**
+
+1. Metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC) on all DDL objects with backward-compatible persistence
+2. Introspection enhancements: SHOW TERSE, IN SCHEMA/DATABASE scoping, SHOW COLUMNS, metadata columns in SHOW/DESCRIBE
+3. ALTER SET/UNSET COMMENT + GET_DDL round-trip DDL reconstruction from stored definitions
+4. Wildcard selection (table_alias.*) with PRIVATE exclusion + queryable FACTS (row-level unaggregated mode with table path validation)
+5. Semi-additive metrics (NON ADDITIVE BY) with CTE-based ROW_NUMBER snapshot selection, effectively-regular classification, and mixed-metric support
+6. Window function metrics (PARTITION BY EXCLUDING) with CTE-based inner aggregation + outer window SELECT, mixing guard, and fan trap skip
+7. Security hardening: FFI catch_unwind on all 25 entry points, graceful lock-poison handling, cycle detection + MAX_DERIVATION_DEPTH=64
+8. Code quality: 38 new unit tests for untested modules, resolve_names generic helper, DimensionName/MetricName newtypes, dead code removal
+
+**Requirements:** 34/34 satisfied
+**Audit:** Passed -- all requirements verified across VERIFICATION.md, SUMMARY.md, and implementation. 4 E2E flows validated.
+
+---
+
 ## v0.5.5 SHOW/DESCRIBE Alignment & Refactoring (Shipped: 2026-04-05)
 
 **Phases completed:** 6 phases, 11 plans, 12 tasks

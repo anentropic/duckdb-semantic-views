@@ -1,510 +1,859 @@
-# Architecture: v0.5.5 SHOW/DESCRIBE Alignment & Module Refactoring
+# Architecture: v0.6.0 Snowflake SQL DDL Parity
 
-**Domain:** DuckDB semantic views extension -- Snowflake-aligned output formats + module directory refactoring
-**Researched:** 2026-04-01
+**Domain:** DuckDB semantic views extension -- Snowflake DDL parity features integration
+**Researched:** 2026-04-09
 **Confidence:** HIGH (direct codebase analysis, Snowflake official docs verified via WebFetch)
 
 ## Executive Summary
 
-v0.5.5 has two independent work streams: (1) aligning all 6 SHOW/DESCRIBE output formats with Snowflake's column schemas, and (2) splitting the two largest modules (expand.rs at 4,490 lines, graph.rs at 2,502 lines) into module directories. These streams are architecturally independent -- output format changes touch ddl/ VTab files and the catalog/model layer, while the refactoring touches expand.rs, graph.rs, and their import sites. This independence enables parallel development or strict sequencing (refactoring first) without conflict.
+v0.6.0 adds seven feature groups to the existing extension. This document maps each feature to its integration points, identifies new vs modified components, and proposes a build order that respects dependencies. The key architectural insight is that these features fall into three tiers of integration complexity:
 
-The SHOW/DESCRIBE alignment is a schema-breaking change to 6 VTab implementations. Snowflake's output format differs significantly from the current implementation: DESCRIBE uses a property-per-row format (5 columns: object_kind, object_name, parent_entity, property, property_value) instead of the current single-row-per-view format. SHOW commands need additional columns (database_name, schema_name, synonyms, comment) and must drop the `expr` column that Snowflake does not expose. A `created_on` timestamp must be stored at define time, requiring a catalog schema migration.
+**Tier 1 (Model + DDL only):** Metadata (COMMENT/SYNONYMS/PRIVATE), GET_DDL reconstruction, SHOW enhancements. These add fields to the model, extend the body parser, and add new VTabs or modify existing ones. Zero changes to the expansion pipeline.
 
-The module refactoring is a zero-behavior-change restructuring that breaks two circular dependencies and splits monoliths into single-responsibility files. The key insight is that `suggest_closest` (Levenshtein utility) and `replace_word_boundary` (string substitution) are pure utilities with no semantic dependency on expansion -- extracting them to `util.rs` breaks the `expand <-> graph` cycle cleanly.
+**Tier 2 (Expansion modifications):** Wildcard selection, queryable FACTS. These add new resolution logic in the expansion pipeline but do not fundamentally change the SELECT/FROM/GROUP BY structure.
 
-## Recommended Architecture
+**Tier 3 (Expansion structural changes):** Semi-additive metrics, window function metrics. These require new expansion modes that produce fundamentally different SQL -- CTEs with window functions, QUALIFY clauses, or queries without GROUP BY despite having metrics. These are the highest-risk features.
 
-### Work Stream 1: SHOW/DESCRIBE Snowflake Alignment
+The recommended build order is: Tier 1 first (unlocks model changes needed by Tier 2/3), then Tier 2 (simpler expansion changes), then Tier 3 (structural expansion changes).
 
-#### Current vs Target: DESCRIBE SEMANTIC VIEW
-
-**Current** (single row, 6 columns):
-```
-| name | base_table | dimensions | metrics | joins | facts |
-| sales | orders | [{...}] | [{...}] | [{...}] | [{...}] |
-```
-
-**Target** (Snowflake property-per-row, 5 columns):
-```
-| object_kind | object_name | parent_entity | property | property_value |
-| NULL | NULL | NULL | COMMENT | ... |
-| TABLE | orders | NULL | BASE_TABLE_NAME | orders |
-| TABLE | orders | NULL | PRIMARY_KEY | ["order_id"] |
-| DIMENSION | region | orders | EXPRESSION | o.region |
-| DIMENSION | region | orders | DATA_TYPE | VARCHAR |
-| METRIC | revenue | orders | EXPRESSION | SUM(o.amount) |
-| METRIC | revenue | orders | DATA_TYPE | DOUBLE |
-| RELATIONSHIP | orders_to_customers | orders | FOREIGN_KEY | ["o_custkey"] |
-| RELATIONSHIP | orders_to_customers | orders | REF_TABLE | customers |
-| RELATIONSHIP | orders_to_customers | orders | REF_KEY | ["c_custkey"] |
-| FACT | is_returned | orders | EXPRESSION | o.status = 'returned' |
-```
-
-This is the most significant schema change. The current `DescribeSemanticViewVTab` emits 1 row with JSON blob columns. The new format emits N rows (one per property per object), where each semantic view element generates multiple rows (one per property). This better matches Snowflake and is more queryable -- users can `WHERE object_kind = 'DIMENSION'` to filter.
-
-**Implementation approach:** Rebuild `describe.rs` entirely. The `DescribeBindData` struct changes from 6 string fields to a `Vec<DescribeRow>` where each row has the 5 Snowflake columns. The `func()` emitter loops over rows like the SHOW VTabs already do. Parse the stored JSON into `SemanticViewDefinition`, then iterate tables, relationships, dimensions, metrics, facts to generate property rows.
-
-#### Current vs Target: SHOW SEMANTIC VIEWS
-
-**Current** (2 columns):
-```
-| name | base_table |
-```
-
-**Snowflake target** (8 columns):
-```
-| created_on | name | kind | database_name | schema_name | comment | owner | owner_role_type |
-```
-
-**Our target** (subset -- no owner/ACL in DuckDB extensions):
-```
-| created_on | name | kind | database_name | schema_name | comment |
-```
-
-`kind` is always `SEMANTIC_VIEW`. `comment` is currently not stored (always empty string initially, or add COMMENT support later). `database_name` and `schema_name` come from DuckDB context at bind time. `created_on` requires storing a timestamp at define time.
-
-#### Current vs Target: SHOW SEMANTIC DIMENSIONS / METRICS
-
-**Current** (5 columns):
-```
-| semantic_view_name | name | expr | source_table | data_type |
-```
-
-**Snowflake target** (8 columns):
-```
-| database_name | schema_name | semantic_view_name | table_name | name | data_type | synonyms | comment |
-```
-
-Key changes: (a) drop `expr` (Snowflake does not expose expressions in SHOW output), (b) rename `source_table` to `table_name`, (c) add `database_name`, `schema_name`, `synonyms`, `comment` columns, (d) reorder columns to match Snowflake.
-
-#### Current vs Target: SHOW SEMANTIC FACTS
-
-Same pattern as dimensions/metrics but facts have no `data_type` in current output. Snowflake SHOW SEMANTIC FACTS likely follows the same 8-column schema as dimensions/metrics (with data_type for facts).
-
-#### Current vs Target: SHOW SEMANTIC DIMENSIONS FOR METRIC
-
-**Current** (5 columns):
-```
-| semantic_view_name | name | expr | source_table | data_type |
-```
-
-**Snowflake target** (6 columns):
-```
-| table_name | name | data_type | required | synonyms | comment |
-```
-
-Key changes: (a) drop `expr`, `source_table` renamed to `table_name`, (b) add `required` boolean column (whether metric mandates this dimension), (c) add `synonyms`, `comment`, (d) remove `semantic_view_name` (single-view-only command).
-
-### Work Stream 2: Module Directory Refactoring
-
-#### Target Module Structure
+## Current Architecture (Reference)
 
 ```
-src/
-  expand/
-    mod.rs          - pub fn expand(), QueryRequest, ExpandError re-exports
-    validate.rs     - request validation, duplicate checks
-    resolve.rs      - find_dimension, find_metric resolution
-    facts.rs        - toposort_facts, inline_facts, toposort_derived, inline_derived_metrics
-    fan_trap.rs     - check_fan_traps, ancestors_to_root
-    role_playing.rs - find_using_context, dim_scoped_aliases
-    join_resolver.rs - resolve_joins_pkfk, synthesize_on_clause
-    sql_gen.rs      - SELECT/FROM/JOIN/WHERE/GROUP BY assembly, quote_ident, quote_table_ref
-  graph/
-    mod.rs          - RelationshipGraph struct, from_definition, toposort, check_no_diamonds, check_no_orphans
-    relationship.rs - validate_graph (orchestrator calling graph methods)
-    facts.rs        - validate_facts, find_fact_references
-    derived_metrics.rs - validate_derived_metrics, contains_aggregate_function
-    using.rs        - validate_using_relationships
-  util.rs           - suggest_closest, replace_word_boundary (NEW)
-  errors.rs         - ParseError (NEW, extracted from parse.rs)
+User SQL                  Parser Hook (C++ shim)          Rust Extension
+---------                 ----------------------          --------------
+CREATE SEMANTIC VIEW  --> detect_ddl_prefix()        --> validate_and_rewrite()
+  name AS ...                                              |
+                                                    parse_keyword_body()
+                                                           |
+                                                    SemanticViewDefinition (JSON)
+                                                           |
+                                                    catalog_insert() --> HashMap + pragma_query_t
+                                                           
+FROM semantic_view(   --> VTab bind()               --> expand()
+  'name',                                                  |
+  dimensions := [...],                              resolve dims/metrics
+  metrics := [...]                                  inline facts/derived
+)                                                   check fan traps
+                                                    build SELECT/FROM/JOIN/GROUP BY
+                                                           |
+                                                    execute_sql_raw(expanded_sql)
+                                                           |
+                                                    duckdb_vector_reference_vector --> output
 ```
 
-#### Dependency Graph After Refactoring
+### Key Components
+
+| Component | File(s) | Role |
+|-----------|---------|------|
+| Model | `model.rs` | `SemanticViewDefinition`, `Dimension`, `Metric`, `Fact`, `Join`, `TableRef` structs |
+| Body Parser | `body_parser.rs` | State machine: parses `AS TABLES(...) RELATIONSHIPS(...) FACTS(...) DIMENSIONS(...) METRICS(...)` |
+| Parse/Rewrite | `parse.rs` | DDL detection, validation, rewrite to `SELECT * FROM fn_from_json('name', 'json')` |
+| Catalog | `catalog.rs` | `CatalogState = Arc<RwLock<HashMap<String, String>>>`, init/insert/upsert/delete |
+| Expansion | `expand/sql_gen.rs` | `expand()` -- builds SELECT/FROM/JOIN/GROUP BY from definition + request |
+| Join Resolver | `expand/join_resolver.rs` | PK/FK graph-based join resolution and ON clause synthesis |
+| Fan Trap | `expand/fan_trap.rs` | LCA-based cardinality analysis |
+| Facts | `expand/facts.rs` | Fact inlining, derived metric resolution via toposort |
+| Role Playing | `expand/role_playing.rs` | USING context resolution for scoped aliases |
+| Query VTab | `query/table_function.rs` | `SemanticViewVTab` -- bind/init/func for `semantic_view()` |
+| DDL VTabs | `ddl/*.rs` | Define, Drop, Alter, Describe, List, Show* -- 11 VTab implementations |
+| Persistence | `ddl/persist.rs` | Parameterized prepared statements for catalog writes |
+
+## Feature Integration Analysis
+
+### 1. Metadata: COMMENT, SYNONYMS, PRIVATE
+
+**Integration tier:** Tier 1 (Model + DDL only)
+**Expansion impact:** NONE
+
+#### What Changes
+
+**model.rs** -- Add fields to existing structs:
+
+```rust
+pub struct Dimension {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+    // Dimensions are always PUBLIC in Snowflake -- no visibility field needed
+}
+
+pub struct Metric {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Visibility::is_default")]
+    pub visibility: Visibility,
+    // NON ADDITIVE BY dims stored here too (see section 2)
+}
+
+pub struct Fact {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+    #[serde(default, skip_serializing_if = "Visibility::is_default")]
+    pub visibility: Visibility,
+}
+
+pub struct TableRef {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+}
+
+pub struct SemanticViewDefinition {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Visibility {
+    #[default]
+    Public,
+    Private,
+}
+```
+
+All new fields use `#[serde(default)]` for backward-compatible deserialization of existing stored JSON.
+
+**body_parser.rs** -- Extend entry parsing within each clause:
+
+The body parser currently uses `parse_qualified_entries` for dims/metrics/facts. Each entry is `alias.name AS expr`. The new syntax adds optional prefixes and suffixes:
 
 ```
-errors.rs     <- parse.rs, body_parser.rs  (breaks parse <-> body_parser cycle)
-util.rs       <- expand/*, graph/*, ddl/show_dims_for_metric.rs  (breaks expand <-> graph cycle)
-model.rs      <- expand/*, graph/*, catalog.rs, parse.rs, body_parser.rs, ddl/*, query/*
-graph/mod.rs  <- expand/fan_trap.rs, expand/join_resolver.rs, ddl/define.rs, ddl/show_dims_for_metric.rs
-expand/mod.rs <- query/table_function.rs, query/explain.rs, query/error.rs, ddl/define.rs
-catalog.rs    <- ddl/define.rs, ddl/drop.rs, ddl/list.rs, ddl/describe.rs, query/table_function.rs
+METRICS (
+    [PRIVATE] alias.name [USING (...)] [NON ADDITIVE BY (...)] AS expr
+        [WITH SYNONYMS = ('syn1', 'syn2')]
+        [COMMENT = 'text']
+)
 ```
 
-All arrows flow one direction. No circular dependencies.
+The parser needs to:
+1. Check for `PRIVATE`/`PUBLIC` keyword before `alias.name`
+2. After `AS expr`, scan for `WITH SYNONYMS = (...)` and `COMMENT = '...'`
+3. Same pattern for FACTS and DIMENSIONS (minus PRIVATE for dims, minus NON ADDITIVE BY for dims/facts)
+4. For TABLES entries: `WITH SYNONYMS` and `COMMENT` after the table declaration
 
-### Component Boundaries
+**parse.rs** -- No structural changes needed. The rewrite path already serializes `SemanticViewDefinition` to JSON.
 
-| Component | Responsibility | Communicates With |
-|-----------|---------------|-------------------|
-| `util.rs` (NEW) | String similarity (Levenshtein), word-boundary replacement | None (leaf module) |
-| `errors.rs` (NEW) | `ParseError` struct with byte-offset position | None (leaf module) |
-| `expand/mod.rs` | Public API: `expand()`, `QueryRequest`, `ExpandError` | `expand/*` submodules, `graph/mod.rs`, `model.rs` |
-| `expand/validate.rs` | Request validation (empty check, duplicate dims/metrics) | `model.rs`, `util.rs` |
-| `expand/resolve.rs` | Dimension/metric name resolution | `model.rs`, `util.rs` |
-| `expand/facts.rs` | Fact DAG toposort, expression inlining, derived metric resolution | `model.rs`, `util.rs` |
-| `expand/fan_trap.rs` | Cardinality-aware fan trap detection + `ancestors_to_root` | `model.rs`, `graph/mod.rs` |
-| `expand/role_playing.rs` | USING RELATIONSHIPS + scoped aliases | `model.rs` |
-| `expand/join_resolver.rs` | PK/FK join resolution, ON clause synthesis | `model.rs`, `graph/mod.rs` |
-| `expand/sql_gen.rs` | SQL string assembly, identifier quoting | `model.rs` |
-| `graph/mod.rs` | `RelationshipGraph` struct + construction | `model.rs` |
-| `graph/relationship.rs` | Graph validation orchestrator | `graph/mod.rs`, `model.rs`, `util.rs` |
-| `graph/facts.rs` | Fact reference detection + validation | `model.rs`, `util.rs` |
-| `graph/derived_metrics.rs` | Derived metric validation, aggregate detection | `model.rs`, `util.rs` |
-| `graph/using.rs` | USING RELATIONSHIPS validation | `model.rs`, `util.rs` |
-| `catalog.rs` | In-memory cache + `_definitions` table persistence | `model.rs` |
-| `ddl/describe.rs` | DESCRIBE SEMANTIC VIEW (property-per-row format) | `catalog.rs`, `model.rs` |
-| `ddl/list.rs` | SHOW SEMANTIC VIEWS | `catalog.rs`, `model.rs` |
-| `ddl/show_dims.rs` | SHOW SEMANTIC DIMENSIONS | `catalog.rs`, `model.rs` |
-| `ddl/show_metrics.rs` | SHOW SEMANTIC METRICS | `catalog.rs`, `model.rs` |
-| `ddl/show_facts.rs` | SHOW SEMANTIC FACTS | `catalog.rs`, `model.rs` |
-| `ddl/show_dims_for_metric.rs` | SHOW SEMANTIC DIMS FOR METRIC | `catalog.rs`, `model.rs`, `graph/mod.rs`, `util.rs` |
+**ddl/describe.rs** -- Extend `collect_*_rows()` to emit COMMENT, SYNONYMS, VISIBILITY properties per object.
 
-### Data Flow
+**ddl/show_dims.rs, show_metrics.rs, show_facts.rs** -- Add `synonyms` and `comment` columns to output schemas (Snowflake includes these in SHOW output).
 
-**SHOW/DESCRIBE flow:**
+**ddl/list.rs** -- Add `comment` column for SHOW SEMANTIC VIEWS (Snowflake full mode includes comment).
+
+#### New Components
+
+- `model::Visibility` enum (new type, 6 lines)
+
+#### Modified Components
+
+- `model.rs` -- 5 struct changes (add fields)
+- `body_parser.rs` -- entry parsing logic extended
+- `ddl/describe.rs` -- new property rows
+- `ddl/show_dims.rs`, `show_metrics.rs`, `show_facts.rs` -- new output columns
+- `ddl/list.rs` -- new output column
+
+### 2. Semi-Additive Metrics (NON ADDITIVE BY)
+
+**Integration tier:** Tier 3 (Expansion structural change)
+**Expansion impact:** MAJOR -- new SQL generation path
+
+#### Snowflake Semantics
+
+`NON ADDITIVE BY (year_dim, month_dim, day_dim)` means: when the query groups by dimensions that overlap with the NON ADDITIVE list, use "last snapshot" aggregation instead of SUM across those dimensions. The rows are sorted by the non-additive dimensions, and LAST_VALUE is used to select the latest snapshot before aggregating.
+
+#### What Changes
+
+**model.rs** -- Add to Metric:
+
+```rust
+pub struct Metric {
+    // ... existing fields ...
+    /// Dimensions that this metric is non-additive by.
+    /// When non-empty, expansion uses snapshot aggregation for these dims.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub non_additive_by: Vec<NonAdditiveDim>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NonAdditiveDim {
+    pub dimension: String,
+    #[serde(default)]
+    pub order: SortOrder,
+    #[serde(default)]
+    pub nulls: NullsOrder,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub enum SortOrder { #[default] Asc, Desc }
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub enum NullsOrder { #[default] Last, First }
 ```
-DDL SQL -> parse.rs (detect_ddl_prefix) -> rewrite to SELECT * FROM vtab_fn(...)
--> DuckDB calls VTab::bind() -> catalog.read().get(name) -> JSON string
--> SemanticViewDefinition::from_json() -> collect rows from definition
--> VTab::func() -> emit rows into DataChunkHandle
+
+**body_parser.rs** -- Parse `NON ADDITIVE BY (dim [ASC|DESC] [NULLS FIRST|LAST], ...)` after USING clause but before AS in metric entries.
+
+**expand/sql_gen.rs** -- This is the critical change. The `expand()` function currently produces:
+
+```sql
+SELECT dims, agg_metrics FROM base JOIN... GROUP BY 1,2,...
 ```
 
-**New data needed for SHOW/DESCRIBE alignment:**
+For a semi-additive metric, the expansion must produce a CTE-based query:
+
+```sql
+WITH __sv_snapshot AS (
+    SELECT dims, measure_expr,
+           ROW_NUMBER() OVER (
+               PARTITION BY non_na_dims
+               ORDER BY na_dim1 DESC, na_dim2 DESC, na_dim3 DESC
+           ) AS __sv_rn
+    FROM base JOIN...
+)
+SELECT non_na_dims,
+       agg_fn(__sv_snapshot.measure_expr) AS metric_name
+FROM __sv_snapshot
+WHERE __sv_rn = 1
+GROUP BY 1, 2, ...
 ```
-created_on:     stored in catalog at define time (new field in JSON or new DB column)
-database_name:  extracted from DuckDB connection context at bind time
-schema_name:    extracted from DuckDB connection context at bind time
-comment:        stored in definition (empty string initially; support COMMENT ON later)
-synonyms:       stored in definition (empty array initially; support SYNONYMS later)
-required:       computed at bind time from metric definition (FOR METRIC command only)
+
+The approach:
+1. Identify which requested dimensions are in `non_additive_by` lists (NA dims) vs not (regular dims)
+2. The inner CTE selects all dims + the raw measure expression (not aggregated)
+3. ROW_NUMBER partitions by non-NA dims, orders by NA dims (user-specified order)
+4. The outer query filters to `__sv_rn = 1` and aggregates the measure
+
+**Key complexity:** When a query mixes semi-additive and regular metrics, the expansion must handle both in a single query. Two strategies:
+- **Strategy A (recommended):** Separate CTE per semi-additive metric, join results on regular dims. Clean but produces N+1 CTEs for N semi-additive metrics.
+- **Strategy B:** Single-pass with conditional aggregation. More complex, harder to debug.
+
+Recommend Strategy A for correctness-first approach.
+
+#### New Components
+
+- `expand/semi_additive.rs` -- New submodule for CTE generation logic
+- `model::NonAdditiveDim`, `SortOrder`, `NullsOrder` types
+
+#### Modified Components
+
+- `expand/sql_gen.rs` -- `expand()` branches on presence of non-additive metrics
+- `expand/mod.rs` -- new submodule declaration
+- `body_parser.rs` -- NON ADDITIVE BY parsing
+- `model.rs` -- Metric struct extension
+
+### 3. Window Function Metrics (PARTITION BY EXCLUDING)
+
+**Integration tier:** Tier 3 (Expansion structural change)
+**Expansion impact:** MAJOR -- expansion without GROUP BY
+
+#### Snowflake Semantics
+
+Window function metrics use `OVER(PARTITION BY ... ORDER BY ...)` instead of aggregate functions. The query produces one row per input row (no aggregation). `PARTITION BY EXCLUDING dims` means "partition by all queried dimensions except the excluded ones."
+
+#### What Changes
+
+**model.rs** -- Add window function metadata to Metric:
+
+```rust
+pub struct Metric {
+    // ... existing fields ...
+    /// When Some, this metric is a window function metric.
+    /// The expansion omits GROUP BY and uses OVER() instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_spec: Option<WindowSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WindowSpec {
+    /// Dimensions to partition by, or EXCLUDING list.
+    pub partition: PartitionSpec,
+    /// ORDER BY within the window.
+    pub order_by: Vec<WindowOrderBy>,
+    /// Optional frame clause (ROWS/RANGE BETWEEN...).
+    pub frame: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PartitionSpec {
+    Include(Vec<String>),    // explicit dimension list
+    Excluding(Vec<String>),  // EXCLUDING dims
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowOrderBy {
+    pub expr: String,
+    pub order: SortOrder,
+    pub nulls: NullsOrder,
+}
+```
+
+**body_parser.rs** -- Parse window function metric syntax. The expr contains the full window function call including OVER clause. The parser needs to recognize the `OVER (PARTITION BY EXCLUDING ...)` pattern.
+
+**expand/sql_gen.rs** -- When any requested metric has `window_spec`, the expansion mode changes:
+
+```sql
+-- Window function metric: no GROUP BY
+SELECT
+    dim1 AS "dim1",
+    dim2 AS "dim2",
+    window_fn(measure) OVER (
+        PARTITION BY dim1
+        ORDER BY dim2 DESC
+    ) AS "metric_name"
+FROM base JOIN...
+```
+
+**Key question:** Can window function metrics and regular aggregate metrics coexist in a single query? In Snowflake, yes -- the query would use a subquery for the aggregation, then apply the window function on top. However, for v0.6.0, recommend requiring that window function metrics are queried separately (not mixed with aggregate metrics). This avoids complex query planning and is consistent with Snowflake's approach where window metrics reference other metrics.
+
+#### New Components
+
+- `expand/window.rs` -- New submodule for window function SQL generation
+- `model::WindowSpec`, `PartitionSpec`, `WindowOrderBy` types
+
+#### Modified Components
+
+- `expand/sql_gen.rs` -- branches on window metric presence
+- `body_parser.rs` -- window function metric parsing
+- `model.rs` -- Metric struct extension
+
+### 4. GET_DDL Reconstruction
+
+**Integration tier:** Tier 1 (DDL only)
+**Expansion impact:** NONE
+
+#### What Changes
+
+GET_DDL reconstructs the `CREATE SEMANTIC VIEW` DDL from the stored JSON definition. This is a pure rendering operation -- read JSON from catalog, format as DDL text.
+
+**New file: `ddl/get_ddl.rs`** -- Implements a VTab that:
+1. Takes a view name parameter
+2. Reads the JSON definition from CatalogState
+3. Deserializes to `SemanticViewDefinition`
+4. Renders back to DDL syntax
+
+The rendering function walks each section:
+
+```rust
+fn render_ddl(name: &str, def: &SemanticViewDefinition) -> String {
+    let mut out = format!("CREATE SEMANTIC VIEW {name} AS\n");
+    render_tables(&mut out, &def.tables);
+    if !def.joins.is_empty() {
+        render_relationships(&mut out, &def.joins, &def.tables);
+    }
+    if !def.facts.is_empty() {
+        render_facts(&mut out, &def.facts);
+    }
+    if !def.dimensions.is_empty() {
+        render_dimensions(&mut out, &def.dimensions);
+    }
+    render_metrics(&mut out, &def.metrics);
+    out
+}
+```
+
+Each `render_*` function reconstructs the clause from struct fields:
+- Tables: `alias AS physical_table [PRIMARY KEY (cols)] [UNIQUE (cols)]`
+- Relationships: `name AS from_alias(fk_cols) REFERENCES to_alias[(ref_cols)]`
+- Facts/Dims/Metrics: `[PRIVATE] alias.name AS expr [USING (...)] [NON ADDITIVE BY (...)] [WITH SYNONYMS = (...)] [COMMENT = '...']`
+
+**parse.rs** -- Add `DdlKind::GetDdl` variant for `GET_DDL SEMANTIC VIEW name` detection. Rewrite to `SELECT * FROM get_ddl_semantic_view('name')`.
+
+**lib.rs** -- Register the new VTab.
+
+#### New Components
+
+- `ddl/get_ddl.rs` -- VTab implementation + render functions (~200-300 lines)
+- `DdlKind::GetDdl` variant in `parse.rs`
+
+#### Modified Components
+
+- `ddl/mod.rs` -- add `pub mod get_ddl;`
+- `parse.rs` -- add detection/rewrite for GET_DDL
+- `lib.rs` -- register VTab
+
+### 5. Queryable FACTS
+
+**Integration tier:** Tier 2 (Expansion modification)
+**Expansion impact:** MODERATE -- new expansion mode
+
+#### Snowflake Semantics
+
+In Snowflake, FACTS can appear in the DIMENSIONS clause or in a separate FACTS clause of the `SEMANTIC_VIEW()` query. Unlike metrics, facts are NOT aggregated. The query returns row-level data with optional GROUP BY for any co-queried dimensions.
+
+#### What Changes
+
+**expand/types.rs** -- Extend `QueryRequest`:
+
+```rust
+pub struct QueryRequest {
+    pub dimensions: Vec<String>,
+    pub metrics: Vec<String>,
+    pub facts: Vec<String>,  // NEW
+}
+```
+
+**expand/sql_gen.rs** -- When facts are requested:
+
+```sql
+-- Facts only (no metrics): row-level, no GROUP BY
+SELECT
+    dim1 AS "dim1",
+    fact_expr AS "fact_name"
+FROM base JOIN...
+
+-- Facts + dimensions (no metrics): row-level grouped
+-- Snowflake: "the query does not group the facts"
+-- This means SELECT DISTINCT dims, fact_exprs (no aggregation)
+SELECT DISTINCT
+    dim1 AS "dim1",
+    fact_expr AS "fact_name"
+FROM base JOIN...
+
+-- Facts + metrics: facts appear alongside aggregated metrics
+-- Facts must be either in GROUP BY or aggregated
+-- Snowflake resolves this by treating facts in a separate subquery
+```
+
+The key insight from Snowflake docs: "Unlike dimensions specified in the DIMENSIONS clause, the query does not group the facts specified in the FACTS clause." This means facts produce row-level output. When combined with metrics, the expansion becomes more complex.
+
+**Recommendation:** For v0.6.0, support facts-only and facts+dimensions (row-level queries). Defer facts+metrics to a future milestone -- the semantic complexity of mixing aggregated and non-aggregated columns in a single query is significant.
+
+**query/table_function.rs** -- Add `facts` named parameter to `SemanticViewVTab`:
+
+```rust
+let facts = match bind.get_named_parameter("facts") {
+    Some(ref val) => unsafe { extract_list_strings(val) },
+    None => vec![],
+};
+```
+
+#### New Components
+
+- None (modifications to existing)
+
+#### Modified Components
+
+- `expand/types.rs` -- `QueryRequest` gains `facts` field
+- `expand/sql_gen.rs` -- new branch for fact queries
+- `expand/resolution.rs` -- add `find_fact()` resolution (parallel to `find_dimension`)
+- `query/table_function.rs` -- parse `facts` parameter
+
+### 6. Wildcard Selection
+
+**Integration tier:** Tier 2 (Expansion modification)
+**Expansion impact:** MODERATE -- resolution-time expansion
+
+#### Snowflake Semantics
+
+`customer.*` in DIMENSIONS or METRICS expands to all dimensions/metrics scoped to the `customer` table alias. An unqualified `*` is not allowed.
+
+#### What Changes
+
+**expand/sql_gen.rs** -- Before resolving individual dimension/metric names, expand wildcards:
+
+```rust
+fn expand_wildcards(
+    names: &[String],
+    items: &[impl HasSourceTable + HasName],
+    kind: &str,  // "dimension" or "metric"
+) -> Result<Vec<String>, ExpandError> {
+    let mut result = Vec::new();
+    for name in names {
+        if name.ends_with(".*") {
+            let alias = &name[..name.len() - 2];
+            let matches: Vec<_> = items.iter()
+                .filter(|item| item.source_table()
+                    .map_or(false, |st| st.eq_ignore_ascii_case(alias)))
+                .map(|item| item.name().to_string())
+                .collect();
+            if matches.is_empty() {
+                return Err(/* no items for alias */);
+            }
+            result.extend(matches);
+        } else {
+            result.push(name.clone());
+        }
+    }
+    Ok(result)
+}
+```
+
+This runs BEFORE the existing resolution loop, replacing `customer.*` with `[customer_name, customer_region, ...]`.
+
+**query/table_function.rs** -- No change needed; wildcards are just strings passed via the `dimensions`/`metrics` list parameters. Expansion happens in `expand()`.
+
+**Visibility filter:** When expanding wildcards, PRIVATE metrics and facts must be excluded. The wildcard resolver needs access to the `Visibility` field.
+
+#### New Components
+
+- None (modifications to existing)
+
+#### Modified Components
+
+- `expand/sql_gen.rs` or new `expand/wildcards.rs` -- wildcard expansion logic
+- `expand/types.rs` -- possible new error variant `NoItemsForAlias`
+
+### 7. SHOW Enhancements
+
+**Integration tier:** Tier 1 (DDL only)
+**Expansion impact:** NONE
+
+#### 7a. IN SCHEMA/DATABASE Scope Filtering
+
+**parse.rs** -- The existing `parse_show_filter_clauses` already handles `IN view_name`. Extend to handle `IN SCHEMA schema_name` and `IN DATABASE db_name`:
+
+```rust
+struct ShowClauses<'a> {
+    // ... existing ...
+    in_schema: Option<&'a str>,   // NEW
+    in_database: Option<&'a str>, // NEW
+}
+```
+
+**ddl/show_*.rs and ddl/list.rs** -- The `_all` VTab variants currently return all views across the catalog. With scope filtering, the rewritten SQL adds WHERE clauses:
+
+```sql
+SELECT * FROM list_semantic_views()
+WHERE database_name = 'my_db' AND schema_name = 'my_schema'
+```
+
+This works because the VTab output already includes `database_name` and `schema_name` columns. The filter can be injected at the SQL rewrite level in `parse.rs` (same pattern as LIKE/STARTS WITH).
+
+#### 7b. TERSE Mode
+
+**parse.rs** -- Detect `TERSE` keyword after `SHOW`:
+
+```
+SHOW TERSE SEMANTIC VIEWS [LIKE ...] [IN ...] [STARTS WITH ...] [LIMIT ...]
+```
+
+Add new `DdlKind` variants: `ShowTerse`, or better, add a `terse: bool` field to the rewrite output.
+
+The simplest approach: TERSE mode is handled at the SQL rewrite level by selecting a subset of columns:
+
+```sql
+-- Full mode (current)
+SELECT * FROM list_semantic_views()
+
+-- TERSE mode
+SELECT created_on, name, kind, database_name, schema_name
+FROM list_semantic_views()
+```
+
+This avoids creating new VTabs. The column subset is fixed per Snowflake spec:
+- SHOW SEMANTIC VIEWS TERSE: `created_on, name, kind, database_name, schema_name`
+- SHOW SEMANTIC DIMENSIONS TERSE: not specified by Snowflake (no TERSE mode documented)
+
+**Recommendation:** Implement TERSE only for SHOW SEMANTIC VIEWS (where Snowflake specifies it). The SHOW SEMANTIC DIMENSIONS/METRICS/FACTS commands do not have a TERSE variant in Snowflake docs.
+
+#### 7c. SHOW COLUMNS
+
+**New file: `ddl/show_columns.rs`** -- A new VTab that returns all components (dimensions, metrics, facts) of a semantic view with their types:
+
+Output schema (Snowflake-aligned):
+```
+column_name | kind | data_type | comment
+```
+
+Where `kind` is `DIMENSION`, `METRIC`, or `FACT`.
+
+**parse.rs** -- Detect `SHOW COLUMNS IN SEMANTIC VIEW name`:
+
+```rust
+DdlKind::ShowColumns => {
+    // Rewrite to: SELECT * FROM show_semantic_columns('name')
+}
+```
+
+#### New Components
+
+- `ddl/show_columns.rs` -- new VTab (~150 lines)
+- `DdlKind::ShowColumns` or `DdlKind::ShowTerse` in `parse.rs`
+
+#### Modified Components
+
+- `parse.rs` -- IN SCHEMA/DATABASE parsing, TERSE detection, SHOW COLUMNS detection
+- `ddl/mod.rs` -- add `pub mod show_columns;`
+- `lib.rs` -- register new VTab
+
+### 8. ALTER SET/UNSET COMMENT
+
+**Integration tier:** Tier 1 (DDL only)
+**Expansion impact:** NONE
+
+#### What Changes
+
+**parse.rs** -- New DDL forms:
+
+```sql
+ALTER SEMANTIC VIEW name SET COMMENT = 'text'
+ALTER SEMANTIC VIEW name UNSET COMMENT
+```
+
+These rewrite to new VTab calls:
+
+```sql
+SELECT * FROM alter_semantic_view_set_comment('name', 'text')
+SELECT * FROM alter_semantic_view_unset_comment('name')
+```
+
+**New file: `ddl/alter_comment.rs`** -- VTab that:
+1. Reads existing JSON from catalog
+2. Deserializes to `SemanticViewDefinition`
+3. Sets/clears the `comment` field
+4. Re-serializes and updates catalog (both HashMap and persistent storage)
+
+**parse.rs** -- Extend ALTER detection to handle SET COMMENT / UNSET COMMENT in addition to RENAME TO.
+
+#### New Components
+
+- `ddl/alter_comment.rs` -- new VTab (~100 lines)
+- New `DdlKind::AlterSetComment`, `DdlKind::AlterUnsetComment` variants
+
+#### Modified Components
+
+- `parse.rs` -- ALTER subcommand parsing
+- `ddl/mod.rs` -- add module
+- `lib.rs` -- register VTab
+
+## Component Boundaries
+
+```
+                                  +-----------+
+                                  |  model.rs |
+                                  | (structs) |
+                                  +-----+-----+
+                                        |
+              +-------------------------+-------------------------+
+              |                         |                         |
+     +--------+--------+      +--------+--------+       +--------+--------+
+     | body_parser.rs   |      |   expand/        |       |   ddl/           |
+     | (parse DDL body) |      | (SQL generation) |       | (VTab handlers)  |
+     +--------+--------+      +--------+--------+       +--------+--------+
+              |                         |                         |
+              v                         v                         v
+     +--------+--------+      +--------+--------+       +--------+--------+
+     |   parse.rs       |      | query/           |       | catalog.rs       |
+     | (detect/rewrite) |      | (table function) |       | (state/persist)  |
+     +--------+--------+      +--------+--------+       +--------+--------+
+              |                         |                         |
+              +-------------------------+-------------------------+
+                                        |
+                                  +-----+-----+
+                                  | lib.rs     |
+                                  | (init/reg) |
+                                  +-----------+
+```
+
+### New vs Modified Summary
+
+| Feature | New Files | Modified Files |
+|---------|-----------|----------------|
+| Metadata (COMMENT/SYNONYMS/PRIVATE) | None | model.rs, body_parser.rs, ddl/describe.rs, ddl/show_*.rs, ddl/list.rs |
+| Semi-additive metrics | expand/semi_additive.rs | model.rs, body_parser.rs, expand/sql_gen.rs, expand/mod.rs |
+| Window function metrics | expand/window.rs | model.rs, body_parser.rs, expand/sql_gen.rs, expand/mod.rs |
+| GET_DDL | ddl/get_ddl.rs | parse.rs, ddl/mod.rs, lib.rs |
+| Queryable FACTS | None | expand/types.rs, expand/sql_gen.rs, expand/resolution.rs, query/table_function.rs |
+| Wildcard selection | expand/wildcards.rs (optional) | expand/sql_gen.rs |
+| SHOW enhancements | ddl/show_columns.rs | parse.rs, ddl/mod.rs, lib.rs |
+| ALTER SET/UNSET COMMENT | ddl/alter_comment.rs | parse.rs, ddl/mod.rs, lib.rs |
+
+## Data Flow Changes
+
+### Current Data Flow (Query Path)
+
+```
+semantic_view('v', dims=['a'], metrics=['m'])
+    --> bind: catalog lookup --> expand(def, req) --> expanded SQL
+    --> bind: type inference (LIMIT 0 or stored)
+    --> bind: build_execution_sql (type cast wrapper)
+    --> func: execute_sql_raw(execution_sql) --> stream chunks
+```
+
+### New Data Flows
+
+**Wildcard Resolution (in bind):**
+```
+dims=['customer.*'] --> expand_wildcards(dims, def.dimensions)
+    --> dims=['customer_name', 'customer_region', ...] --> existing flow
+```
+
+**Queryable FACTS (in bind):**
+```
+facts=['order_count'] --> expand(def, req_with_facts)
+    --> SELECT DISTINCT dims, fact_exprs FROM... (no GROUP BY, no aggregation)
+```
+
+**Semi-Additive Metrics (in expand):**
+```
+metrics=['balance'] where balance.non_additive_by=['year','month','day']
+    --> detect semi-additive --> generate CTE with ROW_NUMBER
+    --> WITH __sv_snapshot AS (
+            SELECT ..., ROW_NUMBER() OVER(PARTITION BY non_na_dims ORDER BY na_dims DESC) AS __sv_rn
+            FROM ...
+        )
+        SELECT non_na_dims, AGG(measure) FROM __sv_snapshot WHERE __sv_rn = 1 GROUP BY ...
+```
+
+**GET_DDL (new DDL path):**
+```
+GET_DDL SEMANTIC VIEW 'name'
+    --> parse.rs: detect, rewrite to SELECT * FROM get_ddl_semantic_view('name')
+    --> VTab bind: catalog lookup, deserialize, render_ddl()
+    --> func: emit single-row VARCHAR result
 ```
 
 ## Patterns to Follow
 
-### Pattern 1: Module Directory with Re-exports
+### Pattern 1: Backward-Compatible Serde Fields
 
-**What:** Convert `foo.rs` to `foo/mod.rs` that re-exports the public API, with internal submodules for each responsibility.
-
-**When:** A single file exceeds ~500 lines and contains 3+ distinct responsibilities.
-
-**Example (expand/mod.rs):**
-```rust
-mod validate;
-mod resolve;
-mod facts;
-mod fan_trap;
-mod role_playing;
-mod join_resolver;
-mod sql_gen;
-
-// Re-export public API -- external callers see no change
-pub use self::validate::QueryRequest;
-pub use self::resolve::ExpandError;
-pub use self::sql_gen::{quote_ident, quote_table_ref};
-
-// The main expand function orchestrates submodules
-pub fn expand(
-    view_name: &str,
-    def: &SemanticViewDefinition,
-    request: &QueryRequest,
-) -> Result<String, ExpandError> {
-    validate::check_request(request, view_name)?;
-    let dims = resolve::resolve_dimensions(request, def, view_name)?;
-    let mets = resolve::resolve_metrics(request, def, view_name)?;
-    // ... orchestrate pipeline steps
-}
-
-// Re-export internal items needed by ddl/show_dims_for_metric.rs
-pub(crate) use self::fan_trap::ancestors_to_root;
-pub(crate) use self::facts::collect_derived_metric_source_tables;
-```
-
-**Why:** External callers (`query/table_function.rs`, `ddl/define.rs`) see the same `crate::expand::expand`, `crate::expand::QueryRequest` paths. Zero breaking changes to import sites. Internal complexity is hidden.
-
-### Pattern 2: Leaf Utility Module
-
-**What:** Extract pure functions with no domain dependencies into a shared utility module.
-
-**When:** A function is imported across module boundaries and creates a circular dependency.
-
-**Example (util.rs):**
-```rust
-/// Suggest the closest matching name using Levenshtein distance.
-/// Returns Some(name) if edit distance <= 3.
-pub fn suggest_closest(name: &str, available: &[String]) -> Option<String> {
-    // ... (moved from expand.rs, unchanged)
-}
-
-/// Replace all word-boundary-delimited occurrences of needle with replacement.
-pub(crate) fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) -> String {
-    // ... (moved from expand.rs, unchanged)
-}
-```
-
-**Why:** Breaks `expand <-> graph` circular dependency. Both modules import from `util` instead of each other. The dependency graph becomes a clean DAG.
-
-### Pattern 3: Property-Per-Row VTab Output
-
-**What:** Emit N rows per entity, one per property, instead of one row with all properties.
-
-**When:** Aligning with Snowflake's DESCRIBE output format.
-
-**Example (describe.rs new pattern):**
-```rust
-struct DescribeRow {
-    object_kind: Option<String>,   // NULL, TABLE, DIMENSION, METRIC, etc.
-    object_name: Option<String>,
-    parent_entity: Option<String>,
-    property: String,
-    property_value: String,
-}
-
-fn collect_describe_rows(def: &SemanticViewDefinition) -> Vec<DescribeRow> {
-    let mut rows = Vec::new();
-    // Semantic view-level properties
-    rows.push(DescribeRow {
-        object_kind: None, object_name: None, parent_entity: None,
-        property: "COMMENT".into(), property_value: "".into(),
-    });
-    // Table-level properties
-    for table in &def.tables {
-        rows.push(DescribeRow {
-            object_kind: Some("TABLE".into()),
-            object_name: Some(table.alias.clone()),
-            parent_entity: None,
-            property: "BASE_TABLE_NAME".into(),
-            property_value: table.table.clone(),
-        });
-        if !table.pk_columns.is_empty() {
-            rows.push(DescribeRow {
-                object_kind: Some("TABLE".into()),
-                object_name: Some(table.alias.clone()),
-                parent_entity: None,
-                property: "PRIMARY_KEY".into(),
-                property_value: format!("{:?}", table.pk_columns),
-            });
-        }
-    }
-    // Dimension properties (EXPRESSION + DATA_TYPE per dimension)
-    for dim in &def.dimensions {
-        let parent = dim.source_table.clone().unwrap_or_else(|| {
-            def.tables.first().map(|t| t.alias.clone()).unwrap_or_default()
-        });
-        rows.push(DescribeRow {
-            object_kind: Some("DIMENSION".into()),
-            object_name: Some(dim.name.clone()),
-            parent_entity: Some(parent.clone()),
-            property: "EXPRESSION".into(),
-            property_value: dim.expr.clone(),
-        });
-        if let Some(ref dt) = dim.output_type {
-            rows.push(DescribeRow {
-                object_kind: Some("DIMENSION".into()),
-                object_name: Some(dim.name.clone()),
-                parent_entity: Some(parent),
-                property: "DATA_TYPE".into(),
-                property_value: dt.clone(),
-            });
-        }
-    }
-    // ... metrics, relationships, facts similarly
-    rows
-}
-```
-
-### Pattern 4: Catalog Schema Migration for created_on
-
-**What:** Add a `created_on` timestamp field to stored definitions.
-
-**When:** SHOW SEMANTIC VIEWS needs a `created_on` column.
-
-**Approach:** Store `created_on` as an ISO 8601 string inside the JSON definition. At define time, inject `Utc::now()` (or DuckDB's `current_timestamp`). For backward compatibility, existing definitions without `created_on` get a fallback value (e.g., empty string or epoch).
+**What:** Every new field on model structs uses `#[serde(default, skip_serializing_if = "...")]`
+**When:** Always when adding fields to serialized structs
+**Why:** Existing stored JSON must deserialize without error. New JSON should omit default values to minimize storage.
 
 ```rust
-// In model.rs
-pub struct SemanticViewDefinition {
-    // ... existing fields
-    #[serde(default)]
-    pub created_on: Option<String>,  // ISO 8601 timestamp, None for pre-v0.5.5 defs
-}
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub comment: Option<String>,
+
+#[serde(default, skip_serializing_if = "Vec::is_empty")]
+pub synonyms: Vec<String>,
+
+#[serde(default, skip_serializing_if = "Visibility::is_default")]
+pub visibility: Visibility,
 ```
 
-**Why not a new DB column?** The `_definitions` table stores `(name VARCHAR, definition VARCHAR)`. Adding a column requires ALTER TABLE migration logic. Embedding `created_on` in the JSON definition is simpler and backward-compatible -- `serde(default)` handles missing fields automatically. The tradeoff is that the timestamp is not independently queryable via SQL on the catalog table, but SHOW SEMANTIC VIEWS is the user-facing query path.
+### Pattern 2: SQL Rewrite at Parse Level (for new DDL forms)
 
-### Pattern 5: Database/Schema Context from DuckDB
+**What:** New DDL commands are detected in `parse.rs` and rewritten to `SELECT * FROM fn(args)`
+**When:** Adding GET_DDL, ALTER SET COMMENT, SHOW COLUMNS, TERSE mode
+**Why:** Consistent with existing architecture -- parser hooks intercept DDL, Rust rewrites to function calls
 
-**What:** Extract `database_name` and `schema_name` from DuckDB connection context at VTab bind time.
+### Pattern 3: CTE Wrapping for Complex Expansion
 
-**Approach:** Execute `SELECT current_database(), current_schema()` via the query connection, or use pragmas. Since VTab bind has access to `BindInfo` which provides `get_extra_info<CatalogState>()`, the database/schema can be injected as additional context alongside the catalog state.
+**What:** Use CTEs (`WITH __sv_* AS (...)`) when the expansion needs intermediate steps
+**When:** Semi-additive metrics (snapshot selection), potentially window function metrics
+**Why:** CTEs keep the SQL readable and debuggable; DuckDB optimizes them away
 
-Alternative: Store `database_name` and `schema_name` in the JSON definition at define time (same approach as `created_on`). This is simpler and avoids runtime SQL execution during bind.
+### Pattern 4: VTab-per-DDL-Verb Pattern
 
-**Recommendation:** Store in JSON at define time. Simpler, deterministic, no bind-time SQL needed. If the database/schema changes after creation (unlikely for extension-managed objects), the stored values reflect creation context (which matches Snowflake behavior).
+**What:** Each DDL operation gets its own VTab implementation
+**When:** GET_DDL, ALTER SET COMMENT, SHOW COLUMNS
+**Why:** Consistent with existing architecture (11 VTabs already follow this pattern)
 
 ## Anti-Patterns to Avoid
 
-### Anti-Pattern 1: Big-Bang Refactoring
+### Anti-Pattern 1: Mutating Expansion Based on Metadata
 
-**What:** Trying to do the module split and output format changes in a single commit.
+**What:** Using COMMENT/SYNONYMS/PRIVATE fields to change SQL expansion behavior
+**Why bad:** Metadata is informational; mixing it with query logic creates coupling
+**Instead:** Metadata flows through DDL/SHOW/DESCRIBE paths only. The only metadata that affects expansion is `visibility: Private` (which blocks querying of private facts/metrics) and `non_additive_by` (which is semantic, not metadata).
 
-**Why bad:** If tests break, you cannot tell whether the issue is from the refactoring (should be behavior-preserving) or the output format change (intentionally changes behavior). Debugging is 2x harder.
+### Anti-Pattern 2: Mixed Aggregation Modes in Single Query
 
-**Instead:** Refactoring first, then output format changes. Each phase should pass `just test-all` independently.
+**What:** Allowing window metrics + aggregate metrics + facts in a single `semantic_view()` call
+**Why bad:** Produces SQL that is extremely complex, hard to debug, and may have ambiguous semantics
+**Instead:** Validate at bind time that the request is one of: (a) regular dims+metrics, (b) facts-only or facts+dims, (c) window metrics+dims. Return a clear error if modes are mixed.
 
-### Anti-Pattern 2: Changing Public API During Module Split
+### Anti-Pattern 3: String Template for GET_DDL Rendering
 
-**What:** Renaming functions, changing signatures, or reorganizing the public API while splitting files.
+**What:** Using format strings with interpolation to build DDL output
+**Why bad:** SQL injection risk if stored names contain single quotes, incorrect escaping
+**Instead:** Use the same identifier quoting (`quote_ident`) already used in expansion
 
-**Why bad:** Creates unnecessary churn in import sites. Every caller must be updated simultaneously. Increases merge conflict surface.
+## Suggested Build Order
 
-**Instead:** The `expand/mod.rs` re-exports everything at the same `crate::expand::*` paths. All existing `use crate::expand::{expand, suggest_closest, QueryRequest}` statements continue to work unchanged. Internal reorganization is invisible to callers.
+### Phase 1: Metadata Foundation (Model + Parser)
 
-### Anti-Pattern 3: Mixing VTab Schema Changes with Logic Changes
+Add all model struct fields (COMMENT, SYNONYMS, PRIVATE/Visibility), extend body_parser.rs to parse the new syntax elements. This phase produces no new user-visible behavior but lays the foundation for everything else.
 
-**What:** Changing output columns AND changing the data collection logic (e.g., fan trap filtering in show_dims_for_metric) in the same phase.
+**Rationale:** Every subsequent feature needs these model fields. Building them first avoids repeated model modifications.
 
-**Why bad:** If a sqllogictest fails, unclear whether the column schema is wrong or the data logic is wrong.
+**Scope:**
+- model.rs: Add Visibility enum, comment/synonyms/visibility fields to all structs, NonAdditiveDim/SortOrder/NullsOrder types
+- body_parser.rs: Parse COMMENT =, WITH SYNONYMS =, PRIVATE/PUBLIC, NON ADDITIVE BY
+- Tests: roundtrip serialization, parser tests for new syntax
 
-**Instead:** Change output columns first (schema alignment), verify all tests pass, then make any logic changes (e.g., adding `required` boolean computation).
+### Phase 2: SHOW/DESCRIBE Metadata Columns + SHOW Enhancements
 
-### Anti-Pattern 4: Using DuckDB Timestamps for created_on
+Surface metadata in SHOW/DESCRIBE output. Add TERSE mode, IN SCHEMA/DATABASE, SHOW COLUMNS.
 
-**What:** Calling DuckDB's `current_timestamp` during VTab bind to populate `created_on`.
+**Rationale:** Once model fields exist, surfacing them in introspection is straightforward. Completing SHOW changes here avoids revisiting these VTabs later.
 
-**Why bad:** Bind happens at query time, not define time. The timestamp would reflect when SHOW was run, not when the view was created.
+**Scope:**
+- ddl/describe.rs: Emit COMMENT, SYNONYMS, VISIBILITY properties
+- ddl/show_dims.rs, show_metrics.rs, show_facts.rs: Add synonyms, comment columns
+- ddl/list.rs: Add comment column
+- ddl/show_columns.rs: New VTab
+- parse.rs: TERSE detection, IN SCHEMA/DATABASE, SHOW COLUMNS detection
 
-**Instead:** Capture the timestamp in the define path (ddl/define.rs) and store it in the JSON definition.
+### Phase 3: ALTER SET/UNSET COMMENT + GET_DDL
+
+**Rationale:** These are self-contained DDL features that depend on the model fields from Phase 1 but not on expansion changes. GET_DDL tests serve as roundtrip validation for the model.
+
+**Scope:**
+- ddl/alter_comment.rs: New VTab
+- ddl/get_ddl.rs: New VTab with render functions
+- parse.rs: New DdlKind variants and rewrite logic
+
+### Phase 4: Wildcard Selection + Queryable FACTS
+
+**Rationale:** These are moderate expansion changes that share a dependency: both need to resolve items from the definition that were not previously queryable (wildcards expand names, facts expand expressions). Building them together exercises the expansion pipeline modification pattern.
+
+**Scope:**
+- expand/sql_gen.rs: Wildcard expansion before resolution
+- expand/types.rs: QueryRequest gains `facts` field
+- expand/resolution.rs: `find_fact()` function
+- query/table_function.rs: Parse `facts` parameter
+- PRIVATE visibility enforcement in wildcard expansion
+
+### Phase 5: Semi-Additive Metrics
+
+**Rationale:** This is the highest-complexity expansion change. All model fields are in place from Phase 1. Building this after simpler expansion changes (Phase 4) means the developer is familiar with the expansion pipeline.
+
+**Scope:**
+- expand/semi_additive.rs: CTE-based expansion for NON ADDITIVE BY
+- expand/sql_gen.rs: Detection and branching for semi-additive metrics
+- Extensive testing: snapshot correctness, mixed regular+semi-additive queries
+
+### Phase 6: Window Function Metrics (if included)
+
+**Rationale:** Most complex feature, orthogonal to semi-additive. Can be deferred to a future milestone if v0.6.0 scope is too large. Currently listed in Out of Scope in PROJECT.md.
+
+**Note:** The milestone context mentions window function metrics, but PROJECT.md lists them as Out of Scope. If included, this should be the last phase due to its structural impact on the expansion pipeline.
+
+**Scope:**
+- expand/window.rs: Window function SQL generation
+- expand/sql_gen.rs: Window metric detection and no-GROUP-BY path
+- Validation that window metrics cannot be mixed with aggregate metrics
 
 ## Scalability Considerations
 
-Not applicable for this milestone -- the changes are structural (module organization) and schema-level (output formats). No performance-sensitive paths are modified. The expansion pipeline, which is the hot path, is only touched by the refactoring (file reorganization), not by behavioral changes.
-
-## Recommended Build Order
-
-The sequencing below minimizes risk by establishing the refactored module structure first (behavior-preserving), then making schema changes on top of the clean structure.
-
-### Phase A: Extract Shared Utilities (C3 + C5)
-
-**New files:** `src/util.rs`, `src/errors.rs`
-**Modified files:** `src/lib.rs` (add `mod util; mod errors;`), `src/expand.rs`, `src/graph.rs`, `src/parse.rs`, `src/body_parser.rs`, `src/ddl/show_dims_for_metric.rs`
-**Risk:** LOW -- moving 2 functions and 1 struct to new files, updating import paths.
-**Validation:** `just test-all` must pass. Zero behavior change.
-
-Steps:
-1. Create `src/util.rs` with `suggest_closest` and `replace_word_boundary` (copy from expand.rs).
-2. Create `src/errors.rs` with `ParseError` (copy from parse.rs).
-3. Update `expand.rs`: remove `suggest_closest` and `replace_word_boundary` definitions, add `use crate::util::{suggest_closest, replace_word_boundary};`
-4. Update `graph.rs`: change `use crate::expand::suggest_closest` to `use crate::util::suggest_closest;`
-5. Update `parse.rs`: remove `ParseError` definition, add `pub use crate::errors::ParseError;` (re-export for backward compat).
-6. Update `body_parser.rs`: change `use crate::parse::ParseError` to `use crate::errors::ParseError;`
-7. Update `show_dims_for_metric.rs`: change `use crate::expand::suggest_closest` to `use crate::util::suggest_closest;`
-8. Run `just test-all`.
-
-### Phase B: Split expand.rs into expand/ Module Directory (C1)
-
-**New directory:** `src/expand/`
-**New files:** `mod.rs`, `validate.rs`, `resolve.rs`, `facts.rs`, `fan_trap.rs`, `role_playing.rs`, `join_resolver.rs`, `sql_gen.rs`
-**Deleted file:** `src/expand.rs` (replaced by `src/expand/mod.rs`)
-**Modified files:** `src/lib.rs` (no change -- `mod expand;` works for both file and directory)
-**Risk:** MEDIUM -- largest refactoring step; 4,490 lines across 8 files. Tests in expand.rs must be distributed to submodules.
-**Validation:** `just test-all` must pass. Zero behavior change. All `use crate::expand::*` paths must still resolve.
-
-Key decisions:
-- Tests stay with the code they test (e.g., fan trap tests go in `fan_trap.rs`).
-- `mod.rs` contains only the `expand()` orchestrator function and re-exports.
-- `pub(crate)` functions like `ancestors_to_root` and `collect_derived_metric_source_tables` are re-exported from `mod.rs` for `ddl/show_dims_for_metric.rs`.
-
-### Phase C: Split graph.rs into graph/ Module Directory (C2)
-
-**New directory:** `src/graph/`
-**New files:** `mod.rs`, `relationship.rs`, `facts.rs`, `derived_metrics.rs`, `using.rs`
-**Deleted file:** `src/graph.rs` (replaced by `src/graph/mod.rs`)
-**Risk:** MEDIUM -- 2,502 lines across 5 files. Simpler than expand/ split because graph functions are more self-contained.
-**Validation:** `just test-all` must pass. Zero behavior change.
-
-### Phase D: Catalog Schema + created_on Timestamp
-
-**Modified files:** `src/model.rs` (add `created_on`, `database_name`, `schema_name` fields), `src/ddl/define.rs` (inject timestamp/context at define time)
-**Risk:** LOW -- additive changes only. `serde(default)` ensures backward compatibility.
-**Validation:** Existing tests pass (old JSON without new fields deserializes correctly). New unit tests for timestamp injection.
-
-### Phase E: SHOW SEMANTIC VIEWS Alignment
-
-**Modified file:** `src/ddl/list.rs`
-**Schema change:** 2 columns -> 6 columns (created_on, name, kind, database_name, schema_name, comment)
-**Risk:** MEDIUM -- breaks existing sqllogictest expectations for SHOW SEMANTIC VIEWS output.
-**Validation:** Update sqllogictest files, run `just test-all`.
-
-### Phase F: SHOW SEMANTIC DIMENSIONS / METRICS / FACTS Alignment
-
-**Modified files:** `src/ddl/show_dims.rs`, `src/ddl/show_metrics.rs`, `src/ddl/show_facts.rs`
-**Schema change:** Current 5 columns -> 8 columns (database_name, schema_name, semantic_view_name, table_name, name, data_type, synonyms, comment). Drop `expr`.
-**Risk:** MEDIUM -- three files with parallel changes, all break existing test expectations.
-**Validation:** Update sqllogictest files, run `just test-all`.
-
-### Phase G: SHOW SEMANTIC DIMENSIONS FOR METRIC Alignment
-
-**Modified file:** `src/ddl/show_dims_for_metric.rs`
-**Schema change:** 5 columns -> 6 columns (table_name, name, data_type, required, synonyms, comment). Drop `expr`, `semantic_view_name`. Add `required` boolean.
-**Risk:** MEDIUM -- the `required` column computation is new logic (currently Snowflake uses it for window function PARTITION BY EXCLUDING; we can default to `false` initially since we don't support window metrics).
-**Validation:** Update sqllogictest, run `just test-all`.
-
-### Phase H: DESCRIBE SEMANTIC VIEW Alignment
-
-**Modified file:** `src/ddl/describe.rs`
-**Schema change:** 6 columns (single row) -> 5 columns (N rows, property-per-row format). Complete rewrite.
-**Risk:** HIGH -- most complex output format change. Largest delta from current behavior. Many test expectations change.
-**Validation:** Comprehensive new sqllogictest cases, run `just test-all`.
-
-### Phase Ordering Rationale
-
-1. **A before B/C:** Utility extraction (5 min) breaks circular deps, making the module splits cleaner.
-2. **B before C:** expand.rs is larger and has more external consumers; splitting it first reduces risk for the graph split.
-3. **A-C before D-H:** Refactoring is behavior-preserving; do it first while the test suite is stable. Output format changes intentionally break tests.
-4. **D before E-H:** Catalog schema changes (created_on, database_name, schema_name) must exist before SHOW VTabs can emit those columns.
-5. **E before F-G:** SHOW SEMANTIC VIEWS is the simplest SHOW command (list.rs is 101 lines). Proves the pattern before tackling the larger SHOW files.
-6. **F before G:** SHOW DIMENSIONS/METRICS/FACTS are structurally identical. Do them together, then the more complex FOR METRIC variant.
-7. **H last:** DESCRIBE is the most radical format change (single row to N rows). Do it after all SHOW commands are proven.
-
-## Integration Points
-
-### New Components
-| Component | Type | Purpose |
-|-----------|------|---------|
-| `src/util.rs` | New module | Shared string utilities (suggest_closest, replace_word_boundary) |
-| `src/errors.rs` | New module | Shared ParseError struct |
-| `src/expand/` | Directory (replaces file) | Module directory for expansion pipeline |
-| `src/graph/` | Directory (replaces file) | Module directory for graph validation |
-
-### Modified Components
-| Component | Change Type | What Changes |
-|-----------|-------------|--------------|
-| `src/model.rs` | Additive fields | `created_on`, `database_name`, `schema_name` on SemanticViewDefinition |
-| `src/ddl/define.rs` | Additive logic | Inject timestamp + context at define time |
-| `src/ddl/list.rs` | Schema change | 2 columns -> 6 columns (Snowflake SHOW SEMANTIC VIEWS format) |
-| `src/ddl/show_dims.rs` | Schema change | 5 columns -> 8 columns (drop expr, add db/schema/synonyms/comment) |
-| `src/ddl/show_metrics.rs` | Schema change | 5 columns -> 8 columns (same as dims) |
-| `src/ddl/show_facts.rs` | Schema change | 4 columns -> 8 columns (add db/schema/data_type/synonyms/comment) |
-| `src/ddl/show_dims_for_metric.rs` | Schema change | 5 columns -> 6 columns (drop expr/sv_name, add required/synonyms/comment) |
-| `src/ddl/describe.rs` | Full rewrite | Single-row 6-column -> N-row 5-column property-per-row format |
-| `src/parse.rs` | Import path | ParseError re-export from errors.rs |
-| `src/body_parser.rs` | Import path | ParseError import from errors.rs |
-
-### Unchanged Components
-| Component | Why Unchanged |
-|-----------|---------------|
-| `src/query/table_function.rs` | Query path unaffected by SHOW/DESCRIBE changes |
-| `src/query/explain.rs` | Uses expand::expand, which is only reorganized not changed |
-| `shim.cpp` | C++ FFI layer unaffected |
-| `src/catalog.rs` | Schema (`name, definition`) unchanged; new fields go in JSON |
+| Concern | Current (v0.5.5) | After v0.6.0 |
+|---------|------------------|--------------|
+| Model struct size | 5 optional fields | +8 optional fields per struct. Serde skip_serializing_if keeps JSON compact |
+| Parser complexity | 5 clause keywords | Same 5 keywords, but each entry has more optional suffixes. State machine approach scales linearly |
+| DdlKind variants | 12 | +3-4 (GET_DDL, ShowColumns, AlterSetComment, AlterUnsetComment) |
+| VTab count | 18 registered | +3-4 (get_ddl, show_columns, alter_comment variants) |
+| Expansion paths | 3 modes (dims-only, metrics-only, both) | +3 modes (facts, semi-additive, window). Each is a separate code path in expand() |
+| JSON storage size | ~500 bytes typical | +10-20% with metadata fields. Negligible for in-memory HashMap |
 
 ## Sources
 
-- [Snowflake SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- output columns: created_on, name, kind, database_name, schema_name, comment, owner, owner_role_type
-- [Snowflake DESCRIBE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view) -- property-per-row format with 5 columns: object_kind, object_name, parent_entity, property, property_value
-- [Snowflake SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- 8 columns: database_name, schema_name, semantic_view_name, table_name, name, data_type, synonyms, comment
-- [Snowflake SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics) -- same 8 columns as dimensions
-- [Snowflake SHOW SEMANTIC DIMENSIONS FOR METRIC](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions-for-metric) -- 6 columns: table_name, name, data_type, required, synonyms, comment
-- [Rust module system: Separating Modules into Different Files](https://doc.rust-lang.org/book/ch07-05-separating-modules-into-different-files.html) -- official Rust book on module directories
-- Direct codebase analysis of all 6 VTab files, expand.rs (4,490 lines), graph.rs (2,502 lines), parse.rs, catalog.rs, model.rs, and import graph
+- [Snowflake CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- full DDL syntax including COMMENT, SYNONYMS, PRIVATE, NON ADDITIVE BY, window functions
+- [Snowflake SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- TERSE mode, IN clause, output columns
+- [Snowflake SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- output columns including synonyms and comment
+- [Snowflake SEMANTIC_VIEW query construct](https://docs.snowflake.com/en/sql-reference/constructs/semantic_view) -- wildcard selection, queryable facts
+- [Snowflake Querying semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/querying) -- facts query examples, wildcard examples
+- [Snowflake GET_DDL](https://docs.snowflake.com/en/sql-reference/functions/get_ddl) -- semantic view reconstruction
+- [Snowflake Using SQL commands](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- ALTER SET COMMENT, GET_DDL examples, SHOW COLUMNS
+- [Snowflake Semi-additive metrics release](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY feature details
+- Direct codebase analysis of `src/` (16,342 LOC Rust)

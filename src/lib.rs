@@ -7,6 +7,7 @@ pub mod model;
 pub mod parse;
 #[cfg(feature = "extension")]
 pub mod query;
+pub mod render_ddl;
 pub mod util;
 
 /// Test helpers for integration tests.
@@ -86,6 +87,18 @@ pub mod test_helpers {
         type_id: u32,
         logical_type: ffi::duckdb_logical_type,
     ) -> TestValue {
+        // SEC-04: Guard against out-of-range indices in test helpers.
+        let row_count = ffi::duckdb_data_chunk_get_size(chunk) as usize;
+        debug_assert!(
+            row_idx < row_count,
+            "read_typed_value: row_idx {row_idx} out of bounds (chunk has {row_count} rows)"
+        );
+        let col_count = ffi::duckdb_data_chunk_get_column_count(chunk) as usize;
+        debug_assert!(
+            col_idx < col_count,
+            "read_typed_value: col_idx {col_idx} out of bounds (chunk has {col_count} columns)"
+        );
+
         use ffi::{
             DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN as BOOLEAN,
             DUCKDB_TYPE_DUCKDB_TYPE_DATE as DATE, DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL as DECIMAL,
@@ -290,11 +303,16 @@ mod extension {
     use crate::{
         catalog::init_catalog,
         ddl::{
-            alter::{AlterRenameState, AlterRenameVTab},
+            alter::{
+                AlterCommentState, AlterRenameState, AlterRenameVTab, AlterSetCommentVTab,
+                AlterUnsetCommentVTab,
+            },
             define::{DefineFromJsonVTab, DefineState},
             describe::DescribeSemanticViewVTab,
             drop::{DropSemanticViewVTab, DropState},
-            list::ListSemanticViewsVTab,
+            get_ddl::GetDdlScalar,
+            list::{ListSemanticViewsVTab, ListTerseSemanticViewsVTab},
+            show_columns::ShowColumnsInSemanticViewVTab,
             show_dims::{ShowSemanticDimensionsAllVTab, ShowSemanticDimensionsVTab},
             show_dims_for_metric::ShowDimensionsForMetricVTab,
             show_facts::{ShowSemanticFactsAllVTab, ShowSemanticFactsVTab},
@@ -444,9 +462,61 @@ mod extension {
             &alter_if_exists_state,
         )?;
 
+        // Register alter_semantic_view_set_comment(name, comment) table function.
+        let alter_set_comment_state = AlterCommentState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            if_exists: false,
+        };
+        con.register_table_function_with_extra_info::<AlterSetCommentVTab, _>(
+            "alter_semantic_view_set_comment",
+            &alter_set_comment_state,
+        )?;
+
+        // Register alter_semantic_view_set_comment_if_exists(name, comment) table function.
+        let alter_set_comment_if_exists_state = AlterCommentState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            if_exists: true,
+        };
+        con.register_table_function_with_extra_info::<AlterSetCommentVTab, _>(
+            "alter_semantic_view_set_comment_if_exists",
+            &alter_set_comment_if_exists_state,
+        )?;
+
+        // Register alter_semantic_view_unset_comment(name) table function.
+        let alter_unset_comment_state = AlterCommentState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            if_exists: false,
+        };
+        con.register_table_function_with_extra_info::<AlterUnsetCommentVTab, _>(
+            "alter_semantic_view_unset_comment",
+            &alter_unset_comment_state,
+        )?;
+
+        // Register alter_semantic_view_unset_comment_if_exists(name) table function.
+        let alter_unset_comment_if_exists_state = AlterCommentState {
+            catalog: catalog_state.clone(),
+            persist_conn,
+            if_exists: true,
+        };
+        con.register_table_function_with_extra_info::<AlterUnsetCommentVTab, _>(
+            "alter_semantic_view_unset_comment_if_exists",
+            &alter_unset_comment_if_exists_state,
+        )?;
+
         // Register table DDL read functions (list_semantic_views, describe_semantic_view).
         con.register_table_function_with_extra_info::<ListSemanticViewsVTab, _>(
             "list_semantic_views",
+            &catalog_state,
+        )?;
+        con.register_table_function_with_extra_info::<ListTerseSemanticViewsVTab, _>(
+            "list_terse_semantic_views",
+            &catalog_state,
+        )?;
+        con.register_table_function_with_extra_info::<ShowColumnsInSemanticViewVTab, _>(
+            "show_columns_in_semantic_view",
             &catalog_state,
         )?;
         con.register_table_function_with_extra_info::<DescribeSemanticViewVTab, _>(
@@ -489,6 +559,9 @@ mod extension {
             "show_semantic_facts_all",
             &catalog_state,
         )?;
+
+        // Register GET_DDL scalar function.
+        con.register_scalar_function_with_state::<GetDdlScalar>("get_ddl", &catalog_state)?;
 
         // Create a NEW connection for the semantic_view table function.
         let mut query_conn: ffi::duckdb_connection = ptr::null_mut();
@@ -590,23 +663,32 @@ mod extension {
         info: ffi::duckdb_extension_info,
         access: *const ffi::duckdb_extension_access,
     ) -> bool {
-        let init_result = semantic_views_init_c_api_internal(info, access);
+        let init_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            semantic_views_init_c_api_internal(info, access)
+        }));
 
-        if let Err(x) = init_result {
-            let error_c_string = std::ffi::CString::new(x.to_string());
-            match error_c_string {
-                Ok(e) => {
-                    (*access).set_error.unwrap()(info, e.as_ptr());
+        match init_result {
+            Ok(Ok(val)) => val,
+            Ok(Err(x)) => {
+                let error_c_string = std::ffi::CString::new(x.to_string());
+                match error_c_string {
+                    Ok(e) => {
+                        (*access).set_error.unwrap()(info, e.as_ptr());
+                    }
+                    Err(_e) => {
+                        let error_alloc_failure = c"An error occurred but the extension failed to allocate memory for an error string";
+                        (*access).set_error.unwrap()(info, error_alloc_failure.as_ptr());
+                    }
                 }
-                Err(_e) => {
-                    let error_alloc_failure = c"An error occurred but the extension failed to allocate memory for an error string";
-                    (*access).set_error.unwrap()(info, error_alloc_failure.as_ptr());
-                }
+                false
             }
-            return false;
+            Err(_panic) => {
+                let panic_msg =
+                    c"Extension init panicked unexpectedly. This is a bug in semantic_views.";
+                (*access).set_error.unwrap()(info, panic_msg.as_ptr());
+                false
+            }
         }
-
-        init_result.unwrap()
     }
 }
 

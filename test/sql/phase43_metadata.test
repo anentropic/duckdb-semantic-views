@@ -1,0 +1,263 @@
+# Phase 43: Metadata annotations integration tests
+# Tests COMMENT, WITH SYNONYMS, and PRIVATE/PUBLIC DDL annotations
+# through the full DDL -> parse -> persist -> query pipeline.
+
+require semantic_views
+
+# ============================================================
+# Setup: create base tables
+# ============================================================
+
+statement ok
+CREATE TABLE p43_orders (id INTEGER, amount DECIMAL(10,2), cost DECIMAL(10,2), region VARCHAR, created_at DATE);
+
+statement ok
+INSERT INTO p43_orders VALUES
+    (1, 100.00, 60.00, 'US', '2026-01-01'),
+    (2, 200.00, 120.00, 'EU', '2026-01-02'),
+    (3, 150.00, 90.00, 'US', '2026-01-03');
+
+statement ok
+CREATE TABLE p43_customers (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO p43_customers VALUES (1, 'Alice'), (2, 'Bob');
+
+# ============================================================
+# Test 1: View-level COMMENT (META-01)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p43_revenue COMMENT = 'Revenue analysis for Q1' AS
+TABLES (
+    o AS p43_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount)
+)
+
+# Verify the view works end-to-end
+query TR rowsort
+SELECT * FROM semantic_view('p43_revenue', dimensions := ['region'], metrics := ['total_revenue']);
+----
+EU	200.00
+US	250.00
+
+# ============================================================
+# Test 2: Object-level COMMENT on entries (META-02)
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p43_revenue;
+
+statement ok
+CREATE SEMANTIC VIEW p43_revenue COMMENT = 'Revenue analysis' AS
+TABLES (
+    o AS p43_orders PRIMARY KEY (id) COMMENT = 'Order records' WITH SYNONYMS = ('sales_orders')
+)
+DIMENSIONS (
+    o.region AS o.region COMMENT = 'Geographic region' WITH SYNONYMS = ('territory', 'area')
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount) COMMENT = 'Total revenue'
+)
+
+# Verify query still works with annotated entries
+query TR rowsort
+SELECT * FROM semantic_view('p43_revenue', dimensions := ['region'], metrics := ['total_revenue']);
+----
+EU	200.00
+US	250.00
+
+# ============================================================
+# Test 3: WITH SYNONYMS standalone (META-03)
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p43_revenue;
+
+statement ok
+CREATE SEMANTIC VIEW p43_revenue AS
+TABLES (
+    o AS p43_orders PRIMARY KEY (id) WITH SYNONYMS = ('order_table', 'sales')
+)
+DIMENSIONS (
+    o.region AS o.region WITH SYNONYMS = ('territory')
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount) WITH SYNONYMS = ('gross_revenue', 'total_sales')
+)
+
+# Verify query still works
+query TR rowsort
+SELECT * FROM semantic_view('p43_revenue', dimensions := ['region'], metrics := ['total_revenue']);
+----
+EU	200.00
+US	250.00
+
+# ============================================================
+# Test 4: PRIVATE/PUBLIC on metrics and facts (META-04)
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p43_revenue;
+
+statement ok
+CREATE SEMANTIC VIEW p43_revenue AS
+TABLES (
+    o AS p43_orders PRIMARY KEY (id)
+)
+FACTS (
+    o.amount_fact AS o.amount,
+    PRIVATE o.cost_fact AS o.cost
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount),
+    PRIVATE o.total_cost AS SUM(o.cost),
+    profit AS total_revenue - total_cost
+)
+
+# ============================================================
+# Test 5: PRIVATE exclusion at query time (META-05)
+# Querying a PRIVATE metric directly should fail
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('p43_revenue', metrics := ['total_cost']);
+----
+private
+
+# ============================================================
+# Test 6: Derived metric referencing PRIVATE base works
+# profit = SUM(amount) - SUM(cost) = (100+200+150) - (60+120+90) = 450 - 270 = 180
+# ============================================================
+
+query R
+SELECT * FROM semantic_view('p43_revenue', metrics := ['profit']);
+----
+180.00
+
+# ============================================================
+# Test 7: Profit with dimensions
+# EU: 200 - 120 = 80, US: (100+150) - (60+90) = 250 - 150 = 100
+# ============================================================
+
+query TR rowsort
+SELECT * FROM semantic_view('p43_revenue', dimensions := ['region'], metrics := ['profit']);
+----
+EU	80.00
+US	100.00
+
+# ============================================================
+# Test 8: PUBLIC metric still queryable alongside derived
+# ============================================================
+
+query TR rowsort
+SELECT * FROM semantic_view('p43_revenue', dimensions := ['region'], metrics := ['total_revenue']);
+----
+EU	200.00
+US	250.00
+
+# ============================================================
+# Test 9: PRIVATE on dimensions rejected (META-04 negative test)
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p43_bad_view AS
+TABLES (
+    o AS p43_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    PRIVATE o.region AS o.region
+)
+METRICS (
+    o.total AS SUM(o.amount)
+)
+----
+PRIVATE
+
+# ============================================================
+# Test 10: COMMENT with escaped quotes
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p43_revenue;
+
+statement ok
+CREATE SEMANTIC VIEW p43_revenue COMMENT = 'It''s a revenue view' AS
+TABLES (
+    o AS p43_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region COMMENT = 'Region where it''s sold'
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount)
+)
+
+# Verify query still works
+query TR rowsort
+SELECT * FROM semantic_view('p43_revenue', dimensions := ['region'], metrics := ['total_revenue']);
+----
+EU	200.00
+US	250.00
+
+# ============================================================
+# Test 11: COMMENT and SYNONYMS in reversed order
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p43_revenue;
+
+statement ok
+CREATE SEMANTIC VIEW p43_revenue AS
+TABLES (
+    o AS p43_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region WITH SYNONYMS = ('territory') COMMENT = 'The region'
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount) COMMENT = 'Total rev' WITH SYNONYMS = ('gross')
+)
+
+# Verify query still works with reversed order
+query TR rowsort
+SELECT * FROM semantic_view('p43_revenue', dimensions := ['region'], metrics := ['total_revenue']);
+----
+EU	200.00
+US	250.00
+
+# ============================================================
+# Test 12: Explicit PUBLIC keyword
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p43_revenue;
+
+statement ok
+CREATE SEMANTIC VIEW p43_revenue AS
+TABLES (
+    o AS p43_orders PRIMARY KEY (id)
+)
+METRICS (
+    PUBLIC o.total_revenue AS SUM(o.amount)
+)
+
+query R
+SELECT * FROM semantic_view('p43_revenue', metrics := ['total_revenue']);
+----
+450.00
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p43_revenue;

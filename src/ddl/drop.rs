@@ -66,41 +66,46 @@ impl VTab for DropSemanticViewVTab {
     type InitData = DropInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        // Declare output schema: single VARCHAR column with the view name.
-        bind.add_result_column("view_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            // Declare output schema: single VARCHAR column with the view name.
+            bind.add_result_column("view_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
-        // Read view name (positional parameter 0).
-        let name = bind.get_parameter(0).to_string();
+            // Read view name (positional parameter 0).
+            let name = bind.get_parameter(0).to_string();
 
-        // Access the DropState from extra_info.
-        let state_ptr = bind.get_extra_info::<DropState>();
-        let state = unsafe { &*state_ptr };
+            // Access the DropState from extra_info.
+            let state_ptr = bind.get_extra_info::<DropState>();
+            let state = unsafe { &*state_ptr };
 
-        // Check catalog first -- gives better error messages than the SQL DELETE.
-        let exists = {
-            let guard = state.catalog.read().unwrap();
-            guard.contains_key(&name)
-        };
+            // Check catalog first -- gives better error messages than the SQL DELETE.
+            let exists = {
+                let guard = state
+                    .catalog
+                    .read()
+                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
+                guard.contains_key(&name)
+            };
 
-        if !exists && !state.if_exists {
-            return Err(format!("semantic view '{name}' does not exist").into());
-        }
-
-        if exists {
-            // 1. Delete from DuckDB table FIRST (write-first for consistency).
-            if let Some(conn) = state.persist_conn {
-                persist_drop(conn, &name);
+            if !exists && !state.if_exists {
+                return Err(format!("semantic view '{name}' does not exist").into());
             }
 
-            // 2. Remove from in-memory catalog.
-            if state.if_exists {
-                catalog_delete_if_exists(&state.catalog, &name);
-            } else {
-                catalog_delete(&state.catalog, &name)?;
-            }
-        }
+            if exists {
+                // 1. Delete from DuckDB table FIRST (write-first for consistency).
+                if let Some(conn) = state.persist_conn {
+                    persist_drop(conn, &name);
+                }
 
-        Ok(DropBindData { name })
+                // 2. Remove from in-memory catalog.
+                if state.if_exists {
+                    catalog_delete_if_exists(&state.catalog, &name);
+                } else {
+                    catalog_delete(&state.catalog, &name)?;
+                }
+            }
+
+            Ok(DropBindData { name })
+        }))
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {

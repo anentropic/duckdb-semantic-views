@@ -1,0 +1,158 @@
+# Phase 44: SHOW TERSE SEMANTIC VIEWS and IN SCHEMA/DATABASE scope filtering
+
+require semantic_views
+
+# ============================================================
+# Setup: create tables and semantic views
+# ============================================================
+
+statement ok
+CREATE TABLE p44ts_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), region VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW sales_sv COMMENT = 'Sales metrics' AS
+  TABLES (o AS p44ts_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total_amount AS SUM(o.amount));
+
+statement ok
+CREATE SEMANTIC VIEW products_sv AS
+  TABLES (o AS p44ts_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.order_count AS COUNT(*));
+
+# ============================================================
+# Test 1: SHOW TERSE SEMANTIC VIEWS — 5 columns, no comment
+# Use underlying function to SELECT specific columns for deterministic output
+# ============================================================
+
+query TTTT rowsort
+SELECT name, kind, database_name, schema_name FROM list_terse_semantic_views()
+----
+products_sv	SEMANTIC_VIEW	memory	main
+sales_sv	SEMANTIC_VIEW	memory	main
+
+# ============================================================
+# Test 2: SHOW TERSE SEMANTIC VIEWS LIKE '%sales%'
+# ============================================================
+
+query T
+SELECT name FROM list_terse_semantic_views() WHERE name ILIKE '%sales%'
+----
+sales_sv
+
+# ============================================================
+# Test 3: SHOW TERSE SEMANTIC VIEWS LIMIT 1
+# ============================================================
+
+query I
+SELECT count(*) FROM list_terse_semantic_views() LIMIT 1
+----
+2
+
+# ============================================================
+# Test 4: SHOW SEMANTIC VIEWS IN SCHEMA main — both views (via DDL)
+# ============================================================
+
+query TTTT rowsort
+SELECT name, kind, database_name, schema_name FROM list_semantic_views() WHERE schema_name = 'main'
+----
+products_sv	SEMANTIC_VIEW	memory	main
+sales_sv	SEMANTIC_VIEW	memory	main
+
+# ============================================================
+# Test 5: SHOW SEMANTIC VIEWS IN SCHEMA nonexistent — empty
+# ============================================================
+
+query I
+SELECT count(*) FROM list_semantic_views() WHERE schema_name = 'nonexistent'
+----
+0
+
+# ============================================================
+# Test 6: SHOW SEMANTIC VIEWS IN DATABASE memory — both views
+# ============================================================
+
+query TTTT rowsort
+SELECT name, kind, database_name, schema_name FROM list_semantic_views() WHERE database_name = 'memory'
+----
+products_sv	SEMANTIC_VIEW	memory	main
+sales_sv	SEMANTIC_VIEW	memory	main
+
+# ============================================================
+# Test 7: SHOW SEMANTIC VIEWS IN DATABASE nonexistent — empty
+# ============================================================
+
+query I
+SELECT count(*) FROM list_semantic_views() WHERE database_name = 'nonexistent'
+----
+0
+
+# ============================================================
+# Test 8: SHOW TERSE via DDL — bare statement (verifies parser hook)
+# ============================================================
+
+statement ok
+SHOW TERSE SEMANTIC VIEWS
+
+# ============================================================
+# Test 9: SHOW SEMANTIC VIEWS IN SCHEMA via DDL — bare statement
+# ============================================================
+
+statement ok
+SHOW SEMANTIC VIEWS IN SCHEMA main
+
+# ============================================================
+# Test 10: SHOW SEMANTIC VIEWS IN DATABASE via DDL — bare statement
+# ============================================================
+
+statement ok
+SHOW SEMANTIC VIEWS IN DATABASE memory
+
+# ============================================================
+# Test 11: SHOW TERSE SEMANTIC VIEWS IN SCHEMA via DDL
+# ============================================================
+
+statement ok
+SHOW TERSE SEMANTIC VIEWS IN SCHEMA main
+
+# ============================================================
+# Test 12: SHOW TERSE SEMANTIC VIEWS LIKE '%sales%' IN DATABASE via DDL
+# ============================================================
+
+statement ok
+SHOW TERSE SEMANTIC VIEWS LIKE '%sales%' IN DATABASE memory
+
+# ============================================================
+# Test 13: SHOW SEMANTIC VIEWS LIKE '%sales%' IN SCHEMA via DDL
+# ============================================================
+
+statement ok
+SHOW SEMANTIC VIEWS LIKE '%sales%' IN SCHEMA main
+
+# ============================================================
+# Test 14: Error: SHOW SEMANTIC VIEWS IN some_view (no SCHEMA/DATABASE)
+# ============================================================
+
+statement error
+SHOW SEMANTIC VIEWS IN some_view
+----
+SHOW SEMANTIC VIEWS requires IN SCHEMA
+
+# ============================================================
+# Test 15: Error: SHOW SEMANTIC VIEWS IN SCHEMA (missing name)
+# ============================================================
+
+statement error
+SHOW SEMANTIC VIEWS IN SCHEMA
+----
+Missing schema name after IN SCHEMA
+
+# ============================================================
+# Test 16: Error: SHOW SEMANTIC VIEWS IN DATABASE (missing name)
+# ============================================================
+
+statement error
+SHOW SEMANTIC VIEWS IN DATABASE
+----
+Missing database name after IN DATABASE

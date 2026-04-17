@@ -54,11 +54,11 @@ impl fmt::Display for QueryError {
             Self::EmptyRequest { view_name } => {
                 write!(
                     f,
-                    "semantic view '{view_name}': specify at least dimensions := [...] or metrics := [...]."
+                    "semantic view '{view_name}': specify at least dimensions := [...], metrics := [...], or facts := [...]."
                 )?;
                 write!(
                     f,
-                    " Run DESCRIBE SEMANTIC VIEW {view_name} to see available dimensions and metrics."
+                    " Run DESCRIBE SEMANTIC VIEW {view_name} to see available dimensions, metrics, and facts."
                 )
             }
             Self::ExpandFailed { source } => {

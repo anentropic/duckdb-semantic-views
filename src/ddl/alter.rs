@@ -6,7 +6,8 @@ use duckdb::{
 };
 use libduckdb_sys as ffi;
 
-use crate::catalog::{catalog_rename, CatalogState};
+use crate::catalog::{catalog_rename, catalog_upsert, CatalogState};
+use crate::model::SemanticViewDefinition;
 
 /// Shared state for `alter_semantic_view_rename` and
 /// `alter_semantic_view_rename_if_exists`.
@@ -73,52 +74,59 @@ impl VTab for AlterRenameVTab {
     type InitData = AlterRenameInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        // Declare output schema: two VARCHAR columns.
-        bind.add_result_column("old_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("new_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            // Declare output schema: two VARCHAR columns.
+            bind.add_result_column("old_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("new_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
-        // Read parameters: old_name (0), new_name (1).
-        let old_name = bind.get_parameter(0).to_string();
-        let new_name = bind.get_parameter(1).to_string();
+            // Read parameters: old_name (0), new_name (1).
+            let old_name = bind.get_parameter(0).to_string();
+            let new_name = bind.get_parameter(1).to_string();
 
-        // Access the AlterRenameState from extra_info.
-        let state_ptr = bind.get_extra_info::<AlterRenameState>();
-        let state = unsafe { &*state_ptr };
+            // Access the AlterRenameState from extra_info.
+            let state_ptr = bind.get_extra_info::<AlterRenameState>();
+            let state = unsafe { &*state_ptr };
 
-        // Check if old_name exists in catalog.
-        let json = {
-            let guard = state.catalog.read().unwrap();
-            guard.get(&old_name).cloned()
-        };
+            // Check if old_name exists in catalog.
+            let json = {
+                let guard = state
+                    .catalog
+                    .read()
+                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
+                guard.get(&old_name).cloned()
+            };
 
-        match json {
-            None => {
-                if state.if_exists {
-                    // Silent no-op: return the names but don't modify anything
-                    return Ok(AlterRenameBindData { old_name, new_name });
-                }
-                return Err(format!("semantic view '{old_name}' does not exist").into());
-            }
-            Some(json_str) => {
-                // Check if new_name already exists
-                {
-                    let guard = state.catalog.read().unwrap();
-                    if guard.contains_key(&new_name) {
-                        return Err(format!("semantic view '{new_name}' already exists").into());
+            match json {
+                None => {
+                    if state.if_exists {
+                        // Silent no-op: return the names but don't modify anything
+                        return Ok(AlterRenameBindData { old_name, new_name });
                     }
+                    return Err(format!("semantic view '{old_name}' does not exist").into());
                 }
+                Some(json_str) => {
+                    // Check if new_name already exists
+                    {
+                        let guard = state.catalog.read().map_err(|_| {
+                            Box::<dyn std::error::Error>::from("catalog lock poisoned")
+                        })?;
+                        if guard.contains_key(&new_name) {
+                            return Err(format!("semantic view '{new_name}' already exists").into());
+                        }
+                    }
 
-                // 1. Persist first (write-first for consistency).
-                if let Some(conn) = state.persist_conn {
-                    persist_rename(conn, &old_name, &new_name, &json_str);
+                    // 1. Persist first (write-first for consistency).
+                    if let Some(conn) = state.persist_conn {
+                        persist_rename(conn, &old_name, &new_name, &json_str);
+                    }
+
+                    // 2. Update in-memory catalog.
+                    catalog_rename(&state.catalog, &old_name, &new_name)?;
                 }
-
-                // 2. Update in-memory catalog.
-                catalog_rename(&state.catalog, &old_name, &new_name)?;
             }
-        }
 
-        Ok(AlterRenameBindData { old_name, new_name })
+            Ok(AlterRenameBindData { old_name, new_name })
+        }))
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
@@ -152,5 +160,220 @@ impl VTab for AlterRenameVTab {
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ALTER SET/UNSET COMMENT (Phase 45)
+// ---------------------------------------------------------------------------
+
+/// Shared state for `alter_semantic_view_set_comment` and
+/// `alter_semantic_view_unset_comment` (with and without IF EXISTS).
+///
+/// See [`crate::ddl::define::DefineState`] for the persist_conn pattern.
+#[derive(Clone)]
+pub struct AlterCommentState {
+    pub catalog: CatalogState,
+    pub persist_conn: Option<ffi::duckdb_connection>,
+    /// When true, silently succeeds if the view does not exist.
+    pub if_exists: bool,
+}
+
+// SAFETY: duckdb_connection is an opaque pointer managed by DuckDB.
+unsafe impl Send for AlterCommentState {}
+unsafe impl Sync for AlterCommentState {}
+
+/// Persist a comment update in `semantic_layer._definitions`.
+fn persist_comment_update(conn: ffi::duckdb_connection, name: &str, json: &str) {
+    unsafe {
+        let _ = super::persist::execute_parameterized(
+            conn,
+            "UPDATE semantic_layer._definitions SET definition = $1 WHERE name = $2",
+            &[json, name],
+        );
+    }
+}
+
+/// Bind-time data for the ALTER SET/UNSET COMMENT table functions.
+pub struct AlterCommentBindData {
+    name: String,
+    status: String,
+}
+
+// SAFETY: String is Send + Sync.
+unsafe impl Send for AlterCommentBindData {}
+unsafe impl Sync for AlterCommentBindData {}
+
+/// Init data for the ALTER SET/UNSET COMMENT table functions.
+pub struct AlterCommentInitData {
+    done: AtomicBool,
+}
+
+// SAFETY: AtomicBool is Send + Sync.
+unsafe impl Send for AlterCommentInitData {}
+unsafe impl Sync for AlterCommentInitData {}
+
+/// Read, modify, persist, and update catalog for a comment change.
+///
+/// Returns `Ok(status_message)` on success, `Err` on failure.
+fn alter_comment_impl(
+    state: &AlterCommentState,
+    name: &str,
+    new_comment: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Read existing JSON from catalog.
+    let json = {
+        let guard = state
+            .catalog
+            .read()
+            .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
+        guard.get(name).cloned()
+    };
+
+    match json {
+        None => {
+            if state.if_exists {
+                return Ok("no-op".to_string());
+            }
+            Err(format!("semantic view '{name}' does not exist").into())
+        }
+        Some(json_str) => {
+            let mut def: SemanticViewDefinition = serde_json::from_str(&json_str)?;
+            let status = if new_comment.is_some() {
+                "comment set"
+            } else {
+                "comment unset"
+            };
+            def.comment = new_comment;
+            let new_json = serde_json::to_string(&def)?;
+
+            // 1. Persist first (write-first for consistency).
+            if let Some(conn) = state.persist_conn {
+                persist_comment_update(conn, name, &new_json);
+            }
+
+            // 2. Update in-memory catalog.
+            catalog_upsert(&state.catalog, name, &new_json)?;
+
+            Ok(status.to_string())
+        }
+    }
+}
+
+/// `alter_semantic_view_set_comment(name, comment)` table function.
+///
+/// Sets the view-level comment on a semantic view. Errors if the view does not
+/// exist (unless `if_exists` is true).
+pub struct AlterSetCommentVTab;
+
+impl VTab for AlterSetCommentVTab {
+    type BindData = AlterCommentBindData;
+    type InitData = AlterCommentInitData;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("status", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+
+            let name = bind.get_parameter(0).to_string();
+            let comment = bind.get_parameter(1).to_string();
+
+            let state_ptr = bind.get_extra_info::<AlterCommentState>();
+            let state = unsafe { &*state_ptr };
+
+            let status = alter_comment_impl(state, &name, Some(comment))?;
+
+            Ok(AlterCommentBindData { name, status })
+        }))
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(AlterCommentInitData {
+            done: AtomicBool::new(false),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let init_data = func.get_init_data();
+        if init_data.done.swap(true, Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+
+        let bind_data = func.get_bind_data();
+        let name_vec = output.flat_vector(0);
+        name_vec.insert(0, bind_data.name.as_str());
+        let status_vec = output.flat_vector(1);
+        status_vec.insert(0, bind_data.status.as_str());
+        output.set_len(1);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        // Two positional parameters: name and comment (both VARCHAR)
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        ])
+    }
+}
+
+/// `alter_semantic_view_unset_comment(name)` table function.
+///
+/// Removes the view-level comment from a semantic view. Errors if the view does
+/// not exist (unless `if_exists` is true).
+pub struct AlterUnsetCommentVTab;
+
+impl VTab for AlterUnsetCommentVTab {
+    type BindData = AlterCommentBindData;
+    type InitData = AlterCommentInitData;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("status", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+
+            let name = bind.get_parameter(0).to_string();
+
+            let state_ptr = bind.get_extra_info::<AlterCommentState>();
+            let state = unsafe { &*state_ptr };
+
+            let status = alter_comment_impl(state, &name, None)?;
+
+            Ok(AlterCommentBindData { name, status })
+        }))
+    }
+
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+        Ok(AlterCommentInitData {
+            done: AtomicBool::new(false),
+        })
+    }
+
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let init_data = func.get_init_data();
+        if init_data.done.swap(true, Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+
+        let bind_data = func.get_bind_data();
+        let name_vec = output.flat_vector(0);
+        name_vec.insert(0, bind_data.name.as_str());
+        let status_vec = output.flat_vector(1);
+        status_vec.insert(0, bind_data.status.as_str());
+        output.set_len(1);
+        Ok(())
+    }
+
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        // One positional parameter: name (VARCHAR)
+        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
     }
 }

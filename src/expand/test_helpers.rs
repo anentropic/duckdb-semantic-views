@@ -3,7 +3,10 @@
 //! Provides builder functions for common SemanticViewDefinition fixtures,
 //! following the pattern established in `graph/test_helpers.rs`.
 
-use crate::model::{Dimension, Fact, Join, Metric, SemanticViewDefinition, TableRef};
+use crate::model::{
+    AccessModifier, Dimension, Fact, Join, Metric, NonAdditiveDim, NullsOrder,
+    SemanticViewDefinition, SortOrder, TableRef, WindowSpec,
+};
 
 /// Base orders view: single table, 2 dimensions, 2 metrics.
 ///
@@ -20,12 +23,16 @@ pub(super) fn orders_view() -> SemanticViewDefinition {
                 expr: "region".to_string(),
                 source_table: None,
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
             },
             Dimension {
                 name: "status".to_string(),
                 expr: "status".to_string(),
                 source_table: None,
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
             },
         ],
         metrics: vec![
@@ -35,6 +42,11 @@ pub(super) fn orders_view() -> SemanticViewDefinition {
                 source_table: None,
                 output_type: None,
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             },
             Metric {
                 name: "order_count".to_string(),
@@ -42,6 +54,11 @@ pub(super) fn orders_view() -> SemanticViewDefinition {
                 source_table: None,
                 output_type: None,
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             },
         ],
         joins: vec![],
@@ -51,6 +68,7 @@ pub(super) fn orders_view() -> SemanticViewDefinition {
         created_on: None,
         database_name: None,
         schema_name: None,
+        comment: None,
     }
 }
 
@@ -74,6 +92,8 @@ pub(super) fn minimal_def(
             expr: dim_expr.to_string(),
             source_table: None,
             output_type: None,
+            comment: None,
+            synonyms: vec![],
         }],
         metrics: vec![Metric {
             name: metric_name.to_string(),
@@ -81,6 +101,11 @@ pub(super) fn minimal_def(
             source_table: None,
             output_type: None,
             using_relationships: vec![],
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Public,
+            non_additive_by: vec![],
+            window_spec: None,
         }],
         joins: vec![],
         facts: vec![],
@@ -89,6 +114,7 @@ pub(super) fn minimal_def(
         created_on: None,
         database_name: None,
         schema_name: None,
+        comment: None,
     }
 }
 
@@ -102,9 +128,25 @@ pub(super) trait TestFixtureExt {
     fn with_join_on(self, table: &str, on: &str) -> Self;
     fn with_table(self, alias: &str, table: &str, pk_columns: &[&str]) -> Self;
     fn with_fact(self, name: &str, expr: &str, source_table: &str) -> Self;
+    fn with_private_metric(self, name: &str, expr: &str, source_table: Option<&str>) -> Self;
+    fn with_private_fact(self, name: &str, expr: &str, source_table: &str) -> Self;
     fn with_using_relationship(self, metric_name: &str, relationships: &[&str]) -> Self;
+    fn with_pkfk_join(
+        self,
+        name: &str,
+        from_alias: &str,
+        to_alias: &str,
+        fk_columns: &[&str],
+        ref_columns: &[&str],
+    ) -> Self;
     fn clear_dimensions(self) -> Self;
     fn clear_metrics(self) -> Self;
+    fn with_non_additive_by(
+        self,
+        metric_name: &str,
+        dims: &[(&str, SortOrder, NullsOrder)],
+    ) -> Self;
+    fn with_window_spec(self, metric_name: &str, spec: WindowSpec) -> Self;
 }
 
 impl TestFixtureExt for SemanticViewDefinition {
@@ -119,6 +161,8 @@ impl TestFixtureExt for SemanticViewDefinition {
             expr: expr.to_string(),
             source_table: source_table.map(|s| s.to_string()),
             output_type: None,
+            comment: None,
+            synonyms: vec![],
         });
         self
     }
@@ -130,6 +174,11 @@ impl TestFixtureExt for SemanticViewDefinition {
             source_table: source_table.map(|s| s.to_string()),
             output_type: None,
             using_relationships: vec![],
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Public,
+            non_additive_by: vec![],
+            window_spec: None,
         });
         self
     }
@@ -151,6 +200,8 @@ impl TestFixtureExt for SemanticViewDefinition {
             table: table.to_string(),
             pk_columns: pk_columns.iter().map(|s| s.to_string()).collect(),
             unique_constraints: vec![],
+            comment: None,
+            synonyms: vec![],
         });
         self
     }
@@ -161,6 +212,38 @@ impl TestFixtureExt for SemanticViewDefinition {
             expr: expr.to_string(),
             source_table: Some(source_table.to_string()),
             output_type: None,
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Public,
+        });
+        self
+    }
+
+    fn with_private_metric(mut self, name: &str, expr: &str, source_table: Option<&str>) -> Self {
+        self.metrics.push(Metric {
+            name: name.to_string(),
+            expr: expr.to_string(),
+            source_table: source_table.map(|s| s.to_string()),
+            output_type: None,
+            using_relationships: vec![],
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Private,
+            non_additive_by: vec![],
+            window_spec: None,
+        });
+        self
+    }
+
+    fn with_private_fact(mut self, name: &str, expr: &str, source_table: &str) -> Self {
+        self.facts.push(Fact {
+            name: name.to_string(),
+            expr: expr.to_string(),
+            source_table: Some(source_table.to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Private,
         });
         self
     }
@@ -172,6 +255,25 @@ impl TestFixtureExt for SemanticViewDefinition {
         self
     }
 
+    fn with_pkfk_join(
+        mut self,
+        name: &str,
+        from_alias: &str,
+        to_alias: &str,
+        fk_columns: &[&str],
+        ref_columns: &[&str],
+    ) -> Self {
+        self.joins.push(Join {
+            table: to_alias.to_string(),
+            from_alias: from_alias.to_string(),
+            fk_columns: fk_columns.iter().map(|s| s.to_string()).collect(),
+            ref_columns: ref_columns.iter().map(|s| s.to_string()).collect(),
+            name: Some(name.to_string()),
+            ..Default::default()
+        });
+        self
+    }
+
     fn clear_dimensions(mut self) -> Self {
         self.dimensions.clear();
         self
@@ -179,6 +281,31 @@ impl TestFixtureExt for SemanticViewDefinition {
 
     fn clear_metrics(mut self) -> Self {
         self.metrics.clear();
+        self
+    }
+
+    fn with_non_additive_by(
+        mut self,
+        metric_name: &str,
+        dims: &[(&str, SortOrder, NullsOrder)],
+    ) -> Self {
+        if let Some(m) = self.metrics.iter_mut().find(|m| m.name == metric_name) {
+            m.non_additive_by = dims
+                .iter()
+                .map(|(dim, order, nulls)| NonAdditiveDim {
+                    dimension: dim.to_string(),
+                    order: *order,
+                    nulls: *nulls,
+                })
+                .collect();
+        }
+        self
+    }
+
+    fn with_window_spec(mut self, metric_name: &str, spec: WindowSpec) -> Self {
+        if let Some(m) = self.metrics.iter_mut().find(|m| m.name == metric_name) {
+            m.window_spec = Some(spec);
+        }
         self
     }
 }

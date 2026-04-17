@@ -1,0 +1,107 @@
+# Phase 44: SHOW COLUMNS IN SEMANTIC VIEW
+
+require semantic_views
+
+# ============================================================
+# Setup: create table and semantic view with varied columns
+# ============================================================
+
+statement ok
+CREATE TABLE p44sc_orders (
+  id INTEGER PRIMARY KEY,
+  customer_id INTEGER,
+  amount DECIMAL(10,2),
+  qty INTEGER,
+  region VARCHAR,
+  order_date DATE
+);
+
+statement ok
+CREATE SEMANTIC VIEW orders_sv AS
+  TABLES (o AS p44sc_orders PRIMARY KEY (id))
+  FACTS (
+    o.raw_amount AS o.amount COMMENT = 'Raw order amount',
+    PRIVATE o.internal_qty AS o.qty
+  )
+  DIMENSIONS (
+    o.region AS o.region COMMENT = 'Geographic region',
+    o.order_date AS o.order_date
+  )
+  METRICS (
+    o.total_revenue AS SUM(o.amount) COMMENT = 'Total revenue',
+    o.order_count AS COUNT(*),
+    PRIVATE o.internal_count AS COUNT(o.id),
+    avg_revenue AS total_revenue / order_count
+  );
+
+# ============================================================
+# Test 1: SHOW COLUMNS returns 8 columns with correct data
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW COLUMNS IN SEMANTIC VIEW orders_sv
+----
+memory	main	orders_sv	avg_revenue	(empty)	DERIVED_METRIC	total_revenue / order_count	(empty)
+memory	main	orders_sv	order_count	(empty)	METRIC	COUNT(*)	(empty)
+memory	main	orders_sv	order_date	(empty)	DIMENSION	o.order_date	(empty)
+memory	main	orders_sv	raw_amount	(empty)	FACT	o.amount	Raw order amount
+memory	main	orders_sv	region	(empty)	DIMENSION	o.region	Geographic region
+memory	main	orders_sv	total_revenue	(empty)	METRIC	SUM(o.amount)	Total revenue
+
+# ============================================================
+# Test 2: Dimensions show kind=DIMENSION
+# ============================================================
+
+query TT rowsort
+SELECT column_name, kind FROM show_columns_in_semantic_view('orders_sv') WHERE kind = 'DIMENSION'
+----
+order_date	DIMENSION
+region	DIMENSION
+
+# ============================================================
+# Test 3: PUBLIC fact shows, PRIVATE fact excluded
+# ============================================================
+
+query TT
+SELECT column_name, kind FROM show_columns_in_semantic_view('orders_sv') WHERE kind = 'FACT'
+----
+raw_amount	FACT
+
+# ============================================================
+# Test 4: PUBLIC metrics show, PRIVATE excluded
+# ============================================================
+
+query TT rowsort
+SELECT column_name, kind FROM show_columns_in_semantic_view('orders_sv') WHERE kind = 'METRIC'
+----
+order_count	METRIC
+total_revenue	METRIC
+
+# ============================================================
+# Test 5: Derived metric shows kind=DERIVED_METRIC
+# ============================================================
+
+query TT
+SELECT column_name, kind FROM show_columns_in_semantic_view('orders_sv') WHERE kind = 'DERIVED_METRIC'
+----
+avg_revenue	DERIVED_METRIC
+
+# ============================================================
+# Test 6: Comment column is populated where set
+# ============================================================
+
+query TT rowsort
+SELECT column_name, comment FROM show_columns_in_semantic_view('orders_sv') WHERE comment != ''
+----
+raw_amount	Raw order amount
+region	Geographic region
+total_revenue	Total revenue
+
+# ============================================================
+# Test 7: Error: nonexistent view
+# ============================================================
+
+statement error
+SHOW COLUMNS IN SEMANTIC VIEW nonexistent_view
+----
+not found

@@ -1,229 +1,369 @@
-# Domain Pitfalls -- SHOW/DESCRIBE Alignment & Module Refactoring (v0.5.5)
+# Domain Pitfalls -- Snowflake SQL DDL Parity (v0.6.0)
 
-**Domain:** Snowflake-aligned SHOW/DESCRIBE output formats + module refactoring in DuckDB Rust extension
-**Researched:** 2026-04-01
-**Context:** The extension has 482 tests (Rust unit, proptest, sqllogictest, DuckLake CI), 15,786 LOC, stores semantic view definitions as JSON in `semantic_layer._definitions`, and uses a C++ shim that dynamically forwards VTab output columns as all-VARCHAR. The C++ shim reads `duckdb_column_count()` and `duckdb_column_name()` at runtime from the underlying Rust VTab result, so column count/name changes propagate automatically -- but test assertions do not.
+**Domain:** Adding Snowflake SQL DDL parity features to an existing DuckDB semantic views extension
+**Researched:** 2026-04-09
+**Context:** Extension has 487 tests, 16,342 LOC across expand/ (7 submodules), graph/ (5 submodules), shared util.rs/errors.rs. Definitions stored as JSON in `semantic_layer._definitions` via parameterized prepared statements. C++ shim dynamically forwards VTab output as all-VARCHAR. Single-pass SQL expansion generates `SELECT dims, agg_metrics FROM base LEFT JOIN ... GROUP BY dims`.
 
 ---
 
 ## Critical Pitfalls
 
-Mistakes that cause rewrites, test suite failures, or breaking changes.
+Mistakes that cause rewrites, incorrect query results, or breaking changes.
 
-### C1: C++ Shim Schema Forwarding Is Transparent but Tests Are Rigid
+### C1: Semi-additive metrics require a fundamentally different expansion path
 
-**What goes wrong:** The C++ `sv_ddl_bind` (shim.cpp:134-201) dynamically reads column count and names from the result of executing rewritten DDL SQL. It declares ALL output columns as VARCHAR. When you change the output schema of any VTab that feeds a DDL command (e.g., adding `created_on`, `database_name`, `schema_name`, `kind` to `ListSemanticViewsVTab`, or restructuring DESCRIBE to property-per-row format), the C++ side picks up the new schema automatically. **However**, sqllogictest assertions are column-count-sensitive. The `query TTTTT` prefix specifies expected column types and count. Every `.test` file that asserts SHOW or DESCRIBE output must be updated atomically with the schema change.
+**What goes wrong:** The current `expand()` function in `src/expand/sql_gen.rs` generates exactly one query shape: `SELECT dims, agg_metrics FROM ... GROUP BY dims`. Semi-additive metrics (NON ADDITIVE BY) require a two-stage expansion: first select the "last snapshot" rows per non-additive dimension partition, then aggregate. Trying to bolt this onto the existing single-pass SQL generation produces either incorrect results (aggregating before snapshot selection) or a combinatorial explosion when mixing regular and semi-additive metrics in one query.
 
-**Why it happens:** The C++ shim is schema-agnostic (good), but the test harness is schema-rigid (by design). Changing the VTab output columns in Rust without simultaneously updating every `.test` file that references those commands creates a guaranteed test failure across the entire sqllogictest suite.
-
-**Consequences:** All 18 sqllogictest files run per-process (one DuckDB per file due to parser extension lifecycle segfault workaround). A single column-count mismatch in one file fails that file's entire test run. If SHOW SEMANTIC DIMENSIONS changes from 5 columns (`TTTTT`) to 8 columns (`TTTTTTTT`), every test asserting that schema breaks.
-
-**Prevention:**
-1. Identify ALL test files referencing each changed command before coding: `phase34_1_show_commands.test`, `phase34_1_show_filtering.test`, `phase34_1_show_dims_for_metric.test`, `phase20_extended_ddl.test` (DESCRIBE assertions).
-2. Change VTab output columns and ALL corresponding test expectations in the same commit.
-3. Run `just test-all` (not just `cargo test`) after every schema change -- sqllogictest catches column-count mismatches that Rust unit tests never see.
-
-**Detection:** `just test-sql` fails with "expected N columns but got M" errors. These are obvious once you look for them but easy to miss if you only run `cargo test`.
-
-**Phase assignment:** Every phase that changes output columns. Must be a hard rule: VTab + tests = atomic.
-
----
-
-### C2: Backward-Incompatible JSON Deserialization When Adding `created_on`
-
-**What goes wrong:** Adding a `created_on` field to `SemanticViewDefinition` is safe for deserialization if done correctly (`#[serde(default)]` handles missing fields). But the catalog persistence table (`semantic_layer._definitions`) stores raw JSON strings. Existing stored JSON from v0.5.4 databases will not contain `created_on`. If any code path assumes `created_on` is always populated (e.g., `.unwrap()` on it), it will panic on views created before the upgrade.
-
-**Why it happens:** The project has a deliberate "no `deny_unknown_fields`" policy on `SemanticViewDefinition` (see model.rs line 160-161 comment). This means new fields can be added without breaking deserialization of old JSON. But the policy protects against deserialization failure, not against code that assumes the new field is populated.
-
-**Consequences:** Views defined before the `created_on` field was added will have `created_on: None`. If SHOW SEMANTIC VIEWS renders `created_on` by calling `.unwrap()`, it panics at query time -- a runtime crash, not a compile-time error.
-
-**Prevention:**
-1. Add `created_on` as `Option<String>` with `#[serde(default)]` and `#[serde(skip_serializing_if = "Option::is_none")]` to match the existing pattern used by `pk_columns`, `unique_constraints`, etc.
-2. In SHOW SEMANTIC VIEWS output, render `None` as empty string (`""`) -- never unwrap.
-3. Write a test that deserializes old-format JSON (without `created_on`) and confirms the VTab emits a row without panicking.
-4. Do NOT add a schema migration to `init_catalog` to backfill `created_on` into stored JSON -- it is unnecessary and risky. Old views simply show blank timestamps.
-5. Store `created_on` inside the JSON definition, not as a separate SQL column in `semantic_layer._definitions`. The JSON approach requires zero schema migration, works with existing `catalog_insert`/`catalog_upsert`, and aligns with how all other definition fields are stored.
-
-**Detection:** If you `.unwrap()` on a `None` `created_on`, `cargo test` will catch it if any test loads a JSON fixture without the field. Existing test fixtures naturally lack the field, so this pitfall is self-detecting if you test against existing fixtures.
-
-**Phase assignment:** Must be addressed in the phase that adds `created_on` to the model. The field addition and its consumers must be reviewed together.
-
----
-
-### C3: DESCRIBE Restructuring Is a Complete Rewrite, Not an Incremental Change
-
-**What goes wrong:** The current DESCRIBE returns a single row with 6 VARCHAR columns (`name`, `base_table`, `dimensions`, `metrics`, `joins`, `facts`). Snowflake's DESCRIBE returns multiple rows in a property-per-row format with 5 columns (`object_kind`, `object_name`, `parent_entity`, `property`, `property_value`). This is not a column rename -- it is a fundamentally different output structure. Every consumer of DESCRIBE output must be rewritten: the VTab bind, the VTab func, the bind data struct, the init data struct, and every test.
-
-**Why it happens:** The original DESCRIBE was designed for quick inspection, not Snowflake compatibility. The Snowflake format is more powerful (queryable with RESULT_SCAN/pipe operator, filterable by object_kind) but radically different.
+**Why it happens:** The expand function treats all metrics identically -- each becomes an aggregate expression in the SELECT list with a shared GROUP BY. NON ADDITIVE BY metrics need a subquery or CTE that filters to the latest snapshot rows before the outer aggregation. Snowflake's behavior: "rows are sorted by the non-additive dimensions, and the values from the last rows (the latest snapshots of values) are aggregated to compute the metric." If both regular and semi-additive metrics coexist in one query request, the expansion must produce a query structure where regular metrics aggregate over ALL rows but semi-additive metrics aggregate only over snapshot-selected rows.
 
 **Consequences:**
-1. `DescribeSemanticViewVTab` must be completely rewritten (not incrementally modified).
-2. The sqllogictest `phase20_extended_ddl.test` asserts the current 6-column schema -- must be rewritten.
-3. Any Python examples or documentation that reference DESCRIBE output format must be updated.
-4. The `DescribeBindData` struct changes from holding scalar strings to holding a `Vec<PropertyRow>`.
-5. The VTab changes from emitting 1 row to emitting potentially 100+ rows for complex views.
+- Incorrect aggregation results (inflated semi-additive values) if snapshot selection is skipped
+- Overly complex generated SQL if both metric types coexist
+- Potential correctness regression in existing tests if the expand function's control flow is restructured carelessly
 
 **Prevention:**
-1. Plan DESCRIBE restructuring as a discrete, atomic phase -- do not interleave it with other changes.
-2. Write the new DESCRIBE VTab as a clean replacement, not an incremental edit. The old code provides no reusable structure.
-3. Build a helper function (e.g., `build_describe_rows(&SemanticViewDefinition) -> Vec<PropertyRow>`) that is unit-testable independently of the VTab machinery.
-4. Update the example Python files (`basic_ddl_and_query.py`, `advanced_features.py`) if they print DESCRIBE output.
+- Design the semi-additive path as a distinct expansion mode using a CTE wrapper. The base CTE joins all tables and selects row-level facts/expressions. An intermediate CTE applies `ROW_NUMBER() OVER (PARTITION BY <non-excluded-dims> ORDER BY <non_additive_dims> DESC) = 1` to pick the latest snapshot row per partition. The outer query then aggregates.
+- When only regular metrics are requested, the existing single-pass path must be untouched -- guard the semi-additive path behind a check for any NON_ADDITIVE_BY annotations in the resolved metrics.
+- Build the NON ADDITIVE BY expansion as a composable wrapper around the existing `expand()` output, rather than adding branches inside the existing function.
+- Test the mixed case explicitly: one query with both `SUM(amount)` (regular) and `SUM(balance) NON ADDITIVE BY (date_dim)` (semi-additive) must produce different aggregation scopes for each metric.
 
-**Detection:** `just test-sql` failure on any test file asserting DESCRIBE output.
+**Detection:** Expansion unit tests that compare regular metric values against semi-additive metric values on the same dataset. If they produce identical results on a dataset with multiple snapshot rows per partition, the semi-additive logic is not activating.
 
-**Phase assignment:** Dedicated DESCRIBE restructuring phase. Do not combine with SHOW column changes.
+**Phase:** Should be an early feature phase -- it is the deepest structural change to the expansion pipeline and all subsequent features (window metrics, queryable facts) should build on the expanded pipeline.
 
 ---
 
-### C4: Module Refactoring Breaks `use crate::expand::` Import Paths Across 10+ Files
+### C2: DuckDB LAST_VALUE IGNORE NULLS crashes on all-NULL partitions (version-dependent)
 
-**What goes wrong:** When splitting `expand.rs` (4,490 lines, 99 tests) into `expand/mod.rs` + submodules, every `use crate::expand::` import across the codebase must resolve to the new module structure. Rust's module system means `expand::suggest_closest` must either be re-exported from `expand/mod.rs` or callers must change to the new path. Same for `expand::ExpandError`, `expand::QueryRequest`, `expand::expand()`.
+**What goes wrong:** DuckDB versions prior to the fix for GitHub issue #20136 (merged December 2025 into main) crash with an internal error ("Attempted to access index 0 within vector of size 0") when `LAST_VALUE(expr ORDER BY ... IGNORE NULLS)` encounters a partition where ALL values are NULL. This is the exact pattern one might reach for when implementing semi-additive snapshot selection.
 
-**Why it happens:** Rust module refactoring is not purely structural -- it changes the public API surface. Moving a function from `expand.rs` to `expand/resolve.rs` means it is now at `crate::expand::resolve::function_name` unless explicitly re-exported via `pub use` in `expand/mod.rs`.
+**Why it happens:** The natural DuckDB expansion for NON ADDITIVE BY uses `LAST_VALUE` or `ROW_NUMBER` with ORDER BY. If using `LAST_VALUE` with `IGNORE NULLS` and a partition has all NULLs for the metric column, DuckDB crashes. This is the class of bug the project has worked hard to prevent (see v0.5.0 Phase 17.1 Python crash investigation).
 
-**Consequences:** If re-exports are missed, compilation fails with "unresolved import" errors. These are caught at compile time (good) but can cascade to many files:
-- `graph.rs` imports `expand::suggest_closest`
-- `query/table_function.rs` imports `expand::expand` and `expand::QueryRequest`
-- `query/explain.rs` imports from `expand`
-- `query/error.rs` imports from `expand`
-- All 99 tests in `expand.rs` must move to the correct submodule or a shared `tests.rs`
+**Consequences:** Extension users with sparse data (NULL metric values in some partitions) hit SIGABRT-level crashes that bypass all Rust safety guarantees.
 
 **Prevention:**
-1. **Re-export everything from `expand/mod.rs`** during the initial split. The `mod.rs` file should contain `pub use` for every public item that was previously accessible as `crate::expand::X`. Preserve the external API before changing it.
-2. Use `cargo test` continuously during the split -- it catches unresolved imports immediately.
-3. Extract `suggest_closest` and `replace_word_boundary` to `src/util.rs` FIRST (breaking the circular dependency) before splitting `expand.rs` into a module directory. This isolates the most dangerous change.
-4. Do the `graph.rs` split AFTER `expand.rs` because `graph.rs` has fewer external dependents.
+- Use `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY <non_additive_dims> DESC) = 1` for snapshot row selection instead of `LAST_VALUE`. ROW_NUMBER is safer because it selects a row position rather than a value, avoiding the NULL-handling edge case entirely.
+- The project currently targets DuckDB 1.5.x, which should include the fix. However, the LTS branch (1.4.x) may not. Verify in CI with both targets.
+- Add a proptest generating all-NULL metric columns within semi-additive partitions.
+- Add an explicit sqllogictest case with all-NULL partitions and semi-additive metrics.
 
-**Detection:** `cargo test` -- Rust compilation errors are immediate and precise. The risk is not silent breakage but cascading fix-up across many files.
+**Detection:** Proptest with `proptest::option::weighted(0.8, arb_value())` to generate high-NULL-rate partitions. Integration test with explicit all-NULL partition.
 
-**Phase assignment:** Module refactoring phase. Must happen in a specific order: util.rs extraction -> expand/ split -> graph/ split.
+**Phase:** Same phase as semi-additive implementation. Must be tested as part of the core semi-additive expansion.
+
+---
+
+### C3: Window function metrics (PARTITION BY EXCLUDING) cannot coexist with GROUP BY
+
+**What goes wrong:** The current expansion always generates GROUP BY when both dimensions and metrics are present. Window function metrics using `PARTITION BY EXCLUDING` produce a per-row result (no aggregation), which is fundamentally incompatible with GROUP BY in the same SELECT. If a query requests both an aggregate metric (`SUM(amount)`) and a window metric (`SUM(amount) OVER (PARTITION BY EXCLUDING date_dim)`), the expansion must handle the fact that SQL mandates window functions operate on the result set AFTER GROUP BY, but Snowflake's PARTITION BY EXCLUDING operates on pre-aggregation rows.
+
+**Why it happens:** A metric defined as `SUM(x) OVER (PARTITION BY ...)` is not an aggregate -- it is a window function. Mixing it with aggregate metrics in the same SELECT clause requires the aggregate metrics to use GROUP BY while the window metric uses OVER. This produces valid SQL only if the window function operates on the grouped result, but Snowflake's PARTITION BY EXCLUDING semantics operate on raw rows, not post-GROUP BY results.
+
+**Consequences:**
+- DuckDB error: "window functions cannot appear in GROUP BY clause"
+- Or incorrect results: window function computes over grouped rows instead of raw rows
+- Users confused by which metrics can be combined in one query
+
+**Prevention:**
+- Forbid mixing aggregate metrics and window function metrics in the same query request. Return a clear ExpandError explaining they must be queried separately. Snowflake enforces strict dimension requirements on window metric queries, effectively preventing mixing.
+- The simplest correct approach: if any requested metric has PARTITION BY EXCLUDING, ALL metrics in that query must be window functions or bare expressions, and the expansion omits GROUP BY entirely.
+- Add a new ExpandError variant `IncompatibleMetricTypes` with a clear message.
+- When only window metrics are requested, generate: `SELECT dims, window_metric_expr OVER (PARTITION BY <all-dims-except-excluded> ORDER BY ...) FROM base LEFT JOIN ...` with NO GROUP BY.
+
+**Detection:** Unit test requesting one aggregate metric and one window metric in the same QueryRequest should return IncompatibleMetricTypes error.
+
+**Phase:** Should follow semi-additive metrics. The expansion pipeline will already have CTE capability from semi-additive work.
+
+---
+
+### C4: JSON schema migration breaks existing stored views when adding new model fields
+
+**What goes wrong:** Adding new fields to `SemanticViewDefinition` (comment, synonyms, private, non_additive_by, partition_by_excluding) and sub-structs (Metric, Dimension, Fact) requires careful serde annotation. If a new field is not `#[serde(default)]`, deserialization of ALL existing stored views fails on extension load, rendering the entire catalog inaccessible.
+
+**Why it happens:** The project stores definitions as JSON in `semantic_layer._definitions`. Every `init_catalog` call deserializes all rows. A single missing `#[serde(default)]` on a new field causes `serde_json::from_str` to fail, which propagates as a catalog load error.
+
+**Consequences:**
+- Total data loss: existing semantic views become inaccessible
+- Extension fails to load entirely (init_catalog returns Err)
+- Users must manually edit the JSON in the DuckDB table to fix
+
+**Prevention:**
+- **Every new field** on `SemanticViewDefinition`, `Metric`, `Dimension`, `Fact`, `Join`, and `TableRef` MUST have `#[serde(default)]`.
+- **Every `Option<T>` field** gets `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+- **Every `Vec<T>` field** gets `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.
+- **Every new enum field** gets `#[serde(default)]` with `#[derive(Default)]` on the enum.
+- **Write a backward-compat test** that deserializes a JSON snapshot from v0.5.5 (the current version) with the new struct definition. This test must be written BEFORE adding any new fields and must pass after fields are added.
+- **Do NOT use `#[serde(deny_unknown_fields)]`** -- the model comment explicitly notes this (model.rs line 160-161).
+- v0.5.3 retrospective Key Lesson 1: "Adding a new field to a widely-used struct creates a large blast radius of required changes." Add ALL new annotation fields in a single batch phase.
+
+**Detection:** Integration test loading a v0.5.5 JSON fixture and verifying all fields deserialize with correct defaults. This is the single most important test for this milestone.
+
+**Phase:** Must be the FIRST phase -- model changes underpin every other feature.
+
+---
+
+### C5: GET_DDL round-trip loses expression quoting information
+
+**What goes wrong:** GET_DDL must reconstruct valid DDL from the stored `SemanticViewDefinition` JSON. But the body parser discards certain DDL-level information:
+1. **Expression quoting**: The parser strips outer quotes from identifiers. If a user wrote `"Order ID"` in a dimension expression, the stored `expr` field contains the expression without its DDL-level quoting context. Reconstructed DDL may need re-quoting.
+2. **Whitespace and formatting**: All formatting is lost during parsing.
+3. **Keyword casing**: Original DDL might use mixed case. Reconstruction normalizes to uppercase.
+4. **NON ADDITIVE BY sort direction**: Must be stored (ASC/DESC, NULLS FIRST/LAST) and reconstructed faithfully.
+
+**Why it happens:** The body parser (`body_parser.rs`) converts DDL text into struct fields, naturally discarding syntactic sugar. The model stores semantic content, not syntactic form.
+
+**Consequences:**
+- Reconstructed DDL, when re-executed, may fail if expression quoting is not restored
+- Users expecting exact round-trip get syntactically different (but semantically equivalent) DDL
+
+**Prevention:**
+- Expressions are stored as opaque SQL strings -- they were valid when parsed and remain valid in reconstruction. The danger is only in the structural parts (names, aliases, PK columns).
+- GET_DDL must re-quote all structural identifiers: table aliases, dimension/metric/fact names, PK column names, relationship names.
+- For the entry format `alias.name AS expr`, always emit double-quoted names.
+- For new annotations, emit canonical form: `NON ADDITIVE BY (dim1 DESC NULLS LAST)`, `COMMENT = 'text'`, `WITH SYNONYMS = ('s1', 's2')`, `PRIVATE`.
+- Write a round-trip proptest: `parse(ddl) -> json -> parse(get_ddl(json))` must produce equal definitions.
+- Accept that GET_DDL output is semantically equivalent but not syntactically identical. Document this.
+
+**Detection:** Round-trip proptest is the canonical verification.
+
+**Phase:** GET_DDL should be one of the LAST features -- it must reconstruct ALL new DDL syntax features (COMMENT, SYNONYMS, PRIVATE, NON ADDITIVE BY, PARTITION BY EXCLUDING).
 
 ---
 
 ## Moderate Pitfalls
 
-### M1: Circular Dependency During Incremental Refactoring
+### M1: COMMENT strings with single quotes break DDL parsing
 
-**What goes wrong:** The current codebase has a known circular dependency: `expand.rs` exports `suggest_closest` which `graph.rs` imports (line 13), while `expand.rs` imports `graph::RelationshipGraph` (line 4). During refactoring, if you split `expand.rs` into submodules before extracting `suggest_closest` to `util.rs`, you may create a temporary state where `graph/` submodules import from `expand/` submodules and vice versa, making the dependency graph harder to reason about.
+**What goes wrong:** Comments like `COMMENT = 'Customer''s total balance'` contain escaped single quotes. The body parser's `split_at_depth0_commas` (body_parser.rs lines 56-59) correctly handles `''` inside strings, but the clause boundary scanner `find_clause_bounds` operates at a higher level and may not correctly handle single-quoted strings that appear in new annotation positions.
+
+**Why it happens:** COMMENT is a new annotation syntax that doesn't follow the existing `alias.name AS expr` pattern. It is a key-value assignment (`COMMENT = 'text'`) that appears either at the view level (before TABLES) or inline on individual entries. The existing parser infrastructure handles entries separated by commas inside clause parentheses, but COMMENT adds a new syntactic form.
+
+**Consequences:**
+- Parse errors on valid DDL containing comments with special characters
+- Truncated comments if the parser misidentifies the end of the string
+- View-level COMMENT may confuse the clause boundary scanner if it appears between clauses
 
 **Prevention:**
-1. Extract `util.rs` (containing `suggest_closest` and `replace_word_boundary`) FIRST -- this is a small, well-bounded extraction.
-2. Update `graph.rs` to import from `crate::util` instead of `crate::expand`.
-3. Verify `cargo test` passes.
-4. THEN proceed with the `expand/` module split.
-5. THEN proceed with the `graph/` module split.
+- View-level COMMENT should appear before the first clause keyword (TABLES). The clause boundary scanner should skip over `COMMENT = '...'` at the top level.
+- Entry-level COMMENT should be parsed within the existing entry parser, after the `AS expr` portion.
+- Use the existing single-quote escaping logic consistently.
+- Test adversarial strings: empty comments, `''` (escaped quotes), `)` characters, clause keywords inside comments (`COMMENT = 'This has DIMENSIONS'`).
+- Add `fuzz_ddl_parse` corpus entries with COMMENT containing special characters.
 
-The order must be: break the cycle, then split the modules.
+**Detection:** Proptest generating random strings as comment values (including ASCII printable, single quotes, parentheses, clause keywords).
 
-**Phase assignment:** First step of the refactoring phase. Single commit.
+**Phase:** Metadata system phase.
 
 ---
 
-### M2: DuckDB Database/Schema Name Retrieval in Extension Context
+### M2: SYNONYMS parsing ambiguity with expression suffix
 
-**What goes wrong:** Snowflake's SHOW output includes `database_name` and `schema_name`. In DuckDB, the equivalent metadata comes from `current_database()` / `current_schema()` SQL functions. But these SQL functions cannot be called from within a VTab `bind()` because the ClientContext lock is held. The extension already has a `persist_conn` and `query_conn` for this purpose, but the SHOW VTab implementations (list.rs, show_dims.rs, etc.) only access `CatalogState` via `extra_info` -- they have no connection handle.
+**What goes wrong:** The Snowflake syntax `WITH SYNONYMS = ('alias1', 'alias2')` introduces a new keyword sequence after a dimension/metric/fact entry. The parser may confuse `WITH` as part of a SQL expression or misparse the parenthesized synonym list as part of the expression.
 
-**Why it happens:** The existing SHOW VTabs were designed to only need the in-memory catalog. Adding database/schema metadata requires either: (a) storing the database/schema name at init time, or (b) passing an additional connection to the VTab via extra_info for metadata queries.
+**Why it happens:** The existing entry parser finds `AS` to split `name AS expr`. After extracting the expression, it must detect where the expression ends and annotations begin. If the expression ends with a parenthesized group (e.g., `COUNT(*)`), distinguishing between the expression's closing paren and a SYNONYMS paren requires keyword look-ahead.
+
+**Consequences:**
+- Silent misparse: synonym strings absorbed into the expression
+- Parse error on valid DDL
 
 **Prevention:**
-1. At `init_catalog` time (or extension init), query `SELECT current_database(), current_schema()` and store the results alongside the catalog state. Create a new wrapper struct (e.g., `ExtensionState { catalog: CatalogState, database_name: String, schema_name: String }`).
-2. Pass this enriched state through `extra_info` to the VTabs.
-3. Do NOT try to execute SQL from within a VTab `bind()` on the main connection -- it will deadlock silently.
-4. For in-memory databases, `current_database()` returns `'memory'` and `current_schema()` returns `'main'` -- these are correct values to display.
+- Parse annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC) AFTER the expression using keyword detection. After the `AS` keyword split, scan the expression portion for trailing annotation keywords at depth-0 (not inside parens/strings).
+- The key insight: annotations use keywords (`COMMENT`, `WITH`, `PRIVATE`, `PUBLIC`) that are unlikely to appear as the LAST token of a valid SQL expression. A depth-0 scan from right-to-left for these keywords should work.
+- Alternative: define a strict grammar where annotations appear in fixed order after the expression. Parse greedily for the expression (everything between AS and the first annotation keyword at depth-0).
+- Test edge cases: `alias.name AS (CASE WHEN x > 0 THEN 1 END) WITH SYNONYMS = ('alt')`, `alias.name AS func(x) COMMENT = 'note'`.
 
-**Detection:** If you try to call `duckdb_query` on the main connection from within `bind()`, the process will hang (deadlock) rather than error. This is silent and hard to debug.
+**Detection:** Test cases with complex expressions followed by annotations.
 
-**Phase assignment:** SHOW SEMANTIC VIEWS column expansion phase. Must precede the VTab changes that need the data.
+**Phase:** Same metadata system phase as COMMENT.
 
 ---
 
-### M3: Dropping `expr` Column from SHOW SEMANTIC DIMENSIONS/METRICS/FACTS
+### M3: PRIVATE metrics interacting with derived metrics
 
-**What goes wrong:** The current SHOW SEMANTIC DIMENSIONS has 5 columns: `semantic_view_name`, `name`, `expr`, `source_table`, `data_type`. Snowflake's equivalent has 8 columns: `database_name`, `schema_name`, `semantic_view_name`, `table_name`, `name`, `data_type`, `synonyms`, `comment`. Snowflake does NOT expose `expr` in SHOW output (expressions are visible in DESCRIBE via the `EXPRESSION` property). Dropping `expr` from SHOW output removes information that users may rely on for debugging.
+**What goes wrong:** A PRIVATE metric cannot be queried directly. But if a derived (non-private) metric references a private metric in its expression, the system must still inline the private metric's expression during expansion. If private metrics are excluded from the resolution pool, derived metrics that depend on them produce invalid SQL.
+
+**Why it happens:** The `inline_derived_metrics` function in `expand/facts.rs` resolves all metric expressions by walking the dependency graph. If private metrics are filtered out before inlining, derived metrics referencing them have unresolved references.
+
+**Consequences:**
+- Derived metrics silently produce invalid SQL
+- Or all derived metrics transitively depending on private metrics are blocked
 
 **Prevention:**
-1. Drop `expr` from SHOW output to align with Snowflake. DESCRIBE (in property-per-row format) still exposes expressions via the `EXPRESSION` property.
-2. Add `database_name` and `schema_name` as the first two columns (matching Snowflake column order).
-3. For `synonyms` and `comment`: Snowflake has these; DuckDB semantic views do not support them yet. Emit empty strings for these columns to maintain schema compatibility.
-4. Rename `source_table` to `table_name` to match Snowflake naming.
-5. Document the column changes in release notes -- users scripting against SHOW output will break.
+- PRIVATE is a query-time filter, not a resolution-time filter. Private metrics must participate fully in the derived metric inlining pass. The PRIVATE check happens only when validating the user's explicit metric request.
+- In `expand()`, resolve ALL metrics (including private) for the inlining pass. Then, when validating requested metric names, reject any marked PRIVATE.
+- Add a new ExpandError variant: `PrivateMetric { view_name, name }`.
+- Test: define `base_metric` (PRIVATE) and `derived_metric AS base_metric * 2` (PUBLIC). Querying `derived_metric` should work; querying `base_metric` should fail.
 
-**Detection:** Any test or script that references `expr` in SHOW output or uses column positions will fail.
+**Detection:** Unit test with private base metric and public derived metric.
 
-**Phase assignment:** SHOW DIMS/METRICS/FACTS alignment phase. Must update all three SHOW commands together for consistency.
+**Phase:** Metadata system phase (PRIVATE/PUBLIC modifiers).
 
 ---
 
-### M4: `parse.rs` Error Type Extraction Order Matters
+### M4: Queryable FACTS mixing row-level and aggregate output
 
-**What goes wrong:** `body_parser.rs` imports `parse::ParseError`. If you extract `ParseError` to `errors.rs` before splitting `expand.rs`/`graph.rs`, the extraction is clean. If you do it after or interleaved, you have to update import paths twice -- once for the initial extraction, and again when the modules that use it are restructured.
+**What goes wrong:** Facts are row-level expressions (no aggregation). If the table function accepts `facts := ['fact_name']` alongside `metrics := ['metric_name']`, the expansion must decide: do facts go in the SELECT without GROUP BY aggregation, or do facts become GROUP BY dimensions? Neither is correct if mixed naively.
 
-**Prevention:** Extract `ParseError` to `errors.rs` at the same time as extracting `suggest_closest` to `util.rs`. Both are "break the dependency cycle" changes that should happen in a single preparatory phase before any module directory splitting.
+**Why it happens:** The current `QueryRequest` has `dimensions` and `metrics`. Adding `facts` creates a third category:
+- Dimensions-only: SELECT DISTINCT
+- Metrics-only: global aggregate
+- Both: GROUP BY dimensions, aggregate metrics
+- Facts: row-level expressions, no aggregation
 
-**Phase assignment:** Same initial refactoring step as M1.
+Facts + metrics in the same request is contradictory for a single flat query.
+
+**Consequences:**
+- Facts treated as dimensions produce incorrect GROUP BY (inflates cardinality)
+- Facts treated as metrics produce errors (they are not aggregates)
+
+**Prevention:**
+- **Facts-only mode**: When facts (and optionally dimensions) are requested with NO metrics, generate `SELECT DISTINCT fact_exprs, dim_exprs FROM ...` (no GROUP BY).
+- **Disallow facts + metrics in the same request.** Return a clear error: "Cannot mix facts (row-level) and metrics (aggregated) in the same query."
+- Add a `facts` field to `QueryRequest`. Check: if `facts` is non-empty AND `metrics` is non-empty, return an error.
+
+**Detection:** Unit test verifying `facts + metrics` returns an error. Unit test verifying `facts + dimensions` produces correct row-level SQL.
+
+**Phase:** Should follow semi-additive and window metric phases.
 
 ---
 
-### M5: Test Migration Is the Largest Work Item
+### M5: Fan trap detection not updated for semi-additive and window metrics
 
-**What goes wrong:** The codebase has 482 tests. Module refactoring affects the location and import paths of tests embedded within the refactored files. Schema changes to SHOW/DESCRIBE affect sqllogictest assertions. The actual code changes (adding columns, restructuring output) are straightforward, but migrating every affected test is labor-intensive and error-prone.
+**What goes wrong:** The existing `check_fan_traps` function checks every (metric, dimension) pair for one-to-many boundary crossings. Semi-additive metrics change the aggregation semantics (snapshot selection before aggregation), potentially neutralizing certain fan traps. Window metrics bypass GROUP BY entirely, making fan trap detection irrelevant for them.
 
-**Why it happens:** Tests for `expand.rs` (99 unit tests) and `graph.rs` (numerous tests) are embedded at the bottom of each file with `#[cfg(test)] mod tests { ... }`. When splitting into module directories, these tests must move to the correct submodule (close to the code they test). Each moved test must have its `use` imports updated.
+**Why it happens:** Fan trap detection assumes all metrics are simple aggregates.
+
+**Consequences:**
+- False positive fan trap errors on semi-additive metrics that would produce correct results after snapshot selection
+- False positive fan trap errors on window metrics that do not aggregate
 
 **Prevention:**
-1. For module splits: keep `#[cfg(test)] mod tests` blocks in each submodule file. Move tests with the function they test, not to a central `tests.rs`.
-2. For sqllogictest: identify all affected `.test` files upfront and update them in the same commit as the schema change.
-3. Run `just test-all` after every individual refactoring step -- do not batch multiple changes before testing.
-4. Consider keeping a `expand/tests.rs` for integration-style tests that exercise the full `expand()` pipeline, while unit tests for individual functions live in their respective submodules.
+- Add a metric kind annotation: `Regular`, `SemiAdditive`, `Window`.
+- In `check_fan_traps`, skip window metrics entirely.
+- For semi-additive metrics: still flag fan traps but with a softer message, or skip them if the non-additive dimensions adequately partition the data. The simplest approach: skip fan trap checking for semi-additive metrics since snapshot selection is specifically designed to handle the "latest value" case.
 
-**Detection:** `cargo test` for Rust test migration errors. `just test-sql` for sqllogictest assertion failures. `just test-all` catches both.
+**Detection:** Test semi-additive metric across one-to-many boundary -- should NOT produce fan trap error.
 
-**Phase assignment:** Embedded in every phase. Budget time for test migration in each phase estimate.
+**Phase:** Same phase as semi-additive metrics.
+
+---
+
+### M6: Wildcard expansion (customer.*) with name collisions across tables
+
+**What goes wrong:** `dimensions := ['customer.*']` should expand to all dimensions from the customer logical table. But if two tables define dimensions with the same name (e.g., both `customer` and `order` have a `status` dimension), the wildcard expansion produces duplicates that the existing `DuplicateDimension` check rejects.
+
+**Why it happens:** Wildcard expansion resolves at `bind()` time to the list of dimension names whose `source_table` matches. The resolved names pass to `expand()`, which performs the duplicate check. If another explicitly named dimension collides with a wildcard-expanded name, the error is confusing.
+
+**Consequences:**
+- Confusing error messages: "duplicate dimension 'status'" when the user only wrote `customer.*`
+- Ambiguity about which dimension "wins" if wildcards from two tables overlap
+
+**Prevention:**
+- Resolve wildcards BEFORE passing to `expand()`, in the `bind()` function.
+- If explicit names collide with wildcard-expanded names, silently deduplicate (they refer to the same dimension).
+- If wildcards from two different tables collide, error with: "Ambiguous dimension 'status' matched by both 'customer.*' and 'order.*'."
+- Implement wildcard resolution as a preprocessing step in `bind()`.
+
+**Detection:** Test: `customer.*` alone, `customer.* + explicit customer.name` (dedup), `customer.* + order.*` with collision (error).
+
+**Phase:** Late in the milestone -- after all features have added their fields to the model.
+
+---
+
+### M7: SHOW ... IN SCHEMA/DATABASE scope model mismatch with DuckDB
+
+**What goes wrong:** Snowflake has ACCOUNT > DATABASE > SCHEMA hierarchy with `IN SCHEMA my_db.my_schema` scoping. DuckDB has a similar hierarchy but the extension stores all semantic views in a single catalog table. v0.5.5 added `database_name` and `schema_name` to `SemanticViewDefinition`, but these are stored inside the JSON definition, not as indexed catalog columns. Filtering by schema requires deserializing every definition to check the field.
+
+**Why it happens:** The metadata fields were added for SHOW output display, not for efficient filtering. The current design reads all definitions into `CatalogState` (a `HashMap<String, String>`) at load time -- filtering requires JSON deserialization of each value.
+
+**Consequences:**
+- `IN SCHEMA` filtering is O(n) with JSON deserialization per entry
+- `IN DATABASE` (no name) must resolve `current_database()`, which requires SQL execution not available in VTab bind
+
+**Prevention:**
+- Accept the O(n) cost -- semantic view catalogs are small (typically <100 entries). The VTab already iterates the full catalog for SHOW.
+- For "current database/schema" resolution: the extension already captures `database_name` and `schema_name` at define time. At query time, resolve the current database/schema in the DDL rewrite step (in `parse.rs`), not in the VTab. The rewrite can inject the current context as a parameter to the VTab function call.
+- Alternatively, resolve in the parse_show_filter_clauses and pass as a string parameter to the VTab.
+- Handle edge cases: `IN DATABASE` (no name) = filter by current database, `IN SCHEMA` (no name) = filter by current schema, `IN SCHEMA db.schema` = filter by both.
+
+**Detection:** Test with views created in different schema contexts, then `SHOW IN SCHEMA x` filtering.
+
+**Phase:** SHOW enhancements phase.
 
 ---
 
 ## Minor Pitfalls
 
-### N1: VTab Chunk Size on Large DESCRIBE Output
+### N1: NON ADDITIVE BY dimension references must be validated at define time
 
-**What goes wrong:** The current VTab pattern uses `init_data.done.swap(true)` to emit all rows in a single `func()` call. The Snowflake property-per-row DESCRIBE format can produce 100+ rows for complex views. The DuckDB standard vector size is 2048, so this is unlikely to be a problem in practice, but the pattern should handle it.
+**What goes wrong:** `NON ADDITIVE BY (dim1, dim2)` references dimension names. If those names don't exist in the view's dimension list, the error should be caught at define time, not query time.
 
-**Prevention:** Implement proper chunked emission in the DESCRIBE VTab: track an offset in `InitData`, emit up to chunk size rows per `func()` call, return `set_len(0)` when offset >= total rows. The existing SHOW VTabs also use single-emission; flag this as tech debt for future scalability.
+**Prevention:** After parsing the metric entry with NON ADDITIVE BY, validate each referenced dimension name against the parsed dimensions list. Emit a ParseError with position if not found, using the existing "did you mean" suggestion pattern.
 
----
-
-### N2: `#[serde(skip_serializing_if)]` Inconsistency on `created_on`
-
-**What goes wrong:** If you forget `skip_serializing_if` on `created_on` and always serialize `created_on: null`, old definitions re-serialized through `catalog_upsert` will gain the new field. This is harmless (serde handles null gracefully) but creates unnecessary JSON churn in stored definitions.
-
-**Prevention:** Follow the existing pattern in `TableRef` (model.rs lines 13, 19): use `#[serde(default, skip_serializing_if = "Option::is_none")]` for the new field.
+**Phase:** Semi-additive metrics phase.
 
 ---
 
-### N3: FOR METRIC `required` Column Semantics
+### N2: PARTITION BY EXCLUDING dimension cross-entity validation
 
-**What goes wrong:** Snowflake's `SHOW SEMANTIC DIMENSIONS FOR METRIC` includes a `required` boolean column for window function metrics with `PARTITION BY EXCLUDING`. DuckDB semantic views do not support window function metrics yet, so `required` is always `false`. If you add the column now, it must always emit `false`.
+**What goes wrong:** Snowflake requires excluded dimensions be "accessible from the same entity that defines the window function metric." If a PARTITION BY EXCLUDING references a dimension from an unreachable table, the generated SQL references an unavailable column.
 
-**Prevention:** Add `required` as a BOOLEAN column, always emit `false`, add a code comment: "Always false until window function metrics are implemented."
+**Prevention:** At define time, verify excluded dimension names are from the same table or a table reachable via one-to-one relationships from the metric's source table.
+
+**Phase:** Window function metrics phase.
 
 ---
 
-### N4: Forgetting to `git rm` Old Files When Creating Module Directories
+### N3: TERSE mode column subsetting requires VTab bind-time awareness
 
-**What goes wrong:** When converting `expand.rs` to `expand/mod.rs`, if both files exist in the source tree, the Rust compiler emits an ambiguity error. Git may retain the old file if not explicitly removed.
+**What goes wrong:** Snowflake TERSE mode returns 5 columns instead of 8 for SHOW SEMANTIC VIEWS. If the VTab always declares 8 columns, the TERSE flag must either change the bind-time schema or leave columns empty.
+
+**Prevention:** Pass TERSE as a named parameter to the VTab. In bind(), declare only the TERSE column set when the flag is true. This matches the existing pattern where different VTab variants declare different column schemas.
+
+**Phase:** SHOW enhancements phase.
+
+---
+
+### N4: Struct blast radius when adding annotation fields
+
+**What goes wrong:** v0.5.3 retrospective: "Adding a new field to a widely-used struct creates a large blast radius (23+ struct literals)." COMMENT, SYNONYMS, PRIVATE, NON_ADDITIVE_BY, PARTITION_BY_EXCLUDING add 5+ fields across Metric, Dimension, Fact, and SemanticViewDefinition.
 
 **Prevention:**
-1. `git rm src/expand.rs` when creating `src/expand/mod.rs`.
-2. `git rm src/graph.rs` when creating `src/graph/mod.rs`.
-3. Verify with `ls src/expand*` and `ls src/graph*` that no orphan files remain.
+- Add ALL new annotation fields in a single batch phase.
+- Verify all test fixtures use `..Default::default()` pattern. Grep for struct literals that manually specify all fields.
+- Consider an `Annotations` sub-struct grouping COMMENT + SYNONYMS + PRIVATE to reduce per-struct blast radius.
+
+**Phase:** First phase (model changes).
 
 ---
 
-### N5: Renaming `source_table` to `table_name` in Output but Not Struct Field
+### N5: GET_DDL ordering must be deterministic for version control
 
-**What goes wrong:** Snowflake uses `table_name` where the current code uses `source_table` as both the struct field name AND the output column name. If you rename only the output column (in `bind_output_columns`) but not the struct field, the code works but the naming inconsistency confuses contributors.
+**What goes wrong:** If reconstruction iterates HashMap fields or unordered collections, output order varies between runs.
 
-**Prevention:** Rename the output column to `table_name` to match Snowflake. Keep the internal struct field name (`source_table`) because it matches the DDL syntax. Add a comment explaining the mapping.
+**Prevention:** Reconstruct in Vec index order (tables, joins, facts, dimensions, metrics). All are stored as Vecs preserving insertion order. Do NOT sort alphabetically -- preserve the user's original declaration order.
+
+**Phase:** GET_DDL phase.
+
+---
+
+### N6: C++ shim column count must be updated for new SHOW columns
+
+**What goes wrong:** Adding columns (comment, synonyms) to SHOW output changes the column count. The C++ shim `sv_ddl_bind` dynamically reads column count from the result, so the schema forwarding is transparent. BUT sqllogictest assertions are column-count-sensitive (`query TTTTT` specifies exact column types and count). Every `.test` file asserting SHOW output must be updated atomically.
+
+**Prevention:** Change VTab output columns and ALL corresponding test expectations in the same commit. Run `just test-all` after every schema change.
+
+**Phase:** Every phase that changes output columns.
+
+---
+
+### N7: View-level vs entry-level COMMENT parsing ambiguity
+
+**What goes wrong:** Snowflake supports COMMENT at the view level (`CREATE SEMANTIC VIEW ... COMMENT = '...' AS TABLES (...)`) and at the entry level (on individual dimensions, metrics, facts). The parser must distinguish between a view-level COMMENT (before TABLES keyword) and the start of the TABLES clause.
+
+**Prevention:** The view-level COMMENT must appear between the view name and `AS` keyword, or between `AS` and the first clause keyword. Since the parser currently expects `AS` followed immediately by clause keywords, insert COMMENT parsing between `AS` and the first clause keyword scan.
+
+**Phase:** Metadata system phase.
 
 ---
 
@@ -231,26 +371,31 @@ The order must be: break the cycle, then split the modules.
 
 | Phase Topic | Likely Pitfall | Mitigation |
 |-------------|---------------|------------|
-| Extract util.rs + errors.rs | M1 (circular deps), M4 (error type order) | Do this FIRST before any module splits. Single commit, verify with `cargo test`. |
-| Split expand.rs into expand/ | C4 (import path breakage), M5 (test migration) | Re-export everything from mod.rs. Move tests with functions. Run `cargo test` after each file move. |
-| Split graph.rs into graph/ | C4 (same pattern) | Smaller surface area than expand. Same re-export strategy. |
-| Add created_on to model | C2 (JSON backward compat) | `Option<String>` with `#[serde(default)]`. Test with old JSON fixtures. Store in JSON, not SQL column. |
-| Add database_name/schema_name | M2 (connection access deadlock) | Query at init time, store in enriched state struct. |
-| SHOW SEMANTIC VIEWS column changes | C1 (test sync), M3 (column removal) | Atomic VTab + test update. Document breaking change. |
-| SHOW SEMANTIC DIMS/METRICS/FACTS changes | C1 (test sync), M3 (same) | All three commands updated together for consistency. |
-| DESCRIBE restructuring | C3 (complete rewrite) | Discrete phase. New VTab from scratch. |
-| SHOW DIMS FOR METRIC required column | N3 (always false) | Add column, emit false, comment the limitation. |
+| Model + backward compat | JSON deserialization failure (C4), struct blast radius (N4) | Every new field: `#[serde(default)]` + backward compat test. Batch all model changes. |
+| Semi-additive metrics | Wrong aggregation scope (C1), DuckDB NULL crash (C2), fan trap interaction (M5) | Two-stage CTE expansion, ROW_NUMBER over LAST_VALUE, fan trap bypass for semi-additive |
+| Window function metrics | GROUP BY incompatibility (C3), fan trap false positives (M5) | Forbid mixing with aggregate metrics, skip fan trap check for window metrics |
+| Metadata (COMMENT/SYNONYMS/PRIVATE) | Parser ambiguity (M1, M2), private metric inlining (M3), view-level COMMENT (N7) | Depth-0 keyword scan for annotations, PRIVATE as query-time-only filter |
+| Queryable FACTS | Facts + metrics mixing (M4) | Separate facts-only expansion mode, error on facts + metrics |
+| Wildcard selection | Name collision (M6) | Pre-resolve in bind(), deduplicate, error on cross-table ambiguity |
+| GET_DDL | Round-trip information loss (C5), ordering fidelity (N5) | Round-trip proptest, canonical ordering, re-quote identifiers |
+| SHOW enhancements | Scope model mismatch (M7), TERSE columns (N3), shim column counts (N6) | Filter on stored metadata, TERSE as VTab param, atomic test updates |
 
 ## Sources
 
-- Snowflake [SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- output columns: created_on, name, kind, database_name, schema_name, comment, owner, owner_role_type (HIGH confidence)
-- Snowflake [DESCRIBE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view) -- property-per-row format: object_kind, object_name, parent_entity, property, property_value (HIGH confidence)
-- Snowflake [SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- columns: database_name, schema_name, semantic_view_name, table_name, name, data_type, synonyms, comment (HIGH confidence)
-- Snowflake [SHOW SEMANTIC DIMENSIONS FOR METRIC](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions-for-metric) -- adds `required` boolean column (HIGH confidence)
-- Snowflake [SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics) -- same 8-column schema as SHOW SEMANTIC DIMENSIONS (HIGH confidence)
-- Snowflake [SHOW SEMANTIC FACTS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-facts) -- same 8-column schema as SHOW SEMANTIC DIMENSIONS (HIGH confidence)
-- Codebase: `cpp/src/shim.cpp` sv_ddl_bind (lines 134-201) -- dynamic column forwarding (HIGH confidence, direct code inspection)
-- Codebase: `src/model.rs` SemanticViewDefinition serde attributes (HIGH confidence, direct code inspection)
-- Codebase: `src/catalog.rs` init_catalog, CatalogState type alias (HIGH confidence, direct code inspection)
-- Codebase: `_notes/architecture.md` C1-C6 refactoring proposals (HIGH confidence, project documentation)
-- Codebase: TECH-DEBT.md item 12 -- DDL pipeline all-VARCHAR forwarding (HIGH confidence, project documentation)
+- [Snowflake CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- NON ADDITIVE BY, PARTITION BY EXCLUDING, COMMENT, SYNONYMS, PRIVATE syntax (HIGH confidence)
+- [Snowflake querying semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/querying) -- query-time behavior, wildcard selection, fact querying (HIGH confidence)
+- [Snowflake SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- IN SCHEMA/DATABASE, TERSE mode, output columns (HIGH confidence)
+- [Snowflake semi-additive release note](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY behavior: "rows are sorted by the non-additive dimensions, and the values from the last rows are aggregated" (HIGH confidence)
+- [Snowflake YAML specification](https://docs.snowflake.com/en/user-guide/views-semantic/semantic-view-yaml-spec) -- non_additive_dimensions fields, synonyms, access_modifier (HIGH confidence)
+- [Snowflake GET_DDL](https://docs.snowflake.com/en/sql-reference/functions/get_ddl) -- semantic view DDL reconstruction (MEDIUM confidence -- limited detail for semantic views specifically)
+- [DuckDB issue #20136](https://github.com/duckdb/duckdb/issues/20136) -- LAST_VALUE/FIRST_VALUE IGNORE NULLS crash on all-NULL partitions, fixed Dec 2025 in PR #20153 (HIGH confidence)
+- [DuckDB window functions](https://duckdb.org/docs/current/sql/functions/window_functions) -- LAST_VALUE, IGNORE NULLS, frame specifications (HIGH confidence)
+- [Serde field attributes](https://serde.rs/field-attrs.html) -- skip_serializing_if, default, backward compatibility patterns (HIGH confidence)
+- [DuckDB SHOW FROM/IN discussion](https://github.com/duckdb/duckdb/discussions/16083) -- IN SCHEMA/DATABASE not natively supported in DuckDB SHOW (MEDIUM confidence)
+- Codebase: `src/expand/sql_gen.rs` -- single-pass expansion with GROUP BY (HIGH confidence, direct inspection)
+- Codebase: `src/expand/fan_trap.rs` -- cardinality-based fan trap detection (HIGH confidence, direct inspection)
+- Codebase: `src/model.rs` -- SemanticViewDefinition serde annotations (HIGH confidence, direct inspection)
+- Codebase: `src/body_parser.rs` -- clause boundary scanning, entry parsing (HIGH confidence, direct inspection)
+- Codebase: `src/parse.rs` -- DDL detection, SHOW filter parsing (HIGH confidence, direct inspection)
+- Project RETROSPECTIVE.md v0.5.3 -- "Adding a new field to widely-used struct creates large blast radius" (HIGH confidence)
+- Project TECH-DEBT.md item 12 -- DDL pipeline all-VARCHAR result forwarding (HIGH confidence)

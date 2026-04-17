@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A DuckDB extension written in Rust that implements semantic views — a declarative layer for defining measures, dimensions, relationships, facts, hierarchies, and derived metrics directly in DuckDB. Users register semantic views via native `CREATE SEMANTIC VIEW` DDL with SQL keyword clauses (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS), then query them with `FROM semantic_view('view', dimensions := [...], metrics := [...])`. The extension expands semantic view references into concrete SQL (with GROUP BY, JOINs from PK/FK declarations, typed output columns, fan trap detection, and role-playing dimension support) and hands the result to DuckDB for execution. SHOW and DESCRIBE commands output Snowflake-aligned column schemas for full introspection.
+A DuckDB extension written in Rust that implements semantic views — a declarative layer for defining measures, dimensions, relationships, facts, and derived metrics directly in DuckDB. Users register semantic views via native `CREATE SEMANTIC VIEW` DDL with SQL keyword clauses (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS), then query them with `FROM semantic_view('view', dimensions := [...], metrics := [...])`. The extension expands semantic view references into concrete SQL (with GROUP BY, JOINs from PK/FK declarations, typed output columns, fan trap detection, role-playing dimension support, semi-additive snapshot aggregation, and window function metrics) and hands the result to DuckDB for execution. Full Snowflake-aligned introspection via SHOW/DESCRIBE commands, SHOW TERSE/COLUMNS, IN SCHEMA/DATABASE scoping, GET_DDL round-trip, and metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC).
 
 The project targets open source release via the DuckDB community extension registry, filling a gap that exists in the ecosystem: Snowflake, Databricks, and Cube.dev all have semantic layers, but DuckDB has none.
 
@@ -72,17 +72,33 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - ✓ Snowflake-aligned SHOW commands: 5-column SHOW VIEWS, 6-column SHOW DIMS/METRICS/FACTS, 4-column SHOW DIMS FOR METRIC with BOOLEAN required — v0.5.5
 - ✓ Snowflake-aligned DESCRIBE: property-per-row format with 5 columns and 6 object kinds — v0.5.5
 - ✓ Persistence hardened: TOCTOU fix (single write lock), parameterized prepared statements replacing string interpolation — v0.5.5
+- ✓ COMMENT annotation on views and all objects (tables, dimensions, metrics, facts) in CREATE DDL — v0.6.0
+- ✓ WITH SYNONYMS annotation on all objects in CREATE DDL — v0.6.0
+- ✓ PRIVATE/PUBLIC access modifiers on facts and metrics; PRIVATE items excluded from query results — v0.6.0
+- ✓ Backward-compatible metadata persistence: pre-v0.6.0 stored views load without error — v0.6.0
+- ✓ SHOW output includes synonyms and comment columns populated from stored metadata — v0.6.0
+- ✓ DESCRIBE output includes COMMENT, SYNONYMS, and ACCESS_MODIFIER properties — v0.6.0
+- ✓ SHOW SEMANTIC VIEWS IN SCHEMA/DATABASE scope filtering — v0.6.0
+- ✓ SHOW TERSE SEMANTIC VIEWS reduced column set — v0.6.0
+- ✓ SHOW COLUMNS IN SEMANTIC VIEW unified dims/facts/metrics with kind column — v0.6.0
+- ✓ ALTER SEMANTIC VIEW SET/UNSET COMMENT — modify view-level comments after creation — v0.6.0
+- ✓ GET_DDL('SEMANTIC_VIEW', 'name') — round-trip DDL reconstruction from stored definitions — v0.6.0
+- ✓ Wildcard dimension/metric selection (table_alias.*) with PRIVATE exclusion — v0.6.0
+- ✓ Queryable FACTS — row-level unaggregated query mode via facts parameter, mutual exclusion with metrics — v0.6.0
+- ✓ Semi-additive metrics (NON ADDITIVE BY) — CTE-based ROW_NUMBER snapshot selection, effectively-regular classification, conditional aggregation for mixed queries, fan trap skip — v0.6.0
+- ✓ Window function metrics (PARTITION BY EXCLUDING) — CTE-based inner aggregation + outer window SELECT, EXCLUDING resolution at query time, window/aggregate mixing error, fan trap skip, SHOW DIMS required=TRUE — v0.6.0
+- ✓ Security & correctness hardening: FFI catch_unwind on all 25 entry points, graceful lock-poison handling, cycle detection + MAX_DERIVATION_DEPTH=64 for derived metrics/facts, bounds-checked test helpers — v0.6.0
+- ✓ Code quality: unit tests for join_resolver/fan_trap/facts (38 new tests), resolve_names generic helper, DimensionName/MetricName newtypes with case-insensitive semantics, NaGroup named struct, dead code removal, property-based test assertions — v0.6.0
 
 ### Active
 
-(No active milestone — next milestone not yet defined)
+(No active requirements — next milestone not yet defined. Use `/gsd-new-milestone` to start.)
 
 ### Out of Scope
 
 - Pre-aggregation / materialization selection — deferred to future milestone
 - YAML definition format — SQL DDL first; YAML is a future path
 - Fan trap auto-deduplication — changes query semantics; detection + blocking is the 80/20
-- Window function metrics — requires expansion without GROUP BY; orthogonal to aggregation model
 - ASOF / temporal relationships — complex temporal join semantics; standard equi-joins cover 95% of cases
 - Aggregate facts (COUNT in FACTS) — blurs row-level boundary; aggregation belongs in METRICS
 - Cross-view optimisation (sharing materialised tables across views) — non-goal by design
@@ -91,17 +107,15 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - Column-level security — beyond row-level filter scope; DuckDB handles column access
 - Fiscal calendar / Sunday-start weeks — ISO 8601 only for now
 - Backward compatibility for old DDL syntax — pre-release; finding the right design
-- Cross-view hierarchies — keep hierarchies within single semantic view's dimension space
 - Cube.dev-style Dijkstra path selection — explicit USING is more deterministic and Snowflake-aligned
 
 ## Context
 
-**Shipped v0.5.5** — Snowflake-aligned SHOW/DESCRIBE output formats, module refactoring (expand/, graph/, util.rs, errors.rs), metadata storage, persistence hardening.
+**Shipped v0.6.0** (2026-04-14) — Snowflake SQL DDL Parity: metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC), ALTER SET/UNSET COMMENT, GET_DDL round-trip, semi-additive metrics (NON ADDITIVE BY with CTE-based snapshot selection), window function metrics (PARTITION BY EXCLUDING), queryable FACTS (row-level mode), wildcard selection (table_alias.*), SHOW TERSE/COLUMNS/IN SCHEMA/DATABASE, FFI catch_unwind on all 25 entry points, DimensionName/MetricName newtypes. 8 phases (43-50), 16 plans, 34 requirements satisfied.
 **Tech stack:** Rust + C++ shim (vendored DuckDB amalgamation via cc crate), duckdb-rs 1.10500.0 (DuckDB 1.5.0), serde_json, strsim, proptest.
-**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns, fan trap detection, and role-playing dimension support. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with parameterized prepared statements and single-lock check-and-mutate pattern. Parser hook via C++ shim with `parser_extension_compat.hpp`: `parse_function` fallback detects all DDL forms (CREATE, DROP, ALTER, DESCRIBE, SHOW variants), Rust `DdlKind` enum dispatches rewrite. DDL body parsed by `body_parser.rs` state machine into TableRef/Join/Dimension/Metric/Fact structs with PK/FK/UNIQUE annotations and inferred cardinality. `RelationshipGraph` validates tree structure and topologically sorts joins. Expansion generates `FROM base AS alias LEFT JOIN t AS alias ON pk=fk` with qualified column references, fact inlining, derived metric resolution, and USING-aware scoped aliases. Code organized into module directories: `expand/` (7 submodules), `graph/` (5 submodules), with shared `util.rs` and `errors.rs` leaf modules.
-**Tests:** 487 Rust tests + 19 sqllogictest files + 6 DuckLake CI tests + Python crash repro + Python caret tests + 4 fuzz targets + 22 infra assertions.
+**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns, fan trap detection, role-playing dimension support, semi-additive snapshot aggregation, and window function metrics. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with parameterized prepared statements and single-lock check-and-mutate pattern. Parser hook via C++ shim with `parser_extension_compat.hpp`: `parse_function` fallback detects all DDL forms (CREATE, DROP, ALTER, DESCRIBE, SHOW variants), Rust `DdlKind` enum dispatches rewrite. DDL body parsed by `body_parser.rs` state machine into TableRef/Join/Dimension/Metric/Fact structs with PK/FK/UNIQUE annotations, metadata (COMMENT/SYNONYMS/PRIVATE), and inferred cardinality. `RelationshipGraph` validates tree structure and topologically sorts joins. Expansion generates `FROM base AS alias LEFT JOIN t AS alias ON pk=fk` with qualified column references, fact inlining, derived metric resolution, USING-aware scoped aliases, CTE-based semi-additive/window metric pipelines, and wildcard expansion. Code organized into module directories: `expand/` (7 submodules), `graph/` (5 submodules), with shared `util.rs` and `errors.rs` leaf modules. DimensionName/MetricName newtypes with case-insensitive semantics for query resolution.
+**Codebase:** 25,983 LOC Rust across src/ and tests/. 705 Rust tests + 32 sqllogictest files + 6 DuckLake CI tests + Python crash repro + Python caret tests + 4 fuzz targets.
 **Known limitations:** See TECH-DEBT.md at repo root for accepted decisions and deferred items.
-**Source LOC:** 16,342 Rust (src/).
 
 **Design research:** A detailed design doc lives in `_notes/semantic-views-duckdb-design-doc.md`. It covers prior art (Cube.dev internals, Snowflake semantic views, Databricks metric views), the two-phase architecture (expansion → pre-aggregation selection), and why `egg`/e-graph rewriting is not needed for this approach.
 
@@ -146,7 +160,16 @@ A DuckDB user can define a semantic view once and query it with any combination 
 | Scoped aliases for role-playing ({alias}__{rel_name}) | Double-underscore separator for uniqueness; aliases are quoted | ✓ Good — deterministic disambiguation |
 | Diamond relaxation for named relationships | Allow multiple paths when all relationships have unique names | ✓ Good — enables role-playing pattern |
 | USING controls dimension alias, not metric aggregation | COUNT(*) counts base rows regardless of USING path | ✓ Good — correct semantics |
-| Semi-additive metrics deferred | Only feature requiring expansion pipeline structural change; deferred again from v0.5.4 | — Pending |
+| Semi-additive via CTE ROW_NUMBER (not LAST_VALUE) | DuckDB LTS crash bug with LAST_VALUE IGNORE NULLS; ROW_NUMBER approach is portable | ✓ Good — correct results, avoids LTS bug |
+| Effectively-regular classification for semi-additive | When all NA dimensions are in query, skip CTE and aggregate normally (Snowflake semantics) | ✓ Good — avoids unnecessary CTE overhead |
+| Window/aggregate mixing prohibition | Window metrics and aggregate metrics cannot coexist in same query | ✓ Good — clear semantics, avoids ambiguous GROUP BY |
+| CTE-based window expansion (inner agg + outer window) | __sv_agg CTE aggregates inner metrics; outer SELECT applies window functions | ✓ Good — correct partition semantics |
+| PARTITION BY EXCLUDING as set difference | Window partitions computed at query time by subtracting EXCLUDING dims from queried dims | ✓ Good — flexible, Snowflake-aligned |
+| FFI catch_unwind on all entry points | AssertUnwindSafe justified: panics caught at boundary, no partially-mutated state | ✓ Good — prevents UB from Rust panics through C++ |
+| MAX_DERIVATION_DEPTH=64 | Prevents stack overflow from linear metric chains passing cycle detection | ✓ Good — safe limit with clear error |
+| Graceful lock-poison via map_err | .map_err() with descriptive string instead of into_inner() recovery | ✓ Good — simpler than recovery, correct for crash scenarios |
+| DimensionName/MetricName newtypes | Case-insensitive Eq/Hash via AsRef<str> + Deref for seamless interop | ✓ Good — compile-time guarantees, consolidated comparison |
+| resolve_names generic helper (9 closure params) | Closures for error construction avoid trait objects while deduplicating 4 resolution loops | ✓ Good — -150 LOC, single responsibility |
 | Module directory pattern with mod.rs re-exports | Submodules use pub(super) for internal sharing; mod.rs re-exports full prior public API | ✓ Good — zero-breakage split of 6,632 lines |
 | Define-time metadata capture via DuckDB SQL | `now()`, `current_database()`, `current_schema()` via catalog_conn; not stored in JSON to avoid stale aliases | ✓ Good — accurate context metadata |
 | Property-per-row DESCRIBE format | Snowflake-aligned: each row is one property of one object; replaces single-row JSON blob | ✓ Good — standard introspection pattern |
@@ -177,4 +200,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-05 after v0.5.5 milestone — Snowflake-aligned SHOW/DESCRIBE, module refactoring, metadata storage, persistence hardening. 6 phases, 33/33 requirements.*
+*Last updated: 2026-04-14 after v0.6.0 milestone — Snowflake SQL DDL Parity.*

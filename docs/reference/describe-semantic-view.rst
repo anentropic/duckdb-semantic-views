@@ -7,7 +7,7 @@
 DESCRIBE SEMANTIC VIEW
 ========================
 
-Returns the definition of a semantic view as a multi-row result set in property-per-row format. Each row represents one property of one object (table, relationship, fact, dimension, metric, or derived metric) in the view definition.
+Returns the definition of a semantic view as a multi-row result set in property-per-row format. Each row represents one property of one object (semantic view, table, relationship, fact, dimension, metric, or derived metric) in the view definition.
 
 
 .. _ref-describe-syntax:
@@ -45,13 +45,13 @@ The result contains multiple rows with 5 VARCHAR columns:
      - Description
    * - ``object_kind``
      - VARCHAR
-     - The type of object: ``TABLE``, ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, or ``DERIVED_METRIC``.
+     - The type of object: ``SEMANTIC_VIEW``, ``TABLE``, ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, or ``DERIVED_METRIC``.
    * - ``object_name``
      - VARCHAR
-     - The name of the object (table name, relationship name, fact/dimension/metric name).
+     - The name of the object (view name, table name, relationship name, fact/dimension/metric name).
    * - ``parent_entity``
      - VARCHAR
-     - The parent table for this object. Empty string for ``TABLE`` objects and ``DERIVED_METRIC`` objects.
+     - The parent table for this object. Empty string for ``SEMANTIC_VIEW``, ``TABLE``, and ``DERIVED_METRIC`` objects.
    * - ``property``
      - VARCHAR
      - The property name being described.
@@ -65,10 +65,22 @@ The result contains multiple rows with 5 VARCHAR columns:
 Object Kinds and Properties
 ===========================
 
-Rows appear in definition order: ``TABLE`` objects first, then ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, and ``DERIVED_METRIC``.
+Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then ``TABLE`` objects, then ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, and ``DERIVED_METRIC``.
+
+**SEMANTIC_VIEW**
+   Emitted only when a view-level comment is set (via :ref:`ALTER SEMANTIC VIEW SET COMMENT <ref-alter-semantic-view>`). Produces one property row:
+
+   .. list-table::
+      :header-rows: 1
+      :widths: 25 75
+
+      * - Property
+        - Description
+      * - ``COMMENT``
+        - The view-level comment text.
 
 **TABLE**
-   One block per table declared in the ``TABLES`` clause. Each table produces 3 or 4 property rows:
+   One block per table declared in the ``TABLES`` clause. Each table produces 3-6 property rows:
 
    .. list-table::
       :header-rows: 1
@@ -84,6 +96,10 @@ Rows appear in definition order: ``TABLE`` objects first, then ``RELATIONSHIP``,
         - The physical table name.
       * - ``PRIMARY_KEY``
         - JSON array of primary key column names (e.g., ``["id"]``). Only emitted when a primary key is declared.
+      * - ``COMMENT``
+        - The table comment text. Only emitted when a comment is set.
+      * - ``SYNONYMS``
+        - JSON array of synonym strings (e.g., ``["transactions","purchases"]``). Only emitted when synonyms are set.
 
 **RELATIONSHIP**
    One block per relationship declared in the ``RELATIONSHIPS`` clause:
@@ -118,6 +134,12 @@ Rows appear in definition order: ``TABLE`` objects first, then ``RELATIONSHIP``,
         - The row-level SQL expression defining the fact.
       * - ``DATA_TYPE``
         - The inferred data type. Empty string if not resolved. Populated when the table contains data.
+      * - ``COMMENT``
+        - The fact comment text. Only emitted when a comment is set.
+      * - ``SYNONYMS``
+        - JSON array of synonym strings. Only emitted when synonyms are set.
+      * - ``ACCESS_MODIFIER``
+        - ``PUBLIC`` or ``PRIVATE``. Always emitted.
 
 **DIMENSION**
    One block per dimension declared in the ``DIMENSIONS`` clause:
@@ -134,6 +156,10 @@ Rows appear in definition order: ``TABLE`` objects first, then ``RELATIONSHIP``,
         - The SQL expression defining the dimension.
       * - ``DATA_TYPE``
         - The inferred data type. Empty string if not resolved.
+      * - ``COMMENT``
+        - The dimension comment text. Only emitted when a comment is set.
+      * - ``SYNONYMS``
+        - JSON array of synonym strings. Only emitted when synonyms are set.
 
 **METRIC**
    One block per base metric (those scoped to a table) declared in the ``METRICS`` clause:
@@ -150,9 +176,19 @@ Rows appear in definition order: ``TABLE`` objects first, then ``RELATIONSHIP``,
         - The aggregate SQL expression defining the metric.
       * - ``DATA_TYPE``
         - The inferred data type. Empty string if not resolved.
+      * - ``COMMENT``
+        - The metric comment text. Only emitted when a comment is set.
+      * - ``SYNONYMS``
+        - JSON array of synonym strings. Only emitted when synonyms are set.
+      * - ``ACCESS_MODIFIER``
+        - ``PUBLIC`` or ``PRIVATE``. Always emitted.
+      * - ``NON_ADDITIVE_BY``
+        - Comma-separated list of non-additive dimensions with optional sort/nulls (e.g., ``report_date DESC NULLS FIRST``). Only emitted for semi-additive metrics.
+      * - ``WINDOW_SPEC``
+        - Reconstructed OVER clause string (e.g., ``AVG(total_qty) OVER (PARTITION BY EXCLUDING date ORDER BY date)``). Only emitted for window metrics.
 
 **DERIVED_METRIC**
-   One block per derived metric (those referencing other metrics rather than a table). Derived metrics have an empty ``parent_entity`` and only 2 property rows:
+   One block per derived metric (those referencing other metrics rather than a table). Derived metrics have an empty ``parent_entity``:
 
    .. list-table::
       :header-rows: 1
@@ -164,6 +200,16 @@ Rows appear in definition order: ``TABLE`` objects first, then ``RELATIONSHIP``,
         - The expression composing other metrics.
       * - ``DATA_TYPE``
         - The inferred data type. Empty string if not resolved.
+      * - ``COMMENT``
+        - The derived metric comment text. Only emitted when a comment is set.
+      * - ``SYNONYMS``
+        - JSON array of synonym strings. Only emitted when synonyms are set.
+      * - ``ACCESS_MODIFIER``
+        - ``PUBLIC`` or ``PRIVATE``. Always emitted.
+      * - ``NON_ADDITIVE_BY``
+        - Only emitted for semi-additive derived metrics.
+      * - ``WINDOW_SPEC``
+        - Only emitted for window-function derived metrics.
 
 
 .. _ref-describe-examples:
@@ -203,175 +249,50 @@ Examples
    │ METRIC      │ total       │ orders        │ TABLE                    │ orders           │
    │ METRIC      │ total       │ orders        │ EXPRESSION               │ SUM(o.amount)    │
    │ METRIC      │ total       │ orders        │ DATA_TYPE                │                  │
+   │ METRIC      │ total       │ orders        │ ACCESS_MODIFIER          │ PUBLIC           │
    └─────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────┘
 
-**Multi-table view with relationships:**
+**View with metadata annotations:**
 
 .. code-block:: sql
 
-   CREATE SEMANTIC VIEW multi_view AS
+   CREATE SEMANTIC VIEW annotated AS
    TABLES (
-       o AS orders    PRIMARY KEY (id),
-       c AS customers PRIMARY KEY (id)
-   )
-   RELATIONSHIPS (
-       order_to_customer AS o(customer_id) REFERENCES c
+       o AS orders PRIMARY KEY (id) COMMENT = 'Order data'
    )
    DIMENSIONS (
-       o.region        AS o.region,
-       c.customer_name AS c.name
+       o.region AS o.region COMMENT = 'Sales region' WITH SYNONYMS = ('territory')
    )
    METRICS (
-       o.total_revenue AS SUM(o.amount)
+       o.revenue AS SUM(o.amount) COMMENT = 'Total revenue'
    );
 
-   DESCRIBE SEMANTIC VIEW multi_view;
+   ALTER SEMANTIC VIEW annotated SET COMMENT = 'Revenue analytics';
+
+   DESCRIBE SEMANTIC VIEW annotated;
 
 .. code-block:: text
 
-   ┌──────────────┬───────────────────┬───────────────┬──────────────────────────┬──────────────────┐
-   │ object_kind  │ object_name       │ parent_entity │ property                 │ property_value   │
-   ├──────────────┼───────────────────┼───────────────┼──────────────────────────┼──────────────────┤
-   │ TABLE        │ orders            │               │ BASE_TABLE_DATABASE_NAME │ memory           │
-   │ TABLE        │ orders            │               │ BASE_TABLE_SCHEMA_NAME   │ main             │
-   │ TABLE        │ orders            │               │ BASE_TABLE_NAME          │ orders           │
-   │ TABLE        │ orders            │               │ PRIMARY_KEY              │ ["id"]           │
-   │ TABLE        │ customers         │               │ BASE_TABLE_DATABASE_NAME │ memory           │
-   │ TABLE        │ customers         │               │ BASE_TABLE_SCHEMA_NAME   │ main             │
-   │ TABLE        │ customers         │               │ BASE_TABLE_NAME          │ customers        │
-   │ TABLE        │ customers         │               │ PRIMARY_KEY              │ ["id"]           │
-   │ RELATIONSHIP │ order_to_customer │ orders        │ TABLE                    │ orders           │
-   │ RELATIONSHIP │ order_to_customer │ orders        │ REF_TABLE                │ customers        │
-   │ RELATIONSHIP │ order_to_customer │ orders        │ FOREIGN_KEY              │ ["customer_id"]  │
-   │ RELATIONSHIP │ order_to_customer │ orders        │ REF_KEY                  │ ["id"]           │
-   │ DIMENSION    │ region            │ orders        │ TABLE                    │ orders           │
-   │ DIMENSION    │ region            │ orders        │ EXPRESSION               │ o.region         │
-   │ DIMENSION    │ region            │ orders        │ DATA_TYPE                │                  │
-   │ DIMENSION    │ customer_name     │ customers     │ TABLE                    │ customers        │
-   │ DIMENSION    │ customer_name     │ customers     │ EXPRESSION               │ c.name           │
-   │ DIMENSION    │ customer_name     │ customers     │ DATA_TYPE                │                  │
-   │ METRIC       │ total_revenue     │ orders        │ TABLE                    │ orders           │
-   │ METRIC       │ total_revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)    │
-   │ METRIC       │ total_revenue     │ orders        │ DATA_TYPE                │                  │
-   └──────────────┴───────────────────┴───────────────┴──────────────────────────┴──────────────────┘
-
-**View with facts:**
-
-.. code-block:: sql
-
-   CREATE SEMANTIC VIEW fact_view AS
-   TABLES (
-       o  AS orders     PRIMARY KEY (id),
-       li AS line_items PRIMARY KEY (id)
-   )
-   RELATIONSHIPS (
-       li_to_order AS li(order_id) REFERENCES o
-   )
-   FACTS (
-       li.net_price AS li.price * li.quantity
-   )
-   DIMENSIONS (
-       o.region AS o.region
-   )
-   METRICS (
-       o.total_net AS SUM(li.net_price)
-   );
-
-   DESCRIBE SEMANTIC VIEW fact_view;
-
-.. code-block:: text
-
-   ┌──────────────┬─────────────┬───────────────┬──────────────────────────┬──────────────────────────┐
-   │ object_kind  │ object_name │ parent_entity │ property                 │ property_value           │
-   ├──────────────┼─────────────┼───────────────┼──────────────────────────┼──────────────────────────┤
-   │ TABLE        │ orders      │               │ BASE_TABLE_DATABASE_NAME │ memory                   │
-   │ TABLE        │ orders      │               │ BASE_TABLE_SCHEMA_NAME   │ main                     │
-   │ TABLE        │ orders      │               │ BASE_TABLE_NAME          │ orders                   │
-   │ TABLE        │ orders      │               │ PRIMARY_KEY              │ ["id"]                   │
-   │ TABLE        │ line_items  │               │ BASE_TABLE_DATABASE_NAME │ memory                   │
-   │ TABLE        │ line_items  │               │ BASE_TABLE_SCHEMA_NAME   │ main                     │
-   │ TABLE        │ line_items  │               │ BASE_TABLE_NAME          │ line_items               │
-   │ TABLE        │ line_items  │               │ PRIMARY_KEY              │ ["id"]                   │
-   │ RELATIONSHIP │ li_to_order │ line_items    │ TABLE                    │ line_items               │
-   │ RELATIONSHIP │ li_to_order │ line_items    │ REF_TABLE                │ orders                   │
-   │ RELATIONSHIP │ li_to_order │ line_items    │ FOREIGN_KEY              │ ["order_id"]             │
-   │ RELATIONSHIP │ li_to_order │ line_items    │ REF_KEY                  │ ["id"]                   │
-   │ FACT         │ net_price   │ line_items    │ TABLE                    │ line_items               │
-   │ FACT         │ net_price   │ line_items    │ EXPRESSION               │ li.price * li.quantity   │
-   │ FACT         │ net_price   │ line_items    │ DATA_TYPE                │                          │
-   │ DIMENSION    │ region      │ orders        │ TABLE                    │ orders                   │
-   │ DIMENSION    │ region      │ orders        │ EXPRESSION               │ o.region                 │
-   │ DIMENSION    │ region      │ orders        │ DATA_TYPE                │                          │
-   │ METRIC       │ total_net   │ orders        │ TABLE                    │ orders                   │
-   │ METRIC       │ total_net   │ orders        │ EXPRESSION               │ SUM(li.net_price)        │
-   │ METRIC       │ total_net   │ orders        │ DATA_TYPE                │                          │
-   └──────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────────────┘
-
-**View with derived metrics:**
-
-Derived metrics appear as ``DERIVED_METRIC`` with an empty ``parent_entity`` and only ``EXPRESSION`` and ``DATA_TYPE`` properties (no ``TABLE`` property):
-
-.. code-block:: sql
-
-   CREATE SEMANTIC VIEW derived_view AS
-   TABLES (o AS orders PRIMARY KEY (id))
-   DIMENSIONS (o.region AS o.region)
-   METRICS (
-       o.revenue AS SUM(o.amount),
-       profit AS revenue * 0.3
-   );
-
-   DESCRIBE SEMANTIC VIEW derived_view;
-
-.. code-block:: text
-
-   ┌────────────────┬─────────────┬───────────────┬──────────────────────────┬──────────────────┐
-   │ object_kind    │ object_name │ parent_entity │ property                 │ property_value   │
-   ├────────────────┼─────────────┼───────────────┼──────────────────────────┼──────────────────┤
-   │ TABLE          │ orders      │               │ BASE_TABLE_DATABASE_NAME │ memory           │
-   │ TABLE          │ orders      │               │ BASE_TABLE_SCHEMA_NAME   │ main             │
-   │ TABLE          │ orders      │               │ BASE_TABLE_NAME          │ orders           │
-   │ TABLE          │ orders      │               │ PRIMARY_KEY              │ ["id"]           │
-   │ DIMENSION      │ region      │ orders        │ TABLE                    │ orders           │
-   │ DIMENSION      │ region      │ orders        │ EXPRESSION               │ o.region         │
-   │ DIMENSION      │ region      │ orders        │ DATA_TYPE                │                  │
-   │ METRIC         │ revenue     │ orders        │ TABLE                    │ orders           │
-   │ METRIC         │ revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)    │
-   │ METRIC         │ revenue     │ orders        │ DATA_TYPE                │                  │
-   │ DERIVED_METRIC │ profit      │               │ EXPRESSION               │ revenue * 0.3    │
-   │ DERIVED_METRIC │ profit      │               │ DATA_TYPE                │                  │
-   └────────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────┘
-
-**Table without PRIMARY KEY:**
-
-When a table is declared without ``PRIMARY KEY``, the ``PRIMARY_KEY`` property row is omitted:
-
-.. code-block:: sql
-
-   CREATE SEMANTIC VIEW no_pk_view AS
-   TABLES (o AS orders)
-   DIMENSIONS (o.region AS o.region)
-   METRICS (o.total AS SUM(o.amount));
-
-   DESCRIBE SEMANTIC VIEW no_pk_view;
-
-.. code-block:: text
-
-   ┌─────────────┬─────────────┬───────────────┬──────────────────────────┬──────────────────┐
-   │ object_kind │ object_name │ parent_entity │ property                 │ property_value   │
-   ├─────────────┼─────────────┼───────────────┼──────────────────────────┼──────────────────┤
-   │ TABLE       │ orders      │               │ BASE_TABLE_DATABASE_NAME │ memory           │
-   │ TABLE       │ orders      │               │ BASE_TABLE_SCHEMA_NAME   │ main             │
-   │ TABLE       │ orders      │               │ BASE_TABLE_NAME          │ orders           │
-   │ DIMENSION   │ region      │ orders        │ TABLE                    │ orders           │
-   │ DIMENSION   │ region      │ orders        │ EXPRESSION               │ o.region         │
-   │ DIMENSION   │ region      │ orders        │ DATA_TYPE                │                  │
-   │ METRIC      │ total       │ orders        │ TABLE                    │ orders           │
-   │ METRIC      │ total       │ orders        │ EXPRESSION               │ SUM(o.amount)    │
-   │ METRIC      │ total       │ orders        │ DATA_TYPE                │                  │
-   └─────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────┘
-
-The ``TABLE`` block has only 3 rows instead of 4.
+   ┌───────────────┬─────────────┬───────────────┬──────────────────────────┬──────────────────────┐
+   │ object_kind   │ object_name │ parent_entity │ property                 │ property_value       │
+   ├───────────────┼─────────────┼───────────────┼──────────────────────────┼──────────────────────┤
+   │ SEMANTIC_VIEW │ annotated   │               │ COMMENT                  │ Revenue analytics    │
+   │ TABLE         │ orders      │               │ BASE_TABLE_DATABASE_NAME │ memory               │
+   │ TABLE         │ orders      │               │ BASE_TABLE_SCHEMA_NAME   │ main                 │
+   │ TABLE         │ orders      │               │ BASE_TABLE_NAME          │ orders               │
+   │ TABLE         │ orders      │               │ PRIMARY_KEY              │ ["id"]               │
+   │ TABLE         │ orders      │               │ COMMENT                  │ Order data           │
+   │ DIMENSION     │ region      │ orders        │ TABLE                    │ orders               │
+   │ DIMENSION     │ region      │ orders        │ EXPRESSION               │ o.region             │
+   │ DIMENSION     │ region      │ orders        │ DATA_TYPE                │                      │
+   │ DIMENSION     │ region      │ orders        │ COMMENT                  │ Sales region         │
+   │ DIMENSION     │ region      │ orders        │ SYNONYMS                 │ ["territory"]        │
+   │ METRIC        │ revenue     │ orders        │ TABLE                    │ orders               │
+   │ METRIC        │ revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)        │
+   │ METRIC        │ revenue     │ orders        │ DATA_TYPE                │                      │
+   │ METRIC        │ revenue     │ orders        │ COMMENT                  │ Total revenue        │
+   │ METRIC        │ revenue     │ orders        │ ACCESS_MODIFIER          │ PUBLIC               │
+   └───────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────────┘
 
 .. tip::
 

@@ -209,6 +209,7 @@ DIMENSION	region	sv_test	DATA_TYPE	(empty)
 METRIC	total_amount	sv_test	TABLE	sv_test
 METRIC	total_amount	sv_test	EXPRESSION	SUM(amount)
 METRIC	total_amount	sv_test	DATA_TYPE	(empty)
+METRIC	total_amount	sv_test	ACCESS_MODIFIER	PUBLIC
 
 # Case insensitive: lowercase describe
 query TTTTT
@@ -224,6 +225,7 @@ DIMENSION	region	sv_test	DATA_TYPE	(empty)
 METRIC	total_amount	sv_test	TABLE	sv_test
 METRIC	total_amount	sv_test	EXPRESSION	SUM(amount)
 METRIC	total_amount	sv_test	DATA_TYPE	(empty)
+METRIC	total_amount	sv_test	ACCESS_MODIFIER	PUBLIC
 
 # Error: describe nonexistent view
 statement error
@@ -268,7 +270,7 @@ METRICS (
     s.avg_amount AS AVG(amount)
 )
 
-# SHOW SEMANTIC VIEWS returns 5 columns: created_on, name, kind, database_name, schema_name
+# SHOW SEMANTIC VIEWS returns 6 columns: created_on, name, kind, database_name, schema_name, comment
 # Use SELECT to skip non-deterministic created_on
 query TT rowsort
 SELECT name, kind FROM list_semantic_views()
@@ -325,6 +327,7 @@ DIMENSION	region	sv_test	DATA_TYPE	(empty)
 METRIC	total_amount	sv_test	TABLE	sv_test
 METRIC	total_amount	sv_test	EXPRESSION	SUM(amount)
 METRIC	total_amount	sv_test	DATA_TYPE	(empty)
+METRIC	total_amount	sv_test	ACCESS_MODIFIER	PUBLIC
 
 # Step 3: SHOW -- verify it appears in the list
 query T
@@ -359,6 +362,7 @@ DIMENSION	region	sv_test	DATA_TYPE	(empty)
 METRIC	avg_amount	sv_test	TABLE	sv_test
 METRIC	avg_amount	sv_test	EXPRESSION	AVG(amount)
 METRIC	avg_amount	sv_test	DATA_TYPE	(empty)
+METRIC	avg_amount	sv_test	ACCESS_MODIFIER	PUBLIC
 
 # Step 6: DROP
 statement ok

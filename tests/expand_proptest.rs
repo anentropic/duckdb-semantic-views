@@ -1,6 +1,6 @@
 use proptest::prelude::*;
-use semantic_views::expand::{expand, QueryRequest};
-use semantic_views::model::{Dimension, Join, Metric, SemanticViewDefinition};
+use semantic_views::expand::{expand, DimensionName, MetricName, QueryRequest};
+use semantic_views::model::{AccessModifier, Dimension, Join, Metric, SemanticViewDefinition};
 
 // ---------------------------------------------------------------------------
 // Test fixture definitions
@@ -18,6 +18,8 @@ fn simple_definition() -> SemanticViewDefinition {
                 source_table: None,
 
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
             },
             Dimension {
                 name: "month".to_string(),
@@ -25,6 +27,8 @@ fn simple_definition() -> SemanticViewDefinition {
                 source_table: None,
 
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
             },
             Dimension {
                 name: "status".to_string(),
@@ -32,6 +36,8 @@ fn simple_definition() -> SemanticViewDefinition {
                 source_table: None,
 
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
             },
         ],
         metrics: vec![
@@ -41,6 +47,11 @@ fn simple_definition() -> SemanticViewDefinition {
                 source_table: None,
                 output_type: None,
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             },
             Metric {
                 name: "order_count".to_string(),
@@ -48,6 +59,11 @@ fn simple_definition() -> SemanticViewDefinition {
                 source_table: None,
                 output_type: None,
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             },
             Metric {
                 name: "avg_amount".to_string(),
@@ -55,6 +71,11 @@ fn simple_definition() -> SemanticViewDefinition {
                 source_table: None,
                 output_type: None,
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             },
         ],
 
@@ -66,6 +87,7 @@ fn simple_definition() -> SemanticViewDefinition {
         created_on: None,
         database_name: None,
         schema_name: None,
+        comment: None,
     }
 }
 
@@ -82,6 +104,8 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: None,
 
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
             },
             Dimension {
                 name: "customer_name".to_string(),
@@ -89,6 +113,8 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: Some("customers".to_string()),
 
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
             },
             Dimension {
                 name: "month".to_string(),
@@ -96,6 +122,8 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: None,
 
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
             },
             Dimension {
                 name: "product_category".to_string(),
@@ -103,6 +131,8 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: Some("products".to_string()),
 
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
             },
         ],
         metrics: vec![
@@ -112,6 +142,11 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: None,
                 output_type: None,
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             },
             Metric {
                 name: "customer_count".to_string(),
@@ -119,6 +154,11 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: Some("customers".to_string()),
                 output_type: None,
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             },
             Metric {
                 name: "product_count".to_string(),
@@ -126,6 +166,11 @@ fn joined_definition() -> SemanticViewDefinition {
                 source_table: Some("products".to_string()),
                 output_type: None,
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             },
         ],
 
@@ -152,6 +197,7 @@ fn joined_definition() -> SemanticViewDefinition {
         created_on: None,
         database_name: None,
         schema_name: None,
+        comment: None,
     }
 }
 
@@ -176,8 +222,9 @@ fn arb_query_request(def: &SemanticViewDefinition) -> impl Strategy<Value = Quer
             !dims.is_empty() || !mets.is_empty()
         })
         .prop_map(|(dims, mets)| QueryRequest {
-            dimensions: dims,
-            metrics: mets,
+            dimensions: dims.into_iter().map(DimensionName::new).collect(),
+            metrics: mets.into_iter().map(MetricName::new).collect(),
+            facts: vec![],
         })
 }
 
@@ -353,15 +400,15 @@ proptest! {
     fn global_aggregate_no_group_by(
         _dummy in Just(QueryRequest {
             dimensions: vec![],
-            metrics: vec!["total_revenue".to_string()],
-
+            metrics: vec![MetricName::new("total_revenue")],
+            facts: vec![],
         })
     ) {
         let def = simple_definition();
         let req = QueryRequest {
             dimensions: vec![],
-            metrics: vec!["total_revenue".to_string()],
-
+            metrics: vec![MetricName::new("total_revenue")],
+            facts: vec![],
         };
         let sql = expand("test", &def, &req).unwrap();
 

@@ -20,6 +20,7 @@ struct ShowDimForMetricRow {
     table_name: String,
     name: String,
     data_type: String,
+    required: bool,
 }
 
 /// Bind-time data: pre-collected dimension rows (fan-trap-filtered).
@@ -166,140 +167,160 @@ impl VTab for ShowDimensionsForMetricVTab {
     type InitData = ShowDimsForMetricInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        // Declare 4-column output schema: table_name, name, data_type, required (BOOLEAN)
-        bind.add_result_column(
-            "table_name",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
-        bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("data_type", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("required", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            // Declare 4-column output schema: table_name, name, data_type, required (BOOLEAN)
+            bind.add_result_column(
+                "table_name",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("data_type", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("required", LogicalTypeHandle::from(LogicalTypeId::Boolean));
 
-        let view_name = bind.get_parameter(0).to_string();
-        let metric_name = bind.get_parameter(1).to_string();
+            let view_name = bind.get_parameter(0).to_string();
+            let metric_name = bind.get_parameter(1).to_string();
 
-        let state_ptr = bind.get_extra_info::<CatalogState>();
-        let guard = unsafe { (*state_ptr).read().expect("catalog RwLock poisoned") };
+            let state_ptr = bind.get_extra_info::<CatalogState>();
+            let guard = unsafe {
+                (*state_ptr)
+                    .read()
+                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
+            };
 
-        let json = guard.get(&view_name).ok_or_else(|| {
-            let available: Vec<String> = guard.keys().cloned().collect();
-            if let Some(suggestion) = suggest_closest(&view_name, &available) {
-                format!(
-                    "semantic view '{}' does not exist. Did you mean '{}'?",
-                    view_name, suggestion
-                )
-            } else {
-                format!("semantic view '{}' does not exist", view_name)
-            }
-        })?;
-
-        let def = SemanticViewDefinition::from_json(&view_name, json)?;
-
-        // Find the metric (case-insensitive)
-        let metric_lower = metric_name.to_ascii_lowercase();
-        let met = def
-            .metrics
-            .iter()
-            .find(|m| m.name.to_ascii_lowercase() == metric_lower)
-            .ok_or_else(|| {
-                let available: Vec<String> = def.metrics.iter().map(|m| m.name.clone()).collect();
-                if let Some(suggestion) = suggest_closest(&metric_name, &available) {
+            let json = guard.get(&view_name).ok_or_else(|| {
+                let available: Vec<String> = guard.keys().cloned().collect();
+                if let Some(suggestion) = suggest_closest(&view_name, &available) {
                     format!(
-                        "metric '{}' not found in semantic view '{}'. Did you mean '{}'?",
-                        metric_name, view_name, suggestion
+                        "semantic view '{}' does not exist. Did you mean '{}'?",
+                        view_name, suggestion
                     )
                 } else {
-                    format!(
-                        "metric '{}' not found in semantic view '{}'",
-                        metric_name, view_name
-                    )
+                    format!("semantic view '{}' does not exist", view_name)
                 }
             })?;
 
-        // Get metric source tables
-        let met_tables: Vec<String> = if let Some(ref st) = met.source_table {
-            vec![st.to_ascii_lowercase()]
-        } else {
-            // Derived metric: resolve source tables transitively
-            collect_derived_metric_source_tables(met, &def.metrics)
-                .into_iter()
-                .map(|s| s.to_ascii_lowercase())
-                .collect()
-        };
+            let def = SemanticViewDefinition::from_json(&view_name, json)?;
 
-        let alias_map = def.alias_to_table_map();
-
-        // If no joins, all dimensions are reachable (single-table view)
-        let rows = if def.joins.is_empty() {
-            def.dimensions
+            // Find the metric (case-insensitive)
+            let metric_lower = metric_name.to_ascii_lowercase();
+            let met = def
+                .metrics
                 .iter()
-                .map(|d| {
-                    let table_name = d
-                        .source_table
-                        .as_ref()
-                        .and_then(|a| alias_map.get(a).cloned())
-                        .unwrap_or_default();
-                    ShowDimForMetricRow {
-                        table_name,
-                        name: d.name.clone(),
-                        data_type: d.output_type.clone().unwrap_or_default(),
+                .find(|m| m.name.to_ascii_lowercase() == metric_lower)
+                .ok_or_else(|| {
+                    let available: Vec<String> =
+                        def.metrics.iter().map(|m| m.name.clone()).collect();
+                    if let Some(suggestion) = suggest_closest(&metric_name, &available) {
+                        format!(
+                            "metric '{}' not found in semantic view '{}'. Did you mean '{}'?",
+                            metric_name, view_name, suggestion
+                        )
+                    } else {
+                        format!(
+                            "metric '{}' not found in semantic view '{}'",
+                            metric_name, view_name
+                        )
                     }
-                })
-                .collect()
-        } else {
-            // Build graph structures for fan-trap checking
-            let graph = RelationshipGraph::from_definition(&def)
-                .map_err(|e| format!("graph error: {e}"))?;
+                })?;
 
-            // Build parent map: each non-root node's parent in the tree
-            let mut parent_map: HashMap<String, String> = HashMap::new();
-            for (child, parents) in &graph.reverse {
-                if let Some(parent) = parents.first() {
-                    parent_map.insert(child.clone(), parent.clone());
+            // Phase 48: Collect required dimension names for window metrics.
+            let required_dim_names: HashSet<String> = if let Some(ref ws) = met.window_spec {
+                let mut names = HashSet::new();
+                for dim_name in &ws.excluding_dims {
+                    names.insert(dim_name.to_ascii_lowercase());
                 }
-            }
+                for dim_name in &ws.partition_dims {
+                    names.insert(dim_name.to_ascii_lowercase());
+                }
+                for ob in &ws.order_by {
+                    names.insert(ob.expr.to_ascii_lowercase());
+                }
+                names
+            } else {
+                HashSet::new()
+            };
 
-            // Build cardinality map: (from_alias_lower, to_alias_lower) -> Cardinality
-            let card_map: HashMap<(String, String), Cardinality> = def
-                .joins
-                .iter()
-                .filter(|j| !j.fk_columns.is_empty())
-                .map(|j| {
-                    (
-                        (
-                            j.from_alias.to_ascii_lowercase(),
-                            j.table.to_ascii_lowercase(),
-                        ),
-                        j.cardinality,
-                    )
-                })
-                .collect();
+            // Get metric source tables
+            let met_tables: Vec<String> = if let Some(ref st) = met.source_table {
+                vec![st.to_ascii_lowercase()]
+            } else {
+                collect_derived_metric_source_tables(met, &def.metrics)
+                    .into_iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect()
+            };
 
-            // Filter dimensions: keep only those reachable without fan-out
-            def.dimensions
-                .iter()
-                .filter(|d| {
-                    is_dimension_reachable_for_metric(d, &met_tables, &parent_map, &card_map)
-                })
-                .map(|d| {
-                    let table_name = d
-                        .source_table
-                        .as_ref()
-                        .and_then(|a| alias_map.get(a).cloned())
-                        .unwrap_or_default();
-                    ShowDimForMetricRow {
-                        table_name,
-                        name: d.name.clone(),
-                        data_type: d.output_type.clone().unwrap_or_default(),
+            let alias_map = def.alias_to_table_map();
+
+            let rows = if def.joins.is_empty() {
+                def.dimensions
+                    .iter()
+                    .map(|d| {
+                        let table_name = d
+                            .source_table
+                            .as_ref()
+                            .and_then(|a| alias_map.get(a).cloned())
+                            .unwrap_or_default();
+                        ShowDimForMetricRow {
+                            table_name,
+                            name: d.name.clone(),
+                            data_type: d.output_type.clone().unwrap_or_default(),
+                            required: required_dim_names.contains(&d.name.to_ascii_lowercase()),
+                        }
+                    })
+                    .collect()
+            } else {
+                let graph = RelationshipGraph::from_definition(&def)
+                    .map_err(|e| format!("graph error: {e}"))?;
+
+                let mut parent_map: HashMap<String, String> = HashMap::new();
+                for (child, parents) in &graph.reverse {
+                    if let Some(parent) = parents.first() {
+                        parent_map.insert(child.clone(), parent.clone());
                     }
-                })
-                .collect()
-        };
+                }
 
-        let mut rows: Vec<ShowDimForMetricRow> = rows;
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
+                let card_map: HashMap<(String, String), Cardinality> = def
+                    .joins
+                    .iter()
+                    .filter(|j| !j.fk_columns.is_empty())
+                    .map(|j| {
+                        (
+                            (
+                                j.from_alias.to_ascii_lowercase(),
+                                j.table.to_ascii_lowercase(),
+                            ),
+                            j.cardinality,
+                        )
+                    })
+                    .collect();
 
-        Ok(ShowDimsForMetricBindData { rows })
+                def.dimensions
+                    .iter()
+                    .filter(|d| {
+                        is_dimension_reachable_for_metric(d, &met_tables, &parent_map, &card_map)
+                    })
+                    .map(|d| {
+                        let table_name = d
+                            .source_table
+                            .as_ref()
+                            .and_then(|a| alias_map.get(a).cloned())
+                            .unwrap_or_default();
+                        ShowDimForMetricRow {
+                            table_name,
+                            name: d.name.clone(),
+                            data_type: d.output_type.clone().unwrap_or_default(),
+                            required: required_dim_names.contains(&d.name.to_ascii_lowercase()),
+                        }
+                    })
+                    .collect()
+            };
+
+            let mut rows: Vec<ShowDimForMetricRow> = rows;
+            rows.sort_by(|a, b| a.name.cmp(&b.name));
+
+            Ok(ShowDimsForMetricBindData { rows })
+        }))
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
@@ -332,10 +353,10 @@ impl VTab for ShowDimensionsForMetricVTab {
             type_vec.insert(i, row.data_type.as_str());
         }
 
-        // Write boolean column: constant FALSE for all rows
+        // Write boolean column: required from bind data (Phase 48: TRUE for window metric dims)
         let req_slice = req_vec.as_mut_slice::<bool>();
-        for i in 0..n {
-            req_slice[i] = false;
+        for (i, row) in bind_data.rows.iter().enumerate() {
+            req_slice[i] = row.required;
         }
 
         output.set_len(n);

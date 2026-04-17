@@ -10,6 +10,7 @@ use duckdb::{
 use libduckdb_sys as ffi;
 
 use crate::catalog::CatalogState;
+use crate::expand::wildcard::{expand_wildcards, WildcardItemType};
 use crate::expand::{expand, QueryRequest};
 use crate::model::SemanticViewDefinition;
 use crate::util::suggest_closest;
@@ -399,116 +400,159 @@ impl VTab for SemanticViewVTab {
     type InitData = SemanticViewInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        // 1. Extract the view name (positional parameter 0).
-        let view_name = bind.get_parameter(0).to_string();
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            // 1. Extract the view name (positional parameter 0).
+            let view_name = bind.get_parameter(0).to_string();
 
-        // 2. Extract dimensions and metrics from named LIST(VARCHAR) parameters.
-        //    Use the raw duckdb_value FFI to iterate list elements.
-        let dimensions = match bind.get_named_parameter("dimensions") {
-            Some(ref val) => unsafe { extract_list_strings(val) },
-            None => vec![],
-        };
-        let metrics = match bind.get_named_parameter("metrics") {
-            Some(ref val) => unsafe { extract_list_strings(val) },
-            None => vec![],
-        };
+            // 2. Extract dimensions and metrics from named LIST(VARCHAR) parameters.
+            //    Use the raw duckdb_value FFI to iterate list elements.
+            let dimensions = match bind.get_named_parameter("dimensions") {
+                Some(ref val) => unsafe { extract_list_strings(val) },
+                None => vec![],
+            };
+            let metrics = match bind.get_named_parameter("metrics") {
+                Some(ref val) => unsafe { extract_list_strings(val) },
+                None => vec![],
+            };
+            let facts = match bind.get_named_parameter("facts") {
+                Some(ref val) => unsafe { extract_list_strings(val) },
+                None => vec![],
+            };
 
-        // 3. Validate: at least one dimension or metric.
-        if dimensions.is_empty() && metrics.is_empty() {
-            return Err(Box::new(QueryError::EmptyRequest {
-                view_name: view_name.clone(),
-            }));
-        }
-
-        // 4. Look up view definition in the catalog.
-        let state_ptr = bind.get_extra_info::<QueryState>();
-        let state = unsafe { &*state_ptr };
-        let catalog_guard = state.catalog.read().expect("catalog RwLock poisoned");
-
-        let json_str = match catalog_guard.get(&view_name) {
-            Some(j) => j.clone(),
-            None => {
-                let available: Vec<String> = catalog_guard.keys().cloned().collect();
-                let suggestion = suggest_closest(&view_name, &available);
-                return Err(Box::new(QueryError::ViewNotFound {
-                    name: view_name,
-                    suggestion,
-                    available,
-                }));
+            // 3. Validate: at least one dimension, metric, or fact.
+            if dimensions.is_empty() && metrics.is_empty() && facts.is_empty() {
+                let err: Box<dyn std::error::Error> = Box::new(QueryError::EmptyRequest {
+                    view_name: view_name.clone(),
+                });
+                return Err(err);
             }
-        };
-        // Release the catalog lock before proceeding.
-        drop(catalog_guard);
 
-        // 5. Parse definition and expand.
-        let def = SemanticViewDefinition::from_json(&view_name, &json_str)
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            // 4. Look up view definition in the catalog.
+            let state_ptr = bind.get_extra_info::<QueryState>();
+            let state = unsafe { &*state_ptr };
+            let catalog_guard = state
+                .catalog
+                .read()
+                .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
 
-        let req = QueryRequest {
-            dimensions: dimensions.clone(),
-            metrics: metrics.clone(),
-        };
-        let expanded_sql = expand(&view_name, &def, &req)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(QueryError::from(e)) })?;
+            let json_str = match catalog_guard.get(&view_name) {
+                Some(j) => j.clone(),
+                None => {
+                    let available: Vec<String> = catalog_guard.keys().cloned().collect();
+                    let suggestion = suggest_closest(&view_name, &available);
+                    let err: Box<dyn std::error::Error> = Box::new(QueryError::ViewNotFound {
+                        name: view_name,
+                        suggestion,
+                        available,
+                    });
+                    return Err(err);
+                }
+            };
+            // Release the catalog lock before proceeding.
+            drop(catalog_guard);
 
-        // 6. Resolve output column names and types.
-        //    Primary path: use DDL-time stored type data (column_type_names + column_types_inferred).
-        //    Fallback path: run LIMIT 0 at bind time (in-memory DB or inference failed at DDL time).
-        //    Full fallback: derive names from definition, all VARCHAR.
-        let type_map: HashMap<String, u32> = def
-            .inferred_types()
-            .map(|(name, t)| (name.to_ascii_lowercase(), normalize_type_id(t)))
-            .collect();
+            // 5. Parse definition, expand wildcards, and expand.
+            let def = SemanticViewDefinition::from_json(&view_name, &json_str)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-        let (column_names, column_type_ids) = if !type_map.is_empty() {
-            // Primary path: DDL-time inference stored both names and types.
-            // Derive column names from requested dims+metrics (expand() order),
-            // look up each name in the DDL-time type map. No LIMIT 0 at query time.
-            let mut names = Vec::new();
-            let mut type_ids = Vec::new();
-            for dim_name in &dimensions {
-                let canonical = def
-                    .dimensions
+            // 5a. Expand table_alias.* wildcards before constructing the query request.
+            let dimensions = expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension)
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    Box::new(QueryError::ExpandFailed {
+                        source: crate::expand::ExpandError::EmptyRequest {
+                            view_name: format!("{view_name}: {e}"),
+                        },
+                    })
+                })?;
+            let metrics = expand_wildcards(&metrics, &def, &WildcardItemType::Metric).map_err(
+                |e| -> Box<dyn std::error::Error> {
+                    Box::new(QueryError::ExpandFailed {
+                        source: crate::expand::ExpandError::EmptyRequest {
+                            view_name: format!("{view_name}: {e}"),
+                        },
+                    })
+                },
+            )?;
+            let facts = expand_wildcards(&facts, &def, &WildcardItemType::Fact).map_err(
+                |e| -> Box<dyn std::error::Error> {
+                    Box::new(QueryError::ExpandFailed {
+                        source: crate::expand::ExpandError::EmptyRequest {
+                            view_name: format!("{view_name}: {e}"),
+                        },
+                    })
+                },
+            )?;
+
+            let req = QueryRequest {
+                dimensions: dimensions
                     .iter()
-                    .find(|d| d.name.eq_ignore_ascii_case(dim_name))
-                    .map_or_else(|| dim_name.clone(), |d| d.name.clone());
-                let t = *type_map
-                    .get(&canonical.to_ascii_lowercase())
-                    .unwrap_or(&0u32);
-                names.push(canonical);
-                type_ids.push(t);
-            }
-            for met_name in &metrics {
-                let canonical = def
-                    .metrics
+                    .map(|s| crate::expand::DimensionName::new(s.clone()))
+                    .collect(),
+                metrics: metrics
                     .iter()
-                    .find(|m| m.name.eq_ignore_ascii_case(met_name))
-                    .map_or_else(|| met_name.clone(), |m| m.name.clone());
-                let t = *type_map
-                    .get(&canonical.to_ascii_lowercase())
-                    .unwrap_or(&0u32);
-                names.push(canonical);
-                type_ids.push(t);
-            }
-            (names, type_ids)
-        } else {
-            // Fallback path: in-memory DB or DDL inference failed.
-            // Run try_infer_schema on the per-query expanded SQL (bind-time, safe on state.conn).
-            let limit0_sql = format!("{expanded_sql} LIMIT 0");
-            if let Some((names, types)) = unsafe { try_infer_schema(state.conn, &limit0_sql) } {
-                let type_ids: Vec<u32> =
-                    types.iter().map(|t| normalize_type_id(*t as u32)).collect();
-                (names, type_ids)
-            } else {
-                // Full fallback: derive names from definition, all VARCHAR (0 = INVALID).
+                    .map(|s| crate::expand::MetricName::new(s.clone()))
+                    .collect(),
+                facts: facts.clone(),
+            };
+            let expanded_sql = expand(&view_name, &def, &req)
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(QueryError::from(e)) })?;
+
+            // 6. Resolve output column names and types.
+            //    Primary path: use DDL-time stored type data (column_type_names + column_types_inferred).
+            //    Fallback path: run LIMIT 0 at bind time (in-memory DB or inference failed at DDL time).
+            //    Full fallback: derive names from definition, all VARCHAR.
+            let type_map: HashMap<String, u32> = def
+                .inferred_types()
+                .map(|(name, t)| (name.to_ascii_lowercase(), normalize_type_id(t)))
+                .collect();
+
+            let (column_names, column_type_ids) = if !facts.is_empty() {
+                // Fact queries: use LIMIT 0 for type inference (facts use per-fact output_type
+                // strings, not the column_types_inferred map).
+                let limit0_sql = format!("{expanded_sql} LIMIT 0");
+                if let Some((names, types)) = unsafe { try_infer_schema(state.conn, &limit0_sql) } {
+                    let type_ids: Vec<u32> =
+                        types.iter().map(|t| normalize_type_id(*t as u32)).collect();
+                    (names, type_ids)
+                } else {
+                    // Full fallback: derive names from definition, all VARCHAR.
+                    let mut names = Vec::new();
+                    for dim_name in &dimensions {
+                        let canonical = def
+                            .dimensions
+                            .iter()
+                            .find(|d| d.name.eq_ignore_ascii_case(dim_name))
+                            .map_or_else(|| dim_name.clone(), |d| d.name.clone());
+                        names.push(canonical);
+                    }
+                    for fact_name in &facts {
+                        let canonical = def
+                            .facts
+                            .iter()
+                            .find(|f| f.name.eq_ignore_ascii_case(fact_name))
+                            .map_or_else(|| fact_name.clone(), |f| f.name.clone());
+                        names.push(canonical);
+                    }
+                    let type_ids = vec![0u32; names.len()];
+                    (names, type_ids)
+                }
+            } else if !type_map.is_empty() {
+                // Primary path: DDL-time inference stored both names and types.
+                // Derive column names from requested dims+metrics (expand() order),
+                // look up each name in the DDL-time type map. No LIMIT 0 at query time.
                 let mut names = Vec::new();
+                let mut type_ids = Vec::new();
                 for dim_name in &dimensions {
                     let canonical = def
                         .dimensions
                         .iter()
                         .find(|d| d.name.eq_ignore_ascii_case(dim_name))
                         .map_or_else(|| dim_name.clone(), |d| d.name.clone());
+                    let t = *type_map
+                        .get(&canonical.to_ascii_lowercase())
+                        .unwrap_or(&0u32);
                     names.push(canonical);
+                    type_ids.push(t);
                 }
                 for met_name in &metrics {
                     let canonical = def
@@ -516,65 +560,98 @@ impl VTab for SemanticViewVTab {
                         .iter()
                         .find(|m| m.name.eq_ignore_ascii_case(met_name))
                         .map_or_else(|| met_name.clone(), |m| m.name.clone());
+                    let t = *type_map
+                        .get(&canonical.to_ascii_lowercase())
+                        .unwrap_or(&0u32);
                     names.push(canonical);
+                    type_ids.push(t);
                 }
-                let type_ids = vec![0u32; names.len()];
                 (names, type_ids)
-            }
-        };
+            } else {
+                // Fallback path: in-memory DB or DDL inference failed.
+                // Run try_infer_schema on the per-query expanded SQL (bind-time, safe on state.conn).
+                let limit0_sql = format!("{expanded_sql} LIMIT 0");
+                if let Some((names, types)) = unsafe { try_infer_schema(state.conn, &limit0_sql) } {
+                    let type_ids: Vec<u32> =
+                        types.iter().map(|t| normalize_type_id(*t as u32)).collect();
+                    (names, type_ids)
+                } else {
+                    // Full fallback: derive names from definition, all VARCHAR (0 = INVALID).
+                    let mut names = Vec::new();
+                    for dim_name in &dimensions {
+                        let canonical = def
+                            .dimensions
+                            .iter()
+                            .find(|d| d.name.eq_ignore_ascii_case(dim_name))
+                            .map_or_else(|| dim_name.clone(), |d| d.name.clone());
+                        names.push(canonical);
+                    }
+                    for met_name in &metrics {
+                        let canonical = def
+                            .metrics
+                            .iter()
+                            .find(|m| m.name.eq_ignore_ascii_case(met_name))
+                            .map_or_else(|| met_name.clone(), |m| m.name.clone());
+                        names.push(canonical);
+                    }
+                    let type_ids = vec![0u32; names.len()];
+                    (names, type_ids)
+                }
+            };
 
-        // 7. Declare typed output columns.
-        //    For DECIMAL/LIST/ENUM: we need the logical type for metadata.
-        //    Check if any column requires a LIMIT-0 query for logical type metadata.
-        const DECIMAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL;
-        const LIST: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST;
-        const ENUM: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_ENUM;
+            // 7. Declare typed output columns.
+            //    For DECIMAL/LIST/ENUM: we need the logical type for metadata.
+            //    Check if any column requires a LIMIT-0 query for logical type metadata.
+            const DECIMAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL;
+            const LIST: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST;
+            const ENUM: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_ENUM;
 
-        let needs_logical_types = column_type_ids
-            .iter()
-            .any(|&t| t == DECIMAL || t == LIST || t == ENUM);
+            let needs_logical_types = column_type_ids
+                .iter()
+                .any(|&t| t == DECIMAL || t == LIST || t == ENUM);
 
-        if needs_logical_types {
-            // Run a LIMIT 0 query to get logical type handles for columns that need them.
-            let limit0_sql = format!("{expanded_sql} LIMIT 0");
-            if let Ok(mut limit0_result) = unsafe { execute_sql_raw(state.conn, &limit0_sql) } {
-                for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
-                    let col_pos =
-                        column_names.iter().position(|n| n == name).unwrap_or(0) as ffi::idx_t;
-                    if type_id == DECIMAL || type_id == LIST || type_id == ENUM {
-                        let lt = LogicalTypeOwned(unsafe {
-                            ffi::duckdb_column_logical_type(&mut limit0_result, col_pos)
-                        });
-                        let out_type = unsafe { declare_output_type(lt.0, type_id) };
-                        bind.add_result_column(name, out_type);
-                    } else {
+            if needs_logical_types {
+                // Run a LIMIT 0 query to get logical type handles for columns that need them.
+                let limit0_sql = format!("{expanded_sql} LIMIT 0");
+                if let Ok(mut limit0_result) = unsafe { execute_sql_raw(state.conn, &limit0_sql) } {
+                    for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
+                        let col_pos =
+                            column_names.iter().position(|n| n == name).unwrap_or(0) as ffi::idx_t;
+                        if type_id == DECIMAL || type_id == LIST || type_id == ENUM {
+                            let lt = LogicalTypeOwned(unsafe {
+                                ffi::duckdb_column_logical_type(&mut limit0_result, col_pos)
+                            });
+                            let out_type = unsafe { declare_output_type(lt.0, type_id) };
+                            bind.add_result_column(name, out_type);
+                        } else {
+                            bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
+                        }
+                    }
+                    unsafe { ffi::duckdb_destroy_result(&mut limit0_result) };
+                } else {
+                    // LIMIT 0 failed — fall back to basic type mapping for all columns.
+                    for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
                         bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
                     }
                 }
-                unsafe { ffi::duckdb_destroy_result(&mut limit0_result) };
             } else {
-                // LIMIT 0 failed — fall back to basic type mapping for all columns.
+                // No DECIMAL/LIST/ENUM — fast path, no LIMIT 0 needed.
                 for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
                     bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
                 }
             }
-        } else {
-            // No DECIMAL/LIST/ENUM — fast path, no LIMIT 0 needed.
-            for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
-                bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
-            }
-        }
 
-        // 8. Build execution SQL with type casts for columns that may have
-        //    runtime type mismatches (HUGEINT→BIGINT, STRUCT/MAP→VARCHAR).
-        let execution_sql = build_execution_sql(&expanded_sql, &column_names, &column_type_ids);
+            // 8. Build execution SQL with type casts for columns that may have
+            //    runtime type mismatches (HUGEINT→BIGINT, STRUCT/MAP→VARCHAR).
+            let execution_sql = build_execution_sql(&expanded_sql, &column_names, &column_type_ids);
 
-        Ok(SemanticViewBindData {
-            expanded_sql,
-            execution_sql,
-            column_names,
-            column_type_ids,
-        })
+            Ok(SemanticViewBindData {
+                expanded_sql,
+                execution_sql,
+                column_names,
+                column_type_ids,
+            })
+        }))
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
@@ -587,102 +664,108 @@ impl VTab for SemanticViewVTab {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            let init_data = func.get_init_data();
+            let bind_data = func.get_bind_data();
 
-        let mut guard = init_data.inner.lock().unwrap();
+            let mut guard = init_data
+                .inner
+                .lock()
+                .map_err(|_| Box::<dyn std::error::Error>::from("query state lock poisoned"))?;
 
-        // First call: execute the query and store the result for streaming.
-        if guard.is_none() {
-            let state = unsafe { &*func.get_extra_info::<QueryState>() };
-            let mut result = unsafe {
-                execute_sql_raw(state.conn, &bind_data.execution_sql).map_err(|e| {
-                    QueryError::SqlExecution {
-                        expanded_sql: bind_data.expanded_sql.clone(),
-                        duckdb_error: e,
-                    }
-                })?
-            };
-            let chunk_count = unsafe { ffi::duckdb_result_chunk_count(result) } as usize;
-            let col_count = unsafe { ffi::duckdb_column_count(&mut result) } as usize;
-            *guard = Some(StreamingState {
-                result,
-                chunk_count,
-                col_count,
-                current_chunk: 0,
-            });
-        }
-
-        let streaming = guard.as_mut().unwrap();
-
-        // All chunks consumed — signal end of stream.
-        if streaming.current_chunk >= streaming.chunk_count {
-            output.set_len(0);
-            return Ok(());
-        }
-
-        // Get the next source chunk.
-        let src_chunk = unsafe {
-            ffi::duckdb_result_get_chunk(streaming.result, streaming.current_chunk as ffi::idx_t)
-        };
-        streaming.current_chunk += 1;
-
-        if src_chunk.is_null() {
-            output.set_len(0);
-            return Ok(());
-        }
-
-        let row_count = unsafe { ffi::duckdb_data_chunk_get_size(src_chunk) } as usize;
-        if row_count == 0 {
-            unsafe { ffi::duckdb_destroy_data_chunk(&mut { src_chunk }) };
-            output.set_len(0);
-            return Ok(());
-        }
-
-        // Zero-copy transfer: reference each source vector into the output chunk.
-        // After duckdb_vector_reference_vector, both vectors share ownership of the
-        // underlying data buffer, so the source chunk can be safely destroyed.
-        //
-        // SAFETY: Before referencing, we validate that source and destination vector
-        // types match. A mismatch would trigger a DuckDB internal assertion
-        // ("Vector::Reference used on vector of different type") which is a hard
-        // crash (SIGABRT). The runtime check converts this to a recoverable error.
-        let out_ptr = output.get_ptr();
-        let n_cols = streaming.col_count.min(bind_data.column_names.len());
-        for col_idx in 0..n_cols {
-            let src_vec =
-                unsafe { ffi::duckdb_data_chunk_get_vector(src_chunk, col_idx as ffi::idx_t) };
-            let dst_vec =
-                unsafe { ffi::duckdb_data_chunk_get_vector(out_ptr, col_idx as ffi::idx_t) };
-
-            // Runtime type validation: compare source and destination vector types.
-            let src_lt = LogicalTypeOwned(unsafe { ffi::duckdb_vector_get_column_type(src_vec) });
-            let dst_lt = LogicalTypeOwned(unsafe { ffi::duckdb_vector_get_column_type(dst_vec) });
-            let src_tid = unsafe { ffi::duckdb_get_type_id(src_lt.0) } as u32;
-            let dst_tid = unsafe { ffi::duckdb_get_type_id(dst_lt.0) } as u32;
-
-            if src_tid != dst_tid {
-                let col_name = bind_data
-                    .column_names
-                    .get(col_idx)
-                    .map_or("?", |n| n.as_str());
-                unsafe { ffi::duckdb_destroy_data_chunk(&mut { src_chunk }) };
-                return Err(Box::new(QueryError::TypeMismatch {
-                    column_index: col_idx,
-                    column_name: col_name.to_string(),
-                    source_type_id: src_tid,
-                    dest_type_id: dst_tid,
-                }));
+            // First call: execute the query and store the result for streaming.
+            if guard.is_none() {
+                let state = unsafe { &*func.get_extra_info::<QueryState>() };
+                let mut result = unsafe {
+                    execute_sql_raw(state.conn, &bind_data.execution_sql).map_err(
+                        |e| -> Box<dyn std::error::Error> {
+                            Box::new(QueryError::SqlExecution {
+                                expanded_sql: bind_data.expanded_sql.clone(),
+                                duckdb_error: e,
+                            })
+                        },
+                    )?
+                };
+                let chunk_count = unsafe { ffi::duckdb_result_chunk_count(result) } as usize;
+                let col_count = unsafe { ffi::duckdb_column_count(&mut result) } as usize;
+                *guard = Some(StreamingState {
+                    result,
+                    chunk_count,
+                    col_count,
+                    current_chunk: 0,
+                });
             }
 
-            unsafe { ffi::duckdb_vector_reference_vector(dst_vec, src_vec) };
-        }
-        output.set_len(row_count);
+            let streaming = guard.as_mut().unwrap();
 
-        // Source chunk can be destroyed — vectors share ownership via reference.
-        unsafe { ffi::duckdb_destroy_data_chunk(&mut { src_chunk }) };
+            // All chunks consumed — signal end of stream.
+            if streaming.current_chunk >= streaming.chunk_count {
+                output.set_len(0);
+                return Ok(());
+            }
 
-        Ok(())
+            // Get the next source chunk.
+            let src_chunk = unsafe {
+                ffi::duckdb_result_get_chunk(
+                    streaming.result,
+                    streaming.current_chunk as ffi::idx_t,
+                )
+            };
+            streaming.current_chunk += 1;
+
+            if src_chunk.is_null() {
+                output.set_len(0);
+                return Ok(());
+            }
+
+            let row_count = unsafe { ffi::duckdb_data_chunk_get_size(src_chunk) } as usize;
+            if row_count == 0 {
+                unsafe { ffi::duckdb_destroy_data_chunk(&mut { src_chunk }) };
+                output.set_len(0);
+                return Ok(());
+            }
+
+            // Zero-copy transfer: reference each source vector into the output chunk.
+            let out_ptr = output.get_ptr();
+            let n_cols = streaming.col_count.min(bind_data.column_names.len());
+            for col_idx in 0..n_cols {
+                let src_vec =
+                    unsafe { ffi::duckdb_data_chunk_get_vector(src_chunk, col_idx as ffi::idx_t) };
+                let dst_vec =
+                    unsafe { ffi::duckdb_data_chunk_get_vector(out_ptr, col_idx as ffi::idx_t) };
+
+                // Runtime type validation: compare source and destination vector types.
+                let src_lt =
+                    LogicalTypeOwned(unsafe { ffi::duckdb_vector_get_column_type(src_vec) });
+                let dst_lt =
+                    LogicalTypeOwned(unsafe { ffi::duckdb_vector_get_column_type(dst_vec) });
+                let src_tid = unsafe { ffi::duckdb_get_type_id(src_lt.0) } as u32;
+                let dst_tid = unsafe { ffi::duckdb_get_type_id(dst_lt.0) } as u32;
+
+                if src_tid != dst_tid {
+                    let col_name = bind_data
+                        .column_names
+                        .get(col_idx)
+                        .map_or("?", |n| n.as_str());
+                    unsafe { ffi::duckdb_destroy_data_chunk(&mut { src_chunk }) };
+                    let err: Box<dyn std::error::Error> = Box::new(QueryError::TypeMismatch {
+                        column_index: col_idx,
+                        column_name: col_name.to_string(),
+                        source_type_id: src_tid,
+                        dest_type_id: dst_tid,
+                    });
+                    return Err(err);
+                }
+
+                unsafe { ffi::duckdb_vector_reference_vector(dst_vec, src_vec) };
+            }
+            output.set_len(row_count);
+
+            // Source chunk can be destroyed — vectors share ownership via reference.
+            unsafe { ffi::duckdb_destroy_data_chunk(&mut { src_chunk }) };
+
+            Ok(())
+        }))
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
@@ -698,6 +781,10 @@ impl VTab for SemanticViewVTab {
             ),
             (
                 "metrics".to_string(),
+                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ),
+            (
+                "facts".to_string(),
                 LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
             ),
         ])

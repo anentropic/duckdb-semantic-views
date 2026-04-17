@@ -1,6 +1,8 @@
 //! Shared test helpers for graph submodule tests.
 
-use crate::model::{Dimension, Fact, Join, Metric, SemanticViewDefinition, TableRef};
+use crate::model::{
+    AccessModifier, Dimension, Fact, Join, Metric, SemanticViewDefinition, TableRef,
+};
 
 /// Helper to build a minimal SemanticViewDefinition for testing.
 pub(super) fn make_def(
@@ -21,6 +23,8 @@ pub(super) fn make_def(
                 table: table.to_string(),
                 pk_columns: pks.iter().map(|s| s.to_string()).collect(),
                 unique_constraints: vec![],
+                comment: None,
+                synonyms: vec![],
             })
             .collect(),
         joins: joins
@@ -39,6 +43,8 @@ pub(super) fn make_def(
                 expr: name.to_string(),
                 source_table: source.map(|s| s.to_string()),
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
             })
             .collect(),
         metrics: metrics
@@ -49,6 +55,11 @@ pub(super) fn make_def(
                 source_table: source.map(|s| s.to_string()),
                 output_type: None,
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             })
             .collect(),
         facts: vec![],
@@ -58,6 +69,7 @@ pub(super) fn make_def(
         created_on: None,
         database_name: None,
         schema_name: None,
+        comment: None,
     }
 }
 
@@ -78,6 +90,8 @@ pub(super) fn make_def_with_facts(
                 table: table.to_string(),
                 pk_columns: vec!["id".to_string()],
                 unique_constraints: vec![],
+                comment: None,
+                synonyms: vec![],
             })
             .collect(),
         facts: facts
@@ -87,6 +101,9 @@ pub(super) fn make_def_with_facts(
                 expr: expr.to_string(),
                 source_table: Some(source.to_string()),
                 output_type: None,
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
             })
             .collect(),
         dimensions: vec![],
@@ -98,6 +115,7 @@ pub(super) fn make_def_with_facts(
         created_on: None,
         database_name: None,
         schema_name: None,
+        comment: None,
     }
 }
 
@@ -114,6 +132,11 @@ pub(super) fn make_def_with_derived_metrics(
             source_table: Some(source.to_string()),
             output_type: None,
             using_relationships: vec![],
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Public,
+            non_additive_by: vec![],
+            window_spec: None,
         });
     }
     for (name, expr) in derived_metrics {
@@ -123,6 +146,11 @@ pub(super) fn make_def_with_derived_metrics(
             source_table: None,
             output_type: None,
             using_relationships: vec![],
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Public,
+            non_additive_by: vec![],
+            window_spec: None,
         });
     }
     SemanticViewDefinition {
@@ -132,6 +160,8 @@ pub(super) fn make_def_with_derived_metrics(
             table: "orders".to_string(),
             pk_columns: vec!["id".to_string()],
             unique_constraints: vec![],
+            comment: None,
+            synonyms: vec![],
         }],
         metrics,
         dimensions: vec![],
@@ -143,6 +173,7 @@ pub(super) fn make_def_with_derived_metrics(
         created_on: None,
         database_name: None,
         schema_name: None,
+        comment: None,
     }
 }
 
@@ -164,6 +195,8 @@ pub(super) fn make_def_with_named_joins(
                 table: table.to_string(),
                 pk_columns: pks.iter().map(|s| s.to_string()).collect(),
                 unique_constraints: vec![],
+                comment: None,
+                synonyms: vec![],
             })
             .collect(),
         joins: joins
@@ -185,6 +218,11 @@ pub(super) fn make_def_with_named_joins(
                 source_table: source.map(|s| s.to_string()),
                 output_type: None,
                 using_relationships: using_rels.iter().map(|s| s.to_string()).collect(),
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             })
             .collect(),
         facts: vec![],
@@ -194,5 +232,6 @@ pub(super) fn make_def_with_named_joins(
         created_on: None,
         database_name: None,
         schema_name: None,
+        comment: None,
     }
 }

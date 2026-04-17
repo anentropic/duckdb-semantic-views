@@ -1,5 +1,5 @@
 .. meta::
-   :description: Syntax reference for ALTER SEMANTIC VIEW RENAME TO, which renames an existing view while preserving its full definition
+   :description: Syntax reference for ALTER SEMANTIC VIEW, covering RENAME TO, SET COMMENT, and UNSET COMMENT operations
 
 .. _ref-alter-semantic-view:
 
@@ -7,11 +7,7 @@
 ALTER SEMANTIC VIEW
 ======================
 
-Renames an existing semantic view. The view definition, including all tables, relationships, dimensions, metrics, and facts, is preserved under the new name. Queries using the old name will fail after the rename.
-
-.. note::
-
-   ``ALTER SEMANTIC VIEW`` only supports the ``RENAME TO`` operation. For other operations use ``CREATE OR REPLACE SEMANTIC VIEW ...``.
+Modifies an existing semantic view. Supports renaming and setting or removing the view-level comment. The view definition (tables, relationships, dimensions, metrics, facts) is preserved.
 
 
 .. _ref-alter-syntax:
@@ -22,6 +18,10 @@ Syntax
 .. code-block:: sqlgrammar
 
    ALTER SEMANTIC VIEW [ IF EXISTS ] <name> RENAME TO <new_name>
+
+   ALTER SEMANTIC VIEW [ IF EXISTS ] <name> SET COMMENT = '<text>'
+
+   ALTER SEMANTIC VIEW [ IF EXISTS ] <name> UNSET COMMENT
 
 
 .. _ref-alter-variants:
@@ -35,6 +35,18 @@ Statement Variants
 ``ALTER SEMANTIC VIEW IF EXISTS <name> RENAME TO <new_name>``
    Renames the semantic view if it exists. If ``<name>`` does not exist, the statement succeeds silently without modifying anything. Returns an error if ``<new_name>`` already exists.
 
+``ALTER SEMANTIC VIEW <name> SET COMMENT = '<text>'``
+   Sets the view-level comment on the semantic view. Replaces any existing comment. Returns an error if the view does not exist.
+
+``ALTER SEMANTIC VIEW IF EXISTS <name> SET COMMENT = '<text>'``
+   Sets the view-level comment if the view exists. If the view does not exist, the statement succeeds silently.
+
+``ALTER SEMANTIC VIEW <name> UNSET COMMENT``
+   Removes the view-level comment from the semantic view. Returns an error if the view does not exist.
+
+``ALTER SEMANTIC VIEW IF EXISTS <name> UNSET COMMENT``
+   Removes the view-level comment if the view exists. If the view does not exist, the statement succeeds silently.
+
 
 .. _ref-alter-params:
 
@@ -42,10 +54,13 @@ Parameters
 ==========
 
 ``<name>``
-   The current name of the semantic view to rename.
+   The name of the semantic view to modify.
 
 ``<new_name>``
-   The new name for the semantic view. Must not match the name of an existing semantic view.
+   The new name for the semantic view (RENAME TO only). Must not match the name of an existing semantic view.
+
+``<text>``
+   The comment text (SET COMMENT only). Must be enclosed in single quotes. Use ``''`` to escape single quotes within the text.
 
 
 .. _ref-alter-output:
@@ -53,7 +68,7 @@ Parameters
 Output Columns
 ==============
 
-Returns a single row with 2 columns:
+**RENAME TO** returns a single row with 2 columns:
 
 .. list-table::
    :header-rows: 1
@@ -68,6 +83,22 @@ Returns a single row with 2 columns:
    * - ``new_name``
      - VARCHAR
      - The new semantic view name after the rename.
+
+**SET COMMENT and UNSET COMMENT** return a single row with 2 columns:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 15 65
+
+   * - Column
+     - Type
+     - Description
+   * - ``name``
+     - VARCHAR
+     - The semantic view name.
+   * - ``status``
+     - VARCHAR
+     - The operation result: ``comment set`` or ``comment unset``.
 
 
 .. _ref-alter-examples:
@@ -103,6 +134,36 @@ After the rename, queries must use the new name:
 
    -- Succeeds silently if 'old_reports' does not exist
    ALTER SEMANTIC VIEW IF EXISTS old_reports RENAME TO new_reports;
+
+**Set a view-level comment:**
+
+.. code-block:: sql
+
+   ALTER SEMANTIC VIEW sales SET COMMENT = 'Revenue analytics for North America';
+
+.. code-block:: text
+
+   ┌───────┬─────────────┐
+   │ name  │ status      │
+   ├───────┼─────────────┤
+   │ sales │ comment set │
+   └───────┴─────────────┘
+
+The comment appears in :ref:`SHOW SEMANTIC VIEWS <ref-show-semantic-views>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>`.
+
+**Remove a view-level comment:**
+
+.. code-block:: sql
+
+   ALTER SEMANTIC VIEW sales UNSET COMMENT;
+
+.. code-block:: text
+
+   ┌───────┬───────────────┐
+   │ name  │ status        │
+   ├───────┼───────────────┤
+   │ sales │ comment unset │
+   └───────┴───────────────┘
 
 **Error: target name already exists:**
 

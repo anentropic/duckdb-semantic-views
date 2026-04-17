@@ -1,0 +1,199 @@
+# Phase 46: Queryable FACTS
+# Tests FACT-01 (fact queries), FACT-02 (unaggregated results),
+# FACT-03 (mutual exclusion), FACT-04 (path validation)
+
+require semantic_views
+
+# ============================================================
+# Setup: orders + line_items tables
+# ============================================================
+
+statement ok
+CREATE TABLE p46f_orders (id INTEGER PRIMARY KEY, region VARCHAR, status VARCHAR);
+
+statement ok
+INSERT INTO p46f_orders VALUES (1, 'US', 'shipped'), (2, 'EU', 'pending'), (3, 'US', 'shipped');
+
+statement ok
+CREATE TABLE p46f_line_items (id INTEGER PRIMARY KEY, order_id INTEGER, product VARCHAR, quantity INTEGER, price DECIMAL(10,2), discount DECIMAL(5,2));
+
+statement ok
+INSERT INTO p46f_line_items VALUES
+    (1, 1, 'Widget', 10, 100.00, 0.10),
+    (2, 1, 'Gadget', 5, 50.00, 0.00),
+    (3, 2, 'Widget', 3, 100.00, 0.05),
+    (4, 3, 'Gadget', 7, 50.00, 0.15);
+
+# ============================================================
+# Setup: semantic view with facts
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p46f_sales AS
+TABLES (
+    o AS p46f_orders PRIMARY KEY (id),
+    li AS p46f_line_items PRIMARY KEY (id)
+)
+RELATIONSHIPS (
+    li_to_o AS li(order_id) REFERENCES o
+)
+FACTS (
+    li.net_price AS li.price * (1 - li.discount),
+    li.line_total AS li.net_price * li.quantity,
+    PRIVATE li.raw_price AS li.price
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.status AS o.status,
+    li.product AS li.product
+)
+METRICS (
+    li.total_revenue AS sum(li.line_total),
+    o.order_count AS count(*)
+);
+
+# ============================================================
+# FACT-01: Basic fact query (facts only, no dimensions)
+# ============================================================
+
+query II
+FROM semantic_view('p46f_sales', facts := ['net_price', 'line_total'])
+ORDER BY 1, 2;
+----
+42.50	297.50
+50.00	250.00
+90.00	900.00
+95.00	285.00
+
+# ============================================================
+# FACT-02: Unaggregated results with dimensions
+# ============================================================
+
+# Facts + dimensions: row-level, no GROUP BY
+query III
+FROM semantic_view('p46f_sales', facts := ['net_price'], dimensions := ['o.region', 'li.product'])
+ORDER BY 1, 2, 3;
+----
+EU	Widget	95.00
+US	Gadget	42.50
+US	Gadget	50.00
+US	Widget	90.00
+
+# Verify row count matches line_items table (4 rows, unaggregated)
+query I
+SELECT count(*) FROM semantic_view('p46f_sales', facts := ['net_price'], dimensions := ['o.region']);
+----
+4
+
+# ============================================================
+# FACT-03: Facts + metrics mutual exclusion
+# ============================================================
+
+statement error
+FROM semantic_view('p46f_sales', facts := ['net_price'], metrics := ['total_revenue']);
+----
+cannot combine facts and metrics
+
+# ============================================================
+# FACT-04: Path validation (divergent paths)
+# ============================================================
+
+# Setup a view with fan-out structure for path validation test
+statement ok
+CREATE TABLE p46f_payments (id INTEGER PRIMARY KEY, order_id INTEGER, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO p46f_payments VALUES (1, 1, 100.00), (2, 2, 50.00);
+
+statement ok
+CREATE SEMANTIC VIEW p46f_fan_test AS
+TABLES (
+    o AS p46f_orders PRIMARY KEY (id),
+    li AS p46f_line_items PRIMARY KEY (id),
+    p AS p46f_payments PRIMARY KEY (id)
+)
+RELATIONSHIPS (
+    li_to_o AS li(order_id) REFERENCES o,
+    p_to_o AS p(order_id) REFERENCES o
+)
+FACTS (
+    li.net_price AS li.price * (1 - li.discount),
+    p.payment_amt AS p.amount
+)
+DIMENSIONS (
+    o.region AS o.region,
+    li.product AS li.product,
+    p.pay_status AS CAST(p.amount AS VARCHAR)
+);
+
+# Fact on li + dim on p = divergent paths (fan from o)
+statement error
+FROM semantic_view('p46f_fan_test', facts := ['net_price'], dimensions := ['pay_status']);
+----
+incompatible table paths
+
+# Fact on li + dim on o = valid (linear path: o -> li)
+query II
+FROM semantic_view('p46f_fan_test', facts := ['net_price'], dimensions := ['o.region'])
+ORDER BY 1, 2;
+----
+EU	95.00
+US	42.50
+US	50.00
+US	90.00
+
+# ============================================================
+# PRIVATE fact exclusion
+# ============================================================
+
+statement error
+FROM semantic_view('p46f_sales', facts := ['raw_price']);
+----
+private
+
+# ============================================================
+# Unknown fact
+# ============================================================
+
+statement error
+FROM semantic_view('p46f_sales', facts := ['nonexistent']);
+----
+unknown fact
+
+# ============================================================
+# Fact-to-fact DAG inlining
+# ============================================================
+
+# line_total depends on net_price -- both should resolve correctly
+query I
+FROM semantic_view('p46f_sales', facts := ['line_total'])
+ORDER BY 1;
+----
+250.00
+285.00
+297.50
+900.00
+
+# ============================================================
+# explain_semantic_view with facts
+# ============================================================
+
+# Verify explain works with facts parameter (at least 1 row in output)
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p46f_sales', facts := ['net_price'], dimensions := ['o.region']);
+----
+true
+
+# ============================================================
+# Wildcard in facts parameter
+# ============================================================
+
+# li.* in facts should expand to net_price and line_total (raw_price is PRIVATE)
+query II
+FROM semantic_view('p46f_sales', facts := ['li.*'])
+ORDER BY 1, 2;
+----
+42.50	297.50
+50.00	250.00
+90.00	900.00
+95.00	285.00

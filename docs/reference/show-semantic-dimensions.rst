@@ -7,7 +7,7 @@
 SHOW SEMANTIC DIMENSIONS
 ==========================
 
-Lists dimensions registered in one or all semantic views. Each row describes a single dimension with its name, source table, and inferred data type.
+Lists dimensions registered in one or all semantic views. Each row describes a single dimension with its name, source table, inferred data type, synonyms, and comment.
 
 
 .. _ref-show-dims-syntax:
@@ -20,6 +20,7 @@ Syntax
    SHOW SEMANTIC DIMENSIONS
        [ LIKE '<pattern>' ]
        [ IN <name> ]
+       [ IN SCHEMA <schema_name> | IN DATABASE <database_name> ]
        [ STARTS WITH '<prefix>' ]
        [ LIMIT <rows> ]
 
@@ -55,6 +56,12 @@ Optional Filtering Clauses
 ``LIKE '<pattern>'``
    Filters dimensions to those whose name matches the pattern. Uses SQL ``LIKE`` pattern syntax: ``%`` matches any sequence of characters, ``_`` matches a single character. Matching is **case-insensitive** (the extension maps ``LIKE`` to DuckDB's ``ILIKE``). The pattern must be enclosed in single quotes.
 
+``IN SCHEMA <schema_name>``
+   Filters dimensions to those in semantic views belonging to the specified schema.
+
+``IN DATABASE <database_name>``
+   Filters dimensions to those in semantic views belonging to the specified database.
+
 ``STARTS WITH '<prefix>'``
    Filters dimensions to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.
 
@@ -73,7 +80,7 @@ When ``LIKE`` and ``STARTS WITH`` are both present, a dimension must satisfy bot
 Output Columns
 ==============
 
-Returns one row per dimension with 6 columns:
+Returns one row per dimension with 8 columns:
 
 .. list-table::
    :header-rows: 1
@@ -100,6 +107,12 @@ Returns one row per dimension with 6 columns:
    * - ``data_type``
      - VARCHAR
      - Reserved for future use. Currently always an empty string for dimensions.
+   * - ``synonyms``
+     - VARCHAR
+     - JSON array of synonym strings (e.g., ``["territory","sales_region"]``). Empty string if no synonyms are set.
+   * - ``comment``
+     - VARCHAR
+     - The dimension comment text. Empty string if no comment is set.
 
 
 .. _ref-show-dims-examples:
@@ -117,13 +130,13 @@ Given a semantic view ``orders_sv`` with three dimensions:
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬──────────────────────┬────────────────┬───────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name     │ name          │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────────┼───────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ customers      │ customer_name │           │
-   │ memory        │ main        │ orders_sv            │ orders         │ order_date    │           │
-   │ memory        │ main        │ orders_sv            │ customers      │ region        │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────────┴───────────────┴───────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────────┬───────────────┬───────────┬──────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name     │ name          │ data_type │ synonyms │ comment │
+   ├───────────────┼─────────────┼──────────────────────┼────────────────┼───────────────┼───────────┼──────────┼─────────┤
+   │ memory        │ main        │ orders_sv            │ customers      │ customer_name │           │          │         │
+   │ memory        │ main        │ orders_sv            │ orders         │ order_date    │           │          │         │
+   │ memory        │ main        │ orders_sv            │ customers      │ region        │           │          │         │
+   └───────────────┴─────────────┴──────────────────────┴────────────────┴───────────────┴───────────┴──────────┴─────────┘
 
 The ``table_name`` column shows the actual physical table name, not the alias used in the DDL.
 
@@ -132,17 +145,6 @@ The ``table_name`` column shows the actual physical table name, not the alias us
 .. code-block:: sql
 
    SHOW SEMANTIC DIMENSIONS;
-
-.. code-block:: text
-
-   ┌───────────────┬─────────────┬──────────────────────┬────────────────┬───────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name     │ name          │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────────┼───────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ customers      │ customer_name │           │
-   │ memory        │ main        │ orders_sv            │ orders         │ order_date    │           │
-   │ memory        │ main        │ orders_sv            │ customers      │ region        │           │
-   │ memory        │ main        │ products_sv          │ products       │ product_name  │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────────┴───────────────┴───────────┘
 
 Results are sorted by ``semantic_view_name`` then ``name``.
 
@@ -154,81 +156,19 @@ Find all dimensions whose name contains "name", across all views:
 
    SHOW SEMANTIC DIMENSIONS LIKE '%name%';
 
-.. code-block:: text
-
-   ┌───────────────┬─────────────┬──────────────────────┬────────────────┬───────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name     │ name          │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────────┼───────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ customers      │ customer_name │           │
-   │ memory        │ main        │ products_sv          │ products       │ product_name  │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────────┴───────────────┴───────────┘
-
 Because ``LIKE`` is case-insensitive, ``LIKE '%NAME%'`` produces the same results.
+
+**Filter by schema:**
+
+.. code-block:: sql
+
+   SHOW SEMANTIC DIMENSIONS IN SCHEMA main;
 
 **Filter by pattern within a specific view:**
 
 .. code-block:: sql
 
    SHOW SEMANTIC DIMENSIONS LIKE '%NAME%' IN orders_sv;
-
-.. code-block:: text
-
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬───────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name          │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼───────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ customers  │ customer_name │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴───────────────┴───────────┘
-
-**Filter by prefix with STARTS WITH (case-sensitive):**
-
-Find dimensions whose name starts with "customer":
-
-.. code-block:: sql
-
-   SHOW SEMANTIC DIMENSIONS STARTS WITH 'customer';
-
-.. code-block:: text
-
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬───────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name          │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼───────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ customers  │ customer_name │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴───────────────┴───────────┘
-
-``STARTS WITH`` is case-sensitive. ``STARTS WITH 'Customer'`` would return no results because the dimension is named ``customer_name`` (lowercase).
-
-**Limit the number of results:**
-
-.. code-block:: sql
-
-   SHOW SEMANTIC DIMENSIONS IN orders_sv LIMIT 2;
-
-.. code-block:: text
-
-   ┌───────────────┬─────────────┬──────────────────────┬────────────────┬───────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name     │ name          │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────────┼───────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ customers      │ customer_name │           │
-   │ memory        │ main        │ orders_sv            │ orders         │ order_date    │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────────┴───────────────┴───────────┘
-
-**Combine multiple clauses:**
-
-All optional clauses can be combined, following the required order (``LIKE``, ``IN``, ``STARTS WITH``, ``LIMIT``):
-
-.. code-block:: sql
-
-   SHOW SEMANTIC DIMENSIONS LIKE '%name%' IN orders_sv STARTS WITH 'cust' LIMIT 10;
-
-.. code-block:: text
-
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬───────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name          │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼───────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ customers  │ customer_name │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴───────────────┴───────────┘
-
-The dimension ``customer_name`` matches both ``LIKE '%name%'`` (contains "name") and ``STARTS WITH 'cust'`` (begins with "cust").
 
 **Error: view does not exist:**
 

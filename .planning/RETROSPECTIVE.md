@@ -417,6 +417,61 @@
 
 ---
 
+## Milestone: v0.6.0 — Snowflake SQL DDL Parity
+
+**Shipped:** 2026-04-14
+**Phases:** 8 (43-50) | **Plans:** 16 | **Commits:** 114
+
+### What Was Built
+- Metadata annotations: COMMENT, SYNONYMS, PRIVATE/PUBLIC on all DDL objects with backward-compatible serde persistence
+- Introspection enhancements: SHOW TERSE, IN SCHEMA/DATABASE scoping, SHOW COLUMNS, metadata columns in SHOW/DESCRIBE output
+- ALTER SET/UNSET COMMENT + GET_DDL round-trip DDL reconstruction (first VScalar in the extension)
+- Wildcard selection (table_alias.*) with PRIVATE exclusion + queryable FACTS (row-level unaggregated mode)
+- Semi-additive metrics (NON ADDITIVE BY) with CTE-based ROW_NUMBER snapshot selection, effectively-regular classification
+- Window function metrics (PARTITION BY EXCLUDING) with CTE-based inner aggregation + outer window SELECT
+- Security hardening: FFI catch_unwind on all 25 entry points, graceful lock-poison handling, cycle detection + depth limits
+- Code quality: 38 new unit tests for untested modules, resolve_names generic helper, DimensionName/MetricName newtypes
+
+### What Worked
+- Tier ordering (model+DDL → expansion mods → structural pipeline changes) — earlier phases were incremental, later phases could build on stable foundation
+- All new model fields use #[serde(default)] from the start — zero backward-compatibility issues through 8 phases of model evolution
+- CTE-based expansion patterns (semi-additive, window) kept the main expansion pipeline clean — new metric types are separate modules, not branches in the main expand()
+- Security hardening as a dedicated phase (49) after all features complete — clean audit of the full surface area without feature pressure
+- Code quality phase (50) as final phase caught real issues: 38 new tests found untested paths, resolve_names deduplication removed 150+ LOC
+- Milestone audit passed clean (34/34 requirements) — the only gaps were REQUIREMENTS.md checkboxes (documentation tracking, not implementation)
+
+### What Was Inefficient
+- REQUIREMENTS.md checkboxes still not updated during phase execution — 16 checkboxes remained unchecked despite verified implementations (same pattern from v0.5.0+)
+- VALIDATION.md files created but never marked nyquist_compliant across all 8 phases — persistent process gap
+- Phase 44 SUMMARY one-liner extraction returned "Status:" for 2 plans — frontmatter parsing issue in gsd-tools
+- Some phase SUMMARY files had inconsistent frontmatter (missing requirements_completed field for most plans)
+
+### Patterns Established
+- CTE-based metric expansion: semi_additive.rs (ROW_NUMBER snapshot) and window.rs (inner agg + outer window) as separate expand/ submodules
+- Effectively-regular classification: when all NON ADDITIVE BY dimensions appear in query, skip CTE and aggregate normally
+- PARTITION BY EXCLUDING as set difference: window partitions = queried dims - excluded dims, computed at query time
+- FFI catch_unwind boundary pattern: AssertUnwindSafe justified, panic → error conversion at every C++ entry point
+- Graceful lock-poison handling: .map_err() with descriptive string (not into_inner() recovery)
+- DimensionName/MetricName newtypes with case-insensitive Eq/Hash for compile-time domain safety
+- Generic resolve_names helper with closure-based error construction (9 params) for resolution loop deduplication
+- NaGroup named struct replacing anonymous tuple for semi-additive grouping
+
+### Key Lessons
+1. CTE-based expansion modules (one per metric type) scale better than branching in the main expand() — semi-additive and window metrics are completely independent code paths
+2. Effectively-regular classification is critical for semi-additive correctness — when all NA dimensions are queried, the CTE is unnecessary overhead and can produce wrong results
+3. FFI catch_unwind + AssertUnwindSafe is safe at FFI boundaries when no partially-mutated state is observable — the justification must be per-site
+4. Newtypes for query resolution names (DimensionName/MetricName) catch entire categories of case-sensitivity bugs at compile time
+5. Code quality phases at milestone end are high-value — Phase 50 found real coverage gaps and refactoring opportunities that accumulated across 7 prior phases
+6. REQUIREMENTS.md checkbox drift is the most persistent process gap across all milestones — needs automation or a phase-completion hook
+
+### Cost Observations
+- 114 commits in 10 days (2026-04-05 → 2026-04-14)
+- 16 plans, 166 files modified, +35,682 / -4,023 lines (net +31,659)
+- Phases 49-50 (security + quality) accounted for ~190 min — valuable cleanup time
+- Notable: Phase 47 P01 was fastest feature plan (31 min) — model+parser pattern fully established by Phase 43
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -433,6 +488,7 @@
 | v0.5.3 | 66 | 4 | FACTS, derived metrics, hierarchies, fan traps, role-playing dims, USING |
 | v0.5.4 | 117 | 6 | Cardinality inference, DuckDB 1.5.0, DDL parity, SHOW filtering, docs site, CE readiness |
 | v0.5.5 | 71 | 6 | Module refactoring, Snowflake-aligned SHOW/DESCRIBE, metadata storage, persistence hardening |
+| v0.6.0 | 114 | 8 | Metadata annotations, semi-additive/window metrics, queryable FACTS, wildcard selection, GET_DDL, security hardening |
 
 ### Cumulative Quality
 
@@ -447,6 +503,7 @@
 | v0.5.3 | 441 | 80+ properties | 4 targets | 11 sqllogictest + DuckLake CI + Python crash + caret |
 | v0.5.4 | 482 | 80+ properties | 4 targets | 18 sqllogictest + DuckLake CI + Python crash + caret + 22 infra assertions |
 | v0.5.5 | 487 | 80+ properties | 4 targets | 19 sqllogictest + DuckLake CI + Python crash + caret + 22 infra assertions |
+| v0.6.0 | 705 | 80+ properties | 4 targets | 32 sqllogictest + DuckLake CI + Python crash + caret + 22 infra assertions |
 
 ### Top Lessons (Verified Across Milestones)
 

@@ -22,7 +22,7 @@ pub const PARSE_DETECTED: u8 = 1;
 // DdlKind enum and detection
 // ---------------------------------------------------------------------------
 
-/// The 9 supported DDL statement forms for semantic views.
+/// The supported DDL statement forms for semantic views.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DdlKind {
     Create,
@@ -32,8 +32,10 @@ pub enum DdlKind {
     DropIfExists,
     Describe,
     Show,
-    AlterRename,
-    AlterRenameIfExists,
+    ShowTerse,
+    ShowColumns,
+    Alter,
+    AlterIfExists,
     ShowDimensions,
     ShowMetrics,
     ShowFacts,
@@ -121,15 +123,23 @@ fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
     }
     // ALTER SEMANTIC VIEW IF EXISTS (5 keywords) -- before ALTER SEMANTIC VIEW
     if let Some(n) = match_keyword_prefix(b, &[b"alter", b"semantic", b"view", b"if", b"exists"]) {
-        return Some((DdlKind::AlterRenameIfExists, n));
+        return Some((DdlKind::AlterIfExists, n));
     }
     // ALTER SEMANTIC VIEW (3 keywords)
     if let Some(n) = match_keyword_prefix(b, &[b"alter", b"semantic", b"view"]) {
-        return Some((DdlKind::AlterRename, n));
+        return Some((DdlKind::Alter, n));
     }
     // DESCRIBE SEMANTIC VIEW (3 keywords)
     if let Some(n) = match_keyword_prefix(b, &[b"describe", b"semantic", b"view"]) {
         return Some((DdlKind::Describe, n));
+    }
+    // SHOW COLUMNS IN SEMANTIC VIEW (5 keywords) -- before all SHOW SEMANTIC matches
+    if let Some(n) = match_keyword_prefix(b, &[b"show", b"columns", b"in", b"semantic", b"view"]) {
+        return Some((DdlKind::ShowColumns, n));
+    }
+    // SHOW TERSE SEMANTIC VIEWS (4 keywords) -- before SHOW SEMANTIC VIEWS
+    if let Some(n) = match_keyword_prefix(b, &[b"show", b"terse", b"semantic", b"views"]) {
+        return Some((DdlKind::ShowTerse, n));
     }
     // SHOW SEMANTIC DIMENSIONS (3 keywords) -- before SHOW SEMANTIC VIEWS
     if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"dimensions"]) {
@@ -216,8 +226,9 @@ fn function_name(kind: DdlKind) -> &'static str {
         DdlKind::DropIfExists => "drop_semantic_view_if_exists",
         DdlKind::Describe => "describe_semantic_view",
         DdlKind::Show => "list_semantic_views",
-        DdlKind::AlterRename => "alter_semantic_view_rename",
-        DdlKind::AlterRenameIfExists => "alter_semantic_view_rename_if_exists",
+        DdlKind::ShowTerse => "list_terse_semantic_views",
+        DdlKind::ShowColumns => "show_columns_in_semantic_view",
+        DdlKind::Alter | DdlKind::AlterIfExists => "alter_semantic_view",
         DdlKind::ShowDimensions => "show_semantic_dimensions",
         DdlKind::ShowMetrics => "show_semantic_metrics",
         DdlKind::ShowFacts => "show_semantic_facts",
@@ -264,11 +275,15 @@ fn extract_quoted_string(input: &str) -> Result<(String, usize), String> {
 ///
 /// LIKE maps to `name ILIKE '<escaped>'` (case-insensitive).
 /// STARTS WITH maps to `name LIKE '<escaped>%'` (case-sensitive).
-/// Both conditions combined with AND. LIMIT appended last.
+/// IN SCHEMA maps to `schema_name = '<escaped>'`.
+/// IN DATABASE maps to `database_name = '<escaped>'`.
+/// All conditions combined with AND. LIMIT appended last.
 fn build_filter_suffix(
     like_pattern: Option<&str>,
     starts_with: Option<&str>,
     limit: Option<u64>,
+    in_schema: Option<&str>,
+    in_database: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
     if let Some(pattern) = like_pattern {
@@ -278,6 +293,14 @@ fn build_filter_suffix(
     if let Some(prefix) = starts_with {
         let escaped = prefix.replace('\'', "''");
         parts.push(format!("name LIKE '{escaped}%'"));
+    }
+    if let Some(schema) = in_schema {
+        let escaped = schema.replace('\'', "''");
+        parts.push(format!("schema_name = '{escaped}'"));
+    }
+    if let Some(db) = in_database {
+        let escaped = db.replace('\'', "''");
+        parts.push(format!("database_name = '{escaped}'"));
     }
     let mut suffix = String::new();
     if !parts.is_empty() {
@@ -295,9 +318,77 @@ fn build_filter_suffix(
 struct ShowClauses<'a> {
     like_pattern: Option<String>,
     in_view: Option<&'a str>,
+    in_schema: Option<&'a str>,
+    in_database: Option<&'a str>,
     for_metric: Option<&'a str>,
     starts_with: Option<String>,
     limit: Option<u64>,
+}
+
+/// Parse a keyword + identifier pair from text starting with IN.
+///
+/// Checks for `IN SCHEMA <name>` or `IN DATABASE <name>`.
+/// Returns `(remaining_text, in_schema, in_database)`.
+fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), String> {
+    let after_in = rest[2..].trim_start();
+
+    // Try to match a keyword (SCHEMA or DATABASE) followed by an identifier.
+    let (keyword, kw_len, label) = if after_in.len() >= 6
+        && after_in[..6].eq_ignore_ascii_case("SCHEMA")
+        && (after_in.len() == 6 || after_in.as_bytes()[6].is_ascii_whitespace())
+    {
+        ("SCHEMA", 6, "schema")
+    } else if after_in.len() >= 8
+        && after_in[..8].eq_ignore_ascii_case("DATABASE")
+        && (after_in.len() == 8 || after_in.as_bytes()[8].is_ascii_whitespace())
+    {
+        ("DATABASE", 8, "database")
+    } else {
+        return Err(
+            "SHOW SEMANTIC VIEWS requires IN SCHEMA <name> or IN DATABASE <name>".to_string(),
+        );
+    };
+
+    let after_kw = after_in[kw_len..].trim_start();
+    if after_kw.is_empty() {
+        return Err(format!("Missing {label} name after IN {keyword}"));
+    }
+    let name_end = after_kw
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(after_kw.len());
+    let name = &after_kw[..name_end];
+    let remaining = after_kw[name_end..].trim_start();
+
+    if keyword == "SCHEMA" {
+        Ok((remaining, Some(name), None))
+    } else {
+        Ok((remaining, None, Some(name)))
+    }
+}
+
+/// Parse FOR METRIC clause (only valid for `ShowDimensions`).
+///
+/// Returns `(remaining_text, metric_name)`.
+fn parse_for_metric<'a>(rest: &'a str, entity: &str) -> Result<(&'a str, &'a str), String> {
+    let after_for = rest[3..].trim_start();
+    if after_for.len() < 6 || !after_for[..6].eq_ignore_ascii_case("METRIC") {
+        return Err("Expected FOR METRIC after view name. \
+             Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] \
+             [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
+            .to_string());
+    }
+    let _ = entity;
+    let after_metric = after_for[6..].trim_start();
+    if after_metric.is_empty() {
+        return Err("Missing metric name after FOR METRIC".to_string());
+    }
+    let name_end = after_metric
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(after_metric.len());
+    Ok((
+        after_metric[name_end..].trim_start(),
+        &after_metric[..name_end],
+    ))
 }
 
 /// Parse optional SHOW SEMANTIC filter clauses from text after the prefix.
@@ -310,12 +401,14 @@ fn parse_show_filter_clauses<'a>(
     let mut rest = after_prefix.trim();
     let mut like_pattern: Option<String> = None;
     let mut in_view: Option<&'a str> = None;
+    let mut in_schema: Option<&'a str> = None;
+    let mut in_database: Option<&'a str> = None;
     let mut for_metric: Option<&'a str> = None;
     let mut starts_with: Option<String> = None;
     let mut limit: Option<u64> = None;
 
     let entity = match kind {
-        DdlKind::Show => "VIEWS",
+        DdlKind::Show | DdlKind::ShowTerse => "VIEWS",
         DdlKind::ShowDimensions => "DIMENSIONS",
         DdlKind::ShowMetrics => "METRICS",
         _ => "FACTS",
@@ -337,18 +430,20 @@ fn parse_show_filter_clauses<'a>(
         && rest[..2].eq_ignore_ascii_case("IN")
         && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
     {
-        if kind == DdlKind::Show {
-            return Err("IN is not valid for SHOW SEMANTIC VIEWS (no scoping view)".to_string());
+        if kind == DdlKind::Show || kind == DdlKind::ShowTerse {
+            let (remaining, schema, database) = parse_in_scope(rest)?;
+            rest = remaining;
+            in_schema = schema;
+            in_database = database;
+        } else {
+            rest = rest[2..].trim_start();
+            if rest.is_empty() {
+                return Err("Missing view name after IN".to_string());
+            }
+            let name_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+            in_view = Some(&rest[..name_end]);
+            rest = rest[name_end..].trim_start();
         }
-        rest = rest[2..].trim_start();
-        if rest.is_empty() {
-            return Err("Missing view name after IN".to_string());
-        }
-        let name_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-        // Safety: we need to return a reference into the original after_prefix.
-        // Since rest is a subslice of after_prefix, &rest[..name_end] is valid.
-        in_view = Some(&rest[..name_end]);
-        rest = rest[name_end..].trim_start();
     }
 
     // 3. Check for FOR METRIC (only for ShowDimensions)
@@ -358,20 +453,9 @@ fn parse_show_filter_clauses<'a>(
                 "FOR METRIC is only valid for SHOW SEMANTIC DIMENSIONS, not SHOW SEMANTIC {entity}"
             ));
         }
-        rest = rest[3..].trim_start();
-        if rest.len() < 6 || !rest[..6].eq_ignore_ascii_case("METRIC") {
-            return Err(
-                "Expected FOR METRIC after view name. \
-                 Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]".to_string()
-            );
-        }
-        rest = rest[6..].trim_start();
-        if rest.is_empty() {
-            return Err("Missing metric name after FOR METRIC".to_string());
-        }
-        let name_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-        for_metric = Some(&rest[..name_end]);
-        rest = rest[name_end..].trim_start();
+        let (remaining, metric_name) = parse_for_metric(rest, entity)?;
+        rest = remaining;
+        for_metric = Some(metric_name);
     }
 
     // 4. Check for STARTS WITH
@@ -420,10 +504,70 @@ fn parse_show_filter_clauses<'a>(
     Ok(ShowClauses {
         like_pattern,
         in_view,
+        in_schema,
+        in_database,
         for_metric,
         starts_with,
         limit,
     })
+}
+
+/// Rewrite an ALTER SEMANTIC VIEW sub-operation to a table function call.
+///
+/// Dispatches on RENAME TO, SET COMMENT, and UNSET COMMENT.
+fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, String> {
+    let after_prefix = trimmed[plen..].trim();
+    let name_end = after_prefix
+        .find(|c: char| c.is_whitespace())
+        .ok_or("Missing view name after ALTER SEMANTIC VIEW")?;
+    let view_name = &after_prefix[..name_end];
+    let rest = after_prefix[name_end..].trim();
+    let rest_upper = rest.to_ascii_uppercase();
+    let safe_name = view_name.replace('\'', "''");
+
+    let if_exists_suffix = if kind == DdlKind::AlterIfExists {
+        "_if_exists"
+    } else {
+        ""
+    };
+
+    if rest_upper.starts_with("RENAME TO") {
+        let new_name = rest["RENAME TO".len()..].trim();
+        if new_name.is_empty() {
+            return Err("Missing new name after RENAME TO".to_string());
+        }
+        let safe_new = new_name.replace('\'', "''");
+        let alter_fn = format!("alter_semantic_view_rename{if_exists_suffix}");
+        Ok(format!(
+            "SELECT * FROM {alter_fn}('{safe_name}', '{safe_new}')"
+        ))
+    } else if rest_upper.starts_with("SET COMMENT") {
+        let after_set_comment = rest["SET COMMENT".len()..].trim_start();
+        if !after_set_comment.starts_with('=') {
+            return Err("Expected '=' after SET COMMENT".to_string());
+        }
+        let after_eq = after_set_comment[1..].trim_start();
+        if !after_eq.starts_with('\'') {
+            return Err("Expected single-quoted string after SET COMMENT =".to_string());
+        }
+        // Extract the quoted string handling '' escaping
+        let (comment_value, _consumed) =
+            extract_quoted_string(after_eq).map_err(|e| format!("Invalid comment string: {e}"))?;
+        // Re-escape for SQL embedding
+        let safe_comment = comment_value.replace('\'', "''");
+        let alter_fn = format!("alter_semantic_view_set_comment{if_exists_suffix}");
+        Ok(format!(
+            "SELECT * FROM {alter_fn}('{safe_name}', '{safe_comment}')"
+        ))
+    } else if rest_upper.starts_with("UNSET COMMENT") {
+        let alter_fn = format!("alter_semantic_view_unset_comment{if_exists_suffix}");
+        Ok(format!("SELECT * FROM {alter_fn}('{safe_name}')"))
+    } else {
+        Err(
+            "Unsupported ALTER operation. Supported: RENAME TO, SET COMMENT, UNSET COMMENT."
+                .to_string(),
+        )
+    }
 }
 
 /// Rewrite a name-only or SHOW semantic view DDL statement to its function call.
@@ -447,14 +591,18 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
             Err("CREATE forms must use validate_and_rewrite".to_string())
         }
-        // Name-only forms
-        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe => {
+        // Name-only forms (DROP, DESCRIBE, SHOW COLUMNS IN SEMANTIC VIEW)
+        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe | DdlKind::ShowColumns => {
             let name = extract_name_only(trimmed, plen)?;
             let safe_name = name.replace('\'', "''");
             Ok(format!("SELECT * FROM {fn_name}('{safe_name}')"))
         }
         // SHOW SEMANTIC VIEWS/DIMENSIONS/METRICS/FACTS: optional LIKE/IN/FOR METRIC/STARTS WITH/LIMIT
-        DdlKind::Show | DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
+        DdlKind::Show
+        | DdlKind::ShowTerse
+        | DdlKind::ShowDimensions
+        | DdlKind::ShowMetrics
+        | DdlKind::ShowFacts => {
             let after_prefix = trimmed[plen..].trim();
             let clauses = parse_show_filter_clauses(after_prefix, kind)?;
 
@@ -477,6 +625,7 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
             } else {
                 let all_fn = match kind {
                     DdlKind::Show => "list_semantic_views",
+                    DdlKind::ShowTerse => "list_terse_semantic_views",
                     DdlKind::ShowDimensions => "show_semantic_dimensions_all",
                     DdlKind::ShowMetrics => "show_semantic_metrics_all",
                     DdlKind::ShowFacts => "show_semantic_facts_all",
@@ -490,31 +639,13 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
                 clauses.like_pattern.as_deref(),
                 clauses.starts_with.as_deref(),
                 clauses.limit,
+                clauses.in_schema,
+                clauses.in_database,
             );
             Ok(format!("{base}{suffix}"))
         }
-        // ALTER RENAME: two-argument form
-        DdlKind::AlterRename | DdlKind::AlterRenameIfExists => {
-            let after_prefix = trimmed[plen..].trim();
-            let name_end = after_prefix
-                .find(|c: char| c.is_whitespace())
-                .ok_or("Missing view name after ALTER SEMANTIC VIEW")?;
-            let old_name = &after_prefix[..name_end];
-            let rest = after_prefix[name_end..].trim();
-            let rest_upper = rest.to_ascii_uppercase();
-            if !rest_upper.starts_with("RENAME TO") {
-                return Err("Expected RENAME TO after view name".to_string());
-            }
-            let new_name = rest["RENAME TO".len()..].trim();
-            if new_name.is_empty() {
-                return Err("Missing new name after RENAME TO".to_string());
-            }
-            let safe_old = old_name.replace('\'', "''");
-            let safe_new = new_name.replace('\'', "''");
-            Ok(format!(
-                "SELECT * FROM {fn_name}('{safe_old}', '{safe_new}')"
-            ))
-        }
+        // ALTER: sub-operation dispatch (RENAME TO, SET COMMENT, UNSET COMMENT)
+        DdlKind::Alter | DdlKind::AlterIfExists => rewrite_alter(trimmed, plen, kind),
     }
 }
 
@@ -554,12 +685,13 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
         DdlKind::Drop
         | DdlKind::DropIfExists
         | DdlKind::Describe
-        | DdlKind::AlterRename
-        | DdlKind::AlterRenameIfExists => {
+        | DdlKind::ShowColumns
+        | DdlKind::Alter
+        | DdlKind::AlterIfExists => {
             let name = extract_name_only(trimmed, plen)?;
             Ok(Some(name))
         }
-        DdlKind::Show => Ok(None),
+        DdlKind::Show | DdlKind::ShowTerse => Ok(None),
         DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
             let after_prefix = trimmed[plen..].trim();
             if after_prefix.is_empty() {
@@ -603,7 +735,7 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
 // Validation layer: ParseError, detect_near_miss, validate_and_rewrite
 // ---------------------------------------------------------------------------
 
-/// The 9 DDL prefixes used for near-miss detection.
+/// The DDL prefixes used for near-miss detection.
 const DDL_PREFIXES: &[&str] = &[
     "create semantic view",
     "create or replace semantic view",
@@ -612,6 +744,8 @@ const DDL_PREFIXES: &[&str] = &[
     "drop semantic view if exists",
     "describe semantic view",
     "show semantic views",
+    "show terse semantic views",
+    "show columns in semantic view",
     "alter semantic view",
     "alter semantic view if exists",
     "show semantic dimensions",
@@ -703,11 +837,27 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
                 position: Some(trim_offset + plen),
             })
         }
-        // No-args form: no validation needed
-        DdlKind::Show => rewrite_ddl(query).map(Some).map_err(|e| ParseError {
-            message: e,
-            position: None,
-        }),
+        // SHOW [TERSE] SEMANTIC VIEWS: optional filter/scope clauses
+        DdlKind::Show | DdlKind::ShowTerse => {
+            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+                message: e,
+                position: Some(trim_offset + plen),
+            })
+        }
+        // SHOW COLUMNS IN SEMANTIC VIEW: name-only form
+        DdlKind::ShowColumns => {
+            let after_prefix = trimmed_no_semi[plen..].trim();
+            if after_prefix.is_empty() {
+                return Err(ParseError {
+                    message: "Missing view name.".to_string(),
+                    position: Some(trim_offset + plen),
+                });
+            }
+            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+                message: e,
+                position: Some(trim_offset + plen),
+            })
+        }
         // SHOW SEMANTIC DIMENSIONS/METRICS/FACTS: optional IN view_name
         DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
             rewrite_ddl(query).map(Some).map_err(|e| ParseError {
@@ -715,41 +865,131 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
                 position: Some(trim_offset + plen),
             })
         }
-        // ALTER RENAME forms: validate old_name RENAME TO new_name
-        DdlKind::AlterRename | DdlKind::AlterRenameIfExists => {
-            let after_prefix = trimmed_no_semi[plen..].trim();
-            if after_prefix.is_empty() {
-                return Err(ParseError {
-                    message: "Missing view name after ALTER SEMANTIC VIEW.".to_string(),
-                    position: Some(trim_offset + plen),
-                });
-            }
-            let name_end = after_prefix
-                .find(|c: char| c.is_whitespace())
-                .ok_or_else(|| ParseError {
-                    message: "Expected RENAME TO after view name.".to_string(),
-                    position: Some(trim_offset + plen + after_prefix.len()),
-                })?;
-            let rest = after_prefix[name_end..].trim();
-            let rest_upper = rest.to_ascii_uppercase();
-            if !rest_upper.starts_with("RENAME TO") {
-                return Err(ParseError {
-                    message: "Expected RENAME TO after view name. ALTER SEMANTIC VIEW only supports RENAME TO.".to_string(),
-                    position: Some(trim_offset + plen + name_end),
-                });
-            }
-            let new_name_str = rest["RENAME TO".len()..].trim();
-            if new_name_str.is_empty() {
-                return Err(ParseError {
-                    message: "Missing new name after RENAME TO.".to_string(),
-                    position: Some(trim_offset + plen + after_prefix.len()),
-                });
-            }
+        // ALTER forms: validate sub-operation (RENAME TO, SET COMMENT, UNSET COMMENT)
+        DdlKind::Alter | DdlKind::AlterIfExists => {
+            validate_alter(trimmed_no_semi, trim_offset, plen)?;
             rewrite_ddl(query).map(Some).map_err(|e| ParseError {
                 message: e,
                 position: Some(trim_offset + plen),
             })
         }
+    }
+}
+
+/// Validate an ALTER SEMANTIC VIEW statement's sub-operation before rewriting.
+///
+/// Checks that the view name and a valid sub-operation (RENAME TO, SET COMMENT,
+/// UNSET COMMENT) are present, returning a `ParseError` on validation failure.
+fn validate_alter(
+    trimmed_no_semi: &str,
+    trim_offset: usize,
+    plen: usize,
+) -> Result<(), ParseError> {
+    let after_prefix = trimmed_no_semi[plen..].trim();
+    if after_prefix.is_empty() {
+        return Err(ParseError {
+            message: "Missing view name after ALTER SEMANTIC VIEW.".to_string(),
+            position: Some(trim_offset + plen),
+        });
+    }
+    let name_end = after_prefix
+        .find(|c: char| c.is_whitespace())
+        .ok_or_else(|| ParseError {
+            message: "Missing ALTER operation after view name. Supported: RENAME TO, SET COMMENT, UNSET COMMENT.".to_string(),
+            position: Some(trim_offset + plen + after_prefix.len()),
+        })?;
+    let rest = after_prefix[name_end..].trim();
+    let rest_upper = rest.to_ascii_uppercase();
+
+    if rest_upper.starts_with("RENAME TO") {
+        let new_name_str = rest["RENAME TO".len()..].trim();
+        if new_name_str.is_empty() {
+            return Err(ParseError {
+                message: "Missing new name after RENAME TO.".to_string(),
+                position: Some(trim_offset + plen + after_prefix.len()),
+            });
+        }
+    } else if rest_upper.starts_with("SET COMMENT") {
+        let after_set_comment = rest["SET COMMENT".len()..].trim_start();
+        if !after_set_comment.starts_with('=') {
+            return Err(ParseError {
+                message: "Expected '=' after SET COMMENT.".to_string(),
+                position: Some(trim_offset + plen + name_end),
+            });
+        }
+        let after_eq = after_set_comment[1..].trim_start();
+        if !after_eq.starts_with('\'') {
+            return Err(ParseError {
+                message: "Expected single-quoted string after SET COMMENT =.".to_string(),
+                position: Some(trim_offset + plen + name_end),
+            });
+        }
+        let _ = extract_quoted_string(after_eq).map_err(|e| ParseError {
+            message: format!("Invalid comment string: {e}"),
+            position: Some(trim_offset + plen + name_end),
+        })?;
+    } else if rest_upper.starts_with("UNSET COMMENT") {
+        // Valid -- no further arguments needed
+    } else {
+        return Err(ParseError {
+            message:
+                "Unsupported ALTER operation. Supported: RENAME TO, SET COMMENT, UNSET COMMENT."
+                    .to_string(),
+            position: Some(trim_offset + plen + name_end),
+        });
+    }
+    Ok(())
+}
+
+/// Extract an optional COMMENT = '...' between the view name and the AS keyword.
+/// Returns (`comment_option`, `remaining_text_after_comment`).
+///
+/// Phase 43: Supports `CREATE SEMANTIC VIEW my_view COMMENT = 'desc' AS ...`
+fn extract_view_comment(text: &str) -> Result<(Option<String>, &str), ParseError> {
+    let upper = text.to_ascii_uppercase();
+    if upper.starts_with("COMMENT") {
+        // Verify word boundary (not e.g. COMMENTARY)
+        if text.len() > 7 && text.as_bytes()[7].is_ascii_alphanumeric() {
+            return Ok((None, text));
+        }
+        let after_kw = text[7..].trim_start();
+        if !after_kw.starts_with('=') {
+            return Err(ParseError {
+                message: "Expected '=' after COMMENT keyword.".to_string(),
+                position: None,
+            });
+        }
+        let after_eq = after_kw[1..].trim_start();
+        if !after_eq.starts_with('\'') {
+            return Err(ParseError {
+                message: "Expected single-quoted string after COMMENT =.".to_string(),
+                position: None,
+            });
+        }
+        // Extract the quoted string handling '' escaping
+        let bytes = after_eq.as_bytes();
+        let mut i = 1; // skip opening quote
+        let mut value = String::new();
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    value.push('\'');
+                    i += 2;
+                    continue;
+                }
+                // Closing quote found
+                let remaining = &after_eq[i + 1..];
+                return Ok((Some(value), remaining));
+            }
+            value.push(bytes[i] as char);
+            i += 1;
+        }
+        Err(ParseError {
+            message: "Unclosed single-quoted string in view-level COMMENT.".to_string(),
+            position: None,
+        })
+    } else {
+        Ok((None, text))
     }
 }
 
@@ -782,10 +1022,15 @@ fn validate_create_body(
 
     let after_name = &after_prefix[name_end..];
 
+    // --- Phase 43: View-level COMMENT extraction ---
+    // Extract optional COMMENT = '...' between the view name and the AS keyword.
+    let after_name_pre = after_name.trim_start();
+    let (view_comment, remaining_after_comment) = extract_view_comment(after_name_pre)?;
+
     // --- AS keyword body path (new in Phase 25) ---
     // If text after the name starts with "AS" (whitespace-delimited), route to the
     // AS-body keyword parser instead of the legacy paren-body path.
-    let after_name_trimmed = after_name.trim_start();
+    let after_name_trimmed = remaining_after_comment.trim_start();
     let is_as_body = after_name_trimmed
         .get(..2)
         .is_some_and(|s| s.eq_ignore_ascii_case("AS"))
@@ -797,11 +1042,13 @@ fn validate_create_body(
         let after_prefix_in_tns = plen + (trimmed_no_semi.len() - plen - after_prefix.len());
         // after_name starts at name_end within after_prefix
         let after_name_in_tns = after_prefix_in_tns + name_end;
-        // after_name_trimmed trims leading whitespace from after_name
-        let as_trim_gap = after_name.len() - after_name_trimmed.len();
-        let body_offset_in_tns = after_name_in_tns + as_trim_gap;
+        // Calculate the byte offset of after_name_trimmed relative to trimmed_no_semi
+        // after_name_trimmed is a slice within after_name, so compute by pointer arithmetic
+        let trimmed_start_in_after_name = after_name.len() - remaining_after_comment.len()
+            + (remaining_after_comment.len() - after_name_trimmed.len());
+        let body_offset_in_tns = after_name_in_tns + trimmed_start_in_after_name;
         let body_offset = trim_offset + body_offset_in_tns;
-        return rewrite_ddl_keyword_body(kind, name, after_name_trimmed, body_offset);
+        return rewrite_ddl_keyword_body(kind, name, after_name_trimmed, body_offset, view_comment);
     }
     // --- End AS keyword body path ---
 
@@ -821,8 +1068,9 @@ fn validate_create_body(
 fn rewrite_ddl_keyword_body(
     kind: DdlKind,
     name: &str,
-    body_text: &str,    // text starting at "AS" (inclusive)
-    body_offset: usize, // byte offset of body_text[0] in original query
+    body_text: &str,              // text starting at "AS" (inclusive)
+    body_offset: usize,           // byte offset of body_text[0] in original query
+    view_comment: Option<String>, // Phase 43: optional view-level COMMENT
 ) -> Result<Option<String>, ParseError> {
     // 1. Call parse_keyword_body (body_text starts at "AS"; pass body_offset)
     let mut keyword_body = parse_keyword_body(body_text, body_offset)?;
@@ -850,6 +1098,7 @@ fn rewrite_ddl_keyword_body(
         created_on: None,
         database_name: None,
         schema_name: None,
+        comment: view_comment,
     };
 
     // 3. Serialize to JSON
@@ -1741,6 +1990,8 @@ mod tests {
                     .iter()
                     .map(|cols| cols.iter().map(|s| (*s).to_string()).collect())
                     .collect(),
+                comment: None,
+                synonyms: vec![],
             }
         }
 
@@ -1931,7 +2182,7 @@ mod tests {
         #[test]
         fn test_build_filter_suffix_like_only() {
             assert_eq!(
-                build_filter_suffix(Some("%rev%"), None, None),
+                build_filter_suffix(Some("%rev%"), None, None, None, None),
                 " WHERE name ILIKE '%rev%'"
             );
         }
@@ -1939,34 +2190,61 @@ mod tests {
         #[test]
         fn test_build_filter_suffix_starts_with_only() {
             assert_eq!(
-                build_filter_suffix(None, Some("total"), None),
+                build_filter_suffix(None, Some("total"), None, None, None),
                 " WHERE name LIKE 'total%'"
             );
         }
 
         #[test]
         fn test_build_filter_suffix_limit_only() {
-            assert_eq!(build_filter_suffix(None, None, Some(5)), " LIMIT 5");
+            assert_eq!(
+                build_filter_suffix(None, None, Some(5), None, None),
+                " LIMIT 5"
+            );
         }
 
         #[test]
         fn test_build_filter_suffix_all_three() {
             assert_eq!(
-                build_filter_suffix(Some("%x%"), Some("a"), Some(10)),
+                build_filter_suffix(Some("%x%"), Some("a"), Some(10), None, None),
                 " WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 10"
             );
         }
 
         #[test]
         fn test_build_filter_suffix_none() {
-            assert_eq!(build_filter_suffix(None, None, None), "");
+            assert_eq!(build_filter_suffix(None, None, None, None, None), "");
         }
 
         #[test]
         fn test_build_filter_suffix_reescapes_quotes() {
             assert_eq!(
-                build_filter_suffix(Some("O'Brien"), None, None),
+                build_filter_suffix(Some("O'Brien"), None, None, None, None),
                 " WHERE name ILIKE 'O''Brien'"
+            );
+        }
+
+        #[test]
+        fn test_build_filter_suffix_in_schema() {
+            assert_eq!(
+                build_filter_suffix(None, None, None, Some("main"), None),
+                " WHERE schema_name = 'main'"
+            );
+        }
+
+        #[test]
+        fn test_build_filter_suffix_in_database() {
+            assert_eq!(
+                build_filter_suffix(None, None, None, None, Some("memory")),
+                " WHERE database_name = 'memory'"
+            );
+        }
+
+        #[test]
+        fn test_build_filter_suffix_like_and_schema() {
+            assert_eq!(
+                build_filter_suffix(Some("%x%"), None, None, Some("main"), None),
+                " WHERE name ILIKE '%x%' AND schema_name = 'main'"
             );
         }
 
@@ -2093,14 +2371,74 @@ mod tests {
         }
 
         #[test]
-        fn test_rewrite_show_views_in_error() {
+        fn test_rewrite_show_views_in_requires_schema_or_database() {
             let result = rewrite_ddl("SHOW SEMANTIC VIEWS IN some_view");
             assert!(
                 result.is_err(),
-                "IN should be rejected for SHOW SEMANTIC VIEWS"
+                "IN without SCHEMA/DATABASE should be rejected for SHOW SEMANTIC VIEWS"
             );
             let err = result.unwrap_err();
-            assert!(err.contains("IN is not valid"), "got: {err}");
+            assert!(
+                err.contains("SHOW SEMANTIC VIEWS requires IN SCHEMA"),
+                "got: {err}"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_views_in_schema() {
+            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS IN SCHEMA main").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM list_semantic_views() WHERE schema_name = 'main'"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_views_in_database() {
+            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS IN DATABASE memory").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM list_semantic_views() WHERE database_name = 'memory'"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_terse() {
+            let sql = rewrite_ddl("SHOW TERSE SEMANTIC VIEWS").unwrap();
+            assert_eq!(sql, "SELECT * FROM list_terse_semantic_views()");
+        }
+
+        #[test]
+        fn test_rewrite_show_terse_like() {
+            let sql = rewrite_ddl("SHOW TERSE SEMANTIC VIEWS LIKE '%prod%'").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM list_terse_semantic_views() WHERE name ILIKE '%prod%'"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_terse_in_schema() {
+            let sql = rewrite_ddl("SHOW TERSE SEMANTIC VIEWS IN SCHEMA main").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM list_terse_semantic_views() WHERE schema_name = 'main'"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_views_in_schema_like() {
+            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS LIKE '%x%' IN SCHEMA main").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM list_semantic_views() WHERE name ILIKE '%x%' AND schema_name = 'main'"
+            );
+        }
+
+        #[test]
+        fn test_rewrite_show_columns_in_semantic_view() {
+            let sql = rewrite_ddl("SHOW COLUMNS IN SEMANTIC VIEW sales").unwrap();
+            assert_eq!(sql, "SELECT * FROM show_columns_in_semantic_view('sales')");
         }
 
         #[test]
@@ -2119,5 +2457,191 @@ mod tests {
             let sql = rewrite_ddl("SHOW SEMANTIC VIEWS").unwrap();
             assert_eq!(sql, "SELECT * FROM list_semantic_views()");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 43: View-level COMMENT tests
+    // -----------------------------------------------------------------------
+
+    mod phase43_view_comment_tests {
+        use crate::parse::validate_and_rewrite;
+
+        #[test]
+        fn test_view_comment_parsed() {
+            let result = validate_and_rewrite(
+                "CREATE SEMANTIC VIEW my_view COMMENT = 'My view' AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.rev AS SUM(o.amount))"
+            ).unwrap().unwrap();
+            // The JSON should contain the comment
+            assert!(
+                result.contains("My view"),
+                "Generated SQL should contain the comment value: {result}"
+            );
+        }
+
+        #[test]
+        fn test_view_without_comment() {
+            let result = validate_and_rewrite(
+                "CREATE SEMANTIC VIEW my_view AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.rev AS SUM(o.amount))"
+            ).unwrap().unwrap();
+            assert!(
+                result.contains("create_semantic_view_from_json"),
+                "Should use correct function: {result}"
+            );
+        }
+
+        #[test]
+        fn test_view_comment_escaped_quotes() {
+            let result = validate_and_rewrite(
+                "CREATE SEMANTIC VIEW my_view COMMENT = 'It''s great' AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.rev AS SUM(o.amount))"
+            ).unwrap().unwrap();
+            assert!(
+                result.contains("It''s great") || result.contains("It's great"),
+                "Generated SQL should contain the escaped comment: {result}"
+            );
+        }
+
+        #[test]
+        fn test_view_comment_with_create_or_replace() {
+            let result = validate_and_rewrite(
+                "CREATE OR REPLACE SEMANTIC VIEW my_view COMMENT = 'Updated' AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.rev AS SUM(o.amount))"
+            ).unwrap().unwrap();
+            assert!(
+                result.contains("Updated"),
+                "Should contain comment: {result}"
+            );
+            assert!(
+                result.contains("create_or_replace"),
+                "Should use OR REPLACE function: {result}"
+            );
+        }
+    }
+
+    // ===================================================================
+    // ALTER SET/UNSET COMMENT tests (Phase 45)
+    // ===================================================================
+
+    #[test]
+    fn test_detect_ddl_kind_alter_set_comment() {
+        assert_eq!(
+            detect_ddl_kind("ALTER SEMANTIC VIEW v SET COMMENT = 'test'"),
+            Some(DdlKind::Alter)
+        );
+    }
+
+    #[test]
+    fn test_detect_ddl_kind_alter_if_exists_set_comment() {
+        assert_eq!(
+            detect_ddl_kind("ALTER SEMANTIC VIEW IF EXISTS v SET COMMENT = 'test'"),
+            Some(DdlKind::AlterIfExists)
+        );
+    }
+
+    #[test]
+    fn test_detect_ddl_kind_alter_unset_comment() {
+        assert_eq!(
+            detect_ddl_kind("ALTER SEMANTIC VIEW v UNSET COMMENT"),
+            Some(DdlKind::Alter)
+        );
+    }
+
+    #[test]
+    fn test_detect_ddl_kind_alter_if_exists_unset_comment() {
+        assert_eq!(
+            detect_ddl_kind("ALTER SEMANTIC VIEW IF EXISTS v UNSET COMMENT"),
+            Some(DdlKind::AlterIfExists)
+        );
+    }
+
+    #[test]
+    fn test_detect_ddl_kind_alter_rename_backwards_compat() {
+        assert_eq!(
+            detect_ddl_kind("ALTER SEMANTIC VIEW v RENAME TO w"),
+            Some(DdlKind::Alter)
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_alter_set_comment() {
+        let result = validate_and_rewrite("ALTER SEMANTIC VIEW v SET COMMENT = 'hello'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            "SELECT * FROM alter_semantic_view_set_comment('v', 'hello')"
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_alter_unset_comment() {
+        let result = validate_and_rewrite("ALTER SEMANTIC VIEW v UNSET COMMENT")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            "SELECT * FROM alter_semantic_view_unset_comment('v')"
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_alter_if_exists_set_comment() {
+        let result = validate_and_rewrite("ALTER SEMANTIC VIEW IF EXISTS v SET COMMENT = 'hello'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            "SELECT * FROM alter_semantic_view_set_comment_if_exists('v', 'hello')"
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_alter_if_exists_unset_comment() {
+        let result = validate_and_rewrite("ALTER SEMANTIC VIEW IF EXISTS v UNSET COMMENT")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            "SELECT * FROM alter_semantic_view_unset_comment_if_exists('v')"
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_alter_rename_unchanged() {
+        let result = validate_and_rewrite("ALTER SEMANTIC VIEW v RENAME TO w")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, "SELECT * FROM alter_semantic_view_rename('v', 'w')");
+    }
+
+    #[test]
+    fn test_validate_rewrite_alter_unsupported_operation() {
+        let err = validate_and_rewrite("ALTER SEMANTIC VIEW v TRUNCATE").unwrap_err();
+        assert!(
+            err.message
+                .contains("RENAME TO, SET COMMENT, UNSET COMMENT"),
+            "Error should list supported ops, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_alter_set_comment_escaped_quotes() {
+        let result = validate_and_rewrite("ALTER SEMANTIC VIEW v SET COMMENT = 'it''s a test'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result,
+            "SELECT * FROM alter_semantic_view_set_comment('v', 'it''s a test')"
+        );
+    }
+
+    #[test]
+    fn test_validate_rewrite_alter_missing_operation() {
+        let err = validate_and_rewrite("ALTER SEMANTIC VIEW v").unwrap_err();
+        assert!(
+            err.message
+                .contains("RENAME TO, SET COMMENT, UNSET COMMENT"),
+            "Error should list supported ops, got: {}",
+            err.message
+        );
     }
 }

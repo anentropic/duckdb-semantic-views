@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::{Cardinality, SemanticViewDefinition};
 
@@ -59,6 +59,20 @@ pub(super) fn check_fan_traps(
 
     // For each metric + dimension pair, check for fan-out on the join path.
     for met in resolved_mets {
+        // Phase 47: Skip fan trap check for semi-additive metrics.
+        // The ROW_NUMBER CTE inherently handles fan-out by selecting one row
+        // per partition, making fan trap detection unnecessary.
+        if !met.non_additive_by.is_empty() {
+            continue;
+        }
+
+        // Phase 48: Skip fan trap check for window function metrics.
+        // Window metrics operate on pre-aggregated CTE results, so fan-out
+        // is handled by the inner aggregation step.
+        if met.is_window() {
+            continue;
+        }
+
         // Get source tables for this metric
         let met_tables: Vec<String> = if let Some(ref st) = met.source_table {
             vec![st.to_ascii_lowercase()]
@@ -128,6 +142,75 @@ pub(crate) fn ancestors_to_root(node: &str, parent_map: &HashMap<String, String>
         current = parent.clone();
     }
     chain
+}
+
+/// Validate that all tables referenced by a fact query are on the same
+/// root-to-leaf path in the relationship tree.
+///
+/// Snowflake constraint: "all facts and dimensions used in the query must be
+/// defined in the same logical table." For our multi-table model, this means
+/// all `source_table` aliases must be reachable through a single linear path
+/// (no fan-out — each pair must have an ancestor/descendant relationship).
+///
+/// Skips validation when there is only one unique table (trivially valid)
+/// or when there are no joins (single-table view).
+#[allow(clippy::result_large_err)]
+pub(super) fn validate_fact_table_path(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    fact_tables: &[String],
+    dim_tables: &[String],
+) -> Result<(), ExpandError> {
+    if def.joins.is_empty() {
+        return Ok(());
+    }
+
+    // Collect all unique table aliases (case-insensitive)
+    let mut all_tables: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for t in fact_tables.iter().chain(dim_tables.iter()) {
+        let lower = t.to_ascii_lowercase();
+        if seen.insert(lower.clone()) {
+            all_tables.push(lower);
+        }
+    }
+
+    if all_tables.len() <= 1 {
+        return Ok(()); // Single table or empty — trivially valid
+    }
+
+    let Ok(graph) = crate::graph::RelationshipGraph::from_definition(def) else {
+        return Ok(()); // Graph was validated at define time
+    };
+
+    // Build parent map from reverse adjacency
+    let mut parent_map: HashMap<String, String> = HashMap::new();
+    for (child, parents) in &graph.reverse {
+        if let Some(parent) = parents.first() {
+            parent_map.insert(child.clone(), parent.clone());
+        }
+    }
+
+    // For each pair, verify one is an ancestor of the other
+    for i in 0..all_tables.len() {
+        for j in (i + 1)..all_tables.len() {
+            let a = &all_tables[i];
+            let b = &all_tables[j];
+            let a_ancestors = ancestors_to_root(a, &parent_map);
+            let b_ancestors = ancestors_to_root(b, &parent_map);
+            let a_is_ancestor_of_b = b_ancestors.iter().any(|x| x == a);
+            let b_is_ancestor_of_a = a_ancestors.iter().any(|x| x == b);
+            if !a_is_ancestor_of_b && !b_is_ancestor_of_a {
+                return Err(ExpandError::FactPathViolation {
+                    view_name: view_name.to_string(),
+                    table_a: a.clone(),
+                    table_b: b.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Build the path from an ancestor down to a target node, given the target's ancestor chain.
@@ -233,4 +316,281 @@ fn check_path_down(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expand::test_helpers::{minimal_def, orders_view, TestFixtureExt};
+    use crate::model::{Cardinality, NullsOrder, SortOrder, WindowSpec};
+
+    #[test]
+    fn test_ancestors_to_root_at_root() {
+        let parent_map: HashMap<String, String> = HashMap::new();
+        let result = ancestors_to_root("root", &parent_map);
+        assert_eq!(result, vec!["root"]);
+    }
+
+    #[test]
+    fn test_ancestors_to_root_single_parent() {
+        let mut parent_map: HashMap<String, String> = HashMap::new();
+        parent_map.insert("child".to_string(), "root".to_string());
+        let result = ancestors_to_root("child", &parent_map);
+        assert_eq!(result, vec!["child", "root"]);
+    }
+
+    #[test]
+    fn test_ancestors_to_root_multi_level() {
+        let mut parent_map: HashMap<String, String> = HashMap::new();
+        parent_map.insert("leaf".to_string(), "mid".to_string());
+        parent_map.insert("mid".to_string(), "root".to_string());
+        let result = ancestors_to_root("leaf", &parent_map);
+        assert_eq!(result, vec!["leaf", "mid", "root"]);
+    }
+
+    #[test]
+    fn test_check_fan_traps_no_joins_ok() {
+        let def = orders_view();
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        assert!(result.is_ok(), "No joins should be OK");
+    }
+
+    #[test]
+    fn test_check_fan_traps_many_to_one_safe_direction() {
+        // orders (root) -> customers via FK. Metric on orders, dim on customers.
+        // This is ManyToOne from orders->customers (orders has FK to customers).
+        // Walking from orders metric to customers dim goes forward on the FK edge = safe.
+        let def = minimal_def("orders", "cust_name", "name", "total", "sum(amount)")
+            .with_table("orders", "orders", &["id"])
+            .with_table("customers", "customers", &["id"])
+            .with_dimension("cust_name", "name", Some("customers"))
+            .with_metric("total", "sum(amount)", Some("orders"))
+            .with_pkfk_join(
+                "orders_customers",
+                "orders",
+                "customers",
+                &["customer_id"],
+                &["id"],
+            );
+        // Remove the initial minimal_def dims/metrics (they have no source_table)
+        let mut def = def;
+        def.dimensions
+            .retain(|d| d.source_table.is_some() || d.name == "cust_name");
+        def.metrics
+            .retain(|m| m.source_table.is_some() || m.name == "total");
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        assert!(
+            result.is_ok(),
+            "ManyToOne forward direction should be safe, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_fan_traps_many_to_one_fan_out() {
+        // orders (root) -> line_items. line_items has FK to orders (ManyToOne from line_items->orders).
+        // Metric on orders, dimension on line_items.
+        // Walking from orders to line_items reverses the ManyToOne edge = fan-out.
+        let def = minimal_def("orders", "item_name", "name", "total", "sum(amount)")
+            .with_table("orders", "orders", &["id"])
+            .with_table("line_items", "line_items", &["id"])
+            .with_dimension("item_name", "name", Some("line_items"))
+            .with_metric("total", "sum(amount)", Some("orders"))
+            .with_pkfk_join(
+                "items_to_orders",
+                "line_items",
+                "orders",
+                &["order_id"],
+                &["id"],
+            );
+        let mut def = def;
+        def.dimensions.retain(|d| d.source_table.is_some());
+        def.metrics.retain(|m| m.source_table.is_some());
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        assert!(result.is_err(), "Should detect fan-out");
+        if let Err(ExpandError::FanTrap { metric_name, .. }) = &result {
+            assert_eq!(metric_name, "total");
+        } else {
+            panic!("Expected FanTrap error, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_check_fan_traps_one_to_one_safe() {
+        // Same fan-out scenario as above, but with OneToOne cardinality.
+        let def = minimal_def("orders", "item_name", "name", "total", "sum(amount)")
+            .with_table("orders", "orders", &["id"])
+            .with_table("line_items", "line_items", &["id"])
+            .with_dimension("item_name", "name", Some("line_items"))
+            .with_metric("total", "sum(amount)", Some("orders"))
+            .with_pkfk_join(
+                "items_to_orders",
+                "line_items",
+                "orders",
+                &["order_id"],
+                &["id"],
+            );
+        let mut def = def;
+        def.dimensions.retain(|d| d.source_table.is_some());
+        def.metrics.retain(|m| m.source_table.is_some());
+        // Mutate the join to OneToOne
+        def.joins.last_mut().unwrap().cardinality = Cardinality::OneToOne;
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        assert!(
+            result.is_ok(),
+            "OneToOne should be safe regardless of direction, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_fan_traps_skips_semi_additive() {
+        // Same fan-out scenario, but the metric has non_additive_by set.
+        let def = minimal_def("orders", "item_name", "name", "total", "sum(amount)")
+            .with_table("orders", "orders", &["id"])
+            .with_table("line_items", "line_items", &["id"])
+            .with_dimension("item_name", "name", Some("line_items"))
+            .with_metric("total_sourced", "sum(amount)", Some("orders"))
+            .with_non_additive_by(
+                "total_sourced",
+                &[("item_name", SortOrder::Desc, NullsOrder::First)],
+            )
+            .with_pkfk_join(
+                "items_to_orders",
+                "line_items",
+                "orders",
+                &["order_id"],
+                &["id"],
+            );
+        let mut def = def;
+        def.dimensions.retain(|d| d.source_table.is_some());
+        def.metrics.retain(|m| m.source_table.is_some());
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        assert!(
+            result.is_ok(),
+            "Semi-additive metrics should skip fan trap check, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_fan_traps_skips_window() {
+        // Same fan-out scenario, but the metric has window_spec set.
+        let def = minimal_def("orders", "item_name", "name", "total", "sum(amount)")
+            .with_table("orders", "orders", &["id"])
+            .with_table("line_items", "line_items", &["id"])
+            .with_dimension("item_name", "name", Some("line_items"))
+            .with_metric("total_sourced", "sum(amount)", Some("orders"))
+            .with_window_spec(
+                "total_sourced",
+                WindowSpec {
+                    window_function: "AVG".to_string(),
+                    inner_metric: "total_sourced".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_pkfk_join(
+                "items_to_orders",
+                "line_items",
+                "orders",
+                &["order_id"],
+                &["id"],
+            );
+        let mut def = def;
+        def.dimensions.retain(|d| d.source_table.is_some());
+        def.metrics.retain(|m| m.source_table.is_some());
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        assert!(
+            result.is_ok(),
+            "Window metrics should skip fan trap check, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_fact_table_path_single_table_ok() {
+        let def = orders_view().with_table("orders", "orders", &["id"]);
+        let fact_tables = vec!["orders".to_string()];
+        let dim_tables = vec!["orders".to_string()];
+        let result = validate_fact_table_path("test", &def, &fact_tables, &dim_tables);
+        assert!(result.is_ok(), "Single table should be OK");
+    }
+
+    #[test]
+    fn test_validate_fact_table_path_ancestor_descendant_ok() {
+        let def = orders_view()
+            .with_table("orders", "orders", &["id"])
+            .with_table("customers", "customers", &["id"])
+            .with_pkfk_join(
+                "orders_customers",
+                "orders",
+                "customers",
+                &["customer_id"],
+                &["id"],
+            );
+        let fact_tables = vec!["orders".to_string()];
+        let dim_tables = vec!["customers".to_string()];
+        let result = validate_fact_table_path("test", &def, &fact_tables, &dim_tables);
+        assert!(
+            result.is_ok(),
+            "Ancestor-descendant should be OK, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_fact_table_path_divergent_tables_err() {
+        // orders (root) -> customers and orders -> products (siblings)
+        let def = orders_view()
+            .with_table("orders", "orders", &["id"])
+            .with_table("customers", "customers", &["id"])
+            .with_table("products", "products", &["id"])
+            .with_pkfk_join(
+                "orders_customers",
+                "orders",
+                "customers",
+                &["customer_id"],
+                &["id"],
+            )
+            .with_pkfk_join(
+                "orders_products",
+                "orders",
+                "products",
+                &["product_id"],
+                &["id"],
+            );
+        // customers and products are siblings (neither ancestor of the other)
+        let fact_tables = vec!["customers".to_string()];
+        let dim_tables = vec!["products".to_string()];
+        let result = validate_fact_table_path("test", &def, &fact_tables, &dim_tables);
+        assert!(result.is_err(), "Divergent tables should fail");
+        if let Err(ExpandError::FactPathViolation {
+            table_a, table_b, ..
+        }) = &result
+        {
+            assert!(
+                (table_a == "customers" && table_b == "products")
+                    || (table_a == "products" && table_b == "customers"),
+                "Should identify the divergent tables"
+            );
+        } else {
+            panic!("Expected FactPathViolation, got: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_fact_table_path_no_joins_ok() {
+        let def = orders_view();
+        let fact_tables = vec!["orders".to_string()];
+        let dim_tables = vec!["customers".to_string()];
+        let result = validate_fact_table_path("test", &def, &fact_tables, &dim_tables);
+        assert!(result.is_ok(), "No joins should be OK");
+    }
 }

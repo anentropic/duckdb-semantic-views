@@ -22,6 +22,8 @@ Syntax
        <alias> AS <table_name>
            [ PRIMARY KEY ( <column> [, <column> ...] ) ]
            [ UNIQUE ( <column> [, <column> ...] ) ]
+           [ COMMENT = '<text>' ]
+           [ WITH SYNONYMS = ( '<synonym>' [, '<synonym>' ...] ) ]
        [, ... ]
    )
    [ RELATIONSHIPS (
@@ -30,16 +32,37 @@ Syntax
        [, ... ]
    ) ]
    [ FACTS (
-       <alias>.<fact_name> AS <row_level_expression>
+       [ PRIVATE ] <alias>.<fact_name> AS <row_level_expression>
+           [ COMMENT = '<text>' ]
+           [ WITH SYNONYMS = ( '<synonym>' [, '<synonym>' ...] ) ]
        [, ... ]
    ) ]
    [ DIMENSIONS (
        <alias>.<dim_name> AS <expression>
+           [ COMMENT = '<text>' ]
+           [ WITH SYNONYMS = ( '<synonym>' [, '<synonym>' ...] ) ]
        [, ... ]
    ) ]
    [ METRICS (
-       <alias>.<metric_name> [ USING ( <rel_name> [, <rel_name> ...] ) ] AS <aggregate_expression>
-       [, <metric_name> AS <expression> ... ]
+       [ PRIVATE ] <alias>.<metric_name>
+           [ USING ( <rel_name> [, <rel_name> ...] ) ]
+           [ NON ADDITIVE BY ( <dim_name> [ ASC | DESC ] [ NULLS FIRST | NULLS LAST ]
+               [, <dim_name> ... ] ) ]
+           AS <aggregate_expression>
+           [ COMMENT = '<text>' ]
+           [ WITH SYNONYMS = ( '<synonym>' [, '<synonym>' ...] ) ]
+       [, [ PRIVATE ] <metric_name>
+           [ NON ADDITIVE BY ( ... ) ]
+           AS <expression> ... ]
+       [, [ PRIVATE ] <alias>.<metric_name> AS
+           <window_func>( <inner_metric> [, <extra_arg> ...] )
+               OVER ( [ PARTITION BY EXCLUDING <dim_name> [, <dim_name> ...] ]
+                      | [ PARTITION BY <dim_name> [, <dim_name> ...] ]
+                      [ ORDER BY <dim_name> [ ASC | DESC ] [ NULLS FIRST | NULLS LAST ]
+                          [, <dim_name> ...] ]
+                      [ <frame_clause> ] )
+           [ COMMENT = '<text>' ]
+           [ WITH SYNONYMS = ( '<synonym>' [, '<synonym>' ...] ) ] ]
    ) ]
 
 
@@ -76,8 +99,8 @@ Declares the physical tables available to the semantic view. Each entry assigns 
 .. code-block:: sql
 
    TABLES (
-       o AS orders    PRIMARY KEY (id),
-       c AS customers PRIMARY KEY (id)
+       o AS orders    PRIMARY KEY (id) COMMENT = 'Order transactions',
+       c AS customers PRIMARY KEY (id) WITH SYNONYMS = ('clients', 'buyers')
    )
 
 **Parameters:**
@@ -85,6 +108,8 @@ Declares the physical tables available to the semantic view. Each entry assigns 
 - ``<alias>``, a short name used to reference this table in all other clauses.
 - ``<table_name>``, the physical table name. Supports catalog-qualified names (``catalog.schema.table``).
 - ``PRIMARY KEY (<column>, ...)``, optional. One or more columns forming the table's primary key. Used for JOIN synthesis and cardinality inference. This is semantic metadata, not a DuckDB constraint. Omit for fact tables that do not need to be join targets.
+- ``COMMENT = '<text>'``, optional. A human-readable description of the table.
+- ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability. Must come after COMMENT if both are present.
 
 **Optional: UNIQUE constraints:**
 
@@ -148,14 +173,20 @@ Declares named row-level expressions. Facts are inlined into metric expressions 
 .. code-block:: sql
 
    FACTS (
-       li.net_price  AS li.extended_price * (1 - li.discount),
+       li.net_price  AS li.extended_price * (1 - li.discount)
+           COMMENT = 'Price after discount',
+       PRIVATE li.internal_cost AS li.unit_cost * li.quantity,
        li.tax_amount AS li.net_price * li.tax_rate
+           WITH SYNONYMS = ('tax', 'vat')
    )
 
 **Parameters:**
 
+- ``PRIVATE``, optional. When present, the fact cannot be queried directly via ``facts := [...]`` but can still be referenced in metric expressions.
 - ``<alias>.<fact_name>``, the table alias and fact name. Facts are scoped to a single table.
 - ``<row_level_expression>``, any SQL expression that operates on individual rows. Must not contain aggregate functions.
+- ``COMMENT = '<text>'``, optional. A human-readable description.
+- ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
 
 **Fact chaining:**
 
@@ -177,8 +208,8 @@ Declares named grouping expressions available for queries.
 .. code-block:: sql
 
    DIMENSIONS (
-       o.region   AS o.region,
-       o.category AS o.category,
+       o.region   AS o.region COMMENT = 'Sales region',
+       o.category AS o.category WITH SYNONYMS = ('product_category'),
        o.month    AS date_trunc('month', o.ordered_at)
    )
 
@@ -186,6 +217,8 @@ Declares named grouping expressions available for queries.
 
 - ``<alias>.<dim_name>``, the table alias and dimension name. The alias indicates which table the dimension comes from (used for join dependency resolution).
 - ``<expression>``, any SQL expression. Can be a simple column reference (``o.region``) or a computed expression (``date_trunc('month', o.ordered_at)``).
+- ``COMMENT = '<text>'``, optional. A human-readable description.
+- ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
 
 
 .. _ref-create-metrics:
@@ -193,15 +226,15 @@ Declares named grouping expressions available for queries.
 METRICS
 -------
 
-Declares named aggregation expressions and derived metrics.
+Declares named aggregation expressions, derived metrics, semi-additive metrics, and window metrics.
 
 **Base metrics** (with table alias, containing aggregate functions):
 
 .. code-block:: sql
 
    METRICS (
-       o.revenue     AS SUM(o.amount),
-       o.order_count AS COUNT(*)
+       o.revenue     AS SUM(o.amount) COMMENT = 'Total revenue',
+       o.order_count AS COUNT(*) WITH SYNONYMS = ('num_orders')
    )
 
 **Derived metrics** (no table alias, referencing other metric names):
@@ -224,19 +257,85 @@ Declares named aggregation expressions and derived metrics.
        f.arrivals   USING (arr_airport) AS COUNT(*)
    )
 
+**PRIVATE metrics:**
+
+.. code-block:: sql
+
+   METRICS (
+       PRIVATE o.raw_total AS SUM(o.amount),
+       net_total AS raw_total * 0.9
+   )
+
+**Semi-additive metrics** (with ``NON ADDITIVE BY``):
+
+.. code-block:: sql
+
+   METRICS (
+       a.total_balance AS SUM(a.balance)
+           NON ADDITIVE BY (report_date DESC NULLS FIRST)
+   )
+
+When a query does not include the non-additive dimension, the extension generates a CTE with ``ROW_NUMBER`` to select one snapshot row per group before aggregating. When the non-additive dimension is included in the query, the metric behaves as a standard additive metric.
+
+See :ref:`howto-semi-additive` for details.
+
+**Window metrics** (with ``OVER`` clause):
+
+Window metrics wrap another metric in a SQL window function. The ``OVER`` clause supports two mutually exclusive partitioning modes:
+
+``PARTITION BY EXCLUDING`` computes the partition set dynamically at query time as "all queried dimensions minus the excluded ones." The partition changes depending on which dimensions are requested:
+
+.. code-block:: sql
+
+   METRICS (
+       s.total_qty AS SUM(s.quantity),
+       s.rolling_avg AS
+           AVG(total_qty) OVER (PARTITION BY EXCLUDING date
+               ORDER BY date NULLS LAST
+               RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW)
+   )
+
+``PARTITION BY`` (without ``EXCLUDING``) specifies an explicit, fixed set of partition dimensions. The partition set is always exactly the listed dimensions, regardless of what other dimensions are queried:
+
+.. code-block:: sql
+
+   METRICS (
+       s.total_qty AS SUM(s.quantity),
+       s.store_avg AS
+           AVG(total_qty) OVER (PARTITION BY store ORDER BY date NULLS LAST)
+   )
+
+See :ref:`howto-window-metrics` for details on both modes.
+
+.. warning::
+
+   ``NON ADDITIVE BY`` and ``OVER`` cannot be combined on the same metric. A metric is either semi-additive or a window metric, not both.
+
 **Parameters:**
 
+- ``PRIVATE``, optional. When present, the metric cannot be queried directly but can be referenced by derived metric expressions.
 - ``<alias>.<metric_name>``, table alias and metric name for base metrics.
 - ``<metric_name>``, name only (no alias) for derived metrics.
 - ``USING (<rel_name>, ...)``, optional. Specifies which named relationship(s) this metric traverses. Used to disambiguate when a dimension comes from a role-playing table.
+- ``NON ADDITIVE BY (<dim_name> [ASC|DESC] [NULLS FIRST|NULLS LAST], ...)``, optional. Declares the metric as semi-additive, specifying which dimensions trigger snapshot selection.
 - ``<aggregate_expression>``, for base metrics: any expression containing aggregate functions.
 - ``<expression>``, for derived metrics: an expression referencing other metric names (no aggregate functions).
+- ``<window_func>(<inner_metric>, ...) OVER (...)``, for window metrics: wraps another metric in a window function.
+- ``COMMENT = '<text>'``, optional. A human-readable description.
+- ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
 
 **Validation rules:**
 
 - Derived metrics must not contain aggregate functions.
 - Circular derived metric references are rejected.
 - ``USING`` relationship names must match declared relationships.
+- ``NON ADDITIVE BY`` dimension names must match declared dimensions.
+- Window metric inner metric name must match a declared metric.
+- Window metric ``EXCLUDING`` dimension names must match declared dimensions.
+- Window metric ``PARTITION BY`` dimension names must match declared dimensions.
+- Window metric ``ORDER BY`` dimension names must match declared dimensions.
+- ``NON ADDITIVE BY`` and ``OVER`` cannot both appear on the same metric.
+- ``OVER`` cannot appear on a derived metric (one without a table alias). Only qualified metrics (``alias.name``) can use ``OVER``.
 
 
 .. _ref-create-examples:
@@ -308,4 +407,79 @@ Examples
        f.departures    USING (dep_airport) AS COUNT(*),
        f.arrivals      USING (arr_airport) AS COUNT(*),
        total_flights   AS departures + arrivals
+   );
+
+**With metadata annotations:**
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW sales AS
+   TABLES (
+       li AS line_items PRIMARY KEY (id) COMMENT = 'Transaction line items'
+   )
+   FACTS (
+       li.net_price AS li.extended_price * (1 - li.discount)
+           COMMENT = 'Price after discount' WITH SYNONYMS = ('discounted_price')
+   )
+   DIMENSIONS (
+       li.region AS li.region COMMENT = 'Sales territory'
+   )
+   METRICS (
+       li.total_net AS SUM(li.net_price) COMMENT = 'Net revenue'
+   );
+
+**Semi-additive metric:**
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW account_metrics AS
+   TABLES (
+       a AS accounts PRIMARY KEY (id)
+   )
+   DIMENSIONS (
+       a.customer_id AS a.customer_id,
+       a.report_date AS a.report_date
+   )
+   METRICS (
+       a.total_balance AS SUM(a.balance)
+           NON ADDITIVE BY (report_date DESC NULLS FIRST)
+   );
+
+**Window metric with PARTITION BY EXCLUDING:**
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW store_analytics AS
+   TABLES (
+       s AS sales PRIMARY KEY (id)
+   )
+   DIMENSIONS (
+       s.store AS s.store,
+       s.date  AS s.sale_date
+   )
+   METRICS (
+       s.total_qty AS SUM(s.quantity),
+       s.rolling_avg AS
+           AVG(total_qty) OVER (PARTITION BY EXCLUDING date
+               ORDER BY date NULLS LAST)
+   );
+
+**Window metric with explicit PARTITION BY:**
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW store_analytics AS
+   TABLES (
+       s AS sales PRIMARY KEY (id)
+   )
+   DIMENSIONS (
+       s.store  AS s.store,
+       s.date   AS s.sale_date,
+       s.region AS s.region
+   )
+   METRICS (
+       s.total_qty AS SUM(s.quantity),
+       s.store_avg AS
+           AVG(total_qty) OVER (PARTITION BY store
+               ORDER BY date NULLS LAST)
    );

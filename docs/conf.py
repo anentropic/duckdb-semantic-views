@@ -81,6 +81,31 @@ html_theme_options = {
                     "url": "how-to/data-sources",
                     "summary": "Connect CSV, Parquet, Iceberg, and database tables to semantic views",
                 },
+                {
+                    "title": "Metadata Annotations",
+                    "url": "how-to/metadata-annotations",
+                    "summary": "Add comments, synonyms, and access modifiers to view definitions",
+                },
+                {
+                    "title": "Semi-Additive Metrics",
+                    "url": "how-to/semi-additive-metrics",
+                    "summary": "Define snapshot metrics with NON ADDITIVE BY for balances and inventory",
+                },
+                {
+                    "title": "Window Metrics",
+                    "url": "how-to/window-metrics",
+                    "summary": "Define rolling averages, lag comparisons, and rankings with OVER clauses",
+                },
+                {
+                    "title": "Wildcard Selection",
+                    "url": "how-to/wildcard-selection",
+                    "summary": "Select all items for a table alias using alias.* patterns",
+                },
+                {
+                    "title": "Query Facts",
+                    "url": "how-to/query-facts",
+                    "summary": "Query facts directly as row-level columns without aggregation",
+                },
             ],
         },
         {

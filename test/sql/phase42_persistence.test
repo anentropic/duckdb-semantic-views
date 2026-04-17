@@ -59,10 +59,10 @@ SELECT name FROM list_semantic_views();
 persist_roundtrip
 
 # Verify SHOW SEMANTIC DIMENSIONS works after restart
-query TTTTTT
+query TTTTTTTT
 SHOW SEMANTIC DIMENSIONS IN persist_roundtrip;
 ----
-memory	main	persist_roundtrip	events	event_type	(empty)
+memory	main	persist_roundtrip	events	event_type	(empty)	[]	(empty)
 
 # Drop the view (exercises persist_drop with parameterized DELETE)
 statement ok

@@ -201,3 +201,221 @@ pub(super) fn resolve_joins_pkfk(
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expand::test_helpers::{orders_view, TestFixtureExt};
+    use crate::model::{Cardinality, Join, TableRef};
+
+    #[test]
+    fn test_synthesize_on_clause_single_column() {
+        let join = Join {
+            table: "customers".to_string(),
+            from_alias: "orders".to_string(),
+            fk_columns: vec!["customer_id".to_string()],
+            ref_columns: vec![],
+            ..Default::default()
+        };
+        let tables = vec![TableRef {
+            alias: "customers".to_string(),
+            table: "customers".to_string(),
+            pk_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        let result = synthesize_on_clause(&join, &tables);
+        assert_eq!(result, r#""orders"."customer_id" = "customers"."id""#);
+    }
+
+    #[test]
+    fn test_synthesize_on_clause_composite_keys() {
+        let join = Join {
+            table: "target".to_string(),
+            from_alias: "source".to_string(),
+            fk_columns: vec!["a".to_string(), "b".to_string()],
+            ref_columns: vec![],
+            ..Default::default()
+        };
+        let tables = vec![TableRef {
+            alias: "target".to_string(),
+            table: "target".to_string(),
+            pk_columns: vec!["x".to_string(), "y".to_string()],
+            ..Default::default()
+        }];
+        let result = synthesize_on_clause(&join, &tables);
+        assert!(
+            result.contains(r#"= "target"."x""#),
+            "Should contain target.x"
+        );
+        assert!(
+            result.contains("AND"),
+            "Should contain AND for composite keys"
+        );
+        assert!(
+            result.contains(r#"= "target"."y""#),
+            "Should contain target.y"
+        );
+    }
+
+    #[test]
+    fn test_synthesize_on_clause_empty_fk_columns() {
+        let join = Join {
+            table: "customers".to_string(),
+            from_alias: "orders".to_string(),
+            fk_columns: vec![],
+            ref_columns: vec![],
+            ..Default::default()
+        };
+        let tables = vec![TableRef {
+            alias: "customers".to_string(),
+            table: "customers".to_string(),
+            pk_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        let result = synthesize_on_clause(&join, &tables);
+        assert_eq!(
+            result, "",
+            "Empty fk_columns should produce empty ON clause"
+        );
+    }
+
+    #[test]
+    fn test_synthesize_on_clause_scoped_uses_to_alias() {
+        let join = Join {
+            table: "airports".to_string(),
+            from_alias: "flights".to_string(),
+            fk_columns: vec!["dep_airport_code".to_string()],
+            ref_columns: vec!["code".to_string()],
+            ..Default::default()
+        };
+        let tables = vec![TableRef {
+            alias: "airports".to_string(),
+            table: "airports".to_string(),
+            pk_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        let result = synthesize_on_clause_scoped(&join, &tables, "airports__dep_airport");
+        assert!(
+            result.contains(r#""airports__dep_airport""#),
+            "Should use scoped alias, got: {result}"
+        );
+        assert!(
+            !result.contains(r#""airports"."#),
+            "Should not use bare table alias on right side"
+        );
+    }
+
+    #[test]
+    fn test_synthesize_on_clause_scoped_prefers_ref_columns() {
+        let join = Join {
+            table: "airports".to_string(),
+            from_alias: "flights".to_string(),
+            fk_columns: vec!["dep_code".to_string()],
+            ref_columns: vec!["code".to_string()],
+            ..Default::default()
+        };
+        let tables = vec![TableRef {
+            alias: "airports".to_string(),
+            table: "airports".to_string(),
+            pk_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        let result = synthesize_on_clause_scoped(&join, &tables, "airports__dep");
+        assert!(
+            result.contains(r#""code""#),
+            "Should use ref_columns, got: {result}"
+        );
+        assert!(
+            !result.contains(r#""id""#),
+            "Should not use pk_columns when ref_columns are present"
+        );
+    }
+
+    #[test]
+    fn test_synthesize_on_clause_scoped_falls_back_to_pk() {
+        let join = Join {
+            table: "airports".to_string(),
+            from_alias: "flights".to_string(),
+            fk_columns: vec!["dep_code".to_string()],
+            ref_columns: vec![],
+            ..Default::default()
+        };
+        let tables = vec![TableRef {
+            alias: "airports".to_string(),
+            table: "airports".to_string(),
+            pk_columns: vec!["id".to_string()],
+            ..Default::default()
+        }];
+        let result = synthesize_on_clause_scoped(&join, &tables, "airports__dep");
+        assert!(
+            result.contains(r#""id""#),
+            "Should fall back to pk_columns when ref_columns are empty, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_joins_pkfk_no_joins() {
+        let def = orders_view();
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = resolve_joins_pkfk(&def, &resolved_dims, &resolved_mets);
+        assert!(result.is_empty(), "No joins should produce empty result");
+    }
+
+    #[test]
+    fn test_resolve_joins_pkfk_single_join() {
+        let def = orders_view()
+            .with_table("orders", "orders", &["id"])
+            .with_table("customers", "customers", &["id"])
+            .with_dimension("cust_name", "name", Some("customers"))
+            .with_pkfk_join(
+                "orders_customers",
+                "orders",
+                "customers",
+                &["customer_id"],
+                &["id"],
+            );
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = resolve_joins_pkfk(&def, &resolved_dims, &resolved_mets);
+        assert!(
+            result.contains(&"customers".to_string()),
+            "Should include customers join, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_joins_pkfk_with_using_relationship() {
+        // Build a role-playing scenario: flights -> airports via dep_airport and arr_airport
+        let def = orders_view()
+            .with_base_table("flights")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("flights", "flights", &["id"])
+            .with_table("airports", "airports", &["code"])
+            .with_dimension("airport_name", "name", Some("airports"))
+            .with_metric("flight_count", "count(*)", Some("flights"))
+            .with_using_relationship("flight_count", &["dep_airport"])
+            .with_pkfk_join(
+                "dep_airport",
+                "flights",
+                "airports",
+                &["dep_code"],
+                &["code"],
+            )
+            .with_pkfk_join(
+                "arr_airport",
+                "flights",
+                "airports",
+                &["arr_code"],
+                &["code"],
+            );
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = resolve_joins_pkfk(&def, &resolved_dims, &resolved_mets);
+        assert!(
+            result.iter().any(|a| a.contains("airports__dep_airport")),
+            "Should include scoped alias airports__dep_airport, got: {result:?}"
+        );
+    }
+}

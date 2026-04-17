@@ -94,6 +94,7 @@ DIMENSION	region	p25_orders	DATA_TYPE	(empty)
 METRIC	total_revenue	p25_orders	TABLE	p25_orders
 METRIC	total_revenue	p25_orders	EXPRESSION	SUM(revenue)
 METRIC	total_revenue	p25_orders	DATA_TYPE	(empty)
+METRIC	total_revenue	p25_orders	ACCESS_MODIFIER	PUBLIC
 
 # DDL-07: SHOW works -- returns view name and kind for all current views
 query TT rowsort

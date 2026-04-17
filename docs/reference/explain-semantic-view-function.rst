@@ -29,8 +29,6 @@ Syntax
 Parameters
 ==========
 
-Parameters are identical to :ref:`semantic_view() <ref-sv-params>`.
-
 .. list-table::
    :header-rows: 1
    :widths: 20 15 65
@@ -43,12 +41,16 @@ Parameters are identical to :ref:`semantic_view() <ref-sv-params>`.
      - The name of the semantic view to explain.
    * - ``dimensions``
      - LIST (named)
-     - Optional list of dimension names.
+     - Optional list of dimension names. Supports ``alias.*`` wildcard patterns.
    * - ``metrics``
      - LIST (named)
-     - Optional list of metric names.
+     - Optional list of metric names. Supports ``alias.*`` wildcard patterns.
 
 At least one of ``dimensions`` or ``metrics`` must be specified.
+
+.. note::
+
+   ``explain_semantic_view()`` does not support the ``facts`` parameter. To inspect fact definitions, use :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>`.
 
 
 .. _ref-explain-output:
@@ -115,5 +117,6 @@ Sample output:
 .. tip::
 
    Use ``explain_semantic_view()`` to verify that the extension generates the SQL
-   you expect, especially when debugging join paths, fact inlining, or
-   role-playing dimension scoped aliases.
+   you expect, especially when debugging join paths, fact inlining,
+   role-playing dimension scoped aliases, semi-additive CTE expansion,
+   or window function CTE expansion.

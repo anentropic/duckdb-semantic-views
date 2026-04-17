@@ -1,5 +1,5 @@
 .. meta::
-   :description: Syntax reference for SHOW SEMANTIC VIEWS, including optional LIKE, STARTS WITH, and LIMIT filtering clauses
+   :description: Syntax reference for SHOW SEMANTIC VIEWS, including TERSE variant, IN SCHEMA/IN DATABASE qualifiers, and optional LIKE, STARTS WITH, and LIMIT filtering
 
 .. _ref-show-semantic-views:
 
@@ -7,7 +7,7 @@
 SHOW SEMANTIC VIEWS
 ====================
 
-Lists all registered semantic views, with optional filtering by name pattern, prefix, or row count.
+Lists all registered semantic views, with optional filtering by name pattern, prefix, schema, database, or row count.
 
 
 .. _ref-show-syntax:
@@ -17,12 +17,25 @@ Syntax
 
 .. code-block:: sqlgrammar
 
-   SHOW SEMANTIC VIEWS
+   SHOW [ TERSE ] SEMANTIC VIEWS
        [ LIKE '<pattern>' ]
+       [ IN SCHEMA <schema_name> | IN DATABASE <database_name> ]
        [ STARTS WITH '<prefix>' ]
        [ LIMIT <rows> ]
 
 All clauses are optional. When multiple clauses appear, they must follow the order shown above.
+
+
+.. _ref-show-variants:
+
+Statement Variants
+==================
+
+``SHOW SEMANTIC VIEWS``
+   Returns all registered semantic views with 6 columns.
+
+``SHOW TERSE SEMANTIC VIEWS``
+   Returns a compact listing with 5 columns (no ``comment`` column).
 
 
 .. _ref-show-filtering:
@@ -32,6 +45,12 @@ Optional Filtering Clauses
 
 ``LIKE '<pattern>'``
    Filters views to those whose name matches the pattern. Uses SQL ``LIKE`` pattern syntax: ``%`` matches any sequence of characters, ``_`` matches a single character. Matching is **case-insensitive** (the extension maps ``LIKE`` to DuckDB's ``ILIKE``). The pattern must be enclosed in single quotes.
+
+``IN SCHEMA <schema_name>``
+   Filters views to those in the specified schema.
+
+``IN DATABASE <database_name>``
+   Filters views to those in the specified database.
 
 ``STARTS WITH '<prefix>'``
    Filters views to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.
@@ -43,7 +62,7 @@ When ``LIKE`` and ``STARTS WITH`` are both present, a view must satisfy both con
 
 .. warning::
 
-   Clause order is enforced. ``LIKE`` must come before ``STARTS WITH``, and ``STARTS WITH`` must come before ``LIMIT``. Placing clauses out of order produces a syntax error.
+   Clause order is enforced. ``LIKE`` must come before ``IN SCHEMA``/``IN DATABASE``, and ``STARTS WITH`` must come before ``LIMIT``. Placing clauses out of order produces a syntax error.
 
 
 .. _ref-show-output:
@@ -51,7 +70,7 @@ When ``LIKE`` and ``STARTS WITH`` are both present, a view must satisfy both con
 Output Columns
 ==============
 
-Returns one row per registered semantic view with 5 columns:
+**SHOW SEMANTIC VIEWS** returns one row per registered semantic view with 6 columns:
 
 .. list-table::
    :header-rows: 1
@@ -75,6 +94,34 @@ Returns one row per registered semantic view with 5 columns:
    * - ``schema_name``
      - VARCHAR
      - The DuckDB schema containing the view (e.g., ``main``).
+   * - ``comment``
+     - VARCHAR
+     - The view-level comment. Empty string if no comment is set.
+
+**SHOW TERSE SEMANTIC VIEWS** returns 5 columns (same as above, without ``comment``):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 15 65
+
+   * - Column
+     - Type
+     - Description
+   * - ``created_on``
+     - VARCHAR
+     - Timestamp when the semantic view was created.
+   * - ``name``
+     - VARCHAR
+     - The semantic view name.
+   * - ``kind``
+     - VARCHAR
+     - Always ``SEMANTIC_VIEW``.
+   * - ``database_name``
+     - VARCHAR
+     - The DuckDB database containing the view.
+   * - ``schema_name``
+     - VARCHAR
+     - The DuckDB schema containing the view.
 
 
 .. _ref-show-examples:
@@ -88,19 +135,46 @@ The ``created_on`` column contains a non-deterministic timestamp. To get determi
 
 .. code-block:: sql
 
-   SELECT name, kind, database_name, schema_name
+   SELECT name, kind, database_name, schema_name, comment
    FROM (SHOW SEMANTIC VIEWS);
 
 .. code-block:: text
 
-   ┌─────────────────┬───────────────┬───────────────┬─────────────┐
-   │ name            │ kind          │ database_name │ schema_name │
-   ├─────────────────┼───────────────┼───────────────┼─────────────┤
-   │ order_metrics   │ SEMANTIC_VIEW │ memory        │ main        │
-   │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │
-   └─────────────────┴───────────────┴───────────────┴─────────────┘
+   ┌─────────────────┬───────────────┬───────────────┬─────────────┬──────────────────────┐
+   │ name            │ kind          │ database_name │ schema_name │ comment              │
+   ├─────────────────┼───────────────┼───────────────┼─────────────┼──────────────────────┤
+   │ order_metrics   │ SEMANTIC_VIEW │ memory        │ main        │ Revenue analytics    │
+   │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │                      │
+   └─────────────────┴───────────────┴───────────────┴─────────────┴──────────────────────┘
 
 If no semantic views are registered, the result set is empty.
+
+**TERSE variant (no comment column):**
+
+.. code-block:: sql
+
+   SHOW TERSE SEMANTIC VIEWS;
+
+.. code-block:: text
+
+   ┌─────────────────────┬─────────────────┬───────────────┬───────────────┬─────────────┐
+   │ created_on          │ name            │ kind          │ database_name │ schema_name │
+   ├─────────────────────┼─────────────────┼───────────────┼───────────────┼─────────────┤
+   │ 2026-04-02 10:30:00 │ order_metrics   │ SEMANTIC_VIEW │ memory        │ main        │
+   │ 2026-04-02 10:35:00 │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │
+   └─────────────────────┴─────────────────┴───────────────┴───────────────┴─────────────┘
+
+**Filter by schema:**
+
+.. code-block:: sql
+
+   SHOW SEMANTIC VIEWS IN SCHEMA main;
+
+**Filter by database:**
+
+.. code-block:: sql
+
+   SHOW SEMANTIC VIEWS IN DATABASE memory;
 
 **Filter by pattern with LIKE (case-insensitive):**
 
@@ -109,14 +183,6 @@ Find all views whose name contains "order":
 .. code-block:: sql
 
    SHOW SEMANTIC VIEWS LIKE '%order%';
-
-.. code-block:: text
-
-   ┌─────────────────────┬───────────────┬───────────────┬───────────────┬─────────────┐
-   │ created_on          │ name          │ kind          │ database_name │ schema_name │
-   ├─────────────────────┼───────────────┼───────────────┼───────────────┼─────────────┤
-   │ 2026-04-02 10:30:00 │ order_metrics │ SEMANTIC_VIEW │ memory        │ main        │
-   └─────────────────────┴───────────────┴───────────────┴───────────────┴─────────────┘
 
 Because ``LIKE`` is case-insensitive, ``LIKE '%ORDER%'`` produces the same results.
 
@@ -128,14 +194,6 @@ Find views whose name starts with "sales":
 
    SHOW SEMANTIC VIEWS STARTS WITH 'sales';
 
-.. code-block:: text
-
-   ┌─────────────────────┬─────────────────┬───────────────┬───────────────┬─────────────┐
-   │ created_on          │ name            │ kind          │ database_name │ schema_name │
-   ├─────────────────────┼─────────────────┼───────────────┼───────────────┼─────────────┤
-   │ 2026-04-02 10:35:00 │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │
-   └─────────────────────┴─────────────────┴───────────────┴───────────────┴─────────────┘
-
 ``STARTS WITH`` is case-sensitive. ``STARTS WITH 'Sales'`` would return no results because the view is named ``sales_analytics`` (lowercase).
 
 **Limit the number of results:**
@@ -144,48 +202,21 @@ Find views whose name starts with "sales":
 
    SHOW SEMANTIC VIEWS LIMIT 1;
 
-.. code-block:: text
-
-   ┌─────────────────────┬───────────────┬───────────────┬───────────────┬─────────────┐
-   │ created_on          │ name          │ kind          │ database_name │ schema_name │
-   ├─────────────────────┼───────────────┼───────────────┼───────────────┼─────────────┤
-   │ 2026-04-02 10:30:00 │ order_metrics │ SEMANTIC_VIEW │ memory        │ main        │
-   └─────────────────────┴───────────────┴───────────────┴───────────────┴─────────────┘
-
 **Combine multiple clauses:**
 
-All optional clauses can be combined, following the required order (``LIKE``, ``STARTS WITH``, ``LIMIT``):
+All optional clauses can be combined, following the required order:
 
 .. code-block:: sql
 
-   SHOW SEMANTIC VIEWS LIKE '%a%' STARTS WITH 'sales' LIMIT 10;
+   SHOW SEMANTIC VIEWS LIKE '%a%' IN SCHEMA main STARTS WITH 'sales' LIMIT 10;
 
-.. code-block:: text
-
-   ┌─────────────────────┬─────────────────┬───────────────┬───────────────┬─────────────┐
-   │ created_on          │ name            │ kind          │ database_name │ schema_name │
-   ├─────────────────────┼─────────────────┼───────────────┼───────────────┼─────────────┤
-   │ 2026-04-02 10:35:00 │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │
-   └─────────────────────┴─────────────────┴───────────────┴───────────────┴─────────────┘
-
-The view ``sales_analytics`` matches both ``LIKE '%a%'`` (contains "a") and ``STARTS WITH 'sales'`` (begins with "sales").
-
-**Select specific columns to skip the timestamp:**
+**TERSE with filtering:**
 
 .. code-block:: sql
 
-   SELECT name, kind, database_name, schema_name
-   FROM (SHOW SEMANTIC VIEWS)
-   WHERE name ILIKE '%ics%';
+   SHOW TERSE SEMANTIC VIEWS LIKE '%order%';
 
-.. code-block:: text
-
-   ┌─────────────────┬───────────────┬───────────────┬─────────────┐
-   │ name            │ kind          │ database_name │ schema_name │
-   ├─────────────────┼───────────────┼───────────────┼─────────────┤
-   │ order_metrics   │ SEMANTIC_VIEW │ memory        │ main        │
-   │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │
-   └─────────────────┴───────────────┴───────────────┴─────────────┘
+   SHOW TERSE SEMANTIC VIEWS IN SCHEMA main;
 
 **The statement is case-insensitive:**
 

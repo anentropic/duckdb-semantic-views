@@ -41,6 +41,7 @@ DIMENSION	region	p41_orders	DATA_TYPE	(empty)
 METRIC	total	p41_orders	TABLE	p41_orders
 METRIC	total	p41_orders	EXPRESSION	SUM(o.amount)
 METRIC	total	p41_orders	DATA_TYPE	(empty)
+METRIC	total	p41_orders	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================
 # Test 2: Multi-table view with relationships (DESC-03)
@@ -88,6 +89,7 @@ DIMENSION	customer_name	p41_customers	DATA_TYPE	(empty)
 METRIC	total_revenue	p41_orders	TABLE	p41_orders
 METRIC	total_revenue	p41_orders	EXPRESSION	SUM(o.amount)
 METRIC	total_revenue	p41_orders	DATA_TYPE	(empty)
+METRIC	total_revenue	p41_orders	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================
 # Test 3: Facts (DESC-05)
@@ -130,12 +132,14 @@ RELATIONSHIP	li_to_order	p41_line_items	REF_KEY	["id"]
 FACT	net_price	p41_line_items	TABLE	p41_line_items
 FACT	net_price	p41_line_items	EXPRESSION	li.price * li.quantity
 FACT	net_price	p41_line_items	DATA_TYPE	(empty)
+FACT	net_price	p41_line_items	ACCESS_MODIFIER	PUBLIC
 DIMENSION	region	p41_orders	TABLE	p41_orders
 DIMENSION	region	p41_orders	EXPRESSION	o.region
 DIMENSION	region	p41_orders	DATA_TYPE	(empty)
 METRIC	total_net	p41_orders	TABLE	p41_orders
 METRIC	total_net	p41_orders	EXPRESSION	SUM(li.net_price)
 METRIC	total_net	p41_orders	DATA_TYPE	(empty)
+METRIC	total_net	p41_orders	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================
 # Test 4: Derived metrics (DESC-07)
@@ -165,8 +169,10 @@ DIMENSION	region	p41_orders	DATA_TYPE	(empty)
 METRIC	revenue	p41_orders	TABLE	p41_orders
 METRIC	revenue	p41_orders	EXPRESSION	SUM(o.amount)
 METRIC	revenue	p41_orders	DATA_TYPE	(empty)
+METRIC	revenue	p41_orders	ACCESS_MODIFIER	PUBLIC
 DERIVED_METRIC	profit	(empty)	EXPRESSION	revenue * 0.3
 DERIVED_METRIC	profit	(empty)	DATA_TYPE	(empty)
+DERIVED_METRIC	profit	(empty)	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================
 # Test 5: Table without PRIMARY KEY (Pitfall 3)
@@ -191,6 +197,7 @@ DIMENSION	region	p41_orders	DATA_TYPE	(empty)
 METRIC	total	p41_orders	TABLE	p41_orders
 METRIC	total	p41_orders	EXPRESSION	SUM(o.amount)
 METRIC	total	p41_orders	DATA_TYPE	(empty)
+METRIC	total	p41_orders	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================
 # Test 6: Error case -- nonexistent view
@@ -218,34 +225,35 @@ DIMENSION	region	p41_orders	DATA_TYPE	(empty)
 METRIC	total	p41_orders	TABLE	p41_orders
 METRIC	total	p41_orders	EXPRESSION	SUM(o.amount)
 METRIC	total	p41_orders	DATA_TYPE	(empty)
+METRIC	total	p41_orders	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================
 # Test 8: COUNT(*) verification
 # ============================================================
 
-# Simple view with PK: 4 TABLE + 3 DIM + 3 METRIC = 10 rows
+# Simple view with PK: 4 TABLE + 3 DIM + 3 METRIC + 1 ACCESS_MODIFIER = 11 rows
 query I
 SELECT COUNT(*) FROM describe_semantic_view('p41_simple');
 ----
-10
+11
 
-# No-PK view: 3 TABLE + 3 DIM + 3 METRIC = 9 rows
+# No-PK view: 3 TABLE + 3 DIM + 3 METRIC + 1 ACCESS_MODIFIER = 10 rows
 query I
 SELECT COUNT(*) FROM describe_semantic_view('p41_nopk');
 ----
-9
+10
 
-# Multi-table view: 4+4 TABLE + 4 REL + 3+3 DIM + 3 METRIC = 21 rows
+# Multi-table view: 4+4 TABLE + 4 REL + 3+3 DIM + 3 METRIC + 1 ACCESS_MODIFIER = 22 rows
 query I
 SELECT COUNT(*) FROM describe_semantic_view('p41_multi');
 ----
-21
+22
 
-# Derived metrics view: 4 TABLE + 3 DIM + 3 METRIC + 2 DERIVED = 12 rows
+# Derived metrics view: 4 TABLE + 3 DIM + 3 METRIC + 2 DERIVED + 2 ACCESS_MODIFIER = 14 rows
 query I
 SELECT COUNT(*) FROM describe_semantic_view('p41_derived');
 ----
-12
+14
 
 # ============================================================
 # Cleanup

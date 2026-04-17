@@ -9,6 +9,8 @@ SHOW SEMANTIC DIMENSIONS FOR METRIC
 
 Returns only the dimensions that can be safely combined with a specific metric, filtering out dimensions that would cause a fan trap. In single-table views, all dimensions are returned. In multi-table views, the extension analyzes the relationship graph and excludes dimensions whose join path to the metric's source table would traverse a one-to-many edge, which would duplicate rows and inflate aggregation results.
 
+For window function metrics, the ``required`` column indicates which dimensions must be included in the query because they appear in the metric's ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clauses.
+
 For background on what fan traps are and how to resolve them, see :ref:`How to Understand and Avoid Fan Traps <howto-fan-traps>`.
 
 
@@ -91,7 +93,7 @@ Returns one row per reachable dimension with 4 columns:
      - The inferred data type of the dimension. Empty string if not resolved.
    * - ``required``
      - BOOLEAN
-     - Always ``false``. Reserved for future Snowflake parity.
+     - ``TRUE`` if the dimension is referenced in a window metric's ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clause (meaning it must be included in the query for that metric). ``FALSE`` for all other dimensions and for non-window metrics.
 
 
 .. _ref-show-dims-for-metric-filtering:
@@ -106,6 +108,7 @@ The filtering logic determines whether a dimension is reachable from a metric's 
 - **One-to-many (reverse):** Traversing from the referenced table back to the FK table is fan-out. This direction duplicates rows, inflating aggregates. Dimensions reachable only through such an edge are excluded.
 - **One-to-one:** If the FK columns match a ``PRIMARY KEY`` or ``UNIQUE`` constraint on the FK table, the relationship is one-to-one. Both directions are safe.
 - **Derived metrics:** For derived metrics (those without a table alias), the extension resolves all base metrics they depend on and uses the union of their source tables. A dimension is included if it is reachable from at least one of those source tables without fan-out.
+- **Window metrics:** Fan trap checking is skipped for window function metrics. All dimensions reachable in the relationship graph are returned, since window metrics do not aggregate across join boundaries in the same way as standard aggregate metrics. Dimensions referenced in the ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clauses are marked ``required = TRUE``.
 
 
 .. _ref-show-dims-for-metric-examples:
@@ -198,6 +201,46 @@ For ``line_item_sum`` (source table: ``line_items``), the path from ``line_items
    │ customers  │ customer_name    │           │ false    │
    │ line_items │ item_qty         │           │ false    │
    └────────────┴──────────────────┴───────────┴──────────┘
+
+**Window metric with required dimensions:**
+
+.. versionadded:: 0.6.0
+
+When querying dimensions for a window function metric, the ``required`` column is ``TRUE`` for any dimension referenced in the metric's ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clauses. These dimensions must be included in the query for the window metric to function correctly.
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW monthly_sv AS
+   TABLES (
+       o AS orders PRIMARY KEY (id)
+   )
+   DIMENSIONS (
+       o.region AS o.region,
+       o.month  AS o.month,
+       o.status AS o.status
+   )
+   METRICS (
+       o.total_qty AS SUM(o.qty),
+       o.avg_qty   AS AVG(total_qty) OVER (PARTITION BY EXCLUDING region ORDER BY month)
+   );
+
+   SHOW SEMANTIC DIMENSIONS IN monthly_sv FOR METRIC avg_qty;
+
+.. code-block:: text
+
+   ┌────────────┬────────┬───────────┬──────────┐
+   │ table_name │ name   │ data_type │ required │
+   ├────────────┼────────┼───────────┼──────────┤
+   │ orders     │ month  │           │ true     │
+   │ orders     │ region │           │ true     │
+   │ orders     │ status │           │ false    │
+   └────────────┴────────┴───────────┴──────────┘
+
+In this example, ``region`` is required because it appears in ``EXCLUDING`` (it defines the partition boundary), and ``month`` is required because it appears in ``ORDER BY`` (it defines the window ordering). The ``status`` dimension is optional -- it can be included in the query but is not referenced by the window specification.
+
+.. tip::
+
+   Use the ``required`` column to build valid queries for window metrics. Omitting a required dimension produces a query-time error: ``window function metric 'avg_qty' requires dimension 'month' to be included in the query``.
 
 **Filter safe dimensions with LIKE (case-insensitive):**
 

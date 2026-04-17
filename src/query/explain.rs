@@ -11,6 +11,8 @@ use crate::model::SemanticViewDefinition;
 use crate::util::suggest_closest;
 
 use super::error::QueryError;
+use crate::expand::wildcard::{expand_wildcards, WildcardItemType};
+
 use super::table_function::{
     execute_sql_raw, extract_list_strings, read_varchar_from_vector, QueryState,
 };
@@ -116,81 +118,107 @@ impl VTab for ExplainSemanticViewVTab {
     type InitData = ExplainInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        // 1. Extract parameters (same as semantic_query).
-        let view_name = bind.get_parameter(0).to_string();
+        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
+            // 1. Extract parameters (same as semantic_query).
+            let view_name = bind.get_parameter(0).to_string();
 
-        let dimensions = match bind.get_named_parameter("dimensions") {
-            Some(ref val) => unsafe { extract_list_strings(val) },
-            None => vec![],
-        };
-        let metrics = match bind.get_named_parameter("metrics") {
-            Some(ref val) => unsafe { extract_list_strings(val) },
-            None => vec![],
-        };
+            let dimensions = match bind.get_named_parameter("dimensions") {
+                Some(ref val) => unsafe { extract_list_strings(val) },
+                None => vec![],
+            };
+            let metrics = match bind.get_named_parameter("metrics") {
+                Some(ref val) => unsafe { extract_list_strings(val) },
+                None => vec![],
+            };
+            let facts = match bind.get_named_parameter("facts") {
+                Some(ref val) => unsafe { extract_list_strings(val) },
+                None => vec![],
+            };
 
-        // 2. Validate: at least one dimension or metric.
-        if dimensions.is_empty() && metrics.is_empty() {
-            return Err(Box::new(QueryError::EmptyRequest {
-                view_name: view_name.clone(),
-            }));
-        }
+            // 2. Validate: at least one dimension, metric, or fact.
+            if dimensions.is_empty() && metrics.is_empty() && facts.is_empty() {
+                let err: Box<dyn std::error::Error> = Box::new(QueryError::EmptyRequest {
+                    view_name: view_name.clone(),
+                });
+                return Err(err);
+            }
 
-        // 3. Look up view definition in the catalog.
-        let state_ptr = bind.get_extra_info::<QueryState>();
-        let state = unsafe { &*state_ptr };
-        let catalog_guard = state.catalog.read().expect("catalog RwLock poisoned");
+            // 3. Look up view definition in the catalog.
+            let state_ptr = bind.get_extra_info::<QueryState>();
+            let state = unsafe { &*state_ptr };
+            let catalog_guard = state
+                .catalog
+                .read()
+                .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
 
-        let json_str = if let Some(j) = catalog_guard.get(&view_name) {
-            j.clone()
-        } else {
-            let available: Vec<String> = catalog_guard.keys().cloned().collect();
-            let suggestion = suggest_closest(&view_name, &available);
-            return Err(Box::new(QueryError::ViewNotFound {
-                name: view_name,
-                suggestion,
-                available,
-            }));
-        };
-        drop(catalog_guard);
+            let json_str = if let Some(j) = catalog_guard.get(&view_name) {
+                j.clone()
+            } else {
+                let available: Vec<String> = catalog_guard.keys().cloned().collect();
+                let suggestion = suggest_closest(&view_name, &available);
+                let err: Box<dyn std::error::Error> = Box::new(QueryError::ViewNotFound {
+                    name: view_name,
+                    suggestion,
+                    available,
+                });
+                return Err(err);
+            };
+            drop(catalog_guard);
 
-        // 4. Parse definition and expand.
-        let def = SemanticViewDefinition::from_json(&view_name, &json_str)
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        let req = QueryRequest {
-            dimensions: dimensions.clone(),
-            metrics: metrics.clone(),
-        };
-        let expanded_sql = expand(&view_name, &def, &req)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(QueryError::from(e)) })?;
+            // 4. Parse definition, expand wildcards, and expand.
+            let def = SemanticViewDefinition::from_json(&view_name, &json_str)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-        // 5. Build the three-part output.
-        let mut lines: Vec<String> = Vec::new();
+            let dimensions = expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            let metrics = expand_wildcards(&metrics, &def, &WildcardItemType::Metric)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            let facts = expand_wildcards(&facts, &def, &WildcardItemType::Fact)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-        // Part 1: Metadata header.
-        lines.push(format!("-- Semantic View: {view_name}"));
-        lines.push(format!("-- Dimensions: {}", dimensions.join(", ")));
-        lines.push(format!("-- Metrics: {}", metrics.join(", ")));
-        lines.push(String::new());
+            let req = QueryRequest {
+                dimensions: dimensions
+                    .iter()
+                    .map(|s| crate::expand::DimensionName::new(s.clone()))
+                    .collect(),
+                metrics: metrics
+                    .iter()
+                    .map(|s| crate::expand::MetricName::new(s.clone()))
+                    .collect(),
+                facts: facts.clone(),
+            };
+            let expanded_sql = expand(&view_name, &def, &req)
+                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(QueryError::from(e)) })?;
 
-        // Part 2: Expanded SQL.
-        lines.push("-- Expanded SQL:".to_string());
-        for sql_line in expanded_sql.lines() {
-            lines.push(sql_line.to_string());
-        }
-        lines.push(String::new());
+            // 5. Build the three-part output.
+            let mut lines: Vec<String> = Vec::new();
 
-        // Part 3: DuckDB EXPLAIN plan.
-        lines.push("-- DuckDB Plan:".to_string());
-        let explain_lines = unsafe { collect_explain_lines(state.conn, &expanded_sql) };
-        lines.extend(explain_lines);
+            lines.push(format!("-- Semantic View: {view_name}"));
+            lines.push(format!("-- Dimensions: {}", dimensions.join(", ")));
+            lines.push(format!("-- Metrics: {}", metrics.join(", ")));
+            if !facts.is_empty() {
+                lines.push(format!("-- Facts: {}", facts.join(", ")));
+            }
+            lines.push(String::new());
 
-        // 6. Declare output column.
-        bind.add_result_column(
-            "explain_output",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
+            lines.push("-- Expanded SQL:".to_string());
+            for sql_line in expanded_sql.lines() {
+                lines.push(sql_line.to_string());
+            }
+            lines.push(String::new());
 
-        Ok(ExplainBindData { lines })
+            lines.push("-- DuckDB Plan:".to_string());
+            let explain_lines = unsafe { collect_explain_lines(state.conn, &expanded_sql) };
+            lines.extend(explain_lines);
+
+            // 6. Declare output column.
+            bind.add_result_column(
+                "explain_output",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+
+            Ok(ExplainBindData { lines })
+        }))
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
@@ -254,6 +282,10 @@ impl VTab for ExplainSemanticViewVTab {
             ),
             (
                 "metrics".to_string(),
+                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
+            ),
+            (
+                "facts".to_string(),
                 LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
             ),
         ])

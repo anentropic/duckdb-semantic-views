@@ -74,6 +74,32 @@ pub fn is_word_boundary_char(b: u8) -> bool {
     !b.is_ascii_alphanumeric() && b != b'_'
 }
 
+/// Wrap a closure in `catch_unwind`, converting panics to `Box<dyn Error>`.
+///
+/// Used at FFI boundaries to prevent Rust panics from unwinding through C++ frames
+/// (which is undefined behavior). The closure must return `Result<T, Box<dyn Error>>`.
+///
+/// On panic, the payload is inspected for `&str` or `String` messages to produce
+/// a descriptive error. Unknown payloads produce a generic "unknown cause" message.
+pub fn catch_unwind_to_result<F, T>(f: F) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: FnOnce() -> Result<T, Box<dyn std::error::Error>> + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(f) {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                format!("internal error (panic): {s}")
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                format!("internal error (panic): {s}")
+            } else {
+                "internal error (panic): unknown cause".to_string()
+            };
+            Err(msg.into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

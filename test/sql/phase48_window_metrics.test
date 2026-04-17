@@ -1,0 +1,265 @@
+# Phase 48: Window function metrics
+# Tests WIN-02 through WIN-05: expansion pipeline, mixing error, fan trap skip,
+# SHOW DIMS required=TRUE, GET_DDL round-trip, DESCRIBE
+
+require semantic_views
+
+# ========================================
+# Setup: sales + dates tables
+# ========================================
+
+statement ok
+CREATE TABLE p48_dates (
+    date DATE PRIMARY KEY,
+    year INTEGER
+);
+
+statement ok
+INSERT INTO p48_dates VALUES
+    ('2024-01-01', 2024),
+    ('2024-01-02', 2024),
+    ('2024-01-03', 2024),
+    ('2024-01-04', 2024),
+    ('2024-01-05', 2024);
+
+statement ok
+CREATE TABLE p48_sales (
+    id INTEGER PRIMARY KEY,
+    store VARCHAR,
+    sale_date DATE,
+    quantity INTEGER
+);
+
+statement ok
+INSERT INTO p48_sales VALUES
+    (1, 'NYC', '2024-01-01', 10),
+    (2, 'NYC', '2024-01-02', 20),
+    (3, 'NYC', '2024-01-03', 15),
+    (4, 'NYC', '2024-01-04', 25),
+    (5, 'NYC', '2024-01-05', 30),
+    (6, 'LA',  '2024-01-01', 5),
+    (7, 'LA',  '2024-01-02', 8),
+    (8, 'LA',  '2024-01-03', 12),
+    (9, 'LA',  '2024-01-04', 7),
+    (10, 'LA', '2024-01-05', 18);
+
+# ========================================
+# Test 1: DDL - CREATE SEMANTIC VIEW with window metrics
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW p48_sales_view AS
+TABLES (
+    s AS p48_sales PRIMARY KEY (id),
+    d AS p48_dates PRIMARY KEY (date)
+)
+RELATIONSHIPS (
+    sales_dates AS s(sale_date) REFERENCES d
+)
+DIMENSIONS (
+    d.date AS d.date,
+    d.year AS d.year,
+    s.store AS s.store
+)
+METRICS (
+    PRIVATE s.total_qty AS SUM(s.quantity),
+    s.avg_qty AS AVG(total_qty) OVER (PARTITION BY EXCLUDING date ORDER BY date ASC NULLS LAST),
+    s.qty_lag AS LAG(total_qty, 1) OVER (PARTITION BY EXCLUDING date ORDER BY date ASC NULLS LAST)
+)
+
+# ========================================
+# Test 2: Query window metric only (AVG)
+# avg_qty: running average of total_qty per store+year, ordered by date
+# ========================================
+
+query TTIR rowsort
+SELECT * FROM semantic_view('p48_sales_view', dimensions := ['store', 'date', 'year'], metrics := ['avg_qty']);
+----
+LA	2024-01-01	2024	5.0
+LA	2024-01-02	2024	6.5
+LA	2024-01-03	2024	8.333333333333334
+LA	2024-01-04	2024	8.0
+LA	2024-01-05	2024	10.0
+NYC	2024-01-01	2024	10.0
+NYC	2024-01-02	2024	15.0
+NYC	2024-01-03	2024	15.0
+NYC	2024-01-04	2024	17.5
+NYC	2024-01-05	2024	20.0
+
+# ========================================
+# Test 3: Query LAG window metric
+# First row per partition should be NULL (no previous row)
+# ========================================
+
+query TTII rowsort
+SELECT * FROM semantic_view('p48_sales_view', dimensions := ['store', 'date', 'year'], metrics := ['qty_lag']);
+----
+LA	2024-01-01	2024	NULL
+LA	2024-01-02	2024	5
+LA	2024-01-03	2024	8
+LA	2024-01-04	2024	12
+LA	2024-01-05	2024	7
+NYC	2024-01-01	2024	NULL
+NYC	2024-01-02	2024	10
+NYC	2024-01-03	2024	20
+NYC	2024-01-04	2024	15
+NYC	2024-01-05	2024	25
+
+# ========================================
+# Test 4: Mixed window + aggregate error
+# ========================================
+
+statement error
+SELECT * FROM semantic_view('p48_sales_view', dimensions := ['store', 'date'], metrics := ['total_qty', 'avg_qty']);
+----
+metric 'total_qty' is private
+
+# ========================================
+# Test 4b: Mixed window + aggregate error (with public aggregate metric)
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW p48_mix_view AS
+TABLES (s AS p48_sales PRIMARY KEY (id))
+DIMENSIONS (s.store AS s.store, s.date AS s.sale_date)
+METRICS (
+    s.total_qty AS SUM(s.quantity),
+    s.avg_qty AS AVG(total_qty) OVER (PARTITION BY EXCLUDING date ORDER BY date ASC NULLS LAST)
+)
+
+statement error
+SELECT * FROM semantic_view('p48_mix_view', dimensions := ['store', 'date'], metrics := ['total_qty', 'avg_qty']);
+----
+cannot mix window function metrics
+
+# ========================================
+# Test 5: Missing required dimension error
+# date is required by EXCLUDING and ORDER BY
+# ========================================
+
+statement error
+SELECT * FROM semantic_view('p48_sales_view', dimensions := ['store'], metrics := ['avg_qty']);
+----
+requires dimension 'date'
+
+# ========================================
+# Test 6: SHOW SEMANTIC DIMENSIONS FOR METRIC
+# date should be required=TRUE (in EXCLUDING + ORDER BY)
+# year and store should be required=FALSE
+# ========================================
+
+query TTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN p48_sales_view FOR METRIC avg_qty
+----
+p48_dates	date	(empty)	true
+p48_dates	year	(empty)	false
+p48_sales	store	(empty)	false
+
+# ========================================
+# Test 7: GET_DDL round-trip
+# OVER clause should appear in reconstructed DDL
+# ========================================
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p48_sales_view') LIKE '%OVER (%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p48_sales_view') LIKE '%PARTITION BY EXCLUDING%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p48_sales_view') LIKE '%ORDER BY date NULLS LAST%'
+----
+true
+
+# ========================================
+# Test 8: DESCRIBE surfaces WINDOW_SPEC
+# DESCRIBE omits default ASC and NULLS LAST
+# ========================================
+
+query TTTTT
+SELECT * FROM describe_semantic_view('p48_sales_view') WHERE property = 'WINDOW_SPEC' ORDER BY object_name;
+----
+METRIC	avg_qty	p48_sales	WINDOW_SPEC	AVG(total_qty) OVER (PARTITION BY EXCLUDING date ORDER BY date)
+METRIC	qty_lag	p48_sales	WINDOW_SPEC	LAG(total_qty, 1) OVER (PARTITION BY EXCLUDING date ORDER BY date)
+
+# ========================================
+# Test 9: Fan trap skip for window metrics
+# Create a view where metric crosses many-to-one boundary
+# Window metric should NOT trigger fan trap error
+# ========================================
+
+statement ok
+CREATE TABLE p48_customers (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO p48_customers VALUES (1, 'Alice'), (2, 'Bob');
+
+statement ok
+CREATE TABLE p48_orders (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER,
+    order_date DATE,
+    amount INTEGER
+);
+
+statement ok
+INSERT INTO p48_orders VALUES
+    (1, 1, '2024-01-01', 100),
+    (2, 1, '2024-01-02', 200),
+    (3, 2, '2024-01-01', 150);
+
+statement ok
+CREATE SEMANTIC VIEW p48_fan_view AS
+TABLES (
+    c AS p48_customers PRIMARY KEY (id),
+    o AS p48_orders PRIMARY KEY (id)
+)
+RELATIONSHIPS (
+    cust_orders AS o(customer_id) REFERENCES c
+)
+DIMENSIONS (
+    c.customer_name AS c.name,
+    o.order_date AS o.order_date
+)
+METRICS (
+    PRIVATE o.total_amount AS SUM(o.amount),
+    o.running_avg AS AVG(total_amount) OVER (PARTITION BY EXCLUDING order_date ORDER BY order_date ASC NULLS LAST)
+)
+
+# This would be a fan trap for regular aggregate on o queried with c.customer_name,
+# but window metrics skip fan trap check.
+query TTR rowsort
+SELECT * FROM semantic_view('p48_fan_view', dimensions := ['customer_name', 'order_date'], metrics := ['running_avg']);
+----
+Alice	2024-01-01	100.0
+Alice	2024-01-02	150.0
+Bob	2024-01-01	150.0
+
+# ========================================
+# Cleanup
+# ========================================
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p48_fan_view;
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p48_mix_view;
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p48_sales_view;
+
+statement ok
+DROP TABLE IF EXISTS p48_orders;
+
+statement ok
+DROP TABLE IF EXISTS p48_customers;
+
+statement ok
+DROP TABLE IF EXISTS p48_sales;
+
+statement ok
+DROP TABLE IF EXISTS p48_dates;

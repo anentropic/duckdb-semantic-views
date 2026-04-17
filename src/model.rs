@@ -18,6 +18,14 @@ pub struct TableRef {
     /// Not serialized when empty to preserve backward-compatible JSON.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unique_constraints: Vec<Vec<String>>,
+    /// Optional human-readable comment for this table entry.
+    /// Old stored JSON without this field deserializes to None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Informational synonyms (aliases) for this table entry.
+    /// Old stored JSON without this field deserializes to empty Vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
 }
 
 /// A named SQL column expression used as a dimension.
@@ -36,6 +44,104 @@ pub struct Dimension {
     /// If None, the inferred or fallback type is used.
     #[serde(default)]
     pub output_type: Option<String>,
+    /// Optional human-readable comment for this dimension.
+    /// Old stored JSON without this field deserializes to None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Informational synonyms (aliases) for this dimension.
+    /// Old stored JSON without this field deserializes to empty Vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+}
+
+/// Sort order for NON ADDITIVE BY dimension ordering.
+/// Default: Asc (matches Snowflake default).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum SortOrder {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl SortOrder {
+    /// Returns `true` when the variant is the default (`Asc`).
+    /// Used by `serde(skip_serializing_if)` to omit the field from JSON
+    /// when it matches the default, preserving backward-compatible output.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Asc)
+    }
+}
+
+/// NULLS placement for NON ADDITIVE BY dimension ordering.
+/// Default: Last (matches `DuckDB` ASC default and Snowflake ASC default).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum NullsOrder {
+    #[default]
+    Last,
+    First,
+}
+
+impl NullsOrder {
+    /// Returns `true` when the variant is the default (`Last`).
+    /// Used by `serde(skip_serializing_if)` to omit the field from JSON
+    /// when it matches the default, preserving backward-compatible output.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Last)
+    }
+}
+
+/// A dimension reference in a NON ADDITIVE BY clause.
+/// Specifies which dimension(s) a metric is non-additive by,
+/// with sort order and nulls placement for snapshot selection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct NonAdditiveDim {
+    pub dimension: String,
+    #[serde(default, skip_serializing_if = "SortOrder::is_default")]
+    pub order: SortOrder,
+    #[serde(default, skip_serializing_if = "NullsOrder::is_default")]
+    pub nulls: NullsOrder,
+}
+
+/// Parsed window function specification for window metrics.
+/// Stored alongside the raw expression for expansion-time rewriting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct WindowSpec {
+    /// The window function name (e.g., "AVG", "LAG", "SUM")
+    pub window_function: String,
+    /// The metric name referenced inside the window function
+    pub inner_metric: String,
+    /// Additional arguments after the inner metric (e.g., "30" in LAG(metric, 30))
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// Dimensions to EXCLUDE from partitioning (PARTITION BY EXCLUDING semantics)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluding_dims: Vec<String>,
+    /// Explicit partition dimensions (PARTITION BY semantics, mutually exclusive with `excluding_dims`)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_dims: Vec<String>,
+    /// ORDER BY clause entries (dimension/expression + direction + nulls)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order_by: Vec<WindowOrderBy>,
+    /// Raw frame clause (e.g., "RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_clause: Option<String>,
+}
+
+/// An ORDER BY entry in a window function specification.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct WindowOrderBy {
+    pub expr: String,
+    #[serde(default, skip_serializing_if = "SortOrder::is_default")]
+    pub order: SortOrder,
+    #[serde(default, skip_serializing_if = "NullsOrder::is_default")]
+    pub nulls: NullsOrder,
 }
 
 /// A named aggregation expression used as a metric.
@@ -61,6 +167,39 @@ pub struct Metric {
     /// Not serialized when empty to preserve backward-compatible JSON.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub using_relationships: Vec<String>,
+    /// Optional human-readable comment for this metric.
+    /// Old stored JSON without this field deserializes to None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Informational synonyms (aliases) for this metric.
+    /// Old stored JSON without this field deserializes to empty Vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+    /// Access modifier: PUBLIC (default, queryable) or PRIVATE (hidden from queries,
+    /// usable only in derived metric expressions).
+    /// Old stored JSON without this field deserializes as Public.
+    #[serde(default, skip_serializing_if = "AccessModifier::is_default")]
+    pub access: AccessModifier,
+    /// Dimensions this metric is non-additive by (snapshot aggregation).
+    /// When non-empty, expansion uses `ROW_NUMBER` CTE for snapshot selection.
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub non_additive_by: Vec<NonAdditiveDim>,
+    /// Window function specification for window metrics.
+    /// When Some, this metric uses a window function wrapping another metric.
+    /// Old stored JSON without this field deserializes to None.
+    /// Not serialized when None to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_spec: Option<WindowSpec>,
+}
+
+impl Metric {
+    /// Returns true if this metric is a window function metric.
+    #[must_use]
+    pub fn is_window(&self) -> bool {
+        self.window_spec.is_some()
+    }
 }
 
 /// A named raw SQL column expression — a pre-aggregation fact, scoped to a table alias.
@@ -78,6 +217,19 @@ pub struct Fact {
     /// Old stored JSON without this field deserializes to None.
     #[serde(default)]
     pub output_type: Option<String>,
+    /// Optional human-readable comment for this fact.
+    /// Old stored JSON without this field deserializes to None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Informational synonyms (aliases) for this fact.
+    /// Old stored JSON without this field deserializes to empty Vec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+    /// Access modifier: PUBLIC (default, queryable) or PRIVATE (hidden from queries,
+    /// usable only in derived metric expressions).
+    /// Old stored JSON without this field deserializes as Public.
+    #[serde(default, skip_serializing_if = "AccessModifier::is_default")]
+    pub access: AccessModifier,
 }
 
 /// A column-pair relationship entry for composite or single FK declarations.
@@ -110,6 +262,27 @@ impl Cardinality {
     #[must_use]
     pub fn is_default(&self) -> bool {
         matches!(self, Self::ManyToOne)
+    }
+}
+
+/// Access modifier for facts and metrics.
+/// Default is Public -- private items cannot be queried directly
+/// but can be referenced by derived metric expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub enum AccessModifier {
+    #[default]
+    Public,
+    Private,
+}
+
+impl AccessModifier {
+    /// Returns `true` when the variant is the default (`Public`).
+    /// Used by `serde(skip_serializing_if)` to omit the field from JSON
+    /// when it matches the default, preserving backward-compatible output.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Public)
     }
 }
 
@@ -203,6 +376,10 @@ pub struct SemanticViewDefinition {
     /// Old stored JSON without this field deserializes to None.
     #[serde(default)]
     pub schema_name: Option<String>,
+    /// View-level comment describing the purpose of this semantic view.
+    /// Old stored JSON without this field deserializes to None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 impl SemanticViewDefinition {
@@ -232,28 +409,6 @@ impl SemanticViewDefinition {
             .map(String::as_str)
             .zip(self.column_types_inferred.iter().copied())
     }
-}
-
-/// Parse a `DuckDB` LIST-of-VARCHAR string representation into column names.
-///
-/// `duckdb_value_varchar` renders a `VARCHAR[]` value as `[col1, col2]`.
-/// This helper strips the brackets and splits on `, `.
-///
-/// Examples: `"[id]"` -> `["id"]`, `"[a, b]"` -> `["a", "b"]`, `"[]"` -> `[]`.
-#[allow(dead_code)]
-pub(crate) fn parse_constraint_columns(s: &str) -> Vec<String> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() || trimmed == "[]" {
-        return Vec::new();
-    }
-    let inner = trimmed
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(trimmed);
-    if inner.is_empty() {
-        return Vec::new();
-    }
-    inner.split(", ").map(|c| c.trim().to_string()).collect()
 }
 
 impl SemanticViewDefinition {
@@ -328,40 +483,6 @@ mod tests {
         let def = SemanticViewDefinition::from_json("orders", json).unwrap();
         assert_eq!(def.dimensions[0].source_table.as_deref(), Some("customers"));
         assert_eq!(def.metrics[0].source_table.as_deref(), Some("line_items"));
-    }
-
-    mod constraint_column_parsing_tests {
-        use super::*;
-
-        #[test]
-        fn parse_constraint_columns_single() {
-            assert_eq!(parse_constraint_columns("[id]"), vec!["id"]);
-        }
-
-        #[test]
-        fn parse_constraint_columns_composite() {
-            assert_eq!(
-                parse_constraint_columns("[first_name, last_name]"),
-                vec!["first_name", "last_name"]
-            );
-        }
-
-        #[test]
-        fn parse_constraint_columns_empty_brackets() {
-            let result: Vec<String> = parse_constraint_columns("[]");
-            assert!(result.is_empty());
-        }
-
-        #[test]
-        fn parse_constraint_columns_empty_string() {
-            let result: Vec<String> = parse_constraint_columns("");
-            assert!(result.is_empty());
-        }
-
-        #[test]
-        fn parse_constraint_columns_whitespace() {
-            assert_eq!(parse_constraint_columns("[ a , b ]"), vec!["a", "b"]);
-        }
     }
 
     mod phase11_model_tests {
@@ -510,6 +631,7 @@ mod tests {
                 created_on: None,
                 database_name: None,
                 schema_name: None,
+                comment: None,
             };
             let json = serde_json::to_string(&def).unwrap();
             assert!(
@@ -623,6 +745,11 @@ mod tests {
                 source_table: Some("f".to_string()),
                 output_type: None,
                 using_relationships: vec!["dep_airport".to_string()],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             };
             let json = serde_json::to_string(&met).unwrap();
             assert!(json.contains("using_relationships"));
@@ -650,6 +777,11 @@ mod tests {
                 source_table: Some("o".to_string()),
                 output_type: None,
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             };
             let json = serde_json::to_string(&met).unwrap();
             assert!(
@@ -669,6 +801,8 @@ mod tests {
                 expr: "region".to_string(),
                 source_table: None,
                 output_type: Some("BIGINT".to_string()),
+                comment: None,
+                synonyms: vec![],
             };
             let json = serde_json::to_string(&dim).unwrap();
             let rt: Dimension = serde_json::from_str(&json).unwrap();
@@ -683,6 +817,11 @@ mod tests {
                 source_table: None,
                 output_type: Some("DOUBLE".to_string()),
                 using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
             };
             let json = serde_json::to_string(&met).unwrap();
             let rt: Metric = serde_json::from_str(&json).unwrap();
@@ -705,6 +844,7 @@ mod tests {
                 created_on: None,
                 database_name: None,
                 schema_name: None,
+                comment: None,
             };
             let json = serde_json::to_string(&def).unwrap();
             let rt: SemanticViewDefinition = serde_json::from_str(&json).unwrap();
@@ -760,6 +900,8 @@ mod tests {
                     vec!["email".to_string()],
                     vec!["first_name".to_string(), "last_name".to_string()],
                 ],
+                comment: None,
+                synonyms: vec![],
             };
             let json = serde_json::to_string(&tr).unwrap();
             assert!(json.contains("unique_constraints"));
@@ -814,6 +956,8 @@ mod tests {
                 table: "orders".to_string(),
                 pk_columns: vec!["id".to_string()],
                 unique_constraints: vec![],
+                comment: None,
+                synonyms: vec![],
             };
             let json = serde_json::to_string(&tr).unwrap();
             assert!(
@@ -845,6 +989,8 @@ mod tests {
                 table: "fact_table".to_string(),
                 pk_columns: vec![],
                 unique_constraints: vec![],
+                comment: None,
+                synonyms: vec![],
             };
             assert_eq!(tr.alias, "f");
             assert_eq!(tr.table, "fact_table");
@@ -903,6 +1049,9 @@ mod tests {
                 expr: "amount".to_string(),
                 source_table: Some("orders".to_string()),
                 output_type: Some("DECIMAL(10,2)".to_string()),
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
             };
             let json = serde_json::to_string(&fact).unwrap();
             let rt: Fact = serde_json::from_str(&json).unwrap();
@@ -917,6 +1066,490 @@ mod tests {
                 fact.output_type.is_none(),
                 "output_type should default to None"
             );
+        }
+    }
+
+    mod phase43_metadata_tests {
+        use super::*;
+
+        #[test]
+        fn access_modifier_default_is_public() {
+            assert_eq!(AccessModifier::default(), AccessModifier::Public);
+        }
+
+        #[test]
+        fn access_modifier_is_default() {
+            assert!(AccessModifier::Public.is_default());
+            assert!(!AccessModifier::Private.is_default());
+        }
+
+        #[test]
+        fn pre_v060_json_deserializes_with_defaults() {
+            // Full v0.5.5 JSON blob with NO comment/synonyms/access fields
+            let json = r#"{
+                "base_table": "orders",
+                "tables": [{"alias": "o", "table": "orders", "pk_columns": ["id"]}],
+                "dimensions": [{"name": "region", "expr": "region", "source_table": "o"}],
+                "metrics": [{"name": "revenue", "expr": "SUM(amount)", "source_table": "o", "using_relationships": ["rel1"]}],
+                "facts": [{"name": "unit_price", "expr": "price / qty", "source_table": "o", "output_type": "DOUBLE"}],
+                "joins": [{"table": "c", "from_alias": "o", "fk_columns": ["customer_id"]}],
+                "column_type_names": ["region", "revenue"],
+                "column_types_inferred": [17, 20],
+                "created_on": "2026-04-01T12:00:00Z",
+                "database_name": "mydb",
+                "schema_name": "main"
+            }"#;
+            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+
+            // View-level comment
+            assert!(def.comment.is_none(), "view comment should default to None");
+
+            // Table metadata
+            assert!(
+                def.tables[0].comment.is_none(),
+                "table comment should default to None"
+            );
+            assert!(
+                def.tables[0].synonyms.is_empty(),
+                "table synonyms should default to []"
+            );
+
+            // Dimension metadata
+            assert!(
+                def.dimensions[0].comment.is_none(),
+                "dim comment should default to None"
+            );
+            assert!(
+                def.dimensions[0].synonyms.is_empty(),
+                "dim synonyms should default to []"
+            );
+
+            // Metric metadata
+            assert!(
+                def.metrics[0].comment.is_none(),
+                "metric comment should default to None"
+            );
+            assert!(
+                def.metrics[0].synonyms.is_empty(),
+                "metric synonyms should default to []"
+            );
+            assert_eq!(
+                def.metrics[0].access,
+                AccessModifier::Public,
+                "metric access should default to Public"
+            );
+
+            // Fact metadata
+            assert!(
+                def.facts[0].comment.is_none(),
+                "fact comment should default to None"
+            );
+            assert!(
+                def.facts[0].synonyms.is_empty(),
+                "fact synonyms should default to []"
+            );
+            assert_eq!(
+                def.facts[0].access,
+                AccessModifier::Public,
+                "fact access should default to Public"
+            );
+        }
+
+        #[test]
+        fn metric_with_access_private_roundtrips() {
+            let met = Metric {
+                name: "internal_rev".to_string(),
+                expr: "SUM(amount)".to_string(),
+                source_table: None,
+                output_type: None,
+                using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Private,
+                non_additive_by: vec![],
+                window_spec: None,
+            };
+            let json = serde_json::to_string(&met).unwrap();
+            assert!(
+                json.contains(r#""access":"Private""#),
+                "Private access must appear in JSON: {json}"
+            );
+            let rt: Metric = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.access, AccessModifier::Private);
+        }
+
+        #[test]
+        fn metric_with_access_public_omits_field() {
+            let met = Metric {
+                name: "revenue".to_string(),
+                expr: "SUM(amount)".to_string(),
+                source_table: None,
+                output_type: None,
+                using_relationships: vec![],
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+                non_additive_by: vec![],
+                window_spec: None,
+            };
+            let json = serde_json::to_string(&met).unwrap();
+            assert!(
+                !json.contains("access"),
+                "Public access (default) should be omitted from JSON: {json}"
+            );
+            // Also verify empty synonyms omitted
+            assert!(
+                !json.contains("synonyms"),
+                "Empty synonyms should be omitted from JSON: {json}"
+            );
+            // Also verify None comment omitted
+            assert!(
+                !json.contains("comment"),
+                "None comment should be omitted from JSON: {json}"
+            );
+        }
+
+        #[test]
+        fn dimension_with_comment_and_synonyms_roundtrips() {
+            let dim = Dimension {
+                name: "region".to_string(),
+                expr: "region".to_string(),
+                source_table: None,
+                output_type: None,
+                comment: Some("Geographic region".to_string()),
+                synonyms: vec!["area".to_string(), "territory".to_string()],
+            };
+            let json = serde_json::to_string(&dim).unwrap();
+            assert!(
+                json.contains(r#""comment":"Geographic region""#),
+                "comment in JSON: {json}"
+            );
+            assert!(
+                json.contains(r#""synonyms":["area","territory"]"#),
+                "synonyms in JSON: {json}"
+            );
+            let rt: Dimension = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.comment.as_deref(), Some("Geographic region"));
+            assert_eq!(rt.synonyms, vec!["area", "territory"]);
+        }
+
+        #[test]
+        fn table_ref_with_metadata_roundtrips() {
+            let tr = TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                pk_columns: vec!["id".to_string()],
+                unique_constraints: vec![],
+                comment: Some("Main orders table".to_string()),
+                synonyms: vec!["order_facts".to_string()],
+            };
+            let json = serde_json::to_string(&tr).unwrap();
+            assert!(
+                json.contains(r#""comment":"Main orders table""#),
+                "comment in JSON: {json}"
+            );
+            assert!(
+                json.contains(r#""synonyms":["order_facts"]"#),
+                "synonyms in JSON: {json}"
+            );
+            let rt: TableRef = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.comment.as_deref(), Some("Main orders table"));
+            assert_eq!(rt.synonyms, vec!["order_facts"]);
+        }
+
+        #[test]
+        fn fact_with_access_and_metadata_roundtrips() {
+            let fact = Fact {
+                name: "unit_price".to_string(),
+                expr: "price / qty".to_string(),
+                source_table: Some("o".to_string()),
+                output_type: None,
+                comment: Some("Price per unit".to_string()),
+                synonyms: vec!["price_per_item".to_string()],
+                access: AccessModifier::Private,
+            };
+            let json = serde_json::to_string(&fact).unwrap();
+            assert!(
+                json.contains(r#""access":"Private""#),
+                "access in JSON: {json}"
+            );
+            assert!(
+                json.contains(r#""comment":"Price per unit""#),
+                "comment in JSON: {json}"
+            );
+            let rt: Fact = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.access, AccessModifier::Private);
+            assert_eq!(rt.comment.as_deref(), Some("Price per unit"));
+            assert_eq!(rt.synonyms, vec!["price_per_item"]);
+        }
+
+        #[test]
+        fn view_level_comment_roundtrips() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                comment: Some("Revenue analytics view".to_string()),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            assert!(
+                json.contains(r#""comment":"Revenue analytics view""#),
+                "view comment in JSON: {json}"
+            );
+            let rt = SemanticViewDefinition::from_json("orders", &json).unwrap();
+            assert_eq!(rt.comment.as_deref(), Some("Revenue analytics view"));
+        }
+    }
+
+    mod phase47_non_additive_tests {
+        use super::*;
+
+        #[test]
+        fn sort_order_default_is_asc() {
+            assert_eq!(SortOrder::default(), SortOrder::Asc);
+        }
+
+        #[test]
+        fn nulls_order_default_is_last() {
+            assert_eq!(NullsOrder::default(), NullsOrder::Last);
+        }
+
+        #[test]
+        fn sort_order_is_default() {
+            assert!(SortOrder::Asc.is_default());
+            assert!(!SortOrder::Desc.is_default());
+        }
+
+        #[test]
+        fn nulls_order_is_default() {
+            assert!(NullsOrder::Last.is_default());
+            assert!(!NullsOrder::First.is_default());
+        }
+
+        #[test]
+        fn non_additive_dim_with_defaults_skips_order_and_nulls() {
+            let nad = NonAdditiveDim {
+                dimension: "date_dim".to_string(),
+                order: SortOrder::Asc,
+                nulls: NullsOrder::Last,
+            };
+            let json = serde_json::to_string(&nad).unwrap();
+            assert!(
+                !json.contains("order"),
+                "Default order (Asc) should be omitted: {json}"
+            );
+            assert!(
+                !json.contains("nulls"),
+                "Default nulls (Last) should be omitted: {json}"
+            );
+        }
+
+        #[test]
+        fn non_additive_dim_with_non_defaults_includes_fields() {
+            let nad = NonAdditiveDim {
+                dimension: "date_dim".to_string(),
+                order: SortOrder::Desc,
+                nulls: NullsOrder::First,
+            };
+            let json = serde_json::to_string(&nad).unwrap();
+            assert!(
+                json.contains(r#""order":"Desc""#),
+                "Desc order should appear in JSON: {json}"
+            );
+            assert!(
+                json.contains(r#""nulls":"First""#),
+                "First nulls should appear in JSON: {json}"
+            );
+            // Roundtrip
+            let rt: NonAdditiveDim = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.order, SortOrder::Desc);
+            assert_eq!(rt.nulls, NullsOrder::First);
+        }
+
+        #[test]
+        fn metric_without_non_additive_by_deserializes_with_empty_vec() {
+            // Backward compat: pre-v0.6.0 JSON without non_additive_by field
+            let json = r#"{"name":"revenue","expr":"SUM(amount)"}"#;
+            let met: Metric = serde_json::from_str(json).unwrap();
+            assert!(
+                met.non_additive_by.is_empty(),
+                "non_additive_by should default to [] for old JSON"
+            );
+        }
+
+        #[test]
+        fn metric_with_empty_non_additive_by_omits_field() {
+            let met = Metric {
+                name: "revenue".to_string(),
+                expr: "SUM(amount)".to_string(),
+                non_additive_by: vec![],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&met).unwrap();
+            assert!(
+                !json.contains("non_additive_by"),
+                "Empty non_additive_by should be omitted from JSON: {json}"
+            );
+        }
+
+        #[test]
+        fn metric_with_non_additive_by_roundtrips() {
+            let met = Metric {
+                name: "balance".to_string(),
+                expr: "SUM(amount)".to_string(),
+                source_table: Some("a".to_string()),
+                non_additive_by: vec![
+                    NonAdditiveDim {
+                        dimension: "date_dim".to_string(),
+                        order: SortOrder::Desc,
+                        nulls: NullsOrder::First,
+                    },
+                    NonAdditiveDim {
+                        dimension: "account".to_string(),
+                        order: SortOrder::Asc,
+                        nulls: NullsOrder::Last,
+                    },
+                ],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&met).unwrap();
+            assert!(
+                json.contains("non_additive_by"),
+                "non_additive_by with entries should appear in JSON: {json}"
+            );
+            let rt: Metric = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.non_additive_by.len(), 2);
+            assert_eq!(rt.non_additive_by[0].dimension, "date_dim");
+            assert_eq!(rt.non_additive_by[0].order, SortOrder::Desc);
+            assert_eq!(rt.non_additive_by[0].nulls, NullsOrder::First);
+            assert_eq!(rt.non_additive_by[1].dimension, "account");
+            assert_eq!(rt.non_additive_by[1].order, SortOrder::Asc);
+            assert_eq!(rt.non_additive_by[1].nulls, NullsOrder::Last);
+        }
+    }
+
+    mod window_spec_tests {
+        use super::*;
+
+        #[test]
+        fn window_spec_roundtrip_serde() {
+            let ws = WindowSpec {
+                window_function: "AVG".to_string(),
+                inner_metric: "total_qty".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec!["date_dim".to_string()],
+                partition_dims: vec![],
+                order_by: vec![WindowOrderBy {
+                    expr: "date_dim".to_string(),
+                    order: SortOrder::Asc,
+                    nulls: NullsOrder::Last,
+                }],
+                frame_clause: None,
+            };
+            let json = serde_json::to_string(&ws).unwrap();
+            let rt: WindowSpec = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.window_function, "AVG");
+            assert_eq!(rt.inner_metric, "total_qty");
+            assert_eq!(rt.excluding_dims, vec!["date_dim"]);
+            assert_eq!(rt.order_by.len(), 1);
+            assert_eq!(rt.order_by[0].expr, "date_dim");
+            assert!(rt.frame_clause.is_none());
+        }
+
+        #[test]
+        fn metric_without_window_spec_deserializes_from_old_json() {
+            // Backward compat: pre-Phase 48 JSON has no window_spec field
+            let json = r#"{"name":"revenue","expr":"SUM(amount)"}"#;
+            let met: Metric = serde_json::from_str(json).unwrap();
+            assert!(met.window_spec.is_none());
+            assert!(!met.is_window());
+        }
+
+        #[test]
+        fn window_spec_full_roundtrip() {
+            let ws = WindowSpec {
+                window_function: "LAG".to_string(),
+                inner_metric: "balance".to_string(),
+                extra_args: vec!["30".to_string()],
+                excluding_dims: vec!["region".to_string(), "status".to_string()],
+                partition_dims: vec![],
+                order_by: vec![
+                    WindowOrderBy {
+                        expr: "date_dim".to_string(),
+                        order: SortOrder::Desc,
+                        nulls: NullsOrder::First,
+                    },
+                    WindowOrderBy {
+                        expr: "account".to_string(),
+                        order: SortOrder::Asc,
+                        nulls: NullsOrder::Last,
+                    },
+                ],
+                frame_clause: Some(
+                    "RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW".to_string(),
+                ),
+            };
+            let json = serde_json::to_string(&ws).unwrap();
+            let rt: WindowSpec = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.window_function, "LAG");
+            assert_eq!(rt.inner_metric, "balance");
+            assert_eq!(rt.extra_args, vec!["30"]);
+            assert_eq!(rt.excluding_dims, vec!["region", "status"]);
+            assert_eq!(rt.order_by.len(), 2);
+            assert_eq!(rt.order_by[0].expr, "date_dim");
+            assert_eq!(rt.order_by[0].order, SortOrder::Desc);
+            assert_eq!(rt.order_by[0].nulls, NullsOrder::First);
+            assert_eq!(rt.order_by[1].expr, "account");
+            assert_eq!(rt.order_by[1].order, SortOrder::Asc);
+            assert_eq!(rt.order_by[1].nulls, NullsOrder::Last);
+            assert_eq!(
+                rt.frame_clause.as_deref(),
+                Some("RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW")
+            );
+        }
+
+        #[test]
+        fn window_order_by_non_default_sort_nulls_roundtrips() {
+            let wob = WindowOrderBy {
+                expr: "ts".to_string(),
+                order: SortOrder::Desc,
+                nulls: NullsOrder::First,
+            };
+            let json = serde_json::to_string(&wob).unwrap();
+            assert!(json.contains("\"order\":\"Desc\""));
+            assert!(json.contains("\"nulls\":\"First\""));
+            let rt: WindowOrderBy = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.order, SortOrder::Desc);
+            assert_eq!(rt.nulls, NullsOrder::First);
+        }
+
+        #[test]
+        fn metric_with_empty_window_spec_omits_field() {
+            let met = Metric {
+                name: "revenue".to_string(),
+                expr: "SUM(amount)".to_string(),
+                window_spec: None,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&met).unwrap();
+            assert!(
+                !json.contains("window_spec"),
+                "None window_spec should be omitted from JSON: {json}"
+            );
+        }
+
+        #[test]
+        fn metric_is_window_returns_true_when_set() {
+            let met = Metric {
+                name: "avg_qty_7d".to_string(),
+                expr: "AVG(total_qty) OVER (...)".to_string(),
+                window_spec: Some(WindowSpec {
+                    window_function: "AVG".to_string(),
+                    inner_metric: "total_qty".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(met.is_window());
         }
     }
 }

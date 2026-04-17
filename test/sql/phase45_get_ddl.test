@@ -1,0 +1,423 @@
+# Phase 45: GET_DDL('SEMANTIC_VIEW', 'name')
+#
+# Verifies GET_DDL scalar function for DDL reconstruction:
+#   SHOW-07: Returns a valid CREATE OR REPLACE SEMANTIC VIEW statement
+#   SHOW-08: Output round-trips correctly
+#
+# Requirements covered: SHOW-07, SHOW-08
+
+require semantic_views
+
+# ============================================================
+# Setup: create base tables
+# ============================================================
+
+statement ok
+CREATE TABLE p45g_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), cost DECIMAL(10,2), region VARCHAR, status VARCHAR);
+
+statement ok
+INSERT INTO p45g_orders VALUES
+    (1, 100.00, 60.00, 'US', 'active'),
+    (2, 200.00, 120.00, 'EU', 'active'),
+    (3, 150.00, 90.00, 'US', 'inactive');
+
+statement ok
+CREATE TABLE p45g_customers (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO p45g_customers VALUES (1, 'Alice'), (2, 'Bob');
+
+# ============================================================
+# Case 1: Minimal view GET_DDL
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p45g_simple AS
+TABLES (
+    o AS p45g_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total AS SUM(o.amount)
+)
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_simple') LIKE '%CREATE OR REPLACE SEMANTIC VIEW p45g_simple%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_simple') LIKE '%TABLES (%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_simple') LIKE '%DIMENSIONS (%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_simple') LIKE '%METRICS (%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_simple') LIKE '%o AS p45g_orders PRIMARY KEY (id)%'
+----
+true
+
+# ============================================================
+# Case 2: View with all annotations (COMMENT, SYNONYMS, PRIVATE)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p45g_annotated COMMENT = 'Annotated view' AS
+TABLES (
+    o AS p45g_orders PRIMARY KEY (id) COMMENT = 'Order table' WITH SYNONYMS = ('sales')
+)
+DIMENSIONS (
+    o.region AS o.region COMMENT = 'Geographic region' WITH SYNONYMS = ('territory', 'area')
+)
+METRICS (
+    o.total AS SUM(o.amount) COMMENT = 'Total revenue',
+    PRIVATE o.total_cost AS SUM(o.cost) WITH SYNONYMS = ('cost_total')
+)
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_annotated') LIKE '%COMMENT = ''Annotated view''%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_annotated') LIKE '%COMMENT = ''Order table''%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_annotated') LIKE '%WITH SYNONYMS = (''sales'')%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_annotated') LIKE '%COMMENT = ''Geographic region''%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_annotated') LIKE '%WITH SYNONYMS = (''territory'', ''area'')%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_annotated') LIKE '%PRIVATE%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_annotated') LIKE '%WITH SYNONYMS = (''cost_total'')%'
+----
+true
+
+# ============================================================
+# Case 3: View with RELATIONSHIPS
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p45g_joined AS
+TABLES (
+    o AS p45g_orders PRIMARY KEY (id),
+    c AS p45g_customers PRIMARY KEY (id)
+)
+RELATIONSHIPS (
+    order_customer AS o(id) REFERENCES c
+)
+DIMENSIONS (
+    o.region AS o.region,
+    c.cust_name AS c.name
+)
+METRICS (
+    o.total AS SUM(o.amount)
+)
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_joined') LIKE '%RELATIONSHIPS (%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_joined') LIKE '%order_customer AS o(id) REFERENCES c%'
+----
+true
+
+# ============================================================
+# Case 4: View with FACTS
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p45g_facts AS
+TABLES (
+    o AS p45g_orders PRIMARY KEY (id)
+)
+FACTS (
+    o.margin AS o.amount - o.cost,
+    o.is_active AS CASE WHEN o.status = 'active' THEN 1 ELSE 0 END
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total AS SUM(o.amount)
+)
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_facts') LIKE '%FACTS (%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_facts') LIKE '%o.margin AS o.amount - o.cost%'
+----
+true
+
+# Expression with single quotes preserved verbatim
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_facts') LIKE '%CASE WHEN o.status%'
+----
+true
+
+# ============================================================
+# Case 5: View with USING RELATIONSHIPS on metrics
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p45g_using AS
+TABLES (
+    o AS p45g_orders PRIMARY KEY (id),
+    c AS p45g_customers PRIMARY KEY (id)
+)
+RELATIONSHIPS (
+    order_cust AS o(id) REFERENCES c
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total USING (order_cust) AS SUM(o.amount)
+)
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_using') LIKE '%USING (order_cust)%'
+----
+true
+
+# ============================================================
+# Case 6: Round-trip test (SHOW-08)
+#
+# Strategy: create a complex view, verify GET_DDL output, drop it,
+# re-create using the exact DDL that GET_DDL produces, and verify
+# the re-created view produces identical GET_DDL output.
+#
+# DuckDB has no dynamic SQL EXECUTE — we manually copy the DDL
+# output format to prove it is re-executable and round-trips.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p45g_roundtrip COMMENT = 'Round-trip test' AS
+TABLES (
+    o AS p45g_orders PRIMARY KEY (id) COMMENT = 'Orders'
+)
+FACTS (
+    o.margin AS o.amount - o.cost
+)
+DIMENSIONS (
+    o.region AS o.region COMMENT = 'Region' WITH SYNONYMS = ('territory')
+)
+METRICS (
+    o.total AS SUM(o.amount) COMMENT = 'Revenue',
+    PRIVATE o.total_cost AS SUM(o.cost)
+)
+
+# Capture the first GET_DDL output
+query I
+SELECT length(GET_DDL('SEMANTIC_VIEW', 'p45g_roundtrip')) > 0
+----
+true
+
+# Store DDL text for comparison
+statement ok
+CREATE TABLE p45g_ddl_store AS SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_roundtrip') AS ddl_text;
+
+# Verify expected DDL content
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_roundtrip') LIKE '%CREATE OR REPLACE SEMANTIC VIEW p45g_roundtrip%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_roundtrip') LIKE '%COMMENT = ''Round-trip test''%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_roundtrip') LIKE '%FACTS (%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_roundtrip') LIKE '%PRIVATE%'
+----
+true
+
+# Drop the view
+statement ok
+DROP SEMANTIC VIEW p45g_roundtrip
+
+# Re-create using CREATE OR REPLACE matching the GET_DDL output format
+# This proves the DDL format is parseable and re-executable
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW p45g_roundtrip COMMENT = 'Round-trip test' AS
+TABLES (
+    o AS p45g_orders PRIMARY KEY (id) COMMENT = 'Orders'
+)
+FACTS (
+    o.margin AS o.amount - o.cost
+)
+DIMENSIONS (
+    o.region AS o.region COMMENT = 'Region' WITH SYNONYMS = ('territory')
+)
+METRICS (
+    o.total AS SUM(o.amount) COMMENT = 'Revenue',
+    PRIVATE o.total_cost AS SUM(o.cost)
+)
+
+# The view should exist again and produce identical GET_DDL output
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_roundtrip') = (SELECT ddl_text FROM p45g_ddl_store)
+----
+true
+
+# Verify the re-created view still works for queries
+query TR rowsort
+SELECT * FROM semantic_view('p45g_roundtrip', dimensions := ['region'], metrics := ['total']);
+----
+EU	200.00
+US	250.00
+
+# Cleanup round-trip temp table
+statement ok
+DROP TABLE p45g_ddl_store
+
+# ============================================================
+# Case 7: Error - nonexistent view
+# ============================================================
+
+statement error
+SELECT GET_DDL('SEMANTIC_VIEW', 'nonexistent_p45g')
+----
+does not exist
+
+# ============================================================
+# Case 8: Error - unsupported object type
+# ============================================================
+
+statement error
+SELECT GET_DDL('TABLE', 'something')
+----
+unsupported object type
+
+# ============================================================
+# Case 9: Comment with single quotes
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p45g_quoted COMMENT = 'it''s a test' AS
+TABLES (
+    o AS p45g_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total AS SUM(o.amount)
+)
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_quoted') LIKE '%COMMENT = ''it''''s a test''%'
+----
+true
+
+# Round-trip the quoted comment view
+statement ok
+CREATE TABLE p45g_quoted_ddl AS SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_quoted') AS ddl_text;
+
+statement ok
+DROP SEMANTIC VIEW p45g_quoted
+
+# Re-create using the same DDL format GET_DDL produces
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW p45g_quoted COMMENT = 'it''s a test' AS
+TABLES (
+    o AS p45g_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total AS SUM(o.amount)
+)
+
+# Comment should survive round-trip — GET_DDL output matches original
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p45g_quoted') = (SELECT ddl_text FROM p45g_quoted_ddl)
+----
+true
+
+statement ok
+DROP TABLE p45g_quoted_ddl
+
+# ============================================================
+# Case 10: Case-insensitive object type
+# ============================================================
+
+query I
+SELECT GET_DDL('semantic_view', 'p45g_simple') LIKE '%CREATE OR REPLACE SEMANTIC VIEW p45g_simple%'
+----
+true
+
+query I
+SELECT GET_DDL('Semantic_View', 'p45g_simple') LIKE '%CREATE OR REPLACE SEMANTIC VIEW p45g_simple%'
+----
+true
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p45g_simple
+
+statement ok
+DROP SEMANTIC VIEW p45g_annotated
+
+statement ok
+DROP SEMANTIC VIEW p45g_joined
+
+statement ok
+DROP SEMANTIC VIEW p45g_facts
+
+statement ok
+DROP SEMANTIC VIEW p45g_using
+
+statement ok
+DROP SEMANTIC VIEW p45g_roundtrip
+
+statement ok
+DROP SEMANTIC VIEW p45g_quoted
+
+statement ok
+DROP TABLE p45g_orders
+
+statement ok
+DROP TABLE p45g_customers

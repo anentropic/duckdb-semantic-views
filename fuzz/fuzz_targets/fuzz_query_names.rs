@@ -15,6 +15,7 @@ fuzz_target!(|input: NameFuzzInput| {
     let req = QueryRequest {
         dimensions: input.dim_names,
         metrics: input.metric_names,
+        facts: vec![],
     };
     if let Ok(sql) = expand("fuzz_view", &def, &req) {
         assert!(!sql.is_empty());

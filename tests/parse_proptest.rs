@@ -108,10 +108,17 @@ fn build_suffix(kind: DdlKind, name: &str) -> String {
         DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe => {
             format!(" {name}")
         }
-        DdlKind::Show | DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
+        DdlKind::Show
+        | DdlKind::ShowTerse
+        | DdlKind::ShowDimensions
+        | DdlKind::ShowMetrics
+        | DdlKind::ShowFacts => {
             format!(" {name}")
         }
-        DdlKind::AlterRename | DdlKind::AlterRenameIfExists => {
+        DdlKind::ShowColumns => {
+            format!(" {name}")
+        }
+        DdlKind::Alter | DdlKind::AlterIfExists => {
             format!(" {name} RENAME TO new_{name}")
         }
     }

@@ -222,23 +222,23 @@ San Francisco	1
 # Test 11: SHOW SEMANTIC DIMENSIONS resolves aliases to table names
 # ============================================================
 
-query TTTTTT rowsort
+query TTTTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN p32_flights_view;
 ----
-memory	main	p32_flights_view	p32_airports	city	(empty)
-memory	main	p32_flights_view	p32_airports	country	(empty)
-memory	main	p32_flights_view	p32_flights	carrier	(empty)
+memory	main	p32_flights_view	p32_airports	city	(empty)	[]	(empty)
+memory	main	p32_flights_view	p32_airports	country	(empty)	[]	(empty)
+memory	main	p32_flights_view	p32_flights	carrier	(empty)	[]	(empty)
 
 # ============================================================
 # Test 12: SHOW SEMANTIC METRICS resolves aliases to table names
 # ============================================================
 
-query TTTTTT rowsort
+query TTTTTTTT rowsort
 SHOW SEMANTIC METRICS IN p32_flights_view;
 ----
-memory	main	p32_flights_view	(empty)	total_flights	(empty)
-memory	main	p32_flights_view	p32_flights	arrival_count	(empty)
-memory	main	p32_flights_view	p32_flights	departure_count	(empty)
+memory	main	p32_flights_view	(empty)	total_flights	(empty)	[]	(empty)
+memory	main	p32_flights_view	p32_flights	arrival_count	(empty)	[]	(empty)
+memory	main	p32_flights_view	p32_flights	departure_count	(empty)	[]	(empty)
 
 # ============================================================
 # Test 13: DESCRIBE shows actual table names for role-playing view
@@ -275,11 +275,14 @@ DIMENSION	carrier	p32_flights	DATA_TYPE	(empty)
 METRIC	departure_count	p32_flights	TABLE	p32_flights
 METRIC	departure_count	p32_flights	EXPRESSION	COUNT(*)
 METRIC	departure_count	p32_flights	DATA_TYPE	(empty)
+METRIC	departure_count	p32_flights	ACCESS_MODIFIER	PUBLIC
 METRIC	arrival_count	p32_flights	TABLE	p32_flights
 METRIC	arrival_count	p32_flights	EXPRESSION	COUNT(*)
 METRIC	arrival_count	p32_flights	DATA_TYPE	(empty)
+METRIC	arrival_count	p32_flights	ACCESS_MODIFIER	PUBLIC
 DERIVED_METRIC	total_flights	(empty)	EXPRESSION	departure_count + arrival_count
 DERIVED_METRIC	total_flights	(empty)	DATA_TYPE	(empty)
+DERIVED_METRIC	total_flights	(empty)	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================
 # Cleanup

@@ -529,6 +529,8 @@ mod tests {
                 table: "orders".to_string(),
                 pk_columns: vec![],
                 unique_constraints: vec![],
+                comment: None,
+                synonyms: vec![],
             }],
             joins: vec![Join {
                 table: "customers".to_string(),
@@ -545,6 +547,7 @@ mod tests {
             created_on: None,
             database_name: None,
             schema_name: None,
+            comment: None,
         };
         assert!(
             validate_graph(&def).is_ok(),
@@ -722,6 +725,7 @@ mod tests {
                 created_on: None,
                 database_name: None,
                 schema_name: None,
+                comment: None,
             }
         }
 
@@ -734,12 +738,16 @@ mod tests {
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
                         unique_constraints: vec![],
+                        comment: None,
+                        synonyms: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
                         unique_constraints: vec![],
+                        comment: None,
+                        synonyms: vec![],
                     },
                 ],
                 vec![Join {
@@ -766,12 +774,16 @@ mod tests {
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
                         unique_constraints: vec![],
+                        comment: None,
+                        synonyms: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
                         unique_constraints: vec![vec!["email".to_string()]],
+                        comment: None,
+                        synonyms: vec![],
                     },
                 ],
                 vec![Join {
@@ -798,12 +810,16 @@ mod tests {
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
                         unique_constraints: vec![],
+                        comment: None,
+                        synonyms: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
                         unique_constraints: vec![vec!["email".to_string()]],
+                        comment: None,
+                        synonyms: vec![],
                     },
                 ],
                 vec![Join {
@@ -834,12 +850,16 @@ mod tests {
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
                         unique_constraints: vec![],
+                        comment: None,
+                        synonyms: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string(), "email".to_string()],
                         unique_constraints: vec![],
+                        comment: None,
+                        synonyms: vec![],
                     },
                 ],
                 vec![Join {
@@ -868,12 +888,16 @@ mod tests {
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
                         unique_constraints: vec![],
+                        comment: None,
+                        synonyms: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["ID".to_string()],
                         unique_constraints: vec![],
+                        comment: None,
+                        synonyms: vec![],
                     },
                 ],
                 vec![Join {
@@ -901,12 +925,16 @@ mod tests {
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
                         unique_constraints: vec![],
+                        comment: None,
+                        synonyms: vec![],
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
                         unique_constraints: vec![],
+                        comment: None,
+                        synonyms: vec![],
                     },
                 ],
                 vec![Join {

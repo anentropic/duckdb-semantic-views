@@ -107,6 +107,7 @@ DIMENSION	id	err_source	DATA_TYPE	(empty)
 METRIC	total	err_source	TABLE	err_source
 METRIC	total	err_source	EXPRESSION	SUM(val)
 METRIC	total	err_source	DATA_TYPE	(empty)
+METRIC	total	err_source	ACCESS_MODIFIER	PUBLIC
 
 # Normal SQL unaffected
 query I

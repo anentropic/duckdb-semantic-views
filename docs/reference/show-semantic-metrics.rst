@@ -7,7 +7,7 @@
 SHOW SEMANTIC METRICS
 ========================
 
-Lists metrics registered in one or all semantic views. Each row describes a single metric with its name, source table, and inferred data type. Both base metrics and derived metrics are included.
+Lists metrics registered in one or all semantic views. Each row describes a single metric with its name, source table, inferred data type, synonyms, and comment. Both base metrics and derived metrics are included.
 
 
 .. _ref-show-metrics-syntax:
@@ -20,6 +20,7 @@ Syntax
    SHOW SEMANTIC METRICS
        [ LIKE '<pattern>' ]
        [ IN <name> ]
+       [ IN SCHEMA <schema_name> | IN DATABASE <database_name> ]
        [ STARTS WITH '<prefix>' ]
        [ LIMIT <rows> ]
 
@@ -55,6 +56,12 @@ Optional Filtering Clauses
 ``LIKE '<pattern>'``
    Filters metrics to those whose name matches the pattern. Uses SQL ``LIKE`` pattern syntax: ``%`` matches any sequence of characters, ``_`` matches a single character. Matching is **case-insensitive** (the extension maps ``LIKE`` to DuckDB's ``ILIKE``). The pattern must be enclosed in single quotes.
 
+``IN SCHEMA <schema_name>``
+   Filters metrics to those in semantic views belonging to the specified schema.
+
+``IN DATABASE <database_name>``
+   Filters metrics to those in semantic views belonging to the specified database.
+
 ``STARTS WITH '<prefix>'``
    Filters metrics to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.
 
@@ -73,7 +80,7 @@ When ``LIKE`` and ``STARTS WITH`` are both present, a metric must satisfy both c
 Output Columns
 ==============
 
-Returns one row per metric with 6 columns:
+Returns one row per metric with 8 columns:
 
 .. list-table::
    :header-rows: 1
@@ -100,6 +107,12 @@ Returns one row per metric with 6 columns:
    * - ``data_type``
      - VARCHAR
      - Reserved for future use. Currently always an empty string for metrics.
+   * - ``synonyms``
+     - VARCHAR
+     - JSON array of synonym strings (e.g., ``["total_sales","gmv"]``). Empty string if no synonyms are set.
+   * - ``comment``
+     - VARCHAR
+     - The metric comment text. Empty string if no comment is set.
 
 
 .. _ref-show-metrics-examples:
@@ -117,28 +130,18 @@ Given a semantic view ``orders_sv`` with two base metrics:
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬──────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name         │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼──────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ orders     │ order_count  │           │
-   │ memory        │ main        │ orders_sv            │ orders     │ total_amount │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴──────────────┴───────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬──────────────┬───────────┬──────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name         │ data_type │ synonyms │ comment │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼──────────────┼───────────┼──────────┼─────────┤
+   │ memory        │ main        │ orders_sv            │ orders     │ order_count  │           │          │         │
+   │ memory        │ main        │ orders_sv            │ orders     │ total_amount │           │          │         │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴──────────────┴───────────┴──────────┴─────────┘
 
 **List metrics across all views:**
 
 .. code-block:: sql
 
    SHOW SEMANTIC METRICS;
-
-.. code-block:: text
-
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬──────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name         │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼──────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ orders     │ order_count  │           │
-   │ memory        │ main        │ orders_sv            │ orders     │ total_amount │           │
-   │ memory        │ main        │ products_sv          │ products   │ avg_price    │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴──────────────┴───────────┘
 
 Results are sorted by ``semantic_view_name`` then ``name``.
 
@@ -150,47 +153,13 @@ Find all metrics whose name contains "amount":
 
    SHOW SEMANTIC METRICS LIKE '%amount%';
 
-.. code-block:: text
-
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬──────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name         │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼──────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ orders     │ total_amount │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴──────────────┴───────────┘
-
 Because ``LIKE`` is case-insensitive, ``LIKE '%AMOUNT%'`` produces the same results.
 
-**Filter by prefix with STARTS WITH (case-sensitive):**
-
-Find metrics whose name starts with "order":
+**Filter by schema:**
 
 .. code-block:: sql
 
-   SHOW SEMANTIC METRICS STARTS WITH 'order';
-
-.. code-block:: text
-
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬─────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name        │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼─────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ orders     │ order_count │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴─────────────┴───────────┘
-
-``STARTS WITH`` is case-sensitive. ``STARTS WITH 'Order'`` would return no results because the metric is named ``order_count`` (lowercase).
-
-**Limit the number of results:**
-
-.. code-block:: sql
-
-   SHOW SEMANTIC METRICS IN orders_sv LIMIT 1;
-
-.. code-block:: text
-
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬─────────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name        │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼─────────────┼───────────┤
-   │ memory        │ main        │ orders_sv            │ orders     │ order_count │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴─────────────┴───────────┘
+   SHOW SEMANTIC METRICS IN SCHEMA main;
 
 **Derived metrics appear with an empty table_name:**
 
@@ -198,32 +167,18 @@ Derived metrics reference other metrics rather than a specific physical table. T
 
 .. code-block:: sql
 
-   CREATE SEMANTIC VIEW profit_analysis AS
-   TABLES (
-       li AS line_items PRIMARY KEY (id)
-   )
-   DIMENSIONS (
-       li.product AS li.product
-   )
-   METRICS (
-       li.revenue AS SUM(li.extended_price),
-       li.cost    AS SUM(li.unit_cost),
-       profit     AS revenue - cost,
-       margin     AS profit / revenue * 100
-   );
-
    SHOW SEMANTIC METRICS IN profit_analysis;
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬─────────┬───────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name    │ data_type │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼─────────┼───────────┤
-   │ memory        │ main        │ profit_analysis      │ line_items │ cost    │           │
-   │ memory        │ main        │ profit_analysis      │            │ margin  │           │
-   │ memory        │ main        │ profit_analysis      │            │ profit  │           │
-   │ memory        │ main        │ profit_analysis      │ line_items │ revenue │           │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴─────────┴───────────┘
+   ┌───────────────┬─────────────┬──────────────────────┬────────────┬─────────┬───────────┬──────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name    │ data_type │ synonyms │ comment │
+   ├───────────────┼─────────────┼──────────────────────┼────────────┼─────────┼───────────┼──────────┼─────────┤
+   │ memory        │ main        │ profit_analysis      │ line_items │ cost    │           │          │         │
+   │ memory        │ main        │ profit_analysis      │            │ margin  │           │          │         │
+   │ memory        │ main        │ profit_analysis      │            │ profit  │           │          │         │
+   │ memory        │ main        │ profit_analysis      │ line_items │ revenue │           │          │         │
+   └───────────────┴─────────────┴──────────────────────┴────────────┴─────────┴───────────┴──────────┴─────────┘
 
 Base metrics (``revenue``, ``cost``) show their physical table name. Derived metrics (``profit``, ``margin``) show an empty ``table_name`` because they reference other metrics rather than a specific table.
 

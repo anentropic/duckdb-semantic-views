@@ -1,396 +1,615 @@
-# Feature Landscape: v0.5.5 SHOW/DESCRIBE Alignment & Refactoring
+# Feature Landscape: v0.6.0 Snowflake SQL DDL Parity
 
-**Domain:** DuckDB Rust extension -- Snowflake-aligned SHOW/DESCRIBE output formats + module directory refactoring
-**Researched:** 2026-04-01
-**Milestone:** v0.5.5 -- Align all 6 SHOW/DESCRIBE output formats with Snowflake; split expand.rs and graph.rs into module directories
-**Status:** Subsequent milestone research (v0.5.4 shipped 2026-03-27)
-**Overall confidence:** HIGH (Snowflake output schemas verified from official docs for all 6 commands; existing codebase analyzed directly)
+**Domain:** DuckDB Rust extension -- Snowflake SQL DDL parity features for semantic views
+**Researched:** 2026-04-09
+**Milestone:** v0.6.0 -- Close all remaining feature gaps against Snowflake's SQL DDL semantic views
+**Status:** Subsequent milestone research (v0.5.5 shipped 2026-04-05)
+**Overall confidence:** HIGH (Snowflake DDL syntax, SHOW/DESCRIBE schemas, and query semantics verified from official docs; dbt MetricFlow semi-additive pattern cross-referenced)
 
 ---
 
 ## Scope
 
-This document covers the feature surface for v0.5.5: restructuring DESCRIBE to Snowflake's property-per-row format, aligning all SHOW command column schemas, adding `created_on`/`database_name`/`schema_name` metadata, and splitting the two largest modules into clean directories.
+This document covers the 9 target feature areas for v0.6.0. Each is assessed against Snowflake's implementation, comparable systems (dbt MetricFlow, Cube.dev), and the existing codebase.
 
 **What already exists (NOT in scope for research):**
-- DESCRIBE SEMANTIC VIEW: 6 columns (name, base_table, dimensions JSON, metrics JSON, joins JSON, facts JSON), single row
-- SHOW SEMANTIC VIEWS: 2 columns (name, base_table)
-- SHOW SEMANTIC DIMENSIONS: 5 columns (semantic_view_name, name, expr, source_table, data_type)
-- SHOW SEMANTIC METRICS: 5 columns (same pattern)
-- SHOW SEMANTIC FACTS: 4 columns (semantic_view_name, name, expr, source_table -- no data_type)
-- SHOW SEMANTIC DIMENSIONS FOR METRIC: 5 columns (same as SHOW DIMS)
-- LIKE, STARTS WITH, LIMIT filtering on all SHOW commands
-- 482 tests, 15.8K LOC
-- expand.rs (4,440 lines), graph.rs (2,333 lines)
+- CREATE/DROP/ALTER RENAME/CREATE OR REPLACE SEMANTIC VIEW
+- TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS clauses
+- PK/FK/UNIQUE relationships with cardinality inference
+- Standard aggregate metrics (SUM, COUNT, AVG, MIN, MAX, etc.)
+- Derived metrics (metric-on-metric composition)
+- Fan trap detection, role-playing dimensions, USING RELATIONSHIPS
+- SHOW SEMANTIC VIEWS/DIMENSIONS/METRICS/FACTS with LIKE/STARTS WITH/LIMIT/IN
+- DESCRIBE SEMANTIC VIEW (property-per-row, 5 columns, 6 object kinds)
+- Metadata storage (created_on, database_name, schema_name)
+- 487 tests, 16,342 LOC
 
-**Focus:** Output format alignment, metadata storage changes, `required` column semantics, and module decomposition.
+**Focus:** New DDL features, query capabilities, and introspection enhancements.
 
 ---
 
 ## Table Stakes
 
-Features users expect. Missing = output format diverges from Snowflake alignment goal.
+Features that Snowflake's SQL DDL semantic views support and that users working toward parity will expect. Missing = incomplete Snowflake alignment claim.
 
-### T1: DESCRIBE SEMANTIC VIEW -- Property-Per-Row Format
+### T1: Semi-Additive Metrics (NON ADDITIVE BY)
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Restructure DESCRIBE output from 1 row with 6 JSON blob columns to N rows with 5 columns: `object_kind`, `object_name`, `parent_entity`, `property`, `property_value` |
-| **Why Expected** | This is the core format change. Snowflake's DESCRIBE returns one row per property, enabling SELECT/WHERE filtering on individual properties. The current JSON blob format requires client-side JSON parsing. |
-| **Complexity** | **Medium** -- complete rewrite of `DescribeSemanticViewVTab` |
-| **Dependencies** | None -- self-contained rewrite of `src/ddl/describe.rs` |
+| **Feature** | Support `NON ADDITIVE BY (dim1, dim2, ...)` on metric definitions. At query time, instead of aggregating across the named dimensions, sort by them and take the last (most recent) value before aggregating. |
+| **Why Expected** | Snowflake shipped NON ADDITIVE BY on 2026-03-05. dbt MetricFlow has `non_additive_dimension` with `window_choice: max/min`. Semi-additive measures are a fundamental data warehouse concept (account balances, inventory levels, MRR). Without this, users cannot correctly model snapshot data. |
+| **Complexity** | **High** -- requires structural expansion pipeline changes |
+| **Dependencies** | None on other v0.6.0 features; self-contained expansion path change |
 
-**Snowflake's exact schema (verified from official docs):**
+**How Snowflake does it:**
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `object_kind` | VARCHAR | Type of object: TABLE, RELATIONSHIP, DIMENSION, FACT, METRIC, DERIVED_METRIC, or NULL (view-level) |
-| `object_name` | VARCHAR | Name of the dimension, fact, metric, logical table, or relationship |
-| `parent_entity` | VARCHAR | Parent table name for dims/facts/metrics/relationships; NULL for tables/derived metrics/view-level |
-| `property` | VARCHAR | Property name (TABLE, EXPRESSION, DATA_TYPE, PRIMARY_KEY, FOREIGN_KEY, REF_TABLE, REF_KEY, etc.) |
-| `property_value` | VARCHAR | Property value as string |
+DDL syntax:
+```sql
+METRICS (
+  bank.m_account_balance
+    NON ADDITIVE BY (year_dim, month_dim, day_dim)
+    AS SUM(balance)
+)
+```
 
-**Properties to emit per object_kind (our extension's subset):**
+The `NON ADDITIVE BY` dimensions have optional sort order (`ASC|DESC`) and `NULLS FIRST|LAST`:
+```
+NON ADDITIVE BY (
+  <dimension> [ { ASC | DESC } ] [ NULLS { FIRST | LAST } ]
+  [ , ... ]
+)
+```
 
-| object_kind | Properties | Source in Model |
-|-------------|-----------|-----------------|
-| TABLE | BASE_TABLE_NAME, PRIMARY_KEY | `TableRef.table`, `TableRef.pk_columns` joined by comma |
-| TABLE | BASE_TABLE_DATABASE_NAME, BASE_TABLE_SCHEMA_NAME | Stored metadata (see T5 below) |
-| RELATIONSHIP | TABLE, REF_TABLE, FOREIGN_KEY, REF_KEY | `Join.from_alias`, `Join.table`, `Join.fk_columns`, `Join.pk_columns` |
-| DIMENSION | TABLE, EXPRESSION, DATA_TYPE | `Dimension.source_table`, `Dimension.expr`, `Dimension.output_type` |
-| FACT | TABLE, EXPRESSION, DATA_TYPE | `Fact.source_table`, `Fact.expr`, (fact type if available) |
-| METRIC | TABLE, EXPRESSION, DATA_TYPE | `Metric.source_table`, `Metric.expr`, `Metric.output_type` |
-| DERIVED_METRIC | EXPRESSION, DATA_TYPE | `Metric.expr` (no TABLE -- derived metrics reference other metrics) |
+At query time: rows are sorted by the non-additive dimensions (descending by default for "latest snapshot" semantics), and the values from the last rows are aggregated. This means for a SUM(balance) metric that is NON ADDITIVE BY (date_dim), the system takes the last date's balance per group and sums those.
 
-**Properties we skip (per user decision or N/A):**
-- COMMENT, SYNONYMS (user decided: no NULL placeholders)
-- ACCESS_MODIFIER (DuckDB has no RBAC)
-- CONSTRAINT (not implemented -- PK expressed as TABLE property)
-- CUSTOM_INSTRUCTIONS (Snowflake Cortex AI specific)
-- Cortex Search Service properties (Snowflake specific)
+**How dbt MetricFlow does it:**
 
-**parent_entity mapping:**
-- TABLE: NULL (tables are top-level)
-- RELATIONSHIP: NULL (relationships reference two tables, not one parent)
-- DIMENSION: `source_table` (the logical table this dim belongs to)
-- FACT: `source_table` (the logical table this fact belongs to)
-- METRIC: `source_table` (the logical table this metric belongs to)
-- DERIVED_METRIC: NULL (no table association)
+```yaml
+measures:
+  - name: account_balance
+    agg: sum
+    expr: balance
+    non_additive_dimension:
+      name: date
+      window_choice: max  # or min
+      window_groupings:
+        - customer_id
+```
 
-**Row ordering:** View-level properties first (if any), then TABLEs, then RELATIONSHIPs, then DIMENSIONs, then FACTs, then METRICs. Within each group, alphabetical by object_name, then by property name.
+MetricFlow generates a CTE with `ROW_NUMBER() OVER (PARTITION BY [groupings] ORDER BY [dim] DESC)` and filters to `rn = 1` before aggregating. This is the standard SQL pattern for semi-additive measures.
 
-**Row count estimate:** A typical view with 2 tables, 1 relationship, 5 dims, 3 facts, 4 metrics produces ~48 rows. Comfortably within DuckDB's 2048-row chunk size.
+**Expansion SQL pattern (what this extension should generate):**
 
-**Implementation pattern:** The bind function parses the stored JSON into `SemanticViewDefinition`, walks each component in order, emits one row per property into a `Vec<DescribeRow>`, and the func callback emits them. Same pattern as existing SHOW commands.
+For `SUM(balance) NON ADDITIVE BY (date_dim)` with requested dimensions `[customer_id, date_dim]`:
+```sql
+-- Standard aggregation: GROUP BY customer_id, date_dim
+-- Semi-additive: no change when ALL non-additive dims are in the query
 
-**Confidence:** HIGH (schema verified from [DESCRIBE SEMANTIC VIEW docs](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view))
+-- But when date_dim is NOT in the requested dimensions:
+WITH _dedup AS (
+  SELECT *, ROW_NUMBER() OVER (
+    PARTITION BY customer_id  -- remaining dimensions
+    ORDER BY date_dim DESC    -- non-additive dims, descending
+  ) AS _rn
+  FROM base_table
+)
+SELECT customer_id, SUM(balance)
+FROM _dedup WHERE _rn = 1
+GROUP BY customer_id
+```
+
+**Key design decisions needed:**
+1. **Default sort order:** Snowflake uses ASC by default for NON ADDITIVE BY dimensions, but "last row" semantics typically means DESC. Need to verify the exact Snowflake behavior vs implement the sensible default (DESC = latest).
+2. **Interaction with fan traps:** Semi-additive metrics with JOINs need the dedup CTE before the JOIN, or the fan trap detection needs to account for the dedup.
+3. **Interaction with derived metrics:** A derived metric referencing a semi-additive metric should inherit the semi-additive behavior (the base metric's dedup applies first).
+
+**Model changes required:**
+```rust
+pub struct Metric {
+    // ... existing fields ...
+    /// Dimensions that this metric is non-additive across.
+    /// Empty = fully additive (default).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub non_additive_dims: Vec<NonAdditiveDim>,
+}
+
+pub struct NonAdditiveDim {
+    pub dimension: String,
+    pub descending: bool,       // default true for "latest"
+    pub nulls_last: bool,       // default true
+}
+```
+
+**Parser changes:** Body parser must recognize `NON ADDITIVE BY (...)` between metric name and `AS` expression.
+
+**Expansion changes:** This is the hard part. The expansion pipeline currently generates a single `SELECT ... FROM ... GROUP BY ...`. Semi-additive metrics require a CTE-based pre-filter when non-additive dimensions are excluded from the query. The expansion engine must:
+1. Detect which requested dimensions overlap with non-additive dimensions
+2. If ALL non-additive dims are in the query: standard expansion (no change)
+3. If SOME/NONE non-additive dims are in the query: wrap with ROW_NUMBER CTE
+
+**Confidence:** HIGH for Snowflake syntax; MEDIUM for expansion approach (standard SQL pattern, but integration with existing JOIN/fan-trap/USING machinery needs design)
 
 ---
 
-### T2: SHOW SEMANTIC VIEWS -- Expanded Column Schema
+### T2: COMMENT on Views and Objects
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Expand from 2 columns (name, base_table) to 5 columns: `created_on`, `name`, `kind`, `database_name`, `schema_name` |
-| **Why Expected** | Snowflake returns 8 columns; our subset drops owner/role/extension/comment columns that have no DuckDB equivalent. The remaining 5 provide essential metadata for programmatic consumption. |
-| **Complexity** | **Medium** -- requires metadata storage changes (T5) + rewrite of `ListSemanticViewsVTab` |
-| **Dependencies** | T5 (created_on + database_name + schema_name storage) |
+| **Feature** | Support `COMMENT = '...'` on the semantic view itself, on tables, dimensions, metrics, and facts in the DDL. Surface comments in DESCRIBE and SHOW output. Support `ALTER SEMANTIC VIEW SET COMMENT = '...'` and `UNSET COMMENT`. |
+| **Why Expected** | Snowflake supports COMMENT at every level of the semantic view. Comments are the primary documentation mechanism for semantic models. Without comments, the semantic layer cannot serve as a self-documenting data catalog. |
+| **Complexity** | **Medium** -- pervasive but shallow; touches parser, model, catalog, SHOW, DESCRIBE |
+| **Dependencies** | None |
 
-**Target schema:**
+**Snowflake's exact DDL syntax:**
 
-| Column | Type | Source |
-|--------|------|--------|
-| `created_on` | TIMESTAMP | Stored at define time (see T5) |
-| `name` | VARCHAR | Already available |
-| `kind` | VARCHAR | Constant: 'SEMANTIC_VIEW' |
-| `database_name` | VARCHAR | Stored at define time (see T5) |
-| `schema_name` | VARCHAR | Stored at define time (see T5) |
+View-level:
+```sql
+CREATE SEMANTIC VIEW my_view
+  COMMENT = 'Revenue analysis view'
+  TABLES (...)
+  ...
+```
 
-**What changes from current:**
-- ADD: `created_on`, `kind`, `database_name`, `schema_name`
-- DROP: `base_table` (this information moves to DESCRIBE as TABLE properties)
+Object-level (tables, dimensions, facts, metrics):
+```sql
+TABLES (
+  orders AS my_schema.orders
+    PRIMARY KEY (order_id)
+    COMMENT = 'All customer orders'
+)
+DIMENSIONS (
+  orders.order_date AS orders.created_at
+    COMMENT = 'Date the order was placed'
+)
+METRICS (
+  orders.total_revenue AS SUM(orders.amount)
+    COMMENT = 'Total revenue across all orders'
+)
+FACTS (
+  orders.amount_fact AS orders.amount
+    COMMENT = 'Raw order amount'
+)
+```
 
-**Breaking change:** Users currently referencing `base_table` from SHOW SEMANTIC VIEWS must switch to DESCRIBE. This is acceptable for a pre-1.0 extension.
+ALTER syntax:
+```sql
+ALTER SEMANTIC VIEW my_view SET COMMENT = 'Updated description'
+ALTER SEMANTIC VIEW my_view UNSET COMMENT
+```
 
-**Confidence:** HIGH (schema verified from [SHOW SEMANTIC VIEWS docs](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views))
+**DESCRIBE output:** Comments appear as a COMMENT property row for each object_kind. The view-level comment appears with `object_kind = NULL, property = 'COMMENT'`.
+
+**SHOW output:** Snowflake's SHOW SEMANTIC VIEWS has a `comment` column (position 6 of 8). SHOW SEMANTIC DIMENSIONS/METRICS/FACTS have a `comment` column (position 8 of 8).
+
+**Model changes required:**
+
+```rust
+pub struct SemanticViewDefinition {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,  // view-level comment
+}
+
+pub struct TableRef {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+pub struct Dimension {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+// Same for Metric and Fact
+```
+
+**Parser changes:** Recognize `COMMENT = '...'` after object definitions. The body parser state machine needs a new trailing-clause recognition for each entry type.
+
+**ALTER changes:** Extend `DdlKind` to handle `ALTER SEMANTIC VIEW <name> SET COMMENT = '...'` and `UNSET COMMENT`. The ALTER currently only supports RENAME TO. Need to add SET/UNSET variants.
+
+**SHOW changes:** Add `comment` column to all SHOW commands (SHOW VIEWS position 6; SHOW DIMS/METRICS/FACTS position 8). This is additive -- new column at end.
+
+**DESCRIBE changes:** Emit COMMENT property row for each object that has one. View-level comment emitted with `object_kind = NULL`.
+
+**Confidence:** HIGH (straightforward string metadata; Snowflake syntax well-documented)
 
 ---
 
-### T3: SHOW SEMANTIC DIMENSIONS/METRICS/FACTS -- Aligned Column Schema
+### T3: SYNONYMS on Objects
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Align all three SHOW commands from 5/4 columns to 6 columns: `database_name`, `schema_name`, `semantic_view_name`, `table_name`, `name`, `data_type` |
-| **Why Expected** | Snowflake uses an 8-column schema (adding synonyms, comment). Our subset drops those two per user decision but must include the remaining 6. |
-| **Complexity** | **Low** -- additive column changes + column rename + column removal |
-| **Dependencies** | T5 (database_name + schema_name storage) |
+| **Feature** | Support `WITH SYNONYMS = ('alias1', 'alias2')` on tables, dimensions, metrics, and facts in the DDL. |
+| **Why Expected** | Snowflake supports synonyms on all object types. Synonyms serve as alternative names for Cortex Analyst / AI-powered querying. They appear in DESCRIBE and SHOW output. |
+| **Complexity** | **Low-Medium** -- same pattern as COMMENT but with list values |
+| **Dependencies** | None |
 
-**Target schema (same for all three commands):**
+**Snowflake's exact DDL syntax:**
 
-| Column | Type | Source |
-|--------|------|--------|
-| `database_name` | VARCHAR | Stored at define time |
-| `schema_name` | VARCHAR | Stored at define time |
-| `semantic_view_name` | VARCHAR | Already available |
-| `table_name` | VARCHAR | Currently `source_table` -- renamed |
-| `name` | VARCHAR | Already available |
-| `data_type` | VARCHAR | Already available for dims/metrics; needs addition for facts |
+```sql
+TABLES (
+  orders AS my_schema.orders
+    PRIMARY KEY (order_id)
+    WITH SYNONYMS = ('sales_orders', 'purchase_records')
+)
+DIMENSIONS (
+  orders.cust_name AS orders.customer_name
+    WITH SYNONYMS = ('customer_name', 'buyer_name')
+)
+```
 
-**What changes from current:**
-- ADD: `database_name`, `schema_name` (prepended)
-- RENAME: `source_table` to `table_name`
-- DROP: `expr` (user decision: implementation detail, available via DESCRIBE EXPRESSION property)
-- ADD to FACTS: `data_type` (Snowflake includes it; current facts output omits it)
+**Important Snowflake note:** "Synonyms are used for informational purposes only. You cannot use a synonym to refer to a dimension, fact, or metric in another dimension, fact, or metric."
 
-**Breaking change:** `expr` column removal and `source_table` rename. Acceptable for pre-1.0.
+This means synonyms are pure metadata -- they do not affect query resolution or expansion. They exist for documentation and AI-powered natural language query interfaces.
 
-**SHOW SEMANTIC FACTS data_type:** Facts currently have no `output_type` field in the model. The `Fact` struct stores `name`, `expr`, and `source_table` only. Adding `data_type` to facts requires either:
-1. Adding `output_type: Option<String>` to the `Fact` struct and populating it during type inference (same as dims/metrics)
-2. Emitting empty string for facts without type info
+**Model changes required:**
 
-Option 1 is cleaner and consistent with dims/metrics. Facts are row-level expressions with deterministic types, so LIMIT 0 inference can resolve them.
+```rust
+pub struct Dimension {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synonyms: Vec<String>,
+}
+// Same for TableRef, Metric, Fact
+```
 
-**Confidence:** HIGH (schemas verified from [SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions), [SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics), [SHOW SEMANTIC FACTS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-facts))
+**SHOW output:** Snowflake's SHOW SEMANTIC DIMENSIONS/METRICS/FACTS have a `synonyms` column (position 7 of 8), rendered as a JSON array string like `["cust_name", "buyer_name"]`.
+
+**DESCRIBE output:** Emit SYNONYMS property row for each object that has synonyms.
+
+**Confidence:** HIGH (pure metadata; no query-time behavior)
 
 ---
 
-### T4: SHOW SEMANTIC DIMENSIONS FOR METRIC -- Aligned with `required` Column
+### T4: PRIVATE/PUBLIC Access Modifiers
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Align from 5 columns to 4 columns: `table_name`, `name`, `data_type`, `required` |
-| **Why Expected** | Snowflake's FOR METRIC output has 6 columns (adding synonyms, comment); our subset drops those two. The `required` column is Snowflake-specific and meaningful. |
-| **Complexity** | **Medium** -- column changes are simple, but `required` semantics need a design decision |
-| **Dependencies** | None beyond existing fan-trap filtering logic |
+| **Feature** | Support `PRIVATE` / `PUBLIC` keywords on facts and metrics. Private objects cannot be queried directly. |
+| **Why Expected** | Snowflake supports PRIVATE/PUBLIC on facts and metrics. This enables hiding intermediate calculations (helper facts, internal metrics) from end users while keeping them available for derived metric composition. |
+| **Complexity** | **Low-Medium** -- model + parser + query-time validation |
+| **Dependencies** | None |
 
-**Target schema:**
+**Snowflake's rules:**
+1. Dimensions are always PUBLIC (cannot be marked PRIVATE)
+2. Facts and metrics default to PUBLIC if neither keyword is specified
+3. Private facts/metrics cannot be queried or used in WHERE conditions
+4. Private facts/metrics CAN be referenced by other metrics in the same view (derived metric composition)
+5. Private objects appear in GET_DDL output
+6. Private objects appear in SHOW output only if the role has REFERENCES or OWNERSHIP privilege (DuckDB has no RBAC, so always visible)
 
-| Column | Type | Source |
-|--------|------|--------|
-| `table_name` | VARCHAR | Currently `source_table` -- renamed |
-| `name` | VARCHAR | Already available |
-| `data_type` | VARCHAR | Already available |
-| `required` | BOOLEAN | New -- see analysis below |
+**Model changes:**
 
-**What changes from current:**
-- DROP: `semantic_view_name` (scoped to single view by the command itself)
-- DROP: `expr` (consistent with other SHOW commands)
-- RENAME: `source_table` to `table_name`
-- ADD: `required` BOOLEAN column
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AccessModifier {
+    #[default]
+    Public,
+    Private,
+}
 
-**The `required` column -- what Snowflake does (verified from official docs):**
+pub struct Metric {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "AccessModifier::is_default")]
+    pub access: AccessModifier,
+}
 
-In Snowflake, `required` is TRUE when a metric's definition includes a `PARTITION BY EXCLUDING` clause naming that dimension. This means the metric (typically a window function metric) cannot be computed without grouping by that dimension.
+pub struct Fact {
+    // ... existing fields ...
+    #[serde(default, skip_serializing_if = "AccessModifier::is_default")]
+    pub access: AccessModifier,
+}
+```
 
-**The `required` column -- what this extension should do:**
+**Query-time enforcement:** When a user requests a private metric or fact in `semantic_view('view', metrics := ['private_metric'])`, the extension should return an error: "Metric 'private_metric' is private and cannot be queried directly."
 
-This extension does not support `PARTITION BY EXCLUDING` (that is a window function metric feature, out of scope per PROJECT.md). Since only aggregate metrics are supported, no dimension is ever structurally required -- any subset of fan-trap-safe dimensions is valid.
+**DESCRIBE output:** Emit ACCESS_MODIFIER property row for facts and metrics.
 
-**Decision: `required` = constant FALSE for all rows.**
+**Parser changes:** Recognize optional `PRIVATE` / `PUBLIC` keyword before `<table_alias>.<name>` in FACTS and METRICS clauses.
 
-Rationale:
-- Honest: no dimension is structurally required for aggregate metrics
-- Snowflake-compatible: the column exists in the schema
-- Future-proof: when window function metrics are added, `required` gains real meaning via `PARTITION BY EXCLUDING`
-- No false requirements: avoids confusing users into thinking they *must* include certain dimensions
-
-Alternative considered and rejected: "infer required from fan-trap safety" -- this conflates "available" (what FOR METRIC already filters to) with "required" (what the metric definition demands). These are different concepts.
-
-**Confidence:** HIGH (schema and semantics verified from [SHOW SEMANTIC DIMENSIONS FOR METRIC docs](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions-for-metric))
+**Confidence:** HIGH (straightforward boolean-like modifier with query-time check)
 
 ---
 
-### T5: Metadata Storage -- created_on, database_name, schema_name
+### T5: GET_DDL Reconstruction
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Store `created_on` timestamp, `database_name`, and `schema_name` at define time in the catalog JSON. Surface in SHOW/DESCRIBE output. |
-| **Why Expected** | Prerequisite for T2 and T3. Without stored metadata, SHOW commands cannot populate these columns. |
-| **Complexity** | **Medium** -- model change, catalog write-path change, migration for existing definitions |
-| **Dependencies** | None -- foundational change that others depend on |
+| **Feature** | Reconstruct a valid `CREATE SEMANTIC VIEW` DDL statement from the stored JSON definition. Callable as `SELECT get_semantic_view_ddl('view_name')` or exposed via a DDL command. |
+| **Why Expected** | Snowflake supports `GET_DDL('SEMANTIC VIEW', 'view_name')` which returns the complete DDL. This is essential for version control, migration scripts, and backup workflows. Round-trip fidelity (create -> get_ddl -> create) is critical. |
+| **Complexity** | **Medium** -- must handle all DDL features including new ones (comments, synonyms, access modifiers, NON ADDITIVE BY) |
+| **Dependencies** | Should be implemented AFTER T1-T4 so all features are representable |
+
+**Snowflake's behavior:**
+- Returns a `CREATE OR REPLACE SEMANTIC VIEW` statement
+- Includes PRIVATE facts/metrics in the output
+- May include default property values
+- Must be a valid, re-executable DDL statement
 
 **Implementation approach:**
 
-1. **New fields in `SemanticViewDefinition`:**
-   ```rust
-   #[serde(default)]
-   pub created_on: Option<String>,   // ISO 8601: "2026-04-01T12:34:56Z"
-   #[serde(default)]
-   pub database_name: Option<String>,
-   #[serde(default)]
-   pub schema_name: Option<String>,
-   ```
+A scalar function `get_semantic_view_ddl(name VARCHAR) -> VARCHAR` that:
+1. Loads the `SemanticViewDefinition` from catalog
+2. Reconstructs each clause (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS) with proper formatting
+3. Includes all metadata (COMMENT, SYNONYMS, PRIVATE/PUBLIC, NON ADDITIVE BY)
+4. Returns a formatted, re-parseable DDL string
 
-2. **Set at define time:** In the `catalog_insert` / `catalog_insert_or_replace` paths, populate before JSON serialization.
+**Key concerns:**
+- **Round-trip fidelity:** `CREATE` -> store -> `GET_DDL` -> `CREATE OR REPLACE` must produce an identical definition. This means the model must preserve all DDL-specified information, including ordering of entries.
+- **Formatting:** Snowflake returns nicely indented DDL. The extension should produce readable output.
+- **Lossy fields:** `column_type_names` and `column_types_inferred` are inferred at define time and should NOT appear in GET_DDL output (they are not part of the DDL surface).
 
-3. **Timestamp source:** Use `std::time::SystemTime` formatted to ISO 8601. Avoids adding `chrono` as a dependency. Second precision is sufficient for display.
-   ```rust
-   use std::time::{SystemTime, UNIX_EPOCH};
-   let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-   // Format: "2026-04-01T12:34:56Z"
-   ```
+**Alternative interface:** Instead of a scalar function, could be a DDL command: `GET DDL FOR SEMANTIC VIEW 'name'`. The scalar function is simpler to implement and more flexible (can be used in SELECT, COPY TO, etc.).
 
-4. **database_name source:** The `db_path` string passed through extension init. For `:memory:` databases, use `"memory"`. For file-backed databases, extract the database name (typically the filename without extension, matching DuckDB's `current_database()` behavior).
-
-5. **schema_name source:** Always `"semantic_layer"` -- definitions live in the `semantic_layer._definitions` table. This is the schema context where the semantic view metadata resides.
-
-6. **Migration for existing definitions:** Old stored JSON without these fields deserializes as `None` via `#[serde(default)]`. SHOW output renders NULL for `created_on` on old definitions. `database_name` and `schema_name` can be backfilled at load time from the current DuckDB context.
-
-**Alternative considered and rejected:** Querying DuckDB `SELECT current_database()` at bind time instead of storing. This avoids model changes but is incorrect when a database is re-attached under a different alias. Storing at define time is the correct approach.
-
-**Confidence:** HIGH (straightforward model extension; `#[serde(default)]` migration pattern already used for `facts`, `tables`, `column_type_names`)
+**Confidence:** HIGH (string reconstruction from known model; no query-time behavior)
 
 ---
 
-### T6: Module Directory Refactoring -- expand.rs and graph.rs
+### T6: Queryable FACTS (Row-Level Query Mode)
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Split `expand.rs` (4,440 lines) into `expand/` module directory and `graph.rs` (2,333 lines) into `graph/` module directory. Extract shared `util.rs` and `errors.rs`. |
-| **Why Expected** | These are the two largest files in the codebase. `graph.rs` is targeted for future PyO3/Maturin extraction. Module directories establish clean boundaries. |
-| **Complexity** | **Medium-High** -- mechanical but high-volume; must preserve all 482 tests |
-| **Dependencies** | None -- pure refactoring, no behavior changes |
+| **Feature** | Support `FACTS` clause in the `semantic_view()` table function, returning row-level fact values without GROUP BY. Cannot be combined with METRICS in the same query. |
+| **Why Expected** | Snowflake supports `FACTS` in the `SEMANTIC_VIEW()` query clause. Facts return row-level data without aggregation. This is useful for detail-level reporting, debugging, and data quality checks. |
+| **Complexity** | **Medium** -- requires a new expansion path without GROUP BY |
+| **Dependencies** | None on other v0.6.0 features |
 
-**Current state:**
-- `expand.rs`: 4,440 lines -- query expansion, SQL generation, fact inlining, derived metric resolution, USING relationship scoping, type inference
-- `graph.rs`: 2,333 lines -- `RelationshipGraph`, topological sort, fan trap detection, parent/child maps, cardinality tracking, cycle/diamond validation
+**Snowflake's rules:**
+1. `FACTS` and `METRICS` cannot be specified in the same query
+2. When using FACTS with DIMENSIONS, all facts and dimensions must be from the same logical table
+3. FACTS queries produce row-level output (no GROUP BY)
+4. Facts can be used in WHERE clauses
 
-**Suggested decomposition for expand/:**
-| File | Contents | Approx Lines |
-|------|----------|--------------|
-| `expand/mod.rs` | Public API re-exports, `SemanticExpander` struct | ~200 |
-| `expand/sql_gen.rs` | `build_execution_sql`, FROM/JOIN clause generation, GROUP BY | ~800 |
-| `expand/fact_inlining.rs` | Fact expression substitution, word-boundary matching, DAG resolution | ~600 |
-| `expand/metric_resolution.rs` | Derived metric inlining, `collect_derived_metric_source_tables`, stacking | ~500 |
-| `expand/using_relationships.rs` | USING clause handling, scoped alias generation, ambiguity detection | ~400 |
-| `expand/type_inference.rs` | LIMIT 0 type inference, type map construction, cast wrapping | ~500 |
-| `expand/helpers.rs` | `suggest_closest`, `ancestors_to_root`, shared utilities | ~300 |
-| `expand/tests.rs` or inline `#[cfg(test)]` | Test modules (likely the largest chunk) | ~1,100 |
+**Current state:** Facts exist in the model and DDL but are only used for inlining into metric expressions. The `semantic_view()` table function only accepts `dimensions` and `metrics` parameters.
 
-**Suggested decomposition for graph/:**
-| File | Contents | Approx Lines |
-|------|----------|--------------|
-| `graph/mod.rs` | Public API re-exports, `RelationshipGraph` struct | ~200 |
-| `graph/builder.rs` | `from_definition()`, adjacency list construction, reverse edges | ~400 |
-| `graph/validation.rs` | Cycle detection, diamond detection, tree structure validation | ~400 |
-| `graph/toposort.rs` | Kahn's algorithm, topological ordering | ~300 |
-| `graph/fan_trap.rs` | Fan trap detection, LCA path analysis, cardinality edge checking | ~400 |
-| `graph/join_synthesis.rs` | `synthesize_on_clause()`, PK/FK matching, ON clause generation | ~300 |
-| `graph/tests.rs` or inline `#[cfg(test)]` | Test modules | ~330 |
+**Query syntax change:**
 
-**Shared extractions:**
-- `util.rs`: `suggest_closest()` (strsim fuzzy matching) -- currently in `expand.rs` but used by `show_dims_for_metric.rs` too
-- `errors.rs`: Common error types if circular dependencies exist between expand/ and graph/
+```sql
+-- Current: only metrics mode
+FROM semantic_view('view', dimensions := ['d1'], metrics := ['m1'])
 
-**Key constraint:** `show_dims_for_metric.rs` imports `ancestors_to_root` and `collect_derived_metric_source_tables` from `expand.rs`. After splitting, these must remain accessible -- either via `expand::helpers` re-export or by moving to a shared `util.rs`.
+-- New: facts mode
+FROM semantic_view('view', dimensions := ['d1'], facts := ['f1', 'f2'])
+```
 
-**Risk:** Module boundary decisions may need adjustment during implementation if hidden coupling surfaces. The test suite (482 tests) is the safety net.
+**Expansion for FACTS mode:**
+```sql
+-- No GROUP BY, no aggregation
+SELECT d1_expr AS d1, f1_expr AS f1, f2_expr AS f2
+FROM base_table AS alias
+-- JOINs if needed (but same-table constraint may eliminate this)
+WHERE <filters>
+```
 
-**Confidence:** HIGH (straightforward mechanical refactoring with a comprehensive test suite)
+**Validation at query time:**
+- If both `facts` and `metrics` are specified: error
+- If facts reference different tables than dimensions: error (same-table constraint)
+- If a private fact is requested: error
+
+**Model changes:** The table function bind needs a new `facts` parameter.
+
+**Confidence:** HIGH for semantics; MEDIUM for implementation (same-table constraint enforcement, new expansion path)
+
+---
+
+### T7: Wildcard Dimension/Metric Selection
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Support `table_alias.*` syntax in the `dimensions` and `metrics` parameters to select all dimensions or metrics from a specific logical table. |
+| **Why Expected** | Snowflake supports `customer.*` in both DIMENSIONS and METRICS clauses. This is a significant convenience for tables with many dimensions/metrics. |
+| **Complexity** | **Low** -- expand wildcards to concrete names at query time |
+| **Dependencies** | None |
+
+**Snowflake's rules:**
+1. Must be qualified with a table alias: `customer.*` is valid, bare `*` is not
+2. Applies to DIMENSIONS, METRICS, and FACTS clauses separately
+3. Expands to all objects scoped to that logical table
+
+**Implementation approach:**
+
+In the table function bind:
+1. Parse each requested dimension/metric/fact name
+2. If it matches `<alias>.*` pattern, expand to all objects with that `source_table`
+3. Proceed with normal validation on the expanded list
+
+**Key edge case:** What if `customer.*` in dimensions yields a dimension that causes a fan trap with a requested metric? The fan trap detection should run AFTER wildcard expansion, so the user gets a clear error about which specific dimension is problematic.
+
+**Parser changes:** None in the DDL parser. This is a query-time parameter expansion.
+
+**Model changes:** None. The expansion is purely in the table function bind logic.
+
+**Confidence:** HIGH (simple string expansion; no semantic complexity)
 
 ---
 
 ## Differentiators
 
-Features that set the product apart. Not expected, but valued.
+Features that set the product apart or align with Snowflake but go beyond minimum viability.
 
-### D1: Hierarchies in DESCRIBE Output
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | Emit HIERARCHY as an `object_kind` in DESCRIBE with a DIMENSIONS property listing the drill path |
-| **Value Proposition** | Snowflake does not have a `SHOW SEMANTIC HIERARCHIES` command. Exposing hierarchy metadata via DESCRIBE makes it discoverable. |
-| **Complexity** | Low -- hierarchies already in model, just needs property emission |
-| **Dependencies** | T1 (DESCRIBE rewrite must be done first) |
-
-Not in Snowflake's schema, but the extension already supports hierarchies and they should be visible somewhere. DESCRIBE is the natural home. Emit as:
-- object_kind: `HIERARCHY`
-- object_name: hierarchy name
-- parent_entity: NULL
-- property: `DIMENSIONS`
-- property_value: comma-separated dimension names in drill order
-
-### D2: TERSE Mode for SHOW SEMANTIC VIEWS
+### D1: Window Function Metrics (PARTITION BY EXCLUDING)
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Support `SHOW TERSE SEMANTIC VIEWS` returning only 3 columns: created_on, name, kind |
-| **Value Proposition** | Snowflake supports TERSE mode; useful for scripting where full metadata is not needed |
-| **Complexity** | Medium -- requires parser to detect TERSE keyword |
-| **Dependencies** | T2 (SHOW VIEWS alignment) |
+| **Feature** | Support window function metrics with `PARTITION BY EXCLUDING` in the DDL, producing non-aggregated output alongside regular metrics. |
+| **Value Proposition** | Snowflake supports this for rolling averages, cumulative sums, and other window calculations. This is a significant analytical capability. |
+| **Complexity** | **Very High** -- requires a fundamentally different expansion path that does NOT use GROUP BY |
+| **Dependencies** | T1 (semi-additive) shares expansion path concerns |
 
-**Recommendation: Defer.** Adds parser complexity for marginal value. The standard SHOW output is only 5 columns.
+**How Snowflake does it:**
 
-### D3: Lexicographic Sort by (database, schema, name)
+```sql
+METRICS (
+  store_sales.avg_7_days_sales_quantity
+    AS AVG(total_sales_quantity) OVER (
+      PARTITION BY EXCLUDING date.date, date.year
+      ORDER BY date.date
+      RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW
+    )
+)
+```
+
+`PARTITION BY EXCLUDING` means: partition by ALL dimensions in the query EXCEPT the named ones. This is a Snowflake-specific SQL extension -- `EXCLUDING` is not valid outside semantic view metric definitions.
+
+**Query rules:** When querying a window function metric, you MUST also include the dimensions named in PARTITION BY EXCLUDING and ORDER BY. The `required` column in SHOW SEMANTIC DIMENSIONS FOR METRIC indicates these mandatory dimensions.
+
+**Why this is a differentiator, not table stakes:** Window function metrics require an expansion path that produces output WITHOUT GROUP BY, which is architecturally orthogonal to the current aggregation model. The existing expansion pipeline assumes every query produces `SELECT ... GROUP BY dims`. Window metrics need row-level output with window expressions layered on top.
+
+**Recommendation:** Implement the DDL parsing and model storage now so definitions are complete, but defer query-time expansion to a later milestone. This allows GET_DDL round-trip fidelity and correct DESCRIBE/SHOW output while avoiding the expansion complexity.
+
+If implemented in v0.6.0, the `required` column in SHOW SEMANTIC DIMENSIONS FOR METRIC gains real meaning (currently constant FALSE).
+
+**Confidence:** HIGH for syntax; LOW for expansion implementation (architectural change needed)
+
+---
+
+### D2: SHOW ... IN SCHEMA/DATABASE Scope Filtering
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Sort all SHOW output lexicographically by database_name, schema_name, then object name |
-| **Value Proposition** | Matches Snowflake's documented ordering guarantee |
-| **Complexity** | Low -- already sorted by name; add database/schema as prefix sort keys |
-| **Dependencies** | T5 (database_name + schema_name must be available) |
+| **Feature** | Extend SHOW commands to support `IN DATABASE <name>` and `IN SCHEMA <name>` scope filtering, beyond the current `IN <semantic_view_name>`. |
+| **Value Proposition** | Snowflake supports ACCOUNT/DATABASE/SCHEMA scoping. For DuckDB with attached databases, DATABASE-level scoping has real value. |
+| **Complexity** | **Low-Medium** -- parser and WHERE clause injection |
+| **Dependencies** | T5 metadata (database_name, schema_name stored at define time) |
 
-Trivial to implement since there is only one database and schema context. The sort effectively remains by name only, but the code should be structured to support multi-database scenarios if they ever arise.
+**Current state:** SHOW SEMANTIC VIEWS supports no IN clause. SHOW SEMANTIC DIMENSIONS/METRICS/FACTS support `IN <view_name>` to scope to a single view. Cross-view forms (`_all` suffix) return everything.
+
+**Snowflake's IN clause:**
+```sql
+SHOW SEMANTIC VIEWS IN DATABASE my_db
+SHOW SEMANTIC VIEWS IN SCHEMA my_db.my_schema
+SHOW SEMANTIC DIMENSIONS IN SCHEMA my_db.my_schema
+```
+
+**Implementation:** Add `IN DATABASE <name>` and `IN SCHEMA <name>` variants to the SHOW parser. Generate WHERE clauses filtering on stored `database_name` and `schema_name`.
+
+For SHOW SEMANTIC VIEWS: `IN DATABASE` and `IN SCHEMA` are the meaningful scopes.
+For SHOW SEMANTIC DIMENSIONS/METRICS/FACTS: `IN <view_name>` already works; add `IN DATABASE` and `IN SCHEMA` as alternatives.
+
+**Confidence:** HIGH (mechanical WHERE clause injection)
+
+---
+
+### D3: TERSE Mode for SHOW Commands
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Support `SHOW TERSE SEMANTIC VIEWS` returning a reduced column set. |
+| **Value Proposition** | Snowflake supports TERSE for SHOW SEMANTIC VIEWS (not for DIMS/METRICS/FACTS). Returns: created_on, name, kind, database_name, schema_name (the same 5 columns -- so in practice TERSE is identical to regular for our extension since we already omit comment/owner). |
+| **Complexity** | **Low** -- parser change to detect TERSE keyword |
+| **Dependencies** | None |
+
+**Key insight:** In Snowflake, TERSE removes the `comment`, `owner`, and `owner_role_type` columns. Since this extension already omits those columns, TERSE mode would produce identical output to regular mode. The value is syntactic compatibility -- scripts written for Snowflake that use `SHOW TERSE SEMANTIC VIEWS` should not error.
+
+**Recommendation:** Implement as a no-op parser recognition (accept the TERSE keyword, produce standard output). This is cheap and ensures Snowflake DDL script portability.
+
+**Confidence:** HIGH (trivial)
+
+---
+
+### D4: SHOW COLUMNS on Semantic View
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | Support `SHOW COLUMNS IN VIEW <semantic_view_name>` returning dimensions, facts, and metrics with a `kind` column. |
+| **Value Proposition** | Snowflake's SHOW COLUMNS is a unified interface that works across tables, views, and semantic views. It returns a `kind` column with values DIMENSION, FACT, or METRIC. |
+| **Complexity** | **Medium** -- new command + parser prefix detection |
+| **Dependencies** | None |
+
+**Snowflake's SHOW COLUMNS output for semantic views:**
+
+| Column | Description |
+|--------|-------------|
+| table_name | Semantic view name |
+| schema_name | Schema |
+| column_name | Dimension/fact/metric name |
+| data_type | Data type |
+| null? | Nullability |
+| default | Default value |
+| kind | DIMENSION, FACT, or METRIC |
+| expression | The defining expression |
+| comment | Comment text |
+| database_name | Database |
+| autoincrement | N/A for semantic views |
+
+**Alternative:** The existing SHOW SEMANTIC DIMENSIONS + SHOW SEMANTIC METRICS + SHOW SEMANTIC FACTS already provides this information (split across three commands). SHOW COLUMNS provides a single unified view.
+
+**Recommendation:** Implement if time allows. Lower priority than the core DDL features (T1-T7).
+
+**Confidence:** HIGH for semantics; MEDIUM for implementation (new DDL prefix detection)
 
 ---
 
 ## Anti-Features
 
-Features to explicitly NOT build in v0.5.5.
+Features to explicitly NOT build in v0.6.0.
 
 | Anti-Feature | Why Avoid | What to Do Instead |
 |--------------|-----------|-------------------|
-| `comment` / `synonyms` columns with NULL placeholders | User explicitly decided against NULL placeholder columns. They add visual noise without value until comments/synonyms are first-class features. | Omit entirely. Add columns when comments/synonyms become a DDL feature. |
-| `owner` / `owner_role_type` columns in SHOW VIEWS | DuckDB has no RBAC model. These are Snowflake-specific. | Omit. Not applicable to DuckDB extensions. |
-| `access_modifier` property in DESCRIBE | Snowflake PRIVATE/PUBLIC access; DuckDB has no access control. | Omit. All objects are implicitly public. |
-| `extension` column in SHOW VIEWS | Snowflake-specific column for semantic view extensions (a Snowflake concept). | Omit. Not applicable. |
-| CONSTRAINT object_kind in DESCRIBE | Snowflake uses constraints for time-range boundaries (START_COLUMN/END_COLUMN). | Omit. PK/UNIQUE expressed as TABLE properties. |
-| CUSTOM_INSTRUCTIONS object_kind | Snowflake Cortex AI integration. | Omit entirely. |
-| Cortex Search Service dimension properties | Snowflake-specific AI/search integration. | Omit entirely. |
-| `SHOW COLUMNS` command | Snowflake has a separate SHOW COLUMNS returning dims/facts/metrics with a `kind` column. | Not needed. SHOW SEMANTIC DIMENSIONS/METRICS/FACTS already covers this. Avoid duplicate interfaces. |
-| `IN ACCOUNT / IN DATABASE` scoping | Snowflake scopes SHOW across databases/accounts. DuckDB extension operates in a single database. | Omit. `IN semantic_view_name` is the only meaningful scope. |
-| `SHOW TERSE SEMANTIC VIEWS` | Adds parser complexity for marginal scripting benefit. | Defer to future milestone. |
+| `owner` / `owner_role_type` columns in SHOW VIEWS | DuckDB has no RBAC model. These are Snowflake-specific privilege columns. | Omit. Not applicable to DuckDB extensions. |
+| CUSTOM_INSTRUCTIONS object_kind in DESCRIBE | Snowflake Cortex AI integration for natural language query hints. | Omit entirely. Snowflake-specific AI feature. |
+| Cortex Search Service dimension properties | Snowflake-specific vector search integration. | Omit entirely. |
+| CONSTRAINT object_kind (DISTINCT_RANGE) | Snowflake uses constraints for time-range boundaries (START_COLUMN/END_COLUMN). Niche temporal feature. | Omit. PK/UNIQUE expressed as TABLE properties. |
+| Synonym-based query resolution | Snowflake explicitly states synonyms are "informational only." Building synonym resolution would be non-standard. | Store synonyms as metadata only. |
+| `IN ACCOUNT` scoping | DuckDB extensions operate within a single database. Account-level scoping is meaningless. | Omit. `IN DATABASE` and `IN SCHEMA` cover the meaningful scopes. |
+| Window function metric query expansion (if parser-only approach taken) | Architectural change to support non-GROUP BY expansion paths. Very high complexity. | Parse and store in model; defer expansion to future milestone. |
+| `USING RELATIONSHIPS` for facts queries | Snowflake's same-table constraint for facts eliminates multi-table join paths. | Enforce same-table constraint; no join path selection needed for facts. |
 
 ---
 
 ## Feature Dependencies
 
 ```
-T5: Metadata storage (created_on, database_name, schema_name)
-  |
-  +--> T2: SHOW SEMANTIC VIEWS (uses stored created_on, database_name, schema_name)
-  |
-  +--> T3: SHOW SEMANTIC DIMENSIONS/METRICS/FACTS (uses stored database_name, schema_name)
+T2: COMMENT ----+
+T3: SYNONYMS ---+--> T5: GET_DDL (needs all metadata to reconstruct)
+T4: PRIVATE ----+
+T1: NON ADDITIVE --+
 
-T1: DESCRIBE property-per-row rewrite (independent, no prerequisites)
+T6: Queryable FACTS (independent)
+T7: Wildcard selection (independent)
 
-T4: SHOW DIMS FOR METRIC alignment (independent, no prerequisites)
+D1: Window metrics (independent, but shares expansion concerns with T1)
+D2: IN SCHEMA/DATABASE (uses stored database_name/schema_name from v0.5.5)
+D3: TERSE mode (parser-only, independent)
+D4: SHOW COLUMNS (independent)
 
-T6: Module directory refactoring (independent, no prerequisites)
-    (But should be done BEFORE or AFTER the SHOW/DESCRIBE changes, not during,
-     to avoid merge conflicts in the same files being restructured)
+T2 COMMENT --> ALTER SET/UNSET COMMENT (extends existing ALTER infrastructure)
 
-Fact data_type (needed by T3 for SHOW FACTS)
-  +--> Requires `output_type` field added to Fact model
-  +--> Requires type inference update to populate fact types
+SHOW output changes (add comment/synonyms columns) depend on T2/T3 model changes.
+DESCRIBE output changes (new property rows) depend on T2/T3/T4 model changes.
 ```
 
-**Critical insight:** T6 (module refactoring) should be either the first or last phase. Doing it mid-milestone while SHOW/DESCRIBE files are also changing creates merge complexity. Recommend doing it first since it does not change behavior and provides a cleaner code structure for the subsequent SHOW/DESCRIBE changes.
+**Critical ordering insight:** T5 (GET_DDL) should be the LAST table-stakes feature implemented because it must reconstruct ALL other features faithfully. Implementing it first would require updating it with every subsequent feature addition.
+
+**Recommended phase ordering:**
+1. **Metadata features (T2 + T3 + T4)** -- Add comment, synonyms, access modifiers to model/parser/SHOW/DESCRIBE. These are shallow, pervasive changes that touch the same files. Bundle them to minimize churn.
+2. **Semi-additive metrics (T1)** -- Deep expansion pipeline change. Independent of metadata features. Implement after metadata is stable.
+3. **Queryable FACTS (T6)** -- New expansion path (no GROUP BY). Independent.
+4. **Wildcard selection (T7)** -- Simple query-time expansion. Can go anywhere.
+5. **GET_DDL (T5)** -- Last, after all DDL features are finalized.
+6. **Introspection (D2 + D3 + D4)** -- Polish features that can be added at any point.
 
 ---
 
 ## Complexity Assessment Summary
 
-| Feature | Complexity | Est. LOC Delta | Risk | Phase Order |
-|---------|------------|----------------|------|-------------|
-| T6: Module refactoring (expand/, graph/) | Medium-High | ~0 net (reorganization) | Low (test suite as safety net) | 1st |
-| T5: Metadata storage (created_on, db, schema) | Medium | ~80 (model + catalog) | Low (proven #[serde(default)] pattern) | 2nd |
-| T1: DESCRIBE property-per-row | Medium | ~150 (complete rewrite of describe.rs) | Low-Medium (new output format) | 3rd |
-| T2: SHOW VIEWS alignment | Low-Medium | ~60 (rewrite list.rs) | Low | 4th |
-| T3: SHOW DIMS/METRICS/FACTS alignment | Low | ~80 (column changes across 3 files) | Low | 5th |
-| T4: SHOW DIMS FOR METRIC alignment | Medium | ~40 (column changes + required) | Low | 6th |
-| D1: Hierarchies in DESCRIBE | Low | ~30 | None | With T1 |
-| **Total** | **Medium** | **~440 LOC delta** | **Low-Medium** | |
+| Feature | Complexity | Est. LOC Delta | Risk | Category |
+|---------|------------|----------------|------|----------|
+| T1: Semi-additive metrics (NON ADDITIVE BY) | High | ~400 (parser + model + expansion + tests) | Medium (expansion pipeline structural change) | Table Stakes |
+| T2: COMMENT on views and objects | Medium | ~250 (parser + model + SHOW + DESCRIBE + ALTER) | Low | Table Stakes |
+| T3: SYNONYMS on objects | Low-Medium | ~200 (same pattern as COMMENT) | Low | Table Stakes |
+| T4: PRIVATE/PUBLIC access modifiers | Low-Medium | ~180 (model + parser + query validation + DESCRIBE) | Low | Table Stakes |
+| T5: GET_DDL reconstruction | Medium | ~300 (DDL string builder + tests) | Low-Medium (round-trip fidelity) | Table Stakes |
+| T6: Queryable FACTS | Medium | ~250 (new expansion path + table function param + tests) | Medium (new code path) | Table Stakes |
+| T7: Wildcard selection | Low | ~80 (query-time name expansion) | Low | Table Stakes |
+| D1: Window function metrics | Very High | ~600+ (parser + model + expansion architecture) | High (orthogonal expansion path) | Differentiator |
+| D2: SHOW IN SCHEMA/DATABASE | Low-Medium | ~100 (parser + WHERE injection) | Low | Differentiator |
+| D3: TERSE mode | Low | ~30 (parser recognition) | None | Differentiator |
+| D4: SHOW COLUMNS | Medium | ~200 (new command + parser) | Low | Differentiator |
+| **Table Stakes Total** | | **~1,660 LOC** | | |
+| **All Features Total** | | **~2,590 LOC** | | |
 
 ---
 
@@ -398,22 +617,23 @@ Fact data_type (needed by T3 for SHOW FACTS)
 
 Prioritize:
 
-1. **T6: Module directory refactoring** -- do first while no other changes are in flight. Provides clean structure for subsequent work. Test suite validates correctness.
+1. **T2 + T3 + T4: Metadata features bundle** -- COMMENT, SYNONYMS, PRIVATE/PUBLIC. These three touch the same model structs, parser paths, and SHOW/DESCRIBE outputs. Bundling reduces file churn. Low individual complexity, medium combined.
 
-2. **T5: Metadata storage at define time** -- prerequisite for multiple SHOW changes. Small, foundational change that unblocks T2 and T3. Include fact `output_type` addition here too.
+2. **T1: Semi-additive metrics** -- The most impactful semantic feature. Required for correct snapshot data modeling. High complexity but self-contained within the expansion pipeline.
 
-3. **T1: DESCRIBE property-per-row rewrite** -- the largest structural change. Independent of SHOW changes. Should be done before SHOW changes so DESCRIBE becomes the canonical place to find `expr` values (which are being dropped from SHOW).
+3. **T6: Queryable FACTS** -- Enables row-level querying, a distinct query mode. Medium complexity.
 
-4. **T2: SHOW SEMANTIC VIEWS alignment** -- uses new stored fields. Establishes the pattern for remaining SHOW changes.
+4. **T7: Wildcard selection** -- Low-hanging fruit. Simple convenience feature.
 
-5. **T3: SHOW DIMS/METRICS/FACTS alignment** -- mechanical column changes following the pattern established in T2.
+5. **T5: GET_DDL reconstruction** -- Must be last table-stakes feature so it can represent everything.
 
-6. **T4: SHOW DIMS FOR METRIC alignment with `required` column** -- last because the `required` semantics are the most nuanced decision (constant FALSE).
+6. **D3: TERSE mode** -- Trivial parser change for Snowflake compatibility.
+
+7. **D2: IN SCHEMA/DATABASE** -- Useful introspection enhancement.
 
 Defer:
-- **D2: TERSE mode** -- parser complexity for marginal value. Future milestone.
-- **D3: Lexicographic sort** -- trivially correct already (single database/schema). Can fold into T2/T3 if desired.
-- **D1: Hierarchies in DESCRIBE** -- fold into T1 if scope allows, otherwise defer.
+- **D1: Window function metrics** -- Very high complexity. Parse and store the DDL now but defer query-time expansion. This gives GET_DDL round-trip fidelity without the expansion architecture changes.
+- **D4: SHOW COLUMNS** -- Nice-to-have unified view, but redundant with existing SHOW SEMANTIC DIMENSIONS/METRICS/FACTS.
 
 ---
 
@@ -421,24 +641,29 @@ Defer:
 
 ### Snowflake Official Documentation (HIGH confidence)
 
-- [DESCRIBE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view) -- Property-per-row format, 5-column schema, object_kind/property combinations, parent_entity rules
-- [SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- 8-column schema (created_on, name, kind, database_name, schema_name, comment, owner, owner_role_type), TERSE mode, filtering
-- [SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- 8-column schema (database_name, schema_name, semantic_view_name, table_name, name, data_type, synonyms, comment)
-- [SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics) -- Same 8-column schema as dimensions
-- [SHOW SEMANTIC FACTS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-facts) -- Same 8-column schema; facts DO have data_type
-- [SHOW SEMANTIC DIMENSIONS FOR METRIC](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions-for-metric) -- 6-column schema (table_name, name, data_type, required, synonyms, comment); `required` = TRUE when PARTITION BY EXCLUDING names the dimension
-- [Using SQL commands for semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- Complete command listing, SHOW COLUMNS as alternative
+- [CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- Complete DDL syntax including NON ADDITIVE BY, PARTITION BY EXCLUDING, COMMENT, SYNONYMS, PRIVATE/PUBLIC
+- [SEMANTIC_VIEW query syntax](https://docs.snowflake.com/en/sql-reference/constructs/semantic_view) -- FACTS vs METRICS mutual exclusivity, wildcard `table.*` syntax, window metric required dimensions
+- [Querying semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/querying) -- FACTS rules, same-table constraint, WHERE clause support
+- [ALTER SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/alter-semantic-view) -- SET/UNSET COMMENT syntax (only comment alterable; other changes require replace)
+- [DESCRIBE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view) -- 5-column output, ACCESS_MODIFIER/COMMENT/SYNONYMS properties per object_kind
+- [SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- 8-column output with comment, TERSE mode, IN scope, LIKE/STARTS WITH/LIMIT
+- [SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- 8-column output including synonyms and comment columns
+- [SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics) -- Same 8-column schema
+- [SHOW SEMANTIC FACTS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-facts) -- Same 8-column schema
+- [SHOW COLUMNS](https://docs.snowflake.com/en/sql-reference/sql/show-columns) -- `kind` column for DIMENSION/FACT/METRIC, works with semantic views via VIEW keyword
+- [GET_DDL](https://docs.snowflake.com/en/sql-reference/functions/get_ddl) -- Supports 'SEMANTIC VIEW' object type
+- [Semi-additive metrics release note](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY feature announcement (March 5, 2026)
 
-### Project Source Code (HIGH confidence -- direct analysis)
+### dbt / MetricFlow (MEDIUM confidence -- cross-reference)
 
-- `src/ddl/describe.rs` -- Current 6-column single-row DescribeSemanticViewVTab (146 lines)
-- `src/ddl/list.rs` -- Current 2-column ListSemanticViewsVTab (102 lines)
-- `src/ddl/show_dims.rs` -- Current 5-column ShowSemanticDimensionsVTab (199 lines)
-- `src/ddl/show_metrics.rs` -- Current 5-column ShowSemanticMetricsVTab (201 lines)
-- `src/ddl/show_facts.rs` -- Current 4-column ShowSemanticFactsVTab (194 lines)
-- `src/ddl/show_dims_for_metric.rs` -- Current 5-column ShowDimensionsForMetricVTab (336 lines)
-- `src/model.rs` -- SemanticViewDefinition struct, Dimension/Metric/Fact/Join/TableRef structs
-- `src/catalog.rs` -- CatalogState (HashMap<String, String>), init_catalog, catalog_insert
-- `src/expand.rs` -- 4,440 lines, query expansion engine
-- `src/graph.rs` -- 2,333 lines, relationship graph and validation
-- `TECH-DEBT.md` -- Item 12: DDL pipeline uses all-VARCHAR result forwarding (relevant to output type decisions)
+- [dbt Measures documentation](https://docs.getdbt.com/docs/build/measures) -- `non_additive_dimension` parameter with `window_choice` and `window_groupings`
+- [dbt Semantic Layer Spec Proposal #7456](https://github.com/dbt-labs/dbt-core/discussions/7456) -- Semi-additive measures design discussion
+
+### Cube.dev (MEDIUM confidence -- cross-reference)
+
+- [Cube.dev Measures documentation](https://cube.dev/docs/product/data-modeling/reference/measures) -- Additive vs non-additive measure types
+- [Cube.dev Non-Additivity guide](https://cube.dev/docs/guides/recipes/query-acceleration/non-additivity) -- Pre-aggregation strategies for non-additive measures
+
+### General Data Warehouse Patterns (MEDIUM confidence)
+
+- [Semi-Additive Measures in DAX (SQLBI)](https://www.sqlbi.com/articles/semi-additive-measures-in-dax/) -- Conceptual reference for LAST_VALUE over time patterns

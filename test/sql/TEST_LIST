@@ -16,4 +16,15 @@ test/sql/phase34_1_show_dims_for_metric.test
 test/sql/phase34_1_1_show_filtering.test
 test/sql/phase39_metadata_storage.test
 test/sql/phase41_describe.test
+test/sql/phase43_metadata.test
+test/sql/phase44_show_metadata.test
+test/sql/phase44_describe_metadata.test
+test/sql/phase44_show_terse_scope.test
+test/sql/phase44_show_columns.test
+test/sql/phase45_alter_comment.test
+test/sql/phase45_get_ddl.test
+test/sql/phase46_wildcard.test
+test/sql/phase46_fact_query.test
+test/sql/phase47_semi_additive.test
+test/sql/phase48_window_metrics.test
 test/sql/peg_compat.test
