@@ -41,7 +41,7 @@ jobs:
 
       - name: Install just
         if: steps.latest.outputs.is_new == 'true'
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       - name: Install Rust stable
         if: steps.latest.outputs.is_new == 'true'
@@ -212,7 +212,7 @@ jobs:
 
       - name: Install just
         if: steps.lts.outputs.is_new == 'true'
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
 
       - name: Install Rust stable
         if: steps.lts.outputs.is_new == 'true'
