@@ -29,8 +29,8 @@ extension = ["duckdb/loadable-extension", "duckdb/vscalar", "dep:cc"]
 arbitrary = ["dep:arbitrary"]
 
 [dependencies]
-duckdb = { version = "=1.10500.0", default-features = false }
-libduckdb-sys = "=1.10500.0"
+duckdb = { version = "=1.10502.0", default-features = false }
+libduckdb-sys = "=1.10502.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strsim = "0.11"
