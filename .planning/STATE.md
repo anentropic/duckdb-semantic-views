@@ -1,69 +1,44 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.6.0
-milestone_name: Snowflake SQL DDL Parity
-status: complete
-stopped_at: Milestone v0.6.0 shipped
-last_updated: "2026-04-14"
-last_activity: 2026-04-14
+milestone: v0.7.0
+milestone_name: YAML Definitions & Materialization Routing
+status: active
+stopped_at: null
+last_updated: "2026-04-18"
+last_activity: 2026-04-18
 progress:
-  total_phases: 8
-  completed_phases: 8
-  total_plans: 16
-  completed_plans: 16
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-04-14)
+See: .planning/PROJECT.md (updated 2026-04-18)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Planning next milestone
+**Current focus:** Defining requirements
 
 ## Current Position
 
-Phase: -
-Plan: -
-Status: v0.6.0 milestone shipped — ready for next milestone
-Last activity: 2026-04-14
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-04-18 — Milestone v0.7.0 started
 
-Progress: [██████████] 100%
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 16 (v0.6.0)
+- Total plans completed: 0 (v0.7.0)
 - Average duration: --
 - Total execution time: 0 hours
-
-**By Phase:**
-
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| 43 | 2 | - | - |
-| 44 | 2 | - | - |
-| 45 | 2 | - | - |
-| 46 | 2 | - | - |
-| 47 | 2 | - | - |
-| 48 | 2 | - | - |
-| 49 | 2 | - | - |
-| 50 | 2 | - | - |
-
-*Updated after each plan completion*
-| Phase 45 P01 | 64min | 2 tasks | 7 files |
-| Phase 46 P01 | 69min | 3 tasks | 14 files |
-| Phase 46 P02 | 53min | 2 tasks | 6 files |
-| Phase 47 P01 | 31min | 2 tasks | 8 files |
-| Phase 47 P02 | 47min | 2 tasks | 6 files |
-| Phase 48 P02 | 32min | 2 tasks | 8 files |
-| Phase 49 P01 | 43min | 2 tasks | 16 files |
-| Phase 49 P02 | 79min | 2 tasks | 19 files |
-| Phase 50 P01 | 48min | 3 tasks | 4 files |
-| Phase 50 P02 | 20min | 3 tasks | 10 files |
 
 ## Accumulated Context
 

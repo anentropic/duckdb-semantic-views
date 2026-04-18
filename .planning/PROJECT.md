@@ -92,7 +92,16 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Active
 
-(No active requirements — next milestone not yet defined. Use `/gsd-new-milestone` to start.)
+## Current Milestone: v0.7.0 YAML Definitions & Materialization Routing
+
+**Goal:** Add YAML as a second definition format (mirroring the existing JSON schema) alongside SQL DDL, and a materialization routing engine that transparently redirects queries to pre-existing aggregated tables when they cover the requested dimensions and metrics.
+
+**Target features:**
+- YAML definition format: inline `FROM YAML $$ ... $$` and file-based `FROM YAML FILE '...'`, mirroring existing SemanticViewDefinition JSON schema
+- GET_DDL round-trip export to YAML format
+- Materialization routing engine: new MATERIALIZATIONS clause declaring pre-existing aggregated tables with covered dimensions and metrics
+- Transparent query routing to materializations when they cover the requested dims+metrics, with re-aggregation for subset matches
+- Fallback to raw table expansion when no materialization matches (current behavior)
 
 ### Out of Scope
 
@@ -200,4 +209,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after v0.6.0 milestone — Snowflake SQL DDL Parity.*
+*Last updated: 2026-04-18 after v0.7.0 milestone start — YAML Definitions & Materialization Routing.*
