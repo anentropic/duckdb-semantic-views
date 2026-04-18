@@ -12,17 +12,17 @@ require semantic_views
 # Section 1: CLN-01 -- Paren-body syntax rejected with clear error
 # ============================================================
 
-# Non-AS-body syntax produces a clear "Expected 'AS' keyword" error
+# Non-AS-body syntax produces a clear error mentioning both AS and FROM YAML
 statement error
 CREATE SEMANTIC VIEW err_test (tables := [{'alias': 't', 'table': 't'}], dimensions := [{'name': 'x', 'expr': 'x', 'source_table': 't'}])
 ----
-Expected 'AS' keyword
+Expected 'AS' or 'FROM YAML' after view name
 
-# Empty parens also rejected (no AS keyword)
+# Empty parens also rejected
 statement error
 CREATE SEMANTIC VIEW err_test ();
 ----
-Expected 'AS' keyword
+Expected 'AS' or 'FROM YAML' after view name
 
 # ============================================================
 # Section 2: ERR-02 -- Structural errors (missing name, etc.)

@@ -1142,7 +1142,7 @@ fn rewrite_ddl_keyword_body(
 
 /// Extract content from a dollar-quoted string (`$$...$$` or `$tag$...$tag$`).
 ///
-/// Returns `(content, bytes_consumed)` where bytes_consumed includes both
+/// Returns `(content, bytes_consumed)` where `bytes_consumed` includes both
 /// opening and closing delimiters. The content does NOT include the delimiters.
 fn extract_dollar_quoted(input: &str) -> Result<(String, usize), ParseError> {
     if !input.starts_with('$') {
@@ -1151,21 +1151,18 @@ fn extract_dollar_quoted(input: &str) -> Result<(String, usize), ParseError> {
             position: None,
         });
     }
-    let tag_end = input[1..]
-        .find('$')
-        .ok_or_else(|| ParseError {
-            message: "Unterminated dollar-quote opening delimiter".to_string(),
-            position: None,
-        })?
-        + 2;
+    let tag_end = input[1..].find('$').ok_or_else(|| ParseError {
+        message: "Unterminated dollar-quote opening delimiter".to_string(),
+        position: None,
+    })? + 2;
     let delimiter = &input[..tag_end];
     let content_start = tag_end;
-    let close_pos = input[content_start..].find(delimiter).ok_or_else(|| ParseError {
-        message: format!(
-            "Unterminated dollar-quoted string (expected closing '{delimiter}')"
-        ),
-        position: None,
-    })?;
+    let close_pos = input[content_start..]
+        .find(delimiter)
+        .ok_or_else(|| ParseError {
+            message: format!("Unterminated dollar-quoted string (expected closing '{delimiter}')"),
+            position: None,
+        })?;
     let content = &input[content_start..content_start + close_pos];
     let total = content_start + close_pos + delimiter.len();
     Ok((content.to_string(), total))
@@ -1192,11 +1189,12 @@ fn rewrite_ddl_yaml_body(
         });
     }
 
-    let mut def = crate::model::SemanticViewDefinition::from_yaml_with_size_cap(name, &yaml_content)
-        .map_err(|e| ParseError {
-            message: e,
-            position: None,
-        })?;
+    let mut def =
+        crate::model::SemanticViewDefinition::from_yaml_with_size_cap(name, &yaml_content)
+            .map_err(|e| ParseError {
+                message: e,
+                position: None,
+            })?;
 
     if let Some(c) = view_comment {
         def.comment = Some(c);
@@ -2846,16 +2844,20 @@ $$"#;
     #[test]
     fn test_yaml_rewrite_create_if_not_exists() {
         let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
-        let result = rewrite_ddl_yaml_body(DdlKind::CreateIfNotExists, "v", yaml_text, None).unwrap();
+        let result =
+            rewrite_ddl_yaml_body(DdlKind::CreateIfNotExists, "v", yaml_text, None).unwrap();
         let sql = result.unwrap();
         assert!(sql.contains("create_semantic_view_if_not_exists_from_json"));
     }
 
     #[test]
     fn test_yaml_rewrite_trailing_content_rejected() {
-        let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$ extra stuff";
+        let yaml_text =
+            "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$ extra stuff";
         let err = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap_err();
-        assert!(err.message.contains("Unexpected content after closing dollar-quote"));
+        assert!(err
+            .message
+            .contains("Unexpected content after closing dollar-quote"));
     }
 
     #[test]
@@ -2867,8 +2869,15 @@ $$"#;
 
     #[test]
     fn test_yaml_rewrite_comment_override() {
-        let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\ncomment: yaml comment\n$$";
-        let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, Some("ddl comment".to_string())).unwrap();
+        let yaml_text =
+            "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\ncomment: yaml comment\n$$";
+        let result = rewrite_ddl_yaml_body(
+            DdlKind::Create,
+            "v",
+            yaml_text,
+            Some("ddl comment".to_string()),
+        )
+        .unwrap();
         let sql = result.unwrap();
         // DDL comment overrides YAML comment
         assert!(sql.contains("ddl comment"));
@@ -2934,7 +2943,11 @@ $$"#;
     fn test_error_message_mentions_from_yaml() {
         let query = "CREATE SEMANTIC VIEW v SOMETHING_ELSE";
         let err = validate_and_rewrite(query).unwrap_err();
-        assert!(err.message.contains("FROM YAML"), "Error should mention FROM YAML: {}", err.message);
+        assert!(
+            err.message.contains("FROM YAML"),
+            "Error should mention FROM YAML: {}",
+            err.message
+        );
     }
 
     #[test]
