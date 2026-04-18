@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// A table alias entry for the `tables` DDL parameter.
 /// Maps a short alias (e.g., `"o"`) to a physical table name (e.g., `"orders"`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct TableRef {
     pub alias: String,
@@ -29,7 +29,7 @@ pub struct TableRef {
 }
 
 /// A named SQL column expression used as a dimension.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Dimension {
     pub name: String,
@@ -97,7 +97,7 @@ impl NullsOrder {
 /// A dimension reference in a NON ADDITIVE BY clause.
 /// Specifies which dimension(s) a metric is non-additive by,
 /// with sort order and nulls placement for snapshot selection.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct NonAdditiveDim {
     pub dimension: String,
@@ -109,7 +109,7 @@ pub struct NonAdditiveDim {
 
 /// Parsed window function specification for window metrics.
 /// Stored alongside the raw expression for expansion-time rewriting.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct WindowSpec {
     /// The window function name (e.g., "AVG", "LAG", "SUM")
@@ -134,7 +134,7 @@ pub struct WindowSpec {
 }
 
 /// An ORDER BY entry in a window function specification.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct WindowOrderBy {
     pub expr: String,
@@ -145,7 +145,7 @@ pub struct WindowOrderBy {
 }
 
 /// A named aggregation expression used as a metric.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Metric {
     pub name: String,
@@ -204,7 +204,7 @@ impl Metric {
 
 /// A named raw SQL column expression — a pre-aggregation fact, scoped to a table alias.
 /// Added in Phase 11 for the FACTS clause of CREATE SEMANTIC VIEW.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Fact {
     pub name: String,
@@ -234,7 +234,7 @@ pub struct Fact {
 
 /// A column-pair relationship entry for composite or single FK declarations.
 /// Used in the `relationships` DDL parameter's `join_columns` field.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct JoinColumn {
     pub from: String,
@@ -287,7 +287,7 @@ impl AccessModifier {
 }
 
 /// A JOIN relationship between the base table and another source table.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Join {
     pub table: String,
@@ -337,7 +337,7 @@ pub struct Join {
 /// Optional fields: `joins` (defaults to []), `facts` (defaults to []).
 /// Note: `deny_unknown_fields` is intentionally NOT set — old stored JSON with extra
 /// fields (e.g., from future schema changes) must still load without error.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SemanticViewDefinition {
     pub base_table: String,
@@ -421,6 +421,39 @@ impl SemanticViewDefinition {
         let def: Self = serde_json::from_str(json)
             .map_err(|e| format!("invalid definition for semantic view '{name}': {e}"))?;
         Ok(def)
+    }
+}
+
+impl SemanticViewDefinition {
+    /// Maximum YAML input size (1 MiB). Sanity guard against oversized input.
+    /// This is NOT a security boundary -- creating semantic views is a
+    /// privileged operation guarded by warehouse auth. See trust assumption docs.
+    pub const YAML_SIZE_CAP: usize = 1_048_576;
+
+    /// Parse a YAML string into a typed semantic view definition.
+    ///
+    /// Returns an error if the YAML is syntactically invalid or missing
+    /// required fields. The `name` parameter appears in the error message.
+    pub fn from_yaml(name: &str, yaml: &str) -> Result<Self, String> {
+        let def: Self = yaml_serde::from_str(yaml)
+            .map_err(|e| format!("invalid YAML definition for semantic view '{name}': {e}"))?;
+        Ok(def)
+    }
+
+    /// Parse YAML with a size cap check.
+    ///
+    /// Rejects input exceeding [`YAML_SIZE_CAP`] (1 MiB) before parsing.
+    /// Returns an error including the actual size and the cap.
+    pub fn from_yaml_with_size_cap(name: &str, yaml: &str) -> Result<Self, String> {
+        if yaml.len() > Self::YAML_SIZE_CAP {
+            return Err(format!(
+                "YAML definition for semantic view '{name}' exceeds size limit \
+                 ({} bytes > {} byte cap)",
+                yaml.len(),
+                Self::YAML_SIZE_CAP,
+            ));
+        }
+        Self::from_yaml(name, yaml)
     }
 }
 

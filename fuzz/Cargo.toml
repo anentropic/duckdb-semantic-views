@@ -34,3 +34,8 @@ doc = false
 name = "fuzz_ddl_parse"
 path = "fuzz_targets/fuzz_ddl_parse.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_yaml_parse"
+path = "fuzz_targets/fuzz_yaml_parse.rs"
+doc = false
