@@ -165,7 +165,7 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
 
 **Milestone Goal:** Add YAML as a second definition format alongside SQL DDL, and a materialization routing engine that transparently redirects queries to pre-existing aggregated tables when they cover the requested dimensions and metrics.
 
-- [ ] **Phase 51: YAML Parser Core** (1 plan) - yaml_serde dependency, YAML-to-SemanticViewDefinition conversion, shared validation, size cap
+- [x] **Phase 51: YAML Parser Core** (1 plan) - yaml_serde dependency, YAML-to-SemanticViewDefinition conversion, shared validation, size cap (completed 2026-04-18)
 - [ ] **Phase 52: YAML DDL Integration** - FROM YAML $$ dollar-quoting, parser hook detection, CREATE/REPLACE/IF NOT EXISTS modifiers
 - [ ] **Phase 53: YAML File Loading** - FROM YAML FILE with DuckDB file abstraction and enable_external_access security
 - [ ] **Phase 54: Materialization Model & DDL** - Materialization struct, MATERIALIZATIONS clause in body parser, persistence, YAML support
@@ -183,9 +183,9 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
   1. A YAML string containing tables, relationships, dimensions, metrics, facts, and metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC) deserializes into the same SemanticViewDefinition as equivalent SQL DDL
   2. A YAML string exceeding the size cap (1MB) is rejected with a clear error before parsing begins
   3. The same define-time validation (graph validation, expression checks, DAG resolution) runs identically for YAML-originated and SQL-originated definitions
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 Plans:
-- [ ] 51-01-PLAN.md -- yaml_serde dependency, PartialEq derives, from_yaml/from_yaml_with_size_cap, comprehensive test suite
+- [x] 51-01-PLAN.md -- yaml_serde dependency, PartialEq derives, from_yaml/from_yaml_with_size_cap, comprehensive test suite
 
 ### Phase 52: YAML DDL Integration
 **Goal**: Users can create semantic views from inline YAML via native DDL
@@ -257,7 +257,7 @@ Phases execute in numeric order: 51 -> 52 -> 53 -> 54 -> 55 -> 56 -> 57
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 51. YAML Parser Core | v0.7.0 | 0/1 | Not started | - |
+| 51. YAML Parser Core | v0.7.0 | 1/1 | Complete   | 2026-04-18 |
 | 52. YAML DDL Integration | v0.7.0 | 0/0 | Not started | - |
 | 53. YAML File Loading | v0.7.0 | 0/0 | Not started | - |
 | 54. Materialization Model & DDL | v0.7.0 | 0/0 | Not started | - |
