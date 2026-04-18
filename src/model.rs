@@ -1585,4 +1585,304 @@ mod tests {
             assert!(met.is_window());
         }
     }
+
+    mod yaml_tests {
+        use super::*;
+
+        #[test]
+        fn minimal_yaml_deserializes() {
+            let yaml = "base_table: orders\ndimensions:\n  - name: region\n    expr: region\nmetrics:\n  - name: revenue\n    expr: SUM(amount)\n";
+            let def = SemanticViewDefinition::from_yaml("orders", yaml).unwrap();
+            assert_eq!(def.base_table, "orders");
+            assert_eq!(def.dimensions.len(), 1);
+            assert_eq!(def.dimensions[0].name, "region");
+            assert_eq!(def.dimensions[0].expr, "region");
+            assert_eq!(def.metrics.len(), 1);
+            assert_eq!(def.metrics[0].name, "revenue");
+            assert_eq!(def.metrics[0].expr, "SUM(amount)");
+        }
+
+        #[test]
+        fn full_yaml_all_fields() {
+            let yaml = r#"
+base_table: orders
+tables:
+  - alias: o
+    table: orders
+    pk_columns:
+      - id
+    unique_constraints:
+      - - email
+      - - first_name
+        - last_name
+    comment: Main orders table
+    synonyms:
+      - order_facts
+  - alias: c
+    table: customers
+    pk_columns:
+      - id
+joins:
+  - table: c
+    from_alias: o
+    fk_columns:
+      - customer_id
+    ref_columns:
+      - id
+    name: order_to_customer
+    cardinality: ManyToOne
+facts:
+  - name: unit_price
+    expr: "o.price / o.qty"
+    source_table: o
+    output_type: DOUBLE
+    comment: Price per unit
+    synonyms:
+      - price_per_item
+    access: Private
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+    output_type: VARCHAR
+    comment: Geographic region
+    synonyms:
+      - area
+      - territory
+metrics:
+  - name: revenue
+    expr: SUM(o.amount)
+    source_table: o
+    output_type: "DECIMAL(18,2)"
+    comment: Total revenue
+    synonyms:
+      - total_revenue
+    access: Public
+    using_relationships:
+      - order_to_customer
+  - name: balance
+    expr: SUM(o.amount)
+    source_table: o
+    non_additive_by:
+      - dimension: date_dim
+        order: Desc
+        nulls: First
+  - name: avg_qty_7d
+    expr: AVG(total_qty)
+    window_spec:
+      window_function: AVG
+      inner_metric: total_qty
+      excluding_dims:
+        - date_dim
+      order_by:
+        - expr: date_dim
+          order: Asc
+          nulls: Last
+      frame_clause: "RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW"
+comment: Revenue analytics view
+"#;
+            let def = SemanticViewDefinition::from_yaml("orders", yaml).unwrap();
+            // Tables
+            assert_eq!(def.tables.len(), 2);
+            assert_eq!(def.tables[0].alias, "o");
+            assert_eq!(def.tables[0].table, "orders");
+            assert_eq!(def.tables[0].pk_columns, vec!["id"]);
+            assert_eq!(def.tables[0].unique_constraints.len(), 2);
+            assert_eq!(def.tables[0].comment.as_deref(), Some("Main orders table"));
+            assert_eq!(def.tables[0].synonyms, vec!["order_facts"]);
+            // Joins
+            assert_eq!(def.joins.len(), 1);
+            assert_eq!(def.joins[0].table, "c");
+            assert_eq!(def.joins[0].from_alias, "o");
+            assert_eq!(def.joins[0].fk_columns, vec!["customer_id"]);
+            assert_eq!(def.joins[0].ref_columns, vec!["id"]);
+            assert_eq!(def.joins[0].name.as_deref(), Some("order_to_customer"));
+            assert_eq!(def.joins[0].cardinality, Cardinality::ManyToOne);
+            // Facts
+            assert_eq!(def.facts.len(), 1);
+            assert_eq!(def.facts[0].name, "unit_price");
+            assert_eq!(def.facts[0].access, AccessModifier::Private);
+            assert_eq!(def.facts[0].comment.as_deref(), Some("Price per unit"));
+            assert_eq!(def.facts[0].synonyms, vec!["price_per_item"]);
+            // Dimensions
+            assert_eq!(def.dimensions.len(), 1);
+            assert_eq!(def.dimensions[0].source_table.as_deref(), Some("o"));
+            assert_eq!(def.dimensions[0].output_type.as_deref(), Some("VARCHAR"));
+            assert_eq!(
+                def.dimensions[0].comment.as_deref(),
+                Some("Geographic region")
+            );
+            assert_eq!(def.dimensions[0].synonyms, vec!["area", "territory"]);
+            // Metrics
+            assert_eq!(def.metrics.len(), 3);
+            assert_eq!(def.metrics[0].access, AccessModifier::Public);
+            assert_eq!(
+                def.metrics[0].using_relationships,
+                vec!["order_to_customer"]
+            );
+            assert_eq!(def.metrics[0].comment.as_deref(), Some("Total revenue"));
+            assert_eq!(def.metrics[0].synonyms, vec!["total_revenue"]);
+            // Semi-additive metric
+            assert_eq!(def.metrics[1].non_additive_by.len(), 1);
+            assert_eq!(def.metrics[1].non_additive_by[0].dimension, "date_dim");
+            assert_eq!(def.metrics[1].non_additive_by[0].order, SortOrder::Desc);
+            assert_eq!(def.metrics[1].non_additive_by[0].nulls, NullsOrder::First);
+            // Window metric
+            let ws = def.metrics[2].window_spec.as_ref().unwrap();
+            assert_eq!(ws.window_function, "AVG");
+            assert_eq!(ws.inner_metric, "total_qty");
+            assert_eq!(ws.excluding_dims, vec!["date_dim"]);
+            assert_eq!(ws.order_by.len(), 1);
+            assert_eq!(ws.order_by[0].expr, "date_dim");
+            assert_eq!(ws.order_by[0].order, SortOrder::Asc);
+            assert_eq!(ws.order_by[0].nulls, NullsOrder::Last);
+            assert!(ws
+                .frame_clause
+                .as_deref()
+                .unwrap()
+                .contains("RANGE BETWEEN"));
+            // View-level comment
+            assert_eq!(def.comment.as_deref(), Some("Revenue analytics view"));
+        }
+
+        #[test]
+        fn optional_fields_default_when_omitted() {
+            let yaml = "base_table: t\ndimensions: []\nmetrics: []\n";
+            let def = SemanticViewDefinition::from_yaml("test", yaml).unwrap();
+            assert!(def.tables.is_empty());
+            assert!(def.joins.is_empty());
+            assert!(def.facts.is_empty());
+            assert!(def.column_type_names.is_empty());
+            assert!(def.column_types_inferred.is_empty());
+            assert!(def.created_on.is_none());
+            assert!(def.database_name.is_none());
+            assert!(def.schema_name.is_none());
+            assert!(def.comment.is_none());
+        }
+
+        #[test]
+        fn enum_variants_roundtrip_yaml() {
+            // AccessModifier::Private
+            let yaml = "base_table: t\ndimensions: []\nmetrics:\n  - name: m\n    expr: SUM(x)\n    access: Private\n";
+            let def = SemanticViewDefinition::from_yaml("test", yaml).unwrap();
+            assert_eq!(def.metrics[0].access, AccessModifier::Private);
+
+            // Cardinality::OneToOne
+            let yaml2 = "base_table: t\ndimensions: []\nmetrics: []\njoins:\n  - table: c\n    cardinality: OneToOne\n";
+            let def2 = SemanticViewDefinition::from_yaml("test", yaml2).unwrap();
+            assert_eq!(def2.joins[0].cardinality, Cardinality::OneToOne);
+        }
+
+        #[test]
+        fn yaml_json_produce_identical_structs() {
+            let yaml = "base_table: orders\ndimensions:\n  - name: region\n    expr: region\nmetrics:\n  - name: revenue\n    expr: SUM(amount)\n";
+            let json = r#"{"base_table":"orders","dimensions":[{"name":"region","expr":"region"}],"metrics":[{"name":"revenue","expr":"SUM(amount)"}]}"#;
+            let from_yaml = SemanticViewDefinition::from_yaml("test", yaml).unwrap();
+            let from_json = SemanticViewDefinition::from_json("test", json).unwrap();
+            assert_eq!(from_yaml, from_json);
+        }
+
+        #[test]
+        fn invalid_yaml_syntax_returns_error_with_name() {
+            let result = SemanticViewDefinition::from_yaml("my_view", "{{invalid yaml");
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("my_view"),
+                "error should contain view name: {err}"
+            );
+            assert!(
+                err.contains("invalid YAML definition"),
+                "error should contain prefix: {err}"
+            );
+        }
+
+        #[test]
+        fn missing_required_field_is_error() {
+            let yaml = "dimensions: []\nmetrics: []\n";
+            // base_table has no #[serde(default)] — omitting it is an error for both
+            // JSON and YAML. This matches the JSON test `missing_base_table_is_error`.
+            let result = SemanticViewDefinition::from_yaml("test", yaml);
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("invalid YAML definition"),
+                "error should contain prefix: {err}"
+            );
+        }
+
+        #[test]
+        fn size_cap_rejects_oversized_input() {
+            let oversized = "a".repeat(1_048_577); // 1 byte over cap
+            let result = SemanticViewDefinition::from_yaml_with_size_cap("big", &oversized);
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.contains("exceeds size limit"), "error: {err}");
+            assert!(
+                err.contains("1048577 bytes"),
+                "should contain actual size: {err}"
+            );
+            assert!(
+                err.contains("1048576 byte cap"),
+                "should contain cap: {err}"
+            );
+        }
+
+        #[test]
+        fn size_cap_accepts_exactly_1mb() {
+            // Build a valid YAML string padded to exactly 1MB
+            let prefix = "base_table: t\ndimensions: []\nmetrics: []\n# ";
+            let pad_len = SemanticViewDefinition::YAML_SIZE_CAP - prefix.len();
+            let padded = format!("{prefix}{}", "x".repeat(pad_len));
+            assert_eq!(padded.len(), SemanticViewDefinition::YAML_SIZE_CAP);
+            let result = SemanticViewDefinition::from_yaml_with_size_cap("test", &padded);
+            assert!(
+                result.is_ok(),
+                "exactly 1MB should be accepted: {}",
+                result.unwrap_err()
+            );
+        }
+
+        #[test]
+        fn unknown_fields_accepted_in_yaml() {
+            let yaml = "base_table: t\ndimensions: []\nmetrics: []\nextra_field: surprise\n";
+            assert!(
+                SemanticViewDefinition::from_yaml("test", yaml).is_ok(),
+                "unknown fields must not cause rejection (no deny_unknown_fields)"
+            );
+        }
+
+        #[test]
+        fn yaml_json_roundtrip_via_serialize() {
+            // Build a struct, serialize to both formats, deserialize both, assert equal
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "region".to_string(),
+                    ..Default::default()
+                }],
+                metrics: vec![Metric {
+                    name: "revenue".to_string(),
+                    expr: "SUM(amount)".to_string(),
+                    access: AccessModifier::Private,
+                    ..Default::default()
+                }],
+                facts: vec![Fact {
+                    name: "unit_price".to_string(),
+                    expr: "price / qty".to_string(),
+                    access: AccessModifier::Private,
+                    ..Default::default()
+                }],
+                comment: Some("test view".to_string()),
+                ..Default::default()
+            };
+            let json_str = serde_json::to_string(&def).unwrap();
+            let yaml_str = yaml_serde::to_string(&def).unwrap();
+
+            let from_json = SemanticViewDefinition::from_json("test", &json_str).unwrap();
+            let from_yaml = SemanticViewDefinition::from_yaml("test", &yaml_str).unwrap();
+            assert_eq!(from_json, from_yaml);
+        }
+    }
 }
