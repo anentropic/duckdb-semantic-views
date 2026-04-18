@@ -1052,10 +1052,22 @@ fn validate_create_body(
     }
     // --- End AS keyword body path ---
 
-    // Non-AS-body syntax rejected -- AS keyword required after view name.
+    // --- FROM YAML body path (Phase 52) ---
+    let is_yaml_body = after_name_trimmed
+        .get(..9)
+        .is_some_and(|s| s.eq_ignore_ascii_case("FROM YAML"))
+        && (after_name_trimmed.len() == 9
+            || after_name_trimmed.as_bytes()[9].is_ascii_whitespace());
+    if is_yaml_body {
+        let yaml_text = after_name_trimmed[9..].trim_start();
+        return rewrite_ddl_yaml_body(kind, name, yaml_text, view_comment);
+    }
+    // --- End FROM YAML body path ---
+
+    // Non-AS/FROM-YAML syntax rejected -- AS keyword or FROM YAML required after view name.
     let pos_in_trimmed = plen + (trimmed_no_semi.len() - plen - after_prefix.len()) + name_end;
     Err(ParseError {
-        message: "Expected 'AS' keyword after view name. Use: CREATE SEMANTIC VIEW name AS TABLES (...) DIMENSIONS (...) METRICS (...)".to_string(),
+        message: "Expected 'AS' or 'FROM YAML' after view name. Use: CREATE SEMANTIC VIEW name AS TABLES (...) DIMENSIONS (...) METRICS (...) or: CREATE SEMANTIC VIEW name FROM YAML $$ ... $$".to_string(),
         position: Some(trim_offset + pos_in_trimmed),
     })
 }
@@ -1119,6 +1131,98 @@ fn rewrite_ddl_keyword_body(
         _ => unreachable!("rewrite_ddl_keyword_body only called for CREATE forms"),
     };
 
+    Ok(Some(format!(
+        "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 52: Dollar-quote extraction and YAML DDL rewrite
+// ---------------------------------------------------------------------------
+
+/// Extract content from a dollar-quoted string (`$$...$$` or `$tag$...$tag$`).
+///
+/// Returns `(content, bytes_consumed)` where bytes_consumed includes both
+/// opening and closing delimiters. The content does NOT include the delimiters.
+fn extract_dollar_quoted(input: &str) -> Result<(String, usize), ParseError> {
+    if !input.starts_with('$') {
+        return Err(ParseError {
+            message: "Expected '$' to begin dollar-quoted string".to_string(),
+            position: None,
+        });
+    }
+    let tag_end = input[1..]
+        .find('$')
+        .ok_or_else(|| ParseError {
+            message: "Unterminated dollar-quote opening delimiter".to_string(),
+            position: None,
+        })?
+        + 2;
+    let delimiter = &input[..tag_end];
+    let content_start = tag_end;
+    let close_pos = input[content_start..].find(delimiter).ok_or_else(|| ParseError {
+        message: format!(
+            "Unterminated dollar-quoted string (expected closing '{delimiter}')"
+        ),
+        position: None,
+    })?;
+    let content = &input[content_start..content_start + close_pos];
+    let total = content_start + close_pos + delimiter.len();
+    Ok((content.to_string(), total))
+}
+
+/// Rewrite a FROM YAML dollar-quoted DDL statement to a JSON-parameterized function call.
+///
+/// Called when `validate_create_body` detects the `FROM YAML` keyword path.
+/// Extracts dollar-quoted YAML, deserializes via `from_yaml_with_size_cap()`,
+/// serializes to JSON, and embeds in a `SELECT * FROM create_semantic_view_from_json('name', 'json')` call.
+fn rewrite_ddl_yaml_body(
+    kind: DdlKind,
+    name: &str,
+    yaml_text: &str,
+    view_comment: Option<String>,
+) -> Result<Option<String>, ParseError> {
+    let (yaml_content, consumed) = extract_dollar_quoted(yaml_text)?;
+
+    let trailing = yaml_text[consumed..].trim();
+    if !trailing.is_empty() {
+        return Err(ParseError {
+            message: format!("Unexpected content after closing dollar-quote: '{trailing}'"),
+            position: None,
+        });
+    }
+
+    let mut def = crate::model::SemanticViewDefinition::from_yaml_with_size_cap(name, &yaml_content)
+        .map_err(|e| ParseError {
+            message: e,
+            position: None,
+        })?;
+
+    if let Some(c) = view_comment {
+        def.comment = Some(c);
+    }
+
+    if def.base_table.is_empty() {
+        if let Some(first) = def.tables.first() {
+            def.base_table = first.table.clone();
+        }
+    }
+
+    infer_cardinality(&def.tables, &mut def.joins)?;
+
+    let json = serde_json::to_string(&def).map_err(|e| ParseError {
+        message: format!("Failed to serialize YAML definition: {e}"),
+        position: None,
+    })?;
+
+    let safe_name = name.replace('\'', "''");
+    let safe_json = json.replace('\'', "''");
+    let fn_name = match kind {
+        DdlKind::Create => "create_semantic_view_from_json",
+        DdlKind::CreateOrReplace => "create_or_replace_semantic_view_from_json",
+        DdlKind::CreateIfNotExists => "create_semantic_view_if_not_exists_from_json",
+        _ => unreachable!("rewrite_ddl_yaml_body only called for CREATE forms"),
+    };
     Ok(Some(format!(
         "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
     )))
@@ -1776,8 +1880,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("Expected 'AS' keyword"),
-            "Expected 'Expected 'AS' keyword' error, got: {}",
+            err.message.contains("Expected 'AS' or 'FROM YAML'"),
+            "Expected 'Expected AS or FROM YAML' error, got: {}",
             err.message
         );
     }
@@ -1890,13 +1994,13 @@ mod tests {
 
     #[test]
     fn test_parse_error_position_paren_body_rejected() {
-        // Non-AS-body syntax returns "Expected 'AS' keyword" error with position
+        // Non-AS-body syntax returns "Expected 'AS' or 'FROM YAML'" error with position
         let query = "CREATE SEMANTIC VIEW x (tables := [])";
         let result = validate_and_rewrite(query);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("Expected 'AS' keyword"),
+            err.message.contains("Expected 'AS' or 'FROM YAML'"),
             "got: {}",
             err.message
         );
@@ -1959,8 +2063,8 @@ mod tests {
             assert!(result.is_err(), "Paren-body must be rejected: {result:?}");
             let err = result.unwrap_err();
             assert!(
-                err.message.contains("Expected 'AS' keyword"),
-                "Expected 'Expected 'AS' keyword' error, got: {}",
+                err.message.contains("Expected 'AS' or 'FROM YAML'"),
+                "Expected 'Expected AS or FROM YAML' error, got: {}",
                 err.message
             );
         }
@@ -2643,5 +2747,217 @@ mod tests {
             "Error should list supported ops, got: {}",
             err.message
         );
+    }
+
+    // ===================================================================
+    // Phase 52: Dollar-quote extraction tests
+    // ===================================================================
+
+    #[test]
+    fn test_extract_dollar_quoted_untagged() {
+        let (content, consumed) = extract_dollar_quoted("$$hello world$$").unwrap();
+        assert_eq!(content, "hello world");
+        assert_eq!(consumed, 15);
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_tagged() {
+        let (content, consumed) = extract_dollar_quoted("$yaml$my content$yaml$").unwrap();
+        assert_eq!(content, "my content");
+        assert_eq!(consumed, 22);
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_empty_content() {
+        let (content, consumed) = extract_dollar_quoted("$$$$").unwrap();
+        assert_eq!(content, "");
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_no_leading_dollar() {
+        let err = extract_dollar_quoted("not a dollar").unwrap_err();
+        assert!(err.message.contains("Expected '$'"));
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_unterminated_opening() {
+        let err = extract_dollar_quoted("$no_close").unwrap_err();
+        assert!(err.message.contains("Unterminated dollar-quote opening"));
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_unterminated_body() {
+        let err = extract_dollar_quoted("$$no closing").unwrap_err();
+        assert!(err.message.contains("Unterminated dollar-quoted string"));
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_inner_dollar() {
+        // First closing $$ wins — content is "has inner "
+        let (content, consumed) = extract_dollar_quoted("$$has inner $$ text$$").unwrap();
+        assert_eq!(content, "has inner ");
+        assert_eq!(consumed, 14);
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_multiline() {
+        let input = "$$\ntables:\n  - alias: o\n    table: orders\n$$";
+        let (content, _) = extract_dollar_quoted(input).unwrap();
+        assert!(content.contains("tables:"));
+        assert!(content.contains("alias: o"));
+    }
+
+    // ===================================================================
+    // Phase 52: YAML DDL rewrite tests
+    // ===================================================================
+
+    #[test]
+    fn test_yaml_rewrite_basic_create() {
+        let yaml_text = r#"$$
+base_table: orders
+tables:
+  - alias: o
+    table: orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total_amount
+    expr: SUM(o.amount)
+    source_table: o
+$$"#;
+        let result = rewrite_ddl_yaml_body(DdlKind::Create, "test_view", yaml_text, None).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.starts_with("SELECT * FROM create_semantic_view_from_json('test_view',"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_create_or_replace() {
+        let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = rewrite_ddl_yaml_body(DdlKind::CreateOrReplace, "v", yaml_text, None).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("create_or_replace_semantic_view_from_json"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_create_if_not_exists() {
+        let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = rewrite_ddl_yaml_body(DdlKind::CreateIfNotExists, "v", yaml_text, None).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("create_semantic_view_if_not_exists_from_json"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_trailing_content_rejected() {
+        let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$ extra stuff";
+        let err = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap_err();
+        assert!(err.message.contains("Unexpected content after closing dollar-quote"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_invalid_yaml() {
+        let yaml_text = "$$\n: : : not valid yaml [[[$$";
+        let err = rewrite_ddl_yaml_body(DdlKind::Create, "bad_view", yaml_text, None).unwrap_err();
+        assert!(err.message.contains("bad_view"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_comment_override() {
+        let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\ncomment: yaml comment\n$$";
+        let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, Some("ddl comment".to_string())).unwrap();
+        let sql = result.unwrap();
+        // DDL comment overrides YAML comment
+        assert!(sql.contains("ddl comment"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_base_table_populated() {
+        let yaml_text = r#"$$
+base_table: ""
+tables:
+  - alias: o
+    table: orders
+    pk_columns: []
+dimensions: []
+metrics: []
+$$"#;
+        let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
+        let sql = result.unwrap();
+        // base_table should be populated from first table entry
+        assert!(sql.contains("orders"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_tagged_dollar_quote() {
+        let yaml_text = "$yaml$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$yaml$";
+        let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
+        assert!(result.is_some());
+    }
+
+    // ===================================================================
+    // Phase 52: FROM YAML detection in validate_create_body
+    // ===================================================================
+
+    #[test]
+    fn test_from_yaml_detection_via_rewrite_ddl() {
+        let query = r#"CREATE SEMANTIC VIEW yaml_test FROM YAML $$
+base_table: t
+tables: []
+dimensions: []
+metrics: []
+$$"#;
+        let result = validate_and_rewrite(query).unwrap();
+        assert!(result.is_some());
+        let sql = result.unwrap();
+        assert!(sql.contains("create_semantic_view_from_json('yaml_test'"));
+    }
+
+    #[test]
+    fn test_from_yaml_case_insensitive() {
+        let query = "CREATE SEMANTIC VIEW v from yaml $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_from_yaml_mixed_case() {
+        let query = "CREATE SEMANTIC VIEW v From Yaml $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_error_message_mentions_from_yaml() {
+        let query = "CREATE SEMANTIC VIEW v SOMETHING_ELSE";
+        let err = validate_and_rewrite(query).unwrap_err();
+        assert!(err.message.contains("FROM YAML"), "Error should mention FROM YAML: {}", err.message);
+    }
+
+    #[test]
+    fn test_create_or_replace_from_yaml() {
+        let query = "CREATE OR REPLACE SEMANTIC VIEW v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("create_or_replace_semantic_view_from_json"));
+    }
+
+    #[test]
+    fn test_create_if_not_exists_from_yaml() {
+        let query = "CREATE SEMANTIC VIEW IF NOT EXISTS v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("create_semantic_view_if_not_exists_from_json"));
+    }
+
+    #[test]
+    fn test_comment_with_from_yaml() {
+        let query = "CREATE SEMANTIC VIEW v COMMENT = 'my comment' FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("my comment"));
     }
 }

@@ -337,7 +337,7 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    /// Non-AS-body syntax returns "Expected 'AS' keyword" error with position.
+    /// Non-AS-body syntax returns "Expected 'AS' or 'FROM YAML'" error with position.
     #[test]
     fn position_invariant_paren_body_rejected(
         spaces in "[ ]{0,20}",
@@ -345,8 +345,8 @@ proptest! {
         let query = format!("{spaces}CREATE SEMANTIC VIEW x (tbles := [])");
         let err = validate_and_rewrite(&query).unwrap_err();
         prop_assert!(
-            err.message.contains("Expected 'AS' keyword"),
-            "Expected 'Expected AS keyword' error, got: {}",
+            err.message.contains("Expected 'AS' or 'FROM YAML'"),
+            "Expected 'Expected AS or FROM YAML' error, got: {}",
             err.message
         );
         prop_assert!(err.position.is_some());
