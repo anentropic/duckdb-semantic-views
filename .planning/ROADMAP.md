@@ -208,7 +208,9 @@ Plans:
   1. `CREATE SEMANTIC VIEW name FROM YAML FILE '/path/to/file.yaml'` creates a semantic view from the file contents
   2. When `SET enable_external_access = false`, `FROM YAML FILE` is rejected with a security error
   3. File loading uses DuckDB's file abstraction (read_text), not direct filesystem access
-**Plans**: TBD
+**Plans:** 1 plan
+Plans:
+- [ ] 53-01-PLAN.md -- FROM YAML FILE detection, C++ file reading, integration tests
 
 ### Phase 54: Materialization Model & DDL
 **Goal**: Users can declare materializations as part of a semantic view definition
@@ -261,7 +263,7 @@ Phases execute in numeric order: 51 -> 52 -> 53 -> 54 -> 55 -> 56 -> 57
 |-------|-----------|----------------|--------|-----------|
 | 51. YAML Parser Core | v0.7.0 | 1/1 | Complete    | 2026-04-18 |
 | 52. YAML DDL Integration | v0.7.0 | 1/1 | Complete    | 2026-04-18 |
-| 53. YAML File Loading | v0.7.0 | 0/0 | Not started | - |
+| 53. YAML File Loading | v0.7.0 | 0/1 | Planning    | - |
 | 54. Materialization Model & DDL | v0.7.0 | 0/0 | Not started | - |
 | 55. Materialization Routing Engine | v0.7.0 | 0/0 | Not started | - |
 | 56. YAML Export | v0.7.0 | 0/0 | Not started | - |
