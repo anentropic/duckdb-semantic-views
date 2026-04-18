@@ -65,31 +65,31 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| YAML-01 | — | Pending |
-| YAML-02 | — | Pending |
-| YAML-03 | — | Pending |
-| YAML-04 | — | Pending |
-| YAML-05 | — | Pending |
-| YAML-06 | — | Pending |
-| YAML-07 | — | Pending |
-| YAML-08 | — | Pending |
-| YAML-09 | — | Pending |
-| MAT-01 | — | Pending |
-| MAT-02 | — | Pending |
-| MAT-03 | — | Pending |
-| MAT-04 | — | Pending |
-| MAT-05 | — | Pending |
-| MAT-06 | — | Pending |
-| MAT-07 | — | Pending |
-| INTR-01 | — | Pending |
-| INTR-02 | — | Pending |
-| INTR-03 | — | Pending |
+| YAML-01 | Phase 52 | Pending |
+| YAML-02 | Phase 53 | Pending |
+| YAML-03 | Phase 51 | Pending |
+| YAML-04 | Phase 56 | Pending |
+| YAML-05 | Phase 51 | Pending |
+| YAML-06 | Phase 52 | Pending |
+| YAML-07 | Phase 53 | Pending |
+| YAML-08 | Phase 56 | Pending |
+| YAML-09 | Phase 51 | Pending |
+| MAT-01 | Phase 54 | Pending |
+| MAT-02 | Phase 55 | Pending |
+| MAT-03 | Phase 55 | Pending |
+| MAT-04 | Phase 55 | Pending |
+| MAT-05 | Phase 55 | Pending |
+| MAT-06 | Phase 54 | Pending |
+| MAT-07 | Phase 54 | Pending |
+| INTR-01 | Phase 57 | Pending |
+| INTR-02 | Phase 57 | Pending |
+| INTR-03 | Phase 57 | Pending |
 
 **Coverage:**
 - v0.7.0 requirements: 19 total
-- Mapped to phases: 0
-- Unmapped: 19 ⚠️
+- Mapped to phases: 19
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-04-18*
-*Last updated: 2026-04-18 after initial definition*
+*Last updated: 2026-04-17 after roadmap creation*

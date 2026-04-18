@@ -161,15 +161,104 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
 
 </details>
 
+### v0.7.0 YAML Definitions & Materialization Routing (In Progress)
+
+**Milestone Goal:** Add YAML as a second definition format alongside SQL DDL, and a materialization routing engine that transparently redirects queries to pre-existing aggregated tables when they cover the requested dimensions and metrics.
+
+- [ ] **Phase 51: YAML Parser Core** - serde_yaml_ng dependency, YAML-to-SemanticViewDefinition conversion, shared validation, size cap
+- [ ] **Phase 52: YAML DDL Integration** - FROM YAML $$ dollar-quoting, parser hook detection, CREATE/REPLACE/IF NOT EXISTS modifiers
+- [ ] **Phase 53: YAML File Loading** - FROM YAML FILE with DuckDB file abstraction and enable_external_access security
+- [ ] **Phase 54: Materialization Model & DDL** - Materialization struct, MATERIALIZATIONS clause in body parser, persistence, YAML support
+- [ ] **Phase 55: Materialization Routing Engine** - Query-time routing with exact-match set containment, fallback, semi-additive/window exclusion
+- [ ] **Phase 56: YAML Export** - READ_YAML_FROM_SEMANTIC_VIEW scalar function, round-trip including materializations
+- [ ] **Phase 57: Introspection & Diagnostics** - explain_semantic_view routing info, DESCRIBE materializations, SHOW SEMANTIC MATERIALIZATIONS
+
+## Phase Details
+
+### Phase 51: YAML Parser Core
+**Goal**: Users can parse YAML definitions into identical internal representations as SQL DDL
+**Depends on**: Nothing (first phase of v0.7.0)
+**Requirements**: YAML-03, YAML-05, YAML-09
+**Success Criteria** (what must be TRUE):
+  1. A YAML string containing tables, relationships, dimensions, metrics, facts, and metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC) deserializes into the same SemanticViewDefinition as equivalent SQL DDL
+  2. A YAML string exceeding the size cap (1MB) is rejected with a clear error before parsing begins
+  3. The same define-time validation (graph validation, expression checks, DAG resolution) runs identically for YAML-originated and SQL-originated definitions
+**Plans**: TBD
+
+### Phase 52: YAML DDL Integration
+**Goal**: Users can create semantic views from inline YAML via native DDL
+**Depends on**: Phase 51
+**Requirements**: YAML-01, YAML-06
+**Success Criteria** (what must be TRUE):
+  1. `CREATE SEMANTIC VIEW name FROM YAML $$ ... $$` creates a semantic view that is queryable via `semantic_view()`
+  2. `CREATE OR REPLACE SEMANTIC VIEW name FROM YAML $$ ... $$` replaces an existing view
+  3. `CREATE SEMANTIC VIEW IF NOT EXISTS name FROM YAML $$ ... $$` is a no-op when the view already exists
+  4. The parser hook correctly detects `FROM YAML` and routes through the YAML parsing path
+**Plans**: TBD
+
+### Phase 53: YAML File Loading
+**Goal**: Users can create semantic views from external YAML files with proper security boundaries
+**Depends on**: Phase 52
+**Requirements**: YAML-02, YAML-07
+**Success Criteria** (what must be TRUE):
+  1. `CREATE SEMANTIC VIEW name FROM YAML FILE '/path/to/file.yaml'` creates a semantic view from the file contents
+  2. When `SET enable_external_access = false`, `FROM YAML FILE` is rejected with a security error
+  3. File loading uses DuckDB's file abstraction (read_text), not direct filesystem access
+**Plans**: TBD
+
+### Phase 54: Materialization Model & DDL
+**Goal**: Users can declare materializations as part of a semantic view definition
+**Depends on**: Phase 51 (YAML support for MAT-06 requires parser core)
+**Requirements**: MAT-01, MAT-06, MAT-07
+**Success Criteria** (what must be TRUE):
+  1. `MATERIALIZATIONS` clause in SQL DDL accepts named materializations with TABLE, DIMENSIONS, and METRICS sub-clauses
+  2. `MATERIALIZATIONS` section in YAML definitions produces the same internal representation as the SQL DDL clause
+  3. Materialization metadata persists across DuckDB restarts (stored and loaded with backward compatibility for pre-v0.7.0 views)
+  4. Define-time validation ensures materialization dimensions and metrics reference declared names in the semantic view
+**Plans**: TBD
+
+### Phase 55: Materialization Routing Engine
+**Goal**: Queries are transparently routed to pre-existing aggregated tables when materializations cover the request
+**Depends on**: Phase 54
+**Requirements**: MAT-02, MAT-03, MAT-04, MAT-05
+**Success Criteria** (what must be TRUE):
+  1. When a materialization exactly covers the requested dimensions and metrics, the query reads from the materialization table instead of expanding raw sources
+  2. When no materialization matches, the query falls back to raw table expansion with no error and no observable behavior change
+  3. Queries involving semi-additive metrics (NON ADDITIVE BY) or window function metrics (PARTITION BY EXCLUDING) always fall back to raw expansion regardless of materialization coverage
+  4. A user who has not declared any materializations sees zero behavior change from this feature
+**Plans**: TBD
+
+### Phase 56: YAML Export
+**Goal**: Users can export stored semantic views as YAML for version control and round-trip workflows
+**Depends on**: Phase 54 (materializations must be in model for export to include them)
+**Requirements**: YAML-04, YAML-08
+**Success Criteria** (what must be TRUE):
+  1. `SELECT READ_YAML_FROM_SEMANTIC_VIEW('name')` returns a YAML string representing the stored definition, including materializations if declared
+  2. The exported YAML can be fed back into `CREATE SEMANTIC VIEW ... FROM YAML $$ ... $$` to recreate an identical semantic view (lossless round-trip)
+  3. Fully qualified names (database.schema.view_name) are supported in the function argument
+**Plans**: TBD
+
+### Phase 57: Introspection & Diagnostics
+**Goal**: Users can inspect materialization routing decisions and materialization metadata through existing introspection commands
+**Depends on**: Phase 55
+**Requirements**: INTR-01, INTR-02, INTR-03
+**Success Criteria** (what must be TRUE):
+  1. `explain_semantic_view()` output includes which materialization was selected (or "none") and the expanded SQL reflects the routed table
+  2. `DESCRIBE SEMANTIC VIEW` includes materialization entries showing each materialization's name, table, covered dimensions, and covered metrics
+  3. `SHOW SEMANTIC MATERIALIZATIONS IN view_name` lists all declared materializations with their covered dimensions and metrics
+**Plans**: TBD
+
 ## Progress
+
+**Execution Order:**
+Phases execute in numeric order: 51 -> 52 -> 53 -> 54 -> 55 -> 56 -> 57
 
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
-| 43. Metadata Foundation | v0.6.0 | 2/2 | Complete | 2026-04-10 |
-| 44. SHOW/DESCRIBE Metadata Surface + Enhancements | v0.6.0 | 2/2 | Complete | 2026-04-11 |
-| 45. ALTER COMMENT + GET_DDL | v0.6.0 | 2/2 | Complete | 2026-04-11 |
-| 46. Wildcard Selection + Queryable FACTS | v0.6.0 | 2/2 | Complete | 2026-04-12 |
-| 47. Semi-Additive Metrics | v0.6.0 | 2/2 | Complete | 2026-04-12 |
-| 48. Window Function Metrics | v0.6.0 | 2/2 | Complete | 2026-04-12 |
-| 49. Security & Correctness Hardening | v0.6.0 | 2/2 | Complete | 2026-04-14 |
-| 50. Code Quality & Test Coverage | v0.6.0 | 2/2 | Complete | 2026-04-14 |
+| 51. YAML Parser Core | v0.7.0 | 0/0 | Not started | - |
+| 52. YAML DDL Integration | v0.7.0 | 0/0 | Not started | - |
+| 53. YAML File Loading | v0.7.0 | 0/0 | Not started | - |
+| 54. Materialization Model & DDL | v0.7.0 | 0/0 | Not started | - |
+| 55. Materialization Routing Engine | v0.7.0 | 0/0 | Not started | - |
+| 56. YAML Export | v0.7.0 | 0/0 | Not started | - |
+| 57. Introspection & Diagnostics | v0.7.0 | 0/0 | Not started | - |

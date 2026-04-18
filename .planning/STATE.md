@@ -4,10 +4,10 @@ milestone: v0.7.0
 milestone_name: YAML Definitions & Materialization Routing
 status: active
 stopped_at: null
-last_updated: "2026-04-18"
-last_activity: 2026-04-18
+last_updated: "2026-04-17"
+last_activity: 2026-04-17
 progress:
-  total_phases: 0
+  total_phases: 7
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-18)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Defining requirements
+**Current focus:** Phase 51 - YAML Parser Core
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-04-18 — Milestone v0.7.0 started
+Phase: 51 (1 of 7 in v0.7.0) (YAML Parser Core)
+Plan: 0 of 0 in current phase
+Status: Ready to plan
+Last activity: 2026-04-17 -- Roadmap created for v0.7.0
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -47,26 +47,11 @@ Progress: [░░░░░░░░░░] 0%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- [v0.6.0 planning]: Build order follows tier model -- Tier 1 (model+DDL) before Tier 2 (expansion mods) before Tier 3 (expansion structural changes)
-- [v0.6.0 planning]: Semi-additive uses ROW_NUMBER() CTE, not LAST_VALUE IGNORE NULLS (DuckDB LTS crash bug)
-- [v0.6.0 planning]: All new model fields use #[serde(default)] for backward compatibility
-- [Phase 45]: Generalize DdlKind::AlterRename to DdlKind::Alter with sub-operation dispatch for RENAME TO, SET COMMENT, UNSET COMMENT
-- [Phase 46]: Wildcard module placed in expand/ (not query/) so unit tests run without extension feature
-- [Phase 46]: Fact queries use LIMIT 0 type inference rather than DDL-time type map (facts use per-fact output_type)
-- [Phase 47]: NON ADDITIVE BY extracted before USING in parse order to handle both together
-- [Phase 47]: DESC defaults to NULLS FIRST when user does not specify NULLS (matches DuckDB/Snowflake)
-- [Phase 47]: GET_DDL always emits explicit NULLS LAST/FIRST to avoid version divergence
-- [Phase 47]: CTE with ROW_NUMBER() for semi-additive expansion (not LAST_VALUE due to DuckDB LTS crash)
-- [Phase 47]: Fan trap check skips semi-additive metrics entirely (ROW_NUMBER handles fan-out)
-- [Phase 47]: Effectively-regular classification: all NA dims in query -> standard aggregation, no CTE
-- [Phase 48]: CTE __sv_agg aggregates inner metrics by all queried dims; outer SELECT applies window functions with computed PARTITION BY
-- [Phase 48]: Window metrics and aggregate metrics are mutually exclusive in same query (WindowAggregateMixing error)
-- [Phase 49]: Use .map_err() with descriptive string instead of into_inner() lock recovery for poisoned locks
-- [Phase 49]: AssertUnwindSafe justified at FFI boundary: panics caught and converted to errors, no partially-mutated state observed
-- [Phase 49]: MAX_DERIVATION_DEPTH=64 prevents stack overflow from linear metric chains that pass cycle detection
-- [Phase 50]: Retain one golden-file anchor test while converting 4 others to property assertions for refactor resilience
-- [Phase 50]: resolve_names uses 9 closure parameters for error construction at call sites, avoiding trait objects
-- [Phase 50]: DimensionName/MetricName newtypes with AsRef<str> + Deref for seamless string interop
+- [v0.7.0 roadmap]: Two independent tracks -- YAML (51-53) and Materialization (54-55), converging at YAML Export (56) and Introspection (57)
+- [v0.7.0 roadmap]: serde_yaml_ng 0.10 selected as YAML dependency (serde_yaml archived, serde_yml has RUSTSEC advisory)
+- [v0.7.0 roadmap]: Semi-additive and window metrics unconditionally excluded from materialization routing
+- [v0.7.0 roadmap]: Re-aggregation for subset matches deferred to v2 (MAT-F01) -- exact match only in v0.7.0
+- [v0.7.0 roadmap]: YAML export (Phase 56) placed after materialization model (Phase 54) so materializations appear in YAML output
 
 ### Pending Todos
 
@@ -76,7 +61,9 @@ Recent decisions affecting current work:
 
 ### Blockers/Concerns
 
-(None — v0.6.0 milestone complete. All prior blockers resolved.)
+- serde_yaml_ng anchor bomb handling needs verification (may need manual size cap before parse)
+- Dollar-quote behavior in parser hook needs integration test (parser hook fires before DuckDB parser)
+- Materialization table existence: define-time vs query-time validation TBD
 
 ### Quick Tasks Completed
 
@@ -93,6 +80,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-04-14T12:02:10.895Z
-Stopped at: Completed 50-02-PLAN.md (Expand Module Refactoring)
+Last session: 2026-04-17
+Stopped at: Roadmap created for v0.7.0, ready to plan Phase 51
 Resume file: None
