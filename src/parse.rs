@@ -1052,7 +1052,7 @@ fn validate_create_body(
     }
     // --- End AS keyword body path ---
 
-    // --- FROM YAML body path (Phase 52) ---
+    // --- FROM YAML body path (Phase 52 + Phase 53) ---
     let is_yaml_body = after_name_trimmed
         .get(..9)
         .is_some_and(|s| s.eq_ignore_ascii_case("FROM YAML"))
@@ -1060,6 +1060,18 @@ fn validate_create_body(
             || after_name_trimmed.as_bytes()[9].is_ascii_whitespace());
     if is_yaml_body {
         let yaml_text = after_name_trimmed[9..].trim_start();
+
+        // Phase 53: FROM YAML FILE '/path' sub-branch
+        let is_file = yaml_text
+            .get(..4)
+            .is_some_and(|s| s.eq_ignore_ascii_case("FILE"))
+            && (yaml_text.len() == 4 || yaml_text.as_bytes()[4].is_ascii_whitespace());
+        if is_file {
+            let file_text = yaml_text[4..].trim_start();
+            return rewrite_ddl_yaml_file_body(kind, name, file_text, view_comment);
+        }
+
+        // Phase 52: FROM YAML $$...$$ inline sub-branch (existing)
         return rewrite_ddl_yaml_body(kind, name, yaml_text, view_comment);
     }
     // --- End FROM YAML body path ---
@@ -1067,7 +1079,11 @@ fn validate_create_body(
     // Non-AS/FROM-YAML syntax rejected -- AS keyword or FROM YAML required after view name.
     let pos_in_trimmed = plen + (trimmed_no_semi.len() - plen - after_prefix.len()) + name_end;
     Err(ParseError {
-        message: "Expected 'AS' or 'FROM YAML' after view name. Use: CREATE SEMANTIC VIEW name AS TABLES (...) DIMENSIONS (...) METRICS (...) or: CREATE SEMANTIC VIEW name FROM YAML $$ ... $$".to_string(),
+        message: "Expected 'AS' or 'FROM YAML' after view name. Use: CREATE SEMANTIC VIEW name \
+                  AS TABLES (...) DIMENSIONS (...) METRICS (...) or: CREATE SEMANTIC VIEW name \
+                  FROM YAML $$ ... $$ or: CREATE SEMANTIC VIEW name FROM YAML FILE \
+                  '/path/to/file.yaml'"
+            .to_string(),
         position: Some(trim_offset + pos_in_trimmed),
     })
 }
@@ -1133,6 +1149,87 @@ fn rewrite_ddl_keyword_body(
 
     Ok(Some(format!(
         "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 53: Single-quoted file path extraction and YAML FILE sentinel
+// ---------------------------------------------------------------------------
+
+/// Extract a single-quoted string literal from the input.
+///
+/// Returns `(unescaped_content, bytes_consumed)` on success.
+/// Handles SQL-standard escaped single quotes (`''` -> `'`).
+fn extract_single_quoted(input: &str) -> Result<(String, usize), ParseError> {
+    if !input.starts_with('\'') {
+        return Err(ParseError {
+            message: "Expected single-quoted file path after FILE keyword. \
+                      Use: FROM YAML FILE '/path/to/file.yaml'"
+                .to_string(),
+            position: None,
+        });
+    }
+    let mut result = String::new();
+    let mut i = 1; // skip opening quote
+    let bytes = input.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                result.push('\'');
+                i += 2;
+            } else {
+                return Ok((result, i + 1));
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    Err(ParseError {
+        message: "Unterminated file path string (missing closing single quote)".to_string(),
+        position: None,
+    })
+}
+
+/// Generate a sentinel string for C++ shim to intercept and read the file.
+///
+/// Sentinel format: `__SV_YAML_FILE__<path>\x00<kind>\x00<name>\x00<comment>`
+/// The C++ shim reads the file via `read_text()`, reconstructs as inline YAML,
+/// and re-invokes `sv_rewrite_ddl_rust`.
+fn rewrite_ddl_yaml_file_body(
+    kind: DdlKind,
+    name: &str,
+    file_text: &str,
+    view_comment: Option<String>,
+) -> Result<Option<String>, ParseError> {
+    let (file_path, consumed) = extract_single_quoted(file_text)?;
+
+    let trailing = file_text[consumed..].trim();
+    if !trailing.is_empty() {
+        return Err(ParseError {
+            message: format!("Unexpected content after file path: '{trailing}'"),
+            position: None,
+        });
+    }
+
+    if file_path.is_empty() {
+        return Err(ParseError {
+            message: "File path cannot be empty. \
+                      Use: FROM YAML FILE '/path/to/file.yaml'"
+                .to_string(),
+            position: None,
+        });
+    }
+
+    let kind_num = match kind {
+        DdlKind::Create => 0,
+        DdlKind::CreateOrReplace => 1,
+        DdlKind::CreateIfNotExists => 2,
+        _ => unreachable!("rewrite_ddl_yaml_file_body only called for CREATE forms"),
+    };
+    let comment = view_comment.unwrap_or_default();
+    Ok(Some(format!(
+        "__SV_YAML_FILE__{file_path}\x00{kind_num}\x00{name}\x00{comment}"
     )))
 }
 
@@ -2972,5 +3069,157 @@ $$"#;
         let result = validate_and_rewrite(query).unwrap();
         let sql = result.unwrap();
         assert!(sql.contains("my comment"));
+    }
+
+    // ===================================================================
+    // Phase 53: FROM YAML FILE tests
+    // ===================================================================
+
+    #[test]
+    fn test_extract_single_quoted_basic() {
+        let (content, consumed) = extract_single_quoted("'/path/to/file.yaml'").unwrap();
+        assert_eq!(content, "/path/to/file.yaml");
+        assert_eq!(consumed, 20);
+    }
+
+    #[test]
+    fn test_extract_single_quoted_escaped() {
+        // '/file''s.yaml' = ' f i l e ' ' s . y a m l ' = 15 chars
+        let (content, consumed) = extract_single_quoted("'/file''s.yaml'").unwrap();
+        assert_eq!(content, "/file's.yaml");
+        assert_eq!(consumed, 15);
+    }
+
+    #[test]
+    fn test_extract_single_quoted_empty() {
+        let (content, consumed) = extract_single_quoted("''").unwrap();
+        assert_eq!(content, "");
+        assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn test_extract_single_quoted_no_quote() {
+        let err = extract_single_quoted("no quote").unwrap_err();
+        assert!(
+            err.message.contains("Expected single-quoted file path"),
+            "Error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_extract_single_quoted_unterminated() {
+        let err = extract_single_quoted("'unterminated").unwrap_err();
+        assert!(
+            err.message.contains("Unterminated file path string"),
+            "Error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_create() {
+        let result =
+            rewrite_ddl_yaml_file_body(DdlKind::Create, "myview", "'/path/to/def.yaml'", None)
+                .unwrap();
+        let sentinel = result.unwrap();
+        assert!(sentinel.starts_with("__SV_YAML_FILE__"));
+        assert!(sentinel.contains("path/to/def.yaml"));
+        assert!(sentinel.contains("\x000\x00myview\x00"));
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_replace() {
+        let result = rewrite_ddl_yaml_file_body(
+            DdlKind::CreateOrReplace,
+            "v",
+            "'/f.yaml'",
+            Some("a comment".into()),
+        )
+        .unwrap();
+        let sentinel = result.unwrap();
+        assert!(sentinel.contains("\x001\x00v\x00a comment"));
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_if_not_exists() {
+        let result =
+            rewrite_ddl_yaml_file_body(DdlKind::CreateIfNotExists, "v", "'/f.yaml'", None).unwrap();
+        let sentinel = result.unwrap();
+        assert!(sentinel.contains("\x002\x00v\x00"));
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_with_comment() {
+        let result = rewrite_ddl_yaml_file_body(
+            DdlKind::Create,
+            "v",
+            "'/f.yaml'",
+            Some("my comment".into()),
+        )
+        .unwrap();
+        let sentinel = result.unwrap();
+        assert!(sentinel.contains("my comment"));
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_empty_path() {
+        let err = rewrite_ddl_yaml_file_body(DdlKind::Create, "v", "''", None).unwrap_err();
+        assert!(
+            err.message.contains("File path cannot be empty"),
+            "Error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_trailing_content() {
+        let err = rewrite_ddl_yaml_file_body(DdlKind::Create, "v", "'/f.yaml' extra stuff", None)
+            .unwrap_err();
+        assert!(
+            err.message.contains("Unexpected content after file path"),
+            "Error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_yaml_file() {
+        let query = "CREATE SEMANTIC VIEW v FROM YAML FILE '/test.yaml'";
+        let result = validate_and_rewrite(query).unwrap();
+        let sentinel = result.unwrap();
+        assert!(
+            sentinel.starts_with("__SV_YAML_FILE__"),
+            "Expected sentinel prefix, got: {}",
+            sentinel
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_yaml_file_case_insensitive() {
+        let query = "CREATE SEMANTIC VIEW v from yaml file '/test.yaml'";
+        let result = validate_and_rewrite(query).unwrap();
+        let sentinel = result.unwrap();
+        assert!(sentinel.starts_with("__SV_YAML_FILE__"));
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_yaml_inline_still_works() {
+        // Regression: FROM YAML $$...$$ still works after FILE branch is added
+        let query = "CREATE SEMANTIC VIEW v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("create_semantic_view_from_json"));
+    }
+
+    #[test]
+    fn test_error_message_mentions_from_yaml_file() {
+        let query = "CREATE SEMANTIC VIEW v SOMETHING_ELSE";
+        let err = validate_and_rewrite(query).unwrap_err();
+        assert!(
+            err.message.contains("FROM YAML FILE"),
+            "Error should mention FROM YAML FILE: {}",
+            err.message
+        );
     }
 }
