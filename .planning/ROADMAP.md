@@ -166,7 +166,7 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
 **Milestone Goal:** Add YAML as a second definition format alongside SQL DDL, and a materialization routing engine that transparently redirects queries to pre-existing aggregated tables when they cover the requested dimensions and metrics.
 
 - [x] **Phase 51: YAML Parser Core** (1 plan) - yaml_serde dependency, YAML-to-SemanticViewDefinition conversion, shared validation, size cap (completed 2026-04-18)
-- [ ] **Phase 52: YAML DDL Integration** - FROM YAML $$ dollar-quoting, parser hook detection, CREATE/REPLACE/IF NOT EXISTS modifiers
+- [ ] **Phase 52: YAML DDL Integration** (1 plan) - FROM YAML $$ dollar-quoting, parser hook detection, CREATE/REPLACE/IF NOT EXISTS modifiers
 - [ ] **Phase 53: YAML File Loading** - FROM YAML FILE with DuckDB file abstraction and enable_external_access security
 - [ ] **Phase 54: Materialization Model & DDL** - Materialization struct, MATERIALIZATIONS clause in body parser, persistence, YAML support
 - [ ] **Phase 55: Materialization Routing Engine** - Query-time routing with exact-match set containment, fallback, semi-additive/window exclusion
@@ -196,7 +196,9 @@ Plans:
   2. `CREATE OR REPLACE SEMANTIC VIEW name FROM YAML $$ ... $$` replaces an existing view
   3. `CREATE SEMANTIC VIEW IF NOT EXISTS name FROM YAML $$ ... $$` is a no-op when the view already exists
   4. The parser hook correctly detects `FROM YAML` and routes through the YAML parsing path
-**Plans**: TBD
+**Plans:** 1 plan
+Plans:
+- [ ] 52-01-PLAN.md -- dollar-quote extraction, YAML-to-JSON rewrite, FROM YAML detection, unit tests, sqllogictest integration tests
 
 ### Phase 53: YAML File Loading
 **Goal**: Users can create semantic views from external YAML files with proper security boundaries
@@ -258,7 +260,7 @@ Phases execute in numeric order: 51 -> 52 -> 53 -> 54 -> 55 -> 56 -> 57
 | Phase | Milestone | Plans Complete | Status | Completed |
 |-------|-----------|----------------|--------|-----------|
 | 51. YAML Parser Core | v0.7.0 | 1/1 | Complete    | 2026-04-18 |
-| 52. YAML DDL Integration | v0.7.0 | 0/0 | Not started | - |
+| 52. YAML DDL Integration | v0.7.0 | 0/1 | Not started | - |
 | 53. YAML File Loading | v0.7.0 | 0/0 | Not started | - |
 | 54. Materialization Model & DDL | v0.7.0 | 0/0 | Not started | - |
 | 55. Materialization Routing Engine | v0.7.0 | 0/0 | Not started | - |
