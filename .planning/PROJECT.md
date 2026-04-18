@@ -209,4 +209,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-18 after v0.7.0 milestone start — YAML Definitions & Materialization Routing.*
+*Last updated: 2026-04-18 after Phase 51 (YAML Parser Core) complete — yaml_serde dependency, from_yaml/from_yaml_with_size_cap, PartialEq derives, 716 tests green.*
