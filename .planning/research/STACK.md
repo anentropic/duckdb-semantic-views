@@ -1,262 +1,153 @@
 # Technology Stack
 
-**Project:** DuckDB Semantic Views v0.6.0 -- Snowflake SQL DDL Parity
-**Researched:** 2026-04-09
-**Scope:** Stack additions/changes for semi-additive metrics, window function metrics, metadata system, GET_DDL, queryable FACTS, wildcards, SHOW enhancements
+**Project:** DuckDB Semantic Views v0.7.0 -- YAML Definitions & Materialization Routing
+**Researched:** 2026-04-17
 
-## Key Finding: No New Crates Required
+## Recommended Stack Additions
 
-This milestone requires **zero new Rust dependencies**. Every feature builds on existing capabilities:
+### YAML Parsing: `serde_yaml_ng`
 
-- **Semi-additive metrics (NON ADDITIVE BY):** Pure SQL expansion change -- generates `LAST_VALUE(...) OVER (PARTITION BY ... ORDER BY ...)` which DuckDB supports natively. No new library needed; this is string-based SQL generation in `expand/sql_gen.rs`.
-- **Window function metrics (PARTITION BY EXCLUDING):** Same expansion engine, different SQL output path. Generates window functions instead of GROUP BY aggregation. DuckDB's window function support is comprehensive (confirmed: LAST_VALUE, SUM OVER, PARTITION BY all available).
-- **Metadata (COMMENT, SYNONYMS, PRIVATE/PUBLIC):** New fields on existing serde-derived model structs. Stored as JSON in the same catalog table. No serialization library changes.
-- **GET_DDL reconstruction:** Pure Rust string building from `SemanticViewDefinition` fields. No template engine needed -- the DDL is simple enough for `format!`/`write!` macros.
-- **Queryable FACTS:** New code path in the expand function that emits SELECT without GROUP BY. Reuses existing join resolution, table function infrastructure, and typed output pipeline.
-- **Wildcard selection (e.g. `customer.*`):** Pattern matching on dimension/metric names at expand time. Standard library `str::ends_with` / iterator filtering.
-- **SHOW enhancements (TERSE, IN scope, SHOW COLUMNS):** New VTab implementations following the established pattern in `src/ddl/`. Column schema changes only.
+| Technology | Version | Purpose | Why |
+|------------|---------|---------|-----|
+| serde_yaml_ng | 0.10 | Deserialize/serialize YAML to/from existing `SemanticViewDefinition` | Drop-in serde integration with existing model structs; API mirrors serde_json (`from_str`, `to_string`); maintained fork of dtolnay's serde_yaml; MIT license passes cargo-deny |
 
-## Current Stack (Unchanged for v0.6.0)
+**Rationale:** The existing `SemanticViewDefinition` struct and all its nested types (`TableRef`, `Dimension`, `Metric`, `Fact`, `Join`, etc.) already derive `Serialize` and `Deserialize`. Adding YAML support means adding a single dependency and calling `serde_yaml_ng::from_str()` instead of `serde_json::from_str()`. No model changes required.
 
-### Core Dependencies
-| Technology | Version | Purpose | v0.6.0 Impact |
-|------------|---------|---------|---------------|
-| duckdb (Rust) | =1.10500.0 | DuckDB C API bindings, VTab trait, `LogicalTypeId` | No change. VTab pattern reused for SHOW COLUMNS and TERSE variants |
-| libduckdb-sys | =1.10500.0 | Raw FFI bindings (`duckdb_query`, `duckdb_vector_reference_vector`) | No change. Same query execution path for window function metrics |
-| serde | 1.x | Derive `Serialize`/`Deserialize` on model types | No change. New fields added with `#[serde(default)]` for backward compat |
-| serde_json | 1.x | JSON serialization of `SemanticViewDefinition` | No change. Handles new metadata fields via existing patterns |
-| strsim | 0.11 | Levenshtein distance for "did you mean?" suggestions | No change |
-| cc | 1.x (optional) | C++ shim compilation for extension builds | No change |
+**Why `serde_yaml_ng` over alternatives:**
+
+| Crate | Version | Status | Verdict |
+|-------|---------|--------|---------|
+| serde_yaml (dtolnay) | 0.9 | **Archived** March 2024, unmaintained | REJECTED -- abandoned |
+| serde_yml | 0.0.x | **RUSTSEC-2025-0068**: unsound, AI-generated nonsense code, archived | REJECTED -- security advisory |
+| serde_yaml_bw | 2.5.5 | Maintained fork, supports merge keys | VIABLE but serde-saphyr recommended over it by its own author |
+| serde-saphyr | 0.0.23 | No unsafe, panic-free, 1000+ tests, active development | VIABLE but pre-1.0 API (0.0.x), breaking changes expected |
+| serde_yaml_ng | 0.10 | Maintained fork of dtolnay's original, MIT, closest API match | **SELECTED** |
+
+**Decision:** `serde_yaml_ng` wins because:
+1. **API compatibility** -- identical function signatures to `serde_json` (`from_str`, `to_string`), minimizing learning curve and code patterns
+2. **Proven lineage** -- direct fork from dtolnay's high-quality original; minimal divergence from the battle-tested codebase
+3. **Version maturity** -- at 0.10, further along than serde-saphyr's 0.0.x; less likely to have breaking API changes
+4. **License** -- MIT, already in `deny.toml` allowlist
+5. **Dependency weight** -- depends on `serde 1.0` (already in Cargo.toml) and `unsafe-libyaml` (auto-translated C, same backend as the original)
+
+**Risk:** `serde_yaml_ng` currently uses `unsafe-libyaml` (an auto-translated C libyaml binding). The maintainer is actively migrating to `libyaml-safer` (safe Rust port). This is a LOW risk: unsafe-libyaml has been the YAML backend for the entire Rust ecosystem for years; the migration to safe Rust is an improvement, not a fix for known bugs.
+
+**Confidence:** MEDIUM -- verified via GitHub repo, crates.io listing, and RustSec advisories. Not verified via Context7 (not available for this crate).
+
+### No Additional Crates Required
+
+The remaining v0.7.0 features need **zero additional dependencies**:
+
+| Feature | Implementation Approach | Why No New Crate |
+|---------|------------------------|------------------|
+| Dollar-quoted YAML blocks (`$$ ... $$`) | Extend `body_parser.rs` or `parse.rs` to detect `FROM YAML $$` prefix and extract the YAML body before the closing `$$` | DuckDB already supports `$$` in its SQL parser; our parser hook receives the full query string including dollar-quoted content. Simple string scanning for `$$` delimiters. |
+| YAML FILE loading (`FROM YAML FILE '...'`) | `std::fs::read_to_string()` in the DDL handler | Already used in `src/catalog.rs` for migration file I/O. Standard library only. |
+| YAML-to-JSON conversion at define time | `serde_yaml_ng::from_str::<SemanticViewDefinition>()` then store as JSON via existing `serde_json::to_string()` | YAML is an input format only; internal storage remains JSON. One-time conversion at define time. |
+| GET_DDL YAML export | `serde_yaml_ng::to_string(&def)` in a new `render_yaml.rs` | Direct serialization of existing model struct. May need `#[serde(skip)]` on internal-only fields (column_types_inferred, etc.) or a separate YAML-specific output struct. |
+| MATERIALIZATIONS clause | New `Materialization` struct in `model.rs` with `Serialize`/`Deserialize` derives | Pure Rust: new model type, body_parser extension, set-containment matching logic in expansion. |
+| Materialization routing | Set-containment matching in `expand/mod.rs` | The algorithm is a simple sequential scan with `is_subset` checks on `HashSet<String>`. Per the design doc, this is a pure function -- no external query planner needed. Already uses `HashSet` from std. |
+| Re-aggregation wrapper | SQL string generation wrapping a `FROM materialized_table GROUP BY` | Same pattern as existing CTE-based SQL generation in `expand/sql_gen.rs`. |
+
+## Integration Points with Existing Serde Pipeline
+
+### Current Flow (JSON only)
+```
+DDL SQL text
+  -> body_parser::parse_keyword_body()
+  -> SemanticViewDefinition struct
+  -> serde_json::to_string()
+  -> catalog INSERT (JSON blob in VARCHAR column)
+
+catalog SELECT (JSON blob)
+  -> serde_json::from_str::<SemanticViewDefinition>()
+  -> expansion engine
+```
+
+### New Flow (YAML + JSON)
+```
+DDL SQL text with FROM YAML $$ ... $$ or FROM YAML FILE '...'
+  -> parse.rs: detect YAML prefix, extract YAML body
+  -> serde_yaml_ng::from_str::<SemanticViewDefinition>()
+  -> serde_json::to_string()                              # convert to JSON for storage
+  -> catalog INSERT (JSON blob -- same as before)
+
+GET_DDL('SEMANTIC_VIEW', 'name', 'YAML')                  # optional YAML export
+  -> serde_json::from_str::<SemanticViewDefinition>()
+  -> serde_yaml_ng::to_string()                           # render as YAML
+```
+
+**Key design principle:** YAML is an **input/output format**, not a storage format. Internal catalog persistence remains JSON. This avoids any migration of stored data and preserves backward compatibility with pre-v0.7.0 definitions.
+
+### YAML Field Mapping
+
+The `SemanticViewDefinition` struct's serde attributes (`#[serde(default)]`, `#[serde(skip_serializing_if)]`) work identically for YAML as for JSON. The existing backward-compatibility annotations (empty Vec defaults, None defaults) apply automatically.
+
+Fields to exclude from YAML export (internal-only):
+- `column_type_names` / `column_types_inferred` -- DDL-time inference data, not user-facing
+- `created_on` / `database_name` / `schema_name` -- runtime metadata, not part of definition
+
+Approach: Either use `#[serde(skip)]` (but this breaks JSON roundtrip) or create a lightweight wrapper/view struct for YAML output that omits these fields.
+
+## Current Stack (Unchanged)
+
+### Core Framework
+| Technology | Version | Purpose |
+|------------|---------|---------|
+| duckdb (crate) | =1.10502.0 | DuckDB Rust bindings, exact-pinned to DuckDB 1.5.2 |
+| libduckdb-sys | =1.10502.0 | Raw C API bindings |
+| serde | 1 | Serialization/deserialization framework |
+| serde_json | 1 | JSON format (catalog persistence) |
+| strsim | 0.11 | Levenshtein distance for "did you mean" suggestions |
+| cc | 1 (optional) | C++ compilation for extension builds |
 
 ### Dev Dependencies
-| Technology | Version | Purpose | v0.6.0 Impact |
-|------------|---------|---------|---------------|
-| proptest | 1.11 | Property-based testing for expansion, parsing, DDL round-trip | No change. New proptest strategies for semi-additive/window metric expansion |
-| cargo-husky | 1.x | Pre-commit hooks | No change |
+| Technology | Version | Purpose |
+|------------|---------|---------|
+| proptest | 1.11 | Property-based testing |
+| cargo-husky | 1 | Git hooks |
+
+## Installation
+
+```toml
+# Add to Cargo.toml [dependencies]:
+serde_yaml_ng = "0.10"
+```
+
+```bash
+cargo add serde_yaml_ng@0.10
+```
+
+No `deny.toml` changes needed -- MIT license is already allowed.
+
+## Alternatives Considered
+
+| Category | Recommended | Alternative | Why Not |
+|----------|-------------|-------------|---------|
+| YAML parsing | serde_yaml_ng 0.10 | serde-saphyr 0.0.23 | Pre-1.0 API with expected breaking changes; we need stability for a single-purpose YAML layer, not a cutting-edge parser. Would be the pick if starting fresh in 2027+. |
+| YAML parsing | serde_yaml_ng 0.10 | serde_yml | RUSTSEC-2025-0068 advisory: unsound, AI-generated code, archived. Hard no. |
+| YAML parsing | serde_yaml_ng 0.10 | serde_yaml (dtolnay) | Archived March 2024, unmaintained. |
+| Materialization routing | Std library (HashSet) | egg (e-graph rewriting) | Massive overkill. Design doc explicitly rules this out: "Our pre-aggregation selector is a pure function. DuckDB handles the rest." Set-containment matching is ~50 lines of Rust. |
+| Materialization routing | Std library (HashSet) | Custom query planner | The extension is a preprocessor, not a query engine. DuckDB handles optimization. |
+| Dollar-quoted parsing | String scanning in parse.rs | Pest/nom parser combinator | The `$$` delimiter is trivial to detect: find opening `$$`, find closing `$$`, take substring. Adding a parser combinator library for two find operations would be absurd. |
+| File I/O | std::fs::read_to_string | DuckDB read_file/read_text | DuckDB's file functions are SQL-level and would require executing SQL to read a file, then passing the result to the YAML parser. Using std::fs is simpler and already established in the codebase (catalog.rs). |
 
 ## What NOT to Add
 
-### No Template Engine for GET_DDL
-**Considered:** `tera`, `askama`, `minijinja` for DDL reconstruction.
-**Decision:** Do not add. GET_DDL output is a single `CREATE SEMANTIC VIEW` statement. The DDL grammar is fixed and fully under our control. A `fn get_ddl(name: &str, def: &SemanticViewDefinition) -> String` with `write!` macros is simpler, has zero dependencies, and is easier to test. Template engines add compilation time and a DSL learning curve for ~100 lines of string building.
-
-### No Regex Crate for Wildcard Expansion
-**Considered:** `regex` crate for `customer.*` pattern matching.
-**Decision:** Do not add. Wildcard syntax is limited to `<table_alias>.*` -- a single pattern that splits on `.` and checks for `*`. This is `str::split_once('.')` + exact match, not a regex problem. Adding `regex` (~300KB compile) for one string split is wasteful.
-
-### No Additional Parsing Library for NON ADDITIVE BY / PARTITION BY EXCLUDING
-**Considered:** `nom`, `pest`, `lalrpop` for parsing new metric modifier clauses.
-**Decision:** Do not add. The existing `body_parser.rs` state machine handles all current clause parsing. The new modifiers (`NON ADDITIVE BY (dim1 DESC, dim2 ASC)` and `PARTITION BY EXCLUDING (dim1)`) follow the same parenthesized-list pattern already parsed by `split_at_depth0_commas`. Extend the existing metric parser to recognize these keywords after the `AS <expr>` portion.
-
-### No chrono/time Crate
-**Considered:** `chrono` or `time` for timestamp handling in metadata.
-**Decision:** Do not add. Timestamps are already stored as VARCHAR strings via DuckDB's `now()` function (established in v0.5.5). The pattern is: capture via SQL, store as string, output as string. No Rust-side date manipulation needed.
-
-## Integration Points for New Features
-
-### Model Layer (`src/model.rs`)
-
-New fields on existing structs (all with `#[serde(default)]` for backward compat):
-
-```rust
-// On SemanticViewDefinition:
-pub comment: Option<String>,           // View-level comment
-
-// On Dimension:
-pub comment: Option<String>,           // COMMENT = '...'
-pub synonyms: Vec<String>,             // WITH SYNONYMS = ('...', '...')
-
-// On Metric:
-pub comment: Option<String>,
-pub synonyms: Vec<String>,
-pub is_private: bool,                  // PRIVATE modifier (default: false = PUBLIC)
-pub non_additive_dims: Vec<NonAdditiveDim>,  // NON ADDITIVE BY (...)
-pub partition_by_excluding: Vec<String>,     // PARTITION BY EXCLUDING (...)
-
-// On Fact:
-pub comment: Option<String>,
-pub synonyms: Vec<String>,
-pub is_private: bool,
-
-// On TableRef:
-pub comment: Option<String>,
-pub synonyms: Vec<String>,
-
-// New struct:
-pub struct NonAdditiveDim {
-    pub name: String,                  // dimension name reference
-    pub descending: bool,              // DESC (default: false = ASC)
-    pub nulls_first: bool,             // NULLS FIRST (default: false = NULLS LAST)
-}
-```
-
-**Confidence:** HIGH -- follows established `#[serde(default, skip_serializing_if)]` pattern used for every model extension since v0.2.0.
-
-### Body Parser (`src/body_parser.rs`)
-
-Extensions needed in `parse_single_metric_entry` and `parse_metrics_clause`:
-
-1. **NON ADDITIVE BY:** After parsing `AS <expr>`, check for `NON ADDITIVE BY (` keyword sequence. Parse comma-separated dimension references with optional `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST` modifiers. Reuse `split_at_depth0_commas` for the parenthesized list.
-
-2. **PARTITION BY EXCLUDING:** After parsing `AS <expr>`, check for `PARTITION BY EXCLUDING (` keyword sequence. Parse comma-separated dimension references (no sort modifiers).
-
-3. **COMMENT/SYNONYMS/PRIVATE/PUBLIC on table entries:** Extend `parse_single_table_entry` to recognize `COMMENT = '...'` and `WITH SYNONYMS = ('...', '...')` after the PRIMARY KEY / UNIQUE clauses.
-
-4. **COMMENT/SYNONYMS/PRIVATE/PUBLIC on dim/metric/fact entries:** Extend `parse_single_qualified_entry` and `parse_single_metric_entry` to recognize these modifiers after the expression.
-
-**Confidence:** HIGH -- the parser is a hand-written state machine with established extension patterns. Each new modifier is a keyword check + parenthesized list parse, identical in structure to existing USING RELATIONSHIPS parsing.
-
-### Expansion Engine (`src/expand/sql_gen.rs`)
-
-Three new expansion modes need to coexist with the current grouped-aggregation path:
-
-1. **Semi-additive metrics (NON ADDITIVE BY):**
-   - For each semi-additive metric, generate a subquery or CTE that uses `LAST_VALUE(expr IGNORE NULLS) OVER (PARTITION BY <group_dims> ORDER BY <non_additive_dims>)` followed by `DISTINCT` to collapse window results.
-   - The tricky part: mixing semi-additive and regular metrics in one query. Snowflake handles this by computing semi-additive values first (via window), then aggregating. Our expansion should do the same: wrap the base query with window functions, then outer-aggregate.
-   - **Approach:** Two-pass expansion. Inner query computes window functions for semi-additive metrics alongside raw values. Outer query does GROUP BY with regular aggregates on the window-computed values.
-
-2. **Window function metrics (PARTITION BY EXCLUDING):**
-   - These metrics must NOT be grouped. They produce row-level output with a window function applied.
-   - When the query includes PARTITION BY EXCLUDING metrics, skip GROUP BY entirely. All dimensions appear as bare columns; window metrics get `OVER (PARTITION BY <all_queried_dims EXCEPT excluded>)`.
-   - **Constraint:** Cannot mix regular aggregate metrics and window metrics in the same query (Snowflake enforces this too). Detect and reject at expand time.
-
-3. **Queryable FACTS:**
-   - New query mode: `FROM semantic_view('v', facts := ['f1', 'f2'])` or `FROM semantic_view('v', facts := ['f1'], dimensions := ['d1'])`.
-   - No GROUP BY. Facts are row-level expressions. Dimensions in fact-query mode are bare columns (no aggregation).
-   - **Constraint:** Cannot mix facts and metrics in the same query (matches Snowflake: "You cannot specify both FACTS and METRICS in the same clause"). Detect and reject.
-
-**Confidence:** HIGH for facts and window metrics (straightforward expansion paths). MEDIUM for semi-additive metrics (two-pass expansion is more complex; needs careful testing of mixed metric queries).
-
-### DDL Detection (`src/parse.rs`)
-
-New `DdlKind` variants needed:
-
-```rust
-pub enum DdlKind {
-    // ... existing variants ...
-    ShowColumns,           // SHOW COLUMNS IN VIEW <name>
-    GetDdl,                // GET_DDL('SEMANTIC_VIEW', '<name>')
-}
-```
-
-**Note on GET_DDL:** Snowflake's `GET_DDL` is a built-in function, not DDL syntax. For DuckDB, implement as a scalar function or table function: `SELECT get_semantic_view_ddl('view_name')`. This avoids parser hook complexity. The function reads from the catalog and reconstructs the DDL string.
-
-**Confidence:** HIGH -- follows established `DdlKind` dispatch pattern.
-
-### Query Interface (`src/query/table_function.rs`)
-
-The `QueryRequest` struct needs extension:
-
-```rust
-pub struct QueryRequest {
-    pub dimensions: Vec<String>,
-    pub metrics: Vec<String>,
-    pub facts: Vec<String>,          // NEW: fact names for row-level query mode
-}
-```
-
-The `semantic_view` table function bind needs to accept a `facts` named parameter and dispatch to the appropriate expansion mode.
-
-**Confidence:** HIGH -- mirrors existing `dimensions`/`metrics` parameter handling.
-
-### SHOW Enhancements (`src/ddl/`)
-
-| Feature | Implementation | New Files |
-|---------|---------------|-----------|
-| SHOW ... IN SCHEMA/DATABASE | Filter by `database_name`/`schema_name` in VTab bind | No -- extend existing VTabs |
-| TERSE mode | Conditional column declaration in VTab bind (skip comment/synonyms columns) | No -- parameter check in existing VTabs |
-| SHOW COLUMNS | New VTab listing all dims/facts/metrics as "columns" | `src/ddl/show_columns.rs` |
-| synonyms/comment in SHOW output | Add 2 VARCHAR columns to existing ShowDimRow/ShowMetricRow/ShowFactRow | No -- extend existing structs |
-
-**Column additions for Snowflake alignment:**
-
-Current SHOW SEMANTIC DIMENSIONS has 6 columns. Snowflake has 8 (adds `synonyms`, `comment`). Add these two columns to all three SHOW object commands (dims, metrics, facts).
-
-Current SHOW SEMANTIC VIEWS has 5 columns. Snowflake has 8 (adds `comment`, `owner`, `owner_role_type`). Add `comment` column. Skip `owner`/`owner_role_type` (DuckDB has no role system -- emit empty strings for compatibility).
-
-**Confidence:** HIGH -- pure additive column changes following established VTab patterns.
-
-### DDL Result Pipeline (`shim.cpp`)
-
-The C++ result forwarding pipeline currently handles all `DdlKind` variants. New variants (ShowColumns, GetDdl) route through the same `sv_ddl_execute` -> `duckdb_value_varchar` -> output path. No C++ changes needed unless we add GET_DDL as a separate function outside the parser hook pipeline.
-
-**Decision:** Route GET_DDL through the DDL pipeline for consistency. It's detected as a parser hook form (`GET_DDL('SEMANTIC_VIEW', 'name')`) and rewritten to a table function call. The C++ pipeline returns the single-row VARCHAR result.
-
-**Alternative (preferred):** Register GET_DDL as a standalone scalar function that returns VARCHAR. This is simpler: no parser hook detection needed, no C++ pipeline involvement. Just `SELECT get_semantic_view_ddl('orders')`. Register it alongside the existing table functions at extension init.
-
-**Recommendation:** Use the scalar function approach. It's cleaner, avoids parser hook complexity, and matches how DuckDB users expect functions to work.
-
-**Confidence:** MEDIUM -- the scalar function registration path via duckdb-rs `create_scalar_function` may need investigation. The VTab path (table function returning one row) is proven.
-
-## DuckDB Capabilities Verification
-
-Features the new expansion relies on, verified against DuckDB documentation:
-
-| SQL Feature | DuckDB Support | Used By | Confidence |
-|-------------|---------------|---------|------------|
-| `LAST_VALUE(expr IGNORE NULLS) OVER (PARTITION BY ... ORDER BY ...)` | YES -- documented, full window function support | Semi-additive metrics | HIGH |
-| `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | YES -- default frame with ORDER BY | Semi-additive metrics | HIGH |
-| `SUM(expr) OVER (PARTITION BY ...)` | YES -- all aggregates usable as window functions | Window function metrics | HIGH |
-| Window functions without GROUP BY | YES -- standard SQL behavior | PARTITION BY EXCLUDING | HIGH |
-| `SELECT DISTINCT` on window function output | YES | Semi-additive dedup | HIGH |
-
-## Semi-Additive Expansion Strategy
-
-The most complex new feature. Snowflake's approach: for a semi-additive metric like `SUM(balance) NON ADDITIVE BY (date_dim DESC NULLS FIRST)`, when querying with dimensions [customer, date_dim]:
-
-1. Partition by non-excluded dimensions (customer)
-2. Order by the non-additive dimensions (date_dim DESC NULLS FIRST)
-3. Take the LAST_VALUE per partition (latest snapshot)
-4. Aggregate (SUM) across partitions
-
-**DuckDB expansion pattern:**
-
-```sql
--- Inner: compute last-value per snapshot group
-WITH _snapshot AS (
-  SELECT
-    customer AS "customer",
-    date_dim AS "date_dim",
-    LAST_VALUE(balance IGNORE NULLS) OVER (
-      PARTITION BY customer
-      ORDER BY date_dim DESC NULLS FIRST
-      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-    ) AS "_semi_balance"
-  FROM ...
-)
--- Outer: aggregate the snapshot values
-SELECT
-  "customer",
-  SUM("_semi_balance") AS "total_balance"
-FROM _snapshot
-GROUP BY 1
-```
-
-This two-pass CTE approach keeps the expansion engine's output as a single SQL string, compatible with the existing `execute_sql_raw` pipeline. No changes to the query execution layer.
-
-**Confidence:** MEDIUM -- the CTE wrapping approach is sound in principle but needs validation against edge cases: multiple semi-additive metrics with different NON ADDITIVE BY dimensions, mixing semi-additive and regular metrics, semi-additive metrics with no non-additive dimensions in the query.
-
-## Wildcard Expansion Strategy
-
-For `dimensions := ['customer.*']`:
-
-1. At expand time, parse `customer.*` as (table_alias=`customer`, pattern=`*`)
-2. Find all dimensions where `source_table == "customer"` (or alias matches)
-3. Expand the wildcard into the concrete dimension names
-4. Proceed with normal expansion
-
-This happens before validation, so the expanded names go through the existing duplicate/unknown checks.
-
-**Confidence:** HIGH -- pure string manipulation at the request-parsing layer.
+| Temptation | Why Not |
+|------------|---------|
+| DuckDB YAML community extension | That extension parses YAML values in query results. We need YAML-to-struct deserialization at DDL time. Completely different use case. |
+| Full YAML framework (e.g., yaml-rust2 directly) | We need serde integration, not a low-level YAML parser. Our model structs already derive serde traits. |
+| Template engine for YAML export | `serde_yaml_ng::to_string()` handles serialization. Manual string building (as in `render_ddl.rs`) is the fallback if the serde output format needs customization. |
+| Query planning/rewriting crate | The materialization routing algorithm is 3 checks: (1) are all requested metrics in the materialization? (2) are all requested dimensions in the materialization? (3) are the metrics additive? This is `HashSet::is_subset`. |
+| Regex crate | Dollar-quoted string detection needs no regex. `str::find("$$")` suffices. |
 
 ## Sources
 
-- [Snowflake CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- NON ADDITIVE BY, COMMENT, SYNONYMS, PRIVATE/PUBLIC, PARTITION BY EXCLUDING syntax
-- [Snowflake semi-additive metrics release note (March 5, 2026)](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY behavior specification
-- [Snowflake SEMANTIC_VIEW query construct](https://docs.snowflake.com/en/sql-reference/constructs/semantic_view) -- FACTS query mode, wildcard `table.*` syntax, METRICS/FACTS mutual exclusion
-- [Snowflake SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- TERSE, IN scope, column schema
-- [Snowflake SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- synonyms/comment columns, no TERSE
-- [Snowflake SHOW COLUMNS](https://docs.snowflake.com/en/sql-reference/sql/show-columns) -- semantic view support, column schema
-- [Snowflake DESCRIBE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view) -- SYNONYMS/COMMENT property rows
-- [Snowflake GET_DDL](https://docs.snowflake.com/en/sql-reference/functions/get_ddl) -- function-based DDL reconstruction
-- [DuckDB Window Functions](https://duckdb.org/docs/current/sql/functions/window_functions) -- LAST_VALUE, IGNORE NULLS, frame specs
+- [serde_yaml_ng on GitHub](https://github.com/acatton/serde-yaml-ng) -- MIT, maintained fork, v0.10
+- [RUSTSEC-2025-0068: serde_yml advisory](https://rustsec.org/advisories/RUSTSEC-2025-0068.html) -- unsound, archived
+- [serde-saphyr on GitHub](https://github.com/bourumir-wyngs/serde-saphyr) -- Apache-2.0/MIT, v0.0.23, safe Rust
+- [Rust forum: serde_yaml deprecation alternatives](https://users.rust-lang.org/t/serde-yaml-deprecation-alternatives/108868) -- community consensus
+- [DuckDB dollar-quoted strings](https://duckdb.org/docs/current/sql/data_types/text) -- native `$$` support
+- [DuckDB securing extensions](https://duckdb.org/docs/stable/operations_manual/securing_duckdb/overview) -- file access context
+- [Snowflake SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML](https://docs.snowflake.com/en/sql-reference/stored-procedures/system_create_semantic_view_from_yaml) -- `$$` YAML syntax reference
+- [Design doc: semantic-views-duckdb-design-doc.md](_notes/semantic-views-duckdb-design-doc.md) -- materialization routing algorithm

@@ -1,595 +1,593 @@
-# Feature Landscape: v0.6.0 Snowflake SQL DDL Parity
+# Feature Landscape: v0.7.0 YAML Definitions & Materialization Routing
 
-**Domain:** DuckDB Rust extension -- Snowflake SQL DDL parity features for semantic views
-**Researched:** 2026-04-09
-**Milestone:** v0.6.0 -- Close all remaining feature gaps against Snowflake's SQL DDL semantic views
-**Status:** Subsequent milestone research (v0.5.5 shipped 2026-04-05)
-**Overall confidence:** HIGH (Snowflake DDL syntax, SHOW/DESCRIBE schemas, and query semantics verified from official docs; dbt MetricFlow semi-additive pattern cross-referenced)
+**Domain:** DuckDB Rust extension -- YAML definition format and materialization routing engine
+**Researched:** 2026-04-17
+**Milestone:** v0.7.0 -- YAML as second definition format + materialization routing for pre-aggregated tables
+**Status:** Subsequent milestone research (v0.6.0 shipped 2026-04-14)
+**Overall confidence:** HIGH (Snowflake YAML spec verified from official docs; Cube.dev pre-aggregation matching algorithm verified from docs + source references; Databricks metric view materialization verified from official docs)
 
 ---
 
 ## Scope
 
-This document covers the 9 target feature areas for v0.6.0. Each is assessed against Snowflake's implementation, comparable systems (dbt MetricFlow, Cube.dev), and the existing codebase.
+This document covers two feature areas for v0.7.0:
+
+**Area A: YAML Definition Format**
+- Inline YAML: `CREATE SEMANTIC VIEW name FROM YAML $$ ... $$`
+- File-based YAML: `CREATE SEMANTIC VIEW name FROM YAML FILE '/path/to/file.yaml'`
+- YAML round-trip export: GET_DDL variant producing YAML output
+
+**Area B: Materialization Routing**
+- MATERIALIZATIONS clause in CREATE SEMANTIC VIEW DDL
+- Query-time routing to pre-existing aggregated tables
+- Re-aggregation for subset dimension matches
+- Fallback to raw table expansion (current behavior)
 
 **What already exists (NOT in scope for research):**
-- CREATE/DROP/ALTER RENAME/CREATE OR REPLACE SEMANTIC VIEW
-- TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS clauses
-- PK/FK/UNIQUE relationships with cardinality inference
-- Standard aggregate metrics (SUM, COUNT, AVG, MIN, MAX, etc.)
-- Derived metrics (metric-on-metric composition)
+- Complete SQL keyword DDL (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS)
+- All metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC)
+- Semi-additive metrics, window function metrics, derived metrics
 - Fan trap detection, role-playing dimensions, USING RELATIONSHIPS
-- SHOW SEMANTIC VIEWS/DIMENSIONS/METRICS/FACTS with LIKE/STARTS WITH/LIMIT/IN
-- DESCRIBE SEMANTIC VIEW (property-per-row, 5 columns, 6 object kinds)
-- Metadata storage (created_on, database_name, schema_name)
-- 487 tests, 16,342 LOC
+- GET_DDL for SQL DDL round-trip
+- Full query expansion engine producing concrete SQL
+- SemanticViewDefinition model with serde Serialize/Deserialize
 
-**Focus:** New DDL features, query capabilities, and introspection enhancements.
+---
+
+## Comparable System Analysis
+
+### Snowflake: YAML Semantic Views
+
+**How it works:** Snowflake provides two system procedures for YAML-based semantic views:
+
+1. `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML(schema, yaml_string, verify_only)` -- creates a semantic view from YAML
+2. `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW(view_name)` -- exports a semantic view back to YAML
+
+The YAML format is table-centric (dimensions, facts, metrics are nested under tables), while the SQL DDL is flat (dimensions, facts, metrics are top-level clauses with qualified names). Both produce identical semantic views -- the storage format is the same regardless of input method.
+
+**Key YAML schema structure:**
+```yaml
+name: view_name
+description: view comment
+tables:
+  - name: alias
+    base_table: { database: db, schema: sch, table: tbl }
+    primary_key: { columns: [col1] }
+    dimensions: [{ name, expr, data_type, synonyms, description, unique, is_enum, sample_values }]
+    time_dimensions: [{ name, expr, data_type, synonyms, description, unique }]
+    facts: [{ name, expr, data_type, synonyms, description, access_modifier }]
+    metrics: [{ name, expr, synonyms, description, access_modifier, non_additive_dimensions, using_relationships }]
+    filters: [{ name, expr, synonyms, description }]
+relationships:
+  - { name, left_table, right_table, relationship_columns: [{ left_column, right_column }], relationship_type }
+metrics:  # view-level derived metrics
+  - { name, expr, synonyms, description, access_modifier }
+verified_queries:  # Cortex Analyst hints
+  - { name, question, sql, verified_by, verified_at, use_as_onboarding_question }
+```
+
+**Key differences from SQL DDL:**
+- YAML nests dims/facts/metrics under tables (table-centric); SQL DDL uses flat qualified references (`table.name`)
+- YAML has `time_dimensions` as a separate category; SQL DDL has no such distinction
+- YAML has `filters` (reusable WHERE conditions); SQL DDL has no `FILTERS` clause
+- YAML has `verified_queries` (Cortex AI hints); SQL DDL has no equivalent
+- YAML uses `access_modifier: private_access`; SQL DDL uses `PRIVATE` keyword
+- YAML has `is_enum` and `sample_values` on dimensions; SQL DDL does not
+- YAML `relationship_type` is `many_to_one` (inferred); SQL DDL infers from PK/UNIQUE
+
+**Round-trip fidelity:** Snowflake guarantees that `CREATE FROM YAML -> READ YAML` produces valid YAML that can recreate the same view. The exported YAML may reformat or reorder fields but is semantically equivalent.
+
+**Confidence:** HIGH (verified from Snowflake official docs: YAML spec page, CREATE_FROM_YAML procedure, READ_YAML function)
+
+### Databricks: Metric View Materialization
+
+**How it works:** Databricks embeds materialization declarations directly in the metric view YAML definition via a `materialization` top-level field:
+
+```yaml
+materialization:
+  schedule: every 6 hours
+  mode: relaxed
+  materialized_views:
+    - name: baseline
+      type: unaggregated
+    - name: revenue_breakdown
+      type: aggregated
+      dimensions: [category, color]
+      measures: [total_revenue]
+```
+
+**Two materialization types:**
+1. **Aggregated:** Pre-computes specific dimension+measure combinations. Query routing requires exact dimension match and measure subset match.
+2. **Unaggregated:** Materializes the entire unaggregated data model (source tables + joins + filters applied). Broader coverage, less performance lift.
+
+**Query routing algorithm (3-step):**
+1. **Exact match:** grouping expressions precisely match materialization dimensions; aggregation expressions are a subset of materialization measures
+2. **Unaggregated match:** if an unaggregated materialization exists
+3. **Fallback:** route to source tables
+
+**Relaxed mode:** Only checks that materialized views contain necessary dimensions and measures. Skips freshness verification, SQL setting compatibility, and result determinism checks.
+
+**Refresh:** Managed by Lakeflow Spark Declarative Pipelines. Schedule-based or manual `REFRESH MATERIALIZED VIEW <name>`.
+
+**Confidence:** HIGH (verified from Databricks official docs)
+
+### Cube.dev: Pre-Aggregation Matching
+
+**How it works:** Cube defines pre-aggregations inline in cube definitions:
+
+```javascript
+cube(`orders`, {
+  measures: { count: { type: `count` } },
+  dimensions: { status: { sql: `status`, type: `string` } },
+  pre_aggregations: {
+    orders_by_status: {
+      measures: [count],
+      dimensions: [status],
+      time_dimension: created_at,
+      granularity: `day`,
+    }
+  }
+});
+```
+
+**Matching algorithm (sequential, first-match-wins):**
+1. Extract members (measures, dimensions, time dimensions) from query
+2. If query references views, resolve to underlying cube members
+3. Scan pre-aggregations in definition order (rollup before original_sql)
+4. For each candidate, check ALL of:
+   - All leaf measures are present AND **additive** (SUM, COUNT, MIN, MAX, COUNT_DISTINCT_APPROX compose; COUNT_DISTINCT, AVG do not)
+   - All dimensions and filter dimensions are present
+   - Time granularity is <= query granularity (use GCD: a `day` rollup serves `week`/`month` queries)
+   - Timezone matches
+   - Join tree is compatible
+5. First match wins; fall back to raw source if none
+
+**Re-aggregation:** When a query uses a subset of dimensions from a matched rollup, Cube Store "aggregates over missing dimensions." This only works for additive measures. Cube uses "aggregating indexes" -- essentially a rollup of a rollup table -- to optimize this pattern at build time rather than query time.
+
+**Non-additive measures:** Three strategies:
+1. Replace `count_distinct` with `count_distinct_approx` (additive, approximate)
+2. Decompose: store SUM + COUNT separately, compute AVG at query time
+3. Create exact-match-only pre-aggregations (no re-aggregation possible)
+
+**Confidence:** HIGH (verified from Cube.dev official docs + design doc analysis)
+
+### dbt MetricFlow: Saved Queries / Exports
+
+**How it works:** dbt does NOT have inline materialization declarations. Instead:
+1. Define metrics in YAML
+2. Create "saved queries" that pin specific metric+dimension combinations
+3. "Exports" materialize saved queries into tables/views in the data platform
+
+```yaml
+saved_queries:
+  - name: revenue_by_region
+    query_params:
+      metrics: [total_revenue]
+      group_by: [region, date]
+    exports:
+      - name: revenue_by_region_table
+        config:
+          export_as: table
+          schema: analytics
+```
+
+dbt MetricFlow does NOT do automatic query routing to materialized tables. Exports are static materialized outputs. Users query the exported table directly or use the Semantic Layer API with optional caching.
+
+**Confidence:** MEDIUM (verified from dbt official docs; dbt's approach is architecturally different -- no transparent routing)
 
 ---
 
 ## Table Stakes
 
-Features that Snowflake's SQL DDL semantic views support and that users working toward parity will expect. Missing = incomplete Snowflake alignment claim.
+Features users expect. Missing = incomplete or broken-feeling implementation.
 
-### T1: Semi-Additive Metrics (NON ADDITIVE BY)
+### T1: YAML Definition Parsing (FROM YAML $$...$$)
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Support `NON ADDITIVE BY (dim1, dim2, ...)` on metric definitions. At query time, instead of aggregating across the named dimensions, sort by them and take the last (most recent) value before aggregating. |
-| **Why Expected** | Snowflake shipped NON ADDITIVE BY on 2026-03-05. dbt MetricFlow has `non_additive_dimension` with `window_choice: max/min`. Semi-additive measures are a fundamental data warehouse concept (account balances, inventory levels, MRR). Without this, users cannot correctly model snapshot data. |
-| **Complexity** | **High** -- requires structural expansion pipeline changes |
-| **Dependencies** | None on other v0.6.0 features; self-contained expansion path change |
+| **Feature** | Parse inline YAML in `CREATE SEMANTIC VIEW name FROM YAML $$ yaml_content $$` and produce the same `SemanticViewDefinition` as SQL DDL. Dollar-quoting avoids escaping issues. |
+| **Why Expected** | Snowflake provides this via `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`. YAML is the lingua franca for semantic model definitions across Cube.dev (JS/YAML), dbt (YAML), and Databricks (YAML). Many users maintain semantic models in YAML files for version control. The existing JSON storage model (`SemanticViewDefinition` with serde) makes YAML a near-zero-cost addition. |
+| **Complexity** | **Medium** -- YAML parsing is straightforward via serde; the complexity is in mapping Snowflake's table-centric YAML schema to the existing flat model, handling field name differences, and validating required fields. |
+| **Dependencies** | New crate dependency: a YAML serde library (see STACK.md for recommendation). Parser hook must detect `FROM YAML` prefix. |
 
-**How Snowflake does it:**
+**Design decisions needed:**
 
-DDL syntax:
-```sql
-METRICS (
-  bank.m_account_balance
-    NON ADDITIVE BY (year_dim, month_dim, day_dim)
-    AS SUM(balance)
-)
-```
+1. **YAML schema design -- Snowflake-aligned vs native:**
+   - Snowflake nests dims/facts/metrics under tables (table-centric). The existing SQL DDL uses flat qualified references (`table.name AS expr`).
+   - **Recommendation:** Use the Snowflake YAML schema as the canonical format. The extension already stores a flat `SemanticViewDefinition` JSON internally -- the YAML parser must transform table-centric YAML into the flat model. This is a straightforward denormalization step: iterate tables, prefix each dim/fact/metric name with `table_alias.name`.
 
-The `NON ADDITIVE BY` dimensions have optional sort order (`ASC|DESC`) and `NULLS FIRST|LAST`:
-```
-NON ADDITIVE BY (
-  <dimension> [ { ASC | DESC } ] [ NULLS { FIRST | LAST } ]
-  [ , ... ]
-)
-```
+2. **Dollar-quoting syntax:**
+   - `FROM YAML $$ ... $$` follows PostgreSQL dollar-quoting convention. The parser detects `FROM YAML` after the view name, then scans for matching `$$` delimiters.
+   - Alternative: `FROM YAML '...'` with single-quote escaping -- worse UX for multi-line YAML.
+   - **Recommendation:** Dollar-quoting (`$$`). Simple to implement in the parser (scan for `$$` start, read until next `$$`).
 
-At query time: rows are sorted by the non-additive dimensions (descending by default for "latest snapshot" semantics), and the values from the last rows are aggregated. This means for a SUM(balance) metric that is NON ADDITIVE BY (date_dim), the system takes the last date's balance per group and sums those.
+3. **Fields not in existing model:**
+   - `time_dimensions` -- Snowflake distinguishes these from regular dimensions. The existing model has no such distinction (removed in v0.4.0). **Decision:** Accept `time_dimensions` in YAML, store as regular dimensions. Emit as `dimensions` in round-trip. No special query-time behavior.
+   - `filters` -- Snowflake has named reusable filter conditions. Not in current model. **Decision:** Defer to future milestone. Reject with clear error if present in YAML.
+   - `verified_queries` -- Cortex AI feature. **Decision:** Ignore/strip silently. Not applicable.
+   - `is_enum`, `sample_values` -- Dimension metadata for AI. **Decision:** Ignore/strip silently. Pure metadata with no query-time behavior.
+   - `cortex_search_service` -- Snowflake-specific. **Decision:** Ignore/strip silently.
+   - `data_type` -- Snowflake requires this on dimensions/facts in YAML. The existing model has `output_type` (optional). **Decision:** Map `data_type` to `output_type`.
 
-**How dbt MetricFlow does it:**
-
-```yaml
-measures:
-  - name: account_balance
-    agg: sum
-    expr: balance
-    non_additive_dimension:
-      name: date
-      window_choice: max  # or min
-      window_groupings:
-        - customer_id
-```
-
-MetricFlow generates a CTE with `ROW_NUMBER() OVER (PARTITION BY [groupings] ORDER BY [dim] DESC)` and filters to `rn = 1` before aggregating. This is the standard SQL pattern for semi-additive measures.
-
-**Expansion SQL pattern (what this extension should generate):**
-
-For `SUM(balance) NON ADDITIVE BY (date_dim)` with requested dimensions `[customer_id, date_dim]`:
-```sql
--- Standard aggregation: GROUP BY customer_id, date_dim
--- Semi-additive: no change when ALL non-additive dims are in the query
-
--- But when date_dim is NOT in the requested dimensions:
-WITH _dedup AS (
-  SELECT *, ROW_NUMBER() OVER (
-    PARTITION BY customer_id  -- remaining dimensions
-    ORDER BY date_dim DESC    -- non-additive dims, descending
-  ) AS _rn
-  FROM base_table
-)
-SELECT customer_id, SUM(balance)
-FROM _dedup WHERE _rn = 1
-GROUP BY customer_id
-```
-
-**Key design decisions needed:**
-1. **Default sort order:** Snowflake uses ASC by default for NON ADDITIVE BY dimensions, but "last row" semantics typically means DESC. Need to verify the exact Snowflake behavior vs implement the sensible default (DESC = latest).
-2. **Interaction with fan traps:** Semi-additive metrics with JOINs need the dedup CTE before the JOIN, or the fan trap detection needs to account for the dedup.
-3. **Interaction with derived metrics:** A derived metric referencing a semi-additive metric should inherit the semi-additive behavior (the base metric's dedup applies first).
-
-**Model changes required:**
-```rust
-pub struct Metric {
-    // ... existing fields ...
-    /// Dimensions that this metric is non-additive across.
-    /// Empty = fully additive (default).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub non_additive_dims: Vec<NonAdditiveDim>,
-}
-
-pub struct NonAdditiveDim {
-    pub dimension: String,
-    pub descending: bool,       // default true for "latest"
-    pub nulls_last: bool,       // default true
-}
-```
-
-**Parser changes:** Body parser must recognize `NON ADDITIVE BY (...)` between metric name and `AS` expression.
-
-**Expansion changes:** This is the hard part. The expansion pipeline currently generates a single `SELECT ... FROM ... GROUP BY ...`. Semi-additive metrics require a CTE-based pre-filter when non-additive dimensions are excluded from the query. The expansion engine must:
-1. Detect which requested dimensions overlap with non-additive dimensions
-2. If ALL non-additive dims are in the query: standard expansion (no change)
-3. If SOME/NONE non-additive dims are in the query: wrap with ROW_NUMBER CTE
-
-**Confidence:** HIGH for Snowflake syntax; MEDIUM for expansion approach (standard SQL pattern, but integration with existing JOIN/fan-trap/USING machinery needs design)
+**Confidence:** HIGH (serde makes YAML parsing trivial; the mapping logic is the real work)
 
 ---
 
-### T2: COMMENT on Views and Objects
+### T2: YAML File Loading (FROM YAML FILE '/path')
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Support `COMMENT = '...'` on the semantic view itself, on tables, dimensions, metrics, and facts in the DDL. Surface comments in DESCRIBE and SHOW output. Support `ALTER SEMANTIC VIEW SET COMMENT = '...'` and `UNSET COMMENT`. |
-| **Why Expected** | Snowflake supports COMMENT at every level of the semantic view. Comments are the primary documentation mechanism for semantic models. Without comments, the semantic layer cannot serve as a self-documenting data catalog. |
-| **Complexity** | **Medium** -- pervasive but shallow; touches parser, model, catalog, SHOW, DESCRIBE |
-| **Dependencies** | None |
+| **Feature** | Load YAML from a file path: `CREATE SEMANTIC VIEW name FROM YAML FILE '/path/to/definition.yaml'`. Read file, parse as YAML, produce same result as inline YAML. |
+| **Why Expected** | Users maintain semantic models in version-controlled YAML files. Snowflake's `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML` accepts YAML as a string (requiring users to `$$`-quote file contents). File-based loading is a DX improvement that Snowflake does NOT offer natively -- it requires wrapping in Python/SQL scripting. This is a differentiator for the DuckDB extension. |
+| **Complexity** | **Low** -- File I/O + reuse T1 parsing. The parser detects `FROM YAML FILE`, reads the path, loads the file, delegates to the YAML parser. |
+| **Dependencies** | T1 (YAML parsing logic). File access permissions (DuckDB extension sandbox considerations). |
 
-**Snowflake's exact DDL syntax:**
+**Design decisions needed:**
 
-View-level:
-```sql
-CREATE SEMANTIC VIEW my_view
-  COMMENT = 'Revenue analysis view'
-  TABLES (...)
-  ...
-```
+1. **Path resolution:** Relative paths should resolve relative to the DuckDB database file directory (consistent with DuckDB's `read_csv_auto` behavior). Absolute paths work as-is.
+2. **File not found:** Clear error: `"YAML file not found: '/path/to/file.yaml'"`.
+3. **Security:** DuckDB extensions can read files within DuckDB's allowed paths. No special sandboxing needed beyond what DuckDB already enforces.
 
-Object-level (tables, dimensions, facts, metrics):
-```sql
-TABLES (
-  orders AS my_schema.orders
-    PRIMARY KEY (order_id)
-    COMMENT = 'All customer orders'
-)
-DIMENSIONS (
-  orders.order_date AS orders.created_at
-    COMMENT = 'Date the order was placed'
-)
-METRICS (
-  orders.total_revenue AS SUM(orders.amount)
-    COMMENT = 'Total revenue across all orders'
-)
-FACTS (
-  orders.amount_fact AS orders.amount
-    COMMENT = 'Raw order amount'
-)
-```
-
-ALTER syntax:
-```sql
-ALTER SEMANTIC VIEW my_view SET COMMENT = 'Updated description'
-ALTER SEMANTIC VIEW my_view UNSET COMMENT
-```
-
-**DESCRIBE output:** Comments appear as a COMMENT property row for each object_kind. The view-level comment appears with `object_kind = NULL, property = 'COMMENT'`.
-
-**SHOW output:** Snowflake's SHOW SEMANTIC VIEWS has a `comment` column (position 6 of 8). SHOW SEMANTIC DIMENSIONS/METRICS/FACTS have a `comment` column (position 8 of 8).
-
-**Model changes required:**
-
-```rust
-pub struct SemanticViewDefinition {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,  // view-level comment
-}
-
-pub struct TableRef {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-}
-
-pub struct Dimension {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-}
-
-// Same for Metric and Fact
-```
-
-**Parser changes:** Recognize `COMMENT = '...'` after object definitions. The body parser state machine needs a new trailing-clause recognition for each entry type.
-
-**ALTER changes:** Extend `DdlKind` to handle `ALTER SEMANTIC VIEW <name> SET COMMENT = '...'` and `UNSET COMMENT`. The ALTER currently only supports RENAME TO. Need to add SET/UNSET variants.
-
-**SHOW changes:** Add `comment` column to all SHOW commands (SHOW VIEWS position 6; SHOW DIMS/METRICS/FACTS position 8). This is additive -- new column at end.
-
-**DESCRIBE changes:** Emit COMMENT property row for each object that has one. View-level comment emitted with `object_kind = NULL`.
-
-**Confidence:** HIGH (straightforward string metadata; Snowflake syntax well-documented)
+**Confidence:** HIGH (trivial file I/O; all complexity is in T1)
 
 ---
 
-### T3: SYNONYMS on Objects
+### T3: YAML Round-Trip Export (GET_DDL variant)
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Support `WITH SYNONYMS = ('alias1', 'alias2')` on tables, dimensions, metrics, and facts in the DDL. |
-| **Why Expected** | Snowflake supports synonyms on all object types. Synonyms serve as alternative names for Cortex Analyst / AI-powered querying. They appear in DESCRIBE and SHOW output. |
-| **Complexity** | **Low-Medium** -- same pattern as COMMENT but with list values |
-| **Dependencies** | None |
+| **Feature** | Export a semantic view definition as YAML. Either a new function `GET_YAML('SEMANTIC_VIEW', 'name')` or a format parameter `GET_DDL('SEMANTIC_VIEW', 'name', format := 'yaml')`. |
+| **Why Expected** | Snowflake provides `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW(name)` for this exact purpose. The YAML export enables version control, migration between environments, and creating new views from modified exports. Round-trip fidelity (YAML -> create -> export YAML -> create) is critical. |
+| **Complexity** | **Medium** -- requires serializing `SemanticViewDefinition` back to the Snowflake-aligned YAML schema (table-centric nesting). This is the inverse of T1's denormalization. |
+| **Dependencies** | T1 (same YAML schema understanding). Existing GET_DDL infrastructure in `render_ddl.rs`. |
 
-**Snowflake's exact DDL syntax:**
+**Design decisions needed:**
+
+1. **Interface:** Two options:
+   - `GET_DDL('SEMANTIC_VIEW', 'name', 'YAML')` -- third parameter selects format. Natural extension of existing GET_DDL.
+   - `GET_YAML('SEMANTIC_VIEW', 'name')` -- separate function. Cleaner but another DDL/function to register.
+   - **Recommendation:** `GET_DDL` with format parameter. Snowflake uses a separate function but our GET_DDL is already a scalar function; adding a format parameter is trivial.
+
+2. **Re-nesting logic:** The flat `SemanticViewDefinition` stores dimensions with `source_table: Some("orders")`. The YAML export must group dimensions by source_table and nest them under the appropriate table entry. Dimensions/facts/metrics without `source_table` go under the first (base) table.
+
+3. **Fields to emit:** Emit all fields that are present in the model. Omit Snowflake-only fields that we don't store (`time_dimensions` as separate category, `filters`, `verified_queries`, `is_enum`, `sample_values`). Use Snowflake field names for compatibility (`access_modifier: private_access` not `access: Private`).
+
+4. **Round-trip fidelity guarantee:** `CREATE FROM YAML -> GET_DDL YAML` must produce YAML that can recreate the same view. Field ordering may differ but semantic content must be identical. This means:
+   - Order of tables, dimensions, metrics in YAML output should follow definition order
+   - Default values should be omitted (e.g., `access_modifier: public_access` is the default, omit it)
+
+**Confidence:** HIGH (inverse of T1; serde YAML serialization handles the heavy lifting)
+
+---
+
+### T4: Materialization Declaration (MATERIALIZATIONS clause)
+
+| Aspect | Detail |
+|--------|--------|
+| **Feature** | New `MATERIALIZATIONS` clause in CREATE SEMANTIC VIEW DDL declaring pre-existing aggregated tables with their covered dimensions and metrics. No automatic table creation or refresh -- the user manages the materialized tables. |
+| **Why Expected** | This is the core value of the materialization routing feature. Cube.dev, Databricks, and the project's own design doc all identify materialization routing as the second phase of semantic view architecture. The existing expansion engine handles Phase 1 (semantic expansion); this adds Phase 2 (pre-aggregation selection). |
+| **Complexity** | **Medium** -- new DDL clause, model struct, parser changes. No query-time behavior yet (that's T5). |
+| **Dependencies** | None on YAML features. |
+
+**DDL syntax design:**
 
 ```sql
-TABLES (
-  orders AS my_schema.orders
-    PRIMARY KEY (order_id)
-    WITH SYNONYMS = ('sales_orders', 'purchase_records')
-)
-DIMENSIONS (
-  orders.cust_name AS orders.customer_name
-    WITH SYNONYMS = ('customer_name', 'buyer_name')
+CREATE SEMANTIC VIEW sales_analysis
+TABLES (...)
+RELATIONSHIPS (...)
+DIMENSIONS (...)
+METRICS (...)
+MATERIALIZATIONS (
+    daily_revenue AS 'analytics.daily_revenue_agg'
+        DIMENSIONS (date_dim, region)
+        METRICS (total_revenue, order_count),
+    monthly_summary AS 'analytics.monthly_summary'
+        DIMENSIONS (month_dim, region, category)
+        METRICS (total_revenue, order_count, avg_order_value)
 )
 ```
 
-**Important Snowflake note:** "Synonyms are used for informational purposes only. You cannot use a synonym to refer to a dimension, fact, or metric in another dimension, fact, or metric."
+**Key design decisions:**
 
-This means synonyms are pure metadata -- they do not affect query resolution or expansion. They exist for documentation and AI-powered natural language query interfaces.
+1. **Materialization = pointer to existing table:** Unlike Cube.dev (which manages materialization lifecycle) or Databricks (which creates and refreshes materialized views), this extension only POINTS to pre-existing tables. The user creates/refreshes these tables themselves (via DuckDB `CREATE TABLE AS`, dbt, or external ETL). This aligns with the "DuckDB is the engine, extension is the preprocessor" design principle.
 
-**Model changes required:**
+2. **Metadata stored per materialization:**
+   ```rust
+   pub struct Materialization {
+       pub name: String,           // logical name for the materialization
+       pub table: String,          // physical table name (qualified)
+       pub dimensions: Vec<String>,// dimension names covered (must match dim names in view)
+       pub metrics: Vec<String>,   // metric names covered (must match metric names in view)
+   }
+   ```
 
-```rust
-pub struct Dimension {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub synonyms: Vec<String>,
-}
-// Same for TableRef, Metric, Fact
-```
+3. **Define-time validation:**
+   - All dimension names must exist in the semantic view's DIMENSIONS
+   - All metric names must exist in the semantic view's METRICS
+   - The materialized table must exist (verify via `LIMIT 0` query, same pattern as type inference)
+   - Warn (not error) if a metric is non-additive and appears in a materialization (re-aggregation may produce incorrect results)
 
-**SHOW output:** Snowflake's SHOW SEMANTIC DIMENSIONS/METRICS/FACTS have a `synonyms` column (position 7 of 8), rendered as a JSON array string like `["cust_name", "buyer_name"]`.
+4. **Ordering:** Materializations are checked in definition order (first match wins), following Cube.dev's convention.
 
-**DESCRIBE output:** Emit SYNONYMS property row for each object that has synonyms.
+**What this does NOT include:**
+- No `REFRESH` mechanism (user manages tables)
+- No `SCHEDULE` (no automation)
+- No freshness tracking (no staleness checks)
+- No `type: unaggregated` (Databricks-specific; all materializations are aggregated)
 
-**Confidence:** HIGH (pure metadata; no query-time behavior)
+**Confidence:** HIGH (straightforward DDL + model addition; query routing is T5)
 
 ---
 
-### T4: PRIVATE/PUBLIC Access Modifiers
+### T5: Query-Time Materialization Routing
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Support `PRIVATE` / `PUBLIC` keywords on facts and metrics. Private objects cannot be queried directly. |
-| **Why Expected** | Snowflake supports PRIVATE/PUBLIC on facts and metrics. This enables hiding intermediate calculations (helper facts, internal metrics) from end users while keeping them available for derived metric composition. |
-| **Complexity** | **Low-Medium** -- model + parser + query-time validation |
-| **Dependencies** | None |
+| **Feature** | At query time, when `semantic_view('view', dimensions := [...], metrics := [...])` is called, check if any declared materialization covers the requested dimensions and metrics. If yes, route to the materialized table instead of expanding raw tables. |
+| **Why Expected** | This is the core value proposition. Without routing, materializations are just metadata. The design doc (Phase 2) explicitly calls this out as a substitution, not a rewrite. |
+| **Complexity** | **High** -- requires a matching algorithm, SQL generation for materialization queries, and integration with the existing expansion pipeline. |
+| **Dependencies** | T4 (materialization declarations must exist). |
 
-**Snowflake's rules:**
-1. Dimensions are always PUBLIC (cannot be marked PRIVATE)
-2. Facts and metrics default to PUBLIC if neither keyword is specified
-3. Private facts/metrics cannot be queried or used in WHERE conditions
-4. Private facts/metrics CAN be referenced by other metrics in the same view (derived metric composition)
-5. Private objects appear in GET_DDL output
-6. Private objects appear in SHOW output only if the role has REFERENCES or OWNERSHIP privilege (DuckDB has no RBAC, so always visible)
+**Matching algorithm (adapted from Cube.dev + Databricks):**
 
-**Model changes:**
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum AccessModifier {
-    #[default]
-    Public,
-    Private,
-}
-
-pub struct Metric {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "AccessModifier::is_default")]
-    pub access: AccessModifier,
-}
-
-pub struct Fact {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "AccessModifier::is_default")]
-    pub access: AccessModifier,
+```
+fn select_materialization(
+    requested_dims: &[DimensionName],
+    requested_metrics: &[MetricName],
+    materializations: &[Materialization],
+) -> Option<&Materialization> {
+    for mat in materializations {
+        // 1. ALL requested metrics must be present in materialization
+        if !requested_metrics.iter().all(|m| mat.metrics.contains(m)) {
+            continue;
+        }
+        // 2. ALL requested dimensions must be present in materialization
+        //    (superset is OK -- we re-aggregate over extra dims)
+        if !requested_dims.iter().all(|d| mat.dimensions.contains(d)) {
+            continue;
+        }
+        // 3. ALL requested metrics must be additive for re-aggregation
+        //    (if mat has MORE dimensions than requested)
+        if mat.dimensions.len() > requested_dims.len() {
+            if !requested_metrics.iter().all(|m| is_additive(m)) {
+                continue;
+            }
+        }
+        return Some(mat);
+    }
+    None
 }
 ```
 
-**Query-time enforcement:** When a user requests a private metric or fact in `semantic_view('view', metrics := ['private_metric'])`, the extension should return an error: "Metric 'private_metric' is private and cannot be queried directly."
+**Additivity classification:**
 
-**DESCRIBE output:** Emit ACCESS_MODIFIER property row for facts and metrics.
+| Aggregate | Additive | Re-aggregation function |
+|-----------|----------|------------------------|
+| SUM | Yes | SUM |
+| COUNT | Yes | SUM (count of counts) |
+| MIN | Yes | MIN |
+| MAX | Yes | MAX |
+| AVG | No* | N/A (decompose into SUM/COUNT) |
+| COUNT(DISTINCT ...) | No | N/A |
+| Derived metrics | Depends | Check leaf measures |
+| Semi-additive (NON ADDITIVE BY) | No | N/A (snapshot semantics break) |
+| Window metrics | No | N/A (window semantics break) |
 
-**Parser changes:** Recognize optional `PRIVATE` / `PUBLIC` keyword before `<table_alias>.<name>` in FACTS and METRICS clauses.
+*AVG can be decomposed but requires both SUM and COUNT to be in the materialization. This is a future optimization, not table stakes.
 
-**Confidence:** HIGH (straightforward boolean-like modifier with query-time check)
+**SQL generation for materialization hit:**
+
+Exact match (same dimensions):
+```sql
+SELECT dim1, dim2, metric1, metric2
+FROM analytics.daily_revenue_agg
+```
+
+Subset match (fewer dimensions requested than materialized):
+```sql
+SELECT dim1, SUM(metric1) AS metric1, SUM(metric2) AS metric2
+FROM analytics.daily_revenue_agg
+GROUP BY dim1
+```
+
+Note: COUNT metrics become `SUM(metric_name)` in re-aggregation because the materialized table stores counts that must be summed, not re-counted.
+
+**Key design decisions:**
+
+1. **Matching order:** Definition order (first match wins). Simple, predictable, same as Cube.dev.
+2. **Exact match preference:** If a materialization has exactly the requested dimensions, prefer it over one requiring re-aggregation. This means we should check exact matches first, then superset matches.
+3. **Filter passthrough:** WHERE clauses from the user's query must be applied to the materialization table query. The materialization table must have the filtered columns available.
+4. **Non-additive rejection:** If ANY requested metric is non-additive and the match requires re-aggregation (superset dimensions), skip that materialization. Exact dimension matches are fine for non-additive metrics.
+5. **Fallback:** If no materialization matches, fall back to current behavior (raw table expansion). This is the default and must always work.
+
+**Integration with expansion pipeline:**
+
+The routing check happens BEFORE expansion. In the `build_execution_sql` flow:
+1. Parse requested dimensions and metrics
+2. Check materializations (new step)
+3. If match found: generate simple SELECT from materialized table (possibly with GROUP BY for re-aggregation)
+4. If no match: proceed with existing expansion pipeline
+
+This is a clean insertion point -- the materialization router produces a complete SQL string that replaces the expansion output.
+
+**Confidence:** HIGH for the matching algorithm (well-established pattern across Cube.dev and Databricks); MEDIUM for integration with existing pipeline (needs careful handling of WHERE clauses, column naming, and type inference)
 
 ---
 
-### T5: GET_DDL Reconstruction
+### T6: Re-Aggregation for Subset Matches
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Reconstruct a valid `CREATE SEMANTIC VIEW` DDL statement from the stored JSON definition. Callable as `SELECT get_semantic_view_ddl('view_name')` or exposed via a DDL command. |
-| **Why Expected** | Snowflake supports `GET_DDL('SEMANTIC VIEW', 'view_name')` which returns the complete DDL. This is essential for version control, migration scripts, and backup workflows. Round-trip fidelity (create -> get_ddl -> create) is critical. |
-| **Complexity** | **Medium** -- must handle all DDL features including new ones (comments, synonyms, access modifiers, NON ADDITIVE BY) |
-| **Dependencies** | Should be implemented AFTER T1-T4 so all features are representable |
+| **Feature** | When a materialization has MORE dimensions than requested, wrap the materialization query in a GROUP BY over the requested dimensions, re-aggregating the metrics. |
+| **Why Expected** | Cube.dev calls this "aggregating over missing dimensions." Databricks exact-match-only approach is more conservative. Re-aggregation is what makes a single wide materialization serve multiple queries. Without it, you'd need one materialization per dimension combination. |
+| **Complexity** | **Medium** -- the SQL generation is straightforward but requires knowing the re-aggregation function for each metric. |
+| **Dependencies** | T4 (materializations), T5 (routing). |
 
-**Snowflake's behavior:**
-- Returns a `CREATE OR REPLACE SEMANTIC VIEW` statement
-- Includes PRIVATE facts/metrics in the output
-- May include default property values
-- Must be a valid, re-executable DDL statement
+**Re-aggregation function mapping:**
+
+The expansion engine already knows each metric's aggregate expression (e.g., `SUM(orders.amount)`). For re-aggregation, we need to map from the original aggregate to the re-aggregation aggregate:
+
+| Original Aggregate | Re-Aggregation Aggregate | Notes |
+|--------------------|----|-------|
+| `SUM(expr)` | `SUM(metric_name)` | Additive |
+| `COUNT(*)` | `SUM(metric_name)` | Count-of-counts = SUM |
+| `COUNT(expr)` | `SUM(metric_name)` | Same as COUNT(*) |
+| `MIN(expr)` | `MIN(metric_name)` | Min-of-mins = MIN |
+| `MAX(expr)` | `MAX(metric_name)` | Max-of-maxes = MAX |
+| `AVG(expr)` | Not supported | Would need SUM+COUNT decomposition |
+| `COUNT(DISTINCT expr)` | Not supported | Cannot re-aggregate distinct counts |
 
 **Implementation approach:**
 
-A scalar function `get_semantic_view_ddl(name VARCHAR) -> VARCHAR` that:
-1. Loads the `SemanticViewDefinition` from catalog
-2. Reconstructs each clause (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS) with proper formatting
-3. Includes all metadata (COMMENT, SYNONYMS, PRIVATE/PUBLIC, NON ADDITIVE BY)
-4. Returns a formatted, re-parseable DDL string
+1. Parse the metric's `expr` to extract the aggregate function name (SUM/COUNT/MIN/MAX/AVG/etc.)
+2. Classify as additive or non-additive
+3. For additive metrics, generate re-aggregation SQL using the mapped function
+4. For non-additive metrics, reject the materialization for subset matches
 
-**Key concerns:**
-- **Round-trip fidelity:** `CREATE` -> store -> `GET_DDL` -> `CREATE OR REPLACE` must produce an identical definition. This means the model must preserve all DDL-specified information, including ordering of entries.
-- **Formatting:** Snowflake returns nicely indented DDL. The extension should produce readable output.
-- **Lossy fields:** `column_type_names` and `column_types_inferred` are inferred at define time and should NOT appear in GET_DDL output (they are not part of the DDL surface).
+**Aggregate detection:** The existing model stores `expr` as a raw SQL string (e.g., `"SUM(orders.amount)"`). We need to extract the outermost aggregate function. A simple regex or prefix scan for `SUM(`, `COUNT(`, `MIN(`, `MAX(` is sufficient -- derived metrics that reference other metrics are already inlined before this point.
 
-**Alternative interface:** Instead of a scalar function, could be a DDL command: `GET DDL FOR SEMANTIC VIEW 'name'`. The scalar function is simpler to implement and more flexible (can be used in SELECT, COPY TO, etc.).
+**Edge case -- derived metrics:** A derived metric like `revenue_per_order AS total_revenue / order_count` references two additive metrics. For re-aggregation from a materialization, the derived metric's stored value in the materialized table is already the derived value -- it CANNOT be re-aggregated. Derived metrics should either:
+- Be excluded from re-aggregation (treated as non-additive)
+- Or be re-computed from their component metrics in the re-aggregation query
 
-**Confidence:** HIGH (string reconstruction from known model; no query-time behavior)
+**Recommendation:** Exclude derived metrics from re-aggregation. If a query requests a derived metric and the materialization match requires re-aggregation, skip that materialization. This is conservative but correct.
 
----
-
-### T6: Queryable FACTS (Row-Level Query Mode)
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | Support `FACTS` clause in the `semantic_view()` table function, returning row-level fact values without GROUP BY. Cannot be combined with METRICS in the same query. |
-| **Why Expected** | Snowflake supports `FACTS` in the `SEMANTIC_VIEW()` query clause. Facts return row-level data without aggregation. This is useful for detail-level reporting, debugging, and data quality checks. |
-| **Complexity** | **Medium** -- requires a new expansion path without GROUP BY |
-| **Dependencies** | None on other v0.6.0 features |
-
-**Snowflake's rules:**
-1. `FACTS` and `METRICS` cannot be specified in the same query
-2. When using FACTS with DIMENSIONS, all facts and dimensions must be from the same logical table
-3. FACTS queries produce row-level output (no GROUP BY)
-4. Facts can be used in WHERE clauses
-
-**Current state:** Facts exist in the model and DDL but are only used for inlining into metric expressions. The `semantic_view()` table function only accepts `dimensions` and `metrics` parameters.
-
-**Query syntax change:**
-
-```sql
--- Current: only metrics mode
-FROM semantic_view('view', dimensions := ['d1'], metrics := ['m1'])
-
--- New: facts mode
-FROM semantic_view('view', dimensions := ['d1'], facts := ['f1', 'f2'])
-```
-
-**Expansion for FACTS mode:**
-```sql
--- No GROUP BY, no aggregation
-SELECT d1_expr AS d1, f1_expr AS f1, f2_expr AS f2
-FROM base_table AS alias
--- JOINs if needed (but same-table constraint may eliminate this)
-WHERE <filters>
-```
-
-**Validation at query time:**
-- If both `facts` and `metrics` are specified: error
-- If facts reference different tables than dimensions: error (same-table constraint)
-- If a private fact is requested: error
-
-**Model changes:** The table function bind needs a new `facts` parameter.
-
-**Confidence:** HIGH for semantics; MEDIUM for implementation (same-table constraint enforcement, new expansion path)
-
----
-
-### T7: Wildcard Dimension/Metric Selection
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | Support `table_alias.*` syntax in the `dimensions` and `metrics` parameters to select all dimensions or metrics from a specific logical table. |
-| **Why Expected** | Snowflake supports `customer.*` in both DIMENSIONS and METRICS clauses. This is a significant convenience for tables with many dimensions/metrics. |
-| **Complexity** | **Low** -- expand wildcards to concrete names at query time |
-| **Dependencies** | None |
-
-**Snowflake's rules:**
-1. Must be qualified with a table alias: `customer.*` is valid, bare `*` is not
-2. Applies to DIMENSIONS, METRICS, and FACTS clauses separately
-3. Expands to all objects scoped to that logical table
-
-**Implementation approach:**
-
-In the table function bind:
-1. Parse each requested dimension/metric/fact name
-2. If it matches `<alias>.*` pattern, expand to all objects with that `source_table`
-3. Proceed with normal validation on the expanded list
-
-**Key edge case:** What if `customer.*` in dimensions yields a dimension that causes a fan trap with a requested metric? The fan trap detection should run AFTER wildcard expansion, so the user gets a clear error about which specific dimension is problematic.
-
-**Parser changes:** None in the DDL parser. This is a query-time parameter expansion.
-
-**Model changes:** None. The expansion is purely in the table function bind logic.
-
-**Confidence:** HIGH (simple string expansion; no semantic complexity)
+**Confidence:** MEDIUM (aggregate detection from raw SQL strings is heuristic; need robust parsing or model-level metadata)
 
 ---
 
 ## Differentiators
 
-Features that set the product apart or align with Snowflake but go beyond minimum viability.
+Features that set the product apart or exceed comparable system capabilities.
 
-### D1: Window Function Metrics (PARTITION BY EXCLUDING)
+### D1: Additivity Metadata on Metrics
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Support window function metrics with `PARTITION BY EXCLUDING` in the DDL, producing non-aggregated output alongside regular metrics. |
-| **Value Proposition** | Snowflake supports this for rolling averages, cumulative sums, and other window calculations. This is a significant analytical capability. |
-| **Complexity** | **Very High** -- requires a fundamentally different expansion path that does NOT use GROUP BY |
-| **Dependencies** | T1 (semi-additive) shares expansion path concerns |
+| **Feature** | Store explicit additivity classification on each metric in the model, derived at define time from the metric expression. Expose in DESCRIBE output. |
+| **Value Proposition** | Cube.dev derives additivity from measure type declarations. Databricks infers from aggregate functions. This extension currently stores raw SQL expressions. Adding additivity metadata removes the need for heuristic aggregate detection at query time (T6 re-aggregation) and makes the routing decision more robust. |
+| **Complexity** | **Medium** -- aggregate function detection at parse time + model field |
+| **Dependencies** | Useful for T5/T6 but not strictly required (can detect at query time) |
 
-**How Snowflake does it:**
-
-```sql
-METRICS (
-  store_sales.avg_7_days_sales_quantity
-    AS AVG(total_sales_quantity) OVER (
-      PARTITION BY EXCLUDING date.date, date.year
-      ORDER BY date.date
-      RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW
-    )
-)
+**Implementation:**
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Additivity {
+    #[default]
+    Unknown,       // raw expr, couldn't detect
+    Additive,      // SUM, COUNT, MIN, MAX
+    NonAdditive,   // AVG, COUNT DISTINCT, etc.
+    Derived,       // references other metrics
+    SemiAdditive,  // NON ADDITIVE BY present
+    Window,        // window function metric
+}
 ```
 
-`PARTITION BY EXCLUDING` means: partition by ALL dimensions in the query EXCEPT the named ones. This is a Snowflake-specific SQL extension -- `EXCLUDING` is not valid outside semantic view metric definitions.
+Parse-time detection: scan `expr` for outermost aggregate function. If it starts with `SUM(`, `COUNT(`, `MIN(`, `MAX(` -> Additive. If `AVG(` -> NonAdditive. If it references another metric name -> Derived. If `non_additive_by` is non-empty -> SemiAdditive. If `window_spec` is Some -> Window.
 
-**Query rules:** When querying a window function metric, you MUST also include the dimensions named in PARTITION BY EXCLUDING and ORDER BY. The `required` column in SHOW SEMANTIC DIMENSIONS FOR METRIC indicates these mandatory dimensions.
+This metadata would also power SHOW SEMANTIC METRICS with an `additivity` column.
 
-**Why this is a differentiator, not table stakes:** Window function metrics require an expansion path that produces output WITHOUT GROUP BY, which is architecturally orthogonal to the current aggregation model. The existing expansion pipeline assumes every query produces `SELECT ... GROUP BY dims`. Window metrics need row-level output with window expressions layered on top.
-
-**Recommendation:** Implement the DDL parsing and model storage now so definitions are complete, but defer query-time expansion to a later milestone. This allows GET_DDL round-trip fidelity and correct DESCRIBE/SHOW output while avoiding the expansion complexity.
-
-If implemented in v0.6.0, the `required` column in SHOW SEMANTIC DIMENSIONS FOR METRIC gains real meaning (currently constant FALSE).
-
-**Confidence:** HIGH for syntax; LOW for expansion implementation (architectural change needed)
+**Confidence:** HIGH (straightforward classification from existing model data)
 
 ---
 
-### D2: SHOW ... IN SCHEMA/DATABASE Scope Filtering
+### D2: Materialization Validation Report
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Extend SHOW commands to support `IN DATABASE <name>` and `IN SCHEMA <name>` scope filtering, beyond the current `IN <semantic_view_name>`. |
-| **Value Proposition** | Snowflake supports ACCOUNT/DATABASE/SCHEMA scoping. For DuckDB with attached databases, DATABASE-level scoping has real value. |
-| **Complexity** | **Low-Medium** -- parser and WHERE clause injection |
-| **Dependencies** | T5 metadata (database_name, schema_name stored at define time) |
+| **Feature** | A diagnostic command `EXPLAIN MATERIALIZATION FOR SEMANTIC VIEW 'name' dimensions := [...] metrics := [...]` that shows which materialization (if any) would be selected and why. |
+| **Value Proposition** | Databricks uses `EXPLAIN EXTENDED` to verify materialization routing. Cube.dev has `Playground` diagnostics. Without a way to verify routing decisions, users cannot debug why a query hits raw tables instead of a materialization. |
+| **Complexity** | **Low-Medium** -- reuse matching algorithm, format diagnostic output |
+| **Dependencies** | T4, T5 |
 
-**Current state:** SHOW SEMANTIC VIEWS supports no IN clause. SHOW SEMANTIC DIMENSIONS/METRICS/FACTS support `IN <view_name>` to scope to a single view. Cross-view forms (`_all` suffix) return everything.
-
-**Snowflake's IN clause:**
-```sql
-SHOW SEMANTIC VIEWS IN DATABASE my_db
-SHOW SEMANTIC VIEWS IN SCHEMA my_db.my_schema
-SHOW SEMANTIC DIMENSIONS IN SCHEMA my_db.my_schema
+**Output format:**
+```
+Selected: daily_revenue (analytics.daily_revenue_agg)
+Match type: subset (re-aggregation required)
+Dimensions matched: 2/3 (date_dim, region)
+Extra dimensions: category (will be aggregated away)
+Metrics: total_revenue (SUM -> SUM), order_count (COUNT -> SUM)
+Skipped: monthly_summary (missing metric: avg_order_value)
 ```
 
-**Implementation:** Add `IN DATABASE <name>` and `IN SCHEMA <name>` variants to the SHOW parser. Generate WHERE clauses filtering on stored `database_name` and `schema_name`.
-
-For SHOW SEMANTIC VIEWS: `IN DATABASE` and `IN SCHEMA` are the meaningful scopes.
-For SHOW SEMANTIC DIMENSIONS/METRICS/FACTS: `IN <view_name>` already works; add `IN DATABASE` and `IN SCHEMA` as alternatives.
-
-**Confidence:** HIGH (mechanical WHERE clause injection)
+**Confidence:** HIGH (diagnostic wrapper around T5 matching logic)
 
 ---
 
-### D3: TERSE Mode for SHOW Commands
+### D3: YAML with MATERIALIZATIONS
 
 | Aspect | Detail |
 |--------|--------|
-| **Feature** | Support `SHOW TERSE SEMANTIC VIEWS` returning a reduced column set. |
-| **Value Proposition** | Snowflake supports TERSE for SHOW SEMANTIC VIEWS (not for DIMS/METRICS/FACTS). Returns: created_on, name, kind, database_name, schema_name (the same 5 columns -- so in practice TERSE is identical to regular for our extension since we already omit comment/owner). |
-| **Complexity** | **Low** -- parser change to detect TERSE keyword |
-| **Dependencies** | None |
+| **Feature** | Support MATERIALIZATIONS in the YAML schema, enabling full definition of a semantic view (including materialization routing) in a single YAML file. |
+| **Value Proposition** | Databricks includes materialization in their YAML metric view definitions. This would make the YAML format fully self-contained. |
+| **Complexity** | **Low** -- extend YAML schema with materializations section |
+| **Dependencies** | T1 (YAML parsing), T4 (materialization model) |
 
-**Key insight:** In Snowflake, TERSE removes the `comment`, `owner`, and `owner_role_type` columns. Since this extension already omits those columns, TERSE mode would produce identical output to regular mode. The value is syntactic compatibility -- scripts written for Snowflake that use `SHOW TERSE SEMANTIC VIEWS` should not error.
+**YAML syntax:**
+```yaml
+materializations:
+  - name: daily_revenue
+    table: analytics.daily_revenue_agg
+    dimensions: [date_dim, region]
+    metrics: [total_revenue, order_count]
+```
 
-**Recommendation:** Implement as a no-op parser recognition (accept the TERSE keyword, produce standard output). This is cheap and ensures Snowflake DDL script portability.
-
-**Confidence:** HIGH (trivial)
-
----
-
-### D4: SHOW COLUMNS on Semantic View
-
-| Aspect | Detail |
-|--------|--------|
-| **Feature** | Support `SHOW COLUMNS IN VIEW <semantic_view_name>` returning dimensions, facts, and metrics with a `kind` column. |
-| **Value Proposition** | Snowflake's SHOW COLUMNS is a unified interface that works across tables, views, and semantic views. It returns a `kind` column with values DIMENSION, FACT, or METRIC. |
-| **Complexity** | **Medium** -- new command + parser prefix detection |
-| **Dependencies** | None |
-
-**Snowflake's SHOW COLUMNS output for semantic views:**
-
-| Column | Description |
-|--------|-------------|
-| table_name | Semantic view name |
-| schema_name | Schema |
-| column_name | Dimension/fact/metric name |
-| data_type | Data type |
-| null? | Nullability |
-| default | Default value |
-| kind | DIMENSION, FACT, or METRIC |
-| expression | The defining expression |
-| comment | Comment text |
-| database_name | Database |
-| autoincrement | N/A for semantic views |
-
-**Alternative:** The existing SHOW SEMANTIC DIMENSIONS + SHOW SEMANTIC METRICS + SHOW SEMANTIC FACTS already provides this information (split across three commands). SHOW COLUMNS provides a single unified view.
-
-**Recommendation:** Implement if time allows. Lower priority than the core DDL features (T1-T7).
-
-**Confidence:** HIGH for semantics; MEDIUM for implementation (new DDL prefix detection)
+**Confidence:** HIGH (simple YAML section mapped to existing Materialization model)
 
 ---
 
 ## Anti-Features
 
-Features to explicitly NOT build in v0.6.0.
+Features to explicitly NOT build in v0.7.0.
 
 | Anti-Feature | Why Avoid | What to Do Instead |
 |--------------|-----------|-------------------|
-| `owner` / `owner_role_type` columns in SHOW VIEWS | DuckDB has no RBAC model. These are Snowflake-specific privilege columns. | Omit. Not applicable to DuckDB extensions. |
-| CUSTOM_INSTRUCTIONS object_kind in DESCRIBE | Snowflake Cortex AI integration for natural language query hints. | Omit entirely. Snowflake-specific AI feature. |
-| Cortex Search Service dimension properties | Snowflake-specific vector search integration. | Omit entirely. |
-| CONSTRAINT object_kind (DISTINCT_RANGE) | Snowflake uses constraints for time-range boundaries (START_COLUMN/END_COLUMN). Niche temporal feature. | Omit. PK/UNIQUE expressed as TABLE properties. |
-| Synonym-based query resolution | Snowflake explicitly states synonyms are "informational only." Building synonym resolution would be non-standard. | Store synonyms as metadata only. |
-| `IN ACCOUNT` scoping | DuckDB extensions operate within a single database. Account-level scoping is meaningless. | Omit. `IN DATABASE` and `IN SCHEMA` cover the meaningful scopes. |
-| Window function metric query expansion (if parser-only approach taken) | Architectural change to support non-GROUP BY expansion paths. Very high complexity. | Parse and store in model; defer expansion to future milestone. |
-| `USING RELATIONSHIPS` for facts queries | Snowflake's same-table constraint for facts eliminates multi-table join paths. | Enforce same-table constraint; no join path selection needed for facts. |
+| Automatic materialization creation/refresh | DuckDB extension is a preprocessor, not a scheduler. Cube.dev and Databricks manage materialization lifecycle because they control the runtime. DuckDB does not. Users create tables themselves. | Declare pointers to existing tables. Document `CREATE TABLE AS` patterns. |
+| Freshness tracking / staleness detection | Requires metadata storage for refresh timestamps, which adds complexity for marginal value in a local DuckDB context. | User is responsible for table freshness. Consider a SHOW MATERIALIZATIONS command showing declared (not live) metadata. |
+| `type: unaggregated` materializations | Databricks-specific. An unaggregated materialization is just a regular table with joins pre-applied -- the user can create this themselves. The routing logic would need a different code path (no re-aggregation, just scan replacement). | Only support aggregated materializations. For "pre-joined" tables, users can create a view and reference it as a base table. |
+| AVG decomposition (SUM+COUNT auto-split) | Cube.dev supports this but it requires the materialization table to have separate sum and count columns. The extension cannot verify this without schema inspection of the external table. Too magic. | Reject AVG metrics in re-aggregation scenarios. Users should store SUM and COUNT separately if they want re-aggregation. |
+| Cross-view materialization sharing | The design doc explicitly lists this as a non-goal. Each semantic view's materializations are independent. | No cross-view optimization. |
+| Snowflake `time_dimensions` as first-class category | Removed in v0.4.0. Time dimensions are regular dimensions with `date_trunc()` in expr. Adding a separate category would be a regression. | Accept `time_dimensions` in YAML, store as regular dimensions. |
+| Snowflake `filters` clause | Not in the existing model. Would require a new DDL clause and query-time filter application mechanism. Orthogonal to v0.7.0 goals. | Reject with clear error if present in YAML. Defer to future milestone. |
+| Snowflake `verified_queries` / Cortex AI features | DuckDB extension has no AI integration. These are Snowflake-specific. | Silently ignore in YAML parsing. |
+| Granularity-based matching (day serves month) | Cube.dev does GCD granularity matching for time dimensions. This extension has no granularity concept (removed in v0.4.0). Time truncation is in dimension expressions. | Dimension matching is name-based only. A `date_dim` materialization does not auto-serve `month_dim` queries. Users must declare separate materializations or use the same dimension names. |
+| Materialization priority/scoring | Cube.dev uses first-match-wins. Adding scoring (prefer exact match, then smallest superset) adds complexity. | First-match-wins for v0.7.0. Recommend users order materializations from most-specific to least-specific. Document this clearly. Consider exact-match-first as a v0.7.1 enhancement. |
 
 ---
 
 ## Feature Dependencies
 
 ```
-T2: COMMENT ----+
-T3: SYNONYMS ---+--> T5: GET_DDL (needs all metadata to reconstruct)
-T4: PRIVATE ----+
-T1: NON ADDITIVE --+
+T1: YAML Parsing (FROM YAML $$...$$)
+  |
+  +---> T2: YAML File Loading (FROM YAML FILE) -- reuses T1 parser
+  |
+  +---> T3: YAML Export (GET_DDL YAML format) -- inverse of T1 mapping
+  |
+  +---> D3: YAML with MATERIALIZATIONS -- extends T1 + T4
 
-T6: Queryable FACTS (independent)
-T7: Wildcard selection (independent)
+T4: Materialization Declaration (MATERIALIZATIONS clause)
+  |
+  +---> T5: Query-Time Routing -- uses T4 model
+  |       |
+  |       +---> T6: Re-Aggregation -- extends T5 with GROUP BY wrapper
+  |
+  +---> D2: Materialization Validation Report -- diagnostic for T5
+  |
+  +---> D3: YAML with MATERIALIZATIONS -- extends T4 model
 
-D1: Window metrics (independent, but shares expansion concerns with T1)
-D2: IN SCHEMA/DATABASE (uses stored database_name/schema_name from v0.5.5)
-D3: TERSE mode (parser-only, independent)
-D4: SHOW COLUMNS (independent)
+D1: Additivity Metadata -- independent but improves T5/T6
 
-T2 COMMENT --> ALTER SET/UNSET COMMENT (extends existing ALTER infrastructure)
-
-SHOW output changes (add comment/synonyms columns) depend on T2/T3 model changes.
-DESCRIBE output changes (new property rows) depend on T2/T3/T4 model changes.
+No dependency between YAML features (T1-T3) and Materialization features (T4-T6).
+They can be implemented in parallel tracks.
 ```
 
-**Critical ordering insight:** T5 (GET_DDL) should be the LAST table-stakes feature implemented because it must reconstruct ALL other features faithfully. Implementing it first would require updating it with every subsequent feature addition.
+**Critical ordering insight:** YAML and Materialization are independent feature tracks. They can be phased separately:
 
-**Recommended phase ordering:**
-1. **Metadata features (T2 + T3 + T4)** -- Add comment, synonyms, access modifiers to model/parser/SHOW/DESCRIBE. These are shallow, pervasive changes that touch the same files. Bundle them to minimize churn.
-2. **Semi-additive metrics (T1)** -- Deep expansion pipeline change. Independent of metadata features. Implement after metadata is stable.
-3. **Queryable FACTS (T6)** -- New expansion path (no GROUP BY). Independent.
-4. **Wildcard selection (T7)** -- Simple query-time expansion. Can go anywhere.
-5. **GET_DDL (T5)** -- Last, after all DDL features are finalized.
-6. **Introspection (D2 + D3 + D4)** -- Polish features that can be added at any point.
+- **Track A (YAML):** T1 -> T2 -> T3
+- **Track B (Materialization):** T4 -> T5 -> T6 -> D2
+
+T3 (YAML export) should come after T4 if D3 (YAML materializations) is in scope, so the export includes materializations.
 
 ---
 
@@ -597,19 +595,17 @@ DESCRIBE output changes (new property rows) depend on T2/T3/T4 model changes.
 
 | Feature | Complexity | Est. LOC Delta | Risk | Category |
 |---------|------------|----------------|------|----------|
-| T1: Semi-additive metrics (NON ADDITIVE BY) | High | ~400 (parser + model + expansion + tests) | Medium (expansion pipeline structural change) | Table Stakes |
-| T2: COMMENT on views and objects | Medium | ~250 (parser + model + SHOW + DESCRIBE + ALTER) | Low | Table Stakes |
-| T3: SYNONYMS on objects | Low-Medium | ~200 (same pattern as COMMENT) | Low | Table Stakes |
-| T4: PRIVATE/PUBLIC access modifiers | Low-Medium | ~180 (model + parser + query validation + DESCRIBE) | Low | Table Stakes |
-| T5: GET_DDL reconstruction | Medium | ~300 (DDL string builder + tests) | Low-Medium (round-trip fidelity) | Table Stakes |
-| T6: Queryable FACTS | Medium | ~250 (new expansion path + table function param + tests) | Medium (new code path) | Table Stakes |
-| T7: Wildcard selection | Low | ~80 (query-time name expansion) | Low | Table Stakes |
-| D1: Window function metrics | Very High | ~600+ (parser + model + expansion architecture) | High (orthogonal expansion path) | Differentiator |
-| D2: SHOW IN SCHEMA/DATABASE | Low-Medium | ~100 (parser + WHERE injection) | Low | Differentiator |
-| D3: TERSE mode | Low | ~30 (parser recognition) | None | Differentiator |
-| D4: SHOW COLUMNS | Medium | ~200 (new command + parser) | Low | Differentiator |
-| **Table Stakes Total** | | **~1,660 LOC** | | |
-| **All Features Total** | | **~2,590 LOC** | | |
+| T1: YAML parsing (FROM YAML) | Medium | ~500 (YAML schema structs + mapping + parser detection + tests) | Medium (schema mapping fidelity) | Table Stakes |
+| T2: YAML file loading | Low | ~80 (file I/O + path resolution) | Low | Table Stakes |
+| T3: YAML export (GET_DDL YAML) | Medium | ~400 (reverse mapping + serialization + tests) | Low-Medium (round-trip fidelity) | Table Stakes |
+| T4: Materialization declaration | Medium | ~350 (model + parser + define-time validation + tests) | Low | Table Stakes |
+| T5: Query-time routing | High | ~500 (matching algorithm + SQL generation + pipeline integration + tests) | Medium (WHERE passthrough, type inference) | Table Stakes |
+| T6: Re-aggregation | Medium | ~300 (aggregate detection + re-agg SQL generation + tests) | Medium (heuristic aggregate detection) | Table Stakes |
+| D1: Additivity metadata | Medium | ~200 (model field + parse-time detection + SHOW column) | Low | Differentiator |
+| D2: Validation report | Low-Medium | ~150 (diagnostic formatting + new command) | Low | Differentiator |
+| D3: YAML materializations | Low | ~100 (YAML schema extension) | Low | Differentiator |
+| **Table Stakes Total** | | **~2,130 LOC** | | |
+| **All Features Total** | | **~2,580 LOC** | | |
 
 ---
 
@@ -617,23 +613,30 @@ DESCRIBE output changes (new property rows) depend on T2/T3/T4 model changes.
 
 Prioritize:
 
-1. **T2 + T3 + T4: Metadata features bundle** -- COMMENT, SYNONYMS, PRIVATE/PUBLIC. These three touch the same model structs, parser paths, and SHOW/DESCRIBE outputs. Bundling reduces file churn. Low individual complexity, medium combined.
+1. **T1: YAML parsing** -- Core YAML capability. New crate dependency. Define the YAML schema structs. This is the foundation for T2 and T3.
 
-2. **T1: Semi-additive metrics** -- The most impactful semantic feature. Required for correct snapshot data modeling. High complexity but self-contained within the expansion pipeline.
+2. **T2: YAML file loading** -- Trivial addition once T1 exists. High user value for version-controlled definitions.
 
-3. **T6: Queryable FACTS** -- Enables row-level querying, a distinct query mode. Medium complexity.
+3. **T4: Materialization declaration** -- Core materialization model. Independent of YAML. Define the MATERIALIZATIONS clause, model struct, parser, and define-time validation.
 
-4. **T7: Wildcard selection** -- Low-hanging fruit. Simple convenience feature.
+4. **T5: Query-time routing** -- The core value of materializations. Without this, T4 is just metadata. Implement the matching algorithm and SQL generation.
 
-5. **T5: GET_DDL reconstruction** -- Must be last table-stakes feature so it can represent everything.
+5. **T6: Re-aggregation** -- What makes materializations flexible. A single wide materialization can serve many queries. Implement aggregate detection and re-aggregation SQL.
 
-6. **D3: TERSE mode** -- Trivial parser change for Snowflake compatibility.
+6. **T3: YAML export** -- Completes the YAML round-trip. Should come after T4 is settled so YAML export can include materializations (D3).
 
-7. **D2: IN SCHEMA/DATABASE** -- Useful introspection enhancement.
+7. **D1: Additivity metadata** -- Makes T5/T6 more robust. Worth including if time permits.
 
 Defer:
-- **D1: Window function metrics** -- Very high complexity. Parse and store the DDL now but defer query-time expansion. This gives GET_DDL round-trip fidelity without the expansion architecture changes.
-- **D4: SHOW COLUMNS** -- Nice-to-have unified view, but redundant with existing SHOW SEMANTIC DIMENSIONS/METRICS/FACTS.
+- **D2: Validation report** -- Useful diagnostic but not required for correct functionality. Can be added in a follow-up.
+- **D3: YAML materializations** -- Low complexity, but only needed after both T1 and T4 are done. Bundle with T3.
+
+**Recommended phase ordering:**
+1. **YAML Core (T1 + T2)** -- Add YAML crate dependency, define YAML schema structs, implement FROM YAML parsing and file loading. These are tightly coupled.
+2. **Materialization Model (T4)** -- Add MATERIALIZATIONS clause, model, parser, validation. Independent of YAML.
+3. **Materialization Routing (T5 + T6)** -- Matching algorithm + re-aggregation. The hard part. Independent of YAML.
+4. **YAML Export + Materializations in YAML (T3 + D3)** -- Complete the round-trip with all features represented. Last because it must serialize everything including materializations.
+5. **Polish (D1, D2)** -- Additivity metadata and diagnostics if time permits.
 
 ---
 
@@ -641,29 +644,35 @@ Defer:
 
 ### Snowflake Official Documentation (HIGH confidence)
 
-- [CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- Complete DDL syntax including NON ADDITIVE BY, PARTITION BY EXCLUDING, COMMENT, SYNONYMS, PRIVATE/PUBLIC
-- [SEMANTIC_VIEW query syntax](https://docs.snowflake.com/en/sql-reference/constructs/semantic_view) -- FACTS vs METRICS mutual exclusivity, wildcard `table.*` syntax, window metric required dimensions
-- [Querying semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/querying) -- FACTS rules, same-table constraint, WHERE clause support
-- [ALTER SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/alter-semantic-view) -- SET/UNSET COMMENT syntax (only comment alterable; other changes require replace)
-- [DESCRIBE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/desc-semantic-view) -- 5-column output, ACCESS_MODIFIER/COMMENT/SYNONYMS properties per object_kind
-- [SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- 8-column output with comment, TERSE mode, IN scope, LIKE/STARTS WITH/LIMIT
-- [SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- 8-column output including synonyms and comment columns
-- [SHOW SEMANTIC METRICS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-metrics) -- Same 8-column schema
-- [SHOW SEMANTIC FACTS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-facts) -- Same 8-column schema
-- [SHOW COLUMNS](https://docs.snowflake.com/en/sql-reference/sql/show-columns) -- `kind` column for DIMENSION/FACT/METRIC, works with semantic views via VIEW keyword
-- [GET_DDL](https://docs.snowflake.com/en/sql-reference/functions/get_ddl) -- Supports 'SEMANTIC VIEW' object type
-- [Semi-additive metrics release note](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY feature announcement (March 5, 2026)
+- [YAML specification for semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/semantic-view-yaml-spec) -- Complete YAML schema with all fields, types, constraints
+- [SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML](https://docs.snowflake.com/en/sql-reference/stored-procedures/system_create_semantic_view_from_yaml) -- Procedure syntax, parameters, verify_only mode
+- [SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW](https://docs.snowflake.com/en/sql-reference/functions/system_read_yaml_from_semantic_view) -- YAML export function, round-trip workflow
+- [CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- SQL DDL syntax (no materialization support)
 
-### dbt / MetricFlow (MEDIUM confidence -- cross-reference)
+### Databricks Official Documentation (HIGH confidence)
 
-- [dbt Measures documentation](https://docs.getdbt.com/docs/build/measures) -- `non_additive_dimension` parameter with `window_choice` and `window_groupings`
-- [dbt Semantic Layer Spec Proposal #7456](https://github.com/dbt-labs/dbt-core/discussions/7456) -- Semi-additive measures design discussion
+- [Materialization for metric views](https://docs.databricks.com/aws/en/metric-views/materialization) -- Materialization YAML syntax, routing algorithm, relaxed mode, refresh mechanisms
+- [Metric view YAML syntax reference](https://docs.databricks.com/gcp/en/business-semantics/metric-views/yaml-reference) -- Complete YAML schema
 
-### Cube.dev (MEDIUM confidence -- cross-reference)
+### Cube.dev Official Documentation (HIGH confidence)
 
-- [Cube.dev Measures documentation](https://cube.dev/docs/product/data-modeling/reference/measures) -- Additive vs non-additive measure types
-- [Cube.dev Non-Additivity guide](https://cube.dev/docs/guides/recipes/query-acceleration/non-additivity) -- Pre-aggregation strategies for non-additive measures
+- [Matching queries with pre-aggregations](https://cube.dev/docs/product/caching/matching-pre-aggregations) -- Sequential matching algorithm, additivity checks, time dimension rules
+- [Pre-aggregations reference](https://cube.dev/docs/product/data-modeling/reference/pre-aggregations) -- Definition syntax, types (rollup, original_sql, rollup_join, rollup_lambda)
+- [Using pre-aggregations](https://cube.dev/docs/product/caching/using-pre-aggregations) -- Aggregating indexes, re-aggregation over missing dimensions
+- [Accelerating non-additive measures](https://cube.dev/docs/product/caching/recipes/non-additivity) -- Decomposition strategies, count_distinct_approx
 
-### General Data Warehouse Patterns (MEDIUM confidence)
+### dbt / MetricFlow (MEDIUM confidence)
 
-- [Semi-Additive Measures in DAX (SQLBI)](https://www.sqlbi.com/articles/semi-additive-measures-in-dax/) -- Conceptual reference for LAST_VALUE over time patterns
+- [Saved queries](https://docs.getdbt.com/docs/build/saved-queries) -- YAML saved query syntax, cache configuration
+- [Exports](https://docs.getdbt.com/docs/use-dbt-semantic-layer/exports) -- Materialization of saved queries, schema/alias config
+
+### Rust YAML Ecosystem (MEDIUM confidence)
+
+- [serde_yaml deprecation discussion](https://users.rust-lang.org/t/serde-yaml-deprecation-alternatives/108868) -- serde_yaml deprecated; alternatives: serde_yml (unsound advisory RUSTSEC-2025-0068), serde-yaml-ng, serde_yaml_bw, serde-saphyr
+- [RUSTSEC-2025-0068](https://rustsec.org/advisories/RUSTSEC-2025-0068.html) -- serde_yml advisory
+
+### Project Internal References
+
+- `_notes/semantic-views-duckdb-design-doc.md` -- Two-phase architecture (expansion + pre-aggregation selection), Cube.dev pre-aggregation algorithm analysis, why `egg` is not needed
+- `src/model.rs` -- Current SemanticViewDefinition, Metric, Dimension, Fact structs with serde derive
+- `src/render_ddl.rs` -- Existing GET_DDL SQL reconstruction

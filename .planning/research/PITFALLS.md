@@ -1,369 +1,283 @@
-# Domain Pitfalls -- Snowflake SQL DDL Parity (v0.6.0)
+# Domain Pitfalls -- YAML Definitions & Materialization Routing (v0.7.0)
 
-**Domain:** Adding Snowflake SQL DDL parity features to an existing DuckDB semantic views extension
-**Researched:** 2026-04-09
-**Context:** Extension has 487 tests, 16,342 LOC across expand/ (7 submodules), graph/ (5 submodules), shared util.rs/errors.rs. Definitions stored as JSON in `semantic_layer._definitions` via parameterized prepared statements. C++ shim dynamically forwards VTab output as all-VARCHAR. Single-pass SQL expansion generates `SELECT dims, agg_metrics FROM base LEFT JOIN ... GROUP BY dims`.
+**Domain:** Adding YAML as a second definition format and materialization routing to an existing DuckDB semantic views extension
+**Researched:** 2026-04-17
+**Context:** Extension has 705 tests, 25,983 LOC across expand/ (7 submodules), graph/ (5 submodules), shared util.rs/errors.rs. Definitions stored as JSON in `semantic_layer._definitions` via parameterized prepared statements. C++ shim dynamically forwards VTab output as all-VARCHAR. Expansion generates complex SQL with CTE-based semi-additive/window metric pipelines, fan trap detection, role-playing dimensions, derived metrics with DAG validation, and PRIVATE/PUBLIC access control. Current definition path: SQL DDL -> body_parser.rs -> SemanticViewDefinition -> JSON -> catalog. Adding a second input path (YAML) and a query-time interception layer (materialization routing) touches nearly every module.
 
 ---
 
 ## Critical Pitfalls
 
-Mistakes that cause rewrites, incorrect query results, or breaking changes.
+Mistakes that cause rewrites, data correctness bugs, or security vulnerabilities.
 
-### C1: Semi-additive metrics require a fundamentally different expansion path
+### Pitfall 1: Re-aggregation of Non-Additive Metrics Produces Silently Wrong Results
 
-**What goes wrong:** The current `expand()` function in `src/expand/sql_gen.rs` generates exactly one query shape: `SELECT dims, agg_metrics FROM ... GROUP BY dims`. Semi-additive metrics (NON ADDITIVE BY) require a two-stage expansion: first select the "last snapshot" rows per non-additive dimension partition, then aggregate. Trying to bolt this onto the existing single-pass SQL generation produces either incorrect results (aggregating before snapshot selection) or a combinatorial explosion when mixing regular and semi-additive metrics in one query.
+**What goes wrong:** A materialization table stores pre-aggregated data at dimension granularity (region, month, product). A query requests a subset (region, month). The routing engine matches the materialization and wraps it with `GROUP BY region, month`. For SUM and COUNT, this is correct -- they are additive. For COUNT(DISTINCT customer_id), AVG(price), or PERCENTILE_CONT(0.5), re-aggregation produces wrong numbers. Summing daily unique users to get monthly uniques overcounts. Averaging averages is not the same as averaging raw values.
 
-**Why it happens:** The expand function treats all metrics identically -- each becomes an aggregate expression in the SELECT list with a shared GROUP BY. NON ADDITIVE BY metrics need a subquery or CTE that filters to the latest snapshot rows before the outer aggregation. Snowflake's behavior: "rows are sorted by the non-additive dimensions, and the values from the last rows (the latest snapshots of values) are aggregated to compute the metric." If both regular and semi-additive metrics coexist in one query request, the expansion must produce a query structure where regular metrics aggregate over ALL rows but semi-additive metrics aggregate only over snapshot-selected rows.
+**Why it happens:** The additivity check is easy to forget when the routing code path works perfectly for SUM/COUNT. Every metric expression in this codebase is a raw SQL string (e.g., `"SUM(amount)"`, `"COUNT(DISTINCT customer_id)"`), and there is no structured representation of the aggregate function type. Detecting additivity requires parsing the SQL expression to extract the outermost aggregate function.
 
-**Consequences:**
-- Incorrect aggregation results (inflated semi-additive values) if snapshot selection is skipped
-- Overly complex generated SQL if both metric types coexist
-- Potential correctness regression in existing tests if the expand function's control flow is restructured carelessly
+**Consequences:** Users get wrong query results with no error or warning. This is the worst possible failure mode for a semantic layer -- the entire value proposition is correct results.
 
 **Prevention:**
-- Design the semi-additive path as a distinct expansion mode using a CTE wrapper. The base CTE joins all tables and selects row-level facts/expressions. An intermediate CTE applies `ROW_NUMBER() OVER (PARTITION BY <non-excluded-dims> ORDER BY <non_additive_dims> DESC) = 1` to pick the latest snapshot row per partition. The outer query then aggregates.
-- When only regular metrics are requested, the existing single-pass path must be untouched -- guard the semi-additive path behind a check for any NON_ADDITIVE_BY annotations in the resolved metrics.
-- Build the NON ADDITIVE BY expansion as a composable wrapper around the existing `expand()` output, rather than adding branches inside the existing function.
-- Test the mixed case explicitly: one query with both `SUM(amount)` (regular) and `SUM(balance) NON ADDITIVE BY (date_dim)` (semi-additive) must produce different aggregation scopes for each metric.
+1. Classify metrics as additive/non-additive at define time. Parse the outermost function from the metric expression and store an `Additivity` enum (Additive, NonAdditive, DerivedUnknown) in the `Metric` model.
+2. During materialization matching, reject matches where any requested metric is non-additive AND the query dimensions are a proper subset of the materialization dimensions (i.e., re-aggregation would be needed).
+3. Non-additive metrics in a materialization can only be used when the query dimensions EXACTLY match the materialization dimensions (no re-aggregation needed).
+4. Additive functions: SUM, COUNT, MIN, MAX. Non-additive: COUNT(DISTINCT ...), AVG, MEDIAN, PERCENTILE_CONT/DISC, any user-defined expression that cannot be determined. AVG can be decomposed into SUM/COUNT for re-aggregation if both components are stored.
+5. When unsure about additivity (complex expressions, nested functions), default to non-additive -- correctness over performance.
 
-**Detection:** Expansion unit tests that compare regular metric values against semi-additive metric values on the same dataset. If they produce identical results on a dataset with multiple snapshot rows per partition, the semi-additive logic is not activating.
+**Detection:** Unit tests comparing materialization-routed query results against raw-table expansion for identical inputs. Property-based tests with random dimension subsets for each aggregate function type. Mandatory test case: `COUNT(DISTINCT x)` with subset dimensions must NOT match a materialization that requires re-aggregation.
 
-**Phase:** Should be an early feature phase -- it is the deepest structural change to the expansion pipeline and all subsequent features (window metrics, queryable facts) should build on the expanded pipeline.
+**Phase:** Materialization routing engine phase. Must be foundational to the matching algorithm.
 
 ---
 
-### C2: DuckDB LAST_VALUE IGNORE NULLS crashes on all-NULL partitions (version-dependent)
+### Pitfall 2: Semi-Additive and Window Metrics Bypass Materialization Correctness
 
-**What goes wrong:** DuckDB versions prior to the fix for GitHub issue #20136 (merged December 2025 into main) crash with an internal error ("Attempted to access index 0 within vector of size 0") when `LAST_VALUE(expr ORDER BY ... IGNORE NULLS)` encounters a partition where ALL values are NULL. This is the exact pattern one might reach for when implementing semi-additive snapshot selection.
+**What goes wrong:** The existing codebase has semi-additive metrics (NON ADDITIVE BY with CTE-based ROW_NUMBER snapshot selection) and window function metrics (PARTITION BY EXCLUDING with CTE-based inner aggregation + outer window SELECT). These metrics have complex expansion pipelines that cannot be replicated by simple `SELECT ... FROM materialization GROUP BY ...` re-aggregation. A materialization router that only checks metric names and dimensions without understanding these special metric types will route to a materialization and produce wrong results.
 
-**Why it happens:** The natural DuckDB expansion for NON ADDITIVE BY uses `LAST_VALUE` or `ROW_NUMBER` with ORDER BY. If using `LAST_VALUE` with `IGNORE NULLS` and a partition has all NULLs for the metric column, DuckDB crashes. This is the class of bug the project has worked hard to prevent (see v0.5.0 Phase 17.1 Python crash investigation).
+**Why it happens:** Semi-additive metrics depend on having raw-granularity rows to pick the latest snapshot via ROW_NUMBER. Window metrics depend on inner aggregation + outer window application. Both require the full CTE pipeline. A pre-aggregated materialization has already collapsed the rows, destroying the information needed for these operations.
 
-**Consequences:** Extension users with sparse data (NULL metric values in some partitions) hit SIGABRT-level crashes that bypass all Rust safety guarantees.
+**Consequences:** Snapshot metrics return wrong values (not the latest snapshot). Window metrics compute windows over the wrong partition boundaries. Both are silent correctness failures.
 
 **Prevention:**
-- Use `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY <non_additive_dims> DESC) = 1` for snapshot row selection instead of `LAST_VALUE`. ROW_NUMBER is safer because it selects a row position rather than a value, avoiding the NULL-handling edge case entirely.
-- The project currently targets DuckDB 1.5.x, which should include the fix. However, the LTS branch (1.4.x) may not. Verify in CI with both targets.
-- Add a proptest generating all-NULL metric columns within semi-additive partitions.
-- Add an explicit sqllogictest case with all-NULL partitions and semi-additive metrics.
+1. During materialization matching, automatically exclude any query that includes semi-additive metrics (those with `non_additive_by` populated) or window metrics (those with `window_spec` populated).
+2. These metrics should NEVER be served from a materialization unless the materialization was specifically built to store the output of that exact CTE pipeline (i.e., the materialization dimensions exactly match the query dimensions AND the materialization was built for that specific metric). Even then, this is fragile.
+3. Simpler rule: if any requested metric is semi-additive or windowed, skip materialization routing entirely and fall back to raw expansion.
 
-**Detection:** Proptest with `proptest::option::weighted(0.8, arb_value())` to generate high-NULL-rate partitions. Integration test with explicit all-NULL partition.
+**Detection:** Test that semi-additive and window metrics are never routed to materializations. Negative test cases for the matching algorithm.
 
-**Phase:** Same phase as semi-additive implementation. Must be tested as part of the core semi-additive expansion.
+**Phase:** Materialization routing engine phase, implemented alongside the additivity check.
 
 ---
 
-### C3: Window function metrics (PARTITION BY EXCLUDING) cannot coexist with GROUP BY
+### Pitfall 3: serde_yaml is Deprecated and Alternatives Have Soundness Issues
 
-**What goes wrong:** The current expansion always generates GROUP BY when both dimensions and metrics are present. Window function metrics using `PARTITION BY EXCLUDING` produce a per-row result (no aggregation), which is fundamentally incompatible with GROUP BY in the same SELECT. If a query requests both an aggregate metric (`SUM(amount)`) and a window metric (`SUM(amount) OVER (PARTITION BY EXCLUDING date_dim)`), the expansion must handle the fact that SQL mandates window functions operate on the result set AFTER GROUP BY, but Snowflake's PARTITION BY EXCLUDING operates on pre-aggregation rows.
+**What goes wrong:** The obvious dependency choice `serde_yaml` is archived and unmaintained. The fork `serde_yml` had soundness issues (segfaults in the serializer) and its GitHub project was also archived. Choosing the wrong YAML crate leads to either unmaintained dependencies triggering `cargo-deny` advisories, or soundness bugs causing crashes in the extension (which runs inside DuckDB's process).
 
-**Why it happens:** A metric defined as `SUM(x) OVER (PARTITION BY ...)` is not an aggregate -- it is a window function. Mixing it with aggregate metrics in the same SELECT clause requires the aggregate metrics to use GROUP BY while the window metric uses OVER. This produces valid SQL only if the window function operates on the grouped result, but Snowflake's PARTITION BY EXCLUDING semantics operate on raw rows, not post-GROUP BY results.
+**Why it happens:** The Rust YAML ecosystem is fragmented after dtolnay deprecated serde_yaml. Multiple forks exist with varying quality, and the situation is still evolving.
 
-**Consequences:**
-- DuckDB error: "window functions cannot appear in GROUP BY clause"
-- Or incorrect results: window function computes over grouped rows instead of raw rows
-- Users confused by which metrics can be combined in one query
+**Consequences:** cargo-deny CI failures. Potential segfaults in DuckDB process from unsound YAML parsing. Advisory warnings on the community extension registry.
 
 **Prevention:**
-- Forbid mixing aggregate metrics and window function metrics in the same query request. Return a clear ExpandError explaining they must be queried separately. Snowflake enforces strict dimension requirements on window metric queries, effectively preventing mixing.
-- The simplest correct approach: if any requested metric has PARTITION BY EXCLUDING, ALL metrics in that query must be window functions or bare expressions, and the expansion omits GROUP BY entirely.
-- Add a new ExpandError variant `IncompatibleMetricTypes` with a clear message.
-- When only window metrics are requested, generate: `SELECT dims, window_metric_expr OVER (PARTITION BY <all-dims-except-excluded> ORDER BY ...) FROM base LEFT JOIN ...` with NO GROUP BY.
+1. Use `serde_yaml_ng` (maintained fork of serde_yaml using unsafe-libyaml) as the primary choice -- it has the most traction and closest API compatibility with the original serde_yaml.
+2. Alternative: `serde-saphyr` which uses a pure-Rust YAML parser (saphyr-rs), eliminating unsafe code entirely. Better for security but newer and less battle-tested.
+3. Pin the chosen crate version exactly (matching the project pattern of `= version` pins for duckdb).
+4. Test: fuzz the YAML parser with adversarial inputs including the billion laughs payloads (anchor bombs). Add a `fuzz_yaml_parse` target alongside the existing `fuzz_ddl_parse` and `fuzz_json_parse`.
+5. Document the choice rationale in TECH-DEBT.md.
 
-**Detection:** Unit test requesting one aggregate metric and one window metric in the same QueryRequest should return IncompatibleMetricTypes error.
+**Detection:** `cargo-deny` CI step will catch unmaintained/unsound advisories. Fuzz testing catches crashes.
 
-**Phase:** Should follow semi-additive metrics. The expansion pipeline will already have CTE capability from semi-additive work.
+**Phase:** First phase -- YAML parsing infrastructure must be established before YAML definitions can be implemented.
 
 ---
 
-### C4: JSON schema migration breaks existing stored views when adding new model fields
+### Pitfall 4: YAML Anchor/Alias Bombs (Billion Laughs Attack)
 
-**What goes wrong:** Adding new fields to `SemanticViewDefinition` (comment, synonyms, private, non_additive_by, partition_by_excluding) and sub-structs (Metric, Dimension, Fact) requires careful serde annotation. If a new field is not `#[serde(default)]`, deserialization of ALL existing stored views fails on extension load, rendering the entire catalog inaccessible.
+**What goes wrong:** YAML's anchor (&) and alias (*) features allow recursive references that cause exponential memory expansion during deserialization. A 1KB YAML file can expand to gigabytes of memory, crashing the DuckDB process. Since this extension accepts user-provided YAML (both inline and from files), this is a real attack surface.
 
-**Why it happens:** The project stores definitions as JSON in `semantic_layer._definitions`. Every `init_catalog` call deserializes all rows. A single missing `#[serde(default)]` on a new field causes `serde_json::from_str` to fail, which propagates as a catalog load error.
+**Why it happens:** YAML's expressive power (anchors, merge keys, alias expansion) is a security liability when processing untrusted input. Most YAML libraries expand aliases eagerly during parsing.
 
-**Consequences:**
-- Total data loss: existing semantic views become inaccessible
-- Extension fails to load entirely (init_catalog returns Err)
-- Users must manually edit the JSON in the DuckDB table to fix
+**Consequences:** DuckDB process crash from OOM. Denial of service. Since extensions run with full process privileges, there is no sandboxing to contain this.
 
 **Prevention:**
-- **Every new field** on `SemanticViewDefinition`, `Metric`, `Dimension`, `Fact`, `Join`, and `TableRef` MUST have `#[serde(default)]`.
-- **Every `Option<T>` field** gets `#[serde(default, skip_serializing_if = "Option::is_none")]`.
-- **Every `Vec<T>` field** gets `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.
-- **Every new enum field** gets `#[serde(default)]` with `#[derive(Default)]` on the enum.
-- **Write a backward-compat test** that deserializes a JSON snapshot from v0.5.5 (the current version) with the new struct definition. This test must be written BEFORE adding any new fields and must pass after fields are added.
-- **Do NOT use `#[serde(deny_unknown_fields)]`** -- the model comment explicitly notes this (model.rs line 160-161).
-- v0.5.3 retrospective Key Lesson 1: "Adding a new field to a widely-used struct creates a large blast radius of required changes." Add ALL new annotation fields in a single batch phase.
+1. Set a maximum input size limit for YAML definitions (e.g., 1MB -- no legitimate semantic view definition would be larger).
+2. After deserialization, validate that the resulting `SemanticViewDefinition` struct has reasonable cardinality (e.g., max 10,000 dimensions, max 10,000 metrics). This catches bomb payloads that expand into huge structures.
+3. If using `serde-saphyr`, check if it has built-in anchor depth/expansion limits. If using `serde_yaml_ng`, the underlying unsafe-libyaml may not have limits -- the input size cap is the primary defense.
+4. Consider disabling anchor/alias processing entirely if the YAML library supports it. Semantic view definitions should not need anchors.
+5. The fuzz target (`fuzz_yaml_parse`) must include anchor bomb patterns.
 
-**Detection:** Integration test loading a v0.5.5 JSON fixture and verifying all fields deserialize with correct defaults. This is the single most important test for this milestone.
+**Detection:** Fuzz target with crafted anchor bomb payloads. Unit test verifying that oversized YAML inputs are rejected before parsing. Memory-limited test environment.
 
-**Phase:** Must be the FIRST phase -- model changes underpin every other feature.
+**Phase:** YAML parsing infrastructure phase, as part of input validation.
 
 ---
 
-### C5: GET_DDL round-trip loses expression quoting information
+### Pitfall 5: Dual Definition Format Creates Model Drift
 
-**What goes wrong:** GET_DDL must reconstruct valid DDL from the stored `SemanticViewDefinition` JSON. But the body parser discards certain DDL-level information:
-1. **Expression quoting**: The parser strips outer quotes from identifiers. If a user wrote `"Order ID"` in a dimension expression, the stored `expr` field contains the expression without its DDL-level quoting context. Reconstructed DDL may need re-quoting.
-2. **Whitespace and formatting**: All formatting is lost during parsing.
-3. **Keyword casing**: Original DDL might use mixed case. Reconstruction normalizes to uppercase.
-4. **NON ADDITIVE BY sort direction**: Must be stored (ASC/DESC, NULLS FIRST/LAST) and reconstructed faithfully.
+**What goes wrong:** SQL DDL and YAML produce the same `SemanticViewDefinition` struct via different parsing paths. Over time, new features are added to the SQL DDL body_parser but not to the YAML parser (or vice versa). GET_DDL round-trip works for SQL-created views but breaks for YAML-created views. SHOW/DESCRIBE commands display different information depending on how the view was created.
 
-**Why it happens:** The body parser (`body_parser.rs`) converts DDL text into struct fields, naturally discarding syntactic sugar. The model stores semantic content, not syntactic form.
+**Why it happens:** Two input parsers targeting the same model is inherently fragile. The existing codebase has extensive backward-compat tests for the JSON serialization format, but those test the storage layer, not the input parsing layer. Each new model field (like `comment`, `synonyms`, `access`, `non_additive_by`, `window_spec`) added in future milestones needs to be implemented in BOTH parsers.
 
-**Consequences:**
-- Reconstructed DDL, when re-executed, may fail if expression quoting is not restored
-- Users expecting exact round-trip get syntactically different (but semantically equivalent) DDL
+**Consequences:** Feature asymmetry between SQL and YAML definitions. User confusion. Bugs where YAML definitions silently drop metadata that SQL definitions preserve. GET_DDL produces incorrect output for YAML-created views.
 
 **Prevention:**
-- Expressions are stored as opaque SQL strings -- they were valid when parsed and remain valid in reconstruction. The danger is only in the structural parts (names, aliases, PK columns).
-- GET_DDL must re-quote all structural identifiers: table aliases, dimension/metric/fact names, PK column names, relationship names.
-- For the entry format `alias.name AS expr`, always emit double-quoted names.
-- For new annotations, emit canonical form: `NON ADDITIVE BY (dim1 DESC NULLS LAST)`, `COMMENT = 'text'`, `WITH SYNONYMS = ('s1', 's2')`, `PRIVATE`.
-- Write a round-trip proptest: `parse(ddl) -> json -> parse(get_ddl(json))` must produce equal definitions.
-- Accept that GET_DDL output is semantically equivalent but not syntactically identical. Document this.
+1. **Shared validation layer.** Both SQL DDL and YAML parsing must produce a `SemanticViewDefinition` and then pass through the same validation function. This function checks all invariants (graph validation, PK/FK resolution, cardinality inference, UNIQUE constraint checking). Currently this validation is scattered across `body_parser.rs` and `ddl/define.rs`.
+2. **Feature parity tests.** For every SQL DDL test case, create a corresponding YAML test case that produces the same `SemanticViewDefinition`. Assert `serde_json::to_string(from_sql) == serde_json::to_string(from_yaml)`.
+3. **YAML schema derives from Rust structs.** The YAML format should map 1:1 to the serde-serialized form of `SemanticViewDefinition` (which is already the JSON format). Do not invent a new schema -- deserialize YAML directly into `SemanticViewDefinition` using serde. This makes the two formats structurally identical.
+4. **Reject YAML-only features.** Do not add any capability to YAML that SQL DDL does not have, and vice versa. The formats are two syntaxes for the same model.
 
-**Detection:** Round-trip proptest is the canonical verification.
+**Detection:** CI test that round-trips: SQL DDL -> SemanticViewDefinition -> JSON -> YAML -> SemanticViewDefinition and asserts equality. Coverage tool showing which model fields are tested in both parsing paths.
 
-**Phase:** GET_DDL should be one of the LAST features -- it must reconstruct ALL new DDL syntax features (COMMENT, SYNONYMS, PRIVATE, NON ADDITIVE BY, PARTITION BY EXCLUDING).
+**Phase:** YAML parser implementation phase. The shared validation extraction should happen first, before the YAML parser is built.
 
 ---
 
 ## Moderate Pitfalls
 
-### M1: COMMENT strings with single quotes break DDL parsing
+### Pitfall 6: Dollar-Quoted String Parsing Edge Cases
 
-**What goes wrong:** Comments like `COMMENT = 'Customer''s total balance'` contain escaped single quotes. The body parser's `split_at_depth0_commas` (body_parser.rs lines 56-59) correctly handles `''` inside strings, but the clause boundary scanner `find_clause_bounds` operates at a higher level and may not correctly handle single-quoted strings that appear in new annotation positions.
+**What goes wrong:** The `FROM YAML $$ ... $$` syntax requires parsing dollar-quoted strings in the DDL detection layer (`parse.rs`). Nested delimiters are the primary risk: if YAML content contains the sequence `$$`, the parser terminates early and produces a truncated definition. Tagged delimiters (`$yaml$...$yaml$`) help but introduce new edge cases: the tag must follow PostgreSQL identifier rules (no `$` in tag, no leading digits), and the parser must handle mismatched tags gracefully.
 
-**Why it happens:** COMMENT is a new annotation syntax that doesn't follow the existing `alias.name AS expr` pattern. It is a key-value assignment (`COMMENT = 'text'`) that appears either at the view level (before TABLES) or inline on individual entries. The existing parser infrastructure handles entries separated by commas inside clause parentheses, but COMMENT adds a new syntactic form.
+**Why it happens:** The existing DDL parser in `parse.rs` uses `match_keyword_prefix` for keyword detection and `body_parser.rs` for the body after `AS`. Dollar-quoting is a new parsing mode that does not exist anywhere in the current codebase. The body_parser's `split_at_depth0_commas` already handles single-quote escaping and paren depth, but dollar-quoting is a fundamentally different quoting mechanism.
 
-**Consequences:**
-- Parse errors on valid DDL containing comments with special characters
-- Truncated comments if the parser misidentifies the end of the string
-- View-level COMMENT may confuse the clause boundary scanner if it appears between clauses
+**Consequences:** Truncated YAML definitions that deserialize into incomplete `SemanticViewDefinition` structs with missing required fields, causing confusing errors. Or: YAML content that happens to contain `$$` silently breaks.
 
 **Prevention:**
-- View-level COMMENT should appear before the first clause keyword (TABLES). The clause boundary scanner should skip over `COMMENT = '...'` at the top level.
-- Entry-level COMMENT should be parsed within the existing entry parser, after the `AS expr` portion.
-- Use the existing single-quote escaping logic consistently.
-- Test adversarial strings: empty comments, `''` (escaped quotes), `)` characters, clause keywords inside comments (`COMMENT = 'This has DIMENSIONS'`).
-- Add `fuzz_ddl_parse` corpus entries with COMMENT containing special characters.
+1. Implement dollar-quote scanning as a dedicated function in `parse.rs`, not as an extension of `split_at_depth0_commas`.
+2. Support tagged delimiters: `$yaml$...$yaml$`, `$sv$...$sv$` etc., with the plain `$$` as the default.
+3. Scan for the exact closing delimiter (including tag) -- do not stop at the first `$$` if a tagged delimiter was used.
+4. Validate the tag follows identifier rules (alphanumeric + underscore, no leading digit, no `$`).
+5. Add proptest/fuzz cases for YAML content containing `$$`, `$yaml$`, single `$`, and other delimiter-like patterns.
+6. Error message for unterminated dollar-quote should include the expected closing delimiter and the byte position where the opening was found.
 
-**Detection:** Proptest generating random strings as comment values (including ASCII printable, single quotes, parentheses, clause keywords).
+**Detection:** Proptest generating random YAML-like strings containing `$` characters inside dollar-quoted blocks. Explicit test for `$$` inside YAML content with tagged delimiters.
 
-**Phase:** Metadata system phase.
+**Phase:** DDL detection/rewriting phase (extends `parse.rs` for `FROM YAML` syntax).
 
 ---
 
-### M2: SYNONYMS parsing ambiguity with expression suffix
+### Pitfall 7: File I/O Security with `FROM YAML FILE`
 
-**What goes wrong:** The Snowflake syntax `WITH SYNONYMS = ('alias1', 'alias2')` introduces a new keyword sequence after a dimension/metric/fact entry. The parser may confuse `WITH` as part of a SQL expression or misparse the parenthesized synonym list as part of the expression.
+**What goes wrong:** `FROM YAML FILE '/path/to/definition.yaml'` reads a file from the filesystem. DuckDB has security controls (`enable_external_access`, `allowed_directories`, `allowed_paths`) that restrict file access. If the extension reads files directly via `std::fs::read_to_string` (bypassing DuckDB's filesystem layer), it circumvents these security controls. Conversely, if it uses DuckDB's `read_text` function, it needs a connection to execute SQL, which introduces the familiar execution-lock deadlock problem (the extension holds the ClientContext lock during DDL processing).
 
-**Why it happens:** The existing entry parser finds `AS` to split `name AS expr`. After extracting the expression, it must detect where the expression ends and annotations begin. If the expression ends with a parenthesized group (e.g., `COUNT(*)`), distinguishing between the expression's closing paren and a SYNONYMS paren requires keyword look-ahead.
+**Why it happens:** The extension already does file I/O in `catalog.rs` (the v0.1.0 companion file migration), but that is a one-time migration of the extension's own data. Reading user-specified file paths is a different security surface. The `read_text` approach is correct from a security standpoint but architecturally problematic given the existing lock patterns.
 
-**Consequences:**
-- Silent misparse: synonym strings absorbed into the expression
-- Parse error on valid DDL
+**Consequences:** If bypassing DuckDB's filesystem: security controls are circumvented, path traversal attacks possible (e.g., `FROM YAML FILE '/etc/passwd'`), and the community extension registry may reject the extension. If using `read_text`: potential deadlocks from the execution lock pattern documented in TECH-DEBT.md item 9.
 
 **Prevention:**
-- Parse annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC) AFTER the expression using keyword detection. After the `AS` keyword split, scan the expression portion for trailing annotation keywords at depth-0 (not inside parens/strings).
-- The key insight: annotations use keywords (`COMMENT`, `WITH`, `PRIVATE`, `PUBLIC`) that are unlikely to appear as the LAST token of a valid SQL expression. A depth-0 scan from right-to-left for these keywords should work.
-- Alternative: define a strict grammar where annotations appear in fixed order after the expression. Parse greedily for the expression (everything between AS and the first annotation keyword at depth-0).
-- Test edge cases: `alias.name AS (CASE WHEN x > 0 THEN 1 END) WITH SYNONYMS = ('alt')`, `alias.name AS func(x) COMMENT = 'note'`.
+1. Use DuckDB's `read_text` function via the `catalog_conn` connection (which is separate from the main connection and used for PK resolution already). This connection is created at init time and does not hold the ClientContext lock.
+2. Path validation: reject absolute paths outside of DuckDB's configured allowed directories. Query `PRAGMA enable_external_access` to check the setting before attempting file reads.
+3. Size limit: read the file, check length before parsing (max 1MB for a semantic view YAML).
+4. Relative path resolution: relative paths should resolve relative to the DuckDB database file location (matching DuckDB's convention for COPY and IMPORT), not relative to the process working directory.
+5. Test: verify that `FROM YAML FILE` respects `enable_external_access=false` by setting the pragma and asserting the operation fails.
 
-**Detection:** Test cases with complex expressions followed by annotations.
+**Detection:** Integration test setting `enable_external_access=false` and verifying file read is rejected. Negative test with path traversal patterns (`../../../etc/passwd`).
 
-**Phase:** Same metadata system phase as COMMENT.
+**Phase:** YAML file reading phase, after inline YAML is working.
 
 ---
 
-### M3: PRIVATE metrics interacting with derived metrics
+### Pitfall 8: Materialization Staleness is Silent
 
-**What goes wrong:** A PRIVATE metric cannot be queried directly. But if a derived (non-private) metric references a private metric in its expression, the system must still inline the private metric's expression during expansion. If private metrics are excluded from the resolution pool, derived metrics that depend on them produce invalid SQL.
+**What goes wrong:** A MATERIALIZATIONS clause declares that a table `monthly_revenue_agg` covers certain dimensions and metrics. The user populates this table once. Later, the raw data changes (new orders, corrections), but the materialization table is not refreshed. Queries routed to the materialization return stale data. There is no mechanism to detect or warn about this.
 
-**Why it happens:** The `inline_derived_metrics` function in `expand/facts.rs` resolves all metric expressions by walking the dependency graph. If private metrics are filtered out before inlining, derived metrics referencing them have unresolved references.
+**Why it happens:** The v0.7.0 design explicitly scopes materialization as "routing to pre-existing tables" with no refresh mechanism. This is architecturally correct (materialization management is a future milestone), but users may not understand that the extension provides no freshness guarantees.
 
-**Consequences:**
-- Derived metrics silently produce invalid SQL
-- Or all derived metrics transitively depending on private metrics are blocked
+**Consequences:** Users get silently stale results when data changes after materialization was populated. Debugging this requires understanding that the query was routed to a materialization.
 
 **Prevention:**
-- PRIVATE is a query-time filter, not a resolution-time filter. Private metrics must participate fully in the derived metric inlining pass. The PRIVATE check happens only when validating the user's explicit metric request.
-- In `expand()`, resolve ALL metrics (including private) for the inlining pass. Then, when validating requested metric names, reject any marked PRIVATE.
-- Add a new ExpandError variant: `PrivateMetric { view_name, name }`.
-- Test: define `base_metric` (PRIVATE) and `derived_metric AS base_metric * 2` (PUBLIC). Querying `derived_metric` should work; querying `base_metric` should fail.
+1. When a query is routed to a materialization, include a comment in the expanded SQL: `/* routed to materialization: monthly_revenue_agg */`. This makes materialization routing visible in `explain_semantic_view` output.
+2. Document clearly that materializations are user-managed tables with no automatic refresh. The MATERIALIZATIONS clause is a declaration of coverage, not a refresh directive.
+3. Consider adding an optional `STALE_AFTER` annotation to the MATERIALIZATIONS clause for future use, but do not implement enforcement in v0.7.0.
+4. The `explain_semantic_view` function should indicate when a materialization was selected and which one, so users can debug unexpected results.
 
-**Detection:** Unit test with private base metric and public derived metric.
+**Detection:** Unit test that `explain_semantic_view` output includes the materialization table name when routing occurs. Documentation review.
 
-**Phase:** Metadata system phase (PRIVATE/PUBLIC modifiers).
+**Phase:** Materialization routing engine phase, as part of the routing decision output.
 
 ---
 
-### M4: Queryable FACTS mixing row-level and aggregate output
+### Pitfall 9: Type Mismatches Between Materialization and Raw Table Expansion
 
-**What goes wrong:** Facts are row-level expressions (no aggregation). If the table function accepts `facts := ['fact_name']` alongside `metrics := ['metric_name']`, the expansion must decide: do facts go in the SELECT without GROUP BY aggregation, or do facts become GROUP BY dimensions? Neither is correct if mixed naively.
+**What goes wrong:** The materialization table was created with `CREATE TABLE ... AS SELECT ...` at some point, capturing column types. Later, the raw table schema changes (e.g., an INTEGER column becomes BIGINT due to DuckDB's auto-upgrade, or a new column is added). The materialization table retains the old types. When the routing engine substitutes the materialization table, the output column types differ from what would be produced by raw expansion. This breaks the typed output pipeline (`build_execution_sql` and `duckdb_vector_reference_vector`).
 
-**Why it happens:** The current `QueryRequest` has `dimensions` and `metrics`. Adding `facts` creates a third category:
-- Dimensions-only: SELECT DISTINCT
-- Metrics-only: global aggregate
-- Both: GROUP BY dimensions, aggregate metrics
-- Facts: row-level expressions, no aggregation
+**Why it happens:** The extension infers column types at define time via LIMIT 0 query (`column_types_inferred` in `SemanticViewDefinition`). The materialization table has its own column types. These can diverge. The existing `build_execution_sql` cast wrapper handles some type mismatches, but it was designed for minor DuckDB optimizer differences (HUGEINT vs BIGINT), not for arbitrary materialization-vs-raw divergence.
 
-Facts + metrics in the same request is contradictory for a single flat query.
-
-**Consequences:**
-- Facts treated as dimensions produce incorrect GROUP BY (inflates cardinality)
-- Facts treated as metrics produce errors (they are not aggregates)
+**Consequences:** Type mismatch errors at query time. Or worse: silent truncation if a wider type (BIGINT) is cast to a narrower type (INTEGER) from the materialization.
 
 **Prevention:**
-- **Facts-only mode**: When facts (and optionally dimensions) are requested with NO metrics, generate `SELECT DISTINCT fact_exprs, dim_exprs FROM ...` (no GROUP BY).
-- **Disallow facts + metrics in the same request.** Return a clear error: "Cannot mix facts (row-level) and metrics (aggregated) in the same query."
-- Add a `facts` field to `QueryRequest`. Check: if `facts` is non-empty AND `metrics` is non-empty, return an error.
+1. At define time (when MATERIALIZATIONS clause is parsed), validate that the materialization table exists and its columns match the expected types. This is similar to the existing LIMIT 0 type inference.
+2. At query time, when routing to a materialization, check that the output columns from the materialization query have types compatible with the expected output. Reuse the existing `build_execution_sql` cast wrapper.
+3. Store the expected materialization column types in the `SemanticViewDefinition` so that type validation does not require re-querying the materialization table at query time.
+4. If the materialization table has been dropped or its schema has changed, fall back to raw expansion with a warning (not an error).
 
-**Detection:** Unit test verifying `facts + metrics` returns an error. Unit test verifying `facts + dimensions` produces correct row-level SQL.
+**Detection:** Test with a materialization table whose column types intentionally differ from raw table expansion. Verify graceful degradation (fallback or clear error).
 
-**Phase:** Should follow semi-additive and window metric phases.
+**Phase:** Materialization routing engine phase, during the query rewriting step.
 
 ---
 
-### M5: Fan trap detection not updated for semi-additive and window metrics
+### Pitfall 10: Materialization Matching Ignores Derived Metrics and Fact Inlining
 
-**What goes wrong:** The existing `check_fan_traps` function checks every (metric, dimension) pair for one-to-many boundary crossings. Semi-additive metrics change the aggregation semantics (snapshot selection before aggregation), potentially neutralizing certain fan traps. Window metrics bypass GROUP BY entirely, making fan trap detection irrelevant for them.
+**What goes wrong:** A metric like `gross_margin` is defined as a derived metric (`revenue - cost`, where `revenue` and `cost` are other metrics). The routing engine checks whether a materialization contains `gross_margin`, but the materialization table was populated using the raw expansion which inlines derived metrics into their component expressions. The materialization stores a column named `gross_margin` that contains the correct pre-computed values, but the routing engine does not understand that `gross_margin` in the materialization is the same as the derived metric `gross_margin` in the definition.
 
-**Why it happens:** Fan trap detection assumes all metrics are simple aggregates.
+**Why it happens:** The existing expansion engine resolves derived metrics through `inline_derived_metrics` in `facts.rs`, which performs multi-pass expression substitution. A materialization table is a flat table with column names -- it does not retain the derivation chain. The routing engine must map metric names to materialization column names, not metric expressions.
 
-**Consequences:**
-- False positive fan trap errors on semi-additive metrics that would produce correct results after snapshot selection
-- False positive fan trap errors on window metrics that do not aggregate
+**Consequences:** Derived metrics are never matched to materializations, causing them to always fall back to raw expansion even when the materialization has the pre-computed values.
 
 **Prevention:**
-- Add a metric kind annotation: `Regular`, `SemiAdditive`, `Window`.
-- In `check_fan_traps`, skip window metrics entirely.
-- For semi-additive metrics: still flag fan traps but with a softer message, or skip them if the non-additive dimensions adequately partition the data. The simplest approach: skip fan trap checking for semi-additive metrics since snapshot selection is specifically designed to handle the "latest value" case.
+1. Materialization matching should work by metric NAME, not by expression. The MATERIALIZATIONS clause declares which metric names are covered. If `gross_margin` is listed, the routing engine trusts that the materialization table has a column with that pre-computed value.
+2. The MATERIALIZATIONS clause should list dimension and metric names, not expressions. Validation at define time checks that listed names exist in the semantic view definition.
+3. For derived metrics, the user is responsible for ensuring the materialization table was populated with the correct derived values. The extension does not verify derivation chains against materialization contents.
 
-**Detection:** Test semi-additive metric across one-to-many boundary -- should NOT produce fan trap error.
+**Detection:** Test with a derived metric that is covered by a materialization. Verify the routing engine selects the materialization.
 
-**Phase:** Same phase as semi-additive metrics.
-
----
-
-### M6: Wildcard expansion (customer.*) with name collisions across tables
-
-**What goes wrong:** `dimensions := ['customer.*']` should expand to all dimensions from the customer logical table. But if two tables define dimensions with the same name (e.g., both `customer` and `order` have a `status` dimension), the wildcard expansion produces duplicates that the existing `DuplicateDimension` check rejects.
-
-**Why it happens:** Wildcard expansion resolves at `bind()` time to the list of dimension names whose `source_table` matches. The resolved names pass to `expand()`, which performs the duplicate check. If another explicitly named dimension collides with a wildcard-expanded name, the error is confusing.
-
-**Consequences:**
-- Confusing error messages: "duplicate dimension 'status'" when the user only wrote `customer.*`
-- Ambiguity about which dimension "wins" if wildcards from two tables overlap
-
-**Prevention:**
-- Resolve wildcards BEFORE passing to `expand()`, in the `bind()` function.
-- If explicit names collide with wildcard-expanded names, silently deduplicate (they refer to the same dimension).
-- If wildcards from two different tables collide, error with: "Ambiguous dimension 'status' matched by both 'customer.*' and 'order.*'."
-- Implement wildcard resolution as a preprocessing step in `bind()`.
-
-**Detection:** Test: `customer.*` alone, `customer.* + explicit customer.name` (dedup), `customer.* + order.*` with collision (error).
-
-**Phase:** Late in the milestone -- after all features have added their fields to the model.
-
----
-
-### M7: SHOW ... IN SCHEMA/DATABASE scope model mismatch with DuckDB
-
-**What goes wrong:** Snowflake has ACCOUNT > DATABASE > SCHEMA hierarchy with `IN SCHEMA my_db.my_schema` scoping. DuckDB has a similar hierarchy but the extension stores all semantic views in a single catalog table. v0.5.5 added `database_name` and `schema_name` to `SemanticViewDefinition`, but these are stored inside the JSON definition, not as indexed catalog columns. Filtering by schema requires deserializing every definition to check the field.
-
-**Why it happens:** The metadata fields were added for SHOW output display, not for efficient filtering. The current design reads all definitions into `CatalogState` (a `HashMap<String, String>`) at load time -- filtering requires JSON deserialization of each value.
-
-**Consequences:**
-- `IN SCHEMA` filtering is O(n) with JSON deserialization per entry
-- `IN DATABASE` (no name) must resolve `current_database()`, which requires SQL execution not available in VTab bind
-
-**Prevention:**
-- Accept the O(n) cost -- semantic view catalogs are small (typically <100 entries). The VTab already iterates the full catalog for SHOW.
-- For "current database/schema" resolution: the extension already captures `database_name` and `schema_name` at define time. At query time, resolve the current database/schema in the DDL rewrite step (in `parse.rs`), not in the VTab. The rewrite can inject the current context as a parameter to the VTab function call.
-- Alternatively, resolve in the parse_show_filter_clauses and pass as a string parameter to the VTab.
-- Handle edge cases: `IN DATABASE` (no name) = filter by current database, `IN SCHEMA` (no name) = filter by current schema, `IN SCHEMA db.schema` = filter by both.
-
-**Detection:** Test with views created in different schema contexts, then `SHOW IN SCHEMA x` filtering.
-
-**Phase:** SHOW enhancements phase.
+**Phase:** Materialization routing engine phase, specifically the matching algorithm design.
 
 ---
 
 ## Minor Pitfalls
 
-### N1: NON ADDITIVE BY dimension references must be validated at define time
+### Pitfall 11: YAML Multiline Strings and SQL Expression Fidelity
 
-**What goes wrong:** `NON ADDITIVE BY (dim1, dim2)` references dimension names. If those names don't exist in the view's dimension list, the error should be caught at define time, not query time.
-
-**Prevention:** After parsing the metric entry with NON ADDITIVE BY, validate each referenced dimension name against the parsed dimensions list. Emit a ParseError with position if not found, using the existing "did you mean" suggestion pattern.
-
-**Phase:** Semi-additive metrics phase.
-
----
-
-### N2: PARTITION BY EXCLUDING dimension cross-entity validation
-
-**What goes wrong:** Snowflake requires excluded dimensions be "accessible from the same entity that defines the window function metric." If a PARTITION BY EXCLUDING references a dimension from an unreachable table, the generated SQL references an unavailable column.
-
-**Prevention:** At define time, verify excluded dimension names are from the same table or a table reachable via one-to-one relationships from the metric's source table.
-
-**Phase:** Window function metrics phase.
-
----
-
-### N3: TERSE mode column subsetting requires VTab bind-time awareness
-
-**What goes wrong:** Snowflake TERSE mode returns 5 columns instead of 8 for SHOW SEMANTIC VIEWS. If the VTab always declares 8 columns, the TERSE flag must either change the bind-time schema or leave columns empty.
-
-**Prevention:** Pass TERSE as a named parameter to the VTab. In bind(), declare only the TERSE column set when the flag is true. This matches the existing pattern where different VTab variants declare different column schemas.
-
-**Phase:** SHOW enhancements phase.
-
----
-
-### N4: Struct blast radius when adding annotation fields
-
-**What goes wrong:** v0.5.3 retrospective: "Adding a new field to a widely-used struct creates a large blast radius (23+ struct literals)." COMMENT, SYNONYMS, PRIVATE, NON_ADDITIVE_BY, PARTITION_BY_EXCLUDING add 5+ fields across Metric, Dimension, Fact, and SemanticViewDefinition.
+**What goes wrong:** YAML literal block scalars (`|`) preserve newlines, folded block scalars (`>`) fold newlines to spaces. SQL expressions in dimension/metric `expr` fields may contain significant whitespace (e.g., CASE WHEN statements). Using the wrong YAML scalar style silently alters the expression.
 
 **Prevention:**
-- Add ALL new annotation fields in a single batch phase.
-- Verify all test fixtures use `..Default::default()` pattern. Grep for struct literals that manually specify all fields.
-- Consider an `Annotations` sub-struct grouping COMMENT + SYNONYMS + PRIVATE to reduce per-struct blast radius.
+1. Document that metric/dimension expressions should use literal block scalars (`|`) or quoted strings, not folded block scalars (`>`).
+2. Trim trailing whitespace/newlines from parsed expressions before storing them.
+3. Test round-trip: YAML with multiline CASE WHEN expression -> parse -> serialize to JSON -> compare with expected.
 
-**Phase:** First phase (model changes).
-
----
-
-### N5: GET_DDL ordering must be deterministic for version control
-
-**What goes wrong:** If reconstruction iterates HashMap fields or unordered collections, output order varies between runs.
-
-**Prevention:** Reconstruct in Vec index order (tables, joins, facts, dimensions, metrics). All are stored as Vecs preserving insertion order. Do NOT sort alphabetically -- preserve the user's original declaration order.
-
-**Phase:** GET_DDL phase.
+**Phase:** YAML parser implementation phase.
 
 ---
 
-### N6: C++ shim column count must be updated for new SHOW columns
+### Pitfall 12: GET_DDL YAML Round-Trip Fidelity
 
-**What goes wrong:** Adding columns (comment, synonyms) to SHOW output changes the column count. The C++ shim `sv_ddl_bind` dynamically reads column count from the result, so the schema forwarding is transparent. BUT sqllogictest assertions are column-count-sensitive (`query TTTTT` specifies exact column types and count). Every `.test` file asserting SHOW output must be updated atomically.
+**What goes wrong:** `GET_DDL('SEMANTIC_VIEW', 'name')` currently renders SQL DDL from stored `SemanticViewDefinition`. Adding YAML format output (`GET_DDL('SEMANTIC_VIEW', 'name', 'YAML')`) requires a YAML renderer. If the YAML renderer does not handle all model fields (comment, synonyms, access, non_additive_by, window_spec), the round-trip is lossy.
 
-**Prevention:** Change VTab output columns and ALL corresponding test expectations in the same commit. Run `just test-all` after every schema change.
+**Prevention:**
+1. The YAML renderer should use serde's YAML serialization of `SemanticViewDefinition` directly, not a hand-rolled template. This ensures all fields are included automatically when the model grows.
+2. Test: `GET_DDL -> parse back -> compare SemanticViewDefinition` for every model variant (with/without comments, synonyms, access modifiers, semi-additive, window specs).
 
-**Phase:** Every phase that changes output columns.
+**Phase:** GET_DDL YAML export phase, after the YAML parser is complete.
 
 ---
 
-### N7: View-level vs entry-level COMMENT parsing ambiguity
+### Pitfall 13: Materialization Routing Interacts with USING RELATIONSHIPS
 
-**What goes wrong:** Snowflake supports COMMENT at the view level (`CREATE SEMANTIC VIEW ... COMMENT = '...' AS TABLES (...)`) and at the entry level (on individual dimensions, metrics, facts). The parser must distinguish between a view-level COMMENT (before TABLES keyword) and the start of the TABLES clause.
+**What goes wrong:** A metric with `USING RELATIONSHIPS (rel_name)` specifies a join path. The materialization table was pre-computed using that specific join path. The routing engine matches the metric name but does not verify the USING context. If the query changes the USING relationship (or omits it), the materialization's pre-computed values may be wrong (computed over a different join path).
 
-**Prevention:** The view-level COMMENT must appear between the view name and `AS` keyword, or between `AS` and the first clause keyword. Since the parser currently expects `AS` followed immediately by clause keywords, insert COMMENT parsing between `AS` and the first clause keyword scan.
+**Prevention:**
+1. Materialization matching should be conservative: if any requested metric has `using_relationships`, skip materialization routing for that query entirely. The interaction between USING paths and materialization coverage is too complex for v0.7.0.
+2. Future versions can support USING-aware materializations with explicit declaration of which relationship path the materialization covers.
 
-**Phase:** Metadata system phase.
+**Phase:** Materialization routing engine phase, as an exclusion rule.
+
+---
+
+### Pitfall 14: Backward-Compatible Catalog Persistence for MATERIALIZATIONS
+
+**What goes wrong:** Adding a `materializations` field to `SemanticViewDefinition` changes the JSON schema stored in `semantic_layer._definitions`. Pre-v0.7.0 stored views do not have this field. If the new code requires `materializations` to be present, existing views fail to load.
+
+**Prevention:**
+1. Follow the existing pattern: `#[serde(default, skip_serializing_if = "Vec::is_empty")] pub materializations: Vec<Materialization>`. This is exactly how `facts`, `joins`, `tables`, `non_additive_by`, and every other optional field is handled.
+2. Backward-compat test: deserialize pre-v0.7.0 JSON (without `materializations` field) and verify it loads with empty materializations vec.
+3. This is a well-established pattern in this codebase -- 14 prior model extensions have used it successfully.
+
+**Phase:** Model extension phase (first phase).
+
+---
+
+### Pitfall 15: Materialization Query Expansion Differs from Raw Expansion Column Order
+
+**What goes wrong:** Raw expansion generates columns in the order: dimensions first, then metrics (this is the GROUP BY order). A materialization table may have columns in a different order, or may have additional columns not requested. If the routing engine does `SELECT * FROM materialization`, the column order differs from raw expansion, breaking callers that depend on positional column access.
+
+**Prevention:**
+1. When routing to a materialization, generate explicit `SELECT dim1, dim2, SUM(metric1), SUM(metric2) FROM materialization GROUP BY dim1, dim2` with columns in the same order as raw expansion would produce.
+2. Never use `SELECT *` from the materialization table.
+3. Quote all column names (using the existing `quote_ident` function) to handle reserved words.
+
+**Phase:** Materialization routing engine phase, during SQL generation.
 
 ---
 
@@ -371,31 +285,34 @@ Facts + metrics in the same request is contradictory for a single flat query.
 
 | Phase Topic | Likely Pitfall | Mitigation |
 |-------------|---------------|------------|
-| Model + backward compat | JSON deserialization failure (C4), struct blast radius (N4) | Every new field: `#[serde(default)]` + backward compat test. Batch all model changes. |
-| Semi-additive metrics | Wrong aggregation scope (C1), DuckDB NULL crash (C2), fan trap interaction (M5) | Two-stage CTE expansion, ROW_NUMBER over LAST_VALUE, fan trap bypass for semi-additive |
-| Window function metrics | GROUP BY incompatibility (C3), fan trap false positives (M5) | Forbid mixing with aggregate metrics, skip fan trap check for window metrics |
-| Metadata (COMMENT/SYNONYMS/PRIVATE) | Parser ambiguity (M1, M2), private metric inlining (M3), view-level COMMENT (N7) | Depth-0 keyword scan for annotations, PRIVATE as query-time-only filter |
-| Queryable FACTS | Facts + metrics mixing (M4) | Separate facts-only expansion mode, error on facts + metrics |
-| Wildcard selection | Name collision (M6) | Pre-resolve in bind(), deduplicate, error on cross-table ambiguity |
-| GET_DDL | Round-trip information loss (C5), ordering fidelity (N5) | Round-trip proptest, canonical ordering, re-quote identifiers |
-| SHOW enhancements | Scope model mismatch (M7), TERSE columns (N3), shim column counts (N6) | Filter on stored metadata, TERSE as VTab param, atomic test updates |
+| YAML crate selection | Deprecated/unsound dependencies (Pitfall 3) | Use serde_yaml_ng or serde-saphyr; pin version; add fuzz target |
+| Dollar-quote parsing | Nested delimiters truncate content (Pitfall 6) | Tagged delimiters ($yaml$...$yaml$); dedicated scanner function |
+| YAML inline parsing | Anchor bombs cause OOM (Pitfall 4) | Input size cap (1MB); post-parse cardinality validation |
+| YAML file reading | Security bypass of DuckDB file access controls (Pitfall 7) | Use DuckDB's read_text via catalog_conn; respect enable_external_access |
+| YAML parser | Multiline string fidelity (Pitfall 11) | Document scalar styles; trim trailing whitespace; round-trip tests |
+| Shared validation extraction | Model drift between SQL and YAML paths (Pitfall 5) | Extract validation from body_parser.rs; feature parity tests |
+| GET_DDL YAML output | Lossy round-trip (Pitfall 12) | Use serde YAML serialization, not hand-rolled template |
+| Materialization model | Backward-compat catalog breakage (Pitfall 14) | Follow existing serde(default, skip_serializing_if) pattern |
+| Materialization matching | Non-additive re-aggregation (Pitfall 1) | Classify additivity at define time; reject non-additive subset matches |
+| Materialization matching | Semi-additive/window metric bypass (Pitfall 2) | Exclude semi-additive and window metrics from routing |
+| Materialization matching | Derived metric name resolution (Pitfall 10) | Match by metric name, not expression |
+| Materialization matching | USING relationship interaction (Pitfall 13) | Skip routing for queries with USING metrics |
+| Materialization query gen | Column order/type mismatches (Pitfalls 9, 15) | Explicit SELECT with quoted column names; type validation at define time |
+| Materialization output | Staleness invisible to users (Pitfall 8) | SQL comment annotation; explain_semantic_view visibility |
 
 ## Sources
 
-- [Snowflake CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- NON ADDITIVE BY, PARTITION BY EXCLUDING, COMMENT, SYNONYMS, PRIVATE syntax (HIGH confidence)
-- [Snowflake querying semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/querying) -- query-time behavior, wildcard selection, fact querying (HIGH confidence)
-- [Snowflake SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- IN SCHEMA/DATABASE, TERSE mode, output columns (HIGH confidence)
-- [Snowflake semi-additive release note](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY behavior: "rows are sorted by the non-additive dimensions, and the values from the last rows are aggregated" (HIGH confidence)
-- [Snowflake YAML specification](https://docs.snowflake.com/en/user-guide/views-semantic/semantic-view-yaml-spec) -- non_additive_dimensions fields, synonyms, access_modifier (HIGH confidence)
-- [Snowflake GET_DDL](https://docs.snowflake.com/en/sql-reference/functions/get_ddl) -- semantic view DDL reconstruction (MEDIUM confidence -- limited detail for semantic views specifically)
-- [DuckDB issue #20136](https://github.com/duckdb/duckdb/issues/20136) -- LAST_VALUE/FIRST_VALUE IGNORE NULLS crash on all-NULL partitions, fixed Dec 2025 in PR #20153 (HIGH confidence)
-- [DuckDB window functions](https://duckdb.org/docs/current/sql/functions/window_functions) -- LAST_VALUE, IGNORE NULLS, frame specifications (HIGH confidence)
-- [Serde field attributes](https://serde.rs/field-attrs.html) -- skip_serializing_if, default, backward compatibility patterns (HIGH confidence)
-- [DuckDB SHOW FROM/IN discussion](https://github.com/duckdb/duckdb/discussions/16083) -- IN SCHEMA/DATABASE not natively supported in DuckDB SHOW (MEDIUM confidence)
-- Codebase: `src/expand/sql_gen.rs` -- single-pass expansion with GROUP BY (HIGH confidence, direct inspection)
-- Codebase: `src/expand/fan_trap.rs` -- cardinality-based fan trap detection (HIGH confidence, direct inspection)
-- Codebase: `src/model.rs` -- SemanticViewDefinition serde annotations (HIGH confidence, direct inspection)
-- Codebase: `src/body_parser.rs` -- clause boundary scanning, entry parsing (HIGH confidence, direct inspection)
-- Codebase: `src/parse.rs` -- DDL detection, SHOW filter parsing (HIGH confidence, direct inspection)
-- Project RETROSPECTIVE.md v0.5.3 -- "Adding a new field to widely-used struct creates large blast radius" (HIGH confidence)
-- Project TECH-DEBT.md item 12 -- DDL pipeline all-VARCHAR result forwarding (HIGH confidence)
+- [serde_yaml deprecation discussion](https://users.rust-lang.org/t/serde-yaml-deprecation-alternatives/108868)
+- [serde_yaml 0.9.34+deprecated on docs.rs](https://docs.rs/crate/serde_yaml/latest)
+- [serde_yml soundness issues](https://github.com/sebastienrousseau/serde_yml)
+- [serde_yaml_ng maintained fork](https://github.com/acatton/serde-yaml-ng)
+- [serde-saphyr pure-Rust YAML](https://github.com/bourumir-wyngs/serde-saphyr)
+- [DuckDB securing extensions](https://duckdb.org/docs/stable/operations_manual/securing_duckdb/overview)
+- [DuckDB file access with read_text](https://duckdb.org/docs/current/guides/file_formats/read_file)
+- [Cube.dev pre-aggregation matching](https://cube.dev/docs/product/caching/matching-pre-aggregations)
+- [Cube.dev non-additivity recipes](https://cube.dev/docs/product/caching/recipes/non-additivity)
+- [Aggregation Consistency Errors in Semantic Layers](https://arxiv.org/pdf/2307.00417)
+- [Billion laughs attack (Wikipedia)](https://en.wikipedia.org/wiki/Billion_laughs_attack)
+- [PostgreSQL dollar-quoted string constants](https://www.geeksforgeeks.org/postgresql/postgresql-dollar-quoted-string-constants/)
+- [Holistics non-additive measures documentation](https://docs.holistics.io/docs/modeling/non-additive-measures)
+- Project design doc: `_notes/semantic-views-duckdb-design-doc.md` (pre-aggregation selection algorithm)

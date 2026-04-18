@@ -1,17 +1,17 @@
 # Project Research Summary
 
-**Project:** DuckDB Semantic Views v0.6.0 — Snowflake SQL DDL Parity
-**Domain:** DuckDB Rust extension — close all remaining feature gaps against Snowflake SQL DDL semantic views
-**Researched:** 2026-04-09
+**Project:** DuckDB Semantic Views v0.7.0 — YAML Definitions & Materialization Routing
+**Domain:** DuckDB Rust extension — YAML definition format and materialization routing engine
+**Researched:** 2026-04-18
 **Confidence:** HIGH
 
 ## Executive Summary
 
-v0.6.0 closes the remaining feature gaps between this extension and Snowflake's SQL DDL semantic views. The codebase (16,342 LOC, 487 tests) is mature with established patterns for every category of work: serde-driven model extensions, hand-written state machine parsing, VTab-per-DDL-verb DDL handling, and a single-pass SQL expansion engine. All seven target feature groups map cleanly onto existing extension points — no new Rust crates are required, and architectural boundaries remain unchanged.
+v0.7.0 adds two architecturally independent feature tracks to a mature extension (705 tests, 25,983 LOC). Track A is a YAML definition format: users can write `CREATE SEMANTIC VIEW name FROM YAML $$ ... $$` or `FROM YAML FILE '/path/to/file.yaml'` as an alternative to SQL keyword DDL. Track B is a materialization routing engine: a new `MATERIALIZATIONS` clause declares pre-existing aggregated tables, and at query time the extension transparently routes `semantic_view()` calls to those tables instead of expanding raw sources. Both tracks converge on the existing `SemanticViewDefinition` model struct as their common interface — YAML parsing produces the same struct SQL DDL produces, and materialization routing consumes an extended version of it.
 
-The features fall into three tiers: Tier 1 (metadata, GET_DDL, SHOW enhancements) touches only the model layer and DDL VTabs with zero expansion pipeline impact. Tier 2 (wildcard selection, queryable FACTS) adds new resolution modes to the expansion pipeline without restructuring SQL shape. Tier 3 (semi-additive metrics, window function metrics) requires fundamentally different SQL generation. Build order must follow tier order so model changes stabilize before expansion changes begin.
+The recommended approach is to implement YAML as a parse-time transformation: YAML input is parsed in Rust, converted to JSON, and fed into the existing `_from_json` table function pipeline. This avoids new table function registrations and keeps the DDL execution path identical. The single new dependency is `serde_yaml_ng 0.10`, a maintained fork of dtolnay's original serde_yaml. The obvious alternatives have critical problems: `serde_yaml` is archived, `serde_yml` has a live RUSTSEC-2025-0068 soundness advisory. Materialization routing requires only std library additions — a new `materialize.rs` module using `HashSet::is_subset` checks, inserted as a pre-check before the existing expansion pipeline.
 
-The primary technical risk is semi-additive metric expansion (NON ADDITIVE BY). The existing single-pass expansion generates exactly one query shape; semi-additive requires a CTE-based two-stage approach using `ROW_NUMBER()` (not `LAST_VALUE IGNORE NULLS`, which has a DuckDB all-NULL crash bug on LTS 1.4.x). Window function metrics (PARTITION BY EXCLUDING) are architecturally orthogonal — research recommends parsing and storing the model now, with query-time expansion returning an error if queried (full expansion deferred or implemented last).
+The dominant risk across both tracks is correctness of the materialization routing engine. Re-aggregating non-additive metrics (AVG, COUNT DISTINCT), semi-additive metrics (NON ADDITIVE BY), and window function metrics through a GROUP BY wrapper over a pre-aggregated table produces silently wrong results — the worst possible failure mode for a semantic layer. The mitigation is conservative routing: classify metrics for additivity at define time and refuse to route to a materialization when any requested metric is non-additive and re-aggregation would be required. A secondary risk is model drift between the SQL DDL and YAML parsing paths as future features are added; a shared post-parse validation function and feature-parity test pairs are the prevention.
 
 ---
 
@@ -19,84 +19,93 @@ The primary technical risk is semi-additive metric expansion (NON ADDITIVE BY). 
 
 ### Recommended Stack
 
-**Zero new crates required.** Every v0.6.0 feature builds on the existing dependency set (duckdb =1.10500.0, serde_json 1.x, strsim 0.11). No template engines, regex, date libraries, or parsing libraries needed.
+The only new dependency is `serde_yaml_ng = "0.10"`. Because `SemanticViewDefinition` and all nested structs already derive `serde::Serialize` and `serde::Deserialize`, YAML parsing is largely free once the dependency is added. All remaining features — dollar-quote detection, file I/O, materialization routing, re-aggregation SQL generation — use only the existing Rust standard library.
 
-DuckDB natively supports all required SQL constructs for semi-additive and window function metrics: `LAST_VALUE(expr IGNORE NULLS) OVER (PARTITION BY ... ORDER BY ...)`, window aggregates without GROUP BY, and CTE wrapping. Semi-additive should use `ROW_NUMBER()` for the snapshot selection CTE (safer than `LAST_VALUE` on DuckDB LTS).
+**Core technologies:**
+- `serde_yaml_ng 0.10`: YAML deserialization/serialization — only maintained serde-compatible fork without security advisories; MIT license already allowed in `deny.toml`
+- DuckDB `read_text()` via `catalog_conn`: YAML FILE loading — must use DuckDB's file abstraction (not `std::fs`) to respect `enable_external_access` security controls
+- `std::collections::HashSet` (existing): Materialization routing — set-containment checks are the entire routing algorithm; no external query planner needed
+
+**Critical rejections:** `serde_yaml` (archived March 2024), `serde_yml` (RUSTSEC-2025-0068, archived), `serde-saphyr` (pre-1.0 API, viable for future milestones).
 
 ### Expected Features
 
-**Table stakes (must have for Snowflake parity):**
-1. COMMENT on views and all objects (tables, dimensions, metrics, facts)
-2. SYNONYMS on all objects (informational only — do NOT affect query resolution)
-3. PRIVATE/PUBLIC access modifiers on facts and metrics (PRIVATE cannot be queried but CAN be referenced by derived metrics)
-4. Semi-additive metrics (NON ADDITIVE BY) — snapshot aggregation via `ROW_NUMBER()` CTE pre-filter
-5. Queryable FACTS — row-level query mode; mutually exclusive with METRICS in same query
-6. ALTER SET/UNSET COMMENT
-7. SHOW enhancements: synonyms/comment columns, IN SCHEMA/DATABASE scope, TERSE mode, SHOW COLUMNS
+**Table stakes (must have):**
+- T1: YAML inline parsing (`FROM YAML $$ ... $$`) — foundation for all YAML features
+- T2: YAML file loading (`FROM YAML FILE '/path'`) — DX advantage; trivial once T1 exists
+- T3: YAML round-trip export (`GET_DDL('SEMANTIC_VIEW', 'name', 'YAML')`) — version control workflow
+- T4: Materialization declaration (`MATERIALIZATIONS` clause) — data model for routing
+- T5: Query-time materialization routing — core value; without this T4 is dead metadata
+- T6: Re-aggregation for subset matches — makes one wide materialization serve many queries; requires additivity gating
 
 **Differentiators:**
-1. GET_DDL reconstruction — round-trip DDL from stored JSON; validates model fidelity
-2. Wildcard selection (`table_alias.*`) — query-time convenience
-3. Window function metrics (PARTITION BY EXCLUDING) — DDL model + parse now, expansion last
-4. Fan trap detection remains a DuckDB advantage over Snowflake (which silently produces wrong results)
+- D1: Additivity metadata on `Metric` struct — stored at define time, makes T5/T6 robust; surfaces in SHOW output
+- D2: `EXPLAIN MATERIALIZATION FOR SEMANTIC VIEW` — routing transparency; users cannot debug without it
+- D3: Materializations section in YAML schema — completes YAML feature parity with SQL DDL
 
-**Anti-features (do not implement):**
-- Direct SQL query interface (`SELECT AGG(metric) FROM sv GROUP BY dim`) — fundamentally different architecture
-- SEMANTIC_VIEW() clause syntax — requires parser-level integration beyond current hook model
-- Cortex AI integration (AI_SQL_GENERATION, AI_QUESTION_CATEGORIZATION) — Snowflake-specific
-- COPY GRANTS — no DuckDB RBAC
+**Defer (v0.8+):** Automatic refresh, freshness tracking, AVG decomposition, granularity-based time matching, `filters` clause, cross-view materialization sharing.
 
 ### Architecture Approach
 
-Seven feature groups fall into three integration tiers:
+YAML and Materialization are independent tracks meeting only at `model.rs`. The recommended YAML-to-JSON-at-parse-time approach eliminates new table function registrations — the rewritten SQL is identical to the SQL DDL path, so the execution engine sees no difference.
 
-**Tier 1 — Model + DDL only (no expansion impact):**
-- Metadata fields (COMMENT, SYNONYMS, PRIVATE/PUBLIC) on model structs with `#[serde(default)]`
-- Body parser extensions for new annotation suffixes
-- SHOW/DESCRIBE output column additions
-- ALTER SET/UNSET COMMENT (new DdlKind variant)
-- GET_DDL (table function reading stored JSON, reconstructing DDL text)
-- SHOW enhancements (TERSE, IN scope, SHOW COLUMNS)
+**New components:**
+1. `yaml_parser.rs` — YAML string → `SemanticViewDefinition` via `YamlDef` intermediate structs; converts to JSON for existing `_from_json` pipeline
+2. `materialize.rs` — `route_query()` with set-containment matching; returns `RouteResult::Materialized(sql)` or `RouteResult::Fallback`
+3. `render_yaml.rs` — serde-based YAML serialization of `SemanticViewDefinition`; used by extended `GET_DDL`
 
-**Tier 2 — Expansion modifications (no SQL shape change):**
-- Wildcard selection: resolve `alias.*` to matching dimension/metric names before existing resolution loop
-- Queryable FACTS: separate expansion mode without GROUP BY, no aggregation
+**Modified components:** `parse.rs` (FROM YAML detection + dollar-quote extraction), `model.rs` (Materialization struct + field), `body_parser.rs` (MATERIALIZATIONS clause), `query/table_function.rs` (routing pre-check before expand), `ddl/get_ddl.rs` (YAML format parameter).
 
-**Tier 3 — Expansion structural changes (different SQL shape):**
-- Semi-additive metrics: CTE-based two-stage expansion (ROW_NUMBER snapshot selection → GROUP BY aggregation)
-- Window function metrics: expansion without GROUP BY, PARTITION BY EXCLUDING
+**Key architectural constraint:** File I/O for `FROM YAML FILE` must happen at bind time via `read_text()` in the rewritten SQL, not at parse time. The parser hook context does not have access to the execution engine.
 
 ### Critical Pitfalls
 
-1. **JSON backward compatibility (CRITICAL):** Adding 5+ new fields across Metric, Dimension, Fact, and SemanticViewDefinition. A single missing `#[serde(default)]` renders the entire catalog inaccessible. Batch all model changes in Phase 1 with a v0.5.5 JSON deserialization test as gate.
-2. **Semi-additive expansion scope (CRITICAL):** CTE composable wrapper, not inline branching. Use separate CTE per semi-additive metric for correctness over optimization.
-3. **DuckDB LAST_VALUE IGNORE NULLS crash (CRITICAL):** Use `ROW_NUMBER()` instead on LTS 1.4.x branch.
-4. **Window metrics + GROUP BY incompatible (CRITICAL):** Detect and error at expand time — cannot coexist with aggregate metrics.
-5. **GET_DDL round-trip quoting (MODERATE):** Expressions survive as opaque SQL strings, but structural identifiers must be re-quoted. Validate with round-trip proptest.
-6. **SHOW IN SCHEMA/DATABASE model mismatch (MODERATE):** DuckDB has no native `IN SCHEMA` for extension SHOW. Filter on stored metadata fields (database_name, schema_name from v0.5.5).
-7. **Parser annotation ambiguity (MODERATE):** Grammar for COMMENT/SYNONYMS after expressions needs design decision: right-to-left keyword scan vs fixed-order grammar.
+1. **Re-aggregation of non-additive metrics produces silently wrong results** — AVG, COUNT DISTINCT, PERCENTILE cannot be re-aggregated with GROUP BY. Prevention: classify additivity at define time (parse outermost aggregate function); refuse subset-dimension routing for non-additive metrics; default Unknown → NonAdditive.
+
+2. **Semi-additive and window metrics bypass correctness** — NON ADDITIVE BY requires CTE-based ROW_NUMBER snapshot selection; window metrics require inner-aggregation + outer-window pipelines. A pre-aggregated materialization has already collapsed raw rows. Prevention: if any requested metric is semi-additive or windowed, always fall back to raw expansion.
+
+3. **serde_yaml ecosystem fragmentation** — `serde_yaml` archived, `serde_yml` has live RUSTSEC soundness advisory (segfaults in serializer). Prevention: use `serde_yaml_ng 0.10` specifically; add `fuzz_yaml_parse` target; document in TECH-DEBT.md.
+
+4. **YAML anchor/alias bombs** — 1KB YAML with nested anchors expands to gigabytes, crashing DuckDB process. Prevention: 1MB input size cap before parsing; post-parse cardinality validation; anchor bomb patterns in fuzz target.
+
+5. **Dual-format model drift** — SQL DDL and YAML paths diverge as future features are added to one but not the other. Prevention: extract shared post-parse validation function; create feature-parity test pairs; use serde-based YAML renderer (not hand-rolled templates).
+
+6. **File I/O security bypass** — `std::fs::read_to_string` circumvents DuckDB's `enable_external_access`. Prevention: use `read_text()` via `catalog_conn`; test failure when `enable_external_access=false`.
 
 ---
 
-## Suggested Build Order (6 Phases)
+## Suggested Build Order (8 Phases)
 
-1. **Metadata Foundation** — Model struct fields + body_parser.rs extensions + backward-compat JSON test. Prerequisite for everything else.
-2. **SHOW/DESCRIBE Metadata Surface + SHOW Enhancements** — Surface metadata columns, TERSE mode, IN SCHEMA/DATABASE, SHOW COLUMNS.
-3. **ALTER SET/UNSET COMMENT + GET_DDL** — DDL-only changes; GET_DDL validates round-trip fidelity.
-4. **Wildcard Selection + Queryable FACTS** — Tier 2 expansion modifications; familiarizes with expansion pipeline before Tier 3.
-5. **Semi-Additive Metrics (NON ADDITIVE BY)** — Highest-complexity expansion change; CTE-based snapshot aggregation.
-6. **Window Function Metrics** — Parse and store PARTITION BY EXCLUDING in model; implement expansion or return error if queried.
+1. **YAML Parser Core** — `serde_yaml_ng` dependency, `YamlDef` structs, YAML → `SemanticViewDefinition` conversion, shared post-parse validation extraction. Additivity enum on Metric established here (needed by Phase 5).
+2. **Dollar-Quoting and DDL Integration** — `FROM YAML` detection in `validate_create_body()`, dollar-quote extraction, YAML-to-JSON-at-parse-time rewrite. End-to-end `CREATE ... FROM YAML $$...$$`.
+3. **YAML File Loading** — `FROM YAML FILE '/path'` syntax, `read_text()` subquery rewrite, file security boundary.
+4. **Materialization Model and DDL** — `Materialization` struct, `MATERIALIZATIONS` clause in `body_parser.rs`, define-time validation, backward-compat tests.
+5. **Materialization Routing Engine (Exact Match)** — `materialize.rs` with `route_query()`, integration in `table_function.rs`, exclusion rules for semi-additive/window/USING metrics.
+6. **Re-Aggregation for Subset Matches** — Subset-dimension routing with GROUP BY, aggregate function mapping (SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX), additivity gating.
+7. **YAML Export and YAML+MATERIALIZATIONS** — `render_yaml.rs`, `GET_DDL('SEMANTIC_VIEW', 'name', 'YAML')` format parameter, materializations in YAML schema, round-trip tests.
+8. **Introspection and Diagnostics** — `EXPLAIN MATERIALIZATION FOR SEMANTIC VIEW`, materialization entries in DESCRIBE, optional `SHOW SEMANTIC MATERIALIZATIONS`.
+
+### Phase Ordering Rationale
+- Tracks A (YAML, Phases 1-3) and B (Materialization, Phases 4-6) are fully independent and can be interleaved
+- D1 (additivity metadata) placed in Phase 1 rather than polish because Phase 5 routing correctness depends on it
+- Exact-match routing (Phase 5) separated from re-aggregation (Phase 6) to provide a safe shippable increment
+- YAML export (Phase 7) placed after Phase 4 so materializations are included in the round-trip format
+
+### Research Flags
+
+**No additional research needed:** Phases 1-4, 7, 8 use standard patterns with direct codebase precedent.
+
+**Elevated testing (correctness risk):** Phase 5 (routing exclusion rules — negative test cases mandatory), Phase 6 (aggregate detection from SQL strings — proptest mandatory; conservative Unknown→NonAdditive default).
 
 ---
 
 ## Open Questions
 
-- **Mixed regular + semi-additive metrics:** When a query requests both, should expansion generate a CTE-based split query or forbid mixing? Snowflake allows mixing. Design decision needed in Phase 5.
-- **Semi-additive + fan trap interaction:** Should fan trap check skip semi-additive metrics entirely, or produce a warning?
-- **NON ADDITIVE BY sort order:** Snowflake syntax says ASC but "last row" semantics implies DESC. Needs exact verification.
-- **GET_DDL registration:** Scalar function via `create_scalar_function` needs verification; VTab (table function) is proven fallback.
-- **Window metric SHOW COLUMNS `required` column:** Exact behavior needs verification against Snowflake.
-- **PARTITION BY EXCLUDING grammar:** Body parser design for window function metrics needs careful design.
+- **`serde_yaml_ng` anchor bomb handling:** Verify whether the crate limits anchor expansion or if we need manual protection.
+- **Dollar-quote behavior in parser hook:** DuckDB supports `$$` at SQL level, but our parser hook fires before DuckDB's parser. Needs integration test.
+- **`catalog_conn` availability for file I/O:** Verify this connection is accessible in the file-loading code path.
+- **Materialization table existence validation:** Define-time vs query-time validation of materialization table existence.
+- **Additivity for complex expressions:** `SUM(CASE WHEN ... THEN amount END)` is additive but not trivially detectable. May need conservative heuristic.
 
 ---
 
