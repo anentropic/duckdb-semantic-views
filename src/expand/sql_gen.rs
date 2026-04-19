@@ -1087,6 +1087,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1301,6 +1302,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1387,6 +1389,7 @@ GROUP BY
                     },
                 ],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1462,6 +1465,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1624,6 +1628,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1715,6 +1720,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -2388,6 +2394,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -2483,6 +2490,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -2556,6 +2564,7 @@ GROUP BY
                     synonyms: vec![],
                     access: AccessModifier::Public,
                 }],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -2687,6 +2696,7 @@ GROUP BY
                     },
                 ],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -2789,6 +2799,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3052,6 +3063,7 @@ GROUP BY
                     },
                 ],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3255,6 +3267,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3328,6 +3341,7 @@ GROUP BY
                 }],
                 joins: vec![],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3397,6 +3411,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3499,6 +3514,7 @@ GROUP BY
                 ],
                 joins: vec![],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3560,6 +3576,7 @@ GROUP BY
                 ],
                 joins: vec![],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,

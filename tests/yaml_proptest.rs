@@ -1,7 +1,8 @@
 use proptest::prelude::*;
 use semantic_views::model::{
-    AccessModifier, Cardinality, Dimension, Fact, Join, JoinColumn, Metric, NonAdditiveDim,
-    NullsOrder, SemanticViewDefinition, SortOrder, TableRef, WindowOrderBy, WindowSpec,
+    AccessModifier, Cardinality, Dimension, Fact, Join, JoinColumn, Materialization, Metric,
+    NonAdditiveDim, NullsOrder, SemanticViewDefinition, SortOrder, TableRef, WindowOrderBy,
+    WindowSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -173,6 +174,21 @@ fn arb_join() -> impl Strategy<Value = Join> {
         )
 }
 
+fn arb_materialization() -> impl Strategy<Value = Materialization> {
+    (
+        arb_name(),
+        arb_name(),
+        proptest::collection::vec(arb_name(), 0..=3),
+        proptest::collection::vec(arb_name(), 0..=3),
+    )
+        .prop_map(|(name, table, dimensions, metrics)| Materialization {
+            name,
+            table,
+            dimensions,
+            metrics,
+        })
+}
+
 fn arb_definition() -> impl Strategy<Value = SemanticViewDefinition> {
     (
         arb_name(),
@@ -182,9 +198,10 @@ fn arb_definition() -> impl Strategy<Value = SemanticViewDefinition> {
         proptest::collection::vec(arb_join(), 0..=2),
         proptest::collection::vec(arb_fact(), 0..=2),
         proptest::option::of("[a-z ]{1,30}"),
+        proptest::collection::vec(arb_materialization(), 0..=2),
     )
         .prop_map(
-            |(base_table, tables, dimensions, metrics, joins, facts, comment)| {
+            |(base_table, tables, dimensions, metrics, joins, facts, comment, materializations)| {
                 SemanticViewDefinition {
                     base_table,
                     tables,
@@ -192,6 +209,7 @@ fn arb_definition() -> impl Strategy<Value = SemanticViewDefinition> {
                     metrics,
                     joins,
                     facts,
+                    materializations,
                     column_type_names: vec![],
                     column_types_inferred: vec![],
                     created_on: None,
@@ -224,5 +242,12 @@ proptest! {
 
         // Assert structural equality
         prop_assert_eq!(from_json, from_yaml);
+    }
+
+    #[test]
+    fn materialization_json_roundtrip(mat in arb_materialization()) {
+        let json_str = serde_json::to_string(&mat).expect("JSON serialize");
+        let roundtripped: Materialization = serde_json::from_str(&json_str).expect("JSON deserialize");
+        prop_assert_eq!(mat, roundtripped);
     }
 }

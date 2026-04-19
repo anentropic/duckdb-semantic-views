@@ -63,6 +63,7 @@ pub(super) fn make_def(
             })
             .collect(),
         facts: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],
@@ -109,6 +110,7 @@ pub(super) fn make_def_with_facts(
         dimensions: vec![],
         metrics: vec![],
         joins: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],
@@ -167,6 +169,7 @@ pub(super) fn make_def_with_derived_metrics(
         dimensions: vec![],
         joins: vec![],
         facts: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],
@@ -226,6 +229,7 @@ pub(super) fn make_def_with_named_joins(
             })
             .collect(),
         facts: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],

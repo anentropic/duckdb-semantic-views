@@ -248,6 +248,43 @@ fn emit_metrics(out: &mut String, def: &SemanticViewDefinition) {
     out.push_str(")\n");
 }
 
+/// Emit MATERIALIZATIONS clause entries.
+fn emit_materializations(out: &mut String, def: &SemanticViewDefinition) {
+    out.push_str("MATERIALIZATIONS (\n");
+    for (i, mat) in def.materializations.iter().enumerate() {
+        out.push_str("    ");
+        out.push_str(&mat.name);
+        out.push_str(" AS (\n");
+        out.push_str("        TABLE ");
+        out.push_str(&mat.table);
+        if !mat.dimensions.is_empty() || !mat.metrics.is_empty() {
+            out.push_str(",\n");
+        } else {
+            out.push('\n');
+        }
+        if !mat.dimensions.is_empty() {
+            out.push_str("        DIMENSIONS (");
+            out.push_str(&mat.dimensions.join(", "));
+            out.push(')');
+            if !mat.metrics.is_empty() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+        if !mat.metrics.is_empty() {
+            out.push_str("        METRICS (");
+            out.push_str(&mat.metrics.join(", "));
+            out.push_str(")\n");
+        }
+        out.push_str("    )");
+        if i + 1 < def.materializations.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str(")\n");
+}
+
 /// Reconstruct a `CREATE OR REPLACE SEMANTIC VIEW` DDL statement from a stored
 /// definition. Returns `Err` for legacy definitions (empty `tables` vec).
 ///
@@ -286,6 +323,9 @@ pub fn render_create_ddl(name: &str, def: &SemanticViewDefinition) -> Result<Str
     }
     if !def.metrics.is_empty() {
         emit_metrics(&mut out, def);
+    }
+    if !def.materializations.is_empty() {
+        emit_materializations(&mut out, def);
     }
 
     Ok(out)
@@ -847,5 +887,109 @@ mod tests {
         let ws = kb.metrics[1].window_spec.as_ref().unwrap();
         assert!(ws.excluding_dims.is_empty());
         assert_eq!(ws.partition_dims, vec!["region"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 54: MATERIALIZATIONS DDL reconstruction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_materializations_emitted_when_present() {
+        use crate::model::Materialization;
+        let mut def = minimal_def();
+        def.materializations = vec![Materialization {
+            name: "daily_rev".to_string(),
+            table: "daily_revenue_agg".to_string(),
+            dimensions: vec!["region".to_string()],
+            metrics: vec!["revenue".to_string()],
+        }];
+        let ddl = render_create_ddl("mv", &def).unwrap();
+        assert!(
+            ddl.contains("MATERIALIZATIONS ("),
+            "DDL should contain MATERIALIZATIONS: {ddl}"
+        );
+        assert!(
+            ddl.contains("daily_rev AS ("),
+            "DDL should contain materialization name: {ddl}"
+        );
+        assert!(
+            ddl.contains("TABLE daily_revenue_agg"),
+            "DDL should contain TABLE sub-clause: {ddl}"
+        );
+        assert!(
+            ddl.contains("DIMENSIONS (region)"),
+            "DDL should contain DIMENSIONS sub-clause: {ddl}"
+        );
+        assert!(
+            ddl.contains("METRICS (revenue)"),
+            "DDL should contain METRICS sub-clause: {ddl}"
+        );
+    }
+
+    #[test]
+    fn test_materializations_omitted_when_empty() {
+        let def = minimal_def();
+        let ddl = render_create_ddl("nomats", &def).unwrap();
+        assert!(
+            !ddl.contains("MATERIALIZATIONS"),
+            "DDL should not contain MATERIALIZATIONS when empty: {ddl}"
+        );
+    }
+
+    #[test]
+    fn test_materializations_clause_ordering() {
+        use crate::model::Materialization;
+        let mut def = minimal_def();
+        def.materializations = vec![Materialization {
+            name: "mat1".to_string(),
+            table: "t1".to_string(),
+            dimensions: vec!["region".to_string()],
+            metrics: vec![],
+        }];
+        let ddl = render_create_ddl("ordered", &def).unwrap();
+        let metrics_pos = ddl.find("METRICS (").unwrap();
+        let mats_pos = ddl.find("MATERIALIZATIONS (").unwrap();
+        assert!(
+            metrics_pos < mats_pos,
+            "MATERIALIZATIONS should come after METRICS"
+        );
+    }
+
+    #[test]
+    fn test_materializations_ddl_roundtrip() {
+        use crate::body_parser::parse_keyword_body;
+        use crate::model::Materialization;
+        let mut def = minimal_def();
+        def.materializations = vec![
+            Materialization {
+                name: "daily_rev".to_string(),
+                table: "daily_revenue_agg".to_string(),
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["revenue".to_string()],
+            },
+            Materialization {
+                name: "monthly_rev".to_string(),
+                table: "monthly_agg".to_string(),
+                dimensions: vec![],
+                metrics: vec!["revenue".to_string()],
+            },
+        ];
+        let ddl1 = render_create_ddl("rt", &def).unwrap();
+        // Parse the generated DDL body
+        let as_pos = ddl1.find(" AS\n").unwrap();
+        let body = format!("AS {}", &ddl1[as_pos + 4..]);
+        let kb = parse_keyword_body(&body, 0).expect("Round-trip parse should succeed");
+        let def2 = SemanticViewDefinition {
+            base_table: "orders".to_string(),
+            tables: kb.tables,
+            dimensions: kb.dimensions,
+            metrics: kb.metrics,
+            joins: kb.relationships,
+            facts: kb.facts,
+            materializations: kb.materializations,
+            ..Default::default()
+        };
+        let ddl2 = render_create_ddl("rt", &def2).unwrap();
+        assert_eq!(ddl1, ddl2, "Round-trip DDL should be identical");
     }
 }

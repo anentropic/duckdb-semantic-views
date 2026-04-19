@@ -81,6 +81,7 @@ fn simple_definition() -> SemanticViewDefinition {
 
         joins: vec![],
         facts: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],
@@ -191,6 +192,7 @@ fn joined_definition() -> SemanticViewDefinition {
             },
         ],
         facts: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],

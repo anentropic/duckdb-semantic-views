@@ -541,6 +541,7 @@ mod tests {
             dimensions: vec![],
             metrics: vec![],
             facts: vec![],
+            materializations: vec![],
 
             column_type_names: vec![],
             column_types_inferred: vec![],
@@ -719,6 +720,7 @@ mod tests {
                 dimensions: vec![],
                 metrics: vec![],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],

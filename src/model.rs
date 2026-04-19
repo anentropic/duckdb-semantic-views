@@ -202,6 +202,30 @@ impl Metric {
     }
 }
 
+/// A named materialization declaration mapping a pre-aggregated table
+/// to the dimensions and metrics it covers.
+///
+/// At define time, only the dimension/metric name references are validated
+/// (must match declared names). The TABLE is not validated for existence
+/// (it may be created later by external tools like dbt).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct Materialization {
+    /// User-assigned name for this materialization (e.g., `daily_revenue_by_region`).
+    pub name: String,
+    /// Fully qualified table name of the pre-aggregated table
+    /// (e.g., `catalog.schema.daily_revenue_agg`).
+    pub table: String,
+    /// Dimension names covered by this materialization.
+    /// Must be a subset of the semantic view's declared dimensions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dimensions: Vec<String>,
+    /// Metric names covered by this materialization.
+    /// Must be a subset of the semantic view's declared metrics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<String>,
+}
+
 /// A named raw SQL column expression — a pre-aggregation fact, scoped to a table alias.
 /// Added in Phase 11 for the FACTS clause of CREATE SEMANTIC VIEW.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -351,6 +375,11 @@ pub struct SemanticViewDefinition {
     pub joins: Vec<Join>,
     #[serde(default)]
     pub facts: Vec<Fact>,
+    /// Named materializations mapping pre-aggregated tables to covered dims/metrics.
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub materializations: Vec<Materialization>,
     /// Column names from DDL-time LIMIT 0 inference, parallel to `column_types_inferred`.
     /// Populated by `create_semantic_view` `invoke()`. Empty = no inference ran.
     /// Used by `bind()` to build a name→type map for subquery column lookups.
@@ -658,6 +687,7 @@ mod tests {
 
                 joins: vec![],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -871,6 +901,7 @@ mod tests {
 
                 joins: vec![],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec!["region".to_string(), "revenue".to_string()],
                 column_types_inferred: vec![17u32, 20u32],
@@ -1883,6 +1914,146 @@ comment: Revenue analytics view
             let from_json = SemanticViewDefinition::from_json("test", &json_str).unwrap();
             let from_yaml = SemanticViewDefinition::from_yaml("test", &yaml_str).unwrap();
             assert_eq!(from_json, from_yaml);
+        }
+    }
+
+    mod phase54_materialization_tests {
+        use super::*;
+
+        #[test]
+        fn materialization_json_roundtrip() {
+            let mat = Materialization {
+                name: "daily_rev".to_string(),
+                table: "daily_revenue_agg".to_string(),
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["revenue".to_string(), "order_count".to_string()],
+            };
+            let json = serde_json::to_string(&mat).unwrap();
+            let rt: Materialization = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.name, "daily_rev");
+            assert_eq!(rt.table, "daily_revenue_agg");
+            assert_eq!(rt.dimensions, vec!["region"]);
+            assert_eq!(rt.metrics, vec!["revenue", "order_count"]);
+        }
+
+        #[test]
+        fn materialization_yaml_roundtrip() {
+            let mat = Materialization {
+                name: "daily_rev".to_string(),
+                table: "catalog.schema.daily_revenue_agg".to_string(),
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["revenue".to_string()],
+            };
+            let yaml_str = yaml_serde::to_string(&mat).unwrap();
+            let rt: Materialization = yaml_serde::from_str(&yaml_str).unwrap();
+            assert_eq!(rt.name, "daily_rev");
+            assert_eq!(rt.table, "catalog.schema.daily_revenue_agg");
+            assert_eq!(rt.dimensions, vec!["region"]);
+            assert_eq!(rt.metrics, vec!["revenue"]);
+        }
+
+        #[test]
+        fn definition_with_materializations_json_roundtrip() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "region".to_string(),
+                    ..Default::default()
+                }],
+                metrics: vec![Metric {
+                    name: "revenue".to_string(),
+                    expr: "SUM(amount)".to_string(),
+                    ..Default::default()
+                }],
+                materializations: vec![Materialization {
+                    name: "daily_rev".to_string(),
+                    table: "daily_revenue_agg".to_string(),
+                    dimensions: vec!["region".to_string()],
+                    metrics: vec!["revenue".to_string()],
+                }],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            assert!(
+                json.contains("materializations"),
+                "materializations should appear in JSON: {json}"
+            );
+            let rt = SemanticViewDefinition::from_json("test", &json).unwrap();
+            assert_eq!(rt.materializations.len(), 1);
+            assert_eq!(rt.materializations[0].name, "daily_rev");
+            assert_eq!(rt.materializations[0].table, "daily_revenue_agg");
+            assert_eq!(rt.materializations[0].dimensions, vec!["region"]);
+            assert_eq!(rt.materializations[0].metrics, vec!["revenue"]);
+        }
+
+        #[test]
+        fn old_json_without_materializations_deserializes_to_empty_vec() {
+            // Backward compat: pre-v0.7.0 JSON without materializations field
+            let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+            let def = SemanticViewDefinition::from_json("test", json).unwrap();
+            assert!(
+                def.materializations.is_empty(),
+                "materializations should default to [] for old JSON"
+            );
+        }
+
+        #[test]
+        fn empty_materializations_omitted_from_json() {
+            let def = SemanticViewDefinition {
+                base_table: "orders".to_string(),
+                materializations: vec![],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            assert!(
+                !json.contains("materializations"),
+                "Empty materializations should be omitted from JSON: {json}"
+            );
+        }
+
+        #[test]
+        fn yaml_and_json_with_materializations_produce_identical_structs() {
+            let yaml = r#"
+base_table: orders
+dimensions:
+  - name: region
+    expr: region
+metrics:
+  - name: revenue
+    expr: SUM(amount)
+materializations:
+  - name: daily_rev
+    table: daily_revenue_agg
+    dimensions:
+      - region
+    metrics:
+      - revenue
+"#;
+            let from_yaml = SemanticViewDefinition::from_yaml("test", yaml).unwrap();
+
+            let json = serde_json::to_string(&from_yaml).unwrap();
+            let from_json = SemanticViewDefinition::from_json("test", &json).unwrap();
+            assert_eq!(from_yaml, from_json);
+        }
+
+        #[test]
+        fn materialization_empty_dims_and_metrics_omitted_from_json() {
+            let mat = Materialization {
+                name: "test".to_string(),
+                table: "t".to_string(),
+                dimensions: vec![],
+                metrics: vec![],
+            };
+            let json = serde_json::to_string(&mat).unwrap();
+            assert!(
+                !json.contains("dimensions"),
+                "Empty dimensions should be omitted from Materialization JSON: {json}"
+            );
+            assert!(
+                !json.contains("metrics"),
+                "Empty metrics should be omitted from Materialization JSON: {json}"
+            );
         }
     }
 }

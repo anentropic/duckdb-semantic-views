@@ -1121,6 +1121,7 @@ fn rewrite_ddl_keyword_body(
         metrics: keyword_body.metrics,
         joins: keyword_body.relationships,
         facts: keyword_body.facts,
+        materializations: keyword_body.materializations,
         column_type_names: vec![],
         column_types_inferred: vec![],
         created_on: None,
