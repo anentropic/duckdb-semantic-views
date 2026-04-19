@@ -22,10 +22,10 @@ Requirements for YAML Definitions & Materialization Routing milestone. Each maps
 ### Materialization Routing
 
 - [ ] **MAT-01**: User can declare materializations in `CREATE SEMANTIC VIEW` via `MATERIALIZATIONS` clause with `mat_name AS (TABLE catalog.schema.table, DIMENSIONS (...), METRICS (...))`
-- [ ] **MAT-02**: At query time, the engine routes to a materialization when it exactly covers the requested dimensions and metrics
-- [ ] **MAT-03**: When no materialization matches, the query falls back to raw table expansion (no error)
-- [ ] **MAT-04**: Semi-additive and window function metrics are excluded from materialization routing (always expand from raw)
-- [ ] **MAT-05**: Materialization routing is transparent — no user-visible behavior change without matching materializations
+- [x] **MAT-02**: At query time, the engine routes to a materialization when it exactly covers the requested dimensions and metrics
+- [x] **MAT-03**: When no materialization matches, the query falls back to raw table expansion (no error)
+- [x] **MAT-04**: Semi-additive and window function metrics are excluded from materialization routing (always expand from raw)
+- [x] **MAT-05**: Materialization routing is transparent — no user-visible behavior change without matching materializations
 - [ ] **MAT-06**: `MATERIALIZATIONS` clause works in both SQL DDL and YAML definitions
 - [ ] **MAT-07**: Materialization metadata persists across DuckDB restarts
 
@@ -75,10 +75,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | YAML-08 | Phase 56 | Pending |
 | YAML-09 | Phase 51 | Complete |
 | MAT-01 | Phase 54 | Pending |
-| MAT-02 | Phase 55 | Pending |
-| MAT-03 | Phase 55 | Pending |
-| MAT-04 | Phase 55 | Pending |
-| MAT-05 | Phase 55 | Pending |
+| MAT-02 | Phase 55 | Complete |
+| MAT-03 | Phase 55 | Complete |
+| MAT-04 | Phase 55 | Complete |
+| MAT-05 | Phase 55 | Complete |
 | MAT-06 | Phase 54 | Pending |
 | MAT-07 | Phase 54 | Pending |
 | INTR-01 | Phase 57 | Pending |
