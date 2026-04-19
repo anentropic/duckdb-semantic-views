@@ -168,7 +168,7 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
 - [x] **Phase 51: YAML Parser Core** (1 plan) - yaml_serde dependency, YAML-to-SemanticViewDefinition conversion, shared validation, size cap (completed 2026-04-18)
 - [x] **Phase 52: YAML DDL Integration** (1 plan) - FROM YAML $$ dollar-quoting, parser hook detection, CREATE/REPLACE/IF NOT EXISTS modifiers (completed 2026-04-18)
 - [x] **Phase 53: YAML File Loading** - FROM YAML FILE with DuckDB file abstraction and enable_external_access security (completed 2026-04-19)
-- [ ] **Phase 54: Materialization Model & DDL** - Materialization struct, MATERIALIZATIONS clause in body parser, persistence, YAML support
+- [ ] **Phase 54: Materialization Model & DDL** (1 plan) - Materialization struct, MATERIALIZATIONS clause in body parser, persistence, YAML support
 - [ ] **Phase 55: Materialization Routing Engine** - Query-time routing with exact-match set containment, fallback, semi-additive/window exclusion
 - [ ] **Phase 56: YAML Export** - READ_YAML_FROM_SEMANTIC_VIEW scalar function, round-trip including materializations
 - [ ] **Phase 57: Introspection & Diagnostics** - explain_semantic_view routing info, DESCRIBE materializations, SHOW SEMANTIC MATERIALIZATIONS
@@ -221,7 +221,9 @@ Plans:
   2. `MATERIALIZATIONS` section in YAML definitions produces the same internal representation as the SQL DDL clause
   3. Materialization metadata persists across DuckDB restarts (stored and loaded with backward compatibility for pre-v0.7.0 views)
   4. Define-time validation ensures materialization dimensions and metrics reference declared names in the semantic view
-**Plans**: TBD
+**Plans:** 1 plan
+Plans:
+- [ ] 54-01-PLAN.md -- Materialization struct, body parser clause, parse.rs wiring, render_ddl reconstruction, define-time validation, YAML support, sqllogictest integration tests
 
 ### Phase 55: Materialization Routing Engine
 **Goal**: Queries are transparently routed to pre-existing aggregated tables when materializations cover the request
@@ -264,7 +266,7 @@ Phases execute in numeric order: 51 -> 52 -> 53 -> 54 -> 55 -> 56 -> 57
 | 51. YAML Parser Core | v0.7.0 | 1/1 | Complete    | 2026-04-18 |
 | 52. YAML DDL Integration | v0.7.0 | 1/1 | Complete    | 2026-04-18 |
 | 53. YAML File Loading | v0.7.0 | 1/1 | Complete    | 2026-04-19 |
-| 54. Materialization Model & DDL | v0.7.0 | 0/0 | Not started | - |
+| 54. Materialization Model & DDL | v0.7.0 | 0/1 | Not started | - |
 | 55. Materialization Routing Engine | v0.7.0 | 0/0 | Not started | - |
 | 56. YAML Export | v0.7.0 | 0/0 | Not started | - |
 | 57. Introspection & Diagnostics | v0.7.0 | 0/0 | Not started | - |
