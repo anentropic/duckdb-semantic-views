@@ -167,7 +167,7 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
 
 - [x] **Phase 51: YAML Parser Core** (1 plan) - yaml_serde dependency, YAML-to-SemanticViewDefinition conversion, shared validation, size cap (completed 2026-04-18)
 - [x] **Phase 52: YAML DDL Integration** (1 plan) - FROM YAML $$ dollar-quoting, parser hook detection, CREATE/REPLACE/IF NOT EXISTS modifiers (completed 2026-04-18)
-- [ ] **Phase 53: YAML File Loading** - FROM YAML FILE with DuckDB file abstraction and enable_external_access security
+- [x] **Phase 53: YAML File Loading** - FROM YAML FILE with DuckDB file abstraction and enable_external_access security (completed 2026-04-19)
 - [ ] **Phase 54: Materialization Model & DDL** - Materialization struct, MATERIALIZATIONS clause in body parser, persistence, YAML support
 - [ ] **Phase 55: Materialization Routing Engine** - Query-time routing with exact-match set containment, fallback, semi-additive/window exclusion
 - [ ] **Phase 56: YAML Export** - READ_YAML_FROM_SEMANTIC_VIEW scalar function, round-trip including materializations
@@ -208,9 +208,9 @@ Plans:
   1. `CREATE SEMANTIC VIEW name FROM YAML FILE '/path/to/file.yaml'` creates a semantic view from the file contents
   2. When `SET enable_external_access = false`, `FROM YAML FILE` is rejected with a security error
   3. File loading uses DuckDB's file abstraction (read_text), not direct filesystem access
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 Plans:
-- [ ] 53-01-PLAN.md -- FROM YAML FILE detection, C++ file reading, integration tests
+- [x] 53-01-PLAN.md -- FROM YAML FILE detection, C++ file reading, integration tests
 
 ### Phase 54: Materialization Model & DDL
 **Goal**: Users can declare materializations as part of a semantic view definition
@@ -263,7 +263,7 @@ Phases execute in numeric order: 51 -> 52 -> 53 -> 54 -> 55 -> 56 -> 57
 |-------|-----------|----------------|--------|-----------|
 | 51. YAML Parser Core | v0.7.0 | 1/1 | Complete    | 2026-04-18 |
 | 52. YAML DDL Integration | v0.7.0 | 1/1 | Complete    | 2026-04-18 |
-| 53. YAML File Loading | v0.7.0 | 0/1 | Planning    | - |
+| 53. YAML File Loading | v0.7.0 | 1/1 | Complete   | 2026-04-19 |
 | 54. Materialization Model & DDL | v0.7.0 | 0/0 | Not started | - |
 | 55. Materialization Routing Engine | v0.7.0 | 0/0 | Not started | - |
 | 56. YAML Export | v0.7.0 | 0/0 | Not started | - |
