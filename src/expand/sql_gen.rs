@@ -355,6 +355,15 @@ pub fn expand(
         },
     )?;
 
+    // Phase 55: Materialization routing.
+    // Attempt to route to a pre-aggregated table if an exact match exists.
+    // Returns None if no match, or if any metric is semi-additive / window.
+    if let Some(routed_sql) =
+        super::materialization::try_route_materialization(def, &resolved_dims, &resolved_mets)
+    {
+        return Ok(routed_sql);
+    }
+
     // 4. Pre-compute all metric expressions: inline facts into base metrics,
     //    then inline metric references into derived metrics.
     let topo_order = toposort_facts(&def.facts).map_err(|e| ExpandError::CycleDetected {

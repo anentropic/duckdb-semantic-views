@@ -4,7 +4,7 @@
 //! following the pattern established in `graph/test_helpers.rs`.
 
 use crate::model::{
-    AccessModifier, Dimension, Fact, Join, Metric, NonAdditiveDim, NullsOrder,
+    AccessModifier, Dimension, Fact, Join, Materialization, Metric, NonAdditiveDim, NullsOrder,
     SemanticViewDefinition, SortOrder, TableRef, WindowSpec,
 };
 
@@ -149,6 +149,13 @@ pub(super) trait TestFixtureExt {
         dims: &[(&str, SortOrder, NullsOrder)],
     ) -> Self;
     fn with_window_spec(self, metric_name: &str, spec: WindowSpec) -> Self;
+    fn with_materialization(
+        self,
+        name: &str,
+        table: &str,
+        dimensions: &[&str],
+        metrics: &[&str],
+    ) -> Self;
 }
 
 impl TestFixtureExt for SemanticViewDefinition {
@@ -308,6 +315,22 @@ impl TestFixtureExt for SemanticViewDefinition {
         if let Some(m) = self.metrics.iter_mut().find(|m| m.name == metric_name) {
             m.window_spec = Some(spec);
         }
+        self
+    }
+
+    fn with_materialization(
+        mut self,
+        name: &str,
+        table: &str,
+        dimensions: &[&str],
+        metrics: &[&str],
+    ) -> Self {
+        self.materializations.push(Materialization {
+            name: name.to_string(),
+            table: table.to_string(),
+            dimensions: dimensions.iter().map(|s| s.to_string()).collect(),
+            metrics: metrics.iter().map(|s| s.to_string()).collect(),
+        });
         self
     }
 }

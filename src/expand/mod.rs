@@ -1,6 +1,7 @@
 mod facts;
 mod fan_trap;
 mod join_resolver;
+mod materialization;
 mod resolution;
 mod role_playing;
 mod semi_additive;
