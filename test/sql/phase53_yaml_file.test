@@ -1,0 +1,197 @@
+# Phase 53: YAML file loading integration tests
+# Tests for CREATE SEMANTIC VIEW ... FROM YAML FILE '/path'
+
+require semantic_views
+
+# Setup: create backing tables
+statement ok
+CREATE TABLE p53_orders (id INTEGER PRIMARY KEY, amount DOUBLE, region VARCHAR);
+
+statement ok
+INSERT INTO p53_orders VALUES (1, 100.0, 'East'), (2, 200.0, 'West');
+
+# Write a YAML definition file to __TEST_DIR__
+statement ok
+COPY (SELECT 'base_table: p53_orders
+tables:
+  - alias: o
+    table: p53_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total_amount
+    expr: SUM(o.amount)
+    source_table: o' AS content)
+TO '__TEST_DIR__/p53_test.yaml' (FORMAT CSV, HEADER FALSE, QUOTE '');
+
+# ---------------------------------------------------------------
+# YAML-02: CREATE SEMANTIC VIEW from YAML file
+# ---------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p53_from_file FROM YAML FILE '__TEST_DIR__/p53_test.yaml'
+
+# Verify the view is queryable
+query TR rowsort
+SELECT region, total_amount FROM semantic_view('p53_from_file', dimensions := ['region'], metrics := ['total_amount'])
+----
+East	100.0
+West	200.0
+
+# Verify metrics-only query works
+query R
+SELECT total_amount FROM semantic_view('p53_from_file', metrics := ['total_amount'])
+----
+300.0
+
+# ---------------------------------------------------------------
+# YAML-02: CREATE OR REPLACE from YAML file
+# ---------------------------------------------------------------
+
+# Write a different YAML definition
+statement ok
+COPY (SELECT 'base_table: p53_orders
+tables:
+  - alias: o
+    table: p53_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: order_count
+    expr: COUNT(o.id)
+    source_table: o' AS content)
+TO '__TEST_DIR__/p53_test_v2.yaml' (FORMAT CSV, HEADER FALSE, QUOTE '');
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW p53_from_file FROM YAML FILE '__TEST_DIR__/p53_test_v2.yaml'
+
+# Verify the view was replaced (new metric name)
+query TR rowsort
+SELECT region, order_count FROM semantic_view('p53_from_file', dimensions := ['region'], metrics := ['order_count'])
+----
+East	1
+West	1
+
+# ---------------------------------------------------------------
+# YAML-02: CREATE IF NOT EXISTS from YAML file (no-op)
+# ---------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW IF NOT EXISTS p53_from_file FROM YAML FILE '__TEST_DIR__/p53_test.yaml'
+
+# Verify original view (with order_count) is still in place
+query TR rowsort
+SELECT region, order_count FROM semantic_view('p53_from_file', dimensions := ['region'], metrics := ['order_count'])
+----
+East	1
+West	1
+
+# ---------------------------------------------------------------
+# YAML-02: COMMENT = '...' with FROM YAML FILE
+# ---------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p53_commented COMMENT = 'Loaded from file' FROM YAML FILE '__TEST_DIR__/p53_test.yaml'
+
+query R
+SELECT total_amount FROM semantic_view('p53_commented', metrics := ['total_amount'])
+----
+300.0
+
+# ---------------------------------------------------------------
+# YAML-02: Case-insensitive FROM YAML FILE detection
+# ---------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p53_lowercase from yaml file '__TEST_DIR__/p53_test.yaml'
+
+query R
+SELECT total_amount FROM semantic_view('p53_lowercase', metrics := ['total_amount'])
+----
+300.0
+
+# ---------------------------------------------------------------
+# Error cases: file not found (before disabling external access)
+# ---------------------------------------------------------------
+
+statement error
+CREATE SEMANTIC VIEW p53_missing FROM YAML FILE '__TEST_DIR__/nonexistent_file.yaml'
+----
+FROM YAML FILE failed
+
+# ---------------------------------------------------------------
+# Error cases: missing file path quotes (parser-level, no file I/O)
+# ---------------------------------------------------------------
+
+statement error
+CREATE SEMANTIC VIEW p53_no_quotes FROM YAML FILE /path/to/file.yaml
+----
+Expected single-quoted file path
+
+# ---------------------------------------------------------------
+# Regression: inline YAML still works after FILE branch added
+# ---------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p53_inline_regression FROM YAML $$
+base_table: p53_orders
+tables:
+  - alias: o
+    table: p53_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total_amount
+    expr: SUM(o.amount)
+    source_table: o
+$$
+
+query R
+SELECT total_amount FROM semantic_view('p53_inline_regression', metrics := ['total_amount'])
+----
+300.0
+
+# ---------------------------------------------------------------
+# Cleanup (must happen before disabling external access)
+# ---------------------------------------------------------------
+
+statement ok
+DROP SEMANTIC VIEW p53_from_file
+
+statement ok
+DROP SEMANTIC VIEW p53_commented
+
+statement ok
+DROP SEMANTIC VIEW p53_lowercase
+
+statement ok
+DROP SEMANTIC VIEW p53_inline_regression
+
+statement ok
+DROP TABLE p53_orders
+
+# ---------------------------------------------------------------
+# YAML-07: Security enforcement -- enable_external_access=false
+# This test is last because SET enable_external_access = false
+# cannot be re-enabled while the database is running.
+# ---------------------------------------------------------------
+
+statement ok
+SET enable_external_access = false
+
+statement error
+CREATE SEMANTIC VIEW p53_blocked FROM YAML FILE '__TEST_DIR__/p53_test.yaml'
+----
+FROM YAML FILE failed

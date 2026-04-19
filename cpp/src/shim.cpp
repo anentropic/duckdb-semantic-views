@@ -152,9 +152,105 @@ static unique_ptr<FunctionData> sv_ddl_bind(
         throw BinderException("Semantic view DDL failed: %s", error_buf);
     }
 
+    // Phase 53: Intercept YAML FILE sentinel and read file before final rewrite
+    string sql(sql_str.c_str());
+
+    if (sql.rfind("__SV_YAML_FILE__", 0) == 0) {
+        // Parse sentinel: __SV_YAML_FILE__<path>\x01<kind>\x01<name>\x01<comment>
+        // Uses \x01 (SOH) as separator because the sentinel passes through
+        // C string APIs that treat \x00 (NUL) as a terminator.
+        auto payload = sql.substr(16);
+        vector<string> parts;
+        size_t pos = 0;
+        for (int i = 0; i < 3; i++) {
+            auto sep = payload.find('\x01', pos);
+            if (sep == string::npos) {
+                parts.push_back(payload.substr(pos));
+                break;
+            }
+            parts.push_back(payload.substr(pos, sep - pos));
+            pos = sep + 1;
+        }
+        if (pos < payload.size()) {
+            parts.push_back(payload.substr(pos));
+        }
+
+        if (parts.size() < 3) {
+            throw BinderException("Internal error: malformed YAML FILE sentinel");
+        }
+
+        auto &file_path = parts[0];
+        auto &kind_str = parts[1];
+        auto &view_name = parts[2];
+        auto comment = parts.size() > 3 ? parts[3] : string();
+
+        // Step 1: Read file via read_text() -- SQL-escape the file path
+        string escaped_path;
+        for (char c : file_path) {
+            escaped_path += c;
+            if (c == '\'') escaped_path += '\'';
+        }
+        string read_sql = "SELECT content FROM read_text('" + escaped_path + "')";
+
+        duckdb_result file_result;
+        if (duckdb_query(sv_ddl_conn, read_sql.c_str(), &file_result) != DuckDBSuccess) {
+            auto err_ptr = duckdb_result_error(&file_result);
+            string err_msg = err_ptr ? string(err_ptr) : "File read failed";
+            duckdb_destroy_result(&file_result);
+            throw BinderException("FROM YAML FILE failed: %s", err_msg);
+        }
+
+        auto row_count = duckdb_row_count(&file_result);
+        if (row_count == 0) {
+            duckdb_destroy_result(&file_result);
+            throw BinderException("FROM YAML FILE failed: no content returned from '%s'",
+                                  file_path);
+        }
+
+        // SELECT content FROM read_text(...) projects content as column 0
+        char *content_ptr = duckdb_value_varchar(&file_result, 0, 0);
+        string yaml_content = content_ptr ? string(content_ptr) : "";
+        if (content_ptr) duckdb_free(content_ptr);
+        duckdb_destroy_result(&file_result);
+
+        // Step 2: Reconstruct query as inline YAML with tagged dollar-quote
+        // Tagged delimiter avoids collision with $$ in YAML content
+        string kind_prefix;
+        if (kind_str == "0") kind_prefix = "CREATE SEMANTIC VIEW ";
+        else if (kind_str == "1") kind_prefix = "CREATE OR REPLACE SEMANTIC VIEW ";
+        else kind_prefix = "CREATE SEMANTIC VIEW IF NOT EXISTS ";
+
+        string reconstructed = kind_prefix + view_name;
+        if (!comment.empty()) {
+            string escaped_comment;
+            for (char c : comment) {
+                escaped_comment += c;
+                if (c == '\'') escaped_comment += '\'';
+            }
+            reconstructed += " COMMENT = '" + escaped_comment + "'";
+        }
+        reconstructed += " FROM YAML $__sv_file$" + yaml_content + "$__sv_file$";
+
+        // Step 3: Re-invoke Rust rewrite with the inline YAML query
+        // Allocate buffer large enough for potentially large YAML content
+        size_t rewrite_buf_size = std::max(size_t(65536), yaml_content.size() * 2 + 4096);
+        std::string rewrite_sql(rewrite_buf_size, '\0');
+        memset(error_buf, 0, sizeof(error_buf));
+
+        rc = sv_rewrite_ddl_rust(
+            reconstructed.c_str(), reconstructed.size(),
+            rewrite_sql.data(), rewrite_sql.size(),
+            error_buf, sizeof(error_buf));
+
+        if (rc != 0) {
+            throw BinderException("Semantic view DDL failed: %s", error_buf);
+        }
+        sql = string(rewrite_sql.c_str());
+    }
+
     // Step 2: Execute the rewritten SQL on the DDL connection
     duckdb_result result;
-    if (duckdb_query(sv_ddl_conn, sql_str.c_str(), &result) != DuckDBSuccess) {
+    if (duckdb_query(sv_ddl_conn, sql.c_str(), &result) != DuckDBSuccess) {
         auto err_ptr = duckdb_result_error(&result);
         string err_msg = err_ptr ? string(err_ptr) : "DDL execution failed (unknown error)";
         duckdb_destroy_result(&result);

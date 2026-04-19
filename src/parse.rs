@@ -1193,7 +1193,9 @@ fn extract_single_quoted(input: &str) -> Result<(String, usize), ParseError> {
 
 /// Generate a sentinel string for C++ shim to intercept and read the file.
 ///
-/// Sentinel format: `__SV_YAML_FILE__<path>\x00<kind>\x00<name>\x00<comment>`
+/// Sentinel format: `__SV_YAML_FILE__<path>\x01<kind>\x01<name>\x01<comment>`
+/// Uses `\x01` (SOH) as field separator instead of `\x00` (NUL) because the
+/// sentinel is passed through C string APIs that treat NUL as a terminator.
 /// The C++ shim reads the file via `read_text()`, reconstructs as inline YAML,
 /// and re-invokes `sv_rewrite_ddl_rust`.
 fn rewrite_ddl_yaml_file_body(
@@ -1229,7 +1231,7 @@ fn rewrite_ddl_yaml_file_body(
     };
     let comment = view_comment.unwrap_or_default();
     Ok(Some(format!(
-        "__SV_YAML_FILE__{file_path}\x00{kind_num}\x00{name}\x00{comment}"
+        "__SV_YAML_FILE__{file_path}\x01{kind_num}\x01{name}\x01{comment}"
     )))
 }
 
@@ -3125,7 +3127,7 @@ $$"#;
         let sentinel = result.unwrap();
         assert!(sentinel.starts_with("__SV_YAML_FILE__"));
         assert!(sentinel.contains("path/to/def.yaml"));
-        assert!(sentinel.contains("\x000\x00myview\x00"));
+        assert!(sentinel.contains("\x010\x01myview\x01"));
     }
 
     #[test]
@@ -3138,7 +3140,7 @@ $$"#;
         )
         .unwrap();
         let sentinel = result.unwrap();
-        assert!(sentinel.contains("\x001\x00v\x00a comment"));
+        assert!(sentinel.contains("\x011\x01v\x01a comment"));
     }
 
     #[test]
@@ -3146,7 +3148,7 @@ $$"#;
         let result =
             rewrite_ddl_yaml_file_body(DdlKind::CreateIfNotExists, "v", "'/f.yaml'", None).unwrap();
         let sentinel = result.unwrap();
-        assert!(sentinel.contains("\x002\x00v\x00"));
+        assert!(sentinel.contains("\x012\x01v\x01"));
     }
 
     #[test]
