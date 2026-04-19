@@ -169,7 +169,7 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
 - [x] **Phase 52: YAML DDL Integration** (1 plan) - FROM YAML $$ dollar-quoting, parser hook detection, CREATE/REPLACE/IF NOT EXISTS modifiers (completed 2026-04-18)
 - [x] **Phase 53: YAML File Loading** - FROM YAML FILE with DuckDB file abstraction and enable_external_access security (completed 2026-04-19)
 - [x] **Phase 54: Materialization Model & DDL** (1 plan) - Materialization struct, MATERIALIZATIONS clause in body parser, persistence, YAML support (completed 2026-04-19)
-- [ ] **Phase 55: Materialization Routing Engine** - Query-time routing with exact-match set containment, fallback, semi-additive/window exclusion
+- [ ] **Phase 55: Materialization Routing Engine** (1 plan) - Query-time routing with exact-match set containment, fallback, semi-additive/window exclusion
 - [ ] **Phase 56: YAML Export** - READ_YAML_FROM_SEMANTIC_VIEW scalar function, round-trip including materializations
 - [ ] **Phase 57: Introspection & Diagnostics** - explain_semantic_view routing info, DESCRIBE materializations, SHOW SEMANTIC MATERIALIZATIONS
 
@@ -234,7 +234,9 @@ Plans:
   2. When no materialization matches, the query falls back to raw table expansion with no error and no observable behavior change
   3. Queries involving semi-additive metrics (NON ADDITIVE BY) or window function metrics (PARTITION BY EXCLUDING) always fall back to raw expansion regardless of materialization coverage
   4. A user who has not declared any materializations sees zero behavior change from this feature
-**Plans**: TBD
+**Plans:** 1 plan
+Plans:
+- [ ] 55-01-PLAN.md -- try_route_materialization() pure function, expand() early-exit integration, with_materialization() test builder, unit tests, sqllogictest integration tests
 
 ### Phase 56: YAML Export
 **Goal**: Users can export stored semantic views as YAML for version control and round-trip workflows
@@ -267,6 +269,6 @@ Phases execute in numeric order: 51 -> 52 -> 53 -> 54 -> 55 -> 56 -> 57
 | 52. YAML DDL Integration | v0.7.0 | 1/1 | Complete    | 2026-04-18 |
 | 53. YAML File Loading | v0.7.0 | 1/1 | Complete    | 2026-04-19 |
 | 54. Materialization Model & DDL | v0.7.0 | 1/1 | Complete    | 2026-04-19 |
-| 55. Materialization Routing Engine | v0.7.0 | 0/0 | Not started | - |
+| 55. Materialization Routing Engine | v0.7.0 | 0/1 | Not started | - |
 | 56. YAML Export | v0.7.0 | 0/0 | Not started | - |
 | 57. Introspection & Diagnostics | v0.7.0 | 0/0 | Not started | - |
