@@ -358,7 +358,7 @@ fn emit_materializations(out: &mut String, def: &SemanticViewDefinition) {
 | A4 | MATERIALIZATIONS clause appears last (after METRICS) in clause order | Clause Ordering | Low -- natural ordering since it references dims/metrics |
 | A5 | Each materialization must have at least one dimension or one metric | Validation | Low -- a materialization with neither is semantically meaningless |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Duplicate materialization names**
    - What we know: Dimension and metric names must be unique within their respective clauses.
