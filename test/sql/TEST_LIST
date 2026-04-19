@@ -30,3 +30,4 @@ test/sql/phase48_window_metrics.test
 test/sql/peg_compat.test
 test/sql/phase52_yaml_ddl.test
 test/sql/phase53_yaml_file.test
+test/sql/phase54_materializations.test

@@ -1,0 +1,313 @@
+# Phase 54: MATERIALIZATIONS clause DDL integration tests
+#
+# Verifies:
+#   MAT-01: MATERIALIZATIONS clause parsing and storage
+#   MAT-06: YAML materializations produce same representation
+#   MAT-07: Backward compatibility (views without materializations)
+
+require semantic_views
+
+# ============================================================
+# Setup: create base tables and pre-aggregated tables
+# ============================================================
+
+statement ok
+CREATE TABLE p54_orders (id INTEGER PRIMARY KEY, region VARCHAR, amount DECIMAL(10,2), order_date DATE);
+
+statement ok
+INSERT INTO p54_orders VALUES
+    (1, 'East', 100.00, '2024-01-01'),
+    (2, 'West', 200.00, '2024-01-02'),
+    (3, 'East', 150.00, '2024-01-03');
+
+statement ok
+CREATE TABLE p54_daily_agg (region VARCHAR, revenue DECIMAL(10,2), order_count BIGINT);
+
+statement ok
+CREATE TABLE p54_monthly_agg (region VARCHAR, revenue DECIMAL(10,2));
+
+# ============================================================
+# Section 1: Basic MATERIALIZATIONS clause parsing and querying
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p54_basic_mat AS
+TABLES (
+    o AS p54_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.revenue AS SUM(o.amount),
+    o.order_count AS COUNT(*)
+)
+MATERIALIZATIONS (
+    daily_rev AS (
+        TABLE p54_daily_agg,
+        DIMENSIONS (region),
+        METRICS (revenue, order_count)
+    )
+)
+
+# Verify the view is queryable (materializations don't affect query behavior yet -- Phase 55)
+query I
+SELECT count(*) FROM semantic_view('p54_basic_mat', dimensions := ['region'], metrics := ['revenue'])
+----
+2
+
+# ============================================================
+# Section 2: Multiple materializations
+# ============================================================
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW p54_basic_mat AS
+TABLES (
+    o AS p54_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.revenue AS SUM(o.amount),
+    o.order_count AS COUNT(*)
+)
+MATERIALIZATIONS (
+    daily_rev AS (
+        TABLE p54_daily_agg,
+        DIMENSIONS (region),
+        METRICS (revenue, order_count)
+    ),
+    monthly_rev AS (
+        TABLE p54_monthly_agg,
+        DIMENSIONS (region),
+        METRICS (revenue)
+    )
+)
+
+# ============================================================
+# Section 3: GET_DDL round-trip with materializations
+# ============================================================
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p54_basic_mat') LIKE '%MATERIALIZATIONS%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p54_basic_mat') LIKE '%daily_rev%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p54_basic_mat') LIKE '%monthly_rev%'
+----
+true
+
+# ============================================================
+# Section 4: View without materializations (backward compat)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p54_no_mat AS
+TABLES (
+    o AS p54_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.revenue AS SUM(o.amount)
+)
+
+# GET_DDL should NOT include MATERIALIZATIONS for view without them
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p54_no_mat') LIKE '%MATERIALIZATIONS%'
+----
+false
+
+# ============================================================
+# Section 5: Error cases -- validation
+# ============================================================
+
+# Materialization referencing non-existent dimension
+statement error
+CREATE SEMANTIC VIEW p54_bad_dim AS
+TABLES (o AS p54_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.revenue AS SUM(o.amount))
+MATERIALIZATIONS (
+    bad_mat AS (
+        TABLE some_table,
+        DIMENSIONS (nonexistent_dim),
+        METRICS (revenue)
+    )
+)
+----
+dimension 'nonexistent_dim' not found
+
+# Materialization referencing non-existent metric
+statement error
+CREATE SEMANTIC VIEW p54_bad_met AS
+TABLES (o AS p54_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.revenue AS SUM(o.amount))
+MATERIALIZATIONS (
+    bad_mat AS (
+        TABLE some_table,
+        DIMENSIONS (region),
+        METRICS (nonexistent_metric)
+    )
+)
+----
+metric 'nonexistent_metric' not found
+
+# Materialization with neither DIMENSIONS nor METRICS
+statement error
+CREATE SEMANTIC VIEW p54_empty_mat AS
+TABLES (o AS p54_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.revenue AS SUM(o.amount))
+MATERIALIZATIONS (
+    empty_mat AS (
+        TABLE some_table
+    )
+)
+----
+must specify at least one of DIMENSIONS or METRICS
+
+# Duplicate materialization names
+statement error
+CREATE SEMANTIC VIEW p54_dup_mat AS
+TABLES (o AS p54_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.revenue AS SUM(o.amount))
+MATERIALIZATIONS (
+    same_name AS (
+        TABLE table1,
+        DIMENSIONS (region)
+    ),
+    same_name AS (
+        TABLE table2,
+        METRICS (revenue)
+    )
+)
+----
+Duplicate materialization name
+
+# ============================================================
+# Section 6: MATERIALIZATIONS clause ordering
+# ============================================================
+
+# MATERIALIZATIONS before METRICS should fail
+statement error
+CREATE SEMANTIC VIEW p54_order_err AS
+TABLES (o AS p54_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+MATERIALIZATIONS (
+    bad AS (TABLE t, DIMENSIONS (region))
+)
+METRICS (o.revenue AS SUM(o.amount))
+----
+out of order
+
+# ============================================================
+# Section 7: DIMENSIONS-only and METRICS-only materializations
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p54_partial_mat AS
+TABLES (o AS p54_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.revenue AS SUM(o.amount))
+MATERIALIZATIONS (
+    dims_only AS (
+        TABLE t1,
+        DIMENSIONS (region)
+    ),
+    mets_only AS (
+        TABLE t2,
+        METRICS (revenue)
+    )
+)
+
+# ============================================================
+# Section 8: YAML with materializations (via FROM YAML)
+# ============================================================
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW p54_yaml_mat FROM YAML $$
+base_table: p54_orders
+tables:
+  - alias: o
+    table: p54_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: revenue
+    expr: SUM(o.amount)
+    source_table: o
+materializations:
+  - name: daily_rev
+    table: p54_daily_agg
+    dimensions:
+      - region
+    metrics:
+      - revenue
+$$
+
+# Verify YAML-created view with materializations has GET_DDL output including materializations
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p54_yaml_mat') LIKE '%MATERIALIZATIONS%'
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p54_yaml_mat') LIKE '%daily_rev%'
+----
+true
+
+# ============================================================
+# Section 9: Qualified table names in materialization TABLE clause
+# ============================================================
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW p54_qual_mat AS
+TABLES (o AS p54_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.revenue AS SUM(o.amount))
+MATERIALIZATIONS (
+    qual_mat AS (
+        TABLE catalog.schema.daily_revenue_agg,
+        DIMENSIONS (region),
+        METRICS (revenue)
+    )
+)
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p54_qual_mat') LIKE '%catalog.schema.daily_revenue_agg%'
+----
+true
+
+# ============================================================
+# Section 10: Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p54_basic_mat
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p54_no_mat
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p54_partial_mat
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p54_yaml_mat
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p54_qual_mat
