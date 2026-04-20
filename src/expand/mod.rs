@@ -24,3 +24,5 @@ pub use types::{DimensionName, ExpandError, MetricName, QueryRequest};
 pub(crate) use facts::collect_derived_metric_source_tables;
 #[cfg(feature = "extension")]
 pub(crate) use fan_trap::ancestors_to_root;
+#[cfg(feature = "extension")]
+pub(crate) use materialization::find_routing_materialization_name;

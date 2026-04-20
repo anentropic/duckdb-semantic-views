@@ -55,33 +55,6 @@ fn collect_table_rows(def: &SemanticViewDefinition, rows: &mut Vec<DescribeRow>)
     let db_name = def.database_name.clone().unwrap_or_default();
     let sch_name = def.schema_name.clone().unwrap_or_default();
 
-    // Handle legacy definitions with empty tables vec.
-    if def.tables.is_empty() {
-        let obj_name = def.base_table.clone();
-        rows.push(DescribeRow {
-            object_kind: "TABLE".to_string(),
-            object_name: obj_name.clone(),
-            parent_entity: String::new(),
-            property: "BASE_TABLE_DATABASE_NAME".to_string(),
-            property_value: db_name.clone(),
-        });
-        rows.push(DescribeRow {
-            object_kind: "TABLE".to_string(),
-            object_name: obj_name.clone(),
-            parent_entity: String::new(),
-            property: "BASE_TABLE_SCHEMA_NAME".to_string(),
-            property_value: sch_name.clone(),
-        });
-        rows.push(DescribeRow {
-            object_kind: "TABLE".to_string(),
-            object_name: obj_name,
-            parent_entity: String::new(),
-            property: "BASE_TABLE_NAME".to_string(),
-            property_value: def.base_table.clone(),
-        });
-        return;
-    }
-
     for table in &def.tables {
         let obj_name = table.table.clone();
 
@@ -481,6 +454,36 @@ fn collect_metric_rows(
     }
 }
 
+/// Collect MATERIALIZATION property rows from the definition.
+///
+/// Each materialization emits three rows: TABLE, DIMENSIONS, METRICS.
+/// When `def.materializations` is empty, no rows are added.
+fn collect_materialization_rows(def: &SemanticViewDefinition, rows: &mut Vec<DescribeRow>) {
+    for mat in &def.materializations {
+        rows.push(DescribeRow {
+            object_kind: "MATERIALIZATION".to_string(),
+            object_name: mat.name.clone(),
+            parent_entity: String::new(),
+            property: "TABLE".to_string(),
+            property_value: mat.table.clone(),
+        });
+        rows.push(DescribeRow {
+            object_kind: "MATERIALIZATION".to_string(),
+            object_name: mat.name.clone(),
+            parent_entity: String::new(),
+            property: "DIMENSIONS".to_string(),
+            property_value: format_json_array(&mat.dimensions),
+        });
+        rows.push(DescribeRow {
+            object_kind: "MATERIALIZATION".to_string(),
+            object_name: mat.name.clone(),
+            parent_entity: String::new(),
+            property: "METRICS".to_string(),
+            property_value: format_json_array(&mat.metrics),
+        });
+    }
+}
+
 /// Table function: Snowflake-aligned DESCRIBE SEMANTIC VIEW.
 ///
 /// Returns property-per-row output with 5 VARCHAR columns:
@@ -534,11 +537,7 @@ impl VTab for DescribeSemanticViewVTab {
 
             // Build alias->table map and compute base table name.
             let alias_map = def.alias_to_table_map();
-            let base_table = def
-                .tables
-                .first()
-                .map(|t| t.table.clone())
-                .unwrap_or_else(|| def.base_table.clone());
+            let base_table = def.base_table().to_string();
 
             // Collect rows in definition order.
             let mut rows = Vec::new();
@@ -556,6 +555,7 @@ impl VTab for DescribeSemanticViewVTab {
             collect_fact_rows(&def, &base_table, &alias_map, &mut rows);
             collect_dimension_rows(&def, &base_table, &alias_map, &mut rows);
             collect_metric_rows(&def, &base_table, &alias_map, &mut rows);
+            collect_materialization_rows(&def, &mut rows);
 
             Ok(DescribeBindData { rows })
         }))

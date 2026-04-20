@@ -77,6 +77,53 @@ pub(crate) fn try_route_materialization(
     None
 }
 
+/// Find the name of the materialization that would be selected for routing.
+///
+/// Returns `Some(&str)` with the materialization name if an exact match exists,
+/// `None` if no match or if routing would be excluded (semi-additive/window).
+///
+/// This is used by `explain_semantic_view` to report the routing decision
+/// without duplicating the matching logic from `try_route_materialization`.
+#[allow(dead_code)] // Used only under `extension` feature (explain.rs)
+pub(crate) fn find_routing_materialization_name<'a>(
+    def: &'a SemanticViewDefinition,
+    resolved_dims: &[&Dimension],
+    resolved_mets: &[&Metric],
+) -> Option<&'a str> {
+    if def.materializations.is_empty() {
+        return None;
+    }
+    if resolved_mets.iter().any(|m| !m.non_additive_by.is_empty()) {
+        return None;
+    }
+    if resolved_mets.iter().any(|m| m.is_window()) {
+        return None;
+    }
+
+    let req_dims: HashSet<String> = resolved_dims
+        .iter()
+        .map(|d| d.name.to_ascii_lowercase())
+        .collect();
+    let req_mets: HashSet<String> = resolved_mets
+        .iter()
+        .map(|m| m.name.to_ascii_lowercase())
+        .collect();
+
+    for mat in &def.materializations {
+        let mat_dims: HashSet<String> = mat
+            .dimensions
+            .iter()
+            .map(|d| d.to_ascii_lowercase())
+            .collect();
+        let mat_mets: HashSet<String> =
+            mat.metrics.iter().map(|m| m.to_ascii_lowercase()).collect();
+        if mat_dims == req_dims && mat_mets == req_mets {
+            return Some(&mat.name);
+        }
+    }
+    None
+}
+
 /// Generate a SELECT from the materialization table.
 ///
 /// The materialization table is expected to have columns named after the
@@ -495,6 +542,92 @@ mod tests {
 
     // ================================================
     // End-to-end via expand() -- no match, standard expansion
+    // ================================================
+
+    // ================================================
+    // find_routing_materialization_name tests (INTR-01)
+    // ================================================
+
+    #[test]
+    fn find_name_returns_none_for_empty_materializations() {
+        let def = orders_view();
+        assert!(def.materializations.is_empty());
+        let dims = resolve_dims(&def, &["region"]);
+        let mets = resolve_mets(&def, &["total_revenue"]);
+        assert!(find_routing_materialization_name(&def, &dims, &mets).is_none());
+    }
+
+    #[test]
+    fn find_name_returns_matching_mat_name() {
+        let def = orders_view().with_materialization(
+            "region_agg",
+            "agg_table",
+            &["region"],
+            &["total_revenue", "order_count"],
+        );
+        let dims = resolve_dims(&def, &["region"]);
+        let mets = resolve_mets(&def, &["total_revenue", "order_count"]);
+        assert_eq!(
+            find_routing_materialization_name(&def, &dims, &mets),
+            Some("region_agg")
+        );
+    }
+
+    #[test]
+    fn find_name_returns_none_for_no_match() {
+        let def = orders_view().with_materialization(
+            "region_agg",
+            "agg_table",
+            &["region"],
+            &["total_revenue"],
+        );
+        let dims = resolve_dims(&def, &["status"]);
+        let mets = resolve_mets(&def, &["order_count"]);
+        assert!(find_routing_materialization_name(&def, &dims, &mets).is_none());
+    }
+
+    #[test]
+    fn find_name_returns_none_for_semi_additive() {
+        let def = orders_view()
+            .with_non_additive_by(
+                "total_revenue",
+                &[("region", SortOrder::Desc, NullsOrder::Last)],
+            )
+            .with_materialization(
+                "region_agg",
+                "agg_table",
+                &["region"],
+                &["total_revenue", "order_count"],
+            );
+        let dims = resolve_dims(&def, &["region"]);
+        let mets = resolve_mets(&def, &["total_revenue", "order_count"]);
+        assert!(find_routing_materialization_name(&def, &dims, &mets).is_none());
+    }
+
+    #[test]
+    fn find_name_returns_none_for_window() {
+        let def = orders_view()
+            .with_window_spec(
+                "total_revenue",
+                WindowSpec {
+                    window_function: "AVG".to_string(),
+                    inner_metric: "order_count".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_materialization(
+                "region_agg",
+                "agg_table",
+                &["region"],
+                &["total_revenue", "order_count"],
+            );
+        let dims = resolve_dims(&def, &["region"]);
+        let mets = resolve_mets(&def, &["total_revenue", "order_count"]);
+        assert!(find_routing_materialization_name(&def, &dims, &mets).is_none());
+    }
+
+    // ================================================
+    // End-to-end via expand() -- matching materialization
     // ================================================
 
     #[test]
