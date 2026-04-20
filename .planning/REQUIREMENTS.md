@@ -12,11 +12,11 @@ Requirements for YAML Definitions & Materialization Routing milestone. Each maps
 - [ ] **YAML-01**: User can create a semantic view from inline YAML using `CREATE SEMANTIC VIEW name FROM YAML $$ ... $$`
 - [ ] **YAML-02**: User can create a semantic view from a YAML file using `CREATE SEMANTIC VIEW name FROM YAML FILE '/path/to/file.yaml'`
 - [x] **YAML-03**: YAML schema supports all SemanticViewDefinition fields: tables, relationships, dimensions, metrics, facts, and metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC)
-- [ ] **YAML-04**: User can export a stored semantic view as YAML via `SELECT READ_YAML_FROM_SEMANTIC_VIEW('name')` (supports fully qualified names)
+- [x] **YAML-04**: User can export a stored semantic view as YAML via `SELECT READ_YAML_FROM_SEMANTIC_VIEW('name')` (supports fully qualified names)
 - [x] **YAML-05**: YAML and SQL DDL produce identical internal representations — same validation, persistence, and query behavior
 - [ ] **YAML-06**: `CREATE OR REPLACE` and `IF NOT EXISTS` modifiers work with `FROM YAML` syntax
 - [ ] **YAML-07**: YAML FILE loading respects DuckDB's `enable_external_access` security setting
-- [ ] **YAML-08**: YAML round-trip is lossless — `READ_YAML_FROM_SEMANTIC_VIEW` output can recreate an identical semantic view
+- [x] **YAML-08**: YAML round-trip is lossless — `READ_YAML_FROM_SEMANTIC_VIEW` output can recreate an identical semantic view
 - [x] **YAML-09**: YAML input is size-capped to prevent anchor/alias bomb denial-of-service
 
 ### Materialization Routing
@@ -68,11 +68,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | YAML-01 | Phase 52 | Pending |
 | YAML-02 | Phase 53 | Pending |
 | YAML-03 | Phase 51 | Complete |
-| YAML-04 | Phase 56 | Pending |
+| YAML-04 | Phase 56 | Complete |
 | YAML-05 | Phase 51 | Complete |
 | YAML-06 | Phase 52 | Pending |
 | YAML-07 | Phase 53 | Pending |
-| YAML-08 | Phase 56 | Pending |
+| YAML-08 | Phase 56 | Complete |
 | YAML-09 | Phase 51 | Complete |
 | MAT-01 | Phase 54 | Pending |
 | MAT-02 | Phase 55 | Complete |

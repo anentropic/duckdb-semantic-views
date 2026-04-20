@@ -170,7 +170,7 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
 - [x] **Phase 53: YAML File Loading** - FROM YAML FILE with DuckDB file abstraction and enable_external_access security (completed 2026-04-19)
 - [x] **Phase 54: Materialization Model & DDL** (1 plan) - Materialization struct, MATERIALIZATIONS clause in body parser, persistence, YAML support (completed 2026-04-19)
 - [x] **Phase 55: Materialization Routing Engine** (1 plan) - Query-time routing with exact-match set containment, fallback, semi-additive/window exclusion (completed 2026-04-19)
-- [ ] **Phase 56: YAML Export** (1 plan) - READ_YAML_FROM_SEMANTIC_VIEW scalar function, round-trip including materializations
+- [x] **Phase 56: YAML Export** (1 plan) - READ_YAML_FROM_SEMANTIC_VIEW scalar function, round-trip including materializations (completed 2026-04-20)
 - [ ] **Phase 57: Introspection & Diagnostics** - explain_semantic_view routing info, DESCRIBE materializations, SHOW SEMANTIC MATERIALIZATIONS
 
 ## Phase Details
@@ -246,9 +246,9 @@ Plans:
   1. `SELECT READ_YAML_FROM_SEMANTIC_VIEW('name')` returns a YAML string representing the stored definition, including materializations if declared
   2. The exported YAML can be fed back into `CREATE SEMANTIC VIEW ... FROM YAML $$ ... $$` to recreate an identical semantic view (lossless round-trip)
   3. Fully qualified names (database.schema.view_name) are supported in the function argument
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 Plans:
-- [ ] 56-01-PLAN.md -- render_yaml.rs export logic, model.rs skip_serializing_if cleanup, ReadYamlFromSemanticViewScalar VScalar, sqllogictest integration tests, proptest round-trip
+- [x] 56-01-PLAN.md -- render_yaml.rs export logic, model.rs skip_serializing_if cleanup, ReadYamlFromSemanticViewScalar VScalar, sqllogictest integration tests, proptest round-trip
 
 ### Phase 57: Introspection & Diagnostics
 **Goal**: Users can inspect materialization routing decisions and materialization metadata through existing introspection commands
@@ -272,5 +272,5 @@ Phases execute in numeric order: 51 -> 52 -> 53 -> 54 -> 55 -> 56 -> 57
 | 53. YAML File Loading | v0.7.0 | 1/1 | Complete    | 2026-04-19 |
 | 54. Materialization Model & DDL | v0.7.0 | 1/1 | Complete    | 2026-04-19 |
 | 55. Materialization Routing Engine | v0.7.0 | 1/1 | Complete    | 2026-04-19 |
-| 56. YAML Export | v0.7.0 | 0/1 | Planned | - |
+| 56. YAML Export | v0.7.0 | 1/1 | Complete   | 2026-04-20 |
 | 57. Introspection & Diagnostics | v0.7.0 | 0/0 | Not started | - |
