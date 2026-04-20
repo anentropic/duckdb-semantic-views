@@ -8,6 +8,7 @@ pub mod parse;
 #[cfg(feature = "extension")]
 pub mod query;
 pub mod render_ddl;
+pub mod render_yaml;
 pub mod util;
 
 /// Test helpers for integration tests.

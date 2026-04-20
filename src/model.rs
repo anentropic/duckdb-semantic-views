@@ -357,16 +357,14 @@ pub struct Join {
 /// Top-level definition of a semantic view.
 ///
 /// Stored as JSON in `semantic_layer._definitions`.
-/// Required fields: `base_table`, `dimensions`, `metrics`.
+/// Required fields: `tables`, `dimensions`, `metrics`.
 /// Optional fields: `joins` (defaults to []), `facts` (defaults to []).
 /// Note: `deny_unknown_fields` is intentionally NOT set — old stored JSON with extra
 /// fields (e.g., from future schema changes) must still load without error.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SemanticViewDefinition {
-    pub base_table: String,
-    /// Phase 11.1: table alias registry for multi-table views.
-    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Table alias registry for multi-table views.
     #[serde(default)]
     pub tables: Vec<TableRef>,
     pub dimensions: Vec<Dimension>,
@@ -383,27 +381,27 @@ pub struct SemanticViewDefinition {
     /// Column names from DDL-time LIMIT 0 inference, parallel to `column_types_inferred`.
     /// Populated by `create_semantic_view` `invoke()`. Empty = no inference ran.
     /// Used by `bind()` to build a name→type map for subquery column lookups.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_type_names: Vec<String>,
     /// DDL-time inferred column types stored as `ffi::duckdb_type` (u32) values.
     /// Populated by `create_semantic_view` `invoke()` after running LIMIT 0.
     /// Parallel to `column_type_names`: `column_type_names[i]` ↔ `column_types_inferred[i]`.
     /// Empty vec = no inference ran (in-memory DB or inference failed) → VARCHAR fallback.
     /// `bind()` builds a name→type `HashMap` from both vecs to look up requested columns by name.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_types_inferred: Vec<u32>,
     /// ISO 8601 timestamp of when this semantic view was created.
     /// Captured at define time via `DuckDB` `now()`.
     /// Old stored JSON without this field deserializes to None.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_on: Option<String>,
     /// Database name from the connection context at define time.
     /// Old stored JSON without this field deserializes to None.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_name: Option<String>,
     /// Schema name from the connection context at define time.
     /// Old stored JSON without this field deserializes to None.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_name: Option<String>,
     /// View-level comment describing the purpose of this semantic view.
     /// Old stored JSON without this field deserializes to None.
@@ -412,6 +410,15 @@ pub struct SemanticViewDefinition {
 }
 
 impl SemanticViewDefinition {
+    /// Physical table name of the primary (first) table in the view.
+    ///
+    /// All semantic views have at least one table entry. This is the table
+    /// that appears in the FROM clause of expanded SQL.
+    #[must_use]
+    pub fn base_table(&self) -> &str {
+        self.tables.first().map_or("", |t| t.table.as_str())
+    }
+
     /// Build a mapping from table alias to actual table name.
     ///
     /// Used by SHOW/DESCRIBE `VTabs` to resolve the stored alias (e.g. `"o"`)
@@ -493,21 +500,15 @@ mod tests {
     #[test]
     fn valid_definition_roundtrips() {
         let json = r#"{
-            "base_table": "orders",
+            "tables": [{"alias": "o", "table": "orders"}],
             "dimensions": [{"name": "region", "expr": "region"}],
             "metrics": [{"name": "revenue", "expr": "sum(amount)"}]
         }"#;
         let def = SemanticViewDefinition::from_json("orders", json).unwrap();
-        assert_eq!(def.base_table, "orders");
+        assert_eq!(def.base_table(), "orders");
         assert_eq!(def.dimensions.len(), 1);
         assert_eq!(def.metrics.len(), 1);
         assert!(def.joins.is_empty());
-    }
-
-    #[test]
-    fn missing_base_table_is_error() {
-        let json = r#"{"dimensions": [], "metrics": []}"#;
-        assert!(SemanticViewDefinition::from_json("test", json).is_err());
     }
 
     #[test]
@@ -676,7 +677,6 @@ mod tests {
         #[test]
         fn semantic_view_definition_with_tables_roundtrip() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![TableRef {
                     alias: "o".to_string(),
                     table: "orders".to_string(),
@@ -777,7 +777,6 @@ mod tests {
         #[test]
         fn definition_with_cardinality_joins_roundtrips() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 dimensions: vec![],
                 metrics: vec![],
                 joins: vec![Join {
@@ -894,7 +893,6 @@ mod tests {
         #[test]
         fn column_types_inferred_roundtrips() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![],
                 dimensions: vec![],
                 metrics: vec![],
@@ -1073,7 +1071,6 @@ mod tests {
         #[test]
         fn created_on_roundtrip() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 dimensions: vec![],
                 metrics: vec![],
                 created_on: Some("2026-04-01T12:00:00Z".to_string()),
@@ -1350,7 +1347,6 @@ mod tests {
         #[test]
         fn view_level_comment_roundtrips() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 comment: Some("Revenue analytics view".to_string()),
                 ..Default::default()
             };
@@ -1622,9 +1618,9 @@ mod tests {
 
         #[test]
         fn minimal_yaml_deserializes() {
-            let yaml = "base_table: orders\ndimensions:\n  - name: region\n    expr: region\nmetrics:\n  - name: revenue\n    expr: SUM(amount)\n";
+            let yaml = "tables:\n  - alias: o\n    table: orders\ndimensions:\n  - name: region\n    expr: region\nmetrics:\n  - name: revenue\n    expr: SUM(amount)\n";
             let def = SemanticViewDefinition::from_yaml("orders", yaml).unwrap();
-            assert_eq!(def.base_table, "orders");
+            assert_eq!(def.base_table(), "orders");
             assert_eq!(def.dimensions.len(), 1);
             assert_eq!(def.dimensions[0].name, "region");
             assert_eq!(def.dimensions[0].expr, "region");
@@ -1829,20 +1825,6 @@ comment: Revenue analytics view
         }
 
         #[test]
-        fn missing_required_field_is_error() {
-            let yaml = "dimensions: []\nmetrics: []\n";
-            // base_table has no #[serde(default)] — omitting it is an error for both
-            // JSON and YAML. This matches the JSON test `missing_base_table_is_error`.
-            let result = SemanticViewDefinition::from_yaml("test", yaml);
-            assert!(result.is_err());
-            let err = result.unwrap_err();
-            assert!(
-                err.contains("invalid YAML definition"),
-                "error should contain prefix: {err}"
-            );
-        }
-
-        #[test]
         fn size_cap_rejects_oversized_input() {
             let oversized = "a".repeat(1_048_577); // 1 byte over cap
             let result = SemanticViewDefinition::from_yaml_with_size_cap("big", &oversized);
@@ -1887,7 +1869,6 @@ comment: Revenue analytics view
         fn yaml_json_roundtrip_via_serialize() {
             // Build a struct, serialize to both formats, deserialize both, assert equal
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
                     expr: "region".to_string(),
@@ -1955,7 +1936,6 @@ comment: Revenue analytics view
         #[test]
         fn definition_with_materializations_json_roundtrip() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
                     expr: "region".to_string(),
@@ -2001,7 +1981,6 @@ comment: Revenue analytics view
         #[test]
         fn empty_materializations_omitted_from_json() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 materializations: vec![],
                 ..Default::default()
             };

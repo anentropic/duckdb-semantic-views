@@ -191,7 +191,6 @@ fn arb_materialization() -> impl Strategy<Value = Materialization> {
 
 fn arb_definition() -> impl Strategy<Value = SemanticViewDefinition> {
     (
-        arb_name(),
         proptest::collection::vec(arb_table_ref(), 0..=2),
         proptest::collection::vec(arb_dimension(), 1..=3),
         proptest::collection::vec(arb_metric(), 1..=3),
@@ -201,9 +200,8 @@ fn arb_definition() -> impl Strategy<Value = SemanticViewDefinition> {
         proptest::collection::vec(arb_materialization(), 0..=2),
     )
         .prop_map(
-            |(base_table, tables, dimensions, metrics, joins, facts, comment, materializations)| {
+            |(tables, dimensions, metrics, joins, facts, comment, materializations)| {
                 SemanticViewDefinition {
-                    base_table,
                     tables,
                     dimensions,
                     metrics,
@@ -249,5 +247,23 @@ proptest! {
         let json_str = serde_json::to_string(&mat).expect("JSON serialize");
         let roundtripped: Materialization = serde_json::from_str(&json_str).expect("JSON deserialize");
         prop_assert_eq!(mat, roundtripped);
+    }
+
+    #[test]
+    fn yaml_export_roundtrip(def in arb_definition()) {
+        let yaml_str = semantic_views::render_yaml::render_yaml_export(&def)
+            .expect("YAML export should succeed");
+        let reimported = SemanticViewDefinition::from_yaml("proptest", &yaml_str)
+            .expect("Re-import should succeed");
+
+        // Strip internal fields from original for comparison
+        let mut expected = def.clone();
+        expected.column_type_names.clear();
+        expected.column_types_inferred.clear();
+        expected.created_on = None;
+        expected.database_name = None;
+        expected.schema_name = None;
+
+        prop_assert_eq!(expected, reimported);
     }
 }
