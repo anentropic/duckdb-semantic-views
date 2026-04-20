@@ -112,7 +112,8 @@ fn build_suffix(kind: DdlKind, name: &str) -> String {
         | DdlKind::ShowTerse
         | DdlKind::ShowDimensions
         | DdlKind::ShowMetrics
-        | DdlKind::ShowFacts => {
+        | DdlKind::ShowFacts
+        | DdlKind::ShowMaterializations => {
             format!(" {name}")
         }
         DdlKind::ShowColumns => {

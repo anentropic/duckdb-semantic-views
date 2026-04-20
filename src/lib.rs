@@ -318,6 +318,9 @@ mod extension {
             show_dims::{ShowSemanticDimensionsAllVTab, ShowSemanticDimensionsVTab},
             show_dims_for_metric::ShowDimensionsForMetricVTab,
             show_facts::{ShowSemanticFactsAllVTab, ShowSemanticFactsVTab},
+            show_materializations::{
+                ShowSemanticMaterializationsAllVTab, ShowSemanticMaterializationsVTab,
+            },
             show_metrics::{ShowSemanticMetricsAllVTab, ShowSemanticMetricsVTab},
         },
         query::explain::ExplainSemanticViewVTab,
@@ -559,6 +562,16 @@ mod extension {
         )?;
         con.register_table_function_with_extra_info::<ShowSemanticFactsAllVTab, _>(
             "show_semantic_facts_all",
+            &catalog_state,
+        )?;
+
+        // SHOW SEMANTIC MATERIALIZATIONS
+        con.register_table_function_with_extra_info::<ShowSemanticMaterializationsVTab, _>(
+            "show_semantic_materializations",
+            &catalog_state,
+        )?;
+        con.register_table_function_with_extra_info::<ShowSemanticMaterializationsAllVTab, _>(
+            "show_semantic_materializations_all",
             &catalog_state,
         )?;
 

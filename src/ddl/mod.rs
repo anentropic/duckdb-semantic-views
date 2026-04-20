@@ -10,4 +10,5 @@ pub mod show_columns;
 pub mod show_dims;
 pub mod show_dims_for_metric;
 pub mod show_facts;
+pub mod show_materializations;
 pub mod show_metrics;

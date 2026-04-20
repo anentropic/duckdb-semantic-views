@@ -39,6 +39,7 @@ pub enum DdlKind {
     ShowDimensions,
     ShowMetrics,
     ShowFacts,
+    ShowMaterializations,
 }
 
 /// Match a fixed sequence of keyword tokens at the start of `input`, tolerating
@@ -153,6 +154,10 @@ fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
     if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"facts"]) {
         return Some((DdlKind::ShowFacts, n));
     }
+    // SHOW SEMANTIC MATERIALIZATIONS (3 keywords) -- before SHOW SEMANTIC VIEWS
+    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"materializations"]) {
+        return Some((DdlKind::ShowMaterializations, n));
+    }
     // SHOW SEMANTIC VIEWS (3 keywords)
     if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"views"]) {
         return Some((DdlKind::Show, n));
@@ -232,6 +237,7 @@ fn function_name(kind: DdlKind) -> &'static str {
         DdlKind::ShowDimensions => "show_semantic_dimensions",
         DdlKind::ShowMetrics => "show_semantic_metrics",
         DdlKind::ShowFacts => "show_semantic_facts",
+        DdlKind::ShowMaterializations => "show_semantic_materializations",
     }
 }
 
@@ -602,7 +608,8 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
         | DdlKind::ShowTerse
         | DdlKind::ShowDimensions
         | DdlKind::ShowMetrics
-        | DdlKind::ShowFacts => {
+        | DdlKind::ShowFacts
+        | DdlKind::ShowMaterializations => {
             let after_prefix = trimmed[plen..].trim();
             let clauses = parse_show_filter_clauses(after_prefix, kind)?;
 
@@ -629,6 +636,7 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
                     DdlKind::ShowDimensions => "show_semantic_dimensions_all",
                     DdlKind::ShowMetrics => "show_semantic_metrics_all",
                     DdlKind::ShowFacts => "show_semantic_facts_all",
+                    DdlKind::ShowMaterializations => "show_semantic_materializations_all",
                     _ => unreachable!(),
                 };
                 format!("SELECT * FROM {all_fn}()")
@@ -692,7 +700,10 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
             Ok(Some(name))
         }
         DdlKind::Show | DdlKind::ShowTerse => Ok(None),
-        DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
+        DdlKind::ShowDimensions
+        | DdlKind::ShowMetrics
+        | DdlKind::ShowFacts
+        | DdlKind::ShowMaterializations => {
             let after_prefix = trimmed[plen..].trim();
             if after_prefix.is_empty() {
                 return Ok(None); // Cross-view form, no specific name
@@ -752,6 +763,7 @@ const DDL_PREFIXES: &[&str] = &[
     "show semantic dimensions for metric",
     "show semantic metrics",
     "show semantic facts",
+    "show semantic materializations",
 ];
 
 /// Detect near-miss DDL prefixes using fuzzy matching.
@@ -858,13 +870,14 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
                 position: Some(trim_offset + plen),
             })
         }
-        // SHOW SEMANTIC DIMENSIONS/METRICS/FACTS: optional IN view_name
-        DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
-            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
-                message: e,
-                position: Some(trim_offset + plen),
-            })
-        }
+        // SHOW SEMANTIC DIMENSIONS/METRICS/FACTS/MATERIALIZATIONS: optional IN view_name
+        DdlKind::ShowDimensions
+        | DdlKind::ShowMetrics
+        | DdlKind::ShowFacts
+        | DdlKind::ShowMaterializations => rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+            message: e,
+            position: Some(trim_offset + plen),
+        }),
         // ALTER forms: validate sub-operation (RENAME TO, SET COMMENT, UNSET COMMENT)
         DdlKind::Alter | DdlKind::AlterIfExists => {
             validate_alter(trimmed_no_semi, trim_offset, plen)?;
@@ -1107,15 +1120,7 @@ fn rewrite_ddl_keyword_body(
     infer_cardinality(&keyword_body.tables, &mut keyword_body.relationships)?;
 
     // 2. Construct SemanticViewDefinition from KeywordBody
-    //    base_table = first table's physical table name (backward compat)
-    let base_table = keyword_body
-        .tables
-        .first()
-        .map(|t| t.table.clone())
-        .unwrap_or_default();
-
     let def = crate::model::SemanticViewDefinition {
-        base_table,
         tables: keyword_body.tables,
         dimensions: keyword_body.dimensions,
         metrics: keyword_body.metrics,
@@ -1298,12 +1303,6 @@ fn rewrite_ddl_yaml_body(
 
     if let Some(c) = view_comment {
         def.comment = Some(c);
-    }
-
-    if def.base_table.is_empty() {
-        if let Some(first) = def.tables.first() {
-            def.base_table = first.table.clone();
-        }
     }
 
     infer_cardinality(&def.tables, &mut def.joins)?;
@@ -2659,6 +2658,62 @@ mod tests {
             let sql = rewrite_ddl("SHOW SEMANTIC VIEWS").unwrap();
             assert_eq!(sql, "SELECT * FROM list_semantic_views()");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 57: SHOW SEMANTIC MATERIALIZATIONS tests (INTR-03)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_show_materializations() {
+        assert_eq!(
+            detect_ddl_kind("SHOW SEMANTIC MATERIALIZATIONS"),
+            Some(DdlKind::ShowMaterializations)
+        );
+    }
+
+    #[test]
+    fn detect_show_materializations_in_view() {
+        assert_eq!(
+            detect_ddl_kind("SHOW SEMANTIC MATERIALIZATIONS IN my_view"),
+            Some(DdlKind::ShowMaterializations)
+        );
+    }
+
+    #[test]
+    fn rewrite_show_materializations_all() {
+        let sql = rewrite_ddl("SHOW SEMANTIC MATERIALIZATIONS").unwrap();
+        assert_eq!(sql, "SELECT * FROM show_semantic_materializations_all()");
+    }
+
+    #[test]
+    fn rewrite_show_materializations_in_view() {
+        let sql = rewrite_ddl("SHOW SEMANTIC MATERIALIZATIONS IN my_view").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM show_semantic_materializations('my_view')"
+        );
+    }
+
+    #[test]
+    fn near_miss_show_materialization() {
+        // "SHOW SEMANTIC MATERIALIZATION" (missing 'S') should suggest the correct prefix
+        let result = detect_near_miss("SHOW SEMANTIC MATERIALIZATION");
+        assert!(result.is_some());
+        let err = result.unwrap();
+        assert!(err.message.contains("Did you mean"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn extract_ddl_name_show_materializations_in() {
+        let result = extract_ddl_name("SHOW SEMANTIC MATERIALIZATIONS IN my_view").unwrap();
+        assert_eq!(result, Some("my_view".to_string()));
+    }
+
+    #[test]
+    fn extract_ddl_name_show_materializations_all() {
+        let result = extract_ddl_name("SHOW SEMANTIC MATERIALIZATIONS").unwrap();
+        assert_eq!(result, None);
     }
 
     // -----------------------------------------------------------------------
