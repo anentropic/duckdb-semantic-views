@@ -5,6 +5,7 @@ pub mod drop;
 pub mod get_ddl;
 pub mod list;
 pub mod persist;
+pub mod read_yaml;
 pub mod show_columns;
 pub mod show_dims;
 pub mod show_dims_for_metric;

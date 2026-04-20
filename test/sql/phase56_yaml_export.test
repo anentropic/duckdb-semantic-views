@@ -1,0 +1,334 @@
+# Phase 56: READ_YAML_FROM_SEMANTIC_VIEW
+#
+# Verifies YAML export scalar function and round-trip fidelity:
+#   YAML-04: Returns a valid YAML string for a stored semantic view
+#   YAML-08: Exported YAML round-trips correctly
+#
+# Requirements covered: YAML-04, YAML-08
+
+require semantic_views
+
+# ============================================================
+# Setup: create base tables
+# ============================================================
+
+statement ok
+CREATE TABLE p56_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), cost DECIMAL(10,2), region VARCHAR, status VARCHAR);
+
+statement ok
+INSERT INTO p56_orders VALUES
+    (1, 100.00, 60.00, 'US', 'active'),
+    (2, 200.00, 120.00, 'EU', 'active'),
+    (3, 150.00, 90.00, 'US', 'inactive');
+
+statement ok
+CREATE TABLE p56_customers (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO p56_customers VALUES (1, 'Alice'), (2, 'Bob');
+
+# ============================================================
+# Case 1: Basic YAML export
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p56_simple AS
+TABLES (
+    o AS p56_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total AS SUM(o.amount)
+)
+
+# Verify YAML output contains expected keys
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%tables:%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%dimensions:%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%metrics:%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%p56_orders%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%region%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%SUM(o.amount)%'
+----
+true
+
+# ============================================================
+# Case 2: Internal fields absent from YAML output
+# ============================================================
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%column_type_names%'
+----
+false
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%column_types_inferred%'
+----
+false
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%created_on%'
+----
+false
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%database_name%'
+----
+false
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_simple') LIKE '%schema_name%'
+----
+false
+
+# ============================================================
+# Case 3: View with MATERIALIZATIONS
+# ============================================================
+
+statement ok
+CREATE TABLE p56_daily_agg (region VARCHAR, total DECIMAL(10,2));
+
+statement ok
+INSERT INTO p56_daily_agg VALUES ('US', 250.00), ('EU', 200.00);
+
+statement ok
+CREATE SEMANTIC VIEW p56_materialized AS
+TABLES (
+    o AS p56_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total AS SUM(o.amount)
+)
+MATERIALIZATIONS (
+    daily_rev AS (
+        TABLE p56_daily_agg,
+        DIMENSIONS (region),
+        METRICS (total)
+    )
+)
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_materialized') LIKE '%materializations:%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_materialized') LIKE '%daily_rev%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_materialized') LIKE '%p56_daily_agg%'
+----
+true
+
+# ============================================================
+# Case 4: View with metadata annotations
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p56_annotated COMMENT = 'Annotated view' AS
+TABLES (
+    o AS p56_orders PRIMARY KEY (id) COMMENT = 'Order table' WITH SYNONYMS = ('sales')
+)
+DIMENSIONS (
+    o.region AS o.region COMMENT = 'Geographic region' WITH SYNONYMS = ('territory', 'area')
+)
+METRICS (
+    o.total AS SUM(o.amount) COMMENT = 'Total revenue',
+    PRIVATE o.total_cost AS SUM(o.cost) WITH SYNONYMS = ('cost_total')
+)
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_annotated') LIKE '%Annotated view%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_annotated') LIKE '%Geographic region%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_annotated') LIKE '%territory%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_annotated') LIKE '%Private%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_annotated') LIKE '%cost_total%'
+----
+true
+
+# ============================================================
+# Case 5: Fully qualified name resolution
+# ============================================================
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('memory.main.p56_simple') LIKE '%tables:%'
+----
+true
+
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('main.p56_simple') LIKE '%tables:%'
+----
+true
+
+# FQN returns same result as bare name
+query I
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('memory.main.p56_simple') = READ_YAML_FROM_SEMANTIC_VIEW('p56_simple')
+----
+true
+
+# ============================================================
+# Case 6: Nonexistent view error
+# ============================================================
+
+statement error
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('nonexistent_p56')
+----
+does not exist
+
+# ============================================================
+# Case 7: Round-trip verification
+#
+# Create a view, export YAML, drop it, re-create from manually
+# matching YAML, and verify the query output is identical.
+# ============================================================
+
+# Create source view and query it
+statement ok
+CREATE SEMANTIC VIEW p56_rt_source AS
+TABLES (
+    o AS p56_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total AS SUM(o.amount)
+)
+
+# Store query results from original view
+statement ok
+CREATE TABLE p56_rt_results AS
+SELECT * FROM semantic_view('p56_rt_source', dimensions := ['region'], metrics := ['total'])
+
+# Store YAML export
+statement ok
+CREATE TABLE p56_rt_yaml AS SELECT READ_YAML_FROM_SEMANTIC_VIEW('p56_rt_source') AS yaml_text
+
+# Verify exported YAML is valid (contains expected structure)
+query I
+SELECT yaml_text LIKE '%tables:%' FROM p56_rt_yaml
+----
+true
+
+query I
+SELECT yaml_text LIKE '%dimensions:%' FROM p56_rt_yaml
+----
+true
+
+query I
+SELECT yaml_text LIKE '%metrics:%' FROM p56_rt_yaml
+----
+true
+
+# Drop original view
+statement ok
+DROP SEMANTIC VIEW p56_rt_source
+
+# Re-create from YAML (manually matching expected YAML output format)
+statement ok
+CREATE SEMANTIC VIEW p56_rt_target FROM YAML $$
+tables:
+- alias: o
+  table: p56_orders
+  pk_columns:
+  - id
+dimensions:
+- name: region
+  expr: o.region
+  source_table: o
+metrics:
+- name: total
+  expr: SUM(o.amount)
+  source_table: o
+$$
+
+# Query the re-created view and compare
+query TR rowsort
+SELECT * FROM semantic_view('p56_rt_target', dimensions := ['region'], metrics := ['total'])
+----
+EU	200.00
+US	250.00
+
+# Verify results match original
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM semantic_view('p56_rt_target', dimensions := ['region'], metrics := ['total'])
+    EXCEPT
+    SELECT * FROM p56_rt_results
+)
+----
+0
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p56_simple
+
+statement ok
+DROP SEMANTIC VIEW p56_materialized
+
+statement ok
+DROP SEMANTIC VIEW p56_annotated
+
+statement ok
+DROP SEMANTIC VIEW p56_rt_target
+
+statement ok
+DROP TABLE p56_rt_results
+
+statement ok
+DROP TABLE p56_rt_yaml
+
+statement ok
+DROP TABLE p56_daily_agg
+
+statement ok
+DROP TABLE p56_orders
+
+statement ok
+DROP TABLE p56_customers

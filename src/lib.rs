@@ -313,6 +313,7 @@ mod extension {
             drop::{DropSemanticViewVTab, DropState},
             get_ddl::GetDdlScalar,
             list::{ListSemanticViewsVTab, ListTerseSemanticViewsVTab},
+            read_yaml::ReadYamlFromSemanticViewScalar,
             show_columns::ShowColumnsInSemanticViewVTab,
             show_dims::{ShowSemanticDimensionsAllVTab, ShowSemanticDimensionsVTab},
             show_dims_for_metric::ShowDimensionsForMetricVTab,
@@ -563,6 +564,12 @@ mod extension {
 
         // Register GET_DDL scalar function.
         con.register_scalar_function_with_state::<GetDdlScalar>("get_ddl", &catalog_state)?;
+
+        // Register READ_YAML_FROM_SEMANTIC_VIEW scalar function.
+        con.register_scalar_function_with_state::<ReadYamlFromSemanticViewScalar>(
+            "read_yaml_from_semantic_view",
+            &catalog_state,
+        )?;
 
         // Create a NEW connection for the semantic_view table function.
         let mut query_conn: ffi::duckdb_connection = ptr::null_mut();
