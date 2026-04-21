@@ -46,7 +46,7 @@ First, create the pre-aggregated table:
 Then declare a semantic view with a materialization pointing to that table:
 
 .. code-block:: sql
-   :emphasize-lines: 13-19
+   :emphasize-lines: 12-18
 
    CREATE SEMANTIC VIEW order_metrics AS
    TABLES (
