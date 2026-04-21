@@ -2,7 +2,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use semantic_views::expand::{expand, QueryRequest};
-use semantic_views::model::{Dimension, Metric, SemanticViewDefinition};
+use semantic_views::model::{Dimension, Metric, SemanticViewDefinition, TableRef};
 
 #[derive(Debug, Arbitrary)]
 struct NameFuzzInput {
@@ -25,7 +25,11 @@ fuzz_target!(|input: NameFuzzInput| {
 
 fn fixed_definition() -> SemanticViewDefinition {
     SemanticViewDefinition {
-        base_table: "orders".to_string(),
+        tables: vec![TableRef {
+            alias: "orders".to_string(),
+            table: "orders".to_string(),
+            ..Default::default()
+        }],
         dimensions: vec![
             Dimension {
                 name: "region".to_string(),
