@@ -171,7 +171,7 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
 - [x] **Phase 54: Materialization Model & DDL** (1 plan) - Materialization struct, MATERIALIZATIONS clause in body parser, persistence, YAML support (completed 2026-04-19)
 - [x] **Phase 55: Materialization Routing Engine** (1 plan) - Query-time routing with exact-match set containment, fallback, semi-additive/window exclusion (completed 2026-04-19)
 - [x] **Phase 56: YAML Export** (1 plan) - READ_YAML_FROM_SEMANTIC_VIEW scalar function, round-trip including materializations (completed 2026-04-20)
-- [ ] **Phase 57: Introspection & Diagnostics** (1 plan) - explain_semantic_view routing info, DESCRIBE materializations, SHOW SEMANTIC MATERIALIZATIONS
+- [x] **Phase 57: Introspection & Diagnostics** (1 plan) - explain_semantic_view routing info, DESCRIBE materializations, SHOW SEMANTIC MATERIALIZATIONS (completed 2026-04-21)
 
 ## Phase Details
 
@@ -258,9 +258,9 @@ Plans:
   1. `explain_semantic_view()` output includes which materialization was selected (or "none") and the expanded SQL reflects the routed table
   2. `DESCRIBE SEMANTIC VIEW` includes materialization entries showing each materialization's name, table, covered dimensions, and covered metrics
   3. `SHOW SEMANTIC MATERIALIZATIONS IN view_name` lists all declared materializations with their covered dimensions and metrics
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 Plans:
-- [ ] 57-01-PLAN.md -- EXPLAIN materialization header, DESCRIBE materialization rows, SHOW SEMANTIC MATERIALIZATIONS command
+- [x] 57-01-PLAN.md -- EXPLAIN materialization header, DESCRIBE materialization rows, SHOW SEMANTIC MATERIALIZATIONS command
 
 ## Progress
 
@@ -275,4 +275,4 @@ Phases execute in numeric order: 51 -> 52 -> 53 -> 54 -> 55 -> 56 -> 57
 | 54. Materialization Model & DDL | v0.7.0 | 1/1 | Complete    | 2026-04-19 |
 | 55. Materialization Routing Engine | v0.7.0 | 1/1 | Complete    | 2026-04-19 |
 | 56. YAML Export | v0.7.0 | 1/1 | Complete    | 2026-04-20 |
-| 57. Introspection & Diagnostics | v0.7.0 | 0/1 | Not started | - |
+| 57. Introspection & Diagnostics | v0.7.0 | 1/1 | Complete   | 2026-04-21 |

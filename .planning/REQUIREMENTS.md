@@ -31,9 +31,9 @@ Requirements for YAML Definitions & Materialization Routing milestone. Each maps
 
 ### Introspection
 
-- [ ] **INTR-01**: `explain_semantic_view()` output includes materialization routing decision (materialization name or "none") and expanded SQL reflects the routed table
-- [ ] **INTR-02**: `DESCRIBE SEMANTIC VIEW` includes materialization entries
-- [ ] **INTR-03**: `SHOW SEMANTIC MATERIALIZATIONS IN view_name` lists all declared materializations with covered dimensions and metrics
+- [x] **INTR-01**: `explain_semantic_view()` output includes materialization routing decision (materialization name or "none") and expanded SQL reflects the routed table
+- [x] **INTR-02**: `DESCRIBE SEMANTIC VIEW` includes materialization entries
+- [x] **INTR-03**: `SHOW SEMANTIC MATERIALIZATIONS IN view_name` lists all declared materializations with covered dimensions and metrics
 
 ## v2 Requirements
 
@@ -81,9 +81,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | MAT-05 | Phase 55 | Complete |
 | MAT-06 | Phase 54 | Pending |
 | MAT-07 | Phase 54 | Pending |
-| INTR-01 | Phase 57 | Pending |
-| INTR-02 | Phase 57 | Pending |
-| INTR-03 | Phase 57 | Pending |
+| INTR-01 | Phase 57 | Complete |
+| INTR-02 | Phase 57 | Complete |
+| INTR-03 | Phase 57 | Complete |
 
 **Coverage:**
 - v0.7.0 requirements: 19 total
