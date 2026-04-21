@@ -33,3 +33,4 @@ test/sql/phase53_yaml_file.test
 test/sql/phase54_materializations.test
 test/sql/phase55_materialization_routing.test
 test/sql/phase56_yaml_export.test
+test/sql/phase57_introspection.test
