@@ -39,7 +39,7 @@ Snowflake and Databricks, along with dbt Cloud, Cube.dev and others, all ship se
       :link: how-to-guides
       :link-type: ref
 
-      FACTS, derived metrics, role-playing dimensions, fan traps, data sources.
+      FACTS, derived metrics, role-playing dimensions, fan traps, data sources, materializations, YAML definitions.
 
    .. grid-item-card:: Snowflake comparison
       :link: explanation-snowflake

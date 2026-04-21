@@ -1,5 +1,5 @@
 .. meta::
-   :description: Goal-oriented guides for FACTS, derived metrics, role-playing dimensions, fan trap resolution, data source connectivity, metadata annotations, semi-additive metrics, window metrics, wildcard selection, and fact queries
+   :description: Goal-oriented guides for FACTS, derived metrics, role-playing dimensions, fan trap resolution, data source connectivity, metadata annotations, semi-additive metrics, window metrics, wildcard selection, fact queries, materializations, and YAML definitions
 
 .. _how-to-guides:
 
@@ -19,6 +19,8 @@ Goal-oriented guides for specific tasks with DuckDB Semantic Views.
 - :ref:`howto-window-metrics` -- Define window function metrics for rolling averages, lag comparisons, and rankings using OVER clauses.
 - :ref:`howto-wildcard-selection` -- Select all dimensions, metrics, or facts for a table alias using wildcard patterns in queries.
 - :ref:`howto-query-facts` -- Query facts directly as row-level columns without aggregation.
+- :ref:`howto-materializations` -- Declare materializations that route matching queries to pre-aggregated tables.
+- :ref:`howto-yaml-definitions` -- Export and import semantic view definitions as YAML for version control and migration.
 
 .. toctree::
    :hidden:
@@ -33,3 +35,5 @@ Goal-oriented guides for specific tasks with DuckDB Semantic Views.
    window-metrics
    wildcard-selection
    query-facts
+   materializations
+   yaml-definitions

@@ -1,27 +1,86 @@
 # Editor Report
 
-**Generated:** 2026-04-13
-**Files reviewed:** 4 (changed pages) + 28 (terminology scan across all docs)
-**Changes made:** 5
-  - BLOCKING: 0
-  - SUGGESTION: 1
-  - NITPICK: 0
+**Generated:** 2026-04-21
+**Files reviewed:** 16
+**Changes made:** 24
+  - BLOCKING: 6
+  - SUGGESTION: 12
+  - NITPICK: 6
 
 ## Summary
 
-The four changed pages are well-written with consistent terminology, correct cross-references, and no structural type blur. One minor AI-writing pattern was fixed (significance inflation in error-messages.rst). Internal notes were stripped from all four files. All accuracy claims verified against source code.
+The documentation is well-written and free of AI patterns. The primary changes were stripping internal HTML comments from all 16 pages and adding cross-reference links to unlinked inline code mentions of API symbols. No terminology inconsistencies, type blur, or AI writing patterns were found.
 
 ---
 
-## docs/how-to/window-metrics.rst
+## docs/how-to/materializations.rst
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| How Materializations Work | Unlinked `semantic_view()` code mention in prose | Linked to `:ref:\`semantic_view() <ref-semantic-view-function>\`` |
+| Troubleshooting | Unlinked `explain_semantic_view()` code mention in prose | Linked to `:ref:\`explain_semantic_view() <ref-explain-semantic-view>\`` |
 
 ### SUGGESTION
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Post-processing | Internal notes stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (38 lines) |
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (31 lines) |
 
-No terminology, type blur, humanizer, or cross-reference issues found. Page is a clean how-to with consistent structure matching other how-to guides.
+---
+
+## docs/how-to/yaml-definitions.rst
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Export with READ_YAML_FROM_SEMANTIC_VIEW | Unlinked `READ_YAML_FROM_SEMANTIC_VIEW()` code mention (first occurrence in prose) | Linked to `:ref:\`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>\`` |
+| Troubleshooting | Unlinked `READ_YAML_FROM_SEMANTIC_VIEW()` code mention in error description | Linked to `:ref:\`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>\`` |
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (29 lines) |
+
+---
+
+## docs/reference/show-semantic-materializations.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (26 lines) |
+
+---
+
+## docs/reference/read-yaml-from-semantic-view.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (24 lines) |
+
+---
+
+## docs/explanation/databricks-comparison.rst
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Concept Mapping table | Unlinked `READ_YAML_FROM_SEMANTIC_VIEW()` in YAML definitions row | Linked to `:ref:\`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>\`` |
+| Features in DuckDB table | Unlinked `explain_semantic_view()` and `READ_YAML_FROM_SEMANTIC_VIEW()` in feature rows | Linked both to their respective `:ref:` targets |
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (27 lines) |
 
 ---
 
@@ -31,41 +90,133 @@ No terminology, type blur, humanizer, or cross-reference issues found. Page is a
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Post-processing | Internal notes stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (18 lines) |
-
-No terminology, type blur, humanizer, or cross-reference issues found. Page follows the SQL reference pattern consistently.
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (35 lines) |
 
 ---
 
-## docs/reference/show-semantic-dimensions-for-metric.rst
+## docs/reference/describe-semantic-view.rst
 
 ### SUGGESTION
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Post-processing | Internal notes stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (18 lines) |
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (25 lines) |
 
-No terminology, type blur, humanizer, or cross-reference issues found.
+---
+
+## docs/reference/explain-semantic-view-function.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (25 lines) |
+
+---
+
+## docs/reference/get-ddl.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (21 lines) |
 
 ---
 
 ## docs/reference/error-messages.rst
 
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| YAML Errors intro | Unlinked `READ_YAML_FROM_SEMANTIC_VIEW()` code mention in section intro | Linked to `:ref:\`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>\`` |
+
 ### SUGGESTION
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Window and aggregate metric mixing | AI vocabulary: "fundamentally" removed from "These produce fundamentally different result shapes" | Changed to "These produce different result shapes (row-level vs. grouped)" |
-| Post-processing | Internal notes stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (20 lines) |
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (27 lines) |
 
-No terminology, type blur, or cross-reference issues found. All existing `:ref:` links verified as valid.
+---
+
+## docs/explanation/semantic-views-vs-regular-views.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Materialization Support | Unlinked `semantic_view()` in final paragraph linked | Linked to `:ref:\`semantic_view() <ref-semantic-view-function>\`` |
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (25 lines) |
+
+---
+
+## docs/explanation/snowflake-comparison.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| A Note on Snowflake's YAML Spec | Unlinked `READ_YAML_FROM_SEMANTIC_VIEW()` in YAML section linked | Linked to `:ref:\`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>\`` |
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (19 lines) |
+
+---
+
+## docs/reference/index.rst
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (12 lines) |
+
+---
+
+## docs/how-to/index.rst
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (12 lines) |
+
+---
+
+## docs/index.rst
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (6 lines) |
+
+---
+
+## docs/explanation/index.rst
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| (whole page) | Internal HTML comment block stripped | Removed `<!-- INTERNAL NOTES FOR EDITOR -->` block (10 lines) |
 
 ---
 
 ## Terminology Changes
 
-No terminology changes were needed. All terms across all 28+ documentation files are consistent with the canonical forms in `terminology.yaml` and match source code symbol names.
-
 | Term | Before | After | Authority |
 |------|--------|-------|-----------|
-| (none) | -- | -- | -- |
+| (none) | -- | -- | No terminology inconsistencies found across all doc files |
+
+**New terms added to terminology.yaml:**
+
+| Term | Source |
+|------|--------|
+| `READ_YAML_FROM_SEMANTIC_VIEW()` | scalar function in src/ddl/read_yaml.rs |
+| `Materialization` | struct in src/model.rs |
+| `Databricks` | proper noun (new comparison page) |
+| `Delta Lake` | proper noun (Databricks comparison) |
+| `Unity Catalog` | proper noun (Databricks comparison) |
+| `semi-additive metric` | project term |
+| `window metric` | project term |
+| `materialization` | project term |

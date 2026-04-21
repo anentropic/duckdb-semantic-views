@@ -192,7 +192,7 @@ pub(super) fn expand_semi_additive(
 
     // CTE FROM clause (same logic as expand())
     sql.push_str("\n    FROM ");
-    sql.push_str(&quote_table_ref(&def.base_table));
+    sql.push_str(&quote_table_ref(def.base_table()));
     if let Some(base_ref) = def.tables.first() {
         sql.push_str(" AS ");
         sql.push_str(&quote_ident(&base_ref.alias));
@@ -680,7 +680,7 @@ mod tests {
         // dim on a means traversing c->a which is one-to-many fan-out direction).
         // But with semi-additive, it should be skipped.
         let def = orders_view()
-            .with_base_table("customers")
+            .with_table("customers", "customers", &[])
             .clear_dimensions()
             .clear_metrics()
             .with_table("c", "customers", &["id"])
@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn test_semi_additive_multi_table_join() {
         let def = orders_view()
-            .with_base_table("accounts")
+            .with_table("accounts", "accounts", &[])
             .clear_dimensions()
             .clear_metrics()
             .with_table("a", "accounts", &["id"])

@@ -7,7 +7,7 @@
 DESCRIBE SEMANTIC VIEW
 ========================
 
-Returns the definition of a semantic view as a multi-row result set in property-per-row format. Each row represents one property of one object (semantic view, table, relationship, fact, dimension, metric, or derived metric) in the view definition.
+Returns the definition of a semantic view as a multi-row result set in property-per-row format. Each row represents one property of one object (semantic view, table, relationship, fact, dimension, metric, derived metric, or materialization) in the view definition.
 
 
 .. _ref-describe-syntax:
@@ -45,13 +45,13 @@ The result contains multiple rows with 5 VARCHAR columns:
      - Description
    * - ``object_kind``
      - VARCHAR
-     - The type of object: ``SEMANTIC_VIEW``, ``TABLE``, ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, or ``DERIVED_METRIC``.
+     - The type of object: ``SEMANTIC_VIEW``, ``TABLE``, ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, ``DERIVED_METRIC``, or ``MATERIALIZATION``.
    * - ``object_name``
      - VARCHAR
-     - The name of the object (view name, table name, relationship name, fact/dimension/metric name).
+     - The name of the object (view name, table name, relationship name, fact/dimension/metric name, materialization name).
    * - ``parent_entity``
      - VARCHAR
-     - The parent table for this object. Empty string for ``SEMANTIC_VIEW``, ``TABLE``, and ``DERIVED_METRIC`` objects.
+     - The parent table for this object. Empty string for ``SEMANTIC_VIEW``, ``TABLE``, ``DERIVED_METRIC``, and ``MATERIALIZATION`` objects.
    * - ``property``
      - VARCHAR
      - The property name being described.
@@ -65,7 +65,7 @@ The result contains multiple rows with 5 VARCHAR columns:
 Object Kinds and Properties
 ===========================
 
-Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then ``TABLE`` objects, then ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, and ``DERIVED_METRIC``.
+Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then ``TABLE`` objects, then ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, ``DERIVED_METRIC``, and ``MATERIALIZATION``.
 
 **SEMANTIC_VIEW**
    Emitted only when a view-level comment is set (via :ref:`ALTER SEMANTIC VIEW SET COMMENT <ref-alter-semantic-view>`). Produces one property row:
@@ -211,6 +211,24 @@ Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then `
       * - ``WINDOW_SPEC``
         - Only emitted for window-function derived metrics.
 
+**MATERIALIZATION**
+   .. versionadded:: 0.7.0
+
+   One block per materialization declared in the ``MATERIALIZATIONS`` clause. Each materialization produces 3 property rows. Materializations have an empty ``parent_entity``:
+
+   .. list-table::
+      :header-rows: 1
+      :widths: 25 75
+
+      * - Property
+        - Description
+      * - ``TABLE``
+        - The physical table name that the materialization points to.
+      * - ``DIMENSIONS``
+        - JSON array of dimension names covered by this materialization (e.g., ``["region"]``). Empty array ``[]`` when no dimensions are declared.
+      * - ``METRICS``
+        - JSON array of metric names covered by this materialization (e.g., ``["revenue","order_count"]``). Empty array ``[]`` when no metrics are declared.
+
 
 .. _ref-describe-examples:
 
@@ -293,6 +311,42 @@ Examples
    │ METRIC        │ revenue     │ orders        │ COMMENT                  │ Total revenue        │
    │ METRIC        │ revenue     │ orders        │ ACCESS_MODIFIER          │ PUBLIC               │
    └───────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────────┘
+
+**View with materializations:**
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW order_metrics AS
+   TABLES (
+       o AS orders PRIMARY KEY (id)
+   )
+   DIMENSIONS (
+       o.region AS o.region
+   )
+   METRICS (
+       o.revenue     AS SUM(o.amount),
+       o.order_count AS COUNT(*)
+   )
+   MATERIALIZATIONS (
+       region_agg AS (
+           TABLE daily_revenue_agg,
+           DIMENSIONS (region),
+           METRICS (revenue, order_count)
+       )
+   );
+
+   SELECT * FROM (DESCRIBE SEMANTIC VIEW order_metrics)
+   WHERE object_kind = 'MATERIALIZATION';
+
+.. code-block:: text
+
+   ┌─────────────────┬────────────┬───────────────┬────────────┬──────────────────────────────┐
+   │ object_kind     │ object_name│ parent_entity │ property   │ property_value               │
+   ├─────────────────┼────────────┼───────────────┼────────────┼──────────────────────────────┤
+   │ MATERIALIZATION │ region_agg │               │ TABLE      │ daily_revenue_agg            │
+   │ MATERIALIZATION │ region_agg │               │ DIMENSIONS │ ["region"]                   │
+   │ MATERIALIZATION │ region_agg │               │ METRICS    │ ["revenue","order_count"]    │
+   └─────────────────┴────────────┴───────────────┴────────────┴──────────────────────────────┘
 
 .. tip::
 

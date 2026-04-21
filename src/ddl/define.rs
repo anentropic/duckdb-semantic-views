@@ -296,6 +296,7 @@ impl VTab for DefineFromJsonVTab {
                     .collect();
 
                 let type_conn = state.persist_conn.unwrap_or(state.catalog_conn);
+                let fallback_table = def.base_table().to_string();
 
                 for fact in &mut def.facts {
                     let alias = fact.source_table.as_deref().unwrap_or("");
@@ -303,7 +304,7 @@ impl VTab for DefineFromJsonVTab {
                         .source_table
                         .as_ref()
                         .and_then(|a| alias_to_table.get(&a.to_ascii_lowercase()).cloned())
-                        .unwrap_or_else(|| def.base_table.clone());
+                        .unwrap_or_else(|| fallback_table.clone());
 
                     // Include AS alias so expressions like `li.price` resolve correctly.
                     let from_clause = if alias.is_empty() {

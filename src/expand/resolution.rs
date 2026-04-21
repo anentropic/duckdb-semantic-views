@@ -34,6 +34,33 @@ pub fn quote_table_ref(table: &str) -> String {
         .join(".")
 }
 
+/// Qualify a table name with the definition's catalog/schema, then quote it.
+///
+/// If the table name is already dot-qualified (contains `.`), it is used as-is
+/// to avoid double-qualification. Otherwise, `database_name` and `schema_name`
+/// from the definition are prepended as available.
+///
+/// This ensures the expanded SQL uses fully-qualified table references, which
+/// is required for execution contexts (e.g. ADBC) that don't inherit the
+/// connection's default catalog/schema search path.
+#[must_use]
+pub fn qualify_and_quote_table_ref(table: &str, def: &SemanticViewDefinition) -> String {
+    // Already dot-qualified — don't double-qualify.
+    if table.contains('.') {
+        return quote_table_ref(table);
+    }
+
+    let mut parts = Vec::new();
+    if let Some(db) = &def.database_name {
+        parts.push(quote_ident(db));
+    }
+    if let Some(schema) = &def.schema_name {
+        parts.push(quote_ident(schema));
+    }
+    parts.push(quote_ident(table));
+    parts.join(".")
+}
+
 /// Look up a dimension by name using case-insensitive matching.
 ///
 /// Supports table-qualified names: if `name` contains a '.' (e.g., "o.region"),

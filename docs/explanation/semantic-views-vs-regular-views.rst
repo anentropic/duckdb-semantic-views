@@ -96,7 +96,7 @@ Key Differences
      - Defined once, reused across all queries
    * - Query interface
      - ``SELECT * FROM view``
-     - ``semantic_view('name', dimensions := [...], metrics := [...])``
+     - :ref:`semantic_view('name', ...) <ref-semantic-view-function>`
 
 
 .. _explanation-sv-why:
@@ -140,11 +140,37 @@ Semantic views are not a replacement for regular views in all cases.
 - Exploration workflows where analysts want to slice data by different dimensions without writing new queries
 
 
-.. _explanation-sv-not-materialized:
+.. _explanation-sv-materialization:
 
-Semantic Views Are Not Materialized
-====================================
+Materialization Support
+========================
 
-Semantic views do not store data. The extension is a *preprocessor*: it generates SQL and hands it to DuckDB for execution. Each query runs fresh against the underlying tables. There is no caching, no pre-aggregation, and no materialized result set.
+.. versionadded:: 0.7.0
 
-This means semantic view query performance is the same as running the equivalent SQL directly. The value is in query generation and metric consistency, not in performance optimization.
+By default, semantic views do not store data. The extension is a *preprocessor*: it generates SQL and hands it to DuckDB for execution. Each query runs fresh against the underlying tables.
+
+Starting in v0.7.0, the ``MATERIALIZATIONS`` clause lets you optionally route queries to pre-aggregated tables. When a query's requested dimensions and metrics exactly match a declared materialization, the extension reads from the pre-aggregated table instead of expanding raw sources with JOINs and GROUP BY.
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW order_metrics AS
+   TABLES (
+       o AS orders PRIMARY KEY (id)
+   )
+   DIMENSIONS (
+       o.region AS o.region
+   )
+   METRICS (
+       o.revenue AS SUM(o.amount)
+   )
+   MATERIALIZATIONS (
+       region_agg AS (
+           TABLE daily_revenue_by_region,
+           DIMENSIONS (region),
+           METRICS (revenue)
+       )
+   );
+
+This is not automatic caching or background refresh. You create and maintain the pre-aggregated table yourself (or use external tools like dbt). The extension simply routes matching queries to it. For queries that do not match any materialization, standard on-demand SQL generation continues as before.
+
+Materialization routing is transparent to the caller -- the :ref:`semantic_view() <ref-semantic-view-function>` interface does not change. See :ref:`howto-materializations` for a detailed guide.

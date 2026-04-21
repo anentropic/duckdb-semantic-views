@@ -106,6 +106,16 @@ html_theme_options = {
                     "url": "how-to/query-facts",
                     "summary": "Query facts directly as row-level columns without aggregation",
                 },
+                {
+                    "title": "Materializations",
+                    "url": "how-to/materializations",
+                    "summary": "Route matching queries to pre-aggregated tables",
+                },
+                {
+                    "title": "YAML Definitions",
+                    "url": "how-to/yaml-definitions",
+                    "summary": "Export and import semantic view definitions as YAML",
+                },
             ],
         },
         {
@@ -121,6 +131,11 @@ html_theme_options = {
                     "title": "Snowflake Comparison",
                     "url": "explanation/snowflake-comparison",
                     "summary": "Feature comparison with Snowflake SQL DDL semantic views",
+                },
+                {
+                    "title": "Databricks Comparison",
+                    "url": "explanation/databricks-comparison",
+                    "summary": "Feature comparison with Databricks metric views",
                 },
             ],
         },

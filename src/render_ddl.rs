@@ -338,7 +338,6 @@ mod tests {
 
     fn minimal_def() -> SemanticViewDefinition {
         SemanticViewDefinition {
-            base_table: "orders".to_string(),
             tables: vec![TableRef {
                 alias: "o".to_string(),
                 table: "orders".to_string(),
@@ -493,7 +492,6 @@ mod tests {
     #[test]
     fn test_empty_tables_error() {
         let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
             ..Default::default()
         };
         let result = render_create_ddl("legacy", &def);
@@ -675,7 +673,6 @@ mod tests {
         let kb = parse_keyword_body(&body, 0).expect("Round-trip parse should succeed");
         // Reconstruct from parsed body
         let def2 = SemanticViewDefinition {
-            base_table: "orders".to_string(),
             tables: kb.tables,
             dimensions: kb.dimensions,
             metrics: kb.metrics,
@@ -827,7 +824,6 @@ mod tests {
         let body = format!("AS {}", &ddl1[as_pos + 4..]);
         let kb = parse_keyword_body(&body, 0).expect("Round-trip parse should succeed");
         let def2 = SemanticViewDefinition {
-            base_table: "orders".to_string(),
             tables: kb.tables,
             dimensions: kb.dimensions,
             metrics: kb.metrics,
@@ -980,7 +976,6 @@ mod tests {
         let body = format!("AS {}", &ddl1[as_pos + 4..]);
         let kb = parse_keyword_body(&body, 0).expect("Round-trip parse should succeed");
         let def2 = SemanticViewDefinition {
-            base_table: "orders".to_string(),
             tables: kb.tables,
             dimensions: kb.dimensions,
             metrics: kb.metrics,

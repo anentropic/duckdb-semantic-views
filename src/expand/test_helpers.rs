@@ -10,13 +10,19 @@ use crate::model::{
 
 /// Base orders view: single table, 2 dimensions, 2 metrics.
 ///
-/// - base_table: "orders"
+/// - table: "orders" (alias "orders")
 /// - dimensions: region, status
 /// - metrics: total_revenue = sum(amount), order_count = count(*)
 pub(super) fn orders_view() -> SemanticViewDefinition {
     SemanticViewDefinition {
-        base_table: "orders".to_string(),
-        tables: vec![],
+        tables: vec![TableRef {
+            alias: "orders".to_string(),
+            table: "orders".to_string(),
+            pk_columns: vec![],
+            unique_constraints: vec![],
+            comment: None,
+            synonyms: vec![],
+        }],
         dimensions: vec![
             Dimension {
                 name: "region".to_string(),
@@ -75,19 +81,25 @@ pub(super) fn orders_view() -> SemanticViewDefinition {
 
 /// Minimal single-dim, single-metric view for focused tests.
 ///
-/// - base_table: configurable
+/// - table: configurable (alias = table name)
 /// - dimensions: one with given name/expr
 /// - metrics: one with given name/expr
 pub(super) fn minimal_def(
-    base_table: &str,
+    table: &str,
     dim_name: &str,
     dim_expr: &str,
     metric_name: &str,
     metric_expr: &str,
 ) -> SemanticViewDefinition {
     SemanticViewDefinition {
-        base_table: base_table.to_string(),
-        tables: vec![],
+        tables: vec![TableRef {
+            alias: table.to_string(),
+            table: table.to_string(),
+            pk_columns: vec![],
+            unique_constraints: vec![],
+            comment: None,
+            synonyms: vec![],
+        }],
         dimensions: vec![Dimension {
             name: dim_name.to_string(),
             expr: dim_expr.to_string(),
@@ -124,7 +136,6 @@ pub(super) fn minimal_def(
 ///
 /// Allows builder-style chaining: `orders_view().with_dimension(...).with_join(...)`
 pub(super) trait TestFixtureExt {
-    fn with_base_table(self, base_table: &str) -> Self;
     fn with_dimension(self, name: &str, expr: &str, source_table: Option<&str>) -> Self;
     fn with_metric(self, name: &str, expr: &str, source_table: Option<&str>) -> Self;
     fn with_join_on(self, table: &str, on: &str) -> Self;
@@ -159,11 +170,6 @@ pub(super) trait TestFixtureExt {
 }
 
 impl TestFixtureExt for SemanticViewDefinition {
-    fn with_base_table(mut self, base_table: &str) -> Self {
-        self.base_table = base_table.to_string();
-        self
-    }
-
     fn with_dimension(mut self, name: &str, expr: &str, source_table: Option<&str>) -> Self {
         self.dimensions.push(Dimension {
             name: name.to_string(),

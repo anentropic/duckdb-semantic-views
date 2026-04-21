@@ -1,5 +1,5 @@
 .. meta::
-   :description: Full syntax and parameter reference for CREATE SEMANTIC VIEW, covering TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, and METRICS clauses
+   :description: Full syntax and parameter reference for CREATE SEMANTIC VIEW, covering TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, and MATERIALIZATIONS clauses, plus FROM YAML and FROM YAML FILE variants
 
 .. _ref-create-semantic-view:
 
@@ -7,13 +7,15 @@
 CREATE SEMANTIC VIEW
 ======================
 
-Creates a semantic view definition, registering dimensions, metrics, relationships, and facts for on-demand query expansion.
+Creates a semantic view definition, registering dimensions, metrics, relationships, facts, and materializations for on-demand query expansion.
 
 
 .. _ref-create-syntax:
 
 Syntax
 ======
+
+**Keyword body (AS):**
 
 .. code-block:: sqlgrammar
 
@@ -64,6 +66,28 @@ Syntax
            [ COMMENT = '<text>' ]
            [ WITH SYNONYMS = ( '<synonym>' [, '<synonym>' ...] ) ] ]
    ) ]
+   [ MATERIALIZATIONS (
+       <mat_name> AS (
+           TABLE <table_name>,
+           [ DIMENSIONS ( <dim_name> [, <dim_name> ...] ) , ]
+           [ METRICS ( <metric_name> [, <metric_name> ...] ) ]
+       )
+       [, ... ]
+   ) ]
+
+**YAML body (FROM YAML):**
+
+.. versionadded:: 0.7.0
+
+.. code-block:: sqlgrammar
+
+   CREATE [ OR REPLACE ] SEMANTIC VIEW [ IF NOT EXISTS ] <name>
+       FROM YAML $$ <yaml_content> $$
+
+   CREATE [ OR REPLACE ] SEMANTIC VIEW [ IF NOT EXISTS ] <name>
+       FROM YAML FILE '<file_path>'
+
+The ``FROM YAML`` variant accepts a YAML definition in a dollar-quoted string (``$$...$$`` or ``$tag$...$tag$``). The ``FROM YAML FILE`` variant reads the YAML definition from a file at the given path.
 
 
 .. _ref-create-variants:
@@ -80,13 +104,15 @@ Statement Variants
 ``CREATE SEMANTIC VIEW IF NOT EXISTS <name> AS ...``
    Creates a new semantic view only if no view with the same name exists. If a view with the name already exists, the statement succeeds silently without modifying it.
 
+All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` / ``FROM YAML FILE`` body.
+
 
 .. _ref-create-clauses:
 
 Clauses
 =======
 
-Clauses must appear in the following order: ``TABLES``, ``RELATIONSHIPS``, ``FACTS``, ``DIMENSIONS``, ``METRICS``. ``TABLES`` is required. At least one of ``DIMENSIONS`` or ``METRICS`` is required. All other clauses are optional.
+Clauses must appear in the following order: ``TABLES``, ``RELATIONSHIPS``, ``FACTS``, ``DIMENSIONS``, ``METRICS``, ``MATERIALIZATIONS``. ``TABLES`` is required. At least one of ``DIMENSIONS`` or ``METRICS`` is required. All other clauses are optional.
 
 
 .. _ref-create-tables:
@@ -338,6 +364,99 @@ See :ref:`howto-window-metrics` for details on both modes.
 - ``OVER`` cannot appear on a derived metric (one without a table alias). Only qualified metrics (``alias.name``) can use ``OVER``.
 
 
+.. _ref-create-materializations:
+
+MATERIALIZATIONS
+-----------------
+
+.. versionadded:: 0.7.0
+
+Declares named materializations that map pre-aggregated tables to the dimensions and metrics they cover. When a query's requested dimensions and metrics exactly match a materialization, the extension routes to the pre-aggregated table instead of expanding raw sources.
+
+.. code-block:: sql
+
+   MATERIALIZATIONS (
+       region_agg AS (
+           TABLE daily_revenue_by_region,
+           DIMENSIONS (region),
+           METRICS (revenue, order_count)
+       ),
+       global_agg AS (
+           TABLE global_totals,
+           METRICS (revenue)
+       )
+   )
+
+**Parameters:**
+
+- ``<mat_name>``, a unique name identifying this materialization.
+- ``TABLE <table_name>``, the physical table containing pre-aggregated data. Supports catalog-qualified names (``catalog.schema.table``). The table is not validated for existence at define time (it may be created later by external tools like dbt).
+- ``DIMENSIONS (<dim_name>, ...)``, optional. Dimension names from the view's ``DIMENSIONS`` clause that the materialization table covers.
+- ``METRICS (<metric_name>, ...)``, optional. Metric names from the view's ``METRICS`` clause that the materialization table covers.
+
+At least one of ``DIMENSIONS`` or ``METRICS`` must be specified in each materialization entry.
+
+**Routing behavior:**
+
+- Routing uses **exact match**: both the dimension set and metric set must exactly equal the query's requested sets (case-insensitive comparison).
+- Materializations are scanned in **definition order**; the **first match wins**.
+- Semi-additive metrics (``NON ADDITIVE BY``) and window metrics (``OVER``) are **always excluded** from routing.
+- When no match is found, the extension falls back to standard expansion.
+
+See :ref:`howto-materializations` for a detailed guide.
+
+**Validation rules:**
+
+- Materialization names must be unique within a view.
+- Dimension names must match declared dimensions in the view's ``DIMENSIONS`` clause.
+- Metric names must match declared metrics in the view's ``METRICS`` clause.
+- Each materialization must specify at least one of ``DIMENSIONS`` or ``METRICS``.
+
+
+.. _ref-create-from-yaml:
+
+FROM YAML
+---------
+
+.. versionadded:: 0.7.0
+
+Creates a semantic view from a YAML definition instead of the keyword-based ``AS`` body. Two forms are supported:
+
+**Inline YAML (dollar-quoted):**
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW order_metrics FROM YAML $$
+   tables:
+     - alias: o
+       table: orders
+       pk_columns:
+         - id
+   dimensions:
+     - name: region
+       expr: o.region
+       source_table: o
+   metrics:
+     - name: revenue
+       expr: SUM(o.amount)
+       source_table: o
+   $$
+
+The YAML content is enclosed in dollar-quote delimiters. Tagged dollar-quoting (``$yaml$...$yaml$``) is also supported.
+
+**YAML from file:**
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW order_metrics FROM YAML FILE '/path/to/definition.yaml'
+
+The file path must be single-quoted. DuckDB reads the file contents and parses as YAML.
+
+See :ref:`howto-yaml-definitions` for a detailed workflow guide.
+
+**YAML size limit:** YAML definitions are capped at 1 MiB. Definitions exceeding this limit are rejected with an error.
+
+
 .. _ref-create-examples:
 
 Examples
@@ -483,3 +602,64 @@ Examples
            AVG(total_qty) OVER (PARTITION BY store
                ORDER BY date NULLS LAST)
    );
+
+**With materializations:**
+
+.. versionadded:: 0.7.0
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW order_metrics AS
+   TABLES (
+       o AS orders PRIMARY KEY (id)
+   )
+   DIMENSIONS (
+       o.region AS o.region,
+       o.status AS o.status
+   )
+   METRICS (
+       o.revenue     AS SUM(o.amount),
+       o.order_count AS COUNT(*)
+   )
+   MATERIALIZATIONS (
+       region_agg AS (
+           TABLE daily_revenue_by_region,
+           DIMENSIONS (region),
+           METRICS (revenue, order_count)
+       ),
+       region_status_agg AS (
+           TABLE revenue_by_region_status,
+           DIMENSIONS (region, status),
+           METRICS (revenue)
+       )
+   );
+
+**From inline YAML:**
+
+.. versionadded:: 0.7.0
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW order_metrics FROM YAML $$
+   tables:
+     - alias: o
+       table: orders
+       pk_columns:
+         - id
+   dimensions:
+     - name: region
+       expr: o.region
+       source_table: o
+   metrics:
+     - name: revenue
+       expr: SUM(o.amount)
+       source_table: o
+   $$
+
+**From YAML file:**
+
+.. versionadded:: 0.7.0
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW order_metrics FROM YAML FILE '/path/to/definition.yaml'

@@ -1,13 +1,13 @@
 # Persona Report
 
-**Generated:** 2026-04-13
+**Generated:** 2026-04-21
 **Audience:** Data engineers exploring semantic views (intermediate)
 **Scenarios tested:** 5
 **Results:** 5 PASS, 0 PARTIAL, 0 FAIL
 
 ## Summary
 
-The documentation provides a complete and well-structured experience for data engineers evaluating DuckDB Semantic Views as an open-source alternative to Snowflake. Every major user journey -- from first install through complex multi-table modeling, Snowflake feature comparison, catalog management, and fan trap awareness -- is fully navigable from the homepage through clear cross-references. The Diataxis structure is well-applied: tutorials teach by doing with realistic analytics data, how-to guides solve specific problems, explanations provide context for decision-making, and reference pages document exact syntax with output columns and worked examples. Language calibration is strong -- SQL and data engineering terminology is used naturally while semantic-view-specific concepts (TABLES clause, RELATIONSHIPS, FACTS, derived metrics, fan traps, USING RELATIONSHIPS) are always explained from scratch. New pages added since the last evaluation (semi-additive metrics, window metrics, wildcard selection, query facts, metadata annotations, GET_DDL, SHOW COLUMNS) are well-integrated into the navigation via the how-to index, reference index, and Snowflake comparison concept mapping table.
+The documentation provides an excellent experience for an intermediate data engineer evaluating DuckDB Semantic Views as an open-source alternative to Snowflake or Databricks. The Diataxis structure is well-executed: tutorials teach through guided hands-on examples with realistic analytics data, how-to guides solve specific tasks with prerequisites and troubleshooting, reference pages document syntax with parameter tables and worked examples, and explanation pages provide context for platform comparison and decision-making. All five scenarios were achievable from start to finish with clear navigation paths, complete code examples with expected output, and language calibrated to someone who knows SQL and data engineering but is new to semantic views. New features added since the last evaluation (materializations, YAML definitions, Databricks comparison) are fully documented and well-integrated into the navigation structure.
 
 ---
 
@@ -23,8 +23,8 @@ The documentation provides a complete and well-structured experience for data en
 2. Navigated to: `docs/tutorials/getting-started.rst`
    - Found: Complete tutorial with time estimate (5 minutes) and prerequisites (DuckDB installed, basic SQL knowledge).
    - Install: Tab set for DuckDB CLI and Python, showing `INSTALL semantic_views FROM community; LOAD semantic_views;`
-   - Sample data: Realistic `orders` table with INSERT VALUES.
-   - DDL: Full `CREATE SEMANTIC VIEW` with inline explanation of the `alias.name AS expression` pattern. The TABLES, DIMENSIONS, and METRICS clauses are each explained.
+   - Sample data: Realistic `orders` table with INSERT VALUES (regions, categories, amounts).
+   - DDL: Full `CREATE SEMANTIC VIEW` with inline explanation of the `alias.name AS expression` pattern. TABLES, DIMENSIONS, and METRICS clauses each explained.
    - Verification: `SHOW SEMANTIC VIEWS` with expected output table.
    - Query: All three query modes demonstrated (dimensions+metrics, dimensions-only, metrics-only) with complete SQL and expected result tables. WHERE filtering also shown.
    - Inspection: `explain_semantic_view()` for generated SQL, cross-referenced to its reference page.
@@ -46,11 +46,11 @@ Type-alignment: Tutorial (learning-oriented, study + action). Exactly what a fir
    - Found: Grid card "Multi-table semantic views" with description "Model relationships between tables and query across them."
    - Followed: Link to `tutorial-multi-table`
 2. Navigated to: `docs/tutorials/multi-table.rst`
-   - Found: Complete tutorial with realistic e-commerce schema (customers, products, orders) including dates.
+   - Found: Complete tutorial with realistic e-commerce star schema (customers, products, orders) including dates.
    - TABLES clause: Three tables with aliases and PRIMARY KEY declarations. Tip clarifies PRIMARY KEY is metadata only, not a DuckDB constraint.
-   - RELATIONSHIPS clause: Two FK references with emphasize-lines. Clear prose: "o(customer_id) REFERENCES c means the customer_id column on orders (alias o) is a foreign key to the primary key of customers (alias c)." Satisfies never-assume for relationship modeling.
+   - RELATIONSHIPS clause: Two FK references with emphasized lines. Clear prose: "o(customer_id) REFERENCES c means the customer_id column on orders (alias o) is a foreign key to the primary key of customers (alias c)." Satisfies never-assume for relationship modeling.
    - Selective join: Query for customer dimensions only, with `explain_semantic_view()` to verify products table is not joined. Directly satisfies "see generated SQL to verify join correctness."
-   - Cross-table: Both dimension tables joined when both are requested, with expected output.
+   - Cross-table: Both dimension tables joined when both requested, with expected output.
    - Computed dimension: `date_trunc('month', o.ordered_at)` demonstrates expression-based dimensions.
    - DESCRIBE: Full view inspection.
    - CREATE OR REPLACE: View update with new dimension and metric. Tip cross-references ALTER SEMANTIC VIEW RENAME TO.
@@ -60,7 +60,7 @@ Type-alignment: Tutorial (progressive hands-on learning). Correct. All success c
 
 ---
 
-## Scenario S3: I want to compare this extension's capabilities and syntax with Snowflake Semantic Views to decide if it fits my use case
+## Scenario S3: I want to compare this extension's capabilities and syntax with Snowflake and Databricks Semantic Views to decide if it fits my use case
 
 **Verdict:** PASS
 
@@ -72,77 +72,101 @@ Type-alignment: Tutorial (progressive hands-on learning). Correct. All success c
 2. Navigated to: `docs/explanation/snowflake-comparison.rst`
    - Found: Comprehensive comparison page.
    - YAML spec disclaimer: Note clarifying SQL DDL interface comparison only.
-   - Concept mapping table: 16+ rows covering CREATE/ALTER/DROP/DESCRIBE/SHOW/GET_DDL, TABLES, RELATIONSHIPS, DIMENSIONS, METRICS, FACTS, derived metrics, semi-additive metrics, window metrics, metadata annotations, access modifiers, wildcard selection, query interface. Cross-references to relevant how-to and reference pages throughout.
-   - Syntax alignment: Side-by-side tab set showing actual DDL from both platforms. PRIMARY KEY difference is immediately visible.
-   - Key Differences sections:
-     - PRIMARY KEY declarations: Three-case table (native DuckDB with PK, without PK, external sources) plus Iceberg-specific tip. Thorough.
-     - Query interface: Warning admonition about table function vs direct SQL. Side-by-side examples including Snowflake's AGG syntax (noted as not supported).
-     - Cardinality inference: Explains PK/UNIQUE-based inference.
-     - USING RELATIONSHIPS: Identical syntax confirmed.
-     - Facts query mode: v0.6.0 addition with `facts := [...]` parameter.
-     - Semi-additive and window metrics: v0.6.0 addition with behavioral differences listed.
-   - Features not yet supported: Honest table with 3 items (direct SQL query interface, column-level security, ASOF/temporal relationships) with status and rationale.
-   - YAML spec section: Lists YAML-only concepts (time_dimensions, custom_instructions, access_modifier, sample_values) and explains they serve Cortex Analyst.
+   - Concept mapping table: 19 rows covering all DDL statements (CREATE/ALTER/DROP/DESCRIBE/SHOW/GET_DDL), core model concepts (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS, FACTS), advanced features (semi-additive, window, materializations, wildcards, metadata annotations, access modifiers), and query interface. Cross-references to relevant how-to and reference pages throughout.
+   - Syntax alignment: Side-by-side tab set showing DDL from both platforms. PRIMARY KEY difference immediately visible.
+   - Key Differences sections: Primary Key declarations with three-case table and Iceberg tip, Query Interface with warning about table function vs direct SQL, Cardinality Inference, USING RELATIONSHIPS, Facts Query Mode, Semi-Additive and Window Metrics, Materializations (unique to DuckDB).
+   - Features not yet supported: Honest three-item table with status and rationale.
+   - YAML spec section: Explains Snowflake YAML-only concepts and clarifies DuckDB YAML format serves version control, not AI prompt tuning.
+3. Navigated to: `docs/explanation/index.rst` (via sidebar)
+   - Found: Link to Databricks Comparison
+   - Followed: Link to `explanation-databricks`
+4. Navigated to: `docs/explanation/databricks-comparison.rst`
+   - Found: Parallel structure to Snowflake comparison.
+   - Concept mapping table covering all key concepts with clear terminology mapping (MEASURES vs METRICS, FROM clause vs TABLES+RELATIONSHIPS).
+   - Side-by-side syntax tab set.
+   - Key Differences: Multi-table handling (explicit JOIN in FROM vs declarative RELATIONSHIPS with join synthesis), Query Interface, MEASURES vs METRICS keyword, Dimension Expressions.
+   - Features unique to DuckDB: 11-row table including FACTS, NON ADDITIVE BY, window metrics, MATERIALIZATIONS, RELATIONSHIPS, fan trap detection, role-playing dimensions, YAML import/export.
+   - Features unique to Databricks: 5-row table including direct SQL, Unity Catalog, row-level security, AI/BI integration, Delta Lake materialized views.
+   - "Choosing Between Them" section positioning DuckDB as lightweight, local-first alternative.
 
-Type-alignment: Explanation (understanding-oriented, study + cognition). Correct for platform evaluation. All success criteria met.
+Type-alignment: Explanation (study + cognition). Correct for platform evaluation and decision-making. All success criteria met.
 
 ---
 
-## Scenario S4: I want to inspect and manage the semantic views I have defined -- rename a view, list all views with filtering, and explore what dimensions/metrics/facts a view has
+## Scenario S4: I want to define a semantic view with pre-aggregated materializations and export it as YAML for version control
 
 **Verdict:** PASS
 
 ### Navigation Path
 
 1. Started at: `docs/index.rst`
-   - Found: Grid card "DDL reference" linking to CREATE SEMANTIC VIEW. The hidden toctree includes `reference/index`.
-   - Followed: Navigation to reference section.
-2. Navigated to: `docs/reference/index.rst`
-   - Found: Complete index listing all 11 DDL statements and 2 query functions with one-line descriptions. Clear links to ALTER, SHOW SEMANTIC VIEWS, SHOW SEMANTIC DIMENSIONS, SHOW SEMANTIC METRICS, SHOW SEMANTIC FACTS, plus newer entries (SHOW COLUMNS, GET_DDL).
-3. Navigated to: `docs/reference/alter-semantic-view.rst`
-   - Found: Complete reference for RENAME TO, SET COMMENT, UNSET COMMENT. Syntax grammar, all 6 variants (with/without IF EXISTS for each operation), parameters, output columns tables for each variant, realistic examples including rename, safe no-op, name collision error, comment set/unset with output, and case-insensitive syntax.
-4. Navigated to: `docs/reference/show-semantic-views.rst`
-   - Found: Complete reference with TERSE variant, LIKE (case-insensitive via ILIKE), IN SCHEMA/IN DATABASE, STARTS WITH (case-sensitive), LIMIT. Clause order warning. Output columns tables (6 for full, 5 for TERSE). Examples covering all filtering combinations, combined clauses, column selection technique, and empty results.
-5. Navigated to: `docs/reference/show-semantic-dimensions.rst`
-   - Found: Complete reference with IN <name> variant, 8 output columns including synonyms and comment. Clause order warning. Examples with expected output. Cross-reference tip to FOR METRIC variant.
-6. Navigated to: `docs/reference/show-semantic-metrics.rst`
-   - Found: Same consistent structure. 8 output columns. Derived metrics explanation with empty table_name. Complete examples.
-7. Navigated to: `docs/reference/show-semantic-facts.rst`
-   - Found: Same consistent structure. 8 output columns with data_type inference. Chained facts example explaining why data_type is empty for fact-referencing-fact. Error cases.
-
-Structural consistency (Rule 3): All SHOW reference pages follow the same template: Syntax, Statement Variants, Parameters, Optional Filtering Clauses, Output Columns, Examples. All ALTER/SHOW/DESCRIBE pages use the same section ordering. Strong consistency.
-
-Type-alignment: Reference (information-oriented, work + cognition). Correct for looking up exact syntax and output schemas. All success criteria met.
-
----
-
-## Scenario S5: I want to find out which dimensions are safe to query alongside a specific metric in a multi-table view, without triggering a fan trap
-
-**Verdict:** PASS
-
-### Navigation Path
-
-1. Started at: `docs/index.rst`
-   - Found: Grid card "How-to guides" mentioning "fan traps."
+   - Found: Grid card "How-to guides" mentioning materializations and YAML definitions in its description.
    - Followed: Link to `how-to-guides`
 2. Navigated to: `docs/how-to/index.rst`
-   - Found: "howto-fan-traps" listed with description: "Understand, detect, and resolve fan traps that inflate aggregation results in multi-table views."
-   - Also found: "SHOW SEMANTIC DIMENSIONS FOR METRIC" referenced in the reference index (accessible via the "DDL reference" homepage card).
-   - Followed: Link to reference index first for the specific command.
-3. Navigated to: `docs/reference/index.rst`
-   - Found: "SHOW SEMANTIC DIMENSIONS ... FOR METRIC -- List dimensions safe to use with a specific metric (fan trap aware)."
-   - Followed: Link to `ref-show-dims-for-metric`
-4. Navigated to: `docs/reference/show-semantic-dimensions-for-metric.rst`
-   - Found: Complete reference page with:
-     - Opening explanation with cross-reference back to `howto-fan-traps` for background (bidirectional link).
-     - Syntax: IN and FOR METRIC as required clauses, LIKE/STARTS WITH/LIMIT as optional.
-     - Parameters with fuzzy matching tip for error messages.
-     - Fan trap filtering logic: 6 rules (same table, many-to-one safe, one-to-many excluded, one-to-one both safe, derived metrics trace to union of source tables, window metrics skip fan trap checking with required column).
-     - Output columns: 4 columns including `required` boolean for window metrics.
-     - Examples: Single-table (all dimensions safe), multi-table chain with clear explanation of why item_qty is excluded for order_total but included for line_item_sum, window metric with required dimensions, LIKE/STARTS WITH/LIMIT filtering, derived metrics inheritance, error cases.
-   - Alternative path: `docs/reference/show-semantic-dimensions.rst` ends with a tip cross-referencing this page. `docs/how-to/fan-traps.rst` also cross-references this command.
+   - Found: Bulleted list with links to howto-materializations ("Declare materializations that route matching queries to pre-aggregated tables") and howto-yaml-definitions ("Export and import semantic view definitions as YAML for version control and migration").
+   - Followed: Link to howto-materializations
+3. Navigated to: `docs/how-to/materializations.rst`
+   - Found: Complete how-to guide with versionadded 0.7.0 marker.
+   - Concept: Clear explanation of what materializations do (map dims+metrics to pre-aggregated table).
+   - Declare: Step-by-step with pre-aggregated table creation, then MATERIALIZATIONS clause with emphasized lines. Tip about column naming requirement.
+   - Routing: Exact-match logic explained with two examples (matching vs non-matching). Warning about superset matching not being supported.
+   - Multiple: Multiple materializations with definition-order precedence.
+   - Exclusions: Semi-additive and window metrics always excluded with code example.
+   - Verify: explain_semantic_view() with Materialization header line in output.
+   - Inspect: SHOW SEMANTIC MATERIALIZATIONS and DESCRIBE with filtering.
+   - Troubleshooting: 5 specific error scenarios with causes and fixes.
+   - Related: Cross-references to CREATE reference, SHOW reference, explain reference, and related how-to guides.
+   - Followed: Link back to how-to index for YAML guide
+4. Navigated to: `docs/how-to/yaml-definitions.rst`
+   - Found: Complete how-to guide with versionadded 0.7.0 marker.
+   - Export: READ_YAML_FROM_SEMANTIC_VIEW() with COPY-to-file pattern and schema-qualified names.
+   - Stripped fields: Explains which internal fields are omitted and why.
+   - Import inline: FROM YAML with dollar-quoting, tagged dollar-quoting, CREATE OR REPLACE and IF NOT EXISTS variants.
+   - Import file: FROM YAML FILE with single-quoted path.
+   - Round-trip: Three-step workflow (export, import, verify with GET_DDL) with version control tip.
+   - Troubleshooting: 7 specific error scenarios with causes and fixes.
+   - Related: Cross-references to READ_YAML reference, CREATE reference, GET_DDL reference.
 
-Type-alignment: Reference (information-oriented) with strong worked examples that also serve a how-to function. Correct for the persona's need to programmatically discover safe dimension combinations. All success criteria met.
+Type-alignment: How-to guides (work + action). Correct for task-oriented needs. All success criteria met.
+
+---
+
+## Scenario S5: I want to define semi-additive metrics and window function metrics for snapshot data and time-series analysis
+
+**Verdict:** PASS
+
+### Navigation Path
+
+1. Started at: `docs/index.rst`
+   - Found: Grid card "How-to guides"
+   - Followed: Link to `how-to-guides`
+2. Navigated to: `docs/how-to/index.rst`
+   - Found: Links to howto-semi-additive ("Define metrics with NON ADDITIVE BY for snapshot data like account balances and inventory levels") and howto-window-metrics ("Define window function metrics for rolling averages, lag comparisons, and rankings using OVER clauses").
+   - Followed: Link to howto-semi-additive
+3. Navigated to: `docs/how-to/semi-additive-metrics.rst`
+   - Found: Complete how-to guide.
+   - Snapshot Data: Clear explanation of the double-counting problem using account balances -- a realistic example table shows why SUM(balance) across dates gives wrong results.
+   - Define: NON ADDITIVE BY syntax with sort order (DESC NULLS FIRST) and emphasized line.
+   - Sort Order: ASC/DESC and NULLS FIRST/LAST options with examples.
+   - Multiple: Multiple non-additive dimensions supported.
+   - Behavior: Key distinction between active (NA dim not in query, CTE generated) and inactive (NA dim in query, standard aggregation). Snowflake alignment noted.
+   - Verify: explain_semantic_view() showing the ROW_NUMBER CTE and CASE WHEN __sv_rn = 1 pattern. Generated SQL is fully shown.
+   - Restrictions: Warning that NON ADDITIVE BY and OVER cannot be combined.
+   - Troubleshooting: 3 specific issues with fixes.
+4. Navigated to: `docs/how-to/index.rst` (back), then to howto-window-metrics
+5. Navigated to: `docs/how-to/window-metrics.rst`
+   - Found: Complete how-to guide.
+   - Define: Window metric wrapping another metric with OVER clause.
+   - PARTITION BY: Clear explanation of fixed PARTITION BY vs dynamic PARTITION BY EXCLUDING, with tip on when to use each.
+   - ORDER BY: Sort direction and NULLS placement.
+   - Frame Clauses: RANGE and ROWS support with 7-day rolling average example.
+   - Extra Args: LAG/LEAD with offset argument.
+   - Required Dimensions: Error messages shown for missing required dimensions. Tip to use SHOW SEMANTIC DIMENSIONS FOR METRIC.
+   - Mixing Restriction: Warning that window and aggregate metrics cannot be mixed, with error message shown and workaround (two separate queries).
+   - Verify: explain_semantic_view() showing CTE expansion.
+   - Troubleshooting: 7 specific error scenarios with descriptions.
+
+Type-alignment: How-to guides (work + action). Correct. All success criteria met.
 
 ---
 

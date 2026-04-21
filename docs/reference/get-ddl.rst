@@ -45,7 +45,7 @@ Parameters
 Output
 ======
 
-Returns a single VARCHAR value containing the full ``CREATE OR REPLACE SEMANTIC VIEW`` DDL statement. The DDL includes all clauses (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS) with all annotations (COMMENT, WITH SYNONYMS, PRIVATE, NON ADDITIVE BY, OVER).
+Returns a single VARCHAR value containing the full ``CREATE OR REPLACE SEMANTIC VIEW`` DDL statement. The DDL includes all clauses (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS) with all annotations (COMMENT, WITH SYNONYMS, PRIVATE, NON ADDITIVE BY, OVER). The ``MATERIALIZATIONS`` clause is included only when the view has materializations declared; it is omitted for views without materializations.
 
 
 .. _ref-get-ddl-examples:
@@ -72,6 +72,35 @@ Sample output:
    )
    METRICS (
        o.revenue AS SUM(o.amount) COMMENT = 'Total revenue'
+   )
+
+**Retrieve DDL for a view with materializations:**
+
+.. code-block:: sql
+
+   SELECT GET_DDL('SEMANTIC_VIEW', 'order_metrics');
+
+Sample output:
+
+.. code-block:: text
+
+   CREATE OR REPLACE SEMANTIC VIEW order_metrics AS
+   TABLES (
+       o AS orders PRIMARY KEY (id)
+   )
+   DIMENSIONS (
+       o.region AS o.region
+   )
+   METRICS (
+       o.revenue AS SUM(o.amount),
+       o.order_count AS COUNT(*)
+   )
+   MATERIALIZATIONS (
+       region_agg AS (
+           TABLE daily_revenue_by_region,
+           DIMENSIONS (region),
+           METRICS (revenue, order_count)
+       )
    )
 
 **Round-trip verification:**
