@@ -71,7 +71,7 @@ Import from Inline YAML
 
 Use ``FROM YAML`` with a dollar-quoted string to create a semantic view from an inline YAML definition:
 
-.. code-block:: text
+.. code-block:: duckdb-sql
 
    CREATE SEMANTIC VIEW order_metrics FROM YAML $$
    tables:
@@ -91,7 +91,7 @@ Use ``FROM YAML`` with a dollar-quoted string to create a semantic view from an 
 
 The YAML body is enclosed in ``$$`` dollar-quote delimiters. Tagged dollar-quoting is also supported for clarity:
 
-.. code-block:: text
+.. code-block:: duckdb-sql
 
    CREATE SEMANTIC VIEW order_metrics FROM YAML $yaml$
    tables:
@@ -111,7 +111,7 @@ The YAML body is enclosed in ``$$`` dollar-quote delimiters. Tagged dollar-quoti
 
 Both ``CREATE OR REPLACE`` and ``CREATE IF NOT EXISTS`` variants work with ``FROM YAML``:
 
-.. code-block:: text
+.. code-block:: duckdb-sql
 
    CREATE OR REPLACE SEMANTIC VIEW order_metrics FROM YAML $$
    ...

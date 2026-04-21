@@ -151,6 +151,8 @@ templates_path = ["_templates"]
 
 
 def setup(app):
+    from _ext.duckdb_sql_lexer import DuckDBSqlLexer
     from _ext.sqlgrammar_lexer import SqlGrammarLexer
 
     app.add_lexer("sqlgrammar", SqlGrammarLexer)
+    app.add_lexer("duckdb-sql", DuckDBSqlLexer)

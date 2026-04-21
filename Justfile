@@ -113,7 +113,7 @@ check-fuzz:
     cargo +nightly check --manifest-path fuzz/Cargo.toml
 
 # Run the full CI suite locally (lint + test + fuzz check)
-ci: lint test-all check-fuzz
+ci: lint test-all check-fuzz docs-check
 
 # Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
 fuzz target="fuzz_json_parse" time="300":
@@ -155,6 +155,10 @@ update-headers:
 clean:
     make clean
     cargo clean
+
+# Check Sphinx documentation builds without warnings (mirrors CI)
+docs-check:
+    uv run --project docs sphinx-build -b html -W docs docs/_build/html
 
 # Build Sphinx documentation to docs/_build/html (clean build)
 docs-build:

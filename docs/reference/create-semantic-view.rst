@@ -424,7 +424,7 @@ Creates a semantic view from a YAML definition instead of the keyword-based ``AS
 
 **Inline YAML (dollar-quoted):**
 
-.. code-block:: text
+.. code-block:: duckdb-sql
 
    CREATE SEMANTIC VIEW order_metrics FROM YAML $$
    tables:
@@ -638,7 +638,7 @@ Examples
 
 .. versionadded:: 0.7.0
 
-.. code-block:: text
+.. code-block:: duckdb-sql
 
    CREATE SEMANTIC VIEW order_metrics FROM YAML $$
    tables:
