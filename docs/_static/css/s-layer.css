@@ -18,3 +18,18 @@ div.localtoc > h3 {
 .toctree-wrapper > ul > li > .reference.internal {
     font-weight: 600;
 }
+/* --- Cycling subtitle (typed.js) --- */
+.cycling-subtitle {
+    font-family: var(--sy-f-heading);
+    font-size: 1.25em;
+    margin-top: -0.5em;
+    margin-bottom: 1.5em;
+    font-weight: 400;
+}
+.cycling-subtitle .typed-cursor {
+    color: var(--accent-11);
+}
+#typed-target {
+    color: var(--accent-11);
+    font-weight: 600;
+}

@@ -7,6 +7,24 @@
 DuckDB Semantic Views
 ========================
 
+.. raw:: html
+
+   <p class="cycling-subtitle">
+     The semantic layer for your <span id="typed-target"></span>
+   </p>
+   <script src="https://unpkg.com/typed.js@3.0.0/dist/typed.umd.js"></script>
+   <script>
+     new Typed('#typed-target', {
+       strings: ['Iceberg tables', 'CSV files', 'Ducklake', 'dataframes'],
+       typeSpeed: 50,
+       backSpeed: 30,
+       backDelay: 2000,
+       loop: true,
+       showCursor: true,
+       cursorChar: '|',
+     });
+   </script>
+
 A `Semantic Layer <https://www.databricks.com/blog/what-is-a-semantic-layer>`_ sits between your raw tables and the people querying them. Instead of everyone writing their own ``SUM(amount)`` and hoping they ``GROUP BY`` the same columns, you define each metric and dimension once, in one place. Analysts pick the ones they want; the system assembles the SQL.
 
 Snowflake and Databricks, along with dbt Cloud, Cube.dev and others, all ship semantic layers in different forms. Snowflake has `Semantic Views <https://docs.snowflake.com/en/user-guide/views-semantic/overview>`_, Databricks calls them `Metric Views <https://docs.databricks.com/aws/en/metric-views/>`_, both as a SQL syntax sugar for a special kind of flexible view-like interface over aggregated metrics and dimensions. This extension brings the same idea to DuckDB, using DDL syntax modeled closely on Snowflake's ``CREATE SEMANTIC VIEW``.
