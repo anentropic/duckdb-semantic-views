@@ -24,6 +24,7 @@ SQL syntax reference for all DuckDB Semantic Views statements and functions.
 - :ref:`ref-show-columns` -- List all queryable columns in a semantic view with types, expressions, and comments.
 - :ref:`ref-get-ddl` -- Retrieve the full CREATE DDL text for a stored semantic view.
 - :ref:`ref-read-yaml` -- Export a semantic view definition as a YAML string.
+- :ref:`ref-yaml-format` -- Field-by-field specification of the YAML schema accepted by ``FROM YAML``.
 
 **Query functions**
 
@@ -50,6 +51,7 @@ SQL syntax reference for all DuckDB Semantic Views statements and functions.
    show-columns-semantic-view
    get-ddl
    read-yaml-from-semantic-view
+   yaml-format
    semantic-view-function
    explain-semantic-view-function
    error-messages

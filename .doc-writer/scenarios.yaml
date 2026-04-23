@@ -39,6 +39,7 @@ user_personas:
       - "docs/reference/show-columns-semantic-view.rst"
       - "docs/reference/get-ddl.rst"
       - "docs/reference/read-yaml-from-semantic-view.rst"
+      - "docs/reference/yaml-format.rst"
       - "docs/reference/semantic-view-function.rst"
       - "docs/reference/explain-semantic-view-function.rst"
       - "docs/reference/error-messages.rst"

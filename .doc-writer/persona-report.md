@@ -1,13 +1,13 @@
 # Persona Report
 
-**Generated:** 2026-03-21
+**Generated:** 2026-04-22
 **Audience:** Data engineers exploring semantic views (intermediate)
 **Scenarios tested:** 5
-**Results:** 4 PASS, 1 PARTIAL, 0 FAIL
+**Results:** 5 PASS, 0 PARTIAL, 0 FAIL
 
 ## Summary
 
-The documentation provides an excellent experience for a data engineer evaluating DuckDB Semantic Views. The Diataxis-organized structure (Tutorials, How-To Guides, Explanation, Reference) maps well to the persona's journey from discovery to production modeling. Tutorials are well-paced for intermediate users, how-to guides are goal-oriented with realistic examples, the Snowflake comparison directly addresses the discovery story, and the reference pages are thorough. The one area of friction is the Iceberg/data-sources guide, which covers the topic but lacks the depth needed for a data engineer building a production DuckDB + Iceberg stack.
+The documentation provides an excellent experience for an intermediate data engineer evaluating DuckDB Semantic Views as an open-source alternative to Snowflake or Databricks. The Diataxis structure is well-executed across all four quadrants: tutorials teach through guided hands-on examples, how-to guides solve specific tasks with prerequisites and troubleshooting, reference pages document syntax with parameter tables and worked examples, and explanation pages provide context for platform comparison and decision-making. All five scenarios were achievable from start to finish with clear navigation paths, complete code examples with expected output, and language calibrated to someone who knows SQL and data engineering but is new to semantic views. The recently modified YAML definitions how-to (reordered to Import-first) reads naturally for a task-oriented user, and the new YAML format reference page fills a critical gap by providing field-by-field specifications that were previously only available through examples.
 
 ---
 
@@ -18,20 +18,21 @@ The documentation provides an excellent experience for a data engineer evaluatin
 ### Navigation Path
 
 1. Started at: `docs/index.rst`
-   - Found: Clear homepage with grid cards linking to all major sections. The "Getting Started" card is the first and most prominent, with description: "Install the extension, create your first semantic view, and run your first query in 5 minutes."
-   - Followed: "Getting Started" card link to `tutorials/getting-started`
+   - Found: Grid card "Getting started" prominently placed first, with description: "Install the extension, create your first semantic view, and run a query in 5 minutes."
+   - Followed: Link to `tutorial-getting-started`
+
 2. Navigated to: `docs/tutorials/getting-started.rst`
-   - Found: Complete tutorial with clear prerequisites (DuckDB installed, basic SQL knowledge -- appropriate for persona), time estimate (5 minutes), and installation instructions for both CLI and Python via tab set.
-   - Found: A note about pre-release status with link to source repo for build-from-source -- addresses the reality that the extension may not be on the registry yet.
-   - Found: Sample data creation with realistic `orders` table and INSERT values -- not placeholder data.
-   - Found: Full `CREATE SEMANTIC VIEW` with clear explanation of the `alias.name AS expression` pattern for both dimensions and metrics.
-   - Found: Verification step (`SHOW SEMANTIC VIEWS`) with expected output.
-   - Found: All three query modes demonstrated with expected output tables: dimensions + metrics, dimensions only, metrics only, plus filtering with WHERE.
-   - Found: `explain_semantic_view()` section showing how to inspect generated SQL.
-   - Found: Clean up section (`DROP SEMANTIC VIEW`) and summary of what was learned.
-   - Found: Clear next step link to multi-table tutorial via `:ref:` cross-reference.
-   - Type-alignment: Tutorial (learning by doing) -- matches exactly what a first-time user needs. The guided lesson format with sample data, step-by-step instructions, and expected output is well-calibrated.
-   - Language calibration: Appropriate for intermediate users. Does not over-explain SQL basics, but fully explains semantic view concepts (what dimensions and metrics are, the naming pattern, what each query mode does). Matches the persona's "never assume" list.
+   - Found: Complete tutorial with time estimate (5 minutes) and prerequisites (DuckDB installed, basic SQL knowledge -- appropriate for persona).
+   - **Install the Extension:** Tab set for DuckDB CLI and Python with exact commands (`INSTALL semantic_views FROM community; LOAD semantic_views;`). Both paths clear and complete.
+   - **Create Sample Data:** Realistic `orders` table with copy-pasteable SQL including INSERT statements. Not placeholder data.
+   - **Define a Semantic View:** Full `CREATE SEMANTIC VIEW` DDL with inline explanation of the `alias.name AS expression` pattern. Each dimension and metric explained individually: "o.region AS o.region creates a dimension called region from the region column of the table aliased as o." Satisfies the never-assume requirement for DDL syntax.
+   - **Verify:** `SHOW SEMANTIC VIEWS` with expected output table.
+   - **Query the Semantic View:** All three query modes demonstrated (dimensions+metrics, dimensions-only, metrics-only) with complete SQL and expected result tables. WHERE filtering also shown.
+   - **Inspect the Generated SQL:** `explain_semantic_view()` demonstrated with cross-reference to its reference page via `:ref:`.
+   - **Clean Up:** `DROP SEMANTIC VIEW` shown.
+   - **What You Learned:** Summary with cross-references to CREATE SEMANTIC VIEW, SHOW SEMANTIC VIEWS, semantic_view(), explain_semantic_view(), and DROP SEMANTIC VIEW reference pages. Clear "Next" pointer to multi-table tutorial.
+   - Type-alignment: Tutorial (learning-oriented, study + action). Exactly what a first-time user needs.
+   - Language calibration: Assumes SQL knowledge (appropriate). Explains semantic view concepts thoroughly (satisfies never_assume). The naming pattern is explicitly decoded.
 
 ---
 
@@ -42,131 +43,203 @@ The documentation provides an excellent experience for a data engineer evaluatin
 ### Navigation Path
 
 1. Started at: `docs/index.rst`
-   - Found: "Multi-Table Semantic Views" card: "Learn to model relationships between tables and query across them."
-   - Followed: Card link to `tutorials/multi-table`
+   - Found: Grid card "Multi-table semantic views" with description "Model relationships between tables and query across them."
+   - Followed: Link to `tutorial-multi-table`
+
 2. Navigated to: `docs/tutorials/multi-table.rst`
-   - Found: Clear prerequisite linking back to getting-started tutorial via `:ref:`. Assumes familiarity with star schema concepts -- appropriate for the persona's assumed knowledge of data engineering concepts.
-   - Found: Realistic e-commerce schema (orders, customers, products) with sample data including dates for time-dimension demonstration.
-   - Found: Full DDL with TABLES, RELATIONSHIPS, DIMENSIONS, METRICS. The RELATIONSHIPS clause is explained clearly: "the customer_id column on orders (alias o) is a foreign key to the primary key of customers (alias c)."
-   - Found: Helpful tip that PRIMARY KEY is metadata for the semantic view, not a DuckDB constraint -- important clarification.
-   - Found: Query demonstrating automatic join pruning (only customers joined, products not needed) with suggestion to verify via `explain_semantic_view()`.
-   - Found: Query across both dimension tables.
-   - Found: Computed dimension example (`date_trunc('month', o.ordered_at)`) demonstrating that dimensions are not limited to column references.
-   - Found: `DESCRIBE SEMANTIC VIEW` usage.
-   - Found: `CREATE OR REPLACE` for updating views.
-   - Found: Clean up and summary with cross-references to how-to guides (FACTS, derived metrics, role-playing dimensions).
-   - Type-alignment: Tutorial -- correct. The user is learning multi-table modeling by building a complete example.
-   - Language calibration: Uses data engineering terminology naturally (fact table, dimension tables, star schema, foreign keys) as expected for the persona, while fully explaining the semantic-view-specific concepts (TABLES clause, RELATIONSHIPS clause, join pruning behavior).
+   - Found: Complete tutorial with time estimate (10 minutes), prerequisites (links back to getting-started), and star schema assumption noted (appropriate for persona's assumed knowledge).
+   - **Create the Schema:** Three-table e-commerce schema (orders, customers, products) with realistic sample data including dates. Tables correctly identified as fact and dimension tables.
+   - **Define the Semantic View:** Full DDL with TABLES (three aliases, PKs), RELATIONSHIPS (two FK references with emphasized lines), DIMENSIONS (from multiple tables including computed `date_trunc`), and METRICS. The RELATIONSHIPS clause explained clearly: "the customer_id column on orders (alias o) is a foreign key to the primary key of customers (alias c)." Satisfies never-assume for relationship modeling.
+   - **Query One Dimension Table:** Demonstrates selective join -- only customers joined, products excluded. Expected output shown. `explain_semantic_view()` used to verify. Directly satisfies "see generated SQL to verify join correctness."
+   - **Query Across Both Dimension Tables:** Both tables joined. Output shown.
+   - **Use a Computed Dimension:** `date_trunc` dimension queried with output.
+   - **Describe the View:** `DESCRIBE SEMANTIC VIEW` demonstrated with cross-reference.
+   - **Update the View:** `CREATE OR REPLACE` shown. Tip about `ALTER SEMANTIC VIEW ... RENAME TO` with cross-reference.
+   - **What You Learned:** Summary with cross-references to how-to guides (facts, derived metrics, role-playing dimensions).
+   - Helpful tip: "The PRIMARY KEY declaration is used by the extension to synthesize JOIN ON clauses. It does not create a constraint in DuckDB." -- important clarification for data engineers.
+   - Type-alignment: Tutorial (progressive hands-on learning). Correct.
 
 ---
 
-## Scenario S3: I want to compare this extension's capabilities and syntax with Snowflake Semantic Views to decide if it fits my use case
+## Scenario S3: I want to compare this extension's capabilities and syntax with Snowflake and Databricks Semantic Views to decide if it fits my use case
 
 **Verdict:** PASS
 
 ### Navigation Path
 
 1. Started at: `docs/index.rst`
-   - Found: "Concepts" card: "Understand how semantic views differ from regular views and how they compare to Snowflake."
-   - Followed: Card link to `explanation/index`
-2. Navigated to: `docs/explanation/index.rst`
-   - Found: Toctree listing two pages: "semantic-views-vs-regular-views" and "snowflake-comparison".
-   - Followed: `snowflake-comparison` (the directly relevant page for this scenario)
-3. Navigated to: `docs/explanation/snowflake-comparison.rst`
-   - Found: Clear opening note distinguishing Snowflake's two interfaces (SQL DDL vs YAML spec) and stating all comparisons target the SQL DDL only -- exactly what the persona needs, following the guidance in context.md.
-   - Found: Concept mapping table covering all major concepts (TABLES, RELATIONSHIPS, DIMENSIONS, METRICS, FACTS, derived metrics, query interface, inspection, listing) with side-by-side columns for Snowflake and DuckDB.
-   - Found: Syntax alignment section with side-by-side code examples in a tab set (Snowflake vs DuckDB) showing the same semantic view definition. The key difference (PRIMARY KEY required in DuckDB) is visually apparent.
-   - Found: Key Differences section with warning admonitions for: PRIMARY KEY declarations (Snowflake resolves from catalog, DuckDB requires explicit), query interface (table function vs direct SQL), cardinality inference, and USING RELATIONSHIPS.
-   - Found: "Features Not Yet Supported" table listing: semi-additive metrics (deferred), window function metrics (not planned), direct SQL query interface (not planned), column-level security (out of scope), ASOF/temporal relationships (not planned). Each has a clear status and rationale.
-   - Found: Final section on Snowflake's YAML spec, explaining why YAML-spec-only concepts (time_dimensions, custom_instructions, access_modifier, sample_values) are not applicable.
-   - Type-alignment: Explanation -- correct. The user wants to understand differences and make a decision, not follow steps. The page provides conceptual understanding and comparison context.
-   - Language calibration: Assumes familiarity with Snowflake (appropriate), explains all DuckDB-specific behaviors and differences (as required by "never assume" list for Snowflake/Databricks behavioral differences).
+   - Found: Grid card "Snowflake comparison" with description "Feature-by-feature comparison with Snowflake's CREATE SEMANTIC VIEW."
+   - Followed: Link to `explanation-snowflake`
+
+2. Navigated to: `docs/explanation/snowflake-comparison.rst`
+   - Found: Comprehensive comparison page.
+   - **YAML spec disclaimer:** Note clarifying SQL DDL interface comparison only -- correctly separates the two Snowflake interfaces.
+   - **Concept Mapping:** 22-row table covering all DDL statements, core model concepts, advanced features (semi-additive, window, materializations, wildcards, metadata, access modifiers), and query interface. Cross-references to relevant how-to and reference pages throughout.
+   - **Syntax Alignment:** Side-by-side tab set showing DDL from both platforms. PRIMARY KEY difference visually apparent.
+   - **Key Differences:** Seven detailed subsections:
+     - Primary Key Declarations: Three-case table (native with PK, native without, external sources). Iceberg-specific tip. Code examples for both cases. Error message shown.
+     - Query Interface: Warning admonition. Side-by-side syntax. Notes Snowflake's direct SQL and AGG function not supported.
+     - Cardinality Inference: Clear explanation with link to fan traps how-to.
+     - USING RELATIONSHIPS: Identical syntax noted.
+     - Facts Query Mode: Warning about mutual exclusivity of facts and metrics.
+     - Semi-Additive and Window Metrics: Behavioral differences listed.
+     - Materializations: Notes this is DuckDB-only, not in Snowflake DDL.
+   - **Features Not Yet Supported:** Clear three-row table with status and rationale.
+   - **A Note on Snowflake's YAML Spec:** Explains YAML-spec-only concepts (time_dimensions, custom_instructions, etc.) and clarifies DuckDB YAML uses its own schema for version control, not AI prompt tuning. Links to the YAML how-to guide.
+   - Followed: Navigation to `explanation-databricks` via explanation index page
+
+3. Navigated to: `docs/explanation/index.rst`
+   - Found: Link to Databricks Comparison.
+   - Followed: Link to `explanation-databricks`
+
+4. Navigated to: `docs/explanation/databricks-comparison.rst`
+   - Found: Parallel structure to Snowflake comparison.
+   - **Concept Mapping:** 18-row table with clear terminology mapping (MEASURES vs METRICS, FROM clause vs TABLES+RELATIONSHIPS). Now includes YAML definitions and materializations rows.
+   - **Syntax Comparison:** Side-by-side tab set.
+   - **Key Differences:** Multi-table handling (explicit JOIN vs declarative RELATIONSHIPS with join synthesis), Query Interface, MEASURES vs METRICS, Dimension Expressions.
+   - **Features in DuckDB Not in Databricks:** 11-row table (FACTS, NON ADDITIVE BY, window metrics, MATERIALIZATIONS, RELATIONSHIPS, fan trap detection, role-playing dimensions, YAML import/export, explain_semantic_view, WITH SYNONYMS, PRIVATE/PUBLIC).
+   - **Features in Databricks Not in DuckDB:** 5-row table (direct SQL, Unity Catalog, row-level security, AI/BI, Delta Lake materialized views).
+   - **Choosing Between Them:** Honest positioning -- lightweight/local-first vs cloud platform. Not interchangeable.
+   - Type-alignment: Explanation pages (understanding-oriented, cognition-based). Correct for platform evaluation and decision-making.
+   - Language calibration: Assumes Snowflake/Databricks familiarity (appropriate). Explains all DuckDB-specific behaviors and differences (satisfies never-assume).
 
 ---
 
-## Scenario S4: I want to connect DuckDB to my Iceberg tables and define a semantic view over them
-
-**Verdict:** PARTIAL
-
-### Navigation Path
-
-1. Started at: `docs/index.rst`
-   - Found: "How-To Guides" card: "Task-oriented guides for FACTS, derived metrics, role-playing dimensions, fan traps, and data sources."
-   - Note: Iceberg is not mentioned by name on the homepage. The "data sources" phrase is the closest match, but a data engineer searching specifically for Iceberg might not immediately identify this as the right link.
-   - Followed: Card link to `how-to/index`
-2. Navigated to: `docs/how-to/index.rst`
-   - Found: Toctree listing five pages: facts, derived-metrics, role-playing-dimensions, fan-traps, data-sources.
-   - Followed: `data-sources` (the relevant page for Iceberg)
-3. Navigated to: `docs/how-to/data-sources.rst`
-   - Found: Opening states semantic views work over "any table that DuckDB can see" including Iceberg -- addresses the core question.
-   - Found: Iceberg section with `INSTALL iceberg; LOAD iceberg;` and `iceberg_scan()` usage with S3 path, followed by a single-table semantic view definition.
-   - Found: Tip about DuckDB + Iceberg + analytics application stack: "semantic views provide a stable query interface over Iceberg tables."
-   - Found: Mixed sources section showing Iceberg + Postgres + Parquet all feeding into one multi-table semantic view -- directly relevant to the "build a DuckDB + Iceberg + analytics app stack" user task.
-   - Found: Catalog-qualified table names section, useful for more complex setups.
-   - Friction: The Iceberg section is quite brief. For a data engineer building a production DuckDB + Iceberg stack, several practical questions are left unanswered:
-     - No mention of S3 credentials configuration (AWS_ACCESS_KEY_ID, etc.) or authentication setup.
-     - No mention of Iceberg catalog types (REST catalog, Glue, Hive metastore) and how to specify them.
-     - No mention of schema evolution considerations -- what happens if the Iceberg table schema changes after the semantic view is defined?
-     - No mention of DuckLake (which appears to be part of the project's test suite) or other Iceberg-related DuckDB features.
-     - The example uses `CREATE TABLE ... AS SELECT * FROM iceberg_scan(...)` which copies data into DuckDB memory. A production setup would more likely use a view or direct reference to avoid data duplication. This is mentioned in the Parquet section ("Alternatively, create a view over the Parquet file") but not in the Iceberg section.
-   - Type-alignment: How-to guide -- correct type for "I want to connect to Iceberg." However, the depth is insufficient for the stated user task of "Build a DuckDB + Iceberg + analytics app stack." The page covers the happy path but omits the practical details a production setup requires.
-
-### Gap Analysis
-
-**Where:** `docs/how-to/data-sources.rst` > Iceberg Tables section
-**What:** The Iceberg section covers the minimum path (install, scan, define view) but omits practical production details: S3 credential configuration, catalog type specification, schema evolution handling, and the option to use a view instead of copying data into memory. The "alternatively, create a view" pattern shown in the Parquet section is not repeated for Iceberg.
-**Impact:** A data engineer following only this guide would get a working proof-of-concept but would hit unanswered questions when moving to a production Iceberg setup. They would need to leave the docs and consult DuckDB's Iceberg extension documentation separately.
-**Suggested Fix:** In `docs/how-to/data-sources.rst`, section "Iceberg Tables": (1) Add a note or link to DuckDB's Iceberg extension documentation for credential and catalog configuration. (2) Show the `CREATE VIEW` alternative for Iceberg as is done for Parquet, so users understand they do not have to copy all data into DuckDB memory. (3) Optionally add a brief mention of schema evolution considerations -- if the Iceberg table schema changes, the semantic view definition may need updating via `CREATE OR REPLACE`.
-
----
-
-## Scenario S5: I want to understand how to avoid fan traps and use FACTS and derived metrics to build a robust semantic model
+## Scenario S4: I want to define a semantic view with pre-aggregated materializations and export it as YAML for version control
 
 **Verdict:** PASS
 
 ### Navigation Path
 
 1. Started at: `docs/index.rst`
-   - Found: "How-To Guides" card mentioning FACTS, derived metrics, and fan traps.
-   - Followed: Card link to `how-to/index`
+   - Found: "How-to guides" card mentioning "materializations, YAML definitions" in its description.
+   - Followed: Link to `how-to-guides`
+
 2. Navigated to: `docs/how-to/index.rst`
-   - Found: Three relevant pages: facts, derived-metrics, fan-traps.
-   - Followed: `fan-traps` first (understanding the problem before learning the tools)
-3. Navigated to: `docs/how-to/fan-traps.rst`
-   - Found: Clear explanation of what a fan trap is using a concrete orders/line_items example. The explanation progresses from concept (one-to-many duplication) to mechanism (how the extension infers cardinality from PK/UNIQUE) to concrete example with full DDL, sample data, safe query, and blocked query with exact error message.
-   - Found: Three approaches to fix fan traps: remove problematic dimension, use metric from same table, restructure the view.
-   - Found: One-to-one relationship section explaining the safe traversal case.
-   - Type-alignment: This page is a hybrid -- it explains concepts (what is a fan trap, how detection works) and provides how-to steps (how to fix them). For this scenario, the blend works well because the user needs both understanding and actionable fixes.
-   - Followed: Back to `how-to/index.rst`, then to `facts`
-4. Navigated to: `docs/how-to/facts.rst`
-   - Found: Clear explanation that facts are row-level (not aggregate) expressions scoped to a table alias. Basic fact definition with `net_price` example.
-   - Found: Fact chaining section showing `tax_amount` referencing `net_price` with step-by-step resolution chain.
-   - Found: Multi-table facts example showing facts scoped to one table used with dimensions from other tables.
-   - Found: Verification via `explain_semantic_view()`.
-   - Found: Troubleshooting section covering circular references, aggregate functions in facts, and name-not-found errors.
-   - Cross-references: Prerequisites link to multi-table tutorial via `:ref:`.
-   - Followed: Back to `how-to/index.rst`, then to `derived-metrics`
-5. Navigated to: `docs/how-to/derived-metrics.rst`
-   - Found: Clear distinction between base metrics (table alias prefix, aggregate functions) and derived metrics (no prefix, reference metric names).
-   - Found: Complete example with revenue, cost, profit, margin showing the composition pattern.
-   - Found: Query example with expected output.
-   - Found: Stacking section showing how derived metrics can reference other derived metrics with full expansion chain.
-   - Found: Combined facts + derived metrics example showing the full resolution pipeline: fact -> base metric -> derived metric.
-   - Found: Troubleshooting for aggregate-in-derived, circular references, and unknown references.
-   - Cross-references: Prerequisites link to multi-table tutorial and facts how-to via `:ref:`.
-   - Type-alignment: How-to guides -- correct. The user has a specific task (build robust models with these features) and the pages provide step-by-step guidance.
-   - Language calibration: Uses data engineering terms naturally (row-level expression, aggregation, dependency chain) while fully explaining semantic-view-specific concepts (FACTS clause, derived metrics, fact chaining, topological resolution).
+   - Found: Listed entries for both materializations ("Declare materializations that route matching queries to pre-aggregated tables") and YAML definitions ("Import and export semantic view definitions as YAML for version control and migration").
+   - Followed: Link to `howto-materializations`
+
+3. Navigated to: `docs/how-to/materializations.rst`
+   - Found: Complete how-to guide with versionadded 0.7.0 marker and clear prerequisites.
+   - **How Materializations Work:** Clear concept -- maps dims+metrics to a pre-aggregated table, transparent routing, query interface unchanged.
+   - **Declare a Materialization:** Step-by-step: create pre-aggregated table first, then MATERIALIZATIONS clause with emphasized lines in the DDL. Clause ordering rule stated (must appear after METRICS). Tip about column naming requirement.
+   - **How Routing Works:** Exact-match logic explained with two conditions. Case-insensitive. Two examples: one that matches, one that does not. Warning about no superset matching in v0.7.0 -- important caveat clearly stated.
+   - **Multiple Materializations:** Definition-order, first-match semantics. Full DDL example.
+   - **Routing Exclusions:** Semi-additive and window metrics always excluded. Code example showing the bypass behavior.
+   - **Verify Routing:** `explain_semantic_view()` with `-- Materialization:` header line in output. Sample output shown for both matched and unmatched cases.
+   - **Inspect with SHOW and DESCRIBE:** Both `SHOW SEMANTIC MATERIALIZATIONS` and `DESCRIBE` with object_kind filtering demonstrated.
+   - **Troubleshooting:** Five specific error scenarios with explanations and fixes.
+   - **Related:** Cross-references to CREATE reference, SHOW reference, explain reference, and semi-additive/window how-to guides.
+   - Followed: Link to `howto-yaml-definitions` from how-to index
+
+4. Navigated to: `docs/how-to/yaml-definitions.rst` (recently reordered to Import-first)
+   - Found: Complete how-to guide with versionadded 0.7.0 marker.
+   - **Import from Inline YAML** (now first section): Dollar-quoted syntax with full, realistic example showing tables/dimensions/metrics. Tagged dollar-quoting variant shown. CREATE OR REPLACE and IF NOT EXISTS variants noted. This Import-first ordering makes good sense for the how-to pattern: a user arriving here is more likely to have a YAML file they want to import than to start with export.
+   - **Import from a YAML File:** `FROM YAML FILE` with single-quoted path. Both CREATE and CREATE OR REPLACE variants shown.
+   - **Export with READ_YAML_FROM_SEMANTIC_VIEW:** Function call shown. COPY TO file pattern for saving to disk demonstrated -- important practical detail. Schema-qualified names noted. Cross-reference to reference page.
+   - **Round-Trip Workflow:** Three-step numbered workflow (export, import, verify with GET_DDL). Tip about storing YAML in version control alongside the data model.
+   - **Troubleshooting:** Seven specific error messages with explanations and fixes. Covers unterminated strings, empty paths, size limits, and view-not-found on export.
+   - **Related:** Cross-references to YAML format reference, READ_YAML reference, CREATE reference, and GET_DDL. The link to `ref-yaml-format` is important -- connects the how-to to the specification.
+   - Followed: Link to `ref-yaml-format` from Related section
+
+5. Navigated to: `docs/reference/yaml-format.rst` (new page)
+   - Found: Complete field-by-field YAML schema reference.
+   - **SQL-to-YAML mapping table:** Seven-row table mapping SQL clause names to YAML keys. The `RELATIONSHIPS -> joins` difference called out explicitly with a note ("Different name -- YAML uses the internal joins key") -- this would have been a stumbling block without documentation.
+   - **Complete Example:** Comprehensive YAML covering all features: tables with pk_columns/comment/synonyms, joins with from_alias/fk_columns/cardinality, facts with chaining, dimensions with source_table/output_type, metrics including derived (no source_table), semi-additive (non_additive_by), and materializations. This serves as both a specification and a template.
+   - **Minimal Example:** Bare minimum YAML (tables + dimensions + metrics).
+   - **Top-Level Keys:** Seven keys with types, required/optional, descriptions. Footnote: "At least one of dimensions or metrics must be non-empty."
+   - **Table:** Six fields (alias, table, pk_columns, unique_constraints, comment, synonyms) with types, defaults, descriptions. Code example.
+   - **Dimension:** Six fields (name, expr, source_table, output_type, comment, synonyms). Code example with computed dimension.
+   - **Metric:** Ten fields covering base, derived, private, semi-additive, and window variants. Five separate code examples, one for each variant. This is thorough.
+   - **Fact:** Seven fields. Code example with chaining.
+   - **Join:** Six fields (table, from_alias, fk_columns, ref_columns, name, cardinality). Code example showing both basic and explicit ref_columns usage.
+   - **Materialization:** Four fields. Code example with multiple entries.
+   - **NonAdditiveDim:** Three fields (dimension, order, nulls). Code example.
+   - **WindowSpec:** Seven fields (window_function, inner_metric, extra_args, excluding_dims, partition_dims, order_by, frame_clause). Code example.
+   - **WindowOrderBy:** Three fields (expr, order, nulls).
+   - **Size Limit:** 1 MiB documented.
+   - **Related:** Cross-references back to CREATE reference, READ_YAML reference, and YAML how-to guide.
+   - Type-alignment: Reference documentation (information-oriented, work-context). The user is looking up field specifications, and the page provides structured tables with defaults and examples for every type. Correct Diataxis alignment.
+   - Language calibration: Technical but accessible. Field descriptions use data engineering terminology naturally (PK/FK, cardinality, aggregate) while explaining semantic-view-specific structures through the descriptions. No jargon left undefined.
+
+---
+
+## Scenario S5: I want to define semi-additive metrics and window function metrics for snapshot data (like account balances) and time-series analysis
+
+**Verdict:** PASS
+
+### Navigation Path
+
+1. Started at: `docs/index.rst`
+   - Found: "How-to guides" card. No direct homepage card for semi-additive or window metrics, but the how-to card description is broad enough.
+   - Followed: Link to `how-to-guides`
+
+2. Navigated to: `docs/how-to/index.rst`
+   - Found: Both guides listed clearly with descriptive summaries:
+     - "Define metrics with NON ADDITIVE BY for snapshot data like account balances and inventory levels."
+     - "Define window function metrics for rolling averages, lag comparisons, and rankings using OVER clauses."
+   - Followed: Link to `howto-semi-additive`
+
+3. Navigated to: `docs/how-to/semi-additive-metrics.rst`
+   - Found: Complete how-to guide with prerequisites.
+   - **Snapshot Data:** Excellent motivation section. Shows concrete account balances data table and explains the double-counting problem clearly: "If you query SUM(balance) grouped by customer_id across both dates, you get 1050 for ACME (500 + 550) -- but that is double-counting. The real current balance is 550." This is exactly the explanation needed for someone who knows SQL aggregation but has never encountered semi-additive measures.
+   - **Define a Semi-Additive Metric:** Full DDL with emphasized `NON ADDITIVE BY` line. Clear explanation of what the declaration means in practice.
+   - **Sort Order and NULLS Placement:** ASC/DESC and NULLS FIRST/LAST options with two concrete examples (latest balance vs earliest balance).
+   - **Multiple Non-Additive Dimensions:** Syntax shown.
+   - **Snapshot Behavior:** Key distinction between two cases: (1) non-additive dimension not in query -- CTE with ROW_NUMBER generated, snapshot selection active; (2) non-additive dimension in query -- standard aggregation, no CTE. Snowflake alignment noted. Both cases have query examples.
+   - **Verify the Generated SQL:** Full CTE expansion shown via `explain_semantic_view()`. The generated SQL is explained: ROW_NUMBER partitioned by queried dims, ordered by non-additive dim, then `CASE WHEN __sv_rn = 1` in the aggregation.
+   - **Restrictions:** Warning about mutual exclusivity with OVER.
+   - **Troubleshooting:** Three specific issues (dimension not found, unexpected results, performance with multiple NA sets).
+   - Followed: Back to how-to index, then link to `howto-window-metrics`
+
+4. Navigated to: `docs/how-to/window-metrics.rst`
+   - Found: Complete how-to guide with prerequisites (including familiarity with SQL window functions -- appropriate for persona).
+   - **Define a Window Metric:** Full DDL with OVER clause wrapping another metric. Emphasized lines highlighting the window metric definition.
+   - **PARTITION BY:** Both modes covered thoroughly in one section:
+     - Plain PARTITION BY: fixed partition set. Example with `store_avg` always partitioning by store.
+     - PARTITION BY EXCLUDING: dynamic partition set. Two worked examples showing how excluding dims interact with different queried dimension sets.
+     - Tip explaining when to use each mode. Mutual exclusivity noted.
+   - **ORDER BY with Sort and NULLS:** Sort direction and NULLS placement examples.
+   - **Frame Clauses:** RANGE and ROWS with `INTERVAL '6 days' PRECEDING` rolling average example.
+   - **Extra Function Arguments:** LAG with offset (30 rows) demonstrated.
+   - **Required Dimensions:** Error messages shown for missing dimensions in EXCLUDING, PARTITION BY, and ORDER BY. Tip about `SHOW SEMANTIC DIMENSIONS FOR METRIC` for discovering required dimensions.
+   - **Mixing Restriction:** Warning that window and aggregate metrics cannot coexist in the same query. Error message shown. Workaround provided (two separate queries, join results).
+   - **Verify the Generated SQL:** CTE expansion pattern described (aggregate CTE + outer window SELECT).
+   - **Troubleshooting:** Six specific error scenarios with exact error messages.
+   - Type-alignment: How-to guides (goal-oriented, work + action). Correct. The user has specific tasks (define semi-additive metrics, define window metrics) and gets step-by-step directions with complete examples.
+   - Language calibration: Assumes SQL window function knowledge (appropriate for intermediate). Explains NON ADDITIVE BY and PARTITION BY EXCLUDING as new, extension-specific concepts (satisfies never-assume for dimension/metric definitions). The snapshot data explanation is particularly well-calibrated -- does not over-explain basic aggregation but thoroughly explains why standard SUM fails for snapshot data.
 
 ---
 
 ## Revision Recommendations
 
-### FAIL Issues (trigger revision)
+No revision needed. All scenarios passed.
 
-No FAIL issues identified.
+### Cross-Reference Quality (Rule 4)
 
-### PARTIAL Issues (for project author approval)
+Cross-referencing is thorough and consistent throughout the documentation:
 
-| Scenario | Page | Gap | Suggested Fix |
-|----------|------|-----|---------------|
-| S4 | `docs/how-to/data-sources.rst` > Iceberg Tables | Iceberg section is minimal -- missing S3 credential guidance, catalog configuration, CREATE VIEW alternative (shown for Parquet but not Iceberg), and schema evolution considerations | In `docs/how-to/data-sources.rst`, section "Iceberg Tables": (1) Add a cross-reference or link to DuckDB Iceberg extension docs for credential and catalog setup. (2) Show the `CREATE VIEW` alternative as done in the Parquet section to avoid copying data into memory. (3) Add a brief note on schema evolution: if the underlying table schema changes, update the semantic view with `CREATE OR REPLACE`. |
+- All inline code mentions of DDL commands (`CREATE SEMANTIC VIEW`, `DROP SEMANTIC VIEW`, `ALTER SEMANTIC VIEW`) link to their reference pages via `:ref:` labels.
+- Function mentions (`semantic_view()`, `explain_semantic_view()`, `READ_YAML_FROM_SEMANTIC_VIEW()`, `GET_DDL()`) consistently link to their reference pages.
+- How-to guides cross-reference related how-to guides and relevant reference pages in "Related" sections.
+- Tutorials end with "What You Learned" sections containing cross-references and "Next" pointers.
+- The YAML how-to links to the new YAML format reference (`ref-yaml-format`), and the format reference links back to the how-to and CREATE reference. This bidirectional linking is well-done.
+- The Snowflake comparison page links to 10+ how-to and reference pages from the concept mapping table.
+
+### Persona-Calibrated Language (Rule 5)
+
+Language calibration is well-executed for the intermediate data engineer persona:
+
+- SQL and DuckDB basics are assumed without explanation (appropriate).
+- Star schema, fact tables, dimension tables, PK/FK, cardinality -- all used as shared vocabulary (appropriate for assumed knowledge).
+- Semantic view concepts are always explained before use (satisfies never_assume).
+- DDL syntax is always shown in full with clause-by-clause explanation (satisfies never_assume).
+- Relationship modeling is explained using PK/FK terminology the audience knows, extended with semantic-view-specific concepts (satisfies never_assume).
+- Snowflake/Databricks differences are called out with side-by-side syntax and explicit warnings (satisfies never_assume).
+- The YAML format reference correctly notes the `RELATIONSHIPS -> joins` naming difference, preventing confusion.
+
+### Recently Modified Pages Assessment
+
+- **docs/how-to/yaml-definitions.rst (reordered to Import-first):** The Import-first ordering is the right structure for a how-to guide. A user arriving at this page has a task in mind, and the most common first task is "I have a YAML file or want to create from YAML" rather than "I want to export." The flow (inline import, file import, export, round-trip) builds logically and the troubleshooting section covers all seven YAML-specific error cases.
+
+- **docs/reference/yaml-format.rst (new YAML format reference):** This page fills a critical documentation gap. Before this page existed, a user writing YAML definitions would have to reverse-engineer the format from the limited examples in the how-to guide or the CREATE reference. Now there is a complete, field-by-field specification with types, required/optional indicators, defaults, and code examples for every variant. Three details stand out as particularly valuable: (1) the SQL-to-YAML mapping table at the top, which immediately addresses the `RELATIONSHIPS -> joins` naming discrepancy; (2) the five separate Metric code examples covering every metric variant; and (3) the sub-object specifications (NonAdditiveDim, WindowSpec, WindowOrderBy) which would be impossible to discover without documentation or source code access.

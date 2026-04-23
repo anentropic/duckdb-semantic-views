@@ -1,67 +1,21 @@
 .. meta::
-   :description: Export semantic view definitions to YAML and import them from inline YAML or YAML files for version control, migration, and sharing
+   :description: Import semantic view definitions from inline YAML or YAML files, export existing views to YAML, and round-trip definitions for version control and migration
 
 .. _howto-yaml-definitions:
 
 ==============================================
-How to Export and Import YAML Definitions
+How to Import and Export YAML Definitions
 ==============================================
 
-This guide shows how to export a semantic view definition to YAML, import a semantic view from inline YAML, and import from a YAML file. These features enable version-controlled definitions, cross-environment migration, and sharing semantic view configurations outside of SQL.
+This guide shows how to create a semantic view from a YAML definition (inline or file), export an existing view to YAML, and round-trip definitions between environments. These features enable version-controlled definitions, cross-environment migration, and sharing semantic view configurations outside of SQL.
 
 .. versionadded:: 0.7.0
 
 **Prerequisites:**
 
 - A working DuckDB installation with the ``semantic_views`` extension loaded
-- For export: an existing semantic view to export
 - For file import: a YAML definition file accessible to DuckDB
-
-
-.. _howto-yaml-export:
-
-Export with READ_YAML_FROM_SEMANTIC_VIEW
-========================================
-
-Use the :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` scalar function to export an existing semantic view as a YAML string:
-
-.. code-block:: sql
-
-   SELECT READ_YAML_FROM_SEMANTIC_VIEW('order_metrics');
-
-The function returns a single VARCHAR value containing the YAML representation of the view definition. The output includes all clauses (tables, relationships, facts, dimensions, metrics, materializations) that were declared when the view was created.
-
-To save the output to a file, use DuckDB's ``COPY`` statement:
-
-.. code-block:: sql
-
-   COPY (SELECT READ_YAML_FROM_SEMANTIC_VIEW('order_metrics'))
-   TO '/path/to/order_metrics.yaml' (FORMAT CSV, HEADER FALSE, QUOTE '');
-
-The function supports schema-qualified and catalog-qualified view names:
-
-.. code-block:: sql
-
-   SELECT READ_YAML_FROM_SEMANTIC_VIEW('main.order_metrics');
-   SELECT READ_YAML_FROM_SEMANTIC_VIEW('memory.main.order_metrics');
-
-See :ref:`ref-read-yaml` for the full function reference.
-
-
-.. _howto-yaml-stripped:
-
-Stripped Fields
-===============
-
-The exported YAML omits internal fields that are repopulated automatically at define time:
-
-- ``column_type_names`` -- column name list from DDL-time type inference
-- ``column_types_inferred`` -- column type IDs from DDL-time type inference
-- ``created_on`` -- creation timestamp
-- ``database_name`` -- connection-specific database context
-- ``schema_name`` -- connection-specific schema context
-
-These fields are not needed when importing the definition into a new environment. They are regenerated when the imported view is created.
+- For export: an existing semantic view to export
 
 
 .. _howto-yaml-import-inline:
@@ -141,6 +95,36 @@ The file path must be single-quoted. DuckDB reads the file and parses its conten
    FROM YAML FILE '/path/to/order_metrics.yaml'
 
 
+.. _howto-yaml-export:
+
+Export with READ_YAML_FROM_SEMANTIC_VIEW
+========================================
+
+Use the :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` scalar function to export an existing semantic view as a YAML string:
+
+.. code-block:: sql
+
+   SELECT READ_YAML_FROM_SEMANTIC_VIEW('order_metrics');
+
+The function returns a single VARCHAR value containing the YAML representation of the view definition. The output includes all clauses (tables, relationships, facts, dimensions, metrics, materializations) that were declared when the view was created.
+
+To save the output to a file, use DuckDB's ``COPY`` statement:
+
+.. code-block:: sql
+
+   COPY (SELECT READ_YAML_FROM_SEMANTIC_VIEW('order_metrics'))
+   TO '/path/to/order_metrics.yaml' (FORMAT CSV, HEADER FALSE, QUOTE '');
+
+The function supports schema-qualified and catalog-qualified view names:
+
+.. code-block:: sql
+
+   SELECT READ_YAML_FROM_SEMANTIC_VIEW('main.order_metrics');
+   SELECT READ_YAML_FROM_SEMANTIC_VIEW('memory.main.order_metrics');
+
+See :ref:`ref-read-yaml` for the full function reference.
+
+
 .. _howto-yaml-roundtrip:
 
 Round-Trip Workflow
@@ -216,6 +200,7 @@ See :ref:`ref-error-messages` for the full list of YAML-related error messages.
 Related
 =======
 
+- :ref:`ref-yaml-format` -- YAML definition format specification
 - :ref:`ref-read-yaml` -- ``READ_YAML_FROM_SEMANTIC_VIEW()`` function reference
 - :ref:`ref-create-semantic-view` -- ``FROM YAML`` and ``FROM YAML FILE`` syntax
 - :ref:`ref-get-ddl` -- Export as SQL DDL (alternative to YAML export)

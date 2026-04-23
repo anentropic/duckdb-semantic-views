@@ -44,32 +44,32 @@ Snowflake and Databricks, along with dbt Cloud, Cube.dev and others, all ship se
 
       Model relationships between tables and query across them.
 
+   .. grid-item-card:: Building a complete model
+      :link: tutorial-building-model
+      :link-type: ref
+
+      Facts, derived metrics, and iterative model refinement in 15 minutes.
+
+.. grid:: 1 2 3 3
+   :gutter: 3
+
    .. grid-item-card:: DDL reference
       :link: ref-create-semantic-view
       :link-type: ref
 
       Full syntax for ``CREATE SEMANTIC VIEW`` and related DDL.
 
-.. grid:: 1 2 3 3
-   :gutter: 3
-
    .. grid-item-card:: How-to guides
       :link: how-to-guides
       :link-type: ref
 
-      FACTS, derived metrics, role-playing dimensions, fan traps, data sources, materializations, YAML definitions.
+      Modeling, advanced metrics, data sources, materializations, YAML definitions, and more.
 
    .. grid-item-card:: Snowflake comparison
       :link: explanation-snowflake
       :link-type: ref
 
       Feature-by-feature comparison with Snowflake's ``CREATE SEMANTIC VIEW``.
-
-   .. grid-item-card:: Query reference
-      :link: ref-semantic-view-function
-      :link-type: ref
-
-      Reference for ``semantic_view()`` and ``explain_semantic_view()``.
 
 
 .. toctree::

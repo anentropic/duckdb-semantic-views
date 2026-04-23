@@ -1,0 +1,779 @@
+.. meta::
+   :description: Complete field-by-field reference for the YAML schema accepted by CREATE SEMANTIC VIEW FROM YAML
+
+.. _ref-yaml-format:
+
+======================
+YAML Definition Format
+======================
+
+Specification of the YAML schema accepted by ``CREATE SEMANTIC VIEW ... FROM YAML``. Every semantic view definition — whether created from inline YAML, a YAML file, or exported via :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` — follows this format.
+
+.. versionadded:: 0.7.0
+
+The YAML format maps directly to the internal ``SemanticViewDefinition`` structure. Field names follow serde conventions, which differ from SQL clause names in some cases:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 30 40
+
+   * - SQL Clause
+     - YAML Key
+     - Notes
+   * - ``TABLES``
+     - ``tables``
+     -
+   * - ``RELATIONSHIPS``
+     - ``joins``
+     - Different name — YAML uses the internal ``joins`` key
+   * - ``FACTS``
+     - ``facts``
+     -
+   * - ``DIMENSIONS``
+     - ``dimensions``
+     -
+   * - ``METRICS``
+     - ``metrics``
+     -
+   * - ``MATERIALIZATIONS``
+     - ``materializations``
+     -
+   * - ``COMMENT``
+     - ``comment``
+     - View-level comment
+
+
+.. _ref-yaml-format-example:
+
+Complete Example
+================
+
+A comprehensive YAML definition covering all supported features:
+
+.. code-block:: yaml
+
+   tables:
+     - alias: o
+       table: orders
+       pk_columns:
+         - id
+       comment: Order transactions
+       synonyms:
+         - order_facts
+     - alias: c
+       table: customers
+       pk_columns:
+         - id
+
+   joins:
+     - table: c
+       from_alias: o
+       fk_columns:
+         - customer_id
+       name: order_customer
+       cardinality: ManyToOne
+
+   facts:
+     - name: net_price
+       expr: o.extended_price * (1 - o.discount)
+       source_table: o
+       comment: Price after discount
+       synonyms:
+         - discounted_price
+
+   dimensions:
+     - name: region
+       expr: o.region
+       source_table: o
+       comment: Sales territory
+     - name: customer_name
+       expr: c.name
+       source_table: c
+
+   metrics:
+     - name: revenue
+       expr: SUM(o.amount)
+       source_table: o
+       comment: Total revenue
+       synonyms:
+         - total_revenue
+     - name: order_count
+       expr: COUNT(*)
+       source_table: o
+     - name: avg_order
+       expr: revenue / order_count
+     - name: balance
+       expr: SUM(o.amount)
+       source_table: o
+       non_additive_by:
+         - dimension: report_date
+           order: Desc
+           nulls: First
+
+   materializations:
+     - name: region_agg
+       table: daily_revenue_by_region
+       dimensions:
+         - region
+       metrics:
+         - revenue
+         - order_count
+
+   comment: Revenue analytics view
+
+
+.. _ref-yaml-format-minimal:
+
+A minimal definition requires only ``tables``, and at least one of ``dimensions`` or ``metrics``:
+
+.. code-block:: yaml
+
+   tables:
+     - alias: o
+       table: orders
+       pk_columns:
+         - id
+   dimensions:
+     - name: region
+       expr: o.region
+       source_table: o
+   metrics:
+     - name: revenue
+       expr: SUM(o.amount)
+       source_table: o
+
+
+.. _ref-yaml-format-toplevel:
+
+Top-Level Keys
+==============
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 15 12 53
+
+   * - Key
+     - Type
+     - Required
+     - Description
+   * - ``tables``
+     - list of `Table`_
+     - Yes
+     - Physical tables available to the view.
+   * - ``dimensions``
+     - list of `Dimension`_
+     - Yes :sup:`*`
+     - Named grouping expressions.
+   * - ``metrics``
+     - list of `Metric`_
+     - Yes :sup:`*`
+     - Named aggregation or derived expressions.
+   * - ``joins``
+     - list of `Join`_
+     - No
+     - FK/PK relationships between tables. Maps to the SQL ``RELATIONSHIPS`` clause.
+   * - ``facts``
+     - list of `Fact`_
+     - No
+     - Named row-level expressions (no aggregates).
+   * - ``materializations``
+     - list of `Materialization`_
+     - No
+     - Pre-aggregated table mappings for query routing.
+   * - ``comment``
+     - string
+     - No
+     - View-level human-readable description.
+
+:sup:`*` At least one of ``dimensions`` or ``metrics`` must be non-empty.
+
+
+.. _ref-yaml-format-table:
+
+Table
+=====
+
+Each entry in the ``tables`` list declares a physical table with an alias. The first table is the **base table** (root of the relationship graph).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 12 10 38
+
+   * - Field
+     - Type
+     - Required
+     - Default
+     - Description
+   * - ``alias``
+     - string
+     - Yes
+     -
+     - Short name used to reference this table in all other sections.
+   * - ``table``
+     - string
+     - Yes
+     -
+     - Physical table name. Supports catalog-qualified names (``catalog.schema.table``).
+   * - ``pk_columns``
+     - list of string
+     - No
+     - ``[]``
+     - Primary key column names. Used for JOIN synthesis and cardinality inference.
+   * - ``unique_constraints``
+     - list of list of string
+     - No
+     - ``[]``
+     - UNIQUE constraint column lists. Each inner list is one constraint. Used for cardinality inference.
+   * - ``comment``
+     - string
+     - No
+     - null
+     - Human-readable description.
+   * - ``synonyms``
+     - list of string
+     - No
+     - ``[]``
+     - Alternative names for discoverability.
+
+.. code-block:: yaml
+
+   tables:
+     - alias: o
+       table: orders
+       pk_columns:
+         - id
+       unique_constraints:
+         - - email
+       comment: Order transactions
+       synonyms:
+         - order_facts
+
+
+.. _ref-yaml-format-dimension:
+
+Dimension
+=========
+
+Each entry in the ``dimensions`` list declares a named grouping expression.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 12 10 38
+
+   * - Field
+     - Type
+     - Required
+     - Default
+     - Description
+   * - ``name``
+     - string
+     - Yes
+     -
+     - Dimension name.
+   * - ``expr``
+     - string
+     - Yes
+     -
+     - SQL expression. Can be a column reference (``o.region``) or computed (``date_trunc('month', o.ordered_at)``).
+   * - ``source_table``
+     - string
+     - No
+     - null
+     - Table alias this dimension comes from. Used for join dependency resolution.
+   * - ``output_type``
+     - string
+     - No
+     - null
+     - Override output column type. Wraps the expression in ``CAST(expr AS <type>)``.
+   * - ``comment``
+     - string
+     - No
+     - null
+     - Human-readable description.
+   * - ``synonyms``
+     - list of string
+     - No
+     - ``[]``
+     - Alternative names for discoverability.
+
+.. code-block:: yaml
+
+   dimensions:
+     - name: region
+       expr: o.region
+       source_table: o
+       comment: Sales territory
+     - name: order_month
+       expr: date_trunc('month', o.ordered_at)
+       source_table: o
+       output_type: DATE
+
+
+.. _ref-yaml-format-metric:
+
+Metric
+======
+
+Each entry in the ``metrics`` list declares a named aggregation, derived metric, semi-additive metric, or window metric.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 12 10 38
+
+   * - Field
+     - Type
+     - Required
+     - Default
+     - Description
+   * - ``name``
+     - string
+     - Yes
+     -
+     - Metric name.
+   * - ``expr``
+     - string
+     - Yes
+     -
+     - For base metrics: aggregate expression (``SUM(o.amount)``). For derived metrics: arithmetic over other metric names (``revenue - cost``).
+   * - ``source_table``
+     - string
+     - No
+     - null
+     - Table alias. Present for base metrics, absent for derived metrics.
+   * - ``output_type``
+     - string
+     - No
+     - null
+     - Override output column type.
+   * - ``using_relationships``
+     - list of string
+     - No
+     - ``[]``
+     - Named relationships this metric traverses (for role-playing dimensions).
+   * - ``comment``
+     - string
+     - No
+     - null
+     - Human-readable description.
+   * - ``synonyms``
+     - list of string
+     - No
+     - ``[]``
+     - Alternative names for discoverability.
+   * - ``access``
+     - string
+     - No
+     - ``Public``
+     - Access modifier: ``Public`` (queryable) or ``Private`` (usable only in derived expressions).
+   * - ``non_additive_by``
+     - list of `NonAdditiveDim`_
+     - No
+     - ``[]``
+     - Semi-additive dimensions for snapshot selection. Mutually exclusive with ``window_spec``.
+   * - ``window_spec``
+     - `WindowSpec`_
+     - No
+     - null
+     - Window function specification. Mutually exclusive with ``non_additive_by``.
+
+**Base metric** (with ``source_table`` and aggregate expression):
+
+.. code-block:: yaml
+
+   metrics:
+     - name: revenue
+       expr: SUM(o.amount)
+       source_table: o
+
+**Derived metric** (no ``source_table``, references other metrics):
+
+.. code-block:: yaml
+
+   metrics:
+     - name: profit
+       expr: revenue - cost
+
+**Private metric:**
+
+.. code-block:: yaml
+
+   metrics:
+     - name: raw_total
+       expr: SUM(o.amount)
+       source_table: o
+       access: Private
+
+**Semi-additive metric:**
+
+.. code-block:: yaml
+
+   metrics:
+     - name: total_balance
+       expr: SUM(a.balance)
+       source_table: a
+       non_additive_by:
+         - dimension: report_date
+           order: Desc
+           nulls: First
+
+**Window metric:**
+
+.. code-block:: yaml
+
+   metrics:
+     - name: rolling_avg
+       expr: AVG(total_qty)
+       source_table: s
+       window_spec:
+         window_function: AVG
+         inner_metric: total_qty
+         excluding_dims:
+           - date
+         order_by:
+           - expr: date
+             order: Asc
+             nulls: Last
+         frame_clause: "RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW"
+
+
+.. _ref-yaml-format-fact:
+
+Fact
+====
+
+Each entry in the ``facts`` list declares a named row-level expression. Facts can reference other facts (resolved in topological order). Aggregate functions are not allowed.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 12 10 38
+
+   * - Field
+     - Type
+     - Required
+     - Default
+     - Description
+   * - ``name``
+     - string
+     - Yes
+     -
+     - Fact name.
+   * - ``expr``
+     - string
+     - Yes
+     -
+     - Row-level SQL expression. Must not contain aggregate functions.
+   * - ``source_table``
+     - string
+     - No
+     - null
+     - Table alias this fact is scoped to.
+   * - ``output_type``
+     - string
+     - No
+     - null
+     - Output type hint for ``SHOW SEMANTIC FACTS``.
+   * - ``comment``
+     - string
+     - No
+     - null
+     - Human-readable description.
+   * - ``synonyms``
+     - list of string
+     - No
+     - ``[]``
+     - Alternative names for discoverability.
+   * - ``access``
+     - string
+     - No
+     - ``Public``
+     - Access modifier: ``Public`` (queryable via ``facts := [...]``) or ``Private`` (usable only in metric expressions).
+
+.. code-block:: yaml
+
+   facts:
+     - name: net_price
+       expr: o.extended_price * (1 - o.discount)
+       source_table: o
+       comment: Price after discount
+       synonyms:
+         - discounted_price
+     - name: tax_amount
+       expr: o.net_price * o.tax_rate
+       source_table: o
+
+
+.. _ref-yaml-format-join:
+
+Join
+====
+
+Each entry in the ``joins`` list declares a FK/PK relationship between tables. This maps to the SQL ``RELATIONSHIPS`` clause.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 12 10 38
+
+   * - Field
+     - Type
+     - Required
+     - Default
+     - Description
+   * - ``table``
+     - string
+     - Yes
+     -
+     - Target table alias (the table being joined to).
+   * - ``from_alias``
+     - string
+     - No
+     - ``""``
+     - Source table alias containing the FK columns.
+   * - ``fk_columns``
+     - list of string
+     - No
+     - ``[]``
+     - FK column names on the source table.
+   * - ``ref_columns``
+     - list of string
+     - No
+     - ``[]``
+     - Referenced columns on the target table. Defaults to the target's primary key if omitted.
+   * - ``name``
+     - string
+     - No
+     - null
+     - Relationship name. Required for role-playing dimensions (``using_relationships``).
+   * - ``cardinality``
+     - string
+     - No
+     - ``ManyToOne``
+     - ``ManyToOne`` or ``OneToOne``. Used for fan trap detection.
+
+.. code-block:: yaml
+
+   joins:
+     - table: c
+       from_alias: o
+       fk_columns:
+         - customer_id
+       name: order_customer
+       cardinality: ManyToOne
+     - table: a
+       from_alias: f
+       fk_columns:
+         - departure_code
+       ref_columns:
+         - airport_code
+       name: dep_airport
+
+
+.. _ref-yaml-format-materialization:
+
+Materialization
+===============
+
+Each entry in the ``materializations`` list maps a pre-aggregated table to the dimensions and metrics it covers.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 12 10 38
+
+   * - Field
+     - Type
+     - Required
+     - Default
+     - Description
+   * - ``name``
+     - string
+     - Yes
+     -
+     - Materialization name (unique within the view).
+   * - ``table``
+     - string
+     - Yes
+     -
+     - Pre-aggregated table name. Supports catalog-qualified names. Not validated for existence at define time.
+   * - ``dimensions``
+     - list of string
+     - No
+     - ``[]``
+     - Dimension names covered. Must match declared dimension names.
+   * - ``metrics``
+     - list of string
+     - No
+     - ``[]``
+     - Metric names covered. Must match declared metric names.
+
+At least one of ``dimensions`` or ``metrics`` must be specified.
+
+.. code-block:: yaml
+
+   materializations:
+     - name: region_agg
+       table: daily_revenue_by_region
+       dimensions:
+         - region
+       metrics:
+         - revenue
+         - order_count
+     - name: global_agg
+       table: global_totals
+       metrics:
+         - revenue
+
+
+.. _ref-yaml-format-nonadditivedim:
+
+NonAdditiveDim
+==============
+
+Used within a metric's ``non_additive_by`` list to specify snapshot selection behavior.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 12 10 38
+
+   * - Field
+     - Type
+     - Required
+     - Default
+     - Description
+   * - ``dimension``
+     - string
+     - Yes
+     -
+     - Dimension name for snapshot selection.
+   * - ``order``
+     - string
+     - No
+     - ``Asc``
+     - Sort direction: ``Asc`` or ``Desc``.
+   * - ``nulls``
+     - string
+     - No
+     - ``Last``
+     - NULLS placement: ``Last`` or ``First``.
+
+.. code-block:: yaml
+
+   non_additive_by:
+     - dimension: report_date
+       order: Desc
+       nulls: First
+
+
+.. _ref-yaml-format-windowspec:
+
+WindowSpec
+==========
+
+Used within a metric's ``window_spec`` field to declare a window function metric.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 12 10 38
+
+   * - Field
+     - Type
+     - Required
+     - Default
+     - Description
+   * - ``window_function``
+     - string
+     - Yes
+     -
+     - Window function name (``AVG``, ``LAG``, ``SUM``, ``RANK``, etc.).
+   * - ``inner_metric``
+     - string
+     - Yes
+     -
+     - Name of the metric to wrap in the window function.
+   * - ``extra_args``
+     - list of string
+     - No
+     - ``[]``
+     - Additional function arguments (e.g., ``["30"]`` for ``LAG(metric, 30)``).
+   * - ``excluding_dims``
+     - list of string
+     - No
+     - ``[]``
+     - Dimensions to exclude from the partition set (``PARTITION BY EXCLUDING`` semantics). Mutually exclusive with ``partition_dims``.
+   * - ``partition_dims``
+     - list of string
+     - No
+     - ``[]``
+     - Explicit partition dimensions (``PARTITION BY`` semantics). Mutually exclusive with ``excluding_dims``.
+   * - ``order_by``
+     - list of `WindowOrderBy`_
+     - No
+     - ``[]``
+     - ORDER BY entries for the window frame.
+   * - ``frame_clause``
+     - string
+     - No
+     - null
+     - Raw SQL frame clause (e.g., ``RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW``).
+
+.. code-block:: yaml
+
+   window_spec:
+     window_function: AVG
+     inner_metric: total_qty
+     excluding_dims:
+       - date
+     order_by:
+       - expr: date
+         order: Asc
+         nulls: Last
+     frame_clause: "RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW"
+
+
+.. _ref-yaml-format-windoworderby:
+
+WindowOrderBy
+=============
+
+Used within a window spec's ``order_by`` list.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 12 10 38
+
+   * - Field
+     - Type
+     - Required
+     - Default
+     - Description
+   * - ``expr``
+     - string
+     - Yes
+     -
+     - Dimension name or expression to order by.
+   * - ``order``
+     - string
+     - No
+     - ``Asc``
+     - Sort direction: ``Asc`` or ``Desc``.
+   * - ``nulls``
+     - string
+     - No
+     - ``Last``
+     - NULLS placement: ``Last`` or ``First``.
+
+
+.. _ref-yaml-format-size-limit:
+
+Size Limit
+==========
+
+YAML definitions are capped at 1 MiB (1,048,576 bytes). Definitions exceeding this limit are rejected before parsing. Large definitions should be split into multiple semantic views.
+
+
+.. _ref-yaml-format-related:
+
+Related
+=======
+
+- :ref:`ref-create-semantic-view` -- ``FROM YAML`` and ``FROM YAML FILE`` syntax
+- :ref:`ref-read-yaml` -- Export a semantic view as YAML
+- :ref:`howto-yaml-definitions` -- Step-by-step import and export workflow

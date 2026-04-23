@@ -11,7 +11,7 @@ This guide shows how to define derived metrics, which combine other metrics by n
 
 **Prerequisites:**
 
-- A working multi-table semantic view (see :ref:`tutorial-multi-table`)
+- A working multi-table semantic view (see :ref:`tutorial-multi-table`, or :ref:`tutorial-building-model` for a guided introduction to derived metrics)
 - Understanding of the ``FACTS`` clause (see :ref:`howto-facts`)
 
 

@@ -11,7 +11,7 @@ This guide shows how to use the ``FACTS`` clause to define reusable row-level ex
 
 **Prerequisites:**
 
-- A working semantic view with ``TABLES``, ``DIMENSIONS``, and ``METRICS`` (see :ref:`tutorial-multi-table`)
+- A working semantic view with ``TABLES``, ``DIMENSIONS``, and ``METRICS`` (see :ref:`tutorial-multi-table`, or :ref:`tutorial-building-model` for a guided introduction to facts)
 - Understanding of aggregate vs. row-level expressions in SQL
 
 

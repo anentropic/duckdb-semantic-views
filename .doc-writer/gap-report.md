@@ -1,69 +1,52 @@
-# Gap Report
+# Gap Detection Report
 
-**Generated:** 2026-04-21
+**Generated:** 2026-04-23
 **Source root:** src/
 **Language:** rust
-**Total undocumented symbols:** 4 (user-facing features from v0.7.0 phases 54-57)
-**Potentially stale pages:** 29
+**Total exported symbols:** N/A (SQL DDL interface, not Rust library)
+**Undocumented symbols:** 0
 
-## Undocumented Symbols
+## SQL Interface Coverage
 
-New in v0.7.0 (phases 54-57) — no dedicated documentation pages exist for these features:
+All user-facing SQL statements and functions have dedicated reference pages:
 
-### MATERIALIZATIONS clause (src/body_parser.rs, src/model.rs)
-- `Materialization` struct — declares a pre-aggregated table mapped to a subset of dimensions and metrics
-- MATERIALIZATIONS keyword body section in CREATE SEMANTIC VIEW DDL
+| SQL Statement / Function | Reference Page | Status |
+|--------------------------|----------------|--------|
+| `CREATE SEMANTIC VIEW` | `reference/create-semantic-view.rst` | Documented |
+| `ALTER SEMANTIC VIEW` | `reference/alter-semantic-view.rst` | Documented |
+| `DROP SEMANTIC VIEW` | `reference/drop-semantic-view.rst` | Documented |
+| `DESCRIBE SEMANTIC VIEW` | `reference/describe-semantic-view.rst` | Documented |
+| `SHOW SEMANTIC VIEWS` | `reference/show-semantic-views.rst` | Documented |
+| `SHOW SEMANTIC DIMENSIONS` | `reference/show-semantic-dimensions.rst` | Documented |
+| `SHOW SEMANTIC METRICS` | `reference/show-semantic-metrics.rst` | Documented |
+| `SHOW SEMANTIC FACTS` | `reference/show-semantic-facts.rst` | Documented |
+| `SHOW SEMANTIC MATERIALIZATIONS` | `reference/show-semantic-materializations.rst` | Documented |
+| `SHOW SEMANTIC DIMENSIONS FOR METRIC` | `reference/show-semantic-dimensions-for-metric.rst` | Documented |
+| `SHOW COLUMNS IN SEMANTIC VIEW` | `reference/show-columns-semantic-view.rst` | Documented |
+| `GET_DDL('SEMANTIC_VIEW', ...)` | `reference/get-ddl.rst` | Documented |
+| `READ_YAML_FROM_SEMANTIC_VIEW()` | `reference/read-yaml-from-semantic-view.rst` | Documented |
+| `semantic_view()` | `reference/semantic-view-function.rst` | Documented |
+| `explain_semantic_view()` | `reference/explain-semantic-view-function.rst` | Documented |
+| `FROM YAML` / `FROM YAML FILE` | `reference/create-semantic-view.rst` | Documented |
+| YAML format specification | `reference/yaml-format.rst` | Documented (new) |
 
-### Materialization routing (src/expand/sql_gen.rs)
-- Automatic query routing to pre-aggregated tables when queried dimensions/metrics are a subset of a materialization's declared coverage
+## How-To Coverage
 
-### YAML export (src/ddl/read_yaml.rs, src/render_yaml.rs)
-- `READ_YAML_FROM_SEMANTIC_VIEW('name')` scalar function — exports semantic view definition as YAML
-- `render_yaml_export` — internal render logic with field stripping (strips column_type_names, created_on, database/schema context)
-
-### Materialization introspection (src/ddl/show_materializations.rs)
-- `SHOW SEMANTIC MATERIALIZATIONS IN SEMANTIC VIEW 'name'` — per-view materialization listing
-- `SHOW SEMANTIC MATERIALIZATIONS` — cross-view materialization listing
-- Materialization details in DESCRIBE and EXPLAIN output
-
-## Potentially Stale Pages
-
-29 doc pages are older than recent source changes:
-
-- `docs/explanation/semantic-views-vs-regular-views.rst` (doc: 2026-03-27, source: 2026-04-21)
-- `docs/how-to/data-sources.rst` (doc: 2026-03-27, source: 2026-04-21)
-- `docs/how-to/derived-metrics.rst` (doc: 2026-03-27, source: 2026-04-21)
-- `docs/how-to/fan-traps.rst` (doc: 2026-03-27, source: 2026-04-21)
-- `docs/how-to/role-playing-dimensions.rst` (doc: 2026-03-27, source: 2026-04-21)
-- `docs/reference/drop-semantic-view.rst` (doc: 2026-03-27, source: 2026-04-21)
-- `docs/index.rst` (doc: 2026-04-05, source: 2026-04-21)
-- `docs/tutorials/getting-started.rst` (doc: 2026-04-05, source: 2026-04-21)
-- `docs/tutorials/multi-table.rst` (doc: 2026-04-05, source: 2026-04-21)
-- `docs/explanation/snowflake-comparison.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/how-to/facts.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/how-to/metadata-annotations.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/how-to/query-facts.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/how-to/semi-additive-metrics.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/how-to/wildcard-selection.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/how-to/window-metrics.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/alter-semantic-view.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/create-semantic-view.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/describe-semantic-view.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/error-messages.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/explain-semantic-view-function.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/get-ddl.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/semantic-view-function.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/show-columns-semantic-view.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/show-semantic-dimensions-for-metric.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/show-semantic-dimensions.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/show-semantic-facts.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/show-semantic-metrics.rst` (doc: 2026-04-17, source: 2026-04-21)
-- `docs/reference/show-semantic-views.rst` (doc: 2026-04-17, source: 2026-04-21)
+| Feature | How-To Page | Status |
+|---------|-------------|--------|
+| FACTS | `how-to/facts.rst` | Documented |
+| Derived metrics | `how-to/derived-metrics.rst` | Documented |
+| Role-playing dimensions | `how-to/role-playing-dimensions.rst` | Documented |
+| Fan traps | `how-to/fan-traps.rst` | Documented |
+| Data sources | `how-to/data-sources.rst` | Documented |
+| Metadata annotations | `how-to/metadata-annotations.rst` | Documented |
+| Semi-additive metrics | `how-to/semi-additive-metrics.rst` | Documented |
+| Window metrics | `how-to/window-metrics.rst` | Documented |
+| Wildcard selection | `how-to/wildcard-selection.rst` | Documented |
+| Query facts | `how-to/query-facts.rst` | Documented |
+| Materializations | `how-to/materializations.rst` | Documented |
+| YAML definitions | `how-to/yaml-definitions.rst` | Documented |
 
 ## Note
 
-Compared to previous gap report (2026-04-13): all 4 undocumented symbols are newly discovered — they were added in v0.7.0 phases 54-57. The previous report had 7 stale-content issues (e.g., PARTITION BY variant gaps); those may or may not be resolved.
-
-The scanner output includes internal Rust structs (VTab bindings, graph validators, etc.).
-These are implementation details. Since `api_reference: "manual"` is set, they are excluded
-from gap tracking.
+The standard Rust export scanner is not applicable for this project type. Coverage is assessed against the SQL DDL interface. All v0.7.0 features (materializations, YAML definitions, YAML format reference) now have dedicated documentation pages. Previous gap report (2026-04-21) flagged 4 undocumented symbols — all are now covered.
