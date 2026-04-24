@@ -118,7 +118,6 @@ mod tests {
 
     fn test_def() -> SemanticViewDefinition {
         SemanticViewDefinition {
-            base_table: "orders".to_string(),
             tables: vec![
                 TableRef {
                     alias: "o".to_string(),

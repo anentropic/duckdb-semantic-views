@@ -472,6 +472,46 @@
 
 ---
 
+## Milestone: v0.7.0 — YAML Definitions & Materialization Routing
+
+**Shipped:** 2026-04-24
+**Phases:** 7 | **Plans:** 7 | **Commits:** 78
+
+### What Was Built
+- YAML definition format: inline (`FROM YAML $$...$$`), file-based (`FROM YAML FILE`), and export (`READ_YAML_FROM_SEMANTIC_VIEW`) with lossless round-trip
+- Materialization routing: MATERIALIZATIONS clause in DDL and YAML, transparent query routing to pre-aggregated tables on exact dim/metric match, semi-additive/window exclusion
+- Materialization introspection: EXPLAIN routing header, DESCRIBE MATERIALIZATION rows, SHOW SEMANTIC MATERIALIZATIONS command
+- Dollar-quote extraction (tagged and untagged), sentinel protocol for Rust-to-C++ file loading, tagged dollar-quote collision avoidance
+
+### What Worked
+- Single-plan-per-phase structure: 7 phases with 1 plan each kept execution lean and focused
+- Dual-track roadmap (YAML 51-53, Materialization 54-55, convergence 56-57) allowed independent development with clean integration
+- Pure-function routing design: `try_route_materialization()` has no side effects, no DB access — trivially testable
+- Sentinel protocol for FFI file loading: clean separation of Rust parsing and C++ file reading
+- `from_yaml_with_size_cap` inherited from Phase 51 gave all YAML paths automatic DoS protection
+
+### What Was Inefficient
+- UAT initially written with wrong DDL syntax (NON ADDITIVE BY after AS instead of before) — revealed that the body parser silently accepts modifiers as part of the expression string when placed after AS
+- REQUIREMENTS.md checkbox tracking fell behind — 10/19 checked at milestone close despite all being implemented
+
+### Patterns Established
+- Dollar-quote extraction pattern reusable for any multi-line string literal in DDL
+- VTab pair pattern (single-view + cross-view AllVTab) for SHOW commands — now used by 5 SHOW commands
+- Feature-gated re-export pattern for cross-module access to extension-only code
+- YAML-JSON equivalence testing via proptest strategies
+
+### Key Lessons
+- The body parser DDL syntax ordering (modifiers before AS) should produce a warning or error when modifiers appear after AS — silent acceptance is a user experience gap
+- Fastest milestone yet (7 days, 7 phases) — the model/parser/test patterns from v0.5.2-v0.6.0 are now fully mature
+- yaml_serde (serde_yaml_ng) was a seamless drop-in; the serde ecosystem makes adding new serialization formats trivial when the model already derives serde traits
+
+### Cost Observations
+- 7 phases in 7 days — average <1 day per phase
+- Lightest plan overhead of any milestone: 1 plan per phase, no revisions needed
+- Security audit covered 22 threats across 7 phases with 0 open threats
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution
@@ -489,6 +529,7 @@
 | v0.5.4 | 117 | 6 | Cardinality inference, DuckDB 1.5.0, DDL parity, SHOW filtering, docs site, CE readiness |
 | v0.5.5 | 71 | 6 | Module refactoring, Snowflake-aligned SHOW/DESCRIBE, metadata storage, persistence hardening |
 | v0.6.0 | 114 | 8 | Metadata annotations, semi-additive/window metrics, queryable FACTS, wildcard selection, GET_DDL, security hardening |
+| v0.7.0 | 78 | 7 | YAML definitions (inline + file + export), materialization routing, materialization introspection |
 
 ### Cumulative Quality
 
@@ -504,6 +545,7 @@
 | v0.5.4 | 482 | 80+ properties | 4 targets | 18 sqllogictest + DuckLake CI + Python crash + caret + 22 infra assertions |
 | v0.5.5 | 487 | 80+ properties | 4 targets | 19 sqllogictest + DuckLake CI + Python crash + caret + 22 infra assertions |
 | v0.6.0 | 705 | 80+ properties | 4 targets | 32 sqllogictest + DuckLake CI + Python crash + caret + 22 infra assertions |
+| v0.7.0 | 823 | 82+ properties | 6 targets | 36 sqllogictest + DuckLake CI + Python crash + caret |
 
 ### Top Lessons (Verified Across Milestones)
 

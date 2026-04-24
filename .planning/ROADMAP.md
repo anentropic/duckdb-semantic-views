@@ -13,6 +13,7 @@
 - ✅ **v0.5.4 Snowflake-Parity & Registry Publishing** -- Phases 33-36 (shipped 2026-03-27)
 - ✅ **v0.5.5 SHOW/DESCRIBE Alignment & Refactoring** -- Phases 37-42 (shipped 2026-04-05)
 - ✅ **v0.6.0 Snowflake SQL DDL Parity** -- Phases 43-50 (shipped 2026-04-14)
+- ✅ **v0.7.0 YAML Definitions & Materialization Routing** -- Phases 51-57 (shipped 2026-04-24)
 
 ## Phases
 
@@ -161,15 +162,17 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
 
 </details>
 
-## Progress
+<details>
+<summary>v0.7.0 YAML Definitions & Materialization Routing (Phases 51-57) -- SHIPPED 2026-04-24</summary>
 
-| Phase | Milestone | Plans Complete | Status | Completed |
-|-------|-----------|----------------|--------|-----------|
-| 43. Metadata Foundation | v0.6.0 | 2/2 | Complete | 2026-04-10 |
-| 44. SHOW/DESCRIBE Metadata Surface + Enhancements | v0.6.0 | 2/2 | Complete | 2026-04-11 |
-| 45. ALTER COMMENT + GET_DDL | v0.6.0 | 2/2 | Complete | 2026-04-11 |
-| 46. Wildcard Selection + Queryable FACTS | v0.6.0 | 2/2 | Complete | 2026-04-12 |
-| 47. Semi-Additive Metrics | v0.6.0 | 2/2 | Complete | 2026-04-12 |
-| 48. Window Function Metrics | v0.6.0 | 2/2 | Complete | 2026-04-12 |
-| 49. Security & Correctness Hardening | v0.6.0 | 2/2 | Complete | 2026-04-14 |
-| 50. Code Quality & Test Coverage | v0.6.0 | 2/2 | Complete | 2026-04-14 |
+- [x] Phase 51: YAML Parser Core (1/1 plans) -- completed 2026-04-18
+- [x] Phase 52: YAML DDL Integration (1/1 plans) -- completed 2026-04-18
+- [x] Phase 53: YAML File Loading (1/1 plans) -- completed 2026-04-19
+- [x] Phase 54: Materialization Model & DDL (1/1 plans) -- completed 2026-04-19
+- [x] Phase 55: Materialization Routing Engine (1/1 plans) -- completed 2026-04-19
+- [x] Phase 56: YAML Export (1/1 plans) -- completed 2026-04-20
+- [x] Phase 57: Introspection & Diagnostics (1/1 plans) -- completed 2026-04-21
+
+Full details: [milestones/v0.7.0-ROADMAP.md](milestones/v0.7.0-ROADMAP.md)
+
+</details>

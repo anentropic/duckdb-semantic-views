@@ -9,8 +9,14 @@ use semantic_views::model::{AccessModifier, Dimension, Join, Metric, SemanticVie
 /// Simple definition: base_table "orders", 3 dimensions, 3 metrics, 1 filter, no joins.
 fn simple_definition() -> SemanticViewDefinition {
     SemanticViewDefinition {
-        base_table: "orders".to_string(),
-        tables: vec![],
+        tables: vec![semantic_views::model::TableRef {
+            alias: "orders".to_string(),
+            table: "orders".to_string(),
+            pk_columns: vec![],
+            unique_constraints: vec![],
+            comment: None,
+            synonyms: vec![],
+        }],
         dimensions: vec![
             Dimension {
                 name: "region".to_string(),
@@ -81,6 +87,7 @@ fn simple_definition() -> SemanticViewDefinition {
 
         joins: vec![],
         facts: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],
@@ -95,8 +102,14 @@ fn simple_definition() -> SemanticViewDefinition {
 /// 3 metrics (2 with source_table), 2 joins, 1 filter.
 fn joined_definition() -> SemanticViewDefinition {
     SemanticViewDefinition {
-        base_table: "orders".to_string(),
-        tables: vec![],
+        tables: vec![semantic_views::model::TableRef {
+            alias: "orders".to_string(),
+            table: "orders".to_string(),
+            pk_columns: vec![],
+            unique_constraints: vec![],
+            comment: None,
+            synonyms: vec![],
+        }],
         dimensions: vec![
             Dimension {
                 name: "region".to_string(),
@@ -191,6 +204,7 @@ fn joined_definition() -> SemanticViewDefinition {
             },
         ],
         facts: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],

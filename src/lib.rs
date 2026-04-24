@@ -8,6 +8,7 @@ pub mod parse;
 #[cfg(feature = "extension")]
 pub mod query;
 pub mod render_ddl;
+pub mod render_yaml;
 pub mod util;
 
 /// Test helpers for integration tests.
@@ -312,10 +313,14 @@ mod extension {
             drop::{DropSemanticViewVTab, DropState},
             get_ddl::GetDdlScalar,
             list::{ListSemanticViewsVTab, ListTerseSemanticViewsVTab},
+            read_yaml::ReadYamlFromSemanticViewScalar,
             show_columns::ShowColumnsInSemanticViewVTab,
             show_dims::{ShowSemanticDimensionsAllVTab, ShowSemanticDimensionsVTab},
             show_dims_for_metric::ShowDimensionsForMetricVTab,
             show_facts::{ShowSemanticFactsAllVTab, ShowSemanticFactsVTab},
+            show_materializations::{
+                ShowSemanticMaterializationsAllVTab, ShowSemanticMaterializationsVTab,
+            },
             show_metrics::{ShowSemanticMetricsAllVTab, ShowSemanticMetricsVTab},
         },
         query::explain::ExplainSemanticViewVTab,
@@ -560,8 +565,24 @@ mod extension {
             &catalog_state,
         )?;
 
+        // SHOW SEMANTIC MATERIALIZATIONS
+        con.register_table_function_with_extra_info::<ShowSemanticMaterializationsVTab, _>(
+            "show_semantic_materializations",
+            &catalog_state,
+        )?;
+        con.register_table_function_with_extra_info::<ShowSemanticMaterializationsAllVTab, _>(
+            "show_semantic_materializations_all",
+            &catalog_state,
+        )?;
+
         // Register GET_DDL scalar function.
         con.register_scalar_function_with_state::<GetDdlScalar>("get_ddl", &catalog_state)?;
+
+        // Register READ_YAML_FROM_SEMANTIC_VIEW scalar function.
+        con.register_scalar_function_with_state::<ReadYamlFromSemanticViewScalar>(
+            "read_yaml_from_semantic_view",
+            &catalog_state,
+        )?;
 
         // Create a NEW connection for the semantic_view table function.
         let mut query_conn: ffi::duckdb_connection = ptr::null_mut();

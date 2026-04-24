@@ -388,7 +388,7 @@ mod tests {
     fn test_resolve_joins_pkfk_with_using_relationship() {
         // Build a role-playing scenario: flights -> airports via dep_airport and arr_airport
         let def = orders_view()
-            .with_base_table("flights")
+            .with_table("flights", "flights", &[])
             .clear_dimensions()
             .clear_metrics()
             .with_table("flights", "flights", &["id"])

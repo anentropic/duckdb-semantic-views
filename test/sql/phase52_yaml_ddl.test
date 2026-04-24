@@ -1,0 +1,238 @@
+# Phase 52: YAML DDL integration tests
+# Tests for CREATE SEMANTIC VIEW ... FROM YAML $$ ... $$
+
+require semantic_views
+
+# Setup: test tables with data
+statement ok
+CREATE TABLE p52_orders (id INTEGER PRIMARY KEY, amount DOUBLE, region VARCHAR);
+
+statement ok
+INSERT INTO p52_orders VALUES (1, 100.0, 'East'), (2, 200.0, 'West'), (3, 150.0, 'East');
+
+statement ok
+CREATE TABLE p52_customers (cust_id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO p52_customers VALUES (10, 'Alice'), (20, 'Bob');
+
+# ---------------------------------------------------------------
+# YAML-01: CREATE SEMANTIC VIEW from inline YAML
+# ---------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p52_yaml_basic FROM YAML $$
+base_table: p52_orders
+tables:
+  - alias: o
+    table: p52_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total_amount
+    expr: SUM(o.amount)
+    source_table: o
+$$
+
+# Verify the view is queryable
+query TR rowsort
+SELECT region, total_amount FROM semantic_view('p52_yaml_basic', dimensions := ['region'], metrics := ['total_amount'])
+----
+East	250.0
+West	200.0
+
+# Verify metrics-only query works
+query R
+SELECT total_amount FROM semantic_view('p52_yaml_basic', metrics := ['total_amount'])
+----
+450.0
+
+# ---------------------------------------------------------------
+# YAML-01: Tagged dollar-quoting ($yaml$...$yaml$)
+# ---------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p52_yaml_tagged FROM YAML $yaml$
+base_table: p52_orders
+tables:
+  - alias: o
+    table: p52_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total_amount
+    expr: SUM(o.amount)
+    source_table: o
+$yaml$
+
+query R
+SELECT total_amount FROM semantic_view('p52_yaml_tagged', metrics := ['total_amount'])
+----
+450.0
+
+# ---------------------------------------------------------------
+# YAML-06: CREATE OR REPLACE with FROM YAML
+# ---------------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW p52_yaml_basic FROM YAML $$
+base_table: p52_orders
+tables:
+  - alias: o
+    table: p52_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: order_count
+    expr: COUNT(o.id)
+    source_table: o
+$$
+
+# Verify the view was replaced (new metric name)
+query TR rowsort
+SELECT region, order_count FROM semantic_view('p52_yaml_basic', dimensions := ['region'], metrics := ['order_count'])
+----
+East	2
+West	1
+
+# ---------------------------------------------------------------
+# YAML-06: CREATE IF NOT EXISTS (no-op when view exists)
+# ---------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW IF NOT EXISTS p52_yaml_basic FROM YAML $$
+base_table: p52_orders
+tables:
+  - alias: o
+    table: p52_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: should_not_appear
+    expr: SUM(o.amount)
+    source_table: o
+$$
+
+# Verify the original view (with order_count) is still in place
+query TR rowsort
+SELECT region, order_count FROM semantic_view('p52_yaml_basic', dimensions := ['region'], metrics := ['order_count'])
+----
+East	2
+West	1
+
+# ---------------------------------------------------------------
+# YAML-01: COMMENT = '...' with FROM YAML
+# ---------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p52_yaml_commented COMMENT = 'Sales by region from YAML' FROM YAML $$
+base_table: p52_orders
+tables:
+  - alias: o
+    table: p52_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total_amount
+    expr: SUM(o.amount)
+    source_table: o
+$$
+
+query R
+SELECT total_amount FROM semantic_view('p52_yaml_commented', metrics := ['total_amount'])
+----
+450.0
+
+# ---------------------------------------------------------------
+# YAML-01: Case-insensitive FROM YAML detection
+# ---------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p52_yaml_lowercase from yaml $$
+base_table: p52_orders
+tables:
+  - alias: o
+    table: p52_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total_amount
+    expr: SUM(o.amount)
+    source_table: o
+$$
+
+query R
+SELECT total_amount FROM semantic_view('p52_yaml_lowercase', metrics := ['total_amount'])
+----
+450.0
+
+# ---------------------------------------------------------------
+# Error cases
+# ---------------------------------------------------------------
+
+# Invalid YAML content
+statement error
+CREATE SEMANTIC VIEW p52_bad_yaml FROM YAML $$
+: : : not valid yaml [[[
+$$
+----
+invalid YAML definition
+
+# Unterminated dollar-quote
+statement error
+CREATE SEMANTIC VIEW p52_unterminated FROM YAML $$
+base_table: orders
+----
+Unterminated dollar-quoted string
+
+# Missing dollar-quote entirely
+statement error
+CREATE SEMANTIC VIEW p52_no_dollar FROM YAML base_table: orders
+----
+Expected '$'
+
+# ---------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------
+
+statement ok
+DROP SEMANTIC VIEW p52_yaml_basic
+
+statement ok
+DROP SEMANTIC VIEW p52_yaml_tagged
+
+statement ok
+DROP SEMANTIC VIEW p52_yaml_commented
+
+statement ok
+DROP SEMANTIC VIEW p52_yaml_lowercase
+
+statement ok
+DROP TABLE p52_orders
+
+statement ok
+DROP TABLE p52_customers

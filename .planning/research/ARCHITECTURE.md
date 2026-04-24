@@ -1,859 +1,611 @@
-# Architecture: v0.6.0 Snowflake SQL DDL Parity
+# Architecture: v0.7.0 YAML Definitions & Materialization Routing
 
-**Domain:** DuckDB semantic views extension -- Snowflake DDL parity features integration
-**Researched:** 2026-04-09
-**Confidence:** HIGH (direct codebase analysis, Snowflake official docs verified via WebFetch)
+**Domain:** DuckDB semantic views extension -- YAML definition format and materialization routing engine
+**Researched:** 2026-04-17
+**Confidence:** HIGH (direct codebase analysis, Snowflake/Databricks docs verified, DuckDB capabilities confirmed)
 
 ## Executive Summary
 
-v0.6.0 adds seven feature groups to the existing extension. This document maps each feature to its integration points, identifies new vs modified components, and proposes a build order that respects dependencies. The key architectural insight is that these features fall into three tiers of integration complexity:
+v0.7.0 introduces two major features to the existing extension: (1) a YAML definition format as a second input path alongside SQL DDL, and (2) a materialization routing engine that transparently redirects queries to pre-existing aggregated tables. These features are architecturally independent -- YAML is an input format concern (parse layer), while materialization routing is an output/expansion concern (query layer). This independence means they can be built in parallel phases or sequentially without cross-dependencies.
 
-**Tier 1 (Model + DDL only):** Metadata (COMMENT/SYNONYMS/PRIVATE), GET_DDL reconstruction, SHOW enhancements. These add fields to the model, extend the body parser, and add new VTabs or modify existing ones. Zero changes to the expansion pipeline.
+The key architectural insight is that both features converge on the existing `SemanticViewDefinition` model as their common interface. YAML parsing produces the same `SemanticViewDefinition` struct that the SQL DDL body parser produces. Materialization routing consumes `SemanticViewDefinition` (extended with a new `materializations` field) at query expansion time. Neither feature requires changes to the catalog persistence layer -- JSON serialization via serde handles the new fields transparently.
 
-**Tier 2 (Expansion modifications):** Wildcard selection, queryable FACTS. These add new resolution logic in the expansion pipeline but do not fundamentally change the SELECT/FROM/GROUP BY structure.
+## Recommended Architecture
 
-**Tier 3 (Expansion structural changes):** Semi-additive metrics, window function metrics. These require new expansion modes that produce fundamentally different SQL -- CTEs with window functions, QUALIFY clauses, or queries without GROUP BY despite having metrics. These are the highest-risk features.
-
-The recommended build order is: Tier 1 first (unlocks model changes needed by Tier 2/3), then Tier 2 (simpler expansion changes), then Tier 3 (structural expansion changes).
-
-## Current Architecture (Reference)
+### High-Level Data Flow
 
 ```
-User SQL                  Parser Hook (C++ shim)          Rust Extension
----------                 ----------------------          --------------
-CREATE SEMANTIC VIEW  --> detect_ddl_prefix()        --> validate_and_rewrite()
-  name AS ...                                              |
-                                                    parse_keyword_body()
-                                                           |
-                                                    SemanticViewDefinition (JSON)
-                                                           |
-                                                    catalog_insert() --> HashMap + pragma_query_t
-                                                           
-FROM semantic_view(   --> VTab bind()               --> expand()
-  'name',                                                  |
-  dimensions := [...],                              resolve dims/metrics
-  metrics := [...]                                  inline facts/derived
-)                                                   check fan traps
-                                                    build SELECT/FROM/JOIN/GROUP BY
-                                                           |
-                                                    execute_sql_raw(expanded_sql)
-                                                           |
-                                                    duckdb_vector_reference_vector --> output
+                         YAML INPUT PATH
+                         ===============
+SQL DDL Input            YAML Input (inline or file)
+     |                        |
+     v                        v
+  parse.rs                 parse.rs (new DdlKind variants)
+  detect_ddl_prefix()      detect FROM YAML / FROM YAML FILE
+     |                        |
+     v                        v
+  body_parser.rs           yaml_parser.rs (NEW)
+  parse_keyword_body()     parse_yaml_body()
+     |                        |
+     +---------+  +-----------+
+               |  |
+               v  v
+     SemanticViewDefinition (model.rs)
+               |
+     +---------+---------+
+     |                   |
+     v                   v
+  catalog.rs          render_ddl.rs / render_yaml.rs (NEW)
+  (JSON persist)      (GET_DDL export)
+
+
+                    MATERIALIZATION ROUTING
+                    ======================
+  semantic_view('view', dims := [...], metrics := [...])
+               |
+               v
+     query/table_function.rs  (bind)
+               |
+               v
+     materialize.rs (NEW) -- route_query()
+     Check materializations for coverage
+               |
+        +------+------+
+        |             |
+  Full match     No match / partial
+        |             |
+        v             v
+  SELECT from    expand/sql_gen.rs
+  mat table      (existing expansion)
+  (+ re-agg)
+        |             |
+        +------+------+
+               |
+               v
+     Execute SQL on query_conn
 ```
 
-### Key Components
+### Component Boundaries
 
-| Component | File(s) | Role |
-|-----------|---------|------|
-| Model | `model.rs` | `SemanticViewDefinition`, `Dimension`, `Metric`, `Fact`, `Join`, `TableRef` structs |
-| Body Parser | `body_parser.rs` | State machine: parses `AS TABLES(...) RELATIONSHIPS(...) FACTS(...) DIMENSIONS(...) METRICS(...)` |
-| Parse/Rewrite | `parse.rs` | DDL detection, validation, rewrite to `SELECT * FROM fn_from_json('name', 'json')` |
-| Catalog | `catalog.rs` | `CatalogState = Arc<RwLock<HashMap<String, String>>>`, init/insert/upsert/delete |
-| Expansion | `expand/sql_gen.rs` | `expand()` -- builds SELECT/FROM/JOIN/GROUP BY from definition + request |
-| Join Resolver | `expand/join_resolver.rs` | PK/FK graph-based join resolution and ON clause synthesis |
-| Fan Trap | `expand/fan_trap.rs` | LCA-based cardinality analysis |
-| Facts | `expand/facts.rs` | Fact inlining, derived metric resolution via toposort |
-| Role Playing | `expand/role_playing.rs` | USING context resolution for scoped aliases |
-| Query VTab | `query/table_function.rs` | `SemanticViewVTab` -- bind/init/func for `semantic_view()` |
-| DDL VTabs | `ddl/*.rs` | Define, Drop, Alter, Describe, List, Show* -- 11 VTab implementations |
-| Persistence | `ddl/persist.rs` | Parameterized prepared statements for catalog writes |
+| Component | Responsibility | Status | Communicates With |
+|-----------|---------------|--------|-------------------|
+| `parse.rs` | DDL detection, validation, rewriting to function calls | MODIFY -- add DdlKind variants for `FROM YAML` | `body_parser.rs`, `yaml_parser.rs` (new) |
+| `body_parser.rs` | SQL keyword body parsing (TABLES, DIMS, METRICS) | NO CHANGE | `parse.rs` |
+| `yaml_parser.rs` (NEW) | YAML body parsing to `SemanticViewDefinition` | NEW | `parse.rs`, `model.rs` |
+| `model.rs` | `SemanticViewDefinition` and sub-structs | MODIFY -- add `materializations: Vec<Materialization>` | everything |
+| `catalog.rs` | In-memory cache + catalog table persistence | NO CHANGE (serde handles new fields) | `model.rs`, `ddl/define.rs` |
+| `render_ddl.rs` | SQL DDL reconstruction from stored definitions | NO CHANGE | `model.rs`, `ddl/get_ddl.rs` |
+| `render_yaml.rs` (NEW) | YAML export from stored definitions | NEW | `model.rs`, `ddl/get_ddl.rs` |
+| `materialize.rs` (NEW) | Materialization routing engine | NEW | `model.rs`, `expand/sql_gen.rs` |
+| `expand/sql_gen.rs` | Query expansion to concrete SQL | MODIFY -- call materialization router before expansion | `materialize.rs` (new), `model.rs` |
+| `query/table_function.rs` | Table function bind/execute | MINOR MODIFY -- route through materialization check | `expand/sql_gen.rs`, `materialize.rs` (new) |
+| `ddl/get_ddl.rs` | GET_DDL scalar function | MODIFY -- support YAML output format | `render_yaml.rs` (new) |
+| `shim.cpp` | C++ parser hook registration | NO CHANGE | `parse.rs` via FFI |
 
-## Feature Integration Analysis
+## Feature 1: YAML Definitions
 
-### 1. Metadata: COMMENT, SYNONYMS, PRIVATE
+### 1.1 DDL Syntax Design
 
-**Integration tier:** Tier 1 (Model + DDL only)
-**Expansion impact:** NONE
+Two forms following the Snowflake pattern:
 
-#### What Changes
+```sql
+-- Inline YAML with dollar-quoting
+CREATE SEMANTIC VIEW my_view FROM YAML $$
+tables:
+  - alias: o
+    table: orders
+    primary_key: [id]
+dimensions:
+  - name: region
+    expr: o.region
+metrics:
+  - name: revenue
+    expr: SUM(o.amount)
+$$;
 
-**model.rs** -- Add fields to existing structs:
+-- File-based YAML
+CREATE SEMANTIC VIEW my_view FROM YAML FILE 'path/to/definition.yaml';
+
+-- Also supports OR REPLACE and IF NOT EXISTS
+CREATE OR REPLACE SEMANTIC VIEW my_view FROM YAML $$ ... $$;
+CREATE SEMANTIC VIEW IF NOT EXISTS my_view FROM YAML FILE '...';
+```
+
+**Rationale for dollar-quoting:** DuckDB natively supports `$$`-delimited string constants (confirmed via DuckDB docs). Dollar-quoting avoids the need to escape single quotes inside YAML content, which would be painful since YAML uses colons, brackets, and can contain SQL expressions with single quotes. This mirrors Snowflake's `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML` which also uses dollar-quoting for inline YAML.
+
+### 1.2 Parser Hook Integration (parse.rs)
+
+The `FROM YAML` and `FROM YAML FILE` syntax is NOT a new DdlKind variant -- it is a **body format specifier** within the existing CREATE forms. The detection flow is:
+
+1. `detect_ddl_prefix()` detects `CREATE SEMANTIC VIEW` (existing logic, unchanged)
+2. `validate_create_body()` extracts view name, optional COMMENT (existing logic)
+3. **NEW branch:** After extracting the view name + optional COMMENT, check if the remaining text starts with `FROM YAML` instead of `AS`
+4. If `FROM YAML $$`, extract the dollar-quoted content and route to `yaml_parser.rs`
+5. If `FROM YAML FILE '...'`, extract the file path (will be loaded at bind time, not parse time)
+6. If `AS`, route to existing `body_parser.rs` (unchanged)
+
+**Why not a new DdlKind?** The DdlKind enum distinguishes statement-level forms (CREATE vs DROP vs ALTER). YAML vs SQL body is a sub-dispatch within CREATE -- the same DdlKind::Create/CreateOrReplace/CreateIfNotExists apply. Adding `CreateFromYaml` etc. would triple the CREATE variants for no benefit. Instead, the body format detection happens inside `validate_create_body()`.
+
+**Modification to `validate_create_body()`:** After the existing `is_as_body` check, add:
 
 ```rust
-pub struct Dimension {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub synonyms: Vec<String>,
-    // Dimensions are always PUBLIC in Snowflake -- no visibility field needed
-}
+let is_yaml_body = after_name_trimmed
+    .get(..9)
+    .is_some_and(|s| s.eq_ignore_ascii_case("FROM YAML"))
+    && (after_name_trimmed.len() == 9
+        || after_name_trimmed.as_bytes()[9].is_ascii_whitespace());
 
-pub struct Metric {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub synonyms: Vec<String>,
-    #[serde(default, skip_serializing_if = "Visibility::is_default")]
-    pub visibility: Visibility,
-    // NON ADDITIVE BY dims stored here too (see section 2)
-}
-
-pub struct Fact {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub synonyms: Vec<String>,
-    #[serde(default, skip_serializing_if = "Visibility::is_default")]
-    pub visibility: Visibility,
-}
-
-pub struct TableRef {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub synonyms: Vec<String>,
-}
-
-pub struct SemanticViewDefinition {
-    // ... existing fields ...
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum Visibility {
-    #[default]
-    Public,
-    Private,
+if is_yaml_body {
+    return rewrite_ddl_yaml_body(kind, name, after_name_trimmed, body_offset, view_comment);
 }
 ```
 
-All new fields use `#[serde(default)]` for backward-compatible deserialization of existing stored JSON.
+### 1.3 Dollar-Quoted String Extraction
 
-**body_parser.rs** -- Extend entry parsing within each clause:
+DuckDB's parser already handles dollar-quoting at the SQL level. However, the parser extension hook fires BEFORE DuckDB's own parser succeeds (it is a fallback parser). This means `CREATE SEMANTIC VIEW` statements are intercepted as raw text. The `$$` extraction must happen in Rust.
 
-The body parser currently uses `parse_qualified_entries` for dims/metrics/facts. Each entry is `alias.name AS expr`. The new syntax adds optional prefixes and suffixes:
+**Algorithm for `extract_dollar_quoted()`:**
 
 ```
+1. Find opening $$ (or $tag$) after "FROM YAML" + whitespace
+2. Find matching closing $$ (or $tag$) -- same tag
+3. Return content between delimiters
+4. Error if no closing delimiter found
+```
+
+For v0.7.0, support only `$$` (untagged). Tagged dollar-quoting (`$yaml$ ... $yaml$`) is a nice-to-have but low priority.
+
+### 1.4 YAML Parser (yaml_parser.rs -- NEW MODULE)
+
+A new module `src/yaml_parser.rs` that:
+1. Takes a YAML string
+2. Parses it into a `SemanticViewDefinition`
+3. Returns the same struct as `parse_keyword_body()` but from YAML input
+
+**Implementation approach:** Use `serde_yml` crate (the maintained fork of deprecated `serde_yaml`). Since `SemanticViewDefinition` already derives `Serialize` and `Deserialize`, the YAML parsing is nearly free -- but the YAML schema should use user-friendly field names, not the internal JSON representation.
+
+**YAML schema design (mapping to internal model):**
+
+```yaml
+tables:
+  - alias: o
+    table: orders
+    primary_key: [id]
+    unique: [[email], [first_name, last_name]]
+    comment: "Main orders table"
+    synonyms: [order_facts]
+
+relationships:
+  - name: order_to_customer
+    from: o
+    columns: [customer_id]
+    references: c
+
+facts:
+  - name: unit_price
+    table: o
+    expr: price / qty
+    comment: "Price per unit"
+
+dimensions:
+  - name: region
+    table: o
+    expr: o.region
+    type: VARCHAR
+    comment: "Geographic region"
+    synonyms: [area, territory]
+
+metrics:
+  - name: revenue
+    table: o
+    expr: SUM(o.amount)
+    type: DOUBLE
+    using: [order_to_customer]
+    non_additive_by:
+      - dimension: date_dim
+        order: DESC
+        nulls: FIRST
+    comment: "Total revenue"
+    synonyms: [total_revenue]
+    access: private
+
+materializations:
+  - table: orders_daily_agg
+    dimensions: [date_dim, region]
+    metrics: [revenue, order_count]
+```
+
+**Key design decision:** The YAML schema uses **human-readable field names** (`table` instead of `source_table`, `primary_key` instead of `pk_columns`, `from` instead of `from_alias`) and maps to the internal model structs via custom deserialization. This is different from just serializing/deserializing `SemanticViewDefinition` directly as YAML, which would expose internal field names that are confusing to users.
+
+**Implementation strategy:** Define intermediate `YamlDef` structs with `serde(rename)` attributes that map to the user-facing YAML field names, then convert `YamlDef` -> `SemanticViewDefinition` with validation. This keeps the internal model stable while providing a clean YAML API.
+
+### 1.5 FILE Loading Path
+
+For `FROM YAML FILE 'path/to/definition.yaml'`:
+
+**Option A (recommended): Use DuckDB's `read_text()` at bind time.**
+
+The rewritten SQL would be:
+```sql
+SELECT * FROM create_semantic_view_from_yaml(
+  'view_name',
+  (SELECT content FROM read_text('path/to/definition.yaml'))
+)
+```
+
+This leverages DuckDB's built-in file access layer which already handles:
+- Local filesystem paths
+- S3/GCS/Azure blob storage (via httpfs extension)
+- Glob patterns (not useful here but free)
+
+**Why not read files from Rust?** The extension runs in DuckDB's process. Rust's `std::fs::read_to_string()` would work for local files but would bypass DuckDB's FileSystem abstraction -- no cloud storage support, no access control integration. Using `read_text()` as a subquery in the rewritten SQL keeps file I/O in DuckDB's domain.
+
+**Alternative considered and rejected:** Reading the file in the parse/validate phase. The parse hook runs in the parser extension context, which does not have access to the execution engine or file system. File reads must happen at bind time (when the rewritten SQL executes).
+
+**Implementation:** In `rewrite_ddl_yaml_body()`, when `FILE` is detected:
+1. Extract the file path from the single-quoted string
+2. Generate rewritten SQL that wraps `read_text()` as a subquery
+3. The YAML content arrives as a string parameter to the `create_semantic_view_from_yaml` table function
+4. The table function calls `yaml_parser::parse_yaml()` to produce `SemanticViewDefinition`
+
+### 1.6 YAML-Aware Table Functions
+
+Two new table functions needed for YAML-based creation:
+
+| Function | Purpose | Parameters |
+|----------|---------|------------|
+| `create_semantic_view_from_yaml` | Create from YAML string | `(name, yaml_text)` |
+| `create_or_replace_semantic_view_from_yaml` | Create/replace from YAML | `(name, yaml_text)` |
+| `create_semantic_view_if_not_exists_from_yaml` | Create if absent from YAML | `(name, yaml_text)` |
+
+These mirror the existing `_from_json` table functions. They could share implementation by having a common `create_from_definition()` that takes a `SemanticViewDefinition`, with the `_from_yaml` variants calling `yaml_parser::parse_yaml()` first and the `_from_json` variants calling `SemanticViewDefinition::from_json()`.
+
+**Alternatively (simpler):** The YAML path could convert YAML -> JSON at parse time, then call the existing `_from_json` functions. This avoids new table functions entirely:
+
+```rust
+// In rewrite_ddl_yaml_body():
+let yaml_def = yaml_parser::parse_yaml(yaml_text)?;
+let json = serde_json::to_string(&yaml_def)?;
+// Rewrite to existing JSON path
+Ok(format!("SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"))
+```
+
+**Recommendation:** Use the YAML-to-JSON-at-parse-time approach. This has zero new table function registrations, reuses the existing `_from_json` path entirely, and keeps the DDL pipeline simple. The YAML parsing happens in Rust (parse.rs), and by the time DuckDB executes the rewritten SQL, it is identical to the SQL DDL path.
+
+### 1.7 GET_DDL YAML Export (render_yaml.rs -- NEW MODULE)
+
+A new module `src/render_yaml.rs` that renders `SemanticViewDefinition` as YAML text. Parallel to `render_ddl.rs` which renders SQL DDL.
+
+**Invocation:** Extend `GET_DDL` to accept a third optional parameter:
+```sql
+SELECT GET_DDL('SEMANTIC_VIEW', 'my_view');           -- SQL (default)
+SELECT GET_DDL('SEMANTIC_VIEW', 'my_view', 'YAML');   -- YAML
+```
+
+**Modification to `ddl/get_ddl.rs`:** Check for the third parameter. If `'YAML'`, call `render_yaml::render_yaml()` instead of `render_ddl::render_create_ddl()`. Requires adding a third optional parameter to the VScalar signature.
+
+**YAML rendering approach:** Use `serde_yml::to_string()` on the intermediate `YamlDef` structs (same ones used for parsing). This ensures round-trip fidelity: YAML in -> internal model -> YAML out produces equivalent YAML.
+
+## Feature 2: Materialization Routing
+
+### 2.1 Concept
+
+A materialization declares that a pre-existing table contains pre-aggregated data for a known set of dimensions and metrics. At query time, if the requested dimensions and metrics are a subset of a materialization's coverage, the query can be routed to the materialization table instead of expanding from raw tables.
+
+**Key constraint:** This is NOT pre-aggregation (the extension does not create or refresh materialized tables). It is a routing engine that assumes the user has created and maintains the aggregated tables externally. The extension simply redirects queries when possible.
+
+### 2.2 DDL Syntax
+
+A new optional `MATERIALIZATIONS` clause in the SQL DDL body:
+
+```sql
+CREATE SEMANTIC VIEW sales AS
+TABLES (
+    o AS orders PRIMARY KEY (id),
+    c AS customers PRIMARY KEY (id)
+)
+RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.date_dim AS DATE_TRUNC('day', o.order_date)
+)
 METRICS (
-    [PRIVATE] alias.name [USING (...)] [NON ADDITIVE BY (...)] AS expr
-        [WITH SYNONYMS = ('syn1', 'syn2')]
-        [COMMENT = 'text']
+    o.revenue AS SUM(o.amount),
+    o.order_count AS COUNT(*)
+)
+MATERIALIZATIONS (
+    orders_daily_agg DIMENSIONS (date_dim, region) METRICS (revenue, order_count),
+    orders_region_agg DIMENSIONS (region) METRICS (revenue)
 )
 ```
 
-The parser needs to:
-1. Check for `PRIVATE`/`PUBLIC` keyword before `alias.name`
-2. After `AS expr`, scan for `WITH SYNONYMS = (...)` and `COMMENT = '...'`
-3. Same pattern for FACTS and DIMENSIONS (minus PRIVATE for dims, minus NON ADDITIVE BY for dims/facts)
-4. For TABLES entries: `WITH SYNONYMS` and `COMMENT` after the table declaration
+In YAML:
+```yaml
+materializations:
+  - table: orders_daily_agg
+    dimensions: [date_dim, region]
+    metrics: [revenue, order_count]
+  - table: orders_region_agg
+    dimensions: [region]
+    metrics: [revenue]
+```
 
-**parse.rs** -- No structural changes needed. The rewrite path already serializes `SemanticViewDefinition` to JSON.
+### 2.3 Model Extension (model.rs)
 
-**ddl/describe.rs** -- Extend `collect_*_rows()` to emit COMMENT, SYNONYMS, VISIBILITY properties per object.
-
-**ddl/show_dims.rs, show_metrics.rs, show_facts.rs** -- Add `synonyms` and `comment` columns to output schemas (Snowflake includes these in SHOW output).
-
-**ddl/list.rs** -- Add `comment` column for SHOW SEMANTIC VIEWS (Snowflake full mode includes comment).
-
-#### New Components
-
-- `model::Visibility` enum (new type, 6 lines)
-
-#### Modified Components
-
-- `model.rs` -- 5 struct changes (add fields)
-- `body_parser.rs` -- entry parsing logic extended
-- `ddl/describe.rs` -- new property rows
-- `ddl/show_dims.rs`, `show_metrics.rs`, `show_facts.rs` -- new output columns
-- `ddl/list.rs` -- new output column
-
-### 2. Semi-Additive Metrics (NON ADDITIVE BY)
-
-**Integration tier:** Tier 3 (Expansion structural change)
-**Expansion impact:** MAJOR -- new SQL generation path
-
-#### Snowflake Semantics
-
-`NON ADDITIVE BY (year_dim, month_dim, day_dim)` means: when the query groups by dimensions that overlap with the NON ADDITIVE list, use "last snapshot" aggregation instead of SUM across those dimensions. The rows are sorted by the non-additive dimensions, and LAST_VALUE is used to select the latest snapshot before aggregating.
-
-#### What Changes
-
-**model.rs** -- Add to Metric:
+Add a new struct and field:
 
 ```rust
-pub struct Metric {
-    // ... existing fields ...
-    /// Dimensions that this metric is non-additive by.
-    /// When non-empty, expansion uses snapshot aggregation for these dims.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub non_additive_by: Vec<NonAdditiveDim>,
-}
-
+/// A pre-existing aggregated table that covers specific dimensions and metrics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NonAdditiveDim {
-    pub dimension: String,
-    #[serde(default)]
-    pub order: SortOrder,
-    #[serde(default)]
-    pub nulls: NullsOrder,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub enum SortOrder { #[default] Asc, Desc }
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub enum NullsOrder { #[default] Last, First }
-```
-
-**body_parser.rs** -- Parse `NON ADDITIVE BY (dim [ASC|DESC] [NULLS FIRST|LAST], ...)` after USING clause but before AS in metric entries.
-
-**expand/sql_gen.rs** -- This is the critical change. The `expand()` function currently produces:
-
-```sql
-SELECT dims, agg_metrics FROM base JOIN... GROUP BY 1,2,...
-```
-
-For a semi-additive metric, the expansion must produce a CTE-based query:
-
-```sql
-WITH __sv_snapshot AS (
-    SELECT dims, measure_expr,
-           ROW_NUMBER() OVER (
-               PARTITION BY non_na_dims
-               ORDER BY na_dim1 DESC, na_dim2 DESC, na_dim3 DESC
-           ) AS __sv_rn
-    FROM base JOIN...
-)
-SELECT non_na_dims,
-       agg_fn(__sv_snapshot.measure_expr) AS metric_name
-FROM __sv_snapshot
-WHERE __sv_rn = 1
-GROUP BY 1, 2, ...
-```
-
-The approach:
-1. Identify which requested dimensions are in `non_additive_by` lists (NA dims) vs not (regular dims)
-2. The inner CTE selects all dims + the raw measure expression (not aggregated)
-3. ROW_NUMBER partitions by non-NA dims, orders by NA dims (user-specified order)
-4. The outer query filters to `__sv_rn = 1` and aggregates the measure
-
-**Key complexity:** When a query mixes semi-additive and regular metrics, the expansion must handle both in a single query. Two strategies:
-- **Strategy A (recommended):** Separate CTE per semi-additive metric, join results on regular dims. Clean but produces N+1 CTEs for N semi-additive metrics.
-- **Strategy B:** Single-pass with conditional aggregation. More complex, harder to debug.
-
-Recommend Strategy A for correctness-first approach.
-
-#### New Components
-
-- `expand/semi_additive.rs` -- New submodule for CTE generation logic
-- `model::NonAdditiveDim`, `SortOrder`, `NullsOrder` types
-
-#### Modified Components
-
-- `expand/sql_gen.rs` -- `expand()` branches on presence of non-additive metrics
-- `expand/mod.rs` -- new submodule declaration
-- `body_parser.rs` -- NON ADDITIVE BY parsing
-- `model.rs` -- Metric struct extension
-
-### 3. Window Function Metrics (PARTITION BY EXCLUDING)
-
-**Integration tier:** Tier 3 (Expansion structural change)
-**Expansion impact:** MAJOR -- expansion without GROUP BY
-
-#### Snowflake Semantics
-
-Window function metrics use `OVER(PARTITION BY ... ORDER BY ...)` instead of aggregate functions. The query produces one row per input row (no aggregation). `PARTITION BY EXCLUDING dims` means "partition by all queried dimensions except the excluded ones."
-
-#### What Changes
-
-**model.rs** -- Add window function metadata to Metric:
-
-```rust
-pub struct Metric {
-    // ... existing fields ...
-    /// When Some, this metric is a window function metric.
-    /// The expansion omits GROUP BY and uses OVER() instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window_spec: Option<WindowSpec>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WindowSpec {
-    /// Dimensions to partition by, or EXCLUDING list.
-    pub partition: PartitionSpec,
-    /// ORDER BY within the window.
-    pub order_by: Vec<WindowOrderBy>,
-    /// Optional frame clause (ROWS/RANGE BETWEEN...).
-    pub frame: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PartitionSpec {
-    Include(Vec<String>),    // explicit dimension list
-    Excluding(Vec<String>),  // EXCLUDING dims
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WindowOrderBy {
-    pub expr: String,
-    pub order: SortOrder,
-    pub nulls: NullsOrder,
-}
-```
-
-**body_parser.rs** -- Parse window function metric syntax. The expr contains the full window function call including OVER clause. The parser needs to recognize the `OVER (PARTITION BY EXCLUDING ...)` pattern.
-
-**expand/sql_gen.rs** -- When any requested metric has `window_spec`, the expansion mode changes:
-
-```sql
--- Window function metric: no GROUP BY
-SELECT
-    dim1 AS "dim1",
-    dim2 AS "dim2",
-    window_fn(measure) OVER (
-        PARTITION BY dim1
-        ORDER BY dim2 DESC
-    ) AS "metric_name"
-FROM base JOIN...
-```
-
-**Key question:** Can window function metrics and regular aggregate metrics coexist in a single query? In Snowflake, yes -- the query would use a subquery for the aggregation, then apply the window function on top. However, for v0.6.0, recommend requiring that window function metrics are queried separately (not mixed with aggregate metrics). This avoids complex query planning and is consistent with Snowflake's approach where window metrics reference other metrics.
-
-#### New Components
-
-- `expand/window.rs` -- New submodule for window function SQL generation
-- `model::WindowSpec`, `PartitionSpec`, `WindowOrderBy` types
-
-#### Modified Components
-
-- `expand/sql_gen.rs` -- branches on window metric presence
-- `body_parser.rs` -- window function metric parsing
-- `model.rs` -- Metric struct extension
-
-### 4. GET_DDL Reconstruction
-
-**Integration tier:** Tier 1 (DDL only)
-**Expansion impact:** NONE
-
-#### What Changes
-
-GET_DDL reconstructs the `CREATE SEMANTIC VIEW` DDL from the stored JSON definition. This is a pure rendering operation -- read JSON from catalog, format as DDL text.
-
-**New file: `ddl/get_ddl.rs`** -- Implements a VTab that:
-1. Takes a view name parameter
-2. Reads the JSON definition from CatalogState
-3. Deserializes to `SemanticViewDefinition`
-4. Renders back to DDL syntax
-
-The rendering function walks each section:
-
-```rust
-fn render_ddl(name: &str, def: &SemanticViewDefinition) -> String {
-    let mut out = format!("CREATE SEMANTIC VIEW {name} AS\n");
-    render_tables(&mut out, &def.tables);
-    if !def.joins.is_empty() {
-        render_relationships(&mut out, &def.joins, &def.tables);
-    }
-    if !def.facts.is_empty() {
-        render_facts(&mut out, &def.facts);
-    }
-    if !def.dimensions.is_empty() {
-        render_dimensions(&mut out, &def.dimensions);
-    }
-    render_metrics(&mut out, &def.metrics);
-    out
-}
-```
-
-Each `render_*` function reconstructs the clause from struct fields:
-- Tables: `alias AS physical_table [PRIMARY KEY (cols)] [UNIQUE (cols)]`
-- Relationships: `name AS from_alias(fk_cols) REFERENCES to_alias[(ref_cols)]`
-- Facts/Dims/Metrics: `[PRIVATE] alias.name AS expr [USING (...)] [NON ADDITIVE BY (...)] [WITH SYNONYMS = (...)] [COMMENT = '...']`
-
-**parse.rs** -- Add `DdlKind::GetDdl` variant for `GET_DDL SEMANTIC VIEW name` detection. Rewrite to `SELECT * FROM get_ddl_semantic_view('name')`.
-
-**lib.rs** -- Register the new VTab.
-
-#### New Components
-
-- `ddl/get_ddl.rs` -- VTab implementation + render functions (~200-300 lines)
-- `DdlKind::GetDdl` variant in `parse.rs`
-
-#### Modified Components
-
-- `ddl/mod.rs` -- add `pub mod get_ddl;`
-- `parse.rs` -- add detection/rewrite for GET_DDL
-- `lib.rs` -- register VTab
-
-### 5. Queryable FACTS
-
-**Integration tier:** Tier 2 (Expansion modification)
-**Expansion impact:** MODERATE -- new expansion mode
-
-#### Snowflake Semantics
-
-In Snowflake, FACTS can appear in the DIMENSIONS clause or in a separate FACTS clause of the `SEMANTIC_VIEW()` query. Unlike metrics, facts are NOT aggregated. The query returns row-level data with optional GROUP BY for any co-queried dimensions.
-
-#### What Changes
-
-**expand/types.rs** -- Extend `QueryRequest`:
-
-```rust
-pub struct QueryRequest {
+pub struct Materialization {
+    /// The physical table name (may be schema-qualified).
+    pub table: String,
+    /// Dimension names covered by this materialization.
     pub dimensions: Vec<String>,
+    /// Metric names covered by this materialization.
     pub metrics: Vec<String>,
-    pub facts: Vec<String>,  // NEW
 }
 ```
 
-**expand/sql_gen.rs** -- When facts are requested:
-
-```sql
--- Facts only (no metrics): row-level, no GROUP BY
-SELECT
-    dim1 AS "dim1",
-    fact_expr AS "fact_name"
-FROM base JOIN...
-
--- Facts + dimensions (no metrics): row-level grouped
--- Snowflake: "the query does not group the facts"
--- This means SELECT DISTINCT dims, fact_exprs (no aggregation)
-SELECT DISTINCT
-    dim1 AS "dim1",
-    fact_expr AS "fact_name"
-FROM base JOIN...
-
--- Facts + metrics: facts appear alongside aggregated metrics
--- Facts must be either in GROUP BY or aggregated
--- Snowflake resolves this by treating facts in a separate subquery
-```
-
-The key insight from Snowflake docs: "Unlike dimensions specified in the DIMENSIONS clause, the query does not group the facts specified in the FACTS clause." This means facts produce row-level output. When combined with metrics, the expansion becomes more complex.
-
-**Recommendation:** For v0.6.0, support facts-only and facts+dimensions (row-level queries). Defer facts+metrics to a future milestone -- the semantic complexity of mixing aggregated and non-aggregated columns in a single query is significant.
-
-**query/table_function.rs** -- Add `facts` named parameter to `SemanticViewVTab`:
+Add to `SemanticViewDefinition`:
 
 ```rust
-let facts = match bind.get_named_parameter("facts") {
-    Some(ref val) => unsafe { extract_list_strings(val) },
-    None => vec![],
+/// Pre-existing materialization tables with known dim/metric coverage.
+/// Old stored JSON without this field deserializes with empty Vec.
+/// Not serialized when empty to preserve backward-compatible JSON.
+#[serde(default, skip_serializing_if = "Vec::is_empty")]
+pub materializations: Vec<Materialization>,
+```
+
+**Backward compatibility:** `#[serde(default)]` ensures old stored JSON (without `materializations`) loads with `vec![]`. `skip_serializing_if = "Vec::is_empty"` ensures existing views without materializations produce identical JSON. This is the same pattern used for every field added since v0.5.2.
+
+### 2.4 Body Parser Extension (body_parser.rs)
+
+Add `MATERIALIZATIONS` as a new optional clause keyword, ordered after METRICS:
+
+```rust
+const CLAUSE_KEYWORDS: &[&str] = &[
+    "tables", "relationships", "facts", "dimensions", "metrics", "materializations"
+];
+const CLAUSE_ORDER: &[&str] = &[
+    "tables", "relationships", "facts", "dimensions", "metrics", "materializations"
+];
+```
+
+The MATERIALIZATIONS clause parser needs to handle:
+```
+mat_table_name DIMENSIONS (dim1, dim2) METRICS (metric1, metric2)
+```
+
+This is a simpler syntax than the existing clauses (no expressions, just name lists).
+
+### 2.5 Materialization Router (materialize.rs -- NEW MODULE)
+
+The core routing logic:
+
+```rust
+pub enum RouteResult {
+    /// Query can be fully served from a materialization table.
+    /// The SQL selects from the mat table with re-aggregation if needed.
+    Materialized(String),
+    /// No suitable materialization found; fall back to normal expansion.
+    Fallback,
+}
+
+pub fn route_query(
+    def: &SemanticViewDefinition,
+    req: &QueryRequest,
+) -> RouteResult {
+    // 1. Skip if no materializations defined
+    // 2. For each materialization, check if requested dims are a subset
+    //    of mat dims AND requested metrics are a subset of mat metrics
+    // 3. Pick the "best" match (smallest superset = fewest extra dims/metrics)
+    // 4. If exact match: SELECT dims, metrics FROM mat_table GROUP BY dims
+    //    (GROUP BY needed because mat may have more granularity than requested)
+    // 5. If no match: return Fallback
+}
+```
+
+**Routing algorithm:**
+
+```
+For each materialization M:
+  if requested_dims is subset of M.dimensions
+     AND requested_metrics is subset of M.metrics:
+    score = |M.dimensions| + |M.metrics|  // prefer smaller materializations
+    candidates.push((M, score))
+
+Sort candidates by score ascending (prefer tightest match)
+Return first candidate or Fallback
+```
+
+**Re-aggregation for subset matches:** When the requested dimensions are a proper subset of the materialization's dimensions, the query needs re-aggregation:
+
+```sql
+-- Mat table has: date_dim, region, revenue, order_count
+-- Request: dimensions=[region], metrics=[revenue]
+-- Generated SQL:
+SELECT "region", SUM("revenue") AS "revenue"
+FROM orders_daily_agg
+GROUP BY "region"
+```
+
+The re-aggregation assumes metrics are SUM-compatible (additive). For non-additive metrics (like `MAX`, `AVG`), re-aggregation produces incorrect results. The routing engine should skip materializations for metrics that use non-SUM aggregations unless the dimensions match exactly.
+
+**Handling non-additive metrics:** Two approaches:
+
+1. **Conservative (recommended for v0.7.0):** Only route to materializations when requested dimensions exactly match the materialization's dimensions. No re-aggregation. This is correct for all aggregation types.
+
+2. **Smart re-aggregation (future):** Analyze the metric expression to determine if re-aggregation is safe (SUM, COUNT are additive; MAX, MIN are semi-additive; AVG is not re-aggregatable). This requires expression analysis that is complex and error-prone.
+
+**Recommendation:** Start with exact-dimension matching only. Re-aggregation for subset matches is a v0.8.0 feature. This simplifies the routing logic and avoids correctness pitfalls.
+
+### 2.6 Integration with Expansion Pipeline
+
+The materialization check happens BEFORE `expand()` in the query path:
+
+```rust
+// In query/table_function.rs bind(), after resolving the definition:
+let route = materialize::route_query(&def, &req);
+let expanded_sql = match route {
+    RouteResult::Materialized(sql) => sql,
+    RouteResult::Fallback => expand(view_name, &def, &req)?,
 };
 ```
 
-#### New Components
+This is a clean interception point because:
+1. The `QueryRequest` (dims + metrics) is already parsed
+2. The `SemanticViewDefinition` (with materializations) is already loaded
+3. The result (a SQL string) feeds into the same execution path
 
-- None (modifications to existing)
+**No changes to `expand/sql_gen.rs` internals.** The materialization router is a pre-check that short-circuits the expansion. If no materialization matches, the existing expansion runs unchanged.
 
-#### Modified Components
+### 2.7 Materialization Validation at Define Time
 
-- `expand/types.rs` -- `QueryRequest` gains `facts` field
-- `expand/sql_gen.rs` -- new branch for fact queries
-- `expand/resolution.rs` -- add `find_fact()` resolution (parallel to `find_dimension`)
-- `query/table_function.rs` -- parse `facts` parameter
+When a view with materializations is created, validate:
 
-### 6. Wildcard Selection
+1. **Dimension names exist:** Each dimension name in a materialization must match a declared dimension in the view.
+2. **Metric names exist:** Each metric name in a materialization must match a declared metric in the view.
+3. **Table is accessible:** Optionally verify the materialization table exists (via catalog query). Could be deferred to query time.
 
-**Integration tier:** Tier 2 (Expansion modification)
-**Expansion impact:** MODERATE -- resolution-time expansion
+This validation happens in `parse.rs::rewrite_ddl_keyword_body()` after constructing the `SemanticViewDefinition`, or in `ddl/define.rs` during the create flow. The latter is preferred because it can use the catalog_conn for table existence checks.
 
-#### Snowflake Semantics
+### 2.8 SHOW/DESCRIBE Integration
 
-`customer.*` in DIMENSIONS or METRICS expands to all dimensions/metrics scoped to the `customer` table alias. An unqualified `*` is not allowed.
+- `DESCRIBE SEMANTIC VIEW` should show materialization entries (new object kind)
+- `SHOW COLUMNS IN SEMANTIC VIEW` may optionally include materialization info
+- A new `SHOW SEMANTIC MATERIALIZATIONS IN view_name` command could list materialization tables and their coverage
 
-#### What Changes
-
-**expand/sql_gen.rs** -- Before resolving individual dimension/metric names, expand wildcards:
-
-```rust
-fn expand_wildcards(
-    names: &[String],
-    items: &[impl HasSourceTable + HasName],
-    kind: &str,  // "dimension" or "metric"
-) -> Result<Vec<String>, ExpandError> {
-    let mut result = Vec::new();
-    for name in names {
-        if name.ends_with(".*") {
-            let alias = &name[..name.len() - 2];
-            let matches: Vec<_> = items.iter()
-                .filter(|item| item.source_table()
-                    .map_or(false, |st| st.eq_ignore_ascii_case(alias)))
-                .map(|item| item.name().to_string())
-                .collect();
-            if matches.is_empty() {
-                return Err(/* no items for alias */);
-            }
-            result.extend(matches);
-        } else {
-            result.push(name.clone());
-        }
-    }
-    Ok(result)
-}
-```
-
-This runs BEFORE the existing resolution loop, replacing `customer.*` with `[customer_name, customer_region, ...]`.
-
-**query/table_function.rs** -- No change needed; wildcards are just strings passed via the `dimensions`/`metrics` list parameters. Expansion happens in `expand()`.
-
-**Visibility filter:** When expanding wildcards, PRIVATE metrics and facts must be excluded. The wildcard resolver needs access to the `Visibility` field.
-
-#### New Components
-
-- None (modifications to existing)
-
-#### Modified Components
-
-- `expand/sql_gen.rs` or new `expand/wildcards.rs` -- wildcard expansion logic
-- `expand/types.rs` -- possible new error variant `NoItemsForAlias`
-
-### 7. SHOW Enhancements
-
-**Integration tier:** Tier 1 (DDL only)
-**Expansion impact:** NONE
-
-#### 7a. IN SCHEMA/DATABASE Scope Filtering
-
-**parse.rs** -- The existing `parse_show_filter_clauses` already handles `IN view_name`. Extend to handle `IN SCHEMA schema_name` and `IN DATABASE db_name`:
-
-```rust
-struct ShowClauses<'a> {
-    // ... existing ...
-    in_schema: Option<&'a str>,   // NEW
-    in_database: Option<&'a str>, // NEW
-}
-```
-
-**ddl/show_*.rs and ddl/list.rs** -- The `_all` VTab variants currently return all views across the catalog. With scope filtering, the rewritten SQL adds WHERE clauses:
-
-```sql
-SELECT * FROM list_semantic_views()
-WHERE database_name = 'my_db' AND schema_name = 'my_schema'
-```
-
-This works because the VTab output already includes `database_name` and `schema_name` columns. The filter can be injected at the SQL rewrite level in `parse.rs` (same pattern as LIKE/STARTS WITH).
-
-#### 7b. TERSE Mode
-
-**parse.rs** -- Detect `TERSE` keyword after `SHOW`:
-
-```
-SHOW TERSE SEMANTIC VIEWS [LIKE ...] [IN ...] [STARTS WITH ...] [LIMIT ...]
-```
-
-Add new `DdlKind` variants: `ShowTerse`, or better, add a `terse: bool` field to the rewrite output.
-
-The simplest approach: TERSE mode is handled at the SQL rewrite level by selecting a subset of columns:
-
-```sql
--- Full mode (current)
-SELECT * FROM list_semantic_views()
-
--- TERSE mode
-SELECT created_on, name, kind, database_name, schema_name
-FROM list_semantic_views()
-```
-
-This avoids creating new VTabs. The column subset is fixed per Snowflake spec:
-- SHOW SEMANTIC VIEWS TERSE: `created_on, name, kind, database_name, schema_name`
-- SHOW SEMANTIC DIMENSIONS TERSE: not specified by Snowflake (no TERSE mode documented)
-
-**Recommendation:** Implement TERSE only for SHOW SEMANTIC VIEWS (where Snowflake specifies it). The SHOW SEMANTIC DIMENSIONS/METRICS/FACTS commands do not have a TERSE variant in Snowflake docs.
-
-#### 7c. SHOW COLUMNS
-
-**New file: `ddl/show_columns.rs`** -- A new VTab that returns all components (dimensions, metrics, facts) of a semantic view with their types:
-
-Output schema (Snowflake-aligned):
-```
-column_name | kind | data_type | comment
-```
-
-Where `kind` is `DIMENSION`, `METRIC`, or `FACT`.
-
-**parse.rs** -- Detect `SHOW COLUMNS IN SEMANTIC VIEW name`:
-
-```rust
-DdlKind::ShowColumns => {
-    // Rewrite to: SELECT * FROM show_semantic_columns('name')
-}
-```
-
-#### New Components
-
-- `ddl/show_columns.rs` -- new VTab (~150 lines)
-- `DdlKind::ShowColumns` or `DdlKind::ShowTerse` in `parse.rs`
-
-#### Modified Components
-
-- `parse.rs` -- IN SCHEMA/DATABASE parsing, TERSE detection, SHOW COLUMNS detection
-- `ddl/mod.rs` -- add `pub mod show_columns;`
-- `lib.rs` -- register new VTab
-
-### 8. ALTER SET/UNSET COMMENT
-
-**Integration tier:** Tier 1 (DDL only)
-**Expansion impact:** NONE
-
-#### What Changes
-
-**parse.rs** -- New DDL forms:
-
-```sql
-ALTER SEMANTIC VIEW name SET COMMENT = 'text'
-ALTER SEMANTIC VIEW name UNSET COMMENT
-```
-
-These rewrite to new VTab calls:
-
-```sql
-SELECT * FROM alter_semantic_view_set_comment('name', 'text')
-SELECT * FROM alter_semantic_view_unset_comment('name')
-```
-
-**New file: `ddl/alter_comment.rs`** -- VTab that:
-1. Reads existing JSON from catalog
-2. Deserializes to `SemanticViewDefinition`
-3. Sets/clears the `comment` field
-4. Re-serializes and updates catalog (both HashMap and persistent storage)
-
-**parse.rs** -- Extend ALTER detection to handle SET COMMENT / UNSET COMMENT in addition to RENAME TO.
-
-#### New Components
-
-- `ddl/alter_comment.rs` -- new VTab (~100 lines)
-- New `DdlKind::AlterSetComment`, `DdlKind::AlterUnsetComment` variants
-
-#### Modified Components
-
-- `parse.rs` -- ALTER subcommand parsing
-- `ddl/mod.rs` -- add module
-- `lib.rs` -- register VTab
-
-## Component Boundaries
-
-```
-                                  +-----------+
-                                  |  model.rs |
-                                  | (structs) |
-                                  +-----+-----+
-                                        |
-              +-------------------------+-------------------------+
-              |                         |                         |
-     +--------+--------+      +--------+--------+       +--------+--------+
-     | body_parser.rs   |      |   expand/        |       |   ddl/           |
-     | (parse DDL body) |      | (SQL generation) |       | (VTab handlers)  |
-     +--------+--------+      +--------+--------+       +--------+--------+
-              |                         |                         |
-              v                         v                         v
-     +--------+--------+      +--------+--------+       +--------+--------+
-     |   parse.rs       |      | query/           |       | catalog.rs       |
-     | (detect/rewrite) |      | (table function) |       | (state/persist)  |
-     +--------+--------+      +--------+--------+       +--------+--------+
-              |                         |                         |
-              +-------------------------+-------------------------+
-                                        |
-                                  +-----+-----+
-                                  | lib.rs     |
-                                  | (init/reg) |
-                                  +-----------+
-```
-
-### New vs Modified Summary
-
-| Feature | New Files | Modified Files |
-|---------|-----------|----------------|
-| Metadata (COMMENT/SYNONYMS/PRIVATE) | None | model.rs, body_parser.rs, ddl/describe.rs, ddl/show_*.rs, ddl/list.rs |
-| Semi-additive metrics | expand/semi_additive.rs | model.rs, body_parser.rs, expand/sql_gen.rs, expand/mod.rs |
-| Window function metrics | expand/window.rs | model.rs, body_parser.rs, expand/sql_gen.rs, expand/mod.rs |
-| GET_DDL | ddl/get_ddl.rs | parse.rs, ddl/mod.rs, lib.rs |
-| Queryable FACTS | None | expand/types.rs, expand/sql_gen.rs, expand/resolution.rs, query/table_function.rs |
-| Wildcard selection | expand/wildcards.rs (optional) | expand/sql_gen.rs |
-| SHOW enhancements | ddl/show_columns.rs | parse.rs, ddl/mod.rs, lib.rs |
-| ALTER SET/UNSET COMMENT | ddl/alter_comment.rs | parse.rs, ddl/mod.rs, lib.rs |
-
-## Data Flow Changes
-
-### Current Data Flow (Query Path)
-
-```
-semantic_view('v', dims=['a'], metrics=['m'])
-    --> bind: catalog lookup --> expand(def, req) --> expanded SQL
-    --> bind: type inference (LIMIT 0 or stored)
-    --> bind: build_execution_sql (type cast wrapper)
-    --> func: execute_sql_raw(execution_sql) --> stream chunks
-```
-
-### New Data Flows
-
-**Wildcard Resolution (in bind):**
-```
-dims=['customer.*'] --> expand_wildcards(dims, def.dimensions)
-    --> dims=['customer_name', 'customer_region', ...] --> existing flow
-```
-
-**Queryable FACTS (in bind):**
-```
-facts=['order_count'] --> expand(def, req_with_facts)
-    --> SELECT DISTINCT dims, fact_exprs FROM... (no GROUP BY, no aggregation)
-```
-
-**Semi-Additive Metrics (in expand):**
-```
-metrics=['balance'] where balance.non_additive_by=['year','month','day']
-    --> detect semi-additive --> generate CTE with ROW_NUMBER
-    --> WITH __sv_snapshot AS (
-            SELECT ..., ROW_NUMBER() OVER(PARTITION BY non_na_dims ORDER BY na_dims DESC) AS __sv_rn
-            FROM ...
-        )
-        SELECT non_na_dims, AGG(measure) FROM __sv_snapshot WHERE __sv_rn = 1 GROUP BY ...
-```
-
-**GET_DDL (new DDL path):**
-```
-GET_DDL SEMANTIC VIEW 'name'
-    --> parse.rs: detect, rewrite to SELECT * FROM get_ddl_semantic_view('name')
-    --> VTab bind: catalog lookup, deserialize, render_ddl()
-    --> func: emit single-row VARCHAR result
-```
-
-## Patterns to Follow
-
-### Pattern 1: Backward-Compatible Serde Fields
-
-**What:** Every new field on model structs uses `#[serde(default, skip_serializing_if = "...")]`
-**When:** Always when adding fields to serialized structs
-**Why:** Existing stored JSON must deserialize without error. New JSON should omit default values to minimize storage.
-
-```rust
-#[serde(default, skip_serializing_if = "Option::is_none")]
-pub comment: Option<String>,
-
-#[serde(default, skip_serializing_if = "Vec::is_empty")]
-pub synonyms: Vec<String>,
-
-#[serde(default, skip_serializing_if = "Visibility::is_default")]
-pub visibility: Visibility,
-```
-
-### Pattern 2: SQL Rewrite at Parse Level (for new DDL forms)
-
-**What:** New DDL commands are detected in `parse.rs` and rewritten to `SELECT * FROM fn(args)`
-**When:** Adding GET_DDL, ALTER SET COMMENT, SHOW COLUMNS, TERSE mode
-**Why:** Consistent with existing architecture -- parser hooks intercept DDL, Rust rewrites to function calls
-
-### Pattern 3: CTE Wrapping for Complex Expansion
-
-**What:** Use CTEs (`WITH __sv_* AS (...)`) when the expansion needs intermediate steps
-**When:** Semi-additive metrics (snapshot selection), potentially window function metrics
-**Why:** CTEs keep the SQL readable and debuggable; DuckDB optimizes them away
-
-### Pattern 4: VTab-per-DDL-Verb Pattern
-
-**What:** Each DDL operation gets its own VTab implementation
-**When:** GET_DDL, ALTER SET COMMENT, SHOW COLUMNS
-**Why:** Consistent with existing architecture (11 VTabs already follow this pattern)
+For v0.7.0, at minimum add materialization info to `DESCRIBE`.
 
 ## Anti-Patterns to Avoid
 
-### Anti-Pattern 1: Mutating Expansion Based on Metadata
+### Anti-Pattern 1: Dual Model Structs
+**What:** Creating separate model types for YAML vs SQL DDL definitions.
+**Why bad:** Doubles the maintenance surface, risks drift between the two formats, complicates catalog persistence.
+**Instead:** Single `SemanticViewDefinition` model. Both parsers produce the same struct. Use intermediate structs only for serde mapping (YamlDef -> SemanticViewDefinition conversion).
 
-**What:** Using COMMENT/SYNONYMS/PRIVATE fields to change SQL expansion behavior
-**Why bad:** Metadata is informational; mixing it with query logic creates coupling
-**Instead:** Metadata flows through DDL/SHOW/DESCRIBE paths only. The only metadata that affects expansion is `visibility: Private` (which blocks querying of private facts/metrics) and `non_additive_by` (which is semantic, not metadata).
+### Anti-Pattern 2: YAML Parsing at Bind Time for Inline YAML
+**What:** Passing raw YAML through the rewritten SQL to be parsed at table function bind time.
+**Why bad:** Escaping YAML content inside SQL strings is fragile. YAML can contain single quotes, backticks, dollar signs. The existing JSON path already has this problem (mitigated by SQL-escaping the JSON), but YAML is worse because it is multi-line and whitespace-sensitive.
+**Instead:** Parse YAML at parse-hook time (in `validate_create_body`), convert to JSON, and pass JSON through the existing `_from_json` path. The YAML content never touches SQL string escaping.
 
-### Anti-Pattern 2: Mixed Aggregation Modes in Single Query
+### Anti-Pattern 3: Re-Aggregation Without Expression Analysis
+**What:** Always re-aggregating metrics when routing to materializations with extra dimensions.
+**Why bad:** `AVG(amount)` in a daily materialization cannot be correctly re-aggregated to monthly by doing `AVG(AVG(amount))`. Similarly, `COUNT(DISTINCT ...)` cannot be re-aggregated.
+**Instead:** Start with exact-dimension-match routing only. Add re-aggregation later with explicit expression analysis.
 
-**What:** Allowing window metrics + aggregate metrics + facts in a single `semantic_view()` call
-**Why bad:** Produces SQL that is extremely complex, hard to debug, and may have ambiguous semantics
-**Instead:** Validate at bind time that the request is one of: (a) regular dims+metrics, (b) facts-only or facts+dims, (c) window metrics+dims. Return a clear error if modes are mixed.
+### Anti-Pattern 4: File I/O in the Parser Hook
+**What:** Reading YAML files during the parse phase (sv_parse_stub / sv_validate_ddl_rust).
+**Why bad:** The parser hook runs in the DuckDB parser context which does not have access to the execution engine, connection state, or file system. File reads would need to go through Rust's `std::fs` directly, bypassing DuckDB's FileSystem abstraction.
+**Instead:** For `FROM YAML FILE`, extract the path at parse time but defer file reading to bind time via `read_text()` in the rewritten SQL.
 
-### Anti-Pattern 3: String Template for GET_DDL Rendering
+## Patterns to Follow
 
-**What:** Using format strings with interpolation to build DDL output
-**Why bad:** SQL injection risk if stored names contain single quotes, incorrect escaping
-**Instead:** Use the same identifier quoting (`quote_ident`) already used in expansion
+### Pattern 1: Serde Default + Skip Serialization (model.rs)
+**What:** All new optional fields use `#[serde(default, skip_serializing_if)]`
+**When:** Every time a field is added to a persisted struct
+**Why:** Ensures backward-compatible deserialization of old stored JSON and forward-compatible serialization (no unnecessary keys in output)
+
+### Pattern 2: Parse-Time Validation, Bind-Time Execution
+**What:** Validate DDL syntax in the parser hook (fast, synchronous, positioned error reporting). Execute side effects at bind time (catalog writes, file I/O).
+**When:** Any new DDL form
+**Why:** Matches the existing architecture. The parser hook returns PARSE_SUCCESSFUL or an error with position. The plan function routes to a table function whose bind() does the actual work.
+
+### Pattern 3: Rewrite to Existing Table Functions
+**What:** New DDL forms should rewrite to existing table function calls rather than registering new table functions where possible.
+**When:** The new form produces the same internal representation as an existing form.
+**Why:** Reduces the extension's registration surface area and avoids code duplication. The YAML path rewriting to `_from_json` after YAML->JSON conversion is a prime example.
+
+## New Components Summary
+
+| Component | Type | LOC Estimate | Dependencies |
+|-----------|------|-------------|--------------|
+| `yaml_parser.rs` | New module | ~200-300 | `serde_yml`, `model.rs` |
+| `render_yaml.rs` | New module | ~150-200 | `serde_yml`, `model.rs` |
+| `materialize.rs` | New module | ~200-300 | `model.rs`, `expand/types.rs` |
+| `Materialization` struct | New in `model.rs` | ~30 | serde |
+
+## Modified Components Summary
+
+| Component | Change | Risk |
+|-----------|--------|------|
+| `parse.rs` :: `validate_create_body()` | Add `FROM YAML` / `FROM YAML FILE` branch after `AS` check | LOW -- additive branch, no existing logic changes |
+| `parse.rs` :: new `rewrite_ddl_yaml_body()` | New function parallel to `rewrite_ddl_keyword_body()` | LOW -- new function, no existing function modified |
+| `parse.rs` :: new `extract_dollar_quoted()` | Dollar-quote extraction utility | LOW -- self-contained |
+| `model.rs` :: `SemanticViewDefinition` | Add `materializations: Vec<Materialization>` | LOW -- serde default handles backward compat |
+| `body_parser.rs` :: `CLAUSE_KEYWORDS` | Add `"materializations"` | LOW -- additive |
+| `body_parser.rs` :: clause parsing | Add materialization clause parser | LOW -- new branch in existing dispatch |
+| `query/table_function.rs` :: bind | Insert materialization routing check before `expand()` | MEDIUM -- touches hot path, needs careful testing |
+| `ddl/get_ddl.rs` :: `GetDdlScalar` | Add optional third parameter for format | LOW -- parameter addition |
+| `lib.rs` | Add `pub mod yaml_parser; pub mod render_yaml; pub mod materialize;` | TRIVIAL |
+| `Cargo.toml` | Add `serde_yml` dependency | LOW |
 
 ## Suggested Build Order
 
-### Phase 1: Metadata Foundation (Model + Parser)
+The build order respects dependencies and provides testable increments:
 
-Add all model struct fields (COMMENT, SYNONYMS, PRIVATE/Visibility), extend body_parser.rs to parse the new syntax elements. This phase produces no new user-visible behavior but lays the foundation for everything else.
+### Phase 1: YAML Parser Core
+**Build:** `yaml_parser.rs`, YAML schema structs, `YamlDef` -> `SemanticViewDefinition` conversion
+**Test:** Unit tests with YAML strings -> verify correct `SemanticViewDefinition` output
+**Dependencies:** `model.rs` (existing), `serde_yml` (new dep)
+**Rationale:** Foundation for all YAML features. Self-contained, testable without extension loading.
 
-**Rationale:** Every subsequent feature needs these model fields. Building them first avoids repeated model modifications.
+### Phase 2: Dollar-Quoting and Parser Integration
+**Build:** `extract_dollar_quoted()` in `parse.rs`, `FROM YAML` detection in `validate_create_body()`, `rewrite_ddl_yaml_body()` function
+**Test:** Unit tests for dollar-quote extraction, `validate_and_rewrite()` tests for YAML DDL forms
+**Dependencies:** Phase 1 (yaml_parser)
+**Rationale:** Connects YAML parsing to the DDL pipeline. Still testable via `cargo test` without extension loading.
 
-**Scope:**
-- model.rs: Add Visibility enum, comment/synonyms/visibility fields to all structs, NonAdditiveDim/SortOrder/NullsOrder types
-- body_parser.rs: Parse COMMENT =, WITH SYNONYMS =, PRIVATE/PUBLIC, NON ADDITIVE BY
-- Tests: roundtrip serialization, parser tests for new syntax
+### Phase 3: YAML FILE Loading
+**Build:** `FROM YAML FILE` path extraction, rewrite to `read_text()` subquery
+**Test:** SQLLogicTest with local YAML files
+**Dependencies:** Phase 2
+**Rationale:** Requires `just build` + sqllogictest because file I/O goes through DuckDB's `read_text()`.
 
-### Phase 2: SHOW/DESCRIBE Metadata Columns + SHOW Enhancements
+### Phase 4: YAML Export (GET_DDL)
+**Build:** `render_yaml.rs`, modification to `ddl/get_ddl.rs` for YAML format parameter
+**Test:** Unit tests for render, sqllogictest for round-trip (create from YAML -> GET_DDL YAML -> verify)
+**Dependencies:** Phase 1 (yaml_parser for round-trip verification)
+**Rationale:** Completes the YAML feature set. Can be built in parallel with Phase 3.
 
-Surface metadata in SHOW/DESCRIBE output. Add TERSE mode, IN SCHEMA/DATABASE, SHOW COLUMNS.
+### Phase 5: Materialization Model
+**Build:** `Materialization` struct in `model.rs`, `MATERIALIZATIONS` clause in `body_parser.rs`, YAML schema extension, define-time validation
+**Test:** Unit tests for parsing, define-time name validation
+**Dependencies:** None (model and parser are independent of YAML)
+**Rationale:** Foundation for routing. Self-contained model + parser work.
 
-**Rationale:** Once model fields exist, surfacing them in introspection is straightforward. Completing SHOW changes here avoids revisiting these VTabs later.
+### Phase 6: Materialization Router
+**Build:** `materialize.rs` with `route_query()`, integration into `query/table_function.rs` bind path
+**Test:** Unit tests for routing algorithm, sqllogictest for end-to-end routing
+**Dependencies:** Phase 5 (model), existing expand/ module
+**Rationale:** The core feature. Requires materialization tables to exist for integration tests.
 
-**Scope:**
-- ddl/describe.rs: Emit COMMENT, SYNONYMS, VISIBILITY properties
-- ddl/show_dims.rs, show_metrics.rs, show_facts.rs: Add synonyms, comment columns
-- ddl/list.rs: Add comment column
-- ddl/show_columns.rs: New VTab
-- parse.rs: TERSE detection, IN SCHEMA/DATABASE, SHOW COLUMNS detection
+### Phase 7: DESCRIBE/SHOW Integration
+**Build:** Materialization entries in DESCRIBE output, optional SHOW SEMANTIC MATERIALIZATIONS
+**Test:** SQLLogicTest
+**Dependencies:** Phase 5 (model)
+**Rationale:** Introspection for materializations. Lower priority than routing.
 
-### Phase 3: ALTER SET/UNSET COMMENT + GET_DDL
-
-**Rationale:** These are self-contained DDL features that depend on the model fields from Phase 1 but not on expansion changes. GET_DDL tests serve as roundtrip validation for the model.
-
-**Scope:**
-- ddl/alter_comment.rs: New VTab
-- ddl/get_ddl.rs: New VTab with render functions
-- parse.rs: New DdlKind variants and rewrite logic
-
-### Phase 4: Wildcard Selection + Queryable FACTS
-
-**Rationale:** These are moderate expansion changes that share a dependency: both need to resolve items from the definition that were not previously queryable (wildcards expand names, facts expand expressions). Building them together exercises the expansion pipeline modification pattern.
-
-**Scope:**
-- expand/sql_gen.rs: Wildcard expansion before resolution
-- expand/types.rs: QueryRequest gains `facts` field
-- expand/resolution.rs: `find_fact()` function
-- query/table_function.rs: Parse `facts` parameter
-- PRIVATE visibility enforcement in wildcard expansion
-
-### Phase 5: Semi-Additive Metrics
-
-**Rationale:** This is the highest-complexity expansion change. All model fields are in place from Phase 1. Building this after simpler expansion changes (Phase 4) means the developer is familiar with the expansion pipeline.
-
-**Scope:**
-- expand/semi_additive.rs: CTE-based expansion for NON ADDITIVE BY
-- expand/sql_gen.rs: Detection and branching for semi-additive metrics
-- Extensive testing: snapshot correctness, mixed regular+semi-additive queries
-
-### Phase 6: Window Function Metrics (if included)
-
-**Rationale:** Most complex feature, orthogonal to semi-additive. Can be deferred to a future milestone if v0.6.0 scope is too large. Currently listed in Out of Scope in PROJECT.md.
-
-**Note:** The milestone context mentions window function metrics, but PROJECT.md lists them as Out of Scope. If included, this should be the last phase due to its structural impact on the expansion pipeline.
-
-**Scope:**
-- expand/window.rs: Window function SQL generation
-- expand/sql_gen.rs: Window metric detection and no-GROUP-BY path
-- Validation that window metrics cannot be mixed with aggregate metrics
+**Note on parallelism:** Phases 1-4 (YAML) and Phases 5-7 (materialization) are independent tracks. They can be built in any interleaving, or one track completed before the other. The only shared touch point is `model.rs`, which receives additive changes from both tracks.
 
 ## Scalability Considerations
 
-| Concern | Current (v0.5.5) | After v0.6.0 |
-|---------|------------------|--------------|
-| Model struct size | 5 optional fields | +8 optional fields per struct. Serde skip_serializing_if keeps JSON compact |
-| Parser complexity | 5 clause keywords | Same 5 keywords, but each entry has more optional suffixes. State machine approach scales linearly |
-| DdlKind variants | 12 | +3-4 (GET_DDL, ShowColumns, AlterSetComment, AlterUnsetComment) |
-| VTab count | 18 registered | +3-4 (get_ddl, show_columns, alter_comment variants) |
-| Expansion paths | 3 modes (dims-only, metrics-only, both) | +3 modes (facts, semi-additive, window). Each is a separate code path in expand() |
-| JSON storage size | ~500 bytes typical | +10-20% with metadata fields. Negligible for in-memory HashMap |
+| Concern | Impact | Approach |
+|---------|--------|----------|
+| YAML parsing performance | Negligible -- YAML files are small (< 100KB typically) | No optimization needed |
+| Materialization routing with many materializations | Linear scan over materializations per query | Fine for < 100 materializations per view. If needed, precompute a dimension-set index |
+| Dollar-quote extraction | O(n) scan for closing delimiter | Fine -- DDL strings are small |
+| File reading for FROM YAML FILE | DuckDB's `read_text()` handles efficiently | No custom buffering needed |
 
 ## Sources
 
-- [Snowflake CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view) -- full DDL syntax including COMMENT, SYNONYMS, PRIVATE, NON ADDITIVE BY, window functions
-- [Snowflake SHOW SEMANTIC VIEWS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-views) -- TERSE mode, IN clause, output columns
-- [Snowflake SHOW SEMANTIC DIMENSIONS](https://docs.snowflake.com/en/sql-reference/sql/show-semantic-dimensions) -- output columns including synonyms and comment
-- [Snowflake SEMANTIC_VIEW query construct](https://docs.snowflake.com/en/sql-reference/constructs/semantic_view) -- wildcard selection, queryable facts
-- [Snowflake Querying semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/querying) -- facts query examples, wildcard examples
-- [Snowflake GET_DDL](https://docs.snowflake.com/en/sql-reference/functions/get_ddl) -- semantic view reconstruction
-- [Snowflake Using SQL commands](https://docs.snowflake.com/en/user-guide/views-semantic/sql) -- ALTER SET COMMENT, GET_DDL examples, SHOW COLUMNS
-- [Snowflake Semi-additive metrics release](https://docs.snowflake.com/en/release-notes/2026/other/2026-03-05-semantic-views-semi-additive-metrics) -- NON ADDITIVE BY feature details
-- Direct codebase analysis of `src/` (16,342 LOC Rust)
+- DuckDB dollar-quoted string support: [Literal Types -- DuckDB](https://duckdb.org/docs/current/sql/data_types/literal_types)
+- DuckDB `read_text()` function: [Directly Reading Files -- DuckDB](https://duckdb.org/docs/current/guides/file_formats/read_file)
+- Snowflake YAML spec: [YAML specification for semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/semantic-view-yaml-spec)
+- Snowflake SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML: [Snowflake Documentation](https://docs.snowflake.com/en/sql-reference/stored-procedures/system_create_semantic_view_from_yaml)
+- Databricks materialization: [Materialization for metric views](https://docs.databricks.com/aws/en/metric-views/materialization)
+- serde_yml (maintained fork): [GitHub - sebastienrousseau/serde_yml](https://github.com/sebastienrousseau/serde_yml)
+- Codebase analysis: `src/parse.rs`, `src/body_parser.rs`, `src/model.rs`, `src/catalog.rs`, `src/render_ddl.rs`, `src/expand/sql_gen.rs`, `src/query/table_function.rs`, `cpp/src/shim.cpp`

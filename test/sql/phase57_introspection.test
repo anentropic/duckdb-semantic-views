@@ -1,0 +1,148 @@
+# name: test/sql/phase57_introspection.test
+# description: Phase 57 - Introspection & Diagnostics for materializations
+# group: [semantic_view]
+
+require semantic_views
+
+# ============================================================
+# Setup: Create test tables and semantic views
+# ============================================================
+
+statement ok
+CREATE TABLE p57_orders (id INTEGER PRIMARY KEY, region VARCHAR, status VARCHAR, amount DECIMAL(10,2));
+
+statement ok
+CREATE TABLE p57_agg_region (region VARCHAR, total_revenue DECIMAL(10,2), order_count BIGINT);
+
+statement ok
+CREATE SEMANTIC VIEW p57_mat_view AS
+TABLES (
+    o AS p57_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.status AS o.status
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount),
+    o.order_count AS COUNT(o.id)
+)
+MATERIALIZATIONS (
+    region_agg AS (
+        TABLE p57_agg_region,
+        DIMENSIONS (region),
+        METRICS (total_revenue, order_count)
+    )
+)
+
+statement ok
+CREATE SEMANTIC VIEW p57_no_mat_view AS
+TABLES (
+    o AS p57_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount)
+)
+
+# ============================================================
+# INTR-01: explain_semantic_view materialization routing info
+# ============================================================
+
+# Matching materialization shows name in header
+query I
+SELECT explain_output FROM explain_semantic_view('p57_mat_view', dimensions := ['region'], metrics := ['total_revenue', 'order_count']) WHERE explain_output LIKE '-- Materialization:%'
+----
+-- Materialization: region_agg
+
+# Non-matching request shows "none"
+query I
+SELECT explain_output FROM explain_semantic_view('p57_mat_view', dimensions := ['region', 'status'], metrics := ['total_revenue']) WHERE explain_output LIKE '-- Materialization:%'
+----
+-- Materialization: none
+
+# View without materializations shows "none"
+query I
+SELECT explain_output FROM explain_semantic_view('p57_no_mat_view', dimensions := ['region'], metrics := ['total_revenue']) WHERE explain_output LIKE '-- Materialization:%'
+----
+-- Materialization: none
+
+# Expanded SQL for matching materialization references agg table
+query I
+SELECT explain_output FROM explain_semantic_view('p57_mat_view', dimensions := ['region'], metrics := ['total_revenue', 'order_count']) WHERE explain_output LIKE 'FROM%p57_agg_region%'
+----
+FROM "p57_agg_region"
+
+# ============================================================
+# INTR-02: DESCRIBE SEMANTIC VIEW with materializations
+# ============================================================
+
+# DESCRIBE includes MATERIALIZATION rows
+query TTTTT
+SELECT * FROM describe_semantic_view('p57_mat_view') WHERE object_kind = 'MATERIALIZATION'
+----
+MATERIALIZATION	region_agg	(empty)	TABLE	p57_agg_region
+MATERIALIZATION	region_agg	(empty)	DIMENSIONS	["region"]
+MATERIALIZATION	region_agg	(empty)	METRICS	["total_revenue","order_count"]
+
+# DESCRIBE without materializations has no MATERIALIZATION rows
+query I
+SELECT COUNT(*) FROM describe_semantic_view('p57_no_mat_view') WHERE object_kind = 'MATERIALIZATION'
+----
+0
+
+# ============================================================
+# INTR-03: SHOW SEMANTIC MATERIALIZATIONS
+# ============================================================
+
+# Single-view form
+query TTTTTTT
+SHOW SEMANTIC MATERIALIZATIONS IN p57_mat_view
+----
+memory	main	p57_mat_view	region_agg	p57_agg_region	["region"]	["total_revenue","order_count"]
+
+# Single-view form for view without materializations returns empty
+query TTTTTTT
+SHOW SEMANTIC MATERIALIZATIONS IN p57_no_mat_view
+----
+
+# Cross-view form lists all materializations
+query TTTTTTT
+SHOW SEMANTIC MATERIALIZATIONS
+----
+memory	main	p57_mat_view	region_agg	p57_agg_region	["region"]	["total_revenue","order_count"]
+
+# LIKE filtering
+query TTTTTTT
+SHOW SEMANTIC MATERIALIZATIONS LIKE 'region%' IN p57_mat_view
+----
+memory	main	p57_mat_view	region_agg	p57_agg_region	["region"]	["total_revenue","order_count"]
+
+# LIKE with no match
+query TTTTTTT
+SHOW SEMANTIC MATERIALIZATIONS LIKE 'xyz%' IN p57_mat_view
+----
+
+# View does not exist -- error
+statement error
+SHOW SEMANTIC MATERIALIZATIONS IN nonexistent_view
+----
+does not exist
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p57_mat_view
+
+statement ok
+DROP SEMANTIC VIEW p57_no_mat_view
+
+statement ok
+DROP TABLE p57_agg_region
+
+statement ok
+DROP TABLE p57_orders

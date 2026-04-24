@@ -1,0 +1,14 @@
+base_table: p53_orders
+tables:
+  - alias: o
+    table: p53_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: order_count
+    expr: COUNT(o.id)
+    source_table: o

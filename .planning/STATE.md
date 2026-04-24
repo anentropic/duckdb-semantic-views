@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.6.0
-milestone_name: Snowflake SQL DDL Parity
-status: complete
-stopped_at: Milestone v0.6.0 shipped
-last_updated: "2026-04-14"
-last_activity: 2026-04-14
+milestone: v0.7.0
+milestone_name: YAML Definitions & Materialization Routing
+status: verifying
+stopped_at: Completed 57-01-PLAN.md
+last_updated: "2026-04-24T18:28:24.196Z"
+last_activity: 2026-04-24
 progress:
-  total_phases: 8
-  completed_phases: 8
-  total_plans: 16
-  completed_plans: 16
+  total_phases: 7
+  completed_phases: 7
+  total_plans: 7
+  completed_plans: 7
   percent: 100
 ---
 
@@ -18,52 +18,27 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-04-14)
+See: .planning/PROJECT.md (updated 2026-04-18)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Planning next milestone
+**Current focus:** Phase 57 — Introspection & Diagnostics
 
 ## Current Position
 
-Phase: -
-Plan: -
-Status: v0.6.0 milestone shipped — ready for next milestone
-Last activity: 2026-04-14
+Phase: 57
+Plan: Not started
+Status: Phase complete — ready for verification
+Last activity: 2026-04-24
 
-Progress: [██████████] 100%
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 16 (v0.6.0)
+- Total plans completed: 7 (v0.7.0)
 - Average duration: --
 - Total execution time: 0 hours
-
-**By Phase:**
-
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| 43 | 2 | - | - |
-| 44 | 2 | - | - |
-| 45 | 2 | - | - |
-| 46 | 2 | - | - |
-| 47 | 2 | - | - |
-| 48 | 2 | - | - |
-| 49 | 2 | - | - |
-| 50 | 2 | - | - |
-
-*Updated after each plan completion*
-| Phase 45 P01 | 64min | 2 tasks | 7 files |
-| Phase 46 P01 | 69min | 3 tasks | 14 files |
-| Phase 46 P02 | 53min | 2 tasks | 6 files |
-| Phase 47 P01 | 31min | 2 tasks | 8 files |
-| Phase 47 P02 | 47min | 2 tasks | 6 files |
-| Phase 48 P02 | 32min | 2 tasks | 8 files |
-| Phase 49 P01 | 43min | 2 tasks | 16 files |
-| Phase 49 P02 | 79min | 2 tasks | 19 files |
-| Phase 50 P01 | 48min | 3 tasks | 4 files |
-| Phase 50 P02 | 20min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -72,26 +47,20 @@ Progress: [██████████] 100%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-- [v0.6.0 planning]: Build order follows tier model -- Tier 1 (model+DDL) before Tier 2 (expansion mods) before Tier 3 (expansion structural changes)
-- [v0.6.0 planning]: Semi-additive uses ROW_NUMBER() CTE, not LAST_VALUE IGNORE NULLS (DuckDB LTS crash bug)
-- [v0.6.0 planning]: All new model fields use #[serde(default)] for backward compatibility
-- [Phase 45]: Generalize DdlKind::AlterRename to DdlKind::Alter with sub-operation dispatch for RENAME TO, SET COMMENT, UNSET COMMENT
-- [Phase 46]: Wildcard module placed in expand/ (not query/) so unit tests run without extension feature
-- [Phase 46]: Fact queries use LIMIT 0 type inference rather than DDL-time type map (facts use per-fact output_type)
-- [Phase 47]: NON ADDITIVE BY extracted before USING in parse order to handle both together
-- [Phase 47]: DESC defaults to NULLS FIRST when user does not specify NULLS (matches DuckDB/Snowflake)
-- [Phase 47]: GET_DDL always emits explicit NULLS LAST/FIRST to avoid version divergence
-- [Phase 47]: CTE with ROW_NUMBER() for semi-additive expansion (not LAST_VALUE due to DuckDB LTS crash)
-- [Phase 47]: Fan trap check skips semi-additive metrics entirely (ROW_NUMBER handles fan-out)
-- [Phase 47]: Effectively-regular classification: all NA dims in query -> standard aggregation, no CTE
-- [Phase 48]: CTE __sv_agg aggregates inner metrics by all queried dims; outer SELECT applies window functions with computed PARTITION BY
-- [Phase 48]: Window metrics and aggregate metrics are mutually exclusive in same query (WindowAggregateMixing error)
-- [Phase 49]: Use .map_err() with descriptive string instead of into_inner() lock recovery for poisoned locks
-- [Phase 49]: AssertUnwindSafe justified at FFI boundary: panics caught and converted to errors, no partially-mutated state observed
-- [Phase 49]: MAX_DERIVATION_DEPTH=64 prevents stack overflow from linear metric chains that pass cycle detection
-- [Phase 50]: Retain one golden-file anchor test while converting 4 others to property assertions for refactor resilience
-- [Phase 50]: resolve_names uses 9 closure parameters for error construction at call sites, avoiding trait objects
-- [Phase 50]: DimensionName/MetricName newtypes with AsRef<str> + Deref for seamless string interop
+- [v0.7.0 roadmap]: Two independent tracks -- YAML (51-53) and Materialization (54-55), converging at YAML Export (56) and Introspection (57)
+- [v0.7.0 roadmap]: serde_yaml_ng 0.10 selected as YAML dependency (serde_yaml archived, serde_yml has RUSTSEC advisory)
+- [v0.7.0 roadmap]: Semi-additive and window metrics unconditionally excluded from materialization routing
+- [v0.7.0 roadmap]: Re-aggregation for subset matches deferred to v2 (MAT-F01) -- exact match only in v0.7.0
+- [v0.7.0 roadmap]: YAML export (Phase 56) placed after materialization model (Phase 54) so materializations appear in YAML output
+- [Phase 51]: yaml_serde 0.10 added as unconditional dependency (not feature-gated), matching serde_json treatment
+- [Phase 51]: PartialEq derived on all 10 model structs -- all fields are PartialEq-safe (no f32/f64)
+- [Phase 51]: YAML_SIZE_CAP (1 MiB) is sanity guard, not security boundary -- trust assumption documented in code
+- [Phase 55]: Routing placed after step 3 (name resolution) in expand() with internal semi-additive/window exclusion checks
+- [Phase 55]: HashSet exact-match with to_ascii_lowercase() for case-insensitive materialization matching
+- [Phase 56]: Field stripping via clone + clear + skip_serializing_if for YAML export (not a separate export struct)
+- [Phase 56]: Bare name extraction via rsplit('.') for FQN support in READ_YAML_FROM_SEMANTIC_VIEW
+- [Phase 57]: find_routing_materialization_name duplicates resolution logic rather than changing expand() return type
+- [Phase 57]: Feature-gated re-export with #[allow(dead_code)] for extension-only cross-module access
 
 ### Pending Todos
 
@@ -101,7 +70,9 @@ Recent decisions affecting current work:
 
 ### Blockers/Concerns
 
-(None — v0.6.0 milestone complete. All prior blockers resolved.)
+- serde_yaml_ng anchor bomb handling needs verification (may need manual size cap before parse)
+- Dollar-quote behavior in parser hook needs integration test (parser hook fires before DuckDB parser)
+- Materialization table existence: define-time vs query-time validation TBD
 
 ### Quick Tasks Completed
 
@@ -115,9 +86,13 @@ Recent decisions affecting current work:
 | 260329-frb | Sync DuckDBVersionMonitor | 2026-03-29 | eef265b |
 | 260331-ta2 | Release recipe for CE registry | 2026-03-31 | 0390bab |
 | 260412-v5h | Generate complete CHANGELOG.md | 2026-04-12 | d42d240 |
+| Phase 51 P01 | 20min | 2 tasks | 6 files |
+| Phase 55 P01 | 18min | 2 tasks | 6 files |
+| Phase 56 P01 | 25min | 2 tasks | 8 files |
+| Phase 57 P01 | 95min | 3 tasks | 11 files |
 
 ## Session Continuity
 
-Last session: 2026-04-14T12:02:10.895Z
-Stopped at: Completed 50-02-PLAN.md (Expand Module Refactoring)
+Last session: 2026-04-21T00:41:49.753Z
+Stopped at: Completed 57-01-PLAN.md
 Resume file: None

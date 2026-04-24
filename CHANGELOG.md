@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-24
+
+### Added
+
+- YAML definition format: `CREATE SEMANTIC VIEW name FROM YAML $$ ... $$` as an alternative to SQL DDL keyword body
+- YAML file loading: `CREATE SEMANTIC VIEW name FROM YAML FILE '/path/to/file.yaml'` with DuckDB `enable_external_access` security enforcement
+- Dollar-quoting for inline YAML: both untagged (`$$...$$`) and tagged (`$yaml$...$yaml$`) forms
+- YAML export: `READ_YAML_FROM_SEMANTIC_VIEW('name')` scalar function with lossless round-trip fidelity
+- Materialization declarations: `MATERIALIZATIONS` clause in SQL DDL and YAML for declaring pre-aggregated tables
+- Materialization routing engine: transparent query redirection to pre-aggregated tables on exact dimension/metric match
+- Semi-additive and window function metrics excluded from materialization routing (always expand from raw sources)
+- `explain_semantic_view()` now includes materialization routing decision (`-- Materialization: <name>` or `-- Materialization: none`)
+- `DESCRIBE SEMANTIC VIEW` includes MATERIALIZATION rows with table, dimensions, and metrics properties
+- `SHOW SEMANTIC MATERIALIZATIONS [IN view_name]` command with LIKE/STARTS WITH/LIMIT filtering
+
 ## [0.6.0] - 2026-04-14
 
 ### Added
@@ -179,7 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/paul-rl/duckdb-semantic-views/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/paul-rl/duckdb-semantic-views/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/paul-rl/duckdb-semantic-views/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/paul-rl/duckdb-semantic-views/compare/v0.5.5...v0.6.0
 [0.5.5]: https://github.com/paul-rl/duckdb-semantic-views/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/paul-rl/duckdb-semantic-views/compare/v0.5.3...v0.5.4

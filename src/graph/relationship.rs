@@ -523,7 +523,6 @@ mod tests {
     fn legacy_empty_fk_columns_skips_validation() {
         // Legacy join with empty fk_columns -> validate_graph returns Ok.
         let mut def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
             tables: vec![TableRef {
                 alias: "o".to_string(),
                 table: "orders".to_string(),
@@ -541,6 +540,7 @@ mod tests {
             dimensions: vec![],
             metrics: vec![],
             facts: vec![],
+            materializations: vec![],
 
             column_type_names: vec![],
             column_types_inferred: vec![],
@@ -713,12 +713,12 @@ mod tests {
         /// Build a minimal definition for FK reference validation testing.
         fn make_fk_ref_def(tables: Vec<TableRef>, joins: Vec<Join>) -> SemanticViewDefinition {
             SemanticViewDefinition {
-                base_table: tables.first().map(|t| t.table.clone()).unwrap_or_default(),
                 tables,
                 joins,
                 dimensions: vec![],
                 metrics: vec![],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],

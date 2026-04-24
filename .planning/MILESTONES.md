@@ -1,5 +1,21 @@
 # Milestones
 
+## v0.7.0 YAML Definitions & Materialization Routing (Shipped: 2026-04-24)
+
+**Phases completed:** 7 phases, 7 plans, 15 tasks
+
+**Key accomplishments:**
+
+- yaml_serde 0.10 integration with from_yaml/from_yaml_with_size_cap, PartialEq on all model structs, 11 unit tests + 256-case proptest proving YAML-JSON equivalence, and fuzz target
+- Dollar-quoted FROM YAML syntax wired into DDL parser with full CREATE/REPLACE/IF NOT EXISTS support, cardinality inference, and 21 unit + 13 integration tests
+- Two-layer file loading via sentinel protocol: Rust detects FROM YAML FILE syntax, C++ reads file via DuckDB read_text() with automatic enable_external_access enforcement
+- MATERIALIZATIONS clause added to semantic view DDL with TABLE/DIMENSIONS/METRICS sub-clauses, YAML support, define-time validation, and backward-compatible persistence
+- Pure-function materialization routing engine with exact-match HashSet comparison, semi-additive/window exclusion, and 17 unit + 8 integration test sections
+- READ_YAML_FROM_SEMANTIC_VIEW scalar function with field stripping, FQN resolution, and round-trip YAML export
+- Materialization awareness added to EXPLAIN, DESCRIBE, and new SHOW SEMANTIC MATERIALIZATIONS command with 7-column VTab pair, parser integration, and 12 new unit tests + 1 sqllogictest file
+
+---
+
 ## v0.6.0 Snowflake SQL DDL Parity (Shipped: 2026-04-14)
 
 **Phases completed:** 8 phases (43-50), 16 plans, 35 tasks

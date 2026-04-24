@@ -1,0 +1,394 @@
+# Phase 55: Materialization Routing Engine integration tests
+#
+# Verifies:
+#   MAT-02: Exact-match routing to materialization table
+#   MAT-03: No-match fallback to raw expansion
+#   MAT-04: Semi-additive and window metric exclusion
+#   MAT-05: Transparent behavior without materializations
+
+require semantic_views
+
+# ============================================================
+# Setup: create base tables and pre-aggregated (materialization) tables
+# ============================================================
+
+statement ok
+CREATE TABLE p55_orders (
+    id INTEGER PRIMARY KEY,
+    region VARCHAR,
+    status VARCHAR,
+    amount DECIMAL(10,2),
+    order_date DATE
+);
+
+statement ok
+INSERT INTO p55_orders VALUES
+    (1, 'East', 'shipped', 100.00, '2024-01-01'),
+    (2, 'West', 'pending', 200.00, '2024-01-02'),
+    (3, 'East', 'shipped', 150.00, '2024-01-03'),
+    (4, 'West', 'shipped', 50.00, '2024-01-04');
+
+# Pre-aggregated by region: matches raw expansion of SUM(amount), COUNT(*)
+statement ok
+CREATE TABLE p55_region_agg (
+    region VARCHAR,
+    total_revenue DECIMAL(10,2),
+    order_count BIGINT
+);
+
+statement ok
+INSERT INTO p55_region_agg VALUES
+    ('East', 250.00, 2),
+    ('West', 250.00, 2);
+
+# Pre-aggregated by region + status
+statement ok
+CREATE TABLE p55_region_status_agg (
+    region VARCHAR,
+    status VARCHAR,
+    total_revenue DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO p55_region_status_agg VALUES
+    ('East', 'shipped', 250.00),
+    ('West', 'pending', 200.00),
+    ('West', 'shipped', 50.00);
+
+# ============================================================
+# Section 1: Exact-match routing (MAT-02)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p55_routed AS
+TABLES (
+    o AS p55_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.status AS o.status
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount),
+    o.order_count AS COUNT(*)
+)
+MATERIALIZATIONS (
+    region_agg AS (
+        TABLE p55_region_agg,
+        DIMENSIONS (region),
+        METRICS (total_revenue, order_count)
+    )
+)
+
+# Query that exactly matches the materialization (region + total_revenue + order_count)
+# Should route to p55_region_agg
+query TRI rowsort
+SELECT * FROM semantic_view('p55_routed', dimensions := ['region'], metrics := ['total_revenue', 'order_count'])
+----
+East	250.00	2
+West	250.00	2
+
+# Verify row count
+query I
+SELECT count(*) FROM semantic_view('p55_routed', dimensions := ['region'], metrics := ['total_revenue', 'order_count'])
+----
+2
+
+# ============================================================
+# Section 2: No-match fallback (MAT-03)
+# ============================================================
+
+# region + status + total_revenue is NOT covered by any materialization
+# Should fall back to raw expansion (GROUP BY)
+query TTR rowsort
+SELECT * FROM semantic_view('p55_routed', dimensions := ['region', 'status'], metrics := ['total_revenue'])
+----
+East	shipped	250.00
+West	pending	200.00
+West	shipped	50.00
+
+query I
+SELECT count(*) FROM semantic_view('p55_routed', dimensions := ['region', 'status'], metrics := ['total_revenue'])
+----
+3
+
+# ============================================================
+# Section 3: Dimensions-only query does NOT route
+# ============================================================
+
+# dimensions-only query for 'region' -- materialization has metrics too,
+# so exact match fails (empty mets != {total_revenue, order_count})
+query T rowsort
+SELECT * FROM semantic_view('p55_routed', dimensions := ['region'])
+----
+East
+West
+
+# ============================================================
+# Section 4: View without materializations (MAT-05)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p55_no_mat AS
+TABLES (
+    o AS p55_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount)
+)
+
+# Standard query with no materializations -- should work as before
+query TR rowsort
+SELECT * FROM semantic_view('p55_no_mat', dimensions := ['region'], metrics := ['total_revenue'])
+----
+East	250.00
+West	250.00
+
+# ============================================================
+# Section 5: Semi-additive metric exclusion (MAT-04)
+# ============================================================
+
+statement ok
+CREATE TABLE p55_semi_agg (
+    region VARCHAR,
+    latest_amount DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO p55_semi_agg VALUES
+    ('East', 999.99),
+    ('West', 999.99);
+
+statement ok
+CREATE SEMANTIC VIEW p55_semi_add AS
+TABLES (
+    o AS p55_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.order_date AS o.order_date
+)
+METRICS (
+    o.latest_amount NON ADDITIVE BY (order_date DESC) AS SUM(o.amount)
+)
+MATERIALIZATIONS (
+    semi_agg AS (
+        TABLE p55_semi_agg,
+        DIMENSIONS (region),
+        METRICS (latest_amount)
+    )
+)
+
+# Semi-additive metric should NOT route to materialization (MAT-04)
+# Falls back to raw expansion with ROW_NUMBER CTE snapshot selection
+# Latest amount per region: East -> 150.00 (2024-01-03), West -> 50.00 (2024-01-04)
+query TR rowsort
+SELECT * FROM semantic_view('p55_semi_add', dimensions := ['region'], metrics := ['latest_amount'])
+----
+East	150.00
+West	50.00
+
+# If routing had happened, we would see 999.99 -- confirm we don't
+query I
+SELECT count(*) FROM semantic_view('p55_semi_add', dimensions := ['region'], metrics := ['latest_amount']) WHERE latest_amount = 999.99
+----
+0
+
+# ============================================================
+# Section 6: Window metric exclusion (MAT-04)
+# ============================================================
+
+statement ok
+CREATE TABLE p55_window_agg (
+    region VARCHAR,
+    running_total DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO p55_window_agg VALUES
+    ('East', 999.99),
+    ('West', 999.99);
+
+statement ok
+CREATE SEMANTIC VIEW p55_window AS
+TABLES (
+    o AS p55_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.order_date AS o.order_date
+)
+METRICS (
+    PRIVATE o.total_revenue AS SUM(o.amount),
+    o.running_total AS SUM(total_revenue) OVER (PARTITION BY EXCLUDING order_date ORDER BY order_date ASC NULLS LAST)
+)
+MATERIALIZATIONS (
+    window_agg AS (
+        TABLE p55_window_agg,
+        DIMENSIONS (region),
+        METRICS (running_total)
+    )
+)
+
+# Window metric should NOT route to materialization (MAT-04)
+# Falls back to CTE-based window expansion
+query TRI rowsort
+SELECT * FROM semantic_view('p55_window', dimensions := ['region', 'order_date'], metrics := ['running_total'])
+----
+East	2024-01-01	100.00
+East	2024-01-03	250.00
+West	2024-01-02	200.00
+West	2024-01-04	250.00
+
+# If routing had happened, we would see 999.99 -- confirm we don't
+query I
+SELECT count(*) FROM semantic_view('p55_window', dimensions := ['region', 'order_date'], metrics := ['running_total']) WHERE running_total = 999.99
+----
+0
+
+# ============================================================
+# Section 7: Multiple materializations -- first match wins
+# ============================================================
+
+statement ok
+CREATE TABLE p55_first_agg (
+    region VARCHAR,
+    total_revenue DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO p55_first_agg VALUES
+    ('East', 111.11),
+    ('West', 222.22);
+
+statement ok
+CREATE TABLE p55_second_agg (
+    region VARCHAR,
+    total_revenue DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO p55_second_agg VALUES
+    ('East', 333.33),
+    ('West', 444.44);
+
+statement ok
+CREATE SEMANTIC VIEW p55_multi_mat AS
+TABLES (
+    o AS p55_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount)
+)
+MATERIALIZATIONS (
+    first_agg AS (
+        TABLE p55_first_agg,
+        DIMENSIONS (region),
+        METRICS (total_revenue)
+    ),
+    second_agg AS (
+        TABLE p55_second_agg,
+        DIMENSIONS (region),
+        METRICS (total_revenue)
+    )
+)
+
+# Should read from the FIRST matching materialization (p55_first_agg)
+query TR rowsort
+SELECT * FROM semantic_view('p55_multi_mat', dimensions := ['region'], metrics := ['total_revenue'])
+----
+East	111.11
+West	222.22
+
+# ============================================================
+# Section 8: Case-insensitive matching
+# ============================================================
+
+statement ok
+CREATE TABLE p55_case_agg (
+    region VARCHAR,
+    total_revenue DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO p55_case_agg VALUES
+    ('East', 777.77),
+    ('West', 888.88);
+
+statement ok
+CREATE SEMANTIC VIEW p55_case_mat AS
+TABLES (
+    o AS p55_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount)
+)
+MATERIALIZATIONS (
+    case_agg AS (
+        TABLE p55_case_agg,
+        DIMENSIONS (Region),
+        METRICS (Total_Revenue)
+    )
+)
+
+# Query with lowercase dim/met names should match despite capitalized mat declarations
+query TR rowsort
+SELECT * FROM semantic_view('p55_case_mat', dimensions := ['region'], metrics := ['total_revenue'])
+----
+East	777.77
+West	888.88
+
+# ============================================================
+# Section 9: Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p55_routed
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p55_no_mat
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p55_semi_add
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p55_window
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p55_multi_mat
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p55_case_mat
+
+statement ok
+DROP TABLE IF EXISTS p55_orders
+
+statement ok
+DROP TABLE IF EXISTS p55_region_agg
+
+statement ok
+DROP TABLE IF EXISTS p55_region_status_agg
+
+statement ok
+DROP TABLE IF EXISTS p55_semi_agg
+
+statement ok
+DROP TABLE IF EXISTS p55_window_agg
+
+statement ok
+DROP TABLE IF EXISTS p55_first_agg
+
+statement ok
+DROP TABLE IF EXISTS p55_second_agg
+
+statement ok
+DROP TABLE IF EXISTS p55_case_agg

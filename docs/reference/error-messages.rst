@@ -30,16 +30,16 @@ Missing view name
 **Fix:** Add a view name: ``CREATE SEMANTIC VIEW my_view AS ...``
 
 
-Expected AS keyword
--------------------
+Expected AS or FROM YAML
+-------------------------
 
 .. code-block:: text
 
-   Expected 'AS' keyword at start of semantic view body.
+   Expected 'AS' or 'FROM YAML' after view name.
 
-**Cause:** The statement has a view name but is missing the ``AS`` keyword before the body clauses.
+**Cause:** The statement has a view name but is missing the ``AS`` keyword or ``FROM YAML`` keywords before the body.
 
-**Fix:** Add ``AS`` after the view name: ``CREATE SEMANTIC VIEW my_view AS TABLES (...)``
+**Fix:** Use either the keyword body (``CREATE SEMANTIC VIEW my_view AS TABLES (...)``) or the YAML body (``CREATE SEMANTIC VIEW my_view FROM YAML $$ ... $$``).
 
 
 Missing TABLES clause
@@ -73,7 +73,7 @@ Unknown clause keyword
 
    Unknown clause keyword '<word>'; did you mean '<KEYWORD>'?
 
-**Cause:** A word in the body does not match any known clause keyword (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS).
+**Cause:** A word in the body does not match any known clause keyword (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS).
 
 **Fix:** Check spelling. The error suggests the closest valid keyword.
 
@@ -96,11 +96,12 @@ Clause out of order
 .. code-block:: text
 
    Clause '<KEYWORD>' appears out of order; clauses must appear as: TABLES,
-   RELATIONSHIPS (optional), FACTS (optional), DIMENSIONS (optional), METRICS (optional).
+   RELATIONSHIPS (optional), FACTS (optional), DIMENSIONS (optional),
+   METRICS (optional), MATERIALIZATIONS (optional).
 
 **Cause:** Clauses are not in the required order.
 
-**Fix:** Reorder clauses to: TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS.
+**Fix:** Reorder clauses to: TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS.
 
 
 Unclosed parenthesis
@@ -266,6 +267,153 @@ OVER clause not allowed on derived metric
 **Cause:** A derived metric (one without a table alias) has an ``OVER`` clause. Window metrics require a qualified name (``alias.metric_name``) because they need a source table for join resolution.
 
 **Fix:** Add a table alias to the metric name: change ``my_metric AS AVG(total) OVER (...)`` to ``alias.my_metric AS AVG(total) OVER (...)``.
+
+
+.. _ref-err-materialization:
+
+Materialization Errors
+-----------------------
+
+.. versionadded:: 0.7.0
+
+These errors occur when validating the ``MATERIALIZATIONS`` clause.
+
+
+Duplicate materialization name
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: text
+
+   Duplicate materialization name '<name>'.
+
+**Cause:** Two or more materializations in the same view share the same name.
+
+**Fix:** Give each materialization a unique name.
+
+
+Materialization dimension not found
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: text
+
+   Materialization '<name>': dimension '<dim>' not found in semantic view
+   dimensions. Did you mean '<suggestion>'?
+
+**Cause:** A materialization references a dimension name that does not exist in the view's ``DIMENSIONS`` clause.
+
+**Fix:** Check the dimension name against the declared dimensions. The error suggests close matches.
+
+
+Materialization metric not found
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: text
+
+   Materialization '<name>': metric '<met>' not found in semantic view
+   metrics. Did you mean '<suggestion>'?
+
+**Cause:** A materialization references a metric name that does not exist in the view's ``METRICS`` clause.
+
+**Fix:** Check the metric name against the declared metrics. The error suggests close matches.
+
+
+Empty materialization coverage
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: text
+
+   Materialization '<name>': must specify at least one of DIMENSIONS or METRICS.
+
+**Cause:** A materialization entry declares only a ``TABLE`` with neither ``DIMENSIONS`` nor ``METRICS``.
+
+**Fix:** Add at least one of ``DIMENSIONS (...)`` or ``METRICS (...)`` to the materialization entry.
+
+
+.. _ref-err-yaml:
+
+YAML Errors
+============
+
+.. versionadded:: 0.7.0
+
+These errors occur when using ``FROM YAML`` or ``FROM YAML FILE`` to create a semantic view, or when exporting with :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>`.
+
+
+Dollar-quote errors
+--------------------
+
+.. code-block:: text
+
+   Expected '$' to begin dollar-quoted string
+
+   Unterminated dollar-quote opening delimiter
+
+   Unterminated dollar-quoted string (expected closing '<delimiter>')
+
+**Cause:** The ``FROM YAML`` body is not properly enclosed in dollar-quote delimiters.
+
+**Fix:** Ensure the YAML content starts with ``$$`` (or ``$tag$``) and ends with the matching closing delimiter.
+
+
+Trailing content after dollar-quote
+-------------------------------------
+
+.. code-block:: text
+
+   Unexpected content after closing dollar-quote: '<text>'
+
+**Cause:** Extra text appears after the closing ``$$`` delimiter.
+
+**Fix:** Remove any content between the closing ``$$`` and the statement terminator.
+
+
+Empty file path
+----------------
+
+.. code-block:: text
+
+   File path cannot be empty.
+
+**Cause:** ``FROM YAML FILE`` was used with an empty single-quoted string.
+
+**Fix:** Provide a valid file path: ``FROM YAML FILE '/path/to/file.yaml'``
+
+
+Missing file path quotes
+--------------------------
+
+.. code-block:: text
+
+   Expected single-quoted file path after FILE keyword.
+
+**Cause:** The file path after ``FROM YAML FILE`` is not enclosed in single quotes.
+
+**Fix:** Use single quotes around the file path: ``FROM YAML FILE '/path/to/file.yaml'``
+
+
+YAML size limit exceeded
+--------------------------
+
+.. code-block:: text
+
+   YAML definition for semantic view '<name>' exceeds size limit
+   (<size> bytes > <cap> bytes).
+
+**Cause:** The YAML content exceeds the 1 MiB (1,048,576 bytes) size cap.
+
+**Fix:** Reduce the YAML definition size, or split the semantic view into multiple smaller views.
+
+
+YAML parsing error
+-------------------
+
+.. code-block:: text
+
+   YAML deserialization error: <details>
+
+**Cause:** The YAML content is not valid YAML or does not match the expected semantic view definition schema.
+
+**Fix:** Check the YAML syntax and structure. The definition must include ``tables``, and at least one of ``dimensions`` or ``metrics``.
 
 
 .. _ref-err-query:

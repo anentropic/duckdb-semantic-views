@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// A table alias entry for the `tables` DDL parameter.
 /// Maps a short alias (e.g., `"o"`) to a physical table name (e.g., `"orders"`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct TableRef {
     pub alias: String,
@@ -29,7 +29,7 @@ pub struct TableRef {
 }
 
 /// A named SQL column expression used as a dimension.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Dimension {
     pub name: String,
@@ -97,7 +97,7 @@ impl NullsOrder {
 /// A dimension reference in a NON ADDITIVE BY clause.
 /// Specifies which dimension(s) a metric is non-additive by,
 /// with sort order and nulls placement for snapshot selection.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct NonAdditiveDim {
     pub dimension: String,
@@ -109,7 +109,7 @@ pub struct NonAdditiveDim {
 
 /// Parsed window function specification for window metrics.
 /// Stored alongside the raw expression for expansion-time rewriting.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct WindowSpec {
     /// The window function name (e.g., "AVG", "LAG", "SUM")
@@ -134,7 +134,7 @@ pub struct WindowSpec {
 }
 
 /// An ORDER BY entry in a window function specification.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct WindowOrderBy {
     pub expr: String,
@@ -145,7 +145,7 @@ pub struct WindowOrderBy {
 }
 
 /// A named aggregation expression used as a metric.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Metric {
     pub name: String,
@@ -202,9 +202,33 @@ impl Metric {
     }
 }
 
+/// A named materialization declaration mapping a pre-aggregated table
+/// to the dimensions and metrics it covers.
+///
+/// At define time, only the dimension/metric name references are validated
+/// (must match declared names). The TABLE is not validated for existence
+/// (it may be created later by external tools like dbt).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct Materialization {
+    /// User-assigned name for this materialization (e.g., `daily_revenue_by_region`).
+    pub name: String,
+    /// Fully qualified table name of the pre-aggregated table
+    /// (e.g., `catalog.schema.daily_revenue_agg`).
+    pub table: String,
+    /// Dimension names covered by this materialization.
+    /// Must be a subset of the semantic view's declared dimensions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dimensions: Vec<String>,
+    /// Metric names covered by this materialization.
+    /// Must be a subset of the semantic view's declared metrics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<String>,
+}
+
 /// A named raw SQL column expression — a pre-aggregation fact, scoped to a table alias.
 /// Added in Phase 11 for the FACTS clause of CREATE SEMANTIC VIEW.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Fact {
     pub name: String,
@@ -234,7 +258,7 @@ pub struct Fact {
 
 /// A column-pair relationship entry for composite or single FK declarations.
 /// Used in the `relationships` DDL parameter's `join_columns` field.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct JoinColumn {
     pub from: String,
@@ -287,7 +311,7 @@ impl AccessModifier {
 }
 
 /// A JOIN relationship between the base table and another source table.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Join {
     pub table: String,
@@ -333,16 +357,14 @@ pub struct Join {
 /// Top-level definition of a semantic view.
 ///
 /// Stored as JSON in `semantic_layer._definitions`.
-/// Required fields: `base_table`, `dimensions`, `metrics`.
+/// Required fields: `tables`, `dimensions`, `metrics`.
 /// Optional fields: `joins` (defaults to []), `facts` (defaults to []).
 /// Note: `deny_unknown_fields` is intentionally NOT set — old stored JSON with extra
 /// fields (e.g., from future schema changes) must still load without error.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SemanticViewDefinition {
-    pub base_table: String,
-    /// Phase 11.1: table alias registry for multi-table views.
-    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Table alias registry for multi-table views.
     #[serde(default)]
     pub tables: Vec<TableRef>,
     pub dimensions: Vec<Dimension>,
@@ -351,30 +373,35 @@ pub struct SemanticViewDefinition {
     pub joins: Vec<Join>,
     #[serde(default)]
     pub facts: Vec<Fact>,
+    /// Named materializations mapping pre-aggregated tables to covered dims/metrics.
+    /// Old stored JSON without this field deserializes with empty Vec.
+    /// Not serialized when empty to preserve backward-compatible JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub materializations: Vec<Materialization>,
     /// Column names from DDL-time LIMIT 0 inference, parallel to `column_types_inferred`.
     /// Populated by `create_semantic_view` `invoke()`. Empty = no inference ran.
     /// Used by `bind()` to build a name→type map for subquery column lookups.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_type_names: Vec<String>,
     /// DDL-time inferred column types stored as `ffi::duckdb_type` (u32) values.
     /// Populated by `create_semantic_view` `invoke()` after running LIMIT 0.
     /// Parallel to `column_type_names`: `column_type_names[i]` ↔ `column_types_inferred[i]`.
     /// Empty vec = no inference ran (in-memory DB or inference failed) → VARCHAR fallback.
     /// `bind()` builds a name→type `HashMap` from both vecs to look up requested columns by name.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_types_inferred: Vec<u32>,
     /// ISO 8601 timestamp of when this semantic view was created.
     /// Captured at define time via `DuckDB` `now()`.
     /// Old stored JSON without this field deserializes to None.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_on: Option<String>,
     /// Database name from the connection context at define time.
     /// Old stored JSON without this field deserializes to None.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_name: Option<String>,
     /// Schema name from the connection context at define time.
     /// Old stored JSON without this field deserializes to None.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_name: Option<String>,
     /// View-level comment describing the purpose of this semantic view.
     /// Old stored JSON without this field deserializes to None.
@@ -383,6 +410,15 @@ pub struct SemanticViewDefinition {
 }
 
 impl SemanticViewDefinition {
+    /// Physical table name of the primary (first) table in the view.
+    ///
+    /// All semantic views have at least one table entry. This is the table
+    /// that appears in the FROM clause of expanded SQL.
+    #[must_use]
+    pub fn base_table(&self) -> &str {
+        self.tables.first().map_or("", |t| t.table.as_str())
+    }
+
     /// Build a mapping from table alias to actual table name.
     ///
     /// Used by SHOW/DESCRIBE `VTabs` to resolve the stored alias (e.g. `"o"`)
@@ -424,6 +460,39 @@ impl SemanticViewDefinition {
     }
 }
 
+impl SemanticViewDefinition {
+    /// Maximum YAML input size (1 MiB). Sanity guard against oversized input.
+    /// This is NOT a security boundary -- creating semantic views is a
+    /// privileged operation guarded by warehouse auth. See trust assumption docs.
+    pub const YAML_SIZE_CAP: usize = 1_048_576;
+
+    /// Parse a YAML string into a typed semantic view definition.
+    ///
+    /// Returns an error if the YAML is syntactically invalid or missing
+    /// required fields. The `name` parameter appears in the error message.
+    pub fn from_yaml(name: &str, yaml: &str) -> Result<Self, String> {
+        let def: Self = yaml_serde::from_str(yaml)
+            .map_err(|e| format!("invalid YAML definition for semantic view '{name}': {e}"))?;
+        Ok(def)
+    }
+
+    /// Parse YAML with a size cap check.
+    ///
+    /// Rejects input exceeding [`YAML_SIZE_CAP`] (1 MiB) before parsing.
+    /// Returns an error including the actual size and the cap.
+    pub fn from_yaml_with_size_cap(name: &str, yaml: &str) -> Result<Self, String> {
+        if yaml.len() > Self::YAML_SIZE_CAP {
+            return Err(format!(
+                "YAML definition for semantic view '{name}' exceeds size limit \
+                 ({} bytes > {} byte cap)",
+                yaml.len(),
+                Self::YAML_SIZE_CAP,
+            ));
+        }
+        Self::from_yaml(name, yaml)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,21 +500,15 @@ mod tests {
     #[test]
     fn valid_definition_roundtrips() {
         let json = r#"{
-            "base_table": "orders",
+            "tables": [{"alias": "o", "table": "orders"}],
             "dimensions": [{"name": "region", "expr": "region"}],
             "metrics": [{"name": "revenue", "expr": "sum(amount)"}]
         }"#;
         let def = SemanticViewDefinition::from_json("orders", json).unwrap();
-        assert_eq!(def.base_table, "orders");
+        assert_eq!(def.base_table(), "orders");
         assert_eq!(def.dimensions.len(), 1);
         assert_eq!(def.metrics.len(), 1);
         assert!(def.joins.is_empty());
-    }
-
-    #[test]
-    fn missing_base_table_is_error() {
-        let json = r#"{"dimensions": [], "metrics": []}"#;
-        assert!(SemanticViewDefinition::from_json("test", json).is_err());
     }
 
     #[test]
@@ -614,7 +677,6 @@ mod tests {
         #[test]
         fn semantic_view_definition_with_tables_roundtrip() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![TableRef {
                     alias: "o".to_string(),
                     table: "orders".to_string(),
@@ -625,6 +687,7 @@ mod tests {
 
                 joins: vec![],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -714,7 +777,6 @@ mod tests {
         #[test]
         fn definition_with_cardinality_joins_roundtrips() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 dimensions: vec![],
                 metrics: vec![],
                 joins: vec![Join {
@@ -831,13 +893,13 @@ mod tests {
         #[test]
         fn column_types_inferred_roundtrips() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![],
                 dimensions: vec![],
                 metrics: vec![],
 
                 joins: vec![],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec!["region".to_string(), "revenue".to_string()],
                 column_types_inferred: vec![17u32, 20u32],
@@ -1009,7 +1071,6 @@ mod tests {
         #[test]
         fn created_on_roundtrip() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 dimensions: vec![],
                 metrics: vec![],
                 created_on: Some("2026-04-01T12:00:00Z".to_string()),
@@ -1286,7 +1347,6 @@ mod tests {
         #[test]
         fn view_level_comment_roundtrips() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 comment: Some("Revenue analytics view".to_string()),
                 ..Default::default()
             };
@@ -1550,6 +1610,429 @@ mod tests {
                 ..Default::default()
             };
             assert!(met.is_window());
+        }
+    }
+
+    mod yaml_tests {
+        use super::*;
+
+        #[test]
+        fn minimal_yaml_deserializes() {
+            let yaml = "tables:\n  - alias: o\n    table: orders\ndimensions:\n  - name: region\n    expr: region\nmetrics:\n  - name: revenue\n    expr: SUM(amount)\n";
+            let def = SemanticViewDefinition::from_yaml("orders", yaml).unwrap();
+            assert_eq!(def.base_table(), "orders");
+            assert_eq!(def.dimensions.len(), 1);
+            assert_eq!(def.dimensions[0].name, "region");
+            assert_eq!(def.dimensions[0].expr, "region");
+            assert_eq!(def.metrics.len(), 1);
+            assert_eq!(def.metrics[0].name, "revenue");
+            assert_eq!(def.metrics[0].expr, "SUM(amount)");
+        }
+
+        #[test]
+        fn full_yaml_all_fields() {
+            let yaml = r#"
+base_table: orders
+tables:
+  - alias: o
+    table: orders
+    pk_columns:
+      - id
+    unique_constraints:
+      - - email
+      - - first_name
+        - last_name
+    comment: Main orders table
+    synonyms:
+      - order_facts
+  - alias: c
+    table: customers
+    pk_columns:
+      - id
+joins:
+  - table: c
+    from_alias: o
+    fk_columns:
+      - customer_id
+    ref_columns:
+      - id
+    name: order_to_customer
+    cardinality: ManyToOne
+facts:
+  - name: unit_price
+    expr: "o.price / o.qty"
+    source_table: o
+    output_type: DOUBLE
+    comment: Price per unit
+    synonyms:
+      - price_per_item
+    access: Private
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+    output_type: VARCHAR
+    comment: Geographic region
+    synonyms:
+      - area
+      - territory
+metrics:
+  - name: revenue
+    expr: SUM(o.amount)
+    source_table: o
+    output_type: "DECIMAL(18,2)"
+    comment: Total revenue
+    synonyms:
+      - total_revenue
+    access: Public
+    using_relationships:
+      - order_to_customer
+  - name: balance
+    expr: SUM(o.amount)
+    source_table: o
+    non_additive_by:
+      - dimension: date_dim
+        order: Desc
+        nulls: First
+  - name: avg_qty_7d
+    expr: AVG(total_qty)
+    window_spec:
+      window_function: AVG
+      inner_metric: total_qty
+      excluding_dims:
+        - date_dim
+      order_by:
+        - expr: date_dim
+          order: Asc
+          nulls: Last
+      frame_clause: "RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW"
+comment: Revenue analytics view
+"#;
+            let def = SemanticViewDefinition::from_yaml("orders", yaml).unwrap();
+            // Tables
+            assert_eq!(def.tables.len(), 2);
+            assert_eq!(def.tables[0].alias, "o");
+            assert_eq!(def.tables[0].table, "orders");
+            assert_eq!(def.tables[0].pk_columns, vec!["id"]);
+            assert_eq!(def.tables[0].unique_constraints.len(), 2);
+            assert_eq!(def.tables[0].comment.as_deref(), Some("Main orders table"));
+            assert_eq!(def.tables[0].synonyms, vec!["order_facts"]);
+            // Joins
+            assert_eq!(def.joins.len(), 1);
+            assert_eq!(def.joins[0].table, "c");
+            assert_eq!(def.joins[0].from_alias, "o");
+            assert_eq!(def.joins[0].fk_columns, vec!["customer_id"]);
+            assert_eq!(def.joins[0].ref_columns, vec!["id"]);
+            assert_eq!(def.joins[0].name.as_deref(), Some("order_to_customer"));
+            assert_eq!(def.joins[0].cardinality, Cardinality::ManyToOne);
+            // Facts
+            assert_eq!(def.facts.len(), 1);
+            assert_eq!(def.facts[0].name, "unit_price");
+            assert_eq!(def.facts[0].access, AccessModifier::Private);
+            assert_eq!(def.facts[0].comment.as_deref(), Some("Price per unit"));
+            assert_eq!(def.facts[0].synonyms, vec!["price_per_item"]);
+            // Dimensions
+            assert_eq!(def.dimensions.len(), 1);
+            assert_eq!(def.dimensions[0].source_table.as_deref(), Some("o"));
+            assert_eq!(def.dimensions[0].output_type.as_deref(), Some("VARCHAR"));
+            assert_eq!(
+                def.dimensions[0].comment.as_deref(),
+                Some("Geographic region")
+            );
+            assert_eq!(def.dimensions[0].synonyms, vec!["area", "territory"]);
+            // Metrics
+            assert_eq!(def.metrics.len(), 3);
+            assert_eq!(def.metrics[0].access, AccessModifier::Public);
+            assert_eq!(
+                def.metrics[0].using_relationships,
+                vec!["order_to_customer"]
+            );
+            assert_eq!(def.metrics[0].comment.as_deref(), Some("Total revenue"));
+            assert_eq!(def.metrics[0].synonyms, vec!["total_revenue"]);
+            // Semi-additive metric
+            assert_eq!(def.metrics[1].non_additive_by.len(), 1);
+            assert_eq!(def.metrics[1].non_additive_by[0].dimension, "date_dim");
+            assert_eq!(def.metrics[1].non_additive_by[0].order, SortOrder::Desc);
+            assert_eq!(def.metrics[1].non_additive_by[0].nulls, NullsOrder::First);
+            // Window metric
+            let ws = def.metrics[2].window_spec.as_ref().unwrap();
+            assert_eq!(ws.window_function, "AVG");
+            assert_eq!(ws.inner_metric, "total_qty");
+            assert_eq!(ws.excluding_dims, vec!["date_dim"]);
+            assert_eq!(ws.order_by.len(), 1);
+            assert_eq!(ws.order_by[0].expr, "date_dim");
+            assert_eq!(ws.order_by[0].order, SortOrder::Asc);
+            assert_eq!(ws.order_by[0].nulls, NullsOrder::Last);
+            assert!(ws
+                .frame_clause
+                .as_deref()
+                .unwrap()
+                .contains("RANGE BETWEEN"));
+            // View-level comment
+            assert_eq!(def.comment.as_deref(), Some("Revenue analytics view"));
+        }
+
+        #[test]
+        fn optional_fields_default_when_omitted() {
+            let yaml = "base_table: t\ndimensions: []\nmetrics: []\n";
+            let def = SemanticViewDefinition::from_yaml("test", yaml).unwrap();
+            assert!(def.tables.is_empty());
+            assert!(def.joins.is_empty());
+            assert!(def.facts.is_empty());
+            assert!(def.column_type_names.is_empty());
+            assert!(def.column_types_inferred.is_empty());
+            assert!(def.created_on.is_none());
+            assert!(def.database_name.is_none());
+            assert!(def.schema_name.is_none());
+            assert!(def.comment.is_none());
+        }
+
+        #[test]
+        fn enum_variants_roundtrip_yaml() {
+            // AccessModifier::Private
+            let yaml = "base_table: t\ndimensions: []\nmetrics:\n  - name: m\n    expr: SUM(x)\n    access: Private\n";
+            let def = SemanticViewDefinition::from_yaml("test", yaml).unwrap();
+            assert_eq!(def.metrics[0].access, AccessModifier::Private);
+
+            // Cardinality::OneToOne
+            let yaml2 = "base_table: t\ndimensions: []\nmetrics: []\njoins:\n  - table: c\n    cardinality: OneToOne\n";
+            let def2 = SemanticViewDefinition::from_yaml("test", yaml2).unwrap();
+            assert_eq!(def2.joins[0].cardinality, Cardinality::OneToOne);
+        }
+
+        #[test]
+        fn yaml_json_produce_identical_structs() {
+            let yaml = "base_table: orders\ndimensions:\n  - name: region\n    expr: region\nmetrics:\n  - name: revenue\n    expr: SUM(amount)\n";
+            let json = r#"{"base_table":"orders","dimensions":[{"name":"region","expr":"region"}],"metrics":[{"name":"revenue","expr":"SUM(amount)"}]}"#;
+            let from_yaml = SemanticViewDefinition::from_yaml("test", yaml).unwrap();
+            let from_json = SemanticViewDefinition::from_json("test", json).unwrap();
+            assert_eq!(from_yaml, from_json);
+        }
+
+        #[test]
+        fn invalid_yaml_syntax_returns_error_with_name() {
+            let result = SemanticViewDefinition::from_yaml("my_view", "{{invalid yaml");
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("my_view"),
+                "error should contain view name: {err}"
+            );
+            assert!(
+                err.contains("invalid YAML definition"),
+                "error should contain prefix: {err}"
+            );
+        }
+
+        #[test]
+        fn size_cap_rejects_oversized_input() {
+            let oversized = "a".repeat(1_048_577); // 1 byte over cap
+            let result = SemanticViewDefinition::from_yaml_with_size_cap("big", &oversized);
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.contains("exceeds size limit"), "error: {err}");
+            assert!(
+                err.contains("1048577 bytes"),
+                "should contain actual size: {err}"
+            );
+            assert!(
+                err.contains("1048576 byte cap"),
+                "should contain cap: {err}"
+            );
+        }
+
+        #[test]
+        fn size_cap_accepts_exactly_1mb() {
+            // Build a valid YAML string padded to exactly 1MB
+            let prefix = "base_table: t\ndimensions: []\nmetrics: []\n# ";
+            let pad_len = SemanticViewDefinition::YAML_SIZE_CAP - prefix.len();
+            let padded = format!("{prefix}{}", "x".repeat(pad_len));
+            assert_eq!(padded.len(), SemanticViewDefinition::YAML_SIZE_CAP);
+            let result = SemanticViewDefinition::from_yaml_with_size_cap("test", &padded);
+            assert!(
+                result.is_ok(),
+                "exactly 1MB should be accepted: {}",
+                result.unwrap_err()
+            );
+        }
+
+        #[test]
+        fn unknown_fields_accepted_in_yaml() {
+            let yaml = "base_table: t\ndimensions: []\nmetrics: []\nextra_field: surprise\n";
+            assert!(
+                SemanticViewDefinition::from_yaml("test", yaml).is_ok(),
+                "unknown fields must not cause rejection (no deny_unknown_fields)"
+            );
+        }
+
+        #[test]
+        fn yaml_json_roundtrip_via_serialize() {
+            // Build a struct, serialize to both formats, deserialize both, assert equal
+            let def = SemanticViewDefinition {
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "region".to_string(),
+                    ..Default::default()
+                }],
+                metrics: vec![Metric {
+                    name: "revenue".to_string(),
+                    expr: "SUM(amount)".to_string(),
+                    access: AccessModifier::Private,
+                    ..Default::default()
+                }],
+                facts: vec![Fact {
+                    name: "unit_price".to_string(),
+                    expr: "price / qty".to_string(),
+                    access: AccessModifier::Private,
+                    ..Default::default()
+                }],
+                comment: Some("test view".to_string()),
+                ..Default::default()
+            };
+            let json_str = serde_json::to_string(&def).unwrap();
+            let yaml_str = yaml_serde::to_string(&def).unwrap();
+
+            let from_json = SemanticViewDefinition::from_json("test", &json_str).unwrap();
+            let from_yaml = SemanticViewDefinition::from_yaml("test", &yaml_str).unwrap();
+            assert_eq!(from_json, from_yaml);
+        }
+    }
+
+    mod phase54_materialization_tests {
+        use super::*;
+
+        #[test]
+        fn materialization_json_roundtrip() {
+            let mat = Materialization {
+                name: "daily_rev".to_string(),
+                table: "daily_revenue_agg".to_string(),
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["revenue".to_string(), "order_count".to_string()],
+            };
+            let json = serde_json::to_string(&mat).unwrap();
+            let rt: Materialization = serde_json::from_str(&json).unwrap();
+            assert_eq!(rt.name, "daily_rev");
+            assert_eq!(rt.table, "daily_revenue_agg");
+            assert_eq!(rt.dimensions, vec!["region"]);
+            assert_eq!(rt.metrics, vec!["revenue", "order_count"]);
+        }
+
+        #[test]
+        fn materialization_yaml_roundtrip() {
+            let mat = Materialization {
+                name: "daily_rev".to_string(),
+                table: "catalog.schema.daily_revenue_agg".to_string(),
+                dimensions: vec!["region".to_string()],
+                metrics: vec!["revenue".to_string()],
+            };
+            let yaml_str = yaml_serde::to_string(&mat).unwrap();
+            let rt: Materialization = yaml_serde::from_str(&yaml_str).unwrap();
+            assert_eq!(rt.name, "daily_rev");
+            assert_eq!(rt.table, "catalog.schema.daily_revenue_agg");
+            assert_eq!(rt.dimensions, vec!["region"]);
+            assert_eq!(rt.metrics, vec!["revenue"]);
+        }
+
+        #[test]
+        fn definition_with_materializations_json_roundtrip() {
+            let def = SemanticViewDefinition {
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    expr: "region".to_string(),
+                    ..Default::default()
+                }],
+                metrics: vec![Metric {
+                    name: "revenue".to_string(),
+                    expr: "SUM(amount)".to_string(),
+                    ..Default::default()
+                }],
+                materializations: vec![Materialization {
+                    name: "daily_rev".to_string(),
+                    table: "daily_revenue_agg".to_string(),
+                    dimensions: vec!["region".to_string()],
+                    metrics: vec!["revenue".to_string()],
+                }],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            assert!(
+                json.contains("materializations"),
+                "materializations should appear in JSON: {json}"
+            );
+            let rt = SemanticViewDefinition::from_json("test", &json).unwrap();
+            assert_eq!(rt.materializations.len(), 1);
+            assert_eq!(rt.materializations[0].name, "daily_rev");
+            assert_eq!(rt.materializations[0].table, "daily_revenue_agg");
+            assert_eq!(rt.materializations[0].dimensions, vec!["region"]);
+            assert_eq!(rt.materializations[0].metrics, vec!["revenue"]);
+        }
+
+        #[test]
+        fn old_json_without_materializations_deserializes_to_empty_vec() {
+            // Backward compat: pre-v0.7.0 JSON without materializations field
+            let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
+            let def = SemanticViewDefinition::from_json("test", json).unwrap();
+            assert!(
+                def.materializations.is_empty(),
+                "materializations should default to [] for old JSON"
+            );
+        }
+
+        #[test]
+        fn empty_materializations_omitted_from_json() {
+            let def = SemanticViewDefinition {
+                materializations: vec![],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&def).unwrap();
+            assert!(
+                !json.contains("materializations"),
+                "Empty materializations should be omitted from JSON: {json}"
+            );
+        }
+
+        #[test]
+        fn yaml_and_json_with_materializations_produce_identical_structs() {
+            let yaml = r#"
+base_table: orders
+dimensions:
+  - name: region
+    expr: region
+metrics:
+  - name: revenue
+    expr: SUM(amount)
+materializations:
+  - name: daily_rev
+    table: daily_revenue_agg
+    dimensions:
+      - region
+    metrics:
+      - revenue
+"#;
+            let from_yaml = SemanticViewDefinition::from_yaml("test", yaml).unwrap();
+
+            let json = serde_json::to_string(&from_yaml).unwrap();
+            let from_json = SemanticViewDefinition::from_json("test", &json).unwrap();
+            assert_eq!(from_yaml, from_json);
+        }
+
+        #[test]
+        fn materialization_empty_dims_and_metrics_omitted_from_json() {
+            let mat = Materialization {
+                name: "test".to_string(),
+                table: "t".to_string(),
+                dimensions: vec![],
+                metrics: vec![],
+            };
+            let json = serde_json::to_string(&mat).unwrap();
+            assert!(
+                !json.contains("dimensions"),
+                "Empty dimensions should be omitted from Materialization JSON: {json}"
+            );
+            assert!(
+                !json.contains("metrics"),
+                "Empty metrics should be omitted from Materialization JSON: {json}"
+            );
         }
     }
 }

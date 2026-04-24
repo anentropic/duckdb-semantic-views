@@ -63,6 +63,9 @@ Concept Mapping
    * - Access modifiers
      - ``PRIVATE`` / ``PUBLIC``
      - ``PRIVATE`` / ``PUBLIC`` on metrics and facts
+   * - Materializations / pre-aggregation
+     - Not part of Snowflake's ``CREATE SEMANTIC VIEW`` DDL
+     - ``MATERIALIZATIONS`` clause for routing to pre-aggregated tables (see :ref:`howto-materializations`)
    * - Query interface
      - Direct SQL with semantic resolution
      - :ref:`semantic_view() <ref-semantic-view-function>` table function
@@ -342,6 +345,16 @@ The behavioral differences are:
 - Window metrics cannot be mixed with aggregate metrics in the same query.
 
 
+Materializations
+-----------------
+
+.. versionadded:: 0.7.0
+
+Snowflake's ``CREATE SEMANTIC VIEW`` SQL DDL does not include a materializations or pre-aggregation concept. Pre-aggregation in Snowflake is handled through separate materialized views.
+
+DuckDB Semantic Views introduces a ``MATERIALIZATIONS`` clause that declares mappings from pre-aggregated tables to the dimensions and metrics they cover. When a query exactly matches a materialization, the extension routes to the pre-aggregated table instead of expanding raw sources. See :ref:`howto-materializations` for details.
+
+
 .. _explanation-sf-not-supported:
 
 Features Not Yet Supported
@@ -375,4 +388,6 @@ Snowflake's `YAML-based semantic view definition <https://docs.snowflake.com/en/
 - ``access_modifier`` for column-level security
 - ``sample_values`` for AI context
 
-DuckDB Semantic Views targets the SQL DDL interface only. Comparisons against YAML-spec-only features are not applicable.
+DuckDB Semantic Views supports YAML definition import (``FROM YAML``) and export (:ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>`), but these use the extension's own YAML schema -- not Snowflake's Cortex Analyst YAML spec. The DuckDB YAML format is a serialization of the same model used by the SQL DDL (tables, relationships, facts, dimensions, metrics, materializations). It is designed for version control, migration, and sharing -- not for AI prompt tuning. Comparisons against Snowflake YAML-spec-only features remain not applicable.
+
+See :ref:`howto-yaml-definitions` for the DuckDB YAML workflow.

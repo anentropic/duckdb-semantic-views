@@ -4,7 +4,9 @@ use crate::util::{replace_word_boundary, suggest_closest};
 use super::facts::{inline_derived_metrics, inline_facts, toposort_facts};
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::{resolve_joins_pkfk, synthesize_on_clause, synthesize_on_clause_scoped};
-use super::resolution::{find_dimension, find_metric, quote_ident, quote_table_ref};
+use super::resolution::{
+    find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident, quote_table_ref,
+};
 use super::role_playing::find_using_context;
 use super::types::{ExpandError, QueryRequest};
 
@@ -176,7 +178,7 @@ fn expand_facts(
 
     // 6. FROM clause — same pattern as expand().
     sql.push_str("\nFROM ");
-    sql.push_str(&quote_table_ref(&def.base_table));
+    sql.push_str(&quote_table_ref(def.base_table()));
     if let Some(base_ref) = def.tables.first() {
         sql.push_str(" AS ");
         sql.push_str(&quote_ident(&base_ref.alias));
@@ -355,6 +357,15 @@ pub fn expand(
         },
     )?;
 
+    // Phase 55: Materialization routing.
+    // Attempt to route to a pre-aggregated table if an exact match exists.
+    // Returns None if no match, or if any metric is semi-additive / window.
+    if let Some(routed_sql) =
+        super::materialization::try_route_materialization(def, &resolved_dims, &resolved_mets)
+    {
+        return Ok(routed_sql);
+    }
+
     // 4. Pre-compute all metric expressions: inline facts into base metrics,
     //    then inline metric references into derived metrics.
     let topo_order = toposort_facts(&def.facts).map_err(|e| ExpandError::CycleDetected {
@@ -485,9 +496,9 @@ pub fn expand(
 
     // 6. FROM clause with base table.
     sql.push_str("\nFROM ");
-    sql.push_str(&quote_table_ref(&def.base_table));
+    sql.push_str(&qualify_and_quote_table_ref(def.base_table(), def));
 
-    // If tables aliases are declared (Phase 11.1), emit AS "alias" after the base table.
+    // If tables aliases are declared, emit AS "alias" after the base table.
     if let Some(base_ref) = def.tables.first() {
         sql.push_str(" AS ");
         sql.push_str(&quote_ident(&base_ref.alias));
@@ -516,7 +527,7 @@ pub fn expand(
                 .find(|t| t.alias.to_ascii_lowercase() == bare_alias);
             let physical_table = table_ref.map_or(bare_alias, |t| t.table.as_str());
             sql.push_str("\nLEFT JOIN ");
-            sql.push_str(&quote_table_ref(physical_table));
+            sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
             sql.push_str(" AS ");
             sql.push_str(&quote_ident(alias));
             sql.push_str(" ON ");
@@ -536,7 +547,7 @@ pub fn expand(
                 .find(|t| t.alias.to_ascii_lowercase() == *alias);
             let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
             sql.push_str("\nLEFT JOIN ");
-            sql.push_str(&quote_table_ref(physical_table));
+            sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
             sql.push_str(" AS ");
             sql.push_str(&quote_ident(alias));
             sql.push_str(" ON ");
@@ -580,7 +591,7 @@ mod tests {
 SELECT
     region AS \"region\",
     sum(amount) AS \"total_revenue\"
-FROM \"orders\"
+FROM \"orders\" AS \"orders\"
 GROUP BY
     1";
             assert_eq!(sql, expected);
@@ -888,7 +899,7 @@ GROUP BY
         #[test]
         fn test_case_insensitive_metric_lookup() {
             let def = SemanticViewDefinition::default()
-                .with_base_table("orders")
+                .with_table("orders", "orders", &[])
                 .with_metric("Total_Revenue", "sum(amount)", None);
             // Request uses lowercase "total_revenue" but definition has "Total_Revenue"
             let req = QueryRequest {
@@ -1022,6 +1033,127 @@ GROUP BY
                 "dot-qualified base_table must be split and quoted: {sql}"
             );
         }
+
+        /// When database_name and schema_name are set on the definition,
+        /// the generated SQL must fully-qualify table references in FROM.
+        /// Without this, ADBC connections fail because they don't maintain
+        /// the same catalog/schema search path as normal connections.
+        #[test]
+        fn test_base_table_qualified_with_catalog_schema() {
+            let mut def = minimal_def("orders", "region", "region", "total_revenue", "sum(amount)");
+            def.database_name = Some("memory".to_string());
+            def.schema_name = Some("main".to_string());
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("region")],
+                metrics: vec![MetricName::new("total_revenue")],
+            };
+            let sql = expand("orders_view", &def, &req).unwrap();
+            assert!(
+                sql.contains("FROM \"memory\".\"main\".\"orders\""),
+                "base table must be catalog.schema qualified when database_name/schema_name are set: {sql}"
+            );
+        }
+
+        /// Same as above but for JOIN targets — joined tables must also be
+        /// fully qualified when database_name/schema_name are present.
+        #[test]
+        fn test_join_table_qualified_with_catalog_schema() {
+            let mut def = orders_view()
+                .with_table("c", "customers", &["id"])
+                .with_pkfk_join("orders_customers", "orders", "c", &["customer_id"], &["id"])
+                .with_dimension("customer_name", "c.name", Some("c"));
+            def.database_name = Some("memory".to_string());
+            def.schema_name = Some("main".to_string());
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![
+                    DimensionName::new("region"),
+                    DimensionName::new("customer_name"),
+                ],
+                metrics: vec![MetricName::new("total_revenue")],
+            };
+            let sql = expand("orders_view", &def, &req).unwrap();
+            assert!(
+                sql.contains("FROM \"memory\".\"main\".\"orders\""),
+                "base table in JOIN query must be qualified: {sql}"
+            );
+            assert!(
+                sql.contains("LEFT JOIN \"memory\".\"main\".\"customers\""),
+                "joined table must be catalog.schema qualified: {sql}"
+            );
+        }
+
+        /// When only schema_name is set (no database_name), qualify with
+        /// just the schema prefix.
+        #[test]
+        fn test_base_table_qualified_schema_only() {
+            let mut def = minimal_def("orders", "region", "region", "total_revenue", "sum(amount)");
+            def.schema_name = Some("analytics".to_string());
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("region")],
+                metrics: vec![MetricName::new("total_revenue")],
+            };
+            let sql = expand("orders_view", &def, &req).unwrap();
+            assert!(
+                sql.contains("FROM \"analytics\".\"orders\""),
+                "base table must be schema-qualified when only schema_name is set: {sql}"
+            );
+        }
+
+        /// When neither database_name nor schema_name are set, table refs
+        /// remain unqualified (backward compat).
+        #[test]
+        fn test_base_table_unqualified_when_no_catalog_schema() {
+            let def = minimal_def("orders", "region", "region", "total_revenue", "sum(amount)");
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("region")],
+                metrics: vec![MetricName::new("total_revenue")],
+            };
+            let sql = expand("orders_view", &def, &req).unwrap();
+            // Should NOT have any dot-qualification beyond what's in the table name itself
+            assert!(
+                sql.contains("FROM \"orders\""),
+                "table must remain unqualified when no catalog/schema set: {sql}"
+            );
+            assert!(
+                !sql.contains("FROM \"memory\""),
+                "must not inject catalog when not set: {sql}"
+            );
+        }
+
+        /// Tables that are already dot-qualified in the definition should
+        /// NOT get double-qualified.
+        #[test]
+        fn test_already_qualified_table_not_double_qualified() {
+            let mut def = minimal_def(
+                "mydb.myschema.orders",
+                "region",
+                "region",
+                "total_revenue",
+                "sum(amount)",
+            );
+            // Even with database_name/schema_name set, a table that's already
+            // dot-qualified should be used as-is.
+            def.database_name = Some("memory".to_string());
+            def.schema_name = Some("main".to_string());
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("region")],
+                metrics: vec![MetricName::new("total_revenue")],
+            };
+            let sql = expand("orders_view", &def, &req).unwrap();
+            assert!(
+                sql.contains("FROM \"mydb\".\"myschema\".\"orders\""),
+                "already-qualified table must not be re-qualified: {sql}"
+            );
+            assert!(
+                !sql.contains("\"memory\".\"main\".\"mydb\""),
+                "must not double-qualify: {sql}"
+            );
+        }
     }
 
     mod phase11_1_expand_tests {
@@ -1030,7 +1162,6 @@ GROUP BY
 
         fn def_with_join_columns() -> crate::model::SemanticViewDefinition {
             crate::model::SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "o".to_string(),
@@ -1087,6 +1218,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1175,7 +1307,7 @@ GROUP BY
         #[test]
         fn output_type_on_metric_emits_cast() {
             let mut def = SemanticViewDefinition::default()
-                .with_base_table("orders")
+                .with_table("orders", "orders", &[])
                 .with_metric("revenue", "sum(amount)", None);
             def.metrics[0].output_type = Some("BIGINT".to_string());
             let req = QueryRequest {
@@ -1192,7 +1324,7 @@ GROUP BY
 
         #[test]
         fn output_type_on_dimension_emits_cast() {
-            let mut def = SemanticViewDefinition::default().with_base_table("orders");
+            let mut def = SemanticViewDefinition::default().with_table("orders", "orders", &[]);
             def.dimensions.push(Dimension {
                 name: "region_id".to_string(),
                 expr: "region_id".to_string(),
@@ -1216,7 +1348,7 @@ GROUP BY
         #[test]
         fn no_output_type_no_cast() {
             let def = SemanticViewDefinition::default()
-                .with_base_table("orders")
+                .with_table("orders", "orders", &[])
                 .with_metric("revenue", "sum(amount)", None);
             let req = QueryRequest {
                 facts: vec![],
@@ -1244,7 +1376,6 @@ GROUP BY
         /// Helper: build a 2-table PK/FK definition (orders -> customers).
         fn pkfk_two_table_def() -> SemanticViewDefinition {
             SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "o".to_string(),
@@ -1301,6 +1432,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1314,7 +1446,6 @@ GROUP BY
         /// Helper: build a 3-table PK/FK definition (li -> o -> c).
         fn pkfk_three_table_def() -> SemanticViewDefinition {
             SemanticViewDefinition {
-                base_table: "line_items".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "li".to_string(),
@@ -1387,6 +1518,7 @@ GROUP BY
                     },
                 ],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1415,7 +1547,6 @@ GROUP BY
         #[test]
         fn test_pkfk_on_clause_composite() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "a".to_string(),
@@ -1462,6 +1593,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1577,7 +1709,6 @@ GROUP BY
 
         fn qualified_ref_def() -> SemanticViewDefinition {
             SemanticViewDefinition {
-                base_table: "p27_orders".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "o".to_string(),
@@ -1624,6 +1755,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1658,7 +1790,6 @@ GROUP BY
         #[test]
         fn test_expand_multiple_qualified_refs_different_tables() {
             let def = SemanticViewDefinition {
-                base_table: "p27_orders".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "o".to_string(),
@@ -1715,6 +1846,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
 
                 column_type_names: vec![],
                 column_types_inferred: vec![],
@@ -1982,7 +2114,7 @@ GROUP BY
         #[test]
         fn expand_without_facts_unchanged() {
             let def = SemanticViewDefinition::default()
-                .with_base_table("orders")
+                .with_table("orders", "orders", &[])
                 .with_metric("total", "SUM(amount)", None);
             let req = QueryRequest {
                 facts: vec![],
@@ -1999,7 +2131,7 @@ GROUP BY
         #[test]
         fn expand_multi_level_facts() {
             let def = SemanticViewDefinition::default()
-                .with_base_table("line_items")
+                .with_table("line_items", "line_items", &[])
                 .with_metric("total_tax", "SUM(tax_amount)", None)
                 .with_fact("net_price", "extended_price * (1 - discount)", "line_items")
                 .with_fact("tax_amount", "net_price * tax_rate", "line_items");
@@ -2316,7 +2448,6 @@ GROUP BY
         #[test]
         fn expand_derived_only_no_base_metrics_requested() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "o".to_string(),
@@ -2388,6 +2519,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -2411,7 +2543,6 @@ GROUP BY
         #[test]
         fn resolve_joins_includes_transitive_deps_from_derived() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "o".to_string(),
@@ -2483,6 +2614,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -2505,7 +2637,6 @@ GROUP BY
         #[test]
         fn expand_derived_metric_with_facts_chain() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![],
                 dimensions: vec![],
                 metrics: vec![
@@ -2556,6 +2687,7 @@ GROUP BY
                     synonyms: vec![],
                     access: AccessModifier::Public,
                 }],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -2587,7 +2719,6 @@ GROUP BY
 
         fn fan_trap_three_table_def() -> SemanticViewDefinition {
             SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "o".to_string(),
@@ -2687,6 +2818,7 @@ GROUP BY
                     },
                 ],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -2740,7 +2872,6 @@ GROUP BY
         #[test]
         fn fan_trap_one_to_one_safe() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "o".to_string(),
@@ -2789,6 +2920,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -2948,7 +3080,6 @@ GROUP BY
 
         fn flights_airports_def() -> SemanticViewDefinition {
             SemanticViewDefinition {
-                base_table: "flights".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "f".to_string(),
@@ -3052,6 +3183,7 @@ GROUP BY
                     },
                 ],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3163,7 +3295,7 @@ GROUP BY
         #[test]
         fn non_ambiguous_single_relationship_works_without_using() {
             let mut def = SemanticViewDefinition::default()
-                .with_base_table("orders")
+                .with_table("orders", "orders", &[])
                 .with_table("o", "orders", &["id"])
                 .with_table("c", "customers", &["id"])
                 .with_dimension("customer_name", "c.name", Some("c"))
@@ -3206,7 +3338,6 @@ GROUP BY
         #[test]
         fn fan_trap_detection_works_with_using_paths() {
             let def = SemanticViewDefinition {
-                base_table: "flights".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "f".to_string(),
@@ -3255,6 +3386,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3297,7 +3429,6 @@ GROUP BY
         #[test]
         fn metric_using_from_base_table_no_unnecessary_join() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![TableRef {
                     alias: "o".to_string(),
                     table: "orders".to_string(),
@@ -3328,6 +3459,7 @@ GROUP BY
                 }],
                 joins: vec![],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3350,7 +3482,6 @@ GROUP BY
         #[test]
         fn backward_compat_no_using_expands_as_before() {
             let def = SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![
                     TableRef {
                         alias: "o".to_string(),
@@ -3397,6 +3528,7 @@ GROUP BY
                     ..Default::default()
                 }],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3461,7 +3593,6 @@ GROUP BY
 
         fn make_def_with_private_metric() -> SemanticViewDefinition {
             SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![],
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
@@ -3499,6 +3630,7 @@ GROUP BY
                 ],
                 joins: vec![],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3510,7 +3642,6 @@ GROUP BY
 
         fn make_def_with_private_and_derived() -> SemanticViewDefinition {
             SemanticViewDefinition {
-                base_table: "orders".to_string(),
                 tables: vec![],
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
@@ -3560,6 +3691,7 @@ GROUP BY
                 ],
                 joins: vec![],
                 facts: vec![],
+                materializations: vec![],
                 column_type_names: vec![],
                 column_types_inferred: vec![],
                 created_on: None,
@@ -3742,7 +3874,7 @@ GROUP BY
         /// Build a multi-table def: orders (o) -> line_items (li), with a dim on o and facts on li.
         fn multi_table_def() -> SemanticViewDefinition {
             SemanticViewDefinition::default()
-                .with_base_table("orders")
+                .with_table("orders", "orders", &[])
                 .with_table("o", "orders", &["id"])
                 .with_table("li", "line_items", &["id"])
                 .with_dimension("region", "o.region", Some("o"))
@@ -3799,7 +3931,7 @@ GROUP BY
         #[test]
         fn test_fact_query_inline_facts() {
             let def = SemanticViewDefinition::default()
-                .with_base_table("orders")
+                .with_table("orders", "orders", &[])
                 .with_table("o", "orders", &["id"])
                 .with_table("li", "line_items", &["id"])
                 .with_fact("net_price", "li.price * (1 - li.discount)", "li")
@@ -3873,7 +4005,7 @@ GROUP BY
         fn test_fact_path_violation() {
             // Fan shape: o -> li, o -> payments (divergent paths)
             let def = SemanticViewDefinition::default()
-                .with_base_table("orders")
+                .with_table("orders", "orders", &[])
                 .with_table("o", "orders", &["id"])
                 .with_table("li", "line_items", &["id"])
                 .with_table("p", "payments", &["id"])
@@ -3899,7 +4031,7 @@ GROUP BY
         fn test_fact_path_valid_linear() {
             // Chain: o -> li -> details (linear path)
             let def = SemanticViewDefinition::default()
-                .with_base_table("orders")
+                .with_table("orders", "orders", &[])
                 .with_table("o", "orders", &["id"])
                 .with_table("li", "line_items", &["id"])
                 .with_table("d", "details", &["id"])

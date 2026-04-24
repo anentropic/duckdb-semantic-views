@@ -6,6 +6,7 @@ use duckdb::{
 };
 use libduckdb_sys as ffi;
 
+use crate::expand::find_routing_materialization_name;
 use crate::expand::{expand, QueryRequest};
 use crate::model::SemanticViewDefinition;
 use crate::util::suggest_closest;
@@ -176,6 +177,30 @@ impl VTab for ExplainSemanticViewVTab {
             let facts = expand_wildcards(&facts, &def, &WildcardItemType::Fact)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
+            // Resolve dims/mets for materialization name lookup (INTR-01).
+            // This duplicates name resolution that expand() also does, but it's
+            // trivial (linear scan of definition arrays) and avoids changing
+            // expand()'s return type.
+            let mat_name = {
+                let dim_refs: Vec<&crate::model::Dimension> = dimensions
+                    .iter()
+                    .filter_map(|name| {
+                        def.dimensions
+                            .iter()
+                            .find(|d| d.name.eq_ignore_ascii_case(name))
+                    })
+                    .collect();
+                let met_refs: Vec<&crate::model::Metric> = metrics
+                    .iter()
+                    .filter_map(|name| {
+                        def.metrics
+                            .iter()
+                            .find(|m| m.name.eq_ignore_ascii_case(name))
+                    })
+                    .collect();
+                find_routing_materialization_name(&def, &dim_refs, &met_refs).map(String::from)
+            };
+
             let req = QueryRequest {
                 dimensions: dimensions
                     .iter()
@@ -198,6 +223,10 @@ impl VTab for ExplainSemanticViewVTab {
             lines.push(format!("-- Metrics: {}", metrics.join(", ")));
             if !facts.is_empty() {
                 lines.push(format!("-- Facts: {}", facts.join(", ")));
+            }
+            match mat_name {
+                Some(ref name) => lines.push(format!("-- Materialization: {name}")),
+                None => lines.push("-- Materialization: none".to_string()),
             }
             lines.push(String::new());
 

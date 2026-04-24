@@ -19,6 +19,9 @@ source_terms:
   - canonical: "Join"
     variants: []
     source: "struct Join in src/model.rs"
+  - canonical: "Materialization"
+    variants: []
+    source: "struct Materialization in src/model.rs"
   - canonical: "Cardinality"
     variants: []
     source: "enum Cardinality in src/model.rs (ManyToOne, OneToOne)"
@@ -40,11 +43,16 @@ source_terms:
   - canonical: "describe_semantic_view()"
     variants: []
     source: "table function registered in src/lib.rs (DescribeSemanticViewVTab)"
+  - canonical: "READ_YAML_FROM_SEMANTIC_VIEW()"
+    variants: []
+    source: "scalar function registered in src/ddl/read_yaml.rs"
 
 proper_nouns:
   - canonical: "DuckDB"
     variants: []
   - canonical: "Snowflake"
+    variants: []
+  - canonical: "Databricks"
     variants: []
   - canonical: "Postgres"
     variants: []
@@ -53,6 +61,10 @@ proper_nouns:
   - canonical: "Parquet"
     variants: []
   - canonical: "Cortex Analyst"
+    variants: []
+  - canonical: "Delta Lake"
+    variants: []
+  - canonical: "Unity Catalog"
     variants: []
 
 project_terms:
@@ -79,6 +91,12 @@ project_terms:
   - canonical: "one-to-one"
     variants: []
   - canonical: "one-to-many"
+    variants: []
+  - canonical: "materialization"
+    variants: []
+  - canonical: "semi-additive metric"
+    variants: []
+  - canonical: "window metric"
     variants: []
 
 overrides: {}

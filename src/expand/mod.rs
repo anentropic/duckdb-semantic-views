@@ -1,6 +1,7 @@
 mod facts;
 mod fan_trap;
 mod join_resolver;
+mod materialization;
 mod resolution;
 mod role_playing;
 mod semi_additive;
@@ -23,3 +24,5 @@ pub use types::{DimensionName, ExpandError, MetricName, QueryRequest};
 pub(crate) use facts::collect_derived_metric_source_tables;
 #[cfg(feature = "extension")]
 pub(crate) use fan_trap::ancestors_to_root;
+#[cfg(feature = "extension")]
+pub(crate) use materialization::find_routing_materialization_name;

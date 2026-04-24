@@ -106,6 +106,16 @@ html_theme_options = {
                     "url": "how-to/query-facts",
                     "summary": "Query facts directly as row-level columns without aggregation",
                 },
+                {
+                    "title": "Materializations",
+                    "url": "how-to/materializations",
+                    "summary": "Route matching queries to pre-aggregated tables",
+                },
+                {
+                    "title": "YAML Definitions",
+                    "url": "how-to/yaml-definitions",
+                    "summary": "Export and import semantic view definitions as YAML",
+                },
             ],
         },
         {
@@ -122,6 +132,11 @@ html_theme_options = {
                     "url": "explanation/snowflake-comparison",
                     "summary": "Feature comparison with Snowflake SQL DDL semantic views",
                 },
+                {
+                    "title": "Databricks Comparison",
+                    "url": "explanation/databricks-comparison",
+                    "summary": "Feature comparison with Databricks metric views",
+                },
             ],
         },
         {"title": "Reference", "url": "reference/index"},
@@ -136,6 +151,8 @@ templates_path = ["_templates"]
 
 
 def setup(app):
+    from _ext.duckdb_sql_lexer import DuckDBSqlLexer
     from _ext.sqlgrammar_lexer import SqlGrammarLexer
 
     app.add_lexer("sqlgrammar", SqlGrammarLexer)
+    app.add_lexer("duckdb-sql", DuckDBSqlLexer)

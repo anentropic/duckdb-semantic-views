@@ -4,19 +4,25 @@
 //! following the pattern established in `graph/test_helpers.rs`.
 
 use crate::model::{
-    AccessModifier, Dimension, Fact, Join, Metric, NonAdditiveDim, NullsOrder,
+    AccessModifier, Dimension, Fact, Join, Materialization, Metric, NonAdditiveDim, NullsOrder,
     SemanticViewDefinition, SortOrder, TableRef, WindowSpec,
 };
 
 /// Base orders view: single table, 2 dimensions, 2 metrics.
 ///
-/// - base_table: "orders"
+/// - table: "orders" (alias "orders")
 /// - dimensions: region, status
 /// - metrics: total_revenue = sum(amount), order_count = count(*)
 pub(super) fn orders_view() -> SemanticViewDefinition {
     SemanticViewDefinition {
-        base_table: "orders".to_string(),
-        tables: vec![],
+        tables: vec![TableRef {
+            alias: "orders".to_string(),
+            table: "orders".to_string(),
+            pk_columns: vec![],
+            unique_constraints: vec![],
+            comment: None,
+            synonyms: vec![],
+        }],
         dimensions: vec![
             Dimension {
                 name: "region".to_string(),
@@ -63,6 +69,7 @@ pub(super) fn orders_view() -> SemanticViewDefinition {
         ],
         joins: vec![],
         facts: vec![],
+        materializations: vec![],
         column_type_names: vec![],
         column_types_inferred: vec![],
         created_on: None,
@@ -74,19 +81,25 @@ pub(super) fn orders_view() -> SemanticViewDefinition {
 
 /// Minimal single-dim, single-metric view for focused tests.
 ///
-/// - base_table: configurable
+/// - table: configurable (alias = table name)
 /// - dimensions: one with given name/expr
 /// - metrics: one with given name/expr
 pub(super) fn minimal_def(
-    base_table: &str,
+    table: &str,
     dim_name: &str,
     dim_expr: &str,
     metric_name: &str,
     metric_expr: &str,
 ) -> SemanticViewDefinition {
     SemanticViewDefinition {
-        base_table: base_table.to_string(),
-        tables: vec![],
+        tables: vec![TableRef {
+            alias: table.to_string(),
+            table: table.to_string(),
+            pk_columns: vec![],
+            unique_constraints: vec![],
+            comment: None,
+            synonyms: vec![],
+        }],
         dimensions: vec![Dimension {
             name: dim_name.to_string(),
             expr: dim_expr.to_string(),
@@ -109,6 +122,7 @@ pub(super) fn minimal_def(
         }],
         joins: vec![],
         facts: vec![],
+        materializations: vec![],
         column_type_names: vec![],
         column_types_inferred: vec![],
         created_on: None,
@@ -122,7 +136,6 @@ pub(super) fn minimal_def(
 ///
 /// Allows builder-style chaining: `orders_view().with_dimension(...).with_join(...)`
 pub(super) trait TestFixtureExt {
-    fn with_base_table(self, base_table: &str) -> Self;
     fn with_dimension(self, name: &str, expr: &str, source_table: Option<&str>) -> Self;
     fn with_metric(self, name: &str, expr: &str, source_table: Option<&str>) -> Self;
     fn with_join_on(self, table: &str, on: &str) -> Self;
@@ -147,14 +160,16 @@ pub(super) trait TestFixtureExt {
         dims: &[(&str, SortOrder, NullsOrder)],
     ) -> Self;
     fn with_window_spec(self, metric_name: &str, spec: WindowSpec) -> Self;
+    fn with_materialization(
+        self,
+        name: &str,
+        table: &str,
+        dimensions: &[&str],
+        metrics: &[&str],
+    ) -> Self;
 }
 
 impl TestFixtureExt for SemanticViewDefinition {
-    fn with_base_table(mut self, base_table: &str) -> Self {
-        self.base_table = base_table.to_string();
-        self
-    }
-
     fn with_dimension(mut self, name: &str, expr: &str, source_table: Option<&str>) -> Self {
         self.dimensions.push(Dimension {
             name: name.to_string(),
@@ -306,6 +321,22 @@ impl TestFixtureExt for SemanticViewDefinition {
         if let Some(m) = self.metrics.iter_mut().find(|m| m.name == metric_name) {
             m.window_spec = Some(spec);
         }
+        self
+    }
+
+    fn with_materialization(
+        mut self,
+        name: &str,
+        table: &str,
+        dimensions: &[&str],
+        metrics: &[&str],
+    ) -> Self {
+        self.materializations.push(Materialization {
+            name: name.to_string(),
+            table: table.to_string(),
+            dimensions: dimensions.iter().map(|s| s.to_string()).collect(),
+            metrics: metrics.iter().map(|s| s.to_string()).collect(),
+        });
         self
     }
 }

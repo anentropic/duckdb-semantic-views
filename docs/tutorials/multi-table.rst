@@ -262,8 +262,8 @@ You now know how to:
 - Use SQL expressions (like ``date_trunc()``) as dimension definitions
 - Update a semantic view with ``CREATE OR REPLACE SEMANTIC VIEW``
 
-Next, explore advanced features in the how-to guides:
+Next, learn how to build a complete model with facts and derived metrics in the :ref:`tutorial-building-model` tutorial. Or explore specific features in the how-to guides:
 
-- :ref:`howto-facts`, reusable row-level expressions
-- :ref:`howto-derived-metrics`, metric-on-metric composition
-- :ref:`howto-role-playing`, same table joined via multiple relationships
+- :ref:`howto-facts` -- reusable row-level expressions
+- :ref:`howto-derived-metrics` -- metric-on-metric composition
+- :ref:`howto-role-playing` -- same table joined via multiple relationships

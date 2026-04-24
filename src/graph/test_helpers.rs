@@ -12,10 +12,6 @@ pub(super) fn make_def(
     metrics: Vec<(&str, Option<&str>)>,
 ) -> SemanticViewDefinition {
     SemanticViewDefinition {
-        base_table: tables
-            .first()
-            .map(|(_, t, _)| t.to_string())
-            .unwrap_or_default(),
         tables: tables
             .iter()
             .map(|(alias, table, pks)| TableRef {
@@ -63,6 +59,7 @@ pub(super) fn make_def(
             })
             .collect(),
         facts: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],
@@ -79,10 +76,6 @@ pub(super) fn make_def_with_facts(
     facts: Vec<(&str, &str, &str)>,
 ) -> SemanticViewDefinition {
     SemanticViewDefinition {
-        base_table: tables
-            .first()
-            .map(|(_, t)| t.to_string())
-            .unwrap_or_default(),
         tables: tables
             .iter()
             .map(|(alias, table)| TableRef {
@@ -109,6 +102,7 @@ pub(super) fn make_def_with_facts(
         dimensions: vec![],
         metrics: vec![],
         joins: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],
@@ -154,7 +148,6 @@ pub(super) fn make_def_with_derived_metrics(
         });
     }
     SemanticViewDefinition {
-        base_table: "orders".to_string(),
         tables: vec![TableRef {
             alias: "o".to_string(),
             table: "orders".to_string(),
@@ -167,6 +160,7 @@ pub(super) fn make_def_with_derived_metrics(
         dimensions: vec![],
         joins: vec![],
         facts: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],
@@ -184,10 +178,6 @@ pub(super) fn make_def_with_named_joins(
     metrics: Vec<(&str, Option<&str>, Vec<&str>)>,     // (name, source, using_rels)
 ) -> SemanticViewDefinition {
     SemanticViewDefinition {
-        base_table: tables
-            .first()
-            .map(|(_, t, _)| t.to_string())
-            .unwrap_or_default(),
         tables: tables
             .iter()
             .map(|(alias, table, pks)| TableRef {
@@ -226,6 +216,7 @@ pub(super) fn make_def_with_named_joins(
             })
             .collect(),
         facts: vec![],
+        materializations: vec![],
 
         column_type_names: vec![],
         column_types_inferred: vec![],

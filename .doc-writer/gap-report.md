@@ -1,41 +1,52 @@
-# Gap Report
+# Gap Detection Report
 
-**Generated:** 2026-04-13
+**Generated:** 2026-04-23
 **Source root:** src/
 **Language:** rust
-**Total undocumented symbols:** 0
-**Potentially stale pages:** 7
+**Total exported symbols:** N/A (SQL DDL interface, not Rust library)
+**Undocumented symbols:** 0
 
-## Undocumented Symbols
+## SQL Interface Coverage
 
-All v0.6.0 features (phases 43-48) now have dedicated doc pages:
+All user-facing SQL statements and functions have dedicated reference pages:
 
-- Metadata annotations -> `docs/how-to/metadata-annotations.rst` (new)
-- SHOW COLUMNS -> `docs/reference/show-columns-semantic-view.rst` (new)
-- GET_DDL -> `docs/reference/get-ddl.rst` (new)
-- Wildcard selection -> `docs/how-to/wildcard-selection.rst` (new)
-- Queryable facts -> `docs/how-to/query-facts.rst` (new)
-- Semi-additive metrics -> `docs/how-to/semi-additive-metrics.rst` (new)
-- Window function metrics -> `docs/how-to/window-metrics.rst` (new)
+| SQL Statement / Function | Reference Page | Status |
+|--------------------------|----------------|--------|
+| `CREATE SEMANTIC VIEW` | `reference/create-semantic-view.rst` | Documented |
+| `ALTER SEMANTIC VIEW` | `reference/alter-semantic-view.rst` | Documented |
+| `DROP SEMANTIC VIEW` | `reference/drop-semantic-view.rst` | Documented |
+| `DESCRIBE SEMANTIC VIEW` | `reference/describe-semantic-view.rst` | Documented |
+| `SHOW SEMANTIC VIEWS` | `reference/show-semantic-views.rst` | Documented |
+| `SHOW SEMANTIC DIMENSIONS` | `reference/show-semantic-dimensions.rst` | Documented |
+| `SHOW SEMANTIC METRICS` | `reference/show-semantic-metrics.rst` | Documented |
+| `SHOW SEMANTIC FACTS` | `reference/show-semantic-facts.rst` | Documented |
+| `SHOW SEMANTIC MATERIALIZATIONS` | `reference/show-semantic-materializations.rst` | Documented |
+| `SHOW SEMANTIC DIMENSIONS FOR METRIC` | `reference/show-semantic-dimensions-for-metric.rst` | Documented |
+| `SHOW COLUMNS IN SEMANTIC VIEW` | `reference/show-columns-semantic-view.rst` | Documented |
+| `GET_DDL('SEMANTIC_VIEW', ...)` | `reference/get-ddl.rst` | Documented |
+| `READ_YAML_FROM_SEMANTIC_VIEW()` | `reference/read-yaml-from-semantic-view.rst` | Documented |
+| `semantic_view()` | `reference/semantic-view-function.rst` | Documented |
+| `explain_semantic_view()` | `reference/explain-semantic-view-function.rst` | Documented |
+| `FROM YAML` / `FROM YAML FILE` | `reference/create-semantic-view.rst` | Documented |
+| YAML format specification | `reference/yaml-format.rst` | Documented (new) |
 
-Reference pages (create-semantic-view, alter-semantic-view, semantic-view-function, show-semantic-views, show-semantic-dimensions, show-semantic-metrics, show-semantic-facts, show-semantic-dimensions-for-metric, describe-semantic-view, error-messages, snowflake-comparison) have been updated in working tree.
+## How-To Coverage
 
-No exported user-facing features remain undocumented at the page level.
-
-## Potentially Stale Pages
-
-7 doc pages have known content gaps where the page text does not match current source code behavior:
-
-- `docs/how-to/window-metrics.rst` (new, untracked) — only documents `PARTITION BY EXCLUDING`; plain `PARTITION BY <dim>` is fully implemented (body_parser.rs:1571, expand/window.rs:247) but not mentioned anywhere in the page. The "PARTITION BY EXCLUDING" section heading and all examples exclusively use EXCLUDING. Semantic difference: EXCLUDING is dynamic (all queried dims minus excluded), PARTITION BY is explicit (exact dims listed).
-- `docs/reference/create-semantic-view.rst` (modified) — syntax diagram line 59 shows only `PARTITION BY EXCLUDING`; missing `PARTITION BY <dim_name> [, ...]` variant. The description at line 293 only explains EXCLUDING semantics.
-- `docs/reference/describe-semantic-view.rst` (modified) — verify window_spec display includes PARTITION BY (non-excluding) format in describe output
-- `docs/reference/show-semantic-dimensions-for-metric.rst` (modified) — verify "required" column description covers PARTITION BY dims (not just EXCLUDING and ORDER BY)
-- `docs/reference/error-messages.rst` (modified) — verify window metric required dimension error covers PARTITION BY reason string (code uses "PARTITION BY" as reason at expand/window.rs:75)
-- `docs/explanation/snowflake-comparison.rst` (modified) — verify window metrics comparison mentions both partitioning modes
-- `docs/how-to/facts.rst` (modified, 2026-03-27) — source last modified 2026-04-12; coarse staleness signal, verify content matches current fact query behavior
+| Feature | How-To Page | Status |
+|---------|-------------|--------|
+| FACTS | `how-to/facts.rst` | Documented |
+| Derived metrics | `how-to/derived-metrics.rst` | Documented |
+| Role-playing dimensions | `how-to/role-playing-dimensions.rst` | Documented |
+| Fan traps | `how-to/fan-traps.rst` | Documented |
+| Data sources | `how-to/data-sources.rst` | Documented |
+| Metadata annotations | `how-to/metadata-annotations.rst` | Documented |
+| Semi-additive metrics | `how-to/semi-additive-metrics.rst` | Documented |
+| Window metrics | `how-to/window-metrics.rst` | Documented |
+| Wildcard selection | `how-to/wildcard-selection.rst` | Documented |
+| Query facts | `how-to/query-facts.rst` | Documented |
+| Materializations | `how-to/materializations.rst` | Documented |
+| YAML definitions | `how-to/yaml-definitions.rst` | Documented |
 
 ## Note
 
-The scanner output includes internal Rust structs (VTab bindings, graph validators, etc.).
-These are implementation details. Since `api_reference: "manual"` is set, they are excluded
-from gap tracking. The substantive gap is content accuracy within existing pages, not missing pages.
+The standard Rust export scanner is not applicable for this project type. Coverage is assessed against the SQL DDL interface. All v0.7.0 features (materializations, YAML definitions, YAML format reference) now have dedicated documentation pages. Previous gap report (2026-04-21) flagged 4 undocumented symbols — all are now covered.

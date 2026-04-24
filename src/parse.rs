@@ -39,6 +39,7 @@ pub enum DdlKind {
     ShowDimensions,
     ShowMetrics,
     ShowFacts,
+    ShowMaterializations,
 }
 
 /// Match a fixed sequence of keyword tokens at the start of `input`, tolerating
@@ -153,6 +154,10 @@ fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
     if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"facts"]) {
         return Some((DdlKind::ShowFacts, n));
     }
+    // SHOW SEMANTIC MATERIALIZATIONS (3 keywords) -- before SHOW SEMANTIC VIEWS
+    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"materializations"]) {
+        return Some((DdlKind::ShowMaterializations, n));
+    }
     // SHOW SEMANTIC VIEWS (3 keywords)
     if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"views"]) {
         return Some((DdlKind::Show, n));
@@ -232,6 +237,7 @@ fn function_name(kind: DdlKind) -> &'static str {
         DdlKind::ShowDimensions => "show_semantic_dimensions",
         DdlKind::ShowMetrics => "show_semantic_metrics",
         DdlKind::ShowFacts => "show_semantic_facts",
+        DdlKind::ShowMaterializations => "show_semantic_materializations",
     }
 }
 
@@ -602,7 +608,8 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
         | DdlKind::ShowTerse
         | DdlKind::ShowDimensions
         | DdlKind::ShowMetrics
-        | DdlKind::ShowFacts => {
+        | DdlKind::ShowFacts
+        | DdlKind::ShowMaterializations => {
             let after_prefix = trimmed[plen..].trim();
             let clauses = parse_show_filter_clauses(after_prefix, kind)?;
 
@@ -629,6 +636,7 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
                     DdlKind::ShowDimensions => "show_semantic_dimensions_all",
                     DdlKind::ShowMetrics => "show_semantic_metrics_all",
                     DdlKind::ShowFacts => "show_semantic_facts_all",
+                    DdlKind::ShowMaterializations => "show_semantic_materializations_all",
                     _ => unreachable!(),
                 };
                 format!("SELECT * FROM {all_fn}()")
@@ -692,7 +700,10 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
             Ok(Some(name))
         }
         DdlKind::Show | DdlKind::ShowTerse => Ok(None),
-        DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
+        DdlKind::ShowDimensions
+        | DdlKind::ShowMetrics
+        | DdlKind::ShowFacts
+        | DdlKind::ShowMaterializations => {
             let after_prefix = trimmed[plen..].trim();
             if after_prefix.is_empty() {
                 return Ok(None); // Cross-view form, no specific name
@@ -752,6 +763,7 @@ const DDL_PREFIXES: &[&str] = &[
     "show semantic dimensions for metric",
     "show semantic metrics",
     "show semantic facts",
+    "show semantic materializations",
 ];
 
 /// Detect near-miss DDL prefixes using fuzzy matching.
@@ -858,13 +870,14 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
                 position: Some(trim_offset + plen),
             })
         }
-        // SHOW SEMANTIC DIMENSIONS/METRICS/FACTS: optional IN view_name
-        DdlKind::ShowDimensions | DdlKind::ShowMetrics | DdlKind::ShowFacts => {
-            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
-                message: e,
-                position: Some(trim_offset + plen),
-            })
-        }
+        // SHOW SEMANTIC DIMENSIONS/METRICS/FACTS/MATERIALIZATIONS: optional IN view_name
+        DdlKind::ShowDimensions
+        | DdlKind::ShowMetrics
+        | DdlKind::ShowFacts
+        | DdlKind::ShowMaterializations => rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+            message: e,
+            position: Some(trim_offset + plen),
+        }),
         // ALTER forms: validate sub-operation (RENAME TO, SET COMMENT, UNSET COMMENT)
         DdlKind::Alter | DdlKind::AlterIfExists => {
             validate_alter(trimmed_no_semi, trim_offset, plen)?;
@@ -1052,10 +1065,38 @@ fn validate_create_body(
     }
     // --- End AS keyword body path ---
 
-    // Non-AS-body syntax rejected -- AS keyword required after view name.
+    // --- FROM YAML body path (Phase 52 + Phase 53) ---
+    let is_yaml_body = after_name_trimmed
+        .get(..9)
+        .is_some_and(|s| s.eq_ignore_ascii_case("FROM YAML"))
+        && (after_name_trimmed.len() == 9
+            || after_name_trimmed.as_bytes()[9].is_ascii_whitespace());
+    if is_yaml_body {
+        let yaml_text = after_name_trimmed[9..].trim_start();
+
+        // Phase 53: FROM YAML FILE '/path' sub-branch
+        let is_file = yaml_text
+            .get(..4)
+            .is_some_and(|s| s.eq_ignore_ascii_case("FILE"))
+            && (yaml_text.len() == 4 || yaml_text.as_bytes()[4].is_ascii_whitespace());
+        if is_file {
+            let file_text = yaml_text[4..].trim_start();
+            return rewrite_ddl_yaml_file_body(kind, name, file_text, view_comment);
+        }
+
+        // Phase 52: FROM YAML $$...$$ inline sub-branch (existing)
+        return rewrite_ddl_yaml_body(kind, name, yaml_text, view_comment);
+    }
+    // --- End FROM YAML body path ---
+
+    // Non-AS/FROM-YAML syntax rejected -- AS keyword or FROM YAML required after view name.
     let pos_in_trimmed = plen + (trimmed_no_semi.len() - plen - after_prefix.len()) + name_end;
     Err(ParseError {
-        message: "Expected 'AS' keyword after view name. Use: CREATE SEMANTIC VIEW name AS TABLES (...) DIMENSIONS (...) METRICS (...)".to_string(),
+        message: "Expected 'AS' or 'FROM YAML' after view name. Use: CREATE SEMANTIC VIEW name \
+                  AS TABLES (...) DIMENSIONS (...) METRICS (...) or: CREATE SEMANTIC VIEW name \
+                  FROM YAML $$ ... $$ or: CREATE SEMANTIC VIEW name FROM YAML FILE \
+                  '/path/to/file.yaml'"
+            .to_string(),
         position: Some(trim_offset + pos_in_trimmed),
     })
 }
@@ -1079,20 +1120,13 @@ fn rewrite_ddl_keyword_body(
     infer_cardinality(&keyword_body.tables, &mut keyword_body.relationships)?;
 
     // 2. Construct SemanticViewDefinition from KeywordBody
-    //    base_table = first table's physical table name (backward compat)
-    let base_table = keyword_body
-        .tables
-        .first()
-        .map(|t| t.table.clone())
-        .unwrap_or_default();
-
     let def = crate::model::SemanticViewDefinition {
-        base_table,
         tables: keyword_body.tables,
         dimensions: keyword_body.dimensions,
         metrics: keyword_body.metrics,
         joins: keyword_body.relationships,
         facts: keyword_body.facts,
+        materializations: keyword_body.materializations,
         column_type_names: vec![],
         column_types_inferred: vec![],
         created_on: None,
@@ -1119,6 +1153,173 @@ fn rewrite_ddl_keyword_body(
         _ => unreachable!("rewrite_ddl_keyword_body only called for CREATE forms"),
     };
 
+    Ok(Some(format!(
+        "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 53: Single-quoted file path extraction and YAML FILE sentinel
+// ---------------------------------------------------------------------------
+
+/// Extract a single-quoted string literal from the input.
+///
+/// Returns `(unescaped_content, bytes_consumed)` on success.
+/// Handles SQL-standard escaped single quotes (`''` -> `'`).
+fn extract_single_quoted(input: &str) -> Result<(String, usize), ParseError> {
+    if !input.starts_with('\'') {
+        return Err(ParseError {
+            message: "Expected single-quoted file path after FILE keyword. \
+                      Use: FROM YAML FILE '/path/to/file.yaml'"
+                .to_string(),
+            position: None,
+        });
+    }
+    let mut result = String::new();
+    let mut i = 1; // skip opening quote
+    let bytes = input.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                result.push('\'');
+                i += 2;
+            } else {
+                return Ok((result, i + 1));
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    Err(ParseError {
+        message: "Unterminated file path string (missing closing single quote)".to_string(),
+        position: None,
+    })
+}
+
+/// Generate a sentinel string for C++ shim to intercept and read the file.
+///
+/// Sentinel format: `__SV_YAML_FILE__<path>\x01<kind>\x01<name>\x01<comment>`
+/// Uses `\x01` (SOH) as field separator instead of `\x00` (NUL) because the
+/// sentinel is passed through C string APIs that treat NUL as a terminator.
+/// The C++ shim reads the file via `read_text()`, reconstructs as inline YAML,
+/// and re-invokes `sv_rewrite_ddl_rust`.
+fn rewrite_ddl_yaml_file_body(
+    kind: DdlKind,
+    name: &str,
+    file_text: &str,
+    view_comment: Option<String>,
+) -> Result<Option<String>, ParseError> {
+    let (file_path, consumed) = extract_single_quoted(file_text)?;
+
+    let trailing = file_text[consumed..].trim();
+    if !trailing.is_empty() {
+        return Err(ParseError {
+            message: format!("Unexpected content after file path: '{trailing}'"),
+            position: None,
+        });
+    }
+
+    if file_path.is_empty() {
+        return Err(ParseError {
+            message: "File path cannot be empty. \
+                      Use: FROM YAML FILE '/path/to/file.yaml'"
+                .to_string(),
+            position: None,
+        });
+    }
+
+    let kind_num = match kind {
+        DdlKind::Create => 0,
+        DdlKind::CreateOrReplace => 1,
+        DdlKind::CreateIfNotExists => 2,
+        _ => unreachable!("rewrite_ddl_yaml_file_body only called for CREATE forms"),
+    };
+    let comment = view_comment.unwrap_or_default();
+    Ok(Some(format!(
+        "__SV_YAML_FILE__{file_path}\x01{kind_num}\x01{name}\x01{comment}"
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 52: Dollar-quote extraction and YAML DDL rewrite
+// ---------------------------------------------------------------------------
+
+/// Extract content from a dollar-quoted string (`$$...$$` or `$tag$...$tag$`).
+///
+/// Returns `(content, bytes_consumed)` where `bytes_consumed` includes both
+/// opening and closing delimiters. The content does NOT include the delimiters.
+fn extract_dollar_quoted(input: &str) -> Result<(String, usize), ParseError> {
+    if !input.starts_with('$') {
+        return Err(ParseError {
+            message: "Expected '$' to begin dollar-quoted string".to_string(),
+            position: None,
+        });
+    }
+    let tag_end = input[1..].find('$').ok_or_else(|| ParseError {
+        message: "Unterminated dollar-quote opening delimiter".to_string(),
+        position: None,
+    })? + 2;
+    let delimiter = &input[..tag_end];
+    let content_start = tag_end;
+    let close_pos = input[content_start..]
+        .find(delimiter)
+        .ok_or_else(|| ParseError {
+            message: format!("Unterminated dollar-quoted string (expected closing '{delimiter}')"),
+            position: None,
+        })?;
+    let content = &input[content_start..content_start + close_pos];
+    let total = content_start + close_pos + delimiter.len();
+    Ok((content.to_string(), total))
+}
+
+/// Rewrite a FROM YAML dollar-quoted DDL statement to a JSON-parameterized function call.
+///
+/// Called when `validate_create_body` detects the `FROM YAML` keyword path.
+/// Extracts dollar-quoted YAML, deserializes via `from_yaml_with_size_cap()`,
+/// serializes to JSON, and embeds in a `SELECT * FROM create_semantic_view_from_json('name', 'json')` call.
+fn rewrite_ddl_yaml_body(
+    kind: DdlKind,
+    name: &str,
+    yaml_text: &str,
+    view_comment: Option<String>,
+) -> Result<Option<String>, ParseError> {
+    let (yaml_content, consumed) = extract_dollar_quoted(yaml_text)?;
+
+    let trailing = yaml_text[consumed..].trim();
+    if !trailing.is_empty() {
+        return Err(ParseError {
+            message: format!("Unexpected content after closing dollar-quote: '{trailing}'"),
+            position: None,
+        });
+    }
+
+    let mut def =
+        crate::model::SemanticViewDefinition::from_yaml_with_size_cap(name, &yaml_content)
+            .map_err(|e| ParseError {
+                message: e,
+                position: None,
+            })?;
+
+    if let Some(c) = view_comment {
+        def.comment = Some(c);
+    }
+
+    infer_cardinality(&def.tables, &mut def.joins)?;
+
+    let json = serde_json::to_string(&def).map_err(|e| ParseError {
+        message: format!("Failed to serialize YAML definition: {e}"),
+        position: None,
+    })?;
+
+    let safe_name = name.replace('\'', "''");
+    let safe_json = json.replace('\'', "''");
+    let fn_name = match kind {
+        DdlKind::Create => "create_semantic_view_from_json",
+        DdlKind::CreateOrReplace => "create_or_replace_semantic_view_from_json",
+        DdlKind::CreateIfNotExists => "create_semantic_view_if_not_exists_from_json",
+        _ => unreachable!("rewrite_ddl_yaml_body only called for CREATE forms"),
+    };
     Ok(Some(format!(
         "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
     )))
@@ -1776,8 +1977,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("Expected 'AS' keyword"),
-            "Expected 'Expected 'AS' keyword' error, got: {}",
+            err.message.contains("Expected 'AS' or 'FROM YAML'"),
+            "Expected 'Expected AS or FROM YAML' error, got: {}",
             err.message
         );
     }
@@ -1890,13 +2091,13 @@ mod tests {
 
     #[test]
     fn test_parse_error_position_paren_body_rejected() {
-        // Non-AS-body syntax returns "Expected 'AS' keyword" error with position
+        // Non-AS-body syntax returns "Expected 'AS' or 'FROM YAML'" error with position
         let query = "CREATE SEMANTIC VIEW x (tables := [])";
         let result = validate_and_rewrite(query);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            err.message.contains("Expected 'AS' keyword"),
+            err.message.contains("Expected 'AS' or 'FROM YAML'"),
             "got: {}",
             err.message
         );
@@ -1959,8 +2160,8 @@ mod tests {
             assert!(result.is_err(), "Paren-body must be rejected: {result:?}");
             let err = result.unwrap_err();
             assert!(
-                err.message.contains("Expected 'AS' keyword"),
-                "Expected 'Expected 'AS' keyword' error, got: {}",
+                err.message.contains("Expected 'AS' or 'FROM YAML'"),
+                "Expected 'Expected AS or FROM YAML' error, got: {}",
                 err.message
             );
         }
@@ -2460,6 +2661,62 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Phase 57: SHOW SEMANTIC MATERIALIZATIONS tests (INTR-03)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_show_materializations() {
+        assert_eq!(
+            detect_ddl_kind("SHOW SEMANTIC MATERIALIZATIONS"),
+            Some(DdlKind::ShowMaterializations)
+        );
+    }
+
+    #[test]
+    fn detect_show_materializations_in_view() {
+        assert_eq!(
+            detect_ddl_kind("SHOW SEMANTIC MATERIALIZATIONS IN my_view"),
+            Some(DdlKind::ShowMaterializations)
+        );
+    }
+
+    #[test]
+    fn rewrite_show_materializations_all() {
+        let sql = rewrite_ddl("SHOW SEMANTIC MATERIALIZATIONS").unwrap();
+        assert_eq!(sql, "SELECT * FROM show_semantic_materializations_all()");
+    }
+
+    #[test]
+    fn rewrite_show_materializations_in_view() {
+        let sql = rewrite_ddl("SHOW SEMANTIC MATERIALIZATIONS IN my_view").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM show_semantic_materializations('my_view')"
+        );
+    }
+
+    #[test]
+    fn near_miss_show_materialization() {
+        // "SHOW SEMANTIC MATERIALIZATION" (missing 'S') should suggest the correct prefix
+        let result = detect_near_miss("SHOW SEMANTIC MATERIALIZATION");
+        assert!(result.is_some());
+        let err = result.unwrap();
+        assert!(err.message.contains("Did you mean"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn extract_ddl_name_show_materializations_in() {
+        let result = extract_ddl_name("SHOW SEMANTIC MATERIALIZATIONS IN my_view").unwrap();
+        assert_eq!(result, Some("my_view".to_string()));
+    }
+
+    #[test]
+    fn extract_ddl_name_show_materializations_all() {
+        let result = extract_ddl_name("SHOW SEMANTIC MATERIALIZATIONS").unwrap();
+        assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
     // Phase 43: View-level COMMENT tests
     // -----------------------------------------------------------------------
 
@@ -2641,6 +2898,385 @@ mod tests {
             err.message
                 .contains("RENAME TO, SET COMMENT, UNSET COMMENT"),
             "Error should list supported ops, got: {}",
+            err.message
+        );
+    }
+
+    // ===================================================================
+    // Phase 52: Dollar-quote extraction tests
+    // ===================================================================
+
+    #[test]
+    fn test_extract_dollar_quoted_untagged() {
+        let (content, consumed) = extract_dollar_quoted("$$hello world$$").unwrap();
+        assert_eq!(content, "hello world");
+        assert_eq!(consumed, 15);
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_tagged() {
+        let (content, consumed) = extract_dollar_quoted("$yaml$my content$yaml$").unwrap();
+        assert_eq!(content, "my content");
+        assert_eq!(consumed, 22);
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_empty_content() {
+        let (content, consumed) = extract_dollar_quoted("$$$$").unwrap();
+        assert_eq!(content, "");
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_no_leading_dollar() {
+        let err = extract_dollar_quoted("not a dollar").unwrap_err();
+        assert!(err.message.contains("Expected '$'"));
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_unterminated_opening() {
+        let err = extract_dollar_quoted("$no_close").unwrap_err();
+        assert!(err.message.contains("Unterminated dollar-quote opening"));
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_unterminated_body() {
+        let err = extract_dollar_quoted("$$no closing").unwrap_err();
+        assert!(err.message.contains("Unterminated dollar-quoted string"));
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_inner_dollar() {
+        // First closing $$ wins — content is "has inner "
+        let (content, consumed) = extract_dollar_quoted("$$has inner $$ text$$").unwrap();
+        assert_eq!(content, "has inner ");
+        assert_eq!(consumed, 14);
+    }
+
+    #[test]
+    fn test_extract_dollar_quoted_multiline() {
+        let input = "$$\ntables:\n  - alias: o\n    table: orders\n$$";
+        let (content, _) = extract_dollar_quoted(input).unwrap();
+        assert!(content.contains("tables:"));
+        assert!(content.contains("alias: o"));
+    }
+
+    // ===================================================================
+    // Phase 52: YAML DDL rewrite tests
+    // ===================================================================
+
+    #[test]
+    fn test_yaml_rewrite_basic_create() {
+        let yaml_text = r#"$$
+base_table: orders
+tables:
+  - alias: o
+    table: orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total_amount
+    expr: SUM(o.amount)
+    source_table: o
+$$"#;
+        let result = rewrite_ddl_yaml_body(DdlKind::Create, "test_view", yaml_text, None).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.starts_with("SELECT * FROM create_semantic_view_from_json('test_view',"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_create_or_replace() {
+        let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = rewrite_ddl_yaml_body(DdlKind::CreateOrReplace, "v", yaml_text, None).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("create_or_replace_semantic_view_from_json"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_create_if_not_exists() {
+        let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result =
+            rewrite_ddl_yaml_body(DdlKind::CreateIfNotExists, "v", yaml_text, None).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("create_semantic_view_if_not_exists_from_json"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_trailing_content_rejected() {
+        let yaml_text =
+            "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$ extra stuff";
+        let err = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap_err();
+        assert!(err
+            .message
+            .contains("Unexpected content after closing dollar-quote"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_invalid_yaml() {
+        let yaml_text = "$$\n: : : not valid yaml [[[$$";
+        let err = rewrite_ddl_yaml_body(DdlKind::Create, "bad_view", yaml_text, None).unwrap_err();
+        assert!(err.message.contains("bad_view"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_comment_override() {
+        let yaml_text =
+            "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\ncomment: yaml comment\n$$";
+        let result = rewrite_ddl_yaml_body(
+            DdlKind::Create,
+            "v",
+            yaml_text,
+            Some("ddl comment".to_string()),
+        )
+        .unwrap();
+        let sql = result.unwrap();
+        // DDL comment overrides YAML comment
+        assert!(sql.contains("ddl comment"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_base_table_populated() {
+        let yaml_text = r#"$$
+base_table: ""
+tables:
+  - alias: o
+    table: orders
+    pk_columns: []
+dimensions: []
+metrics: []
+$$"#;
+        let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
+        let sql = result.unwrap();
+        // base_table should be populated from first table entry
+        assert!(sql.contains("orders"));
+    }
+
+    #[test]
+    fn test_yaml_rewrite_tagged_dollar_quote() {
+        let yaml_text = "$yaml$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$yaml$";
+        let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
+        assert!(result.is_some());
+    }
+
+    // ===================================================================
+    // Phase 52: FROM YAML detection in validate_create_body
+    // ===================================================================
+
+    #[test]
+    fn test_from_yaml_detection_via_rewrite_ddl() {
+        let query = r#"CREATE SEMANTIC VIEW yaml_test FROM YAML $$
+base_table: t
+tables: []
+dimensions: []
+metrics: []
+$$"#;
+        let result = validate_and_rewrite(query).unwrap();
+        assert!(result.is_some());
+        let sql = result.unwrap();
+        assert!(sql.contains("create_semantic_view_from_json('yaml_test'"));
+    }
+
+    #[test]
+    fn test_from_yaml_case_insensitive() {
+        let query = "CREATE SEMANTIC VIEW v from yaml $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_from_yaml_mixed_case() {
+        let query = "CREATE SEMANTIC VIEW v From Yaml $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_error_message_mentions_from_yaml() {
+        let query = "CREATE SEMANTIC VIEW v SOMETHING_ELSE";
+        let err = validate_and_rewrite(query).unwrap_err();
+        assert!(
+            err.message.contains("FROM YAML"),
+            "Error should mention FROM YAML: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_create_or_replace_from_yaml() {
+        let query = "CREATE OR REPLACE SEMANTIC VIEW v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("create_or_replace_semantic_view_from_json"));
+    }
+
+    #[test]
+    fn test_create_if_not_exists_from_yaml() {
+        let query = "CREATE SEMANTIC VIEW IF NOT EXISTS v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("create_semantic_view_if_not_exists_from_json"));
+    }
+
+    #[test]
+    fn test_comment_with_from_yaml() {
+        let query = "CREATE SEMANTIC VIEW v COMMENT = 'my comment' FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("my comment"));
+    }
+
+    // ===================================================================
+    // Phase 53: FROM YAML FILE tests
+    // ===================================================================
+
+    #[test]
+    fn test_extract_single_quoted_basic() {
+        let (content, consumed) = extract_single_quoted("'/path/to/file.yaml'").unwrap();
+        assert_eq!(content, "/path/to/file.yaml");
+        assert_eq!(consumed, 20);
+    }
+
+    #[test]
+    fn test_extract_single_quoted_escaped() {
+        // '/file''s.yaml' = ' f i l e ' ' s . y a m l ' = 15 chars
+        let (content, consumed) = extract_single_quoted("'/file''s.yaml'").unwrap();
+        assert_eq!(content, "/file's.yaml");
+        assert_eq!(consumed, 15);
+    }
+
+    #[test]
+    fn test_extract_single_quoted_empty() {
+        let (content, consumed) = extract_single_quoted("''").unwrap();
+        assert_eq!(content, "");
+        assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn test_extract_single_quoted_no_quote() {
+        let err = extract_single_quoted("no quote").unwrap_err();
+        assert!(
+            err.message.contains("Expected single-quoted file path"),
+            "Error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_extract_single_quoted_unterminated() {
+        let err = extract_single_quoted("'unterminated").unwrap_err();
+        assert!(
+            err.message.contains("Unterminated file path string"),
+            "Error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_create() {
+        let result =
+            rewrite_ddl_yaml_file_body(DdlKind::Create, "myview", "'/path/to/def.yaml'", None)
+                .unwrap();
+        let sentinel = result.unwrap();
+        assert!(sentinel.starts_with("__SV_YAML_FILE__"));
+        assert!(sentinel.contains("path/to/def.yaml"));
+        assert!(sentinel.contains("\x010\x01myview\x01"));
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_replace() {
+        let result = rewrite_ddl_yaml_file_body(
+            DdlKind::CreateOrReplace,
+            "v",
+            "'/f.yaml'",
+            Some("a comment".into()),
+        )
+        .unwrap();
+        let sentinel = result.unwrap();
+        assert!(sentinel.contains("\x011\x01v\x01a comment"));
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_if_not_exists() {
+        let result =
+            rewrite_ddl_yaml_file_body(DdlKind::CreateIfNotExists, "v", "'/f.yaml'", None).unwrap();
+        let sentinel = result.unwrap();
+        assert!(sentinel.contains("\x012\x01v\x01"));
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_with_comment() {
+        let result = rewrite_ddl_yaml_file_body(
+            DdlKind::Create,
+            "v",
+            "'/f.yaml'",
+            Some("my comment".into()),
+        )
+        .unwrap();
+        let sentinel = result.unwrap();
+        assert!(sentinel.contains("my comment"));
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_empty_path() {
+        let err = rewrite_ddl_yaml_file_body(DdlKind::Create, "v", "''", None).unwrap_err();
+        assert!(
+            err.message.contains("File path cannot be empty"),
+            "Error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_rewrite_ddl_yaml_file_body_trailing_content() {
+        let err = rewrite_ddl_yaml_file_body(DdlKind::Create, "v", "'/f.yaml' extra stuff", None)
+            .unwrap_err();
+        assert!(
+            err.message.contains("Unexpected content after file path"),
+            "Error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_yaml_file() {
+        let query = "CREATE SEMANTIC VIEW v FROM YAML FILE '/test.yaml'";
+        let result = validate_and_rewrite(query).unwrap();
+        let sentinel = result.unwrap();
+        assert!(
+            sentinel.starts_with("__SV_YAML_FILE__"),
+            "Expected sentinel prefix, got: {}",
+            sentinel
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_yaml_file_case_insensitive() {
+        let query = "CREATE SEMANTIC VIEW v from yaml file '/test.yaml'";
+        let result = validate_and_rewrite(query).unwrap();
+        let sentinel = result.unwrap();
+        assert!(sentinel.starts_with("__SV_YAML_FILE__"));
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_yaml_inline_still_works() {
+        // Regression: FROM YAML $$...$$ still works after FILE branch is added
+        let query = "CREATE SEMANTIC VIEW v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let result = validate_and_rewrite(query).unwrap();
+        let sql = result.unwrap();
+        assert!(sql.contains("create_semantic_view_from_json"));
+    }
+
+    #[test]
+    fn test_error_message_mentions_from_yaml_file() {
+        let query = "CREATE SEMANTIC VIEW v SOMETHING_ELSE";
+        let err = validate_and_rewrite(query).unwrap_err();
+        assert!(
+            err.message.contains("FROM YAML FILE"),
+            "Error should mention FROM YAML FILE: {}",
             err.message
         );
     }

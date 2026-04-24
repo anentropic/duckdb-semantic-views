@@ -153,7 +153,7 @@ pub(super) fn expand_window_metrics(
 
     // CTE FROM clause
     sql.push_str("\n    FROM ");
-    sql.push_str(&quote_table_ref(&def.base_table));
+    sql.push_str(&quote_table_ref(def.base_table()));
     if let Some(base_ref) = def.tables.first() {
         sql.push_str(" AS ");
         sql.push_str(&quote_ident(&base_ref.alias));
@@ -650,7 +650,7 @@ mod tests {
         // Multi-table view: window metric crosses many-to-one boundary.
         // Without fan trap skip, this would error. With skip, it should succeed.
         let def = orders_view()
-            .with_base_table("customers")
+            .with_table("customers", "customers", &[])
             .clear_dimensions()
             .clear_metrics()
             .with_table("c", "customers", &["id"])

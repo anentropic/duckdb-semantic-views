@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A DuckDB extension written in Rust that implements semantic views — a declarative layer for defining measures, dimensions, relationships, facts, and derived metrics directly in DuckDB. Users register semantic views via native `CREATE SEMANTIC VIEW` DDL with SQL keyword clauses (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS), then query them with `FROM semantic_view('view', dimensions := [...], metrics := [...])`. The extension expands semantic view references into concrete SQL (with GROUP BY, JOINs from PK/FK declarations, typed output columns, fan trap detection, role-playing dimension support, semi-additive snapshot aggregation, and window function metrics) and hands the result to DuckDB for execution. Full Snowflake-aligned introspection via SHOW/DESCRIBE commands, SHOW TERSE/COLUMNS, IN SCHEMA/DATABASE scoping, GET_DDL round-trip, and metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC).
+A DuckDB extension written in Rust that implements semantic views — a declarative layer for defining measures, dimensions, relationships, facts, and derived metrics directly in DuckDB. Users register semantic views via native `CREATE SEMANTIC VIEW` DDL with SQL keyword clauses (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS) or via YAML definitions (`FROM YAML $$...$$` / `FROM YAML FILE`), then query them with `FROM semantic_view('view', dimensions := [...], metrics := [...])`. The extension expands semantic view references into concrete SQL (with GROUP BY, JOINs from PK/FK declarations, typed output columns, fan trap detection, role-playing dimension support, semi-additive snapshot aggregation, window function metrics, and transparent materialization routing) and hands the result to DuckDB for execution. Full Snowflake-aligned introspection via SHOW/DESCRIBE commands, SHOW TERSE/COLUMNS, IN SCHEMA/DATABASE scoping, GET_DDL round-trip, YAML export, materialization introspection, and metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC).
 
 The project targets open source release via the DuckDB community extension registry, filling a gap that exists in the ecosystem: Snowflake, Databricks, and Cube.dev all have semantic layers, but DuckDB has none.
 
@@ -90,14 +90,24 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - ✓ Security & correctness hardening: FFI catch_unwind on all 25 entry points, graceful lock-poison handling, cycle detection + MAX_DERIVATION_DEPTH=64 for derived metrics/facts, bounds-checked test helpers — v0.6.0
 - ✓ Code quality: unit tests for join_resolver/fan_trap/facts (38 new tests), resolve_names generic helper, DimensionName/MetricName newtypes with case-insensitive semantics, NaGroup named struct, dead code removal, property-based test assertions — v0.6.0
 
+- ✓ YAML parser core: serde deserialization with size cap, JSON round-trip equivalence, error reporting with line numbers — v0.7.0 (Phase 51)
+- ✓ YAML DDL integration: `CREATE SEMANTIC VIEW name FROM YAML $$ ... $$` with dollar-quote extraction, OR REPLACE/IF NOT EXISTS support, case-insensitive detection — v0.7.0 (Phase 52)
+- ✓ YAML file loading: `CREATE SEMANTIC VIEW name FROM YAML FILE '/path/to/file.yaml'` with two-layer sentinel protocol (Rust detect → C++ read_text()), automatic enable_external_access enforcement, tagged dollar-quoting — v0.7.0 (Phase 53)
+- ✓ MATERIALIZATIONS clause: named materializations in CREATE SEMANTIC VIEW DDL with TABLE/DIMENSIONS/METRICS sub-clauses, define-time validation (dim/metric refs, duplicates, empty materializations), YAML support via serde, backward-compatible persistence, GET_DDL round-trip — v0.7.0 (Phase 54)
+- ✓ Materialization routing engine: transparent query routing to pre-aggregated tables when materializations exactly cover requested dimensions and metrics, with semi-additive/window exclusion and zero-change fallback — v0.7.0 (Phase 55)
+- ✓ YAML export: `READ_YAML_FROM_SEMANTIC_VIEW('name')` scalar function exports stored definitions as clean YAML with internal field stripping, FQN support, and lossless round-trip back through `CREATE SEMANTIC VIEW ... FROM YAML` — v0.7.0 (Phase 56)
+- ✓ Materialization introspection: `explain_semantic_view()` shows materialization routing decision (name or "none"), DESCRIBE includes MATERIALIZATION property rows (TABLE/DIMENSIONS/METRICS), new `SHOW SEMANTIC MATERIALIZATIONS` command (single-view and cross-view forms with LIKE/STARTS WITH/LIMIT filtering) — v0.7.0 (Phase 57)
+
 ### Active
 
-(No active requirements — next milestone not yet defined. Use `/gsd-new-milestone` to start.)
+### Active
+
+(No active requirements — planning next milestone)
 
 ### Out of Scope
 
-- Pre-aggregation / materialization selection — deferred to future milestone
-- YAML definition format — SQL DDL first; YAML is a future path
+- Pre-aggregation / materialization creation — engine only routes to pre-existing tables; creation is out of scope (e.g. via dbt)
+- Re-aggregation routing (subset dimension matching) — correctness risk for non-additive metrics; deferred to v2 with additivity classification
 - Fan trap auto-deduplication — changes query semantics; detection + blocking is the 80/20
 - ASOF / temporal relationships — complex temporal join semantics; standard equi-joins cover 95% of cases
 - Aggregate facts (COUNT in FACTS) — blurs row-level boundary; aggregation belongs in METRICS
@@ -111,10 +121,10 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ## Context
 
-**Shipped v0.6.0** (2026-04-14) — Snowflake SQL DDL Parity: metadata annotations (COMMENT, SYNONYMS, PRIVATE/PUBLIC), ALTER SET/UNSET COMMENT, GET_DDL round-trip, semi-additive metrics (NON ADDITIVE BY with CTE-based snapshot selection), window function metrics (PARTITION BY EXCLUDING), queryable FACTS (row-level mode), wildcard selection (table_alias.*), SHOW TERSE/COLUMNS/IN SCHEMA/DATABASE, FFI catch_unwind on all 25 entry points, DimensionName/MetricName newtypes. 8 phases (43-50), 16 plans, 34 requirements satisfied.
-**Tech stack:** Rust + C++ shim (vendored DuckDB amalgamation via cc crate), duckdb-rs 1.10500.0 (DuckDB 1.5.0), serde_json, strsim, proptest.
-**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns, fan trap detection, role-playing dimension support, semi-additive snapshot aggregation, and window function metrics. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with parameterized prepared statements and single-lock check-and-mutate pattern. Parser hook via C++ shim with `parser_extension_compat.hpp`: `parse_function` fallback detects all DDL forms (CREATE, DROP, ALTER, DESCRIBE, SHOW variants), Rust `DdlKind` enum dispatches rewrite. DDL body parsed by `body_parser.rs` state machine into TableRef/Join/Dimension/Metric/Fact structs with PK/FK/UNIQUE annotations, metadata (COMMENT/SYNONYMS/PRIVATE), and inferred cardinality. `RelationshipGraph` validates tree structure and topologically sorts joins. Expansion generates `FROM base AS alias LEFT JOIN t AS alias ON pk=fk` with qualified column references, fact inlining, derived metric resolution, USING-aware scoped aliases, CTE-based semi-additive/window metric pipelines, and wildcard expansion. Code organized into module directories: `expand/` (7 submodules), `graph/` (5 submodules), with shared `util.rs` and `errors.rs` leaf modules. DimensionName/MetricName newtypes with case-insensitive semantics for query resolution.
-**Codebase:** 25,983 LOC Rust across src/ and tests/. 705 Rust tests + 32 sqllogictest files + 6 DuckLake CI tests + Python crash repro + Python caret tests + 4 fuzz targets.
+**Shipped v0.7.0** (2026-04-24) — YAML Definitions & Materialization Routing: YAML as second definition format (inline `FROM YAML $$...$$`, file-based `FROM YAML FILE`), materialization declarations (MATERIALIZATIONS clause), transparent query routing to pre-aggregated tables, YAML export with lossless round-trip, materialization introspection (EXPLAIN, DESCRIBE, SHOW SEMANTIC MATERIALIZATIONS). 7 phases (51-57), 7 plans, 19 requirements satisfied, 823+ tests.
+**Tech stack:** Rust + C++ shim (vendored DuckDB amalgamation via cc crate), duckdb-rs 1.10500.0 (DuckDB 1.5.2), serde_json, yaml_serde, strsim, proptest.
+**Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns, fan trap detection, role-playing dimension support, semi-additive snapshot aggregation, and window function metrics. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with parameterized prepared statements and single-lock check-and-mutate pattern. Parser hook via C++ shim with `parser_extension_compat.hpp`: `parse_function` fallback detects all DDL forms (CREATE, DROP, ALTER, DESCRIBE, SHOW variants, FROM YAML), Rust `DdlKind` enum dispatches rewrite. DDL body parsed by `body_parser.rs` state machine into TableRef/Join/Dimension/Metric/Fact structs with PK/FK/UNIQUE annotations, metadata (COMMENT/SYNONYMS/PRIVATE), and inferred cardinality. YAML definitions parsed via `from_yaml_with_size_cap` with dollar-quote extraction. `RelationshipGraph` validates tree structure and topologically sorts joins. Expansion generates `FROM base AS alias LEFT JOIN t AS alias ON pk=fk` with qualified column references, fact inlining, derived metric resolution, USING-aware scoped aliases, CTE-based semi-additive/window metric pipelines, and wildcard expansion. Code organized into module directories: `expand/` (7 submodules), `graph/` (5 submodules), with shared `util.rs` and `errors.rs` leaf modules. DimensionName/MetricName newtypes with case-insensitive semantics for query resolution.
+**Codebase:** ~29,300 LOC Rust across src/ and tests/. 823 Rust tests + 36 sqllogictest files + 6 DuckLake CI tests + Python crash repro + Python caret tests + 6 fuzz targets.
 **Known limitations:** See TECH-DEBT.md at repo root for accepted decisions and deferred items.
 
 **Design research:** A detailed design doc lives in `_notes/semantic-views-duckdb-design-doc.md`. It covers prior art (Cube.dev internals, Snowflake semantic views, Databricks metric views), the two-phase architecture (expansion → pre-aggregation selection), and why `egg`/e-graph rewriting is not needed for this approach.
@@ -186,6 +196,8 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 This document evolves at phase transitions and milestone boundaries.
 
+Last updated: 2026-04-24 (v0.7.0 milestone shipped)
+
 **After each phase transition** (via `/gsd:transition`):
 1. Requirements invalidated? → Move to Out of Scope with reason
 2. Requirements validated? → Move to Validated with phase reference
@@ -200,4 +212,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-14 after v0.6.0 milestone — Snowflake SQL DDL Parity.*
+*Last updated: 2026-04-24 after v0.7.0 milestone complete — YAML definitions, materialization routing, YAML export, materialization introspection. 7 phases (51-57), 19 requirements, 823+ tests, 29,300 LOC.*
