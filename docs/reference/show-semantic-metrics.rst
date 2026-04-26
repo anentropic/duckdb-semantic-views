@@ -106,7 +106,7 @@ Returns one row per metric with 8 columns:
      - The metric name as declared in the ``METRICS`` clause.
    * - ``data_type``
      - VARCHAR
-     - Reserved for future use. Currently always an empty string for metrics.
+     - The inferred data type. Empty string if not resolved.
    * - ``synonyms``
      - VARCHAR
      - JSON array of synonym strings (e.g., ``["total_sales","gmv"]``). Empty string if no synonyms are set.
@@ -130,12 +130,12 @@ Given a semantic view ``orders_sv`` with two base metrics:
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬──────────────┬───────────┬──────────┬─────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name         │ data_type │ synonyms │ comment │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼──────────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv            │ orders     │ order_count  │           │          │         │
-   │ memory        │ main        │ orders_sv            │ orders     │ total_amount │           │          │         │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴──────────────┴───────────┴──────────┴─────────┘
+   ┌───────────────┬─────────────┬────────────────────┬────────────┬──────────────┬───────────┬──────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name │ table_name │ name         │ data_type │ synonyms │ comment │
+   ├───────────────┼─────────────┼────────────────────┼────────────┼──────────────┼───────────┼──────────┼─────────┤
+   │ memory        │ main        │ orders_sv          │ orders     │ order_count  │ BIGINT    │          │         │
+   │ memory        │ main        │ orders_sv          │ orders     │ total_amount │ DOUBLE    │          │         │
+   └───────────────┴─────────────┴────────────────────┴────────────┴──────────────┴───────────┴──────────┴─────────┘
 
 **List metrics across all views:**
 
@@ -171,14 +171,14 @@ Derived metrics reference other metrics rather than a specific physical table. T
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬─────────┬───────────┬──────────┬─────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name    │ data_type │ synonyms │ comment │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼─────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ profit_analysis      │ line_items │ cost    │           │          │         │
-   │ memory        │ main        │ profit_analysis      │            │ margin  │           │          │         │
-   │ memory        │ main        │ profit_analysis      │            │ profit  │           │          │         │
-   │ memory        │ main        │ profit_analysis      │ line_items │ revenue │           │          │         │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴─────────┴───────────┴──────────┴─────────┘
+   ┌───────────────┬─────────────┬────────────────────┬────────────┬─────────┬───────────┬──────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name │ table_name │ name    │ data_type │ synonyms │ comment │
+   ├───────────────┼─────────────┼────────────────────┼────────────┼─────────┼───────────┼──────────┼─────────┤
+   │ memory        │ main        │ profit_analysis    │ line_items │ cost    │ DOUBLE    │          │         │
+   │ memory        │ main        │ profit_analysis    │            │ margin  │ DOUBLE    │          │         │
+   │ memory        │ main        │ profit_analysis    │            │ profit  │ DOUBLE    │          │         │
+   │ memory        │ main        │ profit_analysis    │ line_items │ revenue │ DOUBLE    │          │         │
+   └───────────────┴─────────────┴────────────────────┴────────────┴─────────┴───────────┴──────────┴─────────┘
 
 Base metrics (``revenue``, ``cost``) show their physical table name. Derived metrics (``profit``, ``margin``) show an empty ``table_name`` because they reference other metrics rather than a specific table.
 

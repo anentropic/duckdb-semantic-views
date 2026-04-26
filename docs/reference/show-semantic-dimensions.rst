@@ -106,7 +106,7 @@ Returns one row per dimension with 8 columns:
      - The dimension name as declared in the ``DIMENSIONS`` clause.
    * - ``data_type``
      - VARCHAR
-     - Reserved for future use. Currently always an empty string for dimensions.
+     - The inferred data type. Empty string if not resolved.
    * - ``synonyms``
      - VARCHAR
      - JSON array of synonym strings (e.g., ``["territory","sales_region"]``). Empty string if no synonyms are set.
@@ -130,13 +130,13 @@ Given a semantic view ``orders_sv`` with three dimensions:
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬──────────────────────┬────────────────┬───────────────┬───────────┬──────────┬─────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name     │ name          │ data_type │ synonyms │ comment │
-   ├───────────────┼─────────────┼──────────────────────┼────────────────┼───────────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv            │ customers      │ customer_name │           │          │         │
-   │ memory        │ main        │ orders_sv            │ orders         │ order_date    │           │          │         │
-   │ memory        │ main        │ orders_sv            │ customers      │ region        │           │          │         │
-   └───────────────┴─────────────┴──────────────────────┴────────────────┴───────────────┴───────────┴──────────┴─────────┘
+   ┌───────────────┬─────────────┬────────────────────┬────────────┬───────────────┬───────────┬──────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name │ table_name │ name          │ data_type │ synonyms │ comment │
+   ├───────────────┼─────────────┼────────────────────┼────────────┼───────────────┼───────────┼──────────┼─────────┤
+   │ memory        │ main        │ orders_sv          │ customers  │ customer_name │ VARCHAR   │          │         │
+   │ memory        │ main        │ orders_sv          │ orders     │ order_date    │ DATE      │          │         │
+   │ memory        │ main        │ orders_sv          │ customers  │ region        │ VARCHAR   │          │         │
+   └───────────────┴─────────────┴────────────────────┴────────────┴───────────────┴───────────┴──────────┴─────────┘
 
 The ``table_name`` column shows the actual physical table name, not the alias used in the DDL.
 

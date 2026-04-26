@@ -139,8 +139,8 @@ Examples
    ┌────────────┬─────────┬───────────┬──────────┐
    │ table_name │ name    │ data_type │ required │
    ├────────────┼─────────┼───────────┼──────────┤
-   │ sales      │ product │           │ false    │
-   │ sales      │ region  │           │ false    │
+   │ sales      │ product │ VARCHAR   │ false    │
+   │ sales      │ region  │ VARCHAR   │ false    │
    └────────────┴─────────┴───────────┴──────────┘
 
 With a single table, there are no joins, so every dimension is safe for every metric.
@@ -182,8 +182,8 @@ For ``order_total`` (source table: ``orders``), the path to ``customers`` is man
    ┌────────────┬──────────────────┬───────────┬──────────┐
    │ table_name │ name             │ data_type │ required │
    ├────────────┼──────────────────┼───────────┼──────────┤
-   │ customers  │ customer_country │           │ false    │
-   │ customers  │ customer_name    │           │ false    │
+   │ customers  │ customer_country │ VARCHAR   │ false    │
+   │ customers  │ customer_name    │ VARCHAR   │ false    │
    └────────────┴──────────────────┴───────────┴──────────┘
 
 For ``line_item_sum`` (source table: ``line_items``), the path from ``line_items`` to ``orders`` to ``customers`` is all many-to-one (safe), and ``item_qty`` is on the same table. All three dimensions are included:
@@ -197,9 +197,9 @@ For ``line_item_sum`` (source table: ``line_items``), the path from ``line_items
    ┌────────────┬──────────────────┬───────────┬──────────┐
    │ table_name │ name             │ data_type │ required │
    ├────────────┼──────────────────┼───────────┼──────────┤
-   │ customers  │ customer_country │           │ false    │
-   │ customers  │ customer_name    │           │ false    │
-   │ line_items │ item_qty         │           │ false    │
+   │ customers  │ customer_country │ VARCHAR   │ false    │
+   │ customers  │ customer_name    │ VARCHAR   │ false    │
+   │ line_items │ item_qty         │ INTEGER   │ false    │
    └────────────┴──────────────────┴───────────┴──────────┘
 
 **Window metric with required dimensions:**
@@ -231,9 +231,9 @@ When querying dimensions for a window function metric, the ``required`` column i
    ┌────────────┬────────┬───────────┬──────────┐
    │ table_name │ name   │ data_type │ required │
    ├────────────┼────────┼───────────┼──────────┤
-   │ orders     │ month  │           │ true     │
-   │ orders     │ region │           │ true     │
-   │ orders     │ status │           │ false    │
+   │ orders     │ month  │ VARCHAR   │ true     │
+   │ orders     │ region │ VARCHAR   │ true     │
+   │ orders     │ status │ VARCHAR   │ false    │
    └────────────┴────────┴───────────┴──────────┘
 
 In this example, ``region`` is required because it appears in ``EXCLUDING`` (it defines the partition boundary), and ``month`` is required because it appears in ``ORDER BY`` (it defines the window ordering). The ``status`` dimension is optional -- it can be included in the query but is not referenced by the window specification.
@@ -255,7 +255,7 @@ After fan trap filtering, narrow results further by name pattern:
    ┌────────────┬────────┬───────────┬──────────┐
    │ table_name │ name   │ data_type │ required │
    ├────────────┼────────┼───────────┼──────────┤
-   │ customers  │ region │           │ false    │
+   │ customers  │ region │ VARCHAR   │ false    │
    └────────────┴────────┴───────────┴──────────┘
 
 **Filter safe dimensions with STARTS WITH (case-sensitive):**
@@ -269,7 +269,7 @@ After fan trap filtering, narrow results further by name pattern:
    ┌────────────┬───────────────┬───────────┬──────────┐
    │ table_name │ name          │ data_type │ required │
    ├────────────┼───────────────┼───────────┼──────────┤
-   │ customers  │ customer_name │           │ false    │
+   │ customers  │ customer_name │ VARCHAR   │ false    │
    └────────────┴───────────────┴───────────┴──────────┘
 
 **Limit safe dimensions:**
@@ -283,9 +283,9 @@ After fan trap filtering, narrow results further by name pattern:
    ┌────────────┬───────────────┬───────────┬──────────┐
    │ table_name │ name          │ data_type │ required │
    ├────────────┼───────────────┼───────────┼──────────┤
-   │ customers  │ customer_name │           │ false    │
-   │ customers  │ region        │           │ false    │
-   │ orders     │ order_date    │           │ false    │
+   │ customers  │ customer_name │ VARCHAR   │ false    │
+   │ customers  │ region        │ VARCHAR   │ false    │
+   │ orders     │ order_date    │ DATE      │ false    │
    └────────────┴───────────────┴───────────┴──────────┘
 
 **Derived metrics inherit source tables:**
@@ -315,7 +315,7 @@ After fan trap filtering, narrow results further by name pattern:
    ┌────────────┬───────────────┬───────────┬──────────┐
    │ table_name │ name          │ data_type │ required │
    ├────────────┼───────────────┼───────────┼──────────┤
-   │ customers  │ customer_name │           │ false    │
+   │ customers  │ customer_name │ VARCHAR   │ false    │
    └────────────┴───────────────┴───────────┴──────────┘
 
 The derived metric ``double_total`` depends on ``order_total`` (source: ``orders``). The extension traces this dependency and applies the same reachability rules as if querying ``order_total`` directly.

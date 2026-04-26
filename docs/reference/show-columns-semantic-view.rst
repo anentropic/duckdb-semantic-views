@@ -126,14 +126,14 @@ Examples
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬────────────────────┬─────────────┬───────────┬────────────────┬──────────────────────────┬────────────┐
-   │ database_name │ schema_name │ semantic_view_name │ column_name │ data_type │ kind           │ expression               │ comment    │
-   ├───────────────┼─────────────┼────────────────────┼─────────────┼───────────┼────────────────┼──────────────────────────┼────────────┤
-   │ memory        │ main        │ shop               │ avg_order   │           │ DERIVED_METRIC │ revenue / COUNT(*)       │            │
-   │ memory        │ main        │ shop               │ region      │           │ DIMENSION      │ o.region                 │            │
-   │ memory        │ main        │ shop               │ raw_amount  │           │ FACT           │ o.quantity * o.price     │ Line total │
-   │ memory        │ main        │ shop               │ revenue     │           │ METRIC         │ SUM(o.quantity * o.price)│            │
-   └───────────────┴─────────────┴────────────────────┴─────────────┴───────────┴────────────────┴──────────────────────────┴────────────┘
+   ┌───────────────┬─────────────┬────────────────────┬─────────────┬───────────┬────────────────┬───────────────────────────┬────────────┐
+   │ database_name │ schema_name │ semantic_view_name │ column_name │ data_type │ kind           │ expression                │ comment    │
+   ├───────────────┼─────────────┼────────────────────┼─────────────┼───────────┼────────────────┼───────────────────────────┼────────────┤
+   │ memory        │ main        │ shop               │ avg_order   │ DOUBLE    │ DERIVED_METRIC │ revenue / COUNT(*)        │            │
+   │ memory        │ main        │ shop               │ region      │ VARCHAR   │ DIMENSION      │ o.region                  │            │
+   │ memory        │ main        │ shop               │ raw_amount  │ DOUBLE    │ FACT           │ o.quantity * o.price      │ Line total │
+   │ memory        │ main        │ shop               │ revenue     │ BIGINT    │ METRIC         │ SUM(o.quantity * o.price) │            │
+   └───────────────┴─────────────┴────────────────────┴─────────────┴───────────┴────────────────┴───────────────────────────┴────────────┘
 
 **Error: view does not exist:**
 
