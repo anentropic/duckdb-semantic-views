@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-04-26
+
+### Added
+
+- DDL-time type inference for dimensions and metrics: `data_type` / `DATA_TYPE` columns in SHOW and DESCRIBE output now display inferred types (VARCHAR, BIGINT, DOUBLE, DATE, etc.) instead of empty strings
+- Type inference runs automatically at `CREATE SEMANTIC VIEW` time on file-backed databases via a LIMIT 0 probe query
+- Supported types: VARCHAR, BOOLEAN, integer types (TINYINT through UBIGINT), FLOAT, DOUBLE, DATE, TIME, TIMESTAMP (all variants), INTERVAL, UUID, BLOB, BIT; DECIMAL and parameterized types intentionally left empty to avoid lossy CAST
+- Derived metrics also receive inferred types when resolvable
+- In-memory databases continue to show empty `data_type` (no persist connection available)
+
 ## [0.7.0] - 2026-04-24
 
 ### Added

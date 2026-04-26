@@ -263,10 +263,10 @@ Examples
    │ TABLE       │ orders      │               │ PRIMARY_KEY              │ ["id"]           │
    │ DIMENSION   │ region      │ orders        │ TABLE                    │ orders           │
    │ DIMENSION   │ region      │ orders        │ EXPRESSION               │ o.region         │
-   │ DIMENSION   │ region      │ orders        │ DATA_TYPE                │                  │
+   │ DIMENSION   │ region      │ orders        │ DATA_TYPE                │ VARCHAR          │
    │ METRIC      │ total       │ orders        │ TABLE                    │ orders           │
    │ METRIC      │ total       │ orders        │ EXPRESSION               │ SUM(o.amount)    │
-   │ METRIC      │ total       │ orders        │ DATA_TYPE                │                  │
+   │ METRIC      │ total       │ orders        │ DATA_TYPE                │ BIGINT           │
    │ METRIC      │ total       │ orders        │ ACCESS_MODIFIER          │ PUBLIC           │
    └─────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────┘
 
@@ -276,7 +276,7 @@ Examples
 
    CREATE SEMANTIC VIEW annotated AS
    TABLES (
-       o AS orders PRIMARY KEY (id) COMMENT = 'Order data'
+       o AS orders PRIMARY KEY (id)
    )
    DIMENSIONS (
        o.region AS o.region COMMENT = 'Sales region' WITH SYNONYMS = ('territory')
@@ -302,12 +302,12 @@ Examples
    │ TABLE         │ orders      │               │ COMMENT                  │ Order data           │
    │ DIMENSION     │ region      │ orders        │ TABLE                    │ orders               │
    │ DIMENSION     │ region      │ orders        │ EXPRESSION               │ o.region             │
-   │ DIMENSION     │ region      │ orders        │ DATA_TYPE                │                      │
+   │ DIMENSION     │ region      │ orders        │ DATA_TYPE                │ VARCHAR              │
    │ DIMENSION     │ region      │ orders        │ COMMENT                  │ Sales region         │
    │ DIMENSION     │ region      │ orders        │ SYNONYMS                 │ ["territory"]        │
    │ METRIC        │ revenue     │ orders        │ TABLE                    │ orders               │
    │ METRIC        │ revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)        │
-   │ METRIC        │ revenue     │ orders        │ DATA_TYPE                │                      │
+   │ METRIC        │ revenue     │ orders        │ DATA_TYPE                │ DOUBLE               │
    │ METRIC        │ revenue     │ orders        │ COMMENT                  │ Total revenue        │
    │ METRIC        │ revenue     │ orders        │ ACCESS_MODIFIER          │ PUBLIC               │
    └───────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────────┘
@@ -340,13 +340,13 @@ Examples
 
 .. code-block:: text
 
-   ┌─────────────────┬────────────┬───────────────┬────────────┬──────────────────────────────┐
-   │ object_kind     │ object_name│ parent_entity │ property   │ property_value               │
-   ├─────────────────┼────────────┼───────────────┼────────────┼──────────────────────────────┤
-   │ MATERIALIZATION │ region_agg │               │ TABLE      │ daily_revenue_agg            │
-   │ MATERIALIZATION │ region_agg │               │ DIMENSIONS │ ["region"]                   │
-   │ MATERIALIZATION │ region_agg │               │ METRICS    │ ["revenue","order_count"]    │
-   └─────────────────┴────────────┴───────────────┴────────────┴──────────────────────────────┘
+   ┌─────────────────┬─────────────┬───────────────┬────────────┬──────────────────────────────┐
+   │ object_kind     │ object_name │ parent_entity │ property   │ property_value               │
+   ├─────────────────┼─────────────┼───────────────┼────────────┼──────────────────────────────┤
+   │ MATERIALIZATION │ region_agg  │               │ TABLE      │ daily_revenue_agg            │
+   │ MATERIALIZATION │ region_agg  │               │ DIMENSIONS │ ["region"]                   │
+   │ MATERIALIZATION │ region_agg  │               │ METRICS    │ ["revenue","order_count"]    │
+   └─────────────────┴─────────────┴───────────────┴────────────┴──────────────────────────────┘
 
 .. tip::
 

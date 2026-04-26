@@ -284,6 +284,35 @@ impl VTab for DefineFromJsonVTab {
                             .collect();
                     }
                 }
+
+                // Map inferred types back to dimension/metric output_type fields.
+                if !def.column_type_names.is_empty() {
+                    let type_map: std::collections::HashMap<String, u32> = def
+                        .column_type_names
+                        .iter()
+                        .zip(def.column_types_inferred.iter())
+                        .map(|(name, &tid)| (name.to_ascii_lowercase(), tid))
+                        .collect();
+
+                    for dim in &mut def.dimensions {
+                        if dim.output_type.is_none() {
+                            if let Some(&tid) = type_map.get(&dim.name.to_ascii_lowercase()) {
+                                dim.output_type =
+                                    crate::query::table_function::type_id_to_display_name(tid)
+                                        .map(|s| s.to_string());
+                            }
+                        }
+                    }
+                    for met in &mut def.metrics {
+                        if met.output_type.is_none() {
+                            if let Some(&tid) = type_map.get(&met.name.to_ascii_lowercase()) {
+                                met.output_type =
+                                    crate::query::table_function::type_id_to_display_name(tid)
+                                        .map(|s| s.to_string());
+                            }
+                        }
+                    }
+                }
             }
 
             // Fact type inference: use typeof(expr) to determine fact output types.

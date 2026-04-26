@@ -194,7 +194,7 @@ Facts can reference other facts. Consider a view with two chained facts:
    │ memory        │ main        │ tpch_analysis        │ line_items │ tax_amount │                │          │         │
    └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┴──────────┴─────────┘
 
-``net_price`` has a resolved ``data_type`` because its expression (``li.extended_price * (1 - li.discount)``) uses physical columns. ``tax_amount`` is blank because its expression references another fact (``li.net_price``), which ``typeof`` cannot resolve from a table scan. The extension resolves chained references at query expansion time.
+``net_price`` has an inferred ``data_type`` because its expression (``li.extended_price * (1 - li.discount)``) uses physical columns. ``tax_amount`` is blank because its expression references another fact (``li.net_price``), which ``typeof`` cannot resolve from a table scan. The extension resolves chained references at query expansion time.
 
 **Error: view does not exist:**
 
