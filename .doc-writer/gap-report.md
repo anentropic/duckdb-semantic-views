@@ -1,52 +1,29 @@
-# Gap Detection Report
+# Gap Report
 
-**Generated:** 2026-04-23
+**Generated:** 2026-04-26
 **Source root:** src/
 **Language:** rust
-**Total exported symbols:** N/A (SQL DDL interface, not Rust library)
-**Undocumented symbols:** 0
+**Total undocumented symbols:** 0
+**Potentially stale pages:** 6
 
-## SQL Interface Coverage
+## Undocumented Symbols
 
-All user-facing SQL statements and functions have dedicated reference pages:
+No undocumented user-facing features. All SQL DDL statements, SHOW/DESCRIBE commands, query functions, and features have dedicated reference pages. The Rust `pub` items identified by the export scanner are internal implementation details (vtable structs, bind data types, parser functions) and are not part of the user-facing SQL interface.
 
-| SQL Statement / Function | Reference Page | Status |
-|--------------------------|----------------|--------|
-| `CREATE SEMANTIC VIEW` | `reference/create-semantic-view.rst` | Documented |
-| `ALTER SEMANTIC VIEW` | `reference/alter-semantic-view.rst` | Documented |
-| `DROP SEMANTIC VIEW` | `reference/drop-semantic-view.rst` | Documented |
-| `DESCRIBE SEMANTIC VIEW` | `reference/describe-semantic-view.rst` | Documented |
-| `SHOW SEMANTIC VIEWS` | `reference/show-semantic-views.rst` | Documented |
-| `SHOW SEMANTIC DIMENSIONS` | `reference/show-semantic-dimensions.rst` | Documented |
-| `SHOW SEMANTIC METRICS` | `reference/show-semantic-metrics.rst` | Documented |
-| `SHOW SEMANTIC FACTS` | `reference/show-semantic-facts.rst` | Documented |
-| `SHOW SEMANTIC MATERIALIZATIONS` | `reference/show-semantic-materializations.rst` | Documented |
-| `SHOW SEMANTIC DIMENSIONS FOR METRIC` | `reference/show-semantic-dimensions-for-metric.rst` | Documented |
-| `SHOW COLUMNS IN SEMANTIC VIEW` | `reference/show-columns-semantic-view.rst` | Documented |
-| `GET_DDL('SEMANTIC_VIEW', ...)` | `reference/get-ddl.rst` | Documented |
-| `READ_YAML_FROM_SEMANTIC_VIEW()` | `reference/read-yaml-from-semantic-view.rst` | Documented |
-| `semantic_view()` | `reference/semantic-view-function.rst` | Documented |
-| `explain_semantic_view()` | `reference/explain-semantic-view-function.rst` | Documented |
-| `FROM YAML` / `FROM YAML FILE` | `reference/create-semantic-view.rst` | Documented |
-| YAML format specification | `reference/yaml-format.rst` | Documented (new) |
+Previous gap report (2026-04-23) also found 0 undocumented symbols — no new gaps.
 
-## How-To Coverage
+## Potentially Stale Pages
 
-| Feature | How-To Page | Status |
-|---------|-------------|--------|
-| FACTS | `how-to/facts.rst` | Documented |
-| Derived metrics | `how-to/derived-metrics.rst` | Documented |
-| Role-playing dimensions | `how-to/role-playing-dimensions.rst` | Documented |
-| Fan traps | `how-to/fan-traps.rst` | Documented |
-| Data sources | `how-to/data-sources.rst` | Documented |
-| Metadata annotations | `how-to/metadata-annotations.rst` | Documented |
-| Semi-additive metrics | `how-to/semi-additive-metrics.rst` | Documented |
-| Window metrics | `how-to/window-metrics.rst` | Documented |
-| Wildcard selection | `how-to/wildcard-selection.rst` | Documented |
-| Query facts | `how-to/query-facts.rst` | Documented |
-| Materializations | `how-to/materializations.rst` | Documented |
-| YAML definitions | `how-to/yaml-definitions.rst` | Documented |
+6 doc pages have content that conflicts with the current source code on branch `feat/dim-metric-type-inference`. The branch adds DDL-time type inference for dimensions and metrics (previously only facts had type inference). Specific discrepancies are noted for each page:
 
-## Note
+- `docs/reference/show-semantic-dimensions.rst` (doc: 2026-04-17, source: 2026-04-26) — Line 109 says "Reserved for future use. Currently always an empty string for dimensions." This is now incorrect: type inference populates `data_type` for dimensions at DDL time. Examples show empty `data_type` columns.
+- `docs/reference/show-semantic-metrics.rst` (doc: 2026-04-17, source: 2026-04-26) — Line 109 says "Reserved for future use. Currently always an empty string for metrics." This is now incorrect: type inference populates `data_type` for metrics at DDL time. Examples show empty `data_type` columns.
+- `docs/reference/describe-semantic-view.rst` (doc: 2026-04-24, source: 2026-04-26) — Examples at lines 266, 269, 305, 310 show empty DATA_TYPE for dimensions and metrics. With DDL-time inference, these would show inferred types (e.g., VARCHAR, BIGINT, DOUBLE).
+- `docs/reference/show-columns-semantic-view.rst` (doc: 2026-04-17, source: 2026-04-26) — Examples at lines 132-135 show empty `data_type` for all column kinds. With inference, dimensions and metrics would show inferred types.
+- `docs/reference/show-semantic-dimensions-for-metric.rst` (doc: 2026-04-17, source: 2026-04-26) — Examples show empty `data_type` for dimensions. With inference, types would be populated.
+- `docs/reference/semantic-view-function.rst` (doc: 2026-04-17, source: 2026-04-26) — Line 135 mentions type inference but may need update to clarify that dimension/metric types are now also inferred at define time (not just column output types).
 
-The standard Rust export scanner is not applicable for this project type. Coverage is assessed against the SQL DDL interface. All v0.7.0 features (materializations, YAML definitions, YAML format reference) now have dedicated documentation pages. Previous gap report (2026-04-21) flagged 4 undocumented symbols — all are now covered.
+## Notes
+
+- The timestamp heuristic flags all 40 pages as stale (source modified today on feature branch). The 6 pages listed above are the ones with identified content discrepancies related to the dim/metric type inference feature.
+- 34 remaining pages are timestamp-stale but their content appears current — the source change does not affect their described behavior.
