@@ -3280,4 +3280,146 @@ $$"#;
             err.message
         );
     }
+
+    // ===================================================================
+    // Quick task 260430-vdz: leading-comment skipping
+    //
+    // Failing-test-first: these reference `skip_leading_whitespace_and_comments`
+    // and rely on the helper being applied at five trimming sites. They will
+    // not compile/pass until the fix lands in the next commit.
+    // ===================================================================
+
+    #[test]
+    fn skip_lws_empty() {
+        assert_eq!(skip_leading_whitespace_and_comments(""), 0);
+    }
+
+    #[test]
+    fn skip_lws_only_whitespace() {
+        assert_eq!(skip_leading_whitespace_and_comments("   \n\t"), 5);
+    }
+
+    #[test]
+    fn skip_lws_line_comment() {
+        let q = "-- hi\nCREATE";
+        assert_eq!(&q[skip_leading_whitespace_and_comments(q)..], "CREATE");
+    }
+
+    #[test]
+    fn skip_lws_block_comment() {
+        let q = "/* hi */ CREATE";
+        assert_eq!(&q[skip_leading_whitespace_and_comments(q)..], "CREATE");
+    }
+
+    #[test]
+    fn skip_lws_multiple_comments_and_ws() {
+        let q = "-- a\n  /* b */\n\t-- c\n/*d*/CREATE";
+        assert_eq!(&q[skip_leading_whitespace_and_comments(q)..], "CREATE");
+    }
+
+    #[test]
+    fn skip_lws_block_does_not_nest() {
+        // Outer ends at first */, leaving "trailing */ CREATE"
+        let q = "/* outer /* inner */ trailing */ CREATE";
+        let rest = &q[skip_leading_whitespace_and_comments(q)..];
+        assert!(rest.starts_with("trailing"), "got: {rest:?}");
+    }
+
+    #[test]
+    fn skip_lws_unterminated_block_consumes_to_eof() {
+        let q = "/* never ends";
+        assert_eq!(skip_leading_whitespace_and_comments(q), q.len());
+    }
+
+    #[test]
+    fn skip_lws_no_leading_match() {
+        // No comments and no whitespace -> offset 0
+        assert_eq!(skip_leading_whitespace_and_comments("CREATE"), 0);
+    }
+
+    #[test]
+    fn skip_lws_dash_dash_at_eof() {
+        let q = "-- no newline at end";
+        assert_eq!(skip_leading_whitespace_and_comments(q), q.len());
+    }
+
+    #[test]
+    fn detect_create_with_leading_block_comment() {
+        assert_eq!(
+            detect_semantic_view_ddl("/* hi */ CREATE SEMANTIC VIEW x AS TABLES (t AS t PRIMARY KEY (x)) DIMENSIONS (t.xx AS t.x) METRICS (t.sy AS SUM(t.y))"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn detect_create_with_leading_line_comment() {
+        assert_eq!(
+            detect_semantic_view_ddl("-- hi\nCREATE SEMANTIC VIEW x AS TABLES (t AS t PRIMARY KEY (x)) DIMENSIONS (t.xx AS t.x) METRICS (t.sy AS SUM(t.y))"),
+            PARSE_DETECTED
+        );
+    }
+
+    #[test]
+    fn detect_create_or_replace_with_dbt_style_annotation() {
+        let q = "/* {\"app\": \"dbt\", \"node_id\": \"model.x\"} */ CREATE OR REPLACE SEMANTIC VIEW x AS TABLES (t AS t PRIMARY KEY (x)) DIMENSIONS (t.xx AS t.x) METRICS (t.sy AS SUM(t.y))";
+        assert_eq!(detect_semantic_view_ddl(q), PARSE_DETECTED);
+        let kind = detect_ddl_kind(q);
+        assert_eq!(kind, Some(DdlKind::CreateOrReplace));
+    }
+
+    #[test]
+    fn detect_other_ddl_forms_with_leading_comment() {
+        for q in [
+            "/* x */ DROP SEMANTIC VIEW v",
+            "/* x */ ALTER SEMANTIC VIEW v RENAME TO w",
+            "/* x */ DESCRIBE SEMANTIC VIEW v",
+            "/* x */ SHOW SEMANTIC VIEWS",
+            "/* x */ SHOW SEMANTIC METRICS IN v",
+            "-- annotation\nDROP SEMANTIC VIEW v",
+        ] {
+            assert_eq!(detect_semantic_view_ddl(q), PARSE_DETECTED, "failed: {q}");
+        }
+    }
+
+    #[test]
+    fn comment_only_is_not_semantic_view_ddl() {
+        assert_eq!(
+            detect_semantic_view_ddl("/* just a comment */"),
+            PARSE_NOT_OURS
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("-- just a comment\n"),
+            PARSE_NOT_OURS
+        );
+    }
+
+    #[test]
+    fn validate_and_rewrite_with_leading_comment_succeeds() {
+        let q = "/* annotation */ DROP SEMANTIC VIEW v";
+        let result = validate_and_rewrite(q).expect("should not error");
+        assert!(result.is_some(), "expected DDL detection");
+        let sql = result.unwrap();
+        assert!(sql.contains("drop_semantic_view"), "got: {sql}");
+    }
+
+    #[test]
+    fn extract_ddl_name_with_leading_comment() {
+        assert_eq!(
+            extract_ddl_name("/* annotation */ DROP SEMANTIC VIEW my_view").unwrap(),
+            Some("my_view".to_string())
+        );
+    }
+
+    #[test]
+    fn error_position_accounts_for_leading_comment() {
+        // Missing view name -- error position should point at the offset AFTER
+        // both the comment AND the prefix, in the ORIGINAL query string.
+        let q = "/* hi */ DROP SEMANTIC VIEW";
+        let err = validate_and_rewrite(q).expect_err("should error: missing name");
+        let pos = err.position.expect("position should be set");
+        // Position should be inside the original string (not into the stripped slice).
+        // The prefix "DROP SEMANTIC VIEW" starts at byte 9 (after "/* hi */ ").
+        // After consuming the prefix (18 bytes), we're at byte 27 == query.len().
+        assert_eq!(pos, q.len(), "position should reference original query");
+    }
 }

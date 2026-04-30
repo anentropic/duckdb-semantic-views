@@ -1,0 +1,82 @@
+# Quick task 260430-vdz: parser hook should accept DDL preceded by SQL comments.
+#
+# Before the fix: every statement under the dbt query annotation comment fails
+# with "Parser Error: syntax error at or near \"SEMANTIC\"" because the prefix
+# match anchors at the trimmed start of the query and does not skip /* */ or --.
+#
+# Reported by dbt-duckdb users -- dbt-core unconditionally prepends a query
+# annotation comment of the form `/* {"app": "dbt", "node_id": "model.X"} */`
+# to every statement, which trips the prefix matcher.
+
+require semantic_views
+
+statement ok
+CREATE TABLE t(x INTEGER, y INTEGER);
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20);
+
+# Baseline: plain DDL works
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW sv_plain AS
+TABLES (t AS t PRIMARY KEY (x))
+DIMENSIONS (t.xx AS t.x)
+METRICS (t.sy AS SUM(t.y))
+
+# Baseline: leading whitespace works (current behaviour)
+statement ok
+
+
+   CREATE OR REPLACE SEMANTIC VIEW sv_ws AS
+TABLES (t AS t PRIMARY KEY (x))
+DIMENSIONS (t.xx AS t.x)
+METRICS (t.sy AS SUM(t.y))
+
+# Bug repro #1: leading block comment (the dbt-duckdb case)
+statement ok
+/* {"app": "dbt", "node_id": "model.x"} */ CREATE OR REPLACE SEMANTIC VIEW sv_block AS
+TABLES (t AS t PRIMARY KEY (x))
+DIMENSIONS (t.xx AS t.x)
+METRICS (t.sy AS SUM(t.y))
+
+# Bug repro #2: leading line comment
+statement ok
+-- annotation
+CREATE OR REPLACE SEMANTIC VIEW sv_line AS
+TABLES (t AS t PRIMARY KEY (x))
+DIMENSIONS (t.xx AS t.x)
+METRICS (t.sy AS SUM(t.y))
+
+# Multiple comments + interleaved whitespace
+statement ok
+-- a
+/* b */
+   -- c
+/* d */ CREATE OR REPLACE SEMANTIC VIEW sv_mixed AS
+TABLES (t AS t PRIMARY KEY (x))
+DIMENSIONS (t.xx AS t.x)
+METRICS (t.sy AS SUM(t.y))
+
+# Other DDL forms must also work with leading comments
+statement ok
+/* x */ DESCRIBE SEMANTIC VIEW sv_block
+
+statement ok
+/* x */ SHOW SEMANTIC VIEWS
+
+statement ok
+/* x */ ALTER SEMANTIC VIEW sv_block SET COMMENT = 'hello'
+
+statement ok
+/* x */ DROP SEMANTIC VIEW sv_line
+
+# Comment-only must NOT be classified as semantic-view DDL.
+# (DuckDB will give its own error for the empty/comment-only statement.)
+statement error
+/* nothing */
+----
+
+# Unterminated block comment must NOT panic and must NOT match.
+statement error
+/* unterminated CREATE SEMANTIC VIEW broken AS TABLES (t AS t PRIMARY KEY (x)) DIMENSIONS (t.xx AS t.x) METRICS (t.sy AS SUM(t.y))
+----
