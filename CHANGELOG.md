@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-05-01
+
+### Fixed
+
+- Parser hook now strips leading SQL comments before matching `CREATE / ALTER / DROP / SHOW SEMANTIC VIEW` DDL. Previously, any statement preceded by a `/* ... */` block comment or `-- ... \n` line comment was misclassified as not-our-statement and DuckDB surfaced `Parser Error: syntax error at or near "SEMANTIC"`. This made the extension unusable through dbt-duckdb (which unconditionally prepends a query annotation comment to every statement) and any other tool that prefixes annotations (sqlfluff, BI tools that prepend session/user metadata, etc.). Reported and diagnosed by an external user. Block comments are non-nesting, matching PostgreSQL/DuckDB semantics. Error-position byte offsets are preserved across the consumed comment span, so error carets continue to reference the original query string.
+
 ## [0.7.1] - 2026-04-26
 
 ### Added
