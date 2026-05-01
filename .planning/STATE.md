@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-04-18)
 Phase: 57
 Plan: Not started
 Status: Phase complete — ready for verification
-Last activity: 2026-04-24
+Last activity: 2026-04-30 - Completed quick task 260430-vdz: review bug report semantic_views_parser_comment_bug.md, write failing test to reproduce, then implement fix
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -86,6 +86,7 @@ Recent decisions affecting current work:
 | 260329-frb | Sync DuckDBVersionMonitor | 2026-03-29 | eef265b |
 | 260331-ta2 | Release recipe for CE registry | 2026-03-31 | 0390bab |
 | 260412-v5h | Generate complete CHANGELOG.md | 2026-04-12 | d42d240 |
+| 260430-vdz | Fix parser hook to skip leading SQL comments (-- and /* */) before prefix matching | 2026-04-30 | edf5196 |
 | Phase 51 P01 | 20min | 2 tasks | 6 files |
 | Phase 55 P01 | 18min | 2 tasks | 6 files |
 | Phase 56 P01 | 25min | 2 tasks | 8 files |
