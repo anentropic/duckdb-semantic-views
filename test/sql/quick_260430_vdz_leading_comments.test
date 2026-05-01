@@ -23,10 +23,10 @@ TABLES (t AS t PRIMARY KEY (x))
 DIMENSIONS (t.xx AS t.x)
 METRICS (t.sy AS SUM(t.y))
 
-# Baseline: leading whitespace works (current behaviour)
+# Baseline: leading single-line whitespace works (current behaviour).
+# sqllogictest treats blank lines as block terminators, so this exercises
+# leading spaces only -- multiline whitespace is covered by Rust unit tests.
 statement ok
-
-
    CREATE OR REPLACE SEMANTIC VIEW sv_ws AS
 TABLES (t AS t PRIMARY KEY (x))
 DIMENSIONS (t.xx AS t.x)

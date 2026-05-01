@@ -86,6 +86,56 @@ fn match_keyword_prefix(input: &[u8], keywords: &[&[u8]]) -> Option<usize> {
     Some(pos)
 }
 
+/// Return the byte offset of the first character that is neither ASCII whitespace
+/// nor part of a SQL comment. Recognises:
+///   - `-- ... \n` line comments (terminated by newline or end-of-input)
+///   - `/* ... */` block comments (NOT nested -- matches PostgreSQL/DuckDB behaviour)
+///
+/// Designed for prefix-matching: never errors. An unterminated `/* ...` consumes to
+/// end of input (so the keyword match below it will simply fail and fall through
+/// to `PARSE_NOT_OURS`, matching today's behaviour for malformed queries).
+///
+/// Returns the byte offset where real SQL begins, in the *original* slice. Callers
+/// substitute this for the `query.len() - query.trim_start().len()` whitespace
+/// offset so that v0.5.1 error-caret positions continue to reference the original
+/// query string after a leading comment is consumed.
+///
+/// Quick task 260430-vdz: fixes parser hook compatibility with dbt-duckdb (and
+/// any other tool that prepends a query annotation comment).
+fn skip_leading_whitespace_and_comments(input: &str) -> usize {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    loop {
+        // ASCII whitespace
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // Line comment: -- ... \n
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue; // re-enter loop to consume more whitespace/comments
+        }
+        // Block comment: /* ... */ (non-nesting, Postgres semantics)
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2; // consume "*/"
+            } else {
+                i = bytes.len(); // unterminated -- consume to end
+            }
+            continue;
+        }
+        break;
+    }
+    i
+}
+
 /// Detect the DDL kind and consumed prefix byte count from a query string.
 ///
 /// The input must already be trimmed of leading/trailing whitespace and
@@ -177,7 +227,8 @@ fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
 /// returns, vertical tabs, form feeds) between prefix keywords.
 #[must_use]
 pub fn detect_ddl_kind(query: &str) -> Option<DdlKind> {
-    let trimmed = query.trim().trim_end_matches(';').trim();
+    let lead = skip_leading_whitespace_and_comments(query);
+    let trimmed = query[lead..].trim_end().trim_end_matches(';').trim();
     detect_ddl_prefix(trimmed).map(|(kind, _)| kind)
 }
 
@@ -584,7 +635,8 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
 ///
 /// CREATE forms must go through `validate_and_rewrite` -> `rewrite_ddl_keyword_body`.
 fn rewrite_ddl(query: &str) -> Result<String, String> {
-    let trimmed = query.trim();
+    let lead = skip_leading_whitespace_and_comments(query);
+    let trimmed = query[lead..].trim_end();
     let trimmed = trimmed.trim_end_matches(';').trim();
 
     let (kind, plen) = detect_ddl_prefix(trimmed)
@@ -667,7 +719,8 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
 /// DESCRIBE), and `Ok(None)` for SHOW (no name). Returns `Err` if the query
 /// is not a semantic view DDL statement or is malformed.
 pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
-    let trimmed = query.trim();
+    let lead = skip_leading_whitespace_and_comments(query);
+    let trimmed = query[lead..].trim_end();
     let trimmed = trimmed.trim_end_matches(';').trim();
 
     let (kind, plen) = detect_ddl_prefix(trimmed)
@@ -773,7 +826,8 @@ const DDL_PREFIXES: &[&str] = &[
 /// prefix. Returns `None` if no near-miss is found.
 #[must_use]
 pub fn detect_near_miss(query: &str) -> Option<ParseError> {
-    let trimmed = query.trim();
+    let lead = skip_leading_whitespace_and_comments(query);
+    let trimmed = query[lead..].trim_end();
     let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
     let lower = trimmed_no_semi.to_ascii_lowercase();
 
@@ -801,7 +855,7 @@ pub fn detect_near_miss(query: &str) -> Option<ParseError> {
     }
 
     best.map(|(_, prefix)| {
-        let trim_offset = query.len() - query.trim_start().len();
+        let trim_offset = lead;
         ParseError {
             message: format!(
                 "Unknown statement. Did you mean '{}'?",
@@ -822,9 +876,10 @@ pub fn detect_near_miss(query: &str) -> Option<ParseError> {
 /// - `Ok(None)` -- not a semantic view DDL statement
 /// - `Err(ParseError)` -- validation error with message and optional position
 pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
-    let trimmed = query.trim();
+    let lead = skip_leading_whitespace_and_comments(query);
+    let trimmed = query[lead..].trim_end();
     let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
-    let trim_offset = query.len() - query.trim_start().len();
+    let trim_offset = lead;
 
     let Some((kind, plen)) = detect_ddl_prefix(trimmed_no_semi) else {
         return Ok(None);
