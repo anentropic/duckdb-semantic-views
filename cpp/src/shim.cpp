@@ -49,6 +49,16 @@ extern "C" {
         char *sql_out, size_t sql_out_len,
         char *error_out, size_t error_out_len,
         uint32_t *position_out);
+
+    // Parser-override DDL rewrite: validates DDL and produces *native* SQL
+    // (INSERT / DELETE / UPDATE against semantic_layer._definitions) suitable
+    // for re-parsing through DuckDB's own parser and execution on the caller's
+    // connection. Distinct from sv_rewrite_ddl_rust which targets the internal
+    // table function. Returns 0=success, 1=validation error, 2=not-ours.
+    uint8_t sv_parser_override_rust(
+        const char *query_ptr, size_t query_len,
+        char *sql_out, size_t sql_out_len,
+        char *error_out, size_t error_out_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +344,56 @@ static void sv_ddl_execute(ClientContext &, TableFunctionInput &input,
     state.offset += count;
 }
 
+// ---------------------------------------------------------------------------
+// Parser-override hook: sv_parser_override
+// ---------------------------------------------------------------------------
+// Runs *before* the default parser. Recognized semantic-view DDL is rewritten
+// into native SQL (INSERT / DELETE / UPDATE against semantic_layer._definitions)
+// and re-parsed via DuckDB's own Parser, producing SQLStatement ASTs that DuckDB
+// then plans and executes on the caller's connection — so the writes participate
+// in the caller's transaction (the v0.8.0 fix for ADBC autocommit=false).
+//
+// For non-matching queries, returns DISPLAY_ORIGINAL_ERROR so the dispatcher
+// falls through to the default parser. The legacy sv_parse_stub / sv_plan_function
+// path remains as a defensive fallback for the case where parser_override is
+// disabled (allow_parser_override_extension=DEFAULT) or our override hits an
+// unexpected error — preserving v0.7.x non-transactional behaviour as a safety net.
+static ParserOverrideResult sv_parser_override(
+    ParserExtensionInfo *, const string &query, ParserOptions &) {
+
+    std::string sql_str(65536, '\0');  // 64 KB headroom for large rewritten DDL
+    char error_buf[1024];
+    memset(error_buf, 0, sizeof(error_buf));
+
+    uint8_t rc = sv_parser_override_rust(
+        query.c_str(), query.size(),
+        sql_str.data(), sql_str.size(),
+        error_buf, sizeof(error_buf));
+
+    if (rc == 2) {
+        // Not our query — let DuckDB's default parser handle it.
+        return ParserOverrideResult();
+    }
+
+    if (rc == 1) {
+        // Validation error — propagate the message via DISPLAY_EXTENSION_ERROR.
+        std::runtime_error err(error_buf);
+        return ParserOverrideResult(err);
+    }
+
+    // rc == 0: native SQL produced. Re-parse via DuckDB's Parser. Use
+    // default-constructed ParserOptions so parser_override doesn't recurse
+    // (DEFAULT_OVERRIDE skips parser_override hooks entirely).
+    string native_sql(sql_str.c_str());
+    try {
+        Parser parser;
+        parser.ParseQuery(native_sql);
+        return ParserOverrideResult(std::move(parser.statements));
+    } catch (std::exception &e) {
+        return ParserOverrideResult(e);
+    }
+}
+
 // Plan function: transforms the intercepted CREATE SEMANTIC VIEW statement
 // into a DDL-executing TableFunction. The query text is carried from the
 // parse phase via SemanticViewParseData.
@@ -380,8 +440,16 @@ extern "C" {
             ParserExtension ext;
             ext.parse_function = sv_parse_stub;
             ext.plan_function = sv_plan_function;
+            ext.parser_override = sv_parser_override;
             auto &config = DBConfig::GetConfig(db);
             ParserExtension::Register(config, ext);
+
+            // Enable parser_override dispatch in FALLBACK mode so our hook
+            // runs *before* the default parser for every query, but a miss
+            // (DISPLAY_ORIGINAL_ERROR) cleanly falls through to it. This is
+            // what makes CREATE / DROP / ALTER SEMANTIC VIEW writes participate
+            // in the caller's transaction (v0.8.0).
+            config.SetOption("allow_parser_override_extension", Value("FALLBACK"));
 
             return true;
         } catch (const std::exception &e) {

@@ -17,11 +17,15 @@
 // these declarations still match by:
 //   grep -A 120 'duckdb/parser/parser_extension.hpp' cpp/include/duckdb.cpp
 //
-// NOTE: We intentionally omit the ParserOverrideResult constructors that
-// take vector<unique_ptr<SQLStatement>> and std::exception&, because we
-// never construct ParserOverrideResult objects. The default constructor
-// and the struct layout (type, statements, error fields in order) match
-// duckdb.cpp exactly, which is what matters for ODR compliance.
+// NOTE: ParserOverrideResult constructors are kept in sync with duckdb.cpp;
+// shim.cpp constructs all three forms (default, statements, exception).
+// The struct layout (type, statements, error fields in order) must match
+// duckdb.cpp exactly for ODR compliance.
+//
+// AllowParserOverride enum, full ParserOptions struct, and minimal Parser
+// class declaration are also re-declared here so shim.cpp can re-parse
+// rewritten SQL produced by the parser_override callback. Definitions
+// match duckdb.cpp lines ~23790, ~23800, ~23949.
 
 #pragma once
 
@@ -116,7 +120,22 @@ struct ParserOverrideResult {
 	ErrorData error;
 };
 
-struct ParserOptions;
+//===--------------------------------------------------------------------===//
+// AllowParserOverride
+//===--------------------------------------------------------------------===//
+enum class AllowParserOverride : uint8_t { DEFAULT_OVERRIDE, FALLBACK_OVERRIDE, STRICT_OVERRIDE };
+
+//===--------------------------------------------------------------------===//
+// ParserOptions
+//===--------------------------------------------------------------------===//
+struct ParserOptions {
+	bool preserve_identifier_case = true;
+	bool integer_division = false;
+	idx_t max_expression_depth = 1000;
+	optional_ptr<const ExtensionCallbackManager> extensions;
+	AllowParserOverride parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
+};
+
 typedef ParserOverrideResult (*parser_override_function_t)(ParserExtensionInfo *info, const string &query,
                                                            ParserOptions &options);
 
@@ -149,6 +168,19 @@ class ExtensionCallbackManager {
 public:
 	static ExtensionCallbackManager &Get(DatabaseInstance &db);
 	void Register(ParserExtension extension);
+};
+
+//===--------------------------------------------------------------------===//
+// Parser (minimal — only the surface shim.cpp uses to re-parse rewritten SQL)
+//===--------------------------------------------------------------------===//
+class Parser {
+public:
+	explicit Parser(ParserOptions options = ParserOptions());
+
+	vector<unique_ptr<SQLStatement>> statements;
+
+public:
+	void ParseQuery(const string &query);
 };
 
 } // namespace duckdb

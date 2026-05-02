@@ -1646,6 +1646,224 @@ pub extern "C" fn sv_rewrite_ddl_rust(
     }
 }
 
+// ---------------------------------------------------------------------------
+// v0.8.0: native-SQL rewrite for parser_override (transactional DDL)
+// ---------------------------------------------------------------------------
+//
+// Converts the table-function-call SQL produced by `validate_and_rewrite` into
+// native SQL (INSERT / DELETE / UPDATE against semantic_layer._definitions) so
+// that DuckDB executes it on the caller's connection — making writes participate
+// in the caller's transaction (the v0.8.0 fix for ADBC autocommit=false).
+//
+// The legacy table-function path stays the source of truth for validation and
+// JSON serialization. This function post-processes its output rather than
+// duplicating the rewrite logic. The format coupling is internal — both ends
+// of the conversion live in this file.
+//
+// Currently rewrites these forms; everything else returns Ok(None), causing
+// the parser_override callback to fall through to DuckDB's default parser
+// (and from there the legacy parse_function fallback for non-postgres DDL):
+//
+//   * CREATE / CREATE OR REPLACE / CREATE IF NOT EXISTS  (AS body and inline YAML)
+//
+// Forms NOT yet rewritten (legacy path retains its v0.7.x non-transactional
+// behaviour for these — documented as a v0.8.0 limitation):
+//   * CREATE ... FROM YAML FILE '/path/...'  (sentinel needs C++ file read)
+//   * DROP / DROP IF EXISTS  (need error-on-missing semantics for non-IF-EXISTS form)
+//   * ALTER *  (RENAME needs error-on-missing; SET/UNSET COMMENT needs JSON read+modify+write)
+//   * DESCRIBE / SHOW *  (read-only; transactionality not relevant)
+pub fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, ParseError> {
+    let Some(tf_sql) = validate_and_rewrite(query)? else {
+        return Ok(None);
+    };
+
+    // YAML FILE produces a sentinel string starting with `__SV_YAML_FILE__`,
+    // not a SELECT. Defer to legacy path.
+    if tf_sql.starts_with("__SV_YAML_FILE__") {
+        return Ok(None);
+    }
+
+    let Some(call) = parse_table_function_call(&tf_sql) else {
+        // Not in `SELECT * FROM <fn>(...)` form (e.g. SHOW with WHERE clauses).
+        // Read-only forms — defer to legacy path.
+        return Ok(None);
+    };
+
+    // The args returned by parse_table_function_call retain the SQL escaping
+    // produced by validate_and_rewrite (single quotes doubled). They can be
+    // re-embedded as single-quoted strings without further processing.
+    let args = &call.args;
+    let sql = match call.fn_name.as_str() {
+        "create_semantic_view_from_json" if args.len() == 2 => format!(
+            "INSERT INTO semantic_layer._definitions (name, definition) \
+             VALUES ('{}', '{}') RETURNING name AS view_name",
+            args[0], args[1]
+        ),
+        "create_or_replace_semantic_view_from_json" if args.len() == 2 => format!(
+            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) \
+             VALUES ('{}', '{}') RETURNING name AS view_name",
+            args[0], args[1]
+        ),
+        "create_semantic_view_if_not_exists_from_json" if args.len() == 2 => format!(
+            "INSERT OR IGNORE INTO semantic_layer._definitions (name, definition) \
+             VALUES ('{}', '{}') RETURNING name AS view_name",
+            args[0], args[1]
+        ),
+        // DROP, ALTER, DESCRIBE, SHOW * → defer to legacy path.
+        // DROP without IF EXISTS needs error-on-missing semantics that a plain
+        // DELETE doesn't provide; ALTER SET/UNSET COMMENT needs JSON modification.
+        // Both can be added in a follow-up commit once the error semantics are
+        // worked out (likely via a CTE with error() or a two-step validate+mutate).
+        _ => return Ok(None),
+    };
+
+    Ok(Some(sql))
+}
+
+/// Result of parsing a `SELECT * FROM <fn>('arg1'[, 'arg2'])` SQL string.
+///
+/// `args` retains the original SQL escaping (single quotes doubled), so they
+/// can be substituted back into a new single-quoted SQL string verbatim.
+struct TableFunctionCall {
+    fn_name: String,
+    args: Vec<String>,
+}
+
+/// Parse a `SELECT * FROM <fn_name>('arg1'[, 'arg2'])` SQL string.
+///
+/// Returns `None` for SQL that doesn't match this exact shape (e.g. SHOW forms
+/// with WHERE/LIMIT, or unrecognized prefixes). Handles SQL `''` escaping
+/// inside single-quoted args; preserves the `''` form in the returned strings
+/// so callers can re-embed them in new single-quoted SQL without re-escaping.
+fn parse_table_function_call(sql: &str) -> Option<TableFunctionCall> {
+    const PREFIX: &str = "SELECT * FROM ";
+    let rest = sql.strip_prefix(PREFIX)?;
+
+    // Read the function name up to '('.
+    let paren_pos = rest.find('(')?;
+    let fn_name = rest[..paren_pos].trim().to_string();
+    if fn_name.is_empty() || fn_name.contains(char::is_whitespace) {
+        return None;
+    }
+
+    // Body after the opening paren up to the matching closing paren.
+    // The body is a comma-separated list of single-quoted strings; we walk it
+    // tracking quote state so commas inside strings don't split args.
+    let body = &rest[paren_pos + 1..];
+    let mut args: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut chars = body.char_indices();
+    let mut closing_pos: Option<usize> = None;
+
+    while let Some((i, ch)) = chars.next() {
+        if in_quote {
+            current.push(ch);
+            if ch == '\'' {
+                // Lookahead for `''` doubled-quote escape.
+                let mut peek = body[i + ch.len_utf8()..].chars();
+                if peek.next() == Some('\'') {
+                    // Consume the second '
+                    current.push('\'');
+                    chars.next();
+                } else {
+                    in_quote = false;
+                }
+            }
+        } else {
+            match ch {
+                '\'' => {
+                    in_quote = true;
+                    current.push(ch);
+                }
+                ',' => {
+                    args.push(strip_outer_quotes(current.trim())?.to_string());
+                    current.clear();
+                }
+                ')' => {
+                    closing_pos = Some(i);
+                    break;
+                }
+                c if c.is_whitespace() => {} // ignore between args
+                _ => return None,            // unexpected non-whitespace, non-quote
+            }
+        }
+    }
+
+    let _ = closing_pos?; // must have found a closing paren
+
+    // Push trailing arg if present (handles single-arg and multi-arg cases).
+    let trailing = current.trim();
+    if !trailing.is_empty() {
+        args.push(strip_outer_quotes(trailing)?.to_string());
+    }
+
+    // Anything after the closing paren must be empty or whitespace.
+    let after = &body[closing_pos? + 1..];
+    if !after.trim().is_empty() {
+        return None;
+    }
+
+    Some(TableFunctionCall { fn_name, args })
+}
+
+/// Strip the outer pair of single quotes, leaving doubled-quote escaping intact.
+fn strip_outer_quotes(s: &str) -> Option<&str> {
+    let inner = s.strip_prefix('\'')?.strip_suffix('\'')?;
+    Some(inner)
+}
+
+/// FFI entry point for parser_override. Validates and rewrites recognized
+/// semantic-view DDL into native SQL (INSERT / DELETE / UPDATE against
+/// `semantic_layer._definitions`) suitable for re-parsing through DuckDB's
+/// own parser and execution on the caller's connection.
+///
+/// Return values match the protocol used by sv_parse_stub:
+///   0 = success: native SQL written to `sql_out`
+///   1 = validation error: error written to `error_out`
+///   2 = not ours / not yet handled: caller should defer to default parser
+///       (which falls through to the legacy parse_function fallback path)
+///
+/// # Safety
+///
+/// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
+/// - `sql_out` must point to a writable buffer of `sql_out_len` bytes.
+/// - `error_out` must point to a writable buffer of `error_out_len` bytes.
+#[cfg(feature = "extension")]
+#[no_mangle]
+pub extern "C" fn sv_parser_override_rust(
+    query_ptr: *const u8,
+    query_len: usize,
+    sql_out: *mut u8,
+    sql_out_len: usize,
+    error_out: *mut u8,
+    error_out_len: usize,
+) -> u8 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if query_ptr.is_null() || query_len == 0 {
+            return 2_u8; // not ours
+        }
+        // SAFETY: guaranteed valid UTF-8 by the caller (DuckDB query text).
+        let query = unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(query_ptr, query_len))
+        };
+
+        match rewrite_to_native_sql(query) {
+            Ok(Some(sql)) => {
+                unsafe { write_to_buffer(sql_out, sql_out_len, &sql) };
+                0 // success — native SQL written
+            }
+            Ok(None) => 2, // not ours, or a form we defer to the legacy path
+            Err(err) => {
+                unsafe { write_to_buffer(error_out, error_out_len, &err.message) };
+                1 // validation error
+            }
+        }
+    }));
+
+    result.unwrap_or(2) // on panic: not ours
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
