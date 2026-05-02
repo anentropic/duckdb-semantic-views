@@ -37,19 +37,27 @@ struct SemanticViewParseData : public ParserExtensionParseData {
 // Rust FFI declarations (defined in src/parse.rs)
 // ---------------------------------------------------------------------------
 extern "C" {
-    // DDL rewrite: rewrites DDL to function call SQL (does NOT execute)
-    // Returns 0 on success (SQL written to sql_out), 1 on failure (error in error_out)
+    // DDL rewrite: rewrites DDL to function call SQL (does NOT execute).
+    //
+    // On rc=0: a heap-owned byte buffer pointer + length is written to
+    // *sql_out_ptr / *sql_out_len. The caller takes ownership and MUST
+    // release the buffer via sv_free_buffer once done with it. The buffer
+    // is NOT NUL-terminated — read exactly *sql_out_len bytes.
+    //
+    // On rc=1: error message written to error_out (NUL-terminated, capped at
+    // error_out_len-1 bytes); *sql_out_ptr left untouched (typically null).
     uint8_t sv_rewrite_ddl_rust(
         const char *query_ptr, size_t query_len,
-        char *sql_out, size_t sql_out_len,
+        char **sql_out_ptr, size_t *sql_out_len,
         char *error_out, size_t error_out_len);
 
-    // DDL validation with error reporting: 0=success, 1=error, 2=not-ours
+    // DDL validation with error reporting: 0=success, 1=error, 2=not-ours.
     // On error: error message in error_out, position in *position_out.
     // position_out is set to UINT32_MAX when no position is available.
+    // The validate path discards its rewritten SQL (the parse stub carries
+    // the original query text forward), so no SQL output buffer is needed.
     uint8_t sv_validate_ddl_rust(
         const char *query_ptr, size_t query_len,
-        char *sql_out, size_t sql_out_len,
         char *error_out, size_t error_out_len,
         uint32_t *position_out);
 
@@ -59,6 +67,8 @@ extern "C" {
     // connection. Distinct from sv_rewrite_ddl_rust which targets the internal
     // table function. Returns 0=success, 1=validation error, 2=not-ours.
     //
+    // Same heap-owned out-buffer convention as sv_rewrite_ddl_rust on rc=0.
+    //
     // `db_token` identifies which database's catalog connection to use for
     // existence checks and CREATE-time enrichment. Each extension load is
     // assigned a unique token (see sv_register_parser_hooks) so multi-DB
@@ -67,9 +77,46 @@ extern "C" {
     uint8_t sv_parser_override_rust(
         uint64_t db_token,
         const char *query_ptr, size_t query_len,
-        char *sql_out, size_t sql_out_len,
+        char **sql_out_ptr, size_t *sql_out_len,
         char *error_out, size_t error_out_len);
+
+    // Releases a buffer previously produced by sv_rewrite_ddl_rust or
+    // sv_parser_override_rust. Safe to call with a null pointer (no-op).
+    // ptr/len must be the exact pair the Rust side returned.
+    void sv_free_buffer(char *ptr, size_t len);
 }
+
+// RAII guard for heap-owned buffers returned by the Rust FFI. Ensures the
+// buffer is released even if a downstream call (Parser::ParseQuery,
+// duckdb_query) throws.
+struct SvOwnedBuffer {
+    char *ptr = nullptr;
+    size_t len = 0;
+    SvOwnedBuffer() = default;
+    SvOwnedBuffer(const SvOwnedBuffer &) = delete;
+    SvOwnedBuffer &operator=(const SvOwnedBuffer &) = delete;
+    SvOwnedBuffer(SvOwnedBuffer &&other) noexcept
+        : ptr(other.ptr), len(other.len) {
+        other.ptr = nullptr;
+        other.len = 0;
+    }
+    SvOwnedBuffer &operator=(SvOwnedBuffer &&other) noexcept {
+        if (this != &other) {
+            if (ptr) sv_free_buffer(ptr, len);
+            ptr = other.ptr;
+            len = other.len;
+            other.ptr = nullptr;
+            other.len = 0;
+        }
+        return *this;
+    }
+    ~SvOwnedBuffer() {
+        if (ptr) sv_free_buffer(ptr, len);
+    }
+    string to_string() const {
+        return ptr ? string(ptr, len) : string();
+    }
+};
 
 // Per-extension-load info struct attached to ParserExtension::parser_info.
 // `db_token` selects the right catalog connection on the Rust side; we
@@ -102,7 +149,6 @@ static duckdb_connection sv_ddl_conn = nullptr;
 //   - DISPLAY_ORIGINAL_ERROR: not our statement, let DuckDB show its error
 static ParserExtensionParseResult sv_parse_stub(
     ParserExtensionInfo *, const string &query) {
-    std::string sql_str(16384, '\0');  // 16 KB: validation path, not executed
     char error_buf[1024];
     uint32_t position = UINT32_MAX;
     memset(error_buf, 0, sizeof(error_buf));
@@ -110,7 +156,6 @@ static ParserExtensionParseResult sv_parse_stub(
     uint8_t rc = sv_validate_ddl_rust(
         reinterpret_cast<const char *>(query.c_str()),
         query.size(),
-        sql_str.data(), sql_str.size(),
         error_buf, sizeof(error_buf),
         &position);
 
@@ -169,14 +214,15 @@ static unique_ptr<FunctionData> sv_ddl_bind(
     // The query text is passed as the first (and only) positional parameter
     auto query = StringValue::Get(input.inputs[0]);
 
-    // Step 1: Rewrite DDL to function call SQL via Rust FFI
-    std::string sql_str(65536, '\0');  // 64 KB: execution path needs headroom for large views
+    // Step 1: Rewrite DDL to function call SQL via Rust FFI. Rust hands us
+    // a heap-owned byte buffer (size unbounded — no truncation cap).
+    SvOwnedBuffer sql_buf;
     char error_buf[1024];
     memset(error_buf, 0, sizeof(error_buf));
 
     uint8_t rc = sv_rewrite_ddl_rust(
         query.c_str(), query.size(),
-        sql_str.data(), sql_str.size(),
+        &sql_buf.ptr, &sql_buf.len,
         error_buf, sizeof(error_buf));
 
     if (rc != 0) {
@@ -184,7 +230,7 @@ static unique_ptr<FunctionData> sv_ddl_bind(
     }
 
     // Phase 53: Intercept YAML FILE sentinel and read file before final rewrite
-    string sql(sql_str.c_str());
+    string sql = sql_buf.to_string();
 
     if (sql.rfind("__SV_YAML_FILE__", 0) == 0) {
         // Parse sentinel: __SV_YAML_FILE__<path>\x01<kind>\x01<name>\x01<comment>
@@ -262,21 +308,20 @@ static unique_ptr<FunctionData> sv_ddl_bind(
         }
         reconstructed += " FROM YAML $__sv_file$" + yaml_content + "$__sv_file$";
 
-        // Step 3: Re-invoke Rust rewrite with the inline YAML query
-        // Allocate buffer large enough for potentially large YAML content
-        size_t rewrite_buf_size = std::max(size_t(65536), yaml_content.size() * 2 + 4096);
-        std::string rewrite_sql(rewrite_buf_size, '\0');
+        // Step 3: Re-invoke Rust rewrite with the inline YAML query.
+        // Heap-owned return — no buffer-size heuristic needed.
+        SvOwnedBuffer rewrite_buf;
         memset(error_buf, 0, sizeof(error_buf));
 
         rc = sv_rewrite_ddl_rust(
             reconstructed.c_str(), reconstructed.size(),
-            rewrite_sql.data(), rewrite_sql.size(),
+            &rewrite_buf.ptr, &rewrite_buf.len,
             error_buf, sizeof(error_buf));
 
         if (rc != 0) {
             throw BinderException("Semantic view DDL failed: %s", error_buf);
         }
-        sql = string(rewrite_sql.c_str());
+        sql = rewrite_buf.to_string();
     }
 
     // Step 2: Execute the rewritten SQL on the DDL connection
@@ -382,10 +427,6 @@ static void sv_ddl_execute(ClientContext &, TableFunctionInput &input,
 static ParserOverrideResult sv_parser_override(
     ParserExtensionInfo *info, const string &query, ParserOptions &) {
 
-    std::string sql_str(65536, '\0');  // 64 KB headroom for large rewritten DDL
-    char error_buf[1024];
-    memset(error_buf, 0, sizeof(error_buf));
-
     // Identify which DB's catalog connection this query should use. info is
     // the per-extension-load SemanticViewsParserInfo we attached at registration
     // time; without it we cannot route correctly, so defer to the legacy path.
@@ -394,10 +435,14 @@ static ParserOverrideResult sv_parser_override(
         return ParserOverrideResult();
     }
 
+    SvOwnedBuffer sql_buf;
+    char error_buf[1024];
+    memset(error_buf, 0, sizeof(error_buf));
+
     uint8_t rc = sv_parser_override_rust(
         sv_info->db_token,
         query.c_str(), query.size(),
-        sql_str.data(), sql_str.size(),
+        &sql_buf.ptr, &sql_buf.len,
         error_buf, sizeof(error_buf));
 
     if (rc == 2) {
@@ -413,8 +458,11 @@ static ParserOverrideResult sv_parser_override(
 
     // rc == 0: native SQL produced. Re-parse via DuckDB's Parser. Use
     // default-constructed ParserOptions so parser_override doesn't recurse
-    // (DEFAULT_OVERRIDE skips parser_override hooks entirely).
-    string native_sql(sql_str.c_str());
+    // (DEFAULT_OVERRIDE skips parser_override hooks entirely). The
+    // rewritten SQL is read by exact length, so size is unbounded — the
+    // pre-fix 64 KB cap silently truncated and produced confusing parser
+    // errors for large views.
+    string native_sql = sql_buf.to_string();
     try {
         Parser parser;
         parser.ParseQuery(native_sql);

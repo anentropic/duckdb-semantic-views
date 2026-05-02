@@ -1556,7 +1556,9 @@ pub(crate) fn infer_cardinality(
 /// FFI entry point for DDL validation with error reporting.
 ///
 /// Validates a semantic view DDL statement and returns a tri-state result:
-/// - 0 = success: rewritten SQL written to `sql_out`
+/// - 0 = success: DDL recognised and validated (caller carries the original
+///   query text forward; the rewritten SQL is computed only to surface
+///   validation errors and is discarded)
 /// - 1 = error: error message written to `error_out`, position to `*position_out`
 /// - 2 = not ours: no output written
 ///
@@ -1565,7 +1567,6 @@ pub(crate) fn infer_cardinality(
 /// # Safety
 ///
 /// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
-/// - `sql_out` must point to a writable buffer of `sql_out_len` bytes.
 /// - `error_out` must point to a writable buffer of `error_out_len` bytes.
 /// - `position_out` must point to a writable `u32`.
 #[cfg(feature = "extension")]
@@ -1573,8 +1574,6 @@ pub(crate) fn infer_cardinality(
 pub extern "C" fn sv_validate_ddl_rust(
     query_ptr: *const u8,
     query_len: usize,
-    sql_out: *mut u8,
-    sql_out_len: usize,
     error_out: *mut u8,
     error_out_len: usize,
     position_out: *mut u32,
@@ -1589,14 +1588,11 @@ pub extern "C" fn sv_validate_ddl_rust(
         };
 
         match validate_and_rewrite(query) {
-            Ok(Some(sql)) => {
-                unsafe { write_to_buffer(sql_out, sql_out_len, &sql) };
-                0 // success
-            }
+            Ok(Some(_sql)) => 0, // success — rewritten SQL discarded; caller uses original query
             Ok(None) => {
                 // Not a recognized DDL -- check for near-miss
                 if let Some(err) = detect_near_miss(query) {
-                    unsafe { write_to_buffer(error_out, error_out_len, &err.message) };
+                    unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
                     unsafe {
                         write_position(position_out, err.position);
                     }
@@ -1606,7 +1602,7 @@ pub extern "C" fn sv_validate_ddl_rust(
                 }
             }
             Err(err) => {
-                unsafe { write_to_buffer(error_out, error_out_len, &err.message) };
+                unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
                 unsafe {
                     write_position(position_out, err.position);
                 }
@@ -1634,13 +1630,19 @@ unsafe fn write_position(position_out: *mut u32, position: Option<usize>) {
     }
 }
 
-/// Write a string into a raw byte buffer, null-terminated and truncated to `len - 1`.
+/// Write an error message into a fixed-size, caller-owned byte buffer.
+/// Null-terminated, truncated to `len - 1` bytes.
+///
+/// Use only for short, bounded strings (error messages). For unboundedly
+/// large outputs (rewritten SQL) use `leak_string_to_c_buffer` +
+/// `sv_free_buffer` instead — silently truncating SQL produced confusing
+/// downstream parser errors (see v0.8.0 buffer-truncation fix).
 ///
 /// # Safety
 ///
 /// `buf` must point to a writable buffer of at least `len` bytes.
 #[cfg(feature = "extension")]
-unsafe fn write_to_buffer(buf: *mut u8, len: usize, s: &str) {
+unsafe fn write_error_to_buffer(buf: *mut u8, len: usize, s: &str) {
     if buf.is_null() || len == 0 {
         return;
     }
@@ -1650,26 +1652,108 @@ unsafe fn write_to_buffer(buf: *mut u8, len: usize, s: &str) {
     *buf.add(copy_len) = 0; // null terminate
 }
 
+/// Convert an owned `String` into a heap-allocated byte buffer that the C++
+/// caller takes ownership of. Caller must release via `sv_free_buffer`.
+///
+/// Returns `(ptr, len)`. The buffer is **not** NUL-terminated — the C++
+/// side reads exactly `len` bytes. This avoids any silent truncation cap
+/// regardless of how large the rewritten SQL becomes.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+fn leak_string_to_c_buffer(s: String) -> (*mut u8, usize) {
+    let mut bytes = s.into_bytes();
+    bytes.shrink_to_fit();
+    debug_assert_eq!(bytes.len(), bytes.capacity());
+    let len = bytes.len();
+    let ptr = bytes.as_mut_ptr();
+    std::mem::forget(bytes);
+    (ptr, len)
+}
+
+/// Reclaim a buffer produced by `leak_string_to_c_buffer`.
+///
+/// # Safety
+///
+/// `ptr`/`len` must be the exact pair returned by an earlier call to
+/// `leak_string_to_c_buffer` (or its FFI exports), and may only be released
+/// once.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+// Clippy warns that `Vec::from_raw_parts(p, n, n)` looks suspicious — but
+// here the matching `leak_string_to_c_buffer` deliberately calls
+// `shrink_to_fit` so len == capacity holds. Keeping this shape
+// (vs. Box::from_raw on a *mut [u8]) preserves the symmetry with the
+// allocator that produced the buffer.
+#[allow(clippy::same_length_and_capacity)]
+unsafe fn reclaim_c_buffer(ptr: *mut u8, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    drop(Vec::from_raw_parts(ptr, len, len));
+}
+
+/// FFI export: free a heap buffer produced by an earlier
+/// `sv_parser_override_rust` / `sv_rewrite_ddl_rust` success return.
+///
+/// Safe to call with a null pointer (no-op).
+///
+/// # Safety
+///
+/// `ptr`/`len` must be the exact pair the Rust side returned via its
+/// `sql_out_ptr` / `sql_out_len` out-parameters. Calling with any other
+/// pair (or twice on the same pair) is undefined behaviour.
+#[cfg(feature = "extension")]
+#[no_mangle]
+pub unsafe extern "C" fn sv_free_buffer(ptr: *mut u8, len: usize) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reclaim_c_buffer(ptr, len);
+    }));
+}
+
+/// Internal helper: publish an owned `String` to the FFI out-parameters.
+/// On null out-pointers the buffer is dropped instead of leaked, so a
+/// misbehaving C++ caller cannot induce a memory leak through us.
+///
+/// # Safety
+///
+/// Either both `sql_out_ptr` and `sql_out_len` must point to writable
+/// `*mut u8` / `usize` slots, or both must be null. Mixed null is treated
+/// as "drop and skip writing."
+#[cfg(feature = "extension")]
+unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len: *mut usize) {
+    if sql_out_ptr.is_null() || sql_out_len.is_null() {
+        return; // dropping `sql` here releases the heap allocation
+    }
+    let (ptr, len) = leak_string_to_c_buffer(sql);
+    *sql_out_ptr = ptr;
+    *sql_out_len = len;
+}
+
 /// FFI entry point for DDL rewriting (no execution), called from C++ `sv_ddl_bind`.
 ///
 /// Rewrites a semantic view DDL statement into the corresponding function call
 /// SQL string. The caller (C++) is responsible for executing it.
 ///
-/// On success: writes the rewritten SQL to `sql_out` (null-terminated), returns 0.
-/// On failure: writes the error message to `error_out` (null-terminated), returns 1.
+/// On success: returns 0 and writes a heap-owned byte buffer pointer +
+/// length to `*sql_out_ptr` / `*sql_out_len`. The caller takes ownership and
+/// must release the buffer via `sv_free_buffer`. The buffer is **not**
+/// NUL-terminated; read exactly `*sql_out_len` bytes.
+///
+/// On failure: returns 1, writes the error message into the caller-owned
+/// `error_out` buffer (truncated to `error_out_len - 1`), and leaves
+/// `*sql_out_ptr` untouched (typically null).
 ///
 /// # Safety
 ///
 /// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
-/// - `sql_out` must point to a writable buffer of `sql_out_len` bytes.
+/// - `sql_out_ptr` must point to a writable `*mut u8` slot, or be null.
+/// - `sql_out_len` must point to a writable `usize` slot, or be null.
 /// - `error_out` must point to a writable buffer of `error_out_len` bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
 pub extern "C" fn sv_rewrite_ddl_rust(
     query_ptr: *const u8,
     query_len: usize,
-    sql_out: *mut u8,
-    sql_out_len: usize,
+    sql_out_ptr: *mut *mut u8,
+    sql_out_len: *mut usize,
     error_out: *mut u8,
     error_out_len: usize,
 ) -> u8 {
@@ -1696,15 +1780,17 @@ pub extern "C" fn sv_rewrite_ddl_rust(
 
     match result {
         Ok(Ok(sql)) => {
-            unsafe { write_to_buffer(sql_out, sql_out_len, &sql) };
+            unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
             0 // success
         }
         Ok(Err(err)) => {
-            unsafe { write_to_buffer(error_out, error_out_len, &err) };
+            unsafe { write_error_to_buffer(error_out, error_out_len, &err) };
             1 // failure
         }
         Err(_panic) => {
-            unsafe { write_to_buffer(error_out, error_out_len, "Internal panic in DDL rewrite") };
+            unsafe {
+                write_error_to_buffer(error_out, error_out_len, "Internal panic in DDL rewrite");
+            }
             1 // failure
         }
     }
@@ -2315,7 +2401,10 @@ fn strip_outer_quotes(s: &str) -> Option<&str> {
 /// own parser and execution on the caller's connection.
 ///
 /// Return values match the protocol used by sv_parse_stub:
-///   0 = success: native SQL written to `sql_out`
+///   0 = success: heap-owned native SQL pointer + length written to
+///       `*sql_out_ptr` / `*sql_out_len`. Caller takes ownership and must
+///       release via `sv_free_buffer`. The buffer is **not** NUL-terminated;
+///       read exactly `*sql_out_len` bytes.
 ///   1 = validation error: error written to `error_out`
 ///   2 = not ours / not yet handled: caller should defer to default parser
 ///       (which falls through to the legacy parse_function fallback path)
@@ -2323,7 +2412,8 @@ fn strip_outer_quotes(s: &str) -> Option<&str> {
 /// # Safety
 ///
 /// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
-/// - `sql_out` must point to a writable buffer of `sql_out_len` bytes.
+/// - `sql_out_ptr` must point to a writable `*mut u8` slot, or be null.
+/// - `sql_out_len` must point to a writable `usize` slot, or be null.
 /// - `error_out` must point to a writable buffer of `error_out_len` bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
@@ -2331,8 +2421,8 @@ pub extern "C" fn sv_parser_override_rust(
     db_token: u64,
     query_ptr: *const u8,
     query_len: usize,
-    sql_out: *mut u8,
-    sql_out_len: usize,
+    sql_out_ptr: *mut *mut u8,
+    sql_out_len: *mut usize,
     error_out: *mut u8,
     error_out_len: usize,
 ) -> u8 {
@@ -2347,12 +2437,12 @@ pub extern "C" fn sv_parser_override_rust(
 
         match rewrite_to_native_sql(db_token, query) {
             Ok(Some(sql)) => {
-                unsafe { write_to_buffer(sql_out, sql_out_len, &sql) };
-                0 // success — native SQL written
+                unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
+                0 // success — native SQL handed to caller
             }
             Ok(None) => 2, // not ours, or a form we defer to the legacy path
             Err(err) => {
-                unsafe { write_to_buffer(error_out, error_out_len, &err.message) };
+                unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
                 1 // validation error
             }
         }
@@ -2364,6 +2454,51 @@ pub extern "C" fn sv_parser_override_rust(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===================================================================
+    // FFI heap-buffer round-trip — guards against the v0.8.0 silent-
+    // truncation regression. Pre-fix the SQL output went through a
+    // fixed 64 KB buffer; we now hand the C++ caller an owned heap
+    // pointer + length, released via sv_free_buffer.
+    // ===================================================================
+
+    #[test]
+    fn leak_and_reclaim_round_trips_arbitrary_string() {
+        let original = "INSERT INTO _definitions VALUES ('x', '...');".repeat(4096);
+        assert!(
+            original.len() > 64 * 1024,
+            "test input should exceed legacy cap"
+        );
+
+        let original_clone = original.clone();
+        let (ptr, len) = leak_string_to_c_buffer(original);
+        assert!(!ptr.is_null());
+        assert_eq!(len, original_clone.len());
+
+        // Read back exactly `len` bytes (no NUL terminator assumption).
+        let recovered = unsafe { std::slice::from_raw_parts(ptr.cast_const(), len) };
+        assert_eq!(recovered, original_clone.as_bytes());
+
+        // Free.
+        unsafe { reclaim_c_buffer(ptr, len) };
+    }
+
+    #[test]
+    fn reclaim_null_pointer_is_safe() {
+        // sv_free_buffer must accept null pointers as a no-op so the C++
+        // RAII guard can be unconditionally invoked even when the FFI
+        // call returned an error path.
+        unsafe { reclaim_c_buffer(std::ptr::null_mut(), 0) };
+        unsafe { reclaim_c_buffer(std::ptr::null_mut(), 99) };
+    }
+
+    #[test]
+    fn leak_handles_empty_string() {
+        let (ptr, len) = leak_string_to_c_buffer(String::new());
+        assert_eq!(len, 0);
+        // Empty Vec may have dangling-but-aligned ptr; reclaim must not crash.
+        unsafe { reclaim_c_buffer(ptr, len) };
+    }
 
     // ===================================================================
     // detect_semantic_view_ddl tests (multi-prefix detection)

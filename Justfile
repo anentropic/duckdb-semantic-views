@@ -110,10 +110,17 @@ test-caret: build
 test-adbc: build
     uv run test/integration/test_adbc_transactions.py
 
-# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC
+# Run regression test for the v0.8.0 silent-truncation FFI buffer bug.
+# Creates a semantic view large enough that the rewritten INSERT exceeds
+# the legacy 64 KB shim buffer; pre-fix this would have produced a
+# misleading "Parser Error: syntax error" instead of succeeding.
+test-large-view: build
+    uv run test/integration/test_large_view_rewrite.py
+
+# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC + large-view
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
 # _ensure-test-deps runs early to catch pip version mismatches before slow builds.
-test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc
+test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc test-large-view
 
 # Check that fuzz targets compile (requires nightly)
 check-fuzz:
