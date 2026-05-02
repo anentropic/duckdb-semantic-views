@@ -103,10 +103,17 @@ test-vtab-crash: build
 test-caret: build
     uv run test/integration/test_caret_position.py
 
-# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position
+# Run ADBC end-to-end transactional DDL tests against the built extension.
+# Exercises CREATE / DROP / ALTER SEMANTIC VIEW under an ADBC autocommit=False
+# connection — proves the v0.8.0 transactional-DDL fix works for the original
+# motivating bug.
+test-adbc: build
+    uv run test/integration/test_adbc_transactions.py
+
+# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
 # _ensure-test-deps runs early to catch pip version mismatches before slow builds.
-test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret
+test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc
 
 # Check that fuzz targets compile (requires nightly)
 check-fuzz:
