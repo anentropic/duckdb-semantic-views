@@ -7,23 +7,22 @@ use duckdb::{
 use libduckdb_sys as ffi;
 use std::ffi::CStr;
 
-use crate::catalog::{catalog_insert, catalog_upsert, CatalogState};
-
-/// Shared state for `create_semantic_view` and `create_or_replace_semantic_view`.
+/// Shared state for the legacy `create_semantic_view_from_json` table-function
+/// fallback (still reachable for direct user calls; the v0.8.0 native CREATE
+/// path runs via `parser_override` and writes directly on the caller's
+/// connection).
 ///
-/// `persist_conn` is `Some` for file-backed databases -- it is a separate
+/// `persist_conn` is `Some` for file-backed databases — it is a separate
 /// `duckdb_connection` created at init time and used to execute INSERT into
 /// `semantic_layer._definitions` from within bind (avoids deadlock with
-/// the main connection's execution lock). For in-memory databases,
-/// `persist_conn` is `None` and the HashMap is the sole source of truth.
+/// the main connection's execution lock). For in-memory databases via the
+/// legacy fallback there is no separate write connection: writes go through
+/// `catalog_conn` instead.
 #[derive(Clone)]
 pub struct DefineState {
-    pub catalog: CatalogState,
     pub persist_conn: Option<ffi::duckdb_connection>,
-    /// Connection for catalog queries (e.g., `duckdb_constraints()` lookups).
-    /// Always set -- created at init time from the database handle.
-    /// Distinct from `persist_conn` (which is file-backed only) and the main
-    /// connection (which holds execution locks during bind).
+    /// Connection for catalog queries (e.g., `duckdb_constraints()` lookups)
+    /// and for legacy in-memory writes when `persist_conn` is `None`.
     pub catalog_conn: ffi::duckdb_connection,
     /// When true, uses INSERT OR REPLACE (upsert); when false, errors on duplicate.
     pub or_replace: bool,
@@ -37,22 +36,32 @@ pub struct DefineState {
 unsafe impl Send for DefineState {}
 unsafe impl Sync for DefineState {}
 
-/// Persist a view definition to `semantic_layer._definitions` using the separate
-/// persist_conn. This avoids deadlocking with the main connection's execution lock
-/// (context_lock is non-reentrant; a second duckdb_connection has its own context).
+/// Whether a semantic view already exists in `semantic_layer._definitions`.
+fn view_exists(conn: ffi::duckdb_connection, name: &str) -> Result<bool, String> {
+    crate::catalog::CatalogReader::new(conn).exists(name)
+}
+
+/// Persist a view definition to `semantic_layer._definitions`.
 ///
-/// Uses the Rust ffi::duckdb_query which goes through function pointers (loadable-
-/// extension compatible) rather than direct symbol references.
-///
-/// Returns Ok(()) on success, Err on failure.
-fn persist_define(conn: ffi::duckdb_connection, name: &str, json: &str) -> Result<(), String> {
+/// `or_replace=true` → `INSERT OR REPLACE` (overwrite existing row).
+/// `or_replace=false` → plain `INSERT`; caller is expected to have already
+/// checked for existing rows so that the failure mode of a duplicate row is
+/// surfaced as the friendly "already exists" error rather than a raw
+/// constraint violation.
+fn persist_define(
+    conn: ffi::duckdb_connection,
+    name: &str,
+    json: &str,
+    or_replace: bool,
+) -> Result<(), String> {
+    let sql = if or_replace {
+        "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES ($1, $2)"
+    } else {
+        "INSERT INTO semantic_layer._definitions (name, definition) VALUES ($1, $2)"
+    };
     unsafe {
-        super::persist::execute_parameterized(
-            conn,
-            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES ($1, $2)",
-            &[name, json],
-        )
-        .map_err(|e| format!("failed to persist semantic view '{name}' to catalog table: {e}"))
+        super::persist::execute_parameterized(conn, sql, &[name, json])
+            .map_err(|e| format!("failed to persist semantic view '{name}' to catalog table: {e}"))
     }
 }
 
@@ -364,25 +373,29 @@ impl VTab for DefineFromJsonVTab {
             let json_out = serde_json::to_string(&def)
                 .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
 
-            // Persist to DuckDB table first (file-backed databases only).
-            if let Some(conn) = state.persist_conn {
-                persist_define(conn, &name, &json_out)
-                    .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-            }
+            // Persist to `_definitions`. File-backed DBs use the dedicated
+            // persist_conn; in-memory falls back to catalog_conn.
+            let write_conn = state.persist_conn.unwrap_or(state.catalog_conn);
 
-            // Update in-memory catalog.
             if state.or_replace {
-                catalog_upsert(&state.catalog, &name, &json_out)?;
-            } else if state.if_not_exists {
-                match catalog_insert(&state.catalog, &name, &json_out) {
-                    Ok(()) => {}
-                    Err(e) if e.to_string().contains("already exists") => {
-                        // Silently succeed -- view exists, no replacement needed.
-                    }
-                    Err(e) => return Err(e),
-                }
+                persist_define(write_conn, &name, &json_out, true)
+                    .map_err(Box::<dyn std::error::Error>::from)?;
             } else {
-                catalog_insert(&state.catalog, &name, &json_out)?;
+                let already =
+                    view_exists(write_conn, &name).map_err(Box::<dyn std::error::Error>::from)?;
+                if already {
+                    if state.if_not_exists {
+                        // Silently succeed -- view exists, no replacement needed.
+                    } else {
+                        return Err(format!(
+                            "semantic view '{name}' already exists; use CREATE OR REPLACE SEMANTIC VIEW to overwrite"
+                        )
+                        .into());
+                    }
+                } else {
+                    persist_define(write_conn, &name, &json_out, false)
+                        .map_err(Box::<dyn std::error::Error>::from)?;
+                }
             }
 
             Ok(DefineBindData { name })

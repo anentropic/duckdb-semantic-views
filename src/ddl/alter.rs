@@ -6,7 +6,7 @@ use duckdb::{
 };
 use libduckdb_sys as ffi;
 
-use crate::catalog::{catalog_rename, catalog_upsert, CatalogState};
+use crate::catalog::CatalogReader;
 use crate::model::SemanticViewDefinition;
 
 /// Shared state for `alter_semantic_view_rename` and
@@ -15,7 +15,7 @@ use crate::model::SemanticViewDefinition;
 /// See [`crate::ddl::define::DefineState`] for the persist_conn pattern.
 #[derive(Clone)]
 pub struct AlterRenameState {
-    pub catalog: CatalogState,
+    pub catalog: CatalogReader,
     pub persist_conn: Option<ffi::duckdb_connection>,
     /// When true, silently succeeds if the view does not exist.
     pub if_exists: bool,
@@ -88,13 +88,10 @@ impl VTab for AlterRenameVTab {
             let state = unsafe { &*state_ptr };
 
             // Check if old_name exists in catalog.
-            let json = {
-                let guard = state
-                    .catalog
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
-                guard.get(&old_name).cloned()
-            };
+            let json = state
+                .catalog
+                .lookup(&old_name)
+                .map_err(Box::<dyn std::error::Error>::from)?;
 
             match json {
                 None => {
@@ -105,23 +102,16 @@ impl VTab for AlterRenameVTab {
                     return Err(format!("semantic view '{old_name}' does not exist").into());
                 }
                 Some(json_str) => {
-                    // Check if new_name already exists
+                    if state
+                        .catalog
+                        .exists(&new_name)
+                        .map_err(Box::<dyn std::error::Error>::from)?
                     {
-                        let guard = state.catalog.read().map_err(|_| {
-                            Box::<dyn std::error::Error>::from("catalog lock poisoned")
-                        })?;
-                        if guard.contains_key(&new_name) {
-                            return Err(format!("semantic view '{new_name}' already exists").into());
-                        }
+                        return Err(format!("semantic view '{new_name}' already exists").into());
                     }
 
-                    // 1. Persist first (write-first for consistency).
-                    if let Some(conn) = state.persist_conn {
-                        persist_rename(conn, &old_name, &new_name, &json_str);
-                    }
-
-                    // 2. Update in-memory catalog.
-                    catalog_rename(&state.catalog, &old_name, &new_name)?;
+                    let conn = state.persist_conn.unwrap_or(state.catalog.raw());
+                    persist_rename(conn, &old_name, &new_name, &json_str);
                 }
             }
 
@@ -173,7 +163,7 @@ impl VTab for AlterRenameVTab {
 /// See [`crate::ddl::define::DefineState`] for the persist_conn pattern.
 #[derive(Clone)]
 pub struct AlterCommentState {
-    pub catalog: CatalogState,
+    pub catalog: CatalogReader,
     pub persist_conn: Option<ffi::duckdb_connection>,
     /// When true, silently succeeds if the view does not exist.
     pub if_exists: bool,
@@ -221,14 +211,10 @@ fn alter_comment_impl(
     name: &str,
     new_comment: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // Read existing JSON from catalog.
-    let json = {
-        let guard = state
-            .catalog
-            .read()
-            .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
-        guard.get(name).cloned()
-    };
+    let json = state
+        .catalog
+        .lookup(name)
+        .map_err(Box::<dyn std::error::Error>::from)?;
 
     match json {
         None => {
@@ -247,13 +233,8 @@ fn alter_comment_impl(
             def.comment = new_comment;
             let new_json = serde_json::to_string(&def)?;
 
-            // 1. Persist first (write-first for consistency).
-            if let Some(conn) = state.persist_conn {
-                persist_comment_update(conn, name, &new_json);
-            }
-
-            // 2. Update in-memory catalog.
-            catalog_upsert(&state.catalog, name, &new_json)?;
+            let conn = state.persist_conn.unwrap_or(state.catalog.raw());
+            persist_comment_update(conn, name, &new_json);
 
             Ok(status.to_string())
         }

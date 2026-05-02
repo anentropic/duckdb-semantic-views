@@ -10,14 +10,14 @@ use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
 use libduckdb_sys::duckdb_string_t;
 
-use crate::catalog::CatalogState;
+use crate::catalog::CatalogReader;
 use crate::model::SemanticViewDefinition;
 use crate::render_ddl::render_create_ddl;
 
 pub struct GetDdlScalar;
 
 impl VScalar for GetDdlScalar {
-    type State = CatalogState;
+    type State = CatalogReader;
 
     unsafe fn invoke(
         state: &Self::State,
@@ -44,13 +44,11 @@ impl VScalar for GetDdlScalar {
                     .into());
                 }
 
-                let guard = state
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
-                let json = guard
-                    .get(&name)
+                let json = state
+                    .lookup(&name)
+                    .map_err(Box::<dyn std::error::Error>::from)?
                     .ok_or_else(|| format!("semantic view '{}' does not exist", name))?;
-                let def: SemanticViewDefinition = serde_json::from_str(json)?;
+                let def: SemanticViewDefinition = serde_json::from_str(&json)?;
                 let ddl =
                     render_create_ddl(&name, &def).map_err(|e| -> Box<dyn std::error::Error> {
                         format!("GET_DDL error: {e}").into()

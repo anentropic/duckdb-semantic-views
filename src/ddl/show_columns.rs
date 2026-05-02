@@ -5,7 +5,7 @@ use duckdb::{
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
 };
 
-use crate::catalog::CatalogState;
+use crate::catalog::CatalogReader;
 use crate::model::{AccessModifier, SemanticViewDefinition};
 
 /// A single row in the SHOW COLUMNS IN SEMANTIC VIEW output.
@@ -143,18 +143,14 @@ impl VTab for ShowColumnsInSemanticViewVTab {
 
             let view_name = bind.get_parameter(0).to_string();
 
-            let state_ptr = bind.get_extra_info::<CatalogState>();
-            let guard = unsafe {
-                (*state_ptr)
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
-            };
-
-            let json = guard
-                .get(&view_name)
+            let state_ptr = bind.get_extra_info::<CatalogReader>();
+            let reader = unsafe { *state_ptr };
+            let json = reader
+                .lookup(&view_name)
+                .map_err(Box::<dyn std::error::Error>::from)?
                 .ok_or_else(|| format!("Semantic view '{view_name}' not found"))?;
 
-            let def = SemanticViewDefinition::from_json(&view_name, json)?;
+            let def = SemanticViewDefinition::from_json(&view_name, &json)?;
             let rows = collect_column_rows(&def, &view_name);
 
             Ok(ShowColumnsBindData { rows })

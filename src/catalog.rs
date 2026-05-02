@@ -1,33 +1,28 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, RwLock},
-};
+//! Persistent catalog for semantic view definitions stored in
+//! `semantic_layer._definitions`.
+//!
+//! Prior to v0.8.0 this module also maintained an in-memory `HashMap` mirror
+//! that DDL writes updated alongside the catalog table. v0.8.0 removed the
+//! mirror so catalog reads always see the same state `DuckDB` does — which is
+//! a prerequisite for transactional DDL: the parser-override path emits
+//! `INSERT/DELETE/UPDATE` against `_definitions` directly on the caller's
+//! connection, and any cached mirror would diverge across rollback.
+
+use std::path::PathBuf;
 
 use duckdb::{Connection, Result};
-
-use crate::model::SemanticViewDefinition;
-
-/// Shared in-memory cache of semantic view definitions.
-/// Key: view name. Value: raw JSON string of the definition.
-pub type CatalogState = Arc<RwLock<HashMap<String, String>>>;
 
 // Extension appended to the DuckDB file path to form the v0.1.0 companion file.
 // Used only in the one-time migration below. After the migration runs, the
 // companion file is deleted and this constant is never referenced again at runtime.
 const V010_COMPANION_EXT: &str = "semantic_views";
 
-/// Create the `semantic_layer` schema and `_definitions` table if they do not exist,
-/// then load all existing rows into a new [`CatalogState`].
+/// Create the `semantic_layer` schema and `_definitions` table if they do not
+/// exist, and run the v0.1.0 companion-file migration once for file-backed
+/// databases.
 ///
-/// For file-backed databases, performs a one-time migration: if a v0.1.0 companion
-/// file exists alongside the database, its contents are imported into the table
-/// and the file is deleted. After the migration runs once, the companion file is
-/// gone and this block is a no-op on subsequent loads.
-///
-/// This function is called once at extension load time. It is idempotent: safe to call
-/// on every extension load regardless of whether the catalog already exists.
-pub fn init_catalog(con: &Connection, db_path: &str) -> Result<CatalogState> {
+/// Idempotent: safe to call on every extension load.
+pub fn init_catalog(con: &Connection, db_path: &str) -> Result<()> {
     con.execute_batch(
         "CREATE SCHEMA IF NOT EXISTS semantic_layer;
          CREATE TABLE IF NOT EXISTS semantic_layer._definitions (
@@ -36,24 +31,9 @@ pub fn init_catalog(con: &Connection, db_path: &str) -> Result<CatalogState> {
          );",
     )?;
 
-    // Read existing rows from the DuckDB table.
-    let mut map = HashMap::new();
-    let mut stmt = con.prepare("SELECT name, definition FROM semantic_layer._definitions")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (name, def) = row?;
-        map.insert(name, def);
-    }
-
     // One-time migration: if a v0.1.0 companion file exists alongside the database,
     // import its contents into the table then delete the file.
-    // After this migration runs once, the companion file is gone and this block
-    // is a no-op on subsequent loads (file absent → skip silently).
     if db_path != ":memory:" {
-        // Derive the companion file path: <db_path>.<ext>.<V010_COMPANION_EXT>
-        // e.g. /path/to/mydb.duckdb → /path/to/mydb.duckdb.<companion>
         let migration_path: PathBuf = {
             let mut p = PathBuf::from(db_path);
             let ext = match p.extension() {
@@ -64,222 +44,196 @@ pub fn init_catalog(con: &Connection, db_path: &str) -> Result<CatalogState> {
             p
         };
         if migration_path.exists() {
-            // Read v0.1.0 definitions from the companion file
             if let Ok(contents) = std::fs::read_to_string(&migration_path) {
-                if let Ok(migrated) = serde_json::from_str::<HashMap<String, String>>(&contents) {
+                if let Ok(migrated) =
+                    serde_json::from_str::<std::collections::HashMap<String, String>>(&contents)
+                {
                     for (name, def) in &migrated {
-                        // INSERT OR REPLACE: companion file wins on conflict (latest session state)
                         con.execute(
                             "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
                             duckdb::params![name, def],
                         )?;
-                        // Also update the in-memory map
-                        map.insert(name.clone(), def.clone());
                     }
                 }
             }
-            // Delete the companion file regardless of whether it had data.
-            // Ignore errors (read-only filesystem, race condition, etc.)
             let _ = std::fs::remove_file(&migration_path);
         }
     }
 
-    Ok(Arc::new(RwLock::new(map)))
-}
-
-/// Write a new semantic view definition to the in-memory catalog.
-///
-/// Returns an error if:
-/// - The JSON is invalid
-/// - A view with `name` already exists
-pub fn catalog_insert(
-    state: &CatalogState,
-    name: &str,
-    json: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // Validate JSON before writing — fail fast, nothing written on invalid input
-    SemanticViewDefinition::from_json(name, json).map_err(Box::<dyn std::error::Error>::from)?;
-
-    let mut guard = state
-        .write()
-        .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
-    if guard.contains_key(name) {
-        return Err(format!(
-            "semantic view '{name}' already exists; use CREATE OR REPLACE SEMANTIC VIEW to overwrite"
-        )
-        .into());
-    }
-    guard.insert(name.to_string(), json.to_string());
     Ok(())
 }
 
-/// Remove a semantic view definition from the in-memory catalog.
-///
-/// Returns an error if no view with `name` exists.
-pub fn catalog_delete(
-    state: &CatalogState,
-    name: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut guard = state
-        .write()
-        .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
-    if !guard.contains_key(name) {
-        return Err(format!("semantic view '{name}' does not exist").into());
-    }
-    guard.remove(name);
-    Ok(())
-}
+// ---------------------------------------------------------------------------
+// CatalogReader — extension-side handle wrapping the catalog connection.
+// ---------------------------------------------------------------------------
+//
+// Gated on the `extension` feature because it depends on the C-API stubs
+// (`duckdb_query`, `duckdb_prepare`, ...) which are only linked when the
+// crate is built as a loadable extension.
 
-/// Write or overwrite a semantic view definition in the in-memory catalog.
-///
-/// Unlike `catalog_insert`, this does not error on duplicates — it replaces
-/// any existing definition for `name`.
-///
-/// Returns an error if the JSON is invalid.
-pub fn catalog_upsert(
-    state: &CatalogState,
-    name: &str,
-    json: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    SemanticViewDefinition::from_json(name, json).map_err(Box::<dyn std::error::Error>::from)?;
-    state
-        .write()
-        .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
-        .insert(name.to_string(), json.to_string());
-    Ok(())
-}
-
-/// Remove a semantic view definition from the in-memory catalog if it exists.
-///
-/// Unlike `catalog_delete`, this silently succeeds when the view does not exist.
-pub fn catalog_delete_if_exists(state: &CatalogState, name: &str) {
-    if let Ok(mut guard) = state.write() {
-        guard.remove(name);
-    }
-}
-
-/// Rename a semantic view in the in-memory catalog.
-///
-/// Atomically removes the old name and inserts the new name.
-/// Returns an error if `old_name` does not exist or `new_name` already exists.
-pub fn catalog_rename(
-    state: &CatalogState,
-    old_name: &str,
-    new_name: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut guard = state
-        .write()
-        .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
-    let json = guard
-        .remove(old_name)
-        .ok_or_else(|| format!("semantic view '{old_name}' does not exist"))?;
-    if guard.contains_key(new_name) {
-        // Rollback: put the old entry back
-        guard.insert(old_name.to_string(), json);
-        return Err(format!("semantic view '{new_name}' already exists").into());
-    }
-    guard.insert(new_name.to_string(), json);
-    Ok(())
-}
-
-/// FFI-callable catalog mutation functions.
-///
-/// These functions are gated on the `extension` feature so they are not included in
-/// standalone test binaries (which cannot use the loadable-extension C API stubs).
-///
-/// All functions take an opaque `*const CatalogState` pointer (the Rust Arc<RwLock<HashMap>>)
-/// and return 0 on success, -1 on error.
 #[cfg(feature = "extension")]
-mod ffi_catalog {
-    use super::*;
-    use std::ffi::c_char;
+mod reader {
+    use std::ffi::{CStr, CString};
+    use std::os::raw::c_void;
 
-    unsafe fn str_from_ptr<'a>(ptr: *const c_char) -> Option<&'a str> {
-        if ptr.is_null() {
-            return None;
+    use libduckdb_sys as ffi;
+
+    /// Read-side handle for `semantic_layer._definitions`.
+    ///
+    /// Wraps a raw `duckdb_connection` ("catalog connection") created at
+    /// extension load time. Reads see the connection's transactional view
+    /// of the table, which for the catalog connection is always committed
+    /// state. Writes performed by parser-override-emitted SQL run on the
+    /// *caller's* connection and become visible here on commit.
+    #[derive(Clone, Copy)]
+    pub struct CatalogReader {
+        conn: ffi::duckdb_connection,
+    }
+
+    // SAFETY: `duckdb_connection` is an opaque pointer managed by DuckDB.
+    // The connection itself owns its synchronisation; reads from multiple
+    // threads via the same handle are serialised by DuckDB internally.
+    unsafe impl Send for CatalogReader {}
+    unsafe impl Sync for CatalogReader {}
+
+    impl CatalogReader {
+        pub fn new(conn: ffi::duckdb_connection) -> Self {
+            Self { conn }
         }
-        std::ffi::CStr::from_ptr(ptr).to_str().ok()
+
+        pub fn raw(&self) -> ffi::duckdb_connection {
+            self.conn
+        }
+
+        /// Fetch the JSON definition for a single view.
+        ///
+        /// Returns `Ok(None)` when no row exists.
+        pub fn lookup(&self, name: &str) -> Result<Option<String>, String> {
+            unsafe { prepared_lookup(self.conn, name) }
+        }
+
+        /// Whether a view with this name exists.
+        pub fn exists(&self, name: &str) -> Result<bool, String> {
+            Ok(self.lookup(name)?.is_some())
+        }
+
+        /// Return `(name, definition_json)` for every registered view,
+        /// sorted by name.
+        pub fn list_all(&self) -> Result<Vec<(String, String)>, String> {
+            unsafe { execute_list_all(self.conn) }
+        }
+
+        /// Return just the view names, sorted.
+        pub fn list_names(&self) -> Result<Vec<String>, String> {
+            Ok(self.list_all()?.into_iter().map(|(n, _)| n).collect())
+        }
     }
 
-    /// Insert a new semantic view into the in-memory catalog.
-    /// Returns 0 on success, -1 if pointer null / json invalid / duplicate.
-    #[no_mangle]
-    pub unsafe extern "C" fn semantic_views_catalog_insert(
-        catalog_ptr: *const CatalogState,
-        name_ptr: *const c_char,
-        json_ptr: *const c_char,
-    ) -> i32 {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let Some(state) = catalog_ptr.as_ref() else {
-                return -1;
+    unsafe fn prepared_lookup(
+        conn: ffi::duckdb_connection,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        let c_sql =
+            CString::new("SELECT definition FROM semantic_layer._definitions WHERE name = $1")
+                .map_err(|_| "SQL contains null byte".to_string())?;
+        let mut stmt: ffi::duckdb_prepared_statement = std::ptr::null_mut();
+        let rc = ffi::duckdb_prepare(conn, c_sql.as_ptr(), &mut stmt);
+        if rc != ffi::DuckDBSuccess {
+            let err = ffi::duckdb_prepare_error(stmt);
+            let msg = if err.is_null() {
+                "unknown prepare error".to_string()
+            } else {
+                CStr::from_ptr(err).to_string_lossy().into_owned()
             };
-            let (Some(name), Some(json)) = (str_from_ptr(name_ptr), str_from_ptr(json_ptr)) else {
-                return -1;
+            ffi::duckdb_destroy_prepare(&mut stmt);
+            return Err(msg);
+        }
+
+        let c_name = CString::new(name).map_err(|_| "view name contains null byte".to_string())?;
+        if ffi::duckdb_bind_varchar(stmt, 1, c_name.as_ptr()) != ffi::DuckDBSuccess {
+            ffi::duckdb_destroy_prepare(&mut stmt);
+            return Err("failed to bind view name".to_string());
+        }
+
+        let mut result: ffi::duckdb_result = std::mem::zeroed();
+        let exec_rc = ffi::duckdb_execute_prepared(stmt, &mut result);
+        if exec_rc != ffi::DuckDBSuccess {
+            let err_ptr = ffi::duckdb_result_error(&mut result);
+            let msg = if err_ptr.is_null() {
+                "catalog lookup failed".to_string()
+            } else {
+                CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
             };
-            catalog_insert(state, name, json).map(|_| 0).unwrap_or(-1)
-        }));
-        result.unwrap_or(-1)
+            ffi::duckdb_destroy_result(&mut result);
+            ffi::duckdb_destroy_prepare(&mut stmt);
+            return Err(msg);
+        }
+
+        let row_count = ffi::duckdb_row_count(&mut result);
+        let value = if row_count == 0 {
+            None
+        } else {
+            let val_ptr = ffi::duckdb_value_varchar(&mut result, 0, 0);
+            if val_ptr.is_null() {
+                None
+            } else {
+                let s = CStr::from_ptr(val_ptr).to_string_lossy().into_owned();
+                ffi::duckdb_free(val_ptr.cast::<c_void>());
+                Some(s)
+            }
+        };
+        ffi::duckdb_destroy_result(&mut result);
+        ffi::duckdb_destroy_prepare(&mut stmt);
+        Ok(value)
     }
 
-    /// Upsert a semantic view in the in-memory catalog.
-    /// Returns 0 on success, -1 if pointer null or json invalid.
-    #[no_mangle]
-    pub unsafe extern "C" fn semantic_views_catalog_upsert(
-        catalog_ptr: *const CatalogState,
-        name_ptr: *const c_char,
-        json_ptr: *const c_char,
-    ) -> i32 {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let Some(state) = catalog_ptr.as_ref() else {
-                return -1;
+    unsafe fn execute_list_all(
+        conn: ffi::duckdb_connection,
+    ) -> Result<Vec<(String, String)>, String> {
+        let c_sql =
+            CString::new("SELECT name, definition FROM semantic_layer._definitions ORDER BY name")
+                .map_err(|_| "SQL contains null byte".to_string())?;
+        let mut result: ffi::duckdb_result = std::mem::zeroed();
+        let rc = ffi::duckdb_query(conn, c_sql.as_ptr(), &mut result);
+        if rc != ffi::DuckDBSuccess {
+            let err_ptr = ffi::duckdb_result_error(&mut result);
+            let msg = if err_ptr.is_null() {
+                "catalog list failed".to_string()
+            } else {
+                CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
             };
-            let (Some(name), Some(json)) = (str_from_ptr(name_ptr), str_from_ptr(json_ptr)) else {
-                return -1;
-            };
-            catalog_upsert(state, name, json).map(|_| 0).unwrap_or(-1)
-        }));
-        result.unwrap_or(-1)
-    }
+            ffi::duckdb_destroy_result(&mut result);
+            return Err(msg);
+        }
 
-    /// Delete a semantic view from the in-memory catalog.
-    /// Returns 0 on success, -1 if not found.
-    #[no_mangle]
-    pub unsafe extern "C" fn semantic_views_catalog_delete(
-        catalog_ptr: *const CatalogState,
-        name_ptr: *const c_char,
-    ) -> i32 {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let Some(state) = catalog_ptr.as_ref() else {
-                return -1;
+        let row_count = ffi::duckdb_row_count(&mut result);
+        let mut out = Vec::with_capacity(row_count as usize);
+        for r in 0..row_count {
+            let name_ptr = ffi::duckdb_value_varchar(&mut result, 0, r);
+            let def_ptr = ffi::duckdb_value_varchar(&mut result, 1, r);
+            let name = if name_ptr.is_null() {
+                String::new()
+            } else {
+                let s = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+                ffi::duckdb_free(name_ptr.cast::<c_void>());
+                s
             };
-            let Some(name) = str_from_ptr(name_ptr) else {
-                return -1;
+            let def = if def_ptr.is_null() {
+                String::new()
+            } else {
+                let s = CStr::from_ptr(def_ptr).to_string_lossy().into_owned();
+                ffi::duckdb_free(def_ptr.cast::<c_void>());
+                s
             };
-            catalog_delete(state, name).map(|_| 0).unwrap_or(-1)
-        }));
-        result.unwrap_or(-1)
-    }
-
-    /// Delete a semantic view if it exists; silently succeeds if absent.
-    /// Returns 0 always (unless null pointer, which returns -1).
-    #[no_mangle]
-    pub unsafe extern "C" fn semantic_views_catalog_delete_if_exists(
-        catalog_ptr: *const CatalogState,
-        name_ptr: *const c_char,
-    ) -> i32 {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let Some(state) = catalog_ptr.as_ref() else {
-                return -1;
-            };
-            let Some(name) = str_from_ptr(name_ptr) else {
-                return -1;
-            };
-            catalog_delete_if_exists(state, name);
-            0
-        }));
-        result.unwrap_or(-1)
+            out.push((name, def));
+        }
+        ffi::duckdb_destroy_result(&mut result);
+        Ok(out)
     }
 }
+
+#[cfg(feature = "extension")]
+pub use reader::CatalogReader;
 
 #[cfg(test)]
 mod tests {
@@ -293,53 +247,18 @@ mod tests {
     #[test]
     fn init_catalog_creates_schema_and_table() {
         let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        assert!(state.read().unwrap().is_empty());
+        init_catalog(&con, ":memory:").unwrap();
         // Idempotent: second call must not error
-        let state2 = init_catalog(&con, ":memory:").unwrap();
-        assert!(state2.read().unwrap().is_empty());
-    }
+        init_catalog(&con, ":memory:").unwrap();
 
-    #[test]
-    fn insert_and_retrieve() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        catalog_insert(&state, "orders", json).unwrap();
-        let guard = state.read().unwrap();
-        assert_eq!(guard.get("orders").map(String::as_str), Some(json));
-    }
-
-    #[test]
-    fn duplicate_insert_is_error() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        catalog_insert(&state, "orders", json).unwrap();
-        let result = catalog_insert(&state, "orders", json);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("already exists"), "unexpected: {msg}");
-    }
-
-    #[test]
-    fn delete_removes_from_hashmap() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        catalog_insert(&state, "orders", json).unwrap();
-        catalog_delete(&state, "orders").unwrap();
-        assert!(!state.read().unwrap().contains_key("orders"));
-    }
-
-    #[test]
-    fn delete_nonexistent_is_error() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let result = catalog_delete(&state, "nonexistent");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("does not exist"), "unexpected: {msg}");
+        let count: i64 = con
+            .query_row(
+                "SELECT count(*) FROM semantic_layer._definitions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -382,195 +301,6 @@ mod tests {
             file_path.is_none(),
             "PRAGMA database_list should return no file path for in-memory DB, got: {file_path:?}"
         );
-    }
-
-    #[test]
-    fn init_catalog_loads_existing_rows() {
-        // Simulate data already in the DuckDB table (no sidecar).
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        // Write directly to the table (simulating a previous entrypoint sync).
-        con.execute(
-            "INSERT INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
-            duckdb::params!["orders", json],
-        )
-        .unwrap();
-        // Second load: simulates restart — loads from catalog
-        let state2 = init_catalog(&con, ":memory:").unwrap();
-        assert!(state2.read().unwrap().contains_key("orders"));
-        drop(state);
-    }
-
-    #[test]
-    fn upsert_inserts_when_absent() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        catalog_upsert(&state, "orders", json).unwrap();
-        let guard = state.read().unwrap();
-        assert_eq!(guard.get("orders").map(String::as_str), Some(json));
-    }
-
-    #[test]
-    fn upsert_replaces_when_present() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let json1 = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        let json2 = r#"{"base_table":"orders","dimensions":[{"name":"region","expr":"region"}],"metrics":[]}"#;
-        catalog_upsert(&state, "orders", json1).unwrap();
-        catalog_upsert(&state, "orders", json2).unwrap();
-        let guard = state.read().unwrap();
-        assert_eq!(guard.get("orders").map(String::as_str), Some(json2));
-    }
-
-    #[test]
-    fn upsert_rejects_invalid_json() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let result = catalog_upsert(&state, "orders", "{invalid json}");
-        assert!(result.is_err());
-        // Catalog must remain unchanged
-        assert!(!state.read().unwrap().contains_key("orders"));
-    }
-
-    #[test]
-    fn delete_if_exists_removes() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        catalog_insert(&state, "orders", json).unwrap();
-        catalog_delete_if_exists(&state, "orders");
-        assert!(!state.read().unwrap().contains_key("orders"));
-    }
-
-    #[test]
-    fn delete_if_exists_silent_when_absent() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        // Should not panic or error
-        catalog_delete_if_exists(&state, "nonexistent");
-        assert!(state.read().unwrap().is_empty());
-    }
-
-    #[test]
-    fn rename_moves_entry() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        catalog_insert(&state, "orders", json).unwrap();
-        catalog_rename(&state, "orders", "sales").unwrap();
-        let guard = state.read().unwrap();
-        assert!(!guard.contains_key("orders"));
-        assert_eq!(guard.get("sales").map(String::as_str), Some(json));
-    }
-
-    #[test]
-    fn rename_nonexistent_is_error() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let result = catalog_rename(&state, "nonexistent", "something");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("does not exist"), "unexpected: {msg}");
-    }
-
-    #[test]
-    fn catalog_insert_poisoned_lock_returns_error() {
-        let state: CatalogState = Arc::new(RwLock::new(HashMap::new()));
-        // Poison the lock by panicking in a write guard
-        let state_clone = state.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = state_clone.write().unwrap();
-            panic!("intentional poison");
-        })
-        .join();
-        // Lock is now poisoned
-        let result = catalog_insert(
-            &state,
-            "test",
-            r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#,
-        );
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("poisoned"),
-            "Expected poisoned error, got: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn catalog_delete_poisoned_lock_returns_error() {
-        let state: CatalogState = Arc::new(RwLock::new(HashMap::new()));
-        let state_clone = state.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = state_clone.write().unwrap();
-            panic!("intentional poison");
-        })
-        .join();
-        let result = catalog_delete(&state, "test");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("poisoned"));
-    }
-
-    #[test]
-    fn catalog_upsert_poisoned_lock_returns_error() {
-        let state: CatalogState = Arc::new(RwLock::new(HashMap::new()));
-        let state_clone = state.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = state_clone.write().unwrap();
-            panic!("intentional poison");
-        })
-        .join();
-        let result = catalog_upsert(
-            &state,
-            "test",
-            r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#,
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("poisoned"));
-    }
-
-    #[test]
-    fn catalog_delete_if_exists_poisoned_lock_does_not_panic() {
-        let state: CatalogState = Arc::new(RwLock::new(HashMap::new()));
-        let state_clone = state.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = state_clone.write().unwrap();
-            panic!("intentional poison");
-        })
-        .join();
-        // Should not panic — silently ignores poisoned lock
-        catalog_delete_if_exists(&state, "test");
-    }
-
-    #[test]
-    fn catalog_rename_poisoned_lock_returns_error() {
-        let state: CatalogState = Arc::new(RwLock::new(HashMap::new()));
-        let state_clone = state.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = state_clone.write().unwrap();
-            panic!("intentional poison");
-        })
-        .join();
-        let result = catalog_rename(&state, "old", "new");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("poisoned"));
-    }
-
-    #[test]
-    fn rename_to_existing_is_error() {
-        let con = in_memory_con();
-        let state = init_catalog(&con, ":memory:").unwrap();
-        let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
-        catalog_insert(&state, "orders", json).unwrap();
-        catalog_insert(&state, "sales", json).unwrap();
-        let result = catalog_rename(&state, "orders", "sales");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("already exists"), "unexpected: {msg}");
-        // Verify old entry was rolled back
-        assert!(state.read().unwrap().contains_key("orders"));
     }
 
     #[test]
