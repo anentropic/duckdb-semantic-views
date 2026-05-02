@@ -373,6 +373,81 @@ SELECT count(*) FROM list_semantic_views() WHERE name = 'v080_create_ine'
 1
 
 # ------------------------------------------------------------------
+# CREATE FROM YAML FILE participates in the caller's transaction.
+# Same enrichment helper as inline CREATE; the YAML file read happens on
+# the catalog connection inside the parser_override callback so the user's
+# transaction state is untouched, then the INSERT runs on the caller's
+# connection.
+# ------------------------------------------------------------------
+
+statement ok
+COPY (SELECT 'tables:
+  - alias: o
+    table: v080_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o' AS content)
+TO '__TEST_DIR__/v080_yaml_file.yaml' (FORMAT CSV, HEADER FALSE, QUOTE '');
+
+statement ok
+BEGIN
+
+statement ok
+CREATE SEMANTIC VIEW v080_yaml_rb FROM YAML FILE '__TEST_DIR__/v080_yaml_file.yaml'
+
+# Visible to the same connection inside the transaction.
+query I
+SELECT count(*) FROM semantic_layer._definitions WHERE name = 'v080_yaml_rb'
+----
+1
+
+statement ok
+ROLLBACK
+
+# After rollback the row is gone — pre-v0.8.0 the C++ shim's auto-commit
+# ddl_conn would have left it behind.
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'v080_yaml_rb'
+----
+0
+
+# CREATE FROM YAML FILE + COMMIT persists.
+statement ok
+BEGIN
+
+statement ok
+CREATE SEMANTIC VIEW v080_yaml_commit FROM YAML FILE '__TEST_DIR__/v080_yaml_file.yaml'
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'v080_yaml_commit'
+----
+1
+
+# Plain CREATE FROM YAML FILE on existing view errors at parse_override time.
+statement error
+CREATE SEMANTIC VIEW v080_yaml_commit FROM YAML FILE '__TEST_DIR__/v080_yaml_file.yaml'
+----
+already exists
+
+# CREATE OR REPLACE FROM YAML FILE upserts.
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW v080_yaml_commit FROM YAML FILE '__TEST_DIR__/v080_yaml_file.yaml'
+
+# CREATE IF NOT EXISTS FROM YAML FILE is a silent no-op when present.
+statement ok
+CREATE SEMANTIC VIEW IF NOT EXISTS v080_yaml_commit FROM YAML FILE '__TEST_DIR__/v080_yaml_file.yaml'
+
+# ------------------------------------------------------------------
 # Cleanup
 # ------------------------------------------------------------------
 
@@ -390,3 +465,6 @@ DROP SEMANTIC VIEW IF EXISTS v080_create_commit
 
 statement ok
 DROP SEMANTIC VIEW IF EXISTS v080_create_ine
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS v080_yaml_commit
