@@ -244,6 +244,73 @@ mod tests {
         Connection::open_in_memory().expect("in-memory DuckDB")
     }
 
+    // TEMPORARY: smoke test for v0.8.1 race-guard SQL shape.
+    // CTE+DML+RETURNING is NOT supported in DuckDB 1.10.502 ("Parser Error:
+    // A CTE needs a SELECT"), so we emit two statements separated by `;`:
+    // a guard SELECT that raises via error() if the row is missing, then
+    // the DELETE/UPDATE itself. Both statements run on the caller's
+    // connection in the same transaction (snapshot consistent).
+    #[test]
+    fn two_statement_guard_then_dml_smoke() {
+        let con = in_memory_con();
+        con.execute_batch(
+            "CREATE TABLE t (name VARCHAR PRIMARY KEY, val INTEGER); \
+             INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3);",
+        )
+        .unwrap();
+
+        // 1. Guard fires when row missing.
+        let err = con
+            .execute_batch(
+                "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM t WHERE name = 'nonexistent') \
+                              THEN error('not found') \
+                              ELSE TRUE END; \
+                 DELETE FROM t WHERE name = 'nonexistent' RETURNING name;",
+            )
+            .err()
+            .expect("missing-row guard must error");
+        assert!(format!("{err}").contains("not found"), "unexpected: {err}");
+
+        // Row 'a' must NOT have been deleted (guard aborted before DELETE).
+        let count: i64 = con
+            .query_row("SELECT count(*) FROM t WHERE name = 'a'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // 2. Guard passes; DELETE runs and the user-visible result is the
+        // RETURNING from the last statement.
+        let mut stmt = con
+            .prepare(
+                "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM t WHERE name = 'a') \
+                              THEN error('not found') \
+                              ELSE TRUE END; \
+                 DELETE FROM t WHERE name = 'a' RETURNING name AS view_name;",
+            )
+            .expect("multi-statement parse");
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(names, vec!["a".to_string()]);
+
+        // 3. UPDATE variant.
+        let mut stmt = con
+            .prepare(
+                "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM t WHERE name = 'b') \
+                              THEN error('not found') \
+                              ELSE TRUE END; \
+                 UPDATE t SET val = 99 WHERE name = 'b' RETURNING name AS view_name;",
+            )
+            .expect("UPDATE guard parse");
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(names, vec!["b".to_string()]);
+    }
+
     #[test]
     fn init_catalog_creates_schema_and_table() {
         let con = in_memory_con();

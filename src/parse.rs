@@ -14,49 +14,99 @@ use crate::errors::ParseError;
 use crate::model::{Cardinality, Join, TableRef};
 
 // ---------------------------------------------------------------------------
-// v0.8.0: catalog handle for parser_override DROP/ALTER existence checks.
+// Catalog handle for parser_override DDL rewrites (v0.8.0; v0.8.1 LRU).
 // ---------------------------------------------------------------------------
 //
-// DROP without IF EXISTS and every ALTER form need to know whether a view
-// exists (and, for SET/UNSET COMMENT, what its current JSON definition is)
-// before we can emit native SQL with friendly errors. The parser_override
-// callback runs in a context with no access to the caller's catalog, so we
-// stash a dedicated `CatalogReader` (populated at extension load) in a
-// process-wide `OnceLock` and read it from the Rust FFI thunk.
+// CREATE/DROP/ALTER need to know whether a view exists (and for SET/UNSET
+// COMMENT, what its current JSON definition is) before emitting native SQL
+// with friendly errors. The parser_override callback runs in a context
+// without access to the caller's catalog, so we stash a dedicated
+// `CatalogReader` (populated at extension load) keyed by the per-load
+// `db_token` the C++ shim assigns.
+//
+// v0.8.1: replaced the unbounded `Mutex<Option<HashMap>>` with a
+// 16-entry LRU. libduckdb-sys exposes no DB-destroy or extension-unload
+// callback in 1.10.502, so map entries with a now-dangling
+// `duckdb_connection` accumulate over the process lifetime in long-running
+// daemons that open many DBs. The LRU bounds memory at the cost of the
+// uncommon scenario "this process has loaded the extension into more than
+// 16 distinct DBs and we just dispatched against one of the older ones" —
+// in which case the rewriter surfaces a clear error rather than silently
+// deferring (see `rewrite_create` / `rewrite_drop_or_alter`).
 //
 // The reader sees committed state only — by design. Same-transaction
 // CREATE-then-ALTER is the documented v0.8.0 limitation.
 #[cfg(feature = "extension")]
 mod parser_override_catalog {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
 
     use crate::catalog::CatalogReader;
 
-    /// Catalog handle plus a `is_file_backed` flag (matches the legacy
-    /// `DefineState::persist_conn.is_some()` test) that gates DDL-time type
-    /// inference. Type inference uses `LIMIT 0` probes that depend on user
-    /// tables having been committed; for in-memory DBs we follow the v0.7.1
-    /// behaviour and skip inference entirely.
+    /// Bounded LRU capacity. Sized for the realistic upper bound of
+    /// distinct DBs a Python test suite or analytics daemon opens
+    /// concurrently. Increase if the use case warrants — eviction surfaces
+    /// as an explicit error from rewriters, never silent corruption.
+    const LRU_CAPACITY: usize = 16;
+
+    /// Catalog handle plus an `is_file_backed` flag that gates DDL-time
+    /// type inference. `LIMIT 0` probes used for type inference depend on
+    /// user tables having been committed; for in-memory DBs we follow the
+    /// v0.7.1 behaviour and skip inference entirely.
     #[derive(Clone, Copy)]
     pub struct OverrideContext {
         pub catalog: CatalogReader,
         pub is_file_backed: bool,
     }
 
-    // Per-extension-load context map, keyed by the `db_token` the C++ shim
-    // assigns at registration time. A process can load the extension against
-    // multiple databases sequentially (Python integration tests do this) — a
-    // single global slot would let the first load's stale `catalog_conn` leak
-    // into later parser_override invocations on a different DB.
-    static CONTEXTS: Mutex<Option<HashMap<u64, OverrideContext>>> = Mutex::new(None);
+    /// Bounded LRU: a HashMap for O(1) lookup paired with a VecDeque
+    /// tracking insertion order so eviction is O(1) on insert when full.
+    struct LruContexts {
+        map: HashMap<u64, OverrideContext>,
+        order: VecDeque<u64>,
+    }
+
+    impl LruContexts {
+        fn new() -> Self {
+            Self {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+            }
+        }
+
+        fn set(&mut self, db_token: u64, ctx: OverrideContext) {
+            // Re-insert: drop the prior position so this token moves to MRU.
+            if self.map.contains_key(&db_token) {
+                if let Some(pos) = self.order.iter().position(|&t| t == db_token) {
+                    self.order.remove(pos);
+                }
+            } else if self.map.len() >= LRU_CAPACITY {
+                // Evict LRU.
+                if let Some(victim) = self.order.pop_front() {
+                    self.map.remove(&victim);
+                }
+            }
+            self.map.insert(db_token, ctx);
+            self.order.push_back(db_token);
+        }
+
+        fn get(&self, db_token: u64) -> Option<OverrideContext> {
+            self.map.get(&db_token).copied()
+        }
+    }
+
+    // `HashMap::new` is not const fn, so we lazy-init inside Option.
+    static CONTEXTS: Mutex<Option<LruContexts>> = Mutex::new(None);
 
     /// Install the parser_override context for `db_token`. Called once per
-    /// `init_extension`. Subsequent calls for the same token overwrite (the
-    /// extension being re-loaded against the same DB is benign).
+    /// `init_extension`. Re-installing the same token (extension re-load
+    /// against the same DB) overwrites and refreshes LRU position. When
+    /// the cache is full the least-recently-installed token is evicted —
+    /// subsequent rewrites against the evicted token raise a clear error
+    /// rather than silently deferring to the (now-deleted) legacy path.
     pub fn set(db_token: u64, catalog: CatalogReader, is_file_backed: bool) {
         let mut guard = CONTEXTS.lock().expect("parser_override_catalog poisoned");
-        guard.get_or_insert_with(HashMap::new).insert(
+        guard.get_or_insert_with(LruContexts::new).set(
             db_token,
             OverrideContext {
                 catalog,
@@ -66,11 +116,15 @@ mod parser_override_catalog {
     }
 
     /// Fetch the parser_override context for `db_token`. Returns `None` if
-    /// `set` has not been called for that token (e.g. unit tests not running
-    /// the extension entry point, or a stale token).
+    /// the token was never installed or has been LRU-evicted.
     pub fn get(db_token: u64) -> Option<OverrideContext> {
         let guard = CONTEXTS.lock().expect("parser_override_catalog poisoned");
-        guard.as_ref().and_then(|m| m.get(&db_token).copied())
+        guard.as_ref().and_then(|m| m.get(db_token))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity() -> usize {
+        LRU_CAPACITY
     }
 }
 
@@ -1553,83 +1607,6 @@ pub(crate) fn infer_cardinality(
 // FFI entry points (extension feature-gated)
 // ---------------------------------------------------------------------------
 
-/// FFI entry point for DDL validation with error reporting.
-///
-/// Validates a semantic view DDL statement and returns a tri-state result:
-/// - 0 = success: DDL recognised and validated (caller carries the original
-///   query text forward; the rewritten SQL is computed only to surface
-///   validation errors and is discarded)
-/// - 1 = error: error message written to `error_out`, position to `*position_out`
-/// - 2 = not ours: no output written
-///
-/// `position_out` is set to `u32::MAX` when no position is available.
-///
-/// # Safety
-///
-/// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
-/// - `error_out` must point to a writable buffer of `error_out_len` bytes.
-/// - `position_out` must point to a writable `u32`.
-#[cfg(feature = "extension")]
-#[no_mangle]
-pub extern "C" fn sv_validate_ddl_rust(
-    query_ptr: *const u8,
-    query_len: usize,
-    error_out: *mut u8,
-    error_out_len: usize,
-    position_out: *mut u32,
-) -> u8 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if query_ptr.is_null() || query_len == 0 {
-            return 2_u8; // not ours
-        }
-        // SAFETY: guaranteed valid UTF-8 by the caller (DuckDB query text)
-        let query = unsafe {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(query_ptr, query_len))
-        };
-
-        match validate_and_rewrite(query) {
-            Ok(Some(_sql)) => 0, // success — rewritten SQL discarded; caller uses original query
-            Ok(None) => {
-                // Not a recognized DDL -- check for near-miss
-                if let Some(err) = detect_near_miss(query) {
-                    unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
-                    unsafe {
-                        write_position(position_out, err.position);
-                    }
-                    1 // error (near-miss suggestion)
-                } else {
-                    2 // not ours
-                }
-            }
-            Err(err) => {
-                unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
-                unsafe {
-                    write_position(position_out, err.position);
-                }
-                1 // error (validation failure)
-            }
-        }
-    }));
-
-    result.unwrap_or(2) // on panic: not ours
-}
-
-/// Write a position value to a raw `u32` pointer, using `u32::MAX` as sentinel
-/// for "no position".
-///
-/// # Safety
-///
-/// `position_out` must point to a writable `u32`.
-#[cfg(feature = "extension")]
-unsafe fn write_position(position_out: *mut u32, position: Option<usize>) {
-    if !position_out.is_null() {
-        match position {
-            Some(pos) => *position_out = u32::try_from(pos).unwrap_or(u32::MAX),
-            None => *position_out = u32::MAX,
-        }
-    }
-}
-
 /// Write an error message into a fixed-size, caller-owned byte buffer.
 /// Null-terminated, truncated to `len - 1` bytes.
 ///
@@ -1727,110 +1704,42 @@ unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len:
     *sql_out_len = len;
 }
 
-/// FFI entry point for DDL rewriting (no execution), called from C++ `sv_ddl_bind`.
-///
-/// Rewrites a semantic view DDL statement into the corresponding function call
-/// SQL string. The caller (C++) is responsible for executing it.
-///
-/// On success: returns 0 and writes a heap-owned byte buffer pointer +
-/// length to `*sql_out_ptr` / `*sql_out_len`. The caller takes ownership and
-/// must release the buffer via `sv_free_buffer`. The buffer is **not**
-/// NUL-terminated; read exactly `*sql_out_len` bytes.
-///
-/// On failure: returns 1, writes the error message into the caller-owned
-/// `error_out` buffer (truncated to `error_out_len - 1`), and leaves
-/// `*sql_out_ptr` untouched (typically null).
-///
-/// # Safety
-///
-/// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
-/// - `sql_out_ptr` must point to a writable `*mut u8` slot, or be null.
-/// - `sql_out_len` must point to a writable `usize` slot, or be null.
-/// - `error_out` must point to a writable buffer of `error_out_len` bytes.
-#[cfg(feature = "extension")]
-#[no_mangle]
-pub extern "C" fn sv_rewrite_ddl_rust(
-    query_ptr: *const u8,
-    query_len: usize,
-    sql_out_ptr: *mut *mut u8,
-    sql_out_len: *mut usize,
-    error_out: *mut u8,
-    error_out_len: usize,
-) -> u8 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || -> Result<String, String> {
-            if query_ptr.is_null() || query_len == 0 {
-                return Err("Empty query".to_string());
-            }
-            // SAFETY: guaranteed valid UTF-8 by the caller (DuckDB query text)
-            let query = unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(query_ptr, query_len))
-            };
-
-            // Use validate_and_rewrite for all DDL forms.
-            // validate_and_rewrite returns:
-            //   Ok(Some(sql)) -- DDL detected and rewritten
-            //   Ok(None)      -- not our DDL (should not happen here since parse hook already accepted it)
-            //   Err(ParseError) -- validation/parse error
-            validate_and_rewrite(query)
-                .map_err(|e| e.message)
-                .and_then(|opt| opt.ok_or_else(|| "DDL not recognized".to_string()))
-        },
-    ));
-
-    match result {
-        Ok(Ok(sql)) => {
-            unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
-            0 // success
-        }
-        Ok(Err(err)) => {
-            unsafe { write_error_to_buffer(error_out, error_out_len, &err) };
-            1 // failure
-        }
-        Err(_panic) => {
-            unsafe {
-                write_error_to_buffer(error_out, error_out_len, "Internal panic in DDL rewrite");
-            }
-            1 // failure
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// v0.8.0: native-SQL rewrite for parser_override (transactional DDL)
+// v0.8.x: native-SQL rewrite for parser_override (transactional DDL)
 // ---------------------------------------------------------------------------
 //
-// Converts the table-function-call SQL produced by `validate_and_rewrite` into
-// native SQL (INSERT / DELETE / UPDATE against semantic_layer._definitions) so
-// that DuckDB executes it on the caller's connection — making writes participate
-// in the caller's transaction (the v0.8.0 fix for ADBC autocommit=false).
+// `parser_override` is the sole semantic-view DDL entry point. Every recognised
+// statement is rewritten here and re-executed on the caller's connection by
+// DuckDB — the legacy parse_function / sv_ddl_internal fallback was retired
+// in v0.8.1.
 //
-// The legacy table-function path stays the source of truth for validation and
-// JSON serialization. This function post-processes its output rather than
-// duplicating the rewrite logic. The format coupling is internal — both ends
-// of the conversion live in this file.
+// Rewriting is dispatched by shape:
 //
-// Currently rewrites these forms; everything else returns Ok(None), causing
-// the parser_override callback to fall through to DuckDB's default parser
-// (and from there the legacy parse_function fallback for non-postgres DDL):
+//   * CREATE / CREATE OR REPLACE / CREATE IF NOT EXISTS
+//     CREATE ... FROM YAML FILE '/path/...'
+//     DROP / DROP IF EXISTS
+//     ALTER ... RENAME TO / SET COMMENT / UNSET COMMENT
+//       → emitted as native INSERT / DELETE / UPDATE against
+//         `semantic_layer._definitions`, so writes participate in the
+//         caller's transaction (the v0.8.0 ADBC autocommit=false fix).
 //
-//   * CREATE / CREATE OR REPLACE / CREATE IF NOT EXISTS  (extension feature only)
-//   * DROP / DROP IF EXISTS                              (extension feature only)
-//   * ALTER ... RENAME TO / SET COMMENT / UNSET COMMENT  (extension feature only)
+//   * DESCRIBE / SHOW SEMANTIC * / GET_DDL / READ_YAML_FROM_SEMANTIC_VIEW
+//       → passed through as `SELECT * FROM <existing_read_side_table_function>(...)`
+//         (or the same SQL with WHERE/LIMIT clauses appended). DuckDB re-parses
+//         and executes on the caller's connection. The read-side table functions
+//         themselves still query via `catalog_conn` (committed state); making
+//         DESCRIBE/SHOW transactional w.r.t. the caller's snapshot would require
+//         exposing the executing connection from BindInfo — a separate refactor.
 //
-// All three need a `CatalogReader` for existence checks; CREATE additionally
-// uses it to run catalog-side queries during enrichment (PK lookup, LIMIT 0
-// type inference, fact typing). The handle is `OnceLock`-installed at
-// extension load, so under `cargo test` (no extension feature) these forms
-// still defer to the legacy path.
+//   * Anything else (`validate_and_rewrite` returns None)
+//       → `Ok(None)`; the C++ shim returns DISPLAY_ORIGINAL_ERROR and DuckDB's
+//         default parser handles it.
 //
-// Forms NOT rewritten:
-//   * CREATE ... FROM YAML FILE '/path/...'  (sentinel needs C++ file read;
-//     once the C++ shim has resolved the file the result re-enters this
-//     module as a regular CREATE through DefineFromJsonVTab::bind, which
-//     calls the same shared `enrich_definition_for_create` helper but runs
-//     in non-transactional auto-commit — documented v0.8.0 limitation).
-//   * DESCRIBE / SHOW *  (read-only; transactionality not relevant).
+// CREATE/DROP/ALTER need a `CatalogReader` for existence checks; CREATE also
+// runs catalog-side queries during enrichment (PK lookup, LIMIT 0 type
+// inference, fact typing). The reader is registered at extension load via
+// `set_catalog_for_parser_override`. Under `cargo test` (no extension feature)
+// those code paths are excluded entirely.
 pub fn rewrite_to_native_sql(db_token: u64, query: &str) -> Result<Option<String>, ParseError> {
     let Some(tf_sql) = validate_and_rewrite(query)? else {
         return Ok(None);
@@ -1839,16 +1748,17 @@ pub fn rewrite_to_native_sql(db_token: u64, query: &str) -> Result<Option<String
     // YAML FILE produces a sentinel string starting with `__SV_YAML_FILE__`
     // (path + kind + name + comment). Read the file and route through the
     // shared CREATE emission path so the INSERT runs on the caller's
-    // connection. Falls back to the legacy C++ shim path if the parser_override
-    // context isn't installed (cargo test, no extension feature).
+    // connection.
     if let Some(payload) = tf_sql.strip_prefix("__SV_YAML_FILE__") {
         return rewrite_yaml_file_create(db_token, payload);
     }
 
+    // Read-side DDL (DESCRIBE / SHOW with WHERE/LIMIT clauses) emits SQL that
+    // doesn't match the `SELECT * FROM fn('arg', ...)` shape. Pass through
+    // unchanged; DuckDB executes the read-side table function on the caller's
+    // connection.
     let Some(call) = parse_table_function_call(&tf_sql) else {
-        // Not in `SELECT * FROM <fn>(...)` form (e.g. SHOW with WHERE clauses).
-        // Read-only forms — defer to legacy path.
-        return Ok(None);
+        return Ok(Some(tf_sql));
     };
 
     // The args returned by parse_table_function_call retain the SQL escaping
@@ -1864,17 +1774,27 @@ pub fn rewrite_to_native_sql(db_token: u64, query: &str) -> Result<Option<String
         | "create_semantic_view_if_not_exists_from_json" => {
             rewrite_create(db_token, call.fn_name.as_str(), args)
         }
-        // DROP / ALTER need catalog access for existence checks and JSON
-        // read-modify-write. See `rewrite_drop_or_alter` (extension-only).
-        // DESCRIBE / SHOW are read-only — defer to legacy path.
-        _ => rewrite_drop_or_alter(db_token, call.fn_name.as_str(), args),
+        // DROP / ALTER: existence check + JSON read-modify-write + native
+        // DELETE/UPDATE. See `rewrite_drop_or_alter` (extension-only).
+        "drop_semantic_view"
+        | "drop_semantic_view_if_exists"
+        | "alter_semantic_view_rename"
+        | "alter_semantic_view_rename_if_exists"
+        | "alter_semantic_view_set_comment"
+        | "alter_semantic_view_set_comment_if_exists"
+        | "alter_semantic_view_unset_comment"
+        | "alter_semantic_view_unset_comment_if_exists" => {
+            rewrite_drop_or_alter(db_token, call.fn_name.as_str(), args)
+        }
+        // Read-side table functions (describe_semantic_view, show_*, list_*,
+        // get_ddl, read_yaml_from_semantic_view): pass through.
+        _ => Ok(Some(tf_sql)),
     }
 }
 
 /// DROP / ALTER native-SQL emission, gated on the extension feature because it
 /// needs the runtime `CatalogReader` for existence checks and JSON read-modify-
-/// write. Under `cargo test` (no extension feature) returns `Ok(None)` so DROP
-/// and ALTER fall back through the legacy `parse_function` path.
+/// write.
 #[cfg(not(feature = "extension"))]
 #[allow(clippy::unnecessary_wraps)] // matches the extension-feature signature
 fn rewrite_drop_or_alter(
@@ -1882,6 +1802,8 @@ fn rewrite_drop_or_alter(
     _fn_name: &str,
     _args: &[String],
 ) -> Result<Option<String>, ParseError> {
+    // Unreachable under cargo test (no extension feature, parser_override
+    // entry point not exported). Kept to satisfy the dispatch match arm.
     Ok(None)
 }
 
@@ -1891,10 +1813,17 @@ fn rewrite_drop_or_alter(
     fn_name: &str,
     args: &[String],
 ) -> Result<Option<String>, ParseError> {
-    // Without an installed parser_override context for this DB token defer to
-    // the legacy path.
+    // Missing context = LRU eviction (see B3 bounded LRU) or registration
+    // race. Surface as a clear error rather than letting DuckDB's default
+    // parser produce a generic syntax error on `CREATE SEMANTIC VIEW`.
     let Some(ctx) = parser_override_catalog::get(db_token) else {
-        return Ok(None);
+        return Err(ParseError {
+            message: "semantic_views: catalog context for this database has been evicted \
+                      (process has opened more than 16 databases). Re-load the extension \
+                      or restart the process."
+                .to_string(),
+            position: None,
+        });
     };
     let catalog = ctx.catalog;
 
@@ -1919,17 +1848,24 @@ fn rewrite_drop_or_alter(
         ("alter_semantic_view_unset_comment_if_exists", 1) => {
             rewrite_alter_comment(&catalog, &args[0], None, true)
         }
-        // Read-only or unknown — defer to legacy.
-        _ => Ok(None),
+        // Caller pre-filtered to known names; this is unreachable. If hit, it
+        // is an internal dispatch bug — surface as an error instead of
+        // silently producing wrong SQL.
+        _ => Err(ParseError {
+            message: format!(
+                "internal error: rewrite_drop_or_alter dispatched with unknown \
+                 fn_name='{fn_name}' arity={}",
+                args.len()
+            ),
+            position: None,
+        }),
     }
 }
 
 /// CREATE-side native-SQL emission, gated on the extension feature: needs the
 /// runtime `CatalogReader` for existence checks AND for catalog-side queries
 /// performed by `enrich_definition_for_create` (PK lookup, type inference,
-/// fact typing). Under `cargo test` (no extension feature) returns `Ok(None)`
-/// so CREATE forms fall back through the legacy `parse_function` /
-/// `DefineFromJsonVTab::bind` path.
+/// fact typing).
 #[cfg(not(feature = "extension"))]
 #[allow(clippy::unnecessary_wraps)] // matches the extension-feature signature
 fn rewrite_create(
@@ -1937,6 +1873,8 @@ fn rewrite_create(
     _fn_name: &str,
     _args: &[String],
 ) -> Result<Option<String>, ParseError> {
+    // Unreachable under cargo test (no extension feature, parser_override
+    // entry point not exported). Kept to satisfy the dispatch match arm.
     Ok(None)
 }
 
@@ -1946,15 +1884,25 @@ fn rewrite_create(
     fn_name: &str,
     args: &[String],
 ) -> Result<Option<String>, ParseError> {
-    // Without an installed parser_override context for this DB token defer to
-    // the legacy path (e.g. extension loaded but set_catalog_for_parser_override
-    // not called for this token).
+    // See `rewrite_drop_or_alter` for the eviction-error rationale.
     let Some(ctx) = parser_override_catalog::get(db_token) else {
-        return Ok(None);
+        return Err(ParseError {
+            message: "semantic_views: catalog context for this database has been evicted \
+                      (process has opened more than 16 databases). Re-load the extension \
+                      or restart the process."
+                .to_string(),
+            position: None,
+        });
     };
 
     if args.len() != 2 {
-        return Ok(None);
+        return Err(ParseError {
+            message: format!(
+                "internal error: rewrite_create dispatched with arity={}",
+                args.len()
+            ),
+            position: None,
+        });
     }
     let name = unescape_sql_arg(&args[0]);
     let json = unescape_sql_arg(&args[1]);
@@ -1963,7 +1911,12 @@ fn rewrite_create(
         "create_semantic_view_from_json" => (false, false),
         "create_or_replace_semantic_view_from_json" => (true, false),
         "create_semantic_view_if_not_exists_from_json" => (false, true),
-        _ => return Ok(None),
+        _ => {
+            return Err(ParseError {
+                message: format!("internal error: rewrite_create unknown fn_name='{fn_name}'"),
+                position: None,
+            });
+        }
     };
 
     let def =
@@ -2343,10 +2296,15 @@ struct TableFunctionCall {
 
 /// Parse a `SELECT * FROM <fn_name>('arg1'[, 'arg2'])` SQL string.
 ///
-/// Returns `None` for SQL that doesn't match this exact shape (e.g. SHOW forms
-/// with WHERE/LIMIT, or unrecognized prefixes). Handles SQL `''` escaping
-/// inside single-quoted args; preserves the `''` form in the returned strings
-/// so callers can re-embed them in new single-quoted SQL without re-escaping.
+/// Returns `None` for SQL that doesn't match this exact shape (e.g. SHOW
+/// forms with WHERE/LIMIT, or unrecognized prefixes). Handles SQL `''`
+/// escaping inside single-quoted args; preserves the `''` form in the
+/// returned strings so callers can re-embed them in new single-quoted SQL
+/// without re-escaping.
+///
+/// v0.8.1 tightened (B4): rejects malformed shapes that earlier silently
+/// swallowed — `foo(,)`, `foo('a',)` (trailing comma), `foo('a' 'b')`
+/// (missing comma between args).
 fn parse_table_function_call(sql: &str) -> Option<TableFunctionCall> {
     const PREFIX: &str = "SELECT * FROM ";
     let rest = sql.strip_prefix(PREFIX)?;
@@ -2359,14 +2317,22 @@ fn parse_table_function_call(sql: &str) -> Option<TableFunctionCall> {
     }
 
     // Body after the opening paren up to the matching closing paren.
-    // The body is a comma-separated list of single-quoted strings; we walk it
-    // tracking quote state so commas inside strings don't split args.
+    // The body is a comma-separated list of single-quoted strings; we walk
+    // it tracking quote state so commas inside strings don't split args.
     let body = &rest[paren_pos + 1..];
     let mut args: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
     let mut chars = body.char_indices();
     let mut closing_pos: Option<usize> = None;
+    // After the closing `'` of a string literal, only whitespace / `,` / `)`
+    // are valid. A second `'` would have been peeked-and-consumed in the
+    // in_quote branch (doubled-quote escape).
+    let mut just_closed_quote = false;
+    // Tracks whether the most recent unquoted-state event was a `,`. Used to
+    // reject `foo(,)` / `foo('a',)` where a comma is followed by `)` with no
+    // intervening arg.
+    let mut expecting_arg_after_comma = false;
 
     while let Some((i, ch)) = chars.next() {
         if in_quote {
@@ -2380,19 +2346,38 @@ fn parse_table_function_call(sql: &str) -> Option<TableFunctionCall> {
                     chars.next();
                 } else {
                     in_quote = false;
+                    just_closed_quote = true;
                 }
             }
         } else {
             match ch {
                 '\'' => {
+                    // Two adjacent string literals like `'a' 'b'` (no comma)
+                    // are invalid in our generated SQL — reject.
+                    if just_closed_quote {
+                        return None;
+                    }
                     in_quote = true;
+                    just_closed_quote = false;
+                    expecting_arg_after_comma = false;
                     current.push(ch);
                 }
                 ',' => {
-                    args.push(strip_outer_quotes(current.trim())?.to_string());
+                    let trimmed = current.trim();
+                    if trimmed.is_empty() {
+                        // `foo(,...)` — comma without preceding arg.
+                        return None;
+                    }
+                    args.push(strip_outer_quotes(trimmed)?.to_string());
                     current.clear();
+                    just_closed_quote = false;
+                    expecting_arg_after_comma = true;
                 }
                 ')' => {
+                    if expecting_arg_after_comma {
+                        // `foo('a',)` — trailing comma.
+                        return None;
+                    }
                     closing_pos = Some(i);
                     break;
                 }
@@ -2425,23 +2410,27 @@ fn strip_outer_quotes(s: &str) -> Option<&str> {
     Some(inner)
 }
 
-/// FFI entry point for parser_override. Validates and rewrites recognized
-/// semantic-view DDL into native SQL (INSERT / DELETE / UPDATE against
-/// `semantic_layer._definitions`) suitable for re-parsing through DuckDB's
-/// own parser and execution on the caller's connection.
+/// FFI entry point for parser_override. The sole DDL entry point for the
+/// extension as of v0.8.1 — the legacy parse_function/parse_stub path was
+/// retired. Rewrites recognized semantic-view DDL into native SQL suitable
+/// for re-parsing through DuckDB's own parser and execution on the caller's
+/// connection.
 ///
-/// Return values match the protocol used by sv_parse_stub:
+/// Returns:
 ///   0 = success: heap-owned native SQL pointer + length written to
 ///       `*sql_out_ptr` / `*sql_out_len`. Caller takes ownership and must
 ///       release via `sv_free_buffer`. The buffer is **not** NUL-terminated;
 ///       read exactly `*sql_out_len` bytes.
-///   1 = validation error: error written to `error_out`
-///   2 = not ours / not yet handled: caller should defer to default parser
-///       (which falls through to the legacy parse_function fallback path)
+///   1 = validation error / near-miss suggestion: error message written to
+///       `error_out`.
+///   2 = not ours: defer to default parser. Used both for genuinely
+///       non-semantic SQL and for the early-return on null/empty input or
+///       invalid UTF-8.
 ///
 /// # Safety
 ///
-/// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
+/// - `query_ptr` must point to bytes of length `query_len` (validated as
+///   UTF-8 here; invalid UTF-8 returns 2 rather than triggering UB).
 /// - `sql_out_ptr` must point to a writable `*mut u8` slot, or be null.
 /// - `sql_out_len` must point to a writable `usize` slot, or be null.
 /// - `error_out` must point to a writable buffer of `error_out_len` bytes.
@@ -2460,9 +2449,12 @@ pub extern "C" fn sv_parser_override_rust(
         if query_ptr.is_null() || query_len == 0 {
             return 2_u8; // not ours
         }
-        // SAFETY: guaranteed valid UTF-8 by the caller (DuckDB query text).
-        let query = unsafe {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(query_ptr, query_len))
+        // Reject invalid UTF-8 cleanly rather than relying on
+        // from_utf8_unchecked (B2 hardening). DuckDB query strings are
+        // UTF-8 by spec but a malformed input must not trigger UB.
+        let bytes = unsafe { std::slice::from_raw_parts(query_ptr, query_len) };
+        let Ok(query) = std::str::from_utf8(bytes) else {
+            return 2; // not ours — defer
         };
 
         match rewrite_to_native_sql(db_token, query) {
@@ -2470,7 +2462,17 @@ pub extern "C" fn sv_parser_override_rust(
                 unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
                 0 // success — native SQL handed to caller
             }
-            Ok(None) => 2, // not ours, or a form we defer to the legacy path
+            Ok(None) => {
+                // Genuinely not ours — but check for a near-miss typo
+                // (e.g. `CREAT SEMANTIC VIEW`) so the user sees a helpful
+                // suggestion instead of a generic syntax error from
+                // DuckDB's default parser.
+                if let Some(err) = detect_near_miss(query) {
+                    unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
+                    return 1;
+                }
+                2 // not ours, defer to default parser
+            }
             Err(err) => {
                 unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
                 1 // validation error
@@ -2484,6 +2486,96 @@ pub extern "C" fn sv_parser_override_rust(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===================================================================
+    // parse_table_function_call — happy-path + B4 tightening (v0.8.1).
+    // Pre-v0.8.1 this silently swallowed `foo(,)` and `foo('a',)` and
+    // accepted `foo('a' 'b')` (missing comma). Now they all return None.
+    // ===================================================================
+
+    #[test]
+    fn parse_tf_call_zero_args() {
+        let r = parse_table_function_call("SELECT * FROM foo()").expect("zero-arg parse");
+        assert_eq!(r.fn_name, "foo");
+        assert!(r.args.is_empty());
+    }
+
+    #[test]
+    fn parse_tf_call_single_arg() {
+        let r = parse_table_function_call("SELECT * FROM foo('a')").expect("single-arg parse");
+        assert_eq!(r.fn_name, "foo");
+        assert_eq!(r.args, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn parse_tf_call_multi_arg() {
+        let r = parse_table_function_call("SELECT * FROM foo('a', 'b')").expect("multi-arg parse");
+        assert_eq!(r.fn_name, "foo");
+        assert_eq!(r.args, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parse_tf_call_doubled_quote_inside_arg() {
+        // `'O''Brien'` decodes to `O''Brien` (escaping retained).
+        let r = parse_table_function_call("SELECT * FROM foo('O''Brien')")
+            .expect("doubled-quote parse");
+        assert_eq!(r.args, vec!["O''Brien".to_string()]);
+    }
+
+    #[test]
+    fn parse_tf_call_rejects_lone_comma() {
+        assert!(parse_table_function_call("SELECT * FROM foo(,)").is_none());
+    }
+
+    #[test]
+    fn parse_tf_call_rejects_trailing_comma() {
+        assert!(parse_table_function_call("SELECT * FROM foo('a',)").is_none());
+        assert!(parse_table_function_call("SELECT * FROM foo('a', )").is_none());
+    }
+
+    #[test]
+    fn parse_tf_call_rejects_missing_comma() {
+        assert!(parse_table_function_call("SELECT * FROM foo('a' 'b')").is_none());
+    }
+
+    #[test]
+    fn parse_tf_call_rejects_unknown_prefix() {
+        assert!(parse_table_function_call("INSERT INTO t VALUES ('a')").is_none());
+        assert!(parse_table_function_call("describe_semantic_view('foo')").is_none());
+    }
+
+    // ===================================================================
+    // B3: bounded LRU for parser_override_catalog. Capacity 16; eviction
+    // happens on insert when full; LRU position refreshes on re-insert
+    // of an existing token.
+    // ===================================================================
+
+    #[cfg(feature = "extension")]
+    #[test]
+    fn parser_override_catalog_lru_evicts_oldest() {
+        // Use a contiguous block of high-value tokens to avoid colliding
+        // with any tokens issued by other tests sharing the same global.
+        const BASE: u64 = 0xFFFF_0000;
+        // Create a dummy CatalogReader pointing at null — never dereferenced
+        // here; we only exercise the map mechanics.
+        let null_reader = crate::catalog::CatalogReader::new(
+            std::ptr::null_mut() as libduckdb_sys::duckdb_connection
+        );
+
+        let cap = parser_override_catalog::capacity();
+        // Insert cap+1 tokens; the first should be evicted.
+        for i in 0..(cap as u64 + 1) {
+            parser_override_catalog::set(BASE + i, null_reader, false);
+        }
+        assert!(
+            parser_override_catalog::get(BASE).is_none(),
+            "oldest token should be evicted"
+        );
+        assert!(
+            parser_override_catalog::get(BASE + cap as u64).is_some(),
+            "newest token should be present"
+        );
+    }
 
     // ===================================================================
     // FFI heap-buffer round-trip — guards against the v0.8.0 silent-

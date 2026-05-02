@@ -1,89 +1,14 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+//! CREATE-time enrichment shared by the parser_override CREATE path.
+//!
+//! Pre-v0.8.1 this module also hosted `DefineFromJsonVTab` — a table function
+//! that the legacy parse_function fallback rewrote DDL into. v0.8.1's full
+//! unification deleted that path; `parser_override` now emits native INSERT
+//! against `semantic_layer._definitions` directly. Only the enrichment +
+//! PK-resolution helpers remain — both called by `crate::parse::rewrite_create`
+//! and `crate::parse::rewrite_yaml_file_create`.
 
-use duckdb::{
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
-};
 use libduckdb_sys as ffi;
 use std::ffi::CStr;
-
-/// Shared state for the legacy `create_semantic_view_from_json` table-function
-/// fallback (still reachable for direct user calls; the v0.8.0 native CREATE
-/// path runs via `parser_override` and writes directly on the caller's
-/// connection).
-///
-/// `persist_conn` is `Some` for file-backed databases — it is a separate
-/// `duckdb_connection` created at init time and used to execute INSERT into
-/// `semantic_layer._definitions` from within bind (avoids deadlock with
-/// the main connection's execution lock). For in-memory databases via the
-/// legacy fallback there is no separate write connection: writes go through
-/// `catalog_conn` instead.
-#[derive(Clone)]
-pub struct DefineState {
-    pub persist_conn: Option<ffi::duckdb_connection>,
-    /// Connection for catalog queries (e.g., `duckdb_constraints()` lookups)
-    /// and for legacy in-memory writes when `persist_conn` is `None`.
-    pub catalog_conn: ffi::duckdb_connection,
-    /// When true, uses INSERT OR REPLACE (upsert); when false, errors on duplicate.
-    pub or_replace: bool,
-    /// When true, silently succeeds (no-op) if the view already exists.
-    /// Mutually exclusive with `or_replace` (or_replace takes precedence if both set).
-    pub if_not_exists: bool,
-}
-
-// SAFETY: duckdb_connection is an opaque pointer managed by DuckDB.
-// DuckDB handles concurrent access internally per connection.
-unsafe impl Send for DefineState {}
-unsafe impl Sync for DefineState {}
-
-/// Whether a semantic view already exists in `semantic_layer._definitions`.
-fn view_exists(conn: ffi::duckdb_connection, name: &str) -> Result<bool, String> {
-    crate::catalog::CatalogReader::new(conn).exists(name)
-}
-
-/// Persist a view definition to `semantic_layer._definitions`.
-///
-/// `or_replace=true` → `INSERT OR REPLACE` (overwrite existing row).
-/// `or_replace=false` → plain `INSERT`; caller is expected to have already
-/// checked for existing rows so that the failure mode of a duplicate row is
-/// surfaced as the friendly "already exists" error rather than a raw
-/// constraint violation.
-fn persist_define(
-    conn: ffi::duckdb_connection,
-    name: &str,
-    json: &str,
-    or_replace: bool,
-) -> Result<(), String> {
-    let sql = if or_replace {
-        "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES ($1, $2)"
-    } else {
-        "INSERT INTO semantic_layer._definitions (name, definition) VALUES ($1, $2)"
-    };
-    unsafe {
-        super::persist::execute_parameterized(conn, sql, &[name, json])
-            .map_err(|e| format!("failed to persist semantic view '{name}' to catalog table: {e}"))
-    }
-}
-
-/// Bind-time data for the DDL define table function.
-///
-/// Holds the view name (returned as the single result row).
-pub struct DefineBindData {
-    name: String,
-}
-
-// SAFETY: String is Send + Sync.
-unsafe impl Send for DefineBindData {}
-unsafe impl Sync for DefineBindData {}
-
-/// Init data for the DDL define table function.
-pub struct DefineInitData {
-    done: AtomicBool,
-}
-
-// SAFETY: AtomicBool is Send + Sync.
-unsafe impl Send for DefineInitData {}
-unsafe impl Sync for DefineInitData {}
 
 /// Look up PRIMARY KEY constraints from the DuckDB catalog for tables
 /// that were declared without an explicit PRIMARY KEY in the TABLES clause.
@@ -168,9 +93,8 @@ fn resolve_pk_from_catalog(
 /// 7. Run `typeof(expr)` against the source table for each fact to populate
 ///    fact `output_type` (best-effort).
 ///
-/// Used by both the legacy `DefineFromJsonVTab::bind` path (CREATE FROM YAML
-/// FILE still routes through it) and the v0.8.0 transactional CREATE path
-/// emitted by `parser_override`.
+/// Called by both `parse::rewrite_create` (inline AS-body) and
+/// `parse::rewrite_yaml_file_create` (FROM YAML FILE) under parser_override.
 pub fn enrich_definition_for_create(
     name: &str,
     mut def: crate::model::SemanticViewDefinition,
@@ -336,110 +260,4 @@ pub fn enrich_definition_for_create(
     }
 
     serde_json::to_string(&def).map_err(|e| e.to_string())
-}
-
-/// `create_semantic_view_from_json(name, json)` table function.
-///
-/// Accepts a pre-parsed JSON-serialized `SemanticViewDefinition` (produced by
-/// the AS-body DDL rewriter in parse.rs). Deserializes and stores the definition
-/// using the shared DefineState/persist_define logic.
-///
-/// This is the execution target for `CREATE SEMANTIC VIEW name AS TABLES (...) ...`.
-/// Three variants are registered:
-/// - `create_semantic_view_from_json` (or_replace=false, if_not_exists=false)
-/// - `create_or_replace_semantic_view_from_json` (or_replace=true)
-/// - `create_semantic_view_if_not_exists_from_json` (if_not_exists=true)
-pub struct DefineFromJsonVTab;
-
-impl VTab for DefineFromJsonVTab {
-    type BindData = DefineBindData;
-    type InitData = DefineInitData;
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
-            // Declare output schema: single VARCHAR column with the view name.
-            bind.add_result_column("view_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-
-            let name = bind.get_parameter(0).to_string();
-            let json = bind.get_parameter(1).to_string();
-
-            // Deserialize the JSON into a SemanticViewDefinition.
-            let def = crate::model::SemanticViewDefinition::from_json(&name, &json)
-                .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
-
-            // Access the DefineState from extra_info (moved up for catalog PK resolution).
-            let state_ptr = bind.get_extra_info::<DefineState>();
-            let state = unsafe { &*state_ptr };
-
-            // Run shared enrichment (PK resolution → cardinality → graph
-            // validations → metadata capture → type inference → fact typing).
-            // `persist_conn.is_some()` mirrors the v0.7.1 file-backed gate for
-            // LIMIT 0 type inference; in-memory DBs skip it.
-            let infer_types = state.persist_conn.is_some();
-            let json_out =
-                enrich_definition_for_create(&name, def, state.catalog_conn, infer_types)
-                    .map_err(Box::<dyn std::error::Error>::from)?;
-
-            // Persist to `_definitions`. File-backed DBs use the dedicated
-            // persist_conn; in-memory falls back to catalog_conn.
-            let write_conn = state.persist_conn.unwrap_or(state.catalog_conn);
-
-            if state.or_replace {
-                persist_define(write_conn, &name, &json_out, true)
-                    .map_err(Box::<dyn std::error::Error>::from)?;
-            } else {
-                let already =
-                    view_exists(write_conn, &name).map_err(Box::<dyn std::error::Error>::from)?;
-                if already {
-                    if state.if_not_exists {
-                        // Silently succeed -- view exists, no replacement needed.
-                    } else {
-                        return Err(format!(
-                            "semantic view '{name}' already exists; use CREATE OR REPLACE SEMANTIC VIEW to overwrite"
-                        )
-                        .into());
-                    }
-                } else {
-                    persist_define(write_conn, &name, &json_out, false)
-                        .map_err(Box::<dyn std::error::Error>::from)?;
-                }
-            }
-
-            Ok(DefineBindData { name })
-        }))
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(DefineInitData {
-            done: AtomicBool::new(false),
-        })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let init_data = func.get_init_data();
-        if init_data.done.swap(true, Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-        let bind_data = func.get_bind_data();
-        let name_vec = output.flat_vector(0);
-        name_vec.insert(0, bind_data.name.as_str());
-        output.set_len(1);
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        // Both name and json are positional VARCHAR parameters.
-        Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // name
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // json
-        ])
-    }
-
-    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
-        None // No named parameters -- both are positional
-    }
 }

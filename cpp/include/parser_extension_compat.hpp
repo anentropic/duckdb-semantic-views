@@ -17,19 +17,21 @@
 // these declarations still match by:
 //   grep -A 120 'duckdb/parser/parser_extension.hpp' cpp/include/duckdb.cpp
 //
-// NOTE: ParserOverrideResult constructors are kept in sync with duckdb.cpp;
-// shim.cpp constructs all three forms (default, statements, exception).
-// The struct layout (type, statements, error fields in order) must match
-// duckdb.cpp exactly for ODR compliance.
+// As of v0.8.1 the extension only uses parser_override (the legacy
+// parse_function/plan_function path was retired in the full unification),
+// but the ParserExtension class retains its parse_function and plan_function
+// fields under ODR — we keep their typedefs and supporting structs for
+// layout compatibility even though shim.cpp never assigns to them.
 //
 // AllowParserOverride enum, full ParserOptions struct, and minimal Parser
-// class declaration are also re-declared here so shim.cpp can re-parse
+// class declaration are also re-declared so shim.cpp can re-parse
 // rewritten SQL produced by the parser_override callback. Definitions
 // match duckdb.cpp lines ~23790, ~23800, ~23949.
 
 #pragma once
 
 #include "duckdb.hpp"
+#include <cstddef>
 
 namespace duckdb {
 
@@ -135,6 +137,18 @@ struct ParserOptions {
 	optional_ptr<const ExtensionCallbackManager> extensions;
 	AllowParserOverride parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
 };
+
+// Guard against silent layout drift between this redeclaration and duckdb.cpp.
+// On DuckDB 1.10.502 with the amalgamation pinned in Cargo.toml the layout
+// is { bool, bool, idx_t, optional_ptr<...>, AllowParserOverride } and packs
+// to 32 bytes on a 64-bit target (alignof 8 forces 6B pad after the bools,
+// 7B trailing pad after the enum). If a DuckDB bump changes the field set
+// this assert fires; re-grep parser.hpp / parser_options.hpp in duckdb.cpp
+// and adjust both the struct and this constant in lockstep. Truncating
+// ParserOptions previously caused garbage parse errors like
+// `syntax error at or near "" position 0` (see milestone v0.8.0 commit 55ddcda).
+static_assert(sizeof(ParserOptions) == 32,
+              "ParserOptions layout drift -- re-grep duckdb.cpp parser_options.hpp");
 
 typedef ParserOverrideResult (*parser_override_function_t)(ParserExtensionInfo *info, const string &query,
                                                            ParserOptions &options);

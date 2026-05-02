@@ -144,21 +144,21 @@ fn main() {
     }
 }
 
-/// Generate a patched copy of duckdb.cpp in OUT_DIR for Windows builds.
+/// Generate a patched copy of `duckdb.cpp` in `OUT_DIR` for Windows builds.
 ///
-/// duckdb.cpp includes <windows.h> mid-file (after all DuckDB declarations are
-/// already processed from duckdb.hpp). The windows.h include can define macros that
-/// conflict with identifiers in the DuckDB C++ implementation code that follows:
+/// `duckdb.cpp` includes `<windows.h>` mid-file (after all `DuckDB` declarations are
+/// already processed from `duckdb.hpp`). The `windows.h` include can define macros that
+/// conflict with identifiers in the `DuckDB` C++ implementation code that follows:
 ///
-/// - `GetObject` → `GetObjectA` (wingdi.h): conflicts with ComplexJSON::GetObject
-///   (line ~36327) and ObjectCache::GetObject (line ~37656).
-/// - `interface` → `struct` (objbase.h): conflicts with MultiFileReader `interface`
+/// - `GetObject` → `GetObjectA` (`wingdi.h`): conflicts with `ComplexJSON::GetObject`
+///   (line ~36327) and `ObjectCache::GetObject` (line ~37656).
+/// - `interface` → `struct` (`objbase.h`): conflicts with `MultiFileReader` `interface`
 ///   variable names (line ~65873+).
 ///
-/// The fix adds explicit `#undef` blocks after each <windows.h> include, following
-/// the same pattern DuckDB already uses for CreateDirectory/MoveFile/RemoveDirectory
-/// in the same file. We patch at build time (not at commit time) because duckdb.cpp
-/// is gitignored and re-downloaded from DuckDB releases in CI.
+/// The fix adds explicit `#undef` blocks after each `<windows.h>` include, following
+/// the same pattern `DuckDB` already uses for `CreateDirectory`/`MoveFile`/`RemoveDirectory`
+/// in the same file. We patch at build time (not at commit time) because `duckdb.cpp`
+/// is gitignored and re-downloaded from `DuckDB` releases in CI.
 ///
 /// Returns the path to the patched file (or the original if already patched).
 #[cfg(feature = "extension")]

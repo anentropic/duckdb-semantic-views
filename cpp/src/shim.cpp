@@ -1,17 +1,21 @@
-// C++ helper for the DuckDB semantic_views extension (Option A).
+// C++ helper for the DuckDB semantic_views extension.
 //
-// The Rust entry point (semantic_views_init_c_api, C_STRUCT ABI) owns the DuckDB
-// handshake and function registration. After init, it calls sv_register_parser_hooks()
-// here to register the parser extension hooks. This requires C++ types (ParserExtension,
-// DBConfig) that are only accessible via the C++ API.
+// The Rust entry point (semantic_views_init_c_api, C_STRUCT ABI) owns the
+// DuckDB handshake and function registration. After init, it calls
+// sv_register_parser_hooks() here to install a `parser_override` callback —
+// the sole DDL entry point as of v0.8.1's full unification (the legacy
+// `parse_function` / `sv_ddl_internal` table-function fallback was retired
+// once parser_override could route every recognised DDL form including
+// DESCRIBE / SHOW SEMANTIC * via pass-through).
 //
-// All DuckDB C++ symbols are provided by compiling duckdb.cpp (the amalgamation
-// source) alongside this file. Symbol visibility on the cdylib restricts exports
-// to just the Rust entry point, so these definitions stay internal to the binary.
+// All DuckDB C++ symbols are provided by compiling duckdb.cpp (the
+// amalgamation source) alongside this file. Symbol visibility on the cdylib
+// restricts exports to just the Rust entry point, so these definitions stay
+// internal to the binary.
 //
-// DuckDB 1.5.0 moved the parser extension type declarations from duckdb.hpp into
-// duckdb.cpp. The compat header re-declares them so this translation unit can use
-// them. See cpp/include/parser_extension_compat.hpp for details.
+// DuckDB 1.5.0 moved the parser extension type declarations from duckdb.hpp
+// into duckdb.cpp. The compat header re-declares them so this translation
+// unit can use them. See cpp/include/parser_extension_compat.hpp for details.
 
 #include "parser_extension_compat.hpp"
 #include <atomic>
@@ -21,74 +25,39 @@
 using namespace duckdb;
 
 // ---------------------------------------------------------------------------
-// Parser hook: SemanticViewParseData
-// ---------------------------------------------------------------------------
-// Carries the original query text from parse_function to plan_function.
-struct SemanticViewParseData : public ParserExtensionParseData {
-    string query;
-    explicit SemanticViewParseData(string q) : query(std::move(q)) {}
-    unique_ptr<ParserExtensionParseData> Copy() const override {
-        return make_uniq<SemanticViewParseData>(query);
-    }
-    string ToString() const override { return query; }
-};
-
-// ---------------------------------------------------------------------------
 // Rust FFI declarations (defined in src/parse.rs)
 // ---------------------------------------------------------------------------
 extern "C" {
-    // DDL rewrite: rewrites DDL to function call SQL (does NOT execute).
-    //
-    // On rc=0: a heap-owned byte buffer pointer + length is written to
-    // *sql_out_ptr / *sql_out_len. The caller takes ownership and MUST
-    // release the buffer via sv_free_buffer once done with it. The buffer
-    // is NOT NUL-terminated — read exactly *sql_out_len bytes.
-    //
-    // On rc=1: error message written to error_out (NUL-terminated, capped at
-    // error_out_len-1 bytes); *sql_out_ptr left untouched (typically null).
-    uint8_t sv_rewrite_ddl_rust(
-        const char *query_ptr, size_t query_len,
-        char **sql_out_ptr, size_t *sql_out_len,
-        char *error_out, size_t error_out_len);
-
-    // DDL validation with error reporting: 0=success, 1=error, 2=not-ours.
-    // On error: error message in error_out, position in *position_out.
-    // position_out is set to UINT32_MAX when no position is available.
-    // The validate path discards its rewritten SQL (the parse stub carries
-    // the original query text forward), so no SQL output buffer is needed.
-    uint8_t sv_validate_ddl_rust(
-        const char *query_ptr, size_t query_len,
-        char *error_out, size_t error_out_len,
-        uint32_t *position_out);
-
-    // Parser-override DDL rewrite: validates DDL and produces *native* SQL
-    // (INSERT / DELETE / UPDATE against semantic_layer._definitions) suitable
-    // for re-parsing through DuckDB's own parser and execution on the caller's
-    // connection. Distinct from sv_rewrite_ddl_rust which targets the internal
-    // table function. Returns 0=success, 1=validation error, 2=not-ours.
-    //
-    // Same heap-owned out-buffer convention as sv_rewrite_ddl_rust on rc=0.
+    // Parser-override DDL rewrite. For recognized semantic-view DDL emits
+    // native SQL (INSERT/DELETE/UPDATE on _definitions for write-side DDL,
+    // or `SELECT * FROM <read_side_table_function>(...)` pass-through for
+    // DESCRIBE/SHOW). Returns:
+    //   0 = success: heap-owned (ptr, len) written to *sql_out_ptr/*sql_out_len.
+    //                Caller takes ownership and MUST release via sv_free_buffer.
+    //                Buffer is NOT NUL-terminated — read exactly *sql_out_len bytes.
+    //   1 = error:   message written to error_out (NUL-terminated, capped at
+    //                error_out_len-1 bytes); *sql_out_ptr left untouched.
+    //   2 = not ours: defer to default parser.
     //
     // `db_token` identifies which database's catalog connection to use for
     // existence checks and CREATE-time enrichment. Each extension load is
     // assigned a unique token (see sv_register_parser_hooks) so multi-DB
-    // processes (e.g. Python tests opening successive in-memory + file-backed
-    // databases) don't share a stale catalog connection.
+    // processes (e.g. Python tests opening successive databases) don't share
+    // a stale catalog connection.
     uint8_t sv_parser_override_rust(
         uint64_t db_token,
         const char *query_ptr, size_t query_len,
         char **sql_out_ptr, size_t *sql_out_len,
         char *error_out, size_t error_out_len);
 
-    // Releases a buffer previously produced by sv_rewrite_ddl_rust or
-    // sv_parser_override_rust. Safe to call with a null pointer (no-op).
-    // ptr/len must be the exact pair the Rust side returned.
+    // Releases a buffer previously produced by sv_parser_override_rust.
+    // Safe to call with a null pointer (no-op). ptr/len must be the exact
+    // pair the Rust side returned.
     void sv_free_buffer(char *ptr, size_t len);
 }
 
 // RAII guard for heap-owned buffers returned by the Rust FFI. Ensures the
-// buffer is released even if a downstream call (Parser::ParseQuery,
-// duckdb_query) throws.
+// buffer is released even if a downstream call (Parser::ParseQuery) throws.
 struct SvOwnedBuffer {
     char *ptr = nullptr;
     size_t len = 0;
@@ -122,336 +91,30 @@ struct SvOwnedBuffer {
 // `db_token` selects the right catalog connection on the Rust side; we
 // generate a fresh token on every sv_register_parser_hooks call so each
 // loaded database has an isolated entry in the Rust-side connection map.
-// `ddl_conn` is the per-load connection used by the legacy table-function
-// DDL path (sv_ddl_bind) — see SemanticViewsBindInfo for the bind-side
-// counterpart that carries it through TableFunction::function_info.
 struct SemanticViewsParserInfo : public ParserExtensionInfo {
     uint64_t db_token;
-    duckdb_connection ddl_conn;
-    SemanticViewsParserInfo(uint64_t token, duckdb_connection conn)
-        : db_token(token), ddl_conn(conn) {}
-};
-
-// Per-load info attached to the sv_ddl_internal TableFunction's function_info.
-// Carries the ddl_conn from sv_plan_function (which has access to the
-// ParserExtensionInfo) down to sv_ddl_bind (which only sees the
-// TableFunctionBindInput.info pointer). Lifetime: the shared_ptr is owned
-// by the TableFunction's function_info; the underlying duckdb_connection
-// is owned by Rust's extension::init_extension for the database's lifetime
-// (we hold a non-owning copy of the handle).
-struct SemanticViewsBindInfo : public TableFunctionInfo {
-    duckdb_connection ddl_conn;
-    explicit SemanticViewsBindInfo(duckdb_connection conn) : ddl_conn(conn) {}
+    explicit SemanticViewsParserInfo(uint64_t token) : db_token(token) {}
 };
 
 static std::atomic<uint64_t> sv_next_db_token{1};
 
 // ---------------------------------------------------------------------------
-// Parser hook: sv_parse_stub
-// ---------------------------------------------------------------------------
-// Fallback parse function: only called when DuckDB's own parser fails on a
-// statement. Delegates validation to Rust via FFI (sv_validate_ddl_rust) which
-// handles case-insensitive prefix matching, clause validation, near-miss
-// detection, and error position tracking. Returns one of three outcomes:
-//   - PARSE_SUCCESSFUL: DDL detected and validated, carry query forward
-//   - DISPLAY_EXTENSION_ERROR: validation error with positioned caret
-//   - DISPLAY_ORIGINAL_ERROR: not our statement, let DuckDB show its error
-static ParserExtensionParseResult sv_parse_stub(
-    ParserExtensionInfo *, const string &query) {
-    char error_buf[1024];
-    uint32_t position = UINT32_MAX;
-    memset(error_buf, 0, sizeof(error_buf));
-
-    uint8_t rc = sv_validate_ddl_rust(
-        reinterpret_cast<const char *>(query.c_str()),
-        query.size(),
-        error_buf, sizeof(error_buf),
-        &position);
-
-    if (rc == 0) {
-        // Success: DDL detected and validated -- carry query text forward
-        return ParserExtensionParseResult(
-            make_uniq<SemanticViewParseData>(query));
-    } else if (rc == 1) {
-        // Error: validation failed -- return extension error with position
-        string err_msg(error_buf);
-        ParserExtensionParseResult err_result(err_msg);
-        if (position != UINT32_MAX) {
-            err_result.error_location = static_cast<idx_t>(position);
-        }
-        return err_result;
-    }
-    // rc == 2: not our statement -- let DuckDB show its normal error
-    return ParserExtensionParseResult();
-}
-
-// ---------------------------------------------------------------------------
-// DDL plan function: bind, state, execute, plan
-// ---------------------------------------------------------------------------
-
-// Bind data: holds the full result set from executing rewritten DDL SQL.
-// Each row is a vector of string values (all columns forwarded as VARCHAR).
-struct SvDdlBindData : public FunctionData {
-    vector<vector<string>> rows;    // rows[row_idx][col_idx]
-    vector<string> col_names;
-
-    SvDdlBindData() = default;
-
-    unique_ptr<FunctionData> Copy() const override {
-        auto copy = make_uniq<SvDdlBindData>();
-        copy->rows = rows;
-        copy->col_names = col_names;
-        return copy;
-    }
-    bool Equals(const FunctionData &other) const override {
-        auto &o = other.Cast<SvDdlBindData>();
-        return rows == o.rows && col_names == o.col_names;
-    }
-    // Disable statement caching: the return schema varies per DDL form
-    // (CREATE returns 1 column, DESCRIBE returns 6, SHOW returns 2).
-    bool SupportStatementCache() const override {
-        return false;
-    }
-};
-
-// Bind callback: extracts query from input, calls Rust FFI to rewrite DDL,
-// then executes the rewritten SQL on the per-load ddl_conn (carried via
-// TableFunction::function_info → SemanticViewsBindInfo) and captures the
-// full result.
-static unique_ptr<FunctionData> sv_ddl_bind(
-    ClientContext &, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
-
-    // The query text is passed as the first (and only) positional parameter
-    auto query = StringValue::Get(input.inputs[0]);
-
-    // Per-load ddl_conn — attached to function_info by sv_plan_function.
-    // Each extension load has its own SemanticViewsBindInfo so processes
-    // that load the extension into multiple databases (e.g. Python tests)
-    // route DESCRIBE / SHOW SEMANTIC * statements to the right DB.
-    auto *bind_info = dynamic_cast<SemanticViewsBindInfo *>(input.info.get());
-    if (!bind_info || !bind_info->ddl_conn) {
-        throw BinderException(
-            "Semantic view DDL: missing per-load ddl_conn (internal error)");
-    }
-    duckdb_connection ddl_conn = bind_info->ddl_conn;
-
-    // Step 1: Rewrite DDL to function call SQL via Rust FFI. Rust hands us
-    // a heap-owned byte buffer (size unbounded — no truncation cap).
-    SvOwnedBuffer sql_buf;
-    char error_buf[1024];
-    memset(error_buf, 0, sizeof(error_buf));
-
-    uint8_t rc = sv_rewrite_ddl_rust(
-        query.c_str(), query.size(),
-        &sql_buf.ptr, &sql_buf.len,
-        error_buf, sizeof(error_buf));
-
-    if (rc != 0) {
-        throw BinderException("Semantic view DDL failed: %s", error_buf);
-    }
-
-    // Phase 53: Intercept YAML FILE sentinel and read file before final rewrite
-    string sql = sql_buf.to_string();
-
-    if (sql.rfind("__SV_YAML_FILE__", 0) == 0) {
-        // Parse sentinel: __SV_YAML_FILE__<path>\x01<kind>\x01<name>\x01<comment>
-        // Uses \x01 (SOH) as separator because the sentinel passes through
-        // C string APIs that treat \x00 (NUL) as a terminator.
-        auto payload = sql.substr(16);
-        vector<string> parts;
-        size_t pos = 0;
-        for (int i = 0; i < 3; i++) {
-            auto sep = payload.find('\x01', pos);
-            if (sep == string::npos) {
-                parts.push_back(payload.substr(pos));
-                break;
-            }
-            parts.push_back(payload.substr(pos, sep - pos));
-            pos = sep + 1;
-        }
-        if (pos < payload.size()) {
-            parts.push_back(payload.substr(pos));
-        }
-
-        if (parts.size() < 3) {
-            throw BinderException("Internal error: malformed YAML FILE sentinel");
-        }
-
-        auto &file_path = parts[0];
-        auto &kind_str = parts[1];
-        auto &view_name = parts[2];
-        auto comment = parts.size() > 3 ? parts[3] : string();
-
-        // Step 1: Read file via read_text() -- SQL-escape the file path
-        string escaped_path;
-        for (char c : file_path) {
-            escaped_path += c;
-            if (c == '\'') escaped_path += '\'';
-        }
-        string read_sql = "SELECT content FROM read_text('" + escaped_path + "')";
-
-        duckdb_result file_result;
-        if (duckdb_query(ddl_conn, read_sql.c_str(), &file_result) != DuckDBSuccess) {
-            auto err_ptr = duckdb_result_error(&file_result);
-            string err_msg = err_ptr ? string(err_ptr) : "File read failed";
-            duckdb_destroy_result(&file_result);
-            throw BinderException("FROM YAML FILE failed: %s", err_msg);
-        }
-
-        auto row_count = duckdb_row_count(&file_result);
-        if (row_count == 0) {
-            duckdb_destroy_result(&file_result);
-            throw BinderException("FROM YAML FILE failed: no content returned from '%s'",
-                                  file_path);
-        }
-
-        // SELECT content FROM read_text(...) projects content as column 0
-        char *content_ptr = duckdb_value_varchar(&file_result, 0, 0);
-        string yaml_content = content_ptr ? string(content_ptr) : "";
-        if (content_ptr) duckdb_free(content_ptr);
-        duckdb_destroy_result(&file_result);
-
-        // Step 2: Reconstruct query as inline YAML with tagged dollar-quote
-        // Tagged delimiter avoids collision with $$ in YAML content
-        string kind_prefix;
-        if (kind_str == "0") kind_prefix = "CREATE SEMANTIC VIEW ";
-        else if (kind_str == "1") kind_prefix = "CREATE OR REPLACE SEMANTIC VIEW ";
-        else kind_prefix = "CREATE SEMANTIC VIEW IF NOT EXISTS ";
-
-        string reconstructed = kind_prefix + view_name;
-        if (!comment.empty()) {
-            string escaped_comment;
-            for (char c : comment) {
-                escaped_comment += c;
-                if (c == '\'') escaped_comment += '\'';
-            }
-            reconstructed += " COMMENT = '" + escaped_comment + "'";
-        }
-        reconstructed += " FROM YAML $__sv_file$" + yaml_content + "$__sv_file$";
-
-        // Step 3: Re-invoke Rust rewrite with the inline YAML query.
-        // Heap-owned return — no buffer-size heuristic needed.
-        SvOwnedBuffer rewrite_buf;
-        memset(error_buf, 0, sizeof(error_buf));
-
-        rc = sv_rewrite_ddl_rust(
-            reconstructed.c_str(), reconstructed.size(),
-            &rewrite_buf.ptr, &rewrite_buf.len,
-            error_buf, sizeof(error_buf));
-
-        if (rc != 0) {
-            throw BinderException("Semantic view DDL failed: %s", error_buf);
-        }
-        sql = rewrite_buf.to_string();
-    }
-
-    // Step 2: Execute the rewritten SQL on the DDL connection
-    duckdb_result result;
-    if (duckdb_query(ddl_conn, sql.c_str(), &result) != DuckDBSuccess) {
-        auto err_ptr = duckdb_result_error(&result);
-        string err_msg = err_ptr ? string(err_ptr) : "DDL execution failed (unknown error)";
-        duckdb_destroy_result(&result);
-        throw BinderException("Semantic view DDL failed: %s", err_msg);
-    }
-
-    // Step 3: Read result metadata and declare output columns
-    auto col_count = duckdb_column_count(&result);
-    auto row_count = duckdb_row_count(&result);
-
-    auto bind_data = make_uniq<SvDdlBindData>();
-
-    for (idx_t c = 0; c < col_count; c++) {
-        auto col_name = duckdb_column_name(&result, c);
-        names.push_back(col_name ? string(col_name) : "col" + to_string(c));
-        return_types.push_back(LogicalType::VARCHAR);
-        bind_data->col_names.push_back(names.back());
-    }
-
-    // Edge case: 0-column result (shouldn't happen but handle gracefully)
-    if (col_count == 0) {
-        names.push_back("result");
-        return_types.push_back(LogicalType::VARCHAR);
-        bind_data->col_names.push_back("result");
-    }
-
-    // Step 4: Read all result rows using duckdb_value_varchar
-    for (idx_t r = 0; r < row_count; r++) {
-        vector<string> row;
-        for (idx_t c = 0; c < col_count; c++) {
-            char *val = duckdb_value_varchar(&result, c, r);
-            row.push_back(val ? string(val) : string());
-            if (val) {
-                duckdb_free(val);
-            }
-        }
-        bind_data->rows.push_back(std::move(row));
-    }
-
-    // Step 5: Clean up the result
-    duckdb_destroy_result(&result);
-
-    return bind_data;
-}
-
-// Global state: tracks the current row offset for emitting result data.
-struct SvDdlGlobalState : public GlobalTableFunctionState {
-    idx_t offset = 0;
-};
-
-static unique_ptr<GlobalTableFunctionState> sv_ddl_init_global(
-    ClientContext &, TableFunctionInitInput &) {
-    return make_uniq<SvDdlGlobalState>();
-}
-
-// Execute callback: emits rows from the stored result data.
-// Handles 0, 1, or many rows. Uses offset tracking for chunked emission.
-static void sv_ddl_execute(ClientContext &, TableFunctionInput &input,
-                           DataChunk &output) {
-    auto &state = input.global_state->Cast<SvDdlGlobalState>();
-    auto &bind_data = input.bind_data->Cast<SvDdlBindData>();
-
-    auto total_rows = bind_data.rows.size();
-    if (state.offset >= total_rows) {
-        output.SetCardinality(0);
-        return;
-    }
-
-    // Emit up to STANDARD_VECTOR_SIZE rows per chunk
-    idx_t count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total_rows - state.offset);
-    auto col_count = bind_data.col_names.size();
-
-    for (idx_t r = 0; r < count; r++) {
-        auto &row = bind_data.rows[state.offset + r];
-        for (idx_t c = 0; c < col_count && c < row.size(); c++) {
-            output.SetValue(c, r, Value(row[c]));
-        }
-    }
-
-    output.SetCardinality(count);
-    state.offset += count;
-}
-
-// ---------------------------------------------------------------------------
 // Parser-override hook: sv_parser_override
 // ---------------------------------------------------------------------------
-// Runs *before* the default parser. Recognized semantic-view DDL is rewritten
-// into native SQL (INSERT / DELETE / UPDATE against semantic_layer._definitions)
-// and re-parsed via DuckDB's own Parser, producing SQLStatement ASTs that DuckDB
-// then plans and executes on the caller's connection — so the writes participate
-// in the caller's transaction (the v0.8.0 fix for ADBC autocommit=false).
+// The sole DDL entry point. Runs *before* the default parser. Recognized
+// semantic-view DDL is rewritten into native SQL by the Rust side and
+// re-parsed via DuckDB's own Parser, producing SQLStatement ASTs that DuckDB
+// then plans and executes on the caller's connection — so write-side DDL
+// participates in the caller's transaction.
 //
-// For non-matching queries, returns DISPLAY_ORIGINAL_ERROR so the dispatcher
-// falls through to the default parser. The legacy sv_parse_stub / sv_plan_function
-// path remains as a defensive fallback for the case where parser_override is
-// disabled (allow_parser_override_extension=DEFAULT) or our override hits an
-// unexpected error — preserving v0.7.x non-transactional behaviour as a safety net.
+// For non-matching queries returns DISPLAY_ORIGINAL_ERROR so DuckDB falls
+// through to the default parser.
 static ParserOverrideResult sv_parser_override(
     ParserExtensionInfo *info, const string &query, ParserOptions &) {
 
     // Identify which DB's catalog connection this query should use. info is
-    // the per-extension-load SemanticViewsParserInfo we attached at registration
-    // time; without it we cannot route correctly, so defer to the legacy path.
+    // the per-extension-load SemanticViewsParserInfo we attached at
+    // registration time; if missing we cannot route correctly, so defer.
     auto *sv_info = dynamic_cast<SemanticViewsParserInfo *>(info);
     if (!sv_info) {
         return ParserOverrideResult();
@@ -473,7 +136,8 @@ static ParserOverrideResult sv_parser_override(
     }
 
     if (rc == 1) {
-        // Validation error — propagate the message via DISPLAY_EXTENSION_ERROR.
+        // Validation error or near-miss suggestion — propagate the message
+        // via DISPLAY_EXTENSION_ERROR.
         std::runtime_error err(error_buf);
         return ParserOverrideResult(err);
     }
@@ -481,9 +145,7 @@ static ParserOverrideResult sv_parser_override(
     // rc == 0: native SQL produced. Re-parse via DuckDB's Parser. Use
     // default-constructed ParserOptions so parser_override doesn't recurse
     // (DEFAULT_OVERRIDE skips parser_override hooks entirely). The
-    // rewritten SQL is read by exact length, so size is unbounded — the
-    // pre-fix 64 KB cap silently truncated and produced confusing parser
-    // errors for large views.
+    // rewritten SQL is read by exact length, so size is unbounded.
     string native_sql = sql_buf.to_string();
     try {
         Parser parser;
@@ -494,93 +156,42 @@ static ParserOverrideResult sv_parser_override(
     }
 }
 
-// Plan function: transforms the intercepted CREATE SEMANTIC VIEW statement
-// into a DDL-executing TableFunction. The query text is carried from the
-// parse phase via SemanticViewParseData. The per-load ddl_conn is pulled
-// off the SemanticViewsParserInfo and attached to TableFunction::function_info
-// so sv_ddl_bind can route execution to the right database's connection in
-// processes that load the extension into multiple databases.
-static ParserExtensionPlanResult sv_plan_function(
-    ParserExtensionInfo *info, ClientContext &,
-    unique_ptr<ParserExtensionParseData> parse_data) {
-    auto &sv_data = dynamic_cast<SemanticViewParseData &>(*parse_data);
-
-    auto *sv_info = dynamic_cast<SemanticViewsParserInfo *>(info);
-    if (!sv_info || !sv_info->ddl_conn) {
-        // Should be impossible — sv_register_parser_hooks always installs
-        // a SemanticViewsParserInfo with a non-null ddl_conn.
-        throw InternalException(
-            "Semantic view DDL: missing parser_info ddl_conn");
-    }
-
-    ParserExtensionPlanResult result;
-    result.function = TableFunction("sv_ddl_internal",
-                                    {LogicalType::VARCHAR},
-                                    sv_ddl_execute, sv_ddl_bind,
-                                    sv_ddl_init_global);
-    result.function.function_info =
-        make_shared_ptr<SemanticViewsBindInfo>(sv_info->ddl_conn);
-    // Push the raw query text as the VARCHAR parameter
-    result.parameters.push_back(Value(sv_data.query));
-
-    result.requires_valid_transaction = true;
-    result.return_type = StatementReturnType::QUERY_RESULT;
-    return result;
-}
-
 // ---------------------------------------------------------------------------
 // sv_register_parser_hooks -- called from Rust after C API init
 // ---------------------------------------------------------------------------
-// Receives a duckdb_database handle (C API) and a duckdb_connection for DDL
-// execution. Extracts DatabaseInstance& and registers the parser extension
-// hooks on DBConfig.
+// Extracts DatabaseInstance& from the C API handle and registers the
+// parser_override hook on DBConfig. Allocates a fresh `db_token` so the
+// Rust side can route per-database catalog reads correctly.
 extern "C" {
     bool sv_register_parser_hooks(duckdb_database db_handle,
-                                  duckdb_connection ddl_conn,
                                   uint64_t *out_db_token) {
         try {
-            // Extract DatabaseInstance from the C API handle.
             // duckdb_database -> internal_ptr -> DatabaseWrapper ->
             //   shared_ptr<DuckDB> -> shared_ptr<DatabaseInstance>
             auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
                 db_handle->internal_ptr);
             auto &db = *wrapper->database->instance;
 
-            // Register parser extension.
-            // DuckDB 1.5.0 moved parser extension registration from direct
-            // vector push_back to ParserExtension::Register(config, ext).
-            //
-            // Allocate a fresh per-load token and stash it on parser_info.
-            // The parser_override callback reads it back to look up the right
-            // catalog connection — required for processes that load the
-            // extension against multiple DBs sequentially (e.g. Python tests).
-            // The same parser_info also carries `ddl_conn` for the legacy
-            // table-function path; sv_plan_function copies it onto each
-            // produced TableFunction's function_info so sv_ddl_bind reaches
-            // the right database's connection.
             uint64_t token = sv_next_db_token.fetch_add(1, std::memory_order_relaxed);
             if (out_db_token) {
                 *out_db_token = token;
             }
+
             ParserExtension ext;
-            ext.parse_function = sv_parse_stub;
-            ext.plan_function = sv_plan_function;
             ext.parser_override = sv_parser_override;
             // duckdb::shared_ptr<T> doesn't have an upcast constructor, so we
             // build the std::shared_ptr<ParserExtensionInfo> first (allocates
             // the SemanticViewsParserInfo and immediately upcasts) then hand
             // it to duckdb::shared_ptr's std-interop constructor.
             std::shared_ptr<ParserExtensionInfo> info_std(
-                new SemanticViewsParserInfo(token, ddl_conn));
+                new SemanticViewsParserInfo(token));
             ext.parser_info = duckdb::shared_ptr<ParserExtensionInfo>(info_std);
             auto &config = DBConfig::GetConfig(db);
             ParserExtension::Register(config, ext);
 
             // Enable parser_override dispatch in FALLBACK mode so our hook
-            // runs *before* the default parser for every query, but a miss
-            // (DISPLAY_ORIGINAL_ERROR) cleanly falls through to it. This is
-            // what makes CREATE / DROP / ALTER SEMANTIC VIEW writes participate
-            // in the caller's transaction (v0.8.0).
+            // runs *before* the default parser for every query; a miss
+            // (DISPLAY_ORIGINAL_ERROR) cleanly falls through to it.
             config.SetOption("allow_parser_override_extension", Value("FALLBACK"));
 
             return true;
