@@ -173,6 +173,13 @@ public:
 //===--------------------------------------------------------------------===//
 // Parser (minimal — only the surface shim.cpp uses to re-parse rewritten SQL)
 //===--------------------------------------------------------------------===//
+//
+// Layout MUST mirror duckdb::Parser in the linked amalgamation exactly,
+// including the trailing private `options` field. Truncating it makes
+// `Parser parser;` allocate too little storage and the constructor / ParseQuery
+// will write past the object — observed as garbage parse errors like
+// `syntax error at or near "" position 0`. Keep this in sync with
+// duckdb.cpp's class Parser declaration when bumping DuckDB.
 class Parser {
 public:
 	explicit Parser(ParserOptions options = ParserOptions());
@@ -181,6 +188,9 @@ public:
 
 public:
 	void ParseQuery(const string &query);
+
+private:
+	ParserOptions options;
 };
 
 } // namespace duckdb
