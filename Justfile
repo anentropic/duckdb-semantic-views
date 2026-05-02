@@ -117,10 +117,18 @@ test-adbc: build
 test-large-view: build
     uv run test/integration/test_large_view_rewrite.py
 
-# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC + large-view
+# Multi-DB DDL isolation regression: load the extension into two databases
+# in the same process and verify DESCRIBE / SHOW route to the right database.
+# Pre-fix the C++ shim held a global sv_ddl_conn that the second LOAD would
+# overwrite, causing the first DB's DESCRIBE/SHOW to silently target the
+# second DB's connection.
+test-multi-db: build
+    uv run test/integration/test_multi_db_isolation.py
+
+# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC + large-view + multi-DB
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
 # _ensure-test-deps runs early to catch pip version mismatches before slow builds.
-test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc test-large-view
+test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc test-large-view test-multi-db
 
 # Check that fuzz targets compile (requires nightly)
 check-fuzz:

@@ -122,20 +122,29 @@ struct SvOwnedBuffer {
 // `db_token` selects the right catalog connection on the Rust side; we
 // generate a fresh token on every sv_register_parser_hooks call so each
 // loaded database has an isolated entry in the Rust-side connection map.
+// `ddl_conn` is the per-load connection used by the legacy table-function
+// DDL path (sv_ddl_bind) — see SemanticViewsBindInfo for the bind-side
+// counterpart that carries it through TableFunction::function_info.
 struct SemanticViewsParserInfo : public ParserExtensionInfo {
     uint64_t db_token;
-    explicit SemanticViewsParserInfo(uint64_t token) : db_token(token) {}
+    duckdb_connection ddl_conn;
+    SemanticViewsParserInfo(uint64_t token, duckdb_connection conn)
+        : db_token(token), ddl_conn(conn) {}
+};
+
+// Per-load info attached to the sv_ddl_internal TableFunction's function_info.
+// Carries the ddl_conn from sv_plan_function (which has access to the
+// ParserExtensionInfo) down to sv_ddl_bind (which only sees the
+// TableFunctionBindInput.info pointer). Lifetime: the shared_ptr is owned
+// by the TableFunction's function_info; the underlying duckdb_connection
+// is owned by Rust's extension::init_extension for the database's lifetime
+// (we hold a non-owning copy of the handle).
+struct SemanticViewsBindInfo : public TableFunctionInfo {
+    duckdb_connection ddl_conn;
+    explicit SemanticViewsBindInfo(duckdb_connection conn) : ddl_conn(conn) {}
 };
 
 static std::atomic<uint64_t> sv_next_db_token{1};
-
-// ---------------------------------------------------------------------------
-// File-scope static: DDL connection for executing rewritten statements
-// ---------------------------------------------------------------------------
-// Set by sv_register_parser_hooks, used by sv_ddl_bind.
-// This is a separate connection to avoid deadlocking with the main
-// connection's ClientContext lock during bind.
-static duckdb_connection sv_ddl_conn = nullptr;
 
 // ---------------------------------------------------------------------------
 // Parser hook: sv_parse_stub
@@ -206,13 +215,26 @@ struct SvDdlBindData : public FunctionData {
 };
 
 // Bind callback: extracts query from input, calls Rust FFI to rewrite DDL,
-// then executes the rewritten SQL on sv_ddl_conn and captures the full result.
+// then executes the rewritten SQL on the per-load ddl_conn (carried via
+// TableFunction::function_info → SemanticViewsBindInfo) and captures the
+// full result.
 static unique_ptr<FunctionData> sv_ddl_bind(
     ClientContext &, TableFunctionBindInput &input,
     vector<LogicalType> &return_types, vector<string> &names) {
 
     // The query text is passed as the first (and only) positional parameter
     auto query = StringValue::Get(input.inputs[0]);
+
+    // Per-load ddl_conn — attached to function_info by sv_plan_function.
+    // Each extension load has its own SemanticViewsBindInfo so processes
+    // that load the extension into multiple databases (e.g. Python tests)
+    // route DESCRIBE / SHOW SEMANTIC * statements to the right DB.
+    auto *bind_info = dynamic_cast<SemanticViewsBindInfo *>(input.info.get());
+    if (!bind_info || !bind_info->ddl_conn) {
+        throw BinderException(
+            "Semantic view DDL: missing per-load ddl_conn (internal error)");
+    }
+    duckdb_connection ddl_conn = bind_info->ddl_conn;
 
     // Step 1: Rewrite DDL to function call SQL via Rust FFI. Rust hands us
     // a heap-owned byte buffer (size unbounded — no truncation cap).
@@ -270,7 +292,7 @@ static unique_ptr<FunctionData> sv_ddl_bind(
         string read_sql = "SELECT content FROM read_text('" + escaped_path + "')";
 
         duckdb_result file_result;
-        if (duckdb_query(sv_ddl_conn, read_sql.c_str(), &file_result) != DuckDBSuccess) {
+        if (duckdb_query(ddl_conn, read_sql.c_str(), &file_result) != DuckDBSuccess) {
             auto err_ptr = duckdb_result_error(&file_result);
             string err_msg = err_ptr ? string(err_ptr) : "File read failed";
             duckdb_destroy_result(&file_result);
@@ -326,7 +348,7 @@ static unique_ptr<FunctionData> sv_ddl_bind(
 
     // Step 2: Execute the rewritten SQL on the DDL connection
     duckdb_result result;
-    if (duckdb_query(sv_ddl_conn, sql.c_str(), &result) != DuckDBSuccess) {
+    if (duckdb_query(ddl_conn, sql.c_str(), &result) != DuckDBSuccess) {
         auto err_ptr = duckdb_result_error(&result);
         string err_msg = err_ptr ? string(err_ptr) : "DDL execution failed (unknown error)";
         duckdb_destroy_result(&result);
@@ -474,17 +496,30 @@ static ParserOverrideResult sv_parser_override(
 
 // Plan function: transforms the intercepted CREATE SEMANTIC VIEW statement
 // into a DDL-executing TableFunction. The query text is carried from the
-// parse phase via SemanticViewParseData.
+// parse phase via SemanticViewParseData. The per-load ddl_conn is pulled
+// off the SemanticViewsParserInfo and attached to TableFunction::function_info
+// so sv_ddl_bind can route execution to the right database's connection in
+// processes that load the extension into multiple databases.
 static ParserExtensionPlanResult sv_plan_function(
-    ParserExtensionInfo *, ClientContext &,
+    ParserExtensionInfo *info, ClientContext &,
     unique_ptr<ParserExtensionParseData> parse_data) {
     auto &sv_data = dynamic_cast<SemanticViewParseData &>(*parse_data);
+
+    auto *sv_info = dynamic_cast<SemanticViewsParserInfo *>(info);
+    if (!sv_info || !sv_info->ddl_conn) {
+        // Should be impossible — sv_register_parser_hooks always installs
+        // a SemanticViewsParserInfo with a non-null ddl_conn.
+        throw InternalException(
+            "Semantic view DDL: missing parser_info ddl_conn");
+    }
 
     ParserExtensionPlanResult result;
     result.function = TableFunction("sv_ddl_internal",
                                     {LogicalType::VARCHAR},
                                     sv_ddl_execute, sv_ddl_bind,
                                     sv_ddl_init_global);
+    result.function.function_info =
+        make_shared_ptr<SemanticViewsBindInfo>(sv_info->ddl_conn);
     // Push the raw query text as the VARCHAR parameter
     result.parameters.push_back(Value(sv_data.query));
 
@@ -504,9 +539,6 @@ extern "C" {
                                   duckdb_connection ddl_conn,
                                   uint64_t *out_db_token) {
         try {
-            // Store the DDL connection for use by sv_ddl_bind
-            sv_ddl_conn = ddl_conn;
-
             // Extract DatabaseInstance from the C API handle.
             // duckdb_database -> internal_ptr -> DatabaseWrapper ->
             //   shared_ptr<DuckDB> -> shared_ptr<DatabaseInstance>
@@ -522,6 +554,10 @@ extern "C" {
             // The parser_override callback reads it back to look up the right
             // catalog connection — required for processes that load the
             // extension against multiple DBs sequentially (e.g. Python tests).
+            // The same parser_info also carries `ddl_conn` for the legacy
+            // table-function path; sv_plan_function copies it onto each
+            // produced TableFunction's function_info so sv_ddl_bind reaches
+            // the right database's connection.
             uint64_t token = sv_next_db_token.fetch_add(1, std::memory_order_relaxed);
             if (out_db_token) {
                 *out_db_token = token;
@@ -535,7 +571,7 @@ extern "C" {
             // the SemanticViewsParserInfo and immediately upcasts) then hand
             // it to duckdb::shared_ptr's std-interop constructor.
             std::shared_ptr<ParserExtensionInfo> info_std(
-                new SemanticViewsParserInfo(token));
+                new SemanticViewsParserInfo(token, ddl_conn));
             ext.parser_info = duckdb::shared_ptr<ParserExtensionInfo>(info_std);
             auto &config = DBConfig::GetConfig(db);
             ParserExtension::Register(config, ext);

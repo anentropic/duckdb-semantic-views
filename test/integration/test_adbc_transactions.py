@@ -7,6 +7,10 @@
 # ]
 # requires-python = ">=3.10"
 # ///
+# Note: `import adbc_driver_duckdb` resolves to the module bundled inside
+# the `duckdb` wheel (see duckdb-1.5.x dist-info/RECORD). There is no
+# separate `adbc-driver-duckdb` package on PyPI, so it does not appear in
+# the dependencies list above.
 """
 ADBC end-to-end transactional DDL test for the semantic_views extension.
 
@@ -125,7 +129,7 @@ def run_tests() -> int:
             # Load the extension via SQL. The connection is in a transaction
             # the moment we issue any statement; commit so subsequent DDL/DML
             # tests start from a clean transactional slate.
-            _execute(conn, f"INSTALL '{extension_path}'")
+            _execute(conn, f"FORCE INSTALL '{extension_path}'")
             _execute(conn, "LOAD semantic_views")
             _execute(
                 conn,

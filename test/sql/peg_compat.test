@@ -6,16 +6,19 @@
 #
 # 1. parser_override (v0.8.0+): registered on ParserExtension and called
 #    BEFORE parsing. Parser-agnostic — works under both Bison and PEG. Used
-#    for CREATE / DROP / ALTER SEMANTIC VIEW. The callback returns native
-#    INSERT/DELETE/UPDATE SQL which whichever parser is active happily parses.
+#    for CREATE / DROP / ALTER SEMANTIC VIEW (all four CREATE forms: inline
+#    SQL keyword body, inline FROM YAML, FROM YAML FILE, and OR REPLACE /
+#    IF NOT EXISTS variants). The callback returns native INSERT/DELETE/UPDATE
+#    SQL which whichever parser is active happily parses.
 #
 # 2. parse_function fallback (Bison-era): the legacy parser_extensions hook,
-#    only consulted by Bison. Used for DESCRIBE / SHOW SEMANTIC * forms and
-#    for CREATE ... FROM YAML FILE. These forms therefore fail under PEG.
+#    only consulted by Bison. Used for DESCRIBE / SHOW SEMANTIC * forms.
+#    These forms therefore fail under PEG.
 #
 # This test documents the expected behavior:
 #   1. All DDL works under the default Bison parser
-#   2. Under PEG: CREATE / DROP / ALTER work (parser_override); DESCRIBE / SHOW fail
+#   2. Under PEG: CREATE (incl. FROM YAML FILE) / DROP / ALTER work
+#      (parser_override); DESCRIBE / SHOW fail
 #   3. Querying existing views works under PEG (semantic_view() is a table function)
 #   4. All DDL works again after disabling PEG parser
 #
@@ -68,6 +71,32 @@ METRICS (t2.total_val AS SUM(t2.val))
 # DROP also goes through parser_override.
 statement ok
 DROP SEMANTIC VIEW peg_under_peg
+
+# CREATE ... FROM YAML FILE also goes through parser_override (v0.8.0+):
+# the __SV_YAML_FILE__ sentinel is intercepted in parser_override, the file
+# is read on the catalog connection, and the resulting INSERT is routed
+# through the same native-SQL re-parse path as inline CREATE.
+statement ok
+COPY (SELECT 'tables:
+  - alias: t4
+    table: peg_test_data
+    pk_columns:
+      - id
+dimensions:
+  - name: dim_id
+    expr: t4.id
+    source_table: t4
+metrics:
+  - name: total_val
+    expr: SUM(t4.val)
+    source_table: t4' AS content)
+TO '__TEST_DIR__/peg_yaml_file.yaml' (FORMAT CSV, HEADER FALSE, QUOTE '');
+
+statement ok
+CREATE SEMANTIC VIEW peg_yaml_file FROM YAML FILE '__TEST_DIR__/peg_yaml_file.yaml'
+
+statement ok
+DROP SEMANTIC VIEW peg_yaml_file
 
 # DESCRIBE defers to the Bison-only parse_function fallback — fails under PEG.
 statement error

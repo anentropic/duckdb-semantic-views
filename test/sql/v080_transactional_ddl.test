@@ -448,6 +448,61 @@ statement ok
 CREATE SEMANTIC VIEW IF NOT EXISTS v080_yaml_commit FROM YAML FILE '__TEST_DIR__/v080_yaml_file.yaml'
 
 # ------------------------------------------------------------------
+# Same-transaction duplicate CREATE produces the friendly "already exists"
+# error, not a raw PK constraint violation. The parse-time existence check
+# only sees committed rows; an in-flight CREATE within the same transaction
+# slips past it, so emit_native_create_sql guards the INSERT with a
+# CASE+error() that runs on the caller's connection (and therefore sees
+# the in-flight row).
+# ------------------------------------------------------------------
+
+statement ok
+BEGIN
+
+statement ok
+CREATE SEMANTIC VIEW v080_dup_check AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+
+statement error
+CREATE SEMANTIC VIEW v080_dup_check AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+----
+already exists
+
+statement ok
+ROLLBACK
+
+# IF NOT EXISTS in the same transaction is a silent no-op even when the
+# in-flight CREATE preceded it.
+statement ok
+BEGIN
+
+statement ok
+CREATE SEMANTIC VIEW v080_dup_ine AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+
+statement ok
+CREATE SEMANTIC VIEW IF NOT EXISTS v080_dup_ine AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+
+# Only one row, not two.
+query I
+SELECT count(*) FROM semantic_layer._definitions WHERE name = 'v080_dup_ine'
+----
+1
+
+statement ok
+ROLLBACK
+
+# ------------------------------------------------------------------
 # Cleanup
 # ------------------------------------------------------------------
 

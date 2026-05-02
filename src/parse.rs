@@ -1998,10 +1998,11 @@ fn emit_native_create_sql(
 ) -> Result<Option<String>, ParseError> {
     let name_escaped = escape_sql_arg(name);
 
-    // Same-txn CREATE-then-CREATE for the same name is the documented v0.8.0
-    // limitation: the second CREATE sees committed state, not the in-flight
-    // INSERT, so the duplicate ends up as a PK violation at execute time
-    // rather than a friendly "already exists" parse error.
+    // Parse-time existence check: fast path for the committed-state case.
+    // Same-txn CREATE-then-CREATE slips past this (the catalog connection
+    // only sees committed rows), so the generated SQL below also guards
+    // against the in-flight case via a CASE+error() / WHERE NOT EXISTS
+    // pattern that runs on the caller's transaction.
     let exists = ctx.catalog.exists(name).map_err(|e| ParseError {
         message: format!("catalog lookup failed: {e}"),
         position: None,
@@ -2036,16 +2037,45 @@ fn emit_native_create_sql(
     })?;
     let enriched_escaped = escape_sql_arg(&enriched_json);
 
-    let verb = if or_replace {
-        "INSERT OR REPLACE"
+    // The generated SQL runs on the caller's connection, so its EXISTS
+    // subqueries see in-flight INSERTs from the same transaction. Three
+    // shapes:
+    //   - OR REPLACE: straight INSERT OR REPLACE, no guard needed.
+    //   - IF NOT EXISTS: WHERE NOT EXISTS guard so a same-txn duplicate
+    //     silently no-ops (mirrors the committed-state SELECT WHERE 1=0
+    //     fast path above).
+    //   - Plain CREATE: CASE+error() raises the friendly "already exists"
+    //     message before the INSERT can fire, replacing what would
+    //     otherwise be a generic PK constraint violation.
+    let sql = if or_replace {
+        format!(
+            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) \
+             VALUES ('{name_escaped}', '{enriched_escaped}') \
+             RETURNING name AS view_name"
+        )
+    } else if if_not_exists {
+        format!(
+            "INSERT INTO semantic_layer._definitions (name, definition) \
+             SELECT '{name_escaped}', '{enriched_escaped}' \
+             WHERE NOT EXISTS (SELECT 1 FROM semantic_layer._definitions \
+                               WHERE name = '{name_escaped}') \
+             RETURNING name AS view_name"
+        )
     } else {
-        "INSERT"
+        format!(
+            "INSERT INTO semantic_layer._definitions (name, definition) \
+             SELECT \
+               CASE WHEN EXISTS (SELECT 1 FROM semantic_layer._definitions \
+                                 WHERE name = '{name_escaped}') \
+                    THEN error('semantic view ''{name_escaped}'' already exists; \
+                                use CREATE OR REPLACE SEMANTIC VIEW to overwrite') \
+                    ELSE '{name_escaped}' \
+               END, \
+               '{enriched_escaped}' \
+             RETURNING name AS view_name"
+        )
     };
-    Ok(Some(format!(
-        "{verb} INTO semantic_layer._definitions (name, definition) \
-         VALUES ('{name_escaped}', '{enriched_escaped}') \
-         RETURNING name AS view_name"
-    )))
+    Ok(Some(sql))
 }
 
 /// Read the FROM YAML FILE sentinel produced by `rewrite_ddl_yaml_file_body`,

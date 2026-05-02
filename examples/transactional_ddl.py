@@ -7,6 +7,10 @@
 # ]
 # requires-python = ">=3.10"
 # ///
+# Note: `import adbc_driver_duckdb` resolves to the module bundled inside
+# the `duckdb` wheel (see duckdb-1.5.x dist-info/RECORD). There is no
+# separate `adbc-driver-duckdb` package on PyPI, so it does not appear in
+# the dependencies list above.
 """
 uv run examples/transactional_ddl.py
 
