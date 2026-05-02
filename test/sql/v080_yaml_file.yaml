@@ -1,0 +1,13 @@
+tables:
+  - alias: o
+    table: v080_orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o

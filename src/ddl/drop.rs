@@ -6,13 +6,16 @@ use duckdb::{
 };
 use libduckdb_sys as ffi;
 
-use crate::catalog::{catalog_delete, catalog_delete_if_exists, CatalogState};
+use crate::catalog::CatalogReader;
 
 /// Shared state for `drop_semantic_view` and `drop_semantic_view_if_exists`.
 /// See [`crate::ddl::define::DefineState`] for the persist_conn pattern.
 #[derive(Clone)]
 pub struct DropState {
-    pub catalog: CatalogState,
+    /// Read handle for `_definitions` (used for the existence check).
+    pub catalog: CatalogReader,
+    /// Write connection for `DELETE FROM _definitions`. File-backed DBs use
+    /// the dedicated `persist_conn`; in-memory uses the catalog connection.
     pub persist_conn: Option<ffi::duckdb_connection>,
     /// When true, silently succeeds if the view does not exist.
     pub if_exists: bool,
@@ -78,30 +81,18 @@ impl VTab for DropSemanticViewVTab {
             let state = unsafe { &*state_ptr };
 
             // Check catalog first -- gives better error messages than the SQL DELETE.
-            let exists = {
-                let guard = state
-                    .catalog
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
-                guard.contains_key(&name)
-            };
+            let exists = state
+                .catalog
+                .exists(&name)
+                .map_err(Box::<dyn std::error::Error>::from)?;
 
             if !exists && !state.if_exists {
                 return Err(format!("semantic view '{name}' does not exist").into());
             }
 
             if exists {
-                // 1. Delete from DuckDB table FIRST (write-first for consistency).
-                if let Some(conn) = state.persist_conn {
-                    persist_drop(conn, &name);
-                }
-
-                // 2. Remove from in-memory catalog.
-                if state.if_exists {
-                    catalog_delete_if_exists(&state.catalog, &name);
-                } else {
-                    catalog_delete(&state.catalog, &name)?;
-                }
+                let conn = state.persist_conn.unwrap_or(state.catalog.raw());
+                persist_drop(conn, &name);
             }
 
             Ok(DropBindData { name })

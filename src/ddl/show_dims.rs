@@ -5,7 +5,7 @@ use duckdb::{
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
 };
 
-use crate::catalog::CatalogState;
+use crate::catalog::CatalogReader;
 use crate::ddl::describe::format_json_array;
 use crate::model::SemanticViewDefinition;
 
@@ -151,18 +151,14 @@ impl VTab for ShowSemanticDimensionsVTab {
             bind_output_columns(bind);
 
             let view_name = bind.get_parameter(0).to_string();
-            let state_ptr = bind.get_extra_info::<CatalogState>();
-            let guard = unsafe {
-                (*state_ptr)
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
-            };
-
-            let json = guard
-                .get(&view_name)
+            let state_ptr = bind.get_extra_info::<CatalogReader>();
+            let reader = unsafe { *state_ptr };
+            let json = reader
+                .lookup(&view_name)
+                .map_err(Box::<dyn std::error::Error>::from)?
                 .ok_or_else(|| format!("semantic view '{view_name}' does not exist"))?;
 
-            let mut rows = collect_dims(&view_name, json);
+            let mut rows = collect_dims(&view_name, &json);
             rows.sort_by(|a, b| a.name.cmp(&b.name));
 
             Ok(ShowDimsBindData { rows })
@@ -204,15 +200,14 @@ impl VTab for ShowSemanticDimensionsAllVTab {
         crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
             bind_output_columns(bind);
 
-            let state_ptr = bind.get_extra_info::<CatalogState>();
-            let guard = unsafe {
-                (*state_ptr)
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
-            };
+            let state_ptr = bind.get_extra_info::<CatalogReader>();
+            let reader = unsafe { *state_ptr };
+            let entries = reader
+                .list_all()
+                .map_err(Box::<dyn std::error::Error>::from)?;
 
             let mut rows = Vec::new();
-            for (name, json) in guard.iter() {
+            for (name, json) in &entries {
                 rows.extend(collect_dims(name, json));
             }
             rows.sort_by(|a, b| {

@@ -9,7 +9,7 @@ use duckdb::{
 };
 use libduckdb_sys as ffi;
 
-use crate::catalog::CatalogState;
+use crate::catalog::CatalogReader;
 use crate::expand::wildcard::{expand_wildcards, WildcardItemType};
 use crate::expand::{expand, QueryRequest};
 use crate::model::SemanticViewDefinition;
@@ -23,15 +23,15 @@ use super::error::QueryError;
 
 /// Shared state for the `semantic_query` table function.
 ///
-/// Carries the catalog (in-memory view definitions) and a raw `duckdb_connection`
-/// handle for executing expanded SQL via the C API. The connection is created
-/// independently of the host connection by calling `duckdb_connect` on the same
-/// database handle, avoiding lock conflicts with the host during query execution.
-///
-/// For the connection handle extraction strategy, see `extract_query_conn` in lib.rs.
+/// Carries a catalog reader (queries `semantic_layer._definitions` via a
+/// dedicated catalog connection) and a raw `duckdb_connection` handle for
+/// executing expanded SQL via the C API. Both connections are created
+/// independently of the host connection by calling `duckdb_connect` on the
+/// same database handle, avoiding lock conflicts with the host during query
+/// execution.
 #[derive(Clone)]
 pub struct QueryState {
-    pub catalog: CatalogState,
+    pub catalog: CatalogReader,
     /// Raw connection handle for SQL execution.
     pub conn: ffi::duckdb_connection,
 }
@@ -507,15 +507,17 @@ impl VTab for SemanticViewVTab {
             // 4. Look up view definition in the catalog.
             let state_ptr = bind.get_extra_info::<QueryState>();
             let state = unsafe { &*state_ptr };
-            let catalog_guard = state
+            let json_str = match state
                 .catalog
-                .read()
-                .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
-
-            let json_str = match catalog_guard.get(&view_name) {
-                Some(j) => j.clone(),
+                .lookup(&view_name)
+                .map_err(Box::<dyn std::error::Error>::from)?
+            {
+                Some(j) => j,
                 None => {
-                    let available: Vec<String> = catalog_guard.keys().cloned().collect();
+                    let available = state
+                        .catalog
+                        .list_names()
+                        .map_err(Box::<dyn std::error::Error>::from)?;
                     let suggestion = suggest_closest(&view_name, &available);
                     let err: Box<dyn std::error::Error> = Box::new(QueryError::ViewNotFound {
                         name: view_name,
@@ -525,8 +527,6 @@ impl VTab for SemanticViewVTab {
                     return Err(err);
                 }
             };
-            // Release the catalog lock before proceeding.
-            drop(catalog_guard);
 
             // 5. Parse definition, expand wildcards, and expand.
             let def = SemanticViewDefinition::from_json(&view_name, &json_str)

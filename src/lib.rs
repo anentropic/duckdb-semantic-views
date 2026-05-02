@@ -332,6 +332,7 @@ mod extension {
         fn sv_register_parser_hooks(
             db_handle: ffi::duckdb_database,
             ddl_conn: ffi::duckdb_connection,
+            out_db_token: *mut u64,
         ) -> bool;
     }
 
@@ -356,15 +357,15 @@ mod extension {
             }
         };
 
-        // Initialize the catalog.
-        let catalog_state = init_catalog(con, &db_path)?;
+        // Initialize the persistent catalog (schema + table + companion-file migration).
+        init_catalog(con, &db_path)?;
 
-        // Create a separate connection for DDL persistence.
-        // Only created for file-backed databases — in-memory DBs use HashMap only.
-        // This connection is used by define_semantic_view / drop_semantic_view via FFI
-        // to write to semantic_layer._definitions without deadlocking the main
-        // connection's execution lock (context_lock is non-reentrant; a second
-        // duckdb_connection has its own context).
+        // Create a separate connection for DDL persistence on file-backed
+        // databases. The legacy table-function DDL path uses this connection
+        // to write to `semantic_layer._definitions` without deadlocking the
+        // main connection's execution lock (context_lock is non-reentrant;
+        // a second duckdb_connection has its own context). For in-memory
+        // databases the catalog connection serves the same purpose.
         let persist_conn: Option<ffi::duckdb_connection> = if db_path.as_ref() != ":memory:" {
             let mut conn: ffi::duckdb_connection = ptr::null_mut();
             let rc = unsafe { ffi::duckdb_connect(db_handle, &mut conn) };
@@ -376,19 +377,44 @@ mod extension {
             None
         };
 
-        // Register create_semantic_view_from_json(name, json) -- target for native DDL.
-        // The native DDL path (CREATE SEMANTIC VIEW ... AS ...) rewrites to a call to
-        // these _from_json table functions. Three variants cover the 3 CREATE forms.
-        // Create a dedicated connection for catalog queries (duckdb_constraints() lookups).
-        // Always created for both file-backed and in-memory databases.
+        // Dedicated connection for catalog queries (`duckdb_constraints()`
+        // lookups, `_definitions` reads, etc.). Always created for both
+        // file-backed and in-memory databases.
         let mut catalog_conn: ffi::duckdb_connection = ptr::null_mut();
         let rc = unsafe { ffi::duckdb_connect(db_handle, &mut catalog_conn) };
         if rc != ffi::DuckDBSuccess {
-            return Err("Failed to create catalog connection for PK resolution".into());
+            return Err("Failed to create catalog connection".into());
+        }
+        let catalog_reader = crate::catalog::CatalogReader::new(catalog_conn);
+
+        // Create the DDL connection early so we can register parser hooks and
+        // capture the per-load `db_token` before any other code path needs it.
+        // The hook needs to be in place AND mapped to the right catalog reader
+        // BEFORE table functions are registered (table-function registration
+        // can itself trigger parsing on some DuckDB versions).
+        let mut ddl_conn: ffi::duckdb_connection = ptr::null_mut();
+        let rc = unsafe { ffi::duckdb_connect(db_handle, &mut ddl_conn) };
+        if rc != ffi::DuckDBSuccess {
+            return Err("Failed to create DDL connection for parser hook".into());
         }
 
+        let mut db_token: u64 = 0;
+        if !unsafe { sv_register_parser_hooks(db_handle, ddl_conn, &mut db_token) } {
+            return Err("Failed to register parser hooks via C++ helper".into());
+        }
+
+        // v0.8.0: install the catalog handle the parser_override callback
+        // uses for CREATE/DROP/ALTER existence checks and JSON read-modify-
+        // write, keyed by the token the C++ shim assigned at registration.
+        // `is_file_backed` mirrors the legacy `persist_conn.is_some()` gate so
+        // DDL-time type inference fires only for file-backed DBs.
+        crate::parse::set_catalog_for_parser_override(
+            db_token,
+            catalog_reader,
+            persist_conn.is_some(),
+        );
+
         let define_state = DefineState {
-            catalog: catalog_state.clone(),
             persist_conn,
             catalog_conn,
             or_replace: false,
@@ -400,7 +426,6 @@ mod extension {
         )?;
 
         let define_or_replace_state = DefineState {
-            catalog: catalog_state.clone(),
             persist_conn,
             catalog_conn,
             or_replace: true,
@@ -412,7 +437,6 @@ mod extension {
         )?;
 
         let define_if_not_exists_state = DefineState {
-            catalog: catalog_state.clone(),
             persist_conn,
             catalog_conn,
             or_replace: false,
@@ -425,7 +449,7 @@ mod extension {
 
         // Register drop_semantic_view(name) table function.
         let drop_state = DropState {
-            catalog: catalog_state.clone(),
+            catalog: catalog_reader,
             persist_conn,
             if_exists: false,
         };
@@ -436,7 +460,7 @@ mod extension {
 
         // Register drop_semantic_view_if_exists(name) table function.
         let drop_if_exists_state = DropState {
-            catalog: catalog_state.clone(),
+            catalog: catalog_reader,
             persist_conn,
             if_exists: true,
         };
@@ -447,7 +471,7 @@ mod extension {
 
         // Register alter_semantic_view_rename(old, new) table function.
         let alter_state = AlterRenameState {
-            catalog: catalog_state.clone(),
+            catalog: catalog_reader,
             persist_conn,
             if_exists: false,
         };
@@ -458,7 +482,7 @@ mod extension {
 
         // Register alter_semantic_view_rename_if_exists(old, new) table function.
         let alter_if_exists_state = AlterRenameState {
-            catalog: catalog_state.clone(),
+            catalog: catalog_reader,
             persist_conn,
             if_exists: true,
         };
@@ -469,7 +493,7 @@ mod extension {
 
         // Register alter_semantic_view_set_comment(name, comment) table function.
         let alter_set_comment_state = AlterCommentState {
-            catalog: catalog_state.clone(),
+            catalog: catalog_reader,
             persist_conn,
             if_exists: false,
         };
@@ -480,7 +504,7 @@ mod extension {
 
         // Register alter_semantic_view_set_comment_if_exists(name, comment) table function.
         let alter_set_comment_if_exists_state = AlterCommentState {
-            catalog: catalog_state.clone(),
+            catalog: catalog_reader,
             persist_conn,
             if_exists: true,
         };
@@ -491,7 +515,7 @@ mod extension {
 
         // Register alter_semantic_view_unset_comment(name) table function.
         let alter_unset_comment_state = AlterCommentState {
-            catalog: catalog_state.clone(),
+            catalog: catalog_reader,
             persist_conn,
             if_exists: false,
         };
@@ -502,7 +526,7 @@ mod extension {
 
         // Register alter_semantic_view_unset_comment_if_exists(name) table function.
         let alter_unset_comment_if_exists_state = AlterCommentState {
-            catalog: catalog_state.clone(),
+            catalog: catalog_reader,
             persist_conn,
             if_exists: true,
         };
@@ -514,74 +538,74 @@ mod extension {
         // Register table DDL read functions (list_semantic_views, describe_semantic_view).
         con.register_table_function_with_extra_info::<ListSemanticViewsVTab, _>(
             "list_semantic_views",
-            &catalog_state,
+            &catalog_reader,
         )?;
         con.register_table_function_with_extra_info::<ListTerseSemanticViewsVTab, _>(
             "list_terse_semantic_views",
-            &catalog_state,
+            &catalog_reader,
         )?;
         con.register_table_function_with_extra_info::<ShowColumnsInSemanticViewVTab, _>(
             "show_columns_in_semantic_view",
-            &catalog_state,
+            &catalog_reader,
         )?;
         con.register_table_function_with_extra_info::<DescribeSemanticViewVTab, _>(
             "describe_semantic_view",
-            &catalog_state,
+            &catalog_reader,
         )?;
 
         // SHOW SEMANTIC DIMENSIONS
         con.register_table_function_with_extra_info::<ShowSemanticDimensionsVTab, _>(
             "show_semantic_dimensions",
-            &catalog_state,
+            &catalog_reader,
         )?;
         con.register_table_function_with_extra_info::<ShowSemanticDimensionsAllVTab, _>(
             "show_semantic_dimensions_all",
-            &catalog_state,
+            &catalog_reader,
         )?;
 
         // SHOW SEMANTIC DIMENSIONS FOR METRIC
         con.register_table_function_with_extra_info::<ShowDimensionsForMetricVTab, _>(
             "show_semantic_dimensions_for_metric",
-            &catalog_state,
+            &catalog_reader,
         )?;
 
         // SHOW SEMANTIC METRICS
         con.register_table_function_with_extra_info::<ShowSemanticMetricsVTab, _>(
             "show_semantic_metrics",
-            &catalog_state,
+            &catalog_reader,
         )?;
         con.register_table_function_with_extra_info::<ShowSemanticMetricsAllVTab, _>(
             "show_semantic_metrics_all",
-            &catalog_state,
+            &catalog_reader,
         )?;
 
         // SHOW SEMANTIC FACTS
         con.register_table_function_with_extra_info::<ShowSemanticFactsVTab, _>(
             "show_semantic_facts",
-            &catalog_state,
+            &catalog_reader,
         )?;
         con.register_table_function_with_extra_info::<ShowSemanticFactsAllVTab, _>(
             "show_semantic_facts_all",
-            &catalog_state,
+            &catalog_reader,
         )?;
 
         // SHOW SEMANTIC MATERIALIZATIONS
         con.register_table_function_with_extra_info::<ShowSemanticMaterializationsVTab, _>(
             "show_semantic_materializations",
-            &catalog_state,
+            &catalog_reader,
         )?;
         con.register_table_function_with_extra_info::<ShowSemanticMaterializationsAllVTab, _>(
             "show_semantic_materializations_all",
-            &catalog_state,
+            &catalog_reader,
         )?;
 
         // Register GET_DDL scalar function.
-        con.register_scalar_function_with_state::<GetDdlScalar>("get_ddl", &catalog_state)?;
+        con.register_scalar_function_with_state::<GetDdlScalar>("get_ddl", &catalog_reader)?;
 
         // Register READ_YAML_FROM_SEMANTIC_VIEW scalar function.
         con.register_scalar_function_with_state::<ReadYamlFromSemanticViewScalar>(
             "read_yaml_from_semantic_view",
-            &catalog_state,
+            &catalog_reader,
         )?;
 
         // Create a NEW connection for the semantic_view table function.
@@ -593,7 +617,7 @@ mod extension {
 
         // Register the semantic_view table function.
         let query_state = QueryState {
-            catalog: catalog_state.clone(),
+            catalog: catalog_reader,
             conn: query_conn,
         };
         con.register_table_function_with_extra_info::<SemanticViewVTab, _>(
@@ -607,25 +631,10 @@ mod extension {
             &query_state,
         )?;
 
-        // Create a dedicated DDL connection for the parser hook path.
-        // This connection is ALWAYS created (even for in-memory databases) because
-        // the native DDL path rewrites to `SELECT * FROM create_semantic_view(...)`
-        // which needs a separate connection to avoid deadlocking the ClientContext
-        // lock held during plan/bind. This is distinct from persist_conn (which
-        // writes to the _definitions catalog table for file-backed databases).
-        let mut ddl_conn: ffi::duckdb_connection = ptr::null_mut();
-        let rc = unsafe { ffi::duckdb_connect(db_handle, &mut ddl_conn) };
-        if rc != ffi::DuckDBSuccess {
-            return Err("Failed to create DDL connection for parser hook".into());
-        }
-
-        // Register parser hooks via C++ helper.
-        // The C++ shim extracts DatabaseInstance& from the duckdb_database handle
-        // and registers ParserExtension hooks on DBConfig. This requires C++ types
-        // that are only available via the duckdb.hpp amalgamation header.
-        if !unsafe { sv_register_parser_hooks(db_handle, ddl_conn) } {
-            return Err("Failed to register parser hooks via C++ helper".into());
-        }
+        // Parser hooks (sv_register_parser_hooks) and the per-load ddl_conn
+        // were created earlier in init_extension so the parser_override
+        // catalog map can be populated before any registration triggers a
+        // parse on the connection.
 
         Ok(())
     }

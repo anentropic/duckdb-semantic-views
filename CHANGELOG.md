@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-02
+
+### Added
+
+- Transactional DDL: `CREATE`, `DROP`, and `ALTER SEMANTIC VIEW` now participate in the caller's transaction. `BEGIN ... ROLLBACK` rolls back uncommitted catalog changes and `BEGIN ... COMMIT` persists them, matching the contract that ADBC, dbt, and other transaction-aware clients expect.
+- `parser_override` extension hook: recognised DDL is rewritten into native `INSERT` / `UPDATE` / `DELETE` against `semantic_layer._definitions` and executed on the caller's connection. Non-matching statements fall through to DuckDB's default parser unchanged.
+- All four `CREATE` forms participate in the caller's transaction: inline `AS` keyword body, inline `FROM YAML $$ ... $$`, `FROM YAML FILE '<path>'` (including `https://` and S3 paths via httpfs), and `CREATE OR REPLACE` / `CREATE IF NOT EXISTS` variants.
+- `peg_compat.test`: regression coverage that the override path keeps working under DuckDB's experimental PEG parser, so v0.8.0's transactional DDL survives the upcoming parser switch.
+- ADBC end-to-end test (`test/integration/test_adbc_transactions.py`, runnable via `just test-adbc`) exercising `autocommit=False` rollback / commit semantics for inline, FROM YAML FILE, ALTER, and DROP forms — proves the original ADBC bug is fixed end-to-end.
+
+### Changed
+
+- The in-memory `CatalogState` HashMap that mirrored `_definitions` was removed. All catalog reads now query `_definitions` directly through a single shared `CatalogReader`. This eliminates the divergence risk between the HashMap and the on-disk table that the old write-through-both pattern carried.
+
+### Known limitations
+
+- `semantic_view(...)` queries do not see uncommitted writes to user tables in the same transaction. Expansion runs on a separate `query_conn`, which only sees committed state. Workaround: commit the user-table writes before querying. Inline expansion will be revisited when DuckDB 2.0's PEG grammar-extension API ships.
+- A `CREATE SEMANTIC VIEW` issued in the same uncommitted transaction is no longer visible to subsequent reads in that transaction (e.g. `SHOW SEMANTIC VIEWS` will not list it until commit). Pre-v0.8.0 this happened to work because the in-memory HashMap was updated eagerly; with the HashMap gone, reads see only committed catalog state. Workaround: commit before reading.
+
 ## [0.7.2] - 2026-05-01
 
 ### Fixed

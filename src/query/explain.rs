@@ -147,24 +147,26 @@ impl VTab for ExplainSemanticViewVTab {
             // 3. Look up view definition in the catalog.
             let state_ptr = bind.get_extra_info::<QueryState>();
             let state = unsafe { &*state_ptr };
-            let catalog_guard = state
+            let json_str = match state
                 .catalog
-                .read()
-                .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
-
-            let json_str = if let Some(j) = catalog_guard.get(&view_name) {
-                j.clone()
-            } else {
-                let available: Vec<String> = catalog_guard.keys().cloned().collect();
-                let suggestion = suggest_closest(&view_name, &available);
-                let err: Box<dyn std::error::Error> = Box::new(QueryError::ViewNotFound {
-                    name: view_name,
-                    suggestion,
-                    available,
-                });
-                return Err(err);
+                .lookup(&view_name)
+                .map_err(Box::<dyn std::error::Error>::from)?
+            {
+                Some(j) => j,
+                None => {
+                    let available = state
+                        .catalog
+                        .list_names()
+                        .map_err(Box::<dyn std::error::Error>::from)?;
+                    let suggestion = suggest_closest(&view_name, &available);
+                    let err: Box<dyn std::error::Error> = Box::new(QueryError::ViewNotFound {
+                        name: view_name,
+                        suggestion,
+                        available,
+                    });
+                    return Err(err);
+                }
             };
-            drop(catalog_guard);
 
             // 4. Parse definition, expand wildcards, and expand.
             let def = SemanticViewDefinition::from_json(&view_name, &json_str)

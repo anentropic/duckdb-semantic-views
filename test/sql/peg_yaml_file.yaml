@@ -1,0 +1,13 @@
+tables:
+  - alias: t4
+    table: peg_test_data
+    pk_columns:
+      - id
+dimensions:
+  - name: dim_id
+    expr: t4.id
+    source_table: t4
+metrics:
+  - name: total_val
+    expr: SUM(t4.val)
+    source_table: t4

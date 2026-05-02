@@ -13,6 +13,70 @@ use crate::body_parser::parse_keyword_body;
 use crate::errors::ParseError;
 use crate::model::{Cardinality, Join, TableRef};
 
+// ---------------------------------------------------------------------------
+// v0.8.0: catalog handle for parser_override DROP/ALTER existence checks.
+// ---------------------------------------------------------------------------
+//
+// DROP without IF EXISTS and every ALTER form need to know whether a view
+// exists (and, for SET/UNSET COMMENT, what its current JSON definition is)
+// before we can emit native SQL with friendly errors. The parser_override
+// callback runs in a context with no access to the caller's catalog, so we
+// stash a dedicated `CatalogReader` (populated at extension load) in a
+// process-wide `OnceLock` and read it from the Rust FFI thunk.
+//
+// The reader sees committed state only — by design. Same-transaction
+// CREATE-then-ALTER is the documented v0.8.0 limitation.
+#[cfg(feature = "extension")]
+mod parser_override_catalog {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use crate::catalog::CatalogReader;
+
+    /// Catalog handle plus a `is_file_backed` flag (matches the legacy
+    /// `DefineState::persist_conn.is_some()` test) that gates DDL-time type
+    /// inference. Type inference uses `LIMIT 0` probes that depend on user
+    /// tables having been committed; for in-memory DBs we follow the v0.7.1
+    /// behaviour and skip inference entirely.
+    #[derive(Clone, Copy)]
+    pub struct OverrideContext {
+        pub catalog: CatalogReader,
+        pub is_file_backed: bool,
+    }
+
+    // Per-extension-load context map, keyed by the `db_token` the C++ shim
+    // assigns at registration time. A process can load the extension against
+    // multiple databases sequentially (Python integration tests do this) — a
+    // single global slot would let the first load's stale `catalog_conn` leak
+    // into later parser_override invocations on a different DB.
+    static CONTEXTS: Mutex<Option<HashMap<u64, OverrideContext>>> = Mutex::new(None);
+
+    /// Install the parser_override context for `db_token`. Called once per
+    /// `init_extension`. Subsequent calls for the same token overwrite (the
+    /// extension being re-loaded against the same DB is benign).
+    pub fn set(db_token: u64, catalog: CatalogReader, is_file_backed: bool) {
+        let mut guard = CONTEXTS.lock().expect("parser_override_catalog poisoned");
+        guard.get_or_insert_with(HashMap::new).insert(
+            db_token,
+            OverrideContext {
+                catalog,
+                is_file_backed,
+            },
+        );
+    }
+
+    /// Fetch the parser_override context for `db_token`. Returns `None` if
+    /// `set` has not been called for that token (e.g. unit tests not running
+    /// the extension entry point, or a stale token).
+    pub fn get(db_token: u64) -> Option<OverrideContext> {
+        let guard = CONTEXTS.lock().expect("parser_override_catalog poisoned");
+        guard.as_ref().and_then(|m| m.get(&db_token).copied())
+    }
+}
+
+#[cfg(feature = "extension")]
+pub use parser_override_catalog::set as set_catalog_for_parser_override;
+
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.
 pub const PARSE_NOT_OURS: u8 = 0;
 /// Detected a semantic view DDL statement -- return `PARSE_SUCCESSFUL`.
@@ -1492,7 +1556,9 @@ pub(crate) fn infer_cardinality(
 /// FFI entry point for DDL validation with error reporting.
 ///
 /// Validates a semantic view DDL statement and returns a tri-state result:
-/// - 0 = success: rewritten SQL written to `sql_out`
+/// - 0 = success: DDL recognised and validated (caller carries the original
+///   query text forward; the rewritten SQL is computed only to surface
+///   validation errors and is discarded)
 /// - 1 = error: error message written to `error_out`, position to `*position_out`
 /// - 2 = not ours: no output written
 ///
@@ -1501,7 +1567,6 @@ pub(crate) fn infer_cardinality(
 /// # Safety
 ///
 /// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
-/// - `sql_out` must point to a writable buffer of `sql_out_len` bytes.
 /// - `error_out` must point to a writable buffer of `error_out_len` bytes.
 /// - `position_out` must point to a writable `u32`.
 #[cfg(feature = "extension")]
@@ -1509,8 +1574,6 @@ pub(crate) fn infer_cardinality(
 pub extern "C" fn sv_validate_ddl_rust(
     query_ptr: *const u8,
     query_len: usize,
-    sql_out: *mut u8,
-    sql_out_len: usize,
     error_out: *mut u8,
     error_out_len: usize,
     position_out: *mut u32,
@@ -1525,14 +1588,11 @@ pub extern "C" fn sv_validate_ddl_rust(
         };
 
         match validate_and_rewrite(query) {
-            Ok(Some(sql)) => {
-                unsafe { write_to_buffer(sql_out, sql_out_len, &sql) };
-                0 // success
-            }
+            Ok(Some(_sql)) => 0, // success — rewritten SQL discarded; caller uses original query
             Ok(None) => {
                 // Not a recognized DDL -- check for near-miss
                 if let Some(err) = detect_near_miss(query) {
-                    unsafe { write_to_buffer(error_out, error_out_len, &err.message) };
+                    unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
                     unsafe {
                         write_position(position_out, err.position);
                     }
@@ -1542,7 +1602,7 @@ pub extern "C" fn sv_validate_ddl_rust(
                 }
             }
             Err(err) => {
-                unsafe { write_to_buffer(error_out, error_out_len, &err.message) };
+                unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
                 unsafe {
                     write_position(position_out, err.position);
                 }
@@ -1570,13 +1630,19 @@ unsafe fn write_position(position_out: *mut u32, position: Option<usize>) {
     }
 }
 
-/// Write a string into a raw byte buffer, null-terminated and truncated to `len - 1`.
+/// Write an error message into a fixed-size, caller-owned byte buffer.
+/// Null-terminated, truncated to `len - 1` bytes.
+///
+/// Use only for short, bounded strings (error messages). For unboundedly
+/// large outputs (rewritten SQL) use `leak_string_to_c_buffer` +
+/// `sv_free_buffer` instead — silently truncating SQL produced confusing
+/// downstream parser errors (see v0.8.0 buffer-truncation fix).
 ///
 /// # Safety
 ///
 /// `buf` must point to a writable buffer of at least `len` bytes.
 #[cfg(feature = "extension")]
-unsafe fn write_to_buffer(buf: *mut u8, len: usize, s: &str) {
+unsafe fn write_error_to_buffer(buf: *mut u8, len: usize, s: &str) {
     if buf.is_null() || len == 0 {
         return;
     }
@@ -1586,26 +1652,108 @@ unsafe fn write_to_buffer(buf: *mut u8, len: usize, s: &str) {
     *buf.add(copy_len) = 0; // null terminate
 }
 
+/// Convert an owned `String` into a heap-allocated byte buffer that the C++
+/// caller takes ownership of. Caller must release via `sv_free_buffer`.
+///
+/// Returns `(ptr, len)`. The buffer is **not** NUL-terminated — the C++
+/// side reads exactly `len` bytes. This avoids any silent truncation cap
+/// regardless of how large the rewritten SQL becomes.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+fn leak_string_to_c_buffer(s: String) -> (*mut u8, usize) {
+    let mut bytes = s.into_bytes();
+    bytes.shrink_to_fit();
+    debug_assert_eq!(bytes.len(), bytes.capacity());
+    let len = bytes.len();
+    let ptr = bytes.as_mut_ptr();
+    std::mem::forget(bytes);
+    (ptr, len)
+}
+
+/// Reclaim a buffer produced by `leak_string_to_c_buffer`.
+///
+/// # Safety
+///
+/// `ptr`/`len` must be the exact pair returned by an earlier call to
+/// `leak_string_to_c_buffer` (or its FFI exports), and may only be released
+/// once.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+// Clippy warns that `Vec::from_raw_parts(p, n, n)` looks suspicious — but
+// here the matching `leak_string_to_c_buffer` deliberately calls
+// `shrink_to_fit` so len == capacity holds. Keeping this shape
+// (vs. Box::from_raw on a *mut [u8]) preserves the symmetry with the
+// allocator that produced the buffer.
+#[allow(clippy::same_length_and_capacity)]
+unsafe fn reclaim_c_buffer(ptr: *mut u8, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    drop(Vec::from_raw_parts(ptr, len, len));
+}
+
+/// FFI export: free a heap buffer produced by an earlier
+/// `sv_parser_override_rust` / `sv_rewrite_ddl_rust` success return.
+///
+/// Safe to call with a null pointer (no-op).
+///
+/// # Safety
+///
+/// `ptr`/`len` must be the exact pair the Rust side returned via its
+/// `sql_out_ptr` / `sql_out_len` out-parameters. Calling with any other
+/// pair (or twice on the same pair) is undefined behaviour.
+#[cfg(feature = "extension")]
+#[no_mangle]
+pub unsafe extern "C" fn sv_free_buffer(ptr: *mut u8, len: usize) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reclaim_c_buffer(ptr, len);
+    }));
+}
+
+/// Internal helper: publish an owned `String` to the FFI out-parameters.
+/// On null out-pointers the buffer is dropped instead of leaked, so a
+/// misbehaving C++ caller cannot induce a memory leak through us.
+///
+/// # Safety
+///
+/// Either both `sql_out_ptr` and `sql_out_len` must point to writable
+/// `*mut u8` / `usize` slots, or both must be null. Mixed null is treated
+/// as "drop and skip writing."
+#[cfg(feature = "extension")]
+unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len: *mut usize) {
+    if sql_out_ptr.is_null() || sql_out_len.is_null() {
+        return; // dropping `sql` here releases the heap allocation
+    }
+    let (ptr, len) = leak_string_to_c_buffer(sql);
+    *sql_out_ptr = ptr;
+    *sql_out_len = len;
+}
+
 /// FFI entry point for DDL rewriting (no execution), called from C++ `sv_ddl_bind`.
 ///
 /// Rewrites a semantic view DDL statement into the corresponding function call
 /// SQL string. The caller (C++) is responsible for executing it.
 ///
-/// On success: writes the rewritten SQL to `sql_out` (null-terminated), returns 0.
-/// On failure: writes the error message to `error_out` (null-terminated), returns 1.
+/// On success: returns 0 and writes a heap-owned byte buffer pointer +
+/// length to `*sql_out_ptr` / `*sql_out_len`. The caller takes ownership and
+/// must release the buffer via `sv_free_buffer`. The buffer is **not**
+/// NUL-terminated; read exactly `*sql_out_len` bytes.
+///
+/// On failure: returns 1, writes the error message into the caller-owned
+/// `error_out` buffer (truncated to `error_out_len - 1`), and leaves
+/// `*sql_out_ptr` untouched (typically null).
 ///
 /// # Safety
 ///
 /// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
-/// - `sql_out` must point to a writable buffer of `sql_out_len` bytes.
+/// - `sql_out_ptr` must point to a writable `*mut u8` slot, or be null.
+/// - `sql_out_len` must point to a writable `usize` slot, or be null.
 /// - `error_out` must point to a writable buffer of `error_out_len` bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
 pub extern "C" fn sv_rewrite_ddl_rust(
     query_ptr: *const u8,
     query_len: usize,
-    sql_out: *mut u8,
-    sql_out_len: usize,
+    sql_out_ptr: *mut *mut u8,
+    sql_out_len: *mut usize,
     error_out: *mut u8,
     error_out_len: usize,
 ) -> u8 {
@@ -1632,23 +1780,755 @@ pub extern "C" fn sv_rewrite_ddl_rust(
 
     match result {
         Ok(Ok(sql)) => {
-            unsafe { write_to_buffer(sql_out, sql_out_len, &sql) };
+            unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
             0 // success
         }
         Ok(Err(err)) => {
-            unsafe { write_to_buffer(error_out, error_out_len, &err) };
+            unsafe { write_error_to_buffer(error_out, error_out_len, &err) };
             1 // failure
         }
         Err(_panic) => {
-            unsafe { write_to_buffer(error_out, error_out_len, "Internal panic in DDL rewrite") };
+            unsafe {
+                write_error_to_buffer(error_out, error_out_len, "Internal panic in DDL rewrite");
+            }
             1 // failure
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// v0.8.0: native-SQL rewrite for parser_override (transactional DDL)
+// ---------------------------------------------------------------------------
+//
+// Converts the table-function-call SQL produced by `validate_and_rewrite` into
+// native SQL (INSERT / DELETE / UPDATE against semantic_layer._definitions) so
+// that DuckDB executes it on the caller's connection — making writes participate
+// in the caller's transaction (the v0.8.0 fix for ADBC autocommit=false).
+//
+// The legacy table-function path stays the source of truth for validation and
+// JSON serialization. This function post-processes its output rather than
+// duplicating the rewrite logic. The format coupling is internal — both ends
+// of the conversion live in this file.
+//
+// Currently rewrites these forms; everything else returns Ok(None), causing
+// the parser_override callback to fall through to DuckDB's default parser
+// (and from there the legacy parse_function fallback for non-postgres DDL):
+//
+//   * CREATE / CREATE OR REPLACE / CREATE IF NOT EXISTS  (extension feature only)
+//   * DROP / DROP IF EXISTS                              (extension feature only)
+//   * ALTER ... RENAME TO / SET COMMENT / UNSET COMMENT  (extension feature only)
+//
+// All three need a `CatalogReader` for existence checks; CREATE additionally
+// uses it to run catalog-side queries during enrichment (PK lookup, LIMIT 0
+// type inference, fact typing). The handle is `OnceLock`-installed at
+// extension load, so under `cargo test` (no extension feature) these forms
+// still defer to the legacy path.
+//
+// Forms NOT rewritten:
+//   * CREATE ... FROM YAML FILE '/path/...'  (sentinel needs C++ file read;
+//     once the C++ shim has resolved the file the result re-enters this
+//     module as a regular CREATE through DefineFromJsonVTab::bind, which
+//     calls the same shared `enrich_definition_for_create` helper but runs
+//     in non-transactional auto-commit — documented v0.8.0 limitation).
+//   * DESCRIBE / SHOW *  (read-only; transactionality not relevant).
+pub fn rewrite_to_native_sql(db_token: u64, query: &str) -> Result<Option<String>, ParseError> {
+    let Some(tf_sql) = validate_and_rewrite(query)? else {
+        return Ok(None);
+    };
+
+    // YAML FILE produces a sentinel string starting with `__SV_YAML_FILE__`
+    // (path + kind + name + comment). Read the file and route through the
+    // shared CREATE emission path so the INSERT runs on the caller's
+    // connection. Falls back to the legacy C++ shim path if the parser_override
+    // context isn't installed (cargo test, no extension feature).
+    if let Some(payload) = tf_sql.strip_prefix("__SV_YAML_FILE__") {
+        return rewrite_yaml_file_create(db_token, payload);
+    }
+
+    let Some(call) = parse_table_function_call(&tf_sql) else {
+        // Not in `SELECT * FROM <fn>(...)` form (e.g. SHOW with WHERE clauses).
+        // Read-only forms — defer to legacy path.
+        return Ok(None);
+    };
+
+    // The args returned by parse_table_function_call retain the SQL escaping
+    // produced by validate_and_rewrite (single quotes doubled). They can be
+    // re-embedded as single-quoted strings without further processing.
+    let args = &call.args;
+    match call.fn_name.as_str() {
+        // CREATE forms: enrich the JSON (metadata + type inference + graph
+        // validation) against the catalog connection, then emit native INSERT
+        // on the caller's connection. See `rewrite_create` (extension-only).
+        "create_semantic_view_from_json"
+        | "create_or_replace_semantic_view_from_json"
+        | "create_semantic_view_if_not_exists_from_json" => {
+            rewrite_create(db_token, call.fn_name.as_str(), args)
+        }
+        // DROP / ALTER need catalog access for existence checks and JSON
+        // read-modify-write. See `rewrite_drop_or_alter` (extension-only).
+        // DESCRIBE / SHOW are read-only — defer to legacy path.
+        _ => rewrite_drop_or_alter(db_token, call.fn_name.as_str(), args),
+    }
+}
+
+/// DROP / ALTER native-SQL emission, gated on the extension feature because it
+/// needs the runtime `CatalogReader` for existence checks and JSON read-modify-
+/// write. Under `cargo test` (no extension feature) returns `Ok(None)` so DROP
+/// and ALTER fall back through the legacy `parse_function` path.
+#[cfg(not(feature = "extension"))]
+#[allow(clippy::unnecessary_wraps)] // matches the extension-feature signature
+fn rewrite_drop_or_alter(
+    _db_token: u64,
+    _fn_name: &str,
+    _args: &[String],
+) -> Result<Option<String>, ParseError> {
+    Ok(None)
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_drop_or_alter(
+    db_token: u64,
+    fn_name: &str,
+    args: &[String],
+) -> Result<Option<String>, ParseError> {
+    // Without an installed parser_override context for this DB token defer to
+    // the legacy path.
+    let Some(ctx) = parser_override_catalog::get(db_token) else {
+        return Ok(None);
+    };
+    let catalog = ctx.catalog;
+
+    match (fn_name, args.len()) {
+        ("drop_semantic_view", 1) => rewrite_drop(&catalog, &args[0], false),
+        ("drop_semantic_view_if_exists", 1) => rewrite_drop(&catalog, &args[0], true),
+        ("alter_semantic_view_rename", 2) => {
+            rewrite_alter_rename(&catalog, &args[0], &args[1], false)
+        }
+        ("alter_semantic_view_rename_if_exists", 2) => {
+            rewrite_alter_rename(&catalog, &args[0], &args[1], true)
+        }
+        ("alter_semantic_view_set_comment", 2) => {
+            rewrite_alter_comment(&catalog, &args[0], Some(&args[1]), false)
+        }
+        ("alter_semantic_view_set_comment_if_exists", 2) => {
+            rewrite_alter_comment(&catalog, &args[0], Some(&args[1]), true)
+        }
+        ("alter_semantic_view_unset_comment", 1) => {
+            rewrite_alter_comment(&catalog, &args[0], None, false)
+        }
+        ("alter_semantic_view_unset_comment_if_exists", 1) => {
+            rewrite_alter_comment(&catalog, &args[0], None, true)
+        }
+        // Read-only or unknown — defer to legacy.
+        _ => Ok(None),
+    }
+}
+
+/// CREATE-side native-SQL emission, gated on the extension feature: needs the
+/// runtime `CatalogReader` for existence checks AND for catalog-side queries
+/// performed by `enrich_definition_for_create` (PK lookup, type inference,
+/// fact typing). Under `cargo test` (no extension feature) returns `Ok(None)`
+/// so CREATE forms fall back through the legacy `parse_function` /
+/// `DefineFromJsonVTab::bind` path.
+#[cfg(not(feature = "extension"))]
+#[allow(clippy::unnecessary_wraps)] // matches the extension-feature signature
+fn rewrite_create(
+    _db_token: u64,
+    _fn_name: &str,
+    _args: &[String],
+) -> Result<Option<String>, ParseError> {
+    Ok(None)
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_create(
+    db_token: u64,
+    fn_name: &str,
+    args: &[String],
+) -> Result<Option<String>, ParseError> {
+    // Without an installed parser_override context for this DB token defer to
+    // the legacy path (e.g. extension loaded but set_catalog_for_parser_override
+    // not called for this token).
+    let Some(ctx) = parser_override_catalog::get(db_token) else {
+        return Ok(None);
+    };
+
+    if args.len() != 2 {
+        return Ok(None);
+    }
+    let name = unescape_sql_arg(&args[0]);
+    let json = unescape_sql_arg(&args[1]);
+
+    let (or_replace, if_not_exists) = match fn_name {
+        "create_semantic_view_from_json" => (false, false),
+        "create_or_replace_semantic_view_from_json" => (true, false),
+        "create_semantic_view_if_not_exists_from_json" => (false, true),
+        _ => return Ok(None),
+    };
+
+    let def =
+        crate::model::SemanticViewDefinition::from_json(&name, &json).map_err(|e| ParseError {
+            message: e,
+            position: None,
+        })?;
+
+    emit_native_create_sql(&ctx, &name, def, or_replace, if_not_exists)
+}
+
+/// Shared CREATE-emission helper used by both the table-function-style CREATE
+/// path (`rewrite_create`) and the FROM YAML FILE path (`rewrite_yaml_file_create`).
+///
+/// Steps:
+/// 1. Existence pre-check on committed state (skipped for OR REPLACE).
+/// 2. Run `enrich_definition_for_create` against the catalog connection (PK
+///    resolution, validation, metadata capture, type inference, fact typing).
+/// 3. Emit `INSERT [OR REPLACE] INTO semantic_layer._definitions ...
+///    RETURNING name AS view_name` so DuckDB executes the write on the
+///    caller's connection inside the caller's transaction.
+///
+/// Returns the legacy 0-row `SELECT ... WHERE 1 = 0` shape for IF NOT EXISTS
+/// when the view already exists; errors plain CREATE on an existing view.
+#[cfg(feature = "extension")]
+fn emit_native_create_sql(
+    ctx: &parser_override_catalog::OverrideContext,
+    name: &str,
+    def: crate::model::SemanticViewDefinition,
+    or_replace: bool,
+    if_not_exists: bool,
+) -> Result<Option<String>, ParseError> {
+    let name_escaped = escape_sql_arg(name);
+
+    // Parse-time existence check: fast path for the committed-state case.
+    // Same-txn CREATE-then-CREATE slips past this (the catalog connection
+    // only sees committed rows), so the generated SQL below also guards
+    // against the in-flight case via a CASE+error() / WHERE NOT EXISTS
+    // pattern that runs on the caller's transaction.
+    let exists = ctx.catalog.exists(name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })?;
+
+    if exists && !or_replace {
+        if if_not_exists {
+            return Ok(Some(format!(
+                "SELECT '{name_escaped}'::VARCHAR AS view_name WHERE 1 = 0"
+            )));
+        }
+        return Err(ParseError {
+            message: format!(
+                "semantic view '{name}' already exists; use CREATE OR REPLACE \
+                 SEMANTIC VIEW to overwrite"
+            ),
+            position: None,
+        });
+    }
+
+    // `is_file_backed` matches the legacy `DefineState::persist_conn.is_some()`
+    // behaviour: type inference runs only for file-backed DBs (v0.7.1 design).
+    let enriched_json = crate::ddl::define::enrich_definition_for_create(
+        name,
+        def,
+        ctx.catalog.raw(),
+        ctx.is_file_backed,
+    )
+    .map_err(|e| ParseError {
+        message: e,
+        position: None,
+    })?;
+    let enriched_escaped = escape_sql_arg(&enriched_json);
+
+    // The generated SQL runs on the caller's connection, so its EXISTS
+    // subqueries see in-flight INSERTs from the same transaction. Three
+    // shapes:
+    //   - OR REPLACE: straight INSERT OR REPLACE, no guard needed.
+    //   - IF NOT EXISTS: WHERE NOT EXISTS guard so a same-txn duplicate
+    //     silently no-ops (mirrors the committed-state SELECT WHERE 1=0
+    //     fast path above).
+    //   - Plain CREATE: CASE+error() raises the friendly "already exists"
+    //     message before the INSERT can fire, replacing what would
+    //     otherwise be a generic PK constraint violation.
+    let sql = if or_replace {
+        format!(
+            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) \
+             VALUES ('{name_escaped}', '{enriched_escaped}') \
+             RETURNING name AS view_name"
+        )
+    } else if if_not_exists {
+        format!(
+            "INSERT INTO semantic_layer._definitions (name, definition) \
+             SELECT '{name_escaped}', '{enriched_escaped}' \
+             WHERE NOT EXISTS (SELECT 1 FROM semantic_layer._definitions \
+                               WHERE name = '{name_escaped}') \
+             RETURNING name AS view_name"
+        )
+    } else {
+        format!(
+            "INSERT INTO semantic_layer._definitions (name, definition) \
+             SELECT \
+               CASE WHEN EXISTS (SELECT 1 FROM semantic_layer._definitions \
+                                 WHERE name = '{name_escaped}') \
+                    THEN error('semantic view ''{name_escaped}'' already exists; \
+                                use CREATE OR REPLACE SEMANTIC VIEW to overwrite') \
+                    ELSE '{name_escaped}' \
+               END, \
+               '{enriched_escaped}' \
+             RETURNING name AS view_name"
+        )
+    };
+    Ok(Some(sql))
+}
+
+/// Read the FROM YAML FILE sentinel produced by `rewrite_ddl_yaml_file_body`,
+/// fetch the file via `read_text()` on the catalog connection (preserves
+/// `DuckDB`'s filesystem support — local paths, `https://`, S3 via httpfs,
+/// etc.), parse the YAML into a `SemanticViewDefinition`, then emit a
+/// transactional INSERT through `emit_native_create_sql` so the write
+/// participates in the caller's transaction.
+///
+/// Returns `Ok(None)` when no `parser_override` context is installed for this
+/// `db_token` so the legacy C++ shim path (auto-commit) handles it.
+#[cfg(not(feature = "extension"))]
+#[allow(clippy::unnecessary_wraps)]
+fn rewrite_yaml_file_create(_db_token: u64, _payload: &str) -> Result<Option<String>, ParseError> {
+    Ok(None)
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_yaml_file_create(db_token: u64, payload: &str) -> Result<Option<String>, ParseError> {
+    use std::ffi::CStr;
+    use std::os::raw::c_void;
+
+    use libduckdb_sys as ffi;
+
+    let Some(ctx) = parser_override_catalog::get(db_token) else {
+        return Ok(None);
+    };
+
+    // Sentinel format: `<path>\x01<kind>\x01<name>\x01<comment>` (the
+    // `__SV_YAML_FILE__` prefix has already been stripped by the caller).
+    let mut parts = payload.splitn(4, '\x01');
+    let file_path = parts.next().ok_or_else(|| ParseError {
+        message: "Internal error: malformed YAML FILE sentinel (missing path)".to_string(),
+        position: None,
+    })?;
+    let kind_str = parts.next().ok_or_else(|| ParseError {
+        message: "Internal error: malformed YAML FILE sentinel (missing kind)".to_string(),
+        position: None,
+    })?;
+    let name = parts.next().ok_or_else(|| ParseError {
+        message: "Internal error: malformed YAML FILE sentinel (missing name)".to_string(),
+        position: None,
+    })?;
+    let comment = parts.next().unwrap_or("");
+
+    let (or_replace, if_not_exists) = match kind_str {
+        "0" => (false, false),
+        "1" => (true, false),
+        "2" => (false, true),
+        _ => {
+            return Err(ParseError {
+                message: format!("Internal error: unknown YAML FILE kind '{kind_str}'"),
+                position: None,
+            });
+        }
+    };
+
+    // Read file via read_text(); this is one DuckDB statement on the catalog
+    // connection so the user's transaction state is untouched.
+    let path_escaped = file_path.replace('\'', "''");
+    let read_sql = format!("SELECT content FROM read_text('{path_escaped}')");
+    let mut result =
+        unsafe { crate::query::table_function::execute_sql_raw(ctx.catalog.raw(), &read_sql) }
+            .map_err(|e| ParseError {
+                message: format!("FROM YAML FILE failed: {e}"),
+                position: None,
+            })?;
+    let row_count = unsafe { ffi::duckdb_row_count(&mut result) };
+    if row_count == 0 {
+        unsafe { ffi::duckdb_destroy_result(&mut result) };
+        return Err(ParseError {
+            message: format!("FROM YAML FILE failed: no content returned from '{file_path}'"),
+            position: None,
+        });
+    }
+    let yaml_content = unsafe {
+        let val_ptr = ffi::duckdb_value_varchar(&mut result, 0, 0);
+        if val_ptr.is_null() {
+            ffi::duckdb_destroy_result(&mut result);
+            return Err(ParseError {
+                message: format!("FROM YAML FILE failed: NULL content from '{file_path}'"),
+                position: None,
+            });
+        }
+        let s = CStr::from_ptr(val_ptr).to_string_lossy().into_owned();
+        ffi::duckdb_free(val_ptr.cast::<c_void>());
+        ffi::duckdb_destroy_result(&mut result);
+        s
+    };
+
+    let mut def =
+        crate::model::SemanticViewDefinition::from_yaml_with_size_cap(name, &yaml_content)
+            .map_err(|e| ParseError {
+                message: e,
+                position: None,
+            })?;
+
+    if !comment.is_empty() {
+        def.comment = Some(comment.to_string());
+    }
+
+    // Cardinality inference runs against PK declarations in the YAML; the
+    // shared enrichment helper re-runs it after catalog PK resolution but
+    // we still need this initial pass to populate cardinality where the YAML
+    // already specifies PKs.
+    infer_cardinality(&def.tables, &mut def.joins)?;
+
+    emit_native_create_sql(&ctx, name, def, or_replace, if_not_exists)
+}
+
+/// Undo the SQL `''`-escaping retained in `parse_table_function_call`'s args.
+#[cfg(feature = "extension")]
+fn unescape_sql_arg(s: &str) -> String {
+    s.replace("''", "'")
+}
+
+/// Re-escape a string for embedding in single-quoted SQL.
+#[cfg(feature = "extension")]
+fn escape_sql_arg(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_drop(
+    catalog: &crate::catalog::CatalogReader,
+    name_escaped: &str,
+    if_exists: bool,
+) -> Result<Option<String>, ParseError> {
+    let name = unescape_sql_arg(name_escaped);
+    let exists = catalog.exists(&name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })?;
+
+    if !exists {
+        if if_exists {
+            // Silent no-op, but emit a SELECT that returns the same one-row
+            // schema (`view_name VARCHAR`) the legacy path produces.
+            return Ok(Some(format!(
+                "SELECT '{name_escaped}'::VARCHAR AS view_name WHERE 1 = 0"
+            )));
+        }
+        return Err(ParseError {
+            message: format!("semantic view '{name}' does not exist"),
+            position: None,
+        });
+    }
+
+    Ok(Some(format!(
+        "DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
+         RETURNING name AS view_name"
+    )))
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_alter_rename(
+    catalog: &crate::catalog::CatalogReader,
+    old_escaped: &str,
+    new_escaped: &str,
+    if_exists: bool,
+) -> Result<Option<String>, ParseError> {
+    let old_name = unescape_sql_arg(old_escaped);
+    let new_name = unescape_sql_arg(new_escaped);
+
+    let exists = catalog.exists(&old_name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })?;
+
+    if !exists {
+        if if_exists {
+            // Silent no-op with the legacy two-column schema.
+            return Ok(Some(format!(
+                "SELECT '{old_escaped}'::VARCHAR AS old_name, \
+                 '{new_escaped}'::VARCHAR AS new_name WHERE 1 = 0"
+            )));
+        }
+        return Err(ParseError {
+            message: format!("semantic view '{old_name}' does not exist"),
+            position: None,
+        });
+    }
+
+    if catalog.exists(&new_name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })? {
+        return Err(ParseError {
+            message: format!("semantic view '{new_name}' already exists"),
+            position: None,
+        });
+    }
+
+    // PK update: DuckDB validates uniqueness; the pre-check above gives us
+    // a friendlier error. RETURNING projects the old/new pair from constants.
+    Ok(Some(format!(
+        "UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
+         WHERE name = '{old_escaped}' \
+         RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
+    )))
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_alter_comment(
+    catalog: &crate::catalog::CatalogReader,
+    name_escaped: &str,
+    new_comment_escaped: Option<&str>,
+    if_exists: bool,
+) -> Result<Option<String>, ParseError> {
+    let name = unescape_sql_arg(name_escaped);
+
+    let json_str = catalog.lookup(&name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })?;
+
+    let Some(json_str) = json_str else {
+        if if_exists {
+            // Silent no-op with the legacy (name, status) schema.
+            return Ok(Some(format!(
+                "SELECT '{name_escaped}'::VARCHAR AS name, 'no-op'::VARCHAR AS status \
+                 WHERE 1 = 0"
+            )));
+        }
+        return Err(ParseError {
+            message: format!("semantic view '{name}' does not exist"),
+            position: None,
+        });
+    };
+
+    let mut def: crate::model::SemanticViewDefinition =
+        serde_json::from_str(&json_str).map_err(|e| ParseError {
+            message: format!("failed to parse stored definition: {e}"),
+            position: None,
+        })?;
+
+    let status_label = if new_comment_escaped.is_some() {
+        "comment set"
+    } else {
+        "comment unset"
+    };
+    def.comment = new_comment_escaped.map(unescape_sql_arg);
+
+    let new_json = serde_json::to_string(&def).map_err(|e| ParseError {
+        message: format!("failed to serialize updated definition: {e}"),
+        position: None,
+    })?;
+    let new_json_escaped = escape_sql_arg(&new_json);
+
+    Ok(Some(format!(
+        "UPDATE semantic_layer._definitions SET definition = '{new_json_escaped}' \
+         WHERE name = '{name_escaped}' \
+         RETURNING name, '{status_label}'::VARCHAR AS status"
+    )))
+}
+
+/// Result of parsing a `SELECT * FROM <fn>('arg1'[, 'arg2'])` SQL string.
+///
+/// `args` retains the original SQL escaping (single quotes doubled), so they
+/// can be substituted back into a new single-quoted SQL string verbatim.
+struct TableFunctionCall {
+    fn_name: String,
+    args: Vec<String>,
+}
+
+/// Parse a `SELECT * FROM <fn_name>('arg1'[, 'arg2'])` SQL string.
+///
+/// Returns `None` for SQL that doesn't match this exact shape (e.g. SHOW forms
+/// with WHERE/LIMIT, or unrecognized prefixes). Handles SQL `''` escaping
+/// inside single-quoted args; preserves the `''` form in the returned strings
+/// so callers can re-embed them in new single-quoted SQL without re-escaping.
+fn parse_table_function_call(sql: &str) -> Option<TableFunctionCall> {
+    const PREFIX: &str = "SELECT * FROM ";
+    let rest = sql.strip_prefix(PREFIX)?;
+
+    // Read the function name up to '('.
+    let paren_pos = rest.find('(')?;
+    let fn_name = rest[..paren_pos].trim().to_string();
+    if fn_name.is_empty() || fn_name.contains(char::is_whitespace) {
+        return None;
+    }
+
+    // Body after the opening paren up to the matching closing paren.
+    // The body is a comma-separated list of single-quoted strings; we walk it
+    // tracking quote state so commas inside strings don't split args.
+    let body = &rest[paren_pos + 1..];
+    let mut args: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut chars = body.char_indices();
+    let mut closing_pos: Option<usize> = None;
+
+    while let Some((i, ch)) = chars.next() {
+        if in_quote {
+            current.push(ch);
+            if ch == '\'' {
+                // Lookahead for `''` doubled-quote escape.
+                let mut peek = body[i + ch.len_utf8()..].chars();
+                if peek.next() == Some('\'') {
+                    // Consume the second '
+                    current.push('\'');
+                    chars.next();
+                } else {
+                    in_quote = false;
+                }
+            }
+        } else {
+            match ch {
+                '\'' => {
+                    in_quote = true;
+                    current.push(ch);
+                }
+                ',' => {
+                    args.push(strip_outer_quotes(current.trim())?.to_string());
+                    current.clear();
+                }
+                ')' => {
+                    closing_pos = Some(i);
+                    break;
+                }
+                c if c.is_whitespace() => {} // ignore between args
+                _ => return None,            // unexpected non-whitespace, non-quote
+            }
+        }
+    }
+
+    let _ = closing_pos?; // must have found a closing paren
+
+    // Push trailing arg if present (handles single-arg and multi-arg cases).
+    let trailing = current.trim();
+    if !trailing.is_empty() {
+        args.push(strip_outer_quotes(trailing)?.to_string());
+    }
+
+    // Anything after the closing paren must be empty or whitespace.
+    let after = &body[closing_pos? + 1..];
+    if !after.trim().is_empty() {
+        return None;
+    }
+
+    Some(TableFunctionCall { fn_name, args })
+}
+
+/// Strip the outer pair of single quotes, leaving doubled-quote escaping intact.
+fn strip_outer_quotes(s: &str) -> Option<&str> {
+    let inner = s.strip_prefix('\'')?.strip_suffix('\'')?;
+    Some(inner)
+}
+
+/// FFI entry point for parser_override. Validates and rewrites recognized
+/// semantic-view DDL into native SQL (INSERT / DELETE / UPDATE against
+/// `semantic_layer._definitions`) suitable for re-parsing through DuckDB's
+/// own parser and execution on the caller's connection.
+///
+/// Return values match the protocol used by sv_parse_stub:
+///   0 = success: heap-owned native SQL pointer + length written to
+///       `*sql_out_ptr` / `*sql_out_len`. Caller takes ownership and must
+///       release via `sv_free_buffer`. The buffer is **not** NUL-terminated;
+///       read exactly `*sql_out_len` bytes.
+///   1 = validation error: error written to `error_out`
+///   2 = not ours / not yet handled: caller should defer to default parser
+///       (which falls through to the legacy parse_function fallback path)
+///
+/// # Safety
+///
+/// - `query_ptr` must point to valid UTF-8 bytes of length `query_len`.
+/// - `sql_out_ptr` must point to a writable `*mut u8` slot, or be null.
+/// - `sql_out_len` must point to a writable `usize` slot, or be null.
+/// - `error_out` must point to a writable buffer of `error_out_len` bytes.
+#[cfg(feature = "extension")]
+#[no_mangle]
+pub extern "C" fn sv_parser_override_rust(
+    db_token: u64,
+    query_ptr: *const u8,
+    query_len: usize,
+    sql_out_ptr: *mut *mut u8,
+    sql_out_len: *mut usize,
+    error_out: *mut u8,
+    error_out_len: usize,
+) -> u8 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if query_ptr.is_null() || query_len == 0 {
+            return 2_u8; // not ours
+        }
+        // SAFETY: guaranteed valid UTF-8 by the caller (DuckDB query text).
+        let query = unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(query_ptr, query_len))
+        };
+
+        match rewrite_to_native_sql(db_token, query) {
+            Ok(Some(sql)) => {
+                unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
+                0 // success — native SQL handed to caller
+            }
+            Ok(None) => 2, // not ours, or a form we defer to the legacy path
+            Err(err) => {
+                unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
+                1 // validation error
+            }
+        }
+    }));
+
+    result.unwrap_or(2) // on panic: not ours
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===================================================================
+    // FFI heap-buffer round-trip — guards against the v0.8.0 silent-
+    // truncation regression. Pre-fix the SQL output went through a
+    // fixed 64 KB buffer; we now hand the C++ caller an owned heap
+    // pointer + length, released via sv_free_buffer.
+    // ===================================================================
+
+    #[test]
+    fn leak_and_reclaim_round_trips_arbitrary_string() {
+        let original = "INSERT INTO _definitions VALUES ('x', '...');".repeat(4096);
+        assert!(
+            original.len() > 64 * 1024,
+            "test input should exceed legacy cap"
+        );
+
+        let original_clone = original.clone();
+        let (ptr, len) = leak_string_to_c_buffer(original);
+        assert!(!ptr.is_null());
+        assert_eq!(len, original_clone.len());
+
+        // Read back exactly `len` bytes (no NUL terminator assumption).
+        let recovered = unsafe { std::slice::from_raw_parts(ptr.cast_const(), len) };
+        assert_eq!(recovered, original_clone.as_bytes());
+
+        // Free.
+        unsafe { reclaim_c_buffer(ptr, len) };
+    }
+
+    #[test]
+    fn reclaim_null_pointer_is_safe() {
+        // sv_free_buffer must accept null pointers as a no-op so the C++
+        // RAII guard can be unconditionally invoked even when the FFI
+        // call returned an error path.
+        unsafe { reclaim_c_buffer(std::ptr::null_mut(), 0) };
+        unsafe { reclaim_c_buffer(std::ptr::null_mut(), 99) };
+    }
+
+    #[test]
+    fn leak_handles_empty_string() {
+        let (ptr, len) = leak_string_to_c_buffer(String::new());
+        assert_eq!(len, 0);
+        // Empty Vec may have dangling-but-aligned ptr; reclaim must not crash.
+        unsafe { reclaim_c_buffer(ptr, len) };
+    }
 
     // ===================================================================
     // detect_semantic_view_ddl tests (multi-prefix detection)
