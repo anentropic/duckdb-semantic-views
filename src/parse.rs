@@ -13,6 +13,43 @@ use crate::body_parser::parse_keyword_body;
 use crate::errors::ParseError;
 use crate::model::{Cardinality, Join, TableRef};
 
+// ---------------------------------------------------------------------------
+// v0.8.0: catalog handle for parser_override DROP/ALTER existence checks.
+// ---------------------------------------------------------------------------
+//
+// DROP without IF EXISTS and every ALTER form need to know whether a view
+// exists (and, for SET/UNSET COMMENT, what its current JSON definition is)
+// before we can emit native SQL with friendly errors. The parser_override
+// callback runs in a context with no access to the caller's catalog, so we
+// stash a dedicated `CatalogReader` (populated at extension load) in a
+// process-wide `OnceLock` and read it from the Rust FFI thunk.
+//
+// The reader sees committed state only — by design. Same-transaction
+// CREATE-then-ALTER is the documented v0.8.0 limitation.
+#[cfg(feature = "extension")]
+mod parser_override_catalog {
+    use std::sync::OnceLock;
+
+    use crate::catalog::CatalogReader;
+
+    static CATALOG: OnceLock<CatalogReader> = OnceLock::new();
+
+    /// Install the catalog reader used by parser_override DROP/ALTER rewrites.
+    /// Called once from `init_extension`. Subsequent calls are no-ops.
+    pub fn set(reader: CatalogReader) {
+        let _ = CATALOG.set(reader);
+    }
+
+    /// Fetch the catalog reader. Returns `None` if `set` has not been called
+    /// (e.g. unit tests not running the extension entry point).
+    pub fn get() -> Option<CatalogReader> {
+        CATALOG.get().copied()
+    }
+}
+
+#[cfg(feature = "extension")]
+pub use parser_override_catalog::set as set_catalog_for_parser_override;
+
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.
 pub const PARSE_NOT_OURS: u8 = 0;
 /// Detected a semantic view DDL statement -- return `PARSE_SUCCESSFUL`.
@@ -1664,14 +1701,22 @@ pub extern "C" fn sv_rewrite_ddl_rust(
 // the parser_override callback to fall through to DuckDB's default parser
 // (and from there the legacy parse_function fallback for non-postgres DDL):
 //
-//   * CREATE / CREATE OR REPLACE / CREATE IF NOT EXISTS  (AS body and inline YAML)
+//   * DROP / DROP IF EXISTS                              (extension feature only)
+//   * ALTER ... RENAME TO / SET COMMENT / UNSET COMMENT  (extension feature only)
 //
-// Forms NOT yet rewritten (legacy path retains its v0.7.x non-transactional
-// behaviour for these — documented as a v0.8.0 limitation):
+// DROP and ALTER need a `CatalogReader` for existence checks and JSON
+// read-modify-write; that handle is `OnceLock`-installed at extension load,
+// so under `cargo test` (no extension feature) these forms still defer to
+// the legacy path.
+//
+// Forms NOT rewritten (legacy path retains v0.7.x non-transactional behaviour
+// for these — documented as a v0.8.0 limitation):
+//   * CREATE / CREATE OR REPLACE / CREATE IF NOT EXISTS  — DefineFromJsonVTab::bind
+//     enriches the JSON with database_name / schema_name / created_on, runs
+//     LIMIT 0 type inference, and validates the relationship graph. Emitting a
+//     bare INSERT here would skip all of that and write an under-populated row.
 //   * CREATE ... FROM YAML FILE '/path/...'  (sentinel needs C++ file read)
-//   * DROP / DROP IF EXISTS  (need error-on-missing semantics for non-IF-EXISTS form)
-//   * ALTER *  (RENAME needs error-on-missing; SET/UNSET COMMENT needs JSON read+modify+write)
-//   * DESCRIBE / SHOW *  (read-only; transactionality not relevant)
+//   * DESCRIBE / SHOW *                       (read-only; transactionality not relevant)
 pub fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, ParseError> {
     let Some(tf_sql) = validate_and_rewrite(query)? else {
         return Ok(None);
@@ -1693,31 +1738,213 @@ pub fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, ParseError> 
     // produced by validate_and_rewrite (single quotes doubled). They can be
     // re-embedded as single-quoted strings without further processing.
     let args = &call.args;
-    let sql = match call.fn_name.as_str() {
-        "create_semantic_view_from_json" if args.len() == 2 => format!(
-            "INSERT INTO semantic_layer._definitions (name, definition) \
-             VALUES ('{}', '{}') RETURNING name AS view_name",
-            args[0], args[1]
-        ),
-        "create_or_replace_semantic_view_from_json" if args.len() == 2 => format!(
-            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) \
-             VALUES ('{}', '{}') RETURNING name AS view_name",
-            args[0], args[1]
-        ),
-        "create_semantic_view_if_not_exists_from_json" if args.len() == 2 => format!(
-            "INSERT OR IGNORE INTO semantic_layer._definitions (name, definition) \
-             VALUES ('{}', '{}') RETURNING name AS view_name",
-            args[0], args[1]
-        ),
-        // DROP, ALTER, DESCRIBE, SHOW * → defer to legacy path.
-        // DROP without IF EXISTS needs error-on-missing semantics that a plain
-        // DELETE doesn't provide; ALTER SET/UNSET COMMENT needs JSON modification.
-        // Both can be added in a follow-up commit once the error semantics are
-        // worked out (likely via a CTE with error() or a two-step validate+mutate).
-        _ => return Ok(None),
+    match call.fn_name.as_str() {
+        // CREATE: deferred to the legacy DefineFromJsonVTab::bind path, which
+        // performs metadata enrichment that has to happen before the row is
+        // written — capturing database_name / schema_name / created_on, running
+        // LIMIT 0 type inference, and validating the relationship graph. None
+        // of that work has been moved out of bind() yet, so emitting INSERT
+        // here would write an under-populated row and break SHOW / DESCRIBE.
+        // CREATE remains non-transactional (the legacy path uses persist_conn,
+        // which auto-commits) — documented v0.8.0 limitation.
+        "create_semantic_view_from_json"
+        | "create_or_replace_semantic_view_from_json"
+        | "create_semantic_view_if_not_exists_from_json" => Ok(None),
+        // DROP / ALTER need catalog access for existence checks and JSON
+        // read-modify-write. See `rewrite_drop_or_alter` (extension-only).
+        // DESCRIBE / SHOW are read-only — defer to legacy path.
+        _ => rewrite_drop_or_alter(call.fn_name.as_str(), args),
+    }
+}
+
+/// DROP / ALTER native-SQL emission, gated on the extension feature because it
+/// needs the runtime `CatalogReader` for existence checks and JSON read-modify-
+/// write. Under `cargo test` (no extension feature) returns `Ok(None)` so DROP
+/// and ALTER fall back through the legacy `parse_function` path.
+#[cfg(not(feature = "extension"))]
+#[allow(clippy::unnecessary_wraps)] // matches the extension-feature signature
+fn rewrite_drop_or_alter(_fn_name: &str, _args: &[String]) -> Result<Option<String>, ParseError> {
+    Ok(None)
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_drop_or_alter(fn_name: &str, args: &[String]) -> Result<Option<String>, ParseError> {
+    // Without an installed CatalogReader (e.g. extension loaded but
+    // set_catalog_for_parser_override not yet called) defer to legacy path.
+    let Some(catalog) = parser_override_catalog::get() else {
+        return Ok(None);
     };
 
-    Ok(Some(sql))
+    match (fn_name, args.len()) {
+        ("drop_semantic_view", 1) => rewrite_drop(&catalog, &args[0], false),
+        ("drop_semantic_view_if_exists", 1) => rewrite_drop(&catalog, &args[0], true),
+        ("alter_semantic_view_rename", 2) => {
+            rewrite_alter_rename(&catalog, &args[0], &args[1], false)
+        }
+        ("alter_semantic_view_rename_if_exists", 2) => {
+            rewrite_alter_rename(&catalog, &args[0], &args[1], true)
+        }
+        ("alter_semantic_view_set_comment", 2) => {
+            rewrite_alter_comment(&catalog, &args[0], Some(&args[1]), false)
+        }
+        ("alter_semantic_view_set_comment_if_exists", 2) => {
+            rewrite_alter_comment(&catalog, &args[0], Some(&args[1]), true)
+        }
+        ("alter_semantic_view_unset_comment", 1) => {
+            rewrite_alter_comment(&catalog, &args[0], None, false)
+        }
+        ("alter_semantic_view_unset_comment_if_exists", 1) => {
+            rewrite_alter_comment(&catalog, &args[0], None, true)
+        }
+        // Read-only or unknown — defer to legacy.
+        _ => Ok(None),
+    }
+}
+
+/// Undo the SQL `''`-escaping retained in `parse_table_function_call`'s args.
+#[cfg(feature = "extension")]
+fn unescape_sql_arg(s: &str) -> String {
+    s.replace("''", "'")
+}
+
+/// Re-escape a string for embedding in single-quoted SQL.
+#[cfg(feature = "extension")]
+fn escape_sql_arg(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_drop(
+    catalog: &crate::catalog::CatalogReader,
+    name_escaped: &str,
+    if_exists: bool,
+) -> Result<Option<String>, ParseError> {
+    let name = unescape_sql_arg(name_escaped);
+    let exists = catalog.exists(&name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })?;
+
+    if !exists {
+        if if_exists {
+            // Silent no-op, but emit a SELECT that returns the same one-row
+            // schema (`view_name VARCHAR`) the legacy path produces.
+            return Ok(Some(format!(
+                "SELECT '{name_escaped}'::VARCHAR AS view_name WHERE 1 = 0"
+            )));
+        }
+        return Err(ParseError {
+            message: format!("semantic view '{name}' does not exist"),
+            position: None,
+        });
+    }
+
+    Ok(Some(format!(
+        "DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
+         RETURNING name AS view_name"
+    )))
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_alter_rename(
+    catalog: &crate::catalog::CatalogReader,
+    old_escaped: &str,
+    new_escaped: &str,
+    if_exists: bool,
+) -> Result<Option<String>, ParseError> {
+    let old_name = unescape_sql_arg(old_escaped);
+    let new_name = unescape_sql_arg(new_escaped);
+
+    let exists = catalog.exists(&old_name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })?;
+
+    if !exists {
+        if if_exists {
+            // Silent no-op with the legacy two-column schema.
+            return Ok(Some(format!(
+                "SELECT '{old_escaped}'::VARCHAR AS old_name, \
+                 '{new_escaped}'::VARCHAR AS new_name WHERE 1 = 0"
+            )));
+        }
+        return Err(ParseError {
+            message: format!("semantic view '{old_name}' does not exist"),
+            position: None,
+        });
+    }
+
+    if catalog.exists(&new_name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })? {
+        return Err(ParseError {
+            message: format!("semantic view '{new_name}' already exists"),
+            position: None,
+        });
+    }
+
+    // PK update: DuckDB validates uniqueness; the pre-check above gives us
+    // a friendlier error. RETURNING projects the old/new pair from constants.
+    Ok(Some(format!(
+        "UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
+         WHERE name = '{old_escaped}' \
+         RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
+    )))
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_alter_comment(
+    catalog: &crate::catalog::CatalogReader,
+    name_escaped: &str,
+    new_comment_escaped: Option<&str>,
+    if_exists: bool,
+) -> Result<Option<String>, ParseError> {
+    let name = unescape_sql_arg(name_escaped);
+
+    let json_str = catalog.lookup(&name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })?;
+
+    let Some(json_str) = json_str else {
+        if if_exists {
+            // Silent no-op with the legacy (name, status) schema.
+            return Ok(Some(format!(
+                "SELECT '{name_escaped}'::VARCHAR AS name, 'no-op'::VARCHAR AS status \
+                 WHERE 1 = 0"
+            )));
+        }
+        return Err(ParseError {
+            message: format!("semantic view '{name}' does not exist"),
+            position: None,
+        });
+    };
+
+    let mut def: crate::model::SemanticViewDefinition =
+        serde_json::from_str(&json_str).map_err(|e| ParseError {
+            message: format!("failed to parse stored definition: {e}"),
+            position: None,
+        })?;
+
+    let status_label = if new_comment_escaped.is_some() {
+        "comment set"
+    } else {
+        "comment unset"
+    };
+    def.comment = new_comment_escaped.map(unescape_sql_arg);
+
+    let new_json = serde_json::to_string(&def).map_err(|e| ParseError {
+        message: format!("failed to serialize updated definition: {e}"),
+        position: None,
+    })?;
+    let new_json_escaped = escape_sql_arg(&new_json);
+
+    Ok(Some(format!(
+        "UPDATE semantic_layer._definitions SET definition = '{new_json_escaped}' \
+         WHERE name = '{name_escaped}' \
+         RETURNING name, '{status_label}'::VARCHAR AS status"
+    )))
 }
 
 /// Result of parsing a `SELECT * FROM <fn>('arg1'[, 'arg2'])` SQL string.

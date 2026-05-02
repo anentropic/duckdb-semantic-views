@@ -386,6 +386,10 @@ mod extension {
         }
         let catalog_reader = crate::catalog::CatalogReader::new(catalog_conn);
 
+        // v0.8.0: install the catalog handle the parser_override callback
+        // uses for DROP / ALTER existence checks and JSON read-modify-write.
+        crate::parse::set_catalog_for_parser_override(catalog_reader);
+
         let define_state = DefineState {
             persist_conn,
             catalog_conn,

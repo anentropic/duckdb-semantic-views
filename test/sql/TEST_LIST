@@ -35,3 +35,4 @@ test/sql/phase55_materialization_routing.test
 test/sql/phase56_yaml_export.test
 test/sql/phase57_introspection.test
 test/sql/quick_260430_vdz_leading_comments.test
+test/sql/v080_transactional_ddl.test
