@@ -332,6 +332,7 @@ mod extension {
         fn sv_register_parser_hooks(
             db_handle: ffi::duckdb_database,
             ddl_conn: ffi::duckdb_connection,
+            out_db_token: *mut u64,
         ) -> bool;
     }
 
@@ -386,9 +387,32 @@ mod extension {
         }
         let catalog_reader = crate::catalog::CatalogReader::new(catalog_conn);
 
+        // Create the DDL connection early so we can register parser hooks and
+        // capture the per-load `db_token` before any other code path needs it.
+        // The hook needs to be in place AND mapped to the right catalog reader
+        // BEFORE table functions are registered (table-function registration
+        // can itself trigger parsing on some DuckDB versions).
+        let mut ddl_conn: ffi::duckdb_connection = ptr::null_mut();
+        let rc = unsafe { ffi::duckdb_connect(db_handle, &mut ddl_conn) };
+        if rc != ffi::DuckDBSuccess {
+            return Err("Failed to create DDL connection for parser hook".into());
+        }
+
+        let mut db_token: u64 = 0;
+        if !unsafe { sv_register_parser_hooks(db_handle, ddl_conn, &mut db_token) } {
+            return Err("Failed to register parser hooks via C++ helper".into());
+        }
+
         // v0.8.0: install the catalog handle the parser_override callback
-        // uses for DROP / ALTER existence checks and JSON read-modify-write.
-        crate::parse::set_catalog_for_parser_override(catalog_reader);
+        // uses for CREATE/DROP/ALTER existence checks and JSON read-modify-
+        // write, keyed by the token the C++ shim assigned at registration.
+        // `is_file_backed` mirrors the legacy `persist_conn.is_some()` gate so
+        // DDL-time type inference fires only for file-backed DBs.
+        crate::parse::set_catalog_for_parser_override(
+            db_token,
+            catalog_reader,
+            persist_conn.is_some(),
+        );
 
         let define_state = DefineState {
             persist_conn,
@@ -607,25 +631,10 @@ mod extension {
             &query_state,
         )?;
 
-        // Create a dedicated DDL connection for the parser hook path.
-        // This connection is ALWAYS created (even for in-memory databases) because
-        // the native DDL path rewrites to `SELECT * FROM create_semantic_view(...)`
-        // which needs a separate connection to avoid deadlocking the ClientContext
-        // lock held during plan/bind. This is distinct from persist_conn (which
-        // writes to the _definitions catalog table for file-backed databases).
-        let mut ddl_conn: ffi::duckdb_connection = ptr::null_mut();
-        let rc = unsafe { ffi::duckdb_connect(db_handle, &mut ddl_conn) };
-        if rc != ffi::DuckDBSuccess {
-            return Err("Failed to create DDL connection for parser hook".into());
-        }
-
-        // Register parser hooks via C++ helper.
-        // The C++ shim extracts DatabaseInstance& from the duckdb_database handle
-        // and registers ParserExtension hooks on DBConfig. This requires C++ types
-        // that are only available via the duckdb.hpp amalgamation header.
-        if !unsafe { sv_register_parser_hooks(db_handle, ddl_conn) } {
-            return Err("Failed to register parser hooks via C++ helper".into());
-        }
+        // Parser hooks (sv_register_parser_hooks) and the per-load ddl_conn
+        // were created earlier in init_extension so the parser_override
+        // catalog map can be populated before any registration triggers a
+        // parse on the connection.
 
         Ok(())
     }

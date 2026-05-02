@@ -28,22 +28,49 @@ use crate::model::{Cardinality, Join, TableRef};
 // CREATE-then-ALTER is the documented v0.8.0 limitation.
 #[cfg(feature = "extension")]
 mod parser_override_catalog {
-    use std::sync::OnceLock;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use crate::catalog::CatalogReader;
 
-    static CATALOG: OnceLock<CatalogReader> = OnceLock::new();
-
-    /// Install the catalog reader used by parser_override DROP/ALTER rewrites.
-    /// Called once from `init_extension`. Subsequent calls are no-ops.
-    pub fn set(reader: CatalogReader) {
-        let _ = CATALOG.set(reader);
+    /// Catalog handle plus a `is_file_backed` flag (matches the legacy
+    /// `DefineState::persist_conn.is_some()` test) that gates DDL-time type
+    /// inference. Type inference uses `LIMIT 0` probes that depend on user
+    /// tables having been committed; for in-memory DBs we follow the v0.7.1
+    /// behaviour and skip inference entirely.
+    #[derive(Clone, Copy)]
+    pub struct OverrideContext {
+        pub catalog: CatalogReader,
+        pub is_file_backed: bool,
     }
 
-    /// Fetch the catalog reader. Returns `None` if `set` has not been called
-    /// (e.g. unit tests not running the extension entry point).
-    pub fn get() -> Option<CatalogReader> {
-        CATALOG.get().copied()
+    // Per-extension-load context map, keyed by the `db_token` the C++ shim
+    // assigns at registration time. A process can load the extension against
+    // multiple databases sequentially (Python integration tests do this) — a
+    // single global slot would let the first load's stale `catalog_conn` leak
+    // into later parser_override invocations on a different DB.
+    static CONTEXTS: Mutex<Option<HashMap<u64, OverrideContext>>> = Mutex::new(None);
+
+    /// Install the parser_override context for `db_token`. Called once per
+    /// `init_extension`. Subsequent calls for the same token overwrite (the
+    /// extension being re-loaded against the same DB is benign).
+    pub fn set(db_token: u64, catalog: CatalogReader, is_file_backed: bool) {
+        let mut guard = CONTEXTS.lock().expect("parser_override_catalog poisoned");
+        guard.get_or_insert_with(HashMap::new).insert(
+            db_token,
+            OverrideContext {
+                catalog,
+                is_file_backed,
+            },
+        );
+    }
+
+    /// Fetch the parser_override context for `db_token`. Returns `None` if
+    /// `set` has not been called for that token (e.g. unit tests not running
+    /// the extension entry point, or a stale token).
+    pub fn get(db_token: u64) -> Option<OverrideContext> {
+        let guard = CONTEXTS.lock().expect("parser_override_catalog poisoned");
+        guard.as_ref().and_then(|m| m.get(&db_token).copied())
     }
 }
 
@@ -1701,23 +1728,24 @@ pub extern "C" fn sv_rewrite_ddl_rust(
 // the parser_override callback to fall through to DuckDB's default parser
 // (and from there the legacy parse_function fallback for non-postgres DDL):
 //
+//   * CREATE / CREATE OR REPLACE / CREATE IF NOT EXISTS  (extension feature only)
 //   * DROP / DROP IF EXISTS                              (extension feature only)
 //   * ALTER ... RENAME TO / SET COMMENT / UNSET COMMENT  (extension feature only)
 //
-// DROP and ALTER need a `CatalogReader` for existence checks and JSON
-// read-modify-write; that handle is `OnceLock`-installed at extension load,
-// so under `cargo test` (no extension feature) these forms still defer to
-// the legacy path.
+// All three need a `CatalogReader` for existence checks; CREATE additionally
+// uses it to run catalog-side queries during enrichment (PK lookup, LIMIT 0
+// type inference, fact typing). The handle is `OnceLock`-installed at
+// extension load, so under `cargo test` (no extension feature) these forms
+// still defer to the legacy path.
 //
-// Forms NOT rewritten (legacy path retains v0.7.x non-transactional behaviour
-// for these — documented as a v0.8.0 limitation):
-//   * CREATE / CREATE OR REPLACE / CREATE IF NOT EXISTS  — DefineFromJsonVTab::bind
-//     enriches the JSON with database_name / schema_name / created_on, runs
-//     LIMIT 0 type inference, and validates the relationship graph. Emitting a
-//     bare INSERT here would skip all of that and write an under-populated row.
-//   * CREATE ... FROM YAML FILE '/path/...'  (sentinel needs C++ file read)
-//   * DESCRIBE / SHOW *                       (read-only; transactionality not relevant)
-pub fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, ParseError> {
+// Forms NOT rewritten:
+//   * CREATE ... FROM YAML FILE '/path/...'  (sentinel needs C++ file read;
+//     once the C++ shim has resolved the file the result re-enters this
+//     module as a regular CREATE through DefineFromJsonVTab::bind, which
+//     calls the same shared `enrich_definition_for_create` helper but runs
+//     in non-transactional auto-commit — documented v0.8.0 limitation).
+//   * DESCRIBE / SHOW *  (read-only; transactionality not relevant).
+pub fn rewrite_to_native_sql(db_token: u64, query: &str) -> Result<Option<String>, ParseError> {
     let Some(tf_sql) = validate_and_rewrite(query)? else {
         return Ok(None);
     };
@@ -1739,21 +1767,18 @@ pub fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, ParseError> 
     // re-embedded as single-quoted strings without further processing.
     let args = &call.args;
     match call.fn_name.as_str() {
-        // CREATE: deferred to the legacy DefineFromJsonVTab::bind path, which
-        // performs metadata enrichment that has to happen before the row is
-        // written — capturing database_name / schema_name / created_on, running
-        // LIMIT 0 type inference, and validating the relationship graph. None
-        // of that work has been moved out of bind() yet, so emitting INSERT
-        // here would write an under-populated row and break SHOW / DESCRIBE.
-        // CREATE remains non-transactional (the legacy path uses persist_conn,
-        // which auto-commits) — documented v0.8.0 limitation.
+        // CREATE forms: enrich the JSON (metadata + type inference + graph
+        // validation) against the catalog connection, then emit native INSERT
+        // on the caller's connection. See `rewrite_create` (extension-only).
         "create_semantic_view_from_json"
         | "create_or_replace_semantic_view_from_json"
-        | "create_semantic_view_if_not_exists_from_json" => Ok(None),
+        | "create_semantic_view_if_not_exists_from_json" => {
+            rewrite_create(db_token, call.fn_name.as_str(), args)
+        }
         // DROP / ALTER need catalog access for existence checks and JSON
         // read-modify-write. See `rewrite_drop_or_alter` (extension-only).
         // DESCRIBE / SHOW are read-only — defer to legacy path.
-        _ => rewrite_drop_or_alter(call.fn_name.as_str(), args),
+        _ => rewrite_drop_or_alter(db_token, call.fn_name.as_str(), args),
     }
 }
 
@@ -1763,17 +1788,26 @@ pub fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, ParseError> 
 /// and ALTER fall back through the legacy `parse_function` path.
 #[cfg(not(feature = "extension"))]
 #[allow(clippy::unnecessary_wraps)] // matches the extension-feature signature
-fn rewrite_drop_or_alter(_fn_name: &str, _args: &[String]) -> Result<Option<String>, ParseError> {
+fn rewrite_drop_or_alter(
+    _db_token: u64,
+    _fn_name: &str,
+    _args: &[String],
+) -> Result<Option<String>, ParseError> {
     Ok(None)
 }
 
 #[cfg(feature = "extension")]
-fn rewrite_drop_or_alter(fn_name: &str, args: &[String]) -> Result<Option<String>, ParseError> {
-    // Without an installed CatalogReader (e.g. extension loaded but
-    // set_catalog_for_parser_override not yet called) defer to legacy path.
-    let Some(catalog) = parser_override_catalog::get() else {
+fn rewrite_drop_or_alter(
+    db_token: u64,
+    fn_name: &str,
+    args: &[String],
+) -> Result<Option<String>, ParseError> {
+    // Without an installed parser_override context for this DB token defer to
+    // the legacy path.
+    let Some(ctx) = parser_override_catalog::get(db_token) else {
         return Ok(None);
     };
+    let catalog = ctx.catalog;
 
     match (fn_name, args.len()) {
         ("drop_semantic_view", 1) => rewrite_drop(&catalog, &args[0], false),
@@ -1799,6 +1833,107 @@ fn rewrite_drop_or_alter(fn_name: &str, args: &[String]) -> Result<Option<String
         // Read-only or unknown — defer to legacy.
         _ => Ok(None),
     }
+}
+
+/// CREATE-side native-SQL emission, gated on the extension feature: needs the
+/// runtime `CatalogReader` for existence checks AND for catalog-side queries
+/// performed by `enrich_definition_for_create` (PK lookup, type inference,
+/// fact typing). Under `cargo test` (no extension feature) returns `Ok(None)`
+/// so CREATE forms fall back through the legacy `parse_function` /
+/// `DefineFromJsonVTab::bind` path.
+#[cfg(not(feature = "extension"))]
+#[allow(clippy::unnecessary_wraps)] // matches the extension-feature signature
+fn rewrite_create(
+    _db_token: u64,
+    _fn_name: &str,
+    _args: &[String],
+) -> Result<Option<String>, ParseError> {
+    Ok(None)
+}
+
+#[cfg(feature = "extension")]
+fn rewrite_create(
+    db_token: u64,
+    fn_name: &str,
+    args: &[String],
+) -> Result<Option<String>, ParseError> {
+    // Without an installed parser_override context for this DB token defer to
+    // the legacy path (e.g. extension loaded but set_catalog_for_parser_override
+    // not called for this token).
+    let Some(ctx) = parser_override_catalog::get(db_token) else {
+        return Ok(None);
+    };
+
+    if args.len() != 2 {
+        return Ok(None);
+    }
+    let name_escaped = &args[0];
+    let json_escaped = &args[1];
+    let name = unescape_sql_arg(name_escaped);
+    let json = unescape_sql_arg(json_escaped);
+
+    let (or_replace, if_not_exists) = match fn_name {
+        "create_semantic_view_from_json" => (false, false),
+        "create_or_replace_semantic_view_from_json" => (true, false),
+        "create_semantic_view_if_not_exists_from_json" => (false, true),
+        _ => return Ok(None),
+    };
+
+    // Existence pre-check (committed state). Same-txn CREATE-then-CREATE for
+    // the same name is the documented v0.8.0 limitation: the second CREATE
+    // sees committed state, not the in-flight INSERT.
+    let exists = ctx.catalog.exists(&name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })?;
+
+    if exists && !or_replace {
+        if if_not_exists {
+            // Silent no-op with the legacy single-column schema.
+            return Ok(Some(format!(
+                "SELECT '{name_escaped}'::VARCHAR AS view_name WHERE 1 = 0"
+            )));
+        }
+        return Err(ParseError {
+            message: format!(
+                "semantic view '{name}' already exists; use CREATE OR REPLACE \
+                 SEMANTIC VIEW to overwrite"
+            ),
+            position: None,
+        });
+    }
+
+    // Deserialize, run shared enrichment against the catalog connection, and
+    // serialize back. Errors here surface as parser_override validation errors.
+    // `is_file_backed` matches the legacy `DefineState::persist_conn.is_some()`
+    // behaviour: type inference runs only for file-backed DBs (v0.7.1 design).
+    let def =
+        crate::model::SemanticViewDefinition::from_json(&name, &json).map_err(|e| ParseError {
+            message: e,
+            position: None,
+        })?;
+    let enriched_json = crate::ddl::define::enrich_definition_for_create(
+        &name,
+        def,
+        ctx.catalog.raw(),
+        ctx.is_file_backed,
+    )
+    .map_err(|e| ParseError {
+        message: e,
+        position: None,
+    })?;
+    let enriched_escaped = escape_sql_arg(&enriched_json);
+
+    let verb = if or_replace {
+        "INSERT OR REPLACE"
+    } else {
+        "INSERT"
+    };
+    Ok(Some(format!(
+        "{verb} INTO semantic_layer._definitions (name, definition) \
+         VALUES ('{name_escaped}', '{enriched_escaped}') \
+         RETURNING name AS view_name"
+    )))
 }
 
 /// Undo the SQL `''`-escaping retained in `parse_table_function_call`'s args.
@@ -2059,6 +2194,7 @@ fn strip_outer_quotes(s: &str) -> Option<&str> {
 #[cfg(feature = "extension")]
 #[no_mangle]
 pub extern "C" fn sv_parser_override_rust(
+    db_token: u64,
     query_ptr: *const u8,
     query_len: usize,
     sql_out: *mut u8,
@@ -2075,7 +2211,7 @@ pub extern "C" fn sv_parser_override_rust(
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(query_ptr, query_len))
         };
 
-        match rewrite_to_native_sql(query) {
+        match rewrite_to_native_sql(db_token, query) {
             Ok(Some(sql)) => {
                 unsafe { write_to_buffer(sql_out, sql_out_len, &sql) };
                 0 // success — native SQL written

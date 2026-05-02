@@ -1,18 +1,13 @@
-# v0.8.0: transactional DROP / ALTER SEMANTIC VIEW
+# v0.8.0: transactional CREATE / DROP / ALTER SEMANTIC VIEW
 #
-# Verifies that DROP and ALTER writes participate in the caller's transaction.
-# The parser_override hook rewrites recognised DDL into native DELETE / UPDATE
-# against semantic_layer._definitions, which DuckDB then executes on the
-# caller's connection — so BEGIN / COMMIT / ROLLBACK behave as expected.
+# Verifies that all three write forms participate in the caller's transaction.
+# The parser_override hook rewrites recognised DDL into native
+# INSERT / DELETE / UPDATE against semantic_layer._definitions, which DuckDB
+# then executes on the caller's connection — so BEGIN / COMMIT / ROLLBACK
+# behave as expected.
 #
 # Pre-v0.8.0 these writes ran on a dedicated persist_conn (auto-commit), so
 # rollback left them behind; this test would have failed.
-#
-# CREATE is intentionally NOT covered here — it remains on the legacy
-# DefineFromJsonVTab path because its bind() performs metadata enrichment
-# (database_name / schema_name / created_on / type inference / graph
-# validation) that has not been moved out of bind() yet. Transactional CREATE
-# is a documented v0.8.0 limitation; revisit when the enrichment refactor lands.
 
 require semantic_views
 
@@ -218,6 +213,166 @@ statement ok
 ALTER SEMANTIC VIEW IF EXISTS v080_does_not_exist UNSET COMMENT
 
 # ------------------------------------------------------------------
+# CREATE inside a rolled-back transaction must NOT leave the view behind.
+# ------------------------------------------------------------------
+
+statement ok
+BEGIN
+
+statement ok
+CREATE SEMANTIC VIEW v080_create_rb AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+
+# Visible to the same connection inside the transaction (DuckDB MVCC sees
+# the uncommitted INSERT on the same connection).
+query I
+SELECT count(*) FROM semantic_layer._definitions WHERE name = 'v080_create_rb'
+----
+1
+
+statement ok
+ROLLBACK
+
+# After rollback the row is gone — pre-v0.8.0 the persist_conn auto-commit
+# would have left it behind.
+query I
+SELECT count(*) FROM semantic_layer._definitions WHERE name = 'v080_create_rb'
+----
+0
+
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'v080_create_rb'
+----
+0
+
+# ------------------------------------------------------------------
+# CREATE + COMMIT persists.
+# ------------------------------------------------------------------
+
+statement ok
+BEGIN
+
+statement ok
+CREATE SEMANTIC VIEW v080_create_commit AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS COUNT(*))
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'v080_create_commit'
+----
+1
+
+# Metadata enrichment ran (database_name / schema_name / created_on populated)
+# even though the INSERT was emitted via parser_override.
+query III
+SELECT
+  database_name IS NOT NULL,
+  schema_name IS NOT NULL,
+  created_on IS NOT NULL
+FROM list_semantic_views() WHERE name = 'v080_create_commit'
+----
+true	true	true
+
+# Type inference is gated to file-backed DBs (v0.7.1 design); this
+# sqllogictest runs in-memory so data_type stays empty. The metadata
+# IS NOT NULL checks above already prove the shared enrichment ran.
+
+# ------------------------------------------------------------------
+# Plain CREATE on existing view errors at parse_override time.
+# ------------------------------------------------------------------
+
+statement error
+CREATE SEMANTIC VIEW v080_create_commit AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+----
+already exists
+
+# ------------------------------------------------------------------
+# CREATE OR REPLACE upserts (transactionally).
+# ------------------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW v080_create_commit AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total_replaced AS COUNT(*))
+
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'v080_create_commit'
+----
+1
+
+# Replaced metric is visible.
+query I
+SELECT count(*) FROM show_semantic_metrics('v080_create_commit')
+WHERE name = 'total_replaced'
+----
+1
+
+# CREATE OR REPLACE inside a rolled-back txn restores the prior version.
+statement ok
+BEGIN
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW v080_create_commit AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.rolled_back_metric AS MAX(o.amount))
+
+statement ok
+ROLLBACK
+
+# Pre-rollback metric still present; rolled-back metric absent.
+query I
+SELECT count(*) FROM show_semantic_metrics('v080_create_commit')
+WHERE name = 'total_replaced'
+----
+1
+
+query I
+SELECT count(*) FROM show_semantic_metrics('v080_create_commit')
+WHERE name = 'rolled_back_metric'
+----
+0
+
+# ------------------------------------------------------------------
+# CREATE IF NOT EXISTS: silent no-op when the view exists.
+# ------------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW IF NOT EXISTS v080_create_commit AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.ignored AS COUNT(*))
+
+# Metric from the no-op CREATE is NOT present (the existing view was kept).
+query I
+SELECT count(*) FROM show_semantic_metrics('v080_create_commit')
+WHERE name = 'ignored'
+----
+0
+
+# CREATE IF NOT EXISTS for a fresh name actually creates it.
+statement ok
+CREATE SEMANTIC VIEW IF NOT EXISTS v080_create_ine AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'v080_create_ine'
+----
+1
+
+# ------------------------------------------------------------------
 # Cleanup
 # ------------------------------------------------------------------
 
@@ -229,3 +384,9 @@ DROP SEMANTIC VIEW IF EXISTS v080_rename_conflict
 
 statement ok
 DROP SEMANTIC VIEW IF EXISTS v080_comment_view
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS v080_create_commit
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS v080_create_ine

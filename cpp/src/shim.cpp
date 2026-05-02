@@ -14,6 +14,9 @@
 // them. See cpp/include/parser_extension_compat.hpp for details.
 
 #include "parser_extension_compat.hpp"
+#include <atomic>
+#include <cstdint>
+#include <memory>
 
 using namespace duckdb;
 
@@ -55,11 +58,29 @@ extern "C" {
     // for re-parsing through DuckDB's own parser and execution on the caller's
     // connection. Distinct from sv_rewrite_ddl_rust which targets the internal
     // table function. Returns 0=success, 1=validation error, 2=not-ours.
+    //
+    // `db_token` identifies which database's catalog connection to use for
+    // existence checks and CREATE-time enrichment. Each extension load is
+    // assigned a unique token (see sv_register_parser_hooks) so multi-DB
+    // processes (e.g. Python tests opening successive in-memory + file-backed
+    // databases) don't share a stale catalog connection.
     uint8_t sv_parser_override_rust(
+        uint64_t db_token,
         const char *query_ptr, size_t query_len,
         char *sql_out, size_t sql_out_len,
         char *error_out, size_t error_out_len);
 }
+
+// Per-extension-load info struct attached to ParserExtension::parser_info.
+// `db_token` selects the right catalog connection on the Rust side; we
+// generate a fresh token on every sv_register_parser_hooks call so each
+// loaded database has an isolated entry in the Rust-side connection map.
+struct SemanticViewsParserInfo : public ParserExtensionInfo {
+    uint64_t db_token;
+    explicit SemanticViewsParserInfo(uint64_t token) : db_token(token) {}
+};
+
+static std::atomic<uint64_t> sv_next_db_token{1};
 
 // ---------------------------------------------------------------------------
 // File-scope static: DDL connection for executing rewritten statements
@@ -359,13 +380,22 @@ static void sv_ddl_execute(ClientContext &, TableFunctionInput &input,
 // disabled (allow_parser_override_extension=DEFAULT) or our override hits an
 // unexpected error — preserving v0.7.x non-transactional behaviour as a safety net.
 static ParserOverrideResult sv_parser_override(
-    ParserExtensionInfo *, const string &query, ParserOptions &) {
+    ParserExtensionInfo *info, const string &query, ParserOptions &) {
 
     std::string sql_str(65536, '\0');  // 64 KB headroom for large rewritten DDL
     char error_buf[1024];
     memset(error_buf, 0, sizeof(error_buf));
 
+    // Identify which DB's catalog connection this query should use. info is
+    // the per-extension-load SemanticViewsParserInfo we attached at registration
+    // time; without it we cannot route correctly, so defer to the legacy path.
+    auto *sv_info = dynamic_cast<SemanticViewsParserInfo *>(info);
+    if (!sv_info) {
+        return ParserOverrideResult();
+    }
+
     uint8_t rc = sv_parser_override_rust(
+        sv_info->db_token,
         query.c_str(), query.size(),
         sql_str.data(), sql_str.size(),
         error_buf, sizeof(error_buf));
@@ -422,7 +452,9 @@ static ParserExtensionPlanResult sv_plan_function(
 // execution. Extracts DatabaseInstance& and registers the parser extension
 // hooks on DBConfig.
 extern "C" {
-    bool sv_register_parser_hooks(duckdb_database db_handle, duckdb_connection ddl_conn) {
+    bool sv_register_parser_hooks(duckdb_database db_handle,
+                                  duckdb_connection ddl_conn,
+                                  uint64_t *out_db_token) {
         try {
             // Store the DDL connection for use by sv_ddl_bind
             sv_ddl_conn = ddl_conn;
@@ -437,10 +469,26 @@ extern "C" {
             // Register parser extension.
             // DuckDB 1.5.0 moved parser extension registration from direct
             // vector push_back to ParserExtension::Register(config, ext).
+            //
+            // Allocate a fresh per-load token and stash it on parser_info.
+            // The parser_override callback reads it back to look up the right
+            // catalog connection — required for processes that load the
+            // extension against multiple DBs sequentially (e.g. Python tests).
+            uint64_t token = sv_next_db_token.fetch_add(1, std::memory_order_relaxed);
+            if (out_db_token) {
+                *out_db_token = token;
+            }
             ParserExtension ext;
             ext.parse_function = sv_parse_stub;
             ext.plan_function = sv_plan_function;
             ext.parser_override = sv_parser_override;
+            // duckdb::shared_ptr<T> doesn't have an upcast constructor, so we
+            // build the std::shared_ptr<ParserExtensionInfo> first (allocates
+            // the SemanticViewsParserInfo and immediately upcasts) then hand
+            // it to duckdb::shared_ptr's std-interop constructor.
+            std::shared_ptr<ParserExtensionInfo> info_std(
+                new SemanticViewsParserInfo(token));
+            ext.parser_info = duckdb::shared_ptr<ParserExtensionInfo>(info_std);
             auto &config = DBConfig::GetConfig(db);
             ParserExtension::Register(config, ext);
 

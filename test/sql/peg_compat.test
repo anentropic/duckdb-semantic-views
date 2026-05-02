@@ -1,17 +1,23 @@
 # PEG parser compatibility smoke test for DuckDB 1.5.0+.
 #
 # DuckDB 1.5.0 introduced an opt-in PEG parser (CALL enable_peg_parser()).
-# The semantic_views extension uses Bison-era parser_extensions hooks for DDL
-# interception (CREATE/ALTER/DROP/DESCRIBE/SHOW SEMANTIC VIEW). The PEG parser
-# does NOT consult parser_extensions, so DDL fails under PEG. However, querying
-# existing semantic views via semantic_view() table function works fine under
-# PEG because table functions are standard SQL.
+#
+# The extension uses two interception mechanisms with different PEG behaviour:
+#
+# 1. parser_override (v0.8.0+): registered on ParserExtension and called
+#    BEFORE parsing. Parser-agnostic — works under both Bison and PEG. Used
+#    for CREATE / DROP / ALTER SEMANTIC VIEW. The callback returns native
+#    INSERT/DELETE/UPDATE SQL which whichever parser is active happily parses.
+#
+# 2. parse_function fallback (Bison-era): the legacy parser_extensions hook,
+#    only consulted by Bison. Used for DESCRIBE / SHOW SEMANTIC * forms and
+#    for CREATE ... FROM YAML FILE. These forms therefore fail under PEG.
 #
 # This test documents the expected behavior:
-#   1. DDL works under the default Bison parser
-#   2. DDL fails under PEG parser with "Parser Error"
-#   3. Querying existing views works under PEG parser
-#   4. DDL works again after disabling PEG parser
+#   1. All DDL works under the default Bison parser
+#   2. Under PEG: CREATE / DROP / ALTER work (parser_override); DESCRIBE / SHOW fail
+#   3. Querying existing views works under PEG (semantic_view() is a table function)
+#   4. All DDL works again after disabling PEG parser
 #
 # Requirements covered:
 #   DKDB-05: PEG parser compatibility documented
@@ -45,22 +51,31 @@ SELECT * FROM semantic_view('peg_bison_test', dimensions := ['dim_id'], metrics 
 2	20.0
 
 # ============================================================
-# 3. Enable PEG parser: DDL fails, queries work
+# 3. Enable PEG parser: CREATE / DROP / ALTER work via parser_override;
+#    DESCRIBE / SHOW (parser_extensions fallback) fail.
 # ============================================================
 
 statement ok
 CALL enable_peg_parser();
 
-# DDL fails: PEG parser does not consult parser_extensions fallback hooks
-statement error
-CREATE SEMANTIC VIEW peg_fail_test AS
+# CREATE goes through parser_override (parser-agnostic) — works under PEG.
+statement ok
+CREATE SEMANTIC VIEW peg_under_peg AS
 TABLES (t2 AS peg_test_data PRIMARY KEY (id))
 DIMENSIONS (t2.dim_id AS t2.id)
 METRICS (t2.total_val AS SUM(t2.val))
+
+# DROP also goes through parser_override.
+statement ok
+DROP SEMANTIC VIEW peg_under_peg
+
+# DESCRIBE defers to the Bison-only parse_function fallback — fails under PEG.
+statement error
+DESCRIBE SEMANTIC VIEW peg_bison_test
 ----
 Parser Error
 
-# Querying existing views works: semantic_view() is a standard table function
+# Querying existing views works: semantic_view() is a standard table function.
 query IR
 SELECT * FROM semantic_view('peg_bison_test', dimensions := ['dim_id'], metrics := ['total_val']) ORDER BY dim_id;
 ----
@@ -85,6 +100,10 @@ SELECT * FROM semantic_view('peg_restored_test', dimensions := ['dim_id'], metri
 ----
 1	10.0
 2	20.0
+
+# DESCRIBE works again with Bison.
+statement ok
+DESCRIBE SEMANTIC VIEW peg_bison_test
 
 # ============================================================
 # 5. Cleanup
