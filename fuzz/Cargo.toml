@@ -39,3 +39,8 @@ doc = false
 name = "fuzz_yaml_parse"
 path = "fuzz_targets/fuzz_yaml_parse.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_parser_override_ffi"
+path = "fuzz_targets/fuzz_parser_override_ffi.rs"
+doc = false

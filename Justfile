@@ -125,10 +125,16 @@ test-large-view: build
 test-multi-db: build
     uv run test/integration/test_multi_db_isolation.py
 
-# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC + large-view + multi-DB
+# Concurrent CREATE on the same view name from two threads. PK constraint
+# on _definitions(name) serializes the inserts; exactly one must succeed.
+# Also indirectly exercises the v0.8.1 race-guard pattern for DROP/ALTER.
+test-concurrent: build
+    uv run test/integration/test_concurrent_ddl.py
+
+# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC + large-view + multi-DB + concurrent
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
 # _ensure-test-deps runs early to catch pip version mismatches before slow builds.
-test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc test-large-view test-multi-db
+test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc test-large-view test-multi-db test-concurrent
 
 # Check that fuzz targets compile (requires nightly)
 check-fuzz:

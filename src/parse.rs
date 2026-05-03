@@ -1618,7 +1618,15 @@ pub(crate) fn infer_cardinality(
 /// # Safety
 ///
 /// `buf` must point to a writable buffer of at least `len` bytes.
+///
+/// As of v0.8.1 no caller uses this — validation errors are surfaced via a
+/// synthesised `SELECT error('...')` statement (see `sql_throwing`) because
+/// `DuckDB`'s `FALLBACK_OVERRIDE` mode silently drops `DISPLAY_EXTENSION_ERROR`.
+/// Kept as a low-cost option for a future switch to `STRICT_OVERRIDE` if
+/// `DuckDB` upstream ever wraps the throw in `ParserException::SyntaxError`
+/// to preserve caret rendering.
 #[cfg(feature = "extension")]
+#[allow(dead_code)]
 unsafe fn write_error_to_buffer(buf: *mut u8, len: usize, s: &str) {
     if buf.is_null() || len == 0 {
         return;
@@ -2139,16 +2147,53 @@ fn rewrite_yaml_file_create(db_token: u64, payload: &str) -> Result<Option<Strin
     emit_native_create_sql(&ctx, name, def, or_replace, if_not_exists)
 }
 
+// SQL-string escape helpers (round-trip pair).
+//
+// `escape_sql_arg` doubles single quotes so the input can be embedded inside
+// a single-quoted SQL string literal: `O'Brien` → `O''Brien`. `unescape_sql_arg`
+// reverses the doubling for values that arrived already-escaped (typically
+// from `parse_table_function_call::args`, which retains the SQL form so its
+// callers can re-embed without re-escaping).
+//
+// The pair is unconditionally compiled (no `#[cfg(feature = "extension")]`)
+// so unit tests under `cargo test` can exercise the escaping rules without
+// linking the loadable-extension stubs. They have no FFI dependencies.
+
 /// Undo the SQL `''`-escaping retained in `parse_table_function_call`'s args.
-#[cfg(feature = "extension")]
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 fn unescape_sql_arg(s: &str) -> String {
     s.replace("''", "'")
 }
 
 /// Re-escape a string for embedding in single-quoted SQL.
-#[cfg(feature = "extension")]
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 fn escape_sql_arg(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+/// Build the race-guard SELECT for non-IF-EXISTS DROP/ALTER (B1, v0.8.1).
+///
+/// `name_escaped` is the view name with single quotes already SQL-doubled
+/// (matches the form returned by `parse_table_function_call::args`).
+///
+/// The emitted statement errors with `semantic view '<name>' was concurrently
+/// dropped` when the row is missing from `semantic_layer._definitions`.
+/// Caller appends `;` and the actual DELETE/UPDATE; both run on the caller's
+/// connection in the same transaction so the guard's NOT EXISTS check is
+/// snapshot-consistent with the DML that follows.
+///
+/// The CTE form `WITH op AS (DELETE ... RETURNING)` is rejected by `DuckDB`
+/// 1.10.502 with `Parser Error: A CTE needs a SELECT`, so we use a
+/// two-statement string instead. See the smoke test
+/// `catalog::tests::two_statement_guard_then_dml_smoke` for the working shape.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+fn race_guard_select(name_escaped: &str) -> String {
+    format!(
+        "SELECT CASE WHEN NOT EXISTS \
+                   (SELECT 1 FROM semantic_layer._definitions WHERE name = '{name_escaped}') \
+                THEN error('semantic view ''{name_escaped}'' was concurrently dropped') \
+                ELSE TRUE END"
+    )
 }
 
 #[cfg(feature = "extension")]
@@ -2177,8 +2222,28 @@ fn rewrite_drop(
         });
     }
 
+    if if_exists {
+        // IF EXISTS keeps its silent no-op contract on race: the catalog
+        // pre-check saw the row, but if a concurrent DROP commits before our
+        // DELETE runs, the DELETE simply affects 0 rows and that is fine.
+        return Ok(Some(format!(
+            "DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
+             RETURNING name AS view_name"
+        )));
+    }
+
+    // Race guard: catalog.exists() reads committed state via the catalog
+    // connection — a separate connection from the caller's. Between that
+    // pre-check and the DELETE running on the caller's connection, another
+    // session can commit a DROP of the same view. Without a guard the DELETE
+    // would silently affect 0 rows. The guard SELECT runs on the caller's
+    // connection in the same transaction as the DELETE, so its NOT EXISTS
+    // check is snapshot-consistent. RETURNING from the DELETE is the
+    // user-visible result.
+    let guard = race_guard_select(name_escaped);
     Ok(Some(format!(
-        "DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
+        "{guard}; \
+         DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
          RETURNING name AS view_name"
     )))
 }
@@ -2222,10 +2287,24 @@ fn rewrite_alter_rename(
         });
     }
 
-    // PK update: DuckDB validates uniqueness; the pre-check above gives us
-    // a friendlier error. RETURNING projects the old/new pair from constants.
+    if if_exists {
+        // IF EXISTS preserves its silent contract on race: pre-check saw the
+        // old name; if a concurrent DROP commits before our UPDATE, the
+        // UPDATE simply affects 0 rows.
+        return Ok(Some(format!(
+            "UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
+             WHERE name = '{old_escaped}' \
+             RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
+        )));
+    }
+
+    // Race guard (see rewrite_drop for rationale). PK uniqueness on the new
+    // name is still validated by DuckDB during UPDATE; the pre-check above
+    // only gives a friendlier error in the non-race case.
+    let guard = race_guard_select(old_escaped);
     Ok(Some(format!(
-        "UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
+        "{guard}; \
+         UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
          WHERE name = '{old_escaped}' \
          RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
     )))
@@ -2278,8 +2357,26 @@ fn rewrite_alter_comment(
     })?;
     let new_json_escaped = escape_sql_arg(&new_json);
 
+    if if_exists {
+        // IF EXISTS preserves its silent contract on race: pre-check saw the
+        // row; if a concurrent DROP commits before our UPDATE, the UPDATE
+        // simply affects 0 rows.
+        return Ok(Some(format!(
+            "UPDATE semantic_layer._definitions SET definition = '{new_json_escaped}' \
+             WHERE name = '{name_escaped}' \
+             RETURNING name, '{status_label}'::VARCHAR AS status"
+        )));
+    }
+
+    // Race guard (see rewrite_drop for rationale). Note: this only guards
+    // against concurrent DROP. A concurrent ALTER ... SET COMMENT or
+    // ALTER ... RENAME against the same row could still cause a lost-update
+    // (we serialized our new JSON from the lookup snapshot). That broader
+    // optimistic-concurrency story is out of scope for v0.8.1.
+    let guard = race_guard_select(name_escaped);
     Ok(Some(format!(
-        "UPDATE semantic_layer._definitions SET definition = '{new_json_escaped}' \
+        "{guard}; \
+         UPDATE semantic_layer._definitions SET definition = '{new_json_escaped}' \
          WHERE name = '{name_escaped}' \
          RETURNING name, '{status_label}'::VARCHAR AS status"
     )))
@@ -2466,21 +2563,43 @@ pub extern "C" fn sv_parser_override_rust(
                 // Genuinely not ours — but check for a near-miss typo
                 // (e.g. `CREAT SEMANTIC VIEW`) so the user sees a helpful
                 // suggestion instead of a generic syntax error from
-                // DuckDB's default parser.
+                // DuckDB's default parser. Surfaced via SELECT error('...')
+                // because FALLBACK_OVERRIDE silently drops rc=1
+                // (DISPLAY_EXTENSION_ERROR) — see sql_throwing docstring.
                 if let Some(err) = detect_near_miss(query) {
-                    unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
-                    return 1;
+                    let sql = sql_throwing(&err.message);
+                    unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
+                    return 0;
                 }
                 2 // not ours, defer to default parser
             }
             Err(err) => {
-                unsafe { write_error_to_buffer(error_out, error_out_len, &err.message) };
-                1 // validation error
+                // Same FALLBACK reason as the near-miss branch — see
+                // sql_throwing for the rationale and TECH-DEBT item 22.
+                let sql = sql_throwing(&err.message);
+                unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
+                let _ = (error_out, error_out_len); // unused under FALLBACK
+                0
             }
         }
     }));
 
     result.unwrap_or(2) // on panic: not ours
+}
+
+/// Build a SQL statement that, when executed, raises a runtime error with
+/// the given message. Used by `sv_parser_override_rust` to surface validation
+/// errors and near-miss suggestions in `DuckDB`'s `FALLBACK_OVERRIDE` mode,
+/// which silently drops `DISPLAY_EXTENSION_ERROR` from `parser_override`
+/// callbacks (see duckdb.cpp `ParseInternal`). Throwing via `error()` from a
+/// synthesised statement is the workaround that keeps the message reaching
+/// the caller.
+#[cfg(feature = "extension")]
+fn sql_throwing(message: &str) -> String {
+    let escaped = escape_sql_arg(message);
+    // Cast to VARCHAR so DuckDB's binder doesn't complain about an unknown
+    // result type when the row never materialises.
+    format!("SELECT error('{escaped}')::VARCHAR AS error")
 }
 
 #[cfg(test)]
@@ -2542,6 +2661,84 @@ mod tests {
     fn parse_tf_call_rejects_unknown_prefix() {
         assert!(parse_table_function_call("INSERT INTO t VALUES ('a')").is_none());
         assert!(parse_table_function_call("describe_semantic_view('foo')").is_none());
+    }
+
+    // ===================================================================
+    // B1 / D6: race-guard SQL shape. Pinned so a future refactor cannot
+    // silently drop the snapshot-consistent existence check that protects
+    // non-IF-EXISTS DROP / ALTER from a concurrent commit landing between
+    // the catalog pre-check (separate connection) and the DML.
+    // ===================================================================
+
+    // ===================================================================
+    // C2: SQL escape helpers — round-trip pair, no extension feature.
+    // ===================================================================
+
+    #[test]
+    fn escape_sql_arg_doubles_single_quotes() {
+        assert_eq!(escape_sql_arg(""), "");
+        assert_eq!(escape_sql_arg("plain"), "plain");
+        assert_eq!(escape_sql_arg("O'Brien"), "O''Brien");
+        assert_eq!(escape_sql_arg("a'b'c"), "a''b''c");
+        assert_eq!(escape_sql_arg("''"), "''''");
+    }
+
+    #[test]
+    fn unescape_sql_arg_undoes_escape() {
+        assert_eq!(unescape_sql_arg(""), "");
+        assert_eq!(unescape_sql_arg("plain"), "plain");
+        assert_eq!(unescape_sql_arg("O''Brien"), "O'Brien");
+        assert_eq!(unescape_sql_arg("a''b''c"), "a'b'c");
+    }
+
+    #[test]
+    fn escape_unescape_round_trip() {
+        for s in [
+            "",
+            "plain",
+            "O'Brien",
+            "''already-doubled''",
+            "mix 'of' quotes",
+            "trailing'",
+        ] {
+            assert_eq!(unescape_sql_arg(&escape_sql_arg(s)), s);
+        }
+    }
+
+    #[test]
+    fn race_guard_select_emits_not_exists_and_error() {
+        let g = race_guard_select("sales");
+        assert!(g.contains("NOT EXISTS"), "missing NOT EXISTS: {g}");
+        assert!(
+            g.contains("FROM semantic_layer._definitions WHERE name = 'sales'"),
+            "guard targets wrong table/predicate: {g}"
+        );
+        assert!(
+            g.contains("error('semantic view ''sales'' was concurrently dropped')"),
+            "missing error() with friendly message: {g}"
+        );
+        // Must be a SELECT (so it can run as the first of two statements
+        // without affecting catalog state when the row is present).
+        assert!(g.trim_start().starts_with("SELECT "), "not a SELECT: {g}");
+        // Must not contain a trailing ';' — the caller appends ';' + DML.
+        assert!(!g.contains(';'), "guard must not include ';' itself: {g}");
+    }
+
+    #[test]
+    fn race_guard_select_doubles_quotes_in_name() {
+        // name_escaped already has '' for single quotes; embedding it inside
+        // an outer SQL string literal preserves correct decoding (DuckDB
+        // sees ''X'' as 'X' in the literal). The user-facing error message
+        // must read: semantic view 'O'Brien' was concurrently dropped.
+        let g = race_guard_select("O''Brien");
+        assert!(
+            g.contains("WHERE name = 'O''Brien'"),
+            "WHERE clause wrong: {g}"
+        );
+        assert!(
+            g.contains("error('semantic view ''O''Brien'' was concurrently dropped')"),
+            "error message wrong: {g}"
+        );
     }
 
     // ===================================================================

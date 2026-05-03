@@ -129,6 +129,88 @@ mod reader {
         }
     }
 
+    /// RAII guard for `duckdb_prepared_statement`. Drops the statement on
+    /// scope exit even when the body short-circuits via `?`. Pre-v0.8.1
+    /// every error path repeated `duckdb_destroy_prepare` by hand.
+    struct PreparedStmt {
+        ptr: ffi::duckdb_prepared_statement,
+    }
+
+    impl PreparedStmt {
+        unsafe fn prepare(conn: ffi::duckdb_connection, sql: &CStr) -> Result<Self, String> {
+            let mut ptr: ffi::duckdb_prepared_statement = std::ptr::null_mut();
+            let rc = ffi::duckdb_prepare(conn, sql.as_ptr(), &mut ptr);
+            if rc != ffi::DuckDBSuccess {
+                let err = ffi::duckdb_prepare_error(ptr);
+                let msg = if err.is_null() {
+                    "unknown prepare error".to_string()
+                } else {
+                    CStr::from_ptr(err).to_string_lossy().into_owned()
+                };
+                ffi::duckdb_destroy_prepare(&mut ptr);
+                return Err(msg);
+            }
+            Ok(Self { ptr })
+        }
+
+        fn raw(&self) -> ffi::duckdb_prepared_statement {
+            self.ptr
+        }
+    }
+
+    impl Drop for PreparedStmt {
+        fn drop(&mut self) {
+            unsafe { ffi::duckdb_destroy_prepare(&mut self.ptr) };
+        }
+    }
+
+    /// RAII guard for `duckdb_result`. Like `PreparedStmt`, removes the
+    /// per-error-path `duckdb_destroy_result` calls.
+    struct QueryResult {
+        inner: ffi::duckdb_result,
+    }
+
+    impl QueryResult {
+        fn zeroed() -> Self {
+            Self {
+                inner: unsafe { std::mem::zeroed() },
+            }
+        }
+
+        fn raw_mut(&mut self) -> *mut ffi::duckdb_result {
+            std::ptr::addr_of_mut!(self.inner)
+        }
+    }
+
+    impl Drop for QueryResult {
+        fn drop(&mut self) {
+            unsafe { ffi::duckdb_destroy_result(self.raw_mut()) };
+        }
+    }
+
+    unsafe fn read_column_string(
+        result: *mut ffi::duckdb_result,
+        col: ffi::idx_t,
+        row: ffi::idx_t,
+    ) -> Option<String> {
+        let ptr = ffi::duckdb_value_varchar(result, col, row);
+        if ptr.is_null() {
+            return None;
+        }
+        let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        ffi::duckdb_free(ptr.cast::<c_void>());
+        Some(s)
+    }
+
+    unsafe fn result_error_message(result: *mut ffi::duckdb_result, fallback: &str) -> String {
+        let err_ptr = ffi::duckdb_result_error(result);
+        if err_ptr.is_null() {
+            fallback.to_string()
+        } else {
+            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+        }
+    }
+
     unsafe fn prepared_lookup(
         conn: ffi::duckdb_connection,
         name: &str,
@@ -136,55 +218,28 @@ mod reader {
         let c_sql =
             CString::new("SELECT definition FROM semantic_layer._definitions WHERE name = $1")
                 .map_err(|_| "SQL contains null byte".to_string())?;
-        let mut stmt: ffi::duckdb_prepared_statement = std::ptr::null_mut();
-        let rc = ffi::duckdb_prepare(conn, c_sql.as_ptr(), &mut stmt);
-        if rc != ffi::DuckDBSuccess {
-            let err = ffi::duckdb_prepare_error(stmt);
-            let msg = if err.is_null() {
-                "unknown prepare error".to_string()
-            } else {
-                CStr::from_ptr(err).to_string_lossy().into_owned()
-            };
-            ffi::duckdb_destroy_prepare(&mut stmt);
-            return Err(msg);
-        }
+        let stmt = PreparedStmt::prepare(conn, &c_sql)?;
 
         let c_name = CString::new(name).map_err(|_| "view name contains null byte".to_string())?;
-        if ffi::duckdb_bind_varchar(stmt, 1, c_name.as_ptr()) != ffi::DuckDBSuccess {
-            ffi::duckdb_destroy_prepare(&mut stmt);
+        if ffi::duckdb_bind_varchar(stmt.raw(), 1, c_name.as_ptr()) != ffi::DuckDBSuccess {
             return Err("failed to bind view name".to_string());
         }
 
-        let mut result: ffi::duckdb_result = std::mem::zeroed();
-        let exec_rc = ffi::duckdb_execute_prepared(stmt, &mut result);
+        let mut result = QueryResult::zeroed();
+        let exec_rc = ffi::duckdb_execute_prepared(stmt.raw(), result.raw_mut());
         if exec_rc != ffi::DuckDBSuccess {
-            let err_ptr = ffi::duckdb_result_error(&mut result);
-            let msg = if err_ptr.is_null() {
-                "catalog lookup failed".to_string()
-            } else {
-                CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
-            };
-            ffi::duckdb_destroy_result(&mut result);
-            ffi::duckdb_destroy_prepare(&mut stmt);
-            return Err(msg);
+            return Err(result_error_message(
+                result.raw_mut(),
+                "catalog lookup failed",
+            ));
         }
 
-        let row_count = ffi::duckdb_row_count(&mut result);
-        let value = if row_count == 0 {
-            None
+        let row_count = ffi::duckdb_row_count(result.raw_mut());
+        if row_count == 0 {
+            Ok(None)
         } else {
-            let val_ptr = ffi::duckdb_value_varchar(&mut result, 0, 0);
-            if val_ptr.is_null() {
-                None
-            } else {
-                let s = CStr::from_ptr(val_ptr).to_string_lossy().into_owned();
-                ffi::duckdb_free(val_ptr.cast::<c_void>());
-                Some(s)
-            }
-        };
-        ffi::duckdb_destroy_result(&mut result);
-        ffi::duckdb_destroy_prepare(&mut stmt);
-        Ok(value)
+            Ok(read_column_string(result.raw_mut(), 0, 0))
+        }
     }
 
     unsafe fn execute_list_all(
@@ -193,41 +248,22 @@ mod reader {
         let c_sql =
             CString::new("SELECT name, definition FROM semantic_layer._definitions ORDER BY name")
                 .map_err(|_| "SQL contains null byte".to_string())?;
-        let mut result: ffi::duckdb_result = std::mem::zeroed();
-        let rc = ffi::duckdb_query(conn, c_sql.as_ptr(), &mut result);
+        let mut result = QueryResult::zeroed();
+        let rc = ffi::duckdb_query(conn, c_sql.as_ptr(), result.raw_mut());
         if rc != ffi::DuckDBSuccess {
-            let err_ptr = ffi::duckdb_result_error(&mut result);
-            let msg = if err_ptr.is_null() {
-                "catalog list failed".to_string()
-            } else {
-                CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
-            };
-            ffi::duckdb_destroy_result(&mut result);
-            return Err(msg);
+            return Err(result_error_message(
+                result.raw_mut(),
+                "catalog list failed",
+            ));
         }
 
-        let row_count = ffi::duckdb_row_count(&mut result);
+        let row_count = ffi::duckdb_row_count(result.raw_mut());
         let mut out = Vec::with_capacity(row_count as usize);
         for r in 0..row_count {
-            let name_ptr = ffi::duckdb_value_varchar(&mut result, 0, r);
-            let def_ptr = ffi::duckdb_value_varchar(&mut result, 1, r);
-            let name = if name_ptr.is_null() {
-                String::new()
-            } else {
-                let s = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
-                ffi::duckdb_free(name_ptr.cast::<c_void>());
-                s
-            };
-            let def = if def_ptr.is_null() {
-                String::new()
-            } else {
-                let s = CStr::from_ptr(def_ptr).to_string_lossy().into_owned();
-                ffi::duckdb_free(def_ptr.cast::<c_void>());
-                s
-            };
+            let name = read_column_string(result.raw_mut(), 0, r).unwrap_or_default();
+            let def = read_column_string(result.raw_mut(), 1, r).unwrap_or_default();
             out.push((name, def));
         }
-        ffi::duckdb_destroy_result(&mut result);
         Ok(out)
     }
 }

@@ -191,7 +191,14 @@ extern "C" {
 
             // Enable parser_override dispatch in FALLBACK mode so our hook
             // runs *before* the default parser for every query; a miss
-            // (DISPLAY_ORIGINAL_ERROR) cleanly falls through to it.
+            // (DISPLAY_ORIGINAL_ERROR) cleanly falls through to it. Validation
+            // errors are surfaced via a synthesised SELECT error('...') from
+            // the Rust side because FALLBACK silently drops DISPLAY_EXTENSION_ERROR
+            // (verified in v1.5.2 amalgamation ParseInternal). STRICT does
+            // honour DISPLAY_EXTENSION_ERROR but its Throw() path loses the
+            // ParserException::SyntaxError formatting (LINE/^ caret) that
+            // legacy parse_function used, so STRICT doesn't actually win us
+            // anything user-visible — see TECH-DEBT item 22.
             config.SetOption("allow_parser_override_extension", Value("FALLBACK"));
 
             return true;

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-03
+
+### Changed
+
+- **Architectural unification.** `parser_override` is now the sole DDL entry point. Every recognised form — `CREATE` (all four variants), `DROP`, `ALTER`, `DESCRIBE`, `SHOW SEMANTIC *`, `GET_DDL`, `READ_YAML_FROM_SEMANTIC_VIEW` — is rewritten by a single Rust dispatch and re-parsed by DuckDB on the caller's connection. The legacy `parse_function` / `sv_ddl_internal` table-function fallback was retired (~1500 LOC net deletion). One execution path means transactional semantics, error reporting, and PEG/Bison compatibility are all uniform.
+- **`peg_compat.test` updated.** Under PEG, every DDL form (including `DESCRIBE` and `SHOW`) now works because parser_override fires before whichever parser is active. The Bison-only carve-out for `DESCRIBE` is gone.
+
+### Added
+
+- **DROP / ALTER race guards.** Non-`IF EXISTS` `DROP SEMANTIC VIEW` and `ALTER SEMANTIC VIEW … RENAME / SET COMMENT / UNSET COMMENT` now emit a snapshot-consistent existence check on the caller's connection before the DML. If a concurrent commit lands between the catalog pre-check (committed-state read on a separate connection) and the DML, the user sees `semantic view '<name>' was concurrently dropped` instead of a silent no-op. `IF EXISTS` variants keep their silent-no-op contract.
+- **Bounded LRU for multi-DB processes.** The per-database token → catalog map is capped at 16 entries with insertion-order eviction. Long-lived processes that open more than 16 DuckDB instances no longer leak `CatalogReader` handles; evicted tokens surface as a clear "catalog context for this database has been evicted" error rather than silently routing CREATE to the wrong database.
+- **FFI UTF-8 hardening.** `sv_parser_override_rust` now validates input bytes with checked `from_utf8` instead of `from_utf8_unchecked`. Malformed input cleanly defers to the default parser instead of triggering UB.
+- **`parse_table_function_call` tightening.** The internal helper now rejects `foo(,)`, `foo('a',)` (trailing comma), and `foo('a' 'b')` (missing comma between args). Pre-v0.8.1 these silently parsed as zero-arg or merged-arg calls.
+- **`ParserOptions` size assert.** A static assert pins `sizeof(ParserOptions) == 32` against DuckDB 1.10.502. Silent layout drift previously surfaced as garbage parser errors at position 0; future DuckDB bumps now fail fast at compile time.
+- **`CatalogReader` RAII.** `prepared_lookup` and `execute_list_all` use internal `PreparedStmt` and `QueryResult` guards. Manual `duckdb_destroy_*` calls along error paths are gone.
+- **Test additions.** Concurrent-CREATE Python integration test (`test/integration/test_concurrent_ddl.py`, runnable via `just test-concurrent`); `INSERT OR REPLACE` row-count, byte-identical rollback (MD5), and same-txn `list_semantic_views` visibility cases in `v080_transactional_ddl.test`; type-inference inside `BEGIN/COMMIT` in `test_type_inference.py`; arbitrary-bytes FFI fuzz target (`fuzz_parser_override_ffi`).
+
+### Fixed
+
+- **Validation error messages now reach the user.** Pre-v0.8.1 the architectural unification accidentally hid every `DISPLAY_EXTENSION_ERROR` because DuckDB silently drops them in `FALLBACK_OVERRIDE` mode (verified against duckdb.cpp `ParseInternal`). Errors like `semantic view 'X' does not exist` were replaced with the default parser's `Parser Error: syntax error at or near "SEMANTIC"`. The fix synthesises a `SELECT error('<msg>')` statement and returns it as `PARSE_SUCCESSFUL`, so DuckDB raises the message at execution time.
+
+### Known limitations
+
+- `CALL disable_peg_parser()` resets `allow_parser_override_extension` to `default`, which silently bypasses parser_override hooks. Workaround: re-issue `SET allow_parser_override_extension='FALLBACK'` after disabling PEG. The extension installs `FALLBACK` on load, so a process that never enables PEG never sees this.
+- `DESCRIBE` / `SHOW SEMANTIC *` continue to read committed state via the catalog connection (transactional visibility was already a documented v0.8.0 limitation). An in-flight `CREATE` is not visible to `list_semantic_views()` until commit, even from the same connection.
+- Bounded LRU evictions on processes opening more than 16 databases are silent at the token-allocation site; the next CREATE on the evicted token surfaces as the "catalog context for this database has been evicted" error.
+
 ## [0.8.0] - 2026-05-02
 
 ### Added

@@ -503,8 +503,132 @@ statement ok
 ROLLBACK
 
 # ------------------------------------------------------------------
+# v0.8.1 D2/D3/D4/D8: regression coverage for parser_override DDL.
+# ------------------------------------------------------------------
+
+# D2: CREATE OR REPLACE of an existing view leaves exactly ONE row
+# in `_definitions` (not two). The rewrite emits
+# `INSERT OR REPLACE INTO _definitions ... RETURNING name AS view_name`,
+# which DuckDB resolves by deleting the old row and inserting the new
+# one. A regression that lost the OR REPLACE would either error on the
+# PK constraint or accumulate stale rows.
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW v081_d2 AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.t AS SUM(o.amount))
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW v081_d2 AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.replaced_t AS COUNT(*))
+
+query I
+SELECT count(*) FROM semantic_layer._definitions WHERE name = 'v081_d2'
+----
+1
+
+# The replacement metric is the visible one; the original is gone.
+query II
+SELECT
+  (SELECT count(*) FROM show_semantic_metrics('v081_d2') WHERE name = 'replaced_t'),
+  (SELECT count(*) FROM show_semantic_metrics('v081_d2') WHERE name = 't')
+----
+1	0
+
+# D3: CREATE OR REPLACE inside a rolled-back txn restores the byte-identical
+# definition. Captures MD5 before, runs an OR REPLACE that we roll back, and
+# asserts MD5 unchanged. Pre-v0.8.0 the C++ shim used auto-commit, so the
+# replaced definition would have leaked even after rollback.
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW v081_d3 AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.t AS SUM(o.amount))
+
+statement ok
+CREATE TABLE v081_d3_md5 AS
+  SELECT MD5(definition) AS md5
+  FROM semantic_layer._definitions WHERE name = 'v081_d3'
+
+statement ok
+BEGIN
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW v081_d3 AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.completely_different AS MAX(o.amount))
+
+statement ok
+ROLLBACK
+
+# MD5 must match the pre-rollback snapshot byte-for-byte.
+query I
+SELECT count(*) FROM semantic_layer._definitions d, v081_d3_md5 m
+WHERE d.name = 'v081_d3' AND MD5(d.definition) = m.md5
+----
+1
+
+# D4: inside an open BEGIN with an in-flight CREATE, list_semantic_views
+# (which reads via catalog_conn — committed state only) must agree with a
+# direct read of `_definitions` on the user's connection. Pre-v0.8.1 the
+# direct count was 1 (in-flight row) and list_semantic_views was 0 (catalog
+# connection sees committed state); that's the documented limitation. After
+# COMMIT, both should agree at 1.
+statement ok
+BEGIN
+
+statement ok
+CREATE SEMANTIC VIEW v081_d4 AS
+  TABLES (o AS v080_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.t AS SUM(o.amount))
+
+# In-flight: caller's connection sees its own write (1 row); the catalog
+# connection (used by list_semantic_views) does not yet (0 rows).
+query II
+SELECT
+  (SELECT count(*) FROM semantic_layer._definitions WHERE name = 'v081_d4'),
+  (SELECT count(*) FROM list_semantic_views() WHERE name = 'v081_d4')
+----
+1	0
+
+statement ok
+COMMIT
+
+# After COMMIT both agree.
+query II
+SELECT
+  (SELECT count(*) FROM semantic_layer._definitions WHERE name = 'v081_d4'),
+  (SELECT count(*) FROM list_semantic_views() WHERE name = 'v081_d4')
+----
+1	1
+
+# D8: the in-flight duplicate CREATE error from the same-txn block above
+# (lines 451-474) relies on DuckDB unifying the result type of
+# `CASE WHEN ... THEN error('msg') ELSE name END` — `error()` returns
+# anyelement and unifies with the ELSE branch's VARCHAR. A regression
+# in DuckDB's CASE type unification (or a refactor that changes the
+# emitted SQL shape) would break that test, not this one. This comment
+# documents the implicit dependency; no separate query is needed.
+
+# ------------------------------------------------------------------
 # Cleanup
 # ------------------------------------------------------------------
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS v081_d2
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS v081_d3
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS v081_d4
+
+statement ok
+DROP TABLE IF EXISTS v081_d3_md5
 
 statement ok
 DROP SEMANTIC VIEW IF EXISTS v080_rename_dst
