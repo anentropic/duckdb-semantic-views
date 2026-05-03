@@ -1643,14 +1643,17 @@ unsafe fn write_error_to_buffer(buf: *mut u8, len: usize, s: &str) {
 /// Returns `(ptr, len)`. The buffer is **not** NUL-terminated — the C++
 /// side reads exactly `len` bytes. This avoids any silent truncation cap
 /// regardless of how large the rewritten SQL becomes.
+///
+/// Uses `Box<[u8]>` rather than a leaked `Vec` because `Vec::shrink_to_fit`
+/// is only a hint — the allocator may keep excess capacity, which would
+/// make the matching `Vec::from_raw_parts(ptr, len, len)` in `reclaim_c_buffer`
+/// undefined behaviour in release builds. `into_boxed_slice` actually
+/// guarantees `len == capacity`.
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 fn leak_string_to_c_buffer(s: String) -> (*mut u8, usize) {
-    let mut bytes = s.into_bytes();
-    bytes.shrink_to_fit();
-    debug_assert_eq!(bytes.len(), bytes.capacity());
-    let len = bytes.len();
-    let ptr = bytes.as_mut_ptr();
-    std::mem::forget(bytes);
+    let boxed: Box<[u8]> = s.into_bytes().into_boxed_slice();
+    let len = boxed.len();
+    let ptr = Box::into_raw(boxed).cast::<u8>();
     (ptr, len)
 }
 
@@ -1662,17 +1665,12 @@ fn leak_string_to_c_buffer(s: String) -> (*mut u8, usize) {
 /// `leak_string_to_c_buffer` (or its FFI exports), and may only be released
 /// once.
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-// Clippy warns that `Vec::from_raw_parts(p, n, n)` looks suspicious — but
-// here the matching `leak_string_to_c_buffer` deliberately calls
-// `shrink_to_fit` so len == capacity holds. Keeping this shape
-// (vs. Box::from_raw on a *mut [u8]) preserves the symmetry with the
-// allocator that produced the buffer.
-#[allow(clippy::same_length_and_capacity)]
 unsafe fn reclaim_c_buffer(ptr: *mut u8, len: usize) {
     if ptr.is_null() {
         return;
     }
-    drop(Vec::from_raw_parts(ptr, len, len));
+    let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
+    drop(Box::from_raw(slice));
 }
 
 /// FFI export: free a heap buffer produced by an earlier
@@ -2046,8 +2044,11 @@ fn emit_native_create_sql(
 /// transactional INSERT through `emit_native_create_sql` so the write
 /// participates in the caller's transaction.
 ///
-/// Returns `Ok(None)` when no `parser_override` context is installed for this
-/// `db_token` so the legacy C++ shim path (auto-commit) handles it.
+/// Returns a `ParseError` when no `parser_override` context is installed for
+/// this `db_token` (LRU eviction or registration race), matching
+/// `rewrite_create` / `rewrite_drop_or_alter`. The legacy C++ auto-commit
+/// shim path was retired in v0.8.1, so falling through to the default parser
+/// would produce a generic syntax error instead of an actionable message.
 #[cfg(not(feature = "extension"))]
 #[allow(clippy::unnecessary_wraps)]
 fn rewrite_yaml_file_create(_db_token: u64, _payload: &str) -> Result<Option<String>, ParseError> {
@@ -2061,8 +2062,15 @@ fn rewrite_yaml_file_create(db_token: u64, payload: &str) -> Result<Option<Strin
 
     use libduckdb_sys as ffi;
 
+    // See `rewrite_drop_or_alter` for the eviction-error rationale.
     let Some(ctx) = parser_override_catalog::get(db_token) else {
-        return Ok(None);
+        return Err(ParseError {
+            message: "semantic_views: catalog context for this database has been evicted \
+                      (process has opened more than 16 databases). Re-load the extension \
+                      or restart the process."
+                .to_string(),
+            position: None,
+        });
     };
 
     // Sentinel format: `<path>\x01<kind>\x01<name>\x01<comment>` (the
