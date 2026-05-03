@@ -246,6 +246,21 @@ Declares named grouping expressions available for queries.
 - ``COMMENT = '<text>'``, optional. A human-readable description.
 - ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
 
+**Validation rules:**
+
+- Dimension names must be unique within the view (case-insensitive). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
+- A dimension name cannot collide with any metric name (case-insensitive). See :ref:`ref-err-name-uniqueness`.
+
+**Type inference:**
+
+When creating a semantic view on a file-backed database, the extension infers the ``DATA_TYPE`` for each dimension at define time. It executes a ``LIMIT 0`` query against the underlying tables to detect the output type. Most scalar types are inferred, including ``VARCHAR``, ``INTEGER``, ``BIGINT``, ``DOUBLE``, ``DATE``, ``TIMESTAMP``, ``BOOLEAN``, ``FLOAT``, ``UUID``, and others. Types where inference would be lossy, such as ``DECIMAL``, ``LIST``, and ``ARRAY``, show an empty data type.
+
+The inferred type is visible in :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` (``data_type`` column) and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` (``output_type`` field in the JSON).
+
+.. note::
+
+   Type inference requires a file-backed database. In-memory databases skip inference, leaving ``DATA_TYPE`` empty.
+
 
 .. _ref-create-metrics:
 
@@ -352,6 +367,8 @@ See :ref:`howto-window-metrics` for details on both modes.
 
 **Validation rules:**
 
+- Metric names must be unique within the view (case-insensitive), across both base and derived metrics. See :ref:`ref-err-name-uniqueness`.
+- A metric name cannot collide with any dimension name (case-insensitive). See :ref:`ref-err-name-uniqueness`.
 - Derived metrics must not contain aggregate functions.
 - Circular derived metric references are rejected.
 - ``USING`` relationship names must match declared relationships.
@@ -455,6 +472,10 @@ The file path must be single-quoted. DuckDB reads the file contents and parses a
 See :ref:`howto-yaml-definitions` for a detailed workflow guide.
 
 **YAML size limit:** YAML definitions are capped at 1 MiB. Definitions exceeding this limit are rejected with an error.
+
+**Type inference:**
+
+As with dimensions, the extension infers ``DATA_TYPE`` for each metric at define time on file-backed databases. ``COUNT(*)`` infers as ``BIGINT``, ``SUM`` on integer columns infers as ``BIGINT``, ``SUM`` on float/double columns infers as ``DOUBLE``, and so on. The inferred type is visible in :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>`.
 
 
 .. _ref-create-examples:
