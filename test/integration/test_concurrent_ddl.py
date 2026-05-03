@@ -61,6 +61,13 @@ DIMENSIONS (a.dim AS a.id)
 METRICS (a.m AS SUM(a.val))
 """
 
+CREATE_IF_NOT_EXISTS_SQL = """
+CREATE SEMANTIC VIEW IF NOT EXISTS ine_view AS
+TABLES (a AS t PRIMARY KEY (id))
+DIMENSIONS (a.dim AS a.id)
+METRICS (a.m AS SUM(a.val))
+"""
+
 
 class WorkerResult:
     def __init__(self, idx: int) -> None:
@@ -69,17 +76,18 @@ class WorkerResult:
         self.error: Exception | None = None
 
 
-def worker(thread_conn, result: WorkerResult, gate: threading.Event) -> None:
-    # Both threads block at the gate before issuing their CREATE so they
+def worker(thread_conn, sql: str, result: WorkerResult, gate: threading.Event) -> None:
+    # Both threads block at the gate before issuing their statement so they
     # race the PK constraint check. The thread-local DuckDB connection
     # (obtained via .cursor()) shares the underlying database instance
     # with the master and the other worker, so both inserts hit the same
     # `semantic_layer._definitions` table simultaneously. The PK constraint
     # serializes them: one wins, the other gets a constraint-violation
-    # error.
+    # error (plain CREATE) or silently no-ops (CREATE IF NOT EXISTS via
+    # INSERT OR IGNORE).
     gate.wait()
     try:
-        thread_conn.execute(CREATE_SQL)
+        thread_conn.execute(sql)
         result.ok = True
     except Exception as exc:  # noqa: BLE001 - we want every error type
         result.error = exc
@@ -100,8 +108,8 @@ def test_concurrent_create_serializes() -> bool:
 
         gate = threading.Event()
         r1, r2 = WorkerResult(1), WorkerResult(2)
-        t1 = threading.Thread(target=worker, args=(c1, r1, gate))
-        t2 = threading.Thread(target=worker, args=(c2, r2, gate))
+        t1 = threading.Thread(target=worker, args=(c1, CREATE_SQL, r1, gate))
+        t2 = threading.Thread(target=worker, args=(c2, CREATE_SQL, r2, gate))
         t1.start()
         t2.start()
         gate.set()
@@ -146,9 +154,88 @@ def test_concurrent_create_serializes() -> bool:
         return True
 
 
+def test_concurrent_create_if_not_exists_serializes() -> bool:
+    """Cross-connection CREATE IF NOT EXISTS race: PK constraint serializes.
+
+    INSERT OR IGNORE absorbs *same-snapshot* duplicates atomically (handled
+    by the in-snapshot fast-path tests in v080_transactional_ddl.test), but
+    under DuckDB MVCC two concurrent connections that each see the row
+    absent in their own snapshot will both attempt an INSERT, and the
+    second commit raises a PK constraint violation. That matches plain
+    CREATE concurrency semantics — the silent no-op contract for IF NOT
+    EXISTS applies only to in-snapshot duplicates. See TECH-DEBT item 23.
+
+    This regression test pins the failure shape (clear constraint error,
+    not silent corruption or parser error) so a future SQL rewrite cannot
+    quietly degrade the loser's experience.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = str(Path(tmpdir) / "concurrent_ine.duckdb")
+        master = open_master(db_path)
+        master.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val DOUBLE)")
+        master.execute("INSERT INTO t VALUES (1, 1.0), (2, 2.0)")
+
+        c1 = master.cursor()
+        c2 = master.cursor()
+
+        gate = threading.Event()
+        r1, r2 = WorkerResult(1), WorkerResult(2)
+        t1 = threading.Thread(
+            target=worker, args=(c1, CREATE_IF_NOT_EXISTS_SQL, r1, gate)
+        )
+        t2 = threading.Thread(
+            target=worker, args=(c2, CREATE_IF_NOT_EXISTS_SQL, r2, gate)
+        )
+        t1.start()
+        t2.start()
+        gate.set()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+        if t1.is_alive() or t2.is_alive():
+            print("FAIL: worker thread did not finish within timeout (IF NOT EXISTS)")
+            return False
+
+        successes = [r for r in (r1, r2) if r.ok]
+        failures = [r for r in (r1, r2) if not r.ok]
+
+        if len(successes) != 1:
+            print(f"FAIL: expected exactly 1 success, got {len(successes)}")
+            for r in (r1, r2):
+                print(f"  worker {r.idx}: ok={r.ok} err={r.error!r}")
+            return False
+        if len(failures) != 1:
+            print(f"FAIL: expected exactly 1 failure, got {len(failures)}")
+            return False
+
+        # Catalog should still have exactly one row, regardless of which
+        # worker won.
+        rows = master.execute(
+            "SELECT count(*) FROM semantic_layer._definitions WHERE name = 'ine_view'"
+        ).fetchone()
+        if rows is None or rows[0] != 1:
+            print(f"FAIL: expected 1 row in _definitions, got {rows}")
+            return False
+
+        # Loser should see a PK constraint violation, not a parser error or
+        # corrupt data — pin the shape so a future regression doesn't slip
+        # through.
+        losing_msg = str(failures[0].error or "")
+        if "ine_view" not in losing_msg and "constraint" not in losing_msg.lower():
+            print(
+                "FAIL: losing thread error did not look like a name conflict: "
+                f"{losing_msg!r}"
+            )
+            return False
+
+        print("PASS: concurrent CREATE IF NOT EXISTS serialized on PK constraint")
+        return True
+
+
 def main() -> int:
     try:
-        return 0 if test_concurrent_create_serializes() else 1
+        ok1 = test_concurrent_create_serializes()
+        ok2 = test_concurrent_create_if_not_exists_serializes()
+        return 0 if (ok1 and ok2) else 1
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         return 1

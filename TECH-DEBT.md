@@ -189,6 +189,14 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Why deferred:** Switching to `STRICT_OVERRIDE` would cause every non-semantic SQL statement to round-trip through our hook with `DISPLAY_ORIGINAL_ERROR`, which is fine semantically but slightly costlier. The synthesised-error workaround has zero overhead on success cases and gives identical user experience.
 - **Action if DuckDB ever fixes FALLBACK to honour `DISPLAY_EXTENSION_ERROR`:** Replace `sql_throwing` with a direct `write_error_to_buffer` + rc=1 path; one fewer SQL statement to plan.
 
+### 23. ❓ Cross-connection `CREATE IF NOT EXISTS` race surfaces as PK violation
+
+- **Origin:** v0.8.1 PR #29 ultrareview follow-up; surfaced by the new IF NOT EXISTS path in `test/integration/test_concurrent_ddl.py`.
+- **Decision:** `CREATE SEMANTIC VIEW IF NOT EXISTS` rewrites to `INSERT OR IGNORE` against `semantic_layer._definitions(name)`. This atomically absorbs duplicates that are visible in the caller's own MVCC snapshot — same-transaction duplicates and any racing committer that landed before the caller's transaction began. It does **not** absorb duplicates from a transaction that committed *after* the caller's snapshot was taken: both connections evaluate INSERT against snapshots in which the row is absent, both attempt the INSERT, and DuckDB's PK constraint raises a write-write conflict on the second commit. The loser sees `Constraint Error: Duplicate key "name: <view>" violates primary key constraint`, the same shape plain `CREATE` produces.
+- **Why this is acceptable:** DuckDB's PK enforcement happens at row insert / commit time and is not a hook we can intercept from within `parser_override`. The pragmatic alternatives — application-level retry-on-conflict, a coarse table-level lock, or a serializable isolation upgrade — all sit outside the parser-override SQL path. The current behaviour is no worse than plain `CREATE` and the loser receives a clear, actionable message rather than corrupting data. The in-snapshot silent no-op contract (the case users hit far more often: re-running an idempotent setup script in a single process) is fully preserved.
+- **Mitigation for callers writing parallel bootstrap scripts:** wrap the `CREATE IF NOT EXISTS` in a try/except and treat a constraint violation on the target name as success. `test/integration/test_concurrent_ddl.py::test_concurrent_create_if_not_exists_serializes` pins the failure shape so this caller-side workaround stays valid across releases.
+- **Action if DuckDB ever exposes a hook to retry-on-conflict from a parser_override callback:** add an automatic retry loop and convert this entry to ✅ resolved.
+
 ---
 
 **Date:** 2026-05-03

@@ -4,7 +4,7 @@
 // 1. Pure detection/rewrite functions (`detect_semantic_view_ddl`,
 //    `extract_ddl_name`, `validate_and_rewrite`) testable under `cargo test`
 //    without the extension feature.
-// 2. FFI entry points (`sv_validate_ddl_rust`, `sv_rewrite_ddl_rust`)
+// 2. FFI entry points (`sv_parser_override_rust`, `sv_free_buffer`)
 //    feature-gated on `extension`, with `catch_unwind` for panic safety.
 
 use std::collections::HashSet;
@@ -1375,8 +1375,9 @@ fn extract_single_quoted(input: &str) -> Result<(String, usize), ParseError> {
 /// Sentinel format: `__SV_YAML_FILE__<path>\x01<kind>\x01<name>\x01<comment>`
 /// Uses `\x01` (SOH) as field separator instead of `\x00` (NUL) because the
 /// sentinel is passed through C string APIs that treat NUL as a terminator.
-/// The C++ shim reads the file via `read_text()`, reconstructs as inline YAML,
-/// and re-invokes `sv_rewrite_ddl_rust`.
+/// `rewrite_to_native_sql` strips the prefix and dispatches to
+/// `rewrite_yaml_file_create`, which calls `read_text()` on the catalog
+/// connection (Rust-side) and then routes through `emit_native_create_sql`.
 fn rewrite_ddl_yaml_file_body(
     kind: DdlKind,
     name: &str,
@@ -1674,7 +1675,7 @@ unsafe fn reclaim_c_buffer(ptr: *mut u8, len: usize) {
 }
 
 /// FFI export: free a heap buffer produced by an earlier
-/// `sv_parser_override_rust` / `sv_rewrite_ddl_rust` success return.
+/// `sv_parser_override_rust` success return.
 ///
 /// Safe to call with a null pointer (no-op).
 ///
@@ -2000,9 +2001,13 @@ fn emit_native_create_sql(
     // subqueries see in-flight INSERTs from the same transaction. Three
     // shapes:
     //   - OR REPLACE: straight INSERT OR REPLACE, no guard needed.
-    //   - IF NOT EXISTS: WHERE NOT EXISTS guard so a same-txn duplicate
-    //     silently no-ops (mirrors the committed-state SELECT WHERE 1=0
-    //     fast path above).
+    //   - IF NOT EXISTS: INSERT OR IGNORE absorbs same-snapshot duplicates
+    //     (the same-txn duplicate path, mirroring the SELECT WHERE 1=0
+    //     fast path on committed-state hits). It does *not* paper over
+    //     a cross-connection committer race: two transactions that each
+    //     see no row will both INSERT, and DuckDB's PK constraint raises
+    //     a write-write conflict on the second commit. That matches plain
+    //     CREATE concurrency semantics — see TECH-DEBT item 23.
     //   - Plain CREATE: CASE+error() raises the friendly "already exists"
     //     message before the INSERT can fire, replacing what would
     //     otherwise be a generic PK constraint violation.
@@ -2014,10 +2019,8 @@ fn emit_native_create_sql(
         )
     } else if if_not_exists {
         format!(
-            "INSERT INTO semantic_layer._definitions (name, definition) \
-             SELECT '{name_escaped}', '{enriched_escaped}' \
-             WHERE NOT EXISTS (SELECT 1 FROM semantic_layer._definitions \
-                               WHERE name = '{name_escaped}') \
+            "INSERT OR IGNORE INTO semantic_layer._definitions (name, definition) \
+             VALUES ('{name_escaped}', '{enriched_escaped}') \
              RETURNING name AS view_name"
         )
     } else {
