@@ -98,11 +98,14 @@ A DuckDB user can define a semantic view once and query it with any combination 
 - ✓ YAML export: `READ_YAML_FROM_SEMANTIC_VIEW('name')` scalar function exports stored definitions as clean YAML with internal field stripping, FQN support, and lossless round-trip back through `CREATE SEMANTIC VIEW ... FROM YAML` — v0.7.0 (Phase 56)
 - ✓ Materialization introspection: `explain_semantic_view()` shows materialization routing decision (name or "none"), DESCRIBE includes MATERIALIZATION property rows (TABLE/DIMENSIONS/METRICS), new `SHOW SEMANTIC MATERIALIZATIONS` command (single-view and cross-view forms with LIKE/STARTS WITH/LIMIT filtering) — v0.7.0 (Phase 57)
 
-### Active
+- ✓ Transactional DDL: `CREATE` (all four forms), `DROP`, and `ALTER SEMANTIC VIEW` participate in the caller's transaction via `parser_override` rewriting to native `INSERT`/`UPDATE`/`DELETE` against `_definitions`; `BEGIN ... ROLLBACK` cleanly rolls back uncommitted catalog changes — v0.8.0 (Phase 58)
+- ✓ Architectural unification: `parser_override` is the sole DDL entry point; legacy `parse_function`/`sv_ddl_internal` table-function fallback retired (~1500 LOC net deletion); uniform transactional + error semantics across CREATE/DROP/ALTER/DESCRIBE/SHOW/GET_DDL/READ_YAML — v0.8.0 (Phase 59)
+- ✓ Race guards & validation hardening: non-`IF EXISTS` DROP/ALTER emits snapshot-consistent existence check; FFI input UTF-8 validated (no UB on malformed input); `parse_table_function_call` rejects malformed argument lists; `ParserOptions` size pinned by static assert — v0.8.0 (Phase 60)
+- ✓ Bounded multi-DB isolation, RAII cleanup, and ADBC/concurrent test coverage: per-DB token→catalog map capped at 16 with insertion-order eviction; `CatalogReader` uses RAII guards (`PreparedStmt`, `QueryResult`); ADBC end-to-end test, concurrent-CREATE Python test, FFI fuzz target, type-inference under transaction — v0.8.0 (Phase 61)
 
 ### Active
 
-(No active requirements — planning next milestone)
+- 🛠 Caret-position rendering for validation errors: re-introduce `parse_function` as error-reporting layer (parser_override keeps the success/transactional path); collapse per-DB LRU by attaching `CatalogReader` to `SemanticViewsParserInfo`. Resolves TECH-DEBT items 20 + 22. — v0.8.0 (Phase 62, planned)
 
 ### Out of Scope
 
@@ -122,6 +125,8 @@ A DuckDB user can define a semantic view once and query it with any combination 
 ## Context
 
 **Shipped v0.7.0** (2026-04-24) — YAML Definitions & Materialization Routing: YAML as second definition format (inline `FROM YAML $$...$$`, file-based `FROM YAML FILE`), materialization declarations (MATERIALIZATIONS clause), transparent query routing to pre-aggregated tables, YAML export with lossless round-trip, materialization introspection (EXPLAIN, DESCRIBE, SHOW SEMANTIC MATERIALIZATIONS). 7 phases (51-57), 7 plans, 19 requirements satisfied, 823+ tests.
+
+**In progress v0.8.0** — Transactional DDL & Architectural Unification: `parser_override` as sole DDL entry, all four CREATE forms transactional, DROP/ALTER race guards, bounded multi-DB LRU, FFI UTF-8 hardening, ADBC end-to-end coverage. Phases 58–61 reconstructed retroactively from ad-hoc work (the original v0.8.0 + premature-v0.8.1 branches were consolidated 2026-05-05). Phase 62 (caret restoration + LRU removal) is the active in-flight phase, blocked on a sqllogictest blast-radius spike.
 **Tech stack:** Rust + C++ shim (vendored DuckDB amalgamation via cc crate), duckdb-rs 1.10500.0 (DuckDB 1.5.2), serde_json, yaml_serde, strsim, proptest.
 **Architecture:** Extension is a preprocessor — expands semantic view queries into concrete SQL with typed output columns, fan trap detection, role-playing dimension support, semi-additive snapshot aggregation, and window function metrics. DuckDB handles all execution. Query results stream via zero-copy vector references (`duckdb_vector_reference_vector`). Persistence via `pragma_query_t` with parameterized prepared statements and single-lock check-and-mutate pattern. Parser hook via C++ shim with `parser_extension_compat.hpp`: `parse_function` fallback detects all DDL forms (CREATE, DROP, ALTER, DESCRIBE, SHOW variants, FROM YAML), Rust `DdlKind` enum dispatches rewrite. DDL body parsed by `body_parser.rs` state machine into TableRef/Join/Dimension/Metric/Fact structs with PK/FK/UNIQUE annotations, metadata (COMMENT/SYNONYMS/PRIVATE), and inferred cardinality. YAML definitions parsed via `from_yaml_with_size_cap` with dollar-quote extraction. `RelationshipGraph` validates tree structure and topologically sorts joins. Expansion generates `FROM base AS alias LEFT JOIN t AS alias ON pk=fk` with qualified column references, fact inlining, derived metric resolution, USING-aware scoped aliases, CTE-based semi-additive/window metric pipelines, and wildcard expansion. Code organized into module directories: `expand/` (7 submodules), `graph/` (5 submodules), with shared `util.rs` and `errors.rs` leaf modules. DimensionName/MetricName newtypes with case-insensitive semantics for query resolution.
 **Codebase:** ~29,300 LOC Rust across src/ and tests/. 823 Rust tests + 36 sqllogictest files + 6 DuckLake CI tests + Python crash repro + Python caret tests + 6 fuzz targets.
@@ -196,7 +201,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 This document evolves at phase transitions and milestone boundaries.
 
-Last updated: 2026-04-24 (v0.7.0 milestone shipped)
+Last updated: 2026-05-05 (v0.8.0 milestone reorganised — phases 58–61 reconstructed retroactively after consolidating the ad-hoc v0.8.0 + premature-v0.8.1 work)
 
 **After each phase transition** (via `/gsd:transition`):
 1. Requirements invalidated? → Move to Out of Scope with reason
@@ -212,4 +217,4 @@ Last updated: 2026-04-24 (v0.7.0 milestone shipped)
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-24 after v0.7.0 milestone complete — YAML definitions, materialization routing, YAML export, materialization introspection. 7 phases (51-57), 19 requirements, 823+ tests, 29,300 LOC.*
+*Last updated: 2026-05-05 — v0.8.0 milestone reorganised. Phases 58–61 reconstructed retroactively from ad-hoc v0.8.0 + premature-v0.8.1 work after branch consolidation. Phase 62 (caret restoration + LRU removal) is the active in-flight phase. v0.7.0 prior summary: 7 phases (51-57), 19 requirements, 823+ tests, 29,300 LOC.*

@@ -5,55 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-## [0.8.1] - 2026-05-03
-
-### Changed
-
-- **Architectural unification.** `parser_override` is now the sole DDL entry point. Every recognised form — `CREATE` (all four variants), `DROP`, `ALTER`, `DESCRIBE`, `SHOW SEMANTIC *`, `GET_DDL`, `READ_YAML_FROM_SEMANTIC_VIEW` — is rewritten by a single Rust dispatch and re-parsed by DuckDB on the caller's connection. The legacy `parse_function` / `sv_ddl_internal` table-function fallback was retired (~1500 LOC net deletion). One execution path means transactional semantics, error reporting, and PEG/Bison compatibility are all uniform.
-- **`peg_compat.test` updated.** Under PEG, every DDL form (including `DESCRIBE` and `SHOW`) now works because parser_override fires before whichever parser is active. The Bison-only carve-out for `DESCRIBE` is gone.
+## [0.8.0] - Unreleased
 
 ### Added
 
+- **Transactional DDL.** `CREATE`, `DROP`, and `ALTER SEMANTIC VIEW` now participate in the caller's transaction. `BEGIN ... ROLLBACK` rolls back uncommitted catalog changes and `BEGIN ... COMMIT` persists them, matching the contract that ADBC, dbt, and other transaction-aware clients expect.
+- **`parser_override` extension hook.** Recognised DDL is rewritten into native `INSERT` / `UPDATE` / `DELETE` against `semantic_layer._definitions` and executed on the caller's connection. Non-matching statements fall through to DuckDB's default parser unchanged.
+- **All four `CREATE` forms transactional:** inline `AS` keyword body, inline `FROM YAML $$ ... $$`, `FROM YAML FILE '<path>'` (including `https://` and S3 paths via httpfs), and `CREATE OR REPLACE` / `CREATE IF NOT EXISTS` variants.
 - **DROP / ALTER race guards.** Non-`IF EXISTS` `DROP SEMANTIC VIEW` and `ALTER SEMANTIC VIEW … RENAME / SET COMMENT / UNSET COMMENT` now emit a snapshot-consistent existence check on the caller's connection before the DML. If a concurrent commit lands between the catalog pre-check (committed-state read on a separate connection) and the DML, the user sees `semantic view '<name>' was concurrently dropped` instead of a silent no-op. `IF EXISTS` variants keep their silent-no-op contract.
 - **Bounded LRU for multi-DB processes.** The per-database token → catalog map is capped at 16 entries with insertion-order eviction. Long-lived processes that open more than 16 DuckDB instances no longer leak `CatalogReader` handles; evicted tokens surface as a clear "catalog context for this database has been evicted" error rather than silently routing CREATE to the wrong database.
-- **FFI UTF-8 hardening.** `sv_parser_override_rust` now validates input bytes with checked `from_utf8` instead of `from_utf8_unchecked`. Malformed input cleanly defers to the default parser instead of triggering UB.
-- **`parse_table_function_call` tightening.** The internal helper now rejects `foo(,)`, `foo('a',)` (trailing comma), and `foo('a' 'b')` (missing comma between args). Pre-v0.8.1 these silently parsed as zero-arg or merged-arg calls.
-- **`ParserOptions` size assert.** A static assert pins `sizeof(ParserOptions) == 32` against DuckDB 1.10.502. Silent layout drift previously surfaced as garbage parser errors at position 0; future DuckDB bumps now fail fast at compile time.
 - **`CatalogReader` RAII.** `prepared_lookup` and `execute_list_all` use internal `PreparedStmt` and `QueryResult` guards. Manual `duckdb_destroy_*` calls along error paths are gone.
-- **Test additions.** Concurrent-CREATE Python integration test (`test/integration/test_concurrent_ddl.py`, runnable via `just test-concurrent`); `INSERT OR REPLACE` row-count, byte-identical rollback (MD5), and same-txn `list_semantic_views` visibility cases in `v080_transactional_ddl.test`; type-inference inside `BEGIN/COMMIT` in `test_type_inference.py`; arbitrary-bytes FFI fuzz target (`fuzz_parser_override_ffi`).
+- **`ParserOptions` size assert.** A static assert pins `sizeof(ParserOptions) == 32` against DuckDB 1.10.502. Silent layout drift previously surfaced as garbage parser errors at position 0; future DuckDB bumps now fail fast at compile time.
+- **ADBC end-to-end test** (`test/integration/test_adbc_transactions.py`, runnable via `just test-adbc`) exercising `autocommit=False` rollback / commit semantics for inline, FROM YAML FILE, ALTER, and DROP forms — proves the original ADBC bug is fixed end-to-end.
+- **Concurrent-CREATE Python integration test** (`test/integration/test_concurrent_ddl.py`, runnable via `just test-concurrent`).
+- **`INSERT OR REPLACE` row-count, byte-identical rollback (MD5), and same-txn `list_semantic_views` visibility cases** in `v080_transactional_ddl.test`.
+- **Type-inference under `BEGIN/COMMIT`** in `test_type_inference.py`.
+- **Arbitrary-bytes FFI fuzz target** (`fuzz_parser_override_ffi`).
+- **`peg_compat.test` regression coverage** that the override path keeps working under DuckDB's experimental PEG parser, so v0.8.0's transactional DDL survives the upcoming parser switch. Under PEG, every DDL form (including `DESCRIBE` and `SHOW`) works because parser_override fires before whichever parser is active.
+
+### Changed
+
+- **Architectural unification.** `parser_override` is the sole DDL entry point. Every recognised form — `CREATE` (all four variants), `DROP`, `ALTER`, `DESCRIBE`, `SHOW SEMANTIC *`, `GET_DDL`, `READ_YAML_FROM_SEMANTIC_VIEW` — is rewritten by a single Rust dispatch and re-parsed by DuckDB on the caller's connection. The legacy `parse_function` / `sv_ddl_internal` table-function fallback was retired (~1500 LOC net deletion). One execution path means transactional semantics, error reporting, and PEG/Bison compatibility are all uniform.
+- **`CatalogState` HashMap removed.** All catalog reads now query `_definitions` directly through a single shared `CatalogReader`. This eliminates the divergence risk between the HashMap and the on-disk table that the old write-through-both pattern carried.
 
 ### Fixed
 
-- **Validation error messages now reach the user.** Pre-v0.8.1 the architectural unification accidentally hid every `DISPLAY_EXTENSION_ERROR` because DuckDB silently drops them in `FALLBACK_OVERRIDE` mode (verified against duckdb.cpp `ParseInternal`). Errors like `semantic view 'X' does not exist` were replaced with the default parser's `Parser Error: syntax error at or near "SEMANTIC"`. The fix synthesises a `SELECT error('<msg>')` statement and returns it as `PARSE_SUCCESSFUL`, so DuckDB raises the message at execution time.
-
-### Known limitations
-
-- `CALL disable_peg_parser()` resets `allow_parser_override_extension` to `default`, which silently bypasses parser_override hooks. Workaround: re-issue `SET allow_parser_override_extension='FALLBACK'` after disabling PEG. The extension installs `FALLBACK` on load, so a process that never enables PEG never sees this.
-- `DESCRIBE` / `SHOW SEMANTIC *` continue to read committed state via the catalog connection (transactional visibility was already a documented v0.8.0 limitation). An in-flight `CREATE` is not visible to `list_semantic_views()` until commit, even from the same connection.
-- Bounded LRU evictions on processes opening more than 16 databases are silent at the token-allocation site; the next CREATE on the evicted token surfaces as the "catalog context for this database has been evicted" error.
-- `CREATE SEMANTIC VIEW IF NOT EXISTS` is silent-no-op only against rows visible in the caller's MVCC snapshot. Two parallel processes that each see the row absent will both attempt the INSERT and the loser sees `ConstraintException: Duplicate key "name: <view>" violates primary key constraint` at commit — the same shape plain `CREATE` produces under contention. Multi-process bootstrap scripts should catch this and treat it as success. See TECH-DEBT item 23.
-- Validation errors (`semantic view 'X' does not exist`, unknown clause, etc.) now arrive as runtime `Invalid Input Error` exceptions rather than parse-time errors with caret-position rendering. This is a side effect of the synthesised-`SELECT error('...')` workaround for DuckDB's `FALLBACK_OVERRIDE` mode dropping `DISPLAY_EXTENSION_ERROR`. The error text is unchanged; only the formatting and source-line annotation are affected. See TECH-DEBT item 22.
-
-## [0.8.0] - 2026-05-02
-
-### Added
-
-- Transactional DDL: `CREATE`, `DROP`, and `ALTER SEMANTIC VIEW` now participate in the caller's transaction. `BEGIN ... ROLLBACK` rolls back uncommitted catalog changes and `BEGIN ... COMMIT` persists them, matching the contract that ADBC, dbt, and other transaction-aware clients expect.
-- `parser_override` extension hook: recognised DDL is rewritten into native `INSERT` / `UPDATE` / `DELETE` against `semantic_layer._definitions` and executed on the caller's connection. Non-matching statements fall through to DuckDB's default parser unchanged.
-- All four `CREATE` forms participate in the caller's transaction: inline `AS` keyword body, inline `FROM YAML $$ ... $$`, `FROM YAML FILE '<path>'` (including `https://` and S3 paths via httpfs), and `CREATE OR REPLACE` / `CREATE IF NOT EXISTS` variants.
-- `peg_compat.test`: regression coverage that the override path keeps working under DuckDB's experimental PEG parser, so v0.8.0's transactional DDL survives the upcoming parser switch.
-- ADBC end-to-end test (`test/integration/test_adbc_transactions.py`, runnable via `just test-adbc`) exercising `autocommit=False` rollback / commit semantics for inline, FROM YAML FILE, ALTER, and DROP forms — proves the original ADBC bug is fixed end-to-end.
-
-### Changed
-
-- The in-memory `CatalogState` HashMap that mirrored `_definitions` was removed. All catalog reads now query `_definitions` directly through a single shared `CatalogReader`. This eliminates the divergence risk between the HashMap and the on-disk table that the old write-through-both pattern carried.
+- **FFI UTF-8 hardening.** `sv_parser_override_rust` now validates input bytes with checked `from_utf8` instead of `from_utf8_unchecked`. Malformed input cleanly defers to the default parser instead of triggering UB.
+- **`parse_table_function_call` tightening.** The internal helper now rejects `foo(,)`, `foo('a',)` (trailing comma), and `foo('a' 'b')` (missing comma between args). Previously these silently parsed as zero-arg or merged-arg calls.
+- **Validation error messages reach the user under `FALLBACK_OVERRIDE`.** The unification work accidentally hid every `DISPLAY_EXTENSION_ERROR` because DuckDB silently drops them in `FALLBACK_OVERRIDE` mode (verified against duckdb.cpp `ParseInternal`). Errors like `semantic view 'X' does not exist` were replaced with the default parser's `Parser Error: syntax error at or near "SEMANTIC"`. The current workaround synthesises a `SELECT error('<msg>')` statement and returns it as `PARSE_SUCCESSFUL`, so DuckDB raises the message at execution time. (Caret rendering is lost in this path — see Known Limitations and TECH-DEBT item 22.)
 
 ### Known limitations
 
 - `semantic_view(...)` queries do not see uncommitted writes to user tables in the same transaction. Expansion runs on a separate `query_conn`, which only sees committed state. Workaround: commit the user-table writes before querying. Inline expansion will be revisited when DuckDB 2.0's PEG grammar-extension API ships.
-- A `CREATE SEMANTIC VIEW` issued in the same uncommitted transaction is no longer visible to subsequent reads in that transaction (e.g. `SHOW SEMANTIC VIEWS` will not list it until commit). Pre-v0.8.0 this happened to work because the in-memory HashMap was updated eagerly; with the HashMap gone, reads see only committed catalog state. Workaround: commit before reading.
+- A `CREATE SEMANTIC VIEW` issued in the same uncommitted transaction is not visible to subsequent reads in that transaction (e.g. `SHOW SEMANTIC VIEWS` will not list it until commit). With the HashMap gone, reads see only committed catalog state. Workaround: commit before reading. See TECH-DEBT item 19.
+- `CALL disable_peg_parser()` resets `allow_parser_override_extension` to `default`, which silently bypasses parser_override hooks. Workaround: re-issue `SET allow_parser_override_extension='FALLBACK'` after disabling PEG. The extension installs `FALLBACK` on load, so a process that never enables PEG never sees this. See TECH-DEBT item 21.
+- Bounded LRU evictions on processes opening more than 16 databases are silent at the token-allocation site; the next CREATE on the evicted token surfaces as the "catalog context for this database has been evicted" error. See TECH-DEBT item 20.
+- `CREATE SEMANTIC VIEW IF NOT EXISTS` is silent-no-op only against rows visible in the caller's MVCC snapshot. Two parallel processes that each see the row absent will both attempt the INSERT and the loser sees `ConstraintException: Duplicate key "name: <view>" violates primary key constraint` at commit — the same shape plain `CREATE` produces under contention. Multi-process bootstrap scripts should catch this and treat it as success. See TECH-DEBT item 23.
+- Validation errors (`semantic view 'X' does not exist`, unknown clause, etc.) currently arrive as runtime `Invalid Input Error` exceptions rather than parse-time errors with caret-position rendering. Side effect of the synthesised-`SELECT error('...')` workaround for DuckDB's `FALLBACK_OVERRIDE` mode dropping `DISPLAY_EXTENSION_ERROR`. The error text is unchanged; only the formatting and source-line annotation are affected. See TECH-DEBT item 22.
 
 ## [0.7.2] - 2026-05-01
 

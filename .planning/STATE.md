@@ -1,42 +1,42 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.7.0
-milestone_name: YAML Definitions & Materialization Routing
-status: verifying
-stopped_at: Completed 57-01-PLAN.md
-last_updated: "2026-04-24T18:28:24.196Z"
-last_activity: 2026-04-24
+milestone: v0.8.0
+milestone_name: Transactional DDL & Architectural Unification
+status: planning_phase_62
+stopped_at: Phases 58-61 complete (retroactively GSD'd from ad-hoc work); Phase 62 not yet planned
+last_updated: "2026-05-05T00:00:00.000Z"
+last_activity: 2026-05-05
 progress:
-  total_phases: 7
-  completed_phases: 7
-  total_plans: 7
-  completed_plans: 7
-  percent: 100
+  total_phases: 5
+  completed_phases: 4
+  total_plans: 4
+  completed_plans: 4
+  percent: 80
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-04-18)
+See: .planning/PROJECT.md (updated 2026-05-05)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Phase 57 — Introspection & Diagnostics
+**Current focus:** Phase 62 — Caret restoration + LRU removal (re-introduce `parse_function` as error-reporting layer; collapse per-DB LRU into `SemanticViewsParserInfo`)
 
 ## Current Position
 
-Phase: 57
+Phase: 62
 Plan: Not started
-Status: Phase complete — ready for verification
-Last activity: 2026-04-30 - Completed quick task 260430-vdz: review bug report semantic_views_parser_comment_bug.md, write failing test to reproduce, then implement fix
+Status: Phase planning — sqllogictest blast-radius spike pending; report at `_notes/v0.8.0_phase_62_sqllogictest_spike.md`
+Last activity: 2026-05-05 — milestone reorganisation: consolidated v0.8.1 work into v0.8.0, retroactively reconstructed phases 58–61, rolled Cargo+description.yml back to 0.8.0
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [████████░░] 80%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 7 (v0.7.0)
+- Total plans completed: 7 (v0.7.0) + 4 (v0.8.0 phases 58–61, retroactive)
 - Average duration: --
 - Total execution time: 0 hours
 
@@ -94,6 +94,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-04-21T00:41:49.753Z
-Stopped at: Completed 57-01-PLAN.md
-Resume file: None
+Last session: 2026-05-05T00:00:00.000Z
+Stopped at: v0.8.0 milestone reorganisation — phases 58–61 reconstructed retroactively; Phase 62 awaits sqllogictest spike + planning
+Resume file: `_notes/v0.8.0_phase_62_sqllogictest_spike.md` (when written)

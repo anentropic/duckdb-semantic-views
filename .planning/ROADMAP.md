@@ -14,6 +14,7 @@
 - ✅ **v0.5.5 SHOW/DESCRIBE Alignment & Refactoring** -- Phases 37-42 (shipped 2026-04-05)
 - ✅ **v0.6.0 Snowflake SQL DDL Parity** -- Phases 43-50 (shipped 2026-04-14)
 - ✅ **v0.7.0 YAML Definitions & Materialization Routing** -- Phases 51-57 (shipped 2026-04-24)
+- 🛠 **v0.8.0 Transactional DDL & Architectural Unification** -- Phases 58-62 (in progress; phases 58-61 retroactively GSD'd 2026-05-05)
 
 ## Phases
 
@@ -174,5 +175,32 @@ Full details: [milestones/v0.6.0-ROADMAP.md](milestones/v0.6.0-ROADMAP.md)
 - [x] Phase 57: Introspection & Diagnostics (1/1 plans) -- completed 2026-04-21
 
 Full details: [milestones/v0.7.0-ROADMAP.md](milestones/v0.7.0-ROADMAP.md)
+
+</details>
+
+<details>
+<summary>v0.8.0 Transactional DDL & Architectural Unification (Phases 58-62) -- IN PROGRESS</summary>
+
+Phases 58–61 are retroactive reconstructions: the work was originally completed ad-hoc on `milestone/v0.8.0` (PR #28) and a premature `milestone/v0.8.1` branch, then consolidated into a single v0.8.0 milestone on 2026-05-05 (no git tag was ever issued). PLAN.md and VERIFICATION.md for these phases are back-derived from the actual commits, CHANGELOG, and test artefacts; they do not include RESEARCH.md / DISCUSS.md (those records don't exist for ad-hoc work).
+
+- [x] Phase 58: Transactional DDL via parser_override (1/1 plans) -- completed 2026-05-02 (retroactive)
+
+  Goal: CREATE (all four forms), DROP, ALTER SEMANTIC VIEW participate in caller's transaction. parser_override extension hook rewrites recognised DDL into native INSERT/UPDATE/DELETE against `_definitions` and re-parses on the caller's connection. CatalogState HashMap removed; single CatalogReader path.
+
+- [x] Phase 59: Architectural unification (1/1 plans) -- completed 2026-05-03 (retroactive)
+
+  Goal: parser_override becomes the sole DDL entry. Legacy parse_function / sv_ddl_internal table-function fallback retired (~1500 LOC net deletion). Single execution path → uniform transactional semantics + uniform PEG/Bison compatibility. Introduces a known regression — caret rendering lost for validation errors (TECH-DEBT 22) — fixed in Phase 62.
+
+- [x] Phase 60: Race guards & validation hardening (1/1 plans) -- completed 2026-05-03 (retroactive)
+
+  Goal: Non-`IF EXISTS` DROP/ALTER emits snapshot-consistent existence check; FFI UTF-8 input validated (no UB on malformed bytes); `parse_table_function_call` rejects malformed argument lists; `ParserOptions` size pinned by static assert.
+
+- [x] Phase 61: Bounded multi-DB isolation, RAII, tests & docs (1/1 plans) -- completed 2026-05-03 (retroactive)
+
+  Goal: per-DB token→catalog map capped at 16 entries with insertion-order eviction (TECH-DEBT 20 — known limitation, redesigned in Phase 62); `CatalogReader` adopts RAII guards (`PreparedStmt`, `QueryResult`); ADBC end-to-end test, concurrent-CREATE Python test, `INSERT OR REPLACE` row-count + byte-identical rollback sqllogictest, type-inference inside transaction, FFI fuzz target; CHANGELOG, TECH-DEBT, MAINTAINER updates.
+
+- [ ] Phase 62: Caret restoration + LRU removal (planned)
+
+  Goal: Re-introduce `parse_function` purely as the error-reporting layer (parser_override keeps the success/transactional path). Defer error cases from parser_override → default parser fails → parse_function returns `DISPLAY_EXTENSION_ERROR` with `error_location`, restoring `LINE 1: … ^` caret rendering. Concurrently, attach the `CatalogReader` directly to `SemanticViewsParserInfo` (lifetime tied to `DBConfig`), eliminating the bounded LRU and its silent-eviction error class. Resolves TECH-DEBT items 20 + 22.
 
 </details>
