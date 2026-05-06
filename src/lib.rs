@@ -321,11 +321,16 @@ mod extension {
         query::table_function::{QueryState, SemanticViewVTab},
     };
 
-    // C++ helper for parser hook registration (defined in cpp/src/shim.cpp)
+    // C++ helper for parser hook registration (defined in cpp/src/shim.cpp).
+    // Phase 62: catalog_conn + is_file_backed are bundled into an
+    // OverrideContext (see src/parse.rs::sv_make_override_context) and
+    // attached to the C++ SemanticViewsParserInfo. The legacy
+    // db_token-LRU lookup is gone (TECH-DEBT 20).
     extern "C" {
         fn sv_register_parser_hooks(
             db_handle: ffi::duckdb_database,
-            out_db_token: *mut u64,
+            catalog_conn: ffi::duckdb_connection,
+            is_file_backed: bool,
         ) -> bool;
     }
 
@@ -365,25 +370,17 @@ mod extension {
         }
         let catalog_reader = crate::catalog::CatalogReader::new(catalog_conn);
 
-        // Register parser_override hook BEFORE table functions, so the
-        // per-load db_token is available when `set_catalog_for_parser_override`
-        // is called below — and any parsing triggered by registration sees a
-        // populated catalog map.
-        let mut db_token: u64 = 0;
-        if !unsafe { sv_register_parser_hooks(db_handle, &mut db_token) } {
-            return Err("Failed to register parser hooks via C++ helper".into());
-        }
-
-        // Install the catalog handle the parser_override callback uses for
-        // CREATE/DROP/ALTER existence checks and JSON read-modify-write,
-        // keyed by the token the C++ shim assigned at registration.
+        // Register parser_override hook BEFORE table functions. Phase 62:
+        // the catalog connection + is_file_backed flag are bundled into an
+        // OverrideContext (allocated by sv_make_override_context inside the
+        // C++ shim) and attached directly to SemanticViewsParserInfo. No
+        // global LRU map — lifetime is tied to DBConfig.
         // `is_file_backed` gates DDL-time type inference (LIMIT 0 probes
         // only run on file-backed DBs — matches v0.7.1 design).
-        crate::parse::set_catalog_for_parser_override(
-            db_token,
-            catalog_reader,
-            db_path.as_ref() != ":memory:",
-        );
+        let is_file_backed = db_path.as_ref() != ":memory:";
+        if !unsafe { sv_register_parser_hooks(db_handle, catalog_conn, is_file_backed) } {
+            return Err("Failed to register parser hooks via C++ helper".into());
+        }
 
         // Register table DDL read functions (list_semantic_views, describe_semantic_view).
         con.register_table_function_with_extra_info::<ListSemanticViewsVTab, _>(
