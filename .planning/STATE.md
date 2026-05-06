@@ -2,35 +2,35 @@
 gsd_state_version: 1.0
 milestone: v0.8.0
 milestone_name: Transactional DDL & Architectural Unification
-status: verifying
-stopped_at: Completed 62-04-PLAN.md (Phase 62 ready for /gsd-verify-work)
-last_updated: "2026-05-06T13:43:23.032Z"
+status: shipped
+stopped_at: v0.8.0 milestone shipped — ready for tag and PR merge
+last_updated: "2026-05-06T20:56:27.307Z"
 last_activity: 2026-05-06
 progress:
-  total_phases: 13
-  completed_phases: 8
-  total_plans: 15
-  completed_plans: 11
-  percent: 73
+  total_phases: 5
+  completed_phases: 5
+  total_plans: 8
+  completed_plans: 8
+  percent: 100
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-05-05)
+See: .planning/PROJECT.md (updated 2026-05-06)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Phase 62 — Caret restoration + LRU removal
+**Current focus:** v0.8.0 milestone shipped — planning next milestone
 
 ## Current Position
 
-Phase: 62
-Plan: Not started
-Status: Phase complete — ready for verification
+Milestone: v0.8.0 (shipped 2026-05-06)
+Phase: — (between milestones)
+Status: Ready for tag and PR merge; next milestone planning via /gsd-new-milestone
 Last activity: 2026-05-06
 
-Progress: [████████░░] 80%
+Progress: [██████████] 100% (v0.8.0 complete)
 
 ## Performance Metrics
 
