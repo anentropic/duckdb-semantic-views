@@ -1,0 +1,20 @@
+# Phase 62 Wave 0 — extension re-LOAD idempotency.
+#
+# Wave 0 stages this fixture as a no-op via `halt`. Plan 04 (Wave 3) pins
+# the contract that loading the extension twice into the same DB does not
+# crash and that subsequent DDL still works, even if a second
+# ParserExtensionInfo is registered. RESEARCH §3 Risk A.
+#
+# Behavioural property pinned (from RESEARCH.md §6):
+#   B18: extension re-LOAD in same DB does not crash
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+halt
+
+# Phase 62 Plan 04: LOAD semantic_views; CREATE v1; LOAD semantic_views;
+# DROP v1; — must succeed even if a second ParserExtensionInfo is
+# registered. RESEARCH §3 Risk A.

@@ -1,0 +1,18 @@
+# Phase 62 Wave 0 — multi-line caret coverage.
+#
+# Wave 0 stages this fixture as a no-op via `halt`. Plan 04 (Wave 3) pins
+# DuckDB's "LINE N:" rendering for N != 1 — the caret column should reflect
+# the position WITHIN the offending line, not the absolute byte offset.
+#
+# Behavioural property pinned (from RESEARCH.md §6):
+#   B4: caret column is correct for multi-line CREATE
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+halt
+
+# Phase 62 Plan 04: 3-line CREATE with malformed clause on line 2.
+# Pin DuckDB's "LINE N:" rendering for N != 1.

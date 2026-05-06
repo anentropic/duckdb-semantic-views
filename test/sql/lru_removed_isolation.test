@@ -1,0 +1,23 @@
+# Phase 62 Wave 0 — multi-DB isolation pinned without the LRU.
+#
+# Wave 0 stages this fixture as a no-op via `halt`. Plan 04 (Wave 3) pins
+# the post-LRU-removal contract: ATTACH 17+ databases sequentially in a
+# single session and verify CREATE on each succeeds, with DESCRIBE on the
+# FIRST one still working (pre-Phase-62 the LRU would have evicted DB #1
+# on the 17th ATTACH and surfaced a "catalog context evicted" error).
+#
+# Behavioural property pinned (from RESEARCH.md §6):
+#   B15: multi-DB isolation preserved without LRU (sqllogictest companion
+#        to test_multi_db_isolation.py)
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+halt
+
+# Phase 62 Plan 04: ATTACH 17+ databases sequentially in a single
+# session; CREATE SEMANTIC VIEW v_N on each; DESCRIBE on the FIRST one
+# must succeed (pre-Phase-62 the LRU would have evicted it on the 17th
+# ATTACH). Verifies the LRU silent-eviction error class is gone.

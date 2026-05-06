@@ -1,0 +1,25 @@
+# Phase 62 Wave 0 — caret rendering coverage for CREATE error paths.
+#
+# Wave 0 stages this fixture as a no-op (the `halt` directive stops
+# sqllogictest after the preamble). Plan 04 (Wave 3) populates the actual
+# `statement error` blocks once Plans 02–03 restore caret rendering via
+# parse_function on FALLBACK_OVERRIDE deferral.
+#
+# Behavioural properties pinned (from RESEARCH.md §6):
+#   B1: caret renders for malformed CREATE (missing '(')
+#   B2: caret renders for clause typo (`TBLES` → suggest `TABLES`)
+#   B3: caret renders for prefix near-miss (`CRETAE`)
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+halt
+
+# Phase 62 Plan 04 will populate these. Coverage:
+#   - missing '(' after TABLES
+#   - typo 'TBLES' instead of 'TABLES'
+#   - near-miss prefix 'CRETAE SEMANTIC VIEW'
+# Each `statement error` block expects substring of validator message AND
+# presence of "LINE 1:" + a caret line in the error text.

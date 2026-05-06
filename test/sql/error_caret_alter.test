@@ -1,0 +1,16 @@
+# Phase 62 Wave 0 — caret rendering coverage for ALTER error paths.
+#
+# Wave 0 stages this fixture as a no-op via `halt`. Plan 04 (Wave 3)
+# populates the `statement error` blocks once caret rendering is restored.
+#
+# Behavioural property pinned (from RESEARCH.md §6):
+#   B6: caret renders for ALTER errors (typo in clause keyword)
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+halt
+
+# Phase 62 Plan 04: ALTER SEMANTIC VIEW v RENAM TO w; → caret on RENAM.
