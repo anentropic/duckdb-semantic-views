@@ -1,7 +1,7 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.1.0
-milestone_name: milestone
+milestone: v0.8.0
+milestone_name: Transactional DDL & Architectural Unification
 status: verifying
 stopped_at: Completed 62-04-PLAN.md (Phase 62 ready for /gsd-verify-work)
 last_updated: "2026-05-06T13:43:23.032Z"

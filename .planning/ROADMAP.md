@@ -199,7 +199,7 @@ Phases 58–61 are retroactive reconstructions: the work was originally complete
 
   Goal: per-DB token→catalog map capped at 16 entries with insertion-order eviction (TECH-DEBT 20 — known limitation, redesigned in Phase 62); `CatalogReader` adopts RAII guards (`PreparedStmt`, `QueryResult`); ADBC end-to-end test, concurrent-CREATE Python test, `INSERT OR REPLACE` row-count + byte-identical rollback sqllogictest, type-inference inside transaction, FFI fuzz target; CHANGELOG, TECH-DEBT, MAINTAINER updates.
 
-- [ ] Phase 62: Caret restoration + LRU removal (4 plans, 4 waves)
+- [x] Phase 62: Caret restoration + LRU removal (4/4 plans) -- completed 2026-05-06
 
   Goal: Re-introduce `parse_function` purely as the error-reporting layer (parser_override keeps the success/transactional path). Defer error cases from parser_override → default parser fails → parse_function returns `DISPLAY_EXTENSION_ERROR` with `error_location`, restoring `LINE 1: … ^` caret rendering. Concurrently, attach the `CatalogReader` directly to `SemanticViewsParserInfo` (lifetime tied to `DBConfig`), eliminating the bounded LRU and its silent-eviction error class. Resolves TECH-DEBT items 20 + 22.
 
