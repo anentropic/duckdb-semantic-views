@@ -1558,14 +1558,11 @@ pub(crate) fn infer_cardinality(
 ///
 /// `buf` must point to a writable buffer of at least `len` bytes.
 ///
-/// As of v0.8.1 no caller uses this — validation errors are surfaced via a
-/// synthesised `SELECT error('...')` statement (see `sql_throwing`) because
-/// `DuckDB`'s `FALLBACK_OVERRIDE` mode silently drops `DISPLAY_EXTENSION_ERROR`.
-/// Kept as a low-cost option for a future switch to `STRICT_OVERRIDE` if
-/// `DuckDB` upstream ever wraps the throw in `ParserException::SyntaxError`
-/// to preserve caret rendering.
-#[cfg(feature = "extension")]
-#[allow(dead_code)]
+/// Phase 62 Plan 03 made this the live error-emit path for
+/// `sv_parse_function_rust` (rc=1 / rc=3). It used to be dead under the
+/// v0.8.1 `FALLBACK_OVERRIDE` synthesised-`SELECT error` workaround, which
+/// has been deleted now that `parse_function` re-renders the caret.
+#[cfg(any(feature = "extension", test))]
 unsafe fn write_error_to_buffer(buf: *mut u8, len: usize, s: &str) {
     if buf.is_null() || len == 0 {
         return;
@@ -2523,28 +2520,27 @@ pub unsafe extern "C" fn sv_parser_override_rust(
                 0 // success — native SQL handed to caller
             }
             Ok(None) => {
-                // Genuinely not ours — but check for a near-miss typo
-                // (e.g. `CREAT SEMANTIC VIEW`) so the user sees a helpful
-                // suggestion instead of a generic syntax error from
-                // DuckDB's default parser. Surfaced via SELECT error('...')
-                // because FALLBACK_OVERRIDE silently drops rc=1
-                // (DISPLAY_EXTENSION_ERROR) — see sql_throwing docstring.
-                // Phase 62 Plan 03 swaps this for parse_function-based
-                // caret rendering.
-                if let Some(err) = detect_near_miss(query) {
-                    let sql = sql_throwing(&err.message);
-                    publish_owned_sql(sql, sql_out_ptr, sql_out_len);
-                    return 0;
-                }
+                // Genuinely not ours — defer to the default parser. If the
+                // input is a near-miss for one of our DDL prefixes (e.g.
+                // `CRETAE SEMANTIC VIEW`), `parse_function` (registered
+                // alongside `parser_override` from Phase 62 Plan 03 onward)
+                // will pick this up after the default parser fails on the
+                // unrecognised prefix and re-render the suggestion via
+                // DISPLAY_EXTENSION_ERROR with caret position.
+                let _ = (error_out, error_out_len); // unused under Phase 62
                 2 // not ours, defer to default parser
             }
-            Err(err) => {
-                // Same FALLBACK reason as the near-miss branch — see
-                // sql_throwing for the rationale and TECH-DEBT item 22.
-                let sql = sql_throwing(&err.message);
-                publish_owned_sql(sql, sql_out_ptr, sql_out_len);
-                let _ = (error_out, error_out_len); // unused under FALLBACK
-                0
+            Err(_err) => {
+                // Phase 62: defer to default parser → `sv_parse_stub`
+                // (registered as `parse_function`) re-runs validation and
+                // returns DISPLAY_EXTENSION_ERROR with caret position. The
+                // synthesised `SELECT error('...')` workaround used in
+                // v0.8.1 (sql_throwing) has been deleted now that DuckDB's
+                // ParserException::SyntaxError caret rendering is reachable
+                // again via the parse_function code path. Resolves
+                // TECH-DEBT 22.
+                let _ = (error_out, error_out_len); // unused under Phase 62
+                2
             }
         }
     }));
@@ -2552,19 +2548,136 @@ pub unsafe extern "C" fn sv_parser_override_rust(
     result.unwrap_or(2) // on panic: not ours
 }
 
-/// Build a SQL statement that, when executed, raises a runtime error with
-/// the given message. Used by `sv_parser_override_rust` to surface validation
-/// errors and near-miss suggestions in `DuckDB`'s `FALLBACK_OVERRIDE` mode,
-/// which silently drops `DISPLAY_EXTENSION_ERROR` from `parser_override`
-/// callbacks (see duckdb.cpp `ParseInternal`). Throwing via `error()` from a
-/// synthesised statement is the workaround that keeps the message reaching
-/// the caller.
-#[cfg(feature = "extension")]
-fn sql_throwing(message: &str) -> String {
-    let escaped = escape_sql_arg(message);
-    // Cast to VARCHAR so DuckDB's binder doesn't complain about an unknown
-    // result type when the row never materialises.
-    format!("SELECT error('{escaped}')::VARCHAR AS error")
+/// FFI entry point for `parse_function` — Phase 62's error-reporting layer.
+///
+/// Called by DuckDB's `Parser::ParseQuery` after the default parser fails on
+/// an unrecognised prefix (e.g. `CREATE SEMANTIC VIEW …` or `CRETAE …`).
+/// Re-runs validation against the user's input and returns the validation
+/// error message + a byte-offset position so DuckDB's
+/// `ParserException::SyntaxError` can render `LINE 1: … ^` (caret) at the
+/// offending token.
+///
+/// Return code (`u8`):
+///   * `0` — success / unreachable. `parser_override` should have produced
+///     rewritten SQL on the success path; if validation succeeds AND we
+///     reach `parse_function`, the override didn't fire. We map this to
+///     rc=3 in practice; rc=0 is the defensive "internal error" case.
+///   * `1` — recognised prefix, but body is invalid OR a near-miss
+///     (`CRETAE` etc.) suggestion was produced. `error_out` gets the
+///     message; `position_out` gets the byte offset (or `u32::MAX` if no
+///     position is available).
+///   * `2` — not ours; defer (`DISPLAY_ORIGINAL_ERROR` on the C++ side).
+///   * `3` — valid DDL but `parser_override` didn't fire (override setting
+///     is `DEFAULT` or `STRICT`, e.g. after `CALL disable_peg_parser()`
+///     reset the setting). `error_out` gets an actionable hint
+///     (`SET allow_parser_override_extension='FALLBACK'`); `position_out=0`
+///     so the caret lands on the `C` of `CREATE` / `D` of `DROP`.
+///
+/// `ctx_ptr` is currently unused on this path — validation does not need
+/// the catalog. We keep it in the signature for symmetry with
+/// `sv_parser_override_rust` and to ease a future code path that might
+/// want catalog-aware suggestions.
+///
+/// # Safety
+///
+/// - `query_ptr` must point to bytes of length `query_len`. Invalid UTF-8
+///   makes us return rc=2 (defer) rather than triggering UB.
+/// - `error_out` must point to a writable buffer of `error_out_len` bytes,
+///   or be null. Null is treated as "do not write the message" (rc still
+///   computed correctly).
+/// - `position_out` must point to a writable `u32`, or be null. Null is
+///   treated as "do not write the position".
+#[cfg(any(feature = "extension", test))]
+#[no_mangle]
+pub unsafe extern "C" fn sv_parse_function_rust(
+    ctx_ptr: *const std::ffi::c_void,
+    query_ptr: *const u8,
+    query_len: usize,
+    error_out: *mut u8,
+    error_out_len: usize,
+    position_out: *mut u32,
+) -> u8 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // ctx_ptr unused on this path; the catalog isn't needed for
+        // validation. Suppress unused-warning explicitly.
+        let _ = ctx_ptr;
+
+        // Initialise position_out to UINT32_MAX (no-position sentinel).
+        if !position_out.is_null() {
+            *position_out = u32::MAX;
+        }
+
+        // UTF-8 check; defer rather than synthesise an error on bad bytes.
+        if query_ptr.is_null() || query_len == 0 {
+            return 2_u8;
+        }
+        let bytes = std::slice::from_raw_parts(query_ptr, query_len);
+        let Ok(query) = std::str::from_utf8(bytes) else {
+            return 2_u8;
+        };
+
+        // Recognised DDL prefix?
+        if detect_ddl_kind(query).is_none() {
+            // Not a recognised prefix — try near-miss detection so the
+            // user sees `Did you mean CREATE SEMANTIC VIEW?` instead of
+            // a generic default-parser syntax error.
+            if let Some(err) = detect_near_miss(query) {
+                write_error_to_buffer(error_out, error_out_len, &err.message);
+                if !position_out.is_null() {
+                    *position_out = err
+                        .position
+                        .and_then(|p| u32::try_from(p).ok())
+                        .unwrap_or(u32::MAX);
+                }
+                return 1_u8;
+            }
+            return 2_u8; // genuinely not ours
+        }
+
+        // Recognised prefix — re-run full validation.
+        match validate_and_rewrite(query) {
+            Ok(Some(_rewritten)) => {
+                // Valid DDL but we got here — `parser_override` must not have
+                // fired. Most common cause: `disable_peg_parser` reset
+                // `allow_parser_override_extension` to DEFAULT (TECH-DEBT 21).
+                // Position 0 puts the caret on the `C` of CREATE / `D` of
+                // DROP / etc.
+                let msg = "semantic_views: parser_override is not active for \
+                           this connection (allow_parser_override_extension is \
+                           'DEFAULT' or 'STRICT'). Re-enable with: \
+                           SET allow_parser_override_extension='FALLBACK';";
+                write_error_to_buffer(error_out, error_out_len, msg);
+                if !position_out.is_null() {
+                    *position_out = 0;
+                }
+                3_u8
+            }
+            Ok(None) => {
+                // detect_ddl_kind matched but validate_and_rewrite returned
+                // None — unreachable for a matched prefix. Defensive: emit
+                // an internal-error message rather than panic.
+                write_error_to_buffer(
+                    error_out,
+                    error_out_len,
+                    "semantic_views: internal error — recognised DDL prefix \
+                     produced no rewrite (please report this bug)",
+                );
+                1_u8
+            }
+            Err(parse_err) => {
+                write_error_to_buffer(error_out, error_out_len, &parse_err.message);
+                if !position_out.is_null() {
+                    *position_out = parse_err
+                        .position
+                        .and_then(|p| u32::try_from(p).ok())
+                        .unwrap_or(u32::MAX);
+                }
+                1_u8
+            }
+        }
+    }));
+
+    result.unwrap_or(2) // on panic: not ours
 }
 
 #[cfg(test)]
@@ -2765,6 +2878,137 @@ mod tests {
         // Defensive: null-pointer drop must be a no-op (matches the
         // C++ shim's `if (rust_state) { ... }` guard pattern).
         unsafe { sv_drop_override_context(std::ptr::null_mut()) };
+    }
+
+    // ===================================================================
+    // Phase 62 Plan 03 — sv_parse_function_rust rc=0/1/2/3 contract.
+    // parse_function is reintroduced purely as the error-reporting layer
+    // (caret rendering via DISPLAY_EXTENSION_ERROR + error_location).
+    // parser_override now defers ALL error cases (rc=2) — the synthesised
+    // SELECT error('...') workaround in sql_throwing is gone.
+    // ===================================================================
+
+    /// Helper: invoke sv_parse_function_rust with stack buffers and return
+    /// (rc, error message, position). Available under default features
+    /// because sv_parse_function_rust is a pure-Rust validation layer that
+    /// does not touch the DuckDB C API.
+    fn call_sv_parse_function(query: &str) -> (u8, String, u32) {
+        let mut error_buf = vec![0_u8; 1024];
+        let mut position: u32 = u32::MAX;
+        let rc = unsafe {
+            sv_parse_function_rust(
+                std::ptr::null(),
+                query.as_ptr(),
+                query.len(),
+                error_buf.as_mut_ptr(),
+                error_buf.len(),
+                &mut position as *mut u32,
+            )
+        };
+        // Truncate error_buf at the first NUL.
+        let nul = error_buf.iter().position(|&b| b == 0).unwrap_or(0);
+        let msg = String::from_utf8_lossy(&error_buf[..nul]).into_owned();
+        (rc, msg, position)
+    }
+
+    #[test]
+    fn sv_parse_function_rust_returns_2_for_select() {
+        // Plain SELECT is not ours — defer to default parser (rc=2).
+        let (rc, _msg, _pos) = call_sv_parse_function("SELECT 1;");
+        assert_eq!(rc, 2, "SELECT must defer with rc=2");
+    }
+
+    #[test]
+    fn sv_parse_function_rust_returns_2_for_invalid_utf8() {
+        // Invalid UTF-8 bytes — defer rather than panic (rc=2).
+        let bad: [u8; 5] = [0xFF, 0xFE, 0xFD, 0x00, 0x00];
+        let mut error_buf = vec![0_u8; 1024];
+        let mut position: u32 = u32::MAX;
+        let rc = unsafe {
+            sv_parse_function_rust(
+                std::ptr::null(),
+                bad.as_ptr(),
+                4, // exclude trailing nul, just 4 invalid bytes
+                error_buf.as_mut_ptr(),
+                error_buf.len(),
+                &mut position as *mut u32,
+            )
+        };
+        assert_eq!(rc, 2, "invalid UTF-8 must defer with rc=2");
+    }
+
+    #[test]
+    fn sv_parse_function_rust_returns_1_with_position_for_malformed_create() {
+        // CREATE prefix recognised but body mis-spelled — validate_and_rewrite
+        // returns Err(ParseError) with position set. rc=1; position non-MAX.
+        // We use the proven TABLSE typo (transposition) as in the existing
+        // proptest at as_body_position_invariant_clause_typo.
+        let query = "CREATE SEMANTIC VIEW v AS TABLSE (t);";
+        let (rc, msg, pos) = call_sv_parse_function(query);
+        assert_eq!(rc, 1, "malformed CREATE must return rc=1; msg={msg}");
+        assert_ne!(
+            pos,
+            u32::MAX,
+            "position must be set for malformed CREATE; msg={msg}"
+        );
+        assert!(!msg.is_empty(), "error message must be populated for rc=1");
+    }
+
+    #[test]
+    fn sv_parse_function_rust_returns_1_for_near_miss() {
+        // CRETAE is a near-miss for CREATE; detect_ddl_kind returns None,
+        // detect_near_miss returns Some with position=0. rc=1; suggestion text.
+        let query = "CRETAE SEMANTIC VIEW v AS TABLES (t);";
+        let (rc, msg, pos) = call_sv_parse_function(query);
+        assert_eq!(rc, 1, "near-miss must return rc=1; msg={msg}");
+        assert_eq!(pos, 0, "near-miss position must be 0 (start of CRETAE)");
+        assert!(
+            msg.contains("Did you mean"),
+            "near-miss must contain suggestion text; got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "extension")]
+    #[test]
+    fn sv_parser_override_rust_returns_2_for_validation_failure() {
+        // Phase 62 contract change: the Err(_) branch of rewrite_to_native_sql
+        // now returns rc=2 (defer) rather than synthesising a SELECT error('...')
+        // statement via the deleted sql_throwing helper. parse_function picks
+        // up the error reporting via caret rendering.
+        let ctx_ptr = unsafe {
+            sv_make_override_context(
+                std::ptr::null_mut() as libduckdb_sys::duckdb_connection,
+                false,
+            )
+        };
+        assert!(!ctx_ptr.is_null());
+
+        let query = "CREATE SEMANTIC VIEW v AS TABLSE (t);";
+        let mut sql_ptr: *mut u8 = std::ptr::null_mut();
+        let mut sql_len: usize = 0;
+        let mut error_buf = vec![0_u8; 1024];
+        let rc = unsafe {
+            sv_parser_override_rust(
+                ctx_ptr as *const std::ffi::c_void,
+                query.as_ptr(),
+                query.len(),
+                &mut sql_ptr as *mut *mut u8,
+                &mut sql_len as *mut usize,
+                error_buf.as_mut_ptr(),
+                error_buf.len(),
+            )
+        };
+        assert_eq!(
+            rc, 2,
+            "parser_override Err branch must defer (rc=2) so parse_function can render caret"
+        );
+        assert!(
+            sql_ptr.is_null(),
+            "no rewritten SQL must be published on rc=2"
+        );
+        assert_eq!(sql_len, 0, "no SQL length on rc=2");
+
+        unsafe { sv_drop_override_context(ctx_ptr) };
     }
 
     // ===================================================================
