@@ -20,6 +20,11 @@ assertions here just check for the right *message content* — the caret
 column-counting tests are documented as a known regression in TECH-DEBT
 item 22 and tracked separately.
 
+Phase 62 Wave 0: assertion bodies wired but skipped pending Plan 04. Once
+Plans 02-03 restore caret rendering via parse_function on FALLBACK_OVERRIDE
+deferral, Plan 04 flips the skips to `assert caret_col is not None` and
+adds an exact-column expectation for each test.
+
 Three representative error types are covered:
   1. Structural error -- missing '(' after clause keyword (ERR-02)
   2. Clause-level error -- typo in AS-body keyword (ERR-01)
@@ -134,6 +139,15 @@ def test_caret_missing_paren():
                 f"Expected error about missing '(' but got: {error_text}"
             )
             print(f"  Error: {error_text.splitlines()[0]} -- correct")
+            # Phase 62 Wave 0: caret column extraction wired; staged-skipped
+            # until Plan 04 tightens to `assert caret_col is not None`.
+            caret_col = extract_caret_position(error_text)
+            if caret_col is None:
+                print("  SKIP (caret): Phase 62 Plan 04 will assert caret_col is not None")
+            else:
+                # Plan 04 will replace this branch with:
+                #   assert caret_col == EXPECTED_COLUMN_FOR_THIS_TEST
+                print(f"  caret_col = {caret_col} (Plan 04 will pin exact value)")
     finally:
         conn.close()
 
@@ -156,6 +170,12 @@ def test_caret_clause_typo():
                 f"Expected suggestion for 'TABLES' but got: {error_text}"
             )
             print(f"  Error: {error_text.splitlines()[0]} -- correct")
+            # Phase 62 Wave 0: caret column extraction wired; staged-skipped.
+            caret_col = extract_caret_position(error_text)
+            if caret_col is None:
+                print("  SKIP (caret): Phase 62 Plan 04 will assert caret_col is not None")
+            else:
+                print(f"  caret_col = {caret_col} (Plan 04 will pin exact value)")
     finally:
         conn.close()
 
@@ -179,6 +199,126 @@ def test_caret_near_miss():
                 f"but got: {error_text}"
             )
             print(f"  Error: {error_text.splitlines()[0]} -- correct")
+            # Phase 62 Wave 0: caret column extraction wired; staged-skipped.
+            caret_col = extract_caret_position(error_text)
+            if caret_col is None:
+                print("  SKIP (caret): Phase 62 Plan 04 will assert caret_col is not None")
+            else:
+                print(f"  caret_col = {caret_col} (Plan 04 will pin exact value)")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 62 Wave 0 — additional caret coverage (B4, B5, B6, B7).
+# ---------------------------------------------------------------------------
+# Each test below issues the malformed query, captures the exception, and
+# stages the assertion. Until Plan 04 (Wave 3) restores caret rendering
+# they print SKIP and exit cleanly so the suite stays green.
+
+def test_caret_multiline_typo():
+    """B4: caret column for multi-line CREATE with malformed clause on line 3."""
+    conn = make_connection()
+    try:
+        query = (
+            "CREATE SEMANTIC VIEW v AS\n"
+            "TABLES (t AS orders PRIMARY KEY (id))\n"
+            "DIMENSIONS (TBLES x)"
+        )
+        try:
+            conn.execute(query)
+            print("  SKIP (Plan 04): exception not raised yet under Wave 0 expectations")
+            return
+        except Exception as e:
+            error_text = str(e)
+            print(f"  Error captured: {error_text.splitlines()[0]}")
+            caret_col = extract_caret_position(error_text)
+            if caret_col is None:
+                print("  SKIP (caret): Phase 62 Plan 04 will assert multiline caret_col")
+            else:
+                print(f"  caret_col = {caret_col} (Plan 04 will pin LINE N alignment)")
+    finally:
+        conn.close()
+
+
+def test_caret_unicode_prefix():
+    """B5: caret column with multibyte UTF-8 identifier before the typo."""
+    conn = make_connection()
+    try:
+        # vüé is multibyte (ü = 2 bytes, é = 2 bytes in UTF-8). The typo TBLES
+        # follows; whatever DuckDB does today (byte vs char column counting)
+        # is the contract Plan 04 will pin.
+        query = "CREATE SEMANTIC VIEW vüé AS TBLES (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))"
+        try:
+            conn.execute(query)
+            print("  SKIP (Plan 04): exception not raised yet under Wave 0 expectations")
+            return
+        except Exception as e:
+            error_text = str(e)
+            print(f"  Error captured: {error_text.splitlines()[0]}")
+            caret_col = extract_caret_position(error_text)
+            if caret_col is None:
+                print("  SKIP (caret): Phase 62 Plan 04 will assert unicode caret_col")
+            else:
+                print(f"  caret_col = {caret_col} (Plan 04 will pin byte vs char counting)")
+    finally:
+        conn.close()
+
+
+def test_caret_alter_typo():
+    """B6: caret column for ALTER with bad sub-operation keyword."""
+    conn = make_connection()
+    try:
+        # Set up a view to alter, so ALTER reaches the validator (otherwise the
+        # error path is "view not found"). Plan 04 may simplify if validate_alter
+        # surfaces the typo before name resolution.
+        try:
+            conn.execute(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2))"
+            )
+            conn.execute(
+                "CREATE SEMANTIC VIEW v AS "
+                "TABLES (t AS orders PRIMARY KEY (id)) "
+                "DIMENSIONS (t.id AS id) "
+                "METRICS (t.total AS SUM(t.amount))"
+            )
+        except Exception:
+            pass  # ignore setup failures — Plan 04 may rewrite this scaffold
+
+        query = "ALTER SEMANTIC VIEW v RENAM TO w;"
+        try:
+            conn.execute(query)
+            print("  SKIP (Plan 04): exception not raised yet under Wave 0 expectations")
+            return
+        except Exception as e:
+            error_text = str(e)
+            print(f"  Error captured: {error_text.splitlines()[0]}")
+            caret_col = extract_caret_position(error_text)
+            if caret_col is None:
+                print("  SKIP (caret): Phase 62 Plan 04 will assert ALTER caret_col on RENAM")
+            else:
+                print(f"  caret_col = {caret_col} (Plan 04 will pin RENAM column)")
+    finally:
+        conn.close()
+
+
+def test_caret_drop_missing_name():
+    """B7: caret column for DROP with missing view name."""
+    conn = make_connection()
+    try:
+        query = "DROP SEMANTIC VIEW;"
+        try:
+            conn.execute(query)
+            print("  SKIP (Plan 04): exception not raised yet under Wave 0 expectations")
+            return
+        except Exception as e:
+            error_text = str(e)
+            print(f"  Error captured: {error_text.splitlines()[0]}")
+            caret_col = extract_caret_position(error_text)
+            if caret_col is None:
+                print("  SKIP (caret): Phase 62 Plan 04 will assert DROP caret_col after prefix")
+            else:
+                print(f"  caret_col = {caret_col} (Plan 04 will pin trailing-token column)")
     finally:
         conn.close()
 
@@ -191,6 +331,11 @@ ALL_TESTS = [
     ("test_caret_missing_paren", test_caret_missing_paren),
     ("test_caret_clause_typo", test_caret_clause_typo),
     ("test_caret_near_miss", test_caret_near_miss),
+    # Phase 62 Wave 0 — staged tests; assertions tightened in Plan 04.
+    ("test_caret_multiline_typo", test_caret_multiline_typo),
+    ("test_caret_unicode_prefix", test_caret_unicode_prefix),
+    ("test_caret_alter_typo", test_caret_alter_typo),
+    ("test_caret_drop_missing_name", test_caret_drop_missing_name),
 ]
 
 

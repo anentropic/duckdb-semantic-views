@@ -166,6 +166,71 @@ def test_multi_db_isolation():
             con2.close()
 
 
+def test_seventeen_dbs_sequential_create():
+    """B15 expanded — open 17 in-memory DBs sequentially, CREATE on each.
+
+    Pre-Phase-62: LRU evicts DB #1 on the 17th open and the next CREATE
+    on its handle surfaces 'catalog context for this database has been
+    evicted'. Post-Phase-62: every CREATE succeeds because OverrideContext
+    is attached per-DBConfig and never evicted.
+    """
+    # Phase 62 Wave 0 — Plan 04 will remove this skip.
+    print("  SKIP: Phase 62 Plan 04 will activate this test")
+    return
+    # ---- body left here for Plan 04 to enable ----
+    # connections = []
+    # for i in range(17):
+    #     conn = duckdb.connect(":memory:", config={
+    #         "allow_unsigned_extensions": "true",
+    #         "extension_directory": EXT_DIR,
+    #     })
+    #     conn.execute(f"FORCE INSTALL '{EXT_PATH}'")
+    #     conn.execute("LOAD semantic_views")
+    #     conn.execute(f"CREATE TABLE t_{i}(id INTEGER PRIMARY KEY)")
+    #     conn.execute(f"CREATE SEMANTIC VIEW v_{i} AS TABLES (t_{i} AS t_{i} PRIMARY KEY (id)) DIMENSIONS (t_{i}.id AS id) METRICS (t_{i}.c AS COUNT(*))")
+    #     connections.append(conn)
+    # # Verify oldest DB still has its view (no LRU eviction).
+    # rows = connections[0].execute("DESCRIBE SEMANTIC VIEW v_0").fetchall()
+    # assert len(rows) > 0, "DB #0 lost its view to LRU eviction"
+    # for c in connections:
+    #     c.close()
+
+
+def test_fifty_db_open_close_rss_bounded():
+    """B16 — sequentially open+close 50 in-memory DBs each running a CREATE.
+
+    RSS delta < 50 MB across the loop. The catalog connection leaks one
+    Connection object per DB (~few KB) — bounded by workload, not by an
+    LRU cap. See Phase 62 RESEARCH.md §Q2 for the leak rationale.
+    """
+    # Phase 62 Wave 0 — Plan 04 will remove this skip.
+    print("  SKIP: Phase 62 Plan 04 will activate this test")
+    return
+    # ---- body left here for Plan 04 to enable ----
+    # try:
+    #     import resource
+    #     start_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # except ImportError:
+    #     start_rss = 0
+    # for i in range(50):
+    #     conn = duckdb.connect(":memory:", config={
+    #         "allow_unsigned_extensions": "true",
+    #         "extension_directory": EXT_DIR,
+    #     })
+    #     conn.execute(f"FORCE INSTALL '{EXT_PATH}'")
+    #     conn.execute("LOAD semantic_views")
+    #     conn.execute(f"CREATE TABLE t(id INTEGER PRIMARY KEY)")
+    #     conn.execute(f"CREATE SEMANTIC VIEW v AS TABLES (t AS t PRIMARY KEY (id)) DIMENSIONS (t.id AS id) METRICS (t.c AS COUNT(*))")
+    #     conn.close()
+    # try:
+    #     end_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    #     # macOS reports ru_maxrss in bytes, Linux in KB. Take the safer threshold.
+    #     delta_mb = (end_rss - start_rss) / (1024 * 1024)
+    #     assert delta_mb < 50, f"RSS delta too large: {delta_mb} MB"
+    # except ImportError:
+    #     pass
+
+
 def main():
     print(f"Extension path: {EXT_PATH}")
     print(f"Extension dir:  {EXT_DIR}")
@@ -177,6 +242,15 @@ def main():
 
     results = [
         run_test("multi-DB DDL isolation", test_multi_db_isolation),
+        # Phase 62 Wave 0 — staged tests; bodies enabled in Plan 04.
+        run_test(
+            "seventeen DBs sequential CREATE (B15)",
+            test_seventeen_dbs_sequential_create,
+        ),
+        run_test(
+            "fifty DB open-close RSS bounded (B16)",
+            test_fifty_db_open_close_rss_bounded,
+        ),
     ]
 
     print(f"\n{'=' * 60}")
