@@ -199,9 +199,15 @@ Phases 58–61 are retroactive reconstructions: the work was originally complete
 
   Goal: per-DB token→catalog map capped at 16 entries with insertion-order eviction (TECH-DEBT 20 — known limitation, redesigned in Phase 62); `CatalogReader` adopts RAII guards (`PreparedStmt`, `QueryResult`); ADBC end-to-end test, concurrent-CREATE Python test, `INSERT OR REPLACE` row-count + byte-identical rollback sqllogictest, type-inference inside transaction, FFI fuzz target; CHANGELOG, TECH-DEBT, MAINTAINER updates.
 
-- [ ] Phase 62: Caret restoration + LRU removal (planned)
+- [ ] Phase 62: Caret restoration + LRU removal (4 plans, 4 waves)
 
   Goal: Re-introduce `parse_function` purely as the error-reporting layer (parser_override keeps the success/transactional path). Defer error cases from parser_override → default parser fails → parse_function returns `DISPLAY_EXTENSION_ERROR` with `error_location`, restoring `LINE 1: … ^` caret rendering. Concurrently, attach the `CatalogReader` directly to `SemanticViewsParserInfo` (lifetime tied to `DBConfig`), eliminating the bounded LRU and its silent-eviction error class. Resolves TECH-DEBT items 20 + 22.
+
+  **Plans:** 4 plans
+  - [ ] 62-01-PLAN.md — Wave 0: test scaffolding (sqllogistest fixtures + static_assert + position proptest + Python test skeletons)
+  - [ ] 62-02-PLAN.md — Wave 1: LRU removal; `OverrideContext` direct-attached to `SemanticViewsParserInfo`; Q2 destruction-order leak pattern (per RESEARCH §4)
+  - [ ] 62-03-PLAN.md — Wave 2: caret restoration; `sv_parse_function_rust` + `sv_parse_stub`; `sql_throwing` deleted
+  - [ ] 62-04-PLAN.md — Wave 3: populate fixtures + tighten Python assertions + CHANGELOG + TECH-DEBT 20/22 ✅; manual caret smoke checkpoint
 
   **Pre-planning artefacts** (read before `/gsd-plan-phase 62`):
   - `_notes/v0.8.0_phase_62_ultraplan.md` — full architectural design (mermaid flow + per-file changes + reused-helpers + verification list). Contains 4 open research questions for the research subagent to resolve.
