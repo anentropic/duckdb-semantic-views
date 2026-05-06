@@ -23,7 +23,14 @@ exclude_patterns = ["_build", ".venv"]
 extensions = [
     "sphinx_design",
     "sphinx.ext.githubpages",
+    "myst_parser",
 ]
+
+# -- MyST parser -------------------------------------------------------------
+
+myst_enable_extensions = ["colon_fence"]
+myst_heading_anchors = 3
+suppress_warnings = ["myst.header"]
 
 # -- Shibuya theme -----------------------------------------------------------
 
@@ -140,6 +147,7 @@ html_theme_options = {
             ],
         },
         {"title": "Reference", "url": "reference/index"},
+        {"title": "Release notes", "url": "changelog"},
     ],
 }
 html_css_files = [

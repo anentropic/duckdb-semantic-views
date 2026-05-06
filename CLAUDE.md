@@ -33,7 +33,10 @@ This adds linting (clippy pedantic + fmt + cargo-deny) and fuzz target compilati
 
 At the end of every milestone, before tagging:
 
-1. **Update CHANGELOG.md** — Add a new version section with user-facing feature descriptions. Group related commits into feature-level summaries (don't list individual commits). Follow Keep a Changelog format. Use ROADMAP.md phase descriptions and success criteria as the source, not raw git log.
+1. **Update CHANGELOG.md** — Add a new version section with user-facing feature descriptions. Group related commits into feature-level summaries (don't list individual commits). Use ROADMAP.md phase descriptions and success criteria as the source, not raw git log.
+   - **Format**: Keep a Changelog 1.1.0. The only allowed `###` subheadings under a version are `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`. `Known limitations` is also permitted as a final subheading when a release ships with documented constraints. **Do not** introduce ad-hoc subheadings for internal phases ("Phase 62 — ..."), workstreams, or chronology — fold those bullets into the standard categories.
+   - **In-version churn**: if a feature was added and reverted within the same unreleased version, do not list it in `Added`. Only list what actually shipped at tag time. Likewise, do not include strikethrough "resolved later in the same version" entries.
+   - **Audience**: this file is also rendered verbatim as the docs site Release Notes page (`docs/changelog.md` includes it via MyST). Avoid GSD/phase-internal vocabulary in user-facing bullets; if implementation detail belongs anywhere it's inline within the relevant `Added`/`Changed`/`Fixed` bullet, not as its own subhead.
 2. **Add example file** — New Python example under `examples/` demoing the milestone's features.
 3. **Bump version** — Update Cargo.toml + description.yml.
 

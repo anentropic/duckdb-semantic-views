@@ -79,3 +79,4 @@ Snowflake and Databricks, along with dbt Cloud, Cube.dev and others, all ship se
    how-to/index
    explanation/index
    reference/index
+   changelog
