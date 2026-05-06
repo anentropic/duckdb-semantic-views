@@ -1,16 +1,32 @@
-# Phase 62 Wave 0 — caret rendering coverage for ALTER error paths.
+# Phase 62 Wave 3 — caret rendering coverage for ALTER error paths.
 #
-# Wave 0 stages this fixture as a no-op via `halt`. Plan 04 (Wave 3)
-# populates the `statement error` blocks once caret rendering is restored.
+# Plans 02-03 restored caret rendering. ALTER SEMANTIC VIEW with an
+# unsupported sub-operation keyword (RENAM instead of RENAME TO) triggers
+# validate_alter -> "Unsupported ALTER operation..." with position pointing
+# past the view name.
 #
 # Behavioural property pinned (from RESEARCH.md §6):
-#   B6: caret renders for ALTER errors (typo in clause keyword)
+#   B6: caret renders for ALTER errors
 
 require semantic_views
 
 statement ok
 LOAD semantic_views;
 
-halt
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY);
 
-# Phase 62 Plan 04: ALTER SEMANTIC VIEW v RENAM TO w; → caret on RENAM.
+statement ok
+CREATE SEMANTIC VIEW v_for_alter AS TABLES (t AS t PRIMARY KEY (id)) DIMENSIONS (t.id AS id) METRICS (t.c AS COUNT(*));
+
+# B6: ALTER with bad sub-operation keyword (RENAM instead of RENAME TO)
+statement error
+ALTER SEMANTIC VIEW v_for_alter RENAM TO w;
+----
+Unsupported ALTER operation
+
+# Caret rendering pinned via LINE 1: substring (proves parse_function path).
+statement error
+ALTER SEMANTIC VIEW v_for_alter RENAM TO w;
+----
+LINE 1:

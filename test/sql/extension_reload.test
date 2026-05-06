@@ -1,20 +1,40 @@
-# Phase 62 Wave 0 — extension re-LOAD idempotency.
+# Phase 62 Wave 3 — extension re-LOAD idempotency.
 #
-# Wave 0 stages this fixture as a no-op via `halt`. Plan 04 (Wave 3) pins
-# the contract that loading the extension twice into the same DB does not
-# crash and that subsequent DDL still works, even if a second
-# ParserExtensionInfo is registered. RESEARCH §3 Risk A.
+# Loading the extension twice into the same DB exercises Risk A from
+# RESEARCH.md §3: each LOAD clones the ParserExtensions vector via
+# atomic-shared_ptr swap, so two SemanticViewsParserInfo objects exist
+# after a re-LOAD, each with its own OverrideContext. Both are iterated
+# by Parser::ParseQuery; the first to return success wins. Both are
+# structurally equivalent (same DB, same catalog) so behaviour stays
+# consistent.
 #
 # Behavioural property pinned (from RESEARCH.md §6):
-#   B18: extension re-LOAD in same DB does not crash
+#   B18: extension re-LOAD in same DB does not crash; subsequent DDL works.
 
 require semantic_views
 
 statement ok
 LOAD semantic_views;
 
-halt
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY);
 
-# Phase 62 Plan 04: LOAD semantic_views; CREATE v1; LOAD semantic_views;
-# DROP v1; — must succeed even if a second ParserExtensionInfo is
-# registered. RESEARCH §3 Risk A.
+statement ok
+CREATE SEMANTIC VIEW v_reload AS TABLES (t AS t PRIMARY KEY (id)) DIMENSIONS (t.id AS id) METRICS (t.c AS COUNT(*));
+
+# B18: re-LOAD the extension. DuckDB may de-duplicate (LOAD is idempotent
+# at the Database level) or may compose two parser_info entries; either
+# way the existing view must still be visible and DROP must still work.
+statement ok
+LOAD semantic_views;
+
+# View is still there.
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'v_reload';
+----
+1
+
+# DROP succeeds after re-LOAD -- proves the extension info is still wired
+# correctly even with potentially duplicated parser_info registrations.
+statement ok
+DROP SEMANTIC VIEW v_reload;
