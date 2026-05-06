@@ -168,7 +168,11 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Why deferred:** Routing read-side functions onto the caller's connection requires `libduckdb-sys` to expose the `BindInfo`'s connection handle. The C API does not currently surface it; binding state holds only `parser_info` and the catalog handle we passed in. A custom shim could probably reach into the C++ side, but the gain (transactional read visibility) doesn't justify another layer of FFI surface to maintain.
 - **Action when DuckDB exposes it:** Re-route read-side functions through the executing connection and drop the catalog connection entirely, collapsing onto a single connection per database load.
 
-### 20. ❓ Bounded LRU evictions are silent at the parser-override site
+### 20. ✅ Bounded LRU evictions are silent at the parser-override site
+
+**Resolved in Phase 62 (v0.8.0).** The bounded LRU is gone — each `SemanticViewsParserInfo` now owns an `OverrideContext` directly, lifetime-tied to `DBConfig`. Multi-DB processes can load the extension into arbitrarily many DuckDB instances without eviction. The `duckdb_connection` inside each `OverrideContext` is intentionally leaked at DB shutdown to avoid a use-after-free on `~DatabaseInstance` destruction order — bounded at one Connection (~few KB) per DB ever opened in the process. See `.planning/phases/62-caret-restoration-lru-removal/62-RESEARCH.md` §Q2 for the destruction-order trace and §6 row B15 for the multi-DB test coverage.
+
+**Original limitation (preserved for archaeology):**
 
 - **Origin:** v0.8.1 B3 (bounded LRU for `parser_override_catalog`).
 - **Decision:** The per-extension-load `db_token` → `CatalogReader` map is a 16-entry LRU. A long-lived process that opens more than 16 DuckDB instances will see the oldest token evicted on the 17th load. The next CREATE / DROP / ALTER routed to that token surfaces the friendly error `semantic_views: catalog context for this database has been evicted (process has opened more than 16 databases)`. The eviction itself happens silently inside `parser_override_catalog::set` — there is no log line at the moment of eviction.
@@ -182,7 +186,11 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Why deferred:** `disable_peg_parser` is a built-in pragma; parser_override does not see it. The cleanest fix would be a DuckDB-side change so that disabling PEG preserves whatever parser_override setting was in effect.
 - **Mitigation:** `peg_compat.test` includes the `SET` workaround and CHANGELOG / MAINTAINER document the gotcha.
 
-### 22. ❓ FALLBACK_OVERRIDE silently drops `DISPLAY_EXTENSION_ERROR`
+### 22. ✅ FALLBACK_OVERRIDE silently drops `DISPLAY_EXTENSION_ERROR`
+
+**Resolved in Phase 62 (v0.8.0).** `parse_function` was re-introduced purely as the error-reporting layer. `parser_override` now defers all validation errors with `DISPLAY_ORIGINAL_ERROR` (rc=2); the default parser fails on the unrecognised DDL prefix; DuckDB calls our `sv_parse_stub`; we re-run validation and return `DISPLAY_EXTENSION_ERROR` with `error_location` set to the byte offset of the offending token. `ParserException::SyntaxError` renders `LINE 1: ... ^` for free. The synthesised `SELECT error('...')` workaround (`sql_throwing`) has been deleted. See `.planning/phases/62-caret-restoration-lru-removal/62-RESEARCH.md` §Q1 (position-tracking contract) and §6 rows B1–B7 for the per-DDL caret coverage.
+
+**Original limitation (preserved for archaeology):**
 
 - **Origin:** v0.8.1 milestone close, surfaced when investigating the post-unification sqllogictest failures (see `sql_throwing` helper in `src/parse.rs`).
 - **Decision:** DuckDB's `ParseInternal` (verified in the v1.5.2 amalgamation) ignores any `parser_override` result that isn't `PARSE_SUCCESSFUL` when `allow_parser_override_extension` is `FALLBACK`. That means a Rust-side validation error returned via `DISPLAY_EXTENSION_ERROR` (rc=1 on the FFI boundary) is dropped, and the user sees the default parser's syntax error instead of our message. We work around this by synthesising a `SELECT error('<msg>')` statement and returning it as `PARSE_SUCCESSFUL`, so DuckDB raises the message at execution time. The rc=1 path on the FFI boundary is now dead but kept for forward-compat with `STRICT_OVERRIDE`.
