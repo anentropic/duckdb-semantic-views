@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 62-01-PLAN.md (Wave 0 — test scaffolding + layout guard); ready for 62-02 (Wave 1 — parse_function reintroduction)
-last_updated: "2026-05-06T12:34:34.389Z"
+stopped_at: Completed 62-02-PLAN.md (Wave 1 — LRU removed; OverrideContext direct-attached); ready for 62-03 (Wave 2 — parse_function reintroduction)
+last_updated: "2026-05-06T12:52:33.909Z"
 last_activity: 2026-05-06
 progress:
   total_phases: 13
   completed_phases: 7
   total_plans: 15
-  completed_plans: 8
-  percent: 53
+  completed_plans: 9
+  percent: 60
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-05-05)
 ## Current Position
 
 Phase: 62 (Caret restoration + LRU removal) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-05-06
 
@@ -62,6 +62,7 @@ Recent decisions affecting current work:
 - [Phase 57]: find_routing_materialization_name duplicates resolution logic rather than changing expand() return type
 - [Phase 57]: Feature-gated re-export with #[allow(dead_code)] for extension-only cross-module access
 - [Phase 62]: Phase 62 Plan 01: pre-stage all behavioural test slots (B1-B19) as halt no-ops + skip-guarded staged tests so suite stays green between waves. Pin ParserExtensionParseResult layout via static_assert before Plans 02-03 production changes land.
+- [Phase 62]: Phase 62 Plan 02: Drop for OverrideContext leaks the inner duckdb_connection by design (Q2 destruction-order: ~DBConfig fires AFTER ~DatabaseInstance resets connection_manager, so calling duckdb_disconnect would UAF). Bounded leak — one Connection per DB ever opened, ~few KB each. Matches v0.8.0 baseline.
 
 ### Pending Todos
 
@@ -93,9 +94,10 @@ Recent decisions affecting current work:
 | Phase 56 P01 | 25min | 2 tasks | 8 files |
 | Phase 57 P01 | 95min | 3 tasks | 11 files |
 | Phase 62 P01 | 30 min | 3 tasks | 13 files |
+| Phase 62 P02 | 25min | 3 tasks | 3 files |
 
 ## Session Continuity
 
-Last session: 2026-05-06T12:34:34.387Z
-Stopped at: Completed 62-01-PLAN.md (Wave 0 — test scaffolding + layout guard); ready for 62-02 (Wave 1 — parse_function reintroduction)
+Last session: 2026-05-06T12:52:33.906Z
+Stopped at: Completed 62-02-PLAN.md (Wave 1 — LRU removed; OverrideContext direct-attached); ready for 62-03 (Wave 2 — parse_function reintroduction)
 Resume file: None
