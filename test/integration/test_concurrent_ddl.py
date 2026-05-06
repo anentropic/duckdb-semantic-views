@@ -4,7 +4,7 @@
 # requires-python = ">=3.10"
 # ///
 """
-Concurrent DDL race-guard regression test (v0.8.1, plan task D1).
+Concurrent DDL race-guard regression test (v0.8.0, Phase 60).
 
 Two threads each open the same file-backed DuckDB, BEGIN a transaction, and
 attempt to CREATE the same semantic view name. DuckDB's primary-key constraint
@@ -13,7 +13,7 @@ thread must succeed and the other must see a clear conflict error.
 
 Without the parser_override path emitting an INSERT against `_definitions`
 (v0.8.0+), CREATE went through the legacy plan_function which committed
-out-of-band — concurrency semantics were undefined. v0.8.1 keeps the same
+out-of-band — concurrency semantics were undefined. v0.8.0 keeps the same
 serialization guarantee while collapsing onto a single execution path.
 
 This is also the test that would catch a regression of the B1 race guards:

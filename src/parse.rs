@@ -27,7 +27,7 @@ use crate::model::{Cardinality, Join, TableRef};
 // back into the override callback for every parse). Lifetime is tied to the
 // `DBConfig`, so destruction happens on DB unload.
 //
-// Phase 62 (Wave 1) replaced the v0.8.1 16-entry `db_token` LRU with this
+// Phase 62 (Wave 1) replaced the v0.8.0 16-entry `db_token` LRU with this
 // direct-attachment design — see TECH-DEBT item 20. The LRU's silent-
 // eviction error class is gone because there is no global map any more;
 // each `parser_info` carries its own `OverrideContext`.
@@ -1560,7 +1560,7 @@ pub(crate) fn infer_cardinality(
 ///
 /// Phase 62 Plan 03 made this the live error-emit path for
 /// `sv_parse_function_rust` (rc=1 / rc=3). It used to be dead under the
-/// v0.8.1 `FALLBACK_OVERRIDE` synthesised-`SELECT error` workaround, which
+/// v0.8.0 `FALLBACK_OVERRIDE` synthesised-`SELECT error` workaround, which
 /// has been deleted now that `parse_function` re-renders the caret.
 #[cfg(any(feature = "extension", test))]
 unsafe fn write_error_to_buffer(buf: *mut u8, len: usize, s: &str) {
@@ -1653,7 +1653,7 @@ unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len:
 // `parser_override` is the sole semantic-view DDL entry point. Every recognised
 // statement is rewritten here and re-executed on the caller's connection by
 // DuckDB — the legacy parse_function / sv_ddl_internal fallback was retired
-// in v0.8.1.
+// in v0.8.0.
 //
 // Rewriting is dispatched by shape:
 //
@@ -2060,7 +2060,7 @@ fn escape_sql_arg(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Build the race-guard SELECT for non-IF-EXISTS DROP/ALTER (B1, v0.8.1).
+/// Build the race-guard SELECT for non-IF-EXISTS DROP/ALTER (B1, v0.8.0).
 ///
 /// `name_escaped` is the view name with single quotes already SQL-doubled
 /// (matches the form returned by `parse_table_function_call::args`).
@@ -2261,7 +2261,7 @@ fn rewrite_alter_comment(
     // against concurrent DROP. A concurrent ALTER ... SET COMMENT or
     // ALTER ... RENAME against the same row could still cause a lost-update
     // (we serialized our new JSON from the lookup snapshot). That broader
-    // optimistic-concurrency story is out of scope for v0.8.1.
+    // optimistic-concurrency story is out of scope for v0.8.0.
     let guard = race_guard_select(name_escaped);
     Ok(Some(format!(
         "{guard}; \
@@ -2289,7 +2289,7 @@ struct TableFunctionCall {
 /// returned strings so callers can re-embed them in new single-quoted SQL
 /// without re-escaping.
 ///
-/// v0.8.1 tightened (B4): rejects malformed shapes that earlier silently
+/// v0.8.0 tightened (B4): rejects malformed shapes that earlier silently
 /// swallowed — `foo(,)`, `foo('a',)` (trailing comma), `foo('a' 'b')`
 /// (missing comma between args).
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
@@ -2455,7 +2455,7 @@ pub unsafe extern "C" fn sv_drop_override_context(ctx_ptr: *mut std::ffi::c_void
 }
 
 /// FFI entry point for parser_override. The sole DDL entry point for the
-/// extension as of v0.8.1 — the legacy parse_function/parse_stub path was
+/// extension as of v0.8.0 — the legacy parse_function/parse_stub path was
 /// retired. Rewrites recognized semantic-view DDL into native SQL suitable
 /// for re-parsing through DuckDB's own parser and execution on the caller's
 /// connection.
@@ -2535,7 +2535,7 @@ pub unsafe extern "C" fn sv_parser_override_rust(
                 // (registered as `parse_function`) re-runs validation and
                 // returns DISPLAY_EXTENSION_ERROR with caret position. The
                 // synthesised `SELECT error('...')` workaround used in
-                // v0.8.1 (sql_throwing) has been deleted now that DuckDB's
+                // v0.8.0 (sql_throwing) has been deleted now that DuckDB's
                 // ParserException::SyntaxError caret rendering is reachable
                 // again via the parse_function code path. Resolves
                 // TECH-DEBT 22.
@@ -2721,8 +2721,8 @@ mod tests {
     use super::*;
 
     // ===================================================================
-    // parse_table_function_call — happy-path + B4 tightening (v0.8.1).
-    // Pre-v0.8.1 this silently swallowed `foo(,)` and `foo('a',)` and
+    // parse_table_function_call — happy-path + B4 tightening (v0.8.0).
+    // Pre-v0.8.0 this silently swallowed `foo(,)` and `foo('a',)` and
     // accepted `foo('a' 'b')` (missing comma). Now they all return None.
     // ===================================================================
 
@@ -2856,7 +2856,7 @@ mod tests {
     }
 
     // ===================================================================
-    // Phase 62: OverrideContext direct-attach (replaces the v0.8.1 LRU).
+    // Phase 62: OverrideContext direct-attach (replaces the v0.8.0 LRU).
     // The Drop impl MUST NOT call duckdb_disconnect (RESEARCH §Q2 —
     // destruction-order showstopper). The Box<OverrideContext> Rust
     // allocation IS reclaimed; the inner duckdb_connection leaks.

@@ -376,7 +376,7 @@ def run_tests():
         con.close()
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    # ---- Test 13b (D5, v0.8.1): type inference under transactional CREATE ----
+    # ---- Test 13b (D5, v0.8.0): type inference under transactional CREATE ----
     print(
         "Test 13b: type inference fires on file-backed CREATE inside an explicit BEGIN/COMMIT"
     )

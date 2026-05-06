@@ -106,7 +106,7 @@ test/
 
 ### Data Flow
 
-Every recognised DDL form is rewritten by `parser_override` into native SQL that DuckDB then plans and executes on the caller's connection. There is no longer a separate `parse_function` / `sv_ddl_internal` table-function fallback (deleted in the v0.8.1 architectural unification — see CHANGELOG).
+Every recognised DDL form is rewritten by `parser_override` into native SQL that DuckDB then plans and executes on the caller's connection. There is no longer a separate `parse_function` / `sv_ddl_internal` table-function fallback (deleted in the v0.8.0 architectural unification (Phase 59) — see CHANGELOG).
 
 ```
 DDL (CREATE / DROP / ALTER / DESCRIBE / SHOW / GET_DDL / READ_YAML / FROM YAML FILE)
@@ -164,7 +164,7 @@ Definitions live in `semantic_layer._definitions` (a regular DuckDB table that p
 
 The split exists because read-side table function bind hooks do not (currently) expose the executing connection through libduckdb-sys, so DESCRIBE / SHOW use `catalog_conn` even when called from inside an open transaction. Documented limitation; see TECH-DEBT item 19.
 
-The in-memory `CatalogState` HashMap mirror was removed in v0.8.0; v0.8.1 added internal `PreparedStmt` / `QueryResult` RAII guards in `catalog::reader` so error paths no longer juggle manual `duckdb_destroy_*` calls.
+The in-memory `CatalogState` HashMap mirror was removed in v0.8.0 (Phase 58); Phase 61 added internal `PreparedStmt` / `QueryResult` RAII guards in `catalog::reader` so error paths no longer juggle manual `duckdb_destroy_*` calls.
 
 ## Building
 

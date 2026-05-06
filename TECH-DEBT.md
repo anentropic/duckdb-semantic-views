@@ -159,11 +159,11 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ---
 
-## v0.8.1 additions
+## v0.8.0 additions
 
 ### 19. ❓ DESCRIBE / SHOW SEMANTIC * read committed state, not the caller's transaction
 
-- **Origin:** v0.8.0 known limitation, re-confirmed at v0.8.1 milestone close.
+- **Origin:** v0.8.0 known limitation, re-confirmed at v0.8.0 milestone close.
 - **Decision:** Read-side table functions (`describe_semantic_view`, `list_semantic_views`, `show_semantic_*`, `read_yaml_from_semantic_view`, `get_ddl`) are bound to the catalog connection installed at extension load time. They cannot see in-flight writes the caller has made on its own connection — a `BEGIN; CREATE SEMANTIC VIEW v ...; SHOW SEMANTIC VIEWS` will not list `v` until the COMMIT lands. Documented in CHANGELOG since v0.8.0.
 - **Why deferred:** Routing read-side functions onto the caller's connection requires `libduckdb-sys` to expose the `BindInfo`'s connection handle. The C API does not currently surface it; binding state holds only `parser_info` and the catalog handle we passed in. A custom shim could probably reach into the C++ side, but the gain (transactional read visibility) doesn't justify another layer of FFI surface to maintain.
 - **Action when DuckDB exposes it:** Re-route read-side functions through the executing connection and drop the catalog connection entirely, collapsing onto a single connection per database load.
@@ -174,14 +174,14 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 **Original limitation (preserved for archaeology):**
 
-- **Origin:** v0.8.1 B3 (bounded LRU for `parser_override_catalog`).
+- **Origin:** v0.8.0 B3 (bounded LRU for `parser_override_catalog`).
 - **Decision:** The per-extension-load `db_token` → `CatalogReader` map is a 16-entry LRU. A long-lived process that opens more than 16 DuckDB instances will see the oldest token evicted on the 17th load. The next CREATE / DROP / ALTER routed to that token surfaces the friendly error `semantic_views: catalog context for this database has been evicted (process has opened more than 16 databases)`. The eviction itself happens silently inside `parser_override_catalog::set` — there is no log line at the moment of eviction.
 - **Why this is acceptable:** The 16-database threshold covers every realistic interactive and CI workload. Daemon processes that load against many databases are the only affected scenario and they get a clear actionable error when they hit the wall.
 - **Action if the wall starts to bite:** Either bump the capacity (no other code change needed) or replace the LRU with an explicit registration lifecycle tied to extension-unload (DuckDB does not currently expose an unload hook that we can hook into).
 
 ### 21. ❓ `CALL disable_peg_parser()` resets `allow_parser_override_extension`
 
-- **Origin:** v0.8.1 milestone close, surfaced by `peg_compat.test`.
+- **Origin:** v0.8.0 milestone close, surfaced by `peg_compat.test`.
 - **Decision:** DuckDB's `disable_peg_parser` pragma resets `allow_parser_override_extension` to its `default` value (`DEFAULT_OVERRIDE`), which silently bypasses our hook entirely. Subsequent semantic DDL on that connection produces the default parser's `Parser Error: syntax error at or near "SEMANTIC"`. Working around this requires the caller to explicitly re-set `allow_parser_override_extension='FALLBACK'` after disabling PEG.
 - **Why deferred:** `disable_peg_parser` is a built-in pragma; parser_override does not see it. The cleanest fix would be a DuckDB-side change so that disabling PEG preserves whatever parser_override setting was in effect.
 - **Mitigation:** `peg_compat.test` includes the `SET` workaround and CHANGELOG / MAINTAINER document the gotcha.
@@ -192,14 +192,14 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 **Original limitation (preserved for archaeology):**
 
-- **Origin:** v0.8.1 milestone close, surfaced when investigating the post-unification sqllogictest failures (see `sql_throwing` helper in `src/parse.rs`).
+- **Origin:** v0.8.0 milestone close, surfaced when investigating the post-unification sqllogictest failures (see `sql_throwing` helper in `src/parse.rs`).
 - **Decision:** DuckDB's `ParseInternal` (verified in the v1.5.2 amalgamation) ignores any `parser_override` result that isn't `PARSE_SUCCESSFUL` when `allow_parser_override_extension` is `FALLBACK`. That means a Rust-side validation error returned via `DISPLAY_EXTENSION_ERROR` (rc=1 on the FFI boundary) is dropped, and the user sees the default parser's syntax error instead of our message. We work around this by synthesising a `SELECT error('<msg>')` statement and returning it as `PARSE_SUCCESSFUL`, so DuckDB raises the message at execution time. The rc=1 path on the FFI boundary is now dead but kept for forward-compat with `STRICT_OVERRIDE`.
 - **Why deferred:** Switching to `STRICT_OVERRIDE` would cause every non-semantic SQL statement to round-trip through our hook with `DISPLAY_ORIGINAL_ERROR`, which is fine semantically but slightly costlier. The synthesised-error workaround has zero overhead on success cases and gives identical user experience.
 - **Action if DuckDB ever fixes FALLBACK to honour `DISPLAY_EXTENSION_ERROR`:** Replace `sql_throwing` with a direct `write_error_to_buffer` + rc=1 path; one fewer SQL statement to plan.
 
 ### 23. ❓ Cross-connection `CREATE IF NOT EXISTS` race surfaces as PK violation
 
-- **Origin:** v0.8.1 PR #29 ultrareview follow-up; surfaced by the new IF NOT EXISTS path in `test/integration/test_concurrent_ddl.py`.
+- **Origin:** v0.8.0 PR #29 ultrareview follow-up; surfaced by the new IF NOT EXISTS path in `test/integration/test_concurrent_ddl.py`.
 - **Decision:** `CREATE SEMANTIC VIEW IF NOT EXISTS` rewrites to `INSERT OR IGNORE` against `semantic_layer._definitions(name)`. This atomically absorbs duplicates that are visible in the caller's own MVCC snapshot — same-transaction duplicates and any racing committer that landed before the caller's transaction began. It does **not** absorb duplicates from a transaction that committed *after* the caller's snapshot was taken: both connections evaluate INSERT against snapshots in which the row is absent, both attempt the INSERT, and DuckDB's PK constraint raises a write-write conflict on the second commit. The loser sees `Constraint Error: Duplicate key "name: <view>" violates primary key constraint`, the same shape plain `CREATE` produces.
 - **Why this is acceptable:** DuckDB's PK enforcement happens at row insert / commit time and is not a hook we can intercept from within `parser_override`. The pragmatic alternatives — application-level retry-on-conflict, a coarse table-level lock, or a serializable isolation upgrade — all sit outside the parser-override SQL path. The current behaviour is no worse than plain `CREATE` and the loser receives a clear, actionable message rather than corrupting data. The in-snapshot silent no-op contract (the case users hit far more often: re-running an idempotent setup script in a single process) is fully preserved.
 - **Mitigation for callers writing parallel bootstrap scripts:** wrap the `CREATE IF NOT EXISTS` in a try/except and treat a constraint violation on the target name as success. `test/integration/test_concurrent_ddl.py::test_concurrent_create_if_not_exists_serializes` pins the failure shape so this caller-side workaround stays valid across releases.
@@ -208,5 +208,5 @@ Areas where test coverage is reduced compared to ideal, with justification.
 ---
 
 **Date:** 2026-05-03
-**Milestone:** v0.8.1
+**Milestone:** v0.8.0
 **Audit report:** `.planning/milestones/v1.0-MILESTONE-AUDIT.md`

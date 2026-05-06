@@ -1,7 +1,7 @@
 //! CREATE-time enrichment shared by the parser_override CREATE path.
 //!
-//! Pre-v0.8.1 this module also hosted `DefineFromJsonVTab` — a table function
-//! that the legacy parse_function fallback rewrote DDL into. v0.8.1's full
+//! Pre-v0.8.0 this module also hosted `DefineFromJsonVTab` — a table function
+//! that the legacy parse_function fallback rewrote DDL into. v0.8.0's full
 //! unification deleted that path; `parser_override` now emits native INSERT
 //! against `semantic_layer._definitions` directly. Only the enrichment +
 //! PK-resolution helpers remain — both called by `crate::parse::rewrite_create`

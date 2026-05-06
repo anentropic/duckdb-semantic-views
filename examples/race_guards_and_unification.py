@@ -8,7 +8,7 @@
 """
 uv run examples/race_guards_and_unification.py
 
-Demonstrates v0.8.1 features:
+Demonstrates v0.8.0 features:
   1. Architectural unification — every DDL form (CREATE / DROP / ALTER /
      DESCRIBE / SHOW) goes through the same parser_override path, with one
      net effect: identical behaviour under DuckDB's Bison and PEG parsers.
@@ -91,7 +91,7 @@ def main() -> None:
 
         # ------------------------------------------------------------------
         # 1. Unified path: DESCRIBE / SHOW work even after toggling the PEG
-        #    parser. Pre-v0.8.1 these forms required Bison.
+        #    parser. Pre-v0.8.0 these forms required Bison.
         # ------------------------------------------------------------------
         section("1. Unified parser path: DESCRIBE / SHOW under both parsers")
         for label, switch in [("Bison (default)", None), ("PEG", "enable_peg_parser")]:
@@ -127,7 +127,7 @@ def main() -> None:
 
         # ------------------------------------------------------------------
         # 4. Friendly validation error reaches the user.
-        #    Pre-v0.8.1 this would have surfaced as
+        #    Pre-v0.8.0 this would have surfaced as
         #    `Parser Error: syntax error at or near "SEMANTIC"` because
         #    DuckDB silently drops DISPLAY_EXTENSION_ERROR in FALLBACK mode.
         # ------------------------------------------------------------------

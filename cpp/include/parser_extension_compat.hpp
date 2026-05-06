@@ -17,7 +17,7 @@
 // these declarations still match by:
 //   grep -A 120 'duckdb/parser/parser_extension.hpp' cpp/include/duckdb.cpp
 //
-// As of v0.8.1 the extension only uses parser_override (the legacy
+// As of v0.8.0 the extension only uses parser_override (the legacy
 // parse_function/plan_function path was retired in the full unification),
 // but the ParserExtension class retains its parse_function and plan_function
 // fields under ODR — we keep their typedefs and supporting structs for

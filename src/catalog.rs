@@ -130,7 +130,7 @@ mod reader {
     }
 
     /// RAII guard for `duckdb_prepared_statement`. Drops the statement on
-    /// scope exit even when the body short-circuits via `?`. Pre-v0.8.1
+    /// scope exit even when the body short-circuits via `?`. Pre-v0.8.0
     /// every error path repeated `duckdb_destroy_prepare` by hand.
     struct PreparedStmt {
         ptr: ffi::duckdb_prepared_statement,
@@ -280,7 +280,7 @@ mod tests {
         Connection::open_in_memory().expect("in-memory DuckDB")
     }
 
-    // TEMPORARY: smoke test for v0.8.1 race-guard SQL shape.
+    // TEMPORARY: smoke test for v0.8.0 race-guard SQL shape.
     // CTE+DML+RETURNING is NOT supported in DuckDB 1.10.502 ("Parser Error:
     // A CTE needs a SELECT"), so we emit two statements separated by `;`:
     // a guard SELECT that raises via error() if the row is missing, then
