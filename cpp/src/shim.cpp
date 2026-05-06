@@ -18,7 +18,6 @@
 // unit can use them. See cpp/include/parser_extension_compat.hpp for details.
 
 #include "parser_extension_compat.hpp"
-#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -37,15 +36,16 @@ extern "C" {
     //                Buffer is NOT NUL-terminated — read exactly *sql_out_len bytes.
     //   1 = error:   message written to error_out (NUL-terminated, capped at
     //                error_out_len-1 bytes); *sql_out_ptr left untouched.
-    //   2 = not ours: defer to default parser.
+    //                (Currently unused under FALLBACK_OVERRIDE — kept for
+    //                Phase 62 Plan 03 once parse_function returns.)
+    //   2 = not ours: defer to default parser. Also used for null ctx_ptr.
     //
-    // `db_token` identifies which database's catalog connection to use for
-    // existence checks and CREATE-time enrichment. Each extension load is
-    // assigned a unique token (see sv_register_parser_hooks) so multi-DB
-    // processes (e.g. Python tests opening successive databases) don't share
-    // a stale catalog connection.
+    // Phase 62: ctx_ptr is an opaque Box<OverrideContext>* produced by
+    // sv_make_override_context. It carries the catalog connection +
+    // is_file_backed flag for THIS database. The legacy db_token LRU
+    // lookup is gone (TECH-DEBT 20).
     uint8_t sv_parser_override_rust(
-        uint64_t db_token,
+        const void *ctx_ptr,
         const char *query_ptr, size_t query_len,
         char **sql_out_ptr, size_t *sql_out_len,
         char *error_out, size_t error_out_len);
@@ -54,6 +54,20 @@ extern "C" {
     // Safe to call with a null pointer (no-op). ptr/len must be the exact
     // pair the Rust side returned.
     void sv_free_buffer(char *ptr, size_t len);
+
+    // Phase 62: Box<OverrideContext> ownership FFI. The Rust side allocates
+    // a Box<OverrideContext> wrapping the duckdb_connection + is_file_backed
+    // flag and returns the leaked raw pointer. The C++ shim stashes the
+    // pointer inside SemanticViewsParserInfo::rust_state and hands it back
+    // to sv_parser_override_rust on every parse. ~SemanticViewsParserInfo
+    // calls sv_drop_override_context to free the Rust allocation.
+    //
+    // CRITICAL: sv_drop_override_context does NOT call duckdb_disconnect on
+    // the inner duckdb_connection — see Phase 62 RESEARCH.md §Q2 for the
+    // destruction-order rationale. The Connection object leaks for the
+    // remainder of process life (one Connection per DB ever opened).
+    void *sv_make_override_context(duckdb_connection conn, bool is_file_backed);
+    void  sv_drop_override_context(void *ctx_ptr);
 }
 
 // RAII guard for heap-owned buffers returned by the Rust FFI. Ensures the
@@ -88,15 +102,38 @@ struct SvOwnedBuffer {
 };
 
 // Per-extension-load info struct attached to ParserExtension::parser_info.
-// `db_token` selects the right catalog connection on the Rust side; we
-// generate a fresh token on every sv_register_parser_hooks call so each
-// loaded database has an isolated entry in the Rust-side connection map.
+// Holds an opaque Box<OverrideContext>* (rust_state) that owns the catalog
+// connection + is_file_backed flag for THIS database. Lifetime is tied to
+// DBConfig, so destruction fires on DB unload — no LRU needed (Phase 62
+// resolved TECH-DEBT 20).
 struct SemanticViewsParserInfo : public ParserExtensionInfo {
-    uint64_t db_token;
-    explicit SemanticViewsParserInfo(uint64_t token) : db_token(token) {}
-};
+    void *rust_state;  // Box<OverrideContext>* opaque pointer (Rust-owned).
+    explicit SemanticViewsParserInfo(void *state) : rust_state(state) {}
 
-static std::atomic<uint64_t> sv_next_db_token{1};
+    ~SemanticViewsParserInfo() override {
+        if (rust_state) {
+            sv_drop_override_context(rust_state);
+            rust_state = nullptr;
+        }
+        // CRITICAL — Phase 62 Q2 destruction-order showstopper:
+        // We deliberately do NOT call duckdb_disconnect on the
+        // duckdb_connection contained within OverrideContext's CatalogReader.
+        //
+        // By the time this destructor fires, ~DatabaseInstance has already
+        // reset connection_manager (duckdb.cpp:276819). ~Connection() would
+        // call ConnectionManager::RemoveConnection() on the destroyed
+        // manager — use-after-free.
+        //
+        // The Rust Drop impl on OverrideContext (in src/parse.rs) documents
+        // the same constraint. The duckdb_connection object leaks for the
+        // remainder of process life — bounded at one Connection per DB ever
+        // opened (~few KB each). This matches v0.8.0 commit 680a967 which
+        // shipped successfully with this same leak pattern.
+        //
+        // See .planning/phases/62-caret-restoration-lru-removal/62-RESEARCH.md §Q2.
+        // Resolves TECH-DEBT item 20 (silent LRU eviction class) by removing the LRU.
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Parser-override hook: sv_parser_override
@@ -112,11 +149,12 @@ static std::atomic<uint64_t> sv_next_db_token{1};
 static ParserOverrideResult sv_parser_override(
     ParserExtensionInfo *info, const string &query, ParserOptions &) {
 
-    // Identify which DB's catalog connection this query should use. info is
-    // the per-extension-load SemanticViewsParserInfo we attached at
-    // registration time; if missing we cannot route correctly, so defer.
+    // Identify the OverrideContext for this DB's catalog. info is the
+    // per-extension-load SemanticViewsParserInfo attached at registration
+    // time; if missing or its Rust state is null we cannot route correctly,
+    // so defer to the default parser.
     auto *sv_info = dynamic_cast<SemanticViewsParserInfo *>(info);
-    if (!sv_info) {
+    if (!sv_info || !sv_info->rust_state) {
         return ParserOverrideResult();
     }
 
@@ -125,7 +163,7 @@ static ParserOverrideResult sv_parser_override(
     memset(error_buf, 0, sizeof(error_buf));
 
     uint8_t rc = sv_parser_override_rust(
-        sv_info->db_token,
+        sv_info->rust_state,
         query.c_str(), query.size(),
         &sql_buf.ptr, &sql_buf.len,
         error_buf, sizeof(error_buf));
@@ -160,11 +198,15 @@ static ParserOverrideResult sv_parser_override(
 // sv_register_parser_hooks -- called from Rust after C API init
 // ---------------------------------------------------------------------------
 // Extracts DatabaseInstance& from the C API handle and registers the
-// parser_override hook on DBConfig. Allocates a fresh `db_token` so the
-// Rust side can route per-database catalog reads correctly.
+// parser_override hook on DBConfig. Phase 62: takes the catalog connection
+// + is_file_backed flag and bundles them into an OverrideContext via
+// sv_make_override_context. The boxed OverrideContext is owned by the
+// SemanticViewsParserInfo we register; lifetime is tied to DBConfig so
+// destruction fires on DB unload (no LRU needed — TECH-DEBT 20 resolved).
 extern "C" {
     bool sv_register_parser_hooks(duckdb_database db_handle,
-                                  uint64_t *out_db_token) {
+                                  duckdb_connection catalog_conn,
+                                  bool is_file_backed) {
         try {
             // duckdb_database -> internal_ptr -> DatabaseWrapper ->
             //   shared_ptr<DuckDB> -> shared_ptr<DatabaseInstance>
@@ -172,9 +214,11 @@ extern "C" {
                 db_handle->internal_ptr);
             auto &db = *wrapper->database->instance;
 
-            uint64_t token = sv_next_db_token.fetch_add(1, std::memory_order_relaxed);
-            if (out_db_token) {
-                *out_db_token = token;
+            void *rust_state = sv_make_override_context(catalog_conn, is_file_backed);
+            if (!rust_state) {
+                fprintf(stderr,
+                    "sv_register_parser_hooks: sv_make_override_context returned null\n");
+                return false;
             }
 
             ParserExtension ext;
@@ -184,21 +228,15 @@ extern "C" {
             // the SemanticViewsParserInfo and immediately upcasts) then hand
             // it to duckdb::shared_ptr's std-interop constructor.
             std::shared_ptr<ParserExtensionInfo> info_std(
-                new SemanticViewsParserInfo(token));
+                new SemanticViewsParserInfo(rust_state));
             ext.parser_info = duckdb::shared_ptr<ParserExtensionInfo>(info_std);
             auto &config = DBConfig::GetConfig(db);
             ParserExtension::Register(config, ext);
 
-            // Enable parser_override dispatch in FALLBACK mode so our hook
-            // runs *before* the default parser for every query; a miss
-            // (DISPLAY_ORIGINAL_ERROR) cleanly falls through to it. Validation
-            // errors are surfaced via a synthesised SELECT error('...') from
-            // the Rust side because FALLBACK silently drops DISPLAY_EXTENSION_ERROR
-            // (verified in v1.5.2 amalgamation ParseInternal). STRICT does
-            // honour DISPLAY_EXTENSION_ERROR but its Throw() path loses the
-            // ParserException::SyntaxError formatting (LINE/^ caret) that
-            // legacy parse_function used, so STRICT doesn't actually win us
-            // anything user-visible — see TECH-DEBT item 22.
+            // FALLBACK_OVERRIDE: hook runs before default parser; misses
+            // fall through cleanly. Caret regression (TECH-DEBT 22) is
+            // resolved separately in Phase 62 Plan 03 by re-introducing
+            // parse_function as the error-reporting layer.
             config.SetOption("allow_parser_override_extension", Value("FALLBACK"));
 
             return true;
