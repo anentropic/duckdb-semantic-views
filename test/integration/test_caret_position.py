@@ -228,8 +228,9 @@ def test_caret_near_miss():
 # Phase 62 Wave 0 — additional caret coverage (B4, B5, B6, B7).
 # ---------------------------------------------------------------------------
 # Each test below issues the malformed query, captures the exception, and
-# stages the assertion. Until Plan 04 (Wave 3) restores caret rendering
-# they print SKIP and exit cleanly so the suite stays green.
+# asserts the caret column. Phase 62 Wave 3 activated all assertions —
+# pre-Phase-62 these tests printed SKIP markers because the synthesised
+# SELECT error('...') workaround stripped caret rendering.
 
 def test_caret_multiline_typo():
     """B4: caret column for multi-line CREATE — DuckDB renders LINE N (not LINE 1).
@@ -429,7 +430,7 @@ ALL_TESTS = [
     ("test_caret_missing_paren", test_caret_missing_paren),
     ("test_caret_clause_typo", test_caret_clause_typo),
     ("test_caret_near_miss", test_caret_near_miss),
-    # Phase 62 Wave 0 — staged tests; assertions tightened in Plan 04.
+    # Phase 62 Wave 3 — all 7 caret tests are now actively asserting.
     ("test_caret_multiline_typo", test_caret_multiline_typo),
     ("test_caret_unicode_prefix", test_caret_unicode_prefix),
     ("test_caret_alter_typo", test_caret_alter_typo),

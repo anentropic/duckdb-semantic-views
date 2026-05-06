@@ -271,7 +271,7 @@ def main():
 
     results = [
         run_test("multi-DB DDL isolation", test_multi_db_isolation),
-        # Phase 62 Wave 0 — staged tests; bodies enabled in Plan 04.
+        # Phase 62 Wave 3 — 17-DB and 50-DB tests are now active.
         run_test(
             "seventeen DBs sequential CREATE (B15)",
             test_seventeen_dbs_sequential_create,
