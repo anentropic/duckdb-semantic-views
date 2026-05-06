@@ -2573,10 +2573,13 @@ pub unsafe extern "C" fn sv_parser_override_rust(
 ///     (`SET allow_parser_override_extension='FALLBACK'`); `position_out=0`
 ///     so the caret lands on the `C` of `CREATE` / `D` of `DROP`.
 ///
-/// `ctx_ptr` is currently unused on this path — validation does not need
-/// the catalog. We keep it in the signature for symmetry with
-/// `sv_parser_override_rust` and to ease a future code path that might
-/// want catalog-aware suggestions.
+/// `ctx_ptr` is the same `Box<OverrideContext>*` handed to
+/// `sv_parser_override_rust`. When non-null we re-run the FULL rewrite
+/// (including catalog-aware existence checks in `rewrite_drop` /
+/// `rewrite_alter`); when null we fall back to syntax-only validation.
+/// This is what lets parse_function reproduce the same error message
+/// `parser_override` saw — including "semantic view '…' does not exist"
+/// for DROP-of-missing — with caret rendering attached.
 ///
 /// # Safety
 ///
@@ -2598,10 +2601,6 @@ pub unsafe extern "C" fn sv_parse_function_rust(
     position_out: *mut u32,
 ) -> u8 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // ctx_ptr unused on this path; the catalog isn't needed for
-        // validation. Suppress unused-warning explicitly.
-        let _ = ctx_ptr;
-
         // Initialise position_out to UINT32_MAX (no-position sentinel).
         if !position_out.is_null() {
             *position_out = u32::MAX;
@@ -2634,8 +2633,14 @@ pub unsafe extern "C" fn sv_parse_function_rust(
             return 2_u8; // genuinely not ours
         }
 
-        // Recognised prefix — re-run full validation.
-        match validate_and_rewrite(query) {
+        // Recognised prefix — re-run validation. When ctx_ptr is non-null
+        // (production path) use rewrite_to_native_sql so catalog-level
+        // errors (DROP-of-missing, ALTER-renaming-to-existing-name, …) are
+        // reproduced here just as parser_override saw them. When ctx_ptr
+        // is null (unit tests) fall back to syntax-only validation.
+        let result = run_validation_for_parse_function(ctx_ptr, query);
+
+        match result {
             Ok(Some(_rewritten)) => {
                 // Valid DDL but we got here — `parser_override` must not have
                 // fired. Most common cause: `disable_peg_parser` reset
@@ -2653,9 +2658,8 @@ pub unsafe extern "C" fn sv_parse_function_rust(
                 3_u8
             }
             Ok(None) => {
-                // detect_ddl_kind matched but validate_and_rewrite returned
-                // None — unreachable for a matched prefix. Defensive: emit
-                // an internal-error message rather than panic.
+                // detect_ddl_kind matched but validate returned None —
+                // unreachable for a matched prefix. Defensive.
                 write_error_to_buffer(
                     error_out,
                     error_out_len,
@@ -2678,6 +2682,38 @@ pub unsafe extern "C" fn sv_parse_function_rust(
     }));
 
     result.unwrap_or(2) // on panic: not ours
+}
+
+/// Re-run validation for the parse_function path. Mirrors what
+/// `sv_parser_override_rust` did at parse time: catalog-aware rewrite when a
+/// context is available, syntax-only validation when not (unit tests + the
+/// future case where the C++ shim has lost its rust_state).
+///
+/// Returning `Ok(Some(_))` means "validation succeeded" — at the
+/// parse_function call site this can only happen when parser_override
+/// itself didn't run, so the caller maps it to rc=3 (actionable hint).
+#[cfg(feature = "extension")]
+unsafe fn run_validation_for_parse_function(
+    ctx_ptr: *const std::ffi::c_void,
+    query: &str,
+) -> Result<Option<String>, ParseError> {
+    if ctx_ptr.is_null() {
+        return validate_and_rewrite(query);
+    }
+    let ctx = &*(ctx_ptr as *const OverrideContext);
+    rewrite_to_native_sql(ctx, query)
+}
+
+/// Test-only sibling of `run_validation_for_parse_function` — pure syntax
+/// validation. Under `cargo test` the `extension` feature is OFF (default
+/// features = bundled), so `rewrite_to_native_sql` is unavailable; ctx_ptr
+/// is always null in tests anyway.
+#[cfg(all(not(feature = "extension"), test))]
+unsafe fn run_validation_for_parse_function(
+    _ctx_ptr: *const std::ffi::c_void,
+    query: &str,
+) -> Result<Option<String>, ParseError> {
+    validate_and_rewrite(query)
 }
 
 #[cfg(test)]

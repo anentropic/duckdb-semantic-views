@@ -2,11 +2,19 @@
 //
 // The Rust entry point (semantic_views_init_c_api, C_STRUCT ABI) owns the
 // DuckDB handshake and function registration. After init, it calls
-// sv_register_parser_hooks() here to install a `parser_override` callback —
-// the sole DDL entry point as of v0.8.1's full unification (the legacy
-// `parse_function` / `sv_ddl_internal` table-function fallback was retired
-// once parser_override could route every recognised DDL form including
-// DESCRIBE / SHOW SEMANTIC * via pass-through).
+// sv_register_parser_hooks() here to install:
+//
+//   * parser_override (sv_parser_override) — the success path. Recognised
+//     CREATE / DROP / ALTER / DESCRIBE / SHOW DDL is rewritten to native SQL
+//     and re-parsed on the caller's connection (transactional behaviour).
+//   * parse_function (sv_parse_stub) — Phase 62 Plan 03 error-reporting
+//     layer. Called by DuckDB after the default parser fails on an
+//     unrecognised prefix; re-runs validation and returns
+//     DISPLAY_EXTENSION_ERROR with `error_location` so
+//     ParserException::SyntaxError can render `LINE 1: … ^` (caret).
+//   * plan_function (sv_plan_unreachable) — required sibling of
+//     parse_function; should never fire because sv_parse_stub never returns
+//     PARSE_SUCCESSFUL.
 //
 // All DuckDB C++ symbols are provided by compiling duckdb.cpp (the
 // amalgamation source) alongside this file. Symbol visibility on the cdylib
@@ -19,6 +27,7 @@
 
 #include "parser_extension_compat.hpp"
 #include <cstdint>
+#include <cstring>
 #include <memory>
 
 using namespace duckdb;
@@ -36,8 +45,8 @@ extern "C" {
     //                Buffer is NOT NUL-terminated — read exactly *sql_out_len bytes.
     //   1 = error:   message written to error_out (NUL-terminated, capped at
     //                error_out_len-1 bytes); *sql_out_ptr left untouched.
-    //                (Currently unused under FALLBACK_OVERRIDE — kept for
-    //                Phase 62 Plan 03 once parse_function returns.)
+    //                (Phase 62: unused — Err branches now return rc=2 and
+    //                let parse_function render caret via DISPLAY_EXTENSION_ERROR.)
     //   2 = not ours: defer to default parser. Also used for null ctx_ptr.
     //
     // Phase 62: ctx_ptr is an opaque Box<OverrideContext>* produced by
@@ -49,6 +58,25 @@ extern "C" {
         const char *query_ptr, size_t query_len,
         char **sql_out_ptr, size_t *sql_out_len,
         char *error_out, size_t error_out_len);
+
+    // Phase 62 Plan 03: parse_function callback. Called by DuckDB after the
+    // default parser fails on an unrecognised prefix. Re-runs validation
+    // and returns rc + error message + byte-offset position so
+    // ParserException::SyntaxError can render `LINE 1: ... ^`.
+    // Return codes:
+    //   0 = success/unreachable (defensive)
+    //   1 = ours-but-invalid (validation error or near-miss). error_buf
+    //       gets the message, position_out gets the byte offset (or
+    //       UINT32_MAX if no position is available).
+    //   2 = not ours; defer (DISPLAY_ORIGINAL_ERROR on the C++ side).
+    //   3 = valid DDL but parser_override didn't fire (e.g. override
+    //       setting reset by disable_peg_parser). error_buf gets an
+    //       actionable hint; position_out gets 0.
+    uint8_t sv_parse_function_rust(
+        const void *ctx_ptr,
+        const char *query_ptr, size_t query_len,
+        char *error_buf, size_t error_buf_len,
+        uint32_t *position_out);
 
     // Releases a buffer previously produced by sv_parser_override_rust.
     // Safe to call with a null pointer (no-op). ptr/len must be the exact
@@ -69,6 +97,27 @@ extern "C" {
     void *sv_make_override_context(duckdb_connection conn, bool is_file_backed);
     void  sv_drop_override_context(void *ctx_ptr);
 }
+
+// ---------------------------------------------------------------------------
+// SemanticViewParseData — Phase 62 Plan 03
+// ---------------------------------------------------------------------------
+// Concrete subclass of ParserExtensionParseData required by the
+// ParserExtensionParseResult(unique_ptr<...>) constructor. We never return
+// PARSE_SUCCESSFUL from sv_parse_stub (its sole purpose is rendering errors
+// via DISPLAY_EXTENSION_ERROR), so this type is structurally needed only
+// for layout / type-system reasons. If we ever do produce a parse_data,
+// sv_plan_unreachable below would fire.
+struct SemanticViewParseData : public ParserExtensionParseData {
+    string query;
+    explicit SemanticViewParseData(string q) : query(std::move(q)) {}
+
+    unique_ptr<ParserExtensionParseData> Copy() const override {
+        return make_uniq<SemanticViewParseData>(query);
+    }
+    string ToString() const override {
+        return query;
+    }
+};
 
 // RAII guard for heap-owned buffers returned by the Rust FFI. Ensures the
 // buffer is released even if a downstream call (Parser::ParseQuery) throws.
@@ -174,10 +223,12 @@ static ParserOverrideResult sv_parser_override(
     }
 
     if (rc == 1) {
-        // Validation error or near-miss suggestion — propagate the message
-        // via DISPLAY_EXTENSION_ERROR.
-        std::runtime_error err(error_buf);
-        return ParserOverrideResult(err);
+        // Phase 62 Plan 03: defer to default parser. parse_function
+        // (registered as sv_parse_stub) re-runs validation and returns
+        // DISPLAY_EXTENSION_ERROR with caret position. The Rust side
+        // currently always returns rc=2 on the error path, so this
+        // branch is defensive — kept to match the documented contract.
+        return ParserOverrideResult();
     }
 
     // rc == 0: native SQL produced. Re-parse via DuckDB's Parser. Use
@@ -192,6 +243,103 @@ static ParserOverrideResult sv_parser_override(
     } catch (std::exception &e) {
         return ParserOverrideResult(e);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parse-function hook: sv_parse_stub  (Phase 62 Plan 03)
+// ---------------------------------------------------------------------------
+// Called by DuckDB's Parser::ParseQuery after the default parser fails on
+// an unrecognised prefix. Sole purpose is rendering caret-aware errors via
+// ParserException::SyntaxError(query, msg, error_location).
+//
+// parser_override remains the success path — it rewrites recognized DDL
+// to native SQL, re-parses on the caller's connection, and returns
+// PARSE_SUCCESSFUL (transactional behaviour preserved). For error cases
+// parser_override now ALWAYS returns DISPLAY_ORIGINAL_ERROR (rc=2 from
+// Rust), letting the default parser fail and DuckDB call this stub.
+//
+// We re-run validation through sv_parse_function_rust which returns:
+//   0 — defensive internal error; render as DISPLAY_EXTENSION_ERROR
+//   1 — ours-but-invalid: error_buf populated; position is byte offset
+//   2 — not ours: DISPLAY_ORIGINAL_ERROR (let the default parser's error stand)
+//   3 — valid-but-override-disabled: actionable hint; position=0
+static ParserExtensionParseResult sv_parse_stub(
+    ParserExtensionInfo *info, const string &query) {
+    auto *sv_info = dynamic_cast<SemanticViewsParserInfo *>(info);
+    // ctx_ptr is unused by sv_parse_function_rust today (validation does
+    // not need the catalog), so a null sv_info / rust_state is OK — we
+    // still get correct rc/error/position. Pass through whatever we have.
+    const void *ctx = (sv_info != nullptr) ? sv_info->rust_state : nullptr;
+
+    char error_buf[1024];
+    std::memset(error_buf, 0, sizeof(error_buf));
+    uint32_t position = UINT32_MAX;
+
+    uint8_t rc = sv_parse_function_rust(
+        ctx,
+        query.c_str(), query.size(),
+        error_buf, sizeof(error_buf),
+        &position);
+
+    switch (rc) {
+        case 2:
+            // Not ours — DISPLAY_ORIGINAL_ERROR (default parser's error
+            // text + caret stands).
+            return ParserExtensionParseResult();
+
+        case 1:
+        case 3: {
+            // ours-but-invalid OR valid-but-override-disabled. Both want
+            // DISPLAY_EXTENSION_ERROR with caret position, just different
+            // message text. Construct the std::string explicitly first to
+            // dodge C++'s "most vexing parse" — `ParserExtensionParseResult
+            // result(string(error_buf));` would otherwise be parsed as a
+            // function declaration.
+            string msg(error_buf);
+            ParserExtensionParseResult result(std::move(msg));
+            if (position != UINT32_MAX) {
+                result.error_location = optional_idx(position);
+            }
+            return result;
+        }
+
+        case 0: {
+            // Defensive — sv_parse_function_rust currently never returns 0.
+            // Map to DISPLAY_EXTENSION_ERROR with an internal-error message
+            // rather than letting a silent default-parser error escape.
+            return ParserExtensionParseResult(string(
+                "semantic_views: internal error — sv_parse_function_rust "
+                "returned rc=0 (please report this bug)"));
+        }
+
+        default: {
+            // Defensive — unknown rc. Same handling as rc=0.
+            return ParserExtensionParseResult(string(
+                "semantic_views: internal error — unknown rc from "
+                "sv_parse_function_rust"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan-function hook: sv_plan_unreachable  (Phase 62 Plan 03)
+// ---------------------------------------------------------------------------
+// ParserExtension carries a sibling `plan_function` pointer alongside
+// `parse_function`. The plan function only fires when parse_function returns
+// PARSE_SUCCESSFUL, which sv_parse_stub never does — every code path goes
+// through DISPLAY_EXTENSION_ERROR or DISPLAY_ORIGINAL_ERROR. Provide a
+// hard-fail stub so a contract violation surfaces loudly rather than silently.
+//
+// Signature must match plan_function_t in parser_extension_compat.hpp:
+//   ParserExtensionPlanResult (*)(ParserExtensionInfo *, ClientContext &,
+//                                  unique_ptr<ParserExtensionParseData>);
+static ParserExtensionPlanResult sv_plan_unreachable(
+    ParserExtensionInfo * /*info*/,
+    ClientContext & /*context*/,
+    unique_ptr<ParserExtensionParseData> /*parse_data*/) {
+    throw InternalException(
+        "semantic_views: sv_plan_unreachable called — sv_parse_stub never "
+        "returns PARSE_SUCCESSFUL (please report this bug)");
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +371,17 @@ extern "C" {
 
             ParserExtension ext;
             ext.parser_override = sv_parser_override;
+            // Phase 62 Plan 03: parse_function is the error-reporting layer.
+            // parser_override owns the success path (rewrite + re-parse on the
+            // caller's connection — transactional). When parser_override
+            // defers (rc=2), the default parser fails on the unrecognised
+            // prefix and DuckDB calls sv_parse_stub, which re-runs validation
+            // and returns DISPLAY_EXTENSION_ERROR with `error_location` so
+            // ParserException::SyntaxError renders `LINE 1: … ^` (caret).
+            // sv_plan_unreachable is the required sibling — sv_parse_stub
+            // never returns PARSE_SUCCESSFUL so it should never fire.
+            ext.parse_function  = sv_parse_stub;
+            ext.plan_function   = sv_plan_unreachable;
             // duckdb::shared_ptr<T> doesn't have an upcast constructor, so we
             // build the std::shared_ptr<ParserExtensionInfo> first (allocates
             // the SemanticViewsParserInfo and immediately upcasts) then hand
@@ -235,8 +394,8 @@ extern "C" {
 
             // FALLBACK_OVERRIDE: hook runs before default parser; misses
             // fall through cleanly. Caret regression (TECH-DEBT 22) is
-            // resolved separately in Phase 62 Plan 03 by re-introducing
-            // parse_function as the error-reporting layer.
+            // resolved by parse_function above — sv_parse_stub renders
+            // `LINE 1: ... ^` for every CREATE/DROP/ALTER validation error.
             config.SetOption("allow_parser_override_extension", Value("FALLBACK"));
 
             return true;
