@@ -105,7 +105,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Active
 
-- 🛠 Caret-position rendering for validation errors: re-introduce `parse_function` as error-reporting layer (parser_override keeps the success/transactional path); collapse per-DB LRU by attaching `CatalogReader` to `SemanticViewsParserInfo`. Resolves TECH-DEBT items 20 + 22. — v0.8.0 (Phase 62, planned)
+- 🛠 Caret-position rendering for validation errors: re-introduce `parse_function` as error-reporting layer (parser_override keeps the success/transactional path); collapse per-DB LRU by attaching `CatalogReader` to `SemanticViewsParserInfo`. Resolves TECH-DEBT items 20 + 22. Pre-planning artefacts: `_notes/v0.8.0_phase_62_ultraplan.md` (architectural design) + `_notes/v0.8.0_phase_62_sqllogictest_spike.md` (test blast-radius). — v0.8.0 (Phase 62, planned)
 
 ### Out of Scope
 

@@ -203,4 +203,8 @@ Phases 58–61 are retroactive reconstructions: the work was originally complete
 
   Goal: Re-introduce `parse_function` purely as the error-reporting layer (parser_override keeps the success/transactional path). Defer error cases from parser_override → default parser fails → parse_function returns `DISPLAY_EXTENSION_ERROR` with `error_location`, restoring `LINE 1: … ^` caret rendering. Concurrently, attach the `CatalogReader` directly to `SemanticViewsParserInfo` (lifetime tied to `DBConfig`), eliminating the bounded LRU and its silent-eviction error class. Resolves TECH-DEBT items 20 + 22.
 
+  **Pre-planning artefacts** (read before `/gsd-plan-phase 62`):
+  - `_notes/v0.8.0_phase_62_ultraplan.md` — full architectural design (mermaid flow + per-file changes + reused-helpers + verification list). Contains 4 open research questions for the research subagent to resolve.
+  - `_notes/v0.8.0_phase_62_sqllogictest_spike.md` — test blast-radius scoping. Concludes SMALL: zero prefix-bound matchers in 96 `statement error` blocks; ~100 LOC of test changes total.
+
 </details>
