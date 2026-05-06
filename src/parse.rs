@@ -14,122 +14,60 @@ use crate::errors::ParseError;
 use crate::model::{Cardinality, Join, TableRef};
 
 // ---------------------------------------------------------------------------
-// Catalog handle for parser_override DDL rewrites (v0.8.0; v0.8.1 LRU).
+// Catalog handle for parser_override DDL rewrites (v0.8.0; Phase 62 direct-attach).
 // ---------------------------------------------------------------------------
 //
 // CREATE/DROP/ALTER need to know whether a view exists (and for SET/UNSET
 // COMMENT, what its current JSON definition is) before emitting native SQL
 // with friendly errors. The parser_override callback runs in a context
 // without access to the caller's catalog, so we stash a dedicated
-// `CatalogReader` (populated at extension load) keyed by the per-load
-// `db_token` the C++ shim assigns.
+// `CatalogReader` (populated at extension load) and hand it to the C++ shim
+// as an opaque `Box<OverrideContext>`. The shim attaches the boxed pointer
+// to its `SemanticViewsParserInfo` (the `parser_info` value DuckDB passes
+// back into the override callback for every parse). Lifetime is tied to the
+// `DBConfig`, so destruction happens on DB unload.
 //
-// v0.8.1: replaced the unbounded `Mutex<Option<HashMap>>` with a
-// 16-entry LRU. libduckdb-sys exposes no DB-destroy or extension-unload
-// callback in 1.10.502, so map entries with a now-dangling
-// `duckdb_connection` accumulate over the process lifetime in long-running
-// daemons that open many DBs. The LRU bounds memory at the cost of the
-// uncommon scenario "this process has loaded the extension into more than
-// 16 distinct DBs and we just dispatched against one of the older ones" —
-// in which case the rewriter surfaces a clear error rather than silently
-// deferring (see `rewrite_create` / `rewrite_drop_or_alter`).
+// Phase 62 (Wave 1) replaced the v0.8.1 16-entry `db_token` LRU with this
+// direct-attachment design — see TECH-DEBT item 20. The LRU's silent-
+// eviction error class is gone because there is no global map any more;
+// each `parser_info` carries its own `OverrideContext`.
 //
 // The reader sees committed state only — by design. Same-transaction
 // CREATE-then-ALTER is the documented v0.8.0 limitation.
+
+/// Catalog handle plus an `is_file_backed` flag that gates DDL-time
+/// type inference. `LIMIT 0` probes used for type inference depend on
+/// user tables having been committed; for in-memory DBs we follow the
+/// v0.7.1 behaviour and skip inference entirely.
+///
+/// Owned by the C++ shim as `Box<OverrideContext>` (one per
+/// `SemanticViewsParserInfo`, i.e. one per extension-LOAD-per-DB).
 #[cfg(feature = "extension")]
-mod parser_override_catalog {
-    use std::collections::{HashMap, VecDeque};
-    use std::sync::Mutex;
-
-    use crate::catalog::CatalogReader;
-
-    /// Bounded LRU capacity. Sized for the realistic upper bound of
-    /// distinct DBs a Python test suite or analytics daemon opens
-    /// concurrently. Increase if the use case warrants — eviction surfaces
-    /// as an explicit error from rewriters, never silent corruption.
-    const LRU_CAPACITY: usize = 16;
-
-    /// Catalog handle plus an `is_file_backed` flag that gates DDL-time
-    /// type inference. `LIMIT 0` probes used for type inference depend on
-    /// user tables having been committed; for in-memory DBs we follow the
-    /// v0.7.1 behaviour and skip inference entirely.
-    #[derive(Clone, Copy)]
-    pub struct OverrideContext {
-        pub catalog: CatalogReader,
-        pub is_file_backed: bool,
-    }
-
-    /// Bounded LRU: a HashMap for O(1) lookup paired with a VecDeque
-    /// tracking insertion order so eviction is O(1) on insert when full.
-    struct LruContexts {
-        map: HashMap<u64, OverrideContext>,
-        order: VecDeque<u64>,
-    }
-
-    impl LruContexts {
-        fn new() -> Self {
-            Self {
-                map: HashMap::new(),
-                order: VecDeque::new(),
-            }
-        }
-
-        fn set(&mut self, db_token: u64, ctx: OverrideContext) {
-            // Re-insert: drop the prior position so this token moves to MRU.
-            if self.map.contains_key(&db_token) {
-                if let Some(pos) = self.order.iter().position(|&t| t == db_token) {
-                    self.order.remove(pos);
-                }
-            } else if self.map.len() >= LRU_CAPACITY {
-                // Evict LRU.
-                if let Some(victim) = self.order.pop_front() {
-                    self.map.remove(&victim);
-                }
-            }
-            self.map.insert(db_token, ctx);
-            self.order.push_back(db_token);
-        }
-
-        fn get(&self, db_token: u64) -> Option<OverrideContext> {
-            self.map.get(&db_token).copied()
-        }
-    }
-
-    // `HashMap::new` is not const fn, so we lazy-init inside Option.
-    static CONTEXTS: Mutex<Option<LruContexts>> = Mutex::new(None);
-
-    /// Install the parser_override context for `db_token`. Called once per
-    /// `init_extension`. Re-installing the same token (extension re-load
-    /// against the same DB) overwrites and refreshes LRU position. When
-    /// the cache is full the least-recently-installed token is evicted —
-    /// subsequent rewrites against the evicted token raise a clear error
-    /// rather than silently deferring to the (now-deleted) legacy path.
-    pub fn set(db_token: u64, catalog: CatalogReader, is_file_backed: bool) {
-        let mut guard = CONTEXTS.lock().expect("parser_override_catalog poisoned");
-        guard.get_or_insert_with(LruContexts::new).set(
-            db_token,
-            OverrideContext {
-                catalog,
-                is_file_backed,
-            },
-        );
-    }
-
-    /// Fetch the parser_override context for `db_token`. Returns `None` if
-    /// the token was never installed or has been LRU-evicted.
-    pub fn get(db_token: u64) -> Option<OverrideContext> {
-        let guard = CONTEXTS.lock().expect("parser_override_catalog poisoned");
-        guard.as_ref().and_then(|m| m.get(db_token))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn capacity() -> usize {
-        LRU_CAPACITY
-    }
+pub struct OverrideContext {
+    pub catalog: crate::catalog::CatalogReader,
+    pub is_file_backed: bool,
 }
 
 #[cfg(feature = "extension")]
-pub use parser_override_catalog::set as set_catalog_for_parser_override;
+impl Drop for OverrideContext {
+    fn drop(&mut self) {
+        // Phase 62 Q2 — INTENTIONAL LEAK of self.catalog.conn (the duckdb_connection).
+        //
+        // ~SemanticViewsParserInfo (and therefore Drop for OverrideContext) fires
+        // during ~DBConfig, AFTER ~DatabaseInstance has already reset
+        // connection_manager (duckdb.cpp:276819). Calling duckdb_disconnect here
+        // would invoke ~Connection() → ConnectionManager::RemoveConnection() on
+        // the destroyed manager — use-after-free.
+        //
+        // The leak is bounded at ONE duckdb_connection per DB ever opened in this
+        // process (a few KB each). This matches v0.8.0 commit 680a967 which shipped
+        // successfully with the same leak. The Rust-side Box<OverrideContext>
+        // allocation itself IS reclaimed (this Drop runs and the Box dealloc fires).
+        //
+        // See: .planning/phases/62-caret-restoration-lru-removal/62-RESEARCH.md §Q2.
+        // Resolves TECH-DEBT item 20 (silent LRU eviction class) by removing the LRU.
+    }
+}
 
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.
 pub const PARSE_NOT_OURS: u8 = 0;
@@ -1744,10 +1682,17 @@ unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len:
 //
 // CREATE/DROP/ALTER need a `CatalogReader` for existence checks; CREATE also
 // runs catalog-side queries during enrichment (PK lookup, LIMIT 0 type
-// inference, fact typing). The reader is registered at extension load via
-// `set_catalog_for_parser_override`. Under `cargo test` (no extension feature)
-// those code paths are excluded entirely.
-pub fn rewrite_to_native_sql(db_token: u64, query: &str) -> Result<Option<String>, ParseError> {
+// inference, fact typing). Phase 62 attaches the `OverrideContext` directly
+// to the C++ `SemanticViewsParserInfo` via an opaque `Box`, so the rewriters
+// take `&OverrideContext` here instead of looking up by token. Under
+// `cargo test` (no extension feature) these code paths are excluded entirely
+// (this entry point itself is feature-gated; its sole caller —
+// `sv_parser_override_rust` — is `extension`-only).
+#[cfg(feature = "extension")]
+pub fn rewrite_to_native_sql(
+    ctx: &OverrideContext,
+    query: &str,
+) -> Result<Option<String>, ParseError> {
     let Some(tf_sql) = validate_and_rewrite(query)? else {
         return Ok(None);
     };
@@ -1757,7 +1702,7 @@ pub fn rewrite_to_native_sql(db_token: u64, query: &str) -> Result<Option<String
     // shared CREATE emission path so the INSERT runs on the caller's
     // connection.
     if let Some(payload) = tf_sql.strip_prefix("__SV_YAML_FILE__") {
-        return rewrite_yaml_file_create(db_token, payload);
+        return rewrite_yaml_file_create(ctx, payload);
     }
 
     // Read-side DDL (DESCRIBE / SHOW with WHERE/LIMIT clauses) emits SQL that
@@ -1779,7 +1724,7 @@ pub fn rewrite_to_native_sql(db_token: u64, query: &str) -> Result<Option<String
         "create_semantic_view_from_json"
         | "create_or_replace_semantic_view_from_json"
         | "create_semantic_view_if_not_exists_from_json" => {
-            rewrite_create(db_token, call.fn_name.as_str(), args)
+            rewrite_create(ctx, call.fn_name.as_str(), args)
         }
         // DROP / ALTER: existence check + JSON read-modify-write + native
         // DELETE/UPDATE. See `rewrite_drop_or_alter` (extension-only).
@@ -1791,7 +1736,7 @@ pub fn rewrite_to_native_sql(db_token: u64, query: &str) -> Result<Option<String
         | "alter_semantic_view_set_comment_if_exists"
         | "alter_semantic_view_unset_comment"
         | "alter_semantic_view_unset_comment_if_exists" => {
-            rewrite_drop_or_alter(db_token, call.fn_name.as_str(), args)
+            rewrite_drop_or_alter(ctx, call.fn_name.as_str(), args)
         }
         // Read-side table functions (describe_semantic_view, show_*, list_*,
         // get_ddl, read_yaml_from_semantic_view): pass through.
@@ -1799,39 +1744,14 @@ pub fn rewrite_to_native_sql(db_token: u64, query: &str) -> Result<Option<String
     }
 }
 
-/// DROP / ALTER native-SQL emission, gated on the extension feature because it
-/// needs the runtime `CatalogReader` for existence checks and JSON read-modify-
-/// write.
-#[cfg(not(feature = "extension"))]
-#[allow(clippy::unnecessary_wraps)] // matches the extension-feature signature
-fn rewrite_drop_or_alter(
-    _db_token: u64,
-    _fn_name: &str,
-    _args: &[String],
-) -> Result<Option<String>, ParseError> {
-    // Unreachable under cargo test (no extension feature, parser_override
-    // entry point not exported). Kept to satisfy the dispatch match arm.
-    Ok(None)
-}
-
+/// DROP / ALTER native-SQL emission. Phase 62 takes `&OverrideContext`
+/// directly — the LRU `db_token` indirection is gone (TECH-DEBT 20).
 #[cfg(feature = "extension")]
 fn rewrite_drop_or_alter(
-    db_token: u64,
+    ctx: &OverrideContext,
     fn_name: &str,
     args: &[String],
 ) -> Result<Option<String>, ParseError> {
-    // Missing context = LRU eviction (see B3 bounded LRU) or registration
-    // race. Surface as a clear error rather than letting DuckDB's default
-    // parser produce a generic syntax error on `CREATE SEMANTIC VIEW`.
-    let Some(ctx) = parser_override_catalog::get(db_token) else {
-        return Err(ParseError {
-            message: "semantic_views: catalog context for this database has been evicted \
-                      (process has opened more than 16 databases). Re-load the extension \
-                      or restart the process."
-                .to_string(),
-            position: None,
-        });
-    };
     let catalog = ctx.catalog;
 
     match (fn_name, args.len()) {
@@ -1869,39 +1789,16 @@ fn rewrite_drop_or_alter(
     }
 }
 
-/// CREATE-side native-SQL emission, gated on the extension feature: needs the
-/// runtime `CatalogReader` for existence checks AND for catalog-side queries
-/// performed by `enrich_definition_for_create` (PK lookup, type inference,
-/// fact typing).
-#[cfg(not(feature = "extension"))]
-#[allow(clippy::unnecessary_wraps)] // matches the extension-feature signature
-fn rewrite_create(
-    _db_token: u64,
-    _fn_name: &str,
-    _args: &[String],
-) -> Result<Option<String>, ParseError> {
-    // Unreachable under cargo test (no extension feature, parser_override
-    // entry point not exported). Kept to satisfy the dispatch match arm.
-    Ok(None)
-}
-
+/// CREATE-side native-SQL emission. Phase 62 takes `&OverrideContext`
+/// directly: needs the runtime `CatalogReader` for existence checks AND for
+/// catalog-side queries performed by `enrich_definition_for_create` (PK
+/// lookup, type inference, fact typing).
 #[cfg(feature = "extension")]
 fn rewrite_create(
-    db_token: u64,
+    ctx: &OverrideContext,
     fn_name: &str,
     args: &[String],
 ) -> Result<Option<String>, ParseError> {
-    // See `rewrite_drop_or_alter` for the eviction-error rationale.
-    let Some(ctx) = parser_override_catalog::get(db_token) else {
-        return Err(ParseError {
-            message: "semantic_views: catalog context for this database has been evicted \
-                      (process has opened more than 16 databases). Re-load the extension \
-                      or restart the process."
-                .to_string(),
-            position: None,
-        });
-    };
-
     if args.len() != 2 {
         return Err(ParseError {
             message: format!(
@@ -1932,7 +1829,7 @@ fn rewrite_create(
             position: None,
         })?;
 
-    emit_native_create_sql(&ctx, &name, def, or_replace, if_not_exists)
+    emit_native_create_sql(ctx, &name, def, or_replace, if_not_exists)
 }
 
 /// Shared CREATE-emission helper used by both the table-function-style CREATE
@@ -1950,7 +1847,7 @@ fn rewrite_create(
 /// when the view already exists; errors plain CREATE on an existing view.
 #[cfg(feature = "extension")]
 fn emit_native_create_sql(
-    ctx: &parser_override_catalog::OverrideContext,
+    ctx: &OverrideContext,
     name: &str,
     def: crate::model::SemanticViewDefinition,
     or_replace: bool,
@@ -2048,33 +1945,17 @@ fn emit_native_create_sql(
 /// participates in the caller's transaction.
 ///
 /// Returns a `ParseError` when no `parser_override` context is installed for
-/// this `db_token` (LRU eviction or registration race), matching
-/// `rewrite_create` / `rewrite_drop_or_alter`. The legacy C++ auto-commit
-/// shim path was retired in v0.8.1, so falling through to the default parser
-/// would produce a generic syntax error instead of an actionable message.
-#[cfg(not(feature = "extension"))]
-#[allow(clippy::unnecessary_wraps)]
-fn rewrite_yaml_file_create(_db_token: u64, _payload: &str) -> Result<Option<String>, ParseError> {
-    Ok(None)
-}
-
+/// this `OverrideContext`. Phase 62 takes `&OverrideContext` directly —
+/// the LRU `db_token` indirection is gone (TECH-DEBT 20).
 #[cfg(feature = "extension")]
-fn rewrite_yaml_file_create(db_token: u64, payload: &str) -> Result<Option<String>, ParseError> {
+fn rewrite_yaml_file_create(
+    ctx: &OverrideContext,
+    payload: &str,
+) -> Result<Option<String>, ParseError> {
     use std::ffi::CStr;
     use std::os::raw::c_void;
 
     use libduckdb_sys as ffi;
-
-    // See `rewrite_drop_or_alter` for the eviction-error rationale.
-    let Some(ctx) = parser_override_catalog::get(db_token) else {
-        return Err(ParseError {
-            message: "semantic_views: catalog context for this database has been evicted \
-                      (process has opened more than 16 databases). Re-load the extension \
-                      or restart the process."
-                .to_string(),
-            position: None,
-        });
-    };
 
     // Sentinel format: `<path>\x01<kind>\x01<name>\x01<comment>` (the
     // `__SV_YAML_FILE__` prefix has already been stripped by the caller).
@@ -2155,7 +2036,7 @@ fn rewrite_yaml_file_create(db_token: u64, payload: &str) -> Result<Option<Strin
     // already specifies PKs.
     infer_cardinality(&def.tables, &mut def.joins)?;
 
-    emit_native_create_sql(&ctx, name, def, or_replace, if_not_exists)
+    emit_native_create_sql(ctx, name, def, or_replace, if_not_exists)
 }
 
 // SQL-string escape helpers (round-trip pair).
@@ -2397,6 +2278,7 @@ fn rewrite_alter_comment(
 ///
 /// `args` retains the original SQL escaping (single quotes doubled), so they
 /// can be substituted back into a new single-quoted SQL string verbatim.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 struct TableFunctionCall {
     fn_name: String,
     args: Vec<String>,
@@ -2413,6 +2295,7 @@ struct TableFunctionCall {
 /// v0.8.1 tightened (B4): rejects malformed shapes that earlier silently
 /// swallowed — `foo(,)`, `foo('a',)` (trailing comma), `foo('a' 'b')`
 /// (missing comma between args).
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 fn parse_table_function_call(sql: &str) -> Option<TableFunctionCall> {
     const PREFIX: &str = "SELECT * FROM ";
     let rest = sql.strip_prefix(PREFIX)?;
@@ -2513,9 +2396,65 @@ fn parse_table_function_call(sql: &str) -> Option<TableFunctionCall> {
 }
 
 /// Strip the outer pair of single quotes, leaving doubled-quote escaping intact.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 fn strip_outer_quotes(s: &str) -> Option<&str> {
     let inner = s.strip_prefix('\'')?.strip_suffix('\'')?;
     Some(inner)
+}
+
+/// FFI entry point: construct a heap-boxed `OverrideContext` and return its
+/// raw pointer to the C++ shim. Phase 62 replaced the per-load `db_token`
+/// LRU with this direct ownership: the C++ shim stashes the returned
+/// pointer inside its `SemanticViewsParserInfo` and hands it back to
+/// `sv_parser_override_rust` on every parse.
+///
+/// # Safety
+///
+/// - `conn` must be a valid (or null) `duckdb_connection`. The pointer is
+///   stored verbatim inside the boxed `CatalogReader`; it is intentionally
+///   NOT closed by the resulting `Drop` (see `Drop for OverrideContext`).
+/// - The returned pointer must be passed to `sv_drop_override_context`
+///   exactly once when the C++ shim's `SemanticViewsParserInfo` is
+///   destroyed. Never call `sv_drop_override_context` more than once on
+///   the same pointer.
+#[cfg(feature = "extension")]
+#[no_mangle]
+pub unsafe extern "C" fn sv_make_override_context(
+    conn: libduckdb_sys::duckdb_connection,
+    is_file_backed: bool,
+) -> *mut std::ffi::c_void {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = Box::new(OverrideContext {
+            catalog: crate::catalog::CatalogReader::new(conn),
+            is_file_backed,
+        });
+        Box::into_raw(ctx) as *mut std::ffi::c_void
+    }));
+    result.unwrap_or(std::ptr::null_mut())
+}
+
+/// FFI entry point: re-box and drop the `OverrideContext` allocated by
+/// `sv_make_override_context`. The Rust-side `Box` allocation is freed.
+///
+/// # Safety
+///
+/// - `ctx_ptr` must be a value previously returned by
+///   `sv_make_override_context`, or null.
+/// - Must not be called more than once on the same pointer (use-after-free).
+/// - The `Drop for OverrideContext` impl deliberately does NOT call
+///   `duckdb_disconnect` on the inner connection — see Phase 62 RESEARCH §Q2
+///   (destruction-order showstopper). The connection is intentionally leaked.
+#[cfg(feature = "extension")]
+#[no_mangle]
+pub unsafe extern "C" fn sv_drop_override_context(ctx_ptr: *mut std::ffi::c_void) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if ctx_ptr.is_null() {
+            return;
+        }
+        // Re-box and drop. Drop impl above documents the intentional leak
+        // of the inner `duckdb_connection`.
+        let _ = Box::from_raw(ctx_ptr as *mut OverrideContext);
+    }));
 }
 
 /// FFI entry point for parser_override. The sole DDL entry point for the
@@ -2524,19 +2463,27 @@ fn strip_outer_quotes(s: &str) -> Option<&str> {
 /// for re-parsing through DuckDB's own parser and execution on the caller's
 /// connection.
 ///
+/// Phase 62: takes an opaque `ctx_ptr` (a `Box<OverrideContext>*` produced
+/// by `sv_make_override_context`) instead of the legacy `db_token` LRU
+/// lookup — the override context now lives directly inside
+/// `SemanticViewsParserInfo` (see `cpp/src/shim.cpp`).
+///
 /// Returns:
 ///   0 = success: heap-owned native SQL pointer + length written to
 ///       `*sql_out_ptr` / `*sql_out_len`. Caller takes ownership and must
 ///       release via `sv_free_buffer`. The buffer is **not** NUL-terminated;
 ///       read exactly `*sql_out_len` bytes.
 ///   1 = validation error / near-miss suggestion: error message written to
-///       `error_out`.
+///       `error_out`. (Currently unused under FALLBACK_OVERRIDE; kept for
+///       Phase 62 Plan 03 once `parse_function` returns to caret rendering.)
 ///   2 = not ours: defer to default parser. Used both for genuinely
-///       non-semantic SQL and for the early-return on null/empty input or
-///       invalid UTF-8.
+///       non-semantic SQL, for null `ctx_ptr`, and for the early-return on
+///       null/empty input or invalid UTF-8.
 ///
 /// # Safety
 ///
+/// - `ctx_ptr` must be a non-null pointer previously returned by
+///   `sv_make_override_context`, or null. Null returns rc=2.
 /// - `query_ptr` must point to bytes of length `query_len` (validated as
 ///   UTF-8 here; invalid UTF-8 returns 2 rather than triggering UB).
 /// - `sql_out_ptr` must point to a writable `*mut u8` slot, or be null.
@@ -2544,8 +2491,8 @@ fn strip_outer_quotes(s: &str) -> Option<&str> {
 /// - `error_out` must point to a writable buffer of `error_out_len` bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
-pub extern "C" fn sv_parser_override_rust(
-    db_token: u64,
+pub unsafe extern "C" fn sv_parser_override_rust(
+    ctx_ptr: *const std::ffi::c_void,
     query_ptr: *const u8,
     query_len: usize,
     sql_out_ptr: *mut *mut u8,
@@ -2554,20 +2501,25 @@ pub extern "C" fn sv_parser_override_rust(
     error_out_len: usize,
 ) -> u8 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if ctx_ptr.is_null() {
+            return 2_u8; // no context — defer
+        }
         if query_ptr.is_null() || query_len == 0 {
             return 2_u8; // not ours
         }
         // Reject invalid UTF-8 cleanly rather than relying on
         // from_utf8_unchecked (B2 hardening). DuckDB query strings are
         // UTF-8 by spec but a malformed input must not trigger UB.
-        let bytes = unsafe { std::slice::from_raw_parts(query_ptr, query_len) };
+        let bytes = std::slice::from_raw_parts(query_ptr, query_len);
         let Ok(query) = std::str::from_utf8(bytes) else {
             return 2; // not ours — defer
         };
 
-        match rewrite_to_native_sql(db_token, query) {
+        let ctx = &*(ctx_ptr as *const OverrideContext);
+
+        match rewrite_to_native_sql(ctx, query) {
             Ok(Some(sql)) => {
-                unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
+                publish_owned_sql(sql, sql_out_ptr, sql_out_len);
                 0 // success — native SQL handed to caller
             }
             Ok(None) => {
@@ -2577,9 +2529,11 @@ pub extern "C" fn sv_parser_override_rust(
                 // DuckDB's default parser. Surfaced via SELECT error('...')
                 // because FALLBACK_OVERRIDE silently drops rc=1
                 // (DISPLAY_EXTENSION_ERROR) — see sql_throwing docstring.
+                // Phase 62 Plan 03 swaps this for parse_function-based
+                // caret rendering.
                 if let Some(err) = detect_near_miss(query) {
                     let sql = sql_throwing(&err.message);
-                    unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
+                    publish_owned_sql(sql, sql_out_ptr, sql_out_len);
                     return 0;
                 }
                 2 // not ours, defer to default parser
@@ -2588,7 +2542,7 @@ pub extern "C" fn sv_parser_override_rust(
                 // Same FALLBACK reason as the near-miss branch — see
                 // sql_throwing for the rationale and TECH-DEBT item 22.
                 let sql = sql_throwing(&err.message);
-                unsafe { publish_owned_sql(sql, sql_out_ptr, sql_out_len) };
+                publish_owned_sql(sql, sql_out_ptr, sql_out_len);
                 let _ = (error_out, error_out_len); // unused under FALLBACK
                 0
             }
@@ -2753,36 +2707,64 @@ mod tests {
     }
 
     // ===================================================================
-    // B3: bounded LRU for parser_override_catalog. Capacity 16; eviction
-    // happens on insert when full; LRU position refreshes on re-insert
-    // of an existing token.
+    // Phase 62: OverrideContext direct-attach (replaces the v0.8.1 LRU).
+    // The Drop impl MUST NOT call duckdb_disconnect (RESEARCH §Q2 —
+    // destruction-order showstopper). The Box<OverrideContext> Rust
+    // allocation IS reclaimed; the inner duckdb_connection leaks.
     // ===================================================================
+
+    /// Sentinel marker for the destructor leak test. Stored at a known
+    /// memory location so the test can verify the destructor did NOT
+    /// touch `self.catalog.conn` (which would happen if a stray
+    /// `duckdb_disconnect` call slipped back in).
+    #[cfg(feature = "extension")]
+    #[test]
+    fn override_context_drop_does_not_disconnect() {
+        // Allocate a u64 sentinel on the heap and hand its pointer to the
+        // CatalogReader as if it were a duckdb_connection. If Drop calls
+        // duckdb_disconnect on that pointer, the test process would
+        // segfault (libduckdb would deref it as a Connection*). We only
+        // assert that Drop returns cleanly — survival is the contract.
+        let sentinel: Box<u64> = Box::new(0xDEAD_BEEF_CAFE_BABE);
+        let raw = Box::into_raw(sentinel);
+        let ctx = OverrideContext {
+            catalog: crate::catalog::CatalogReader::new(raw as libduckdb_sys::duckdb_connection),
+            is_file_backed: false,
+        };
+        // Drop runs here at end of scope. If duckdb_disconnect were
+        // called, libduckdb would interpret `raw` as a Connection*, dispatch
+        // through ConnectionManager and likely crash. Survival of this
+        // function == Drop body did not call duckdb_disconnect.
+        drop(ctx);
+        // Reclaim the sentinel ourselves (Drop intentionally leaked it).
+        unsafe {
+            let _ = Box::from_raw(raw);
+        }
+    }
 
     #[cfg(feature = "extension")]
     #[test]
-    fn parser_override_catalog_lru_evicts_oldest() {
-        // Use a contiguous block of high-value tokens to avoid colliding
-        // with any tokens issued by other tests sharing the same global.
-        const BASE: u64 = 0xFFFF_0000;
-        // Create a dummy CatalogReader pointing at null — never dereferenced
-        // here; we only exercise the map mechanics.
-        let null_reader = crate::catalog::CatalogReader::new(
-            std::ptr::null_mut() as libduckdb_sys::duckdb_connection
-        );
+    fn sv_make_and_drop_override_context_round_trip() {
+        // Construct via FFI ctor with a null connection (intentionally —
+        // never dereferenced, just round-tripped through the Box).
+        let ptr = unsafe {
+            sv_make_override_context(
+                std::ptr::null_mut() as libduckdb_sys::duckdb_connection,
+                false,
+            )
+        };
+        assert!(!ptr.is_null(), "ctor must return non-null for a valid Box");
+        // Destruct via FFI dtor — must not panic, must not call
+        // duckdb_disconnect (sentinel-test above pins that contract).
+        unsafe { sv_drop_override_context(ptr) };
+    }
 
-        let cap = parser_override_catalog::capacity();
-        // Insert cap+1 tokens; the first should be evicted.
-        for i in 0..(cap as u64 + 1) {
-            parser_override_catalog::set(BASE + i, null_reader, false);
-        }
-        assert!(
-            parser_override_catalog::get(BASE).is_none(),
-            "oldest token should be evicted"
-        );
-        assert!(
-            parser_override_catalog::get(BASE + cap as u64).is_some(),
-            "newest token should be present"
-        );
+    #[cfg(feature = "extension")]
+    #[test]
+    fn sv_drop_override_context_handles_null() {
+        // Defensive: null-pointer drop must be a no-op (matches the
+        // C++ shim's `if (rust_state) { ... }` guard pattern).
+        unsafe { sv_drop_override_context(std::ptr::null_mut()) };
     }
 
     // ===================================================================
