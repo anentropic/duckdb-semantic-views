@@ -11,19 +11,16 @@ via sqllogictest, but sqllogictest `statement error` only matches message
 substrings. This test closes the gap by inspecting the Python exception text
 to verify the right validation message reaches the caller for malformed DDL.
 
-v0.8.1 change: validation errors are surfaced via a synthesised
-`SELECT error('...')` (FALLBACK_OVERRIDE drops `DISPLAY_EXTENSION_ERROR`),
-so they arrive as runtime exceptions rather than `ParserException` with
-DuckDB's `LINE 1: ... ^` caret rendering. The position info is included in
-the message text via the validator's existing "at byte N" suffix, but the
-assertions here just check for the right *message content* — the caret
-column-counting tests are documented as a known regression in TECH-DEBT
-item 22 and tracked separately.
+Phase 62 (v0.8.0 — 2026-05-06): caret rendering restored. Validation
+errors now arrive as `Parser Error: ... LINE 1: ... ^` via parse_function
+(parser_override defers all errors with rc=2; the default parser fails on
+the unrecognised DDL prefix; DuckDB calls our parse_function which
+returns DISPLAY_EXTENSION_ERROR with byte-offset error_location;
+ParserException::SyntaxError formats the caret).
 
-Phase 62 Wave 0: assertion bodies wired but skipped pending Plan 04. Once
-Plans 02-03 restore caret rendering via parse_function on FALLBACK_OVERRIDE
-deferral, Plan 04 flips the skips to `assert caret_col is not None` and
-adds an exact-column expectation for each test.
+Tests assert both message text AND that `extract_caret_position(...)`
+returns a non-None integer at the expected column. Resolves TECH-DEBT
+item 22.
 
 Three representative error types are covered:
   1. Structural error -- missing '(' after clause keyword (ERR-02)
@@ -126,7 +123,7 @@ def run_test(name, test_fn):
 # ---------------------------------------------------------------------------
 
 def test_caret_missing_paren():
-    """Validation error for missing '(' reaches the caller."""
+    """B1: Validation error for missing '(' reaches the caller with caret."""
     conn = make_connection()
     try:
         query = "CREATE SEMANTIC VIEW myview AS TABLES x"
@@ -139,15 +136,23 @@ def test_caret_missing_paren():
                 f"Expected error about missing '(' but got: {error_text}"
             )
             print(f"  Error: {error_text.splitlines()[0]} -- correct")
-            # Phase 62 Wave 0: caret column extraction wired; staged-skipped
-            # until Plan 04 tightens to `assert caret_col is not None`.
+            # Phase 62: caret rendering restored. Assert the helper finds a
+            # caret column and that it points at-or-near the offending token
+            # ("x" — the lone alias after TABLES).
             caret_col = extract_caret_position(error_text)
-            if caret_col is None:
-                print("  SKIP (caret): Phase 62 Plan 04 will assert caret_col is not None")
-            else:
-                # Plan 04 will replace this branch with:
-                #   assert caret_col == EXPECTED_COLUMN_FOR_THIS_TEST
-                print(f"  caret_col = {caret_col} (Plan 04 will pin exact value)")
+            assert caret_col is not None, (
+                f"Phase 62 contract: caret column must be reported. error={error_text!r}"
+            )
+            assert caret_col >= 0, f"caret_col must be non-negative, got {caret_col}"
+            # Validator emits position pointing to the failing character (the 'x'
+            # alias where '(' was expected). query.index('x', ...) gives us the
+            # offset; allow ±2 wiggle for whitespace handling between TABLES and x.
+            expected = query.index("x", query.index("TABLES"))
+            assert abs(caret_col - expected) <= 2, (
+                f"caret_col {caret_col} should be near offset of 'x' "
+                f"(expected ~{expected}); error={error_text!r}"
+            )
+            print(f"  caret_col = {caret_col} (expected near {expected})")
     finally:
         conn.close()
 
@@ -157,7 +162,7 @@ def test_caret_missing_paren():
 # ---------------------------------------------------------------------------
 
 def test_caret_clause_typo():
-    """Validation error for misspelled clause keyword names the right suggestion."""
+    """B2: Misspelled clause keyword 'TBLES' surfaces with caret on TBLES."""
     conn = make_connection()
     try:
         query = "CREATE SEMANTIC VIEW x AS TBLES (t AS tbl PRIMARY KEY (id)) DIMENSIONS (t.x AS x)"
@@ -170,12 +175,17 @@ def test_caret_clause_typo():
                 f"Expected suggestion for 'TABLES' but got: {error_text}"
             )
             print(f"  Error: {error_text.splitlines()[0]} -- correct")
-            # Phase 62 Wave 0: caret column extraction wired; staged-skipped.
             caret_col = extract_caret_position(error_text)
-            if caret_col is None:
-                print("  SKIP (caret): Phase 62 Plan 04 will assert caret_col is not None")
-            else:
-                print(f"  caret_col = {caret_col} (Plan 04 will pin exact value)")
+            assert caret_col is not None, (
+                f"Phase 62 contract: caret column must be reported. error={error_text!r}"
+            )
+            # Caret should land on the 'T' of TBLES.
+            expected = query.index("TBLES")
+            assert caret_col == expected, (
+                f"caret_col {caret_col} should equal offset of 'TBLES' "
+                f"({expected}); error={error_text!r}"
+            )
+            print(f"  caret_col = {caret_col} (matches offset of 'TBLES')")
     finally:
         conn.close()
 
@@ -185,7 +195,7 @@ def test_caret_clause_typo():
 # ---------------------------------------------------------------------------
 
 def test_caret_near_miss():
-    """Near-miss prefix typo surfaces the 'Did you mean ...' suggestion."""
+    """B3: Near-miss prefix 'CRETAE' surfaces 'Did you mean' with caret on column 0."""
     conn = make_connection()
     try:
         query = "CRETAE SEMANTIC VIEW x (tables := [])"
@@ -199,12 +209,17 @@ def test_caret_near_miss():
                 f"but got: {error_text}"
             )
             print(f"  Error: {error_text.splitlines()[0]} -- correct")
-            # Phase 62 Wave 0: caret column extraction wired; staged-skipped.
             caret_col = extract_caret_position(error_text)
-            if caret_col is None:
-                print("  SKIP (caret): Phase 62 Plan 04 will assert caret_col is not None")
-            else:
-                print(f"  caret_col = {caret_col} (Plan 04 will pin exact value)")
+            assert caret_col is not None, (
+                f"Phase 62 contract: caret column must be reported. error={error_text!r}"
+            )
+            # detect_near_miss returns position=Some(trim_offset) where trim_offset
+            # is leading whitespace/comment skip. With no leading whitespace this is 0.
+            assert caret_col == 0, (
+                f"caret_col should be 0 (start of CRETAE), got {caret_col}; "
+                f"error={error_text!r}"
+            )
+            print(f"  caret_col = {caret_col} (start of input)")
     finally:
         conn.close()
 
@@ -217,87 +232,156 @@ def test_caret_near_miss():
 # they print SKIP and exit cleanly so the suite stays green.
 
 def test_caret_multiline_typo():
-    """B4: caret column for multi-line CREATE with malformed clause on line 3."""
+    """B4: caret column for multi-line CREATE — DuckDB renders LINE N (not LINE 1).
+
+    Setup needs `orders` table to exist for validate to reach line 3; for
+    THIS query the validator hits 'TABLES (t)' missing 'AS' on line 2 first.
+    Either way, an exception is raised and caret rendering must happen.
+    """
     conn = make_connection()
     try:
+        # Use a query whose error is unambiguously multi-line. Validator reports
+        # the first error encountered — for our walker that's the missing 'AS'
+        # on line 2. DuckDB then renders "LINE 2: TABLES (t)" with caret.
         query = (
             "CREATE SEMANTIC VIEW v AS\n"
-            "TABLES (t AS orders PRIMARY KEY (id))\n"
-            "DIMENSIONS (TBLES x)"
+            "TABLES (t)\n"
+            "DIMENSIONS (x)"
         )
         try:
             conn.execute(query)
-            print("  SKIP (Plan 04): exception not raised yet under Wave 0 expectations")
-            return
+            assert False, "Expected exception"
         except Exception as e:
             error_text = str(e)
             print(f"  Error captured: {error_text.splitlines()[0]}")
+            # DuckDB MUST render a "LINE N:" prefix even for multi-line input.
+            assert "LINE" in error_text, (
+                f"multi-line error should contain 'LINE N:' marker. "
+                f"error={error_text!r}"
+            )
             caret_col = extract_caret_position(error_text)
-            if caret_col is None:
-                print("  SKIP (caret): Phase 62 Plan 04 will assert multiline caret_col")
-            else:
-                print(f"  caret_col = {caret_col} (Plan 04 will pin LINE N alignment)")
+            assert caret_col is not None, (
+                f"Phase 62 contract: caret column must be reported even on "
+                f"multi-line input. error={error_text!r}"
+            )
+            # We don't pin the exact column here — it's relative to the offending
+            # line, not absolute. Just assert non-negative and the marker exists.
+            assert caret_col >= 0, f"caret_col must be non-negative, got {caret_col}"
+            print(f"  caret_col = {caret_col} (relative to LINE N)")
     finally:
         conn.close()
 
 
 def test_caret_unicode_prefix():
-    """B5: caret column with multibyte UTF-8 identifier before the typo."""
+    """B5: caret column with multibyte UTF-8 identifier before the typo.
+
+    Contract pinned by Phase 62: ParseError::position is a BYTE offset
+    into the user input. DuckDB's ParserException::SyntaxError uses that
+    byte offset to slice the input into lines, then renders the offending
+    line and prints whitespace + ^ aligned to the byte position within
+    the line. The Python helper extract_caret_position uses str.index('^')
+    which returns CHARACTER offset, so when the prefix contains multibyte
+    chars the rendered caret_col may differ from a naive char count.
+
+    This test asserts the caret is reported and lands at-or-after the
+    character offset of TBLES (a byte-position translates to a char
+    position equal-or-greater because no prefix character is wider than
+    its byte representation). Wide tolerance because exact alignment
+    depends on DuckDB's internal rendering of the line.
+    """
     conn = make_connection()
     try:
-        # vüé is multibyte (ü = 2 bytes, é = 2 bytes in UTF-8). The typo TBLES
-        # follows; whatever DuckDB does today (byte vs char column counting)
-        # is the contract Plan 04 will pin.
-        query = "CREATE SEMANTIC VIEW vüé AS TBLES (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))"
+        # vüé is multibyte: v=1 byte, ü=2 bytes, é=2 bytes (UTF-8).
+        query = "CREATE SEMANTIC VIEW vüé AS TBLES (t)"
         try:
             conn.execute(query)
-            print("  SKIP (Plan 04): exception not raised yet under Wave 0 expectations")
-            return
+            assert False, "Expected exception"
         except Exception as e:
             error_text = str(e)
             print(f"  Error captured: {error_text.splitlines()[0]}")
+            assert "TABLES" in error_text, (
+                f"validator should suggest TABLES for TBLES; error={error_text!r}"
+            )
             caret_col = extract_caret_position(error_text)
-            if caret_col is None:
-                print("  SKIP (caret): Phase 62 Plan 04 will assert unicode caret_col")
-            else:
-                print(f"  caret_col = {caret_col} (Plan 04 will pin byte vs char counting)")
+            assert caret_col is not None, (
+                f"Phase 62 contract: caret column must be reported even with "
+                f"multibyte UTF-8 prefix. error={error_text!r}"
+            )
+            assert caret_col >= 0, f"caret_col must be non-negative, got {caret_col}"
+            # The character-offset of TBLES in the Python str view of the query.
+            tbles_char_offset = query.index("TBLES")
+            # The byte-offset of TBLES (validator's internal position).
+            tbles_byte_offset = query.encode("utf-8").index(b"TBLES")
+            # CONTRACT pinned by Phase 62: although the validator's position is
+            # a BYTE offset, DuckDB's ParserException::SyntaxError renders the
+            # offending line in characters and aligns the caret under the
+            # CHARACTER at that byte position. So Python str.index('^') gives
+            # the CHARACTER offset of TBLES, not the byte offset. This is the
+            # observed contract on DuckDB 1.10.502 with multibyte UTF-8 prefixes.
+            assert caret_col == tbles_char_offset, (
+                f"caret_col {caret_col} should equal CHARACTER offset of "
+                f"TBLES ({tbles_char_offset}); byte offset is "
+                f"{tbles_byte_offset}; error={error_text!r}"
+            )
+            print(
+                f"  caret_col = {caret_col} "
+                f"(char offset {tbles_char_offset}, byte offset {tbles_byte_offset})"
+            )
     finally:
         conn.close()
 
 
 def test_caret_alter_typo():
-    """B6: caret column for ALTER with bad sub-operation keyword."""
+    """B6: caret column for ALTER with bad sub-operation keyword (RENAM)."""
     conn = make_connection()
     try:
-        # Set up a view to alter, so ALTER reaches the validator (otherwise the
-        # error path is "view not found"). Plan 04 may simplify if validate_alter
-        # surfaces the typo before name resolution.
-        try:
-            conn.execute(
-                "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2))"
-            )
-            conn.execute(
-                "CREATE SEMANTIC VIEW v AS "
-                "TABLES (t AS orders PRIMARY KEY (id)) "
-                "DIMENSIONS (t.id AS id) "
-                "METRICS (t.total AS SUM(t.amount))"
-            )
-        except Exception:
-            pass  # ignore setup failures — Plan 04 may rewrite this scaffold
+        # Set up a view to ALTER. validate_alter inspects the sub-operation
+        # text BEFORE name resolution, so the RENAM typo surfaces regardless
+        # of whether the view exists. We still create one for completeness.
+        conn.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2))"
+        )
+        conn.execute(
+            "CREATE SEMANTIC VIEW v AS "
+            "TABLES (t AS orders PRIMARY KEY (id)) "
+            "DIMENSIONS (t.id AS id) "
+            "METRICS (t.total AS SUM(t.amount))"
+        )
 
         query = "ALTER SEMANTIC VIEW v RENAM TO w;"
         try:
             conn.execute(query)
-            print("  SKIP (Plan 04): exception not raised yet under Wave 0 expectations")
-            return
+            assert False, "Expected exception"
         except Exception as e:
             error_text = str(e)
             print(f"  Error captured: {error_text.splitlines()[0]}")
+            assert "ALTER operation" in error_text or "RENAME" in error_text, (
+                f"validator should mention supported ALTER operations; "
+                f"error={error_text!r}"
+            )
             caret_col = extract_caret_position(error_text)
-            if caret_col is None:
-                print("  SKIP (caret): Phase 62 Plan 04 will assert ALTER caret_col on RENAM")
-            else:
-                print(f"  caret_col = {caret_col} (Plan 04 will pin RENAM column)")
+            assert caret_col is not None, (
+                f"Phase 62 contract: caret column must be reported. "
+                f"error={error_text!r}"
+            )
+            # validate_alter returns position somewhere between the end of
+            # the prefix "ALTER SEMANTIC VIEW" and the start of "RENAM".
+            # Empirically the caret lands on the space-or-letter boundary
+            # before RENAM (column 20: the 'v' itself, since that's where
+            # name_end measurement places the offset for this query). Allow
+            # a generous window covering the view-name region through to
+            # the start of RENAM.
+            view_kw_end = query.index("VIEW") + len("VIEW")  # 19
+            renam_start = query.index("RENAM")               # 22
+            assert view_kw_end <= caret_col <= renam_start, (
+                f"caret_col {caret_col} should be between {view_kw_end} "
+                f"(end of 'VIEW') and {renam_start} (start of 'RENAM'); "
+                f"error={error_text!r}"
+            )
+            print(
+                f"  caret_col = {caret_col} "
+                f"(within view-name region: {view_kw_end}..{renam_start})"
+            )
     finally:
         conn.close()
 
@@ -309,16 +393,30 @@ def test_caret_drop_missing_name():
         query = "DROP SEMANTIC VIEW;"
         try:
             conn.execute(query)
-            print("  SKIP (Plan 04): exception not raised yet under Wave 0 expectations")
-            return
+            assert False, "Expected exception"
         except Exception as e:
             error_text = str(e)
             print(f"  Error captured: {error_text.splitlines()[0]}")
+            assert "Missing view name" in error_text, (
+                f"validator should report 'Missing view name'; error={error_text!r}"
+            )
             caret_col = extract_caret_position(error_text)
-            if caret_col is None:
-                print("  SKIP (caret): Phase 62 Plan 04 will assert DROP caret_col after prefix")
-            else:
-                print(f"  caret_col = {caret_col} (Plan 04 will pin trailing-token column)")
+            assert caret_col is not None, (
+                f"Phase 62 contract: caret column must be reported. "
+                f"error={error_text!r}"
+            )
+            # validate_and_rewrite returns position trim_offset+plen for the
+            # DROP-missing-name case. plen covers "DROP SEMANTIC VIEW" (18)
+            # plus the trailing space (the prefix matcher consumes whitespace
+            # to the next token boundary). The caret should land at-or-after
+            # the end of "DROP SEMANTIC VIEW".
+            prefix_end = len("DROP SEMANTIC VIEW")
+            assert caret_col >= prefix_end, (
+                f"caret_col {caret_col} should be at-or-after position "
+                f"{prefix_end} (end of 'DROP SEMANTIC VIEW'); "
+                f"error={error_text!r}"
+            )
+            print(f"  caret_col = {caret_col} (>= end of 'DROP SEMANTIC VIEW' = {prefix_end})")
     finally:
         conn.close()
 

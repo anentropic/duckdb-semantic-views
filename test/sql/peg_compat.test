@@ -129,6 +129,21 @@ SELECT * FROM semantic_view('peg_bison_test', dimensions := ['dim_id'], metrics 
 statement ok
 CALL disable_peg_parser();
 
+# B8 (Phase 62) — disable_peg_parser silently resets
+# allow_parser_override_extension to DEFAULT. Without re-arming FALLBACK,
+# parser_override does NOT fire on this connection; the default parser
+# fails on the unrecognised CREATE SEMANTIC VIEW prefix; DuckDB calls
+# our parse_function which sees a well-formed semantic-view DDL and
+# emits the actionable rc=3 hint with caret.
+statement error
+CREATE SEMANTIC VIEW peg_b8_unprivileged AS
+TABLES (t8 AS peg_test_data PRIMARY KEY (id))
+DIMENSIONS (t8.dim_id AS t8.id)
+METRICS (t8.total_val AS SUM(t8.val))
+----
+SET allow_parser_override_extension='FALLBACK'
+
+# Recovery: re-arm FALLBACK and CREATE succeeds.
 statement ok
 SET allow_parser_override_extension='FALLBACK';
 
