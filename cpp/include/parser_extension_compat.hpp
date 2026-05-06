@@ -32,6 +32,7 @@
 
 #include "duckdb.hpp"
 #include <cstddef>
+#include <type_traits>
 
 namespace duckdb {
 
@@ -83,6 +84,21 @@ struct ParserExtensionParseResult {
 	//! The error location (if unsuccessful)
 	optional_idx error_location;
 };
+
+// Phase 62 layout guard — sv_parse_stub writes result.error_location after
+// construction (the constructors don't take it as a parameter). If a future
+// DuckDB bump moves error_location to private or changes its type from
+// optional_idx, this assertion fires before silent breakage. See
+// `.planning/phases/62-caret-restoration-lru-removal/62-RESEARCH.md` Risk F.
+//
+// The size upper bound is intentionally loose to tolerate ABI padding
+// differences across compilers — its purpose is to catch a *jump* (e.g. a
+// new field added) not to lock the exact byte count. The type-check on
+// error_location is the strict guard.
+static_assert(sizeof(ParserExtensionParseResult) <= 64,
+              "ParserExtensionParseResult layout drift -- re-grep duckdb.cpp parser_extension.hpp");
+static_assert(std::is_same<decltype(ParserExtensionParseResult{}.error_location), optional_idx>::value,
+              "ParserExtensionParseResult::error_location type drift");
 
 typedef ParserExtensionParseResult (*parse_function_t)(ParserExtensionInfo *info, const string &query);
 
