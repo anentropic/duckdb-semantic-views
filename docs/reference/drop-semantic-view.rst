@@ -31,6 +31,10 @@ Statement Variants
 ``DROP SEMANTIC VIEW IF EXISTS <name>``
    Drops the named semantic view if it exists. If the view does not exist, the statement succeeds silently.
 
+.. note::
+
+   Since v0.8.0 ``DROP`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the view). Since v0.8.0, ``DROP SEMANTIC VIEW`` (without ``IF EXISTS``) additionally raises ``semantic view '<name>' was concurrently dropped`` if another process drops the view at the same time, instead of silently succeeding. ``IF EXISTS`` keeps its silent-no-op behaviour. See :ref:`explanation-transactional-ddl`.
+
 
 .. _ref-drop-params:
 

@@ -94,6 +94,10 @@ The file path must be single-quoted. DuckDB reads the file and parses its conten
    CREATE OR REPLACE SEMANTIC VIEW order_metrics
    FROM YAML FILE '/path/to/order_metrics.yaml'
 
+.. note::
+
+   Since v0.8.0 ``CREATE SEMANTIC VIEW ... FROM YAML FILE`` participates in the caller's transaction along with the inline ``AS`` and ``FROM YAML $$ ... $$`` forms. ``BEGIN ... ROLLBACK`` discards the loaded view as expected. See :ref:`explanation-transactional-ddl`.
+
 
 .. _howto-yaml-export:
 

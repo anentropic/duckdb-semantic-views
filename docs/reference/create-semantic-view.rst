@@ -106,6 +106,14 @@ Statement Variants
 
 All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` / ``FROM YAML FILE`` body.
 
+.. note::
+
+   Since v0.8.0 all four ``CREATE`` body variants participate in your surrounding transaction. ``BEGIN ... ROLLBACK`` discards an uncommitted ``CREATE``. See :ref:`explanation-transactional-ddl`.
+
+.. note::
+
+   ``CREATE SEMANTIC VIEW IF NOT EXISTS`` reliably absorbs duplicates within a single process or transaction (re-running a setup script, repeated statements in the same ``BEGIN`` block). It cannot absorb a race between two separate processes that both run ``CREATE IF NOT EXISTS`` against the same database at the same time -- one will succeed and the other will see a constraint error. Concurrent DDL across processes is unusual for typical DuckDB workloads, so most users will never hit this. See :ref:`explanation-txn-ddl-create-race` for the workaround.
+
 
 .. _ref-create-clauses:
 

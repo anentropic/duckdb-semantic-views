@@ -1,245 +1,206 @@
 # Persona Report
 
-**Generated:** 2026-04-22
+**Generated:** 2026-05-06
 **Audience:** Data engineers exploring semantic views (intermediate)
-**Scenarios tested:** 5
-**Results:** 5 PASS, 0 PARTIAL, 0 FAIL
+**Scenarios tested:** 5 (incremental refresh — v0.8.0 transactional DDL)
+**Results:** 4 PASS, 1 PARTIAL, 0 FAIL
 
 ## Summary
 
-The documentation provides an excellent experience for an intermediate data engineer evaluating DuckDB Semantic Views as an open-source alternative to Snowflake or Databricks. The Diataxis structure is well-executed across all four quadrants: tutorials teach through guided hands-on examples, how-to guides solve specific tasks with prerequisites and troubleshooting, reference pages document syntax with parameter tables and worked examples, and explanation pages provide context for platform comparison and decision-making. All five scenarios were achievable from start to finish with clear navigation paths, complete code examples with expected output, and language calibrated to someone who knows SQL and data engineering but is new to semantic views. The recently modified YAML definitions how-to (reordered to Import-first) reads naturally for a task-oriented user, and the new YAML format reference page fills a critical gap by providing field-by-field specifications that were previously only available through examples.
+The transactional-DDL refresh reads cleanly from this persona's perspective. The new `docs/explanation/transactional-ddl-and-limitations.rst` page is well structured: the headline change is clear in the first 100 words, the "skip if you're a single-process user" framing matches how the persona evaluates limitations, and the worked Python try/except pattern for the `IF NOT EXISTS` race is exactly the level of guidance an intermediate engineer needs. Notes on the affected reference pages (CREATE / DROP / ALTER / DESCRIBE / SHOW / yaml-definitions) all cross-link back consistently, and the "Since v0.8.0" framing is applied uniformly across alter/drop. No dangling references to the removed "caret loss" passage were found, and the removed "16-DB LRU" passage left no readable gap (no remaining text suggests a database-count cap). The single PARTIAL is a genuine usability gap, not a writing defect: the Snowflake comparison page does not yet mention transactional-DDL parity in its concept-mapping table or "Key Differences" section, which is the first place a Snowflake-experienced reader will look when forming expectations about `BEGIN ... ROLLBACK` behaviour.
 
 ---
 
-## Scenario S1: I want to install the extension and create my first semantic view over a single table, then query it
+## Scenario S1: I want to wrap a CREATE SEMANTIC VIEW in BEGIN/ROLLBACK and have it actually roll back
 
 **Verdict:** PASS
 
 ### Navigation Path
 
 1. Started at: `docs/index.rst`
-   - Found: Grid card "Getting started" prominently placed first, with description: "Install the extension, create your first semantic view, and run a query in 5 minutes."
-   - Followed: Link to `tutorial-getting-started`
+   - No prominent "transactional DDL" callout on the homepage, but the site has clearly-labelled DDL reference and Explanation cards. As an intermediate user looking for transaction semantics I head for either reference/CREATE or explanation.
+   - Followed: "DDL reference" card → `docs/reference/create-semantic-view.rst`.
+2. Navigated to: `docs/reference/create-semantic-view.rst`
+   - Found: a `.. note::` directly after the Statement Variants section that says "Since v0.8.0 all four CREATE body variants participate in your surrounding transaction. BEGIN ... ROLLBACK discards an uncommitted CREATE." with a `:ref:` link to `explanation-transactional-ddl`.
+   - Followed: ref link → `docs/explanation/transactional-ddl-and-limitations.rst`.
+3. Navigated to: `docs/explanation/transactional-ddl-and-limitations.rst`
+   - Found: section "DDL Now Participates in Your Transaction" with three concrete `BEGIN ... ROLLBACK` examples for CREATE, DROP, and ALTER respectively, plus an explicit statement that this covers all four CREATE body variants and the `OR REPLACE` / `IF NOT EXISTS` modifiers.
+   - Type-alignment check: I needed an explanation ("does this work and how do I rely on it?") and that's exactly what this page provides. Good fit.
 
-2. Navigated to: `docs/tutorials/getting-started.rst`
-   - Found: Complete tutorial with time estimate (5 minutes) and prerequisites (DuckDB installed, basic SQL knowledge -- appropriate for persona).
-   - **Install the Extension:** Tab set for DuckDB CLI and Python with exact commands (`INSTALL semantic_views FROM community; LOAD semantic_views;`). Both paths clear and complete.
-   - **Create Sample Data:** Realistic `orders` table with copy-pasteable SQL including INSERT statements. Not placeholder data.
-   - **Define a Semantic View:** Full `CREATE SEMANTIC VIEW` DDL with inline explanation of the `alias.name AS expression` pattern. Each dimension and metric explained individually: "o.region AS o.region creates a dimension called region from the region column of the table aliased as o." Satisfies the never-assume requirement for DDL syntax.
-   - **Verify:** `SHOW SEMANTIC VIEWS` with expected output table.
-   - **Query the Semantic View:** All three query modes demonstrated (dimensions+metrics, dimensions-only, metrics-only) with complete SQL and expected result tables. WHERE filtering also shown.
-   - **Inspect the Generated SQL:** `explain_semantic_view()` demonstrated with cross-reference to its reference page via `:ref:`.
-   - **Clean Up:** `DROP SEMANTIC VIEW` shown.
-   - **What You Learned:** Summary with cross-references to CREATE SEMANTIC VIEW, SHOW SEMANTIC VIEWS, semantic_view(), explain_semantic_view(), and DROP SEMANTIC VIEW reference pages. Clear "Next" pointer to multi-table tutorial.
-   - Type-alignment: Tutorial (learning-oriented, study + action). Exactly what a first-time user needs.
-   - Language calibration: Assumes SQL knowledge (appropriate). Explains semantic view concepts thoroughly (satisfies never_assume). The naming pattern is explicitly decoded.
+### Outcome
+
+The user can confidently wrap CREATE in `BEGIN/ROLLBACK` after reading this. The example is copy-pasteable, the prose explicitly contrasts pre-v0.8.0 behaviour, and the "you can simplify" note is reassuring without being preachy.
 
 ---
 
-## Scenario S2: I want to model a star schema with multiple tables (fact + dimensions), define relationships, and query across them
+## Scenario S2: I tried to DROP a view that doesn't exist — what error do I see and how should I handle it?
 
 **Verdict:** PASS
 
 ### Navigation Path
 
 1. Started at: `docs/index.rst`
-   - Found: Grid card "Multi-table semantic views" with description "Model relationships between tables and query across them."
-   - Followed: Link to `tutorial-multi-table`
+   - Followed: "DDL reference" → reference index → `docs/reference/drop-semantic-view.rst`.
+2. Navigated to: `docs/reference/drop-semantic-view.rst`
+   - Found: Statement Variants block clearly distinguishes `DROP SEMANTIC VIEW <name>` (errors if missing) from `DROP SEMANTIC VIEW IF EXISTS <name>` (silent no-op).
+   - Found: a `.. note::` with the v0.8.0 framing, and crucially the new concurrent-drop guard text: `semantic view '<name>' was concurrently dropped`. Good — the persona was wondering about this exact scenario.
+   - Followed: `:ref:` link to `explanation-transactional-ddl`.
+3. Navigated to: `docs/explanation/transactional-ddl-and-limitations.rst` → "DROP and ALTER Without IF EXISTS Detect Concurrent Drops"
+   - Found: clear rationale ("you asked for an operation on a specific view, the view was there when the extension checked, and then it wasn't") and the explicit contract for `IF EXISTS`.
+4. Cross-checked: `docs/reference/error-messages.rst`
+   - I would expect this catalogue to include the new `was concurrently dropped` error since it is a user-facing message users will grep for.
+   - Found: the page lists DDL errors, materialization errors, YAML errors, query errors, wildcard errors, near-miss detection. The concurrent-drop error is **not** indexed here.
+   - This is borderline — the persona will most likely reach the explanation page via the `DROP` reference's note, which is the primary path. But a user who hit the error in the wild and pasted it into a Ctrl+F-equivalent search of the error catalogue would not find it. Recording as a minor observation, not a blocker. The two reference pages (DROP, ALTER) and the explanation page all carry the literal error string, so any reasonable search lands somewhere useful.
 
-2. Navigated to: `docs/tutorials/multi-table.rst`
-   - Found: Complete tutorial with time estimate (10 minutes), prerequisites (links back to getting-started), and star schema assumption noted (appropriate for persona's assumed knowledge).
-   - **Create the Schema:** Three-table e-commerce schema (orders, customers, products) with realistic sample data including dates. Tables correctly identified as fact and dimension tables.
-   - **Define the Semantic View:** Full DDL with TABLES (three aliases, PKs), RELATIONSHIPS (two FK references with emphasized lines), DIMENSIONS (from multiple tables including computed `date_trunc`), and METRICS. The RELATIONSHIPS clause explained clearly: "the customer_id column on orders (alias o) is a foreign key to the primary key of customers (alias c)." Satisfies never-assume for relationship modeling.
-   - **Query One Dimension Table:** Demonstrates selective join -- only customers joined, products excluded. Expected output shown. `explain_semantic_view()` used to verify. Directly satisfies "see generated SQL to verify join correctness."
-   - **Query Across Both Dimension Tables:** Both tables joined. Output shown.
-   - **Use a Computed Dimension:** `date_trunc` dimension queried with output.
-   - **Describe the View:** `DESCRIBE SEMANTIC VIEW` demonstrated with cross-reference.
-   - **Update the View:** `CREATE OR REPLACE` shown. Tip about `ALTER SEMANTIC VIEW ... RENAME TO` with cross-reference.
-   - **What You Learned:** Summary with cross-references to how-to guides (facts, derived metrics, role-playing dimensions).
-   - Helpful tip: "The PRIMARY KEY declaration is used by the extension to synthesize JOIN ON clauses. It does not create a constraint in DuckDB." -- important clarification for data engineers.
-   - Type-alignment: Tutorial (progressive hands-on learning). Correct.
+### Outcome
+
+The persona understands both the missing-view (`does not exist`) error and the concurrent-drop (`was concurrently dropped`) error, and gets the `IF EXISTS` contract for both. PASS.
+
+### Minor observation (not a verdict driver)
+
+The `Error Messages` reference page does not yet have an entry for `semantic view '<name>' was concurrently dropped`. That is the canonical "look up an error string" page. Consider adding a short entry under DDL errors. This is **not** a FAIL or PARTIAL because the error message string is reachable via at least three other pages (drop, alter, explanation) and the path through the reference DDL pages is the more natural one for this persona.
 
 ---
 
-## Scenario S3: I want to compare this extension's capabilities and syntax with Snowflake and Databricks Semantic Views to decide if it fits my use case
+## Scenario S3: I want to ALTER a view's name as part of a multi-statement migration that may roll back
 
 **Verdict:** PASS
 
 ### Navigation Path
 
-1. Started at: `docs/index.rst`
-   - Found: Grid card "Snowflake comparison" with description "Feature-by-feature comparison with Snowflake's CREATE SEMANTIC VIEW."
-   - Followed: Link to `explanation-snowflake`
+1. Started at: `docs/index.rst` → reference index → `docs/reference/alter-semantic-view.rst`.
+2. Navigated to: `docs/reference/alter-semantic-view.rst`
+   - Found: Statement Variants block enumerates RENAME TO, SET COMMENT, UNSET COMMENT in both with-IF-EXISTS and without forms.
+   - Found: a `.. note::` immediately after Statement Variants, reading: "Since v0.8.0 ALTER participates in your surrounding transaction (BEGIN ... ROLLBACK restores the previous name and comment). Since v0.8.0, the non-IF EXISTS forms additionally raise `semantic view '<name>' was concurrently dropped` ..."
+   - The wording "restores the previous name and comment" is concrete — it directly answers "if I ROLLBACK my migration, does the rename undo?"
+   - Followed: ref link → explanation page.
+3. Navigated to: `docs/explanation/transactional-ddl-and-limitations.rst`
+   - Found: in "DDL Now Participates in Your Transaction" the third example is exactly `BEGIN; ALTER ... RENAME TO ...; ROLLBACK; -- the view is still called order_metrics`. Direct match.
 
+### Outcome
+
+The persona has full confidence the rename participates in transactions. The Snowflake-experienced reader will note that this matches Snowflake's behaviour without needing a comparison table to spell it out (because it just works the way DDL is "supposed" to work). PASS.
+
+### Cross-page consistency check
+
+The "Since v0.8.0" wording in `alter-semantic-view.rst` matches the wording in `drop-semantic-view.rst` and `create-semantic-view.rst` exactly. Both reference pages correctly use 0.8.0 (not 0.8.1) and link to the same explanation anchor. Consistent.
+
+---
+
+## Scenario S4: I just CREATEd a view in a transaction; can my next DESCRIBE inside the same transaction see it?
+
+**Verdict:** PASS
+
+### Navigation Path
+
+1. Started at: `docs/index.rst` → reference index → `docs/reference/describe-semantic-view.rst`.
+2. Navigated to: `docs/reference/describe-semantic-view.rst`
+   - Found: a `.. note::` directly under Parameters: "DESCRIBE SEMANTIC VIEW reads committed catalog state. A CREATE / ALTER / DROP issued in the same uncommitted transaction is not yet reflected here -- commit first, then describe."
+   - Followed: ref link to `explanation-txn-ddl-write-visibility`.
+3. Navigated to: `docs/explanation/transactional-ddl-and-limitations.rst` → "Reads Inside an Open Transaction See Committed State"
+   - Found: a worked SQL example showing exactly the scenario from the goal:
+     ```sql
+     BEGIN;
+     CREATE SEMANTIC VIEW v ...;
+     SHOW SEMANTIC VIEWS;   -- v is NOT in the result yet
+     COMMIT;
+     SHOW SEMANTIC VIEWS;   -- now v is listed
+     ```
+   - Plus an additional bonus paragraph about `semantic_view(...)` query reads also seeing committed state (intermediate users who try to insert + query in the same transaction will immediately hit this).
+   - Plus a forward-looking line "This limitation will go away when DuckDB exposes the hook the extension needs," which is appropriate calibration for an intermediate audience evaluating maturity.
+
+### Outcome
+
+The persona has no remaining confusion. The DESCRIBE / SHOW pages flag the limitation, the explanation page demonstrates it concretely, and the rule of thumb ("commit before introspecting") is explicit. PASS.
+
+### Cross-page consistency check
+
+The `describe-semantic-view.rst` note links to `:ref:explanation-txn-ddl-write-visibility` (a sub-anchor), not the page top — sharper landing than the more general drop/alter notes. `show-semantic-views.rst` carries the same visibility note with consistent wording. Good.
+
+---
+
+## Scenario S5: I'm comparing this extension to Snowflake's transactional DDL — does it match?
+
+**Verdict:** PARTIAL
+
+### Navigation Path
+
+1. Started at: `docs/index.rst`
+   - Followed: "Snowflake comparison" card → `docs/explanation/snowflake-comparison.rst`.
 2. Navigated to: `docs/explanation/snowflake-comparison.rst`
-   - Found: Comprehensive comparison page.
-   - **YAML spec disclaimer:** Note clarifying SQL DDL interface comparison only -- correctly separates the two Snowflake interfaces.
-   - **Concept Mapping:** 22-row table covering all DDL statements, core model concepts, advanced features (semi-additive, window, materializations, wildcards, metadata, access modifiers), and query interface. Cross-references to relevant how-to and reference pages throughout.
-   - **Syntax Alignment:** Side-by-side tab set showing DDL from both platforms. PRIMARY KEY difference visually apparent.
-   - **Key Differences:** Seven detailed subsections:
-     - Primary Key Declarations: Three-case table (native with PK, native without, external sources). Iceberg-specific tip. Code examples for both cases. Error message shown.
-     - Query Interface: Warning admonition. Side-by-side syntax. Notes Snowflake's direct SQL and AGG function not supported.
-     - Cardinality Inference: Clear explanation with link to fan traps how-to.
-     - USING RELATIONSHIPS: Identical syntax noted.
-     - Facts Query Mode: Warning about mutual exclusivity of facts and metrics.
-     - Semi-Additive and Window Metrics: Behavioral differences listed.
-     - Materializations: Notes this is DuckDB-only, not in Snowflake DDL.
-   - **Features Not Yet Supported:** Clear three-row table with status and rationale.
-   - **A Note on Snowflake's YAML Spec:** Explains YAML-spec-only concepts (time_dimensions, custom_instructions, etc.) and clarifies DuckDB YAML uses its own schema for version control, not AI prompt tuning. Links to the YAML how-to guide.
-   - Followed: Navigation to `explanation-databricks` via explanation index page
+   - Looked at: "Concept Mapping" table. Has rows for Define / Tables / Relationships / Dimensions / Metrics / Facts / Derived metrics / Semi-additive / Window / Metadata / Access modifiers / Materializations / Query interface / Wildcards / DESCRIBE / SHOW / Terse SHOW / SHOW COLUMNS / IN SCHEMA / GET_DDL / ALTER / DROP. **No row for transactional DDL.**
+   - Looked at: "Key Differences" section. Subsections cover Primary Key Declarations, Query Interface, Cardinality Inference, USING RELATIONSHIPS, Facts Query Mode, Semi-Additive and Window Metrics, Materializations. **No subsection mentions transactional DDL or read-committed visibility.**
+   - Looked at: "Features Not Yet Supported" — three rows, none about transactions.
+   - Looked at: bottom of page for any cross-link to `explanation-transactional-ddl`. None.
+3. Backtracked to: `docs/explanation/index.rst`
+   - The new bullet for transactional-ddl is present and clear: "How transactional DDL works since 0.8.0 and the small set of caveats around read visibility, the PEG parser, and concurrent writers."
+   - So the persona can find the page from the Explanation index, but only by leaving the Snowflake-comparison page first.
+4. Navigated separately to: `docs/explanation/transactional-ddl-and-limitations.rst`
+   - Found the full picture, but it isn't framed as a Snowflake comparison. The persona has to hold "what does Snowflake do?" in their head and infer alignment from the description.
 
-3. Navigated to: `docs/explanation/index.rst`
-   - Found: Link to Databricks Comparison.
-   - Followed: Link to `explanation-databricks`
+### Gap Analysis
 
-4. Navigated to: `docs/explanation/databricks-comparison.rst`
-   - Found: Parallel structure to Snowflake comparison.
-   - **Concept Mapping:** 18-row table with clear terminology mapping (MEASURES vs METRICS, FROM clause vs TABLES+RELATIONSHIPS). Now includes YAML definitions and materializations rows.
-   - **Syntax Comparison:** Side-by-side tab set.
-   - **Key Differences:** Multi-table handling (explicit JOIN vs declarative RELATIONSHIPS with join synthesis), Query Interface, MEASURES vs METRICS, Dimension Expressions.
-   - **Features in DuckDB Not in Databricks:** 11-row table (FACTS, NON ADDITIVE BY, window metrics, MATERIALIZATIONS, RELATIONSHIPS, fan trap detection, role-playing dimensions, YAML import/export, explain_semantic_view, WITH SYNONYMS, PRIVATE/PUBLIC).
-   - **Features in Databricks Not in DuckDB:** 5-row table (direct SQL, Unity Catalog, row-level security, AI/BI, Delta Lake materialized views).
-   - **Choosing Between Them:** Honest positioning -- lightweight/local-first vs cloud platform. Not interchangeable.
-   - Type-alignment: Explanation pages (understanding-oriented, cognition-based). Correct for platform evaluation and decision-making.
-   - Language calibration: Assumes Snowflake/Databricks familiarity (appropriate). Explains all DuckDB-specific behaviors and differences (satisfies never-assume).
+**Where:** `docs/explanation/snowflake-comparison.rst`, both the Concept Mapping table (around lines 26-99) and the Key Differences section (lines 154-356).
 
----
+**What:** No mention of transactional DDL parity. A Snowflake-experienced reader doing a feature-by-feature comparison ahead of an evaluation/migration will look here first to confirm `BEGIN ... ROLLBACK` behaves the same way it does in Snowflake. They won't find an answer on this page. The information exists (and reads well) on the new transactional-ddl page, but the user has to navigate away from the comparison page to discover it. Type-alignment is fine on each page individually — the issue is a missing cross-reference between two explanation pages.
 
-## Scenario S4: I want to define a semantic view with pre-aggregated materializations and export it as YAML for version control
+**Impact:** PARTIAL, not FAIL, because:
+- The transactional-ddl explanation page is reachable in two clicks via the Explanation index, and exists on the homepage's Explanation toctree.
+- A determined evaluator will find it.
+- But the "compare features and decide if it fits" task in the persona's `user_tasks` list is a primary use case, and an evaluator who reads only the Snowflake comparison and decides on that basis will leave with an incomplete picture — they may still believe the extension's DDL is non-transactional (which was true before v0.8.0), since the comparison page doesn't say otherwise.
 
-**Verdict:** PASS
+**Suggested Fix:** Two options, either is sufficient:
 
-### Navigation Path
+1. **Minimal:** add one row to the Concept Mapping table:
+   - Concept: "Transactional DDL"
+   - Snowflake column: "DDL participates in BEGIN/COMMIT/ROLLBACK"
+   - DuckDB column: "DDL participates in BEGIN/COMMIT/ROLLBACK (since v0.8.0); see :ref:\`explanation-transactional-ddl\` for read-visibility caveat and concurrent-writer notes"
 
-1. Started at: `docs/index.rst`
-   - Found: "How-to guides" card mentioning "materializations, YAML definitions" in its description.
-   - Followed: Link to `how-to-guides`
+2. **Better:** add a short subsection to "Key Differences" titled "Transactional DDL" that says, in two or three sentences, "Both systems make CREATE/DROP/ALTER SEMANTIC VIEW transactional. Read visibility within an open transaction differs slightly: introspection commands (DESCRIBE, SHOW) see committed state only — see :ref:\`explanation-transactional-ddl\` for details." Snowflake-experienced readers will appreciate the explicit callout that introspection inside a transaction does not see uncommitted writes — that is a behavioural divergence worth flagging up-front.
 
-2. Navigated to: `docs/how-to/index.rst`
-   - Found: Listed entries for both materializations ("Declare materializations that route matching queries to pre-aggregated tables") and YAML definitions ("Import and export semantic view definitions as YAML for version control and migration").
-   - Followed: Link to `howto-materializations`
-
-3. Navigated to: `docs/how-to/materializations.rst`
-   - Found: Complete how-to guide with versionadded 0.7.0 marker and clear prerequisites.
-   - **How Materializations Work:** Clear concept -- maps dims+metrics to a pre-aggregated table, transparent routing, query interface unchanged.
-   - **Declare a Materialization:** Step-by-step: create pre-aggregated table first, then MATERIALIZATIONS clause with emphasized lines in the DDL. Clause ordering rule stated (must appear after METRICS). Tip about column naming requirement.
-   - **How Routing Works:** Exact-match logic explained with two conditions. Case-insensitive. Two examples: one that matches, one that does not. Warning about no superset matching in v0.7.0 -- important caveat clearly stated.
-   - **Multiple Materializations:** Definition-order, first-match semantics. Full DDL example.
-   - **Routing Exclusions:** Semi-additive and window metrics always excluded. Code example showing the bypass behavior.
-   - **Verify Routing:** `explain_semantic_view()` with `-- Materialization:` header line in output. Sample output shown for both matched and unmatched cases.
-   - **Inspect with SHOW and DESCRIBE:** Both `SHOW SEMANTIC MATERIALIZATIONS` and `DESCRIBE` with object_kind filtering demonstrated.
-   - **Troubleshooting:** Five specific error scenarios with explanations and fixes.
-   - **Related:** Cross-references to CREATE reference, SHOW reference, explain reference, and semi-additive/window how-to guides.
-   - Followed: Link to `howto-yaml-definitions` from how-to index
-
-4. Navigated to: `docs/how-to/yaml-definitions.rst` (recently reordered to Import-first)
-   - Found: Complete how-to guide with versionadded 0.7.0 marker.
-   - **Import from Inline YAML** (now first section): Dollar-quoted syntax with full, realistic example showing tables/dimensions/metrics. Tagged dollar-quoting variant shown. CREATE OR REPLACE and IF NOT EXISTS variants noted. This Import-first ordering makes good sense for the how-to pattern: a user arriving here is more likely to have a YAML file they want to import than to start with export.
-   - **Import from a YAML File:** `FROM YAML FILE` with single-quoted path. Both CREATE and CREATE OR REPLACE variants shown.
-   - **Export with READ_YAML_FROM_SEMANTIC_VIEW:** Function call shown. COPY TO file pattern for saving to disk demonstrated -- important practical detail. Schema-qualified names noted. Cross-reference to reference page.
-   - **Round-Trip Workflow:** Three-step numbered workflow (export, import, verify with GET_DDL). Tip about storing YAML in version control alongside the data model.
-   - **Troubleshooting:** Seven specific error messages with explanations and fixes. Covers unterminated strings, empty paths, size limits, and view-not-found on export.
-   - **Related:** Cross-references to YAML format reference, READ_YAML reference, CREATE reference, and GET_DDL. The link to `ref-yaml-format` is important -- connects the how-to to the specification.
-   - Followed: Link to `ref-yaml-format` from Related section
-
-5. Navigated to: `docs/reference/yaml-format.rst` (new page)
-   - Found: Complete field-by-field YAML schema reference.
-   - **SQL-to-YAML mapping table:** Seven-row table mapping SQL clause names to YAML keys. The `RELATIONSHIPS -> joins` difference called out explicitly with a note ("Different name -- YAML uses the internal joins key") -- this would have been a stumbling block without documentation.
-   - **Complete Example:** Comprehensive YAML covering all features: tables with pk_columns/comment/synonyms, joins with from_alias/fk_columns/cardinality, facts with chaining, dimensions with source_table/output_type, metrics including derived (no source_table), semi-additive (non_additive_by), and materializations. This serves as both a specification and a template.
-   - **Minimal Example:** Bare minimum YAML (tables + dimensions + metrics).
-   - **Top-Level Keys:** Seven keys with types, required/optional, descriptions. Footnote: "At least one of dimensions or metrics must be non-empty."
-   - **Table:** Six fields (alias, table, pk_columns, unique_constraints, comment, synonyms) with types, defaults, descriptions. Code example.
-   - **Dimension:** Six fields (name, expr, source_table, output_type, comment, synonyms). Code example with computed dimension.
-   - **Metric:** Ten fields covering base, derived, private, semi-additive, and window variants. Five separate code examples, one for each variant. This is thorough.
-   - **Fact:** Seven fields. Code example with chaining.
-   - **Join:** Six fields (table, from_alias, fk_columns, ref_columns, name, cardinality). Code example showing both basic and explicit ref_columns usage.
-   - **Materialization:** Four fields. Code example with multiple entries.
-   - **NonAdditiveDim:** Three fields (dimension, order, nulls). Code example.
-   - **WindowSpec:** Seven fields (window_function, inner_metric, extra_args, excluding_dims, partition_dims, order_by, frame_clause). Code example.
-   - **WindowOrderBy:** Three fields (expr, order, nulls).
-   - **Size Limit:** 1 MiB documented.
-   - **Related:** Cross-references back to CREATE reference, READ_YAML reference, and YAML how-to guide.
-   - Type-alignment: Reference documentation (information-oriented, work-context). The user is looking up field specifications, and the page provides structured tables with defaults and examples for every type. Correct Diataxis alignment.
-   - Language calibration: Technical but accessible. Field descriptions use data engineering terminology naturally (PK/FK, cardinality, aggregate) while explaining semantic-view-specific structures through the descriptions. No jargon left undefined.
+Option 2 is preferred because read-committed-visibility is a genuine behavioural divergence from Snowflake (where DESCRIBE / SHOW see uncommitted DDL inside the same transaction), not a parity item. The existing transactional-ddl page acknowledges this is a temporary limitation pending a DuckDB hook, but the comparison page never tells the Snowflake user it exists.
 
 ---
 
-## Scenario S5: I want to define semi-additive metrics and window function metrics for snapshot data (like account balances) and time-series analysis
+## Specific verifications requested
 
-**Verdict:** PASS
+### "Caret loss" passage removal
 
-### Navigation Path
+Verified clean. I read the full `transactional-ddl-and-limitations.rst` end to end and checked for trailing references — there is no remaining sentence that begins to discuss caret formatting and trails off, no "as discussed above" pointing at deleted material, and no introduction-summary mismatch (the Summary section on the explanation page lists exactly four bullets that match the four kept sections: rollback, read-committed visibility, IF NOT EXISTS race, PEG parser). The error-messages reference page never discussed caret rendering in the first place, so there is nothing dangling there either. A persona reading either page will not wonder "wait, what about caret formatting?".
 
-1. Started at: `docs/index.rst`
-   - Found: "How-to guides" card. No direct homepage card for semi-additive or window metrics, but the how-to card description is broad enough.
-   - Followed: Link to `how-to-guides`
+### "16-DB LRU" passage removal
 
-2. Navigated to: `docs/how-to/index.rst`
-   - Found: Both guides listed clearly with descriptive summaries:
-     - "Define metrics with NON ADDITIVE BY for snapshot data like account balances and inventory levels."
-     - "Define window function metrics for rolling averages, lag comparisons, and rankings using OVER clauses."
-   - Followed: Link to `howto-semi-additive`
+Verified clean. The transactional-ddl page mentions multi-process / multi-connection scenarios in three places (CREATE race, DROP/ALTER race, summary), and in each case the framing is "if multiple processes are issuing DDL against the same database file at the same time" — never "if you have many databases attached." There is no residual sentence that hints at a database-count cap, and an intermediate persona reading the page comes away with the correct mental model: the extension handles arbitrary numbers of attached databases; the only multi-something caveats are about multi-process writers, which are flagged as "mostly theoretical for typical DuckDB usage." Good removal.
 
-3. Navigated to: `docs/how-to/semi-additive-metrics.rst`
-   - Found: Complete how-to guide with prerequisites.
-   - **Snapshot Data:** Excellent motivation section. Shows concrete account balances data table and explains the double-counting problem clearly: "If you query SUM(balance) grouped by customer_id across both dates, you get 1050 for ACME (500 + 550) -- but that is double-counting. The real current balance is 550." This is exactly the explanation needed for someone who knows SQL aggregation but has never encountered semi-additive measures.
-   - **Define a Semi-Additive Metric:** Full DDL with emphasized `NON ADDITIVE BY` line. Clear explanation of what the declaration means in practice.
-   - **Sort Order and NULLS Placement:** ASC/DESC and NULLS FIRST/LAST options with two concrete examples (latest balance vs earliest balance).
-   - **Multiple Non-Additive Dimensions:** Syntax shown.
-   - **Snapshot Behavior:** Key distinction between two cases: (1) non-additive dimension not in query -- CTE with ROW_NUMBER generated, snapshot selection active; (2) non-additive dimension in query -- standard aggregation, no CTE. Snowflake alignment noted. Both cases have query examples.
-   - **Verify the Generated SQL:** Full CTE expansion shown via `explain_semantic_view()`. The generated SQL is explained: ROW_NUMBER partitioned by queried dims, ordered by non-additive dim, then `CASE WHEN __sv_rn = 1` in the aggregation.
-   - **Restrictions:** Warning about mutual exclusivity with OVER.
-   - **Troubleshooting:** Three specific issues (dimension not found, unexpected results, performance with multiple NA sets).
-   - Followed: Back to how-to index, then link to `howto-window-metrics`
+### "Since v0.8.0" framing consistency
 
-4. Navigated to: `docs/how-to/window-metrics.rst`
-   - Found: Complete how-to guide with prerequisites (including familiarity with SQL window functions -- appropriate for persona).
-   - **Define a Window Metric:** Full DDL with OVER clause wrapping another metric. Emphasized lines highlighting the window metric definition.
-   - **PARTITION BY:** Both modes covered thoroughly in one section:
-     - Plain PARTITION BY: fixed partition set. Example with `store_avg` always partitioning by store.
-     - PARTITION BY EXCLUDING: dynamic partition set. Two worked examples showing how excluding dims interact with different queried dimension sets.
-     - Tip explaining when to use each mode. Mutual exclusivity noted.
-   - **ORDER BY with Sort and NULLS:** Sort direction and NULLS placement examples.
-   - **Frame Clauses:** RANGE and ROWS with `INTERVAL '6 days' PRECEDING` rolling average example.
-   - **Extra Function Arguments:** LAG with offset (30 rows) demonstrated.
-   - **Required Dimensions:** Error messages shown for missing dimensions in EXCLUDING, PARTITION BY, and ORDER BY. Tip about `SHOW SEMANTIC DIMENSIONS FOR METRIC` for discovering required dimensions.
-   - **Mixing Restriction:** Warning that window and aggregate metrics cannot coexist in the same query. Error message shown. Workaround provided (two separate queries, join results).
-   - **Verify the Generated SQL:** CTE expansion pattern described (aggregate CTE + outer window SELECT).
-   - **Troubleshooting:** Six specific error scenarios with exact error messages.
-   - Type-alignment: How-to guides (goal-oriented, work + action). Correct. The user has specific tasks (define semi-additive metrics, define window metrics) and gets step-by-step directions with complete examples.
-   - Language calibration: Assumes SQL window function knowledge (appropriate for intermediate). Explains NON ADDITIVE BY and PARTITION BY EXCLUDING as new, extension-specific concepts (satisfies never-assume for dimension/metric definitions). The snapshot data explanation is particularly well-calibrated -- does not over-explain basic aggregation but thoroughly explains why standard SUM fails for snapshot data.
+Verified consistent across all four pages that carry the framing:
+
+| Page | "Since v0.8.0" wording present? | Links to explanation? |
+|------|--------------------------------|----------------------|
+| `docs/reference/create-semantic-view.rst` | Yes — "Since v0.8.0 all four CREATE body variants participate ..." | Yes (`:ref:explanation-transactional-ddl`) |
+| `docs/reference/alter-semantic-view.rst` | Yes — "Since v0.8.0 ALTER participates ... Since v0.8.0, the non-IF EXISTS forms additionally raise ..." | Yes |
+| `docs/reference/drop-semantic-view.rst` | Yes — "Since v0.8.0 DROP participates ... Since v0.8.0, DROP SEMANTIC VIEW (without IF EXISTS) additionally raises ..." | Yes |
+| `docs/how-to/yaml-definitions.rst` | Yes — "Since v0.8.0 CREATE SEMANTIC VIEW ... FROM YAML FILE participates ..." | Yes |
+| `docs/explanation/transactional-ddl-and-limitations.rst` | Yes — `.. versionadded:: 0.8.0` directive at top, and "Before v0.8.0 these statements committed independently of the surrounding transaction." | n/a (this is the page) |
+| `docs/explanation/index.rst` | Yes — "How transactional DDL works since 0.8.0 ..." | Yes (toc bullet) |
+
+No 0.8.1 references remain. The transition from the prior 0.8.1 framing to 0.8.0 is fully and consistently applied.
 
 ---
 
 ## Revision Recommendations
 
-No revision needed. All scenarios passed.
+### FAIL Issues (trigger revision)
 
-### Cross-Reference Quality (Rule 4)
+None. No scenario failed.
 
-Cross-referencing is thorough and consistent throughout the documentation:
+### PARTIAL Issues (for project author approval)
 
-- All inline code mentions of DDL commands (`CREATE SEMANTIC VIEW`, `DROP SEMANTIC VIEW`, `ALTER SEMANTIC VIEW`) link to their reference pages via `:ref:` labels.
-- Function mentions (`semantic_view()`, `explain_semantic_view()`, `READ_YAML_FROM_SEMANTIC_VIEW()`, `GET_DDL()`) consistently link to their reference pages.
-- How-to guides cross-reference related how-to guides and relevant reference pages in "Related" sections.
-- Tutorials end with "What You Learned" sections containing cross-references and "Next" pointers.
-- The YAML how-to links to the new YAML format reference (`ref-yaml-format`), and the format reference links back to the how-to and CREATE reference. This bidirectional linking is well-done.
-- The Snowflake comparison page links to 10+ how-to and reference pages from the concept mapping table.
+| Scenario | Page | Gap | Suggested Fix |
+|----------|------|-----|---------------|
+| S5 | `docs/explanation/snowflake-comparison.rst` (Concept Mapping table and Key Differences section) | Snowflake comparison page does not mention transactional DDL at all, so a Snowflake-experienced reader doing a feature-by-feature evaluation will not learn that v0.8.0 made DDL transactional, nor that read-committed visibility inside an open transaction is a behavioural divergence from Snowflake. | In `docs/explanation/snowflake-comparison.rst`, Key Differences section: add a short "Transactional DDL" subsection (2-3 sentences) noting parity for CREATE/DROP/ALTER under BEGIN/ROLLBACK, the read-committed-visibility divergence for DESCRIBE/SHOW inside an open transaction, and a `:ref:\`explanation-transactional-ddl\`` link. Optionally also add a "Transactional DDL" row to the Concept Mapping table. |
 
-### Persona-Calibrated Language (Rule 5)
+### Minor observation (not a verdict driver, no action required)
 
-Language calibration is well-executed for the intermediate data engineer persona:
-
-- SQL and DuckDB basics are assumed without explanation (appropriate).
-- Star schema, fact tables, dimension tables, PK/FK, cardinality -- all used as shared vocabulary (appropriate for assumed knowledge).
-- Semantic view concepts are always explained before use (satisfies never_assume).
-- DDL syntax is always shown in full with clause-by-clause explanation (satisfies never_assume).
-- Relationship modeling is explained using PK/FK terminology the audience knows, extended with semantic-view-specific concepts (satisfies never_assume).
-- Snowflake/Databricks differences are called out with side-by-side syntax and explicit warnings (satisfies never_assume).
-- The YAML format reference correctly notes the `RELATIONSHIPS -> joins` naming difference, preventing confusion.
-
-### Recently Modified Pages Assessment
-
-- **docs/how-to/yaml-definitions.rst (reordered to Import-first):** The Import-first ordering is the right structure for a how-to guide. A user arriving at this page has a task in mind, and the most common first task is "I have a YAML file or want to create from YAML" rather than "I want to export." The flow (inline import, file import, export, round-trip) builds logically and the troubleshooting section covers all seven YAML-specific error cases.
-
-- **docs/reference/yaml-format.rst (new YAML format reference):** This page fills a critical documentation gap. Before this page existed, a user writing YAML definitions would have to reverse-engineer the format from the limited examples in the how-to guide or the CREATE reference. Now there is a complete, field-by-field specification with types, required/optional indicators, defaults, and code examples for every variant. Three details stand out as particularly valuable: (1) the SQL-to-YAML mapping table at the top, which immediately addresses the `RELATIONSHIPS -> joins` naming discrepancy; (2) the five separate Metric code examples covering every metric variant; and (3) the sub-object specifications (NonAdditiveDim, WindowSpec, WindowOrderBy) which would be impossible to discover without documentation or source code access.
+`docs/reference/error-messages.rst` does not include an entry for `semantic view '<name>' was concurrently dropped`. The error string is documented on three other pages (drop, alter, transactional-ddl explanation), so users hitting it will find guidance. If/when the error catalogue is next refreshed, consider adding a short entry under DDL errors for completeness. Not blocking this milestone.

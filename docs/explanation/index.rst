@@ -12,6 +12,7 @@ Background concepts and design context for DuckDB Semantic Views.
 - :ref:`explanation-sv-vs-views` -- How semantic views differ from standard SQL views and what the declarative layer adds.
 - :ref:`explanation-snowflake` -- Feature-by-feature comparison with Snowflake's SQL DDL semantic views and where this extension diverges.
 - :ref:`explanation-databricks` -- Feature-by-feature comparison with Databricks metric views and where this extension diverges.
+- :ref:`explanation-transactional-ddl` -- How transactional DDL works since 0.8.0 and the small set of caveats around read visibility, the PEG parser, and concurrent writers.
 
 .. toctree::
    :hidden:
@@ -19,3 +20,4 @@ Background concepts and design context for DuckDB Semantic Views.
    semantic-views-vs-regular-views
    snowflake-comparison
    databricks-comparison
+   transactional-ddl-and-limitations

@@ -716,6 +716,26 @@ Window metric required dimension missing
 **Fix:** Add the required dimension to the query. Use :ref:`SHOW SEMANTIC DIMENSIONS FOR METRIC <ref-show-dims-for-metric>` to see which dimensions are required (``required = TRUE``) for a window metric.
 
 
+.. _ref-err-concurrent-ddl:
+
+Concurrent DDL Errors
+=====================
+
+These errors occur during ``DROP`` or ``ALTER SEMANTIC VIEW`` when another writer modifies the catalog mid-statement.
+
+
+Concurrently dropped (DROP / ALTER)
+-----------------------------------
+
+.. code-block:: text
+
+   semantic view '<name>' was concurrently dropped
+
+**Cause:** A non-``IF EXISTS`` ``DROP`` or ``ALTER`` confirmed the view existed at snapshot time, but another connection removed it before the change applied.
+
+**Fix:** Decide on the contract you want. Use ``IF EXISTS`` if a missing target should silently no-op (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SEMANTIC VIEW IF EXISTS my_view ...``). Otherwise, retry the statement after handling the race in your application. See :ref:`explanation-transactional-ddl` for the snapshot-and-apply mechanism.
+
+
 .. _ref-err-wildcard:
 
 Wildcard Errors
