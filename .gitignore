@@ -53,6 +53,9 @@ test/data/duckdb_extensions/
 # dbt reference material (not part of the project)
 dbt/
 
+# clangd LSP database — regenerated on every cargo build/check from build.rs
+compile_commands.json
+
 # Vendored DuckDB amalgamation (header ~1.8MB, source ~23MB)
 # Re-fetched locally via: just update-headers
 # Re-fetched in CI via: DuckDB Version Monitor workflow
