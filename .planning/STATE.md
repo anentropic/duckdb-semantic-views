@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.7.0
-milestone_name: YAML Definitions & Materialization Routing
-status: verifying
-stopped_at: Completed 57-01-PLAN.md
-last_updated: "2026-04-24T18:28:24.196Z"
-last_activity: 2026-04-24
+milestone: v0.8.0
+milestone_name: Transactional DDL & Architectural Unification
+status: shipped
+stopped_at: v0.8.0 milestone shipped — ready for tag and PR merge
+last_updated: "2026-05-06T20:56:27.307Z"
+last_activity: 2026-05-06
 progress:
-  total_phases: 7
-  completed_phases: 7
-  total_plans: 7
-  completed_plans: 7
+  total_phases: 5
+  completed_phases: 5
+  total_plans: 8
+  completed_plans: 8
   percent: 100
 ---
 
@@ -18,25 +18,25 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-04-18)
+See: .planning/PROJECT.md (updated 2026-05-06)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Phase 57 — Introspection & Diagnostics
+**Current focus:** v0.8.0 milestone shipped — planning next milestone
 
 ## Current Position
 
-Phase: 57
-Plan: Not started
-Status: Phase complete — ready for verification
-Last activity: 2026-04-30 - Completed quick task 260430-vdz: review bug report semantic_views_parser_comment_bug.md, write failing test to reproduce, then implement fix
+Milestone: v0.8.0 (shipped 2026-05-06)
+Phase: — (between milestones)
+Status: Ready for tag and PR merge; next milestone planning via /gsd-new-milestone
+Last activity: 2026-05-06
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██████████] 100% (v0.8.0 complete)
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 7 (v0.7.0)
+- Total plans completed: 11 (v0.7.0) + 4 (v0.8.0 phases 58–61, retroactive)
 - Average duration: --
 - Total execution time: 0 hours
 
@@ -61,6 +61,10 @@ Recent decisions affecting current work:
 - [Phase 56]: Bare name extraction via rsplit('.') for FQN support in READ_YAML_FROM_SEMANTIC_VIEW
 - [Phase 57]: find_routing_materialization_name duplicates resolution logic rather than changing expand() return type
 - [Phase 57]: Feature-gated re-export with #[allow(dead_code)] for extension-only cross-module access
+- [Phase 62]: Phase 62 Plan 01: pre-stage all behavioural test slots (B1-B19) as halt no-ops + skip-guarded staged tests so suite stays green between waves. Pin ParserExtensionParseResult layout via static_assert before Plans 02-03 production changes land.
+- [Phase 62]: Phase 62 Plan 02: Drop for OverrideContext leaks the inner duckdb_connection by design (Q2 destruction-order: ~DBConfig fires AFTER ~DatabaseInstance resets connection_manager, so calling duckdb_disconnect would UAF). Bounded leak — one Connection per DB ever opened, ~few KB each. Matches v0.8.0 baseline.
+- [Phase 62]: Phase 62 Plan 03: parse_function reintroduced as error-reporting layer. parser_override owns success path (transactional rewrite + re-parse); error branches return rc=2 to defer to default parser, which fails on the unrecognised prefix and triggers sv_parse_stub which returns DISPLAY_EXTENSION_ERROR with error_location for caret rendering. sv_parse_function_rust uses rewrite_to_native_sql (catalog-aware) when ctx_ptr is non-null so DROP/ALTER catalog errors are reproduced with caret. sql_throwing helper deleted; write_error_to_buffer is now live. Resolves TECH-DEBT 22.
+- [Phase 62]: TECH-DEBT 20 (bounded LRU eviction) and 22 (FALLBACK_OVERRIDE drops DISPLAY_EXTENSION_ERROR) marked resolved; caret rendering restored via parse_function
 
 ### Pending Todos
 
@@ -91,9 +95,13 @@ Recent decisions affecting current work:
 | Phase 55 P01 | 18min | 2 tasks | 6 files |
 | Phase 56 P01 | 25min | 2 tasks | 8 files |
 | Phase 57 P01 | 95min | 3 tasks | 11 files |
+| Phase 62 P01 | 30 min | 3 tasks | 13 files |
+| Phase 62 P02 | 25min | 3 tasks | 3 files |
+| Phase 62 P03 | 18min | 3 tasks | 2 files |
+| Phase 62 P04 | 30m | 4 tasks | 13 files |
 
 ## Session Continuity
 
-Last session: 2026-04-21T00:41:49.753Z
-Stopped at: Completed 57-01-PLAN.md
+Last session: 2026-05-06T13:33:43.638Z
+Stopped at: Completed 62-04-PLAN.md (Phase 62 ready for /gsd-verify-work)
 Resume file: None

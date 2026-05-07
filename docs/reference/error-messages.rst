@@ -116,6 +116,80 @@ Unclosed parenthesis
 **Fix:** Check for mismatched parentheses in the clause body.
 
 
+.. _ref-err-name-uniqueness:
+
+Duplicate dimension name
+------------------------
+
+.. code-block:: text
+
+   duplicate dimension name '<name>'
+
+**Cause:** Two or more dimensions in the same semantic view share the same name. The comparison is case-insensitive, so ``region`` and ``Region`` are considered duplicates.
+
+**Fix:** Rename one of the dimensions so that all dimension names are unique (ignoring case).
+
+.. code-block:: sql
+
+   -- This will fail: "duplicate dimension name 'Region'"
+   DIMENSIONS (
+       o.region AS o.region,
+       c.Region AS c.sales_region
+   )
+
+   -- Fix: use distinct names
+   DIMENSIONS (
+       o.order_region AS o.region,
+       c.customer_region AS c.sales_region
+   )
+
+
+Duplicate metric name
+---------------------
+
+.. code-block:: text
+
+   duplicate metric name '<name>'
+
+**Cause:** Two or more metrics (base or derived) in the same semantic view share the same name. The comparison is case-insensitive.
+
+**Fix:** Rename one of the metrics so that all metric names are unique (ignoring case).
+
+
+Dimension-metric name collision
+-------------------------------
+
+.. code-block:: text
+
+   name '<name>' is used as both a dimension and a metric
+
+**Cause:** A dimension and a metric share the same name. The comparison is case-insensitive, so a dimension named ``amount`` and a metric named ``Amount`` collide.
+
+**Fix:** Rename either the dimension or the metric so that names are unique across both categories.
+
+.. code-block:: sql
+
+   -- This will fail: "name 'amount' is used as both a dimension and a metric"
+   DIMENSIONS (
+       o.amount AS o.amount_category
+   )
+   METRICS (
+       o.Amount AS SUM(o.amount)
+   )
+
+   -- Fix: use a distinct name for the metric
+   DIMENSIONS (
+       o.amount AS o.amount_category
+   )
+   METRICS (
+       o.total_amount AS SUM(o.amount)
+   )
+
+.. note::
+
+   All three name uniqueness checks run at ``CREATE`` time, before the view definition is persisted. They are independent of the query-time duplicate checks described in :ref:`the next section <ref-err-query>`, which catch the same dimension or metric being requested twice in a single ``semantic_view()`` call.
+
+
 Graph validation errors
 -----------------------
 
@@ -640,6 +714,26 @@ Window metric required dimension missing
 **Cause:** A window function metric references a dimension in its ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clause, but that dimension was not included in the query's ``dimensions := [...]`` list. The ``<reason>`` value indicates which clause requires the dimension (``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY``).
 
 **Fix:** Add the required dimension to the query. Use :ref:`SHOW SEMANTIC DIMENSIONS FOR METRIC <ref-show-dims-for-metric>` to see which dimensions are required (``required = TRUE``) for a window metric.
+
+
+.. _ref-err-concurrent-ddl:
+
+Concurrent DDL Errors
+=====================
+
+These errors occur during ``DROP`` or ``ALTER SEMANTIC VIEW`` when another writer modifies the catalog mid-statement.
+
+
+Concurrently dropped (DROP / ALTER)
+-----------------------------------
+
+.. code-block:: text
+
+   semantic view '<name>' was concurrently dropped
+
+**Cause:** A non-``IF EXISTS`` ``DROP`` or ``ALTER`` confirmed the view existed at snapshot time, but another connection removed it before the change applied.
+
+**Fix:** Decide on the contract you want. Use ``IF EXISTS`` if a missing target should silently no-op (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SEMANTIC VIEW IF EXISTS my_view ...``). Otherwise, retry the statement after handling the race in your application. See :ref:`explanation-transactional-ddl` for the snapshot-and-apply mechanism.
 
 
 .. _ref-err-wildcard:

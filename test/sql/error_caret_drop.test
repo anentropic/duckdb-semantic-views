@@ -1,0 +1,27 @@
+# Phase 62 Wave 3 — caret rendering coverage for DROP error paths.
+#
+# Plans 02-03 restored caret rendering. DROP SEMANTIC VIEW with no name
+# triggers `validate_and_rewrite` -> "Missing view name." with position
+# pointing past the prefix; parse_function returns DISPLAY_EXTENSION_ERROR
+# and DuckDB renders LINE 1: ... ^.
+#
+# Behavioural property pinned (from RESEARCH.md §6):
+#   B7: caret renders for DROP errors (missing name)
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# B7: DROP without name -- validator emits "Missing view name." with caret
+statement error
+DROP SEMANTIC VIEW;
+----
+Missing view name
+
+# Caret rendering is also pinned -- LINE 1: prefix proves parser_extension
+# error path fired (not the synthesised SELECT error workaround).
+statement error
+DROP SEMANTIC VIEW;
+----
+LINE 1:

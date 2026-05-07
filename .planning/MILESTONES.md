@@ -1,5 +1,30 @@
 # Milestones
 
+## v0.8.0 Transactional DDL & Architectural Unification (Shipped: 2026-05-06)
+
+**Phases completed:** 5 phases (58-62), 8 plans
+**Timeline:** 2026-05-02 → 2026-05-06 (5 days, of which phases 58-61 were retroactive reconstruction of ad-hoc work consolidated 2026-05-05)
+**Audit:** ✅ passed (5/5 phases, 7/7 integration, 0/0 requirements — interior architecture milestone with no REQ-IDs)
+
+**Delivered:** All `CREATE` / `DROP` / `ALTER SEMANTIC VIEW` DDL forms now participate in the caller's transaction via a single `parser_override` entry point. Legacy `parse_function` / `sv_ddl_internal` table-function fallback retired (~1500 LOC net deletion). Race guards, FFI UTF-8 hardening, multi-DB isolation, and parser-error caret rendering all delivered as paired structural improvements.
+
+**Key accomplishments:**
+
+1. **Transactional DDL (Phase 58)** — All four `CREATE` body variants (keyword AS, FROM YAML inline, FROM YAML FILE, OR REPLACE / IF NOT EXISTS) plus DROP and ALTER participate in the caller's transaction. `parser_override` rewrites recognised DDL into native INSERT/UPDATE/DELETE against `_definitions` and re-parses on the caller's connection. CatalogState HashMap removed; single CatalogReader path; heap-owned FFI buffers; per-load db_token; ADBC end-to-end test added.
+2. **Architectural unification (Phase 59)** — `parser_override` becomes the sole DDL entry; legacy `parse_function` / `sv_ddl_internal` table-function fallback retired (~1500 LOC removed). Single execution path → uniform transactional semantics + uniform Bison/PEG parser compatibility.
+3. **Race guards & FFI hardening (Phase 60)** — Two-statement DROP/ALTER guard (`SELECT CASE WHEN NOT EXISTS THEN error() ELSE TRUE; DELETE … RETURNING`) emits `semantic view '<name>' was concurrently dropped` if a writer races between snapshot and apply. Checked `from_utf8` on FFI input. `parse_table_function_call` rejects malformed argument shapes. `static_assert` pins `ParserOptions` size.
+4. **Bounded multi-DB isolation, RAII, tests & docs (Phase 61)** — Per-DB token→catalog map capped at 16 entries (TECH-DEBT 20, deliberately introduced as known limitation). `CatalogReader` adopts RAII guards (`PreparedStmt`, `QueryResult`). ADBC + concurrent-CREATE Python tests, `INSERT OR REPLACE` row-count + byte-identical rollback sqllogictest, type-inference inside transaction, FFI fuzz target.
+5. **Caret restoration + LRU removal (Phase 62)** — TECH-DEBT 22 + 20 resolved structurally. `parse_function` reintroduced purely as the error-reporting layer (`parser_override` keeps the success path); validation errors render as `Parser Error: ... LINE 1: ... ^` with the caret aligned to the offending token. The bounded LRU is gone — `OverrideContext` direct-attached to `SemanticViewsParserInfo`, lifetime-tied to `DBConfig`. New actionable error when `allow_parser_override_extension` is `DEFAULT`/`STRICT` (e.g. after `disable_peg_parser`).
+6. **Test infrastructure** — 7 sqllogictest fixtures pinning caret rendering across CREATE/DROP/ALTER/multi-line/UTF-8/multi-DB/extension-reload paths; tightened Python caret assertions (column-position now asserted); 17-DB and 50-DB sequential isolation tests; rc=3 actionable-error case in `peg_compat.test`; `static_assert` on `ParserExtensionParseResult` layout.
+7. **Documentation** — New `docs/explanation/transactional-ddl-and-limitations.rst` explanation page; transactional notes added to CREATE / DROP / ALTER / DESCRIBE / SHOW reference pages; FROM YAML FILE transactional caveat documented; "Transactional DDL" subsection in Snowflake comparison; concurrent-DDL error catalogue in `error-messages.rst`.
+
+**Tech debt resolved:** TECH-DEBT 20 (silent LRU eviction class), TECH-DEBT 22 (FALLBACK_OVERRIDE drops `DISPLAY_EXTENSION_ERROR`)
+**Tech debt added:** TECH-DEBT 19 (read-side functions see committed state — out of scope), 21 (`disable_peg_parser` resets override setting — out of scope), 23 (cross-process `CREATE IF NOT EXISTS` race surfaces as PK violation — DuckDB API limitation)
+
+**Requirements:** vacuous (0/0) — interior architecture milestone with no REQ-IDs assigned. See `.planning/v0.8.0-MILESTONE-AUDIT.md` for full audit.
+
+---
+
 ## v0.7.0 YAML Definitions & Materialization Routing (Shipped: 2026-04-24)
 
 **Phases completed:** 7 phases, 7 plans, 15 tasks

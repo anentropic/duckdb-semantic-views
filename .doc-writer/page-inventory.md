@@ -1,58 +1,97 @@
-# Page Inventory -- DDL-Time Type Inference for Dimensions and Metrics
+# Page Inventory -- Phase 62 Content Refresh (v0.8.0)
 
-**Generated:** 2026-04-26
-**Based on:** 6 flagged stale pages related to commit `7c58f54` (feat: infer DATA_TYPE for dimensions and metrics at DDL time)
-**Branch:** feat/dim-metric-type-inference
-**Scan method:** Each flagged doc page read in full. Source changes reviewed via `git diff df769cd..7c58f54` covering `src/ddl/define.rs` (type inference at DDL time), `src/query/table_function.rs` (new `type_id_to_display_name` function), and `test/integration/test_type_inference.py` (14 integration tests confirming behavior). Cross-referenced with `src/ddl/show_dims.rs`, `src/ddl/show_metrics.rs`, `src/ddl/show_columns.rs`, `src/ddl/show_dims_for_metric.rs`, `src/ddl/describe.rs`, and `src/model.rs` (Dimension/Metric `output_type` field).
+**Generated:** 2026-05-06
+**Mode:** Content refresh only (no new pages)
+**Branch:** milestone/v0.8.0
+**Trigger:** Phase 62 of the v0.8.0 milestone landed today, resolving TECH-DEBT 22 (caret rendering loss) and TECH-DEBT 20 (16-DB LRU eviction). Pre-existing WIP working-tree changes correctly document Phases 58/60/61 but predate Phase 62 and use "v0.8.1" framing for a milestone that was consolidated into v0.8.0 on 2026-05-05 and never tagged.
+
+This is a narrow refresh run. All entries below layer onto the existing working-tree WIP changes -- none replace WIP content wholesale.
 
 ---
 
 ## Change Summary
 
-Prior to commit `7c58f54`, the `output_type` field on `Dimension` and `Metric` model structs was only populated for facts (via `typeof()` at DDL time). Dimensions and metrics always had `output_type: None`, causing all SHOW/DESCRIBE commands to display an empty string in the `data_type` / `DATA_TYPE` column.
+Phase 62 produced two structural changes that invalidate documentation written during Phases 59-61:
 
-The new behavior: at DDL time (during `CREATE SEMANTIC VIEW`), the extension runs a `LIMIT 0` query via the persist connection (file-backed databases only) to infer column types. The inferred type IDs are mapped back to dimension and metric `output_type` fields using the new `type_id_to_display_name()` function. This populates `data_type` / `DATA_TYPE` in SHOW and DESCRIBE output with human-readable type names (e.g., `VARCHAR`, `BIGINT`, `DOUBLE`, `DATE`).
+1. **Caret rendering restored** (TECH-DEBT 22). Phase 59 unified DDL through `parser_override`, which delivered errors as bare runtime `Invalid Input Error` exceptions (no `LINE 1: ... ^` annotation). Phase 62 re-introduced `parse_function` purely as the error-reporting layer with `OverrideContext` attached to `SemanticViewsParserInfo`. Validation errors now render as `Parser Error: ... LINE 1: ... ^` again, matching the historical pre-extension behaviour.
 
-Key behavioral details:
-- **File-backed databases:** Type inference runs at DDL time. Dimensions and metrics show inferred types.
-- **In-memory databases:** No persist connection available, so `output_type` stays `None` and `data_type` / `DATA_TYPE` remains empty.
-- **DECIMAL-typed expressions:** `type_id_to_display_name()` returns `None` for DECIMAL (lossy CAST avoidance), so `data_type` stays empty for `SUM(decimal_col)`.
-- **Derived metrics:** Also get inferred types when the LIMIT 0 query resolves them.
-- **Supported type mappings:** VARCHAR, BOOLEAN, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, DOUBLE, DATE, TIME, TIMESTAMP, INTERVAL, UUID, BLOB, BIT, and timestamp/time variants. HUGEINT maps to BIGINT, UHUGEINT maps to UBIGINT, ENUM maps to VARCHAR, STRUCT/MAP map to VARCHAR.
+2. **Bounded 16-DB LRU removed** (TECH-DEBT 20). Phase 61 introduced a 16-entry insertion-order LRU with explicit eviction errors. Phase 62 deleted the LRU entirely; multi-database isolation is now unbounded with lifetimes tied to `DBConfig`. The "catalog context for this database has been evicted (process has opened more than 16 databases)" error is unreachable.
+
+3. **Milestone consolidation** (administrative). Working drafts split the milestone into v0.8.0 + v0.8.1 (4851e43, d6f077d). On 2026-05-05 the work was consolidated into a single v0.8.0; v0.8.1 was never tagged. Doc passages that say "Since v0.8.1" must normalise to "Since v0.8.0".
 
 ---
 
 ## Content Refresh
 
-Existing pages compared against current source code. Pages with real discrepancies list specific changes needed. Pages that are still accurate note "no changes needed."
+| # | Type | Title | Key Sections / Proposed Edits | File Path | Scope |
+|---|------|-------|-------------------------------|-----------|-------|
+| 1 | (refresh) | Transactional DDL and Known Limitations | **Substantive -- two section removals + intro/summary reconciliation + framing pass.** (a) Lines 49-74 ("Error Messages Are Now Runtime Errors", `_explanation-txn-ddl-error-formatting`): remove the entire section including the `.. versionchanged:: 0.8.1` directive. Phase 62 restored the parse-time caret via `parse_function` as the error-reporting layer, so the rendering is no longer surprising and there is no "limitation" left to explain. (b) Lines 150-162 ("Long-Running Processes Across Many Databases", `_explanation-txn-ddl-multi-db`): remove the entire section. Phase 62 deleted the bounded LRU; the eviction error is unreachable. (c) Line 14 (intro paragraph): remove the phrases "daemons that open dozens of databases" and "One change (error formatting) is visible everywhere, and is purely cosmetic" -- both reference the now-removed sections. Tighten the surrounding sentence so the intro still scans. (d) Lines 187-202 ("Summary"): remove the bullet "Validation errors arrive as runtime ``Invalid Input Error`` exceptions without the caret-style annotation. The error text is unchanged." (~line 195) and the bullet "A single program opening more than 16 databases will see eviction errors on the oldest one." (~line 201). The remaining bullets (transactional CREATE/DROP/ALTER, read-committed introspection, concurrent CREATE IF NOT EXISTS, PEG parser) all stay. (e) "See also" list at lines 204-209: no edits required, all targets still exist. (f) Cross-reference label `_explanation-txn-ddl-error-formatting` will be deleted alongside section (a) -- inbound link from `docs/reference/error-messages.rst` is handled in entry #2. (g) Verify no other "v0.8.1" / "0.8.1" references remain after sections (a) is removed -- the removal also takes lines 54, 58, 66 with it. | docs/explanation/transactional-ddl-and-limitations.rst | substantive |
+| 2 | (refresh) | Error Messages | **Minor -- single note rewrite + retarget cross-reference.** Lines 12-14 admonition currently warns: "Since v0.8.1, DDL validation errors (``semantic view 'X' does not exist``, unknown clauses, name uniqueness violations, and so on) arrive as runtime ``Invalid Input Error`` exceptions rather than parse-time errors with caret-position formatting. The error text is unchanged; only the rendering and source-line annotation are different. See :ref:`explanation-txn-ddl-error-formatting` for the mechanism." This is wrong post-Phase-62 (caret is back) and points at a label that entry #1 removes. Recommended action: **remove the admonition entirely** (lines 12-14, plus the surrounding blank lines). The error catalogue below the note already documents each error verbatim; a "rendering changed" warning is no longer needed. Optionally, before the first error subsection, add a single short paragraph: "Validation errors render as DuckDB ``Parser Error`` with the standard ``LINE 1: ... ^`` caret annotation. The examples below show the bare error text; the runtime output additionally includes the offending source line." If kept, do not add a `:ref:` cross-reference to the removed label. | docs/reference/error-messages.rst | minor |
+| 3 | (refresh) | ALTER SEMANTIC VIEW | **Minor -- one-token framing edit.** Line 52 admonition contains "Since v0.8.1, the non-``IF EXISTS`` forms additionally raise ``semantic view '<name>' was concurrently dropped`` ...". Change "Since v0.8.1" to "Since v0.8.0". The behaviour itself is correct (Phase 60 added the concurrent-drop guard); only the version label is stale. No other edits needed; the rest of the admonition matches current source. | docs/reference/alter-semantic-view.rst | minor |
+| 4 | (refresh) | DROP SEMANTIC VIEW | **Minor -- one-token framing edit.** Line 36 admonition contains "Since v0.8.1, ``DROP SEMANTIC VIEW`` (without ``IF EXISTS``) additionally raises ``semantic view '<name>' was concurrently dropped`` ...". Change "Since v0.8.1" to "Since v0.8.0". Same rationale as entry #3 -- Phase 60 behaviour is correct, version label is stale. | docs/reference/drop-semantic-view.rst | minor |
 
-| # | Type | Title | Key Sections | File Path |
-|---|------|-------|--------------|-----------|
-| 1 | (refresh) | SHOW SEMANTIC DIMENSIONS | **Stale -- description and examples.** (a) Line 109: `data_type` column description says "Reserved for future use. Currently always an empty string for dimensions." This is now incorrect -- type inference populates `data_type` at DDL time (file-backed DBs). Must update description to match the pattern already used by SHOW SEMANTIC FACTS: "The inferred data type. Empty string if not resolved." (b) Example output at lines 133-139 shows empty `data_type` for all dimensions (`customer_name`, `order_date`, `region`). With type inference, these should show inferred types (e.g., `VARCHAR`, `DATE`, `VARCHAR`). Must update example output. | docs/reference/show-semantic-dimensions.rst |
-| 2 | (refresh) | SHOW SEMANTIC METRICS | **Stale -- description and examples.** (a) Line 109: `data_type` column description says "Reserved for future use. Currently always an empty string for metrics." Must update to: "The inferred data type. Empty string if not resolved." (b) Example output at lines 133-138 shows empty `data_type` for `order_count` and `total_amount`. With inference, `order_count` (COUNT(*)) should show `BIGINT`, `total_amount` (SUM of amount, likely non-DECIMAL) should show an inferred type. Must update example output. (c) Derived metric example output at lines 174-181 shows empty `data_type` for all metrics (`cost`, `margin`, `profit`, `revenue`). Derived metrics also get inferred types when resolvable. Must update example output. | docs/reference/show-semantic-metrics.rst |
-| 3 | (refresh) | DESCRIBE SEMANTIC VIEW | **Stale -- examples only (descriptions already correct).** The property description tables for DIMENSION DATA_TYPE (line 158) and METRIC DATA_TYPE (line 177) already say "The inferred data type. Empty string if not resolved." -- these are accurate. However: (a) Simple single-table example output at lines 266 and 269 shows empty DATA_TYPE for dimension `region` and metric `total`. With inference on a file-backed DB, these should show `VARCHAR` and an inferred metric type respectively. (b) Metadata annotations example output at lines 305 and 310 shows empty DATA_TYPE for dimension `region` and metric `revenue`. Must update both example outputs. | docs/reference/describe-semantic-view.rst |
-| 4 | (refresh) | SHOW COLUMNS IN SEMANTIC VIEW | **Stale -- examples only (description already correct).** The `data_type` column description at line 60 already says "The inferred data type. Empty string if not resolved." -- accurate. However: (a) Example output at lines 132-135 shows empty `data_type` for all four column kinds (`avg_order` DERIVED_METRIC, `region` DIMENSION, `raw_amount` FACT, `revenue` METRIC). With inference, dimension, metric, and derived metric types would be populated (FACT types were already inferred pre-commit). Must update example output. | docs/reference/show-columns-semantic-view.rst |
-| 5 | (refresh) | SHOW SEMANTIC DIMENSIONS FOR METRIC | **Stale -- examples only (description already correct).** The `data_type` column description at line 93 already says "The inferred data type of the dimension. Empty string if not resolved." -- accurate. However: (a) All example outputs show empty `data_type` for every dimension across 8 examples (lines 139-144, 182-188, 197-203, 231-237, 255-259, 269-273, 285-289, 316-319). With inference, dimensions like `product` (VARCHAR), `region` (VARCHAR), `customer_name` (VARCHAR), `order_date` (DATE), `item_qty` (INTEGER) would show their inferred types. Must update all example outputs. | docs/reference/show-semantic-dimensions-for-metric.rst |
-| 6 | (refresh) -- no changes needed | semantic_view() | Line 135 states "Column types are inferred at define time from the underlying table columns. If type inference is not available, columns default to VARCHAR." This is accurate and already covers the new behavior. The `semantic_view()` function's output column type inference was implemented before this commit (using `column_type_names` + `column_types_inferred`). The new commit extends inference to also populate `output_type` on dimension/metric model structs (for SHOW/DESCRIBE output), but the query output behavior described on this page is unchanged. No updates needed. | docs/reference/semantic-view-function.rst |
+---
+
+## Pages Verified -- No Changes Needed (pre-deselected)
+
+These pages were flagged by the timestamp heuristic but read against current source code and the WIP working tree show no genuine drift. Exclude from the approved write set.
+
+| # | Type | Title | Reason | File Path |
+|---|------|-------|--------|-----------|
+| -- | (refresh) -- no changes needed | CREATE SEMANTIC VIEW | WIP admonitions added in working tree (Phase 58 transactional + IF NOT EXISTS race caveat) are accurate against post-Phase-62 source. Both notes use "Since v0.8.0" framing already; no "v0.8.1" present. | docs/reference/create-semantic-view.rst |
+| -- | (refresh) -- no changes needed | DESCRIBE SEMANTIC VIEW | WIP read-committed visibility note is accurate. Targets `:ref:`explanation-txn-ddl-write-visibility`` which is preserved by entry #1. No "v0.8.1" framing. | docs/reference/describe-semantic-view.rst |
+| -- | (refresh) -- no changes needed | SHOW SEMANTIC VIEWS | WIP read-committed visibility note is accurate. Targets `:ref:`explanation-txn-ddl-write-visibility`` which is preserved by entry #1. No "v0.8.1" framing. | docs/reference/show-semantic-views.rst |
+| -- | (refresh) -- no changes needed | YAML Definitions (how-to) | WIP "Since v0.8.0 ... FROM YAML FILE participates in the caller's transaction" note is accurate. No "v0.8.1" framing. | docs/how-to/yaml-definitions.rst |
+| -- | (refresh) -- no changes needed | Explanation index | WIP toctree update for transactional-ddl-and-limitations is accurate. The page itself stays in the toctree post-refresh; only two sections are removed from the page. | docs/explanation/index.rst |
+| -- | (refresh) -- no changes needed | Remaining 35 pages (Snowflake/Databricks comparison, YAML format reference, materialization routing, getting-started, all other reference pages, all how-to guides) | Timestamp-stale only. Cover features unrelated to Phase 62 changes. Spot-checked against current source -- no drift. | docs/**/*.rst (remainder) |
 
 ---
 
 ## API Reference Status
 
-**Manual reference.** `api_reference: "manual"` is set in config.yaml. This project exposes a SQL interface, so reference pages are hand-authored SQL syntax reference pages. Inline code mentions in prose use plain `code` formatting without cross-reference links.
+Manual API reference (per `.doc-writer/config.yaml`: `api_reference: manual`). No auto-generated reference. This project exposes a SQL interface and reference pages are hand-authored SQL syntax pages. Inline `code` mentions in this refresh use plain literal formatting without links, consistent with existing pages. No new symbol mentions are introduced by the proposed edits.
 
 ## Audience Targeting
 
-All pages target the single configured persona: **Data engineers exploring semantic views** (intermediate skill level). SQL fluency and DuckDB basics are assumed. Semantic view concepts, DDL syntax, and modeling patterns are always explained.
+All four refresh entries target the single configured persona: **Data engineers exploring semantic views** (intermediate). The `never_assume` list includes "duckdb-semantic-views DDL syntax" and "Differences from Snowflake/Databricks behavior" -- both already respected by surrounding prose in each affected page. Removing the caret-loss and 16-DB sections actually improves persona calibration: those passages explained behaviour the user will never observe, which would have confused them on first read.
 
 ## Coverage Gaps
 
-1. **In-memory vs file-backed distinction**: The type inference behavior differs between file-backed and in-memory databases. The refreshed description text ("Empty string if not resolved") covers this implicitly, but none of the existing pages explicitly explain why `data_type` might be empty. Consider adding a brief note or tip admonition on one of the SHOW pages explaining that type inference requires a file-backed database (i.e., not `:memory:`) and that the types are inferred at `CREATE SEMANTIC VIEW` time. This is a documentation enhancement, not a staleness fix.
-2. **DECIMAL avoidance**: `SUM(decimal_column)` intentionally produces an empty `data_type` to avoid lossy CAST. This behavioral nuance is not documented anywhere. Consider mentioning in a tip or note that certain parameterized types (DECIMAL, LIST, ARRAY) may show empty `data_type` even with inference enabled.
-3. **versionadded annotation**: The type inference for dimensions and metrics is new behavior. Consider adding `.. versionadded::` annotations on the refreshed pages to indicate when this behavior was introduced.
+None introduced. The two sections being removed from `transactional-ddl-and-limitations.rst` describe behaviours that no longer exist in v0.8.0 source as of Phase 62. Removing them does not create a documentation gap -- there is nothing left to document about either case.
+
+## Build-Output Note (informational)
+
+`docs/_build/html/...` and `docs/_build/html/_sources/...` contain stale "v0.8.1" framing too (artefacts of an earlier `sphinx-build` run). These regenerate from source on the next build. Not part of this refresh.
+
+## Cross-Cutting "v0.8.1" Verification
+
+Fresh grep at inventory time:
+
+```
+grep -rn "v0\.8\.1\|0\.8\.1" docs/ --include="*.rst" | grep -v "_build"
+```
+
+returns 6 matches across 4 files -- all covered by the entries above:
+
+- `docs/explanation/transactional-ddl-and-limitations.rst` lines 54, 58, 66 -- handled by entry #1 (sections containing them are removed)
+- `docs/reference/error-messages.rst` line 14 -- handled by entry #2
+- `docs/reference/alter-semantic-view.rst` line 52 -- handled by entry #3
+- `docs/reference/drop-semantic-view.rst` line 36 -- handled by entry #4
+
+No "v0.8.1" reference is missed by this inventory.
+
+---
 
 ## Summary of Work
 
 - **0 new pages** to write
-- **5 pages** requiring content refresh (entries #1-5, real discrepancies with current source)
-- **1 page** confirmed as still accurate (entry #6, no changes needed)
+- **4 pages** requiring content refresh
+  - 1 substantive (transactional-ddl-and-limitations.rst -- two section removals + intro/summary reconciliation)
+  - 3 minor (single-line edits in error-messages.rst, alter-semantic-view.rst, drop-semantic-view.rst)
+- **40+ pages** confirmed as still accurate (no changes needed; pre-deselected for approval prompt)
+
+## Out-of-Scope (per delegation message)
+
+- Internal Rust `pub` items (vtable structs, bind data types, parser functions) are not user-facing -- no API reference work.
+- New v0.8.0 features already documented correctly in WIP (transactional CREATE/DROP/ALTER, IF NOT EXISTS race, FROM YAML FILE transactions, read-committed DESCRIBE/SHOW visibility) are preserved as-is.
+- The 39 timestamp-stale-but-content-current pages are not refreshed.

@@ -1,0 +1,30 @@
+# Phase 62 Wave 3 — multi-line caret coverage.
+#
+# DuckDB's ParserException::SyntaxError renders `LINE N:` where N is the
+# 1-based line containing the caret position (counted by newlines in the
+# original input string up to error_location). Validation errors carry
+# byte offsets into the user input, so multi-line CREATE statements
+# correctly report the offending line, not LINE 1.
+#
+# Behavioural property pinned (from RESEARCH.md §6):
+#   B4: caret column is correct for multi-line CREATE
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY);
+
+# B4: multi-line CREATE; the bad token (missing 'AS') is on line 2.
+# DuckDB reports "LINE 2: TABLES (t)" with caret on the line-2 column.
+# We use a loose `LINE` matcher because 1) the caret column is byte-based
+# and tested precisely in test_caret_position.py, 2) sqllogictest
+# substring-matches against the full rendered error string.
+statement error
+CREATE SEMANTIC VIEW v_ml AS
+TABLES (t)
+DIMENSIONS (TBLES x);
+----
+LINE

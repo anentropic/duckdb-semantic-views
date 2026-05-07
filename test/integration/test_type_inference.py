@@ -376,6 +376,51 @@ def run_tests():
         con.close()
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+    # ---- Test 13b (D5, v0.8.0): type inference under transactional CREATE ----
+    print(
+        "Test 13b: type inference fires on file-backed CREATE inside an explicit BEGIN/COMMIT"
+    )
+    con, tmpdir = make_file_connection()
+    try:
+        con.execute(
+            "CREATE TABLE d5 (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER, ts TIMESTAMP)"
+        )
+        con.execute("INSERT INTO d5 VALUES (1, 'east', 5, '2026-01-01')")
+        con.execute("BEGIN")
+        con.execute(
+            """
+            CREATE SEMANTIC VIEW d5_view AS
+              TABLES (o AS d5 PRIMARY KEY (id))
+              DIMENSIONS (o.region AS o.region, o.ts AS o.ts)
+              METRICS (o.total AS SUM(o.qty))
+            """
+        )
+        con.execute("COMMIT")
+
+        dim_types = show_dims_types(con, "d5_view")
+        met_types = show_metrics_types(con, "d5_view")
+        assert dim_types.get("region") == "VARCHAR", (
+            f"region should be VARCHAR after txn CREATE, got {dim_types.get('region')!r}"
+        )
+        assert dim_types.get("ts", "").startswith("TIMESTAMP"), (
+            f"ts should be TIMESTAMP after txn CREATE, got {dim_types.get('ts')!r}"
+        )
+        # SUM(INTEGER) is HUGEINT or BIGINT depending on DuckDB version; accept
+        # any integer-family inferred type.
+        assert met_types.get("total") in {"BIGINT", "HUGEINT", "INTEGER"}, (
+            f"total should be integer-family, got {met_types.get('total')!r}"
+        )
+        print(
+            f"  PASS: region={dim_types['region']}, ts={dim_types['ts']}, total={met_types['total']}"
+        )
+        passed += 1
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        failed += 1
+    finally:
+        con.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
     # ---- Test 14: In-memory DB produces no type inference ----
     print("Test 14: In-memory DB produces empty data_type (no persist_conn)")
     try:

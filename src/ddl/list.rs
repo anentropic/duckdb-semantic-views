@@ -5,7 +5,7 @@ use duckdb::{
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
 };
 
-use crate::catalog::CatalogState;
+use crate::catalog::CatalogReader;
 use crate::model::SemanticViewDefinition;
 
 /// A single row in the SHOW SEMANTIC VIEWS output.
@@ -70,15 +70,14 @@ impl VTab for ListSemanticViewsVTab {
             );
             bind.add_result_column("comment", LogicalTypeHandle::from(LogicalTypeId::Varchar));
 
-            let state_ptr = bind.get_extra_info::<CatalogState>();
-            let guard = unsafe {
-                (*state_ptr)
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
-            };
+            let state_ptr = bind.get_extra_info::<CatalogReader>();
+            let reader = unsafe { *state_ptr };
+            let entries = reader
+                .list_all()
+                .map_err(Box::<dyn std::error::Error>::from)?;
 
-            let mut rows = Vec::with_capacity(guard.len());
-            for (name, json) in guard.iter() {
+            let mut rows = Vec::with_capacity(entries.len());
+            for (name, json) in &entries {
                 let def = SemanticViewDefinition::from_json(name, json).ok();
                 let (created_on, database_name, schema_name, comment) = match &def {
                     Some(d) => (
@@ -203,15 +202,14 @@ impl VTab for ListTerseSemanticViewsVTab {
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
             );
 
-            let state_ptr = bind.get_extra_info::<CatalogState>();
-            let guard = unsafe {
-                (*state_ptr)
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
-            };
+            let state_ptr = bind.get_extra_info::<CatalogReader>();
+            let reader = unsafe { *state_ptr };
+            let entries = reader
+                .list_all()
+                .map_err(Box::<dyn std::error::Error>::from)?;
 
-            let mut rows = Vec::with_capacity(guard.len());
-            for (name, json) in guard.iter() {
+            let mut rows = Vec::with_capacity(entries.len());
+            for (name, json) in &entries {
                 let def = SemanticViewDefinition::from_json(name, json).ok();
                 let (created_on, database_name, schema_name) = match &def {
                     Some(d) => (

@@ -106,17 +106,26 @@ test/
 
 ### Data Flow
 
-A semantic query goes through these stages:
+Every recognised DDL form is rewritten by `parser_override` into native SQL that DuckDB then plans and executes on the caller's connection. There is no longer a separate `parse_function` / `sv_ddl_internal` table-function fallback (deleted in the v0.8.0 architectural unification (Phase 59) — see CHANGELOG).
 
 ```
-1. User runs CREATE SEMANTIC VIEW shop AS TABLES (...) DIMENSIONS (...) METRICS (...)
-   └── Parser hook (C++ shim) -> Rust trampoline -> body_parser.rs -> catalog.rs (persist via pragma_query_t)
+DDL (CREATE / DROP / ALTER / DESCRIBE / SHOW / GET_DDL / READ_YAML / FROM YAML FILE)
+   └── C++ parser_override hook (cpp/src/shim.cpp::sv_parser_override)
+   └── Rust FFI trampoline (src/parse.rs::sv_parser_override_rust)
+   └── rewrite_to_native_sql
+         ├── validate_and_rewrite (canonical body parser → table-function-call SQL or sentinel)
+         ├── rewrite_create / rewrite_yaml_file_create  (writes: INSERT/UPDATE/DELETE on _definitions)
+         ├── rewrite_drop_or_alter                       (writes: with race-guard SELECT prefix)
+         └── (read-side pass-through: SELECT * FROM <read_side_fn>(...))
+   └── publish_owned_sql → C++ Parser::ParseQuery (DEFAULT_OVERRIDE so the hook does not recurse)
+   └── DuckDB executes the resulting SQLStatement(s) on the caller's connection.
 
-2. User calls semantic_view('shop', dimensions := ['region'], metrics := ['revenue'])
-   └── catalog.rs (lookup definition) -> expand.rs (generate SQL) -> DuckDB (execute SQL) -> results
+semantic_view('shop', dimensions := [...], metrics := [...])
+   └── Standard table function. Bind reads the definition via catalog.rs::CatalogReader,
+       expand/ generates SQL, DuckDB executes it.
 ```
 
-The key insight: `expand.rs` is pure Rust that converts a `SemanticViewDefinition` plus a `QueryRequest` into a SQL string. DuckDB handles all actual data processing. The generated SQL looks like:
+`expand/` is pure Rust that converts a `SemanticViewDefinition` plus a `QueryRequest` into a SQL string. DuckDB handles all actual data processing. The generated SQL looks like:
 
 ```sql
 SELECT
@@ -127,6 +136,11 @@ LEFT JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id"
 GROUP BY
     "o"."region"
 ```
+
+#### Two FALLBACK_OVERRIDE quirks worth knowing
+
+1. **DuckDB silently drops `DISPLAY_EXTENSION_ERROR` from `parser_override` in FALLBACK mode** (`ParseInternal` in the v1.5.2 amalgamation). The success path is unaffected — `parser_override` rewrites recognised DDL into native SQL on the caller's connection. For *validation* errors (e.g. `semantic view 'X' does not exist`, unknown clause), `parser_override` instead returns `DISPLAY_ORIGINAL_ERROR`; the default parser then fails on the unrecognised DDL prefix; DuckDB calls our registered `parse_function`, which re-runs validation and returns `DISPLAY_EXTENSION_ERROR` with `error_location` set to the offending byte offset. `ParserException::SyntaxError` formats the caret automatically. See `sv_parse_function_rust` in `src/parse.rs`. (TECH-DEBT 22 was resolved by this mechanism in Phase 62; the older `sql_throwing` / synthesised-`SELECT error('...')` workaround was deleted.)
+2. **`CALL disable_peg_parser()` resets `allow_parser_override_extension` to `default`,** which silently bypasses our hook. After toggling PEG you must re-issue `SET allow_parser_override_extension='FALLBACK'`. The extension installs `FALLBACK` on load, so a process that never enables PEG is unaffected. See TECH-DEBT.md item 21.
 
 ### Feature Flag Split
 
@@ -143,13 +157,14 @@ The `ddl/` and `query/` modules are gated behind `#[cfg(feature = "extension")]`
 
 ### Catalog Persistence
 
-DDL statements (CREATE, DROP, ALTER SEMANTIC VIEW) are detected by the parser hook and routed through a dedicated DDL connection (`persist_conn`) that avoids lock conflicts with the main execution connection. The catalog uses `pragma_query_t` for persistence:
+Definitions live in `semantic_layer._definitions` (a regular DuckDB table that participates in normal transactional semantics). Two separate connections coexist per extension load:
 
-1. **During DDL:** The parser hook detects the statement, the Rust trampoline parses it, and the DDL handler executes via a separate connection to avoid deadlock.
-2. **Persistence:** Definitions are stored in the `semantic_layer._definitions` table via `pragma_query_t` (write-first pattern).
-3. **On load:** `init_catalog()` reads the definitions table and populates the in-memory HashMap.
+- **Caller's connection.** Where DDL writes execute. `parser_override` produces `INSERT / UPDATE / DELETE ... RETURNING ...` SQL, DuckDB plans it on this connection, and the writes participate in whatever transaction the caller has open.
+- **Catalog connection (`catalog_conn`).** Created at extension load time and held for read-side table functions (`describe_*`, `show_*`, `list_*`, `read_yaml_*`, `get_ddl`) and CREATE-time enrichment (PK lookup, type inference). Reads see committed state — never the caller's in-flight transaction.
 
-The sidecar file approach was eliminated in v0.2.0 in favor of transactional catalog persistence.
+The split exists because read-side table function bind hooks do not (currently) expose the executing connection through libduckdb-sys, so DESCRIBE / SHOW use `catalog_conn` even when called from inside an open transaction. Documented limitation; see TECH-DEBT item 19.
+
+The in-memory `CatalogState` HashMap mirror was removed in v0.8.0 (Phase 58); Phase 61 added internal `PreparedStmt` / `QueryResult` RAII guards in `catalog::reader` so error paths no longer juggle manual `duckdb_destroy_*` calls.
 
 ## Building
 

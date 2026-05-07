@@ -6,7 +6,7 @@ use duckdb::{
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
 };
 
-use crate::catalog::CatalogState;
+use crate::catalog::CatalogReader;
 use crate::expand::{ancestors_to_root, collect_derived_metric_source_tables};
 use crate::graph::RelationshipGraph;
 use crate::model::{Cardinality, Dimension, SemanticViewDefinition};
@@ -180,26 +180,30 @@ impl VTab for ShowDimensionsForMetricVTab {
             let view_name = bind.get_parameter(0).to_string();
             let metric_name = bind.get_parameter(1).to_string();
 
-            let state_ptr = bind.get_extra_info::<CatalogState>();
-            let guard = unsafe {
-                (*state_ptr)
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
+            let state_ptr = bind.get_extra_info::<CatalogReader>();
+            let reader = unsafe { *state_ptr };
+            let json = match reader
+                .lookup(&view_name)
+                .map_err(Box::<dyn std::error::Error>::from)?
+            {
+                Some(j) => j,
+                None => {
+                    let available = reader
+                        .list_names()
+                        .map_err(Box::<dyn std::error::Error>::from)?;
+                    let msg = if let Some(suggestion) = suggest_closest(&view_name, &available) {
+                        format!(
+                            "semantic view '{}' does not exist. Did you mean '{}'?",
+                            view_name, suggestion
+                        )
+                    } else {
+                        format!("semantic view '{}' does not exist", view_name)
+                    };
+                    return Err(msg.into());
+                }
             };
 
-            let json = guard.get(&view_name).ok_or_else(|| {
-                let available: Vec<String> = guard.keys().cloned().collect();
-                if let Some(suggestion) = suggest_closest(&view_name, &available) {
-                    format!(
-                        "semantic view '{}' does not exist. Did you mean '{}'?",
-                        view_name, suggestion
-                    )
-                } else {
-                    format!("semantic view '{}' does not exist", view_name)
-                }
-            })?;
-
-            let def = SemanticViewDefinition::from_json(&view_name, json)?;
+            let def = SemanticViewDefinition::from_json(&view_name, &json)?;
 
             // Find the metric (case-insensitive)
             let metric_lower = metric_name.to_ascii_lowercase();

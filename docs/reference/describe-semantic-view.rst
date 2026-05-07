@@ -28,6 +28,10 @@ Parameters
 ``<name>``
    The name of the semantic view to describe. Returns an error if the view does not exist.
 
+.. note::
+
+   ``DESCRIBE SEMANTIC VIEW`` reads committed catalog state. A ``CREATE`` / ``ALTER`` / ``DROP`` issued in the same uncommitted transaction is not yet reflected here -- commit first, then describe. See :ref:`explanation-txn-ddl-write-visibility`.
+
 
 .. _ref-describe-output:
 

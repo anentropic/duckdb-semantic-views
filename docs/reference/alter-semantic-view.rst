@@ -47,6 +47,10 @@ Statement Variants
 ``ALTER SEMANTIC VIEW IF EXISTS <name> UNSET COMMENT``
    Removes the view-level comment if the view exists. If the view does not exist, the statement succeeds silently.
 
+.. note::
+
+   Since v0.8.0 ``ALTER`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the previous name and comment). Since v0.8.0, the non-``IF EXISTS`` forms additionally raise ``semantic view '<name>' was concurrently dropped`` if another process drops the view at the same time, instead of silently succeeding. ``IF EXISTS`` keeps its silent-no-op behaviour. See :ref:`explanation-transactional-ddl`.
+
 
 .. _ref-alter-params:
 

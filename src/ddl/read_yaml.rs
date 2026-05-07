@@ -12,7 +12,7 @@ use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::WritableVector;
 use libduckdb_sys::duckdb_string_t;
 
-use crate::catalog::CatalogState;
+use crate::catalog::CatalogReader;
 use crate::model::SemanticViewDefinition;
 use crate::render_yaml::render_yaml_export;
 
@@ -25,7 +25,7 @@ fn resolve_bare_name(input: &str) -> &str {
 pub struct ReadYamlFromSemanticViewScalar;
 
 impl VScalar for ReadYamlFromSemanticViewScalar {
-    type State = CatalogState;
+    type State = CatalogReader;
 
     unsafe fn invoke(
         state: &Self::State,
@@ -42,13 +42,11 @@ impl VScalar for ReadYamlFromSemanticViewScalar {
                 let raw_name = DuckString::new(&mut { names[i] }).as_str().to_string();
                 let bare_name = resolve_bare_name(&raw_name);
 
-                let guard = state
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?;
-                let json = guard
-                    .get(bare_name)
+                let json = state
+                    .lookup(bare_name)
+                    .map_err(Box::<dyn std::error::Error>::from)?
                     .ok_or_else(|| format!("semantic view '{}' does not exist", bare_name))?;
-                let def: SemanticViewDefinition = serde_json::from_str(json)?;
+                let def: SemanticViewDefinition = serde_json::from_str(&json)?;
                 let yaml = render_yaml_export(&def)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 out_vec.insert(i, yaml.as_str());

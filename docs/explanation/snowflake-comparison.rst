@@ -355,6 +355,22 @@ Snowflake's ``CREATE SEMANTIC VIEW`` SQL DDL does not include a materializations
 DuckDB Semantic Views introduces a ``MATERIALIZATIONS`` clause that declares mappings from pre-aggregated tables to the dimensions and metrics they cover. When a query exactly matches a materialization, the extension routes to the pre-aggregated table instead of expanding raw sources. See :ref:`howto-materializations` for details.
 
 
+Transactional DDL
+-----------------
+
+.. versionadded:: 0.8.0
+
+Both systems run ``CREATE`` / ``ALTER`` / ``DROP SEMANTIC VIEW`` inside the caller's transaction, so ``BEGIN ... ROLLBACK`` discards uncommitted DDL in either engine.
+
+The DuckDB-specific behaviour worth noting before you build on it:
+
+- ``DESCRIBE SEMANTIC VIEW`` and the ``SHOW SEMANTIC ...`` family read **committed** catalog state. A ``CREATE`` issued earlier in the same uncommitted transaction is not yet visible to introspection in that transaction; commit first, then describe.
+- ``CREATE SEMANTIC VIEW IF NOT EXISTS`` cannot fully absorb a race between two separate processes both running it against the same database at the same moment -- one will succeed and the other will see a constraint error. Within a single process or transaction, ``IF NOT EXISTS`` is reliable.
+- The non-``IF EXISTS`` ``DROP`` and ``ALTER`` forms raise ``semantic view '<name>' was concurrently dropped`` if another writer removes the view between snapshot and apply, instead of silently no-opping.
+
+See :ref:`explanation-transactional-ddl` for the full mechanism and worked examples.
+
+
 .. _explanation-sf-not-supported:
 
 Features Not Yet Supported

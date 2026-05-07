@@ -7,7 +7,7 @@ use duckdb::{
 
 use std::collections::HashMap;
 
-use crate::catalog::CatalogState;
+use crate::catalog::CatalogReader;
 use crate::model::{AccessModifier, SemanticViewDefinition};
 
 /// A single property row in the DESCRIBE output.
@@ -520,20 +520,16 @@ impl VTab for DescribeSemanticViewVTab {
             // Read the name parameter.
             let name = bind.get_parameter(0).to_string();
 
-            // Access the shared catalog state injected via extra_info.
-            let state_ptr = bind.get_extra_info::<CatalogState>();
-            let guard = unsafe {
-                (*state_ptr)
-                    .read()
-                    .map_err(|_| Box::<dyn std::error::Error>::from("catalog lock poisoned"))?
-            };
-
-            let json_str = guard
-                .get(&name)
+            // Access the shared catalog reader injected via extra_info.
+            let state_ptr = bind.get_extra_info::<CatalogReader>();
+            let reader = unsafe { *state_ptr };
+            let json_str = reader
+                .lookup(&name)
+                .map_err(Box::<dyn std::error::Error>::from)?
                 .ok_or_else(|| format!("semantic view '{name}' does not exist"))?;
 
             // Parse the stored JSON into the model.
-            let def = SemanticViewDefinition::from_json(&name, json_str)?;
+            let def = SemanticViewDefinition::from_json(&name, &json_str)?;
 
             // Build alias->table map and compute base table name.
             let alias_map = def.alias_to_table_map();

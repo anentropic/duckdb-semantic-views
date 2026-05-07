@@ -1039,3 +1039,71 @@ proptest! {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 62 — `ParseError::position` MUST be a byte offset into the user's
+// input string, NOT into the rewritten SQL. RESEARCH.md Q1 proves this is
+// already true; these tests pin it as a contract across arbitrary leading
+// whitespace + comments so a future refactor that breaks the invariant
+// fails loudly.
+// ---------------------------------------------------------------------------
+
+/// Smoke test: position arithmetic for a clause-typo error.
+///
+/// `TABLSE` is the transposition typo proven to land position at the typo
+/// byte offset (see `as_body_position_invariant_clause_typo` above). Whatever
+/// prefix we stick before the canonical CREATE, the reported byte offset
+/// must shift by exactly the prefix's byte length.
+#[test]
+fn parse_error_position_is_byte_offset_into_user_input_smoke() {
+    let canonical = "CREATE SEMANTIC VIEW v AS TABLSE (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))";
+    let bad_token_offset = canonical.find("TABLSE").unwrap();
+
+    // Canonical case — no prefix.
+    let err = validate_and_rewrite(canonical).expect_err("should fail on TABLSE");
+    let pos = err
+        .position
+        .expect("position should be set for clause typo");
+    assert_eq!(pos, bad_token_offset, "smoke: canonical case");
+
+    // Whitespace prefix shifts the position by its byte length.
+    let prefixed = format!("   \n\t{canonical}");
+    let prefix_len = prefixed.len() - canonical.len();
+    let err2 = validate_and_rewrite(&prefixed).expect_err("should fail with whitespace");
+    let pos2 = err2.position.expect("position should be set");
+    assert_eq!(
+        pos2,
+        prefix_len + bad_token_offset,
+        "smoke: with whitespace prefix"
+    );
+
+    // Line-comment prefix.
+    let with_comment = format!("-- a comment\n{canonical}");
+    let comment_len = with_comment.len() - canonical.len();
+    let err3 = validate_and_rewrite(&with_comment).expect_err("should fail with comment");
+    let pos3 = err3.position.expect("position should be set");
+    assert_eq!(
+        pos3,
+        comment_len + bad_token_offset,
+        "smoke: with line comment prefix"
+    );
+}
+
+proptest! {
+    /// Position is preserved as user-input byte offset for arbitrary
+    /// safe ASCII whitespace + line-comment prefix.
+    #[test]
+    fn position_byte_offset_preserved_for_arbitrary_prefix(
+        ws in proptest::collection::vec(prop_oneof![Just(' '), Just('\t'), Just('\n')], 0..32),
+        line_comment in r"-- [a-zA-Z0-9 ]{0,40}\n",
+    ) {
+        let prefix: String = ws.into_iter().collect::<String>() + &line_comment;
+        let canonical = "CREATE SEMANTIC VIEW v AS TABLSE (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))";
+        let bad_offset = canonical.find("TABLSE").unwrap();
+        let full = format!("{prefix}{canonical}");
+        let prefix_len = prefix.len();
+        let err = validate_and_rewrite(&full).expect_err("must fail on TABLSE");
+        let pos = err.position.expect("position should always be set for clause typo");
+        prop_assert_eq!(pos, prefix_len + bad_offset);
+    }
+}

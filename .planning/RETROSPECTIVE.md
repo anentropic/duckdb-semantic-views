@@ -512,6 +512,49 @@
 
 ---
 
+## Milestone: v0.8.0 — Transactional DDL & Architectural Unification
+
+**Shipped:** 2026-05-06
+**Phases:** 5 (58-62) | **Plans:** 8 | **Audit:** ✅ passed (5/5 phases, 7/7 integration, 0/0 reqs — vacuous)
+
+### What Was Built
+
+Transactional DDL via `parser_override` (CREATE/DROP/ALTER all participate in caller's transaction); `parser_override` becomes the sole DDL entry with ~1500 LOC of legacy `parse_function`/`sv_ddl_internal` retired; race guards (concurrent-DROP/ALTER guard) and FFI UTF-8 hardening; bounded multi-DB isolation with RAII guards; caret rendering restored via `parse_function` as the error-reporting layer; bounded LRU removed in favour of `OverrideContext` direct-attached to `SemanticViewsParserInfo`. TECH-DEBT 20 + 22 resolved structurally.
+
+### What Worked
+
+- **Pairing limitations with their resolution.** Phases 59 and 61 deliberately introduced TECH-DEBT 20 (LRU eviction) and 22 (caret loss) as known limitations to ship the unification without scope creep. Phase 62 closed both with a single architectural change (parse_function as error-reporting layer + OverrideContext direct-attach). Tech debt that's tracked and scheduled is not the same as tech debt that festers.
+- **Retroactive GSD reconstruction.** Phases 58-61 had been completed ad-hoc on `milestone/v0.8.0` (PR #28) and a premature `milestone/v0.8.1` branch. The 2026-05-05 consolidation back-derived PLAN.md + VERIFICATION.md from commits, CHANGELOG, and test artefacts. This kept the milestone narrative coherent without rewriting history.
+- **Phase 62 ultra-planning before /gsd-plan-phase.** A 164-line `_notes/v0.8.0_phase_62_ultraplan.md` (mermaid flow + per-file changes + 4 open research questions) and a 115-line sqllogictest blast-radius spike pre-empted the planner's research phase. The actual research agent resolved the 4 open questions including catching a Q2 destruction-order showstopper that would have caused a use-after-free if implemented per the original ultraplan.
+- **Q2 destruction-order catch.** RESEARCH.md surfaced that `~DatabaseInstance` resets `connection_manager` BEFORE `~DBConfig` runs, so calling `duckdb_disconnect` from `~SemanticViewsParserInfo` is a UAF. Encoded twice in plan acceptance criteria (grep for absence in both Rust `Drop for OverrideContext` and C++ `~SemanticViewsParserInfo`). Caught before any code was written.
+- **Wave 0 scaffolding contract.** Plan 62-01 staged 7 sqllogictest fixtures, 1 layout `static_assert`, 1 position-byte-offset proptest, and Python skeletons BEFORE Wave 1 modified the parser surface. When Wave 1 + 2 introduced regressions in test 13b and the multi-DB RSS test, the failures were caught immediately rather than at phase verification.
+
+### What Was Inefficient
+
+- **Premature branch split for v0.8.1.** The original work split into v0.8.0 + v0.8.1 branches and was consolidated retroactively. Doc passages used "Since v0.8.1" framing throughout user-facing files (TECH-DEBT, MAINTAINER, CHANGELOG, examples, source comments, Python tests, header comments). The 2026-05-06 normalization swept 30+ references across 11 files post-tag-prep. Cost: a separate chore commit + ~10 minutes; preventable by deciding milestone boundaries before writing version-stamped prose.
+- **Wave-3 plan-text drift.** Plan 04 acceptance criteria assumed specific validator error wordings ("Did you mean", "duplicate dimension") that didn't exactly match what the validator emitted. Executor handled it inline (substring matchers `LINE 1:` + `^` are structurally guaranteed; specific wording is fragile). Worth noting for future plans: prefer structural matchers over wording matchers when the SUT's error text isn't pinned.
+- **CLI archival miscount.** `gsd-tools milestone complete` counted all 13 phase directories (including v0.7.0's 51-57) as v0.8.0 phases and pulled v0.7.0 accomplishments into the MILESTONES.md entry. Required manual rewrite. Likely worth fixing in the CLI to scope by milestone version.
+
+### Patterns Established
+
+- **"Ultraplan + spike notes" as RESEARCH.md inputs.** When pre-planning artefacts already cover the architecture, the gsd-phase-researcher's job becomes "resolve the open questions and produce Validation Architecture", not "research from scratch". Faster, more focused; produced a HIGH-confidence research output in ~10 minutes that caught the Q2 showstopper.
+- **Double-encode showstoppers.** A plan-text comment AND an acceptance-criteria grep that the dangerous code DOESN'T appear in the destructor body. Belt-and-braces; the executor doesn't have to remember why.
+- **Wave 0 = test scaffolding, not no-op.** Establishing fixture skeletons + layout asserts BEFORE the production code change keeps the test surface stable across Wave 1+2 modifications. Each wave's failure is local to its change, not a regression in tests written days earlier.
+
+### Key Lessons
+
+1. **Track TECH-DEBT during the milestone, not after.** Phase 59's CHANGELOG and TECH-DEBT.md entries for items 20+22 made it trivial for Phase 62 to mark them ✅ resolved with cross-references. If you ship a known limitation, write it down at ship time.
+2. **Auto-mode + nested chains can run an entire milestone closing chain end-to-end.** This session ran `/gsd-plan-phase 62 --auto` → `/gsd-execute-phase 62 --auto --no-transition` (4 plans, 4 waves, ~95 minutes inside subagents) → `/gsd-audit-milestone v0.8.0` → `/gsd-complete-milestone v0.8.0` with only PARTIAL-fix approval and one strategic course-correction prompt from the user. The auto-chain flag is robust enough to compose nested skills.
+3. **Compile-commands single-source-of-truth saves repeated false-positive diagnostic noise.** Committing a build.rs that emits `compile_commands.json` from the same `CppBuildSpec` as the cc-crate compile (commit `01dd4aa`) is small (130 LOC) and silences clangd noise from now until the cc-crate or amalgamation surface changes.
+
+### Cost Observations
+
+- Model mix this session: Opus orchestrator + Opus subagents (researcher/planner) + Sonnet checker + Opus executor + Sonnet verifier + Sonnet integration-checker
+- Sessions: 1 (this one)
+- Notable: 4-wave executor agents took 95 minutes total wall-time inside subagent contexts; orchestrator context stayed under ~30% throughout via the path-only briefing pattern.
+
+---
+
 ## Cross-Milestone Trends
 
 ### Process Evolution

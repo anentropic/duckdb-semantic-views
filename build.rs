@@ -20,8 +20,168 @@
 // struct). WIN32_LEAN_AND_MEAN/NOGDI do not reliably suppress these across all Windows SDK
 // versions. On Windows, build.rs generates a patched copy of duckdb.cpp in OUT_DIR with
 // explicit #undef blocks inserted after each <windows.h> include.
+//
+// LSP support: `compile_commands.json` is regenerated on every `cargo build` / `cargo
+// check`, sourcing flags from the same `CppBuildSpec` as the cc-crate invocation so
+// clangd sees exactly what the build sees. clangd is pointed at the file via the
+// checked-in `.clangd` at the repo root (`CompilationDatabase: target`).
+//
+// Output location: always `<CARGO_MANIFEST_DIR>/target/compile_commands.json` so the
+// hardcoded `.clangd` path stays valid. When `CARGO_TARGET_DIR` is set to something
+// other than `<CARGO_MANIFEST_DIR>/target`, a second copy is also written there to
+// keep the build-system invariant (everything generated lives under the cargo target
+// dir). Both `target/` directories are gitignored, so neither copy is committed.
+//
+// Windows caveat: the cc-crate compile substitutes a patched copy of duckdb.cpp from
+// `OUT_DIR` (see `patch_duckdb_cpp_for_windows` below), but `compile_commands.json`
+// still names `cpp/include/duckdb.cpp`. Clangd on Windows therefore parses the
+// unpatched amalgamation and may surface `GetObject` / `interface` macro-conflict
+// diagnostics that the actual build does not see. The diagnostics are cosmetic; the
+// produced extension binary is still built from the patched source.
+
+/// Single source of truth for C++ build flags. Both the cc-crate compile invocation and
+/// the `compile_commands.json` writer read from this so the LSP cannot drift from the build.
+struct CppBuildSpec {
+    std: &'static str,
+    include: &'static str,
+    files: Vec<&'static str>,
+    /// (name, value) — value is None for bare `-Dname` defines.
+    defines: Vec<(&'static str, Option<&'static str>)>,
+}
+
+fn cpp_build_spec(is_windows: bool) -> CppBuildSpec {
+    let mut spec = CppBuildSpec {
+        std: "c++17",
+        include: "cpp/include",
+        files: vec!["cpp/include/duckdb.cpp", "cpp/src/shim.cpp"],
+        defines: Vec::new(),
+    };
+    if is_windows {
+        spec.defines.push(("WIN32_LEAN_AND_MEAN", None));
+        spec.defines.push(("NOMINMAX", None));
+        spec.defines.push(("NOGDI", None));
+        spec.defines.push(("DUCKDB_STATIC_BUILD", None));
+    }
+    spec
+}
+
+/// Write a `compile_commands.json` reflecting `spec`.
+///
+/// Always writes to `<CARGO_MANIFEST_DIR>/target/compile_commands.json` so the
+/// checked-in `.clangd` (which hardcodes `CompilationDatabase: target`) keeps
+/// finding it. When `CARGO_TARGET_DIR` is set to a different path, a second copy
+/// is also written under that directory to keep the build-system invariant that
+/// generated files live under the cargo target dir. Both `target/` locations are
+/// gitignored, so neither copy is committed.
+///
+/// Idempotent — only writes when the rendered JSON differs from the existing file, so
+/// cargo's rerun-if-changed graph doesn't churn from build script self-output.
+///
+/// `directory` inside each entry stays as the workspace root so relative `file` and
+/// `-I` paths resolve correctly.
+fn write_compile_commands_json(spec: &CppBuildSpec) {
+    let dir = std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
+
+    let mut flags: Vec<String> = vec![
+        "clang++".to_string(),
+        format!("-std={}", spec.std),
+        format!("-I{}", spec.include),
+    ];
+    for (name, val) in &spec.defines {
+        match val {
+            Some(v) => flags.push(format!("-D{name}={v}")),
+            None => flags.push(format!("-D{name}")),
+        }
+    }
+    flags.push("-c".to_string());
+
+    let mut entries: Vec<String> = Vec::with_capacity(spec.files.len());
+    for file in &spec.files {
+        let mut args = flags.clone();
+        args.push((*file).to_string());
+        let args_json = args
+            .iter()
+            .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        entries.push(format!(
+            "  {{\n    \"directory\": \"{}\",\n    \"file\": \"{}\",\n    \"arguments\": [{}]\n  }}",
+            dir.replace('\\', "\\\\").replace('"', "\\\""),
+            file.replace('\\', "\\\\").replace('"', "\\\""),
+            args_json,
+        ));
+    }
+    let new_json = format!("[\n{}\n]\n", entries.join(",\n"));
+
+    // Resolve write targets. The `.clangd`-anchored copy under
+    // <CARGO_MANIFEST_DIR>/target is the authoritative path clangd reads. When
+    // CARGO_TARGET_DIR is set to a different location, also write a copy there
+    // so generated artefacts stay under the configured target dir.
+    let manifest_target = std::env::var("CARGO_MANIFEST_DIR")
+        .ok()
+        .map(|m| format!("{m}/target"));
+    let cargo_target = std::env::var("CARGO_TARGET_DIR").ok();
+
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(t) = manifest_target {
+        targets.push(t);
+    }
+    if let Some(t) = cargo_target {
+        if !targets.iter().any(|existing| existing == &t) {
+            targets.push(t);
+        }
+    }
+    if targets.is_empty() {
+        println!(
+            "cargo:warning=neither CARGO_MANIFEST_DIR nor CARGO_TARGET_DIR set; skipping compile_commands.json"
+        );
+        return;
+    }
+
+    for target_dir in &targets {
+        if let Err(e) = std::fs::create_dir_all(target_dir) {
+            println!("cargo:warning=failed to create {target_dir}: {e}");
+            continue;
+        }
+        let path = format!("{target_dir}/compile_commands.json");
+        if std::fs::read_to_string(&path)
+            .ok()
+            .as_deref()
+            .is_some_and(|prev| prev == new_json)
+        {
+            continue;
+        }
+        if let Err(e) = std::fs::write(&path, &new_json) {
+            println!("cargo:warning=failed to write {path}: {e}");
+        }
+    }
+}
 
 fn main() {
+    // Always emit compile_commands.json so clangd works without `--features extension`.
+    // Single source of truth: the same CppBuildSpec drives the cc-crate compile below.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let is_windows = target_os == "windows";
+    write_compile_commands_json(&cpp_build_spec(is_windows));
+
+    // Always rerun if the C++ surface or this script changes — keeps both the cc-crate
+    // build cache and compile_commands.json fresh. Once any rerun-if-changed is emitted,
+    // cargo treats the list as exhaustive, so include every relevant input.
+    //
+    // duckdb.hpp / duckdb.cpp are gitignored (downloaded by `just update-headers`).
+    // Cargo treats a `rerun-if-changed` whose path is missing as "always rerun", which
+    // would force every `cargo check` on a fresh checkout to re-execute this script.
+    // Gate them on existence so they only join the dependency graph once present.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=cpp/src/shim.cpp");
+    println!("cargo:rerun-if-changed=cpp/include/parser_extension_compat.hpp");
+    if std::path::Path::new("cpp/include/duckdb.hpp").exists() {
+        println!("cargo:rerun-if-changed=cpp/include/duckdb.hpp");
+    }
+    if std::path::Path::new("cpp/include/duckdb.cpp").exists() {
+        println!("cargo:rerun-if-changed=cpp/include/duckdb.cpp");
+    }
+
     // Only configure C++ compilation and symbol visibility when building the loadable
     // extension binary. CARGO_FEATURE_EXTENSION is set by Cargo when `--features extension`
     // is passed. During `cargo test` (uses default/bundled feature), this block is skipped.
@@ -41,15 +201,6 @@ fn main() {
     // The cc crate is an optional build-dependency gated on the `extension` feature.
     #[cfg(feature = "extension")]
     {
-        // Ensure cargo re-runs this script when the C++ shim changes.
-        // The cc crate should emit rerun-if-changed automatically, but adding
-        // explicit directives ensures changes to shim.cpp always trigger rebuilds.
-        println!("cargo:rerun-if-changed=cpp/src/shim.cpp");
-        println!("cargo:rerun-if-changed=cpp/include/duckdb.hpp");
-        println!("cargo:rerun-if-changed=cpp/include/duckdb.cpp");
-
-        let is_windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
-
         // On Windows, generate a patched copy of duckdb.cpp in OUT_DIR.
         // duckdb.cpp is gitignored and re-downloaded from DuckDB releases in CI,
         // so patches must be applied at build time, not committed.
@@ -63,14 +214,25 @@ fn main() {
             "cpp/include/duckdb.cpp".to_string()
         };
 
+        let spec = cpp_build_spec(is_windows);
         let mut build = cc::Build::new();
         build
             .cpp(true)
-            .std("c++17")
-            .include("cpp/include")
-            .file(&duckdb_cpp_path)
-            .file("cpp/src/shim.cpp")
+            .std(spec.std)
+            .include(spec.include)
             .warnings(false); // Suppress warnings from DuckDB amalgamation
+
+        // Substitute the patched duckdb.cpp path on Windows; other files come from spec.
+        for file in &spec.files {
+            if *file == "cpp/include/duckdb.cpp" {
+                build.file(&duckdb_cpp_path);
+            } else {
+                build.file(file);
+            }
+        }
+        for (name, val) in &spec.defines {
+            build.define(name, *val);
+        }
 
         if is_windows {
             // MSVC preprocessor defines applied before any source is compiled.
@@ -82,10 +244,7 @@ fn main() {
             // Note: GetObject and `interface` are also explicitly #undef-d in the patched
             // duckdb.cpp (see patch_duckdb_cpp_for_windows below), because NOGDI and
             // WIN32_LEAN_AND_MEAN are not reliable across all Windows SDK configurations.
-            build.define("WIN32_LEAN_AND_MEAN", None);
-            build.define("NOMINMAX", None);
-            build.define("NOGDI", None);
-            build.define("DUCKDB_STATIC_BUILD", None);
+            //
             // /bigobj: duckdb.cpp (~300K lines) exceeds MSVC's default 65,536-section COFF limit.
             // flag_if_supported is a no-op on non-MSVC toolchains.
             build.flag_if_supported("/bigobj");
@@ -144,21 +303,21 @@ fn main() {
     }
 }
 
-/// Generate a patched copy of duckdb.cpp in OUT_DIR for Windows builds.
+/// Generate a patched copy of `duckdb.cpp` in `OUT_DIR` for Windows builds.
 ///
-/// duckdb.cpp includes <windows.h> mid-file (after all DuckDB declarations are
-/// already processed from duckdb.hpp). The windows.h include can define macros that
-/// conflict with identifiers in the DuckDB C++ implementation code that follows:
+/// `duckdb.cpp` includes `<windows.h>` mid-file (after all `DuckDB` declarations are
+/// already processed from `duckdb.hpp`). The `windows.h` include can define macros that
+/// conflict with identifiers in the `DuckDB` C++ implementation code that follows:
 ///
-/// - `GetObject` → `GetObjectA` (wingdi.h): conflicts with ComplexJSON::GetObject
-///   (line ~36327) and ObjectCache::GetObject (line ~37656).
-/// - `interface` → `struct` (objbase.h): conflicts with MultiFileReader `interface`
+/// - `GetObject` → `GetObjectA` (`wingdi.h`): conflicts with `ComplexJSON::GetObject`
+///   (line ~36327) and `ObjectCache::GetObject` (line ~37656).
+/// - `interface` → `struct` (`objbase.h`): conflicts with `MultiFileReader` `interface`
 ///   variable names (line ~65873+).
 ///
-/// The fix adds explicit `#undef` blocks after each <windows.h> include, following
-/// the same pattern DuckDB already uses for CreateDirectory/MoveFile/RemoveDirectory
-/// in the same file. We patch at build time (not at commit time) because duckdb.cpp
-/// is gitignored and re-downloaded from DuckDB releases in CI.
+/// The fix adds explicit `#undef` blocks after each `<windows.h>` include, following
+/// the same pattern `DuckDB` already uses for `CreateDirectory`/`MoveFile`/`RemoveDirectory`
+/// in the same file. We patch at build time (not at commit time) because `duckdb.cpp`
+/// is gitignored and re-downloaded from `DuckDB` releases in CI.
 ///
 /// Returns the path to the patched file (or the original if already patched).
 #[cfg(feature = "extension")]

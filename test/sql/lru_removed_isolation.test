@@ -1,0 +1,90 @@
+# Phase 62 Wave 3 — multi-DB isolation pinned without the LRU.
+#
+# NB: this fixture is a defensive smoke. The TRUE B15 test is in
+# test/integration/test_multi_db_isolation.py::test_seventeen_dbs_sequential_create
+# which uses 17 SEPARATE duckdb.connect() instances (each with its own
+# DBConfig and therefore its own SemanticViewsParserInfo). That is what
+# the original LRU bounded; ATTACH'd databases share a single DBConfig
+# and never exercised the LRU eviction path.
+#
+# This sqllogictest only verifies that ATTACH'd-side multi-DB use under a
+# single DBConfig works post-Phase-62 (no regression from removing the
+# LRU). The Python integration test is the load-bearing coverage.
+#
+# Behavioural property pinned (from RESEARCH.md §6):
+#   B15 (smoke): ATTACH-side multi-DB CREATE survives across 17 attached
+#                in-memory databases without panic / eviction error.
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# ATTACH 17 in-memory DBs sequentially. Pre-Phase-62 the per-load db_token
+# LRU was per-DBConfig; ATTACH does not allocate a new DBConfig so this
+# never exercised the eviction directly. Kept as a smoke that the
+# parser_extension info plumbing works under many ATTACHments.
+
+statement ok
+ATTACH ':memory:' AS db_01;
+
+statement ok
+ATTACH ':memory:' AS db_02;
+
+statement ok
+ATTACH ':memory:' AS db_03;
+
+statement ok
+ATTACH ':memory:' AS db_04;
+
+statement ok
+ATTACH ':memory:' AS db_05;
+
+statement ok
+ATTACH ':memory:' AS db_06;
+
+statement ok
+ATTACH ':memory:' AS db_07;
+
+statement ok
+ATTACH ':memory:' AS db_08;
+
+statement ok
+ATTACH ':memory:' AS db_09;
+
+statement ok
+ATTACH ':memory:' AS db_10;
+
+statement ok
+ATTACH ':memory:' AS db_11;
+
+statement ok
+ATTACH ':memory:' AS db_12;
+
+statement ok
+ATTACH ':memory:' AS db_13;
+
+statement ok
+ATTACH ':memory:' AS db_14;
+
+statement ok
+ATTACH ':memory:' AS db_15;
+
+statement ok
+ATTACH ':memory:' AS db_16;
+
+statement ok
+ATTACH ':memory:' AS db_17;
+
+# Sanity: subsequent semantic DDL on the original (catalog-bound) DB still
+# works after 17 attachments. A regression here would imply the parser
+# extension info pointer was being clobbered.
+
+statement ok
+CREATE TABLE t_post_attach (id INTEGER PRIMARY KEY);
+
+statement ok
+CREATE SEMANTIC VIEW v_post_attach AS TABLES (t_post_attach AS t_post_attach PRIMARY KEY (id)) DIMENSIONS (t_post_attach.id AS id) METRICS (t_post_attach.c AS COUNT(*));
+
+statement ok
+DROP SEMANTIC VIEW v_post_attach;
