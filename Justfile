@@ -127,7 +127,7 @@ test-multi-db: build
 
 # Concurrent CREATE on the same view name from two threads. PK constraint
 # on _definitions(name) serializes the inserts; exactly one must succeed.
-# Also indirectly exercises the v0.8.1 race-guard pattern for DROP/ALTER.
+# Also indirectly exercises the v0.8.0 race-guard pattern for DROP/ALTER.
 test-concurrent: build
     uv run test/integration/test_concurrent_ddl.py
 

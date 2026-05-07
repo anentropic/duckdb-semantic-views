@@ -281,7 +281,7 @@ mod tests {
     }
 
     // TEMPORARY: smoke test for v0.8.0 race-guard SQL shape.
-    // CTE+DML+RETURNING is NOT supported in DuckDB 1.10.502 ("Parser Error:
+    // CTE+DML+RETURNING is NOT supported in DuckDB v1.5.2 ("Parser Error:
     // A CTE needs a SELECT"), so we emit two statements separated by `;`:
     // a guard SELECT that raises via error() if the row is missing, then
     // the DELETE/UPDATE itself. Both statements run on the caller's

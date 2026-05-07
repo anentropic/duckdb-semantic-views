@@ -84,7 +84,7 @@ def section(label: str) -> None:
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "v081_demo.duckdb")
+        db_path = os.path.join(tmpdir, "v080_demo.duckdb")
         con = open_connection(db_path)
         setup_base(con)
         con.execute(CREATE_VIEW)

@@ -155,7 +155,7 @@ struct ParserOptions {
 };
 
 // Guard against silent layout drift between this redeclaration and duckdb.cpp.
-// On DuckDB 1.10.502 with the amalgamation pinned in Cargo.toml the layout
+// On DuckDB v1.5.2 (duckdb-rs crate `=1.10502.0`, pinned in Cargo.toml) the layout
 // is { bool, bool, idx_t, optional_ptr<...>, AllowParserOverride } and packs
 // to 32 bytes on a 64-bit target (alignof 8 forces 6B pad after the bools,
 // 7B trailing pad after the enum). If a DuckDB bump changes the field set
