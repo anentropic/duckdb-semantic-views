@@ -21,12 +21,16 @@
 // versions. On Windows, build.rs generates a patched copy of duckdb.cpp in OUT_DIR with
 // explicit #undef blocks inserted after each <windows.h> include.
 //
-// LSP support: `compile_commands.json` is regenerated under the cargo target directory
-// (`target/compile_commands.json` by default; respects `CARGO_TARGET_DIR`) on every
-// `cargo build`/`cargo check`, sourcing flags from the same `CppBuildSpec` as the cc-crate
-// invocation so clangd sees exactly what the build sees. clangd is pointed at the file
-// via the checked-in `.clangd` at the repo root (`CompilationDatabase: target`). The
-// target dir is gitignored, so the file is never committed.
+// LSP support: `compile_commands.json` is regenerated on every `cargo build` / `cargo
+// check`, sourcing flags from the same `CppBuildSpec` as the cc-crate invocation so
+// clangd sees exactly what the build sees. clangd is pointed at the file via the
+// checked-in `.clangd` at the repo root (`CompilationDatabase: target`).
+//
+// Output location: always `<CARGO_MANIFEST_DIR>/target/compile_commands.json` so the
+// hardcoded `.clangd` path stays valid. When `CARGO_TARGET_DIR` is set to something
+// other than `<CARGO_MANIFEST_DIR>/target`, a second copy is also written there to
+// keep the build-system invariant (everything generated lives under the cargo target
+// dir). Both `target/` directories are gitignored, so neither copy is committed.
 
 /// Single source of truth for C++ build flags. Both the cc-crate compile invocation and
 /// the `compile_commands.json` writer read from this so the LSP cannot drift from the build.
@@ -54,11 +58,14 @@ fn cpp_build_spec(is_windows: bool) -> CppBuildSpec {
     spec
 }
 
-/// Write a `compile_commands.json` under the cargo target directory reflecting `spec`.
-/// Path: `<CARGO_TARGET_DIR>/compile_commands.json`, defaulting to `<crate>/target/...`
-/// when `CARGO_TARGET_DIR` is unset. clangd discovers it via the checked-in `.clangd`
-/// at the repo root (`CompilationDatabase: target`). The target directory is universally
-/// gitignored, so the file is never committed.
+/// Write a `compile_commands.json` reflecting `spec`.
+///
+/// Always writes to `<CARGO_MANIFEST_DIR>/target/compile_commands.json` so the
+/// checked-in `.clangd` (which hardcodes `CompilationDatabase: target`) keeps
+/// finding it. When `CARGO_TARGET_DIR` is set to a different path, a second copy
+/// is also written under that directory to keep the build-system invariant that
+/// generated files live under the cargo target dir. Both `target/` locations are
+/// gitignored, so neither copy is committed.
 ///
 /// Idempotent — only writes when the rendered JSON differs from the existing file, so
 /// cargo's rerun-if-changed graph doesn't churn from build script self-output.
@@ -99,34 +106,47 @@ fn write_compile_commands_json(spec: &CppBuildSpec) {
     }
     let new_json = format!("[\n{}\n]\n", entries.join(",\n"));
 
-    // Resolve the target directory. CARGO_TARGET_DIR overrides; otherwise fall back to
-    // <CARGO_MANIFEST_DIR>/target. If neither env var is set (shouldn't happen under
-    // normal cargo invocation), skip the write rather than guessing.
-    let Some(target_dir) = std::env::var("CARGO_TARGET_DIR").ok().or_else(|| {
-        std::env::var("CARGO_MANIFEST_DIR")
-            .ok()
-            .map(|m| format!("{m}/target"))
-    }) else {
+    // Resolve write targets. The `.clangd`-anchored copy under
+    // <CARGO_MANIFEST_DIR>/target is the authoritative path clangd reads. When
+    // CARGO_TARGET_DIR is set to a different location, also write a copy there
+    // so generated artefacts stay under the configured target dir.
+    let manifest_target = std::env::var("CARGO_MANIFEST_DIR")
+        .ok()
+        .map(|m| format!("{m}/target"));
+    let cargo_target = std::env::var("CARGO_TARGET_DIR").ok();
+
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(t) = manifest_target {
+        targets.push(t);
+    }
+    if let Some(t) = cargo_target {
+        if !targets.iter().any(|existing| existing == &t) {
+            targets.push(t);
+        }
+    }
+    if targets.is_empty() {
         println!(
-            "cargo:warning=neither CARGO_TARGET_DIR nor CARGO_MANIFEST_DIR set; skipping compile_commands.json"
+            "cargo:warning=neither CARGO_MANIFEST_DIR nor CARGO_TARGET_DIR set; skipping compile_commands.json"
         );
         return;
-    };
+    }
 
-    if let Err(e) = std::fs::create_dir_all(&target_dir) {
-        println!("cargo:warning=failed to create {target_dir}: {e}");
-        return;
-    }
-    let path = format!("{target_dir}/compile_commands.json");
-    if std::fs::read_to_string(&path)
-        .ok()
-        .as_deref()
-        .is_some_and(|prev| prev == new_json)
-    {
-        return;
-    }
-    if let Err(e) = std::fs::write(&path, &new_json) {
-        println!("cargo:warning=failed to write {path}: {e}");
+    for target_dir in &targets {
+        if let Err(e) = std::fs::create_dir_all(target_dir) {
+            println!("cargo:warning=failed to create {target_dir}: {e}");
+            continue;
+        }
+        let path = format!("{target_dir}/compile_commands.json");
+        if std::fs::read_to_string(&path)
+            .ok()
+            .as_deref()
+            .is_some_and(|prev| prev == new_json)
+        {
+            continue;
+        }
+        if let Err(e) = std::fs::write(&path, &new_json) {
+            println!("cargo:warning=failed to write {path}: {e}");
+        }
     }
 }
 
@@ -140,11 +160,20 @@ fn main() {
     // Always rerun if the C++ surface or this script changes — keeps both the cc-crate
     // build cache and compile_commands.json fresh. Once any rerun-if-changed is emitted,
     // cargo treats the list as exhaustive, so include every relevant input.
+    //
+    // duckdb.hpp / duckdb.cpp are gitignored (downloaded by `just update-headers`).
+    // Cargo treats a `rerun-if-changed` whose path is missing as "always rerun", which
+    // would force every `cargo check` on a fresh checkout to re-execute this script.
+    // Gate them on existence so they only join the dependency graph once present.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=cpp/src/shim.cpp");
-    println!("cargo:rerun-if-changed=cpp/include/duckdb.hpp");
-    println!("cargo:rerun-if-changed=cpp/include/duckdb.cpp");
     println!("cargo:rerun-if-changed=cpp/include/parser_extension_compat.hpp");
+    if std::path::Path::new("cpp/include/duckdb.hpp").exists() {
+        println!("cargo:rerun-if-changed=cpp/include/duckdb.hpp");
+    }
+    if std::path::Path::new("cpp/include/duckdb.cpp").exists() {
+        println!("cargo:rerun-if-changed=cpp/include/duckdb.cpp");
+    }
 
     // Only configure C++ compilation and symbol visibility when building the loadable
     // extension binary. CARGO_FEATURE_EXTENSION is set by Cargo when `--features extension`

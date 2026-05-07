@@ -209,4 +209,4 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 **Date:** 2026-05-03
 **Milestone:** v0.8.0
-**Audit report:** `.planning/milestones/v1.0-MILESTONE-AUDIT.md`
+**Audit report:** `.planning/milestones/v0.8.0-MILESTONE-AUDIT.md`
