@@ -21,9 +21,12 @@
 // versions. On Windows, build.rs generates a patched copy of duckdb.cpp in OUT_DIR with
 // explicit #undef blocks inserted after each <windows.h> include.
 //
-// LSP support: `compile_commands.json` is regenerated at the repo root on every
+// LSP support: `compile_commands.json` is regenerated under the cargo target directory
+// (`target/compile_commands.json` by default; respects `CARGO_TARGET_DIR`) on every
 // `cargo build`/`cargo check`, sourcing flags from the same `CppBuildSpec` as the cc-crate
-// invocation so clangd sees exactly what the build sees. The file is gitignored.
+// invocation so clangd sees exactly what the build sees. clangd is pointed at the file
+// via the checked-in `.clangd` at the repo root (`CompilationDatabase: target`). The
+// target dir is gitignored, so the file is never committed.
 
 /// Single source of truth for C++ build flags. Both the cc-crate compile invocation and
 /// the `compile_commands.json` writer read from this so the LSP cannot drift from the build.
@@ -51,9 +54,17 @@ fn cpp_build_spec(is_windows: bool) -> CppBuildSpec {
     spec
 }
 
-/// Write a `compile_commands.json` at the repo root reflecting `spec`. Idempotent —
-/// only writes when the rendered JSON differs from the existing file, so cargo's
-/// rerun-if-changed graph doesn't churn from build script self-output.
+/// Write a `compile_commands.json` under the cargo target directory reflecting `spec`.
+/// Path: `<CARGO_TARGET_DIR>/compile_commands.json`, defaulting to `<crate>/target/...`
+/// when `CARGO_TARGET_DIR` is unset. clangd discovers it via the checked-in `.clangd`
+/// at the repo root (`CompilationDatabase: target`). The target directory is universally
+/// gitignored, so the file is never committed.
+///
+/// Idempotent — only writes when the rendered JSON differs from the existing file, so
+/// cargo's rerun-if-changed graph doesn't churn from build script self-output.
+///
+/// `directory` inside each entry stays as the workspace root so relative `file` and
+/// `-I` paths resolve correctly.
 fn write_compile_commands_json(spec: &CppBuildSpec) {
     let dir = std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
 
@@ -88,15 +99,33 @@ fn write_compile_commands_json(spec: &CppBuildSpec) {
     }
     let new_json = format!("[\n{}\n]\n", entries.join(",\n"));
 
-    let path = "compile_commands.json";
-    if std::fs::read_to_string(path)
+    // Resolve the target directory. CARGO_TARGET_DIR overrides; otherwise fall back to
+    // <CARGO_MANIFEST_DIR>/target. If neither env var is set (shouldn't happen under
+    // normal cargo invocation), skip the write rather than guessing.
+    let Some(target_dir) = std::env::var("CARGO_TARGET_DIR").ok().or_else(|| {
+        std::env::var("CARGO_MANIFEST_DIR")
+            .ok()
+            .map(|m| format!("{m}/target"))
+    }) else {
+        println!(
+            "cargo:warning=neither CARGO_TARGET_DIR nor CARGO_MANIFEST_DIR set; skipping compile_commands.json"
+        );
+        return;
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&target_dir) {
+        println!("cargo:warning=failed to create {target_dir}: {e}");
+        return;
+    }
+    let path = format!("{target_dir}/compile_commands.json");
+    if std::fs::read_to_string(&path)
         .ok()
         .as_deref()
         .is_some_and(|prev| prev == new_json)
     {
         return;
     }
-    if let Err(e) = std::fs::write(path, &new_json) {
+    if let Err(e) = std::fs::write(&path, &new_json) {
         println!("cargo:warning=failed to write {path}: {e}");
     }
 }
