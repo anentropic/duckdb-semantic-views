@@ -139,7 +139,7 @@ GROUP BY
 
 #### Two FALLBACK_OVERRIDE quirks worth knowing
 
-1. **DuckDB silently drops `DISPLAY_EXTENSION_ERROR` in FALLBACK mode** (`ParseInternal` in the v1.5.2 amalgamation). To surface validation errors we synthesise a `SELECT error('<msg>')` statement and return it as `PARSE_SUCCESSFUL`. See `sql_throwing` in `src/parse.rs` and TECH-DEBT.md item 22.
+1. **DuckDB silently drops `DISPLAY_EXTENSION_ERROR` from `parser_override` in FALLBACK mode** (`ParseInternal` in the v1.5.2 amalgamation). The success path is unaffected — `parser_override` rewrites recognised DDL into native SQL on the caller's connection. For *validation* errors (e.g. `semantic view 'X' does not exist`, unknown clause), `parser_override` instead returns `DISPLAY_ORIGINAL_ERROR`; the default parser then fails on the unrecognised DDL prefix; DuckDB calls our registered `parse_function`, which re-runs validation and returns `DISPLAY_EXTENSION_ERROR` with `error_location` set to the offending byte offset. `ParserException::SyntaxError` formats the caret automatically. See `sv_parse_function_rust` in `src/parse.rs`. (TECH-DEBT 22 was resolved by this mechanism in Phase 62; the older `sql_throwing` / synthesised-`SELECT error('...')` workaround was deleted.)
 2. **`CALL disable_peg_parser()` resets `allow_parser_override_extension` to `default`,** which silently bypasses our hook. After toggling PEG you must re-issue `SET allow_parser_override_extension='FALLBACK'`. The extension installs `FALLBACK` on load, so a process that never enables PEG is unaffected. See TECH-DEBT.md item 21.
 
 ### Feature Flag Split

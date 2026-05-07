@@ -2,16 +2,19 @@
 #
 # DuckDB 1.5.0 introduced an opt-in PEG parser (CALL enable_peg_parser()).
 #
-# v0.8.1 collapsed all DDL onto the parser_override hook. parser_override is
+# v0.8.0 collapsed all DDL onto the parser_override hook. parser_override is
 # registered on ParserExtension and called BEFORE the active parser; the hook
 # returns native SQL that the live parser then parses. Because the synthesised
 # SQL (INSERT/DELETE/UPDATE on _definitions for write-side, SELECT * FROM
 # read-side table function for DESCRIBE/SHOW/GET_DDL/READ_YAML) only uses
 # vanilla SQL constructs, every form works under Bison and PEG identically.
 #
-# The legacy `parse_function` Bison-only fallback is gone (deleted in the
-# v0.8.1 architectural unification). DESCRIBE / SHOW used to require Bison;
-# v0.8.1 makes them parser-agnostic.
+# The legacy `parse_function` Bison-only fallback as a write-side execution
+# path is gone (the table-function-based DDL was deleted in v0.8.0's Phase 59
+# architectural unification). `parse_function` itself was reintroduced in
+# Phase 62 purely as the error-reporting layer for caret-rendered validation
+# errors — it does not parse or execute DDL on the success path. DESCRIBE /
+# SHOW used to require Bison; v0.8.0 makes them parser-agnostic.
 #
 # This test documents the expected behavior:
 #   1. All DDL works under the default Bison parser
@@ -95,9 +98,11 @@ CREATE SEMANTIC VIEW peg_yaml_file FROM YAML FILE '__TEST_DIR__/peg_yaml_file.ya
 statement ok
 DROP SEMANTIC VIEW peg_yaml_file
 
-# DESCRIBE / SHOW now go through parser_override (v0.8.1 unification) and
-# work under PEG. parser_override emits a `SELECT * FROM <read_side_fn>(...)`
-# pass-through that the PEG parser parses fine. Asserted via `statement ok`
+# DESCRIBE / SHOW now go through parser_override on the success path
+# (v0.8.0 Phase 59 unification) and work under PEG. parser_override emits a
+# `SELECT * FROM <read_side_fn>(...)` pass-through that the PEG parser parses
+# fine. (`parse_function` is registered too but only fires for caret-rendered
+# validation errors, not on the success path.) Asserted via `statement ok`
 # because the row content is covered elsewhere; what matters here is that
 # the parse succeeds under PEG.
 statement ok

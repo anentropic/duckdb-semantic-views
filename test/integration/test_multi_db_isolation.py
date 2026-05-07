@@ -115,8 +115,11 @@ def test_multi_db_isolation():
                 f"db2 should see only view_db2, got: {db2_views}"
             )
 
-            # DESCRIBE goes through the legacy parse_function/sv_ddl_bind
-            # path — this is the path that was broken pre-fix.
+            # DESCRIBE is rewritten on the parser_override success path
+            # (v0.8.0 Phase 59 unification) into a SELECT against the
+            # read-side table function. The original cross-DB-routing bug
+            # this test pins lived in the per-call function_info lookup;
+            # the fix is verified by both DBs returning their own view.
             db1_desc = con1.execute("DESCRIBE SEMANTIC VIEW view_db1").fetchall()
             assert len(db1_desc) > 0, "db1 DESCRIBE returned no rows"
 
@@ -145,9 +148,10 @@ def test_multi_db_isolation():
                 pass
 
             # Issuing SHOW SEMANTIC VIEWS alternately on both connections
-            # exercises the per-call function_info routing through the
-            # legacy parse_function/sv_ddl_bind path. Column 1 of the
-            # SHOW result is `name` (column 0 is `created_on`).
+            # exercises per-call routing on the parser_override success path
+            # (rewritten to SELECT against the read-side table function),
+            # making sure each connection's SHOW resolves against its own DB.
+            # Column 1 of the SHOW result is `name` (column 0 is `created_on`).
             for _ in range(3):
                 db1_now = {row[1] for row in con1.execute(
                     "SHOW SEMANTIC VIEWS"
