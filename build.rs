@@ -31,6 +31,13 @@
 // other than `<CARGO_MANIFEST_DIR>/target`, a second copy is also written there to
 // keep the build-system invariant (everything generated lives under the cargo target
 // dir). Both `target/` directories are gitignored, so neither copy is committed.
+//
+// Windows caveat: the cc-crate compile substitutes a patched copy of duckdb.cpp from
+// `OUT_DIR` (see `patch_duckdb_cpp_for_windows` below), but `compile_commands.json`
+// still names `cpp/include/duckdb.cpp`. Clangd on Windows therefore parses the
+// unpatched amalgamation and may surface `GetObject` / `interface` macro-conflict
+// diagnostics that the actual build does not see. The diagnostics are cosmetic; the
+// produced extension binary is still built from the patched source.
 
 /// Single source of truth for C++ build flags. Both the cc-crate compile invocation and
 /// the `compile_commands.json` writer read from this so the LSP cannot drift from the build.

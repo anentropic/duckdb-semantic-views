@@ -123,9 +123,11 @@ mod reader {
             unsafe { execute_list_all(self.conn) }
         }
 
-        /// Return just the view names, sorted.
+        /// Return just the view names, sorted. Used by error-path suggestion
+        /// helpers ("did you mean ...?"); avoids reading the full JSON
+        /// definition column that `list_all` would pull.
         pub fn list_names(&self) -> Result<Vec<String>, String> {
-            Ok(self.list_all()?.into_iter().map(|(n, _)| n).collect())
+            unsafe { execute_list_names(self.conn) }
         }
     }
 
@@ -263,6 +265,29 @@ mod reader {
             let name = read_column_string(result.raw_mut(), 0, r).unwrap_or_default();
             let def = read_column_string(result.raw_mut(), 1, r).unwrap_or_default();
             out.push((name, def));
+        }
+        Ok(out)
+    }
+
+    /// Names-only counterpart to `execute_list_all`. Skips the `definition`
+    /// column so error-path suggestion lookups don't pay for the JSON blobs.
+    unsafe fn execute_list_names(conn: ffi::duckdb_connection) -> Result<Vec<String>, String> {
+        let c_sql = CString::new("SELECT name FROM semantic_layer._definitions ORDER BY name")
+            .map_err(|_| "SQL contains null byte".to_string())?;
+        let mut result = QueryResult::zeroed();
+        let rc = ffi::duckdb_query(conn, c_sql.as_ptr(), result.raw_mut());
+        if rc != ffi::DuckDBSuccess {
+            return Err(result_error_message(
+                result.raw_mut(),
+                "catalog list failed",
+            ));
+        }
+
+        let row_count = ffi::duckdb_row_count(result.raw_mut());
+        let mut out = Vec::with_capacity(row_count as usize);
+        for r in 0..row_count {
+            let name = read_column_string(result.raw_mut(), 0, r).unwrap_or_default();
+            out.push(name);
         }
         Ok(out)
     }
