@@ -1568,7 +1568,13 @@ unsafe fn write_error_to_buffer(buf: *mut u8, len: usize, s: &str) {
         return;
     }
     let max_copy = len - 1; // reserve space for null terminator
-    let copy_len = s.len().min(max_copy);
+    let mut copy_len = s.len().min(max_copy);
+    // Walk back to a UTF-8 char boundary so a multi-byte codepoint straddling
+    // the truncation point is dropped whole rather than producing an invalid
+    // UTF-8 tail in the C string. is_char_boundary(0) is always true.
+    while !s.is_char_boundary(copy_len) {
+        copy_len -= 1;
+    }
     std::ptr::copy_nonoverlapping(s.as_ptr(), buf, copy_len);
     *buf.add(copy_len) = 0; // null terminate
 }
@@ -4918,5 +4924,51 @@ $$"#;
         // The prefix "DROP SEMANTIC VIEW" starts at byte 9 (after "/* hi */ ").
         // After consuming the prefix (18 bytes), we're at byte 27 == query.len().
         assert_eq!(pos, q.len(), "position should reference original query");
+    }
+
+    // -------------------------------------------------------------------
+    // write_error_to_buffer: UTF-8 char-boundary truncation
+    //
+    // The C buffer is fixed-size (1024 bytes in the C++ shim). If a long
+    // error message has a multi-byte codepoint straddling the truncation
+    // point, naive byte-truncation would emit invalid UTF-8 in the
+    // NUL-terminated tail. The helper must walk back to a char boundary.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn write_error_to_buffer_truncates_at_char_boundary() {
+        // 'é' is two bytes (0xC3 0xA9). Build a string whose byte-length
+        // forces truncation to land mid-codepoint, then verify the C-string
+        // tail is valid UTF-8.
+        let mut s = String::new();
+        for _ in 0..511 {
+            s.push('é'); // 511 * 2 = 1022 bytes
+        }
+        s.push('é'); // now 1024 bytes; max_copy=1023 lands between the two
+                     // bytes of the final 'é'
+        assert_eq!(s.len(), 1024);
+
+        let mut buf = vec![0u8; 1024];
+        unsafe {
+            super::write_error_to_buffer(buf.as_mut_ptr(), buf.len(), &s);
+        }
+        // Find the NUL and slice up to it.
+        let nul = buf
+            .iter()
+            .position(|&b| b == 0)
+            .expect("NUL terminator written");
+        // Bytes before NUL must be valid UTF-8 (no orphaned lead byte).
+        std::str::from_utf8(&buf[..nul]).expect("truncated tail must be valid UTF-8");
+    }
+
+    #[test]
+    fn write_error_to_buffer_handles_short_string() {
+        let s = "ok";
+        let mut buf = vec![0xFFu8; 16];
+        unsafe {
+            super::write_error_to_buffer(buf.as_mut_ptr(), buf.len(), s);
+        }
+        assert_eq!(&buf[..2], b"ok");
+        assert_eq!(buf[2], 0);
     }
 }
