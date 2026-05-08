@@ -12,7 +12,7 @@ extension:
 
 repo:
   github: anentropic/duckdb-semantic-views
-  ref: 9971f4bf0e30756a15cda0b7e1373379626ab123
+  ref: 3089b250d5dc1edb1a969f5ae7008a3b1552290f
 
 docs:
   hello_world: |
