@@ -9,11 +9,12 @@
     "verifier": true,
     "auto_advance": false,
     "nyquist_validation": true,
-    "_auto_chain_active": false,
+    "_auto_chain_active": true,
     "use_worktrees": false
   },
   "git": {
-    "branching_strategy": "milestone"
+    "branching_strategy": "milestone",
+    "milestone_branch_template": "milestone/{milestone}"
   },
   "granularity": "standard"
 }

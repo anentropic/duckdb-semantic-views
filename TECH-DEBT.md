@@ -207,6 +207,17 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ---
 
+## v0.9.0 additions
+
+### 24. ❓ Body parser's TABLES clause splits on whitespace inside quoted source-table names
+
+- **Origin:** v0.9.0 Phase 64 RESEARCH §Pitfall 5; surfaced as a known limitation during the quoted-identifier fix.
+- **Decision:** `parse_single_table_entry` in `src/body_parser.rs` uses a whitespace-based tokenizer to peel off the alias, the `AS`, and the source-table name from each entry in the `TABLES (...)` clause. If a source-table name has whitespace INSIDE a quoted part (e.g. `TABLES (o AS "my db"."schema"."t" PRIMARY KEY (id))`), the tokenizer truncates mid-name and the parse fails. The Phase 64 quoted-identifier fix tightens identifier handling at every other capture site (CREATE / DROP / ALTER / DESCRIBE / SHOW COLUMNS view-name slot, the runtime `semantic_view()` positional arg, and the expansion-side `quote_table_ref`) but leaves this body-parser path on the legacy whitespace tokenizer.
+- **Why deferred:** The bug-report reproduction (`"memory"."main"."orders_sv"` as the VIEW name) doesn't exercise this path. Whitespace inside quoted source-table parts is vanishingly rare — physical-table names almost never contain spaces, and even when they do (`"sales 2024"`), the user has the option of writing them as `"sales_2024"` or aliasing them outside the semantic-views layer. Fixing this requires `src/body_parser.rs` to adopt the `src/ident.rs` `find_identifier_end` helper at multiple parse points, which is non-trivial body-parser surgery for a vanishingly rare case.
+- **Action if a user hits this:** Provide an alias in DuckDB itself (e.g. `CREATE VIEW orders_clean AS SELECT * FROM "my db"."schema"."t"`) and reference the alias in the semantic view's `TABLES` clause. If the case becomes common, port `find_identifier_end` into `src/body_parser.rs::parse_single_table_entry` and surrounding helpers.
+
+---
+
 **Date:** 2026-05-03
 **Milestone:** v0.8.0
 **Audit report:** `.planning/milestones/v0.8.0-MILESTONE-AUDIT.md`

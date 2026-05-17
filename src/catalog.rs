@@ -22,7 +22,16 @@ const V010_COMPANION_EXT: &str = "semantic_views";
 /// databases.
 ///
 /// Idempotent: safe to call on every extension load.
-pub fn init_catalog(con: &Connection, db_path: &str) -> Result<()> {
+///
+/// Phase 63 (v0.9.0): when `is_read_only=true`, skips the entire body —
+/// the host DB is read-only so neither the schema/table CREATE nor the
+/// companion-file migration (which INSERTs into the table) can run.
+/// Reader-path code in `CatalogReader` short-circuits separately when
+/// the table is genuinely absent. See 63-RESEARCH.md §3 Q2.
+pub fn init_catalog(con: &Connection, db_path: &str, is_read_only: bool) -> Result<()> {
+    if is_read_only {
+        return Ok(());
+    }
     con.execute_batch(
         "CREATE SCHEMA IF NOT EXISTS semantic_layer;
          CREATE TABLE IF NOT EXISTS semantic_layer._definitions (
@@ -88,6 +97,12 @@ mod reader {
     #[derive(Clone, Copy)]
     pub struct CatalogReader {
         conn: ffi::duckdb_connection,
+        // Phase 63 (v0.9.0): when false (only possible on a read-only host
+        // DB whose semantic_layer._definitions table was never created),
+        // reader methods short-circuit to "empty" / "not found" without
+        // hitting the DB. On a writable host this is always true (the
+        // table is CREATE'd in init_catalog).
+        catalog_table_present: bool,
     }
 
     // SAFETY: `duckdb_connection` is an opaque pointer managed by DuckDB.
@@ -97,8 +112,11 @@ mod reader {
     unsafe impl Sync for CatalogReader {}
 
     impl CatalogReader {
-        pub fn new(conn: ffi::duckdb_connection) -> Self {
-            Self { conn }
+        pub fn new(conn: ffi::duckdb_connection, catalog_table_present: bool) -> Self {
+            Self {
+                conn,
+                catalog_table_present,
+            }
         }
 
         pub fn raw(&self) -> ffi::duckdb_connection {
@@ -108,7 +126,16 @@ mod reader {
         /// Fetch the JSON definition for a single view.
         ///
         /// Returns `Ok(None)` when no row exists.
+        ///
+        /// Phase 63: when `catalog_table_present=false` (read-only host DB
+        /// without a bootstrapped `_definitions` table), short-circuits to
+        /// `Ok(None)` BEFORE the unsafe FFI call. Callers see the existing
+        /// "semantic view '<name>' does not exist" error path. See
+        /// 63-RESEARCH.md §3 Q4.
         pub fn lookup(&self, name: &str) -> Result<Option<String>, String> {
+            if !self.catalog_table_present {
+                return Ok(None);
+            }
             unsafe { prepared_lookup(self.conn, name) }
         }
 
@@ -119,14 +146,26 @@ mod reader {
 
         /// Return `(name, definition_json)` for every registered view,
         /// sorted by name.
+        ///
+        /// Phase 63: short-circuits to `Ok(Vec::new())` when
+        /// `catalog_table_present=false`.
         pub fn list_all(&self) -> Result<Vec<(String, String)>, String> {
+            if !self.catalog_table_present {
+                return Ok(Vec::new());
+            }
             unsafe { execute_list_all(self.conn) }
         }
 
         /// Return just the view names, sorted. Used by error-path suggestion
         /// helpers ("did you mean ...?"); avoids reading the full JSON
         /// definition column that `list_all` would pull.
+        ///
+        /// Phase 63: short-circuits to `Ok(Vec::new())` when
+        /// `catalog_table_present=false`.
         pub fn list_names(&self) -> Result<Vec<String>, String> {
+            if !self.catalog_table_present {
+                return Ok(Vec::new());
+            }
             unsafe { execute_list_names(self.conn) }
         }
     }
@@ -299,8 +338,16 @@ pub use reader::CatalogReader;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "extension"))]
     use duckdb::Connection;
 
+    // In-memory `Connection` requires the bundled DuckDB API; the `extension`
+    // feature swaps in `loadable-extension` stubs that error at runtime with
+    // "DuckDB API not initialized or DuckDB feature omitted". Tests that need
+    // an actual in-process DB are gated `not(feature = "extension")`; the
+    // CatalogReader short-circuit tests (which never touch the DB) below
+    // run under the `extension` feature.
+    #[cfg(not(feature = "extension"))]
     fn in_memory_con() -> Connection {
         Connection::open_in_memory().expect("in-memory DuckDB")
     }
@@ -311,6 +358,7 @@ mod tests {
     // a guard SELECT that raises via error() if the row is missing, then
     // the DELETE/UPDATE itself. Both statements run on the caller's
     // connection in the same transaction (snapshot consistent).
+    #[cfg(not(feature = "extension"))]
     #[test]
     fn two_statement_guard_then_dml_smoke() {
         let con = in_memory_con();
@@ -372,12 +420,13 @@ mod tests {
         assert_eq!(names, vec!["b".to_string()]);
     }
 
+    #[cfg(not(feature = "extension"))]
     #[test]
     fn init_catalog_creates_schema_and_table() {
         let con = in_memory_con();
-        init_catalog(&con, ":memory:").unwrap();
+        init_catalog(&con, ":memory:", false).unwrap();
         // Idempotent: second call must not error
-        init_catalog(&con, ":memory:").unwrap();
+        init_catalog(&con, ":memory:", false).unwrap();
 
         let count: i64 = con
             .query_row(
@@ -389,6 +438,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    #[cfg(not(feature = "extension"))]
     #[test]
     fn pragma_database_list_returns_file_path() {
         let tmp = std::env::temp_dir();
@@ -415,6 +465,7 @@ mod tests {
         let _ = std::fs::remove_file(tmpfile);
     }
 
+    #[cfg(not(feature = "extension"))]
     #[test]
     fn pragma_database_list_returns_none_for_in_memory() {
         let con = in_memory_con();
@@ -431,6 +482,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "extension"))]
     #[test]
     fn persist_02_rollback_leaves_catalog_unchanged() {
         let tmp = std::env::temp_dir();
@@ -440,7 +492,7 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path}.wal"));
 
         let con = Connection::open(db_path).expect("open file-backed DB");
-        init_catalog(&con, db_path).unwrap();
+        init_catalog(&con, db_path, false).unwrap();
 
         let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
         con.execute(
@@ -479,5 +531,96 @@ mod tests {
         drop(con);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}.wal"));
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 63 (v0.9.0): read-only LOAD support — init_catalog
+    // short-circuit + CatalogReader::{lookup,list_all,list_names}
+    // short-circuits when catalog_table_present=false. See
+    // 63-RESEARCH.md §3 Q2/Q3/Q4.
+    // -----------------------------------------------------------------
+
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn init_catalog_skips_writes_on_readonly() {
+        // Phase 63 (RO-01): is_read_only=true must early-return without
+        // creating the schema. Verified by checking information_schema.
+        let con = in_memory_con();
+        init_catalog(&con, ":memory:", true).unwrap();
+        let count: i64 = con
+            .query_row(
+                "SELECT count(*) FROM information_schema.schemata WHERE schema_name = 'semantic_layer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "init_catalog with is_read_only=true must NOT create the semantic_layer schema"
+        );
+    }
+
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn init_catalog_writes_when_writable() {
+        // Sibling: writable path still creates the schema + table.
+        let con = in_memory_con();
+        init_catalog(&con, ":memory:", false).unwrap();
+        let count: i64 = con
+            .query_row(
+                "SELECT count(*) FROM semantic_layer._definitions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "writable init_catalog must create empty _definitions table"
+        );
+    }
+
+    #[cfg(feature = "extension")]
+    #[test]
+    fn lookup_returns_none_when_table_missing() {
+        // Phase 63 (RO-04): catalog_table_present=false must short-circuit
+        // BEFORE hitting the DB. Use std::ptr::null_mut() for the conn —
+        // the short-circuit must return Ok(None) before any FFI call, so
+        // the null pointer is never dereferenced.
+        use crate::catalog::CatalogReader;
+        let reader = CatalogReader::new(std::ptr::null_mut(), false);
+        let result = reader.lookup("any_view");
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None), got: {:?}",
+            result
+        );
+    }
+
+    #[cfg(feature = "extension")]
+    #[test]
+    fn list_all_returns_empty_when_table_missing() {
+        // Phase 63 (RO-03): catalog_table_present=false must short-circuit.
+        use crate::catalog::CatalogReader;
+        let reader = CatalogReader::new(std::ptr::null_mut(), false);
+        let result = reader.list_all();
+        assert!(
+            matches!(result, Ok(ref v) if v.is_empty()),
+            "expected Ok(empty), got: {:?}",
+            result
+        );
+    }
+
+    #[cfg(feature = "extension")]
+    #[test]
+    fn list_names_returns_empty_when_table_missing() {
+        // Phase 63 (RO-03): catalog_table_present=false must short-circuit.
+        use crate::catalog::CatalogReader;
+        let reader = CatalogReader::new(std::ptr::null_mut(), false);
+        let result = reader.list_names();
+        assert!(
+            matches!(result, Ok(ref v) if v.is_empty()),
+            "expected Ok(empty), got: {:?}",
+            result
+        );
     }
 }

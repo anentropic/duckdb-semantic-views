@@ -206,7 +206,7 @@ pub(super) fn resolve_joins_pkfk(
 mod tests {
     use super::*;
     use crate::expand::test_helpers::{orders_view, TestFixtureExt};
-    use crate::model::{Cardinality, Join, TableRef};
+    use crate::model::{Join, TableRef};
 
     #[test]
     fn test_synthesize_on_clause_single_column() {

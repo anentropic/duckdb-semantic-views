@@ -119,6 +119,61 @@ The ``IF EXISTS`` variants (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SE
 In a single-process workload there's no race window to worry about. This only surfaces if multiple processes are issuing DDL against the same database file at the same time.
 
 
+.. _explanation-txn-ddl-readonly:
+
+Read-Only Databases
+====================
+
+.. versionadded:: 0.9.0
+
+Loading the extension into a read-only DuckDB database works the same way as a writable one -- ``LOAD semantic_views`` succeeds and you can query any semantic view that was previously defined. The extension detects ``access_mode = 'read_only'`` at load time and skips the catalog-table bootstrap that would otherwise fail with DuckDB's read-only error.
+
+Three behaviours change between writable and read-only databases:
+
+1. **Reads work as usual on a bootstrapped database.** If the database already contains a ``semantic_layer._definitions`` table (because it was opened writable before and one or more semantic views were defined), then ``list_semantic_views()``, ``describe_semantic_view('name')``, ``FROM semantic_view('name', dimensions := [...], metrics := [...])``, and the SHOW / DESCRIBE / GET_DDL family all behave identically to writable mode.
+
+2. **A fresh read-only database is treated as having zero views, not as an error.** If the database was never bootstrapped (no ``semantic_layer._definitions`` table exists), ``list_semantic_views()`` returns zero rows. ``describe_semantic_view('anything')`` and ``FROM semantic_view('anything', ...)`` return the standard ``semantic view 'anything' does not exist`` error rather than a raw catalog error about a missing table.
+
+3. **DDL fails with DuckDB's standard read-only error.** ``CREATE``, ``DROP``, and ``ALTER SEMANTIC VIEW`` are rewritten internally into ``INSERT`` / ``DELETE`` / ``UPDATE`` against ``semantic_layer._definitions`` and run on the caller's connection. On a read-only database those statements fail with:
+
+   .. code-block:: text
+
+      Invalid Input Error: Cannot execute statement of type "INSERT" on database "<name>" which is attached in read-only mode!
+
+   The exact statement-type token (``INSERT`` / ``DELETE`` / ``UPDATE``) varies by DDL form. The extension does not wrap or rephrase the message.
+
+Bootstrap-then-reopen workflow
+------------------------------
+
+The typical pattern for shipping a read-only database with pre-defined semantic views is:
+
+.. code-block:: python
+
+   import duckdb
+
+   # Step 1 -- open writable, define views, close.
+   rw = duckdb.connect("analytics.duckdb")
+   rw.execute("LOAD semantic_views")
+   rw.execute("""
+       CREATE SEMANTIC VIEW orders AS
+         TABLES (o AS orders_table PRIMARY KEY (id))
+         DIMENSIONS (o.region AS o.region)
+         METRICS (o.total AS SUM(o.amount))
+   """)
+   rw.close()
+
+   # Step 2 -- reopen read-only and query.
+   ro = duckdb.connect("analytics.duckdb", read_only=True)
+   ro.execute("LOAD semantic_views")
+   rows = ro.execute(
+       "SELECT * FROM semantic_view('orders', dimensions := ['region'], metrics := ['total'])"
+   ).fetchall()
+
+.. note::
+
+   The v0.1.0 → v0.2.0 companion-file migration cannot run on a read-only database. The migration INSERTs the contents of a sidecar ``<db>.semantic_views`` file into ``semantic_layer._definitions`` and then deletes the sidecar -- both writes. If you have a database that was last opened with a release older than v0.2.0 (March 2026) and has never been opened by a newer release, open it once writable to complete the migration before reverting to read-only. Practical impact is near-zero because any database touched by v0.2.0+ has already been migrated.
+
+
 .. _explanation-txn-ddl-peg:
 
 DuckDB's Experimental PEG Parser
@@ -159,6 +214,7 @@ The other items on this page only matter in specific situations:
 
 See also:
 
+- :ref:`explanation-txn-ddl-readonly` -- read-only database support, bootstrap-then-reopen workflow, and the v0.1.0 migration limitation.
 - :ref:`ref-create-semantic-view` -- syntax for all four ``CREATE`` body forms.
 - :ref:`ref-drop-semantic-view` -- ``DROP`` and ``DROP IF EXISTS``.
 - :ref:`ref-alter-semantic-view` -- ``ALTER`` variants.

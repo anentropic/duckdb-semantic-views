@@ -107,7 +107,18 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Active
 
-(None — v0.8.0 shipped 2026-05-06. Next milestone TBD.)
+**Current milestone: v0.9.0 — Read-Only Database LOAD Support**
+
+**Goal:** Allow `LOAD semantic_views` on a read-only DuckDB database so that previously-defined semantic views can be queried; let DDL fail naturally with DuckDB's standard "cannot write to read-only database" error.
+
+**Target features:**
+
+- [ ] Detect read-only access mode at extension LOAD via `current_setting('access_mode')` and skip `init_catalog` write paths (schema + table CREATE, v0.1.0 companion-file migration)
+- [ ] `CatalogReader` gracefully tolerates a missing `semantic_layer._definitions` table (probe at LOAD; short-circuit `lookup`/`list_all`/`list_names` to "empty" / "not found" when the catalog table is absent)
+- [ ] `list_semantic_views()`, `describe_semantic_view()`, and `FROM semantic_view(...)` work end-to-end on a previously-bootstrapped read-only database
+- [ ] DDL (`CREATE`/`DROP`/`ALTER SEMANTIC VIEW`) on a read-only database surfaces DuckDB's native read-only error — no custom wrapper required
+- [ ] Documentation (CHANGELOG, transactional-ddl explanation page, CREATE/DROP/ALTER reference notes, README) covers the new behavior and the bootstrap-then-reopen workflow
+- [ ] New `examples/readonly_load.py` demonstrating bootstrap-writable → reopen-read-only → query → DDL-fails-cleanly
 
 ### Out of Scope
 
@@ -203,7 +214,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 This document evolves at phase transitions and milestone boundaries.
 
-Last updated: 2026-05-06 (v0.8.0 milestone shipped — Phase 62 closed the milestone with caret restoration + LRU removal; TECH-DEBT 20 + 22 resolved)
+Last updated: 2026-05-17 (v0.9.0 milestone reopened pre-tag for Phase 64 quoted-identifier bugfix; now 2 phases, 8 plans complete)
 
 **After each phase transition** (via `/gsd:transition`):
 1. Requirements invalidated? → Move to Out of Scope with reason
@@ -219,4 +230,4 @@ Last updated: 2026-05-06 (v0.8.0 milestone shipped — Phase 62 closed the miles
 4. Update Context with current state
 
 ---
-*Last updated: 2026-05-06 — v0.8.0 milestone shipped (Phases 58-62, 8 plans, 0 REQ-IDs — interior architecture). Audit passed 5/5 phases, 7/7 cross-phase integration. v0.7.0 prior summary: 7 phases (51-57), 19 requirements, 823+ tests, 29,300 LOC.*
+*Last updated: 2026-05-17 — v0.9.0 in progress (reopened pre-tag): Phase 63 Read-Only LOAD (4 plans, RO-01..05 + DOC-01..05 + TEST-01..03 + REL-01) + Phase 64 Quoted Identifier Bugfix (4 plans, QID-01..07, 838 unit tests + 47 sqllogictests + 3 regression). v0.8.0 prior summary: 5 phases (58-62), 8 plans, 0 REQ-IDs (interior architecture), audit passed 5/5 phases + 7/7 cross-phase integration.*

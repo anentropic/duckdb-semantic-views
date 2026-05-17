@@ -15,6 +15,7 @@
 - ✅ **v0.6.0 Snowflake SQL DDL Parity** -- Phases 43-50 (shipped 2026-04-14)
 - ✅ **v0.7.0 YAML Definitions & Materialization Routing** -- Phases 51-57 (shipped 2026-04-24)
 - ✅ **v0.8.0 Transactional DDL & Architectural Unification** -- Phases 58-62 (shipped 2026-05-06)
+- ✅ **v0.9.0 Read-Only Database LOAD Support + Quoted Identifier Bugfix** -- Phases 63-64 (shipped 2026-05-17)
 
 ## Phases
 
@@ -190,5 +191,15 @@ Full details: [milestones/v0.7.0-ROADMAP.md](milestones/v0.7.0-ROADMAP.md)
 Phases 58–61 are retroactive reconstructions: the work was originally completed ad-hoc on `milestone/v0.8.0` (PR #28) and a premature `milestone/v0.8.1` branch, then consolidated into a single v0.8.0 milestone on 2026-05-05 (no v0.8.1 tag was ever issued).
 
 Full details: [milestones/v0.8.0-ROADMAP.md](milestones/v0.8.0-ROADMAP.md)
+
+</details>
+
+<details>
+<summary>✅ v0.9.0 Read-Only Database LOAD Support + Quoted Identifier Bugfix (Phases 63-64) -- SHIPPED 2026-05-17</summary>
+
+- [x] Phase 63: Read-Only Database LOAD Support (4/4 plans) -- completed 2026-05-17
+- [x] Phase 64: Fix CREATE SEMANTIC VIEW quoted identifier handling (4/4 plans) -- completed 2026-05-17
+
+Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
 
 </details>

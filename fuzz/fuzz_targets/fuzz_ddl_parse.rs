@@ -1,4 +1,10 @@
 #![no_main]
+// Phase 64 seed inputs covering quoted-identifier forms live in:
+//   fuzz/seeds/fuzz_ddl_parse/seed_phase64_quoted_bare.txt
+//   fuzz/seeds/fuzz_ddl_parse/seed_phase64_quoted_fqn.txt
+//   fuzz/seeds/fuzz_ddl_parse/seed_phase64_mixed_quoting.txt
+// The same inputs are asserted as permanent regression tests in
+// tests/quoted_idents_regression.rs (workspace-level cargo test).
 use libfuzzer_sys::fuzz_target;
 use semantic_views::parse::{detect_semantic_view_ddl, validate_and_rewrite, PARSE_DETECTED};
 

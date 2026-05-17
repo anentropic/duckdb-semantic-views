@@ -141,7 +141,6 @@ pub(super) trait TestFixtureExt {
     fn with_join_on(self, table: &str, on: &str) -> Self;
     fn with_table(self, alias: &str, table: &str, pk_columns: &[&str]) -> Self;
     fn with_fact(self, name: &str, expr: &str, source_table: &str) -> Self;
-    fn with_private_metric(self, name: &str, expr: &str, source_table: Option<&str>) -> Self;
     fn with_private_fact(self, name: &str, expr: &str, source_table: &str) -> Self;
     fn with_using_relationship(self, metric_name: &str, relationships: &[&str]) -> Self;
     fn with_pkfk_join(
@@ -230,22 +229,6 @@ impl TestFixtureExt for SemanticViewDefinition {
             comment: None,
             synonyms: vec![],
             access: AccessModifier::Public,
-        });
-        self
-    }
-
-    fn with_private_metric(mut self, name: &str, expr: &str, source_table: Option<&str>) -> Self {
-        self.metrics.push(Metric {
-            name: name.to_string(),
-            expr: expr.to_string(),
-            source_table: source_table.map(|s| s.to_string()),
-            output_type: None,
-            using_relationships: vec![],
-            comment: None,
-            synonyms: vec![],
-            access: AccessModifier::Private,
-            non_additive_by: vec![],
-            window_spec: None,
         });
         self
     }

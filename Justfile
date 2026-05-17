@@ -125,16 +125,27 @@ test-large-view: build
 test-multi-db: build
     uv run test/integration/test_multi_db_isolation.py
 
+# Read-only database LOAD regression: bootstrap a view writable, reopen
+# the file read-only via duckdb.connect(path, read_only=True), and
+# verify LOAD succeeds, list_semantic_views() returns the bootstrapped
+# view, semantic_view(...) queries work, and CREATE/DROP/ALTER fail
+# with DuckDB's standard read-only error. Phase 63 (v0.9.0). See
+# test/sql/readonly_load.test for the writable-side smoke fixture and
+# the explanation of why full read-only coverage lives here rather
+# than in sqllogictest.
+test-readonly: build
+    uv run test/integration/test_readonly_load.py
+
 # Concurrent CREATE on the same view name from two threads. PK constraint
 # on _definitions(name) serializes the inserts; exactly one must succeed.
 # Also indirectly exercises the v0.8.0 race-guard pattern for DROP/ALTER.
 test-concurrent: build
     uv run test/integration/test_concurrent_ddl.py
 
-# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC + large-view + multi-DB + concurrent
+# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC + large-view + multi-DB + read-only + concurrent
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
 # _ensure-test-deps runs early to catch pip version mismatches before slow builds.
-test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc test-large-view test-multi-db test-concurrent
+test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc test-large-view test-multi-db test-readonly test-concurrent
 
 # Check that fuzz targets compile (requires nightly)
 check-fuzz:

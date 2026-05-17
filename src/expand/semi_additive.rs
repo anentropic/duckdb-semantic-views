@@ -412,7 +412,7 @@ fn get_rn_column_for_metric(met_idx: usize, na_groups: &[NaGroup]) -> String {
 #[cfg(test)]
 mod tests {
     use crate::expand::test_helpers::{minimal_def, orders_view, TestFixtureExt};
-    use crate::expand::{expand, DimensionName, ExpandError, MetricName, QueryRequest};
+    use crate::expand::{expand, DimensionName, MetricName, QueryRequest};
     use crate::model::{NullsOrder, SortOrder};
 
     use super::{extract_aggregate_func, extract_aggregate_inner};

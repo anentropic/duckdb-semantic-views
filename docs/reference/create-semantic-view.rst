@@ -114,6 +114,10 @@ All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` 
 
    ``CREATE SEMANTIC VIEW IF NOT EXISTS`` reliably absorbs duplicates within a single process or transaction (re-running a setup script, repeated statements in the same ``BEGIN`` block). It cannot absorb a race between two separate processes that both run ``CREATE IF NOT EXISTS`` against the same database at the same time -- one will succeed and the other will see a constraint error. Concurrent DDL across processes is unusual for typical DuckDB workloads, so most users will never hit this. See :ref:`explanation-txn-ddl-create-race` for the workaround.
 
+.. note::
+
+   Requires a writable database. On a read-only database this statement fails with DuckDB's standard ``Cannot execute statement of type "..." which is attached in read-only mode!`` error. See :ref:`explanation-txn-ddl-readonly`.
+
 
 .. _ref-create-clauses:
 

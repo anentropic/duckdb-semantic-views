@@ -479,7 +479,17 @@ impl VTab for SemanticViewVTab {
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
             // 1. Extract the view name (positional parameter 0).
-            let view_name = bind.get_parameter(0).to_string();
+            //    Normalise quoted/qualified forms (e.g. `semantic_view('"v"', ...)`
+            //    or `semantic_view('"db"."sch"."v"', ...)`) to the bare key so
+            //    the catalog lookup below matches the row inserted by CREATE.
+            //    This mirrors the DDL-side capture-site normalisation in
+            //    `src/parse.rs` (Phase 64).
+            let view_name_raw = bind.get_parameter(0).to_string();
+            let view_name = crate::ident::normalize_view_name(&view_name_raw).map_err(|e| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "Invalid view name '{view_name_raw}': {e}"
+                ))
+            })?;
 
             // 2. Extract dimensions and metrics from named LIST(VARCHAR) parameters.
             //    Use the raw duckdb_value FFI to iterate list elements.

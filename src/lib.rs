@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod errors;
 pub mod expand;
 pub mod graph;
+pub mod ident;
 pub mod model;
 pub mod parse;
 #[cfg(feature = "extension")]
@@ -355,8 +356,24 @@ mod extension {
             }
         };
 
+        // Phase 63: Detect read-only access mode for THIS database.
+        // AccessModeSetting::GetSetting (duckdb.cpp:301163-301167) calls
+        // StringUtil::Lower(EnumUtil::ToString(AccessMode)), so the value is
+        // lowercased: "read_only" / "read_write" / "automatic" / "undefined".
+        // We match case-insensitively to be future-proof across DuckDB minor
+        // bumps. Fail-open: if the setting is renamed/removed in a future
+        // version, treat as writable; init_catalog will then surface DuckDB's
+        // own read-only error from CREATE SCHEMA, which is strictly better
+        // than a silent miss.
+        let is_read_only: bool = con
+            .query_row("SELECT current_setting('access_mode')", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map(|s| s.eq_ignore_ascii_case("read_only"))
+            .unwrap_or(false);
+
         // Initialize the persistent catalog (schema + table + companion-file migration).
-        init_catalog(con, &db_path)?;
+        init_catalog(con, &db_path, is_read_only)?;
 
         // Dedicated connection for catalog queries (`duckdb_constraints()`
         // lookups, `_definitions` reads, CREATE-time enrichment, etc.).
@@ -368,7 +385,25 @@ mod extension {
         if rc != ffi::DuckDBSuccess {
             return Err("Failed to create catalog connection".into());
         }
-        let catalog_reader = crate::catalog::CatalogReader::new(catalog_conn);
+
+        // Phase 63: When read-only, probe for semantic_layer._definitions
+        // ONCE so reader-path methods can short-circuit cleanly. Writable
+        // path always has the table (init_catalog just CREATE'd it), so we
+        // skip the probe to avoid an extra query on the hot path.
+        let catalog_table_present: bool = if is_read_only {
+            con.query_row(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = 'semantic_layer' AND table_name = '_definitions' LIMIT 1",
+                [],
+                |row| row.get::<_, i32>(0),
+            )
+            .is_ok()
+        } else {
+            true
+        };
+
+        let catalog_reader =
+            crate::catalog::CatalogReader::new(catalog_conn, catalog_table_present);
 
         // Register parser_override hook BEFORE table functions. Phase 62:
         // the catalog connection + is_file_backed flag are bundled into an
@@ -583,6 +618,63 @@ mod tests {
             std::mem::align_of::<ffi::duckdb_value>(),
             std::mem::align_of::<*mut std::ffi::c_void>(),
             "duckdb_value alignment changed -- value_raw_ptr transmute may be broken"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 63 (v0.9.0): pin DuckDB's `current_setting('access_mode')`
+    // contract so that future DuckDB minor bumps that change the
+    // rendering surface as a CI failure rather than a silent miss in
+    // production. See src/lib.rs::init_extension Phase 63 detection
+    // block and 63-RESEARCH.md §3 Q1.
+    // -----------------------------------------------------------------
+
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn access_mode_lowercased_on_readonly_open() {
+        use duckdb::{AccessMode, Config, Connection};
+
+        // Pin DuckDB's contract: current_setting('access_mode') returns
+        // the lowercased enum form ("read_only"), not "READ_ONLY".
+        // If a future DuckDB version changes this rendering, this test
+        // catches it at CI bump time rather than in production.
+        let tmp = std::env::temp_dir().join("phase63_access_mode_pin.duckdb");
+        let _ = std::fs::remove_file(&tmp);
+        // Bootstrap an empty file with valid header bytes by opening
+        // writable then closing.
+        {
+            let con = Connection::open(&tmp).expect("open writable");
+            con.execute_batch("SELECT 1").unwrap();
+        }
+        let cfg = Config::default()
+            .access_mode(AccessMode::ReadOnly)
+            .expect("set access_mode");
+        let con = Connection::open_with_flags(&tmp, cfg).expect("open read-only");
+        let mode: String = con
+            .query_row("SELECT current_setting('access_mode')", [], |r| r.get(0))
+            .expect("query access_mode");
+        assert_eq!(
+            mode.to_ascii_lowercase(),
+            "read_only",
+            "Phase 63: current_setting('access_mode') must return 'read_only' (lowercased) for read-only DBs; got: {mode:?}"
+        );
+        drop(con);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn access_mode_writable_returns_automatic_or_read_write() {
+        use duckdb::Connection;
+
+        // Sibling test: confirm writable connections do NOT match "read_only".
+        let con = Connection::open_in_memory().expect("in-memory");
+        let mode: String = con
+            .query_row("SELECT current_setting('access_mode')", [], |r| r.get(0))
+            .expect("query access_mode");
+        assert!(
+            !mode.eq_ignore_ascii_case("read_only"),
+            "Phase 63: in-memory DB must NOT report read_only; got: {mode:?}"
         );
     }
 }

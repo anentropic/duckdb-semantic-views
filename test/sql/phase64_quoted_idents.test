@@ -1,0 +1,202 @@
+# Phase 64 — Quoted identifier handling
+#
+# Verifies that CREATE / DROP / ALTER / DESCRIBE / SHOW COLUMNS
+# SEMANTIC VIEW accept any of these quoting forms uniformly:
+#   bare:        orders_sv
+#   full quote:  "orders_sv"
+#   partial fqn: main.orders_sv  |  "main".orders_sv  |  main."orders_sv"
+#   full fqn:    "memory"."main"."orders_sv"  |  any partial-quoting variant thereof
+# and that all of them resolve to the same bare key for semantic_view() lookup.
+#
+# Also verifies that the expansion path emits exactly ONE pair of
+# double quotes per identifier part for TABLES (...) source-table
+# references, even when the source table reference is itself quoted
+# in the DDL.
+#
+# See .planning/phases/64-fix-quoted-identifier-handling/64-RESEARCH.md
+# for the full bug analysis.
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# Set up base table (re-used across scenarios).
+statement ok
+CREATE TABLE orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), region VARCHAR);
+
+statement ok
+INSERT INTO orders VALUES (1, 100.00, 'US'), (2, 200.00, 'EU');
+
+# ------------------------------------------------------------------------
+# QID-01 — fully-quoted FQN CREATE, lookup by short name resolves
+# ------------------------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW "memory"."main"."orders_sv" AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+# semantic_view() with the bare name resolves the row stored under quoted FQN.
+query R
+FROM semantic_view('orders_sv', metrics := ['total']);
+----
+300.00
+
+# ------------------------------------------------------------------------
+# QID-02 — partial-quoting variants normalise to the same bare key
+# ------------------------------------------------------------------------
+
+statement ok
+DROP SEMANTIC VIEW orders_sv;
+
+statement ok
+CREATE SEMANTIC VIEW main."orders_sv" AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+query R
+FROM semantic_view('orders_sv', metrics := ['total']);
+----
+300.00
+
+statement ok
+DROP SEMANTIC VIEW orders_sv;
+
+statement ok
+CREATE SEMANTIC VIEW "main".orders_sv AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+query R
+FROM semantic_view('orders_sv', metrics := ['total']);
+----
+300.00
+
+# ------------------------------------------------------------------------
+# QID-03 — DESCRIBE / ALTER RENAME / DROP accept the same forms
+# ------------------------------------------------------------------------
+
+# DESCRIBE with quoted name resolves
+statement ok
+DESCRIBE SEMANTIC VIEW "orders_sv";
+
+# ALTER RENAME source AND target may both be quoted
+statement ok
+ALTER SEMANTIC VIEW "orders_sv" RENAME TO "memory"."main"."orders_sv_v2";
+
+# Old name no longer resolves; new bare name does
+statement error
+DESCRIBE SEMANTIC VIEW orders_sv;
+----
+semantic view 'orders_sv' does not exist
+
+query R
+FROM semantic_view('orders_sv_v2', metrics := ['total']);
+----
+300.00
+
+# Runtime arg quoted: semantic_view('"orders_sv_v2"', ...) also resolves
+query R
+FROM semantic_view('"orders_sv_v2"', metrics := ['total']);
+----
+300.00
+
+statement ok
+DROP SEMANTIC VIEW "main"."orders_sv_v2";
+
+# ------------------------------------------------------------------------
+# QID-04 — no triple-quoting in expanded SQL when TABLES uses a quoted FQN
+# ------------------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW orders_sv AS
+  TABLES (o AS "memory"."main"."orders" PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+# explain_semantic_view returns the expanded SQL.  Verify that no triple
+# double-quote sequence appears anywhere in the plan and that the correct
+# fully-quoted FQN form appears.
+query I
+SELECT COUNT(*) FROM explain_semantic_view('orders_sv', metrics := ['total'])
+  WHERE explain_output LIKE '%"""%';
+----
+0
+
+query I
+SELECT COUNT(*) FROM explain_semantic_view('orders_sv', metrics := ['total'])
+  WHERE explain_output LIKE '%"memory"."main"."orders"%';
+----
+1
+
+# Query actually runs against the fully-quoted FQN source-table reference
+query R
+FROM semantic_view('orders_sv', metrics := ['total']);
+----
+300.00
+
+# ------------------------------------------------------------------------
+# QID-05 — GET_DDL round-trip preserves bare-name shape
+# ------------------------------------------------------------------------
+
+query T
+SELECT GET_DDL('SEMANTIC_VIEW', 'orders_sv') LIKE 'CREATE OR REPLACE SEMANTIC VIEW orders_sv AS%';
+----
+true
+
+# Round-trip: extract DDL, DROP, re-CREATE, verify lookup.
+statement ok
+DROP SEMANTIC VIEW orders_sv;
+
+# Re-create using the same shape GET_DDL emits (bare view name; quoted
+# source-table FQN).  A user copy-pasting GET_DDL output back into SQL
+# must produce an equivalent view.
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW orders_sv AS
+  TABLES (o AS "memory"."main"."orders" PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+query R
+FROM semantic_view('orders_sv', metrics := ['total']);
+----
+300.00
+
+# ------------------------------------------------------------------------
+# QID-06 — error messages reference the unquoted bare name
+# ------------------------------------------------------------------------
+
+# DESCRIBE on missing view — error says 'nonexistent_view', NOT the quoted form
+statement error
+DESCRIBE SEMANTIC VIEW "memory"."main"."nonexistent_view";
+----
+semantic view 'nonexistent_view' does not exist
+
+# DROP on missing view — same shape
+statement error
+DROP SEMANTIC VIEW "memory"."main"."nonexistent_view";
+----
+semantic view 'nonexistent_view' does not exist
+
+# CREATE duplicate — error references the bare name
+statement error
+CREATE SEMANTIC VIEW "memory"."main"."orders_sv" AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+----
+semantic view 'orders_sv' already exists
+
+# ------------------------------------------------------------------------
+# Cleanup
+# ------------------------------------------------------------------------
+
+statement ok
+DROP SEMANTIC VIEW orders_sv;
+
+statement ok
+DROP TABLE orders;

@@ -627,7 +627,6 @@ mod tests {
             WindowSpec,
         };
         let def = SemanticViewDefinition {
-            base_table: "orders".to_string(),
             tables: vec![TableRef {
                 alias: "o".to_string(),
                 table: "orders".to_string(),

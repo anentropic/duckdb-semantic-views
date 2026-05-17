@@ -1,5 +1,32 @@
 # Milestones
 
+## v0.9.0 Read-Only Database LOAD Support + Quoted Identifier Bugfix (Shipped: 2026-05-17)
+
+**Phases completed:** 2 phases (63-64), 8 plans
+**Timeline:** 2026-05-08 → 2026-05-17 (10 days)
+**Requirements:** 21/21 (RO-01..05, DOC-01..05, TEST-01..03, REL-01, QID-01..07)
+**Git range:** v0.8.0 → HEAD (45 commits, 64 files, +9643/−119 LOC)
+
+**Delivered:** `LOAD semantic_views` now works on read-only DuckDB databases — previously-bootstrapped views can be queried from analytics workers that have no write access. A late-discovered bug where quoted-FQN view names were stored verbatim (breaking short-name lookup and triggering triple-quoted SQL in expansion) was folded into the same milestone pre-tag.
+
+**Key accomplishments:**
+
+1. **Read-only LOAD (Phase 63)** — `LOAD semantic_views` succeeds on read-only DBs. `is_read_only` detected via `current_setting('access_mode')` at LOAD; `init_catalog` skips `CREATE SCHEMA/TABLE` and the v0.1.0 companion-file migration; `catalog_table_present` probe at LOAD short-circuits `prepared_lookup` / `execute_list_all` / `execute_list_names` to "empty"/"not found" without hitting the DB when `_definitions` is absent. DDL emissions unchanged — INSERT/DELETE/UPDATE on `_definitions` surfaces DuckDB's standard "cannot write to read-only database" error.
+2. **Bootstrap-then-reopen example** — `examples/readonly_load.py` demos the full flow (open writable → define → close → reopen RO → query → DDL fails). Uses subprocess bootstrap pattern to sidestep Phase 62 `OverrideContext` in-process RW→RO hang.
+3. **Test coverage** — `test/integration/test_readonly_load.py` (3 scenarios) + `test/sql/readonly_load.test` (writable smoke; sqllogictest runner lacks a readonly directive). Fixture registered in `test/sql/TEST_LIST` per the Phase 63 runner-gate rule.
+4. **Documentation** — New "Read-only databases" section in `transactional-ddl-and-limitations.rst`; one-line notes on CREATE/DROP/ALTER reference pages; README Quick start callout; CHANGELOG `[0.9.0]` section.
+5. **Quoted-identifier normalisation (Phase 64)** — New leaf module `src/ident.rs` with `parse_qualified_identifier` + `normalize_view_name` (+ 33 unit tests + 2 proptests × 256 cases). Wired into 5 DDL capture sites in `src/parse.rs` (extract_name_only, validate_create_body, extract_ddl_name, rewrite_alter source+target, emit_native_create_sql defensive shadow) plus the runtime `semantic_view()` arg in `src/query/table_function.rs`. `CREATE OR REPLACE SEMANTIC VIEW "memory"."main"."orders_sv"` now stores `orders_sv` as the lookup key; `semantic_view('orders_sv', ...)` resolves. ALTER RENAME normalises both source and target identifiers.
+6. **Expansion idempotency (Phase 64)** — `quote_table_ref` in `src/expand/resolution.rs` rewritten to delegate to `ident::parse_qualified_identifier`. Eliminates the secondary `"""triple"""` SQL bug. `qualify_and_quote_table_ref` switched from brittle `.contains('.')` substring test to structural `parts.len() > 1` check (fixes dots-inside-quoted-parts pitfall). `.contains('.')` anti-pattern fully scrubbed from `src/expand/`.
+7. **Acceptance reproduction** — `test/sql/phase64_quoted_idents.test` covers ROADMAP cases (a)-(d): fully-quoted FQN, partial quoting, GET_DDL round-trip, error messages reference unquoted name. Workspace integration test `tests/quoted_idents_regression.rs` + 3 tracked fuzz seeds in `fuzz/seeds/fuzz_ddl_parse/` (corpus dir is gitignored — seeds live in tracked sibling).
+
+**Tech debt added:** TECH-DEBT 24 (body-parser TABLES-clause whitespace-in-quoted-source-table-names — deferred; vanishingly rare).
+**Tech debt resolved:** none in this milestone.
+**Quality gate:** `just test-all` EXIT 0 · `just ci` EXIT 0 · 838 cargo unit tests · 47 sqllogictests · 3 regression tests.
+
+**Process note:** Milestone was reopened pre-tag after Phase 63 was marked shipped, when a downstream user reported the quoted-identifier bug. Phase 64 added as a follow-up.
+
+---
+
 ## v0.8.0 Transactional DDL & Architectural Unification (Shipped: 2026-05-06)
 
 **Phases completed:** 5 phases (58-62), 8 plans

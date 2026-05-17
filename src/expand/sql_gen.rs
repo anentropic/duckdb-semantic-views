@@ -576,7 +576,7 @@ mod tests {
     mod expand_tests {
         use super::*;
         use crate::expand::test_helpers::{minimal_def, orders_view, TestFixtureExt};
-        use crate::model::{Join, SemanticViewDefinition};
+        use crate::model::SemanticViewDefinition;
 
         #[test]
         fn test_basic_single_dimension_single_metric() {
@@ -1302,7 +1302,7 @@ GROUP BY
     mod phase12_cast_tests {
         use super::*;
         use crate::expand::test_helpers::TestFixtureExt;
-        use crate::model::{AccessModifier, Dimension, Metric, SemanticViewDefinition};
+        use crate::model::{Dimension, SemanticViewDefinition};
 
         #[test]
         fn output_type_on_metric_emits_cast() {
@@ -2712,7 +2712,7 @@ GROUP BY
 
     mod phase31_fan_trap_tests {
         use super::*;
-        use crate::expand::test_helpers::{minimal_def, TestFixtureExt};
+        use crate::expand::test_helpers::minimal_def;
         use crate::model::{
             AccessModifier, Cardinality, Dimension, Join, Metric, SemanticViewDefinition, TableRef,
         };
@@ -3868,8 +3868,8 @@ GROUP BY
 
     mod phase46_fact_query_tests {
         use super::*;
-        use crate::expand::test_helpers::{orders_view, TestFixtureExt};
-        use crate::model::{AccessModifier, Fact, Join, SemanticViewDefinition};
+        use crate::expand::test_helpers::TestFixtureExt;
+        use crate::model::SemanticViewDefinition;
 
         /// Build a multi-table def: orders (o) -> line_items (li), with a dim on o and facts on li.
         fn multi_table_def() -> SemanticViewDefinition {

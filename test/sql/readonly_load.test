@@ -1,0 +1,59 @@
+# Phase 63 (v0.9.0) — Read-only LOAD support smoke fixture.
+#
+# The Python sqllogictest runner in python_runner/ does NOT support
+# a `load <path> readonly` directive (Wave 0 spike: `grep -rn 'readonly'
+# python_runner/` returned zero results). DuckDB's access_mode is a
+# startup-only setting and cannot be changed via SET on an open
+# connection, so we cannot toggle a writable connection into read-only
+# mode mid-fixture either.
+#
+# FULL three-scenario coverage of RO-01..RO-05 lives in
+# test/integration/test_readonly_load.py (run via `just test-readonly`,
+# which is part of `just test-all`). That test uses
+# `duckdb.connect(path, read_only=True)` from the Python API where the
+# read-only kwarg is unambiguously available.
+#
+# This sqllogictest fixture pins the WRITABLE bootstrap path that the
+# read-only scenario depends on: a CREATE SEMANTIC VIEW writes the row
+# to semantic_layer._definitions, and a subsequent reader query returns
+# it. If this smoke fixture breaks, the read-only integration test is
+# also expected to break, surfacing the regression earlier in CI.
+#
+# See .planning/phases/63-readonly-database-load-support/63-RESEARCH.md
+# §3 Q6 for the full deferral analysis.
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# --- Writable bootstrap that the read-only scenario consumes ------------
+
+statement ok
+CREATE TABLE orders (id INTEGER PRIMARY KEY, region VARCHAR, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO orders VALUES (1, 'US', 100), (2, 'EU', 200), (3, 'US', 50);
+
+statement ok
+CREATE SEMANTIC VIEW v_readonly_smoke AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+# The bootstrapped view is visible.
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'v_readonly_smoke';
+----
+1
+
+# The semantic_layer._definitions row exists (this is the row a
+# subsequent read-only reopen must surface via list_semantic_views()).
+query I
+SELECT count(*) FROM semantic_layer._definitions WHERE name = 'v_readonly_smoke';
+----
+1
+
+# Cleanup so re-runs of the test stay idempotent.
+statement ok
+DROP SEMANTIC VIEW v_readonly_smoke;

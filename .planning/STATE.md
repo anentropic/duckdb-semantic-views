@@ -1,14 +1,14 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.8.0
-milestone_name: Transactional DDL & Architectural Unification
-status: shipped
-stopped_at: v0.8.0 milestone shipped — ready for tag and PR merge
-last_updated: "2026-05-06T20:56:27.307Z"
-last_activity: 2026-05-06
+milestone: v0.9.0
+milestone_name: Read-Only Database LOAD Support + Quoted Identifier Bugfix
+status: verifying
+stopped_at: Completed 64-04-PLAN.md
+last_updated: "2026-05-17T19:08:57.040Z"
+last_activity: 2026-05-17
 progress:
-  total_phases: 5
-  completed_phases: 5
+  total_phases: 2
+  completed_phases: 2
   total_plans: 8
   completed_plans: 8
   percent: 100
@@ -18,29 +18,34 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-05-06)
+See: .planning/PROJECT.md (updated 2026-05-15)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** v0.8.0 milestone shipped — planning next milestone
+**Current focus:** Phase 64 — Fix CREATE SEMANTIC VIEW quoted identifier handling
 
 ## Current Position
 
-Milestone: v0.8.0 (shipped 2026-05-06)
-Phase: — (between milestones)
-Status: Ready for tag and PR merge; next milestone planning via /gsd-new-milestone
-Last activity: 2026-05-06
+Milestone: v0.9.0 — Read-Only Database LOAD Support + Quoted Identifier Bugfix
+Phase: 64
+Plan: Not started
+Status: Phase complete — ready for verification
+Last activity: 2026-05-17
 
-Progress: [██████████] 100% (v0.8.0 complete)
+Progress: [█████─────] 50% (1/2 phases complete)
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 11 (v0.7.0) + 4 (v0.8.0 phases 58–61, retroactive)
+- Total plans completed: 19 (v0.7.0) + 4 (v0.8.0 phases 58–61, retroactive)
 - Average duration: --
 - Total execution time: 0 hours
 
 ## Accumulated Context
+
+### Roadmap Evolution
+
+- Phase 64 added: Fix CREATE SEMANTIC VIEW quoted identifier handling (downstream bug; quoted FQN stored verbatim, lookup by short name fails, expansion re-quotes producing triple quotes). Folded into v0.9.0 — milestone reopened pre-tag since maintainer squash-merge had not yet happened.
 
 ### Decisions
 
@@ -65,12 +70,23 @@ Recent decisions affecting current work:
 - [Phase 62]: Phase 62 Plan 02: Drop for OverrideContext leaks the inner duckdb_connection by design (Q2 destruction-order: ~DBConfig fires AFTER ~DatabaseInstance resets connection_manager, so calling duckdb_disconnect would UAF). Bounded leak — one Connection per DB ever opened, ~few KB each. Matches v0.8.0 baseline.
 - [Phase 62]: Phase 62 Plan 03: parse_function reintroduced as error-reporting layer. parser_override owns success path (transactional rewrite + re-parse); error branches return rc=2 to defer to default parser, which fails on the unrecognised prefix and triggers sv_parse_stub which returns DISPLAY_EXTENSION_ERROR with error_location for caret rendering. sv_parse_function_rust uses rewrite_to_native_sql (catalog-aware) when ctx_ptr is non-null so DROP/ALTER catalog errors are reproduced with caret. sql_throwing helper deleted; write_error_to_buffer is now live. Resolves TECH-DEBT 22.
 - [Phase 62]: TECH-DEBT 20 (bounded LRU eviction) and 22 (FALLBACK_OVERRIDE drops DISPLAY_EXTENSION_ERROR) marked resolved; caret rendering restored via parse_function
+- [Phase 63]: Phase 63 Plan 01: pass catalog_table_present=true from sv_make_override_context — keeps src/parse.rs UNCHANGED in spirit; routes DDL writes through DuckDB native read-only error (RO-05). Fresh-RO DDL pre-checks may surface catalog errors instead of read-only — covered by RO-05 'or the closest equivalent' wording per RESEARCH §3 Q5.
+- [Phase 63]: Phase 63 Plan 02: added readonly_load.test entry to test/sql/TEST_LIST (Rule 3 — required for fixture to actually run; runner gates on TEST_LIST membership, not directory scan). Skipped just ci per plan §Task 4 (docs-check defers to Plan 04 after Plan 03 lands).
+- [Phase 63]: Phase 63 Plan 03: bootstrap-in-subprocess pattern adopted in examples/readonly_load.py to sidestep Phase 62 OverrideContext in-process RW->RO hang (verified by stuck CPU spin in first draft). Mirrors test_readonly_load.py::bootstrap_in_subprocess. Reflects real production split between bootstrap (build/CI) and read-only query (analytics worker).
+- [Phase 63]: Phase 63 Plan 04: version bump to 0.9.0 (Cargo.toml + description.yml); description.yml repo.ref intentionally unchanged (just release on main owns it post-tag). Tag/squash-merge OUT OF SCOPE — flagged for maintainer in 63-04-SUMMARY.
+- [Phase 64]: Phase 64 Plan 01: ident helper lives in own leaf module (src/ident.rs) — lets src/expand/resolution.rs::quote_table_ref depend on it without parse.rs → expand reverse direction; String error type matches existing convention; empty quoted "" rejected (Snowflake-aligned); find_identifier_end returns input.len() on unterminated quote so callers don't need Option/Result wrap
+- [Phase 64]: Defensive normalize_view_name shadow at emit_native_create_sql entry is UNCONDITIONAL — hardens catalog boundary against future regressions
+- [Phase 64]: ALTER RENAME normalises BOTH source-name and RENAME TO target-name slots; without this the target slot stored the raw quoted FQN
+- [Phase 64]: Use sqllogictest block-form statement error (---- separator + substring), not inline regex — runner does not support inline form
+- [Phase 64]: Tracked fuzz seeds live in fuzz/seeds/<target>/ (gitignore only excludes fuzz/corpus/)
 
 ### Pending Todos
 
 - [ ] Investigate WASM build strategy -- `.planning/todos/pending/2026-03-19-investigate-wasm-build-strategy.md`
 - [ ] Explore dbt semantic layer integration -- `.planning/todos/pending/2026-03-19-explore-dbt-semantic-layer-integration-via-duckdb.md`
 - [ ] Pre-aggregation materializations -- `.planning/todos/pending/2026-03-19-pre-aggregation-materializations-with-query-driven-suggestions.md`
+- [ ] Test hardening — large-schema stress and concurrent access tests -- `.planning/todos/pending/2026-04-04-test-hardening-stress-and-concurrency.md`
+- [ ] Remove obsolete pre-0.5.5 backwards-compatibility shims -- `.planning/todos/pending/2026-05-15-remove-obsolete-pre-0-5-5-backwards-compatibility-shims.md`
 
 ### Blockers/Concerns
 
@@ -99,9 +115,17 @@ Recent decisions affecting current work:
 | Phase 62 P02 | 25min | 3 tasks | 3 files |
 | Phase 62 P03 | 18min | 3 tasks | 2 files |
 | Phase 62 P04 | 30m | 4 tasks | 13 files |
+| Phase 63 P01 | 25min | 3 tasks | 4 files |
+| Phase 63 P02 | 10min | 4 tasks | 4 files |
+| Phase 63 P03 | 25min | 6 tasks | 7 files |
+| Phase 63 P04 | 16min | 3 tasks | 4 files |
+| Phase 64 P01 | 4m | 2 tasks | 2 files |
+| Phase 64 P02 | 7 | 2 tasks | 2 files |
+| Phase 64 P03 | 8 | 2 tasks | 1 files |
+| Phase 64 P04 | 6 | 3 tasks | 12 files |
 
 ## Session Continuity
 
-Last session: 2026-05-06T13:33:43.638Z
-Stopped at: Completed 62-04-PLAN.md (Phase 62 ready for /gsd-verify-work)
+Last session: 2026-05-17T15:51:49.700Z
+Stopped at: Completed 64-04-PLAN.md
 Resume file: None

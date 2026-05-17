@@ -59,6 +59,8 @@ SELECT * FROM semantic_view('order_metrics',
 ) WHERE region = 'East';
 ```
 
+> **Read-only databases:** queries (`semantic_view`, `list_semantic_views`, `describe_semantic_view`, etc.) work against a database opened with `read_only=True`. `CREATE` / `DROP` / `ALTER SEMANTIC VIEW` require a writable database. See the [transactional DDL and limitations](https://anentropic.github.io/duckdb-semantic-views/explanation/transactional-ddl-and-limitations.html#read-only-databases) explanation page for the bootstrap-then-reopen workflow.
+
 ## Multi-table (PK/FK relationships)
 
 Define relationships between tables with PRIMARY KEY and REFERENCES. Only the tables needed for your requested dimensions and metrics get joined.

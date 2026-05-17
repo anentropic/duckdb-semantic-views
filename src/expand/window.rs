@@ -313,7 +313,7 @@ pub(super) fn expand_window_metrics(
 #[cfg(test)]
 mod tests {
     use crate::expand::test_helpers::{minimal_def, orders_view, TestFixtureExt};
-    use crate::expand::{expand, DimensionName, ExpandError, MetricName, QueryRequest};
+    use crate::expand::{expand, DimensionName, MetricName, QueryRequest};
     use crate::model::{NullsOrder, SortOrder, WindowOrderBy, WindowSpec};
 
     /// Single window metric with 3 dims -- CTE with GROUP BY all dims,

@@ -43,3 +43,5 @@ test/sql/error_caret_multiline.test
 test/sql/error_caret_unicode.test
 test/sql/lru_removed_isolation.test
 test/sql/extension_reload.test
+test/sql/readonly_load.test
+test/sql/phase64_quoted_idents.test

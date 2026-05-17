@@ -1,0 +1,1 @@
+CREATE OR REPLACE SEMANTIC VIEW "db"."s"."v" AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.r AS o.r) METRICS (o.t AS SUM(o.a))

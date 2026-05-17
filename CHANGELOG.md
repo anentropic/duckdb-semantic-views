@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes yet._
 
+## [0.9.0] - 2026-05-17
+
+### Added
+
+- **Read-only database LOAD support.** ``LOAD semantic_views`` now succeeds on a read-only DuckDB database. Previously-defined semantic views can be queried via ``list_semantic_views()``, ``describe_semantic_view()``, and ``FROM semantic_view(...)`` against a database opened with ``read_only=True`` (Python) or ``--readonly`` (CLI). On a read-only database that was never bootstrapped, the catalog is treated as empty rather than raising a missing-table error: ``list_semantic_views()`` returns zero rows, and ``describe_semantic_view('x')`` / ``FROM semantic_view('x', ...)`` return the standard ``semantic view 'x' does not exist`` error for any name.
+- **Read-only DDL surfaces DuckDB's standard error.** ``CREATE SEMANTIC VIEW``, ``DROP SEMANTIC VIEW``, and ``ALTER SEMANTIC VIEW`` against a read-only database fail with DuckDB's standard ``Cannot execute statement of type "..." on database "..." which is attached in read-only mode!`` error rather than the previous confusing schema-create failure at LOAD time.
+- **`examples/readonly_load.py`** demonstrating the open-writable → bootstrap → close → reopen-readonly → query → catch-DDL-error workflow.
+- **`just test-readonly` recipe + `test/integration/test_readonly_load.py`** Python integration test (three scenarios: fresh read-only file, bootstrapped reopen, DDL rejection) and `test/sql/readonly_load.test` writable-side smoke fixture. Wired into `just test-all`.
+
+### Fixed
+
+- **Quoted identifier handling in `CREATE / DROP / ALTER / DESCRIBE / SHOW COLUMNS SEMANTIC VIEW`.** All five DDL forms now accept any combination of quoted, partially-quoted, and unquoted fully-qualified names — e.g. `CREATE OR REPLACE SEMANTIC VIEW "memory"."main"."orders_sv" AS ...`, `CREATE SEMANTIC VIEW main."orders_sv" AS ...`, and `CREATE SEMANTIC VIEW orders_sv AS ...` all store the same bare key, and `FROM semantic_view('orders_sv', ...)` resolves them uniformly. `ALTER ... RENAME TO` normalises both the source name and the new-name target. Error messages reference the unquoted bare name. Previously, a quoted FQN was stored verbatim (quotes and all) as the lookup key, which made any subsequent `semantic_view('orders_sv', ...)` call return "view does not exist".
+- **Triple-quoted identifiers in expanded SQL.** When a `TABLES (o AS "memory"."main"."orders" ...)` clause used a quoted source-table reference, the expansion path re-quoted each part producing strings like `"""memory"""."""main"""."""orders"""` in the generated `FROM` clause. The expansion now operates on parsed identifier parts and emits exactly one pair of quotes per part regardless of input shape, restoring `EXPLAIN SEMANTIC VIEW` legibility and (in the rare case the source-table reference had embedded special chars) correctness of the generated SQL.
+
+### Known limitations
+
+- The v0.1.0 → v0.2.0 companion-file migration cannot run on a read-only database (the migration INSERTs into ``semantic_layer._definitions`` which requires write access). Practical impact is near-zero — the companion-file format is four milestone versions stale and any database last opened with v0.2.0+ has already been migrated. If you have a v0.1.0-era database that has never been opened by any newer release, open it once writable to complete the migration before reverting to read-only.
+
 ## [0.8.0] - 2026-05-06
 
 ### Added
@@ -251,7 +269,8 @@ _No unreleased changes yet._
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.7.0...v0.7.1

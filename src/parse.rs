@@ -11,6 +11,7 @@ use std::collections::HashSet;
 
 use crate::body_parser::parse_keyword_body;
 use crate::errors::ParseError;
+use crate::ident::{find_identifier_end, normalize_view_name};
 use crate::model::{Cardinality, Join, TableRef};
 
 // ---------------------------------------------------------------------------
@@ -313,15 +314,17 @@ fn extract_name_only(trimmed: &str, prefix_len: usize) -> Result<String, String>
     if after_prefix.is_empty() {
         return Err("Missing view name".to_string());
     }
-    // Name is everything up to whitespace (or end)
-    let name_end = after_prefix
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(after_prefix.len());
-    let name = &after_prefix[..name_end];
-    if name.is_empty() {
+    // Name is everything up to whitespace (or end), honouring `"..."` regions so
+    // a quoted identifier with inner whitespace (`"my view"`) is captured intact.
+    // `allow_paren=false` — DROP / DESCRIBE / SHOW COLUMNS / ALTER source-name
+    // slots never legally end at `(`.
+    let name_end = find_identifier_end(after_prefix, false);
+    let raw_name = &after_prefix[..name_end];
+    if raw_name.is_empty() {
         return Err("Missing view name".to_string());
     }
-    Ok(name.to_string())
+    let name = normalize_view_name(raw_name).map_err(|e| format!("Invalid view name: {e}"))?;
+    Ok(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -630,10 +633,14 @@ fn parse_show_filter_clauses<'a>(
 /// Dispatches on RENAME TO, SET COMMENT, and UNSET COMMENT.
 fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, String> {
     let after_prefix = trimmed[plen..].trim();
-    let name_end = after_prefix
-        .find(|c: char| c.is_whitespace())
-        .ok_or("Missing view name after ALTER SEMANTIC VIEW")?;
-    let view_name = &after_prefix[..name_end];
+    // Quote-aware delimiter scan so `"my view"` is captured intact (allow_paren=false).
+    let name_end = find_identifier_end(after_prefix, false);
+    if name_end == 0 || name_end == after_prefix.len() {
+        return Err("Missing view name after ALTER SEMANTIC VIEW".to_string());
+    }
+    let raw_view_name = &after_prefix[..name_end];
+    let view_name =
+        normalize_view_name(raw_view_name).map_err(|e| format!("Invalid view name: {e}"))?;
     let rest = after_prefix[name_end..].trim();
     let rest_upper = rest.to_ascii_uppercase();
     let safe_name = view_name.replace('\'', "''");
@@ -645,10 +652,12 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
     };
 
     if rest_upper.starts_with("RENAME TO") {
-        let new_name = rest["RENAME TO".len()..].trim();
-        if new_name.is_empty() {
+        let new_name_raw = rest["RENAME TO".len()..].trim();
+        if new_name_raw.is_empty() {
             return Err("Missing new name after RENAME TO".to_string());
         }
+        let new_name = normalize_view_name(new_name_raw)
+            .map_err(|e| format!("Invalid new view name in RENAME TO: {e}"))?;
         let safe_new = new_name.replace('\'', "''");
         let alter_fn = format!("alter_semantic_view_rename{if_exists_suffix}");
         Ok(format!(
@@ -785,19 +794,22 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
     match kind {
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
             // Extract name directly: after prefix, trim whitespace, take up to
-            // whitespace or '(' (same logic as validate_create_body).
+            // whitespace or '(' (same logic as validate_create_body). Honour
+            // `"..."` regions so quoted/FQN forms (`"db"."sch"."v"`,
+            // `"my view"`) are captured intact and then normalised to the
+            // bare last part.
             let after_prefix = trimmed[plen..].trim_start();
             if after_prefix.is_empty() {
                 return Err("Missing view name".to_string());
             }
-            let name_end = after_prefix
-                .find(|c: char| c.is_whitespace() || c == '(')
-                .unwrap_or(after_prefix.len());
-            let name = &after_prefix[..name_end];
-            if name.is_empty() {
+            let name_end = find_identifier_end(after_prefix, true);
+            let raw_name = &after_prefix[..name_end];
+            if raw_name.is_empty() {
                 return Err("Missing view name".to_string());
             }
-            Ok(Some(name.to_string()))
+            let name =
+                normalize_view_name(raw_name).map_err(|e| format!("Invalid view name: {e}"))?;
+            Ok(Some(name))
         }
         DdlKind::Drop
         | DdlKind::DropIfExists
@@ -1133,16 +1145,24 @@ fn validate_create_body(
         });
     }
 
-    let name_end = after_prefix
-        .find(|c: char| c.is_whitespace() || c == '(')
-        .unwrap_or(after_prefix.len());
-    let name = &after_prefix[..name_end];
-    if name.is_empty() {
+    // Quote-aware delimiter scan; honours `"..."` regions so quoted/FQN forms
+    // like `"db"."sch"."v"` or `"my view"` are captured intact before
+    // normalisation. allow_paren=true: the CREATE form may legally have a `(`
+    // for legacy paren-body callers (the AS-keyword body path is the main one
+    // today, but `(` remains a safe terminator).
+    let name_end = find_identifier_end(after_prefix, true);
+    let raw_name = &after_prefix[..name_end];
+    if raw_name.is_empty() {
         return Err(ParseError {
             message: "Missing view name after DDL prefix.".to_string(),
             position: Some(trim_offset + plen),
         });
     }
+    let name_owned = normalize_view_name(raw_name).map_err(|e| ParseError {
+        message: format!("Invalid view name: {e}"),
+        position: Some(trim_offset + plen),
+    })?;
+    let name = name_owned.as_str();
 
     let after_name = &after_prefix[name_end..];
 
@@ -1856,14 +1876,32 @@ fn emit_native_create_sql(
     or_replace: bool,
     if_not_exists: bool,
 ) -> Result<Option<String>, ParseError> {
-    let name_escaped = escape_sql_arg(name);
+    // Defensive normalisation — idempotent on already-normalised input from
+    // validate_create_body (the only happy-path caller). Guarantees `name`
+    // is the bare view identifier byte-for-byte matching the catalog PK,
+    // regardless of how this function was called. Cost: one strdup + a
+    // state-machine pass (~tens of ns on typical view names) — negligible
+    // relative to the catalog INSERT this function performs.
+    //
+    // The shadow shadows the `&str` parameter with an owned `String`; all
+    // subsequent uses (escape_sql_arg, ctx.catalog.exists, error message
+    // formatting, enrich_definition_for_create) continue to compile because
+    // `String` auto-derefs to `&str` where needed.
+    let name = normalize_view_name(name).map_err(|e| ParseError {
+        message: format!("Invalid view name: {e}"),
+        position: None,
+    })?;
+    let name_escaped = escape_sql_arg(&name);
 
     // Parse-time existence check: fast path for the committed-state case.
-    // Same-txn CREATE-then-CREATE slips past this (the catalog connection
-    // only sees committed rows), so the generated SQL below also guards
-    // against the in-flight case via a CASE+error() / WHERE NOT EXISTS
-    // pattern that runs on the caller's transaction.
-    let exists = ctx.catalog.exists(name).map_err(|e| ParseError {
+    // `name` is guaranteed to be the bare view identifier — defensively
+    // normalised at function entry. The catalog row's PK column stores the
+    // same bare value, so `ctx.catalog.exists(name)` is a byte-for-byte
+    // match. Same-txn CREATE-then-CREATE slips past this (the catalog
+    // connection only sees committed rows), so the generated SQL below
+    // also guards against the in-flight case via a CASE+error() / WHERE
+    // NOT EXISTS pattern that runs on the caller's transaction.
+    let exists = ctx.catalog.exists(&name).map_err(|e| ParseError {
         message: format!("catalog lookup failed: {e}"),
         position: None,
     })?;
@@ -1886,7 +1924,7 @@ fn emit_native_create_sql(
     // `is_file_backed` matches the legacy `DefineState::persist_conn.is_some()`
     // behaviour: type inference runs only for file-backed DBs (v0.7.1 design).
     let enriched_json = crate::ddl::define::enrich_definition_for_create(
-        name,
+        &name,
         def,
         ctx.catalog.raw(),
         ctx.is_file_backed,
@@ -2427,8 +2465,17 @@ pub unsafe extern "C" fn sv_make_override_context(
     is_file_backed: bool,
 ) -> *mut std::ffi::c_void {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Phase 63: pass `catalog_table_present=true`. The OverrideContext is
+        // built once at LOAD by sv_register_parser_hooks; on writable DBs the
+        // table is always present (init_catalog just CREATE'd it). On a
+        // read-only DB, the parser_override path is for DDL — the rewritten
+        // DML on the caller's connection will surface DuckDB's standard
+        // read-only error verbatim (RO-05). For pre-checks against a
+        // fresh read-only DB without a `_definitions` table, the catalog
+        // query may surface a catalog error instead — RO-05's "or the
+        // closest equivalent" wording covers this. See 63-RESEARCH.md §3 Q5.
         let ctx = Box::new(OverrideContext {
-            catalog: crate::catalog::CatalogReader::new(conn),
+            catalog: crate::catalog::CatalogReader::new(conn, true),
             is_file_backed,
         });
         Box::into_raw(ctx) as *mut std::ffi::c_void
@@ -2883,7 +2930,10 @@ mod tests {
         let sentinel: Box<u64> = Box::new(0xDEAD_BEEF_CAFE_BABE);
         let raw = Box::into_raw(sentinel);
         let ctx = OverrideContext {
-            catalog: crate::catalog::CatalogReader::new(raw as libduckdb_sys::duckdb_connection),
+            catalog: crate::catalog::CatalogReader::new(
+                raw as libduckdb_sys::duckdb_connection,
+                true,
+            ),
             is_file_backed: false,
         };
         // Drop runs here at end of scope. If duckdb_disconnect were
@@ -4970,5 +5020,233 @@ $$"#;
         }
         assert_eq!(&buf[..2], b"ok");
         assert_eq!(buf[2], 0);
+    }
+
+    // ===================================================================
+    // Phase 64: Quoted identifier handling (QID-01..QID-06).
+    //
+    // Wires `crate::ident::{normalize_view_name, find_identifier_end}` into
+    // the five DDL capture sites in this file. Each capture site is
+    // exercised here via its public-facing entry point (rewrite_ddl for
+    // DROP/DESCRIBE/SHOW COLUMNS, validate_and_rewrite for CREATE/ALTER,
+    // extract_ddl_name directly) with quoted and FQN forms — the bare
+    // unquoted last part is what reaches the catalog.
+    // ===================================================================
+
+    mod phase64_quoted_ident_tests {
+        use super::*;
+
+        // ----- extract_name_only via rewrite_ddl (DROP / DESCRIBE / SHOW COLUMNS / ALTER source) -----
+
+        #[test]
+        fn drop_with_quoted_fqn() {
+            let sql = rewrite_ddl("DROP SEMANTIC VIEW \"db\".\"sch\".\"v\"").unwrap();
+            assert_eq!(sql, "SELECT * FROM drop_semantic_view('v')");
+        }
+
+        #[test]
+        fn drop_with_quoted_bare() {
+            let sql = rewrite_ddl("DROP SEMANTIC VIEW \"orders_sv\"").unwrap();
+            assert_eq!(sql, "SELECT * FROM drop_semantic_view('orders_sv')");
+        }
+
+        #[test]
+        fn drop_with_unquoted_fqn() {
+            let sql = rewrite_ddl("DROP SEMANTIC VIEW db.sch.v").unwrap();
+            assert_eq!(sql, "SELECT * FROM drop_semantic_view('v')");
+        }
+
+        #[test]
+        fn drop_with_partial_quoting() {
+            let sql = rewrite_ddl("DROP SEMANTIC VIEW main.\"orders_sv\"").unwrap();
+            assert_eq!(sql, "SELECT * FROM drop_semantic_view('orders_sv')");
+        }
+
+        #[test]
+        fn drop_with_quoted_whitespace_name() {
+            // `"my view"` has an inner space — the quote-aware delimiter
+            // scan must NOT truncate mid-quote.
+            let sql = rewrite_ddl("DROP SEMANTIC VIEW \"my view\"").unwrap();
+            assert_eq!(sql, "SELECT * FROM drop_semantic_view('my view')");
+        }
+
+        #[test]
+        fn drop_if_exists_with_quoted_fqn() {
+            let sql = rewrite_ddl("DROP SEMANTIC VIEW IF EXISTS \"db\".\"sch\".\"v\"").unwrap();
+            assert_eq!(sql, "SELECT * FROM drop_semantic_view_if_exists('v')");
+        }
+
+        #[test]
+        fn describe_with_quoted_fqn() {
+            let sql = rewrite_ddl("DESCRIBE SEMANTIC VIEW \"memory\".\"main\".\"v\"").unwrap();
+            assert_eq!(sql, "SELECT * FROM describe_semantic_view('v')");
+        }
+
+        #[test]
+        fn show_columns_with_quoted_fqn() {
+            let sql =
+                rewrite_ddl("SHOW COLUMNS IN SEMANTIC VIEW \"memory\".\"main\".\"v\"").unwrap();
+            assert_eq!(sql, "SELECT * FROM show_columns_in_semantic_view('v')");
+        }
+
+        #[test]
+        fn drop_with_unterminated_quote_errors() {
+            let err = rewrite_ddl("DROP SEMANTIC VIEW \"foo").unwrap_err();
+            assert!(
+                err.contains("Invalid view name") && err.contains("unterminated"),
+                "expected invalid-view-name/unterminated error, got: {err}"
+            );
+        }
+
+        // ----- validate_create_body via validate_and_rewrite (CREATE / OR REPLACE / IF NOT EXISTS) -----
+        //
+        // We use the minimal AS-keyword body that produces a parsable
+        // semantic view definition: `TABLES (...)`, `DIMENSIONS (...)`,
+        // `METRICS (...)`. The captured name's emission inside the
+        // rewritten SQL would show up either via the CREATE function call
+        // (legacy) or — for the post-Phase-62 native path — via the
+        // INSERT, but that path is feature-gated on `extension`.
+        //
+        // What we CAN assert without the extension feature: the result is
+        // Ok(Some(_)) AND extract_ddl_name on the same query returns the
+        // bare name. The combination proves capture-site normalisation.
+
+        const MINIMAL_BODY: &str = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                                    DIMENSIONS (o.region AS o.region) \
+                                    METRICS (o.total AS SUM(o.amount))";
+
+        #[test]
+        fn create_with_quoted_fqn_extracts_bare_name() {
+            let q = format!("CREATE SEMANTIC VIEW \"db\".\"sch\".\"orders_sv\" {MINIMAL_BODY}");
+            let name = extract_ddl_name(&q).unwrap();
+            assert_eq!(name, Some("orders_sv".to_string()));
+        }
+
+        #[test]
+        fn create_or_replace_with_quoted_fqn_extracts_bare_name() {
+            let q = format!(
+                "CREATE OR REPLACE SEMANTIC VIEW \"db\".\"sch\".\"orders_sv\" {MINIMAL_BODY}"
+            );
+            let name = extract_ddl_name(&q).unwrap();
+            assert_eq!(name, Some("orders_sv".to_string()));
+        }
+
+        #[test]
+        fn create_if_not_exists_with_quoted_fqn_extracts_bare_name() {
+            let q = format!(
+                "CREATE SEMANTIC VIEW IF NOT EXISTS \"db\".\"sch\".\"orders_sv\" {MINIMAL_BODY}"
+            );
+            let name = extract_ddl_name(&q).unwrap();
+            assert_eq!(name, Some("orders_sv".to_string()));
+        }
+
+        #[test]
+        fn create_with_partial_quoting_extracts_bare_name() {
+            let q = format!("CREATE SEMANTIC VIEW main.\"orders_sv\" {MINIMAL_BODY}");
+            let name = extract_ddl_name(&q).unwrap();
+            assert_eq!(name, Some("orders_sv".to_string()));
+        }
+
+        #[test]
+        fn create_with_quoted_whitespace_name_extracts_intact() {
+            let q = format!("CREATE SEMANTIC VIEW \"my view\" {MINIMAL_BODY}");
+            let name = extract_ddl_name(&q).unwrap();
+            assert_eq!(name, Some("my view".to_string()));
+        }
+
+        #[test]
+        fn create_with_unterminated_quote_errors() {
+            let q = format!("CREATE SEMANTIC VIEW \"foo {MINIMAL_BODY}");
+            // Since the delimiter scan saturates at input.len() inside an
+            // unterminated quote, normalize_view_name surfaces the error.
+            let err = validate_and_rewrite(&q).unwrap_err();
+            assert!(
+                err.message.contains("Invalid view name") && err.message.contains("unterminated"),
+                "expected invalid-view-name error, got: {}",
+                err.message
+            );
+        }
+
+        // ----- rewrite_alter — source slot AND RENAME TO target slot -----
+
+        #[test]
+        fn alter_rename_source_quoted() {
+            let sql = validate_and_rewrite("ALTER SEMANTIC VIEW \"v\" RENAME TO new_name")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM alter_semantic_view_rename('v', 'new_name')"
+            );
+        }
+
+        #[test]
+        fn alter_rename_target_quoted() {
+            let sql = validate_and_rewrite(
+                "ALTER SEMANTIC VIEW v RENAME TO \"memory\".\"main\".\"new_v\"",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM alter_semantic_view_rename('v', 'new_v')"
+            );
+        }
+
+        #[test]
+        fn alter_rename_both_quoted() {
+            let sql = validate_and_rewrite(
+                "ALTER SEMANTIC VIEW \"memory\".\"main\".\"v\" RENAME TO \"memory\".\"main\".\"new_v\"",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM alter_semantic_view_rename('v', 'new_v')"
+            );
+        }
+
+        #[test]
+        fn alter_set_comment_with_quoted_source() {
+            let sql = validate_and_rewrite("ALTER SEMANTIC VIEW \"v\" SET COMMENT = 'x'")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM alter_semantic_view_set_comment('v', 'x')"
+            );
+        }
+
+        #[test]
+        fn alter_unset_comment_with_quoted_source() {
+            let sql = validate_and_rewrite("ALTER SEMANTIC VIEW \"v\" UNSET COMMENT")
+                .unwrap()
+                .unwrap();
+            assert_eq!(sql, "SELECT * FROM alter_semantic_view_unset_comment('v')");
+        }
+
+        #[test]
+        fn alter_rename_target_unterminated_quote_errors() {
+            let err = validate_and_rewrite("ALTER SEMANTIC VIEW v RENAME TO \"foo").unwrap_err();
+            assert!(
+                err.message.contains("Invalid new view name in RENAME TO"),
+                "expected invalid-new-view-name error, got: {}",
+                err.message
+            );
+        }
+
+        // ----- extract_ddl_name CREATE branch quoted forms (Site C explicit) -----
+
+        #[test]
+        fn extract_ddl_name_quoted_fqn_create() {
+            let q = format!("CREATE SEMANTIC VIEW \"a\".\"b\".\"c\" {MINIMAL_BODY}");
+            assert_eq!(extract_ddl_name(&q).unwrap(), Some("c".to_string()));
+        }
+
+        #[test]
+        fn extract_ddl_name_mixed_quoting_create() {
+            let q = format!("CREATE SEMANTIC VIEW a.\"b\".c {MINIMAL_BODY}");
+            assert_eq!(extract_ddl_name(&q).unwrap(), Some("c".to_string()));
+        }
     }
 }

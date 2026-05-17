@@ -17,36 +17,65 @@ pub fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// Quote a potentially dot-qualified table reference.
+/// Quote a potentially dot-qualified table reference, normalising already-quoted input.
 ///
-/// Splits on `.` and quotes each part individually. This handles:
-/// - Simple names: `orders` -> `"orders"`
-/// - Catalog-qualified: `jaffle.raw_orders` -> `"jaffle"."raw_orders"`
-/// - Fully qualified: `catalog.schema.table` -> `"catalog"."schema"."table"`
+/// Delegates to [`crate::ident::parse_qualified_identifier`] so we operate on the
+/// UNQUOTED logical parts of the identifier, then re-emit each part via
+/// [`quote_ident`]. This makes the function **idempotent** on already-quoted
+/// input — repeated application produces the same canonical form.
 ///
-/// Each part is quoted via `quote_ident`, so embedded double quotes are escaped.
+/// Behaviour:
+/// - Bare:                `orders`               -> `"orders"`
+/// - Two-part bare:       `jaffle.raw_orders`    -> `"jaffle"."raw_orders"`
+/// - Three-part bare:     `catalog.schema.table` -> `"catalog"."schema"."table"`
+/// - Already quoted:      `"memory"."main"."v"`  -> `"memory"."main"."v"`  (idempotent)
+/// - Mixed quoting:       `main."v"`             -> `"main"."v"`
+/// - Embedded `""` escape: `"with""q"`           -> `"with""q"`            (preserved)
+/// - Dot inside quoted part: `"a.b"`             -> `"a.b"`                (single part)
+///
+/// Inputs that fail to parse as a SQL identifier (legacy / malformed strings)
+/// are emitted verbatim wrapped in a single pair of quotes via [`quote_ident`];
+/// this preserves the bare-name fallback behaviour and never produces
+/// double-quoting.
 #[must_use]
 pub fn quote_table_ref(table: &str) -> String {
-    table
-        .split('.')
-        .map(quote_ident)
-        .collect::<Vec<_>>()
-        .join(".")
+    match crate::ident::parse_qualified_identifier(table) {
+        Ok(parts) => parts
+            .iter()
+            .map(|p| quote_ident(p))
+            .collect::<Vec<_>>()
+            .join("."),
+        Err(_) => quote_ident(table),
+    }
 }
 
 /// Qualify a table name with the definition's catalog/schema, then quote it.
 ///
-/// If the table name is already dot-qualified (contains `.`), it is used as-is
-/// to avoid double-qualification. Otherwise, `database_name` and `schema_name`
-/// from the definition are prepended as available.
+/// If the table name is already dot-qualified (more than one structural part),
+/// it is used as-is to avoid double-qualification. Otherwise, `database_name`
+/// and `schema_name` from the definition are prepended as available.
 ///
 /// This ensures the expanded SQL uses fully-qualified table references, which
 /// is required for execution contexts (e.g. ADBC) that don't inherit the
 /// connection's default catalog/schema search path.
+///
+/// We use structural part-count from [`crate::ident::parse_qualified_identifier`]
+/// rather than a raw substring-dot heuristic, so quoted parts that contain
+/// a literal `.` (e.g. `"a.b"`) are correctly recognised as single-part bare
+/// names that should receive the db/schema prefix. If the input fails to parse
+/// (legacy / malformed strings), we fall through to the prepend path with
+/// `quote_ident(table)` — the safest option since prepending the catalog
+/// context cannot cause downstream re-quote bugs.
 #[must_use]
 pub fn qualify_and_quote_table_ref(table: &str, def: &SemanticViewDefinition) -> String {
-    // Already dot-qualified — don't double-qualify.
-    if table.contains('.') {
+    // Structural "is already qualified" test: a parsed identifier with more
+    // than one part means the user already wrote `db.t` / `db.schema.t` /
+    // `"db"."schema"."t"` etc. and we must not prepend a second qualifier.
+    let is_qualified = matches!(
+        crate::ident::parse_qualified_identifier(table),
+        Ok(ref parts) if parts.len() > 1
+    );
+    if is_qualified {
         return quote_table_ref(table);
     }
 
@@ -57,7 +86,15 @@ pub fn qualify_and_quote_table_ref(table: &str, def: &SemanticViewDefinition) ->
     if let Some(schema) = &def.schema_name {
         parts.push(quote_ident(schema));
     }
-    parts.push(quote_ident(table));
+    // `table` here is logically single-part. If it parses cleanly we emit
+    // its unquoted form via quote_ident; if not (malformed) we fall back to
+    // quote_ident on the raw string, which is the same shape quote_table_ref
+    // uses for its Err branch.
+    let last = match crate::ident::parse_qualified_identifier(table) {
+        Ok(p) if p.len() == 1 => quote_ident(&p[0]),
+        _ => quote_ident(table),
+    };
+    parts.push(last);
     parts.join(".")
 }
 
@@ -125,7 +162,29 @@ pub(super) fn find_metric<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{quote_ident, quote_table_ref};
+    use super::{qualify_and_quote_table_ref, quote_ident, quote_table_ref};
+    use crate::model::SemanticViewDefinition;
+
+    /// Minimal SemanticViewDefinition fixture with optional db_name / schema_name.
+    ///
+    /// All other vectors are empty — `qualify_and_quote_table_ref` only reads
+    /// `database_name` and `schema_name`, so we don't need a full view.
+    fn def_with_db_schema(db: Option<&str>, schema: Option<&str>) -> SemanticViewDefinition {
+        SemanticViewDefinition {
+            tables: vec![],
+            dimensions: vec![],
+            metrics: vec![],
+            joins: vec![],
+            facts: vec![],
+            materializations: vec![],
+            column_type_names: vec![],
+            column_types_inferred: vec![],
+            created_on: None,
+            database_name: db.map(str::to_string),
+            schema_name: schema.map(str::to_string),
+            comment: None,
+        }
+    }
 
     mod quote_ident_tests {
         use super::*;
@@ -182,9 +241,196 @@ mod tests {
 
         #[test]
         fn embedded_quotes_in_parts() {
+            // Input `my"db.my"table` is malformed under the new strict parser
+            // (bare parts cannot abut a `"`), so it falls through to the
+            // `quote_ident` fallback path: wrap the entire string in a single
+            // pair of quotes and escape any internal `"` via `""`.
             assert_eq!(
                 quote_table_ref("my\"db.my\"table"),
-                "\"my\"\"db\".\"my\"\"table\""
+                "\"my\"\"db.my\"\"table\""
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // Phase 64-03: idempotency / already-quoted input handling.
+        // -----------------------------------------------------------------
+
+        #[test]
+        fn already_quoted_simple() {
+            assert_eq!(quote_table_ref("\"orders\""), "\"orders\"");
+        }
+
+        #[test]
+        fn already_quoted_two_part() {
+            assert_eq!(
+                quote_table_ref("\"jaffle\".\"raw_orders\""),
+                "\"jaffle\".\"raw_orders\"",
+            );
+        }
+
+        #[test]
+        fn already_quoted_three_part() {
+            assert_eq!(
+                quote_table_ref("\"memory\".\"main\".\"orders\""),
+                "\"memory\".\"main\".\"orders\"",
+            );
+        }
+
+        #[test]
+        fn mixed_quoting_first_quoted() {
+            assert_eq!(quote_table_ref("\"main\".orders"), "\"main\".\"orders\"",);
+        }
+
+        #[test]
+        fn mixed_quoting_last_quoted() {
+            assert_eq!(quote_table_ref("main.\"orders\""), "\"main\".\"orders\"",);
+        }
+
+        #[test]
+        fn mixed_quoting_middle_quoted() {
+            assert_eq!(
+                quote_table_ref("db.\"schema\".table"),
+                "\"db\".\"schema\".\"table\"",
+            );
+        }
+
+        #[test]
+        fn embedded_double_quote_in_quoted_part() {
+            assert_eq!(quote_table_ref("\"with\"\"q\""), "\"with\"\"q\"");
+        }
+
+        #[test]
+        fn dot_inside_quoted_part() {
+            // The `.` is data (single quoted part), not a separator.
+            assert_eq!(quote_table_ref("\"a.b\""), "\"a.b\"");
+        }
+
+        #[test]
+        fn whitespace_inside_quoted_part() {
+            assert_eq!(quote_table_ref("\"my table\""), "\"my table\"");
+        }
+
+        #[test]
+        fn idempotent_property_bare() {
+            let once = quote_table_ref("orders");
+            let twice = quote_table_ref(&once);
+            assert_eq!(once, twice);
+        }
+
+        #[test]
+        fn idempotent_property_fqn() {
+            let once = quote_table_ref("memory.main.orders");
+            let twice = quote_table_ref(&once);
+            assert_eq!(once, twice);
+        }
+
+        #[test]
+        fn idempotent_property_already_quoted_fqn() {
+            // Direct regression coverage for the reported triple-quote bug:
+            // re-quoting an already-quoted FQN must not change it.
+            let input = "\"memory\".\"main\".\"orders_sv\"";
+            assert_eq!(quote_table_ref(input), input);
+            let twice = quote_table_ref(&quote_table_ref(input));
+            assert_eq!(twice, input);
+        }
+
+        #[test]
+        fn malformed_falls_back() {
+            // `"unterminated` has an unterminated quote → parser returns Err →
+            // fallback emits `quote_ident("\"unterminated")` which escapes the
+            // lone `"` as `""` and wraps the whole thing in one pair of quotes.
+            assert_eq!(quote_table_ref("\"unterminated"), "\"\"\"unterminated\"",);
+        }
+    }
+
+    mod qualify_and_quote_table_ref_tests {
+        use super::*;
+
+        #[test]
+        fn bare_name_gets_db_schema_prepended() {
+            let def = def_with_db_schema(Some("db"), Some("schema"));
+            assert_eq!(
+                qualify_and_quote_table_ref("t", &def),
+                "\"db\".\"schema\".\"t\"",
+            );
+        }
+
+        #[test]
+        fn bare_name_with_only_schema() {
+            let def = def_with_db_schema(None, Some("schema"));
+            assert_eq!(qualify_and_quote_table_ref("t", &def), "\"schema\".\"t\"",);
+        }
+
+        #[test]
+        fn bare_name_no_db_no_schema() {
+            let def = def_with_db_schema(None, None);
+            assert_eq!(qualify_and_quote_table_ref("t", &def), "\"t\"");
+        }
+
+        #[test]
+        fn quoted_bare_name_with_dot_inside_treated_as_single_part() {
+            // `"a.b"` is a SINGLE quoted part (the `.` is data, not a separator).
+            // The old substring-dot heuristic mistakenly treated this as
+            // qualified and skipped the prepend. The structural test sees one
+            // part, so db/schema are correctly prepended.
+            let def = def_with_db_schema(Some("db"), Some("schema"));
+            assert_eq!(
+                qualify_and_quote_table_ref("\"a.b\"", &def),
+                "\"db\".\"schema\".\"a.b\"",
+            );
+        }
+
+        #[test]
+        fn already_qualified_two_part() {
+            let def = def_with_db_schema(Some("db"), Some("schema"));
+            assert_eq!(
+                qualify_and_quote_table_ref("jaffle.raw_orders", &def),
+                "\"jaffle\".\"raw_orders\"",
+            );
+        }
+
+        #[test]
+        fn already_qualified_quoted_two_part() {
+            let def = def_with_db_schema(Some("db"), Some("schema"));
+            assert_eq!(
+                qualify_and_quote_table_ref("\"jaffle\".\"raw_orders\"", &def),
+                "\"jaffle\".\"raw_orders\"",
+            );
+        }
+
+        #[test]
+        fn already_qualified_three_part() {
+            let def = def_with_db_schema(Some("db"), Some("schema"));
+            assert_eq!(
+                qualify_and_quote_table_ref("a.b.c", &def),
+                "\"a\".\"b\".\"c\"",
+            );
+        }
+
+        #[test]
+        fn already_qualified_quoted_three_part_idempotent() {
+            // The reported bug shape: already-quoted FQN must not be re-quoted.
+            let def = def_with_db_schema(Some("ignored"), Some("ignored"));
+            let input = "\"memory\".\"main\".\"orders\"";
+            assert_eq!(qualify_and_quote_table_ref(input, &def), input);
+        }
+
+        #[test]
+        fn malformed_falls_through_to_prepend() {
+            // `"unterminated` fails to parse. The structural test returns
+            // is_qualified == false, so we fall through to the prepend path.
+            // The bare-name slot uses quote_ident("\"unterminated") which
+            // escapes the lone `"` and wraps once. Result must not panic and
+            // must contain the db/schema prefix.
+            let def = def_with_db_schema(Some("db"), Some("schema"));
+            let result = qualify_and_quote_table_ref("\"unterminated", &def);
+            assert!(
+                !result.is_empty(),
+                "qualify_and_quote_table_ref must not return empty on malformed input",
+            );
+            assert!(
+                result.starts_with("\"db\".\"schema\"."),
+                "expected db/schema prefix on malformed input, got: {result}",
             );
         }
     }
