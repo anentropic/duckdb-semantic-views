@@ -1,5 +1,6 @@
 pub mod body_parser;
 pub mod catalog;
+pub mod conn_guard;
 pub mod errors;
 pub mod expand;
 pub mod graph;
