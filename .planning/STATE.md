@@ -1,37 +1,35 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.9.0
-milestone_name: Read-Only Database LOAD Support + Quoted Identifier Bugfix
-status: verifying
-stopped_at: Completed 64-04-PLAN.md
-last_updated: "2026-05-17T19:08:57.040Z"
-last_activity: 2026-05-17
+milestone: v0.9.1
+milestone_name: Connection-Lifecycle & Catalog-Context Fixes
+status: executing
+stopped_at: "ROADMAP.md drafted for v0.9.1 (Phases 65–66). Next: `/gsd:plan-phase 65`."
+last_updated: "2026-05-21T16:12:22.576Z"
+last_activity: 2026-05-21 -- Phase 65 planning complete
 progress:
   total_phases: 2
-  completed_phases: 2
-  total_plans: 8
-  completed_plans: 8
-  percent: 100
+  completed_phases: 0
+  total_plans: 4
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-05-15)
+See: .planning/PROJECT.md (updated 2026-05-21)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Phase 64 — Fix CREATE SEMANTIC VIEW quoted identifier handling
+**Current focus:** Phase 65 — OverrideContext Connection Teardown
 
 ## Current Position
 
-Milestone: v0.9.0 — Read-Only Database LOAD Support + Quoted Identifier Bugfix
-Phase: 64
-Plan: Not started
-Status: Phase complete — ready for verification
-Last activity: 2026-05-17
-
-Progress: [█████─────] 50% (1/2 phases complete)
+Phase: 65 (not started)
+Plan: —
+Status: Ready to execute
+Progress: 0/2 phases complete
+Last activity: 2026-05-21 -- Phase 65 planning complete
 
 ## Performance Metrics
 
@@ -46,6 +44,7 @@ Progress: [█████─────] 50% (1/2 phases complete)
 ### Roadmap Evolution
 
 - Phase 64 added: Fix CREATE SEMANTIC VIEW quoted identifier handling (downstream bug; quoted FQN stored verbatim, lookup by short name fails, expansion re-quotes producing triple quotes). Folded into v0.9.0 — milestone reopened pre-tag since maintainer squash-merge had not yet happened.
+- v0.9.1 opened 2026-05-21: two-phase patch milestone for connection-lifecycle / catalog-context regressions. Phase 65 covers in-process RW→RO reopen hang (LIFE-01..04, from Phase 63 deferred-items). Phase 66 covers cross-connection expansion qualification across all paths (EXPAND-CTX-01..03, from `_notes/error_with_adbc.md`) plus release prep (REL-01, REL-02) as its closing plan, matching the v0.9.0 Phase 64 pattern.
 
 ### Decisions
 
@@ -126,6 +125,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-05-17T15:51:49.700Z
-Stopped at: Completed 64-04-PLAN.md
+Last session: 2026-05-21
+Stopped at: ROADMAP.md drafted for v0.9.1 (Phases 65–66). Next: `/gsd:plan-phase 65`.
 Resume file: None

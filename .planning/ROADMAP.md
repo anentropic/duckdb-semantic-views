@@ -16,6 +16,7 @@
 - ✅ **v0.7.0 YAML Definitions & Materialization Routing** -- Phases 51-57 (shipped 2026-04-24)
 - ✅ **v0.8.0 Transactional DDL & Architectural Unification** -- Phases 58-62 (shipped 2026-05-06)
 - ✅ **v0.9.0 Read-Only Database LOAD Support + Quoted Identifier Bugfix** -- Phases 63-64 (shipped 2026-05-17)
+- 🚧 **v0.9.1 Connection-Lifecycle & Catalog-Context Fixes** -- Phases 65-66 (in progress)
 
 ## Phases
 
@@ -201,5 +202,41 @@ Full details: [milestones/v0.8.0-ROADMAP.md](milestones/v0.8.0-ROADMAP.md)
 - [x] Phase 64: Fix CREATE SEMANTIC VIEW quoted identifier handling (4/4 plans) -- completed 2026-05-17
 
 Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
+
+</details>
+
+<details open>
+<summary>🚧 v0.9.1 Connection-Lifecycle & Catalog-Context Fixes (Phases 65-66) -- IN PROGRESS</summary>
+
+- [ ] Phase 65: OverrideContext Connection Teardown (0/4 plans) -- not started
+- [ ] Phase 66: Expansion Qualification Across All Paths + ADBC Tests (0/? plans) -- not started
+
+### Phase Details
+
+### Phase 65: OverrideContext Connection Teardown
+**Goal**: Stop the extension's long-lived `OverrideContext` catalog connection from keeping the underlying DuckDB `Database` alive past the caller's `close()`, so that an in-process bootstrap-then-read-only-reopen sequence no longer hangs.
+**Depends on**: Nothing (first phase of v0.9.1)
+**Requirements**: LIFE-01, LIFE-02, LIFE-03, LIFE-04
+**Success Criteria** (what must be TRUE):
+  1. In the same Python process, after a writable connection that did `LOAD semantic_views` and `CREATE SEMANTIC VIEW` is closed, a subsequent `duckdb.connect(path, read_only=True)` against the same path returns within 5 seconds — verified both on a freshly bootstrapped DB and on a previously bootstrapped DB.
+  2. The chosen mechanism (deterministic teardown via DuckDB extension-unload / DBConfig coupling, OR explicit access-mode-mismatch detection at `init_extension` that surfaces an actionable error) is documented with reasoning in the phase's RESEARCH.md, so the trade-off is recorded for future contributors.
+  3. `test/integration/test_readonly_load.py` includes a new `test_in_process_bootstrap_then_readonly` scenario that performs the bootstrap-then-RO sequence without the subprocess workaround, guarded by a watchdog timeout, and this test fails on the v0.9.0 baseline and passes on v0.9.1.
+  4. `.planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md` is updated in place with the resolution and a forward pointer to v0.9.1, so the deferred-item ledger reflects shipped state.
+**Plans**: 4 plans
+  - 65-01-PLAN.md — Wave-0 spikes (A4 lldb / A6 BindInfo / A7 re-entrancy) + ConnGuard RAII + watchdog test scaffolding (B1-B4, B11)
+  - 65-02-PLAN.md — OverrideContext field swap to db_handle + parser_override per-call ConnGuard + C++ shim signature update
+  - 65-03-PLAN.md — CatalogReader shape (b) refactor + QueryState/SemanticViewBindData per-query ConnGuard + 13 read-side + 2 scalar rewiring; init_extension drops both H1/H2 duckdb_connects
+  - 65-04-PLAN.md — LIFE-04 deferred-items.md update + B13 structural guard + B14 RAII idempotency + just test-all + just ci green gate
+
+### Phase 66: Expansion Qualification Across All Paths + ADBC Tests
+**Goal**: Make `FROM semantic_view(...)` work through ADBC and any other client whose catalog/schema search path diverges from the extension's `query_conn`, by emitting fully-qualified `db.schema.table` references from every expansion site — and ship the milestone (CHANGELOG, version bump, CI green).
+**Depends on**: Phase 65
+**Requirements**: EXPAND-CTX-01, EXPAND-CTX-02, EXPAND-CTX-03, REL-01, REL-02
+**Success Criteria** (what must be TRUE):
+  1. Through `adbc_driver_duckdb`, `SELECT … FROM semantic_view(...)` returns rows (not a `Catalog Error: Table with name X does not exist`) against semantic views that exercise the main expansion path, FACTS, semi-additive metrics, window metrics, and a multi-database `ATTACH` scenario.
+  2. A new `test/integration/test_adbc_queries.py` (runnable via `just test-adbc-queries`) covers those five scenarios end-to-end; it fails on the v0.9.0 baseline and passes on v0.9.1, serving as the regression guard.
+  3. `_notes/error_with_adbc.md` is either removed or updated to point at the v0.9.1 fix, so the downstream report no longer reads as an open upstream bug.
+  4. A user who installs v0.9.1 sees a `## [0.9.1]` section in `CHANGELOG.md` describing both fixes under `### Fixed`, with the `[Unreleased]` block reset and compare links updated; `Cargo.toml` and `description.yml` report `0.9.1`; `just test-all` and `just ci` are green on `milestone/v0.9.1`.
+**Plans**: TBD
 
 </details>
