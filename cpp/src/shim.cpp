@@ -49,10 +49,12 @@ extern "C" {
     //                let parse_function render caret via DISPLAY_EXTENSION_ERROR.)
     //   2 = not ours: defer to default parser. Also used for null ctx_ptr.
     //
-    // Phase 62: ctx_ptr is an opaque Box<OverrideContext>* produced by
-    // sv_make_override_context. It carries the catalog connection +
-    // is_file_backed flag for THIS database. The legacy db_token LRU
-    // lookup is gone (TECH-DEBT 20).
+    // Phase 62 / Phase 65: ctx_ptr is an opaque Box<OverrideContext>*
+    // produced by sv_make_override_context. Phase 65 swapped the carried
+    // duckdb_connection for a non-owning duckdb_database + flags; every
+    // catalog read inside rewrite_* opens its own per-call connection
+    // via the Rust ConnGuard. The legacy db_token LRU lookup is gone
+    // (TECH-DEBT 20).
     uint8_t sv_parser_override_rust(
         const void *ctx_ptr,
         const char *query_ptr, size_t query_len,
@@ -83,18 +85,22 @@ extern "C" {
     // pair the Rust side returned.
     void sv_free_buffer(char *ptr, size_t len);
 
-    // Phase 62: Box<OverrideContext> ownership FFI. The Rust side allocates
-    // a Box<OverrideContext> wrapping the duckdb_connection + is_file_backed
-    // flag and returns the leaked raw pointer. The C++ shim stashes the
-    // pointer inside SemanticViewsParserInfo::rust_state and hands it back
-    // to sv_parser_override_rust on every parse. ~SemanticViewsParserInfo
-    // calls sv_drop_override_context to free the Rust allocation.
+    // Phase 65: OverrideContext no longer owns a duckdb_connection. See
+    // .planning/phases/65-overridecontext-connection-teardown/65-RESEARCH.md §3.3.
     //
-    // CRITICAL: sv_drop_override_context does NOT call duckdb_disconnect on
-    // the inner duckdb_connection — see Phase 62 RESEARCH.md §Q2 for the
-    // destruction-order rationale. The Connection object leaks for the
-    // remainder of process life (one Connection per DB ever opened).
-    void *sv_make_override_context(duckdb_connection conn, bool is_file_backed);
+    // Box<OverrideContext> ownership FFI. The Rust side allocates a
+    // Box<OverrideContext> wrapping the duckdb_database handle +
+    // catalog_table_present flag + is_file_backed flag and returns the
+    // leaked raw pointer. The C++ shim stashes the pointer inside
+    // SemanticViewsParserInfo::rust_state and hands it back to
+    // sv_parser_override_rust on every parse. ~SemanticViewsParserInfo
+    // calls sv_drop_override_context to free the Rust allocation. There
+    // is no longer any duckdb_connection at parser-info scope — every
+    // catalog read inside rewrite_* opens a per-call ConnGuard from
+    // db_handle and drops it before returning.
+    void *sv_make_override_context(duckdb_database db,
+                                   bool catalog_table_present,
+                                   bool is_file_backed);
     void  sv_drop_override_context(void *ctx_ptr);
 }
 
@@ -164,23 +170,13 @@ struct SemanticViewsParserInfo : public ParserExtensionInfo {
             sv_drop_override_context(rust_state);
             rust_state = nullptr;
         }
-        // CRITICAL — Phase 62 Q2 destruction-order showstopper:
-        // We deliberately do NOT call duckdb_disconnect on the
-        // duckdb_connection contained within OverrideContext's CatalogReader.
-        //
-        // By the time this destructor fires, ~DatabaseInstance has already
-        // reset connection_manager (duckdb.cpp:276819). ~Connection() would
-        // call ConnectionManager::RemoveConnection() on the destroyed
-        // manager — use-after-free.
-        //
-        // The Rust Drop impl on OverrideContext (in src/parse.rs) documents
-        // the same constraint. The duckdb_connection object leaks for the
-        // remainder of process life — bounded at one Connection per DB ever
-        // opened (~few KB each). This matches v0.8.0 commit 680a967 which
-        // shipped successfully with this same leak pattern.
-        //
-        // See .planning/phases/62-caret-restoration-lru-removal/62-RESEARCH.md §Q2.
-        // Resolves TECH-DEBT item 20 (silent LRU eviction class) by removing the LRU.
+        // Phase 65: OverrideContext no longer owns a duckdb_connection.
+        // The Phase 62 §Q2 destruction-order question is moot — there is
+        // no connection to leak. Every catalog read inside the rewrite_*
+        // path opens a per-call duckdb_connection via the Rust ConnGuard
+        // and drops it before returning, so by the time this destructor
+        // fires no extension-owned connection is alive.
+        // See .planning/phases/65-overridecontext-connection-teardown/65-RESEARCH.md §3.3.
     }
 };
 
@@ -346,14 +342,17 @@ static ParserExtensionPlanResult sv_plan_unreachable(
 // sv_register_parser_hooks -- called from Rust after C API init
 // ---------------------------------------------------------------------------
 // Extracts DatabaseInstance& from the C API handle and registers the
-// parser_override hook on DBConfig. Phase 62: takes the catalog connection
-// + is_file_backed flag and bundles them into an OverrideContext via
-// sv_make_override_context. The boxed OverrideContext is owned by the
+// parser_override hook on DBConfig. Phase 62 bundled the catalog inputs
+// into an OverrideContext via sv_make_override_context. Phase 65 swapped
+// the cached duckdb_connection for a non-owning duckdb_database handle +
+// catalog_table_present flag; every catalog read in the rewrite_* path
+// now opens its own per-call connection via the Rust ConnGuard and drops
+// it before returning. The boxed OverrideContext is owned by the
 // SemanticViewsParserInfo we register; lifetime is tied to DBConfig so
 // destruction fires on DB unload (no LRU needed — TECH-DEBT 20 resolved).
 extern "C" {
     bool sv_register_parser_hooks(duckdb_database db_handle,
-                                  duckdb_connection catalog_conn,
+                                  bool catalog_table_present,
                                   bool is_file_backed) {
         try {
             // duckdb_database -> internal_ptr -> DatabaseWrapper ->
@@ -362,7 +361,8 @@ extern "C" {
                 db_handle->internal_ptr);
             auto &db = *wrapper->database->instance;
 
-            void *rust_state = sv_make_override_context(catalog_conn, is_file_backed);
+            void *rust_state = sv_make_override_context(
+                db_handle, catalog_table_present, is_file_backed);
             if (!rust_state) {
                 fprintf(stderr,
                     "sv_register_parser_hooks: sv_make_override_context returned null\n");
