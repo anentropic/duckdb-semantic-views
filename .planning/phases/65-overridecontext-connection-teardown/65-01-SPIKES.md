@@ -147,7 +147,22 @@ Plan 03 will need to update `OverrideContext` in lockstep — the same `db_handl
 
 ---
 
-## A7 — Parser-override re-entrancy (DEFERRED-TO-PLAN-02)
+## A7 — Parser-override re-entrancy (RESOLVED — RE-ENTRANCY-UNSAFE on DuckDB 1.5.2)
+
+### Empirical outcome (updated 2026-05-21 by Plan 02 execution)
+
+Plan 02 plumbed `db_handle` through `OverrideContext` (commits `0d2c0b7`, `f9caafe`) and converted every `rewrite_*` site to open a per-call `ConnGuard::open(ctx.db_handle)`. The first `just test-sql` run after the refactor produced concrete falsification evidence:
+
+- **47 sqllogictests run, 43 FAILED** with `Parser Error: catalog connection failed: duckdb_connect failed (rc=1)` on every test that reaches a `ConnGuard::open` site inside `parser_override` (sites: `rewrite_drop_or_alter`, `emit_native_create_sql`, `rewrite_yaml_file_create`).
+- **4 PASS** — `error_caret_create.test`, `error_caret_drop.test`, `error_caret_multiline.test`, `error_caret_unicode.test`. These exercise near-miss / invalid-syntax paths that never reach `ConnGuard::open` and thus confirm the failure is precisely scoped to opening a fresh connection from inside the parser callback.
+
+**Conclusion: RE-ENTRANCY-UNSAFE.** The RESEARCH §3.3 / §6.5 standalone-library argument that `connections_lock` is per-`ConnectionManager` and does not gate the caller's existing connection's parse step is **falsified by the bundled DuckDB 1.5.2** used in the `--features extension` build path. We cannot open a fresh `duckdb_connection` from the parse thread mid-`Parser::ParseQuery` on this DuckDB version. Per-call ConnGuard from inside `parser_override` is not a viable architectural shape.
+
+**Evidence log:** `.planning/phases/65-overridecontext-connection-teardown/65-02-A7-test-sql-evidence.log` (verbatim sqllogictest output; preserved on `milestone/v0.9.1` via commit `656bae7`).
+
+**Phase-level consequence:** Plan 02 hit the T-65-05 stop-and-revisit clause and was marked PARTIAL. The user chose Option A from the resulting checkpoint (defer catalog reads to bind/plan time, OUTSIDE the parse lock — aligns with CONTEXT.md D-07.1). The structural commits (`db_handle` plumbing, C++ shim signature update, `ConnGuard` consumer wiring) survive as foundation for the reshape; the `rewrite_*` per-call `ConnGuard` sites are now known-broken and will be replaced in the reshape.
+
+### Original deferral rationale (preserved for context)
 
 ### Rationale for deferral
 
@@ -181,6 +196,6 @@ If Plan 02 observes a deadlock, it has the option of returning a `checkpoint:dec
 |-------|---------|-------------|
 | A4 | **CONFIRMED** — `DBInstanceCache::GetInstanceInternal` busy-spin (99.4 % CPU; tight `ldr/cmn/b.ne` loop; structural frame depth matches) | RESEARCH §2 root cause stands. The fix must release the extension-held `shared_ptr<DatabaseInstance>` (i.e., not own long-lived `duckdb_connection`s). |
 | A6 | **`BindInfo`-DOES-NOT-EXPOSE-db_handle** (verified across `duckdb-1.10502.0` `vtab/`, `vscalar/`, `extension.rs`, `core/`) | Plan 03 must adopt **shape (a)**: introduce `CatalogHandle { db, catalog_table_present }` as the `extra_info` payload, with `ConnGuard` opened in each bind callback. |
-| A7 | **DEFERRED-TO-PLAN-02** — current baseline lacks the `db_handle` plumbing in `OverrideContext`; empirical falsification will happen automatically as soon as Plan 02 runs an existing parser-override test against the per-call shape. | Acceptable per plan's stated guidance. Plan 02 carries the risk and the falsification signal. |
+| A7 | **RE-ENTRANCY-UNSAFE** (falsified empirically by Plan 02 — 43/47 sqllogictests fail with `duckdb_connect failed (rc=1)` from inside `parser_override` on DuckDB 1.5.2). Original DEFERRED-TO-PLAN-02 rationale preserved below. | Per-call ConnGuard from inside `parser_override` is not viable. Plan 02 hit T-65-05 stop-and-revisit; user chose Option A (defer catalog reads to bind/plan time). Reshape pending replan. |
 
 No production source files were modified by this task (`git diff --stat src/ cpp/` empty post-spike).
