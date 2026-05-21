@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v0.9.1
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: executing
-stopped_at: "ROADMAP.md drafted for v0.9.1 (Phases 65–66). Next: `/gsd:plan-phase 65`."
-last_updated: "2026-05-21T16:12:22.576Z"
-last_activity: 2026-05-21 -- Phase 65 planning complete
+stopped_at: "Completed 65-01-PLAN.md (scaffolding + Wave-0 spikes). Next: /gsd:execute-plan 65 02."
+last_updated: "2026-05-21T17:27:55.178Z"
+last_activity: 2026-05-21
 progress:
   total_phases: 2
   completed_phases: 0
   total_plans: 4
-  completed_plans: 0
+  completed_plans: 1
   percent: 0
 ---
 
@@ -21,15 +21,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-21)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Phase 65 — OverrideContext Connection Teardown
+**Current focus:** Phase 65 — overridecontext-connection-teardown
 
 ## Current Position
 
-Phase: 65 (not started)
-Plan: —
+Phase: 65 (overridecontext-connection-teardown) — EXECUTING
+Plan: 2 of 4
 Status: Ready to execute
-Progress: 0/2 phases complete
-Last activity: 2026-05-21 -- Phase 65 planning complete
+Progress: [███░░░░░░░] 25%
+Last activity: 2026-05-21
 
 ## Performance Metrics
 
@@ -78,6 +78,11 @@ Recent decisions affecting current work:
 - [Phase 64]: ALTER RENAME normalises BOTH source-name and RENAME TO target-name slots; without this the target slot stored the raw quoted FQN
 - [Phase 64]: Use sqllogictest block-form statement error (---- separator + substring), not inline regex — runner does not support inline form
 - [Phase 64]: Tracked fuzz seeds live in fuzz/seeds/<target>/ (gitignore only excludes fuzz/corpus/)
+- [Phase ?]: [Phase 65 P01]: Spike A4 CONFIRMED — DBInstanceCache::GetInstanceInternal busy-spin diagnosis stands (verbatim lldb backtrace captured at 65-01-SPIKES.md)
+- [Phase ?]: [Phase 65 P01]: Spike A6 — BindInfo does NOT expose duckdb_database in duckdb-rs 1.10502.0 → Plan 03 must adopt shape (a) CatalogHandle threaded via extra_info
+- [Phase ?]: [Phase 65 P01]: Spike A7 DEFERRED-TO-PLAN-02 (acceptable per plan guidance); Plan 02 first parser_override sqllogictest will deadlock if re-entrancy unsafe — strictly better falsification than contrived spike on baseline
+- [Phase ?]: [Phase 65 P01]: ConnGuard module declared without #[cfg(feature=extension)] gate so null-drop test runs under default bundled feature; inner FFI body remains gated
+- [Phase ?]: [Phase 65 P01]: ConnGuard is Send but deliberately NOT Sync (per-scope ownership); not Clone/Copy
 
 ### Pending Todos
 
@@ -122,9 +127,10 @@ Recent decisions affecting current work:
 | Phase 64 P02 | 7 | 2 tasks | 2 files |
 | Phase 64 P03 | 8 | 2 tasks | 1 files |
 | Phase 64 P04 | 6 | 3 tasks | 12 files |
+| Phase 65 P01 | 31min | 3 tasks | 5 files |
 
 ## Session Continuity
 
-Last session: 2026-05-21
-Stopped at: ROADMAP.md drafted for v0.9.1 (Phases 65–66). Next: `/gsd:plan-phase 65`.
+Last session: 2026-05-21T17:27:55.171Z
+Stopped at: Completed 65-01-PLAN.md (scaffolding + Wave-0 spikes). Next: /gsd:execute-plan 65 02.
 Resume file: None
