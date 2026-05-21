@@ -4,7 +4,7 @@ milestone: v0.9.1
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: executing
 stopped_at: "Completed 65-01-PLAN.md (scaffolding + Wave-0 spikes). Next: /gsd:execute-plan 65 02."
-last_updated: "2026-05-21T17:27:55.178Z"
+last_updated: "2026-05-21T18:30:00.380Z"
 last_activity: 2026-05-21
 progress:
   total_phases: 2
