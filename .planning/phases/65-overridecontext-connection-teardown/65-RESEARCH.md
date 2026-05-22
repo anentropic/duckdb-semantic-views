@@ -522,6 +522,213 @@ No external service dependencies. All Phase 65 work is local code + tests.
 
 ---
 
+## §16 — Bind/Plan-Time Architecture (Option A — added 2026-05-22)
+
+**Researched:** 2026-05-22 (post Plan 02 falsification + D-11 lock-in)
+**Scope:** Targeted refresh answering the three sub-questions opened by D-11 — *not* a full re-research. §§1–15 above remain authoritative except where noted in §16.1.
+**DuckDB version anchored to:** v1.5.2 (`DUCKDB_VERSION` in `cpp/include/duckdb.hpp`; extension API `1.10502.0` per `Cargo.toml`)
+
+---
+
+### 16.1 Status of prior assumptions
+
+| Section | Status | Notes |
+|---------|--------|-------|
+| §1 Executive Summary "viable shape is D-07-1" | **PARTIALLY FALSIFIED** | The *direction* (don't cache; eliminate the long-lived handle) is correct and locked by D-11. The *location* ("inside `sv_parser_override_rust`") is the falsified part — Plan 02's empirical test proved `duckdb_connect` from inside `parser_override` returns rc=1 (43/47 sqllogictests). The new location is bind/plan time. |
+| §2 Busy-spin diagnosis | **STILL VALID** | Plan 01 Spike A4 confirmed the busy-spin (99.4 % CPU, `ldr/cmn/b.ne` loop, `___lldb_unnamed_symbol####` depth matches `DBInstanceCache::GetInstanceInternal`). Root cause and fix target unchanged. |
+| §3.1 Lifecycle surface table | **STILL VALID** | All hooks enumerated still exist; `parse_function`/`plan_function` row gains new prominence (see §16.2). |
+| §3.2 "What we cannot do" | **STILL VALID** | No DB-shutdown notification, no weak handle, no `ClientContext` from `parser_override`. |
+| **§3.3 / §6.5 standalone-library argument that `connections_lock` is per-`ConnectionManager` and does not gate parse-thread re-entry** | **FALSIFIED (per D-10)** | Empirically: opening a fresh `duckdb_connection` from inside `Parser::ParseQuery` on the bundled DuckDB 1.5.2 returns rc=1. The structural argument (`connections_lock` scope) may still be technically correct, but *some other* gating prevents the second connect — likely `DBInstanceCache::GetOrCreateInstance` interaction with an in-flight parse, or the `PostgresParser` non-reentrancy noted at `duckdb.cpp:347253` (*"Creating a new scope to allow extensions to use PostgresParser, which is not reentrant"*). Root cause of the rc=1 was not isolated past the failure signal; deeper instrumentation deferred — *the bind-time architecture sidesteps the question entirely.* DO NOT delete §3.3 / §6.5 — they remain the trail explaining why bind-time is the chosen target. |
+| §4 Canonical pattern survey | **STILL VALID** | duckdb-postgres / duckdb-iceberg / duckdb-mysql still don't own long-lived `duckdb_connection`. Added datapoint: **duckdb-delta also avoids `ParserExtension`** entirely (uses `StorageExtension` + table functions per WebFetched 2026-05-22 source); semantic-views is the outlier on every axis. |
+| §5 Long-lived handles audit (H1, H2) | **STILL VALID** | H1 and H2 are still the two leaked connections to eliminate. Disposition for H1 changes: catalog reads move to bind/plan time (a new entry point), not per-call inside parser_override. Disposition for H2 unchanged (per-call inside `semantic_view` table function's bind). |
+| §6.1 "open a fresh `duckdb_connection` per parser_override invocation" | **FALSIFIED** | The connect-per-parser_override-call is the precise pattern that hit rc=1. Replaced by §16.2's promote-`parse_function` plan. |
+| §6.2–6.4 (why not D-07-2/3/4) | **STILL VALID** | All three rejections still hold. |
+| §7 Validation Architecture (B1..B14) | **STILL VALID, B13 GREP TARGETS UPDATED** | B1..B12 unchanged. B13 (the structural grep guard) still asserts "no long-lived `duckdb_connection` field on `OverrideContext`" — that's already satisfied (Plan 02 commits `0d2c0b7`, `f9caafe` landed and stay). B14 (ConnGuard Drop test) still applies; consumer of ConnGuard shifts from `rewrite_*` to `sv_plan_function_rust` + bind callbacks. |
+| §9 Surfaced findings | **STILL VALID — §9.1 PROMOTED TO IN-SCOPE** | §9.1 *"route catalog reads through caller's `ClientContext` via `plan_function`"* was tagged "milestone-sized refactor, deferred." With D-11 it is no longer deferred — it IS Plan 02A's shape. The forward-looking finding is now the active plan. §9.2 (TECH-DEBT 19) and §9.3 (`:memory:` smoke test) unchanged. |
+| §13 Open questions (A6, A7) | **CLOSED** | A6 → `BindInfo` does NOT expose `duckdb_database` (confirmed by Plan 01 SPIKES). A7 → re-entrancy-unsafe (confirmed by Plan 02). Both questions are answered; the planner has the empirical evidence to choose architecture without further spikes. |
+
+**One-line summary:** the parse-time per-call connect path is dead; the bind/plan-time path is alive and is the only path that has (a) a `ClientContext &` parameter and (b) demonstrated freedom from the rc=1 failure mode. §16.2–16.5 detail what that path looks like.
+
+---
+
+### 16.2 Sub-question 1 — Promoting `parse_function` to the success path
+
+**The current shape (Phase 62, in `cpp/src/shim.cpp:262-318`):** `sv_parse_stub` is the registered `parse_function`. It is called by DuckDB *only when* the default Postgres parser fails on an unrecognised prefix AND `parser_override` returned non-PARSE_SUCCESSFUL (the call site is `cpp/include/duckdb.cpp:347286`). Its sole purpose today is rendering caret-aware errors via `ParserExtensionParseResult{ string error_message }` with `result.error_location = optional_idx(byte_offset)`. It NEVER returns `PARSE_SUCCESSFUL` (and `sv_plan_unreachable` enforces that contract by throwing if `plan_function` ever fires).
+
+**The proposed shape:** Move the success path from `parser_override` → `parse_function` → `plan_function`. Three callbacks, three roles:
+
+| Callback | Role under Option A | Receives |
+|----------|---------------------|----------|
+| `sv_parser_override` | Either (a) **deregister entirely** (set `ext.parser_override = nullptr`) or (b) **demote to validation-only** — detect the prefix, do structural parse, return `DISPLAY_ORIGINAL_ERROR` (rc=2) so the default parser fails on the prefix and DuckDB calls `parse_function` next. **Path (a) is cleaner.** Cost of removing it: the `FALLBACK_OVERRIDE` setting at `shim.cpp:399` (`config.SetOption("allow_parser_override_extension", Value("FALLBACK"));`) becomes irrelevant, but the default parser will still fail on `CREATE SEMANTIC VIEW`, which still triggers the per-statement `parse_function` loop at `duckdb.cpp:347281-347300`. **PLAN-OPEN:** confirm path (a) preserves all error-message paths — TECH-DEBT 21 (`disable_peg_parser` resets the override setting) becomes moot if we remove the override entirely; the caret tests in `test/integration/test_caret_position.py` must still pass via `parse_function` alone. |
+| `sv_parse_function` | **Promote to success-path entry.** Detect prefix → structural parse (re-use `validate_and_rewrite` from `src/parse.rs:963`) → stash the validated form into `SemanticViewParseData` → return `PARSE_SUCCESSFUL` with the unique_ptr. On structural failure: return `DISPLAY_EXTENSION_ERROR` with caret position (same as today). The `parse_function` runs at line 347286, *after* the inner `PostgresParser another_parser` scope at line 347253-347277 has fully destructed — so it is NOT subject to the rc=1 re-entrancy failure that broke `parser_override`. **NOTE:** `parse_function` still does NOT receive `ClientContext` (signature is `(ParserExtensionInfo *info, const string &query)`). So **no catalog reads happen here either** — only structural parse + carrier stash. | `info: ParserExtensionInfo*`, `query: const string&` |
+| `sv_plan_function` | **Promote from sv_plan_unreachable to the catalog-read + emission entry.** Receives `ClientContext &context` (the one place we get one). Algorithm: (1) extract the validated form from `parse_data`, (2) get `DatabaseInstance& db = *context.db` (or use the `DatabaseInstance::GetDatabase(context)` helper at `duckdb.cpp:179497, 246031`), (3) open a per-call `duckdb_connection` via `ConnGuard::open(db_handle)` where `db_handle` is reconstructed from `db` (see §16.3 for the C-API path), (4) run the existing `rewrite_create` / `rewrite_drop_or_alter` / `emit_native_create_sql` logic on the new connection, (5) drop the guard, (6) return a `ParserExtensionPlanResult` that wraps the work as a TableFunction. | `info, ClientContext &context, unique_ptr<ParserExtensionParseData> parse_data` |
+
+**The hard constraint to design around:** `ParserExtensionPlanResult` does NOT return SQL statements — it returns `{ TableFunction function, vector<Value> parameters, ... }` (see `parser_extension_compat.hpp:108-119`). At `duckdb.cpp:369077` the binder calls `BindTableFunction(parse_result.function, std::move(parse_result.parameters))`. So the `plan_function` result is a SINGLE table-function invocation that runs as the entire bound statement. Today's CREATE path emits `INSERT INTO semantic_layer._definitions ... RETURNING name AS view_name` (a DML statement), not a table-function call. **This is the central design question for Plan 02A.**
+
+Two options for how `sv_plan_function` reconciles "emit SQL" with "must return a TableFunction":
+
+- **Option A1 (emit-then-execute table function):** Register a new internal table function `__sv_execute_native(json_view_name TEXT, native_sql TEXT)` whose bind opens its own connection on `ClientContext.db`, executes `native_sql` (via `Connection::Query(native_sql)`), and projects the result. `sv_plan_function` emits the native SQL string into the parameters vector. Cost: one extra layer of indirection; the actual `INSERT … RETURNING` runs on a *different* connection than the caller, **which loses the transactional behaviour Phase 58 / 62 specifically engineered for.** REJECTED by extension because it regresses Phase 58 transactional DDL (CREATE inside a user transaction can no longer participate).
+- **Option A2 (execute via embedded C++ `Connection::Query` on the caller's `ClientContext`):** Inside `sv_plan_function`, *before* returning the `ParserExtensionPlanResult`, directly run the catalog reads + emit native SQL, then call `context.Query(native_sql)` (using the actual `ClientContext &` we were given — it IS the caller's). Return a `ParserExtensionPlanResult` whose `TableFunction` is a trivial "empty result" projection (or a single-row `SELECT view_name`). This *works* but feels like fighting the API — the "result" of the plan is a side-effect, and the returned TableFunction is a sentinel. **PLAN-OPEN:** verify whether running `context.Query(native_sql)` inside `Binder::Bind(ExtensionStatement&)` (which is itself called from `ClientContext::ParseStatementsInternal` / friends) re-enters a lock. Per `duckdb.cpp:272658` `ClientContext::LockContext` acquires `context_lock` — if `Bind(ExtensionStatement&)` is called with `context_lock` already held, `context.Query` will deadlock.
+- **Option A3 (route through a new TableFunction that takes the *typed parameters* of the DDL):** Register `__sv_create_view(name TEXT, json_def TEXT)`, `__sv_drop_view(name TEXT, if_exists BOOL)`, `__sv_alter_view_rename(old TEXT, new TEXT, if_exists BOOL)`, `__sv_alter_view_comment(name TEXT, comment TEXT NULL, if_exists BOOL)`. `sv_plan_function` does catalog read + enrichment + JSON build, then returns `ParserExtensionPlanResult { __sv_create_view, ["v", "{...json...}"] }`. The table function's bind/init then executes the actual INSERT on a connection it opens itself. **Same transactional-regression problem as A1** unless we route through the caller's connection somehow — which brings us back to the question A2 raised.
+
+**The deepest question is whether the bind-time `ClientContext &` lets us run DML on the caller's transaction.** If yes (A2 works), the architecture is clean. If no (lock re-entry), we need to either (a) accept losing transactional DDL behaviour (regression vs. v0.8.0) or (b) find a different mechanism — e.g., return `ParserExtensionPlanResult` whose TableFunction's bind happens to run on the caller's connection by virtue of being a normal bind, and emit DML from within that bind via a side-channel. This is gnarly.
+
+**Plan 02A spike requirement (BEFORE any production code):** Reproduce the simplest possible Option A2 — a 30-LOC `sv_plan_function` that does `context.Query("SELECT 1")` inside the bind, returns a trivial TableFunction result, and confirm whether (i) the inner query succeeds, (ii) the bound caller's transaction sees its effect, (iii) no deadlock. **If A2 works → Plan 02A proceeds with A2. If A2 deadlocks → escalate to user via `checkpoint:decision` (likely A3 with documented transactional regression, or revisit whether the upstream `parser_override` rc=1 has a workaround we missed).**
+
+**Plan 02A should:** start with a 1–2 day spike on Option A2 viability (per above); if green, refactor `sv_parse_stub` → `sv_parse_function` (success path) and `sv_plan_unreachable` → `sv_plan_function` (catalog reads + emission via `context.Query`); remove the 4× `ConnGuard::open` call sites inside `parse.rs::rewrite_*` and re-home them inside `sv_plan_function`; preserve `SemanticViewParseData` as the parse-time carrier (see §16.4). If A2 spike fails, return to user with concrete failure evidence and the A1/A3 trade-off menu.
+
+**PLAN-OPEN:** The exact mechanism by which `sv_plan_function` runs the native SQL (Option A1/A2/A3) is the central unresolved question. The spike named above is the smallest experiment that distinguishes them.
+
+---
+
+### 16.3 Sub-question 2 — `ClientContext` / `duckdb_connection` access from bind callbacks
+
+**Read-path scope:** 14 table functions registered with `register_table_function_with_extra_info` + 2 scalar functions registered with `register_scalar_function_with_state` (all in `src/lib.rs:425-495`). These are NOT `parser_override` callbacks — they are bind callbacks on user table-function calls like `SELECT * FROM list_semantic_views()`. Plan 01 Spike A6 already confirmed `BindInfo` does NOT expose `duckdb_database` in `duckdb-rs 1.10502.0`.
+
+**Confirmed via verbatim grep of `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/duckdb-1.10502.0/`:**
+
+```bash
+$ grep -rn "client_context\|connection_get\|get_connection\|database_handle\|duckdb_database\b" \
+    src/vtab/ src/vscalar/ src/extension.rs src/core/ 2>/dev/null
+src/inner_connection.rs:21:    db: ffi::duckdb_database,
+src/inner_connection.rs:25:// `duckdb_database` is an opaque C pointer. We share it via `Arc` so the database
+src/inner_connection.rs:32:    pub fn new(db: ffi::duckdb_database, close_on_drop: bool) -> Self {
+src/inner_connection.rs:37:    pub fn raw(&self) -> ffi::duckdb_database {
+src/inner_connection.rs:91:            let mut db: ffi::duckdb_database = ptr::null_mut();
+src/inner_connection.rs:104:    pub(crate) unsafe fn new_from_raw_db(raw: ffi::duckdb_database, close_on_drop: bool) -> Self
+src/lib.rs:287:    pub unsafe fn open_from_raw(raw: ffi::duckdb_database) -> Self
+```
+
+Zero hits inside `vtab/`, `vscalar/`, `extension.rs`, `core/`. The full method surface of `BindInfo` (verbatim from `src/vtab/function.rs:27-113`) is `{ add_result_column, set_error, set_bind_data, get_parameter_count, get_parameter, get_named_parameter, set_cardinality, get_extra_info }`. `InitInfo` and `TableFunctionInfo` are similarly bare.
+
+**Confirmed via grep of libduckdb-sys C bindings:**
+
+```bash
+$ grep -n "pub fn duckdb_bind_\|pub fn duckdb_function_\|pub fn duckdb_init_" \
+    ~/.cargo/registry/src/index.crates.io-*/libduckdb-sys-1.10502.0/src/bindgen_bundled_version.rs
+2555:pub fn duckdb_bind_get_extra_info(info: duckdb_bind_info) -> *mut c_void;
+2563:pub fn duckdb_bind_add_result_column(...)
+2571:pub fn duckdb_bind_get_parameter_count(info: duckdb_bind_info) -> idx_t;
+2575:pub fn duckdb_bind_get_parameter(info, index) -> duckdb_value;
+2579:pub fn duckdb_bind_get_named_parameter(...)
+2584:pub fn duckdb_bind_set_bind_data(...)
+2592:pub fn duckdb_bind_set_cardinality(...)
+2596:pub fn duckdb_bind_set_error(...)
+2600:pub fn duckdb_init_get_extra_info(...)
+2604:pub fn duckdb_init_get_bind_data(...)
+2632:pub fn duckdb_function_get_extra_info(...)
+2636:pub fn duckdb_function_get_bind_data(...)
+2640:pub fn duckdb_function_get_init_data(...)
+2644:pub fn duckdb_function_get_local_init_data(...)
+```
+
+**No `duckdb_bind_get_client_context`, `duckdb_function_get_client_context`, or `duckdb_init_get_client_context` in the C API.** This is a *DuckDB upstream gap*, not a duckdb-rs binding gap — the C-API for table-function bind callbacks just doesn't expose a `ClientContext`. (Contrast: `parser_extension`'s `plan_function` DOES receive a `ClientContext &` because it's invoked directly from `Binder::Bind(ExtensionStatement &stmt)` in C++ at `duckdb.cpp:369065-369085`, never through the C ABI.)
+
+**Note on `duckdb_connection_get_client_context`:** the C API DOES have `duckdb_connection_get_client_context(connection, out_context)` (line 921 of `bindgen_bundled_version.rs`), but that's the *reverse* direction — connection → client_context. It does not help here because we don't have a connection at bind time; we're trying to derive one.
+
+**Conclusion:** The bind/plan-time architecture for the read-path 14 table functions + 2 scalars must use the `extra_info` payload to carry `db_handle`. This is exactly what Plan 01 Spike A6 named as "shape (a)" — `CatalogHandle { db: duckdb_database, catalog_table_present: bool }` passed to `register_table_function_with_extra_info`; each bind callback calls `bind.get_extra_info::<CatalogHandle>()` then `ConnGuard::open(handle.db)`. The guard drops at bind end before the bind callback returns, so no long-lived connection survives.
+
+**Re-litigation of the D-10 falsification for the bind thread:** the rc=1 failure was inside `parser_override`, which runs on the parse thread *during* `Parser::ParseQuery` execution (`duckdb.cpp:347194`). The bind callbacks for table functions run *after* parsing is complete, during `Binder::Bind(TableFunctionRef&)` — a different lifecycle phase with no `PostgresParser` in scope. **There is no evidence that `duckdb_connect` from a bind-callback thread suffers the same rc=1 failure.** Specifically: the existing v0.8.0 `init_extension` (`src/lib.rs:387, 499`) already calls `duckdb_connect` twice during extension load, succeeds, and the long-lived connections work fine — they only fail on TEARDOWN (the busy-spin). So `duckdb_connect` itself works in non-parse contexts on DuckDB 1.5.2.
+
+**Plan 02A should:** introduce `CatalogHandle { db: duckdb_database, catalog_table_present: bool }` in a new module (`src/catalog_handle.rs` or fold into `src/conn_guard.rs`); update the 14 + 2 register sites in `src/lib.rs` to pass `&catalog_handle` instead of `&catalog_reader`; refactor each bind callback (in `src/query/`, `src/show/`, etc.) to (i) `bind.get_extra_info::<CatalogHandle>()`, (ii) `ConnGuard::open(handle.db)`, (iii) construct a `CatalogReader::new(guard.raw(), handle.catalog_table_present)` for the existing helpers, (iv) drop guard before bind returns. **A small spike (~10 LOC change to ONE of the 14 read functions) should validate the pattern before mass refactor — this is the bind-thread analogue of Plan 02's parser-thread spike and is what D-10 implicitly demands we run to confirm rc=1 is not universal.**
+
+**PLAN-OPEN:** Whether the existing `CatalogReader` struct can be refactored to carry an *optional* lifetime-bounded `duckdb_connection` reference (so it borrows from the bind-scope `ConnGuard` instead of owning a Copy-pointer to a leaked one), or whether `CatalogReader::new` is called fresh each bind. The latter is simpler; the former preserves `CatalogReader`'s existing prepared-statement caching (if any). Audit `src/catalog.rs` for any per-CatalogReader state that benefits from instance reuse — if none, the simpler shape wins.
+
+---
+
+### 16.4 Sub-question 3 — `SemanticViewParseData` carrier shape
+
+**Current shape (`cpp/src/shim.cpp:116-126`):**
+
+```cpp
+struct SemanticViewParseData : public ParserExtensionParseData {
+    string query;
+    explicit SemanticViewParseData(string q) : query(std::move(q)) {}
+
+    unique_ptr<ParserExtensionParseData> Copy() const override {
+        return make_uniq<SemanticViewParseData>(query);
+    }
+    string ToString() const override {
+        return query;
+    }
+};
+```
+
+**Today this struct is never instantiated in practice** — `sv_parse_stub` only ever returns `DISPLAY_EXTENSION_ERROR` or `DISPLAY_ORIGINAL_ERROR`, never `PARSE_SUCCESSFUL`. The struct exists for *type-system layout reasons* because `ParserExtensionParseResult(unique_ptr<ParserExtensionParseData>)` requires *some* concrete subclass to compile.
+
+**Under Option A, `SemanticViewParseData` becomes the actual carrier between `parse_function` and `plan_function`.** What `sv_plan_function` needs to do its work (per §16.2):
+
+| Field | Source at parse time | Used by `plan_function` for |
+|-------|----------------------|-----------------------------|
+| `query: string` | The raw input string (already present) | Caret rendering on later-discovered semantic errors; error_location offsets are relative to this string |
+| `verb: DdlKind` (enum: `Create`, `Drop`, `Alter`, `Show`, `Describe`, `List`, …) | `crate::parse::detect_ddl_kind(query)` already returns this | Dispatch in `sv_plan_function` to `rewrite_create` vs. `rewrite_drop_or_alter` vs. read-side passthrough |
+| `validated_form: String` (the table-function-style intermediate emitted by `validate_and_rewrite`) | `validate_and_rewrite(query)?` — already runs in current `sv_parser_override_rust` | Skip re-parsing the body in `plan_function`; pass directly to `rewrite_to_native_sql`-equivalent |
+| `or_replace: bool` / `if_not_exists: bool` / `if_exists: bool` (verb-specific flags) | Extracted during `detect_ddl_kind` + `rewrite_ddl` | Disambiguate CREATE/CREATE-OR-REPLACE/CREATE-IF-NOT-EXISTS and DROP/DROP-IF-EXISTS without re-parsing |
+| `view_name: String` (the bare view identifier, already normalised) | `normalize_view_name` from `src/ident.rs` | Catalog existence check |
+| Source-location metadata: a single `byte_offset: optional<u32>` for the start of the verb keyword | Tracked during `detect_ddl_kind` byte-walking | Caret rendering if `plan_function` discovers a catalog-level error (e.g., "view already exists") and wants to point at the verb |
+
+**The pragmatic shape:** keep `query: string` (already there) and add a small `payload: vector<uint8_t>` opaque to C++ that the Rust side fills with a CBOR/JSON/manual-serialized snapshot of `{verb, validated_form, view_name, or_replace, if_not_exists, if_exists, byte_offset}`. C++ never inspects `payload`; it just round-trips it from `parse_function` to `plan_function`. The Rust FFI for `sv_plan_function_rust` reads `payload`, deserializes, and dispatches. **This is the cleanest cross-FFI carrier — opaque bytes — and avoids declaring 6+ separate fields in `cpp/src/shim.cpp` that C++ doesn't need to know about.**
+
+Alternative: declare each field explicitly in C++ (`uint8_t verb; string view_name; bool or_replace; …`). Pros: no Rust-side serialization. Cons: the C++ shim grows by ~50 LOC of plumbing every time the Rust side needs a new piece of parse-time information; updates require ABI-synchronised changes to two files instead of one.
+
+**Plan 02A should:** add `payload: vector<uint8_t>` to `SemanticViewParseData` (alongside the existing `query: string`); update `Copy()` to clone both; on the Rust side use `bincode` or a manual little-endian layout (no external deps needed for a 6-field record) — see `src/parse.rs`'s existing `unescape_sql_arg`/`escape_sql_arg` style for a precedent of avoiding new dependencies. The carrier's serialization format is internal to the extension; no compatibility constraint.
+
+**Re-parsing avoidance:** `validate_and_rewrite(query)` is the heaviest step in the current `sv_parser_override_rust` (full body parse for CREATE; lighter for DROP/ALTER). Stashing its output in `payload` ensures `sv_plan_function_rust` does ONLY the catalog reads + native-SQL emission — it does not redo body parsing. This is both a performance win (parse the body once, not twice) and a correctness property (the validated form is what's stashed; any drift between parse and plan is impossible by construction).
+
+**PLAN-OPEN:** the encoding format for `payload` (manual little-endian vs. `bincode` 1.3.x vs. `postcard`). Manual LE is ~30 LOC, zero new dependencies, easy to audit. Recommend manual LE for v0.9.1; revisit if the carrier grows past ~10 fields.
+
+---
+
+### 16.5 Sub-question 4 — Community extension survey (timeboxed, ~20 min spent)
+
+The Phase 65 original research surveyed `duckdb-postgres`, `duckdb-mysql`, `duckdb-iceberg` and concluded none use `ParserExtension` for DDL — they all use `StorageExtension` (ATTACH) or table functions. The refresh checked one additional extension and re-verified the negative claim:
+
+| Extension | Uses `ParserExtension`? | DDL mechanism | Catalog-read-during-DDL pattern |
+|-----------|-------------------------|---------------|--------------------------------|
+| `duckdb-delta` (delta_kernel-rs) | **No** | `StorageExtension::Register(config, "delta", …)` + `DeltaCatalogAttach` for `ATTACH … (TYPE delta)`; table functions for scans | `DeltaCatalog` owns metadata; catalog reads happen inside the catalog implementation, not in any extension callback. Source: `src/delta_extension.cpp` via WebFetch 2026-05-22. |
+| `duckdb-postgres` (verified §4.1) | **No** | `StorageExtension::Register` + ATTACH | No catalog-read-during-DDL because no DDL surface; secrets go through `SecretManager`. |
+| `duckdb-mysql` (verified §4.2) | **No** | Same as postgres | Same. |
+| `duckdb-iceberg` (verified §4.3) | **No** | `StorageExtension::Register` + `IRCStorageExtension`; ATTACH-based | Same. |
+| RFC: RBAC extension (gist `dufferzafar/f12081d4`) | **Yes** — proposed `parse_function` + `plan_function` for GRANT/REVOKE | RFC explicitly notes `plan_function` returns *"a TableFunction that executes the DDL"* — matches §16.2 Option A1/A3 problem | Catalog reads via `ClientContextState` cached at `OnConnectionOpened` (the duckdb-postgres pattern). RFC is exploratory; no shipped code. |
+| `duckdb_extension_parser_tools` (hotdata-dev / zfarrell) | **Yes** — uses `ParserExtension` to expose SQL parsing as user-facing scalar functions (`parse_tables()`, etc.) | Pure parsing surface; no DDL emission, no catalog reads. Not a useful analog. | N/A |
+
+**What none of the surveyed extensions provide:** a worked example of `parse_function` + `plan_function` that emits DML on the caller's transaction. The RBAC RFC says "return a TableFunction" without resolving the transaction question; the parser_tools extension only does pure parsing. **The semantic-views extension is solving a problem the surveyed extension corpus hasn't solved.** This validates D-01 / D-05's framing ("find the *correct* model") — we are doing original architectural work, not copying a known pattern.
+
+**Implication for Plan 02A's spike (§16.2):** no upstream reference implementation exists to crib from. The Option A2 viability spike (`context.Query("SELECT 1")` from inside `plan_function`) is the smallest experiment that proves the architectural shape.
+
+**DEFERRED:** deeper read of how httpfs's `CREATE SECRET` is implemented (`SecretManager`-based, not `ParserExtension`-based, so different mechanism entirely). Confirmed via earlier WebSearch results that secrets do NOT go through `ParserExtension`. Research budget exhausted on community survey — additional digging would not change the conclusion.
+
+---
+
+### 16.6 Planner inputs
+
+Concrete decisions the planner needs to make for Plan 02A:
+
+1. **`sv_parser_override` disposition:** remove entirely (set to nullptr) OR keep as a validation-only no-op that returns `DISPLAY_ORIGINAL_ERROR` to force fall-through to `parse_function`. **Recommendation:** remove entirely; one less callback to reason about, TECH-DEBT 21 (`disable_peg_parser` resetting the override setting) becomes moot. Verify caret tests still pass via `parse_function` alone.
+
+2. **`plan_function` execution mechanism (Option A1 vs. A2 vs. A3 from §16.2):** spike Option A2 first (run `context.Query(native_sql)` inside `plan_function` — preserves transactional semantics). If it deadlocks, escalate via `checkpoint:decision` with A1/A3 trade-off summary. **This spike MUST land before any production refactor.**
+
+3. **`SemanticViewParseData` carrier encoding (manual LE vs. bincode):** recommend manual LE for v0.9.1 (zero new dependencies, ~30 LOC, easy audit). Revisit only if carrier grows past ~10 fields.
+
+4. **Read-path refactor shape (`CatalogHandle` vs. refactored `CatalogReader`):** Plan 01 Spike A6 already recommended shape (a) (`CatalogHandle { db, catalog_table_present }` in extra_info). Honour that choice. Run a 10-LOC spike against ONE of the 14 read functions to confirm `duckdb_connect` from a bind-callback thread does not hit the same rc=1 as `parser_override` did (no evidence it would, but verify cheaply before mass refactor — this is the bind-thread analogue D-10 implicitly demands).
+
+5. **Plan 02 commits to keep vs. revert:** keep `0d2c0b7`, `f9caafe`, `656bae7` (per D-12 — `db_handle` plumbing is foundation; signature update is correct for both shapes; evidence log is the audit trail). Remove the 4× `ConnGuard::open` call sites inside `parse.rs::rewrite_*` (the known-broken surface).
+
+6. **Plan re-scoping:**
+   - **Plan 02A (NEW):** the bind/plan-time reshape (this section's output). Replaces the broken parse-time per-call ConnGuard surface with `parse_function` + `plan_function` success path.
+   - **Plan 03 (read-path):** likely unchanged in spirit but verify shape — H2 (`query_conn`) removal still uses `CatalogHandle` in `extra_info` + per-bind `ConnGuard` (matches Plan 01 A6 outcome).
+   - **Plan 04 (ledger + structural guards):** B13 grep targets unchanged (`OverrideContext` still must not regrow a `duckdb_connection` field — Plan 02 already removed it).
+
+7. **Transactional regression risk:** if the spike forces us to A1/A3, document the transactional DDL regression explicitly as a TECH-DEBT entry (CREATE inside user transaction no longer atomic). **Surface to user before shipping**, per CONTEXT.md D-01 — "documenting the limitation" is admissible only if (a)-direction is impossible, and A2 spike is the discriminator.
+
+8. **A6 follow-up spike (bind-thread `duckdb_connect`):** before the 14 + 2 mass refactor, run a one-file spike opening `ConnGuard::open(handle.db)` from inside the `list_semantic_views` bind callback and confirm rc=0. If rc=1 (i.e., D-10 generalises to bind threads), the planner must escalate immediately — the read path becomes architecturally constrained too.
+
+---
+
+*End of §16. §§1–15 remain authoritative except where flagged in §16.1.*
+
+---
+
 ## RESEARCH COMPLETE
 
 **Phase:** 65 — OverrideContext Connection Teardown
