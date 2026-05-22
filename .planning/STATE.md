@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v0.9.1
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
-status: blocked-checkpoint
-stopped_at: "65-02 HALTED at Task 1 checkpoint:decision — A2-DEADLOCK + BIND-THREAD-RC1 invalidate Option A; escalation recommended per USER_HARD_CONSTRAINT (no transactional-DDL regression). Next: /gsd:discuss-phase 65 --assumptions to research alternative architecture."
-last_updated: "2026-05-22T17:30:00.000Z"
-last_activity: 2026-05-22 -- Phase 65 Plan 02 (replanned) ran Wave-0 spikes, halted at Task 1 with escalation recommendation
+status: ready-to-plan
+stopped_at: "65-CONTEXT.md rewritten under B-prime architecture (D-14..D-22) after empirical falsification of Option A and validation of per-call C++ Connection from ClientContext (both write + read paths). Scope expanded to fold in 14+2 read-side functions per REQUIREMENTS.md escape clause. Plans 02-04 archived to *-PRE-BPRIME-*.md. Next: /gsd-plan-phase 65 to create fresh plans (likely 5-6 plans on top of shipped Plan 01)."
+last_updated: "2026-05-23T00:00:00.000Z"
+last_activity: 2026-05-23 -- Phase 65 CONTEXT.md rewritten under B-prime (scope expanded to fold in read path); ready for replan
 progress:
   total_phases: 2
   completed_phases: 0
-  total_plans: 4
+  total_plans: 1
   completed_plans: 1
   percent: 0
 ---
@@ -25,11 +25,11 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 
 ## Current Position
 
-Phase: 65 (overridecontext-connection-teardown) — BLOCKED at Plan 02 Task 1 checkpoint:decision
-Plan: 2 of 4 (HALTED — awaiting user signal to either escalate via /gsd:discuss-phase --assumptions or override the transactional-DDL hard constraint)
-Status: Blocked on checkpoint:decision
-Progress: [███░░░░░░░] 25%
-Last activity: 2026-05-22 -- Plan 02 Wave-0 spikes ran; A2-DEADLOCK + BIND-THREAD-RC1 evidence pinned; Option A invalidated
+Phase: 65 (overridecontext-connection-teardown) — READY TO PLAN (B-prime architecture)
+Plan: 1 of ~6 complete (Plan 01 shipped; Plans 02-04 archived as PRE-BPRIME; fresh plans needed)
+Status: Ready for /gsd-plan-phase 65
+Progress: [██░░░░░░░░] ~17%
+Last activity: 2026-05-23 -- CONTEXT.md rewritten under B-prime (D-14..D-22); read-path folded into scope per spike evidence
 
 ## Performance Metrics
 

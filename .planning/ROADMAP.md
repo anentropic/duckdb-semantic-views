@@ -208,25 +208,24 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
 <details open>
 <summary>🚧 v0.9.1 Connection-Lifecycle & Catalog-Context Fixes (Phases 65-66) -- IN PROGRESS</summary>
 
-- [ ] Phase 65: OverrideContext Connection Teardown (1/4 plans complete; Plan 02 replanned and halted at Task 1 checkpoint:decision — A2-DEADLOCK + BIND-THREAD-RC1 invalidate Option A; escalation pending)
-- [ ] Phase 66: Expansion Qualification Across All Paths + ADBC Tests (0/? plans) -- not started (blocked on Phase 65)
+- [ ] Phase 65: OverrideContext Connection Teardown (1/~6 plans; CONTEXT.md rewritten 2026-05-23 under B-prime architecture; scope expanded to fold in 14+2 read-side functions per REQUIREMENTS.md escape clause; ready for /gsd-plan-phase)
+- [ ] Phase 66: Expansion Qualification Across All Paths + ADBC Tests (0/? plans) -- scope to be revisited after Phase 65 lands (likely shrinks to REL-only since B-prime eliminates the H2 catalog-search-path divergence root cause; do not pre-commit shape until empirically verified)
 
 ### Phase Details
 
-### Phase 65: OverrideContext Connection Teardown
-**Goal**: Stop the extension's long-lived `OverrideContext` catalog connection from keeping the underlying DuckDB `Database` alive past the caller's `close()`, so that an in-process bootstrap-then-read-only-reopen sequence no longer hangs.
+### Phase 65: OverrideContext Connection Teardown (B-prime architecture)
+**Goal**: Eliminate ALL long-lived extension-owned `duckdb_connection` handles (H1 catalog_conn AND H2 query_conn). Every catalog read and DDL emission runs on a per-call C++ `Connection(*context.db)` opened from the caller's live `ClientContext`, wrapped in `ConnGuard` for scope-bounded teardown. After Phase 65, ZERO `duckdb_connection` survives at extension-LOAD scope.
 **Depends on**: Nothing (first phase of v0.9.1)
-**Requirements**: LIFE-01, LIFE-02, LIFE-03, LIFE-04
+**Requirements**: LIFE-01, LIFE-02, LIFE-03, LIFE-04 (read-side fold-in activates the REQUIREMENTS.md "If [BindInfo exposure] becomes possible mid-v0.9.1, fold into scope" clause; the C++ Catalog API registration is the unblocking mechanism, proven by 65-READ-PATH-SPIKE.md)
 **Success Criteria** (what must be TRUE):
-  1. In the same Python process, after a writable connection that did `LOAD semantic_views` and `CREATE SEMANTIC VIEW` is closed, a subsequent `duckdb.connect(path, read_only=True)` against the same path returns within 5 seconds — verified both on a freshly bootstrapped DB and on a previously bootstrapped DB.
-  2. The chosen mechanism (deterministic teardown via DuckDB extension-unload / DBConfig coupling, OR explicit access-mode-mismatch detection at `init_extension` that surfaces an actionable error) is documented with reasoning in the phase's RESEARCH.md, so the trade-off is recorded for future contributors.
-  3. `test/integration/test_readonly_load.py` includes a new `test_in_process_bootstrap_then_readonly` scenario that performs the bootstrap-then-RO sequence without the subprocess workaround, guarded by a watchdog timeout, and this test fails on the v0.9.0 baseline and passes on v0.9.1.
-  4. `.planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md` is updated in place with the resolution and a forward pointer to v0.9.1, so the deferred-item ledger reflects shipped state.
-**Plans**: 4 plans
-  - 65-01-PLAN.md — Wave-0 spikes (A4 lldb / A6 BindInfo / A7 re-entrancy) + ConnGuard RAII + watchdog test scaffolding (B1-B4, B11)
-  - 65-02-PLAN.md — OverrideContext field swap to db_handle + parser_override per-call ConnGuard + C++ shim signature update
-  - 65-03-PLAN.md — CatalogReader shape (b) refactor + QueryState/SemanticViewBindData per-query ConnGuard + 13 read-side + 2 scalar rewiring; init_extension drops both H1/H2 duckdb_connects
-  - 65-04-PLAN.md — LIFE-04 deferred-items.md update + B13 structural guard + B14 RAII idempotency + just test-all + just ci green gate
+  1. In the same Python process, after a writable connection that did `LOAD semantic_views` and `CREATE SEMANTIC VIEW` is closed, a subsequent `duckdb.connect(path, read_only=True)` against the same path returns within 5 seconds — verified both on a freshly bootstrapped DB and on a previously bootstrapped DB (LIFE-01).
+  2. The chosen mechanism (B-prime: per-call C++ `Connection(*context.db)` from every callback that has `ClientContext &`) is documented with reasoning in the phase's RESEARCH.md, with the empirical evidence trail (65-02-SPIKES.md A2-DEADLOCK + BIND-THREAD-RC1, 65-OPTION-B-SPIKE.md PLAN-THREAD-RC0, 65-READ-PATH-SPIKE.md READ-BIND-RC0) preserved as the trade-off record.
+  3. `test/integration/test_readonly_load.py` includes a new `test_in_process_bootstrap_then_readonly` scenario plus read-side variants that exercise SELECT through semantic_view() and list/describe/show after close; all guarded by watchdog; all fail on v0.9.0 baseline and pass on v0.9.1.
+  4. `.planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md` is updated in place with the resolution and a forward pointer to v0.9.1.
+  5. v0.8.0 transactional DDL semantics preserved byte-identical (CREATE inside user BEGIN/COMMIT still participates in the transaction); existing Phase 58 ADBC transactional tests stay green.
+**Plans**: ~6 plans (Plan 01 shipped; Plans 02-04 archived as PRE-BPRIME; replan via /gsd-plan-phase against the new 65-CONTEXT.md)
+  - 65-01-PLAN.md — Wave-0 spikes + ConnGuard RAII + watchdog test scaffolding (B1-B4, B11) — SHIPPED
+  - Plan 02..06 (NEW) — to be created by /gsd-plan-phase 65 against the B-prime CONTEXT.md (likely shape: revert Plan 02 partial + add C++ Catalog API shim; port write path via plan_function; port read path part 1; port read path part 2; retire H1+H2 + LIFE-04 + close-out)
 
 ### Phase 66: Expansion Qualification Across All Paths + ADBC Tests
 **Goal**: Make `FROM semantic_view(...)` work through ADBC and any other client whose catalog/schema search path diverges from the extension's `query_conn`, by emitting fully-qualified `db.schema.table` references from every expansion site — and ship the milestone (CHANGELOG, version bump, CI green).
