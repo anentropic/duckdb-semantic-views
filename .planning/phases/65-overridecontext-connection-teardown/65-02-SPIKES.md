@@ -128,11 +128,52 @@ The implication per RESEARCH §16.2 row "Option A2": the path the planner intend
 
 **Question (RESEARCH §16.6 #8):** Does `duckdb_connect(db_handle)` from inside a read-side table-function `bind` callback (a different lifecycle phase than `parser_override` — post-parse, inside `Binder::Bind(TableFunctionRef&)`) suffer the same rc=1 failure mode that D-10 empirically pinned for the parse thread?
 
-**Status:** **Not run** — the A2 spike returned `A2-DEADLOCK`, which per the USER_HARD_CONSTRAINT block forces a Task 1 escalation (no production refactor proceeds in Plan 02 or Plan 03 without re-research). Running A6-bind would consume a build cycle whose evidence we cannot use: the bind-thread refactor in Plan 03 is **transitively blocked** on the parse/plan-time question because Plan 02's parse_function/plan_function plumbing has no viable success-path mechanism. There is no point empirically confirming Plan 03's pattern works when Plan 02 cannot ship its predecessor commits.
+**Setup:**
 
-**Forward direction:** A6-bind moves into the re-research / next-Plan-02 input pile. If the user picks `escalate` at Task 1, A6-bind should be run as part of `/gsd:discuss-phase --assumptions`'s investigation — preferably alongside any alternative mechanism research (Plan B candidates: rewrite via StorageExtension, or a different DuckDB-1.6+ hook surface, or accept-and-document-with-non-transactional-DDL only if and when the user explicitly approves the regression).
+1. Modified `src/ddl/list.rs` to declare a `OnceLock<usize>` (`A6_BIND_SPIKE_DB_HANDLE`) and, inside `ListSemanticViewsVTab::bind`, read the lock and call `ConnGuard::open(db)` before doing any real bind work. Logged the rc and the `Result<ConnGuard, String>` outcome to stderr via `eprintln!`.
+2. Modified `src/lib.rs::init_extension` to publish `db_handle as usize` into the OnceLock immediately before `init_catalog`. (`OnceLock<usize>` because raw pointers are not `Send + Sync`; the spike uses `as` casts to convert back to `duckdb_database` inside the bind closure.)
+3. Test driver: `test/sql/65_02_a6bind_spike.test`:
 
-**Deferral rationale (per CLAUDE.md `feedback-bounded-scope-with-signal-surfacing`):** running A6-bind now would be expanding scope past the trigger condition. The bind-thread spike is small (<1 day), but small-but-pointless work still costs the milestone schedule and clutters the spike record with provisional evidence whose conclusion is moot until the parse/plan-time question reopens. Surfacing this as a deferred-but-tracked item is the correct GSD discipline.
+   ```sql
+   require semantic_views
+   statement ok
+   LOAD semantic_views;
+   query III
+   SELECT COUNT(*), MIN(name) IS NULL, MAX(name) IS NULL FROM list_semantic_views();
+   ----
+   0	1	1
+   ```
+4. Built via `just build` and ran via `python3 -u -m duckdb_sqllogictest --test-dir test/sql --file-list <(echo test/sql/65_02_a6bind_spike.test) --external-extension build/debug/semantic_views.duckdb_extension` (the `-u` ensures the stderr `eprintln!` lines aren't buffered past process exit).
+
+**Result (conclusion line):** `BIND-THREAD-RC1`
+
+The test PASSES (sqllogictest reports SUCCESS — the bind closure recovers from the failed `duckdb_connect` and proceeds with the existing `CatalogReader`, which still works because today's production path doesn't actually need a new connection at bind time — the long-lived `query_conn` covers that). But the spike's stderr trace shows the `duckdb_connect` attempt itself FAILED with rc=1, three times in a row (once per planning/execution phase that triggers `ListSemanticViewsVTab::bind`).
+
+**Verbatim stderr from the spike run:**
+
+```
+[A6-BIND-SPIKE] duckdb_connect FAILED from list_semantic_views::bind: duckdb_connect failed (rc=1)
+[A6-BIND-SPIKE] duckdb_connect FAILED from list_semantic_views::bind: duckdb_connect failed (rc=1)
+[A6-BIND-SPIKE] duckdb_connect FAILED from list_semantic_views::bind: duckdb_connect failed (rc=1)
+```
+
+**Interpretation:**
+
+- The bind thread, like the parse thread (D-10), CANNOT successfully open a fresh `duckdb_connection` from a `duckdb_database` handle via the `extension`-build C API. Same `rc=1` from `duckdb_connect` as Plan 02 partial's parser_override sites.
+- This **generalises the D-10 falsification** to the post-parse bind callbacks. The standalone-library argument (RESEARCH §3.3 / §6.5) is empirically dead for **both** the parse thread AND the bind thread on DuckDB v1.5.2 in the `--features extension` build.
+- Plan 03's intended architecture (shape (a) per Plan 01 SPIKES A6: `CatalogHandle { db, catalog_table_present }` in extra_info; per-bind `ConnGuard::open(handle.db)`) is **directly invalidated** by this result. The 14 read-side bind callbacks + 2 scalars cannot use per-bind `duckdb_connect`; some other mechanism is needed for the read path too.
+- The current production read path (long-lived `query_conn` opened once at `init_extension` and shared across binds) only works because the connection was opened at init time — when the rc=1 failure does NOT trigger (init runs before `parser_override` is registered and before any user query enters the parse/bind pipeline). The moment any code path tries to open a fresh `duckdb_connect` from inside parse OR bind, rc=1 fires.
+
+### A6-bind-checkpoint-decision
+
+Plan 03's read-side architecture is now constrained too. The options are no longer "shape (a) vs shape (b)" (Plan 01 SPIKES A6 framing) — they have all collapsed because every per-call `duckdb_connect` from inside the request lifecycle fails. The choices the planner faces for the read path are:
+
+1. **Long-lived `query_conn` retained (status quo for v0.9.1):** keep H2 alive past close; accept the same in-process RW→RO busy-spin failure mode for the read path that Plan 02 is supposed to fix. **Regresses LIFE-01.**
+2. **`ClientContext::registered_state` per-connection state (RESEARCH §1 canonical pattern):** install state at `OnConnectionOpened` callback; each user connection gets its own per-connection state including any catalog handles needed. Doesn't need `duckdb_connect` from the request lifecycle at all because reads run on the caller's connection via existing query primitives. Untested in this extension; needs spike + structural research.
+3. **StorageExtension-based replacement (RESEARCH §16.5):** scrap ParserExtension entirely; rewrite as a StorageExtension + ATTACH pattern like duckdb-postgres/iceberg/mysql/delta. Large architectural change; would push v0.9.1 to v0.10.0.
+4. **Wait for DuckDB 1.6+ that exposes a non-deadlocking ClientContext::Query path OR an `OnConnectionOpened`-style hook accessible from C-API:** ship v0.9.1 with the leak, document as known-limitation, plan v0.9.2 / v0.10.0 around a fixed upstream.
+
+**No production refactor proceeds in Plan 03 until Task 1 escalates and the user re-researches the read-path architecture against this new evidence.** Surfacing it here so the re-research input is complete.
 
 ---
 
