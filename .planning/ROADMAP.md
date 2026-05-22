@@ -208,8 +208,8 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
 <details open>
 <summary>🚧 v0.9.1 Connection-Lifecycle & Catalog-Context Fixes (Phases 65-66) -- IN PROGRESS</summary>
 
-- [ ] Phase 65: OverrideContext Connection Teardown (0/4 plans) -- not started
-- [ ] Phase 66: Expansion Qualification Across All Paths + ADBC Tests (0/? plans) -- not started
+- [ ] Phase 65: OverrideContext Connection Teardown (1/4 plans complete; Plan 02 replanned and halted at Task 1 checkpoint:decision — A2-DEADLOCK + BIND-THREAD-RC1 invalidate Option A; escalation pending)
+- [ ] Phase 66: Expansion Qualification Across All Paths + ADBC Tests (0/? plans) -- not started (blocked on Phase 65)
 
 ### Phase Details
 

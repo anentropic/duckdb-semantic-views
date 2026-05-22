@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v0.9.1
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
-status: executing
-stopped_at: "Completed 65-01-PLAN.md (scaffolding + Wave-0 spikes). Next: /gsd:execute-plan 65 02."
-last_updated: "2026-05-22T15:32:33.008Z"
-last_activity: 2026-05-22 -- Phase 65 execution started
+status: blocked-checkpoint
+stopped_at: "65-02 HALTED at Task 1 checkpoint:decision — A2-DEADLOCK + BIND-THREAD-RC1 invalidate Option A; escalation recommended per USER_HARD_CONSTRAINT (no transactional-DDL regression). Next: /gsd:discuss-phase 65 --assumptions to research alternative architecture."
+last_updated: "2026-05-22T17:30:00.000Z"
+last_activity: 2026-05-22 -- Phase 65 Plan 02 (replanned) ran Wave-0 spikes, halted at Task 1 with escalation recommendation
 progress:
   total_phases: 2
   completed_phases: 0
@@ -25,11 +25,11 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 
 ## Current Position
 
-Phase: 65 (overridecontext-connection-teardown) — EXECUTING
-Plan: 1 of 4
-Status: Executing Phase 65
+Phase: 65 (overridecontext-connection-teardown) — BLOCKED at Plan 02 Task 1 checkpoint:decision
+Plan: 2 of 4 (HALTED — awaiting user signal to either escalate via /gsd:discuss-phase --assumptions or override the transactional-DDL hard constraint)
+Status: Blocked on checkpoint:decision
 Progress: [███░░░░░░░] 25%
-Last activity: 2026-05-22 -- Phase 65 execution started
+Last activity: 2026-05-22 -- Plan 02 Wave-0 spikes ran; A2-DEADLOCK + BIND-THREAD-RC1 evidence pinned; Option A invalidated
 
 ## Performance Metrics
 
@@ -83,6 +83,9 @@ Recent decisions affecting current work:
 - [Phase ?]: [Phase 65 P01]: Spike A7 DEFERRED-TO-PLAN-02 (acceptable per plan guidance); Plan 02 first parser_override sqllogictest will deadlock if re-entrancy unsafe — strictly better falsification than contrived spike on baseline
 - [Phase ?]: [Phase 65 P01]: ConnGuard module declared without #[cfg(feature=extension)] gate so null-drop test runs under default bundled feature; inner FFI body remains gated
 - [Phase ?]: [Phase 65 P01]: ConnGuard is Send but deliberately NOT Sync (per-scope ownership); not Clone/Copy
+- [Phase ?]: [Phase 65 P02 replanned]: A2 spike returned A2-DEADLOCK — context.Query from inside sv_plan_function self-deadlocks on ClientContext::context_lock (lldb backtrace at 65-02-SPIKES.md)
+- [Phase ?]: [Phase 65 P02 replanned]: A6-bind spike returned BIND-THREAD-RC1 — duckdb_connect from ListSemanticViewsVTab::bind also returns rc=1, generalising D-10 to the bind thread; Plan 03's shape (a) is empirically invalidated
+- [Phase ?]: [Phase 65 P02 replanned]: HALTED at Task 1 checkpoint:decision per USER_HARD_CONSTRAINT (saved as feedback-transactional-ddl-non-negotiable) — A1/A3 forbidden (regress transactional DDL); only escalate is the live option
 
 ### Pending Todos
 
@@ -128,9 +131,10 @@ Recent decisions affecting current work:
 | Phase 64 P03 | 8 | 2 tasks | 1 files |
 | Phase 64 P04 | 6 | 3 tasks | 12 files |
 | Phase 65 P01 | 31min | 3 tasks | 5 files |
+| Phase 65 P02 (replanned, halted) | ~30min | 2 of 6 tasks (Wave-0 spikes only) | 1 file (SPIKES.md only — both spikes reverted to disk-empty before commit) |
 
 ## Session Continuity
 
-Last session: 2026-05-21T17:27:55.171Z
-Stopped at: Completed 65-01-PLAN.md (scaffolding + Wave-0 spikes). Next: /gsd:execute-plan 65 02.
-Resume file: None
+Last session: 2026-05-22T17:30:00.000Z
+Stopped at: Plan 02 (replanned) halted at Task 1 checkpoint:decision — A2-DEADLOCK + BIND-THREAD-RC1 invalidate Option A; recommended path is escalate via /gsd:discuss-phase 65 --assumptions
+Resume file: .planning/phases/65-overridecontext-connection-teardown/65-02-SUMMARY.md (status: halted-at-checkpoint-decision)
