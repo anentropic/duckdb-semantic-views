@@ -4,13 +4,13 @@ milestone: v0.9.1
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: executing
 stopped_at: "Completed 65-01-PLAN.md (scaffolding + Wave-0 spikes). Next: /gsd:execute-plan 65 02."
-last_updated: "2026-05-21T18:30:00.380Z"
-last_activity: 2026-05-21
+last_updated: "2026-05-22T15:09:13.612Z"
+last_activity: 2026-05-22 -- Phase 65 planning complete
 progress:
   total_phases: 2
   completed_phases: 0
   total_plans: 4
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -29,7 +29,7 @@ Phase: 65 (overridecontext-connection-teardown) — EXECUTING
 Plan: 2 of 4
 Status: Ready to execute
 Progress: [███░░░░░░░] 25%
-Last activity: 2026-05-21
+Last activity: 2026-05-22 -- Phase 65 planning complete
 
 ## Performance Metrics
 
