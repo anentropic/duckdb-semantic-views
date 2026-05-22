@@ -1,8 +1,9 @@
 # Phase 65: OverrideContext Connection Teardown — Context
 
 **Gathered:** 2026-05-21
-**Status:** Ready for research/planning
-**Source:** `/gsd:discuss-phase 65 --assumptions` (root-cause framing exchange)
+**Updated:** 2026-05-22 (replan after Plan 02 A7 falsification — D-10 and D-11 added below)
+**Status:** Ready for replan (65-01 shipped; 65-02 PARTIAL; 65-03/04 to be redrafted under new architecture)
+**Source:** `/gsd:discuss-phase 65 --assumptions` (root-cause framing exchange) + Plan 02 `checkpoint:decision` 2026-05-21 (Option A locked)
 
 <domain>
 ## Phase Boundary
@@ -43,6 +44,16 @@ Out of scope (Phase 66 territory): ADBC / expansion qualification, the `qualify_
   4. (Documented limitation) Detect access-mode mismatch at `init_extension`, error early. Only if 1–3 are conclusively ruled out.
 
   Picking among these is for research/planner output — not pre-decided here. The constraint is "support your choice with evidence and against the alternatives."
+
+### Empirical findings (LOCKED — added 2026-05-22 after Plan 02 execution)
+
+- **D-10** — **A7 (parser_override re-entrancy) is RE-ENTRANCY-UNSAFE on the bundled DuckDB 1.5.2.** Plan 02 plumbed `db_handle` into `OverrideContext` and converted four `rewrite_*` sites to per-call `ConnGuard::open(ctx.db_handle)`. The first `just test-sql` run produced 43/47 failures with `Parser Error: catalog connection failed: duckdb_connect failed (rc=1)`. Every test reaching a `ConnGuard::open` inside `parser_override` failed; the 4 passing tests are caret-rendering paths that never reach `ConnGuard::open`. This **falsifies** RESEARCH §3.3 / §6.5's standalone-library argument that `connections_lock` is per-`ConnectionManager` and does not gate the caller's parse step. On DuckDB 1.5.2 in the `--features extension` build, opening a fresh `duckdb_connection` from inside `Parser::ParseQuery` is not viable. Evidence: `.planning/phases/65-overridecontext-connection-teardown/65-02-A7-test-sql-evidence.log`, updated SPIKES §A7. **Consequence:** any candidate fix that calls `duckdb_connect` from inside `parser_override` is ruled out by this run.
+
+- **D-11** — **Option A is the locked shape: catalog reads move OUT of `parser_override` to bind/plan time.** Picked from Plan 02 `checkpoint:decision` 2026-05-21. The `parser_override` callback is reduced to validation-only (caret rendering + structural parse) and stashes the raw query into `SemanticViewParseData`. `parse_function` (the Phase 62 error-reporting hook) is promoted to the success path: it reads back from `SemanticViewParseData`, derives a connection from `ClientContext`, performs existence checks + enrichment + native-SQL emission OUTSIDE the parse lock, and hands the rewritten query to the planner. This realises **D-07 candidate 1** ("don't cache a connection — open/close per DDL invocation") but at the correct lifecycle point (bind/plan, not parse). Open questions for the research refresh: (i) the exact surface for promoting `parse_function` from error-reporting to success path on the bundled DuckDB version, (ii) whether `TableFunctionInfo` / `FunctionInfo` exposes a `ClientContext` / `duckdb_connection` accessor that would let the 14 read-side bind callbacks + 2 scalars do the same per-call pattern (Plan 01 Spike A6 already confirmed `BindInfo` does NOT expose `duckdb_database`), and (iii) the shape of `SemanticViewParseData` as a carrier (what gets stashed at parse, what gets reconstituted at plan).
+
+- **D-12** — **Plan 02's structural commits stay.** Commits `0d2c0b7` (OverrideContext field swap to `db_handle`), `f9caafe` (C++ shim `sv_register_parser_hooks` signature update), and `656bae7` (evidence log preservation) remain on `milestone/v0.9.1`. The new architecture still needs `db_handle` plumbed through Rust+C++ FFI; the C++ shim signature change is the correct ABI for both shapes. Reverting would discard ~150 LOC of cleanly-tested FFI work and re-introduce the Phase 62 `INTENTIONAL LEAK` comment. The known-broken surface is precisely the 4× `ConnGuard::open` call sites inside `parse.rs::rewrite_*` — those must be removed and replaced by the bind/plan-time path in the new Plan 02A. **Until the new plan ships, `milestone/v0.9.1` is broken: `just test-sql` is 43/47 failing. Do not push to main, do not tag, do not merge.**
+
+- **D-13** — **Plan 01 stays as shipped.** ConnGuard RAII (`src/conn_guard.rs`), the watchdog helper, and the B1..B4/B11 failing-on-baseline tests are still the correct primitives. ConnGuard's consumer in the new architecture is the bind/plan-time callback (or `parse_function` success path), not the `rewrite_*` sites. The watchdog tests are still the right "fails on baseline / passes after fix" evidence per LIFE-03 success criterion 3 — but the "baseline" they fail on is now both the v0.9.0 tag AND the current intermediate state on `milestone/v0.9.1`. After Option A ships, they MUST flip green; Plan 04 runs them as the close-out check.
 
 ### Scope fence
 
