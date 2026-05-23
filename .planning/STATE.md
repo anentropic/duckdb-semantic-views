@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.9.1
+milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
-status: executing
-stopped_at: "Plan 02 (replanned) halted at Task 1 checkpoint:decision — A2-DEADLOCK + BIND-THREAD-RC1 invalidate Option A; recommended path is escalate via /gsd:discuss-phase 65 --assumptions"
-last_updated: "2026-05-23T00:45:16.697Z"
-last_activity: 2026-05-23 -- Phase 65 planning complete
+status: planning
+stopped_at: "B-prime architecture eliminated by EXEC-TIME-RC1 (commit 3f70de6); ALTER-RC0 (commit 2362846) confirmed rewrite-to-UPDATE-with-TF-subquery as the viable pattern. Milestone reframed v0.9.1 → v0.10.0; B-prime plans archived; awaiting /gsd-discuss-phase 65 under read-elimination architecture."
+last_updated: "2026-05-23T11:00:00.000Z"
+last_activity: 2026-05-23 -- Milestone reframed v0.9.1 → v0.10.0 after read-elimination architecture decided
 progress:
   total_phases: 2
   completed_phases: 0
-  total_plans: 7
-  completed_plans: 3
+  total_plans: 2
+  completed_plans: 2
   percent: 0
 ---
 
@@ -25,11 +25,10 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 
 ## Current Position
 
-Phase: 65 (overridecontext-connection-teardown) — READY TO PLAN (B-prime architecture)
-Plan: 1 of ~6 complete (Plan 01 shipped; Plans 02-04 archived as PRE-BPRIME; fresh plans needed)
-Status: Ready to execute
-Progress: [██░░░░░░░░] ~17%
-Last activity: 2026-05-23 -- Phase 65 planning complete
+Phase: 65 (overridecontext-connection-teardown) — REPLANNING under read-elimination architecture
+Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial)
+B-prime plans (03-07) archived; new plans pending /gsd-discuss-phase + /gsd-plan-phase
+Last activity: 2026-05-23 -- Milestone reframed v0.9.1 → v0.10.0; B-prime archived; ALTER-RC0 spike landed
 
 ## Performance Metrics
 
@@ -44,7 +43,7 @@ Last activity: 2026-05-23 -- Phase 65 planning complete
 ### Roadmap Evolution
 
 - Phase 64 added: Fix CREATE SEMANTIC VIEW quoted identifier handling (downstream bug; quoted FQN stored verbatim, lookup by short name fails, expansion re-quotes producing triple quotes). Folded into v0.9.0 — milestone reopened pre-tag since maintainer squash-merge had not yet happened.
-- v0.9.1 opened 2026-05-21: two-phase patch milestone for connection-lifecycle / catalog-context regressions. Phase 65 covers in-process RW→RO reopen hang (LIFE-01..04, from Phase 63 deferred-items). Phase 66 covers cross-connection expansion qualification across all paths (EXPAND-CTX-01..03, from `_notes/error_with_adbc.md`) plus release prep (REL-01, REL-02) as its closing plan, matching the v0.9.0 Phase 64 pattern.
+- v0.9.1 opened 2026-05-21 as a two-phase patch milestone; reframed 2026-05-23 to v0.10.0 after the B-prime architecture for Phase 65 was empirically eliminated (EXEC-TIME-RC1 spike). New architectural premise: preserve `parser_override` (only DuckDB v1.5.2 mechanism that delivers transactional DDL), eliminate the catalog reads that drive the need for a connection inside parser_override (drop PK auto-inference, move metadata to SQL expressions in INSERT, fold existence checks into ON CONFLICT, defer type inference to read-side bind callbacks), and use the rewrite-to-UPDATE-with-TF-subquery pattern (ALTER-RC0) for ALTER and CREATE FROM YAML FILE. Read-path callbacks migrate to C++ Catalog API registration (READ-BIND-RC0) so they gain ClientContext for per-call Connection. Both long-lived connections retire. Phase 66 scope re-evaluation pending Phase 65 re-plan (the H2 catalog-search-path divergence may dissolve once query_conn is retired). See `.planning/phases/65-overridecontext-connection-teardown/65-BPRIME-ARCHIVE-NOTE.md` for the full pivot rationale.
 
 ### Decisions
 
@@ -135,6 +134,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-05-22T17:30:00.000Z
-Stopped at: Plan 02 (replanned) halted at Task 1 checkpoint:decision — A2-DEADLOCK + BIND-THREAD-RC1 invalidate Option A; recommended path is escalate via /gsd:discuss-phase 65 --assumptions
-Resume file: .planning/phases/65-overridecontext-connection-teardown/65-02-SUMMARY.md (status: halted-at-checkpoint-decision)
+Last session: 2026-05-23T11:00:00.000Z
+Stopped at: Milestone reframed v0.9.1 → v0.10.0. B-prime architecture for Phase 65 eliminated by EXEC-TIME-RC1 spike (commit 3f70de6). ALTER-RC0 spike (commit 2362846) confirms rewrite-to-UPDATE-with-TF-subquery pattern is viable. Read-elimination architecture is the new direction for v0.10.0. B-prime plans 65-03..07 + CONTEXT/RESEARCH/PATTERNS archived to *.BPRIME.*.archived names. Phase 65 needs fresh /gsd-discuss-phase + /gsd-plan-phase under the new premise.
+Resume file: .planning/phases/65-overridecontext-connection-teardown/65-BPRIME-ARCHIVE-NOTE.md (explains the pivot)

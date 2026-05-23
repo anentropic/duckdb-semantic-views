@@ -107,16 +107,27 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 ### Active
 
-**Current milestone: v0.9.1 — Connection-Lifecycle & Catalog-Context Fixes**
+**Current milestone: v0.10.0 — Connection-Lifecycle & Catalog-Context Fixes**
 
-**Goal:** Stop the extension's long-lived connections (`OverrideContext` catalog conn + `query_conn`) from blocking real user workflows. Two downstream-reported regressions that both trace back to the extension owning connections separate from the caller's.
+Originally opened 2026-05-21 as v0.9.1 patch milestone. Reframed 2026-05-23 to v0.10.0 after the B-prime architecture for Phase 65 was empirically eliminated by `65-EXEC-TIME-SPIKE.md` (no DuckDB v1.5.2 API surface delivers both transactional DDL on the caller's connection AND per-call `Connection(*context.db)` reads from the same callback). Read-elimination architecture replaces B-prime; see `.planning/phases/65-overridecontext-connection-teardown/65-BPRIME-ARCHIVE-NOTE.md` for the full pivot rationale.
+
+**Goal:** Stop the extension's long-lived connections (`catalog_conn` H1 + `query_conn` H2) from blocking real user workflows. Two downstream-reported regressions that both trace back to the extension owning connections separate from the caller's.
+
+**Architecture (locked):**
+
+- Preserve `parser_override` as the sole DDL entry point — only DuckDB v1.5.2 mechanism that delivers transactional DDL on the caller's connection.
+- Eliminate the catalog reads inside `parser_override` rather than relocating them: drop PK auto-inference (Snowflake-aligned: PK in semantic views is a logical user assertion, not a physical-catalog import); move metadata to SQL expressions in the rewritten INSERT; fold existence checks into ON CONFLICT / DELETE RETURNING race-guards; defer type inference to read-side bind callbacks.
+- ALTER and CREATE FROM YAML FILE use the rewrite-to-UPDATE-with-table-function-subquery pattern (`65-ALTER-REWRITE-SPIKE.md` ALTER-RC0).
+- Read-path callbacks migrate to C++ Catalog API registration (`65-READ-PATH-SPIKE.md` READ-BIND-RC0) so they gain ClientContext and open per-call Connection.
+- Both long-lived connections retire. v0.8.0 transactional DDL semantics preserved byte-identical.
 
 **Target features:**
 
-- [ ] In-process `connect(path) → CREATE SEMANTIC VIEW → close → connect(path, read_only=True)` returns immediately instead of hanging. Fix the `OverrideContext` catalog-connection leak at extension teardown (DuckDB unload hook if available, otherwise detect access-mode mismatch on reopen and surface a clear error). Regression guard: same-process bootstrap-then-RO integration test with a watchdog.
-- [ ] `FROM semantic_view(...)` succeeds through ADBC and any other client with a divergent catalog/schema search path. Port `qualify_and_quote_table_ref` into every remaining expansion site (fact-query, semi-additive, window, materialization routing) so the inner SQL emits fully-qualified `db.schema.table` references in all paths, not just the main `expand()` path.
-- [ ] ADBC end-to-end query test (`SELECT … FROM semantic_view(...)` through `adbc_driver_duckdb`) covering at minimum: main expansion, FACTS query, semi-additive metric, window metric, and a multi-database `ATTACH` scenario.
-- [ ] CHANGELOG `[0.9.1]` section under `### Fixed` documents both fixes; `Cargo.toml` + `description.yml` bumped to 0.9.1.
+- [ ] In-process `connect(path) → CREATE SEMANTIC VIEW → close → connect(path, read_only=True)` returns immediately instead of hanging. Regression guard: same-process bootstrap-then-RO integration test with watchdog.
+- [ ] `FROM semantic_view(...)` succeeds through ADBC and any other client with a divergent catalog/schema search path. Likely resolves transitively under read-elimination (per-call `Connection(*context.db)` inherits caller's search path natively); empirical verification via Phase 66 ADBC test suite.
+- [ ] ADBC end-to-end query test (`SELECT … FROM semantic_view(...)` through `adbc_driver_duckdb`) covering at minimum: main expansion, FACTS query, semi-additive metric, window metric, and multi-database `ATTACH` scenario.
+- [ ] PK auto-inference removal documented under CHANGELOG `### Changed` — small behavior change for users who relied on the catalog fallback; error path guides them to explicit `PRIMARY KEY (cols)` / `UNIQUE (cols)` declaration.
+- [ ] CHANGELOG `[0.10.0]` section documents all changes; `Cargo.toml` + `description.yml` bumped to 0.10.0.
 
 ### Out of Scope
 
@@ -211,8 +222,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 ## Evolution
 
 This document evolves at phase transitions and milestone boundaries.
-
-Last updated: 2026-05-21 (v0.9.1 milestone started — connection-lifecycle / catalog-context patch milestone, 2 phases planned)
+Last updated: 2026-05-23 — milestone reframed v0.9.1 → v0.10.0 after B-prime architecture eliminated; read-elimination architecture is the new direction.
 
 **After each phase transition** (via `/gsd:transition`):
 1. Requirements invalidated? → Move to Out of Scope with reason
@@ -228,4 +238,4 @@ Last updated: 2026-05-21 (v0.9.1 milestone started — connection-lifecycle / ca
 4. Update Context with current state
 
 ---
-*Last updated: 2026-05-21 — v0.9.1 started. Patch milestone driven by two downstream-reported regressions (RW→RO reopen hang from Phase 63 deferred-items; ADBC / cross-connection catalog resolution from `_notes/error_with_adbc.md`). Both trace to the extension owning connections separate from the caller's. Prior v0.9.0 shipped 2026-05-17 with Phase 63 Read-Only LOAD + Phase 64 Quoted-Identifier Bugfix.*
+*Last updated: 2026-05-23 — milestone reframed v0.9.1 → v0.10.0. Originally opened 2026-05-21 as a two-phase patch milestone for the two downstream-reported regressions (RW→RO reopen hang from Phase 63 deferred-items; ADBC / cross-connection catalog resolution from `_notes/error_with_adbc.md`). On 2026-05-23 the B-prime architecture for Phase 65 was empirically eliminated by `65-EXEC-TIME-SPIKE.md`; `65-ALTER-REWRITE-SPIKE.md` validated the read-elimination architecture (preserve parser_override + eliminate the reads inside it; use rewrite-to-UPDATE-with-TF-subquery for ALTER + CREATE FROM YAML FILE; migrate read-path to C++ Catalog API for ClientContext access). Scope expanded sufficiently that the patch-version framing no longer fit; reframed to v0.10.0. Prior v0.9.0 shipped 2026-05-17 with Phase 63 Read-Only LOAD + Phase 64 Quoted-Identifier Bugfix.*
