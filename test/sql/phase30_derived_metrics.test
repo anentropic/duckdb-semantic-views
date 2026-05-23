@@ -212,7 +212,7 @@ RELATIONSHIP	li_to_order	p30_line_items	FOREIGN_KEY	["order_id"]
 RELATIONSHIP	li_to_order	p30_line_items	REF_KEY	["id"]
 FACT	net_price	p30_line_items	TABLE	p30_line_items
 FACT	net_price	p30_line_items	EXPRESSION	li.extended_price * (1 - li.discount)
-FACT	net_price	p30_line_items	DATA_TYPE	DECIMAL(18,4)
+FACT	net_price	p30_line_items	DATA_TYPE	(empty)
 FACT	net_price	p30_line_items	ACCESS_MODIFIER	PUBLIC
 DIMENSION	region	p30_orders	TABLE	p30_orders
 DIMENSION	region	p30_orders	EXPRESSION	o.region

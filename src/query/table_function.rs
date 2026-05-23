@@ -216,6 +216,12 @@ pub(crate) fn normalize_type_id(t: u32) -> u32 {
 /// For these types, `output_type` remains `None` and DESCRIBE shows empty.
 ///
 /// Returns `Some("TYPE_NAME")` for types where CAST is safe (no-op).
+///
+/// Phase 65 (Plan 03): no in-tree caller after the CREATE-time type
+/// inference paths were removed from `enrich_definition_for_create`
+/// (D-16/D-17). Kept alive for Plan 05's read-side bind callbacks
+/// which will re-probe at SHOW / DESCRIBE / `semantic_view()` bind time.
+#[allow(dead_code)]
 pub(crate) fn type_id_to_display_name(type_id: u32) -> Option<&'static str> {
     const BOOLEAN: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN;
     const TINYINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT;

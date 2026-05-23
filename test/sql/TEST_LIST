@@ -46,3 +46,4 @@ test/sql/extension_reload.test
 test/sql/readonly_load.test
 test/sql/phase64_quoted_idents.test
 test/sql/65_pk_error.test
+test/sql/65_metadata_via_sql.test

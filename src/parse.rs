@@ -1924,19 +1924,42 @@ fn emit_native_create_sql(
         });
     }
 
-    // `is_file_backed` matches the legacy `DefineState::persist_conn.is_some()`
-    // behaviour: type inference runs only for file-backed DBs (v0.7.1 design).
-    let enriched_json = crate::ddl::define::enrich_definition_for_create(
-        &name,
-        def,
-        ctx.catalog.raw(),
-        ctx.is_file_backed,
-    )
-    .map_err(|e| ParseError {
-        message: e,
-        position: None,
-    })?;
+    // Phase 65 (D-16, metadata-via-SQL): enrichment no longer takes a
+    // catalog connection. CREATE-time `now()` / `current_database()` /
+    // `current_schema()` capture is embedded as SQL inside the emitted
+    // INSERT via `json_merge_patch` so it resolves on the CALLER's
+    // connection at INSERT-time, preserving D-21 transactional contract
+    // without parser_override holding a long-lived handle. CREATE-time
+    // column type inference (`column_type_names`, fact `output_type`)
+    // is deferred to read-side bind under Plan 05's C++ Catalog API
+    // migration (D-17). `ctx.is_file_backed` is unused here for Plan 03;
+    // Plan 05's read-side probes will gate themselves on the equivalent.
+    let enriched_json =
+        crate::ddl::define::enrich_definition_for_create(&name, def).map_err(|e| ParseError {
+            message: e,
+            position: None,
+        })?;
     let enriched_escaped = escape_sql_arg(&enriched_json);
+
+    // Metadata-via-SQL sub-expression: produces a VARCHAR by patching
+    // the enriched JSON (no created_on / database_name / schema_name
+    // fields populated by the Rust side) with the now()/current_database()
+    // /current_schema() values resolved on the caller's connection.
+    //
+    // RFC-7396 semantics: json_merge_patch overrides any keys present in
+    // the patch. Phase 39 metadata behaviour is preserved because the
+    // enriched JSON omits the three metadata keys (Vec::is_empty /
+    // Option::is_none skip_serializing) so the patch is the sole source.
+    let metadata_patched_definition = format!(
+        "json_merge_patch( \
+            '{enriched_escaped}'::JSON, \
+            json_object( \
+              'created_on', strftime(now(), '%Y-%m-%dT%H:%M:%SZ'), \
+              'database_name', current_database(), \
+              'schema_name', current_schema() \
+            ) \
+         )::VARCHAR"
+    );
 
     // The generated SQL runs on the caller's connection, so its EXISTS
     // subqueries see in-flight INSERTs from the same transaction. Three
@@ -1951,17 +1974,20 @@ fn emit_native_create_sql(
     //     CREATE concurrency semantics — see TECH-DEBT item 23.
     //   - Plain CREATE: CASE+error() raises the friendly "already exists"
     //     message before the INSERT can fire, replacing what would
-    //     otherwise be a generic PK constraint violation.
+    //     otherwise be a generic PK constraint violation. Phase 65: the
+    //     parser-side `ctx.catalog.exists` pre-check above is the
+    //     committed-state fast path; the CASE inside the INSERT is the
+    //     same-transaction guard.
     let sql = if or_replace {
         format!(
             "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) \
-             VALUES ('{name_escaped}', '{enriched_escaped}') \
+             VALUES ('{name_escaped}', {metadata_patched_definition}) \
              RETURNING name AS view_name"
         )
     } else if if_not_exists {
         format!(
             "INSERT OR IGNORE INTO semantic_layer._definitions (name, definition) \
-             VALUES ('{name_escaped}', '{enriched_escaped}') \
+             VALUES ('{name_escaped}', {metadata_patched_definition}) \
              RETURNING name AS view_name"
         )
     } else {
@@ -1974,7 +2000,7 @@ fn emit_native_create_sql(
                                 use CREATE OR REPLACE SEMANTIC VIEW to overwrite') \
                     ELSE '{name_escaped}' \
                END, \
-               '{enriched_escaped}' \
+               {metadata_patched_definition} \
              RETURNING name AS view_name"
         )
     };
@@ -3791,6 +3817,7 @@ mod tests {
             assert_eq!(rels[0].ref_columns, vec!["email"]);
         }
 
+        #[cfg(feature = "extension")]
         #[test]
         fn errors_when_target_has_no_pk_and_no_explicit_ref() {
             // Phase 65 (D-05/D-06): `infer_cardinality` still silently
@@ -3798,6 +3825,9 @@ mod tests {
             // fires inside `enrich_definition_for_create` step 2 with the
             // D-06 actionable message. v0.9.0's resolve_pk_from_catalog
             // catalog fallback is gone (D-05).
+            //
+            // Feature-gated on `extension` because `crate::ddl` lives
+            // under `#[cfg(feature = "extension")]` (src/lib.rs:283-284).
             let tables = vec![
                 make_table("orders", &["id"], &[]),
                 make_table("events", &[], &[]), // no PK declared
@@ -3811,20 +3841,16 @@ mod tests {
             );
 
             // enrich_definition_for_create step 2 fires the D-06 hard
-            // error. We can call it with a null conn here because step 2
-            // returns BEFORE step 4 ever touches `conn`.
+            // error. Phase 65 (Plan 03): the function no longer takes a
+            // `conn` arg or `infer_types` flag — all CREATE-time catalog
+            // access has been removed.
             let def = crate::model::SemanticViewDefinition {
                 tables,
                 joins: rels,
                 ..Default::default()
             };
-            let err = crate::ddl::define::enrich_definition_for_create(
-                "v_bad",
-                def,
-                std::ptr::null_mut(),
-                false,
-            )
-            .expect_err("D-06 hard error must fire for FK→no-PK");
+            let err = crate::ddl::define::enrich_definition_for_create("v_bad", def)
+                .expect_err("D-06 hard error must fire for FK→no-PK");
             assert!(
                 err.contains("has no PRIMARY KEY declared but is referenced by FK in"),
                 "D-06 substring missing in error: {err}"
