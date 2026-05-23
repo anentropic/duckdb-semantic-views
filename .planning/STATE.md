@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: planning
-stopped_at: "B-prime architecture eliminated by EXEC-TIME-RC1 (commit 3f70de6); ALTER-RC0 (commit 2362846) confirmed rewrite-to-UPDATE-with-TF-subquery as the viable pattern. Milestone reframed v0.9.1 → v0.10.0; B-prime plans archived; awaiting /gsd-discuss-phase 65 under read-elimination architecture."
-last_updated: "2026-05-23T11:00:00.000Z"
-last_activity: 2026-05-23 -- Milestone reframed v0.9.1 → v0.10.0 after read-elimination architecture decided
+stopped_at: Phase 65 context gathered (third re-plan; read-elimination architecture; 4-plan structure 03-06)
+last_updated: "2026-05-23T17:29:46.004Z"
+last_activity: 2026-05-23 -- Milestone reframed v0.9.1 → v0.10.0; B-prime archived; ALTER-RC0 spike landed
 progress:
   total_phases: 2
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 2
-  completed_plans: 2
-  percent: 0
+  completed_plans: 4
+  percent: 50
 ---
 
 # Project State
@@ -134,6 +134,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-05-23T11:00:00.000Z
-Stopped at: Milestone reframed v0.9.1 → v0.10.0. B-prime architecture for Phase 65 eliminated by EXEC-TIME-RC1 spike (commit 3f70de6). ALTER-RC0 spike (commit 2362846) confirms rewrite-to-UPDATE-with-TF-subquery pattern is viable. Read-elimination architecture is the new direction for v0.10.0. B-prime plans 65-03..07 + CONTEXT/RESEARCH/PATTERNS archived to *.BPRIME.*.archived names. Phase 65 needs fresh /gsd-discuss-phase + /gsd-plan-phase under the new premise.
-Resume file: .planning/phases/65-overridecontext-connection-teardown/65-BPRIME-ARCHIVE-NOTE.md (explains the pivot)
+Last session: 2026-05-23T17:29:45.989Z
+Stopped at: Phase 65 context gathered (third re-plan; read-elimination architecture; 4-plan structure 03-06)
+Resume file: .planning/phases/65-overridecontext-connection-teardown/65-CONTEXT.md
