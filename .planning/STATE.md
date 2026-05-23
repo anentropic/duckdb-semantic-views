@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
-status: planning
-stopped_at: Phase 65 context gathered (third re-plan; read-elimination architecture; 4-plan structure 03-06)
-last_updated: "2026-05-23T21:47:40.954Z"
-last_activity: 2026-05-23 -- Phase 65 planning complete
+status: executing
+stopped_at: Phase 65 Plan 03 complete (parser_override slimming wave; metadata-via-SQL; D-06 hard error; conn_guard.rs deleted)
+last_updated: "2026-05-24T00:50:00.000Z"
+last_activity: 2026-05-24 -- Plan 65-03 complete; 49/49 just test-sql; 933/933 nextest; 6/6 ADBC transactions
 progress:
   total_phases: 2
   completed_phases: 0
   total_plans: 6
-  completed_plans: 4
-  percent: 0
+  completed_plans: 3
+  percent: 50
 ---
 
 # Project State
@@ -25,10 +25,11 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 
 ## Current Position
 
-Phase: 65 (overridecontext-connection-teardown) — REPLANNING under read-elimination architecture
-Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial)
-B-prime plans (03-07) archived; new plans pending /gsd-discuss-phase + /gsd-plan-phase
-Last activity: 2026-05-23 -- Phase 65 planning complete
+Phase: 65 (overridecontext-connection-teardown) — EXECUTING
+Plan: 3 of 6 complete (Plan 04 next)
+Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection)
+Next plan: 65-04 ALTER architecture wave (json_merge_patch UPDATE rewrites for RENAME / SET COMMENT / UNSET COMMENT; helper TF for CREATE FROM YAML FILE)
+Last activity: 2026-05-24 -- Plan 65-03 complete
 
 ## Performance Metrics
 
@@ -85,6 +86,11 @@ Recent decisions affecting current work:
 - [Phase ?]: [Phase 65 P02 replanned]: A2 spike returned A2-DEADLOCK — context.Query from inside sv_plan_function self-deadlocks on ClientContext::context_lock (lldb backtrace at 65-02-SPIKES.md)
 - [Phase ?]: [Phase 65 P02 replanned]: A6-bind spike returned BIND-THREAD-RC1 — duckdb_connect from ListSemanticViewsVTab::bind also returns rc=1, generalising D-10 to the bind thread; Plan 03's shape (a) is empirically invalidated
 - [Phase ?]: [Phase 65 P02 replanned]: HALTED at Task 1 checkpoint:decision per USER_HARD_CONSTRAINT (saved as feedback-transactional-ddl-non-negotiable) — A1/A3 forbidden (regress transactional DDL); only escalate is the live option
+- [Phase 65 P03]: parser_override slimming complete — OverrideContext reverted to v0.9.0 shape; conn_guard.rs deleted; resolve_pk_from_catalog deleted; metadata capture moved to SQL via json_merge_patch on caller's connection; D-06 hard error for FK→PK-less target with actionable v0.10.0 CHANGELOG message
+- [Phase 65 P03]: D-06 check extended to cover BOTH implicit REFERENCES (empty ref_columns) AND explicit REFERENCES(cols) — superset of plan's literal check; CARD-03 still fires for column-mismatch failures
+- [Phase 65 P03]: phase29/phase30/phase39 sqllogictest FACT DATA_TYPE expectations updated to (empty); Plan 05's read-side bind probe will restore populated types and tests will need re-update
+- [Phase 65 P03]: H1 catalog_conn at src/lib.rs:386-410 still allocated but unused by parser_override CREATE path; Plan 06 retires the allocation
+- [Phase 65 P03]: D-21 transactional invariant intact — test_adbc_transactions.py 6/6 PASS; D-03 watchdog tests still TimeoutError (expected per 65-01-SUMMARY — flip green at Plan 06 only)
 
 ### Pending Todos
 

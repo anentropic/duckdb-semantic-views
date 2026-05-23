@@ -210,7 +210,7 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
 
 **Originally scoped as v0.9.1 patch milestone.** Reframed to v0.10.0 on 2026-05-23 after the B-prime architecture for Phase 65 was empirically eliminated by `65-EXEC-TIME-SPIKE.md` (EXEC-TIME-RC1). The follow-on `65-ALTER-REWRITE-SPIKE.md` (ALTER-RC0) validated a different architectural premise: preserve `parser_override` (only DuckDB v1.5.2 mechanism that delivers transactional DDL) and eliminate the catalog reads inside it. See `.planning/phases/65-overridecontext-connection-teardown/65-BPRIME-ARCHIVE-NOTE.md` for the full pivot rationale.
 
-- [ ] Phase 65: OverrideContext Connection Teardown — REPLANNING under read-elimination architecture (2/7 B-prime plans had landed at archive time: 65-01 ConnGuard + watchdog; 65-02 sv_register_table_function shim partial. B-prime plans 03-07 archived to `*.BPRIME.*.archived`. Fresh `/gsd-discuss-phase 65` + `/gsd-plan-phase 65` pending.)
+- [ ] Phase 65: OverrideContext Connection Teardown — EXECUTING under read-elimination architecture (3/6 plans complete: 65-01 ConnGuard + watchdog [carried], 65-02 sv_register_table_function shim partial [reverted by 65-03], 65-03 parser_override slimming wave [parser_override CREATE path zero catalog reads; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's conn; D-06 hard error]. Plans 65-04 ALTER architecture, 65-05 read-path migration, 65-06 lifecycle close-out remaining.)
 - [ ] Phase 66: Expansion Qualification Across All Paths + ADBC Tests (0/? plans) -- scope to be revisited after Phase 65 lands. The H2 catalog-search-path divergence root cause likely dissolves once `query_conn` is retired by the read-elimination architecture; final scope pending Phase 65 plan shape.
 
 ### Phase Details
@@ -234,7 +234,13 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
   3. `test/integration/test_readonly_load.py` includes new `test_in_process_bootstrap_then_readonly` scenarios that exercise CREATE-then-close-then-reopen-readonly + read-side variants (SELECT through `semantic_view()`, `list`/`describe`/`show` after close); all guarded by watchdog; all fail on v0.9.0 baseline and pass on v0.10.0.
   4. Both long-lived extension-owned `duckdb_connection` handles (H1 catalog_conn, H2 query_conn) are retired from `init_extension`. Structural Rust unit test fails CI if anyone re-introduces a long-lived native handle.
   5. PK auto-inference removal documented in CHANGELOG as a behavior change (users relying on the fallback get a clear error pointing to the explicit-declaration alternative).
-**Plans**: TBD (fresh /gsd-discuss-phase 65 + /gsd-plan-phase 65 pending; pre-existing 65-01 + 65-02 landed work carries over)
+**Plans**:
+  - 65-01 (DONE — `65-01-SUMMARY.md`): ConnGuard scaffolding + 5 watchdog tests (B1..B4 + B11) — ConnGuard later deleted by 65-03 D-02; watchdog tests retained for Plan 06 verification.
+  - 65-02 (PARTIAL — `65-02-PARTIAL-SUMMARY.md`): sv_register_table_function C++ Catalog API shim; OverrideContext db_handle plumbing rewritten back to v0.9.0 shape by 65-03 D-01. Shim infrastructure surviving for Plans 04/05 consumption.
+  - 65-03 (DONE — `65-03-SUMMARY.md`): parser_override slimming wave. Reverted Plan 02 partial damage; deleted conn_guard.rs (D-02), resolve_pk_from_catalog (D-05); moved CREATE-time metadata to SQL via json_merge_patch on caller's conn (D-16, metadata-via-SQL); added D-06 hard error path; deferred type inference to read-side (D-17). parser_override CREATE path has ZERO catalog reads. H1 catalog_conn allocation still present at src/lib.rs:386-410 but unused by CREATE path; Plan 06 retires the allocation. 49/49 sqllogictest; 933/933 nextest; 6/6 ADBC transactions; D-03 watchdog tests still TimeoutError as expected (flip green at Plan 06).
+  - 65-04 (NEXT): ALTER architecture wave — RENAME/SET COMMENT/UNSET COMMENT pure-SQL json_merge_patch UPDATEs; CREATE FROM YAML FILE via `__sv_compute_create_from_yaml` helper TF registered through Plan 02's surviving C++ Catalog API shim.
+  - 65-05: Read-path migration wave — 15 table-function + 2 scalar callbacks migrate to C++ Catalog API; per-call `Connection(*context.db)` from ClientContext; H2 query_conn retires.
+  - 65-06: Lifecycle close-out — H1 catalog_conn retires; structural Rust unit test against re-introduction; extended post-reopen watchdog tests (D-03b); LIFE-04 ledger close.
 
 ### Phase 66: Expansion Qualification Across All Paths + ADBC Tests
 **Goal**: Make `FROM semantic_view(...)` work through ADBC and any other client whose catalog/schema search path diverges from the extension's `query_conn` — and ship the milestone (CHANGELOG, version bump, CI green).
