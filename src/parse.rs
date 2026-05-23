@@ -1498,11 +1498,14 @@ pub(crate) fn infer_cardinality(
                     join.ref_columns.clone_from(&t.pk_columns);
                 }
                 Some(_) => {
-                    // Target has no PK declared in DDL -- defer resolution.
-                    // At bind time, `resolve_pk_from_catalog` will attempt to
-                    // fill in pk_columns from the DuckDB catalog. If that also
-                    // fails, `infer_cardinality` is re-run and this branch
-                    // will be reached again (now as an error).
+                    // Target has no PK declared in DDL -- silently skip
+                    // here. Phase 65 (D-05/D-06): the v0.9.0 fallback to
+                    // `resolve_pk_from_catalog` against duckdb_constraints()
+                    // is gone. The empty `ref_columns` is caught in
+                    // `crate::ddl::define::enrich_definition_for_create`
+                    // step 2 with the D-06 hard error pointing the user
+                    // at the missing PRIMARY KEY / UNIQUE declaration in
+                    // the TABLES clause.
                     continue;
                 }
                 None => {
@@ -3789,19 +3792,48 @@ mod tests {
         }
 
         #[test]
-        fn skips_when_target_has_no_pk_and_no_explicit_ref() {
-            // When target has no PK, infer_cardinality is tolerant: it skips
-            // the join (leaves ref_columns empty) instead of erroring.
-            // At bind time, resolve_pk_from_catalog will attempt catalog lookup.
+        fn errors_when_target_has_no_pk_and_no_explicit_ref() {
+            // Phase 65 (D-05/D-06): `infer_cardinality` still silently
+            // skips the join (leaves ref_columns empty); the hard error
+            // fires inside `enrich_definition_for_create` step 2 with the
+            // D-06 actionable message. v0.9.0's resolve_pk_from_catalog
+            // catalog fallback is gone (D-05).
             let tables = vec![
                 make_table("orders", &["id"], &[]),
-                make_table("events", &[], &[]), // no PK
+                make_table("events", &[], &[]), // no PK declared
             ];
             let mut rels = vec![make_join("r", "orders", "events", &["event_id"], &[])];
+            // infer_cardinality itself remains tolerant: skips the join.
             infer_cardinality(&tables, &mut rels).unwrap();
             assert!(
                 rels[0].ref_columns.is_empty(),
                 "ref_columns should remain empty when target has no PK"
+            );
+
+            // enrich_definition_for_create step 2 fires the D-06 hard
+            // error. We can call it with a null conn here because step 2
+            // returns BEFORE step 4 ever touches `conn`.
+            let def = crate::model::SemanticViewDefinition {
+                tables,
+                joins: rels,
+                ..Default::default()
+            };
+            let err = crate::ddl::define::enrich_definition_for_create(
+                "v_bad",
+                def,
+                std::ptr::null_mut(),
+                false,
+            )
+            .expect_err("D-06 hard error must fire for FK→no-PK");
+            assert!(
+                err.contains("has no PRIMARY KEY declared but is referenced by FK in"),
+                "D-06 substring missing in error: {err}"
+            );
+            assert!(
+                err.contains(
+                    "(v0.10.0: physical-catalog PK auto-inference removed -- see CHANGELOG.)"
+                ),
+                "D-06 CHANGELOG parenthetical missing in error: {err}"
             );
         }
 
