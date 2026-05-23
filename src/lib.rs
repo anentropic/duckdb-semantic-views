@@ -1,6 +1,5 @@
 pub mod body_parser;
 pub mod catalog;
-pub mod conn_guard;
 pub mod errors;
 pub mod expand;
 pub mod graph;
@@ -324,16 +323,14 @@ mod extension {
     };
 
     // C++ helper for parser hook registration (defined in cpp/src/shim.cpp).
-    // Phase 65: db_handle + catalog_table_present + is_file_backed are
-    // bundled into an OverrideContext (see src/parse.rs::sv_make_override_context)
-    // and attached to the C++ SemanticViewsParserInfo. The cached
-    // duckdb_connection (Phase 62 H1) is gone — every catalog read in
-    // the rewrite_* path now opens its own per-call connection via the
-    // Rust ConnGuard. The legacy db_token-LRU lookup is gone (TECH-DEBT 20).
+    // Phase 62: catalog_conn + is_file_backed are bundled into an
+    // OverrideContext (see src/parse.rs::sv_make_override_context) and
+    // attached to the C++ SemanticViewsParserInfo. The legacy
+    // db_token-LRU lookup is gone (TECH-DEBT 20).
     extern "C" {
         fn sv_register_parser_hooks(
             db_handle: ffi::duckdb_database,
-            catalog_table_present: bool,
+            catalog_conn: ffi::duckdb_connection,
             is_file_backed: bool,
         ) -> bool;
     }
@@ -408,16 +405,15 @@ mod extension {
         let catalog_reader =
             crate::catalog::CatalogReader::new(catalog_conn, catalog_table_present);
 
-        // Register parser_override hook BEFORE table functions. Phase 65:
-        // pass db_handle + catalog_table_present + is_file_backed (no
-        // long-lived connection). The OverrideContext built inside the
-        // C++ shim (via sv_make_override_context) carries those flags
-        // plus the non-owning db_handle; each catalog read in rewrite_*
-        // opens its own per-call ConnGuard. Lifetime is tied to DBConfig.
+        // Register parser_override hook BEFORE table functions. Phase 62:
+        // the catalog connection + is_file_backed flag are bundled into an
+        // OverrideContext (allocated by sv_make_override_context inside the
+        // C++ shim) and attached directly to SemanticViewsParserInfo. No
+        // global LRU map — lifetime is tied to DBConfig.
         // `is_file_backed` gates DDL-time type inference (LIMIT 0 probes
         // only run on file-backed DBs — matches v0.7.1 design).
         let is_file_backed = db_path.as_ref() != ":memory:";
-        if !unsafe { sv_register_parser_hooks(db_handle, catalog_table_present, is_file_backed) } {
+        if !unsafe { sv_register_parser_hooks(db_handle, catalog_conn, is_file_backed) } {
             return Err("Failed to register parser hooks via C++ helper".into());
         }
 

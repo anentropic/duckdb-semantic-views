@@ -21,71 +21,54 @@ use crate::model::{Cardinality, Join, TableRef};
 // CREATE/DROP/ALTER need to know whether a view exists (and for SET/UNSET
 // COMMENT, what its current JSON definition is) before emitting native SQL
 // with friendly errors. The parser_override callback runs in a context
-// without access to the caller's catalog, so we stash a non-owning
-// `db_handle: duckdb_database` on `OverrideContext` and hand the box to
-// the C++ shim. The shim attaches the boxed pointer to its
-// `SemanticViewsParserInfo` (the `parser_info` value DuckDB passes back
-// into the override callback for every parse). Lifetime is tied to the
+// without access to the caller's catalog, so we stash a dedicated
+// `CatalogReader` (populated at extension load) and hand it to the C++ shim
+// as an opaque `Box<OverrideContext>`. The shim attaches the boxed pointer
+// to its `SemanticViewsParserInfo` (the `parser_info` value DuckDB passes
+// back into the override callback for every parse). Lifetime is tied to the
 // `DBConfig`, so destruction happens on DB unload.
 //
-// Phase 62 (Wave 1) replaced the v0.8.0 16-entry `db_token` LRU with the
+// Phase 62 (Wave 1) replaced the v0.8.0 16-entry `db_token` LRU with this
 // direct-attachment design — see TECH-DEBT item 20. The LRU's silent-
 // eviction error class is gone because there is no global map any more;
 // each `parser_info` carries its own `OverrideContext`.
 //
-// Phase 65 (v0.9.1) removed the long-lived `catalog: CatalogReader` field
-// (which carried a leaked `duckdb_connection`). Every `rewrite_*` site
-// now opens a per-call `ConnGuard` from `ctx.db_handle` and drops it
-// before returning. Releasing the connection releases the only
-// extension-owned `shared_ptr<DatabaseInstance>` the parser side held —
-// the fix for the in-process RW→RO reopen busy-spin (LIFE-01 / LIFE-02;
-// Phase 65 RESEARCH §3.3, §6).
-//
-// The reader still sees committed state only — by design. Same-transaction
+// The reader sees committed state only — by design. Same-transaction
 // CREATE-then-ALTER is the documented v0.8.0 limitation.
 
-/// Database handle plus the two flags that gate DDL-time behaviour.
-///
-/// Phase 65: replaces the v0.8.0 / Phase 62 `catalog: CatalogReader` field
-/// (which carried a long-lived `duckdb_connection`) with a non-owning
-/// `db_handle: duckdb_database`. Every parser_override catalog read inside
-/// `rewrite_*` now opens a per-call [`crate::conn_guard::ConnGuard`] from
-/// `db_handle` and drops it before returning. Removing the long-lived
-/// connection releases the only extension-owned `shared_ptr<DatabaseInstance>`
-/// the parser side held — fixing the in-process RW→RO reopen busy-spin
-/// (LIFE-01 / LIFE-02; see Phase 65 RESEARCH §3.3).
-///
-/// `is_file_backed` continues to gate DDL-time type inference (`LIMIT 0`
-/// probes only run on file-backed DBs — matches v0.7.1 design).
-/// `catalog_table_present` continues to short-circuit lookup / list paths
-/// on a read-only host DB whose `semantic_layer._definitions` was never
-/// created (Phase 63 RO-04).
+/// Catalog handle plus an `is_file_backed` flag that gates DDL-time
+/// type inference. `LIMIT 0` probes used for type inference depend on
+/// user tables having been committed; for in-memory DBs we follow the
+/// v0.7.1 behaviour and skip inference entirely.
 ///
 /// Owned by the C++ shim as `Box<OverrideContext>` (one per
 /// `SemanticViewsParserInfo`, i.e. one per extension-LOAD-per-DB).
 #[cfg(feature = "extension")]
 pub struct OverrideContext {
-    // PHASE-65-GUARD: do not reintroduce duckdb_connection or CatalogReader field here.
-    pub db_handle: libduckdb_sys::duckdb_database,
-    pub catalog_table_present: bool,
+    pub catalog: crate::catalog::CatalogReader,
     pub is_file_backed: bool,
 }
 
-// SAFETY (Phase 65): `db_handle` is a non-owning `duckdb_database` pointer.
-// The underlying `DatabaseInstance` owns its own synchronisation;
-// `duckdb_connect` / `duckdb_disconnect` are documented thread-safe against
-// a shared `duckdb_database`. The Box pointer crosses through C++ as `void*`
-// via `sv_make_override_context` → `SemanticViewsParserInfo`; the Send +
-// Sync impls preserve the pre-Phase-65 thread-safety contract that the
-// removed `catalog: CatalogReader` field used to provide (see
-// `src/catalog.rs::CatalogReader` Send/Sync impls).
 #[cfg(feature = "extension")]
-unsafe impl Send for OverrideContext {}
-#[cfg(feature = "extension")]
-unsafe impl Sync for OverrideContext {}
-
-// No custom Drop — Box reclaims itself; the db_handle is a non-owning
-// pointer (see Phase 65 RESEARCH §3.3).
+impl Drop for OverrideContext {
+    fn drop(&mut self) {
+        // Phase 62 Q2 — INTENTIONAL LEAK of self.catalog.conn (the duckdb_connection).
+        //
+        // ~SemanticViewsParserInfo (and therefore Drop for OverrideContext) fires
+        // during ~DBConfig, AFTER ~DatabaseInstance has already reset
+        // connection_manager (duckdb.cpp:276819). Calling duckdb_disconnect here
+        // would invoke ~Connection() → ConnectionManager::RemoveConnection() on
+        // the destroyed manager — use-after-free.
+        //
+        // The leak is bounded at ONE duckdb_connection per DB ever opened in this
+        // process (a few KB each). This matches v0.8.0 commit 680a967 which shipped
+        // successfully with the same leak. The Rust-side Box<OverrideContext>
+        // allocation itself IS reclaimed (this Drop runs and the Box dealloc fires).
+        //
+        // See: .planning/phases/62-caret-restoration-lru-removal/62-RESEARCH.md §Q2.
+        // Resolves TECH-DEBT item 20 (silent LRU eviction class) by removing the LRU.
+    }
+}
 
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.
 pub const PARSE_NOT_OURS: u8 = 0;
@@ -1784,25 +1767,15 @@ pub fn rewrite_to_native_sql(
     }
 }
 
-/// DROP / ALTER native-SQL emission. Phase 65 opens a per-call
-/// [`crate::conn_guard::ConnGuard`] on `ctx.db_handle` for the catalog
-/// existence checks performed by the inner helpers, then drops it before
-/// return. Replaces the v0.8.0 / Phase 62 long-lived `catalog_conn` (H1) —
-/// see Phase 65 RESEARCH §5.
+/// DROP / ALTER native-SQL emission. Phase 62 takes `&OverrideContext`
+/// directly — the LRU `db_token` indirection is gone (TECH-DEBT 20).
 #[cfg(feature = "extension")]
 fn rewrite_drop_or_alter(
     ctx: &OverrideContext,
     fn_name: &str,
     args: &[String],
 ) -> Result<Option<String>, ParseError> {
-    // Open a per-call connection via the guard. Drop closes it before
-    // returning from this function.
-    let guard =
-        unsafe { crate::conn_guard::ConnGuard::open(ctx.db_handle) }.map_err(|e| ParseError {
-            message: format!("catalog connection failed: {e}"),
-            position: None,
-        })?;
-    let catalog = crate::catalog::CatalogReader::new(guard.raw(), ctx.catalog_table_present);
+    let catalog = ctx.catalog;
 
     match (fn_name, args.len()) {
         ("drop_semantic_view", 1) => rewrite_drop(&catalog, &args[0], false),
@@ -1911,7 +1884,7 @@ fn emit_native_create_sql(
     // relative to the catalog INSERT this function performs.
     //
     // The shadow shadows the `&str` parameter with an owned `String`; all
-    // subsequent uses (escape_sql_arg, catalog.exists, error message
+    // subsequent uses (escape_sql_arg, ctx.catalog.exists, error message
     // formatting, enrich_definition_for_create) continue to compile because
     // `String` auto-derefs to `&str` where needed.
     let name = normalize_view_name(name).map_err(|e| ParseError {
@@ -1923,69 +1896,37 @@ fn emit_native_create_sql(
     // Parse-time existence check: fast path for the committed-state case.
     // `name` is guaranteed to be the bare view identifier — defensively
     // normalised at function entry. The catalog row's PK column stores the
-    // same bare value, so `catalog.exists(name)` is a byte-for-byte
+    // same bare value, so `ctx.catalog.exists(name)` is a byte-for-byte
     // match. Same-txn CREATE-then-CREATE slips past this (the catalog
     // connection only sees committed rows), so the generated SQL below
     // also guards against the in-flight case via a CASE+error() / WHERE
     // NOT EXISTS pattern that runs on the caller's transaction.
-    //
-    // Phase 65: open a per-call ConnGuard from `ctx.db_handle` for the
-    // existence pre-check. The guard drops at end of scope and
-    // `duckdb_disconnect` fires before we move on to the enrichment phase
-    // (which opens its own guard below). Splitting the two phases into
-    // two short-lived connections (instead of one guard spanning both)
-    // mirrors the per-call shape adopted everywhere else in the
-    // parser_override path — every catalog-read site holds the
-    // connection for exactly the duration of its own work.
-    {
-        let guard = unsafe { crate::conn_guard::ConnGuard::open(ctx.db_handle) }.map_err(|e| {
-            ParseError {
-                message: format!("catalog connection failed: {e}"),
-                position: None,
-            }
-        })?;
-        let catalog = crate::catalog::CatalogReader::new(guard.raw(), ctx.catalog_table_present);
+    let exists = ctx.catalog.exists(&name).map_err(|e| ParseError {
+        message: format!("catalog lookup failed: {e}"),
+        position: None,
+    })?;
 
-        let exists = catalog.exists(&name).map_err(|e| ParseError {
-            message: format!("catalog lookup failed: {e}"),
-            position: None,
-        })?;
-
-        if exists && !or_replace {
-            if if_not_exists {
-                return Ok(Some(format!(
-                    "SELECT '{name_escaped}'::VARCHAR AS view_name WHERE 1 = 0"
-                )));
-            }
-            return Err(ParseError {
-                message: format!(
-                    "semantic view '{name}' already exists; use CREATE OR REPLACE \
-                     SEMANTIC VIEW to overwrite"
-                ),
-                position: None,
-            });
+    if exists && !or_replace {
+        if if_not_exists {
+            return Ok(Some(format!(
+                "SELECT '{name_escaped}'::VARCHAR AS view_name WHERE 1 = 0"
+            )));
         }
-        // existence guard drops here → duckdb_disconnect
-    }
-
-    // Second per-call ConnGuard for enrichment (PK lookup, LIMIT 0 type
-    // inference, fact typing). Drops at function return.
-    let guard =
-        unsafe { crate::conn_guard::ConnGuard::open(ctx.db_handle) }.map_err(|e| ParseError {
-            message: format!("catalog connection failed: {e}"),
+        return Err(ParseError {
+            message: format!(
+                "semantic view '{name}' already exists; use CREATE OR REPLACE \
+                 SEMANTIC VIEW to overwrite"
+            ),
             position: None,
-        })?;
+        });
+    }
 
     // `is_file_backed` matches the legacy `DefineState::persist_conn.is_some()`
     // behaviour: type inference runs only for file-backed DBs (v0.7.1 design).
-    //
-    // Phase 65: reuse `guard.raw()` (the same per-call connection that
-    // performed the existence check above) so we pay one `duckdb_connect`
-    // per CREATE rather than two. The guard drops at function return.
     let enriched_json = crate::ddl::define::enrich_definition_for_create(
         &name,
         def,
-        guard.raw(),
+        ctx.catalog.raw(),
         ctx.is_file_backed,
     )
     .map_err(|e| ParseError {
@@ -2086,20 +2027,12 @@ fn rewrite_yaml_file_create(
         }
     };
 
-    // Read file via read_text(); this is one DuckDB statement on a
-    // per-call connection opened from `ctx.db_handle`. The guard drops at
-    // the end of this function so `duckdb_disconnect` fires before we
-    // return into emit_native_create_sql (which opens its own per-call
-    // guard — see Phase 65 RESEARCH §5).
-    let yaml_guard =
-        unsafe { crate::conn_guard::ConnGuard::open(ctx.db_handle) }.map_err(|e| ParseError {
-            message: format!("FROM YAML FILE: catalog connection failed: {e}"),
-            position: None,
-        })?;
+    // Read file via read_text(); this is one DuckDB statement on the catalog
+    // connection so the user's transaction state is untouched.
     let path_escaped = file_path.replace('\'', "''");
     let read_sql = format!("SELECT content FROM read_text('{path_escaped}')");
     let mut result =
-        unsafe { crate::query::table_function::execute_sql_raw(yaml_guard.raw(), &read_sql) }
+        unsafe { crate::query::table_function::execute_sql_raw(ctx.catalog.raw(), &read_sql) }
             .map_err(|e| ParseError {
                 message: format!("FROM YAML FILE failed: {e}"),
                 position: None,
@@ -2511,29 +2444,16 @@ fn strip_outer_quotes(s: &str) -> Option<&str> {
 }
 
 /// FFI entry point: construct a heap-boxed `OverrideContext` and return its
-/// raw pointer to the C++ shim.
-///
-/// Phase 65 (v0.9.1): the signature changed from
-/// `(duckdb_connection, bool)` to `(duckdb_database, bool, bool)` — the
-/// `OverrideContext` no longer caches a long-lived connection. Every
-/// `rewrite_*` site opens a per-call [`crate::conn_guard::ConnGuard`] from
-/// `db_handle` and drops it before returning. Removing the cached
-/// connection releases the only extension-owned
-/// `shared_ptr<DatabaseInstance>` the parser side held — fixing the
-/// in-process RW→RO reopen busy-spin (LIFE-01 / LIFE-02; Phase 65
-/// RESEARCH §6).
-///
-/// `catalog_table_present` is still captured at LOAD time so reader-side
-/// short-circuits (Phase 63 RO-04) continue to work without a fresh
-/// `information_schema.tables` probe per call.
+/// raw pointer to the C++ shim. Phase 62 replaced the per-load `db_token`
+/// LRU with this direct ownership: the C++ shim stashes the returned
+/// pointer inside its `SemanticViewsParserInfo` and hands it back to
+/// `sv_parser_override_rust` on every parse.
 ///
 /// # Safety
 ///
-/// - `db` must be a valid (or null) `duckdb_database`. The pointer is
-///   stored verbatim inside the boxed `OverrideContext`; it is a
-///   non-owning reference — the underlying `DatabaseInstance` outlives the
-///   parser-info struct because the C++ shim's `SemanticViewsParserInfo`
-///   is destroyed before the database itself.
+/// - `conn` must be a valid (or null) `duckdb_connection`. The pointer is
+///   stored verbatim inside the boxed `CatalogReader`; it is intentionally
+///   NOT closed by the resulting `Drop` (see `Drop for OverrideContext`).
 /// - The returned pointer must be passed to `sv_drop_override_context`
 ///   exactly once when the C++ shim's `SemanticViewsParserInfo` is
 ///   destroyed. Never call `sv_drop_override_context` more than once on
@@ -2541,14 +2461,21 @@ fn strip_outer_quotes(s: &str) -> Option<&str> {
 #[cfg(feature = "extension")]
 #[no_mangle]
 pub unsafe extern "C" fn sv_make_override_context(
-    db: libduckdb_sys::duckdb_database,
-    catalog_table_present: bool,
+    conn: libduckdb_sys::duckdb_connection,
     is_file_backed: bool,
 ) -> *mut std::ffi::c_void {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Phase 63: pass `catalog_table_present=true`. The OverrideContext is
+        // built once at LOAD by sv_register_parser_hooks; on writable DBs the
+        // table is always present (init_catalog just CREATE'd it). On a
+        // read-only DB, the parser_override path is for DDL — the rewritten
+        // DML on the caller's connection will surface DuckDB's standard
+        // read-only error verbatim (RO-05). For pre-checks against a
+        // fresh read-only DB without a `_definitions` table, the catalog
+        // query may surface a catalog error instead — RO-05's "or the
+        // closest equivalent" wording covers this. See 63-RESEARCH.md §3 Q5.
         let ctx = Box::new(OverrideContext {
-            db_handle: db,
-            catalog_table_present,
+            catalog: crate::catalog::CatalogReader::new(conn, true),
             is_file_backed,
         });
         Box::into_raw(ctx) as *mut std::ffi::c_void
@@ -2559,15 +2486,14 @@ pub unsafe extern "C" fn sv_make_override_context(
 /// FFI entry point: re-box and drop the `OverrideContext` allocated by
 /// `sv_make_override_context`. The Rust-side `Box` allocation is freed.
 ///
-/// Phase 65: there is no longer a `duckdb_connection` to manage — the
-/// `OverrideContext` carries a non-owning `db_handle: duckdb_database`
-/// only. The Phase 62 §Q2 destruction-order question is moot.
-///
 /// # Safety
 ///
 /// - `ctx_ptr` must be a value previously returned by
 ///   `sv_make_override_context`, or null.
 /// - Must not be called more than once on the same pointer (use-after-free).
+/// - The `Drop for OverrideContext` impl deliberately does NOT call
+///   `duckdb_disconnect` on the inner connection — see Phase 62 RESEARCH §Q2
+///   (destruction-order showstopper). The connection is intentionally leaked.
 #[cfg(feature = "extension")]
 #[no_mangle]
 pub unsafe extern "C" fn sv_drop_override_context(ctx_ptr: *mut std::ffi::c_void) {
@@ -2983,51 +2909,58 @@ mod tests {
     }
 
     // ===================================================================
-    // Phase 65 (v0.9.1): OverrideContext carries db_handle, no Drop.
-    // The Phase 62 §Q2 destruction-order question is moot because there
-    // is no longer a connection to leak. Tests below pin the new struct
-    // shape (no `catalog: CatalogReader`, no `conn:` field) and verify
-    // that Box ctor/dtor round-trip without panicking. The B13 structural
-    // guard (Plan 04) re-greps for the absence of the old fields.
+    // Phase 62: OverrideContext direct-attach (replaces the v0.8.0 LRU).
+    // The Drop impl MUST NOT call duckdb_disconnect (RESEARCH §Q2 —
+    // destruction-order showstopper). The Box<OverrideContext> Rust
+    // allocation IS reclaimed; the inner duckdb_connection leaks.
     // ===================================================================
 
-    /// Structural guard: OverrideContext must carry `db_handle` of the
-    /// `duckdb_database` pointer type, NOT a `CatalogReader` or a raw
-    /// `duckdb_connection`. Compile-time check via field assignment +
-    /// type-equality through `_: duckdb_database = ctx.db_handle`.
+    /// Sentinel marker for the destructor leak test. Stored at a known
+    /// memory location so the test can verify the destructor did NOT
+    /// touch `self.catalog.conn` (which would happen if a stray
+    /// `duckdb_disconnect` call slipped back in).
     #[cfg(feature = "extension")]
     #[test]
-    fn override_context_carries_db_handle_not_conn() {
+    fn override_context_drop_does_not_disconnect() {
+        // Allocate a u64 sentinel on the heap and hand its pointer to the
+        // CatalogReader as if it were a duckdb_connection. If Drop calls
+        // duckdb_disconnect on that pointer, the test process would
+        // segfault (libduckdb would deref it as a Connection*). We only
+        // assert that Drop returns cleanly — survival is the contract.
+        let sentinel: Box<u64> = Box::new(0xDEAD_BEEF_CAFE_BABE);
+        let raw = Box::into_raw(sentinel);
         let ctx = OverrideContext {
-            db_handle: std::ptr::null_mut(),
-            catalog_table_present: false,
+            catalog: crate::catalog::CatalogReader::new(
+                raw as libduckdb_sys::duckdb_connection,
+                true,
+            ),
             is_file_backed: false,
         };
-        // Type-coerce through the expected duckdb_database type. If a
-        // future refactor reintroduced a `catalog: CatalogReader` field or
-        // changed `db_handle` to a `duckdb_connection`, this line fails to
-        // compile.
-        let _: libduckdb_sys::duckdb_database = ctx.db_handle;
-        assert!(!ctx.catalog_table_present);
-        assert!(!ctx.is_file_backed);
+        // Drop runs here at end of scope. If duckdb_disconnect were
+        // called, libduckdb would interpret `raw` as a Connection*, dispatch
+        // through ConnectionManager and likely crash. Survival of this
+        // function == Drop body did not call duckdb_disconnect.
+        drop(ctx);
+        // Reclaim the sentinel ourselves (Drop intentionally leaked it).
+        unsafe {
+            let _ = Box::from_raw(raw);
+        }
     }
 
     #[cfg(feature = "extension")]
     #[test]
     fn sv_make_and_drop_override_context_round_trip() {
-        // Construct via FFI ctor with a null db handle (intentionally —
-        // never dereferenced, just round-tripped through the Box). Phase
-        // 65 signature: (duckdb_database, bool, bool).
+        // Construct via FFI ctor with a null connection (intentionally —
+        // never dereferenced, just round-tripped through the Box).
         let ptr = unsafe {
             sv_make_override_context(
-                std::ptr::null_mut() as libduckdb_sys::duckdb_database,
-                true,  // catalog_table_present
-                false, // is_file_backed
+                std::ptr::null_mut() as libduckdb_sys::duckdb_connection,
+                false,
             )
         };
         assert!(!ptr.is_null(), "ctor must return non-null for a valid Box");
-        // Destruct via FFI dtor — must not panic. No connection to close
-        // in the new shape.
+        // Destruct via FFI dtor — must not panic, must not call
+        // duckdb_disconnect (sentinel-test above pins that contract).
         unsafe { sv_drop_override_context(ptr) };
     }
 
@@ -3136,9 +3069,8 @@ mod tests {
         // up the error reporting via caret rendering.
         let ctx_ptr = unsafe {
             sv_make_override_context(
-                std::ptr::null_mut() as libduckdb_sys::duckdb_database,
-                true,  // catalog_table_present
-                false, // is_file_backed
+                std::ptr::null_mut() as libduckdb_sys::duckdb_connection,
+                false,
             )
         };
         assert!(!ctx_ptr.is_null());
