@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v0.9.1
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
-status: ready-to-plan
-stopped_at: "65-CONTEXT.md rewritten under B-prime architecture (D-14..D-22) after empirical falsification of Option A and validation of per-call C++ Connection from ClientContext (both write + read paths). Scope expanded to fold in 14+2 read-side functions per REQUIREMENTS.md escape clause. Plans 02-04 archived to *-PRE-BPRIME-*.md. Next: /gsd-plan-phase 65 to create fresh plans (likely 5-6 plans on top of shipped Plan 01)."
-last_updated: "2026-05-23T00:00:00.000Z"
-last_activity: 2026-05-23 -- Phase 65 CONTEXT.md rewritten under B-prime (scope expanded to fold in read path); ready for replan
+status: executing
+stopped_at: "Plan 02 (replanned) halted at Task 1 checkpoint:decision — A2-DEADLOCK + BIND-THREAD-RC1 invalidate Option A; recommended path is escalate via /gsd:discuss-phase 65 --assumptions"
+last_updated: "2026-05-23T00:45:16.697Z"
+last_activity: 2026-05-23 -- Phase 65 planning complete
 progress:
   total_phases: 2
   completed_phases: 0
-  total_plans: 1
-  completed_plans: 1
+  total_plans: 7
+  completed_plans: 3
   percent: 0
 ---
 
@@ -27,9 +27,9 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 
 Phase: 65 (overridecontext-connection-teardown) — READY TO PLAN (B-prime architecture)
 Plan: 1 of ~6 complete (Plan 01 shipped; Plans 02-04 archived as PRE-BPRIME; fresh plans needed)
-Status: Ready for /gsd-plan-phase 65
+Status: Ready to execute
 Progress: [██░░░░░░░░] ~17%
-Last activity: 2026-05-23 -- CONTEXT.md rewritten under B-prime (D-14..D-22); read-path folded into scope per spike evidence
+Last activity: 2026-05-23 -- Phase 65 planning complete
 
 ## Performance Metrics
 

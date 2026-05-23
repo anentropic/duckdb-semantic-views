@@ -208,7 +208,7 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
 <details open>
 <summary>🚧 v0.9.1 Connection-Lifecycle & Catalog-Context Fixes (Phases 65-66) -- IN PROGRESS</summary>
 
-- [ ] Phase 65: OverrideContext Connection Teardown (1/~6 plans; CONTEXT.md rewritten 2026-05-23 under B-prime architecture; scope expanded to fold in 14+2 read-side functions per REQUIREMENTS.md escape clause; ready for /gsd-plan-phase)
+- [ ] Phase 65: OverrideContext Connection Teardown (1/7 plans; Plans 02-07 created 2026-05-23 under B-prime architecture; scope folded in 14+2 read-side functions per REQUIREMENTS.md escape clause)
 - [ ] Phase 66: Expansion Qualification Across All Paths + ADBC Tests (0/? plans) -- scope to be revisited after Phase 65 lands (likely shrinks to REL-only since B-prime eliminates the H2 catalog-search-path divergence root cause; do not pre-commit shape until empirically verified)
 
 ### Phase Details
@@ -223,9 +223,14 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
   3. `test/integration/test_readonly_load.py` includes a new `test_in_process_bootstrap_then_readonly` scenario plus read-side variants that exercise SELECT through semantic_view() and list/describe/show after close; all guarded by watchdog; all fail on v0.9.0 baseline and pass on v0.9.1.
   4. `.planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md` is updated in place with the resolution and a forward pointer to v0.9.1.
   5. v0.8.0 transactional DDL semantics preserved byte-identical (CREATE inside user BEGIN/COMMIT still participates in the transaction); existing Phase 58 ADBC transactional tests stay green.
-**Plans**: ~6 plans (Plan 01 shipped; Plans 02-04 archived as PRE-BPRIME; replan via /gsd-plan-phase against the new 65-CONTEXT.md)
-  - 65-01-PLAN.md — Wave-0 spikes + ConnGuard RAII + watchdog test scaffolding (B1-B4, B11) — SHIPPED
-  - Plan 02..06 (NEW) — to be created by /gsd-plan-phase 65 against the B-prime CONTEXT.md (likely shape: revert Plan 02 partial + add C++ Catalog API shim; port write path via plan_function; port read path part 1; port read path part 2; retire H1+H2 + LIFE-04 + close-out)
+**Plans**: 7 plans
+  - [x] 65-01-PLAN.md — Wave-0 spikes + ConnGuard RAII + watchdog test scaffolding (B1-B4, B11) — SHIPPED
+  - [ ] 65-02-PLAN.md — Revert Plan 02 partial commits + add C++ sv_register_table_function helper (infrastructure only, no production wiring)
+  - [ ] 65-03-PLAN.md — Deregister sv_parser_override; promote sv_parse_function + sv_plan_function (per-call C++ Connection probe for catalog reads); retire H1 catalog_conn; preserve transactional DDL byte-identical
+  - [ ] 65-04-PLAN.md — Port 7 read-side functions (list/show_columns/show_dims/show_dims_for_metric/show_metrics/show_facts incl _all variants) to C++ Catalog API
+  - [ ] 65-05-PLAN.md — Port remaining 6+2 functions (describe/show_materializations/scalars/semantic_view/explain) + add sv_register_scalar_function helper; retire H2 query_conn
+  - [ ] 65-06-PLAN.md — Retire TEMP-PLAN-04 catalog_conn_temp; structural PHASE-65-GUARD Rust unit test; LIFE-04 ledger close-out; TECH-DEBT 25 + 26 filed; just test-all green
+  - [ ] 65-07-PLAN.md — Close-out: dead VTab/VScalar impl deletion + Plan 01 allow-attribute cleanup; just ci regression evidence; phase-level SUMMARY.md
 
 ### Phase 66: Expansion Qualification Across All Paths + ADBC Tests
 **Goal**: Make `FROM semantic_view(...)` work through ADBC and any other client whose catalog/schema search path diverges from the extension's `query_conn`, by emitting fully-qualified `db.schema.table` references from every expansion site — and ship the milestone (CHANGELOG, version bump, CI green).
