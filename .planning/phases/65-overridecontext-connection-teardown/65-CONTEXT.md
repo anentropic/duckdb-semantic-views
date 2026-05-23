@@ -277,5 +277,20 @@ A Rust unit test in `src/lib.rs` (or a dedicated `tests/no_long_lived_conn.rs`) 
 
 ---
 
+## Resolutions during plan-phase (2026-05-23)
+
+These resolve open questions surfaced by `65-RESEARCH.md` (assumptions A1, A3, A7):
+
+- **A7 — 8 enumerated ALTER variants are NOT in scope.** D-09's pure-SQL list and D-10's helper-TF list (combined: 11 ALTER variants) were aspirational. Only 3 ALTER variants exist in `src/parse.rs` today: RENAME TO, SET COMMENT, UNSET COMMENT. The other 8 (MAKE PRIVATE/PUBLIC, SET TAG, ADD SYNONYMS, ADD DIMENSION/METRIC/FACT, DROP DIMENSION/METRIC/FACT/RELATIONSHIP, ADD RELATIONSHIP) are **dropped as non-features** — Snowflake's semantic-views surface does not include them. CLAUDE.md anchor: "If in doubt about SQL syntax or behaviour refer to what Snowflake semantic views does." Plan 04 migrates only the 3 existing variants under the read-elimination architecture plus the CREATE FROM YAML FILE rewrite (D-11).
+- **A1 — JSON mechanism for Plan 04.** `json_set` / `json_remove` are NOT in DuckDB v1.5.2. Plan 04 uses `json_merge_patch` (RFC-7396) instead. Wave 0 of Plan 04 is a 5-minute sqllogictest spike confirming null-as-delete semantics for UNSET COMMENT before the migration tasks run.
+- **A3 — Rust↔C++ bridge spike for Plan 05.** The existing spike (`65-READ-PATH-SPIKE.md`) is purely C++ and never exercises the Rust callback path. Plan 05 Wave 0 is a minimal spike confirming Rust callbacks are reachable from a C++ bind callback via `sv_register_table_function` and that `Connection(*context.db)` works from the bridged callback. The 17-callback migration runs after the spike.
+- **A2 — `sv_register_table_function` is NOT in HEAD.** Research found the Plan 02 partial's C++ shim was self-reverted at the end of the spike. D-04 ("keep the surviving infrastructure") is reframed: there is no committed infrastructure to keep; Plan 04 introduces the shim from scratch (~150 LOC of C++) using the spike code as template. Adjusts Plan 04 scope but not architecture.
+- **Read-side callback count for Plan 05.** Inventory is 17 (15 table functions + 2 scalars), not the 12 listed in D-14. CONTEXT folded `show_X` / `show_X_all` siblings. Plan 05 migrates all 17 plus retires H2 in its final commit (D-15 unchanged).
+
+These resolutions are locked. Plans 03–06 honor them; downstream agents (planner, executor, checker) treat them as part of the canonical phase context.
+
+---
+
 *Phase: 65-overridecontext-connection-teardown*
 *Context gathered: 2026-05-23 via /gsd-discuss-phase 65 (third re-plan; under read-elimination architecture)*
+*Plan-phase resolutions appended: 2026-05-23*

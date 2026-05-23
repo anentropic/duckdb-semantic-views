@@ -5,11 +5,14 @@ status: planned
 nyquist_compliant: true
 wave_0_complete: false
 created: 2026-05-21
+last_refresh: 2026-05-23
 ---
 
 # Phase 65 — Validation Strategy
 
-> Per-phase validation contract for feedback sampling during execution. Derived from RESEARCH.md §7. Anchored to DuckDB v1.5.2.
+> **Refresh note (2026-05-23):** This file was first written under the PRE-BPRIME architecture. Rows B1–B12 below remain authoritative (watchdog tests B1–B4 + B11 carry forward per D-03; regression guards B5–B10, B12 still apply). Rows B13/B14 are **obsolete** under read-elimination (they referenced `OverrideContext.db_handle` and `src/conn_guard.rs`, both being deleted). The canonical per-plan validation strategy under the new architecture lives in `65-RESEARCH.md §10 (Validation Architecture)`. The planner threads B-IDs into per-task verification while honoring the RESEARCH.md §10 plan-level breakdown.
+
+> Per-phase validation contract for feedback sampling during execution. Derived from RESEARCH.md §7 (B-ID inventory) + §10 (per-plan strategy). Anchored to DuckDB v1.5.2.
 
 ---
 
