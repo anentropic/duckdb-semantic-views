@@ -4,14 +4,14 @@ milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: planning
 stopped_at: Phase 65 context gathered (third re-plan; read-elimination architecture; 4-plan structure 03-06)
-last_updated: "2026-05-23T17:29:46.004Z"
-last_activity: 2026-05-23 -- Milestone reframed v0.9.1 → v0.10.0; B-prime archived; ALTER-RC0 spike landed
+last_updated: "2026-05-23T21:47:40.954Z"
+last_activity: 2026-05-23 -- Phase 65 planning complete
 progress:
   total_phases: 2
-  completed_phases: 1
-  total_plans: 2
+  completed_phases: 0
+  total_plans: 6
   completed_plans: 4
-  percent: 50
+  percent: 0
 ---
 
 # Project State
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 Phase: 65 (overridecontext-connection-teardown) — REPLANNING under read-elimination architecture
 Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial)
 B-prime plans (03-07) archived; new plans pending /gsd-discuss-phase + /gsd-plan-phase
-Last activity: 2026-05-23 -- Milestone reframed v0.9.1 → v0.10.0; B-prime archived; ALTER-RC0 spike landed
+Last activity: 2026-05-23 -- Phase 65 planning complete
 
 ## Performance Metrics
 
