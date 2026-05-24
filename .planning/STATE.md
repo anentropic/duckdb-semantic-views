@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: executing
-stopped_at: Phase 65 Plan 03 complete (parser_override slimming wave; metadata-via-SQL; D-06 hard error; conn_guard.rs deleted)
-last_updated: "2026-05-24T00:50:00.000Z"
-last_activity: 2026-05-24 -- Plan 65-03 complete; 49/49 just test-sql; 933/933 nextest; 6/6 ADBC transactions
+stopped_at: Phase 65 Plan 04 complete (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function shim; __sv_compute_create_from_yaml helper TF; pure-SQL json_merge_patch UPDATE for ALTER COMMENT)
+last_updated: "2026-05-24T01:30:00.000Z"
+last_activity: 2026-05-24 -- Plan 65-04 complete; 52/52 just test-sql; 933/933 nextest; 6/6 ADBC; 8/8 test_create_from_yaml_v010
 progress:
   total_phases: 2
   completed_phases: 0
   total_plans: 6
-  completed_plans: 3
-  percent: 50
+  completed_plans: 4
+  percent: 67
 ---
 
 # Project State
@@ -26,10 +26,10 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 ## Current Position
 
 Phase: 65 (overridecontext-connection-teardown) — EXECUTING
-Plan: 3 of 6 complete (Plan 04 next)
-Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection)
-Next plan: 65-04 ALTER architecture wave (json_merge_patch UPDATE rewrites for RENAME / SET COMMENT / UNSET COMMENT; helper TF for CREATE FROM YAML FILE)
-Last activity: 2026-05-24 -- Plan 65-03 complete
+Plan: 4 of 6 complete (Plan 05 next)
+Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership)
+Next plan: 65-05 read-path migration wave (17 read-side bind callbacks migrate to sv_register_table_function with per-call Connection; final commit retires H2 query_conn at src/lib.rs:498-507)
+Last activity: 2026-05-24 -- Plan 65-04 complete
 
 ## Performance Metrics
 
@@ -91,6 +91,15 @@ Recent decisions affecting current work:
 - [Phase 65 P03]: phase29/phase30/phase39 sqllogictest FACT DATA_TYPE expectations updated to (empty); Plan 05's read-side bind probe will restore populated types and tests will need re-update
 - [Phase 65 P03]: H1 catalog_conn at src/lib.rs:386-410 still allocated but unused by parser_override CREATE path; Plan 06 retires the allocation
 - [Phase 65 P03]: D-21 transactional invariant intact — test_adbc_transactions.py 6/6 PASS; D-03 watchdog tests still TimeoutError (expected per 65-01-SUMMARY — flip green at Plan 06 only)
+- [Phase 65 P04]: A1 resolved empirically — DuckDB v1.5.2 json_merge_patch honors RFC-7396 null-as-delete (Wave 0 sqllogictest spike). ALTER UNSET COMMENT therefore uses constant patch literal `{"comment":null}` with no helper TF
+- [Phase 65 P04]: A2 honored — sv_register_table_function introduced from scratch (NOT a revert of a partial Plan 02 commit; that commit was self-reverted at end of spike). ~250 LOC new C++ in shim.cpp + 71-line new shim.hpp; within RESEARCH §5.4 budget
+- [Phase 65 P04]: A7 honored — only the 3 ALTER variants present in HEAD (RENAME TO, SET COMMENT, UNSET COMMENT) were migrated; the 8 enumerated additional variants are NOT implemented (Snowflake non-features)
+- [Phase 65 P04]: D-09 superseded — json_set / json_remove are NOT in DuckDB v1.5.2; use json_merge_patch instead. JSON patch construction uses serde_json::to_string for internal-quote escaping
+- [Phase 65 P04]: __sv_compute_create_from_yaml helper TF returns metadata-less JSON; outer INSERT wraps with json_merge_patch + json_object('created_on',..., 'database_name',..., 'schema_name',...) on caller's conn so D-21 transactional contract preserved (matches Plan 03 inline CREATE byte-for-byte)
+- [Phase 65 P04]: rewrite_yaml_file_create no longer reads files in Rust; the file read happens inside the helper TF's bind callback via Connection probe(*context.db) + read_text() with the path escaped before embedding
+- [Phase 65 P04]: parser_override has ZERO remaining OverrideContext-catalog consumers (rewrite_drop / rewrite_alter_rename / rewrite_alter_comment / emit_native_create_sql all retain ctx.catalog.exists for "does not exist" wording -- Plan 06 retires); H1 catalog_conn at src/lib.rs:386-410 is truly unused by every parser_override path after Plan 04
+- [Phase 65 P04]: D-21 verified end-to-end: test_adbc_transactions.py 6/6 PASS, test_create_from_yaml_v010.py T7 BEGIN+CREATE+ROLLBACK leaves _definitions empty, 65_alter_comment_merge_patch.test B5 BEGIN+ALTER+ROLLBACK restores pre-tx comment
+- [Phase 65 P04]: Cross-database ALTER and CREATE FROM YAML FILE (ATTACH 'db2'; ALTER db2.v) is out-of-scope for v0.10.0 — the v0.9.0 extension only initializes semantic_layer._definitions on the LOAD database; Phase 66 follow-up territory
 
 ### Pending Todos
 
@@ -137,9 +146,11 @@ Recent decisions affecting current work:
 | Phase 64 P04 | 6 | 3 tasks | 12 files |
 | Phase 65 P01 | 31min | 3 tasks | 5 files |
 | Phase 65 P02 (replanned, halted) | ~30min | 2 of 6 tasks (Wave-0 spikes only) | 1 file (SPIKES.md only — both spikes reverted to disk-empty before commit) |
+| Phase 65 P03 | 1h | 3 tasks | 9 files |
+| Phase 65 P04 | 2h | 4 tasks | 10 files |
 
 ## Session Continuity
 
-Last session: 2026-05-23T17:29:45.989Z
-Stopped at: Phase 65 context gathered (third re-plan; read-elimination architecture; 4-plan structure 03-06)
-Resume file: .planning/phases/65-overridecontext-connection-teardown/65-CONTEXT.md
+Last session: 2026-05-24T01:30:00.000Z
+Stopped at: Phase 65 Plan 04 complete (4 of 6 plans done; Plan 05 next -- read-path migration wave; H2 query_conn retirement at end)
+Resume file: .planning/phases/65-overridecontext-connection-teardown/65-04-SUMMARY.md
