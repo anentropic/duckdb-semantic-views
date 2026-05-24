@@ -307,7 +307,13 @@ mod extension {
         ddl::{
             describe::DescribeSemanticViewVTab,
             get_ddl::GetDdlScalar,
-            list::{ListSemanticViewsVTab, ListTerseSemanticViewsVTab},
+            // ListSemanticViewsVTab retired in Plan 05 Task 1 (Wave 0 bridge
+            // spike) — registration now routes through the C++ Catalog API
+            // via `sv_register_list_semantic_views`. The struct + impl in
+            // src/ddl/list.rs is marked `#[allow(dead_code)]` until Plan 05
+            // is fully archived; deletion happens once the remaining 16
+            // read-side migrations have validated the spike pattern.
+            list::ListTerseSemanticViewsVTab,
             read_yaml::ReadYamlFromSemanticViewScalar,
             show_columns::ShowColumnsInSemanticViewVTab,
             show_dims::{ShowSemanticDimensionsAllVTab, ShowSemanticDimensionsVTab},
@@ -333,6 +339,16 @@ mod extension {
             catalog_conn: ffi::duckdb_connection,
             is_file_backed: bool,
         ) -> bool;
+
+        // Phase 65 Plan 05 (Task 1 / Wave 0 bridge spike) — register the
+        // `list_semantic_views()` table function via the C++ Catalog API
+        // path. The bind callback opens a per-call `Connection(*context.db)`
+        // and bridges to the Rust dispatcher
+        // `sv_list_semantic_views_bind_rust` (defined in src/ddl/list.rs)
+        // by casting the stack `Connection *` to `duckdb_connection`. See
+        // `65-05-SPIKE-SUMMARY.md` for the bridge mechanism and the LOC
+        // extrapolation for the remaining 16 read-side migrations.
+        fn sv_register_list_semantic_views(db_handle: ffi::duckdb_database) -> bool;
     }
 
     /// Core initialization logic, called with both the high-level Connection and
@@ -418,10 +434,16 @@ mod extension {
         }
 
         // Register table DDL read functions (list_semantic_views, describe_semantic_view).
-        con.register_table_function_with_extra_info::<ListSemanticViewsVTab, _>(
-            "list_semantic_views",
-            &catalog_reader,
-        )?;
+        //
+        // Phase 65 Plan 05 Task 1 (Wave 0 bridge spike): list_semantic_views
+        // is registered via the C++ Catalog API path so its bind callback
+        // receives a native ClientContext& and can open per-call
+        // Connection(*context.db) instead of consuming the long-lived
+        // catalog_reader. See cpp/src/shim.cpp::sv_register_list_semantic_views
+        // and src/ddl/list.rs::sv_list_semantic_views_bind_rust.
+        if !unsafe { sv_register_list_semantic_views(db_handle) } {
+            return Err("Failed to register list_semantic_views via C++ Catalog API".into());
+        }
         con.register_table_function_with_extra_info::<ListTerseSemanticViewsVTab, _>(
             "list_terse_semantic_views",
             &catalog_reader,

@@ -68,4 +68,20 @@ bool sv_register_table_function(
     duckdb::table_function_t exec_cb,
     duckdb::table_function_init_local_t init_cb);
 
+// Phase 65 Plan 05 (Task 1 / Wave 0 bridge spike) — register the read-side
+// `list_semantic_views()` table function via the C++ Catalog API. The bind
+// callback opens a per-call `Connection(*context.db)` and bridges to the
+// Rust dispatcher (`sv_list_semantic_views_bind_rust`) which performs the
+// catalog read on the per-call connection. The bridge mechanism (cast of
+// the C++ `Connection *` to `duckdb_connection` — confirmed by reading
+// `duckdb.cpp:266432-266447` where `duckdb_connect` does
+// `reinterpret_cast<duckdb_connection>(new Connection(...))`) is the
+// load-bearing primitive that the remaining 16 read-side migrations will
+// reuse. See `65-05-SPIKE-SUMMARY.md` for the LOC extrapolation.
+//
+// This entry point is the registration helper; the bind/function/init
+// callbacks themselves live inside `shim.cpp` (file-static) and are
+// passed into `sv_register_table_function` by name.
+bool sv_register_list_semantic_views(duckdb_database db_handle);
+
 } // extern "C"

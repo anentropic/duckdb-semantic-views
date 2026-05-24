@@ -142,6 +142,36 @@ extern "C" {
         uint8_t kind,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
+
+    // Phase 65 Plan 05 (Task 1 / Wave 0 bridge spike) — Rust dispatcher for
+    // `list_semantic_views()`. The C++ bind callback opens a per-call
+    // `Connection probe(*context.db)` and bridges by casting the stack
+    // `Connection *` to `duckdb_connection` (cast confirmed by
+    // duckdb.cpp:266432-266447 where `duckdb_connect` is literally
+    // `reinterpret_cast<duckdb_connection>(new Connection(...))`, so the
+    // C-API handle is a borrowed pointer to a C++ `Connection`).
+    //
+    // The bridge is a BORROW, not a transfer: the Rust dispatcher does NOT
+    // call `duckdb_disconnect` (which would `delete` the stack Connection
+    // and segfault). When the C++ bind scope ends, the `probe` local's
+    // destructor runs and `~Connection()` does the correct teardown.
+    //
+    // The dispatcher serializes the result rows into a length-prefixed
+    // binary buffer (`u32 row_count; for each row: for each of 6 cols: u32
+    // byte_len; bytes...`) which the C++ bind parses into BindData. The
+    // exec callback then emits rows from BindData. Using a flat binary
+    // wire format avoids needing matched struct layouts across the FFI
+    // boundary.
+    //
+    // Return codes:
+    //   0 — success; (out_ptr, out_len) populated with the binary buffer.
+    //        Caller MUST release via `sv_free_buffer`.
+    //   1 — catalog read error; error_buf populated.
+    //   2 — internal error (panic across FFI); error_buf populated.
+    uint8_t sv_list_semantic_views_bind_rust(
+        duckdb_connection conn,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +665,222 @@ static void sv_create_from_yaml_function(
     output.SetValue(0, 0, Value(bd.new_def));
     output.SetCardinality(1);
     state.emitted = true;
+}
+
+// ---------------------------------------------------------------------------
+// list_semantic_views — Phase 65 Plan 05 (Task 1 / Wave 0 bridge spike)
+// ---------------------------------------------------------------------------
+// First read-side TF migrated from duckdb-rs `register_table_function_with_
+// extra_info` (which marshals `ClientContext &` away — Plan 01 Spike A6) to
+// the C++ Catalog API path via `sv_register_table_function` (Plan 04). The
+// bind callback opens a per-call `Connection probe(*context.db)` and bridges
+// to Rust by casting the stack `Connection *` to `duckdb_connection`. See
+// the FFI declaration block above + `65-05-SPIKE-SUMMARY.md` for the bridge
+// mechanism design and the LOC extrapolation for the remaining 16 read-side
+// migrations.
+//
+// Wire format from Rust dispatcher: a flat length-prefixed binary buffer:
+//   u32 row_count (little-endian)
+//   for each row:
+//     for each of 6 columns:
+//       u32 byte_len (little-endian)
+//       byte_len bytes (UTF-8, NOT NUL-terminated)
+// Buffer is heap-owned by Rust; C++ parses into BindData and immediately
+// releases via `sv_free_buffer`.
+
+struct ListSemanticViewsRow {
+    std::string created_on;
+    std::string name;
+    std::string kind;
+    std::string database_name;
+    std::string schema_name;
+    std::string comment;
+};
+
+struct ListSemanticViewsBindData : public TableFunctionData {
+    std::vector<ListSemanticViewsRow> rows;
+};
+
+struct ListSemanticViewsLocalState : public LocalTableFunctionState {
+    bool emitted = false;
+};
+
+// Helper: read a little-endian u32 from buf[offset..offset+4] and advance.
+// Throws BinderException on out-of-bounds — defensive against an FFI buffer
+// truncated by a panic or allocation failure on the Rust side.
+static uint32_t sv_read_u32_le(const char *buf, size_t buf_len, size_t &offset) {
+    if (offset + 4 > buf_len) {
+        throw BinderException(
+            "list_semantic_views: FFI buffer truncated (expected u32 at offset " +
+            std::to_string(offset) + " of " + std::to_string(buf_len) + ")");
+    }
+    auto p = reinterpret_cast<const unsigned char *>(buf + offset);
+    uint32_t v = static_cast<uint32_t>(p[0])
+               | (static_cast<uint32_t>(p[1]) << 8)
+               | (static_cast<uint32_t>(p[2]) << 16)
+               | (static_cast<uint32_t>(p[3]) << 24);
+    offset += 4;
+    return v;
+}
+
+static std::string sv_read_string(const char *buf, size_t buf_len, size_t &offset) {
+    uint32_t len = sv_read_u32_le(buf, buf_len, offset);
+    if (offset + len > buf_len) {
+        throw BinderException(
+            "list_semantic_views: FFI buffer truncated (expected " +
+            std::to_string(len) + " string bytes at offset " +
+            std::to_string(offset) + " of " + std::to_string(buf_len) + ")");
+    }
+    std::string s(buf + offset, len);
+    offset += len;
+    return s;
+}
+
+static unique_ptr<FunctionData> sv_list_semantic_views_bind(
+    ClientContext &context,
+    TableFunctionBindInput & /*input*/,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<ListSemanticViewsBindData>();
+
+    // Declare the 6-column schema — must match the v0.9.0 Rust VTab exactly
+    // (test/sql/phase42_persistence.test + any other suite that does
+    // SELECT * FROM list_semantic_views() relies on byte-identical column
+    // names and order).
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("created_on");
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("name");
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("kind");
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("database_name");
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("schema_name");
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("comment");
+
+    // Open a per-call Connection on the caller's DatabaseInstance. The
+    // ctor calls `ConnectionManager::AddConnection` (acquires
+    // `connections_lock`) and the matching dtor (RemoveConnection)
+    // releases it at end-of-scope. Both confirmed deadlock-free from the
+    // bind thread by `65-READ-PATH-SPIKE.md` (READ-BIND-RC0).
+    Connection probe(*context.db);
+
+    // Bridge: cast the stack Connection* to duckdb_connection. The C API
+    // handle is literally `reinterpret_cast<duckdb_connection>(Connection*)`
+    // — confirmed by reading the amalgamation:
+    //
+    //   // duckdb.cpp:266440-266446
+    //   connection = new Connection(*wrapper->database);
+    //   *out = reinterpret_cast<duckdb_connection>(connection);
+    //
+    // This is a BORROW: ownership stays with the C++ `probe` local. The
+    // Rust dispatcher MUST NOT call `duckdb_disconnect` on the handle (it
+    // would `delete` a stack-allocated Connection — UB). The bind scope's
+    // destructor handles teardown correctly.
+    duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+
+    SvOwnedBuffer payload;
+    char error_buf[1024];
+    std::memset(error_buf, 0, sizeof(error_buf));
+
+    uint8_t rc = sv_list_semantic_views_bind_rust(
+        borrowed,
+        &payload.ptr, &payload.len,
+        error_buf, sizeof(error_buf));
+
+    if (rc != 0) {
+        // Surface as BinderException so the user sees a proper SQL-layer
+        // error rather than a process crash. The Rust dispatcher's
+        // `catch_unwind` already converts panics into rc=2 + an error
+        // message; this branch just re-raises across the C++ boundary.
+        throw BinderException(
+            std::string("list_semantic_views failed: ") + error_buf);
+    }
+
+    if (payload.ptr == nullptr) {
+        // Defensive: rc=0 with null buffer means zero rows — bd->rows
+        // stays empty. Skip parsing.
+        return std::move(bd);
+    }
+
+    // Parse the flat binary buffer into ListSemanticViewsRow entries.
+    size_t offset = 0;
+    uint32_t row_count = sv_read_u32_le(payload.ptr, payload.len, offset);
+    bd->rows.reserve(row_count);
+    for (uint32_t r = 0; r < row_count; ++r) {
+        ListSemanticViewsRow row;
+        row.created_on    = sv_read_string(payload.ptr, payload.len, offset);
+        row.name          = sv_read_string(payload.ptr, payload.len, offset);
+        row.kind          = sv_read_string(payload.ptr, payload.len, offset);
+        row.database_name = sv_read_string(payload.ptr, payload.len, offset);
+        row.schema_name   = sv_read_string(payload.ptr, payload.len, offset);
+        row.comment       = sv_read_string(payload.ptr, payload.len, offset);
+        bd->rows.push_back(std::move(row));
+    }
+
+    // SvOwnedBuffer destructor releases the Rust-owned buffer via
+    // sv_free_buffer with the exact (ptr, len) pair.
+    return std::move(bd);
+}
+
+static unique_ptr<LocalTableFunctionState> sv_list_semantic_views_init_local(
+    ExecutionContext & /*context*/,
+    TableFunctionInitInput & /*input*/,
+    GlobalTableFunctionState * /*global_state*/) {
+    return make_uniq<ListSemanticViewsLocalState>();
+}
+
+static void sv_list_semantic_views_function(
+    ClientContext & /*context*/,
+    TableFunctionInput &data_p,
+    DataChunk &output) {
+    auto &bd = data_p.bind_data->Cast<ListSemanticViewsBindData>();
+    auto *state_p = data_p.local_state.get();
+    if (state_p == nullptr) {
+        // Defensive: same pattern as sv_create_from_yaml_function.
+        idx_t n = bd.rows.size();
+        for (idx_t i = 0; i < n; ++i) {
+            output.SetValue(0, i, Value(bd.rows[i].created_on));
+            output.SetValue(1, i, Value(bd.rows[i].name));
+            output.SetValue(2, i, Value(bd.rows[i].kind));
+            output.SetValue(3, i, Value(bd.rows[i].database_name));
+            output.SetValue(4, i, Value(bd.rows[i].schema_name));
+            output.SetValue(5, i, Value(bd.rows[i].comment));
+        }
+        output.SetCardinality(n);
+        return;
+    }
+    auto &state = state_p->Cast<ListSemanticViewsLocalState>();
+    if (state.emitted) {
+        output.SetCardinality(0);
+        return;
+    }
+    idx_t n = bd.rows.size();
+    for (idx_t i = 0; i < n; ++i) {
+        output.SetValue(0, i, Value(bd.rows[i].created_on));
+        output.SetValue(1, i, Value(bd.rows[i].name));
+        output.SetValue(2, i, Value(bd.rows[i].kind));
+        output.SetValue(3, i, Value(bd.rows[i].database_name));
+        output.SetValue(4, i, Value(bd.rows[i].schema_name));
+        output.SetValue(5, i, Value(bd.rows[i].comment));
+    }
+    output.SetCardinality(n);
+    state.emitted = true;
+}
+
+extern "C" {
+    bool sv_register_list_semantic_views(duckdb_database db_handle) {
+        // Zero-argument table function — no arg_types array.
+        return sv_register_table_function(
+            db_handle,
+            "list_semantic_views",
+            /*arg_types*/ nullptr, /*arg_count*/ 0,
+            sv_list_semantic_views_bind,
+            sv_list_semantic_views_function,
+            sv_list_semantic_views_init_local);
+    }
 }
 
 // ---------------------------------------------------------------------------
