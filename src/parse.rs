@@ -2007,26 +2007,28 @@ fn emit_native_create_sql(
     Ok(Some(sql))
 }
 
-/// Read the FROM YAML FILE sentinel produced by `rewrite_ddl_yaml_file_body`,
-/// fetch the file via `read_text()` on the catalog connection (preserves
-/// `DuckDB`'s filesystem support — local paths, `https://`, S3 via httpfs,
-/// etc.), parse the YAML into a `SemanticViewDefinition`, then emit a
-/// transactional INSERT through `emit_native_create_sql` so the write
-/// participates in the caller's transaction.
+/// Read the FROM YAML FILE sentinel produced by `rewrite_ddl_yaml_file_body`
+/// and emit a transactional INSERT that selects from the
+/// `__sv_compute_create_from_yaml(path, name, kind, comment)` helper TF
+/// (registered via the C++ Catalog API in `cpp/src/shim.cpp`). The helper's
+/// bind callback opens a per-call `Connection(*context.db)`, runs
+/// `read_text()` against the user-supplied path, calls into Rust to parse
+/// and enrich the YAML, and returns a metadata-less JSON in a single row.
+/// The outer INSERT wraps that row with `json_merge_patch` to add the
+/// metadata fields (`created_on`, `database_name`, `schema_name`) on the
+/// caller's connection -- matching `emit_native_create_sql`'s non-YAML
+/// behaviour byte-for-byte.
 ///
-/// Returns a `ParseError` when no `parser_override` context is installed for
-/// this `OverrideContext`. Phase 62 takes `&OverrideContext` directly —
-/// the LRU `db_token` indirection is gone (TECH-DEBT 20).
+/// Phase 65 Plan 04 (D-11): the YAML read no longer happens on the
+/// extension-owned catalog connection. After Plan 04 lands,
+/// rewrite_yaml_file_create does NOT touch the OverrideContext catalog --
+/// the `_ctx` argument stays for symmetry with rewrite_create. Plan 06
+/// retires both call surfaces.
 #[cfg(feature = "extension")]
 fn rewrite_yaml_file_create(
-    ctx: &OverrideContext,
+    _ctx: &OverrideContext,
     payload: &str,
 ) -> Result<Option<String>, ParseError> {
-    use std::ffi::CStr;
-    use std::os::raw::c_void;
-
-    use libduckdb_sys as ffi;
-
     // Sentinel format: `<path>\x01<kind>\x01<name>\x01<comment>` (the
     // `__SV_YAML_FILE__` prefix has already been stripped by the caller).
     let mut parts = payload.splitn(4, '\x01');
@@ -2044,10 +2046,10 @@ fn rewrite_yaml_file_create(
     })?;
     let comment = parts.next().unwrap_or("");
 
-    let (or_replace, if_not_exists) = match kind_str {
-        "0" => (false, false),
-        "1" => (true, false),
-        "2" => (false, true),
+    let (kind, or_replace, if_not_exists) = match kind_str {
+        "0" => (0_i32, false, false),
+        "1" => (1_i32, true, false),
+        "2" => (2_i32, false, true),
         _ => {
             return Err(ParseError {
                 message: format!("Internal error: unknown YAML FILE kind '{kind_str}'"),
@@ -2056,57 +2058,80 @@ fn rewrite_yaml_file_create(
         }
     };
 
-    // Read file via read_text(); this is one DuckDB statement on the catalog
-    // connection so the user's transaction state is untouched.
-    let path_escaped = file_path.replace('\'', "''");
-    let read_sql = format!("SELECT content FROM read_text('{path_escaped}')");
-    let mut result =
-        unsafe { crate::query::table_function::execute_sql_raw(ctx.catalog.raw(), &read_sql) }
-            .map_err(|e| ParseError {
-                message: format!("FROM YAML FILE failed: {e}"),
-                position: None,
-            })?;
-    let row_count = unsafe { ffi::duckdb_row_count(&mut result) };
-    if row_count == 0 {
-        unsafe { ffi::duckdb_destroy_result(&mut result) };
-        return Err(ParseError {
-            message: format!("FROM YAML FILE failed: no content returned from '{file_path}'"),
-            position: None,
-        });
-    }
-    let yaml_content = unsafe {
-        let val_ptr = ffi::duckdb_value_varchar(&mut result, 0, 0);
-        if val_ptr.is_null() {
-            ffi::duckdb_destroy_result(&mut result);
-            return Err(ParseError {
-                message: format!("FROM YAML FILE failed: NULL content from '{file_path}'"),
-                position: None,
-            });
-        }
-        let s = CStr::from_ptr(val_ptr).to_string_lossy().into_owned();
-        ffi::duckdb_free(val_ptr.cast::<c_void>());
-        ffi::duckdb_destroy_result(&mut result);
-        s
+    // Normalise the view name once so subsequent escape_sql_arg lands on the
+    // bare identifier (matches emit_native_create_sql's defensive
+    // normalisation). The helper TF re-normalises internally via
+    // SemanticViewDefinition::from_yaml_with_size_cap, but we need the bare
+    // name to embed in the outer INSERT's name column anyway.
+    let name = normalize_view_name(name).map_err(|e| ParseError {
+        message: format!("Invalid view name: {e}"),
+        position: None,
+    })?;
+    let name_escaped = escape_sql_arg(&name);
+    let path_escaped = escape_sql_arg(file_path);
+    let comment_escaped = escape_sql_arg(comment);
+
+    // Helper-TF subquery + metadata-via-SQL wrapper. The helper TF returns
+    // exactly one row whose `new_def` column contains the metadata-less
+    // enriched JSON. We patch in the metadata fields on the caller's
+    // connection so they reflect the user's session (matches Plan 03's
+    // non-YAML CREATE behaviour byte-for-byte).
+    //
+    // RFC-7396 semantics (verified by Plan 04 Wave 0 spike): json_merge_patch
+    // overrides keys present in the patch. The helper TF's new_def omits the
+    // three metadata keys (skip_serializing_if on the struct), so the patch
+    // is the sole source -- no risk of overwriting a user-supplied value.
+    let metadata_patched = "json_merge_patch( \
+            new_def::JSON, \
+            json_object( \
+              'created_on', strftime(now(), '%Y-%m-%dT%H:%M:%SZ'), \
+              'database_name', current_database(), \
+              'schema_name', current_schema() \
+            ) \
+         )::VARCHAR"
+        .to_string();
+    let helper_from = format!(
+        "FROM __sv_compute_create_from_yaml('{path_escaped}', \
+            '{name_escaped}', {kind}, '{comment_escaped}')"
+    );
+
+    // Three INSERT shapes mirror the inline CREATE path
+    // (emit_native_create_sql):
+    //   OR REPLACE     : INSERT OR REPLACE -- no friendly-error guard needed.
+    //   IF NOT EXISTS  : INSERT OR IGNORE absorbs same-snapshot duplicates.
+    //   Plain          : CASE+error guard inside SELECT raises the friendly
+    //                    "already exists" message before the INSERT can fire
+    //                    (Phase 60 race-guard pattern carried forward).
+    let sql = if or_replace {
+        format!(
+            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) \
+             SELECT '{name_escaped}', {metadata_patched} \
+             {helper_from} \
+             RETURNING name AS view_name"
+        )
+    } else if if_not_exists {
+        format!(
+            "INSERT OR IGNORE INTO semantic_layer._definitions (name, definition) \
+             SELECT '{name_escaped}', {metadata_patched} \
+             {helper_from} \
+             RETURNING name AS view_name"
+        )
+    } else {
+        format!(
+            "INSERT INTO semantic_layer._definitions (name, definition) \
+             SELECT \
+               CASE WHEN EXISTS (SELECT 1 FROM semantic_layer._definitions \
+                                 WHERE name = '{name_escaped}') \
+                    THEN error('semantic view ''{name_escaped}'' already exists; \
+                                use CREATE OR REPLACE SEMANTIC VIEW to overwrite') \
+                    ELSE '{name_escaped}' \
+               END, \
+               {metadata_patched} \
+             {helper_from} \
+             RETURNING name AS view_name"
+        )
     };
-
-    let mut def =
-        crate::model::SemanticViewDefinition::from_yaml_with_size_cap(name, &yaml_content)
-            .map_err(|e| ParseError {
-                message: e,
-                position: None,
-            })?;
-
-    if !comment.is_empty() {
-        def.comment = Some(comment.to_string());
-    }
-
-    // Cardinality inference runs against PK declarations in the YAML; the
-    // shared enrichment helper re-runs it after catalog PK resolution but
-    // we still need this initial pass to populate cardinality where the YAML
-    // already specifies PKs.
-    infer_cardinality(&def.tables, &mut def.joins)?;
-
-    emit_native_create_sql(ctx, name, def, or_replace, if_not_exists)
+    Ok(Some(sql))
 }
 
 // SQL-string escape helpers (round-trip pair).
