@@ -16,10 +16,10 @@ Phase 64 (v0.9.0) introduced `qualify_and_quote_table_ref` in `src/expand/resolu
 
 ### Connection Lifecycle (RO-REOPEN)
 
-- [ ] **LIFE-01**: After a writable DuckDB connection that did `LOAD semantic_views` is closed in the **same Python process**, a subsequent `duckdb.connect(path, read_only=True)` returns within 5 seconds (vs. the current indefinite hang). Apply to both fresh-bootstrap-then-RO and previously-bootstrapped-then-RO.
-- [ ] **LIFE-02**: The fix is either (a) deterministic teardown of the `OverrideContext` `duckdb_connection` at extension-unload / DBConfig destruction, or (b) detect access-mode mismatch on reopen inside `init_extension` and surface an actionable error instead of hanging. Choice and reasoning documented in the phase RESEARCH.md.
-- [ ] **LIFE-03**: `test/integration/test_readonly_load.py` gains a `test_in_process_bootstrap_then_readonly` scenario that does the bootstrap-then-RO sequence **without** the subprocess workaround and asserts the read-only connect returns under a watchdog. The existing subprocess-based tests stay as deployment-style smoke.
-- [ ] **LIFE-04**: Phase 63's `deferred-items.md` entry "In-process RW→RO reopen of the same DB hangs (Phase 62 OverrideContext leak)" is updated with the resolution and a forward pointer to v0.9.1.
+- [ ] **LIFE-01** (partial — Plan 05 retired H2 contributor; Plan 06 retires H1 + flips watchdog tests green): After a writable DuckDB connection that did `LOAD semantic_views` is closed in the **same Python process**, a subsequent `duckdb.connect(path, read_only=True)` returns within 5 seconds (vs. the current indefinite hang). Apply to both fresh-bootstrap-then-RO and previously-bootstrapped-then-RO.
+- [x] **LIFE-02** (satisfied — Plan 05; mechanism path): The fix is either (a) deterministic teardown of the `OverrideContext` `duckdb_connection` at extension-unload / DBConfig destruction, or (b) detect access-mode mismatch on reopen inside `init_extension` and surface an actionable error instead of hanging. **Resolution:** the read-side `OverrideContext` lifecycle is now per-call `Connection(*context.db)` at bind time — no extension-owned `duckdb_connection` is held past a single read. Plan 06 closes the H1 catalog_conn that still imitates the v0.9.0 leak. Mechanism documented in `65-05-SUMMARY.md` + 65-RESEARCH.md §1.3 + 65-05-SPIKE-SUMMARY.md.
+- [x] **LIFE-03** (satisfied — Plan 01 `4da68eb` landed the test; Plan 05 verified the test surface stays semantically correct): `test/integration/test_readonly_load.py` gains a `test_in_process_bootstrap_then_readonly` scenario that does the bootstrap-then-RO sequence **without** the subprocess workaround and asserts the read-only connect returns under a watchdog. The existing subprocess-based tests stay as deployment-style smoke.
+- [ ] **LIFE-04** (partial — pending Plan 06 close-out): Phase 63's `deferred-items.md` entry "In-process RW→RO reopen of the same DB hangs (Phase 62 OverrideContext leak)" is updated with the resolution and a forward pointer to v0.10.0. Plan 06 owns the final ledger update once watchdog tests flip green.
 
 ### Cross-Connection Expansion Qualification (EXPAND-CTX)
 
@@ -34,12 +34,12 @@ Phase 64 (v0.9.0) introduced `qualify_and_quote_table_ref` in `src/expand/resolu
 
 ## Traceability
 
-| Requirement   | Phase    | Status  |
-|---------------|----------|---------|
-| LIFE-01       | Phase 65 | Pending |
-| LIFE-02       | Phase 65 | Pending |
-| LIFE-03       | Phase 65 | Pending |
-| LIFE-04       | Phase 65 | Pending |
+| Requirement   | Phase    | Status                              |
+|---------------|----------|-------------------------------------|
+| LIFE-01       | Phase 65 | Partial (Plan 05 H2; Plan 06 H1)    |
+| LIFE-02       | Phase 65 | **Satisfied (Plan 05 mechanism)**   |
+| LIFE-03       | Phase 65 | **Satisfied (Plan 01 test landed)** |
+| LIFE-04       | Phase 65 | Partial (Plan 06 close-out)         |
 | EXPAND-CTX-01 | Phase 66 | Pending |
 | EXPAND-CTX-02 | Phase 66 | Pending |
 | EXPAND-CTX-03 | Phase 66 | Pending |

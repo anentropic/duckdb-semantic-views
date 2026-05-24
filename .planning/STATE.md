@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: executing
-stopped_at: Phase 65 Plan 04 complete (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function shim; __sv_compute_create_from_yaml helper TF; pure-SQL json_merge_patch UPDATE for ALTER COMMENT)
-last_updated: "2026-05-24T01:30:00.000Z"
-last_activity: 2026-05-24 -- Plan 65-04 complete; 52/52 just test-sql; 933/933 nextest; 6/6 ADBC; 8/8 test_create_from_yaml_v010
+stopped_at: Phase 65 Plan 05 complete (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection bind; H2 query_conn DELETED; 17 legacy VTab/VScalar carcasses purged; LIFE-02 satisfied; LIFE-01 watchdog tests still RED pending Plan 06 H1 retirement)
+last_updated: "2026-05-24T18:00:00.000Z"
+last_activity: 2026-05-24 -- Plan 65-05 complete; 53/53 just test-sql; 843/843 cargo test --lib; 6/6 ADBC; 3/3 multi-DB; new test_concurrent_reads_per_call_conn.py PASS (80 reads in 0.02s); 5/8 test_readonly_load.py watchdog still RED (Plan 06 H1 retirement)
 progress:
   total_phases: 2
   completed_phases: 0
   total_plans: 6
-  completed_plans: 4
-  percent: 67
+  completed_plans: 5
+  percent: 83
 ---
 
 # Project State
@@ -26,10 +26,10 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 ## Current Position
 
 Phase: 65 (overridecontext-connection-teardown) — EXECUTING
-Plan: 4 of 6 complete (Plan 05 next)
-Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership)
-Next plan: 65-05 read-path migration wave (17 read-side bind callbacks migrate to sv_register_table_function with per-call Connection; final commit retires H2 query_conn at src/lib.rs:498-507)
-Last activity: 2026-05-24 -- Plan 65-04 complete
+Plan: 5 of 6 complete (Plan 06 next)
+Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership), 65-05 (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection(*context.db) bind; H2 query_conn allocation DELETED from init_extension; 17 legacy duckdb-rs VTab/VScalar struct + impl blocks purged atomically ~2,632 LOC across 13 files; src/type_cache.rs unbounded HashMap cache landed unused as deferred optimisation; sv_logical_type_from_c_type_id bridges C-API ↔ C++ enum-value mismatch; new test_concurrent_reads_per_call_conn.py PASSES 80 reads in 0.02s; LIFE-02 satisfied end-to-end; LIFE-01 watchdog tests still RED 5/8 pending Plan 06 H1 retirement)
+Next plan: 65-06 lifecycle close-out (retire H1 catalog_conn at src/lib.rs:441; add structural Rust guard test asserting init_extension allocates no long-lived duckdb_connection; verify 5 currently-RED watchdog tests flip green; close LIFE-01 + LIFE-04 ledgers; if any watchdog test stays red after H1 retirement, file as Phase 67 follow-up per D-22)
+Last activity: 2026-05-24 -- Plan 65-05 complete
 
 ## Performance Metrics
 
@@ -100,6 +100,15 @@ Recent decisions affecting current work:
 - [Phase 65 P04]: parser_override has ZERO remaining OverrideContext-catalog consumers (rewrite_drop / rewrite_alter_rename / rewrite_alter_comment / emit_native_create_sql all retain ctx.catalog.exists for "does not exist" wording -- Plan 06 retires); H1 catalog_conn at src/lib.rs:386-410 is truly unused by every parser_override path after Plan 04
 - [Phase 65 P04]: D-21 verified end-to-end: test_adbc_transactions.py 6/6 PASS, test_create_from_yaml_v010.py T7 BEGIN+CREATE+ROLLBACK leaves _definitions empty, 65_alter_comment_merge_patch.test B5 BEGIN+ALTER+ROLLBACK restores pre-tx comment
 - [Phase 65 P04]: Cross-database ALTER and CREATE FROM YAML FILE (ATTACH 'db2'; ALTER db2.v) is out-of-scope for v0.10.0 — the v0.9.0 extension only initializes semantic_layer._definitions on the LOAD database; Phase 66 follow-up territory
+- [Phase 65 P05]: Bridge mechanism is reinterpret_cast<duckdb_connection>(Connection*) of a stack-allocated `Connection probe(*context.db)` — same cast `duckdb_connect` itself does (duckdb.cpp:266432-266447). BORROW contract: Rust dispatcher never calls duckdb_disconnect; C++ scope ~Connection() handles teardown. Empirically validated by Wave 0 spike (commit 2db2b9b), reused identically across all 17 migrations.
+- [Phase 65 P05]: Wave 6 streaming model uses C++ MaterializedQueryResult inside SemanticViewGlobalState — ColumnDataCollection owns blocks independently of the producing Connection (per duckdb.hpp:18801-18813), so the per-call init_global Connection drops safely before any exec call.
+- [Phase 65 P05]: TWO per-call Connections per semantic_view(...) invocation (bind + init_global) — both drop before any exec call; no shared mutable state contention; verified by test_concurrent_reads_per_call_conn.py (80 reads in 0.02s under 8 threads).
+- [Phase 65 P05]: Named LIST(VARCHAR) parameter registrations (Wave 5 + Wave 6) require hand-built TableFunction construction because the generic sv_register_table_function shim doesn't accept named_parameters spec — TECH-DEBT 1 (v0.10.1 refactor opportunity), non-blocking.
+- [Phase 65 P05]: Type cache (src/type_cache.rs) introduced but NOT consumed by migrated dispatchers — LIMIT-0 probe is sub-millisecond on existing test surface; module + unit tests stay in tree for telemetry-driven future adoption. Deferred optimisation, not TECH-DEBT.
+- [Phase 65 P05]: C-API ↔ C++ enum-value mismatch caught and resolved via sv_logical_type_from_c_type_id (e.g., DECIMAL is 19 vs 21; LIST is 24 vs 101) — would have silently mis-typed every column. Highest-impact Batch 2 discovery. Single source of truth for the conversion (mirrors duckdb-rs's LogicalTypeId::from(u32)).
+- [Phase 65 P05]: 5 helpers from the dead Rust VTab path retired (value_raw_ptr, extract_list_strings, LogicalTypeOwned, type_from_duckdb_type_u32, declare_output_type) — C++ side now owns LIST flattening (sv_serialise_string_list) + LogicalType declaration (sv_logical_type_from_c_type_id). Removes the duckdb-rs Value transmute that relied on repr(Rust) layout assumptions.
+- [Phase 65 P05]: 5/8 test_readonly_load.py watchdog tests still RED post-Batch-3 (same failure shape as pre-Batch-3) — LIFE-01 has TWO contributors (H1 catalog_conn + H2 query_conn); Plan 05 retired H2 only, so DuckDB DBInstanceCache busy-spin on RW↔RO reopen persists. Plan 06 retires H1 → expected to flip 8/8 green. If any test stays red after Plan 06, file as Phase 67 follow-up per D-22.
+- [Phase 65 P05]: test_multi_db_isolation.py 3/3 PASS confirms cross-database catalog/search-path resolution works through the per-call Connection model — preliminary EXPAND-CTX-01 finding: root cause may dissolve after Plan 06, Phase 66 may become test-scaffolding + release-prep only.
 
 ### Pending Todos
 
@@ -148,9 +157,10 @@ Recent decisions affecting current work:
 | Phase 65 P02 (replanned, halted) | ~30min | 2 of 6 tasks (Wave-0 spikes only) | 1 file (SPIKES.md only — both spikes reverted to disk-empty before commit) |
 | Phase 65 P03 | 1h | 3 tasks | 9 files |
 | Phase 65 P04 | 2h | 4 tasks | 10 files |
+| Phase 65 P05 | ~10h (3 batches) | 6 tasks | 19 files (17 read-side sources + lib.rs + 2 test files) |
 
 ## Session Continuity
 
-Last session: 2026-05-24T01:30:00.000Z
-Stopped at: Phase 65 Plan 04 complete (4 of 6 plans done; Plan 05 next -- read-path migration wave; H2 query_conn retirement at end)
-Resume file: .planning/phases/65-overridecontext-connection-teardown/65-04-SUMMARY.md
+Last session: 2026-05-24T18:00:00.000Z
+Stopped at: Phase 65 Plan 05 complete (5 of 6 plans done; Plan 06 next -- lifecycle close-out / H1 catalog_conn retirement + structural guard test + flip 5 RED watchdog tests green)
+Resume file: .planning/phases/65-overridecontext-connection-teardown/65-05-SUMMARY.md
