@@ -2104,6 +2104,370 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 65 Plan 05 Task 6 (Wave 6) — semantic_view migration
+// ---------------------------------------------------------------------------
+//
+// Migrates the main expansion-path `semantic_view(view_name, dimensions :=
+// [...], metrics := [...], facts := [...])` table function off duckdb-rs's
+// `register_table_function_with_extra_info` (which marshals
+// `ClientContext &` away and consumed the long-lived H2 query_conn) to
+// the C++ Catalog API path. The bind callback opens a per-call
+// `Connection probe(*context.db)` and dispatches to
+// `sv_semantic_view_bind_rust` for catalog lookup + expand + LIMIT-0 type
+// inference + execution-SQL construction.
+//
+// Streaming model: bind returns a column schema + the execution SQL
+// string in BindData. `init_global` opens its OWN per-call
+// `Connection probe(*context.db)`, runs `probe.Query(execution_sql)` to
+// materialise the result, and stashes the
+// `unique_ptr<MaterializedQueryResult>` inside the GlobalState. The
+// Connection drops at end of init_global; the materialised result is
+// self-contained (`ColumnDataCollection` owns its storage) and lives
+// for the rest of the query. `func()` then fetches chunks via
+// `result->Fetch()` and copies vector data into the output DataChunk.
+//
+// Per-call lifecycle: TWO Connections are constructed per
+// `semantic_view(...)` invocation — one for bind (catalog probe +
+// LIMIT 0 type inference), one for init_global (actual query). Both
+// drop before any exec call runs. No long-lived extension-owned
+// `duckdb_connection` is consumed by this path.
+//
+// Borrow contract: identical to the 15 prior migrations. The Rust
+// dispatcher MUST NOT call `duckdb_disconnect` on the borrowed handle —
+// teardown is the C++ scope's responsibility.
+
+struct SemanticViewColumnInfo {
+    std::string name;
+    uint32_t type_id = 0;  // C-API DUCKDB_TYPE_* enum value (normalised:
+                           // HUGEINT→BIGINT, UHUGEINT→UBIGINT).
+};
+
+// Map a C-API `DUCKDB_TYPE` enum value (which is what
+// `duckdb_column_type` / `ffi::duckdb_column_type` return in Rust) to a
+// C++ `LogicalType`. The two enum spaces have DIFFERENT integer values
+// (e.g. C-API DUCKDB_TYPE_DECIMAL=19 vs C++ LogicalTypeId::DECIMAL=21),
+// so a naive `static_cast<LogicalTypeId>(c_type_id)` would silently
+// mis-type columns. This helper is the single source of truth for the
+// conversion and mirrors `type_from_duckdb_type_u32` /
+// `declare_output_type` in `src/query/table_function.rs`.
+//
+// DECIMAL / LIST / ENUM intentionally return a default (precisionless)
+// LogicalType — callers (see `sv_resolve_output_logical_types`) override
+// with the probed LogicalType from the LIMIT-0 result so width/scale/
+// child-type are preserved.
+static LogicalType sv_logical_type_from_c_type_id(uint32_t c_type_id) {
+    using duckdb::LogicalTypeId;
+    switch (c_type_id) {
+        case DUCKDB_TYPE_INVALID:    return LogicalType::VARCHAR;  // fallback
+        case DUCKDB_TYPE_BOOLEAN:    return LogicalType::BOOLEAN;
+        case DUCKDB_TYPE_TINYINT:    return LogicalType::TINYINT;
+        case DUCKDB_TYPE_SMALLINT:   return LogicalType::SMALLINT;
+        case DUCKDB_TYPE_INTEGER:    return LogicalType::INTEGER;
+        case DUCKDB_TYPE_BIGINT:     return LogicalType::BIGINT;
+        case DUCKDB_TYPE_UTINYINT:   return LogicalType::UTINYINT;
+        case DUCKDB_TYPE_USMALLINT:  return LogicalType::USMALLINT;
+        case DUCKDB_TYPE_UINTEGER:   return LogicalType::UINTEGER;
+        case DUCKDB_TYPE_UBIGINT:    return LogicalType::UBIGINT;
+        case DUCKDB_TYPE_FLOAT:      return LogicalType::FLOAT;
+        case DUCKDB_TYPE_DOUBLE:     return LogicalType::DOUBLE;
+        case DUCKDB_TYPE_TIMESTAMP:  return LogicalType::TIMESTAMP;
+        case DUCKDB_TYPE_DATE:       return LogicalType::DATE;
+        case DUCKDB_TYPE_TIME:       return LogicalType::TIME;
+        case DUCKDB_TYPE_INTERVAL:   return LogicalType::INTERVAL;
+        case DUCKDB_TYPE_HUGEINT:    return LogicalType::BIGINT;   // normalised
+        case DUCKDB_TYPE_UHUGEINT:   return LogicalType::UBIGINT;  // normalised
+        case DUCKDB_TYPE_VARCHAR:    return LogicalType::VARCHAR;
+        case DUCKDB_TYPE_BLOB:       return LogicalType::BLOB;
+        case DUCKDB_TYPE_TIMESTAMP_S:  return LogicalType::TIMESTAMP_S;
+        case DUCKDB_TYPE_TIMESTAMP_MS: return LogicalType::TIMESTAMP_MS;
+        case DUCKDB_TYPE_TIMESTAMP_NS: return LogicalType::TIMESTAMP_NS;
+        case DUCKDB_TYPE_TIMESTAMP_TZ: return LogicalType::TIMESTAMP_TZ;
+        case DUCKDB_TYPE_TIME_TZ:    return LogicalType::TIME_TZ;
+        case DUCKDB_TYPE_UUID:       return LogicalType::UUID;
+        case DUCKDB_TYPE_BIT:        return LogicalType::BIT;
+        case DUCKDB_TYPE_ENUM:       return LogicalType::VARCHAR;  // declared as VARCHAR
+        case DUCKDB_TYPE_STRUCT:     return LogicalType::VARCHAR;  // fallback to VARCHAR
+        case DUCKDB_TYPE_MAP:        return LogicalType::VARCHAR;
+        case DUCKDB_TYPE_DECIMAL:    return LogicalType::DECIMAL(18, 3);  // placeholder
+        case DUCKDB_TYPE_LIST:       return LogicalType::LIST(LogicalType::VARCHAR);  // placeholder
+        default:
+            // Unknown type — declare VARCHAR so downstream operators don't
+            // get a junk LogicalTypeId. Type mismatch will surface at exec.
+            return LogicalType::VARCHAR;
+    }
+}
+
+struct SemanticViewBindData : public TableFunctionData {
+    std::vector<SemanticViewColumnInfo> columns;
+    std::string execution_sql;
+    std::string expanded_sql_for_error;  // Mirror of execution_sql for SqlExecution error.
+};
+
+struct SemanticViewGlobalState : public GlobalTableFunctionState {
+    std::unique_ptr<MaterializedQueryResult> result;
+    idx_t emitted_chunks = 0;
+};
+
+// Look up DECIMAL/LIST/ENUM logical types via a LIMIT-0 probe on a per-call
+// Connection. Returns a per-column LogicalType for every column in the
+// declared schema; for columns whose type_id isn't DECIMAL/LIST/ENUM, the
+// LogicalType is constructed from the type_id directly (matching the
+// behaviour of `type_from_duckdb_type_u32` on the Rust side).
+//
+// On any probe failure, falls back to declaring all columns by type_id
+// alone — same fallback ladder as the legacy bind.
+static std::vector<LogicalType> sv_resolve_output_logical_types(
+    ClientContext &context,
+    const std::vector<SemanticViewColumnInfo> &cols,
+    const std::string &execution_sql) {
+    std::vector<LogicalType> out;
+    out.reserve(cols.size());
+
+    bool needs_logical_probe = false;
+    for (const auto &c : cols) {
+        // C-API DUCKDB_TYPE_* enum values from duckdb.h. These three need
+        // logical-type metadata to declare correctly: DECIMAL needs
+        // width+scale; LIST needs child type; ENUM declares as VARCHAR but
+        // the LIMIT-0 confirms presence.
+        if (c.type_id == DUCKDB_TYPE_DECIMAL ||
+            c.type_id == DUCKDB_TYPE_LIST) {
+            needs_logical_probe = true;
+            break;
+        }
+    }
+
+    if (!needs_logical_probe) {
+        // Fast path: build each LogicalType straight from the C-API type_id.
+        for (const auto &c : cols) {
+            out.emplace_back(sv_logical_type_from_c_type_id(c.type_id));
+        }
+        return out;
+    }
+
+    // Slow path: run LIMIT 0 on the per-call Connection to extract logical
+    // type metadata for DECIMAL/LIST columns.
+    Connection probe(*context.db);
+    std::string limit0_sql = "SELECT * FROM (" + execution_sql + ") __sv_probe LIMIT 0";
+    auto probe_result = probe.Query(limit0_sql);
+    if (probe_result->HasError() || probe_result->types.size() != cols.size()) {
+        // Fall back to type_id-only declaration if the probe fails.
+        for (const auto &c : cols) {
+            out.emplace_back(sv_logical_type_from_c_type_id(c.type_id));
+        }
+        return out;
+    }
+
+    for (idx_t i = 0; i < cols.size(); ++i) {
+        const auto &c = cols[i];
+        const LogicalType &probed = probe_result->types[i];
+        if (c.type_id == DUCKDB_TYPE_DECIMAL || c.type_id == DUCKDB_TYPE_LIST) {
+            // Use the probed logical type (preserves width/scale/child type).
+            out.emplace_back(probed);
+        } else {
+            out.emplace_back(sv_logical_type_from_c_type_id(c.type_id));
+        }
+    }
+    return out;
+}
+
+static unique_ptr<FunctionData> sv_semantic_view_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    if (input.inputs.empty() || input.inputs[0].IsNull()) {
+        throw BinderException(
+            "semantic_view: view name is required (positional arg 0)");
+    }
+    std::string view_name = input.inputs[0].GetValue<std::string>();
+
+    std::vector<uint8_t> dims_buf, metrics_buf, facts_buf;
+    auto it_d = input.named_parameters.find("dimensions");
+    if (it_d != input.named_parameters.end() && !it_d->second.IsNull()) {
+        dims_buf = sv_serialise_string_list(it_d->second, "dimensions");
+    }
+    auto it_m = input.named_parameters.find("metrics");
+    if (it_m != input.named_parameters.end() && !it_m->second.IsNull()) {
+        metrics_buf = sv_serialise_string_list(it_m->second, "metrics");
+    }
+    auto it_f = input.named_parameters.find("facts");
+    if (it_f != input.named_parameters.end() && !it_f->second.IsNull()) {
+        facts_buf = sv_serialise_string_list(it_f->second, "facts");
+    }
+
+    Connection probe(*context.db);
+    duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+
+    SvOwnedBuffer payload;
+    char error_buf[1024];
+    std::memset(error_buf, 0, sizeof(error_buf));
+    uint8_t rc = sv_semantic_view_bind_rust(
+        borrowed,
+        reinterpret_cast<const uint8_t *>(view_name.data()), view_name.size(),
+        dims_buf.empty()    ? nullptr : dims_buf.data(),    dims_buf.size(),
+        metrics_buf.empty() ? nullptr : metrics_buf.data(), metrics_buf.size(),
+        facts_buf.empty()   ? nullptr : facts_buf.data(),   facts_buf.size(),
+        &payload.ptr, &payload.len,
+        error_buf, sizeof(error_buf));
+    if (rc != 0) {
+        throw BinderException(std::string("semantic_view: ") + error_buf);
+    }
+
+    auto bd = make_uniq<SemanticViewBindData>();
+
+    // Parse the schema + execution_sql wire format.
+    size_t offset = 0;
+    uint32_t n_cols = sv_read_u32_le(payload.ptr, payload.len, offset);
+    bd->columns.reserve(n_cols);
+    for (uint32_t i = 0; i < n_cols; ++i) {
+        SemanticViewColumnInfo info;
+        info.name = sv_read_string(payload.ptr, payload.len, offset);
+        info.type_id = sv_read_u32_le(payload.ptr, payload.len, offset);
+        bd->columns.push_back(std::move(info));
+    }
+    bd->execution_sql = sv_read_string(payload.ptr, payload.len, offset);
+    if (offset != payload.len) {
+        throw BinderException(
+            "semantic_view: FFI buffer has trailing bytes (consumed " +
+            std::to_string(offset) + " of " + std::to_string(payload.len) + ")");
+    }
+    bd->expanded_sql_for_error = bd->execution_sql;
+
+    // Resolve declared logical types — runs a second LIMIT-0 probe on a
+    // per-call Connection if any DECIMAL/LIST/ENUM column is in the
+    // schema (so width/scale/child-type can be honoured).
+    auto declared_types = sv_resolve_output_logical_types(
+        context, bd->columns, bd->execution_sql);
+    for (idx_t i = 0; i < bd->columns.size(); ++i) {
+        return_types.push_back(declared_types[i]);
+        names.push_back(bd->columns[i].name);
+    }
+    return std::move(bd);
+}
+
+static unique_ptr<GlobalTableFunctionState> sv_semantic_view_init_global(
+    ClientContext &context,
+    TableFunctionInitInput &input) {
+    auto &bd = input.bind_data->Cast<SemanticViewBindData>();
+    auto state = make_uniq<SemanticViewGlobalState>();
+
+    // Open a per-call Connection on the caller's DatabaseInstance and run
+    // the materialised query. The Connection drops at end of scope; the
+    // returned MaterializedQueryResult owns its data (via ColumnDataCollection)
+    // and is safe to use across exec invocations.
+    Connection probe(*context.db);
+    auto qresult = probe.Query(bd.execution_sql);
+    if (qresult->HasError()) {
+        // Match the legacy QueryError::SqlExecution wording so existing
+        // sqllogictest matchers stay byte-identical.
+        throw InvalidInputException(
+            "semantic_view: SQL execution failed: " + qresult->GetError() +
+            "  (expanded SQL: " + bd.expanded_sql_for_error + ")");
+    }
+    if (qresult->type != QueryResultType::MATERIALIZED_RESULT) {
+        throw InternalException(
+            "semantic_view: expected MaterializedQueryResult from Connection::Query");
+    }
+    state->result = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(qresult));
+    return std::move(state);
+}
+
+static void sv_semantic_view_function(
+    ClientContext & /*context*/,
+    TableFunctionInput &data_p,
+    DataChunk &output) {
+    auto &bd = data_p.bind_data->Cast<SemanticViewBindData>();
+    auto &gs = data_p.global_state->Cast<SemanticViewGlobalState>();
+
+    // Fetch the next chunk from the materialised result. Fetch() flattens
+    // vectors and returns nullptr when the stream is exhausted.
+    auto chunk = gs.result->Fetch();
+    if (!chunk || chunk->size() == 0) {
+        output.SetCardinality(0);
+        return;
+    }
+
+    // Validate column count — defensive against a planner inserting projections
+    // we didn't anticipate. The legacy Rust impl had a Mutex + col_count check;
+    // for the C++ path we rely on the bind-time schema agreement.
+    idx_t n_cols = std::min<idx_t>(chunk->ColumnCount(), bd.columns.size());
+
+    // Copy each column into the output chunk via Vector::Reference (zero-copy
+    // when types match exactly; falls back to a cast when build_execution_sql
+    // already inserted a `::TYPE` wrapper but the runtime type still differs).
+    for (idx_t col_idx = 0; col_idx < n_cols; ++col_idx) {
+        auto &src = chunk->data[col_idx];
+        auto &dst = output.data[col_idx];
+        if (src.GetType() == dst.GetType()) {
+            // Same logical type — zero-copy reference.
+            dst.Reference(src);
+        } else {
+            // Type mismatch despite the bind-time cast wrapper — last-resort
+            // cast. Matches the legacy QueryError::TypeMismatch fallback but
+            // does the cast instead of erroring; the bind-time cast wrapper
+            // (build_execution_sql) is the primary defence.
+            VectorOperations::DefaultCast(src, dst, chunk->size());
+        }
+    }
+    output.SetCardinality(chunk->size());
+    gs.emitted_chunks++;
+}
+
+// Register semantic_view via the C++ Catalog API — same pattern as
+// sv_register_explain_semantic_view_impl. Constructs TableFunction by hand
+// (rather than going through sv_register_table_function) so the
+// `named_parameters` map can be populated for `dimensions` / `metrics` /
+// `facts`. Also passes `init_global` because semantic_view's exec needs
+// per-execution global state (the materialised query result).
+static bool sv_register_semantic_view_impl(duckdb_database db_handle) {
+    try {
+        auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
+            db_handle->internal_ptr);
+        if (wrapper == nullptr) {
+            fprintf(stderr,
+                "sv_register_semantic_view: null DatabaseWrapper\n");
+            return false;
+        }
+        auto &db = *wrapper->database->instance;
+
+        vector<LogicalType> args = {LogicalType::VARCHAR};
+        TableFunction tf(
+            std::string("semantic_view"),
+            std::move(args),
+            sv_semantic_view_function,
+            sv_semantic_view_bind,
+            sv_semantic_view_init_global,
+            /*init_local*/ nullptr);
+
+        tf.named_parameters["dimensions"] = LogicalType::LIST(LogicalType::VARCHAR);
+        tf.named_parameters["metrics"]    = LogicalType::LIST(LogicalType::VARCHAR);
+        tf.named_parameters["facts"]      = LogicalType::LIST(LogicalType::VARCHAR);
+
+        CreateTableFunctionInfo info(tf);
+        info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+
+        auto &system_catalog = Catalog::GetSystemCatalog(db);
+        auto txn = CatalogTransaction::GetSystemTransaction(db);
+        system_catalog.CreateTableFunction(txn, info);
+        return true;
+    } catch (const std::exception &e) {
+        fprintf(stderr,
+            "sv_register_semantic_view failed: %s\n", e.what());
+        return false;
+    } catch (...) {
+        fprintf(stderr,
+            "sv_register_semantic_view failed: unknown exception\n");
+        return false;
+    }
+}
+
+extern "C" {
+    bool sv_register_semantic_view(duckdb_database db_handle) {
+        return sv_register_semantic_view_impl(db_handle);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // sv_register_parser_hooks -- called from Rust after C API init
 // ---------------------------------------------------------------------------
 // Extracts DatabaseInstance& from the C API handle and registers the

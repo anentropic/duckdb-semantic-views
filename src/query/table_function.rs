@@ -18,6 +18,405 @@ use crate::util::suggest_closest;
 use super::error::QueryError;
 
 // ---------------------------------------------------------------------------
+// Phase 65 Plan 05 Task 6 (Wave 6) — sv_semantic_view_bind_rust
+// ---------------------------------------------------------------------------
+//
+// FFI dispatcher for the migrated
+// `semantic_view(view_name, dimensions := [...], metrics := [...], facts := [...])`
+// table function. The C++ bind callback (`sv_semantic_view_bind` in
+// `cpp/src/shim.cpp`) opens a per-call `Connection probe(*context.db)`,
+// flattens the three optional LIST(VARCHAR) named parameters into the
+// length-prefixed wire format (same encoding as the Wave 5 explain
+// migration), and invokes this dispatcher. Same `reinterpret_cast` bridge
+// + BORROW contract as the 15 prior migrations.
+//
+// Responsibilities of the Rust side:
+//   - Catalog lookup (name normalisation, view-not-found suggestion).
+//   - Wildcard expansion + `QueryRequest` construction.
+//   - `expand::expand()` → expanded SQL.
+//   - Column-type inference at read-side bind time per D-16/D-17:
+//     * For fact queries: always probe via LIMIT 0 on the per-call conn.
+//     * For dim+metric queries: prefer DDL-time persisted types if present
+//       (back-compat for v0.7.1-era catalog rows); fall back to LIMIT 0
+//       probe on per-call conn otherwise.
+//     The type_cache module (`src/type_cache.rs`) is intentionally NOT
+//     consumed here — the per-bind LIMIT 0 cost is well under a
+//     millisecond and the cache adds complexity (fingerprint over the
+//     JSON, lookup_or_probe wiring) without a measured win for the
+//     existing test surface. The cache stays available for a future
+//     follow-up if benchmarks ever justify it; tracked as TECH-DEBT in
+//     the BATCH2-SUMMARY.
+//   - `build_execution_sql()` wrapping for HUGEINT→BIGINT casts etc.
+//
+// The dispatcher returns a flat binary buffer to the C++ side encoding
+// the schema + execution_sql for bind to declare output columns and the
+// init_global callback to run the query. Wire format:
+//
+//   u32 n_cols (little-endian)
+//   for each col:
+//     u32 byte_len + bytes (column name, UTF-8)
+//     u32 type_id (little-endian; already passed through normalize_type_id)
+//   u32 byte_len + bytes (execution_sql, UTF-8)
+//
+// Return codes mirror the Wave 5 dispatcher:
+//   0 — success; (out_ptr, out_len) populated.
+//   1 — user-visible error; error_buf populated (raised as BinderException).
+//   2 — internal error (panic across FFI); error_buf populated.
+
+unsafe fn sv_parse_string_list(buf: *const u8, len: usize) -> Option<Vec<String>> {
+    if buf.is_null() {
+        return if len == 0 { Some(Vec::new()) } else { None };
+    }
+    if len < 4 {
+        return None;
+    }
+    let slice = std::slice::from_raw_parts(buf, len);
+    let mut off = 0usize;
+    let read_u32 = |slice: &[u8], off: &mut usize| -> Option<u32> {
+        if *off + 4 > slice.len() {
+            return None;
+        }
+        let v = u32::from_le_bytes(slice[*off..*off + 4].try_into().ok()?);
+        *off += 4;
+        Some(v)
+    };
+    let count = read_u32(slice, &mut off)? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let n = read_u32(slice, &mut off)? as usize;
+        if off + n > slice.len() {
+            return None;
+        }
+        out.push(String::from_utf8_lossy(&slice[off..off + n]).into_owned());
+        off += n;
+    }
+    if off != len {
+        return None;
+    }
+    Some(out)
+}
+
+/// # Safety
+///
+/// `conn` is a borrowed handle (do NOT disconnect). Wire-format payloads
+/// described above; `name_ptr` must point to `name_len` UTF-8 bytes.
+#[cfg(feature = "extension")]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn sv_semantic_view_bind_rust(
+    conn: ffi::duckdb_connection,
+    name_ptr: *const u8,
+    name_len: usize,
+    dims_ptr: *const u8,
+    dims_len: usize,
+    metrics_ptr: *const u8,
+    metrics_len: usize,
+    facts_ptr: *const u8,
+    facts_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    error_buf: *mut u8,
+    error_buf_len: usize,
+) -> u8 {
+    use crate::ddl::read_ffi::{probe_catalog_table_present, publish_owned_buffer, write_err};
+    use std::panic::AssertUnwindSafe;
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if conn.is_null() {
+            write_err(error_buf, error_buf_len, "duckdb_connection is null");
+            return 1_u8;
+        }
+        if name_ptr.is_null() {
+            write_err(error_buf, error_buf_len, "view name pointer is null");
+            return 1_u8;
+        }
+        let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
+        let view_name_raw = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
+                return 1_u8;
+            }
+        };
+        let view_name = match crate::ident::normalize_view_name(&view_name_raw) {
+            Ok(s) => s,
+            Err(e) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("Invalid view name '{view_name_raw}': {e}"),
+                );
+                return 1_u8;
+            }
+        };
+
+        let dimensions = match sv_parse_string_list(dims_ptr, dims_len) {
+            Some(v) => v,
+            None => {
+                write_err(error_buf, error_buf_len, "malformed `dimensions` payload");
+                return 1_u8;
+            }
+        };
+        let metrics = match sv_parse_string_list(metrics_ptr, metrics_len) {
+            Some(v) => v,
+            None => {
+                write_err(error_buf, error_buf_len, "malformed `metrics` payload");
+                return 1_u8;
+            }
+        };
+        let facts = match sv_parse_string_list(facts_ptr, facts_len) {
+            Some(v) => v,
+            None => {
+                write_err(error_buf, error_buf_len, "malformed `facts` payload");
+                return 1_u8;
+            }
+        };
+
+        if dimensions.is_empty() && metrics.is_empty() && facts.is_empty() {
+            write_err(
+                error_buf,
+                error_buf_len,
+                &QueryError::EmptyRequest {
+                    view_name: view_name.clone(),
+                }
+                .to_string(),
+            );
+            return 1_u8;
+        }
+
+        let reader = CatalogReader::new(conn, probe_catalog_table_present(conn));
+        let json_str = match reader.lookup(&view_name) {
+            Ok(Some(j)) => j,
+            Ok(None) => {
+                let available = reader.list_names().unwrap_or_default();
+                let suggestion = suggest_closest(&view_name, &available);
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::ViewNotFound {
+                        name: view_name,
+                        suggestion,
+                        available,
+                    }
+                    .to_string(),
+                );
+                return 1_u8;
+            }
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
+
+        let def = match SemanticViewDefinition::from_json(&view_name, &json_str) {
+            Ok(d) => d,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e.to_string());
+                return 1_u8;
+            }
+        };
+
+        let dimensions = match expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension) {
+            Ok(v) => v,
+            Err(e) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::ExpandFailed {
+                        source: crate::expand::ExpandError::EmptyRequest {
+                            view_name: format!("{view_name}: {e}"),
+                        },
+                    }
+                    .to_string(),
+                );
+                return 1_u8;
+            }
+        };
+        let metrics = match expand_wildcards(&metrics, &def, &WildcardItemType::Metric) {
+            Ok(v) => v,
+            Err(e) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::ExpandFailed {
+                        source: crate::expand::ExpandError::EmptyRequest {
+                            view_name: format!("{view_name}: {e}"),
+                        },
+                    }
+                    .to_string(),
+                );
+                return 1_u8;
+            }
+        };
+        let facts = match expand_wildcards(&facts, &def, &WildcardItemType::Fact) {
+            Ok(v) => v,
+            Err(e) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::ExpandFailed {
+                        source: crate::expand::ExpandError::EmptyRequest {
+                            view_name: format!("{view_name}: {e}"),
+                        },
+                    }
+                    .to_string(),
+                );
+                return 1_u8;
+            }
+        };
+
+        let req = QueryRequest {
+            dimensions: dimensions
+                .iter()
+                .map(|s| crate::expand::DimensionName::new(s.clone()))
+                .collect(),
+            metrics: metrics
+                .iter()
+                .map(|s| crate::expand::MetricName::new(s.clone()))
+                .collect(),
+            facts: facts.clone(),
+        };
+        let expanded_sql = match expand(&view_name, &def, &req) {
+            Ok(s) => s,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &QueryError::from(e).to_string());
+                return 1_u8;
+            }
+        };
+
+        // Type inference — same fall-back ladder as the legacy bind, but
+        // every LIMIT-0 probe now runs on the per-call connection (`conn`)
+        // instead of the long-lived `state.conn` (H2). The DDL-time
+        // persisted-types branch stays as a back-compat fast path for
+        // v0.7.1-era catalog rows where `column_type_names` may still be
+        // populated; new definitions land with empty vecs (Plan 03 D-16).
+        let type_map: HashMap<String, u32> = def
+            .inferred_types()
+            .map(|(name, t)| (name.to_ascii_lowercase(), normalize_type_id(t)))
+            .collect();
+
+        let (column_names, column_type_ids): (Vec<String>, Vec<u32>) = if !facts.is_empty() {
+            let limit0_sql = format!("{expanded_sql} LIMIT 0");
+            if let Some((names, types)) = try_infer_schema(conn, &limit0_sql) {
+                let type_ids: Vec<u32> =
+                    types.iter().map(|t| normalize_type_id(*t as u32)).collect();
+                (names, type_ids)
+            } else {
+                let mut names = Vec::new();
+                for dim_name in &dimensions {
+                    let canonical = def
+                        .dimensions
+                        .iter()
+                        .find(|d| d.name.eq_ignore_ascii_case(dim_name))
+                        .map_or_else(|| dim_name.clone(), |d| d.name.clone());
+                    names.push(canonical);
+                }
+                for fact_name in &facts {
+                    let canonical = def
+                        .facts
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(fact_name))
+                        .map_or_else(|| fact_name.clone(), |f| f.name.clone());
+                    names.push(canonical);
+                }
+                let type_ids = vec![0u32; names.len()];
+                (names, type_ids)
+            }
+        } else if !type_map.is_empty() {
+            let mut names = Vec::new();
+            let mut type_ids = Vec::new();
+            for dim_name in &dimensions {
+                let canonical = def
+                    .dimensions
+                    .iter()
+                    .find(|d| d.name.eq_ignore_ascii_case(dim_name))
+                    .map_or_else(|| dim_name.clone(), |d| d.name.clone());
+                let t = *type_map
+                    .get(&canonical.to_ascii_lowercase())
+                    .unwrap_or(&0u32);
+                names.push(canonical);
+                type_ids.push(t);
+            }
+            for met_name in &metrics {
+                let canonical = def
+                    .metrics
+                    .iter()
+                    .find(|m| m.name.eq_ignore_ascii_case(met_name))
+                    .map_or_else(|| met_name.clone(), |m| m.name.clone());
+                let t = *type_map
+                    .get(&canonical.to_ascii_lowercase())
+                    .unwrap_or(&0u32);
+                names.push(canonical);
+                type_ids.push(t);
+            }
+            (names, type_ids)
+        } else {
+            let limit0_sql = format!("{expanded_sql} LIMIT 0");
+            if let Some((names, types)) = try_infer_schema(conn, &limit0_sql) {
+                let type_ids: Vec<u32> =
+                    types.iter().map(|t| normalize_type_id(*t as u32)).collect();
+                (names, type_ids)
+            } else {
+                let mut names = Vec::new();
+                for dim_name in &dimensions {
+                    let canonical = def
+                        .dimensions
+                        .iter()
+                        .find(|d| d.name.eq_ignore_ascii_case(dim_name))
+                        .map_or_else(|| dim_name.clone(), |d| d.name.clone());
+                    names.push(canonical);
+                }
+                for met_name in &metrics {
+                    let canonical = def
+                        .metrics
+                        .iter()
+                        .find(|m| m.name.eq_ignore_ascii_case(met_name))
+                        .map_or_else(|| met_name.clone(), |m| m.name.clone());
+                    names.push(canonical);
+                }
+                let type_ids = vec![0u32; names.len()];
+                (names, type_ids)
+            }
+        };
+
+        // Build execution SQL with casts where needed (HUGEINT→BIGINT etc).
+        let execution_sql = build_execution_sql(&expanded_sql, &column_names, &column_type_ids);
+
+        // Serialise schema + execution_sql into a flat binary buffer.
+        let n_cols = column_names.len() as u32;
+        let cap = 4 // n_cols
+            + column_names.iter().map(|n| 4 + n.len()).sum::<usize>()
+            + column_type_ids.len() * 4
+            + 4 + execution_sql.len();
+        let mut buf: Vec<u8> = Vec::with_capacity(cap);
+        buf.extend_from_slice(&n_cols.to_le_bytes());
+        for (name, tid) in column_names.iter().zip(column_type_ids.iter()) {
+            let nl = name.len() as u32;
+            buf.extend_from_slice(&nl.to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.extend_from_slice(&tid.to_le_bytes());
+        }
+        let sql_len = execution_sql.len() as u32;
+        buf.extend_from_slice(&sql_len.to_le_bytes());
+        buf.extend_from_slice(execution_sql.as_bytes());
+
+        publish_owned_buffer(buf, out_ptr, out_len);
+        0_u8
+    }));
+    match result {
+        Ok(rc) => rc,
+        Err(_) => {
+            use crate::ddl::read_ffi::write_err;
+            write_err(
+                error_buf,
+                error_buf_len,
+                "internal error: panic inside sv_semantic_view_bind_rust",
+            );
+            2
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // QueryState -- stored as extra_info on the table function
 // ---------------------------------------------------------------------------
 
@@ -47,6 +446,7 @@ unsafe impl Sync for QueryState {}
 // ---------------------------------------------------------------------------
 
 /// Data computed at bind time: the expanded SQL, output schema, and metadata.
+#[allow(dead_code)]
 pub struct SemanticViewBindData {
     /// The SQL query generated by `expand()`, ready for display (e.g., EXPLAIN).
     expanded_sql: String,
@@ -68,6 +468,7 @@ unsafe impl Send for SemanticViewBindData {}
 unsafe impl Sync for SemanticViewBindData {}
 
 /// Mutable state for streaming result chunks during query execution.
+#[allow(dead_code)]
 struct StreamingState {
     result: ffi::duckdb_result,
     chunk_count: usize,
@@ -87,6 +488,7 @@ impl Drop for StreamingState {
 }
 
 /// State tracked during function execution.
+#[allow(dead_code)]
 pub struct SemanticViewInitData {
     /// Streaming state: `None` before first `func()` call, `Some` during streaming.
     inner: Mutex<Option<StreamingState>>,
@@ -476,6 +878,19 @@ fn build_execution_sql(
 /// ```sql
 /// FROM semantic_query('my_view', dimensions := ['region'], metrics := ['total_revenue'])
 /// ```
+///
+/// # Phase 65 Plan 05 Task 6 (Wave 6)
+///
+/// The duckdb-rs registration of this VTab is RETIRED. `semantic_view` is
+/// now registered via the C++ Catalog API path
+/// (`cpp/src/shim.cpp::sv_register_semantic_view`) so its bind callback
+/// receives a native `ClientContext &` and opens a per-call
+/// `Connection(*context.db)`. The bind body is replicated in
+/// `sv_semantic_view_bind_rust` above; this struct + impl are kept
+/// `#[allow(dead_code)]` for one wave to keep the migration commits
+/// clean — Batch 3 cleanup commit deletes the dead VTab carcasses
+/// together (along with the H2 `query_conn` allocation in src/lib.rs).
+#[allow(dead_code)]
 pub struct SemanticViewVTab;
 
 impl VTab for SemanticViewVTab {
