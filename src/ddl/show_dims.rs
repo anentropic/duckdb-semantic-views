@@ -215,9 +215,101 @@ fn emit_rows(
 // Single-view form: show_semantic_dimensions('view_name')
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Phase 65 Plan 05 Task 3 (Wave 2) — sv_show_semantic_dimensions_bind_rust
+// ---------------------------------------------------------------------------
+// Single-view variant. 8 VARCHAR cols (same shape as the _all variant).
+
+/// # Safety
+///
+/// `conn` is a borrowed handle; `name_ptr` must point to `name_len` UTF-8 bytes.
+#[cfg(feature = "extension")]
+#[no_mangle]
+pub unsafe extern "C" fn sv_show_semantic_dimensions_bind_rust(
+    conn: libduckdb_sys::duckdb_connection,
+    name_ptr: *const u8,
+    name_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    error_buf: *mut u8,
+    error_buf_len: usize,
+) -> u8 {
+    use crate::ddl::read_ffi::{
+        probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
+    };
+    use std::panic::AssertUnwindSafe;
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if conn.is_null() {
+            write_err(error_buf, error_buf_len, "duckdb_connection is null");
+            return 1_u8;
+        }
+        if name_ptr.is_null() {
+            write_err(error_buf, error_buf_len, "view name pointer is null");
+            return 1_u8;
+        }
+        let view_name = match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
+                return 1_u8;
+            }
+        };
+        let reader = CatalogReader::new(conn, probe_catalog_table_present(conn));
+        let json = match reader.lookup(&view_name) {
+            Ok(Some(j)) => j,
+            Ok(None) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("semantic view '{view_name}' does not exist"),
+                );
+                return 1_u8;
+            }
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
+        let mut internal = collect_dims(&view_name, &json);
+        internal.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut rows: Vec<Vec<String>> = Vec::with_capacity(internal.len());
+        for r in internal {
+            rows.push(vec![
+                r.database_name,
+                r.schema_name,
+                r.semantic_view_name,
+                r.table_name,
+                r.name,
+                r.data_type,
+                r.synonyms,
+                r.comment,
+            ]);
+        }
+        let buf = serialize_varchar_rows(&rows);
+        publish_owned_buffer(buf, out_ptr, out_len);
+        0_u8
+    }));
+    match result {
+        Ok(rc) => rc,
+        Err(_) => {
+            use crate::ddl::read_ffi::write_err;
+            write_err(
+                error_buf,
+                error_buf_len,
+                "internal error: panic inside sv_show_semantic_dimensions_bind_rust",
+            );
+            2
+        }
+    }
+}
+
 /// Table function: `SHOW SEMANTIC DIMENSIONS IN view_name`
 ///
 /// Takes one VARCHAR parameter (view name). Returns dimensions for that view.
+///
+/// Phase 65 Plan 05 Task 3 (Wave 2): registration retired in favor of the
+/// C++ Catalog API path (`sv_register_show_semantic_dimensions`).
+#[allow(dead_code)]
 pub struct ShowSemanticDimensionsVTab;
 
 impl VTab for ShowSemanticDimensionsVTab {

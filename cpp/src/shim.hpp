@@ -123,4 +123,17 @@ bool sv_register_show_semantic_metrics_all(duckdb_database db_handle);
 bool sv_register_show_semantic_facts_all(duckdb_database db_handle);
 bool sv_register_show_semantic_materializations_all(duckdb_database db_handle);
 
+// Phase 65 Plan 05 Task 3 (Wave 2) — register the migrated single-arg /
+// two-arg TFs via the C++ Catalog API. All take a VARCHAR view-name
+// argument (the dimensions_for_metric variant additionally takes a metric
+// name). The dimensions_for_metric variant returns 3 VARCHAR + 1 BOOLEAN;
+// the rest return homogeneous VARCHAR rows.
+bool sv_register_show_columns_in_semantic_view(duckdb_database db_handle);
+bool sv_register_describe_semantic_view(duckdb_database db_handle);
+bool sv_register_show_semantic_dimensions(duckdb_database db_handle);
+bool sv_register_show_semantic_metrics(duckdb_database db_handle);
+bool sv_register_show_semantic_facts(duckdb_database db_handle);
+bool sv_register_show_semantic_materializations(duckdb_database db_handle);
+bool sv_register_show_semantic_dimensions_for_metric(duckdb_database db_handle);
+
 } // extern "C"

@@ -202,6 +202,49 @@ extern "C" {
         duckdb_connection conn,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
+
+    // Phase 65 Plan 05 Task 3 (Wave 2) — Rust dispatchers for the migrated
+    // single-arg (view name) and two-arg (view name + metric name) TFs.
+    // All take a per-call borrowed duckdb_connection plus name (ptr, len)
+    // tuples. The single-view show_columns / describe / show_semantic_*
+    // variants emit VARCHAR rows; show_semantic_dimensions_for_metric
+    // emits VARCHAR+BOOL rows (3 VARCHAR + 1 trailing BOOL per row).
+    uint8_t sv_show_columns_in_semantic_view_bind_rust(
+        duckdb_connection conn,
+        const uint8_t *name_ptr, size_t name_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+    uint8_t sv_describe_semantic_view_bind_rust(
+        duckdb_connection conn,
+        const uint8_t *name_ptr, size_t name_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+    uint8_t sv_show_semantic_dimensions_bind_rust(
+        duckdb_connection conn,
+        const uint8_t *name_ptr, size_t name_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+    uint8_t sv_show_semantic_metrics_bind_rust(
+        duckdb_connection conn,
+        const uint8_t *name_ptr, size_t name_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+    uint8_t sv_show_semantic_facts_bind_rust(
+        duckdb_connection conn,
+        const uint8_t *name_ptr, size_t name_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+    uint8_t sv_show_semantic_materializations_bind_rust(
+        duckdb_connection conn,
+        const uint8_t *name_ptr, size_t name_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+    uint8_t sv_show_semantic_dimensions_for_metric_bind_rust(
+        duckdb_connection conn,
+        const uint8_t *view_name_ptr, size_t view_name_len,
+        const uint8_t *metric_name_ptr, size_t metric_name_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1198,61 @@ static void sv_run_varchar_bind(ClientContext &context,
     sv_parse_varchar_payload(payload.ptr, payload.len, bd, fn_name);
 }
 
+// Variant for TFs with one VARCHAR argument (the view name). Extracts the
+// name from input.inputs[0] and forwards it as (ptr, len) to the dispatcher
+// alongside the borrowed connection handle.
+template <typename DispatcherFn>
+static void sv_run_varchar_bind_with_name(ClientContext &context,
+                                          TableFunctionBindInput &input,
+                                          SvVarcharBindData &bd,
+                                          size_t expected_cols,
+                                          const char *fn_name,
+                                          DispatcherFn &&dispatcher) {
+    bd.expected_cols = expected_cols;
+    std::string name = input.inputs[0].GetValue<std::string>();
+    Connection probe(*context.db);
+    duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+    SvOwnedBuffer payload;
+    char error_buf[1024];
+    std::memset(error_buf, 0, sizeof(error_buf));
+    uint8_t rc = dispatcher(borrowed,
+                            reinterpret_cast<const uint8_t *>(name.data()), name.size(),
+                            &payload.ptr, &payload.len,
+                            error_buf, sizeof(error_buf));
+    if (rc != 0) {
+        throw BinderException(std::string(fn_name) + " failed: " + error_buf);
+    }
+    sv_parse_varchar_payload(payload.ptr, payload.len, bd, fn_name);
+}
+
+// Variant for TFs with two VARCHAR arguments (view_name, metric_name).
+template <typename DispatcherFn>
+static void sv_run_varchar_bool_bind_with_two_names(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    SvVarcharBoolBindData &bd,
+    size_t expected_varchar_cols,
+    const char *fn_name,
+    DispatcherFn &&dispatcher) {
+    bd.expected_varchar_cols = expected_varchar_cols;
+    std::string name1 = input.inputs[0].GetValue<std::string>();
+    std::string name2 = input.inputs[1].GetValue<std::string>();
+    Connection probe(*context.db);
+    duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+    SvOwnedBuffer payload;
+    char error_buf[1024];
+    std::memset(error_buf, 0, sizeof(error_buf));
+    uint8_t rc = dispatcher(borrowed,
+                            reinterpret_cast<const uint8_t *>(name1.data()), name1.size(),
+                            reinterpret_cast<const uint8_t *>(name2.data()), name2.size(),
+                            &payload.ptr, &payload.len,
+                            error_buf, sizeof(error_buf));
+    if (rc != 0) {
+        throw BinderException(std::string(fn_name) + " failed: " + error_buf);
+    }
+    sv_parse_varchar_bool_payload(payload.ptr, payload.len, bd, fn_name);
+}
+
 template <typename DispatcherFn>
 static void sv_run_varchar_bool_bind(ClientContext &context,
                                      SvVarcharBoolBindData &bd,
@@ -1375,6 +1473,253 @@ extern "C" {
             nullptr, 0,
             sv_show_semantic_materializations_all_bind,
             sv_emit_varchar_rows, sv_varchar_init_local);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2 single-arg TFs — Phase 65 Plan 05 Task 3
+// ---------------------------------------------------------------------------
+// show_columns_in_semantic_view, describe_semantic_view, and the 4
+// single-view show_semantic_<entity> variants all take one VARCHAR arg
+// (the view name) and emit homogeneous VARCHAR rows. The single
+// show_semantic_dimensions_for_metric takes two VARCHAR args and emits
+// VARCHAR + trailing BOOL rows (handled in the dedicated block further
+// down).
+
+static unique_ptr<FunctionData> sv_show_columns_in_semantic_view_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COLS[] = {
+        "database_name", "schema_name", "semantic_view_name", "column_name",
+        "data_type", "kind", "expression", "comment",
+    };
+    for (auto cn : COLS) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind_with_name(
+        context, input, *bd, 8, "show_columns_in_semantic_view",
+        [](duckdb_connection borrowed,
+           const uint8_t *np, size_t nl,
+           char **op, size_t *ol, char *eb, size_t ebl) {
+            return sv_show_columns_in_semantic_view_bind_rust(
+                borrowed, np, nl, op, ol, eb, ebl);
+        });
+    return std::move(bd);
+}
+
+static unique_ptr<FunctionData> sv_describe_semantic_view_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COLS[] = {
+        "object_kind", "object_name", "parent_entity", "property", "property_value",
+    };
+    for (auto cn : COLS) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind_with_name(
+        context, input, *bd, 5, "describe_semantic_view",
+        [](duckdb_connection borrowed,
+           const uint8_t *np, size_t nl,
+           char **op, size_t *ol, char *eb, size_t ebl) {
+            return sv_describe_semantic_view_bind_rust(
+                borrowed, np, nl, op, ol, eb, ebl);
+        });
+    return std::move(bd);
+}
+
+static unique_ptr<FunctionData> sv_show_semantic_dimensions_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COLS[] = {
+        "database_name", "schema_name", "semantic_view_name", "table_name",
+        "name", "data_type", "synonyms", "comment",
+    };
+    for (auto cn : COLS) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind_with_name(
+        context, input, *bd, 8, "show_semantic_dimensions",
+        [](duckdb_connection borrowed,
+           const uint8_t *np, size_t nl,
+           char **op, size_t *ol, char *eb, size_t ebl) {
+            return sv_show_semantic_dimensions_bind_rust(
+                borrowed, np, nl, op, ol, eb, ebl);
+        });
+    return std::move(bd);
+}
+
+static unique_ptr<FunctionData> sv_show_semantic_metrics_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COLS[] = {
+        "database_name", "schema_name", "semantic_view_name", "table_name",
+        "name", "data_type", "synonyms", "comment",
+    };
+    for (auto cn : COLS) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind_with_name(
+        context, input, *bd, 8, "show_semantic_metrics",
+        [](duckdb_connection borrowed,
+           const uint8_t *np, size_t nl,
+           char **op, size_t *ol, char *eb, size_t ebl) {
+            return sv_show_semantic_metrics_bind_rust(
+                borrowed, np, nl, op, ol, eb, ebl);
+        });
+    return std::move(bd);
+}
+
+static unique_ptr<FunctionData> sv_show_semantic_facts_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COLS[] = {
+        "database_name", "schema_name", "semantic_view_name", "table_name",
+        "name", "data_type", "synonyms", "comment",
+    };
+    for (auto cn : COLS) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind_with_name(
+        context, input, *bd, 8, "show_semantic_facts",
+        [](duckdb_connection borrowed,
+           const uint8_t *np, size_t nl,
+           char **op, size_t *ol, char *eb, size_t ebl) {
+            return sv_show_semantic_facts_bind_rust(
+                borrowed, np, nl, op, ol, eb, ebl);
+        });
+    return std::move(bd);
+}
+
+static unique_ptr<FunctionData> sv_show_semantic_materializations_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COLS[] = {
+        "database_name", "schema_name", "semantic_view_name",
+        "name", "table", "dimensions", "metrics",
+    };
+    for (auto cn : COLS) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind_with_name(
+        context, input, *bd, 7, "show_semantic_materializations",
+        [](duckdb_connection borrowed,
+           const uint8_t *np, size_t nl,
+           char **op, size_t *ol, char *eb, size_t ebl) {
+            return sv_show_semantic_materializations_bind_rust(
+                borrowed, np, nl, op, ol, eb, ebl);
+        });
+    return std::move(bd);
+}
+
+// show_semantic_dimensions_for_metric: 3 VARCHAR + 1 BOOL output, 2 VARCHAR
+// input args.
+static unique_ptr<FunctionData> sv_show_semantic_dimensions_for_metric_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBoolBindData>();
+    return_types.push_back(LogicalType::VARCHAR);
+    names.emplace_back("table_name");
+    return_types.push_back(LogicalType::VARCHAR);
+    names.emplace_back("name");
+    return_types.push_back(LogicalType::VARCHAR);
+    names.emplace_back("data_type");
+    return_types.push_back(LogicalType::BOOLEAN);
+    names.emplace_back("required");
+    sv_run_varchar_bool_bind_with_two_names(
+        context, input, *bd, /*expected_varchar_cols*/ 3,
+        "show_semantic_dimensions_for_metric",
+        [](duckdb_connection borrowed,
+           const uint8_t *vn, size_t vnl,
+           const uint8_t *mn, size_t mnl,
+           char **op, size_t *ol, char *eb, size_t ebl) {
+            return sv_show_semantic_dimensions_for_metric_bind_rust(
+                borrowed, vn, vnl, mn, mnl, op, ol, eb, ebl);
+        });
+    return std::move(bd);
+}
+
+extern "C" {
+    bool sv_register_show_columns_in_semantic_view(duckdb_database db_handle) {
+        LogicalType args[] = {LogicalType::VARCHAR};
+        return sv_register_table_function(
+            db_handle, "show_columns_in_semantic_view",
+            args, 1,
+            sv_show_columns_in_semantic_view_bind,
+            sv_emit_varchar_rows, sv_varchar_init_local);
+    }
+    bool sv_register_describe_semantic_view(duckdb_database db_handle) {
+        LogicalType args[] = {LogicalType::VARCHAR};
+        return sv_register_table_function(
+            db_handle, "describe_semantic_view",
+            args, 1,
+            sv_describe_semantic_view_bind,
+            sv_emit_varchar_rows, sv_varchar_init_local);
+    }
+    bool sv_register_show_semantic_dimensions(duckdb_database db_handle) {
+        LogicalType args[] = {LogicalType::VARCHAR};
+        return sv_register_table_function(
+            db_handle, "show_semantic_dimensions",
+            args, 1,
+            sv_show_semantic_dimensions_bind,
+            sv_emit_varchar_rows, sv_varchar_init_local);
+    }
+    bool sv_register_show_semantic_metrics(duckdb_database db_handle) {
+        LogicalType args[] = {LogicalType::VARCHAR};
+        return sv_register_table_function(
+            db_handle, "show_semantic_metrics",
+            args, 1,
+            sv_show_semantic_metrics_bind,
+            sv_emit_varchar_rows, sv_varchar_init_local);
+    }
+    bool sv_register_show_semantic_facts(duckdb_database db_handle) {
+        LogicalType args[] = {LogicalType::VARCHAR};
+        return sv_register_table_function(
+            db_handle, "show_semantic_facts",
+            args, 1,
+            sv_show_semantic_facts_bind,
+            sv_emit_varchar_rows, sv_varchar_init_local);
+    }
+    bool sv_register_show_semantic_materializations(duckdb_database db_handle) {
+        LogicalType args[] = {LogicalType::VARCHAR};
+        return sv_register_table_function(
+            db_handle, "show_semantic_materializations",
+            args, 1,
+            sv_show_semantic_materializations_bind,
+            sv_emit_varchar_rows, sv_varchar_init_local);
+    }
+    bool sv_register_show_semantic_dimensions_for_metric(duckdb_database db_handle) {
+        LogicalType args[] = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+        return sv_register_table_function(
+            db_handle, "show_semantic_dimensions_for_metric",
+            args, 2,
+            sv_show_semantic_dimensions_for_metric_bind,
+            sv_emit_varchar_bool_rows, sv_varchar_init_local);
     }
 }
 

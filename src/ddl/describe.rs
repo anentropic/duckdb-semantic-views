@@ -10,6 +10,119 @@ use std::collections::HashMap;
 use crate::catalog::CatalogReader;
 use crate::model::{AccessModifier, SemanticViewDefinition};
 
+// ---------------------------------------------------------------------------
+// Phase 65 Plan 05 Task 3 (Wave 2) — sv_describe_semantic_view_bind_rust
+// ---------------------------------------------------------------------------
+// FFI dispatcher for the migrated describe_semantic_view(view_name) TF.
+// 5-column VARCHAR (object_kind, object_name, parent_entity, property,
+// property_value). Same bridge + borrow contract as Wave 0 spike.
+
+/// # Safety
+///
+/// `conn` is a borrowed handle; `name_ptr` must point to `name_len` UTF-8 bytes.
+#[cfg(feature = "extension")]
+#[no_mangle]
+pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
+    conn: libduckdb_sys::duckdb_connection,
+    name_ptr: *const u8,
+    name_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    error_buf: *mut u8,
+    error_buf_len: usize,
+) -> u8 {
+    use crate::ddl::read_ffi::{
+        probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
+    };
+    use std::panic::AssertUnwindSafe;
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if conn.is_null() {
+            write_err(error_buf, error_buf_len, "duckdb_connection is null");
+            return 1_u8;
+        }
+        if name_ptr.is_null() {
+            write_err(error_buf, error_buf_len, "view name pointer is null");
+            return 1_u8;
+        }
+        let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
+        let name = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
+                return 1_u8;
+            }
+        };
+        let reader = CatalogReader::new(conn, probe_catalog_table_present(conn));
+        let json = match reader.lookup(&name) {
+            Ok(Some(j)) => j,
+            Ok(None) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("semantic view '{name}' does not exist"),
+                );
+                return 1_u8;
+            }
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
+        let def = match SemanticViewDefinition::from_json(&name, &json) {
+            Ok(d) => d,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e.to_string());
+                return 1_u8;
+            }
+        };
+        let alias_map = def.alias_to_table_map();
+        let base_table = def.base_table().to_string();
+
+        let mut internal: Vec<DescribeRow> = Vec::new();
+        if let Some(ref comment) = def.comment {
+            internal.push(DescribeRow {
+                object_kind: String::new(),
+                object_name: String::new(),
+                parent_entity: String::new(),
+                property: "COMMENT".to_string(),
+                property_value: comment.clone(),
+            });
+        }
+        collect_table_rows(&def, &mut internal);
+        collect_relationship_rows(&def, &alias_map, &mut internal);
+        collect_fact_rows(&def, &base_table, &alias_map, &mut internal);
+        collect_dimension_rows(&def, &base_table, &alias_map, &mut internal);
+        collect_metric_rows(&def, &base_table, &alias_map, &mut internal);
+        collect_materialization_rows(&def, &mut internal);
+
+        let mut rows: Vec<Vec<String>> = Vec::with_capacity(internal.len());
+        for r in internal {
+            rows.push(vec![
+                r.object_kind,
+                r.object_name,
+                r.parent_entity,
+                r.property,
+                r.property_value,
+            ]);
+        }
+        let buf = serialize_varchar_rows(&rows);
+        publish_owned_buffer(buf, out_ptr, out_len);
+        0_u8
+    }));
+    match result {
+        Ok(rc) => rc,
+        Err(_) => {
+            use crate::ddl::read_ffi::write_err;
+            write_err(
+                error_buf,
+                error_buf_len,
+                "internal error: panic inside sv_describe_semantic_view_bind_rust",
+            );
+            2
+        }
+    }
+}
+
 /// A single property row in the DESCRIBE output.
 ///
 /// Each row represents one property of one object in the semantic view.
@@ -490,6 +603,10 @@ fn collect_materialization_rows(def: &SemanticViewDefinition, rows: &mut Vec<Des
 ///   `(object_kind, object_name, parent_entity, property, property_value)`
 ///
 /// Takes one positional VARCHAR parameter: the view name.
+///
+/// Phase 65 Plan 05 Task 3 (Wave 2): registration retired in favor of the
+/// C++ Catalog API path (`sv_register_describe_semantic_view`).
+#[allow(dead_code)]
 pub struct DescribeSemanticViewVTab;
 
 impl VTab for DescribeSemanticViewVTab {
