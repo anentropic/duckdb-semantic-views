@@ -174,6 +174,7 @@ fn main() {
     // Gate them on existence so they only join the dependency graph once present.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=cpp/src/shim.cpp");
+    println!("cargo:rerun-if-changed=cpp/src/shim.hpp");
     println!("cargo:rerun-if-changed=cpp/include/parser_extension_compat.hpp");
     if std::path::Path::new("cpp/include/duckdb.hpp").exists() {
         println!("cargo:rerun-if-changed=cpp/include/duckdb.hpp");

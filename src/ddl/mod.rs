@@ -3,6 +3,7 @@
 // their `persist::execute_parameterized` helper were removed in v0.8.0's full
 // architectural unification. Only `define::enrich_definition_for_create`
 // remains — called by the parser_override CREATE rewrite.
+pub mod alter_helpers_ffi;
 pub mod define;
 pub mod describe;
 pub mod get_ddl;

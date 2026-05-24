@@ -26,6 +26,7 @@
 // unit can use them. See cpp/include/parser_extension_compat.hpp for details.
 
 #include "parser_extension_compat.hpp"
+#include "shim.hpp"
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -96,6 +97,51 @@ extern "C" {
     // remainder of process life (one Connection per DB ever opened).
     void *sv_make_override_context(duckdb_connection conn, bool is_file_backed);
     void  sv_drop_override_context(void *ctx_ptr);
+
+    // Phase 65 Plan 04 (Task 2 Step C) — Rust FFI bridge for the
+    // `__sv_compute_create_from_yaml` helper TF. Reads file content from
+    // the bind callback (via Connection probe(*context.db) + read_text(?))
+    // and parses + enriches the YAML on the Rust side, returning the
+    // metadata-less JSON definition as a heap-owned (ptr, len) buffer.
+    //
+    // The outer parser_override INSERT wraps `new_def` with json_merge_patch
+    // to add now()/current_database()/current_schema() on the caller's
+    // connection (matching the metadata-via-SQL pattern landed in Plan 03
+    // for the inline CREATE path).
+    //
+    // Parameters:
+    //   content_ptr/len — YAML bytes loaded by the C++ bind callback.
+    //   name_ptr/len    — view name (bare identifier).
+    //   comment_ptr/len — optional COMMENT='...' value; pass len=0 for
+    //                     "no comment provided" (the helper leaves
+    //                     `def.comment` untouched in that case so the
+    //                     YAML's own `comment:` field, if any, survives).
+    //   kind            — 0 = CREATE, 1 = OR REPLACE, 2 = IF NOT EXISTS.
+    //                     Currently unused by the Rust helper (the outer
+    //                     parser_override INSERT shape encodes ON CONFLICT
+    //                     behaviour) but threaded for forward compat with
+    //                     future variants whose enrichment differs.
+    //   out_ptr/out_len — on rc=0, point to a heap-owned UTF-8 buffer
+    //                     (NOT NUL-terminated) holding the JSON definition.
+    //                     Caller MUST release via `sv_free_buffer` with
+    //                     the exact (ptr, len) pair Rust returned.
+    //   error_buf       — on rc!=0, gets a NUL-terminated error message
+    //                     capped at `error_buf_len-1` bytes. Untouched
+    //                     on success.
+    //
+    // Return codes:
+    //   0 — success; (out_ptr, out_len) populated.
+    //   1 — YAML parse / size-cap error; error_buf populated.
+    //   2 — enrichment / validation error; error_buf populated.
+    //   3 — internal error (panic across FFI, allocation failure, etc.);
+    //       error_buf populated.
+    uint8_t sv_compute_create_from_yaml_rust(
+        const uint8_t *content_ptr, size_t content_len,
+        const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *comment_ptr, size_t comment_len,
+        uint8_t kind,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +389,255 @@ static ParserExtensionPlanResult sv_plan_unreachable(
 }
 
 // ---------------------------------------------------------------------------
+// sv_register_table_function — Phase 65 Plan 04 (A2 resolution)
+// ---------------------------------------------------------------------------
+// Reusable C-callable wrapper around the C++ Catalog API table-function
+// registration pattern proven by `65-READ-PATH-SPIKE.md`. Bind callbacks
+// registered via this path receive a native `ClientContext &` (not the
+// duckdb-rs `BindInfo` wrapper which marshals `ClientContext` away), so
+// they can open per-call `Connection(*context.db)` for catalog reads and
+// YAML parsing without needing a long-lived extension-owned connection.
+//
+// Plan 04 consumes this to register `__sv_compute_create_from_yaml`. Plan 05
+// will consume it (and add a scalar sibling) to migrate the 17 read-side
+// callbacks off `query_conn` (H2).
+//
+// Header declaration in cpp/src/shim.hpp.
+extern "C" {
+    bool sv_register_table_function(
+        duckdb_database db_handle,
+        const char *name,
+        const LogicalType *arg_types,
+        size_t arg_count,
+        table_function_bind_t bind_cb,
+        table_function_t exec_cb,
+        table_function_init_local_t init_cb) {
+        try {
+            if (db_handle == nullptr || name == nullptr ||
+                bind_cb == nullptr || exec_cb == nullptr) {
+                fprintf(stderr,
+                    "sv_register_table_function: null required argument\n");
+                return false;
+            }
+            auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
+                db_handle->internal_ptr);
+            if (wrapper == nullptr) {
+                fprintf(stderr,
+                    "sv_register_table_function: null DatabaseWrapper\n");
+                return false;
+            }
+            auto &db = *wrapper->database->instance;
+
+            vector<LogicalType> args;
+            args.reserve(arg_count);
+            for (size_t i = 0; i < arg_count; ++i) {
+                args.push_back(arg_types[i]);
+            }
+
+            // Six-arg TableFunction ctor: (name, args, function, bind,
+            // init_global, init_local). init_global is nullptr; init_local
+            // may be null when the helper TF has no per-execution local
+            // state (e.g. simple one-row emitters like the YAML helper).
+            TableFunction tf(
+                std::string(name),
+                std::move(args),
+                exec_cb,
+                bind_cb,
+                /*init_global*/ nullptr,
+                init_cb);
+
+            CreateTableFunctionInfo info(tf);
+            // ALTER_ON_CONFLICT: extension reload (LOAD semantic_views after
+            // a previous LOAD in the same process) replaces the registration
+            // cleanly instead of throwing on duplicate name.
+            info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+
+            auto &system_catalog = Catalog::GetSystemCatalog(db);
+            auto txn = CatalogTransaction::GetSystemTransaction(db);
+            system_catalog.CreateTableFunction(txn, info);
+            return true;
+        } catch (const std::exception &e) {
+            fprintf(stderr,
+                "sv_register_table_function('%s') failed: %s\n",
+                name ? name : "(null)", e.what());
+            return false;
+        } catch (...) {
+            fprintf(stderr,
+                "sv_register_table_function('%s') failed: unknown exception\n",
+                name ? name : "(null)");
+            return false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// __sv_compute_create_from_yaml — Phase 65 Plan 04 (Task 2 Step B)
+// ---------------------------------------------------------------------------
+// Helper table function registered via `sv_register_table_function`. The bind
+// callback opens `Connection probe(*context.db)`, reads the YAML file via a
+// parameterized `read_text(?)` query (path comes through as a typed `Value`,
+// so there is no SQL-injection surface), then calls the Rust FFI helper
+// `sv_compute_create_from_yaml_rust` to parse + enrich + serialize the YAML
+// into a metadata-less JSON definition. The exec callback emits the JSON
+// as a single VARCHAR row.
+//
+// The outer parser_override INSERT (src/parse.rs::rewrite_yaml_file_create,
+// landed in Task 4) wraps the helper TF's row via `json_merge_patch(new_def,
+// json_object('created_on', strftime(now(), '%Y-%m-%dT%H:%M:%SZ'),
+// 'database_name', current_database(), 'schema_name', current_schema()))`
+// so metadata fields are populated on the caller's connection, preserving
+// the D-21 transactional contract.
+
+struct CreateFromYamlBindData : public TableFunctionData {
+    std::string file_path;
+    std::string view_name;
+    std::string comment;
+    int32_t kind = 0;
+    std::string new_def;
+};
+
+struct CreateFromYamlLocalState : public LocalTableFunctionState {
+    bool emitted = false;
+};
+
+static unique_ptr<FunctionData> sv_create_from_yaml_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<CreateFromYamlBindData>();
+    bd->file_path = input.inputs[0].GetValue<string>();
+    bd->view_name = input.inputs[1].GetValue<string>();
+    bd->kind      = input.inputs[2].GetValue<int32_t>();
+    bd->comment   = input.inputs[3].GetValue<string>();
+
+    // Read the YAML file via a per-call Connection. `read_text(?)` honors
+    // DuckDB's `enable_external_access` setting and other path-resolution
+    // safeguards — we don't introduce a new file-I/O surface.
+    //
+    // SQL safety: the path comes through as a typed `Value` (input.inputs[0]
+    // is a parameterized VARCHAR bound by the outer parser_override SELECT,
+    // not concatenated from user input here). We escape any embedded single
+    // quotes when embedding the path into the read_text(...) SQL string so
+    // a pathological path string ("a'b.yaml") doesn't break the SELECT — the
+    // standard SQL doubling convention. We use Connection::Query here
+    // (returning MaterializedQueryResult directly) rather than the Prepare/
+    // Execute path because the latter returns a non-materialized QueryResult
+    // that triggers an InternalException when down-cast.
+    std::string path_escaped = bd->file_path;
+    {
+        size_t pos = 0;
+        while ((pos = path_escaped.find('\'', pos)) != std::string::npos) {
+            path_escaped.replace(pos, 1, "''");
+            pos += 2;
+        }
+    }
+    Connection probe(*context.db);
+    std::string read_sql =
+        "SELECT content FROM read_text('" + path_escaped + "')";
+    auto result = probe.Query(read_sql);
+    if (result->HasError()) {
+        // The "FROM YAML FILE failed" prefix matches the v0.9.0 wording
+        // pinned by test/sql/phase53_yaml_file.test ("file not found"
+        // and "enable_external_access=false" cases).
+        throw BinderException(
+            "FROM YAML FILE failed: " + result->GetError());
+    }
+    if (result->RowCount() == 0) {
+        throw BinderException(
+            "FROM YAML FILE failed: no content returned from '" +
+            bd->file_path + "'");
+    }
+    Value content_val = result->GetValue(0, 0);
+    if (content_val.IsNull()) {
+        throw BinderException(
+            "FROM YAML FILE failed: NULL content from '" +
+            bd->file_path + "'");
+    }
+    std::string yaml_content = content_val.GetValue<string>();
+
+    // Bridge into Rust to parse + enrich + serialize. The Rust side enforces
+    // YAML_SIZE_CAP (1 MiB) inside from_yaml_with_size_cap, so we deliberately
+    // do NOT pre-check size here — keeps the cap as a single source of truth
+    // on the Rust side.
+    char *out_ptr = nullptr;
+    size_t out_len = 0;
+    char error_buf[1024];
+    std::memset(error_buf, 0, sizeof(error_buf));
+
+    uint8_t rc = sv_compute_create_from_yaml_rust(
+        reinterpret_cast<const uint8_t *>(yaml_content.data()),
+        yaml_content.size(),
+        reinterpret_cast<const uint8_t *>(bd->view_name.data()),
+        bd->view_name.size(),
+        reinterpret_cast<const uint8_t *>(bd->comment.data()),
+        bd->comment.size(),
+        static_cast<uint8_t>(bd->kind),
+        &out_ptr,
+        &out_len,
+        error_buf,
+        sizeof(error_buf));
+
+    if (rc != 0 || out_ptr == nullptr) {
+        // Match "FROM YAML FILE failed:" wording for size/parse errors so
+        // the legacy phase53 sqllogictest assertions stay green.
+        throw BinderException(
+            std::string("FROM YAML FILE failed: ") + error_buf);
+    }
+
+    // Move the heap-owned UTF-8 buffer into bd->new_def, then release the
+    // Rust allocation via sv_free_buffer (the exact (ptr, len) pair Rust
+    // returned). The string copy is unavoidable because std::string demands
+    // its own allocator-owned storage; for a 1 MiB cap this is bounded.
+    bd->new_def.assign(out_ptr, out_len);
+    sv_free_buffer(out_ptr, out_len);
+
+    return_types.push_back(LogicalType::VARCHAR);
+    names.push_back("new_def");
+    return std::move(bd);
+}
+
+static unique_ptr<LocalTableFunctionState> sv_create_from_yaml_init_local(
+    ExecutionContext & /*context*/,
+    TableFunctionInitInput & /*input*/,
+    GlobalTableFunctionState * /*global_state*/) {
+    return make_uniq<CreateFromYamlLocalState>();
+}
+
+static void sv_create_from_yaml_function(
+    ClientContext & /*context*/,
+    TableFunctionInput &data_p,
+    DataChunk &output) {
+    auto &bd = data_p.bind_data->Cast<CreateFromYamlBindData>();
+    // Without an init_local callback registered, data_p.local_state is
+    // nullptr. Use an instance bit on the bind data instead — but bind
+    // data is shared across executions, so for parallel safety we register
+    // init_local. (Currently sv_register_parser_hooks passes nullptr for
+    // init_cb on this helper; flip the registration to use the init_local
+    // path so multiple executions in the same statement don't double-emit.)
+    auto *state_p = data_p.local_state.get();
+    if (state_p == nullptr) {
+        // No local state — fall back to single-emit using a one-shot
+        // pattern keyed on output cardinality. The helper TF is bound and
+        // executed once per outer INSERT so this is safe in practice for
+        // the v0.10.0 surface; if a future caller invokes it inside a
+        // streaming context, init_local should be wired in
+        // sv_register_parser_hooks.
+        output.SetValue(0, 0, Value(bd.new_def));
+        output.SetCardinality(1);
+        return;
+    }
+    auto &state = state_p->Cast<CreateFromYamlLocalState>();
+    if (state.emitted) {
+        output.SetCardinality(0);
+        return;
+    }
+    output.SetValue(0, 0, Value(bd.new_def));
+    output.SetCardinality(1);
+    state.emitted = true;
+}
+
+// ---------------------------------------------------------------------------
 // sv_register_parser_hooks -- called from Rust after C API init
 // ---------------------------------------------------------------------------
 // Extracts DatabaseInstance& from the C API handle and registers the
@@ -397,6 +692,36 @@ extern "C" {
             // resolved by parse_function above — sv_parse_stub renders
             // `LINE 1: ... ^` for every CREATE/DROP/ALTER validation error.
             config.SetOption("allow_parser_override_extension", Value("FALLBACK"));
+
+            // Phase 65 Plan 04 (Task 2 Step B): register the
+            // `__sv_compute_create_from_yaml` helper TF via the C++ Catalog
+            // API so its bind callback receives a native `ClientContext &`
+            // and can open per-call `Connection(*context.db)` to read the
+            // YAML file. The outer parser_override INSERT in
+            // src/parse.rs::rewrite_yaml_file_create wraps the helper TF's
+            // `new_def` row with json_merge_patch + json_object to add
+            // now()/current_database()/current_schema() on the caller's
+            // connection, preserving D-21 transactional contract.
+            {
+                LogicalType arg_types[] = {
+                    LogicalType::VARCHAR,  // file_path
+                    LogicalType::VARCHAR,  // view_name
+                    LogicalType::INTEGER,  // kind (0/1/2)
+                    LogicalType::VARCHAR,  // comment (empty = none)
+                };
+                if (!sv_register_table_function(
+                        db_handle,
+                        "__sv_compute_create_from_yaml",
+                        arg_types, 4,
+                        sv_create_from_yaml_bind,
+                        sv_create_from_yaml_function,
+                        sv_create_from_yaml_init_local)) {
+                    fprintf(stderr,
+                        "sv_register_parser_hooks: failed to register "
+                        "__sv_compute_create_from_yaml helper TF\n");
+                    return false;
+                }
+            }
 
             return true;
         } catch (const std::exception &e) {
