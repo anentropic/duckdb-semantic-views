@@ -305,24 +305,20 @@ mod extension {
 
     use crate::{
         catalog::init_catalog,
-        ddl::{
-            // Phase 65 Plan 05 Tasks 1-3 migrated 12 of 17 read-side
-            // registrations to the C++ Catalog API path:
-            //  - Task 1 (Wave 0): list_semantic_views
-            //  - Task 2 (Wave 1): list_terse + 4 "_all" variants
-            //  - Task 3 (Wave 2): describe + show_columns + 4 single-view
-            //    SHOW variants + show_dimensions_for_metric
-            // The corresponding legacy VTab structs are marked
-            // `#[allow(dead_code)]` in their modules until the Wave 6
-            // cleanup commit. Remaining duckdb-rs registrations
-            // (get_ddl + read_yaml scalars + explain_semantic_view +
-            // semantic_view) are migrated in Tasks 4-6.
-            get_ddl::GetDdlScalar,
-            read_yaml::ReadYamlFromSemanticViewScalar,
-        },
         query::explain::ExplainSemanticViewVTab,
         query::table_function::{QueryState, SemanticViewVTab},
     };
+    // Phase 65 Plan 05 Tasks 1-4 migrated 14 of 17 read-side registrations
+    // to the C++ Catalog API path:
+    //  - Task 1 (Wave 0): list_semantic_views
+    //  - Task 2 (Wave 1): list_terse + 4 "_all" variants
+    //  - Task 3 (Wave 2): describe + show_columns + 4 single-view SHOW
+    //    variants + show_dimensions_for_metric
+    //  - Task 4 (Wave 3): get_ddl + read_yaml_from_semantic_view (scalars)
+    // The corresponding legacy VTab/VScalar structs are marked
+    // `#[allow(dead_code)]` in their modules until the Wave 6 cleanup
+    // commit. Remaining duckdb-rs registrations (explain_semantic_view +
+    // semantic_view) are migrated in Tasks 5-6.
 
     // C++ helper for parser hook registration (defined in cpp/src/shim.cpp).
     // Phase 62: catalog_conn + is_file_backed are bundled into an
@@ -371,6 +367,15 @@ mod extension {
         fn sv_register_show_semantic_materializations(db_handle: ffi::duckdb_database) -> bool;
         fn sv_register_show_semantic_dimensions_for_metric(db_handle: ffi::duckdb_database)
             -> bool;
+
+        // Phase 65 Plan 05 Task 4 (Wave 3) — register the migrated read-side
+        // scalars via the C++ Catalog API. Exec callbacks open per-call
+        // `Connection probe(*state.GetContext().db)` and bridge to the
+        // matching Rust dispatchers (sv_get_ddl_exec_rust /
+        // sv_read_yaml_from_semantic_view_exec_rust). Borrow contract is
+        // identical to the bind-side dispatchers.
+        fn sv_register_get_ddl(db_handle: ffi::duckdb_database) -> bool;
+        fn sv_register_read_yaml_from_semantic_view(db_handle: ffi::duckdb_database) -> bool;
     }
 
     /// Core initialization logic, called with both the high-level Connection and
@@ -527,14 +532,21 @@ mod extension {
             );
         }
 
-        // Register GET_DDL scalar function.
-        con.register_scalar_function_with_state::<GetDdlScalar>("get_ddl", &catalog_reader)?;
-
-        // Register READ_YAML_FROM_SEMANTIC_VIEW scalar function.
-        con.register_scalar_function_with_state::<ReadYamlFromSemanticViewScalar>(
-            "read_yaml_from_semantic_view",
-            &catalog_reader,
-        )?;
+        // Phase 65 Plan 05 Task 4 (Wave 3): GET_DDL +
+        // READ_YAML_FROM_SEMANTIC_VIEW migrated to the C++ Catalog API
+        // path. Each exec callback opens a per-call
+        // `Connection probe(*state.GetContext().db)` and bridges to the
+        // Rust dispatcher; no long-lived `catalog_reader` is consumed by
+        // the read path after Plan 05 Wave 3 (H1 retirement still
+        // pending — Plan 06).
+        if !unsafe { sv_register_get_ddl(db_handle) } {
+            return Err("Failed to register get_ddl via C++ Catalog API".into());
+        }
+        if !unsafe { sv_register_read_yaml_from_semantic_view(db_handle) } {
+            return Err(
+                "Failed to register read_yaml_from_semantic_view via C++ Catalog API".into(),
+            );
+        }
 
         // Create a NEW connection for the semantic_view table function.
         let mut query_conn: ffi::duckdb_connection = ptr::null_mut();

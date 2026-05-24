@@ -136,4 +136,17 @@ bool sv_register_show_semantic_facts(duckdb_database db_handle);
 bool sv_register_show_semantic_materializations(duckdb_database db_handle);
 bool sv_register_show_semantic_dimensions_for_metric(duckdb_database db_handle);
 
+// Phase 65 Plan 05 Task 4 (Wave 3) — register the migrated read-side
+// scalars via the C++ Catalog API. The exec callbacks open a per-call
+// `Connection probe(*state.GetContext().db)` (the scalar analog of the
+// bind-side `Connection(*context.db)` used by the 15 migrated TFs) and
+// bridge to the matching Rust dispatcher (`sv_get_ddl_exec_rust`,
+// `sv_read_yaml_from_semantic_view_exec_rust`) — same borrow contract as
+// the TF dispatchers. See `cpp/src/shim.cpp` per-callback comment blocks.
+//
+// `get_ddl(object_type VARCHAR, name VARCHAR) -> VARCHAR` — 2 args.
+// `read_yaml_from_semantic_view(name VARCHAR) -> VARCHAR` — 1 arg.
+bool sv_register_get_ddl(duckdb_database db_handle);
+bool sv_register_read_yaml_from_semantic_view(duckdb_database db_handle);
+
 } // extern "C"

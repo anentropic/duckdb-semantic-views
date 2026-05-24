@@ -245,6 +245,29 @@ extern "C" {
         const uint8_t *metric_name_ptr, size_t metric_name_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
+
+    // Phase 65 Plan 05 Task 4 (Wave 3) — Rust dispatchers for the migrated
+    // scalar functions (get_ddl, read_yaml_from_semantic_view). Per-row
+    // dispatch: each invocation takes the borrowed per-call duckdb_connection
+    // (opened from the C++ exec callback via Connection probe(*state.GetContext().db))
+    // plus the input string args, and returns a heap-owned UTF-8 buffer for
+    // the C++ side to copy into the result Vector via StringVector::AddString.
+    //
+    // Same wire convention as the bind dispatchers: rc=0 on success with
+    // (out_ptr, out_len) populated (caller frees via sv_free_buffer), rc=1
+    // on user-visible error (error_buf populated, raised as
+    // InvalidInputException by the C++ side), rc=2 on internal panic.
+    uint8_t sv_get_ddl_exec_rust(
+        duckdb_connection conn,
+        const uint8_t *type_ptr, size_t type_len,
+        const uint8_t *name_ptr, size_t name_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+    uint8_t sv_read_yaml_from_semantic_view_exec_rust(
+        duckdb_connection conn,
+        const uint8_t *name_ptr, size_t name_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1720,6 +1743,143 @@ extern "C" {
             args, 2,
             sv_show_semantic_dimensions_for_metric_bind,
             sv_emit_varchar_bool_rows, sv_varchar_init_local);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 65 Plan 05 Task 4 (Wave 3) — scalar function migrations
+// ---------------------------------------------------------------------------
+//
+// Migrate the two read-side scalars (`get_ddl`, `read_yaml_from_semantic_view`)
+// from duckdb-rs `register_scalar_function_with_state` to the C++ Catalog
+// API path established by `sv_register_scalar_function` (Wave 1 prep). Each
+// exec callback opens a per-call `Connection probe(*state.GetContext().db)`
+// (the scalar analog of the bind-side `Connection(*context.db)` used by the
+// 15 TF migrations) and bridges to a Rust dispatcher that performs the
+// lookup + render on the borrowed connection. The borrow contract (Rust
+// MUST NOT call `duckdb_disconnect`) is identical to the TF dispatchers —
+// see `src/ddl/read_ffi.rs` module docs.
+//
+// Per-row Connection construction (rather than per-chunk) keeps the
+// dispatcher shape uniform with the TF migrations and avoids edge cases
+// where a single chunk mixes view names that need different catalog probes.
+// Cost: scalar usage in practice is one or two rows (`SELECT GET_DDL(...)`)
+// — the Connection ctor is sub-millisecond per the READ-PATH-SPIKE evidence.
+
+// Common helper: copy a Rust-owned UTF-8 buffer into the result Vector at
+// `row_idx` via StringVector::AddString (which allocates inside the Vector's
+// string heap). Throws InvalidInputException on rc!=0 with the dispatcher's
+// error_buf as the message. The owned buffer is always freed via
+// `sv_free_buffer` regardless of rc.
+template <typename DispatcherFn>
+static void sv_emit_scalar_row(Vector &result, idx_t row_idx,
+                               const char *fn_name,
+                               DispatcherFn &&dispatcher) {
+    SvOwnedBuffer payload;
+    char error_buf[1024];
+    std::memset(error_buf, 0, sizeof(error_buf));
+    uint8_t rc = dispatcher(&payload.ptr, &payload.len,
+                            error_buf, sizeof(error_buf));
+    if (rc != 0) {
+        throw InvalidInputException(std::string(fn_name) + ": " + error_buf);
+    }
+    // payload.ptr is non-null on rc==0 (publish_owned_buffer guarantees this
+    // when out_ptr is non-null); len may be 0 for an empty string.
+    string_t out_value = StringVector::AddString(
+        result,
+        payload.ptr == nullptr ? "" : payload.ptr,
+        payload.len);
+    FlatVector::GetData<string_t>(result)[row_idx] = out_value;
+}
+
+// get_ddl(object_type VARCHAR, name VARCHAR) -> VARCHAR
+static void sv_get_ddl_exec(DataChunk &args, ExpressionState &state,
+                            Vector &result) {
+    auto &type_vec = args.data[0];
+    auto &name_vec = args.data[1];
+    type_vec.Flatten(args.size());
+    name_vec.Flatten(args.size());
+    auto type_data = FlatVector::GetData<string_t>(type_vec);
+    auto name_data = FlatVector::GetData<string_t>(name_vec);
+    auto &type_validity = FlatVector::Validity(type_vec);
+    auto &name_validity = FlatVector::Validity(name_vec);
+
+    auto &result_validity = FlatVector::Validity(result);
+
+    Connection probe(*state.GetContext().db);
+    duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+
+    for (idx_t i = 0; i < args.size(); ++i) {
+        if (!type_validity.RowIsValid(i) || !name_validity.RowIsValid(i)) {
+            result_validity.SetInvalid(i);
+            continue;
+        }
+        const string_t &t = type_data[i];
+        const string_t &n = name_data[i];
+        sv_emit_scalar_row(
+            result, i, "get_ddl",
+            [&](char **op, size_t *ol, char *eb, size_t ebl) {
+                return sv_get_ddl_exec_rust(
+                    borrowed,
+                    reinterpret_cast<const uint8_t *>(t.GetData()), t.GetSize(),
+                    reinterpret_cast<const uint8_t *>(n.GetData()), n.GetSize(),
+                    op, ol, eb, ebl);
+            });
+    }
+    if (args.AllConstant()) {
+        result.SetVectorType(VectorType::CONSTANT_VECTOR);
+    }
+}
+
+// read_yaml_from_semantic_view(name VARCHAR) -> VARCHAR
+static void sv_read_yaml_from_semantic_view_exec(DataChunk &args,
+                                                 ExpressionState &state,
+                                                 Vector &result) {
+    auto &name_vec = args.data[0];
+    name_vec.Flatten(args.size());
+    auto name_data = FlatVector::GetData<string_t>(name_vec);
+    auto &name_validity = FlatVector::Validity(name_vec);
+    auto &result_validity = FlatVector::Validity(result);
+
+    Connection probe(*state.GetContext().db);
+    duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+
+    for (idx_t i = 0; i < args.size(); ++i) {
+        if (!name_validity.RowIsValid(i)) {
+            result_validity.SetInvalid(i);
+            continue;
+        }
+        const string_t &n = name_data[i];
+        sv_emit_scalar_row(
+            result, i, "read_yaml_from_semantic_view",
+            [&](char **op, size_t *ol, char *eb, size_t ebl) {
+                return sv_read_yaml_from_semantic_view_exec_rust(
+                    borrowed,
+                    reinterpret_cast<const uint8_t *>(n.GetData()), n.GetSize(),
+                    op, ol, eb, ebl);
+            });
+    }
+    if (args.AllConstant()) {
+        result.SetVectorType(VectorType::CONSTANT_VECTOR);
+    }
+}
+
+extern "C" {
+    bool sv_register_get_ddl(duckdb_database db_handle) {
+        LogicalType args[] = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+        return sv_register_scalar_function(
+            db_handle, "get_ddl",
+            args, 2,
+            LogicalType::VARCHAR,
+            sv_get_ddl_exec);
+    }
+    bool sv_register_read_yaml_from_semantic_view(duckdb_database db_handle) {
+        LogicalType args[] = {LogicalType::VARCHAR};
+        return sv_register_scalar_function(
+            db_handle, "read_yaml_from_semantic_view",
+            args, 1,
+            LogicalType::VARCHAR,
+            sv_read_yaml_from_semantic_view_exec);
     }
 }
 
