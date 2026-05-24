@@ -317,13 +317,15 @@ mod extension {
             // have validated the spike pattern.
             read_yaml::ReadYamlFromSemanticViewScalar,
             show_columns::ShowColumnsInSemanticViewVTab,
-            show_dims::{ShowSemanticDimensionsAllVTab, ShowSemanticDimensionsVTab},
+            // Phase 65 Plan 05 Task 2 (Wave 1): the "_all" variants
+            // (Dimensions/Metrics/Facts/Materializations) are migrated to
+            // the C++ Catalog API path; their structs stay in their
+            // respective modules under `#[allow(dead_code)]`.
+            show_dims::ShowSemanticDimensionsVTab,
             show_dims_for_metric::ShowDimensionsForMetricVTab,
-            show_facts::{ShowSemanticFactsAllVTab, ShowSemanticFactsVTab},
-            show_materializations::{
-                ShowSemanticMaterializationsAllVTab, ShowSemanticMaterializationsVTab,
-            },
-            show_metrics::{ShowSemanticMetricsAllVTab, ShowSemanticMetricsVTab},
+            show_facts::ShowSemanticFactsVTab,
+            show_materializations::ShowSemanticMaterializationsVTab,
+            show_metrics::ShowSemanticMetricsVTab,
         },
         query::explain::ExplainSemanticViewVTab,
         query::table_function::{QueryState, SemanticViewVTab},
@@ -355,6 +357,15 @@ mod extension {
         // `list_terse_semantic_views()` table function via the C++ Catalog
         // API. 5-column subset of list_semantic_views.
         fn sv_register_list_terse_semantic_views(db_handle: ffi::duckdb_database) -> bool;
+
+        // Phase 65 Plan 05 Task 2 (Wave 1) — register the migrated zero-arg
+        // "_all" TFs via the C++ Catalog API. Bind callbacks open per-call
+        // Connection(*context.db) and bridge to the matching
+        // sv_show_<name>_all_bind_rust dispatcher.
+        fn sv_register_show_semantic_dimensions_all(db_handle: ffi::duckdb_database) -> bool;
+        fn sv_register_show_semantic_metrics_all(db_handle: ffi::duckdb_database) -> bool;
+        fn sv_register_show_semantic_facts_all(db_handle: ffi::duckdb_database) -> bool;
+        fn sv_register_show_semantic_materializations_all(db_handle: ffi::duckdb_database) -> bool;
     }
 
     /// Core initialization logic, called with both the high-level Connection and
@@ -469,10 +480,13 @@ mod extension {
             "show_semantic_dimensions",
             &catalog_reader,
         )?;
-        con.register_table_function_with_extra_info::<ShowSemanticDimensionsAllVTab, _>(
-            "show_semantic_dimensions_all",
-            &catalog_reader,
-        )?;
+        // Phase 65 Plan 05 Task 2 (Wave 1): show_semantic_dimensions_all
+        // migrated to the C++ Catalog API path.
+        if !unsafe { sv_register_show_semantic_dimensions_all(db_handle) } {
+            return Err(
+                "Failed to register show_semantic_dimensions_all via C++ Catalog API".into(),
+            );
+        }
 
         // SHOW SEMANTIC DIMENSIONS FOR METRIC
         con.register_table_function_with_extra_info::<ShowDimensionsForMetricVTab, _>(
@@ -485,30 +499,35 @@ mod extension {
             "show_semantic_metrics",
             &catalog_reader,
         )?;
-        con.register_table_function_with_extra_info::<ShowSemanticMetricsAllVTab, _>(
-            "show_semantic_metrics_all",
-            &catalog_reader,
-        )?;
+        // Phase 65 Plan 05 Task 2 (Wave 1): show_semantic_metrics_all
+        // migrated to the C++ Catalog API path.
+        if !unsafe { sv_register_show_semantic_metrics_all(db_handle) } {
+            return Err("Failed to register show_semantic_metrics_all via C++ Catalog API".into());
+        }
 
         // SHOW SEMANTIC FACTS
         con.register_table_function_with_extra_info::<ShowSemanticFactsVTab, _>(
             "show_semantic_facts",
             &catalog_reader,
         )?;
-        con.register_table_function_with_extra_info::<ShowSemanticFactsAllVTab, _>(
-            "show_semantic_facts_all",
-            &catalog_reader,
-        )?;
+        // Phase 65 Plan 05 Task 2 (Wave 1): show_semantic_facts_all
+        // migrated to the C++ Catalog API path.
+        if !unsafe { sv_register_show_semantic_facts_all(db_handle) } {
+            return Err("Failed to register show_semantic_facts_all via C++ Catalog API".into());
+        }
 
         // SHOW SEMANTIC MATERIALIZATIONS
         con.register_table_function_with_extra_info::<ShowSemanticMaterializationsVTab, _>(
             "show_semantic_materializations",
             &catalog_reader,
         )?;
-        con.register_table_function_with_extra_info::<ShowSemanticMaterializationsAllVTab, _>(
-            "show_semantic_materializations_all",
-            &catalog_reader,
-        )?;
+        // Phase 65 Plan 05 Task 2 (Wave 1): show_semantic_materializations_all
+        // migrated to the C++ Catalog API path.
+        if !unsafe { sv_register_show_semantic_materializations_all(db_handle) } {
+            return Err(
+                "Failed to register show_semantic_materializations_all via C++ Catalog API".into(),
+            );
+        }
 
         // Register GET_DDL scalar function.
         con.register_scalar_function_with_state::<GetDdlScalar>("get_ddl", &catalog_reader)?;

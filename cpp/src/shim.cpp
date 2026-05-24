@@ -181,6 +181,27 @@ extern "C" {
         duckdb_connection conn,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
+
+    // Phase 65 Plan 05 Task 2 (Wave 1) — Rust dispatchers for the migrated
+    // zero-arg "_all" TFs. All emit homogeneous VARCHAR rows; cell layout
+    // matches the matching legacy duckdb-rs VTab. See per-dispatcher Rust
+    // doc-headers for the exact column order.
+    uint8_t sv_show_semantic_dimensions_all_bind_rust(
+        duckdb_connection conn,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+    uint8_t sv_show_semantic_metrics_all_bind_rust(
+        duckdb_connection conn,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+    uint8_t sv_show_semantic_facts_all_bind_rust(
+        duckdb_connection conn,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+    uint8_t sv_show_semantic_materializations_all_bind_rust(
+        duckdb_connection conn,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1196,6 +1217,164 @@ extern "C" {
             sv_list_terse_semantic_views_bind,
             sv_emit_varchar_rows,
             sv_varchar_init_local);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// show_semantic_dimensions_all — Phase 65 Plan 05 Task 2 (Wave 1)
+// ---------------------------------------------------------------------------
+// 8-column VARCHAR: database_name, schema_name, semantic_view_name,
+// table_name, name, data_type, synonyms, comment.
+
+static unique_ptr<FunctionData> sv_show_semantic_dimensions_all_bind(
+    ClientContext &context,
+    TableFunctionBindInput & /*input*/,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COLS[] = {
+        "database_name", "schema_name", "semantic_view_name", "table_name",
+        "name", "data_type", "synonyms", "comment",
+    };
+    for (auto cn : COLS) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind(
+        context, *bd, /*expected_cols*/ 8, "show_semantic_dimensions_all",
+        [](duckdb_connection borrowed, char **out_ptr, size_t *out_len,
+           char *error_buf, size_t error_buf_len) {
+            return sv_show_semantic_dimensions_all_bind_rust(
+                borrowed, out_ptr, out_len, error_buf, error_buf_len);
+        });
+    return std::move(bd);
+}
+
+extern "C" {
+    bool sv_register_show_semantic_dimensions_all(duckdb_database db_handle) {
+        return sv_register_table_function(
+            db_handle, "show_semantic_dimensions_all",
+            nullptr, 0,
+            sv_show_semantic_dimensions_all_bind,
+            sv_emit_varchar_rows, sv_varchar_init_local);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// show_semantic_metrics_all — Phase 65 Plan 05 Task 2 (Wave 1)
+// ---------------------------------------------------------------------------
+// 8-column VARCHAR (same schema as show_semantic_dimensions_all).
+
+static unique_ptr<FunctionData> sv_show_semantic_metrics_all_bind(
+    ClientContext &context,
+    TableFunctionBindInput & /*input*/,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COLS[] = {
+        "database_name", "schema_name", "semantic_view_name", "table_name",
+        "name", "data_type", "synonyms", "comment",
+    };
+    for (auto cn : COLS) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind(
+        context, *bd, 8, "show_semantic_metrics_all",
+        [](duckdb_connection borrowed, char **out_ptr, size_t *out_len,
+           char *error_buf, size_t error_buf_len) {
+            return sv_show_semantic_metrics_all_bind_rust(
+                borrowed, out_ptr, out_len, error_buf, error_buf_len);
+        });
+    return std::move(bd);
+}
+
+extern "C" {
+    bool sv_register_show_semantic_metrics_all(duckdb_database db_handle) {
+        return sv_register_table_function(
+            db_handle, "show_semantic_metrics_all",
+            nullptr, 0,
+            sv_show_semantic_metrics_all_bind,
+            sv_emit_varchar_rows, sv_varchar_init_local);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// show_semantic_facts_all — Phase 65 Plan 05 Task 2 (Wave 1)
+// ---------------------------------------------------------------------------
+// 8-column VARCHAR (same schema as show_semantic_dimensions_all).
+
+static unique_ptr<FunctionData> sv_show_semantic_facts_all_bind(
+    ClientContext &context,
+    TableFunctionBindInput & /*input*/,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COLS[] = {
+        "database_name", "schema_name", "semantic_view_name", "table_name",
+        "name", "data_type", "synonyms", "comment",
+    };
+    for (auto cn : COLS) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind(
+        context, *bd, 8, "show_semantic_facts_all",
+        [](duckdb_connection borrowed, char **out_ptr, size_t *out_len,
+           char *error_buf, size_t error_buf_len) {
+            return sv_show_semantic_facts_all_bind_rust(
+                borrowed, out_ptr, out_len, error_buf, error_buf_len);
+        });
+    return std::move(bd);
+}
+
+extern "C" {
+    bool sv_register_show_semantic_facts_all(duckdb_database db_handle) {
+        return sv_register_table_function(
+            db_handle, "show_semantic_facts_all",
+            nullptr, 0,
+            sv_show_semantic_facts_all_bind,
+            sv_emit_varchar_rows, sv_varchar_init_local);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// show_semantic_materializations_all — Phase 65 Plan 05 Task 2 (Wave 1)
+// ---------------------------------------------------------------------------
+// 7-column VARCHAR: database_name, schema_name, semantic_view_name, name,
+// table, dimensions, metrics.
+
+static unique_ptr<FunctionData> sv_show_semantic_materializations_all_bind(
+    ClientContext &context,
+    TableFunctionBindInput & /*input*/,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COLS[] = {
+        "database_name", "schema_name", "semantic_view_name",
+        "name", "table", "dimensions", "metrics",
+    };
+    for (auto cn : COLS) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind(
+        context, *bd, 7, "show_semantic_materializations_all",
+        [](duckdb_connection borrowed, char **out_ptr, size_t *out_len,
+           char *error_buf, size_t error_buf_len) {
+            return sv_show_semantic_materializations_all_bind_rust(
+                borrowed, out_ptr, out_len, error_buf, error_buf_len);
+        });
+    return std::move(bd);
+}
+
+extern "C" {
+    bool sv_register_show_semantic_materializations_all(duckdb_database db_handle) {
+        return sv_register_table_function(
+            db_handle, "show_semantic_materializations_all",
+            nullptr, 0,
+            sv_show_semantic_materializations_all_bind,
+            sv_emit_varchar_rows, sv_varchar_init_local);
     }
 }
 

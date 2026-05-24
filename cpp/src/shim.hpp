@@ -115,4 +115,12 @@ bool sv_register_list_semantic_views(duckdb_database db_handle);
 // 5-column subset of list_semantic_views; same bridge mechanism.
 bool sv_register_list_terse_semantic_views(duckdb_database db_handle);
 
+// Phase 65 Plan 05 Task 2 (Wave 1) — register the migrated zero-arg "_all"
+// TFs via the C++ Catalog API. All emit homogeneous VARCHAR rows; column
+// counts and names match the legacy duckdb-rs registrations.
+bool sv_register_show_semantic_dimensions_all(duckdb_database db_handle);
+bool sv_register_show_semantic_metrics_all(duckdb_database db_handle);
+bool sv_register_show_semantic_facts_all(duckdb_database db_handle);
+bool sv_register_show_semantic_materializations_all(duckdb_database db_handle);
+
 } // extern "C"
