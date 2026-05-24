@@ -303,7 +303,7 @@ mod extension {
     use libduckdb_sys as ffi;
     use std::error::Error;
 
-    use crate::{catalog::init_catalog, query::table_function::QueryState};
+    use crate::catalog::init_catalog;
     // Phase 65 Plan 05 Tasks 1-4 migrated 14 of 17 read-side registrations
     // to the C++ Catalog API path:
     //  - Task 1 (Wave 0): list_semantic_views
@@ -460,7 +460,14 @@ mod extension {
             true
         };
 
-        let catalog_reader =
+        // Phase 65 Plan 05 Batch 3: H2 retired (below); `catalog_reader`
+        // is no longer consumed by any read-side registration. Each
+        // migrated bind callback constructs a per-call `CatalogReader`
+        // from `Connection(*context.db)`. We still build the legacy
+        // `CatalogReader` here only so the underlying H1 `catalog_conn`
+        // stays bound until Plan 06 retires the allocation + adds the
+        // structural guard test.
+        let _catalog_reader =
             crate::catalog::CatalogReader::new(catalog_conn, catalog_table_present);
 
         // Register parser_override hook BEFORE table functions. Phase 62:
@@ -563,31 +570,21 @@ mod extension {
             );
         }
 
-        // H2 query_conn — STILL allocated here for one wave. The
-        // semantic_view and explain_semantic_view callbacks no longer
-        // consume it after Plan 05 Batch 2 (Tasks 5 + 6 below); both now
-        // open per-call `Connection(*context.db)` from the C++ Catalog
-        // API path. The allocation is retained ONLY because the dead
-        // legacy `SemanticViewVTab` impl block in
-        // `src/query/table_function.rs` still references `QueryState`
-        // under `#[allow(dead_code)]`. Batch 3 (Plan 05 cleanup commit)
-        // deletes the legacy VTab carcasses and this allocation block
-        // together — at which point `con.register_table_function_with_
-        // extra_info` ceases to be reachable from any live code path.
-        let mut query_conn: ffi::duckdb_connection = ptr::null_mut();
-        let rc = unsafe { ffi::duckdb_connect(db_handle, &mut query_conn) };
-        if rc != ffi::DuckDBSuccess {
-            return Err("Failed to create query connection for semantic_view".into());
-        }
-        // `query_state` is built but never registered with duckdb-rs after
-        // Plan 05 Task 6 — semantic_view goes through the C++ Catalog
-        // API path below. The variable is plumbed only to keep H2 alive
-        // for one wave so the dead `SemanticViewVTab::bind` reference to
-        // `QueryState` compiles; the binding is unused at runtime.
-        let _query_state = QueryState {
-            catalog: catalog_reader,
-            conn: query_conn,
-        };
+        // H2 query_conn RETIRED — Phase 65 Plan 05 Batch 3. Both
+        // `semantic_view` and `explain_semantic_view` now register via
+        // the C++ Catalog API (`sv_register_semantic_view` and
+        // `sv_register_explain_semantic_view` below) and open per-call
+        // `Connection(*context.db)` from the bind callback. No live
+        // read-side code path consumes a long-lived extension-owned
+        // `duckdb_connection`. The 17 legacy VTab/VScalar struct
+        // carcasses that previously fed off `QueryState` are deleted
+        // alongside this allocation.
+        //
+        // H1 `catalog_conn` at line ~441 above is still allocated +
+        // consumed by `sv_register_parser_hooks` only. Plan 06 retires
+        // H1 + adds the structural guard test that asserts no
+        // long-lived `duckdb_connection` allocations remain in
+        // `init_extension`.
 
         // Phase 65 Plan 05 Task 6 (Wave 6): semantic_view migrated off
         // the duckdb-rs `register_table_function_with_extra_info` path
