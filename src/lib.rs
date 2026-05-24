@@ -308,13 +308,13 @@ mod extension {
         ddl::{
             describe::DescribeSemanticViewVTab,
             get_ddl::GetDdlScalar,
-            // ListSemanticViewsVTab retired in Plan 05 Task 1 (Wave 0 bridge
-            // spike) — registration now routes through the C++ Catalog API
-            // via `sv_register_list_semantic_views`. The struct + impl in
-            // src/ddl/list.rs is marked `#[allow(dead_code)]` until Plan 05
-            // is fully archived; deletion happens once the remaining 16
-            // read-side migrations have validated the spike pattern.
-            list::ListTerseSemanticViewsVTab,
+            // ListSemanticViewsVTab retired in Plan 05 Task 1 (Wave 0
+            // bridge spike); ListTerseSemanticViewsVTab retired in Task 2
+            // (Wave 1) — both registrations now route through the C++
+            // Catalog API. The structs + impls in src/ddl/list.rs are
+            // marked `#[allow(dead_code)]` until Plan 05 is fully archived;
+            // deletion happens once the remaining 15 read-side migrations
+            // have validated the spike pattern.
             read_yaml::ReadYamlFromSemanticViewScalar,
             show_columns::ShowColumnsInSemanticViewVTab,
             show_dims::{ShowSemanticDimensionsAllVTab, ShowSemanticDimensionsVTab},
@@ -350,6 +350,11 @@ mod extension {
         // `65-05-SPIKE-SUMMARY.md` for the bridge mechanism and the LOC
         // extrapolation for the remaining 16 read-side migrations.
         fn sv_register_list_semantic_views(db_handle: ffi::duckdb_database) -> bool;
+
+        // Phase 65 Plan 05 Task 2 (Wave 1) — register the migrated
+        // `list_terse_semantic_views()` table function via the C++ Catalog
+        // API. 5-column subset of list_semantic_views.
+        fn sv_register_list_terse_semantic_views(db_handle: ffi::duckdb_database) -> bool;
     }
 
     /// Core initialization logic, called with both the high-level Connection and
@@ -445,10 +450,11 @@ mod extension {
         if !unsafe { sv_register_list_semantic_views(db_handle) } {
             return Err("Failed to register list_semantic_views via C++ Catalog API".into());
         }
-        con.register_table_function_with_extra_info::<ListTerseSemanticViewsVTab, _>(
-            "list_terse_semantic_views",
-            &catalog_reader,
-        )?;
+        // Phase 65 Plan 05 Task 2 (Wave 1): list_terse_semantic_views
+        // migrated to the C++ Catalog API path.
+        if !unsafe { sv_register_list_terse_semantic_views(db_handle) } {
+            return Err("Failed to register list_terse_semantic_views via C++ Catalog API".into());
+        }
         con.register_table_function_with_extra_info::<ShowColumnsInSemanticViewVTab, _>(
             "show_columns_in_semantic_view",
             &catalog_reader,

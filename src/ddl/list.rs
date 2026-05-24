@@ -391,10 +391,106 @@ impl VTab for ListSemanticViewsVTab {
 }
 
 // ---------------------------------------------------------------------------
+// list_terse_semantic_views — Phase 65 Plan 05 Task 2 (Wave 1)
+// ---------------------------------------------------------------------------
+//
+// Same bridge mechanism as `list_semantic_views` (see Wave 0 spike docs at
+// the top of this file). Bind callback opens a per-call
+// `Connection(*context.db)` and calls `sv_list_terse_semantic_views_bind_rust`.
+// Borrow contract: dispatcher MUST NOT call `duckdb_disconnect` on the
+// borrowed handle.
+
+/// FFI dispatcher for the migrated `list_terse_semantic_views()` table
+/// function — 5-column subset of `list_semantic_views()` (no `comment`).
+///
+/// Wire format (length-prefixed binary, LE):
+///   u32 row_count
+///   for each row:
+///     for each of 5 cols: u32 byte_len | bytes (UTF-8)
+///
+/// Columns: (created_on, name, kind, database_name, schema_name).
+///
+/// # Safety
+///
+/// `conn` is a borrowed handle (see file-level docs). Caller must release
+/// the returned buffer via `sv_free_buffer(*out_ptr, *out_len)`.
+#[cfg(feature = "extension")]
+#[no_mangle]
+pub unsafe extern "C" fn sv_list_terse_semantic_views_bind_rust(
+    conn: libduckdb_sys::duckdb_connection,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    error_buf: *mut u8,
+    error_buf_len: usize,
+) -> u8 {
+    use crate::ddl::read_ffi::{
+        probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
+    };
+    use std::panic::AssertUnwindSafe;
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if conn.is_null() {
+            write_err(error_buf, error_buf_len, "duckdb_connection is null");
+            return 1_u8;
+        }
+
+        let table_present = probe_catalog_table_present(conn);
+        let reader = CatalogReader::new(conn, table_present);
+        let entries = match reader.list_all() {
+            Ok(e) => e,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
+
+        let mut rows: Vec<Vec<String>> = Vec::with_capacity(entries.len());
+        for (name, json) in &entries {
+            let def = SemanticViewDefinition::from_json(name, json).ok();
+            let (created_on, database_name, schema_name) = match &def {
+                Some(d) => (
+                    d.created_on.clone().unwrap_or_default(),
+                    d.database_name.clone().unwrap_or_default(),
+                    d.schema_name.clone().unwrap_or_default(),
+                ),
+                None => (String::new(), String::new(), String::new()),
+            };
+            rows.push(vec![
+                created_on,
+                name.clone(),
+                "SEMANTIC_VIEW".to_string(),
+                database_name,
+                schema_name,
+            ]);
+        }
+        rows.sort_by(|a, b| a[1].cmp(&b[1]));
+
+        let buf = serialize_varchar_rows(&rows);
+        publish_owned_buffer(buf, out_ptr, out_len);
+        0_u8
+    }));
+    match result {
+        Ok(rc) => rc,
+        Err(_) => {
+            use crate::ddl::read_ffi::write_err;
+            write_err(
+                error_buf,
+                error_buf_len,
+                "internal error: panic inside sv_list_terse_semantic_views_bind_rust",
+            );
+            2
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SHOW TERSE SEMANTIC VIEWS — 5-column subset (no comment)
+// Legacy VTab — Phase 65 Plan 05 Task 2 (Wave 1) retired the registration
+// in favor of the C++ Catalog API path. Kept under #[allow(dead_code)]
+// until a cleanup commit at the end of Plan 05.
 // ---------------------------------------------------------------------------
 
 /// A single row in the SHOW TERSE SEMANTIC VIEWS output.
+#[allow(dead_code)]
 struct ListTerseRow {
     created_on: String,
     name: String,
@@ -404,6 +500,7 @@ struct ListTerseRow {
 }
 
 /// Bind-time snapshot for terse listing.
+#[allow(dead_code)]
 pub struct ListTerseBindData {
     rows: Vec<ListTerseRow>,
 }
@@ -413,6 +510,7 @@ unsafe impl Send for ListTerseBindData {}
 unsafe impl Sync for ListTerseBindData {}
 
 /// Init data for `list_terse_semantic_views`.
+#[allow(dead_code)]
 pub struct ListTerseInitData {
     done: AtomicBool,
 }
@@ -424,6 +522,10 @@ unsafe impl Sync for ListTerseInitData {}
 /// Table function that returns 5 columns: `(created_on VARCHAR, name VARCHAR,
 /// kind VARCHAR, database_name VARCHAR, schema_name VARCHAR)` — one row per
 /// registered semantic view. No comment column (terse mode).
+///
+/// Phase 65 Plan 05 Task 2: registration retired in favor of the C++
+/// Catalog API path.
+#[allow(dead_code)]
 pub struct ListTerseSemanticViewsVTab;
 
 impl VTab for ListTerseSemanticViewsVTab {

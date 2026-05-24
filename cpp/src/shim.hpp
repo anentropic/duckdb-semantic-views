@@ -110,4 +110,9 @@ bool sv_register_scalar_function(
 // passed into `sv_register_table_function` by name.
 bool sv_register_list_semantic_views(duckdb_database db_handle);
 
+// Phase 65 Plan 05 Task 2 (Wave 1) — register the migrated
+// `list_terse_semantic_views()` table function via the C++ Catalog API.
+// 5-column subset of list_semantic_views; same bridge mechanism.
+bool sv_register_list_terse_semantic_views(duckdb_database db_handle);
+
 } // extern "C"

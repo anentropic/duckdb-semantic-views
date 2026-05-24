@@ -172,6 +172,15 @@ extern "C" {
         duckdb_connection conn,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
+
+    // Phase 65 Plan 05 Task 2 (Wave 1) — Rust dispatcher for the migrated
+    // `list_terse_semantic_views()` table function. 5-column subset of
+    // list_semantic_views (no `comment`). Same bridge mechanism and borrow
+    // contract as the Wave 0 spike.
+    uint8_t sv_list_terse_semantic_views_bind_rust(
+        duckdb_connection conn,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,6 +1153,50 @@ static void sv_run_varchar_bool_bind(ClientContext &context,
         throw BinderException(std::string(fn_name) + " failed: " + error_buf);
     }
     sv_parse_varchar_bool_payload(payload.ptr, payload.len, bd, fn_name);
+}
+
+// ---------------------------------------------------------------------------
+// list_terse_semantic_views — Phase 65 Plan 05 Task 2 (Wave 1)
+// ---------------------------------------------------------------------------
+// 5-column subset of list_semantic_views — same bridge mechanism, no
+// per-function BindData struct (uses generic SvVarcharBindData via the
+// sv_run_varchar_bind helper).
+//
+// Columns: created_on, name, kind, database_name, schema_name.
+
+static unique_ptr<FunctionData> sv_list_terse_semantic_views_bind(
+    ClientContext &context,
+    TableFunctionBindInput & /*input*/,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    static const char *const COL_NAMES[] = {
+        "created_on", "name", "kind", "database_name", "schema_name",
+    };
+    for (auto cn : COL_NAMES) {
+        return_types.push_back(LogicalType::VARCHAR);
+        names.emplace_back(cn);
+    }
+    sv_run_varchar_bind(
+        context, *bd, /*expected_cols*/ 5, "list_terse_semantic_views",
+        [](duckdb_connection borrowed, char **out_ptr, size_t *out_len,
+           char *error_buf, size_t error_buf_len) {
+            return sv_list_terse_semantic_views_bind_rust(
+                borrowed, out_ptr, out_len, error_buf, error_buf_len);
+        });
+    return std::move(bd);
+}
+
+extern "C" {
+    bool sv_register_list_terse_semantic_views(duckdb_database db_handle) {
+        return sv_register_table_function(
+            db_handle,
+            "list_terse_semantic_views",
+            /*arg_types*/ nullptr, /*arg_count*/ 0,
+            sv_list_terse_semantic_views_bind,
+            sv_emit_varchar_rows,
+            sv_varchar_init_local);
+    }
 }
 
 // ---------------------------------------------------------------------------
