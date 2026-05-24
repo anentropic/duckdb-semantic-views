@@ -22,12 +22,18 @@
 
 extern "C" {
 
-// Phase 62 (v0.8.0) entry — registers the parser_override + parse_function
-// + plan_function hooks. Bundles the catalog connection + is_file_backed flag
-// into an OverrideContext owned by the C++ SemanticViewsParserInfo.
-bool sv_register_parser_hooks(duckdb_database db_handle,
-                              duckdb_connection catalog_conn,
-                              bool is_file_backed);
+// Registers the parser_override + parse_function + plan_function hooks
+// plus the `__sv_compute_create_from_yaml` helper TF on the database's
+// `DBConfig` and system catalog.
+//
+// Phase 65 Plan 06: signature slimmed to `(db_handle)` after H1
+// catalog_conn retirement. The C++ shim attaches an empty
+// `OverrideContext` (allocated via `sv_make_override_context()`) to
+// `SemanticViewsParserInfo::rust_state` purely for FFI shape
+// compatibility with `sv_parser_override_rust`'s `ctx_ptr` parameter —
+// no long-lived `duckdb_connection` is owned by the extension after
+// this plan.
+bool sv_register_parser_hooks(duckdb_database db_handle);
 
 // Phase 65 Plan 04 (A2 resolution) — register a table function via the C++
 // Catalog API so its bind callback receives a native `ClientContext &`.

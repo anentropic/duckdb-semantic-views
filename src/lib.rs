@@ -296,7 +296,6 @@ pub mod ddl;
 /// failed due to unresolved C++ symbols from -fvisibility=hidden in the host.
 #[cfg(feature = "extension")]
 mod extension {
-    use std::ptr;
     use std::sync::Arc;
 
     use duckdb::{Connection, Result};
@@ -315,22 +314,20 @@ mod extension {
     //  - Wave 6: semantic_view
     // The legacy duckdb-rs `register_table_function_with_extra_info` /
     // `register_scalar_function_with_state` registrations were deleted
-    // together with the H2 query_conn allocation in the Batch 3 cleanup
-    // commit. H1 catalog_conn at the `let mut catalog_conn = ...` block
-    // below is still allocated pending Plan 06 retirement + structural
-    // guard test.
+    // together with the H2 query_conn allocation in the Plan 05 Batch 3
+    // cleanup commit. Phase 65 Plan 06 retires H1 catalog_conn as well —
+    // `init_extension` no longer allocates any long-lived extension-owned
+    // `duckdb_connection`. `tests/no_long_lived_conn.rs` is the
+    // structural guard that fails CI if any future change re-introduces
+    // one inside `init_extension`.
 
     // C++ helper for parser hook registration (defined in cpp/src/shim.cpp).
-    // Phase 62: catalog_conn + is_file_backed are bundled into an
-    // OverrideContext (see src/parse.rs::sv_make_override_context) and
-    // attached to the C++ SemanticViewsParserInfo. The legacy
-    // db_token-LRU lookup is gone (TECH-DEBT 20).
+    // Phase 65 Plan 06: signature slimmed to `(db_handle)` after H1
+    // catalog_conn retirement. The legacy `catalog_conn` and
+    // `is_file_backed` args are gone — parser_override paths are
+    // pure-SQL and consume neither.
     extern "C" {
-        fn sv_register_parser_hooks(
-            db_handle: ffi::duckdb_database,
-            catalog_conn: ffi::duckdb_connection,
-            is_file_backed: bool,
-        ) -> bool;
+        fn sv_register_parser_hooks(db_handle: ffi::duckdb_database) -> bool;
 
         // Phase 65 Plan 05 (Task 1 / Wave 0 bridge spike) — register the
         // `list_semantic_views()` table function via the C++ Catalog API
@@ -437,52 +434,20 @@ mod extension {
         // Initialize the persistent catalog (schema + table + companion-file migration).
         init_catalog(con, &db_path, is_read_only)?;
 
-        // Dedicated connection for catalog queries (`duckdb_constraints()`
-        // lookups, `_definitions` reads, CREATE-time enrichment, etc.).
-        // Always created for both file-backed and in-memory databases.
-        // Distinct from the user's main connection so reads on this handle
-        // never block on the user's transaction or execution lock.
-        let mut catalog_conn: ffi::duckdb_connection = ptr::null_mut();
-        let rc = unsafe { ffi::duckdb_connect(db_handle, &mut catalog_conn) };
-        if rc != ffi::DuckDBSuccess {
-            return Err("Failed to create catalog connection".into());
-        }
+        // Phase 65 Plan 06: H1 catalog_conn allocation RETIRED. The
+        // parser_override path is now pure-SQL on the caller's connection
+        // — existence checks use a `SELECT CASE WHEN NOT EXISTS THEN
+        // error() ELSE TRUE END; <DML>` two-statement guard that runs
+        // snapshot-consistent with the DML. No long-lived extension-owned
+        // `duckdb_connection` is allocated in `init_extension` after this
+        // plan; `tests/no_long_lived_conn.rs` is the structural guard
+        // that fails CI if anyone re-introduces one.
 
-        // Phase 63: When read-only, probe for semantic_layer._definitions
-        // ONCE so reader-path methods can short-circuit cleanly. Writable
-        // path always has the table (init_catalog just CREATE'd it), so we
-        // skip the probe to avoid an extra query on the hot path.
-        let catalog_table_present: bool = if is_read_only {
-            con.query_row(
-                "SELECT 1 FROM information_schema.tables \
-                 WHERE table_schema = 'semantic_layer' AND table_name = '_definitions' LIMIT 1",
-                [],
-                |row| row.get::<_, i32>(0),
-            )
-            .is_ok()
-        } else {
-            true
-        };
-
-        // Phase 65 Plan 05 Batch 3: H2 retired (below); `catalog_reader`
-        // is no longer consumed by any read-side registration. Each
-        // migrated bind callback constructs a per-call `CatalogReader`
-        // from `Connection(*context.db)`. We still build the legacy
-        // `CatalogReader` here only so the underlying H1 `catalog_conn`
-        // stays bound until Plan 06 retires the allocation + adds the
-        // structural guard test.
-        let _catalog_reader =
-            crate::catalog::CatalogReader::new(catalog_conn, catalog_table_present);
-
-        // Register parser_override hook BEFORE table functions. Phase 62:
-        // the catalog connection + is_file_backed flag are bundled into an
-        // OverrideContext (allocated by sv_make_override_context inside the
-        // C++ shim) and attached directly to SemanticViewsParserInfo. No
-        // global LRU map — lifetime is tied to DBConfig.
-        // `is_file_backed` gates DDL-time type inference (LIMIT 0 probes
-        // only run on file-backed DBs — matches v0.7.1 design).
-        let is_file_backed = db_path.as_ref() != ":memory:";
-        if !unsafe { sv_register_parser_hooks(db_handle, catalog_conn, is_file_backed) } {
+        // Register parser_override hook BEFORE table functions. The C++
+        // shim attaches an (empty) OverrideContext to SemanticViewsParserInfo
+        // for FFI shape compatibility; no per-DB state is carried any more
+        // since H1 catalog_conn was retired in this plan.
+        if !unsafe { sv_register_parser_hooks(db_handle) } {
             return Err("Failed to register parser hooks via C++ helper".into());
         }
 

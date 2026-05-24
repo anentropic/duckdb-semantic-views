@@ -84,18 +84,17 @@ extern "C" {
     // pair the Rust side returned.
     void sv_free_buffer(char *ptr, size_t len);
 
-    // Phase 62: Box<OverrideContext> ownership FFI. The Rust side allocates
-    // a Box<OverrideContext> wrapping the duckdb_connection + is_file_backed
-    // flag and returns the leaked raw pointer. The C++ shim stashes the
-    // pointer inside SemanticViewsParserInfo::rust_state and hands it back
-    // to sv_parser_override_rust on every parse. ~SemanticViewsParserInfo
+    // Box<OverrideContext> ownership FFI. The Rust side allocates a
+    // Box<OverrideContext> (empty struct after Phase 65 Plan 06) and
+    // returns the leaked raw pointer. The C++ shim stashes the pointer
+    // inside SemanticViewsParserInfo::rust_state and hands it back to
+    // sv_parser_override_rust on every parse. ~SemanticViewsParserInfo
     // calls sv_drop_override_context to free the Rust allocation.
     //
-    // CRITICAL: sv_drop_override_context does NOT call duckdb_disconnect on
-    // the inner duckdb_connection — see Phase 62 RESEARCH.md §Q2 for the
-    // destruction-order rationale. The Connection object leaks for the
-    // remainder of process life (one Connection per DB ever opened).
-    void *sv_make_override_context(duckdb_connection conn, bool is_file_backed);
+    // Plan 06: the struct carries no state — there is no longer a
+    // long-lived duckdb_connection to leak. The Box allocation itself
+    // is reclaimed cleanly by sv_drop_override_context.
+    void *sv_make_override_context();
     void  sv_drop_override_context(void *ctx_ptr);
 
     // Phase 65 Plan 04 (Task 2 Step C) — Rust FFI bridge for the
@@ -369,10 +368,12 @@ struct SvOwnedBuffer {
 };
 
 // Per-extension-load info struct attached to ParserExtension::parser_info.
-// Holds an opaque Box<OverrideContext>* (rust_state) that owns the catalog
-// connection + is_file_backed flag for THIS database. Lifetime is tied to
-// DBConfig, so destruction fires on DB unload — no LRU needed (Phase 62
-// resolved TECH-DEBT 20).
+// Holds an opaque Box<OverrideContext>* (rust_state). After Phase 65
+// Plan 06's H1 catalog_conn retirement the OverrideContext is empty —
+// no per-DB state is carried — but the pointer round-trip is preserved
+// so the `dynamic_cast<SemanticViewsParserInfo *>` null-guard pattern
+// in sv_parser_override / sv_parse_stub stays byte-identical with the
+// pre-Plan-06 shape.
 struct SemanticViewsParserInfo : public ParserExtensionInfo {
     void *rust_state;  // Box<OverrideContext>* opaque pointer (Rust-owned).
     explicit SemanticViewsParserInfo(void *state) : rust_state(state) {}
@@ -382,23 +383,6 @@ struct SemanticViewsParserInfo : public ParserExtensionInfo {
             sv_drop_override_context(rust_state);
             rust_state = nullptr;
         }
-        // CRITICAL — Phase 62 Q2 destruction-order showstopper:
-        // We deliberately do NOT call duckdb_disconnect on the
-        // duckdb_connection contained within OverrideContext's CatalogReader.
-        //
-        // By the time this destructor fires, ~DatabaseInstance has already
-        // reset connection_manager (duckdb.cpp:276819). ~Connection() would
-        // call ConnectionManager::RemoveConnection() on the destroyed
-        // manager — use-after-free.
-        //
-        // The Rust Drop impl on OverrideContext (in src/parse.rs) documents
-        // the same constraint. The duckdb_connection object leaks for the
-        // remainder of process life — bounded at one Connection per DB ever
-        // opened (~few KB each). This matches v0.8.0 commit 680a967 which
-        // shipped successfully with this same leak pattern.
-        //
-        // See .planning/phases/62-caret-restoration-lru-removal/62-RESEARCH.md §Q2.
-        // Resolves TECH-DEBT item 20 (silent LRU eviction class) by removing the LRU.
     }
 };
 
@@ -2471,15 +2455,14 @@ extern "C" {
 // sv_register_parser_hooks -- called from Rust after C API init
 // ---------------------------------------------------------------------------
 // Extracts DatabaseInstance& from the C API handle and registers the
-// parser_override hook on DBConfig. Phase 62: takes the catalog connection
-// + is_file_backed flag and bundles them into an OverrideContext via
-// sv_make_override_context. The boxed OverrideContext is owned by the
-// SemanticViewsParserInfo we register; lifetime is tied to DBConfig so
-// destruction fires on DB unload (no LRU needed — TECH-DEBT 20 resolved).
+// parser_override hook on DBConfig. Phase 65 Plan 06: signature slimmed
+// to `(db_handle)` after H1 catalog_conn retirement. The
+// SemanticViewsParserInfo's rust_state still holds a Box<OverrideContext>*,
+// but the struct is empty — preserved for FFI shape compatibility with
+// sv_parser_override_rust's ctx_ptr parameter and the dynamic_cast
+// null-guard pattern in sv_parser_override / sv_parse_stub.
 extern "C" {
-    bool sv_register_parser_hooks(duckdb_database db_handle,
-                                  duckdb_connection catalog_conn,
-                                  bool is_file_backed) {
+    bool sv_register_parser_hooks(duckdb_database db_handle) {
         try {
             // duckdb_database -> internal_ptr -> DatabaseWrapper ->
             //   shared_ptr<DuckDB> -> shared_ptr<DatabaseInstance>
@@ -2487,7 +2470,7 @@ extern "C" {
                 db_handle->internal_ptr);
             auto &db = *wrapper->database->instance;
 
-            void *rust_state = sv_make_override_context(catalog_conn, is_file_backed);
+            void *rust_state = sv_make_override_context();
             if (!rust_state) {
                 fprintf(stderr,
                     "sv_register_parser_hooks: sv_make_override_context returned null\n");
