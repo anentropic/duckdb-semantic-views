@@ -68,6 +68,32 @@ bool sv_register_table_function(
     duckdb::table_function_t exec_cb,
     duckdb::table_function_init_local_t init_cb);
 
+// Phase 65 Plan 05 (Task 2 Step A) — register a scalar function via the C++
+// Catalog API, the scalar sibling of sv_register_table_function. Used by
+// Task 4 / Wave 4 (get_ddl + read_yaml_from_semantic_view migrations).
+//
+// Parameters:
+//   db_handle   — DuckDB C API database handle (unwrapped to
+//                 `DatabaseInstance &` internally).
+//   name        — UTF-8 NUL-terminated scalar-function name.
+//   arg_types   — pointer to `arg_count` `duckdb::LogicalType` values; may
+//                 be null when `arg_count == 0`.
+//   arg_count   — number of entries in `arg_types`.
+//   return_type — `duckdb::LogicalType` of the scalar's return value.
+//   exec_cb     — `void(DataChunk &args, ExpressionState &state, Vector &result)`
+//                 callback invoked at execution time; must be non-null.
+//
+// Returns true on success. Uses `OnCreateConflict::ALTER_ON_CONFLICT` so
+// extension reload does not trip on a duplicate name. Logs to stderr on
+// failure and returns false.
+bool sv_register_scalar_function(
+    duckdb_database db_handle,
+    const char *name,
+    const duckdb::LogicalType *arg_types,
+    size_t arg_count,
+    duckdb::LogicalType return_type,
+    duckdb::scalar_function_t exec_cb);
+
 // Phase 65 Plan 05 (Task 1 / Wave 0 bridge spike) — register the read-side
 // `list_semantic_views()` table function via the C++ Catalog API. The bind
 // callback opens a per-call `Connection(*context.db)` and bridges to the

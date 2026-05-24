@@ -501,6 +501,68 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
+// sv_register_scalar_function — Phase 65 Plan 05 (Task 2 Step A)
+// ---------------------------------------------------------------------------
+// Sibling of `sv_register_table_function`. Registers a scalar function via
+// the C++ Catalog API (`Catalog::CreateFunction` on the system catalog with
+// a `CreateScalarFunctionInfo`). Consumed by Task 4 / Wave 4 to migrate
+// `get_ddl` and `read_yaml_from_semantic_view` off
+// `register_scalar_function_with_state`.
+//
+// Header declaration in cpp/src/shim.hpp.
+extern "C" {
+    bool sv_register_scalar_function(
+        duckdb_database db_handle,
+        const char *name,
+        const LogicalType *arg_types,
+        size_t arg_count,
+        LogicalType return_type,
+        scalar_function_t exec_cb) {
+        try {
+            if (db_handle == nullptr || name == nullptr || exec_cb == nullptr) {
+                fprintf(stderr,
+                    "sv_register_scalar_function: null required argument\n");
+                return false;
+            }
+            auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
+                db_handle->internal_ptr);
+            if (wrapper == nullptr) {
+                fprintf(stderr,
+                    "sv_register_scalar_function: null DatabaseWrapper\n");
+                return false;
+            }
+            auto &db = *wrapper->database->instance;
+
+            vector<LogicalType> args;
+            args.reserve(arg_count);
+            for (size_t i = 0; i < arg_count; ++i) {
+                args.push_back(arg_types[i]);
+            }
+
+            ScalarFunction fn(std::string(name), std::move(args),
+                              return_type, exec_cb);
+            CreateScalarFunctionInfo info(std::move(fn));
+            info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+
+            auto &system_catalog = Catalog::GetSystemCatalog(db);
+            auto txn = CatalogTransaction::GetSystemTransaction(db);
+            system_catalog.CreateFunction(txn, info);
+            return true;
+        } catch (const std::exception &e) {
+            fprintf(stderr,
+                "sv_register_scalar_function('%s') failed: %s\n",
+                name ? name : "(null)", e.what());
+            return false;
+        } catch (...) {
+            fprintf(stderr,
+                "sv_register_scalar_function('%s') failed: unknown exception\n",
+                name ? name : "(null)");
+            return false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // __sv_compute_create_from_yaml — Phase 65 Plan 04 (Task 2 Step B)
 // ---------------------------------------------------------------------------
 // Helper table function registered via `sv_register_table_function`. The bind
@@ -881,6 +943,207 @@ extern "C" {
             sv_list_semantic_views_function,
             sv_list_semantic_views_init_local);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 65 Plan 05 (Tasks 2-5) — Generic VARCHAR-rows + VARCHAR/BOOL-rows
+// helpers for the remaining read-side TF migrations.
+// ---------------------------------------------------------------------------
+//
+// Most of the Phase 65 Plan 05 migrations emit homogeneous VARCHAR result
+// columns (the various SHOW SEMANTIC ... / DESCRIBE SEMANTIC VIEW shapes).
+// To keep the per-TF migration delta to a thin adapter, we factor the
+// payload-parse + bind-data shape + exec emitter into generic helpers here.
+//
+// Each migrated TF still owns its own bind callback (to declare the right
+// column names and call the matching `sv_<name>_bind_rust` dispatcher), but
+// the bulk of the bind + the entire exec/init are reused.
+
+struct SvVarcharBindData : public TableFunctionData {
+    std::vector<std::vector<std::string>> rows;
+    size_t expected_cols = 0;
+};
+
+struct SvVarcharLocalState : public LocalTableFunctionState {
+    bool emitted = false;
+};
+
+// Parse a length-prefixed VARCHAR wire-format payload into bd.rows. The
+// expected column count is taken from bd.expected_cols (must be set by the
+// caller before invocation). Throws BinderException on truncated payload.
+static void sv_parse_varchar_payload(const char *buf, size_t buf_len,
+                                     SvVarcharBindData &bd,
+                                     const char *fn_name) {
+    if (buf == nullptr) {
+        return;  // rc=0 with null buffer == zero rows
+    }
+    size_t offset = 0;
+    uint32_t row_count = sv_read_u32_le(buf, buf_len, offset);
+    bd.rows.reserve(row_count);
+    for (uint32_t r = 0; r < row_count; ++r) {
+        std::vector<std::string> row;
+        row.reserve(bd.expected_cols);
+        for (size_t c = 0; c < bd.expected_cols; ++c) {
+            row.push_back(sv_read_string(buf, buf_len, offset));
+        }
+        bd.rows.push_back(std::move(row));
+    }
+    if (offset != buf_len) {
+        throw BinderException(
+            std::string(fn_name) +
+            ": FFI buffer has trailing bytes (consumed " +
+            std::to_string(offset) + " of " + std::to_string(buf_len) + ")");
+    }
+}
+
+static unique_ptr<LocalTableFunctionState> sv_varchar_init_local(
+    ExecutionContext & /*context*/,
+    TableFunctionInitInput & /*input*/,
+    GlobalTableFunctionState * /*global_state*/) {
+    return make_uniq<SvVarcharLocalState>();
+}
+
+static void sv_emit_varchar_rows(
+    ClientContext & /*context*/,
+    TableFunctionInput &data_p,
+    DataChunk &output) {
+    auto &bd = data_p.bind_data->Cast<SvVarcharBindData>();
+    auto *state_p = data_p.local_state.get();
+    bool emitted = false;
+    if (state_p) {
+        auto &state = state_p->Cast<SvVarcharLocalState>();
+        if (state.emitted) {
+            output.SetCardinality(0);
+            return;
+        }
+        state.emitted = true;
+        emitted = true;
+    }
+    (void)emitted;  // single-shot semantics — even without local state we emit once per bind
+    idx_t n = bd.rows.size();
+    for (idx_t i = 0; i < n; ++i) {
+        const auto &row = bd.rows[i];
+        for (size_t c = 0; c < row.size(); ++c) {
+            output.SetValue(c, i, Value(row[c]));
+        }
+    }
+    output.SetCardinality(n);
+}
+
+// VARCHAR-rows-with-trailing-BOOL shape (used by
+// show_semantic_dimensions_for_metric, which returns 3 VARCHAR + 1 BOOLEAN).
+struct SvVarcharBoolBindData : public TableFunctionData {
+    std::vector<std::pair<std::vector<std::string>, bool>> rows;
+    size_t expected_varchar_cols = 0;  // number of VARCHAR cells per row
+};
+
+static void sv_parse_varchar_bool_payload(const char *buf, size_t buf_len,
+                                          SvVarcharBoolBindData &bd,
+                                          const char *fn_name) {
+    if (buf == nullptr) {
+        return;
+    }
+    size_t offset = 0;
+    uint32_t row_count = sv_read_u32_le(buf, buf_len, offset);
+    bd.rows.reserve(row_count);
+    for (uint32_t r = 0; r < row_count; ++r) {
+        std::vector<std::string> strs;
+        strs.reserve(bd.expected_varchar_cols);
+        for (size_t c = 0; c < bd.expected_varchar_cols; ++c) {
+            strs.push_back(sv_read_string(buf, buf_len, offset));
+        }
+        if (offset + 1 > buf_len) {
+            throw BinderException(
+                std::string(fn_name) +
+                ": FFI buffer truncated (expected u8 bool at offset " +
+                std::to_string(offset) + " of " + std::to_string(buf_len) + ")");
+        }
+        bool b = buf[offset] != 0;
+        offset += 1;
+        bd.rows.emplace_back(std::move(strs), b);
+    }
+    if (offset != buf_len) {
+        throw BinderException(
+            std::string(fn_name) +
+            ": FFI buffer has trailing bytes (consumed " +
+            std::to_string(offset) + " of " + std::to_string(buf_len) + ")");
+    }
+}
+
+static void sv_emit_varchar_bool_rows(
+    ClientContext & /*context*/,
+    TableFunctionInput &data_p,
+    DataChunk &output) {
+    auto &bd = data_p.bind_data->Cast<SvVarcharBoolBindData>();
+    auto *state_p = data_p.local_state.get();
+    if (state_p) {
+        auto &state = state_p->Cast<SvVarcharLocalState>();
+        if (state.emitted) {
+            output.SetCardinality(0);
+            return;
+        }
+        state.emitted = true;
+    }
+    idx_t n = bd.rows.size();
+    for (idx_t i = 0; i < n; ++i) {
+        const auto &strs = bd.rows[i].first;
+        for (size_t c = 0; c < strs.size(); ++c) {
+            output.SetValue(c, i, Value(strs[c]));
+        }
+        // BOOLEAN trailing column at index strs.size().
+        output.SetValue(strs.size(), i, Value::BOOLEAN(bd.rows[i].second));
+    }
+    output.SetCardinality(n);
+}
+
+// Common idiom for the bind callback: open Connection, run Rust dispatcher
+// for the zero-arg case, parse payload into bd. Used by all 5 zero-arg
+// migrated TFs (Task 2 / Wave 1) and reused by Task 3 / Wave 2 with extra
+// VARCHAR args supplied to the dispatcher.
+//
+// `dispatcher` returns rc==0 on success (payload populated), rc!=0 with
+// error_buf NUL-terminated otherwise. Throws BinderException on rc!=0 with
+// the "<fn_name> failed: <error_buf>" message — matches the Wave 0 spike.
+template <typename DispatcherFn>
+static void sv_run_varchar_bind(ClientContext &context,
+                                SvVarcharBindData &bd,
+                                size_t expected_cols,
+                                const char *fn_name,
+                                DispatcherFn &&dispatcher) {
+    bd.expected_cols = expected_cols;
+    Connection probe(*context.db);
+    duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+    SvOwnedBuffer payload;
+    char error_buf[1024];
+    std::memset(error_buf, 0, sizeof(error_buf));
+    uint8_t rc = dispatcher(borrowed,
+                            &payload.ptr, &payload.len,
+                            error_buf, sizeof(error_buf));
+    if (rc != 0) {
+        throw BinderException(std::string(fn_name) + " failed: " + error_buf);
+    }
+    sv_parse_varchar_payload(payload.ptr, payload.len, bd, fn_name);
+}
+
+template <typename DispatcherFn>
+static void sv_run_varchar_bool_bind(ClientContext &context,
+                                     SvVarcharBoolBindData &bd,
+                                     size_t expected_varchar_cols,
+                                     const char *fn_name,
+                                     DispatcherFn &&dispatcher) {
+    bd.expected_varchar_cols = expected_varchar_cols;
+    Connection probe(*context.db);
+    duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+    SvOwnedBuffer payload;
+    char error_buf[1024];
+    std::memset(error_buf, 0, sizeof(error_buf));
+    uint8_t rc = dispatcher(borrowed,
+                            &payload.ptr, &payload.len,
+                            error_buf, sizeof(error_buf));
+    if (rc != 0) {
+        throw BinderException(std::string(fn_name) + " failed: " + error_buf);
+    }
+    sv_parse_varchar_bool_payload(payload.ptr, payload.len, bd, fn_name);
 }
 
 // ---------------------------------------------------------------------------

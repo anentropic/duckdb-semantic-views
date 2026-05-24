@@ -10,6 +10,7 @@ pub mod parse;
 pub mod query;
 pub mod render_ddl;
 pub mod render_yaml;
+pub mod type_cache;
 pub mod util;
 
 /// Test helpers for integration tests.

@@ -8,6 +8,7 @@ pub mod define;
 pub mod describe;
 pub mod get_ddl;
 pub mod list;
+pub mod read_ffi;
 pub mod read_yaml;
 pub mod show_columns;
 pub mod show_dims;

@@ -201,6 +201,33 @@ public:
 };
 
 //===--------------------------------------------------------------------===//
+// CreateScalarFunctionInfo — Phase 65 Plan 05 (Task 2 Step A) compat shim
+//===--------------------------------------------------------------------===//
+//
+// As of DuckDB v1.5.2 the `CreateScalarFunctionInfo` struct is forward-declared
+// in `duckdb.hpp` (lines 41536, 54050) but its body lives in `duckdb.cpp`
+// (line 2539). Because `shim.cpp` is compiled as a separate translation unit
+// from the amalgamation source, the forward declaration alone is not enough
+// for `sv_register_scalar_function` to construct a value. We re-declare the
+// struct here verbatim from `duckdb.cpp:2539-2548`.
+//
+// IMPORTANT: keep this in lockstep with the amalgamation. If a DuckDB bump
+// changes the struct (e.g. adds a field) the linker will accept it (ODR
+// allows multiple declarations of the same type) but the constructed value
+// will have wrong layout — silent corruption. Re-grep when bumping DuckDB:
+//   grep -nE 'struct CreateScalarFunctionInfo' .amalgamation/<ver>/duckdb.cpp
+struct CreateScalarFunctionInfo : public CreateFunctionInfo {
+    DUCKDB_API explicit CreateScalarFunctionInfo(ScalarFunction function);
+    DUCKDB_API explicit CreateScalarFunctionInfo(ScalarFunctionSet set);
+
+    ScalarFunctionSet functions;
+
+public:
+    DUCKDB_API unique_ptr<CreateInfo> Copy() const override;
+    DUCKDB_API unique_ptr<AlterInfo> GetAlterInfo() const override;
+};
+
+//===--------------------------------------------------------------------===//
 // Parser (minimal — only the surface shim.cpp uses to re-parse rewritten SQL)
 //===--------------------------------------------------------------------===//
 //
