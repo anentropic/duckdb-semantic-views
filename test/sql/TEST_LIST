@@ -48,3 +48,5 @@ test/sql/phase64_quoted_idents.test
 test/sql/65_pk_error.test
 test/sql/65_metadata_via_sql.test
 test/sql/65_json_merge_patch_smoke.test
+test/sql/65_alter_comment_merge_patch.test
+test/sql/65_alter_rename_via_sql.test

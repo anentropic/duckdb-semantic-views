@@ -1,0 +1,129 @@
+# Phase 65 (v0.10.0) Plan 04 -- Wave 2.
+#
+# ALTER SEMANTIC VIEW RENAME TO regression coverage. This DDL variant is
+# already pure-SQL post-Plan-03 (no catalog.lookup, no JSON touch -- just
+# UPDATE _definitions SET name = '<new>' wrapped in the Phase 60 dual
+# pre-check / race-guard pattern). Plan 04 adds this regression test so
+# future refactors that touch the dispatch path do not silently break
+# the rename surface.
+#
+# Behavioural properties pinned:
+#   B1: Plain RENAME succeeds; new name visible in list_semantic_views().
+#   B2: Old name no longer visible (single row in catalog).
+#   B3: RENAME-to-existing-name fails with "already exists" (the dual
+#       pre-check from Plan 03).
+#   B4: RENAME-of-nonexistent fails with "does not exist".
+#   B5: IF EXISTS variant on missing is a silent no-op.
+#   B6: Round-trip rename (A -> B -> A) restores original.
+#   B7: View remains queryable under the new name (data path intact).
+#
+# Requirements covered: LIFE-02 regression guard for the pure-SQL ALTER
+# path under the read-elimination architecture.
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# ============================================================
+# Setup
+# ============================================================
+
+statement ok
+CREATE TABLE p65rn_sales (id INTEGER PRIMARY KEY, amount DOUBLE);
+
+statement ok
+INSERT INTO p65rn_sales VALUES (1, 50.0), (2, 75.0);
+
+statement ok
+CREATE SEMANTIC VIEW p65rn_v AS
+  TABLES (o AS p65rn_sales PRIMARY KEY (id))
+  DIMENSIONS (o.id AS o.id)
+  METRICS (o.total AS SUM(o.amount))
+
+# ============================================================
+# B1 + B2: Basic RENAME -- new name visible, old name gone.
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW p65rn_v RENAME TO p65rn_v2
+
+query T
+SELECT name FROM list_semantic_views() WHERE name IN ('p65rn_v', 'p65rn_v2')
+----
+p65rn_v2
+
+# B7: View queryable under the new name.
+query R
+SELECT total FROM semantic_view('p65rn_v2', metrics := ['total'])
+----
+125.0
+
+# ============================================================
+# B6: Round-trip RENAME back.
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW p65rn_v2 RENAME TO p65rn_v
+
+query T
+SELECT name FROM list_semantic_views() WHERE name IN ('p65rn_v', 'p65rn_v2')
+----
+p65rn_v
+
+# ============================================================
+# B4: RENAME of nonexistent view -> "does not exist".
+# ============================================================
+
+statement error
+ALTER SEMANTIC VIEW p65rn_nonexistent RENAME TO p65rn_whatever
+----
+does not exist
+
+# ============================================================
+# B5: IF EXISTS on nonexistent -- silent no-op.
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW IF EXISTS p65rn_nonexistent RENAME TO p65rn_whatever
+
+# ============================================================
+# B3: RENAME to an already-taken name -> "already exists".
+# ============================================================
+
+statement ok
+CREATE TABLE p65rn_other_tbl (id INTEGER PRIMARY KEY);
+
+statement ok
+CREATE SEMANTIC VIEW p65rn_taken AS
+  TABLES (t AS p65rn_other_tbl PRIMARY KEY (id))
+  DIMENSIONS (t.id AS t.id)
+  METRICS (t.c AS COUNT(*))
+
+statement error
+ALTER SEMANTIC VIEW p65rn_v RENAME TO p65rn_taken
+----
+already exists
+
+# Both original views still present and intact.
+query T
+SELECT name FROM list_semantic_views() WHERE name IN ('p65rn_v', 'p65rn_taken') ORDER BY name
+----
+p65rn_taken
+p65rn_v
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p65rn_v
+
+statement ok
+DROP SEMANTIC VIEW p65rn_taken
+
+statement ok
+DROP TABLE p65rn_sales
+
+statement ok
+DROP TABLE p65rn_other_tbl

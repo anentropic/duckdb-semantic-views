@@ -2279,14 +2279,31 @@ fn rewrite_alter_comment(
     new_comment_escaped: Option<&str>,
     if_exists: bool,
 ) -> Result<Option<String>, ParseError> {
+    // Phase 65 Plan 04 (Wave 2 — A1 resolution via json_merge_patch):
+    // ALTER SET/UNSET COMMENT now runs as a pure-SQL UPDATE on the caller's
+    // connection. No `catalog.lookup()` / deserialize / mutate / reserialize
+    // round-trip: the JSON mutation happens entirely inside DuckDB via
+    // json_merge_patch. Wave 0 spike (test/sql/65_json_merge_patch_smoke.test)
+    // confirmed DuckDB v1.5.2 honors RFC-7396 null-as-delete, so UNSET
+    // COMMENT can be a constant patch literal `'{"comment":null}'::JSON`
+    // while SET COMMENT builds the patch via serde_json::to_string for
+    // correct internal-quote escaping.
+    //
+    // We keep the `catalog.exists` pre-check so the non-IF-EXISTS "does not
+    // exist" error wording stays byte-identical with v0.9.0 / phase45's
+    // expectations. That call uses CatalogReader (not catalog.lookup), and
+    // both go away when Plan 06 retires H1. For IF EXISTS the pre-check
+    // surfaces the silent no-op; for plain ALTER the second-line race-guard
+    // SELECT (D-13 unchanged) catches a concurrent DROP between the
+    // pre-check and the UPDATE.
     let name = unescape_sql_arg(name_escaped);
 
-    let json_str = catalog.lookup(&name).map_err(|e| ParseError {
+    let exists = catalog.exists(&name).map_err(|e| ParseError {
         message: format!("catalog lookup failed: {e}"),
         position: None,
     })?;
 
-    let Some(json_str) = json_str else {
+    if !exists {
         if if_exists {
             // Silent no-op with the legacy (name, status) schema.
             return Ok(Some(format!(
@@ -2298,48 +2315,63 @@ fn rewrite_alter_comment(
             message: format!("semantic view '{name}' does not exist"),
             position: None,
         });
-    };
+    }
 
-    let mut def: crate::model::SemanticViewDefinition =
-        serde_json::from_str(&json_str).map_err(|e| ParseError {
-            message: format!("failed to parse stored definition: {e}"),
-            position: None,
-        })?;
-
-    let status_label = if new_comment_escaped.is_some() {
-        "comment set"
-    } else {
-        "comment unset"
-    };
-    def.comment = new_comment_escaped.map(unescape_sql_arg);
-
-    let new_json = serde_json::to_string(&def).map_err(|e| ParseError {
-        message: format!("failed to serialize updated definition: {e}"),
-        position: None,
-    })?;
-    let new_json_escaped = escape_sql_arg(&new_json);
+    // Build the json_merge_patch patch literal.
+    //   SET COMMENT 'new text' -> `'{"comment":"new text"}'::JSON`
+    //   UNSET COMMENT          -> `'{"comment":null}'::JSON`  (RFC-7396 null-as-delete)
+    //
+    // For SET, we use serde_json::to_string on a one-key object so internal
+    // `"` and `\` characters in the user's comment are JSON-escaped
+    // correctly; then escape_sql_arg doubles any embedded single quotes for
+    // the outer single-quoted SQL literal. Belt-and-braces escape: JSON
+    // first (handles `"`/`\`/control chars), SQL second (handles `'`).
+    let (patch_json_for_sql, status_label) =
+        match new_comment_escaped {
+            Some(escaped) => {
+                // The arg arrives SQL-escaped (single quotes doubled); undo
+                // that before handing to serde_json so the JSON value is the
+                // user's literal comment.
+                let comment = unescape_sql_arg(escaped);
+                let patch = serde_json::to_string(&serde_json::json!({"comment": comment}))
+                    .map_err(|e| ParseError {
+                        message: format!("failed to build comment patch: {e}"),
+                        position: None,
+                    })?;
+                (escape_sql_arg(&patch), "comment set")
+            }
+            None => {
+                // UNSET COMMENT: constant patch. The Wave 0 spike empirically
+                // confirms DuckDB v1.5.2 implements RFC-7396 null-as-delete.
+                (r#"{"comment":null}"#.to_string(), "comment unset")
+            }
+        };
 
     if if_exists {
         // IF EXISTS preserves its silent contract on race: pre-check saw the
         // row; if a concurrent DROP commits before our UPDATE, the UPDATE
         // simply affects 0 rows.
         return Ok(Some(format!(
-            "UPDATE semantic_layer._definitions SET definition = '{new_json_escaped}' \
-             WHERE name = '{name_escaped}' \
+            "UPDATE semantic_layer._definitions \
+                SET definition = json_merge_patch(definition::JSON, '{patch_json_for_sql}'::JSON)::VARCHAR \
+              WHERE name = '{name_escaped}' \
              RETURNING name, '{status_label}'::VARCHAR AS status"
         )));
     }
 
-    // Race guard (see rewrite_drop for rationale). Note: this only guards
-    // against concurrent DROP. A concurrent ALTER ... SET COMMENT or
-    // ALTER ... RENAME against the same row could still cause a lost-update
-    // (we serialized our new JSON from the lookup snapshot). That broader
-    // optimistic-concurrency story is out of scope for v0.8.0.
+    // Race guard (see rewrite_drop for rationale). The catalog.exists()
+    // pre-check above reads committed state via the catalog connection; the
+    // race-guard SELECT runs on the caller's connection in the same txn as
+    // the UPDATE so its NOT EXISTS check is snapshot-consistent with the DML
+    // that follows. Concurrent ALTER-against-the-same-row no longer carries
+    // a lost-update risk because we apply the mutation via json_merge_patch
+    // ON THE CURRENT ROW — not a Rust-side snapshot.
     let guard = race_guard_select(name_escaped);
     Ok(Some(format!(
         "{guard}; \
-         UPDATE semantic_layer._definitions SET definition = '{new_json_escaped}' \
-         WHERE name = '{name_escaped}' \
+         UPDATE semantic_layer._definitions \
+            SET definition = json_merge_patch(definition::JSON, '{patch_json_for_sql}'::JSON)::VARCHAR \
+          WHERE name = '{name_escaped}' \
          RETURNING name, '{status_label}'::VARCHAR AS status"
     )))
 }
