@@ -1,0 +1,175 @@
+# Phase 65 (v0.10.0) Plan 05 -- Wave 0 bridge spike (Task 1).
+#
+# Empirical verification that the Rust<->C++ duckdb_connection bridge
+# established by Task 1 is end-to-end functional for the read path:
+#
+#   1. C++ bind callback (cpp/src/shim.cpp::sv_list_semantic_views_bind)
+#      opens Connection probe(*context.db) and casts the stack
+#      Connection* to duckdb_connection.
+#   2. Rust dispatcher (src/ddl/list.rs::sv_list_semantic_views_bind_rust)
+#      wraps the borrowed handle in CatalogReader and reads the catalog.
+#   3. Rows are serialized as a length-prefixed binary buffer, parsed by
+#      the C++ bind into BindData, then emitted by the exec callback.
+#
+# The bridge mechanism (reinterpret_cast<duckdb_connection>(Connection*))
+# is the load-bearing primitive that the remaining 16 read-side migrations
+# (Tasks 2-6) will reuse. If this test fails, the bridge mechanism
+# choice must be revisited before the migration continues.
+#
+# Behavioural properties pinned:
+#   B1: list_semantic_views() against an empty DB returns 0 rows
+#       (probe_catalog_table_present detects the missing table for the
+#       in-memory case and short-circuits cleanly; the function is
+#       reachable and the 6-column schema is present).
+#   B2: After CREATE of a single view, list_semantic_views() returns 1
+#       row with the correct name, kind, database_name, schema_name.
+#   B3: After CREATE of 3 views, list_semantic_views() returns 3 rows
+#       sorted by name (matching the v0.9.0 Rust VTab ordering).
+#   B4: The function is visible in duckdb_functions() with type
+#       table_function (confirms C++ Catalog API registration succeeded).
+#   B5: Bind opens a per-call Connection on every invocation -- two
+#       successive SELECTs return correct results (no stale state
+#       leaked from the first bind).
+#
+# Requirements covered: LIFE-01 (per-call Connection bind pattern for
+# read-side functions), LIFE-02 (Rust dispatcher reachable from C++
+# Catalog API bind callback).
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# B4: registration visibility. The function must appear in DuckDB's
+# function catalog as a table_function -- confirms that
+# sv_register_table_function landed it via system_catalog.CreateTableFunction.
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name = 'list_semantic_views'
+  AND function_type = 'table';
+----
+1
+
+# B1: empty catalog. The bind callback opens Connection probe(*context.db)
+# and the Rust dispatcher probes for semantic_layer._definitions; since
+# nothing has been created yet the probe short-circuits to 0 rows.
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+0
+
+# B1b: schema is correct even with 0 rows -- 6 VARCHAR columns in the
+# Snowflake-aligned order (created_on, name, kind, database_name,
+# schema_name, comment).
+query TTTTTT
+SELECT created_on, name, kind, database_name, schema_name, comment
+FROM list_semantic_views() LIMIT 0;
+----
+
+# B2: single view round-trip.
+statement ok
+CREATE TABLE bridge_t1 (id INTEGER PRIMARY KEY, n INTEGER);
+
+statement ok
+CREATE SEMANTIC VIEW bridge_v1 AS
+  TABLES (
+    t AS bridge_t1 PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    t.tid AS t.id
+  )
+  METRICS (
+    t.cnt AS COUNT(*)
+  );
+
+query TT
+SELECT name, kind FROM list_semantic_views()
+WHERE name = 'bridge_v1';
+----
+bridge_v1	SEMANTIC_VIEW
+
+# B5: two successive SELECTs return the same result -- no per-bind state
+# leakage. Each call opens its own per-call Connection so the second
+# invocation must succeed independently of the first.
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+1
+
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+1
+
+# B3: three views, sorted by name. The Rust dispatcher sorts rows by
+# name before serializing; the C++ side preserves order during parse +
+# emit. The order matches the v0.9.0 Rust VTab (ListBindData) exactly.
+statement ok
+CREATE TABLE bridge_t2 (id INTEGER PRIMARY KEY, n INTEGER);
+
+statement ok
+CREATE TABLE bridge_t3 (id INTEGER PRIMARY KEY, n INTEGER);
+
+statement ok
+CREATE SEMANTIC VIEW bridge_v3 AS
+  TABLES (
+    t AS bridge_t3 PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    t.tid AS t.id
+  )
+  METRICS (
+    t.cnt AS COUNT(*)
+  );
+
+statement ok
+CREATE SEMANTIC VIEW bridge_v2 AS
+  TABLES (
+    t AS bridge_t2 PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    t.tid AS t.id
+  )
+  METRICS (
+    t.cnt AS COUNT(*)
+  );
+
+# Expect 3 rows sorted by name: bridge_v1, bridge_v2, bridge_v3.
+query T
+SELECT name FROM list_semantic_views();
+----
+bridge_v1
+bridge_v2
+bridge_v3
+
+# All 3 share kind = SEMANTIC_VIEW.
+query I
+SELECT count(DISTINCT kind) FROM list_semantic_views();
+----
+1
+
+query T
+SELECT DISTINCT kind FROM list_semantic_views();
+----
+SEMANTIC_VIEW
+
+# Cleanup so the spike doesn't leave state behind for other tests
+# (defensive -- sqllogictest runs each .test against a fresh in-memory
+# DB so this is belt-and-braces).
+statement ok
+DROP SEMANTIC VIEW bridge_v1;
+
+statement ok
+DROP SEMANTIC VIEW bridge_v2;
+
+statement ok
+DROP SEMANTIC VIEW bridge_v3;
+
+statement ok
+DROP TABLE bridge_t1;
+
+statement ok
+DROP TABLE bridge_t2;
+
+statement ok
+DROP TABLE bridge_t3;
