@@ -149,4 +149,26 @@ bool sv_register_show_semantic_dimensions_for_metric(duckdb_database db_handle);
 bool sv_register_get_ddl(duckdb_database db_handle);
 bool sv_register_read_yaml_from_semantic_view(duckdb_database db_handle);
 
+// Phase 65 Plan 05 Task 5 (Wave 5) — register the migrated
+// `explain_semantic_view(view_name VARCHAR, dimensions := LIST(VARCHAR),
+// metrics := LIST(VARCHAR), facts := LIST(VARCHAR))` table function via
+// the C++ Catalog API. The bind opens a per-call
+// `Connection(*context.db)` and bridges to `sv_explain_semantic_view_bind_rust`.
+// Built without going through `sv_register_table_function` because the
+// generic shim does not (yet) accept named-parameter declarations; see
+// `cpp/src/shim.cpp::sv_register_explain_semantic_view_impl`.
+bool sv_register_explain_semantic_view(duckdb_database db_handle);
+
+// Phase 65 Plan 05 Task 6 (Wave 6) — register the migrated
+// `semantic_view(view_name VARCHAR, dimensions := LIST(VARCHAR),
+// metrics := LIST(VARCHAR), facts := LIST(VARCHAR))` table function via
+// the C++ Catalog API. The bind opens a per-call
+// `Connection(*context.db)`, dispatches to `sv_semantic_view_bind_rust`
+// for catalog lookup + expand + type inference, then runs the actual
+// execution SQL on a per-call Connection owned by the init_global state
+// so chunks can be streamed across exec invocations. H1 catalog_conn /
+// H2 query_conn are NOT consumed by this path — Plan 06 retires H1,
+// Batch 3 of Plan 05 retires H2.
+bool sv_register_semantic_view(duckdb_database db_handle);
+
 } // extern "C"

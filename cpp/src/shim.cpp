@@ -268,6 +268,52 @@ extern "C" {
         const uint8_t *name_ptr, size_t name_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
+
+    // Phase 65 Plan 05 Task 5 (Wave 5) — Rust dispatcher for the migrated
+    // `explain_semantic_view(view_name, dimensions := [...], metrics := [...],
+    // facts := [...])` table function. Same per-call Connection BORROW
+    // contract as the 14 Batch-1 migrations. The three optional named
+    // LIST(VARCHAR) parameters are flattened on the C++ side into the
+    // standard length-prefixed wire format (`u32 count; for each entry:
+    // u32 len + bytes`) and passed as (ptr, len) pairs. A null pointer
+    // with len=0 means the named parameter was not supplied (treated as
+    // an empty list).
+    uint8_t sv_explain_semantic_view_bind_rust(
+        duckdb_connection conn,
+        const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *dims_ptr, size_t dims_len,
+        const uint8_t *metrics_ptr, size_t metrics_len,
+        const uint8_t *facts_ptr, size_t facts_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
+
+    // Phase 65 Plan 05 Task 6 (Wave 6) — Rust dispatcher for the bind half
+    // of the migrated `semantic_view(view_name, dimensions := [...],
+    // metrics := [...], facts := [...])` table function. Same per-call
+    // BORROW contract as Wave 5. Performs catalog lookup + expand + LIMIT-0
+    // type-inference + execution-SQL construction, and returns:
+    //
+    //   wire format (u32 little-endian unless noted):
+    //     u32 n_cols
+    //     for each column:
+    //       u32 byte_len + bytes (column name, UTF-8)
+    //       u32 duckdb_type_id (normalised: HUGEINT→BIGINT, UHUGEINT→UBIGINT,
+    //                           STRUCT/MAP/INVALID→VARCHAR for declaration)
+    //     u32 byte_len + bytes (execution_sql, UTF-8)
+    //
+    // The C++ bind callback parses the buffer, declares the output schema
+    // (handling DECIMAL/LIST/ENUM logical-type metadata via a second
+    // LIMIT-0 query on the per-call Connection only when needed), stashes
+    // the execution_sql in BindData, and runs the actual query inside
+    // init_global so chunks can be streamed during exec.
+    uint8_t sv_semantic_view_bind_rust(
+        duckdb_connection conn,
+        const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *dims_ptr, size_t dims_len,
+        const uint8_t *metrics_ptr, size_t metrics_len,
+        const uint8_t *facts_ptr, size_t facts_len,
+        char **out_ptr, size_t *out_len,
+        char *error_buf, size_t error_buf_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,6 +1926,180 @@ extern "C" {
             args, 1,
             LogicalType::VARCHAR,
             sv_read_yaml_from_semantic_view_exec);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 65 Plan 05 Task 5 (Wave 5) — explain_semantic_view migration
+// ---------------------------------------------------------------------------
+//
+// Migrates `explain_semantic_view(view_name, dimensions := [...],
+// metrics := [...], facts := [...])` off duckdb-rs's
+// `register_table_function_with_extra_info` (which marshals
+// `ClientContext &` away) to the C++ Catalog API path. The bind callback
+// opens a per-call `Connection probe(*context.db)` and bridges to the
+// Rust dispatcher `sv_explain_semantic_view_bind_rust` which runs the
+// catalog lookup + expand + EXPLAIN on the per-call connection. Output is
+// one VARCHAR row per explain-output line — reuses the Wave 1/2
+// `SvVarcharBindData` shape + `sv_emit_varchar_rows` exec.
+//
+// Named LIST(VARCHAR) parameter handling: the three optional named
+// parameters are flattened on the C++ side using
+// `sv_serialise_string_list` (length-prefixed wire format) and passed as
+// (ptr, len) pairs to the Rust dispatcher. Missing named parameters are
+// passed as nullptr+0, which the Rust side treats as an empty list.
+
+// Serialise a LIST(VARCHAR) Value into the standard length-prefixed wire
+// format (`u32 count; for each: u32 byte_len + bytes`). The returned bytes
+// can be handed directly to the Rust dispatcher as (ptr, len). Throws
+// BinderException if the Value is not a LIST or contains non-VARCHAR
+// children — defensive: DuckDB's named-parameter type-check already
+// enforces the LIST(VARCHAR) declaration at registration time, so a
+// mismatch here is a planner bug.
+static std::vector<uint8_t> sv_serialise_string_list(
+    const Value &list_val, const char *param_name) {
+    std::vector<uint8_t> buf;
+    const auto &children = ListValue::GetChildren(list_val);
+    uint32_t count = static_cast<uint32_t>(children.size());
+    buf.reserve(4 + children.size() * 16);
+    buf.push_back(static_cast<uint8_t>(count & 0xff));
+    buf.push_back(static_cast<uint8_t>((count >> 8) & 0xff));
+    buf.push_back(static_cast<uint8_t>((count >> 16) & 0xff));
+    buf.push_back(static_cast<uint8_t>((count >> 24) & 0xff));
+    for (const auto &c : children) {
+        if (c.IsNull()) {
+            throw BinderException(
+                std::string("explain_semantic_view: `") + param_name +
+                "` contains a NULL element (only non-NULL VARCHARs accepted)");
+        }
+        // c.GetValue<std::string>() applies any necessary cast. The named-
+        // parameter declaration is LIST(VARCHAR) so this should be a no-op.
+        std::string s = c.GetValue<std::string>();
+        uint32_t len = static_cast<uint32_t>(s.size());
+        buf.push_back(static_cast<uint8_t>(len & 0xff));
+        buf.push_back(static_cast<uint8_t>((len >> 8) & 0xff));
+        buf.push_back(static_cast<uint8_t>((len >> 16) & 0xff));
+        buf.push_back(static_cast<uint8_t>((len >> 24) & 0xff));
+        buf.insert(buf.end(), s.begin(), s.end());
+    }
+    return buf;
+}
+
+static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names) {
+    auto bd = make_uniq<SvVarcharBindData>();
+    bd->expected_cols = 1;
+    return_types.push_back(LogicalType::VARCHAR);
+    names.emplace_back("explain_output");
+
+    if (input.inputs.empty() || input.inputs[0].IsNull()) {
+        throw BinderException(
+            "explain_semantic_view: view name is required (positional arg 0)");
+    }
+    std::string view_name = input.inputs[0].GetValue<std::string>();
+
+    // Pull the three optional named LIST(VARCHAR) parameters. The
+    // `input.named_parameters` map is case-insensitive (per
+    // case_insensitive_map_t). A missing entry means the user did not
+    // supply that named parameter — pass nullptr+0 to the Rust side.
+    std::vector<uint8_t> dims_buf, metrics_buf, facts_buf;
+    auto it_d = input.named_parameters.find("dimensions");
+    if (it_d != input.named_parameters.end() && !it_d->second.IsNull()) {
+        dims_buf = sv_serialise_string_list(it_d->second, "dimensions");
+    }
+    auto it_m = input.named_parameters.find("metrics");
+    if (it_m != input.named_parameters.end() && !it_m->second.IsNull()) {
+        metrics_buf = sv_serialise_string_list(it_m->second, "metrics");
+    }
+    auto it_f = input.named_parameters.find("facts");
+    if (it_f != input.named_parameters.end() && !it_f->second.IsNull()) {
+        facts_buf = sv_serialise_string_list(it_f->second, "facts");
+    }
+
+    Connection probe(*context.db);
+    duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+
+    SvOwnedBuffer payload;
+    char error_buf[1024];
+    std::memset(error_buf, 0, sizeof(error_buf));
+
+    uint8_t rc = sv_explain_semantic_view_bind_rust(
+        borrowed,
+        reinterpret_cast<const uint8_t *>(view_name.data()), view_name.size(),
+        dims_buf.empty()    ? nullptr : dims_buf.data(),    dims_buf.size(),
+        metrics_buf.empty() ? nullptr : metrics_buf.data(), metrics_buf.size(),
+        facts_buf.empty()   ? nullptr : facts_buf.data(),   facts_buf.size(),
+        &payload.ptr, &payload.len,
+        error_buf, sizeof(error_buf));
+
+    if (rc != 0) {
+        throw BinderException(std::string("explain_semantic_view: ") + error_buf);
+    }
+    sv_parse_varchar_payload(payload.ptr, payload.len, *bd,
+                             "explain_semantic_view");
+    return std::move(bd);
+}
+
+// sv_register_table_function does not declare named parameters; for
+// explain_semantic_view (and Wave 6's semantic_view) we need them so
+// DuckDB's binder type-checks `dimensions := [...]` etc. against
+// LIST(VARCHAR). Build the TableFunction by hand and register it via the
+// same Catalog::CreateTableFunction path.
+//
+// Borrow contract identical to sv_register_table_function: callbacks
+// receive `ClientContext &` and the bind opens per-call Connections —
+// no long-lived extension-owned `duckdb_connection`.
+static bool sv_register_explain_semantic_view_impl(duckdb_database db_handle) {
+    try {
+        auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
+            db_handle->internal_ptr);
+        if (wrapper == nullptr) {
+            fprintf(stderr,
+                "sv_register_explain_semantic_view: null DatabaseWrapper\n");
+            return false;
+        }
+        auto &db = *wrapper->database->instance;
+
+        vector<LogicalType> args = {LogicalType::VARCHAR};
+        TableFunction tf(
+            std::string("explain_semantic_view"),
+            std::move(args),
+            sv_emit_varchar_rows,
+            sv_explain_semantic_view_bind,
+            /*init_global*/ nullptr,
+            sv_varchar_init_local);
+
+        // Named LIST(VARCHAR) parameters — match the legacy Rust VTab
+        // signature (`dimensions`, `metrics`, `facts`) byte-for-byte so
+        // existing call sites continue to parse without surprises.
+        tf.named_parameters["dimensions"] = LogicalType::LIST(LogicalType::VARCHAR);
+        tf.named_parameters["metrics"]    = LogicalType::LIST(LogicalType::VARCHAR);
+        tf.named_parameters["facts"]      = LogicalType::LIST(LogicalType::VARCHAR);
+
+        CreateTableFunctionInfo info(tf);
+        info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+
+        auto &system_catalog = Catalog::GetSystemCatalog(db);
+        auto txn = CatalogTransaction::GetSystemTransaction(db);
+        system_catalog.CreateTableFunction(txn, info);
+        return true;
+    } catch (const std::exception &e) {
+        fprintf(stderr,
+            "sv_register_explain_semantic_view failed: %s\n", e.what());
+        return false;
+    } catch (...) {
+        fprintf(stderr,
+            "sv_register_explain_semantic_view failed: unknown exception\n");
+        return false;
+    }
+}
+
+extern "C" {
+    bool sv_register_explain_semantic_view(duckdb_database db_handle) {
+        return sv_register_explain_semantic_view_impl(db_handle);
     }
 }
 

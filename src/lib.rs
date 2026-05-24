@@ -305,7 +305,6 @@ mod extension {
 
     use crate::{
         catalog::init_catalog,
-        query::explain::ExplainSemanticViewVTab,
         query::table_function::{QueryState, SemanticViewVTab},
     };
     // Phase 65 Plan 05 Tasks 1-4 migrated 14 of 17 read-side registrations
@@ -376,6 +375,25 @@ mod extension {
         // identical to the bind-side dispatchers.
         fn sv_register_get_ddl(db_handle: ffi::duckdb_database) -> bool;
         fn sv_register_read_yaml_from_semantic_view(db_handle: ffi::duckdb_database) -> bool;
+
+        // Phase 65 Plan 05 Task 5 (Wave 5) — register the migrated
+        // `explain_semantic_view` table function via the C++ Catalog API.
+        // Bind opens a per-call `Connection(*context.db)` and dispatches to
+        // `sv_explain_semantic_view_bind_rust` in `src/query/explain.rs`.
+        // Replaces the duckdb-rs `register_table_function_with_extra_info`
+        // path that previously fed off the long-lived `QueryState`.
+        fn sv_register_explain_semantic_view(db_handle: ffi::duckdb_database) -> bool;
+
+        // Phase 65 Plan 05 Task 6 (Wave 6) — register the migrated
+        // `semantic_view` table function via the C++ Catalog API. Bind
+        // opens a per-call `Connection(*context.db)` and dispatches to
+        // `sv_semantic_view_bind_rust` in `src/query/table_function.rs`.
+        // Replaces the duckdb-rs `register_table_function_with_extra_info`
+        // path that previously fed off the long-lived `QueryState`. The
+        // H2 `query_conn` allocation site at lines ~540 below is still
+        // present pending the Plan 05 Batch 3 cleanup commit which
+        // deletes it together with the dead VTab carcasses.
+        fn sv_register_semantic_view(db_handle: ffi::duckdb_database) -> bool;
     }
 
     /// Core initialization logic, called with both the high-level Connection and
@@ -565,11 +583,13 @@ mod extension {
             &query_state,
         )?;
 
-        // Register the explain_semantic_view table function.
-        con.register_table_function_with_extra_info::<ExplainSemanticViewVTab, _>(
-            "explain_semantic_view",
-            &query_state,
-        )?;
+        // Phase 65 Plan 05 Task 5 (Wave 5): explain_semantic_view migrated
+        // off the duckdb-rs `register_table_function_with_extra_info` path
+        // to the C++ Catalog API. The bind callback opens a per-call
+        // `Connection(*context.db)` instead of consuming H2/`query_state`.
+        if !unsafe { sv_register_explain_semantic_view(db_handle) } {
+            return Err("Failed to register explain_semantic_view via C++ Catalog API".into());
+        }
 
         Ok(())
     }
