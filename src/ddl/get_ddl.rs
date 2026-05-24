@@ -1,24 +1,16 @@
 //! GET_DDL scalar function: wraps [`crate::render_ddl::render_create_ddl`] as a
-//! `VScalar` so that `SELECT GET_DDL('SEMANTIC_VIEW', 'name')` works inside DuckDB.
+//! C++ Catalog API scalar so that `SELECT GET_DDL('SEMANTIC_VIEW', 'name')`
+//! works inside DuckDB.
 //!
-//! The render logic itself lives in [`crate::render_ddl`] (always compiled, unit-tested
-//! under `cargo test`). This module adds the extension-only VScalar registration.
+//! The render logic itself lives in [`crate::render_ddl`] (always compiled,
+//! unit-tested under `cargo test`). This module adds the extension-only Rust
+//! FFI dispatcher reached from `sv_register_get_ddl` in `cpp/src/shim.cpp`.
 //!
-//! # Phase 65 Plan 05 Task 4 (Wave 3)
+//! # Phase 65 Plan 05 Task 4 (Wave 3) — Batch 3 final cleanup
 //!
-//! `get_ddl` is registered via the C++ Catalog API path
-//! (`sv_register_get_ddl` in `cpp/src/shim.cpp`). The legacy
-//! [`GetDdlScalar`] `VScalar` impl below is retained and marked
-//! `#[allow(dead_code)]` for the duration of Plan 05; the Wave 6 cleanup
-//! commit deletes it together with the other dead VTab/VScalar carcasses.
-//! All live invocations of `SELECT GET_DDL(...)` route through
-//! [`sv_get_ddl_exec_rust`] below.
-
-use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
-use duckdb::types::DuckString;
-use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
-use duckdb::vtab::arrow::WritableVector;
-use libduckdb_sys::duckdb_string_t;
+//! The legacy `GetDdlScalar` `VScalar` impl block was retired in the same
+//! commit that deleted the H2 query_conn allocation; all live invocations
+//! of `SELECT GET_DDL(...)` now route through [`sv_get_ddl_exec_rust`] below.
 
 use crate::catalog::CatalogReader;
 use crate::model::SemanticViewDefinition;
@@ -139,59 +131,7 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
     }
 }
 
-#[allow(dead_code)]
-pub struct GetDdlScalar;
-
-impl VScalar for GetDdlScalar {
-    type State = CatalogReader;
-
-    unsafe fn invoke(
-        state: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
-            let len = input.len();
-            let type_vec = input.flat_vector(0);
-            let name_vec = input.flat_vector(1);
-            let types = type_vec.as_slice_with_len::<duckdb_string_t>(len);
-            let names = name_vec.as_slice_with_len::<duckdb_string_t>(len);
-            let out_vec = output.flat_vector();
-
-            for i in 0..len {
-                let obj_type = DuckString::new(&mut { types[i] }).as_str().to_string();
-                let name = DuckString::new(&mut { names[i] }).as_str().to_string();
-
-                if !obj_type.eq_ignore_ascii_case("SEMANTIC_VIEW") {
-                    return Err(format!(
-                        "GET_DDL: unsupported object type '{}'. Only 'SEMANTIC_VIEW' is supported.",
-                        obj_type
-                    )
-                    .into());
-                }
-
-                let json = state
-                    .lookup(&name)
-                    .map_err(Box::<dyn std::error::Error>::from)?
-                    .ok_or_else(|| format!("semantic view '{}' does not exist", name))?;
-                let def: SemanticViewDefinition = serde_json::from_str(&json)?;
-                let ddl =
-                    render_create_ddl(&name, &def).map_err(|e| -> Box<dyn std::error::Error> {
-                        format!("GET_DDL error: {e}").into()
-                    })?;
-                out_vec.insert(i, ddl.as_str());
-            }
-            Ok(())
-        }))
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![
-                LogicalTypeHandle::from(LogicalTypeId::Varchar), // object_type
-                LogicalTypeHandle::from(LogicalTypeId::Varchar), // name
-            ],
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // return: DDL string
-        )]
-    }
-}
+// Legacy `GetDdlScalar` (duckdb-rs `VScalar` impl) RETIRED — Phase 65
+// Plan 05 Batch 3. The C++ Catalog API path
+// (`sv_register_get_ddl` → `sv_get_ddl_exec_rust`) is the sole
+// registration target.

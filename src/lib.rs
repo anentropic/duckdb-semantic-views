@@ -304,17 +304,21 @@ mod extension {
     use std::error::Error;
 
     use crate::catalog::init_catalog;
-    // Phase 65 Plan 05 Tasks 1-4 migrated 14 of 17 read-side registrations
-    // to the C++ Catalog API path:
-    //  - Task 1 (Wave 0): list_semantic_views
-    //  - Task 2 (Wave 1): list_terse + 4 "_all" variants
-    //  - Task 3 (Wave 2): describe + show_columns + 4 single-view SHOW
-    //    variants + show_dimensions_for_metric
-    //  - Task 4 (Wave 3): get_ddl + read_yaml_from_semantic_view (scalars)
-    // The corresponding legacy VTab/VScalar structs are marked
-    // `#[allow(dead_code)]` in their modules until the Wave 6 cleanup
-    // commit. Remaining duckdb-rs registrations (explain_semantic_view +
-    // semantic_view) are migrated in Tasks 5-6.
+    // Phase 65 Plan 05 (complete after Batch 3 cleanup): all 17 read-side
+    // registrations now go through the C++ Catalog API path:
+    //  - Wave 0: list_semantic_views (bridge spike)
+    //  - Wave 1: list_terse + 4 "_all" variants
+    //  - Wave 2: describe + show_columns + 4 single-view SHOW variants +
+    //            show_dimensions_for_metric
+    //  - Wave 3: get_ddl + read_yaml_from_semantic_view (scalars)
+    //  - Wave 5: explain_semantic_view
+    //  - Wave 6: semantic_view
+    // The legacy duckdb-rs `register_table_function_with_extra_info` /
+    // `register_scalar_function_with_state` registrations were deleted
+    // together with the H2 query_conn allocation in the Batch 3 cleanup
+    // commit. H1 catalog_conn at the `let mut catalog_conn = ...` block
+    // below is still allocated pending Plan 06 retirement + structural
+    // guard test.
 
     // C++ helper for parser hook registration (defined in cpp/src/shim.cpp).
     // Phase 62: catalog_conn + is_file_backed are bundled into an

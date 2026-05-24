@@ -1,27 +1,18 @@
 //! `READ_YAML_FROM_SEMANTIC_VIEW` scalar function: wraps
-//! [`crate::render_yaml::render_yaml_export`] as a `VScalar` so that
-//! `SELECT READ_YAML_FROM_SEMANTIC_VIEW('name')` works inside `DuckDB`.
+//! [`crate::render_yaml::render_yaml_export`] as a C++ Catalog API scalar so
+//! that `SELECT READ_YAML_FROM_SEMANTIC_VIEW('name')` works inside `DuckDB`.
 //!
 //! The render logic itself lives in [`crate::render_yaml`] (always compiled,
-//! unit-tested under `cargo test`). This module adds the extension-only
-//! `VScalar` registration.
+//! unit-tested under `cargo test`). This module adds the extension-only Rust
+//! FFI dispatcher reached from `sv_register_read_yaml_from_semantic_view` in
+//! `cpp/src/shim.cpp`.
 //!
-//! # Phase 65 Plan 05 Task 4 (Wave 3)
+//! # Phase 65 Plan 05 Task 4 (Wave 3) — Batch 3 final cleanup
 //!
-//! `read_yaml_from_semantic_view` is registered via the C++ Catalog API path
-//! (`sv_register_read_yaml_from_semantic_view` in `cpp/src/shim.cpp`). The
-//! legacy [`ReadYamlFromSemanticViewScalar`] `VScalar` impl below is
-//! retained and marked `#[allow(dead_code)]` for the duration of Plan 05;
-//! the Wave 6 cleanup commit deletes it together with the other dead
-//! VTab/VScalar carcasses. All live invocations of
-//! `SELECT READ_YAML_FROM_SEMANTIC_VIEW(...)` route through
-//! [`sv_read_yaml_from_semantic_view_exec_rust`] below.
-
-use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
-use duckdb::types::DuckString;
-use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
-use duckdb::vtab::arrow::WritableVector;
-use libduckdb_sys::duckdb_string_t;
+//! The legacy `ReadYamlFromSemanticViewScalar` `VScalar` impl block was
+//! retired in the same commit that deleted the H2 query_conn allocation; all
+//! live invocations of `SELECT READ_YAML_FROM_SEMANTIC_VIEW(...)` now route
+//! through [`sv_read_yaml_from_semantic_view_exec_rust`] below.
 
 use crate::catalog::CatalogReader;
 use crate::model::SemanticViewDefinition;
@@ -125,47 +116,11 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
     }
 }
 
-#[allow(dead_code)]
-pub struct ReadYamlFromSemanticViewScalar;
-
-impl VScalar for ReadYamlFromSemanticViewScalar {
-    type State = CatalogReader;
-
-    unsafe fn invoke(
-        state: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
-            let len = input.len();
-            let name_vec = input.flat_vector(0);
-            let names = name_vec.as_slice_with_len::<duckdb_string_t>(len);
-            let out_vec = output.flat_vector();
-
-            for i in 0..len {
-                let raw_name = DuckString::new(&mut { names[i] }).as_str().to_string();
-                let bare_name = resolve_bare_name(&raw_name);
-
-                let json = state
-                    .lookup(bare_name)
-                    .map_err(Box::<dyn std::error::Error>::from)?
-                    .ok_or_else(|| format!("semantic view '{}' does not exist", bare_name))?;
-                let def: SemanticViewDefinition = serde_json::from_str(&json)?;
-                let yaml = render_yaml_export(&def)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                out_vec.insert(i, yaml.as_str());
-            }
-            Ok(())
-        }))
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![ScalarFunctionSignature::exact(
-            vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)], // name only (1 arg)
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),       // return: YAML string
-        )]
-    }
-}
+// Legacy `ReadYamlFromSemanticViewScalar` (duckdb-rs `VScalar` impl) RETIRED
+// — Phase 65 Plan 05 Batch 3. The C++ Catalog API path
+// (`sv_register_read_yaml_from_semantic_view` →
+// `sv_read_yaml_from_semantic_view_exec_rust`) is the sole registration
+// target.
 
 #[cfg(test)]
 mod tests {

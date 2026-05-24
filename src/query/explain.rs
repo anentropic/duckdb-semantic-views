@@ -1,9 +1,3 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-use duckdb::{
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
-};
 use libduckdb_sys as ffi;
 
 use crate::catalog::CatalogReader;
@@ -15,9 +9,7 @@ use crate::util::suggest_closest;
 use super::error::QueryError;
 use crate::expand::wildcard::{expand_wildcards, WildcardItemType};
 
-use super::table_function::{
-    execute_sql_raw, extract_list_strings, read_varchar_from_vector, QueryState,
-};
+use super::table_function::{execute_sql_raw, read_varchar_from_vector};
 
 // ---------------------------------------------------------------------------
 // Phase 65 Plan 05 Task 5 (Wave 5) — sv_explain_semantic_view_bind_rust
@@ -325,32 +317,11 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
 }
 
 // ---------------------------------------------------------------------------
-// BindData / InitData
+// Legacy `ExplainBindData` + `ExplainInitData` RETIRED — Phase 65 Plan 05
+// Batch 3. The C++ Catalog API path's bind callback materialises lines
+// into a length-prefixed wire format directly; no shared Rust bind-data
+// struct is needed.
 // ---------------------------------------------------------------------------
-
-/// Data computed at bind time: all output lines to return as rows.
-#[allow(dead_code)]
-pub struct ExplainBindData {
-    /// Each entry is one line of the three-part EXPLAIN output.
-    lines: Vec<String>,
-}
-
-// SAFETY: `Vec<String>` is `Send + Sync`.
-unsafe impl Send for ExplainBindData {}
-unsafe impl Sync for ExplainBindData {}
-
-/// State tracked during function execution.
-#[allow(dead_code)]
-pub struct ExplainInitData {
-    /// Signals when all rows have been emitted.
-    done: AtomicBool,
-    /// Current row index for iteration.
-    row_index: AtomicUsize,
-}
-
-// SAFETY: Atomic types are `Send + Sync`.
-unsafe impl Send for ExplainInitData {}
-unsafe impl Sync for ExplainInitData {}
 
 // ---------------------------------------------------------------------------
 // EXPLAIN plan extraction
@@ -406,240 +377,8 @@ unsafe fn collect_explain_lines(conn: ffi::duckdb_connection, sql: &str) -> Vec<
 }
 
 // ---------------------------------------------------------------------------
-// VTab implementation
+// Legacy `ExplainSemanticViewVTab` (duckdb-rs `VTab` impl) RETIRED — Phase 65
+// Plan 05 Batch 3. The C++ Catalog API path
+// (`sv_register_explain_semantic_view` → `sv_explain_semantic_view_bind_rust`
+// above) is the sole registration target.
 // ---------------------------------------------------------------------------
-
-/// The `explain_semantic_view` table function.
-///
-/// Returns formatted EXPLAIN output with three parts:
-/// 1. Metadata header (view name, dimensions, metrics)
-/// 2. Pretty-printed expanded SQL
-/// 3. `DuckDB` EXPLAIN plan (or graceful fallback)
-///
-/// Usage:
-/// ```sql
-/// FROM explain_semantic_view('my_view', dimensions := ['region'], metrics := ['total_revenue'])
-/// ```
-///
-/// # Phase 65 Plan 05 Task 5 (Wave 5)
-///
-/// The duckdb-rs registration of this VTab is RETIRED. `explain_semantic_view`
-/// is now registered via the C++ Catalog API path
-/// (`cpp/src/shim.cpp::sv_register_explain_semantic_view`) so its bind
-/// callback receives a native `ClientContext &` and opens a per-call
-/// `Connection(*context.db)`. The bind body is replicated in
-/// `sv_explain_semantic_view_bind_rust` above; this struct + impl are kept
-/// `#[allow(dead_code)]` for one wave to keep the migration commits clean
-/// — a single cleanup commit at the end of Plan 05 (Batch 3) deletes the
-/// dead VTab carcasses together.
-#[allow(dead_code)]
-pub struct ExplainSemanticViewVTab;
-
-impl VTab for ExplainSemanticViewVTab {
-    type BindData = ExplainBindData;
-    type InitData = ExplainInitData;
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
-            // 1. Extract parameters (same as semantic_query).
-            let view_name = bind.get_parameter(0).to_string();
-
-            let dimensions = match bind.get_named_parameter("dimensions") {
-                Some(ref val) => unsafe { extract_list_strings(val) },
-                None => vec![],
-            };
-            let metrics = match bind.get_named_parameter("metrics") {
-                Some(ref val) => unsafe { extract_list_strings(val) },
-                None => vec![],
-            };
-            let facts = match bind.get_named_parameter("facts") {
-                Some(ref val) => unsafe { extract_list_strings(val) },
-                None => vec![],
-            };
-
-            // 2. Validate: at least one dimension, metric, or fact.
-            if dimensions.is_empty() && metrics.is_empty() && facts.is_empty() {
-                let err: Box<dyn std::error::Error> = Box::new(QueryError::EmptyRequest {
-                    view_name: view_name.clone(),
-                });
-                return Err(err);
-            }
-
-            // 3. Look up view definition in the catalog.
-            let state_ptr = bind.get_extra_info::<QueryState>();
-            let state = unsafe { &*state_ptr };
-            let json_str = match state
-                .catalog
-                .lookup(&view_name)
-                .map_err(Box::<dyn std::error::Error>::from)?
-            {
-                Some(j) => j,
-                None => {
-                    let available = state
-                        .catalog
-                        .list_names()
-                        .map_err(Box::<dyn std::error::Error>::from)?;
-                    let suggestion = suggest_closest(&view_name, &available);
-                    let err: Box<dyn std::error::Error> = Box::new(QueryError::ViewNotFound {
-                        name: view_name,
-                        suggestion,
-                        available,
-                    });
-                    return Err(err);
-                }
-            };
-
-            // 4. Parse definition, expand wildcards, and expand.
-            let def = SemanticViewDefinition::from_json(&view_name, &json_str)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-
-            let dimensions = expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            let metrics = expand_wildcards(&metrics, &def, &WildcardItemType::Metric)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            let facts = expand_wildcards(&facts, &def, &WildcardItemType::Fact)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-
-            // Resolve dims/mets for materialization name lookup (INTR-01).
-            // This duplicates name resolution that expand() also does, but it's
-            // trivial (linear scan of definition arrays) and avoids changing
-            // expand()'s return type.
-            let mat_name = {
-                let dim_refs: Vec<&crate::model::Dimension> = dimensions
-                    .iter()
-                    .filter_map(|name| {
-                        def.dimensions
-                            .iter()
-                            .find(|d| d.name.eq_ignore_ascii_case(name))
-                    })
-                    .collect();
-                let met_refs: Vec<&crate::model::Metric> = metrics
-                    .iter()
-                    .filter_map(|name| {
-                        def.metrics
-                            .iter()
-                            .find(|m| m.name.eq_ignore_ascii_case(name))
-                    })
-                    .collect();
-                find_routing_materialization_name(&def, &dim_refs, &met_refs).map(String::from)
-            };
-
-            let req = QueryRequest {
-                dimensions: dimensions
-                    .iter()
-                    .map(|s| crate::expand::DimensionName::new(s.clone()))
-                    .collect(),
-                metrics: metrics
-                    .iter()
-                    .map(|s| crate::expand::MetricName::new(s.clone()))
-                    .collect(),
-                facts: facts.clone(),
-            };
-            let expanded_sql = expand(&view_name, &def, &req)
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(QueryError::from(e)) })?;
-
-            // 5. Build the three-part output.
-            let mut lines: Vec<String> = Vec::new();
-
-            lines.push(format!("-- Semantic View: {view_name}"));
-            lines.push(format!("-- Dimensions: {}", dimensions.join(", ")));
-            lines.push(format!("-- Metrics: {}", metrics.join(", ")));
-            if !facts.is_empty() {
-                lines.push(format!("-- Facts: {}", facts.join(", ")));
-            }
-            match mat_name {
-                Some(ref name) => lines.push(format!("-- Materialization: {name}")),
-                None => lines.push("-- Materialization: none".to_string()),
-            }
-            lines.push(String::new());
-
-            lines.push("-- Expanded SQL:".to_string());
-            for sql_line in expanded_sql.lines() {
-                lines.push(sql_line.to_string());
-            }
-            lines.push(String::new());
-
-            lines.push("-- DuckDB Plan:".to_string());
-            let explain_lines = unsafe { collect_explain_lines(state.conn, &expanded_sql) };
-            lines.extend(explain_lines);
-
-            // 6. Declare output column.
-            bind.add_result_column(
-                "explain_output",
-                LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            );
-
-            Ok(ExplainBindData { lines })
-        }))
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(ExplainInitData {
-            done: AtomicBool::new(false),
-            row_index: AtomicUsize::new(0),
-        })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let init_data = func.get_init_data();
-
-        // If already done, signal completion.
-        if init_data.done.load(Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
-
-        let bind_data = func.get_bind_data();
-        let total_lines = bind_data.lines.len();
-        let start = init_data.row_index.load(Ordering::Relaxed);
-
-        if start >= total_lines {
-            init_data.done.store(true, Ordering::Relaxed);
-            output.set_len(0);
-            return Ok(());
-        }
-
-        // Emit lines in chunks. DuckDB standard chunk size is 2048.
-        let chunk_size = 2048;
-        let end = (start + chunk_size).min(total_lines);
-        let count = end - start;
-
-        let out_vec = output.flat_vector(0);
-        for (i, line) in bind_data.lines[start..end].iter().enumerate() {
-            out_vec.insert(i, line.as_str());
-        }
-        output.set_len(count);
-
-        init_data.row_index.store(end, Ordering::Relaxed);
-        if end >= total_lines {
-            init_data.done.store(true, Ordering::Relaxed);
-        }
-
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        // Positional parameter: view_name (VARCHAR)
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
-
-    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
-        Some(vec![
-            (
-                "dimensions".to_string(),
-                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-            ),
-            (
-                "metrics".to_string(),
-                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-            ),
-            (
-                "facts".to_string(),
-                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-            ),
-        ])
-    }
-}

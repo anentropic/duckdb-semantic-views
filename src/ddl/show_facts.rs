@@ -1,10 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use duckdb::{
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
-};
-
 use crate::catalog::CatalogReader;
 use crate::ddl::describe::format_json_array;
 use crate::model::SemanticViewDefinition;
@@ -93,47 +86,11 @@ struct ShowFactRow {
     comment: String,
 }
 
-/// Bind-time data: pre-collected fact rows.
-pub struct ShowFactsBindData {
-    rows: Vec<ShowFactRow>,
-}
-
-// SAFETY: all fields are owned `Vec<ShowFactRow>` (String fields), which is `Send + Sync`.
-unsafe impl Send for ShowFactsBindData {}
-unsafe impl Sync for ShowFactsBindData {}
-
-/// Init data: tracks whether rows have been emitted.
-pub struct ShowFactsInitData {
-    done: AtomicBool,
-}
-
-// SAFETY: `AtomicBool` is `Send + Sync`.
-unsafe impl Send for ShowFactsInitData {}
-unsafe impl Sync for ShowFactsInitData {}
-
-/// Helper: declare the 8-column output schema for facts.
-fn bind_output_columns(bind: &BindInfo) {
-    bind.add_result_column(
-        "database_name",
-        LogicalTypeHandle::from(LogicalTypeId::Varchar),
-    );
-    bind.add_result_column(
-        "schema_name",
-        LogicalTypeHandle::from(LogicalTypeId::Varchar),
-    );
-    bind.add_result_column(
-        "semantic_view_name",
-        LogicalTypeHandle::from(LogicalTypeId::Varchar),
-    );
-    bind.add_result_column(
-        "table_name",
-        LogicalTypeHandle::from(LogicalTypeId::Varchar),
-    );
-    bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-    bind.add_result_column("data_type", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-    bind.add_result_column("synonyms", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-    bind.add_result_column("comment", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-}
+// Phase 65 Plan 05 Batch 3: legacy `ShowFactsBindData` + `ShowFactsInitData`
+// + `bind_output_columns` + `emit_rows` retired with the H2 query_conn
+// allocation. `ShowFactRow` + `collect_facts` remain because the new
+// `sv_show_semantic_facts_bind_rust` / `_all_bind_rust` dispatchers
+// still call them.
 
 /// Helper: collect fact rows for a single view.
 fn collect_facts(view_name: &str, json: &str) -> Vec<ShowFactRow> {
@@ -163,43 +120,6 @@ fn collect_facts(view_name: &str, json: &str) -> Vec<ShowFactRow> {
             }
         })
         .collect()
-}
-
-/// Helper: emit rows from bind data into the output chunk.
-fn emit_rows(
-    func: &TableFunctionInfo<impl VTab<BindData = ShowFactsBindData, InitData = ShowFactsInitData>>,
-    output: &mut DataChunkHandle,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let init_data = func.get_init_data();
-    if init_data.done.swap(true, Ordering::Relaxed) {
-        output.set_len(0);
-        return Ok(());
-    }
-
-    let bind_data = func.get_bind_data();
-    let n = bind_data.rows.len();
-
-    let db_name_vec = output.flat_vector(0);
-    let sch_name_vec = output.flat_vector(1);
-    let sv_vec = output.flat_vector(2);
-    let table_vec = output.flat_vector(3);
-    let name_vec = output.flat_vector(4);
-    let type_vec = output.flat_vector(5);
-    let syn_vec = output.flat_vector(6);
-    let cmt_vec = output.flat_vector(7);
-
-    for (i, row) in bind_data.rows.iter().enumerate() {
-        db_name_vec.insert(i, row.database_name.as_str());
-        sch_name_vec.insert(i, row.schema_name.as_str());
-        sv_vec.insert(i, row.semantic_view_name.as_str());
-        table_vec.insert(i, row.table_name.as_str());
-        name_vec.insert(i, row.name.as_str());
-        type_vec.insert(i, row.data_type.as_str());
-        syn_vec.insert(i, row.synonyms.as_str());
-        cmt_vec.insert(i, row.comment.as_str());
-    }
-    output.set_len(n);
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -294,111 +214,14 @@ pub unsafe extern "C" fn sv_show_semantic_facts_bind_rust(
     }
 }
 
-/// Table function: `SHOW SEMANTIC FACTS IN view_name`
-///
-/// Takes one VARCHAR parameter (view name). Returns facts for that view.
-///
-/// Phase 65 Plan 05 Task 3 (Wave 2): registration retired in favor of the
-/// C++ Catalog API path (`sv_register_show_semantic_facts`).
-#[allow(dead_code)]
-pub struct ShowSemanticFactsVTab;
-
-impl VTab for ShowSemanticFactsVTab {
-    type BindData = ShowFactsBindData;
-    type InitData = ShowFactsInitData;
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
-            bind_output_columns(bind);
-
-            let view_name = bind.get_parameter(0).to_string();
-            let state_ptr = bind.get_extra_info::<CatalogReader>();
-            let reader = unsafe { *state_ptr };
-            let json = reader
-                .lookup(&view_name)
-                .map_err(Box::<dyn std::error::Error>::from)?
-                .ok_or_else(|| format!("semantic view '{view_name}' does not exist"))?;
-
-            let mut rows = collect_facts(&view_name, &json);
-            rows.sort_by(|a, b| a.name.cmp(&b.name));
-
-            Ok(ShowFactsBindData { rows })
-        }))
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(ShowFactsInitData {
-            done: AtomicBool::new(false),
-        })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        emit_rows(func, output)
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
-}
+// Legacy `ShowSemanticFactsVTab` + `ShowSemanticFactsAllVTab` (duckdb-rs
+// VTab impls) RETIRED — Phase 65 Plan 05 Batch 3. The C++ Catalog API
+// paths (`sv_register_show_semantic_facts` /
+// `sv_register_show_semantic_facts_all`) dispatch via the
+// `sv_show_semantic_facts_bind_rust` / `_all_bind_rust` Rust dispatchers
+// above.
 
 // ---------------------------------------------------------------------------
 // Cross-view form: show_semantic_facts_all()
 // ---------------------------------------------------------------------------
-
-/// Table function: `SHOW SEMANTIC FACTS` (no IN clause)
-///
-/// Takes no parameters. Returns facts across all registered semantic views.
-///
-/// Phase 65 Plan 05 Task 2 (Wave 1): registration retired in favor of the
-/// C++ Catalog API path (`sv_register_show_semantic_facts_all`).
-#[allow(dead_code)]
-pub struct ShowSemanticFactsAllVTab;
-
-impl VTab for ShowSemanticFactsAllVTab {
-    type BindData = ShowFactsBindData;
-    type InitData = ShowFactsInitData;
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
-            bind_output_columns(bind);
-
-            let state_ptr = bind.get_extra_info::<CatalogReader>();
-            let reader = unsafe { *state_ptr };
-            let entries = reader
-                .list_all()
-                .map_err(Box::<dyn std::error::Error>::from)?;
-
-            let mut rows = Vec::new();
-            for (name, json) in &entries {
-                rows.extend(collect_facts(name, json));
-            }
-            rows.sort_by(|a, b| {
-                a.semantic_view_name
-                    .cmp(&b.semantic_view_name)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-
-            Ok(ShowFactsBindData { rows })
-        }))
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(ShowFactsInitData {
-            done: AtomicBool::new(false),
-        })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        emit_rows(func, output)
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        None
-    }
-}
+// (Legacy VTab block retired in Plan 05 Batch 3 — see comment above.)
