@@ -4,13 +4,13 @@ milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: ready_to_plan
 stopped_at: "Phase 65.1 Plan 04 complete (WR-03 fix: definitions_table_guard_select)"
-last_updated: "2026-05-25T22:18:59.355Z"
+last_updated: "2026-05-25T22:41:12.500Z"
 last_activity: 2026-05-25
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 19
-  completed_plans: 19
+  completed_plans: 20
   percent: 33
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 ## Current Position
 
 Phase: 65.1 (phase-65-code-review-remediation) — EXECUTING
-Plan: 10 of 14
+Plan: 11 of 14
 Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership), 65-05 (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection(*context.db) bind; H2 query_conn allocation DELETED from init_extension; 17 legacy duckdb-rs VTab/VScalar struct + impl blocks purged atomically ~2,632 LOC across 13 files; src/type_cache.rs unbounded HashMap cache landed unused as deferred optimisation; sv_logical_type_from_c_type_id bridges C-API ↔ C++ enum-value mismatch; new test_concurrent_reads_per_call_conn.py PASSES 80 reads in 0.02s; LIFE-02 satisfied end-to-end; LIFE-01 watchdog tests still RED 5/8 pending Plan 06 H1 retirement), 65-06 (lifecycle close-out; H1 catalog_conn retired from init_extension; OverrideContext slimmed to empty struct; INTENTIONAL LEAK rationale deleted; structural guard test tests/no_long_lived_conn.rs via syn::visit::Visit AST walk; 4 D-03b post-reopen integration tests added covering semantic_view SELECT + describe + SHOW DIMENSIONS + get_ddl; LIFE-04 ledger entry closed with forward pointer; 12/12 test_readonly_load.py PASS; just test-all + just ci both green; 6/6 ADBC; LIFE-01/02/03/04 all Satisfied)
 Next plan: /gsd:plan-phase 65.1
 Last activity: 2026-05-25
@@ -130,6 +130,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 65.1 Plan 08: CR-02 closed (D-04) + IN-01 refreshed (D-07)
 - [Phase ?]: [Phase 65.1 P09]: 317 LOC dead-code purge — src/type_cache.rs (224 LOC unconsumed module) + type_id_to_display_name (82 LOC dead-coded helper) + 11 LOC dangling-comment cleanup; deletion-only refactor closes IN-02 + IN-03 (D-23) with cargo build / test --lib / just test-all all green; eliminates the BATCH2-SUMMARY deferred-optimisation contributor trap
 - [Phase ?]: [Phase 65.1 P09]: IN-05 (D-25) closed — phase651_null_name_inputs.test populated with three D-25 assertions pinning null-name short-circuit behaviour for read_yaml_from_semantic_view + get_ddl; tests confirm current behaviour rather than driving a fix (the short-circuit was already in place pre-Phase-65)
+- [Phase ?]: Plan 10 (WR-06): pin BORROW-contract bridge with file-scope static_assert(sizeof(duckdb_connection) == sizeof(void*)) + load-time runtime probe inside sv_register_parser_hooks (D-12); probe failure surfaces via WR-02 error_buf channel (D-13). sv_register_parser_hooks signature now carries trailing (error_buf, error_buf_len) pair; previously stderr-only failure paths converted.
 
 ### Pending Todos
 
@@ -189,10 +190,11 @@ Recent decisions affecting current work:
 | Phase 65.1 P04 | 40min | 2 tasks | 2 files |
 | Phase 65.1 P08 | 10min | 2 tasks | 1 files |
 | Phase 65.1 P09 | 15min | 2 tasks | 5 files |
+| Phase 65.1 P10 | 25min | 1 tasks | 3 files |
 
 ## Session Continuity
 
-Last session: 2026-05-25T22:18:50.843Z
+Last session: 2026-05-25T22:41:00.172Z
 Stopped at: Phase 65.1 Plan 04 complete (WR-03 fix: definitions_table_guard_select)
 Resume file: 
 None
