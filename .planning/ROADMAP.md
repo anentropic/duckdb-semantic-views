@@ -254,7 +254,7 @@ Plans (in wave order):
 - [x] 65.1-02a-PLAN.md (Wave 1) — WR-02 C-side: registration error_buf ABI + null-init refusal + D-06 comment delete (shim.cpp + shim.hpp)
 - [x] 65.1-03a-PLAN.md (Wave 1) — WR-05 ddl/ side: BorrowedConnection newtype + 15 ddl/ dispatcher migration + IN-06 dedup absorbed
 - [x] 65.1-05-PLAN.md (Wave 1) — WR-04: concurrent writes integration test (CREATE/DROP/ALTER race coverage)
-- [ ] 65.1-02b-PLAN.md (Wave 2) — WR-02 Rust-side: src/lib.rs call sites cascade + populate registration_error_surfaces.rs test (W-01 typed stubs, no transmute)
+- [x] 65.1-02b-PLAN.md (Wave 2) — WR-02 Rust-side: src/lib.rs call sites cascade + populate registration_error_surfaces.rs test (W-01 typed stubs, no transmute)
 - [ ] 65.1-03b-PLAN.md (Wave 2) — WR-05 query/ side: 2 query/ dispatcher migration + DisconnectFinder AST guard extension
 - [ ] 65.1-04-PLAN.md (Wave 2) — WR-03: outer-CASE guard for never-bootstrapped RO DROP/ALTER + integration test (W-06 IF EXISTS pinned)
 - [ ] 65.1-07-PLAN.md (Wave 3) — CR-01 + IN-04: FileSystem-direct YAML read + kind-param removal + access-gating sqllogictest
