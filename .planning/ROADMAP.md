@@ -250,7 +250,7 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
 **Plans:** 14 plans (originally 12; Plan 02 split into 02a/02b and Plan 03 split into 03a/03b per plan-checker B-05/B-06)
 
 Plans (in wave order):
-- [ ] 65.1-01-PLAN.md (Wave 1) — Wave 0 test scaffolds (8 stub files + TEST_LIST registration)
+- [x] 65.1-01-PLAN.md (Wave 1) — Wave 0 test scaffolds (8 stub files + TEST_LIST registration)
 - [ ] 65.1-02a-PLAN.md (Wave 1) — WR-02 C-side: registration error_buf ABI + null-init refusal + D-06 comment delete (shim.cpp + shim.hpp)
 - [ ] 65.1-03a-PLAN.md (Wave 1) — WR-05 ddl/ side: BorrowedConnection newtype + 15 ddl/ dispatcher migration + IN-06 dedup absorbed
 - [ ] 65.1-05-PLAN.md (Wave 1) — WR-04: concurrent writes integration test (CREATE/DROP/ALTER race coverage)
