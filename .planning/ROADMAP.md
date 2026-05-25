@@ -245,12 +245,23 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
 ### Phase 65.1: Phase 65 Code Review Remediation (INSERTED)
 
 **Goal:** Address the 10 remaining Critical + Warning findings from `.planning/phases/65-overridecontext-connection-teardown/65-REVIEW.md` (1 of 11 — WR-01 — already fixed inline in commit `ae17f4b`). Findings span SQL-injection surface in the YAML-file helper TF (CR-01), double-emit hazards in 4 exec callbacks (CR-02), and 8 warnings covering registration-failure surfacing, parser_override write-path concurrency coverage, BORROW-contract enforcement, layout-assumption guards, and silent-fallback paths. Some findings warrant root-cause structural fixes (BORROW newtype, FileSystem-direct path read); others are scoped one-line guards. To be triaged in /gsd-discuss-phase.
-**Requirements**: TBD (derive from REVIEW.md findings during discuss)
+**Requirements**: REM-CR-01, REM-CR-02, REM-WR-02, REM-WR-03, REM-WR-04, REM-WR-05, REM-WR-06, REM-WR-07, REM-WR-08, REM-WR-09, REM-IN-01, REM-IN-02, REM-IN-03, REM-IN-04, REM-IN-05, REM-IN-06, REM-CHG (derived during /gsd-plan-phase from REVIEW.md findings)
 **Depends on:** Phase 65
-**Plans:** 0 plans
+**Plans:** 12 plans
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 65.1 to break down)
+- [ ] 65.1-01-PLAN.md — Wave 0 test scaffolds (8 stub files + TEST_LIST registration)
+- [ ] 65.1-02-PLAN.md — WR-02 + CR-02 D-05/D-06: registration error_buf ABI + null-init refusal + comment delete
+- [ ] 65.1-03-PLAN.md — WR-05: BorrowedConnection newtype + 17 dispatcher migration + AST guard extension
+- [ ] 65.1-04-PLAN.md — WR-03: outer-CASE guard for never-bootstrapped RO DROP/ALTER + integration test
+- [ ] 65.1-05-PLAN.md — WR-04: concurrent writes integration test (CREATE/DROP/ALTER race coverage)
+- [ ] 65.1-06-PLAN.md — D-27 CHANGELOG entries (Security/Changed/Fixed/Removed)
+- [ ] 65.1-07-PLAN.md — CR-01 + IN-04: FileSystem-direct YAML read + kind-param removal + access-gating sqllogictest
+- [ ] 65.1-08-PLAN.md — CR-02 (D-04) + IN-01: converge 4 exec callbacks single-shot + stale comment refresh
+- [ ] 65.1-09-PLAN.md — IN-02/03/06 + IN-05: type_cache deletion + dedup probe/write_err + null-name sqllogictest
+- [ ] 65.1-10-PLAN.md — WR-06: layout static_assert + load-time runtime probe via WR-02 error_buf
+- [ ] 65.1-11-PLAN.md — WR-07/WR-08: BinderException on probe failure + try_infer_schema Result promotion + sqllogictest
+- [ ] 65.1-12-PLAN.md — WR-09: idempotent parser-hook registration via ParserExtensions iterator + LOAD-twice integration test
 
 **Source artifact:** `.planning/phases/65-overridecontext-connection-teardown/65-REVIEW.md` (committed in `6c1dbd6`). WR-01 already addressed in `ae17f4b` (UB closure in `parse_string_list`) — exclude from this phase scope.
 
