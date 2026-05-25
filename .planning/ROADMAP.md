@@ -259,7 +259,7 @@ Plans (in wave order):
 - [x] 65.1-04-PLAN.md (Wave 2) — WR-03: outer-CASE guard for never-bootstrapped RO DROP/ALTER + integration test (W-06 IF EXISTS pinned)
 - [x] 65.1-07-PLAN.md (Wave 3) — CR-01 + IN-04: FileSystem-direct YAML read + kind-param removal + access-gating sqllogictest
 - [x] 65.1-08-PLAN.md (Wave 3) — CR-02 (D-04) + IN-01: converge 4 exec callbacks single-shot + stale comment refresh
-- [ ] 65.1-09-PLAN.md (Wave 3) — IN-02/IN-03 + IN-05: type_cache deletion + null-name sqllogictest (IN-06 moved to 03a)
+- [x] 65.1-09-PLAN.md (Wave 3) — IN-02/IN-03 + IN-05: type_cache deletion + null-name sqllogictest (IN-06 moved to 03a)
 - [ ] 65.1-10-PLAN.md (Wave 4) — WR-06: layout static_assert + load-time runtime probe via WR-02 error_buf
 - [ ] 65.1-11-PLAN.md (Wave 5) — WR-07/WR-08: BinderException on probe failure + try_infer_schema Result promotion + sqllogictest
 - [ ] 65.1-12-PLAN.md (Wave 5) — WR-09: idempotent parser-hook registration + LOAD-twice integration test + structural verification (B-07: sv_count_parser_extensions FFI helper)
