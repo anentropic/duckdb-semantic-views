@@ -112,10 +112,18 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
 ) -> u8 {
     use crate::ddl::read_ffi::{
         probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
+        BorrowedConnection,
     };
     use std::panic::AssertUnwindSafe;
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if conn.is_null() {
+        // Wrap-on-entry (Phase 65.1 D-10 / WR-05). The raw `conn` parameter
+        // is shadowed below; everything downstream goes through `&borrowed`
+        // (for helpers that accept `&BorrowedConnection`) or
+        // `borrowed.as_raw()` (for raw FFI calls like `duckdb_query`).
+        // `ffi::duckdb_disconnect` does not type-check against
+        // `&mut BorrowedConnection`, enforcing the BORROW contract.
+        let borrowed = BorrowedConnection::new(conn);
+        if borrowed.is_null() {
             write_err(error_buf, error_buf_len, "duckdb_connection is null");
             return 1_u8;
         }
@@ -180,10 +188,6 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
             return 1_u8;
         }
 
-        // Phase 65.1 Plan 03a: minimal BorrowedConnection wrap to keep build
-        // green after the helper signatures migrated to &BorrowedConnection.
-        // Full wrap-on-entry migration of this dispatcher lands in Plan 03b.
-        let borrowed = crate::ddl::read_ffi::BorrowedConnection::new(conn);
         let reader = CatalogReader::new(&borrowed, probe_catalog_table_present(&borrowed));
         let json_str = match reader.lookup(&view_name) {
             Ok(Some(j)) => j,
@@ -298,7 +302,7 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
         }
         lines.push(String::new());
         lines.push("-- DuckDB Plan:".to_string());
-        let explain_lines = collect_explain_lines(conn, &expanded_sql);
+        let explain_lines = collect_explain_lines(&borrowed, &expanded_sql);
         lines.extend(explain_lines);
 
         // Serialise as 1-column VARCHAR rows.
@@ -339,13 +343,17 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
 ///
 /// # Safety
 ///
-/// `conn` must be a valid, non-null `duckdb_connection` handle.
+/// The underlying `duckdb_connection` accessed via `borrowed.as_raw()` must
+/// be valid for the lifetime of the borrow.
 #[allow(clippy::cast_possible_truncation)]
-unsafe fn collect_explain_lines(conn: ffi::duckdb_connection, sql: &str) -> Vec<String> {
+unsafe fn collect_explain_lines(
+    borrowed: &crate::ddl::read_ffi::BorrowedConnection,
+    sql: &str,
+) -> Vec<String> {
     let explain_sql = format!("EXPLAIN {sql}");
     let mut lines = Vec::new();
 
-    match execute_sql_raw(conn, &explain_sql) {
+    match execute_sql_raw(borrowed.as_raw(), &explain_sql) {
         Ok(mut result) => {
             let col_count = ffi::duckdb_column_count(&raw mut result) as usize;
             let chunk_count = ffi::duckdb_result_chunk_count(result) as usize;

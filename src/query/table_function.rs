@@ -113,10 +113,17 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
-    use crate::ddl::read_ffi::{probe_catalog_table_present, publish_owned_buffer, write_err};
+    use crate::ddl::read_ffi::{
+        probe_catalog_table_present, publish_owned_buffer, write_err, BorrowedConnection,
+    };
     use std::panic::AssertUnwindSafe;
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if conn.is_null() {
+        // Wrap-on-entry (Phase 65.1 D-10 / WR-05). The raw `conn` parameter
+        // is shadowed; everything downstream goes through `&borrowed` or
+        // `borrowed.as_raw()`. `ffi::duckdb_disconnect` does not type-check
+        // against `&mut BorrowedConnection`, enforcing the BORROW contract.
+        let borrowed = BorrowedConnection::new(conn);
+        if borrowed.is_null() {
             write_err(error_buf, error_buf_len, "duckdb_connection is null");
             return 1_u8;
         }
@@ -178,10 +185,6 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
             return 1_u8;
         }
 
-        // Phase 65.1 Plan 03a: minimal BorrowedConnection wrap to keep build
-        // green after the helper signatures migrated to &BorrowedConnection.
-        // Full wrap-on-entry migration of this dispatcher lands in Plan 03b.
-        let borrowed = crate::ddl::read_ffi::BorrowedConnection::new(conn);
         let reader = CatalogReader::new(&borrowed, probe_catalog_table_present(&borrowed));
         let json_str = match reader.lookup(&view_name) {
             Ok(Some(j)) => j,
@@ -295,7 +298,7 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
 
         let (column_names, column_type_ids): (Vec<String>, Vec<u32>) = if !facts.is_empty() {
             let limit0_sql = format!("{expanded_sql} LIMIT 0");
-            if let Some((names, types)) = try_infer_schema(conn, &limit0_sql) {
+            if let Some((names, types)) = try_infer_schema(&borrowed, &limit0_sql) {
                 let type_ids: Vec<u32> =
                     types.iter().map(|t| normalize_type_id(*t as u32)).collect();
                 (names, type_ids)
@@ -350,7 +353,7 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
             (names, type_ids)
         } else {
             let limit0_sql = format!("{expanded_sql} LIMIT 0");
-            if let Some((names, types)) = try_infer_schema(conn, &limit0_sql) {
+            if let Some((names, types)) = try_infer_schema(&borrowed, &limit0_sql) {
                 let type_ids: Vec<u32> =
                     types.iter().map(|t| normalize_type_id(*t as u32)).collect();
                 (names, type_ids)
@@ -704,12 +707,13 @@ fn build_execution_sql(
 ///
 /// # Safety
 ///
-/// `conn` must be a valid `duckdb_connection`.
+/// The underlying `duckdb_connection` accessed via `borrowed.as_raw()` must
+/// be valid for the lifetime of the borrow.
 pub(crate) unsafe fn try_infer_schema(
-    conn: ffi::duckdb_connection,
+    borrowed: &crate::ddl::read_ffi::BorrowedConnection,
     sql: &str,
 ) -> Option<(Vec<String>, Vec<ffi::duckdb_type>)> {
-    let mut result = execute_sql_raw(conn, sql).ok()?;
+    let mut result = execute_sql_raw(borrowed.as_raw(), sql).ok()?;
 
     let col_count = ffi::duckdb_column_count(&mut result) as usize;
     let mut names = Vec::with_capacity(col_count);
