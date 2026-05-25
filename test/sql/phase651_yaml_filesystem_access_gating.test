@@ -1,0 +1,38 @@
+# Phase 65.1 stub — populated by Plan 07 (CR-01 D-01..D-03). DO NOT delete;
+# runner will skip this file if removed from TEST_LIST.
+#
+# CR-01: SQL injection in __sv_compute_create_from_yaml is eliminated by
+# replacing `Connection::Query("SELECT content FROM read_text('<path>')")`
+# with a direct DuckDB `FileSystem::OpenFile` call (D-01). The
+# `enable_external_access` setting is honoured by LocalFileSystem natively,
+# so the new path stays gated on the same setting as the old one (D-02/D-03).
+#
+# Future assertions (Plan 07 populates):
+#   B1: `SET enable_external_access = false;` followed by
+#       `CREATE SEMANTIC VIEW v FROM YAML FILE '/tmp/x.yaml'` MUST raise a
+#       `statement error` block whose tail contains a substring confirming
+#       the access gate (likely "external access is disabled" or similar
+#       DuckDB-native wording from the FileSystem layer).
+#   B2: With `enable_external_access = true` (the default) and a valid
+#       on-disk YAML file, the same statement MUST succeed — confirms the
+#       FileSystem-direct read path is functional, not just permissive of
+#       the gate.
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# Stub no-op so the runner does not error on an empty file.
+statement ok
+SELECT 1;
+
+# == Future assertions (Plan 07 — CR-01) =====================================
+# statement ok
+# SET enable_external_access = false;
+#
+# statement error
+# CREATE SEMANTIC VIEW v_gated FROM YAML FILE '/tmp/does_not_matter.yaml'
+# ----
+# external access is disabled
+# ============================================================================

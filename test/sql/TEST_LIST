@@ -51,3 +51,6 @@ test/sql/65_json_merge_patch_smoke.test
 test/sql/65_alter_comment_merge_patch.test
 test/sql/65_alter_rename_via_sql.test
 test/sql/65_read_bridge_spike.test
+test/sql/phase651_yaml_filesystem_access_gating.test
+test/sql/phase651_null_name_inputs.test
+test/sql/phase651_bind_probe_hard_errors.test

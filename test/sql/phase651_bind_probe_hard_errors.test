@@ -1,0 +1,59 @@
+# Phase 65.1 stub — populated by Plan 11 (WR-07/WR-08 D-14, D-15, D-16).
+# DO NOT delete; runner will skip this file if removed from TEST_LIST.
+#
+# WR-07/WR-08: silent type-inference fallbacks (DECIMAL(18,3) placeholder in
+# sv_resolve_output_logical_types; VARCHAR fallback for DUCKDB_TYPE_INVALID
+# inside try_infer_schema) are promoted to BinderException with the actual
+# DuckDB error text plumbed through. CHANGELOG entry under `### Changed`
+# documents the user-visible behaviour shift (D-16).
+#
+# Future assertions (Plan 11 populates):
+#   B1: A semantic view whose FACTS or METRICS expression is deliberately
+#       broken (e.g. references a nonexistent column) MUST raise a
+#       `statement error` block whose tail contains the substring
+#       "failed to infer column types" — confirms the new hard-error path
+#       supplants the old silent fallback to a placeholder type.
+#   B2: An existing valid `semantic_view(...)` query MUST still succeed —
+#       confirms the promotion does not regress the happy path (the
+#       LIMIT-0 probe should resolve types cleanly when the underlying
+#       expression compiles).
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# Stub no-op so the runner does not error on an empty file.
+statement ok
+SELECT 1;
+
+# == Future assertions (Plan 11 — WR-07/WR-08 D-14/D-15/D-16) =================
+# statement ok
+# CREATE TABLE p651_orders (order_id INTEGER, total DECIMAL(10,2));
+#
+# # B1: a FACTS expression referencing a nonexistent column must surface the
+# # DuckDB error verbatim wrapped in the new BinderException wording.
+# statement error
+# CREATE SEMANTIC VIEW v_bad_probe
+#   AS
+#     TABLES (o AS p651_orders PRIMARY KEY (order_id))
+#     FACTS  (o.bogus AS o.no_such_column)
+#     DIMENSIONS (o.order_id AS order_id)
+#     METRICS (o.total AS SUM(o.total));
+# SELECT * FROM semantic_view('v_bad_probe', dimensions := ['order_id'])
+# ----
+# failed to infer column types
+#
+# # B2: a valid view still queries cleanly post-promotion.
+# statement ok
+# CREATE SEMANTIC VIEW v_good_probe
+#   AS
+#     TABLES (o AS p651_orders PRIMARY KEY (order_id))
+#     DIMENSIONS (o.order_id AS order_id)
+#     METRICS (o.total AS SUM(o.total));
+#
+# query I
+# SELECT COUNT(*) FROM semantic_view('v_good_probe', metrics := ['total'])
+# ----
+# 1
+# ============================================================================
