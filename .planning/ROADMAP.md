@@ -251,7 +251,7 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
 
 Plans (in wave order):
 - [x] 65.1-01-PLAN.md (Wave 1) — Wave 0 test scaffolds (8 stub files + TEST_LIST registration)
-- [ ] 65.1-02a-PLAN.md (Wave 1) — WR-02 C-side: registration error_buf ABI + null-init refusal + D-06 comment delete (shim.cpp + shim.hpp)
+- [x] 65.1-02a-PLAN.md (Wave 1) — WR-02 C-side: registration error_buf ABI + null-init refusal + D-06 comment delete (shim.cpp + shim.hpp)
 - [ ] 65.1-03a-PLAN.md (Wave 1) — WR-05 ddl/ side: BorrowedConnection newtype + 15 ddl/ dispatcher migration + IN-06 dedup absorbed
 - [ ] 65.1-05-PLAN.md (Wave 1) — WR-04: concurrent writes integration test (CREATE/DROP/ALTER race coverage)
 - [ ] 65.1-02b-PLAN.md (Wave 2) — WR-02 Rust-side: src/lib.rs call sites cascade + populate registration_error_surfaces.rs test (W-01 typed stubs, no transmute)
