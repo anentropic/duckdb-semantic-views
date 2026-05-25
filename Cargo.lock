@@ -1874,6 +1874,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strsim",
+ "syn 2.0.117",
  "yaml_serde",
 ]
 

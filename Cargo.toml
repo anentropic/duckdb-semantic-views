@@ -42,6 +42,13 @@ cc = { version = "1", optional = true }
 
 [dev-dependencies]
 proptest = "1.11"
+# `syn` powers `tests/no_long_lived_conn.rs` — Phase 65 (v0.10.0) Plan 06's
+# structural guard that asserts `init_extension` allocates no long-lived
+# `duckdb_connection`. The `full` feature is needed for function-body parsing;
+# `visit` for the AST walker trait. Transitively available via several
+# duckdb-rs build deps, but pinned explicitly here so the guard test does
+# not regress if those deps drop syn.
+syn = { version = "2", features = ["full", "visit"] }
 
 [dev-dependencies.cargo-husky]
 version = "1"
