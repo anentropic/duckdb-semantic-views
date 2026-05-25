@@ -2115,6 +2115,36 @@ fn escape_sql_arg(s: &str) -> String {
 /// 1.10.502 with `Parser Error: A CTE needs a SELECT`, so we use a
 /// two-statement string instead. See the smoke test
 /// `catalog::tests::two_statement_guard_then_dml_smoke` for the working shape.
+/// Phase 65.1 Plan 04 (WR-03): outer `information_schema` guard.
+///
+/// Emits a SELECT that errors with the canonical
+/// `semantic view '<name>' does not exist` wording when
+/// `semantic_layer._definitions` is missing (e.g. a fresh RO DB that was
+/// never RW-LOADed, so `init_catalog` never ran). Designed to run as the
+/// FIRST statement in a multi-statement string so the subsequent
+/// statements (which reference `_definitions` directly) never bind on a
+/// never-bootstrapped DB — `DuckDB` binds and executes multi-statement
+/// strings one statement at a time, so a failure here short-circuits the
+/// rest (empirically verified — see Plan 04 SUMMARY for probe notes).
+///
+/// We deliberately do NOT collapse this into a single CASE expression
+/// with `existence_guard_select`: `DuckDB` binds CASE branches eagerly, so
+/// the inner `SELECT 1 FROM semantic_layer._definitions ...` would still
+/// fail to bind on missing-table even if the outer WHEN guarantees it
+/// would never evaluate at runtime.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+fn definitions_table_guard_select(name_escaped: &str) -> String {
+    format!(
+        "SELECT CASE \
+              WHEN NOT EXISTS (SELECT 1 FROM information_schema.tables \
+                                WHERE table_schema = 'semantic_layer' \
+                                  AND table_name = '_definitions') \
+                THEN error('semantic view ''{name_escaped}'' does not exist') \
+              ELSE TRUE \
+            END"
+    )
+}
+
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 fn existence_guard_select(name_escaped: &str) -> String {
     format!(
@@ -2143,11 +2173,23 @@ fn rename_collision_guard_select(new_name_escaped: &str) -> String {
 #[cfg(feature = "extension")]
 fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, ParseError> {
     if if_exists {
-        // IF EXISTS: pure DELETE on the caller's connection. The DELETE
-        // affects 0 rows when the view is missing — that is the silent
-        // no-op contract.
+        // IF EXISTS: pure DELETE on the caller's connection — affects 0
+        // rows when the view is missing (silent no-op contract).
+        //
+        // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard`
+        // so the DELETE never binds against a missing
+        // `semantic_layer._definitions` on a never-bootstrapped RO DB
+        // (which would otherwise leak `Catalog Error: Table
+        // _definitions does not exist`). When the table is missing the
+        // guard errors with the canonical "does not exist" wording and
+        // the DELETE is never bound (per-statement lazy bind — see
+        // `definitions_table_guard_select` docs). The silent-no-op
+        // contract for missing-row-but-table-present is preserved by
+        // the DELETE's 0-row effect.
+        let table_guard = definitions_table_guard_select(name_escaped);
         return Ok(Some(format!(
-            "DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
+            "{table_guard}; \
+             DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
              RETURNING name AS view_name"
         )));
     }
@@ -2159,9 +2201,17 @@ fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, P
     // catalog_conn retired; the guard subsumes both the never-existed
     // case and the concurrent-drop case under a single "does not exist"
     // wording.
+    //
+    // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard` so
+    // neither the row-existence guard NOR the DELETE bind against a
+    // missing `semantic_layer._definitions` on a never-bootstrapped RO
+    // DB. Three-statement form: <table_guard>; <row_guard>; <DELETE>.
+    // First statement errors → second and third never bind.
+    let table_guard = definitions_table_guard_select(name_escaped);
     let guard = existence_guard_select(name_escaped);
     Ok(Some(format!(
-        "{guard}; \
+        "{table_guard}; \
+         {guard}; \
          DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
          RETURNING name AS view_name"
     )))
@@ -2181,9 +2231,16 @@ fn rewrite_alter_rename(
         // as the UPDATE so the EXISTS check is snapshot-consistent. The
         // UPDATE itself silently affects 0 rows on a missing source row —
         // matches the IF EXISTS contract.
+        //
+        // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard`
+        // so neither the collision guard NOR the UPDATE bind against a
+        // missing `semantic_layer._definitions` on a never-bootstrapped
+        // RO DB.
+        let table_guard = definitions_table_guard_select(old_escaped);
         let collision_guard = rename_collision_guard_select(new_escaped);
         return Ok(Some(format!(
-            "{collision_guard}; \
+            "{table_guard}; \
+             {collision_guard}; \
              UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
              WHERE name = '{old_escaped}' \
              RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
@@ -2195,10 +2252,16 @@ fn rewrite_alter_rename(
     // the caller's connection in the same transaction so the EXISTS
     // checks are snapshot-consistent with the DML. Phase 65 Plan 06: the
     // legacy `catalog.exists()` Rust-side pre-checks are gone.
+    //
+    // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard` so
+    // none of the row guards / UPDATE bind against a missing
+    // `semantic_layer._definitions` on a never-bootstrapped RO DB.
+    let table_guard = definitions_table_guard_select(old_escaped);
     let exist_guard = existence_guard_select(old_escaped);
     let collision_guard = rename_collision_guard_select(new_escaped);
     Ok(Some(format!(
-        "{exist_guard}; \
+        "{table_guard}; \
+         {exist_guard}; \
          {collision_guard}; \
          UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
          WHERE name = '{old_escaped}' \
@@ -2258,8 +2321,18 @@ fn rewrite_alter_comment(
         // IF EXISTS preserves its silent contract on race: pre-check saw the
         // row; if a concurrent DROP commits before our UPDATE, the UPDATE
         // simply affects 0 rows.
+        //
+        // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard`
+        // so the UPDATE never binds against a missing
+        // `semantic_layer._definitions` on a never-bootstrapped RO DB
+        // (which would leak `Catalog Error: Table _definitions does
+        // not exist`). On missing-table the guard errors with the
+        // canonical wording; on missing-row-but-table-present the
+        // UPDATE's 0-row effect preserves the silent IF EXISTS contract.
+        let table_guard = definitions_table_guard_select(name_escaped);
         return Ok(Some(format!(
-            "UPDATE semantic_layer._definitions \
+            "{table_guard}; \
+             UPDATE semantic_layer._definitions \
                 SET definition = json_merge_patch(definition::JSON, '{patch_json_for_sql}'::JSON)::VARCHAR \
               WHERE name = '{name_escaped}' \
              RETURNING name, '{status_label}'::VARCHAR AS status"
@@ -2272,9 +2345,15 @@ fn rewrite_alter_comment(
     // ALTER-against-the-same-row carries no lost-update risk because we
     // apply the mutation via json_merge_patch ON THE CURRENT ROW — not a
     // Rust-side snapshot.
+    //
+    // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard` so
+    // neither the row guard NOR the UPDATE bind against a missing
+    // `semantic_layer._definitions` on a never-bootstrapped RO DB.
+    let table_guard = definitions_table_guard_select(name_escaped);
     let guard = existence_guard_select(name_escaped);
     Ok(Some(format!(
-        "{guard}; \
+        "{table_guard}; \
+         {guard}; \
          UPDATE semantic_layer._definitions \
             SET definition = json_merge_patch(definition::JSON, '{patch_json_for_sql}'::JSON)::VARCHAR \
           WHERE name = '{name_escaped}' \
@@ -2840,6 +2919,52 @@ mod tests {
         assert!(g.trim_start().starts_with("SELECT "), "not a SELECT: {g}");
         // Must not contain a trailing ';' — the caller appends ';' + DML.
         assert!(!g.contains(';'), "guard must not include ';' itself: {g}");
+    }
+
+    #[test]
+    fn definitions_table_guard_emits_information_schema_check() {
+        // Phase 65.1 Plan 04 (WR-03): the table-guard SELECT runs as the
+        // FIRST statement of the DROP/ALTER rewrite. It checks
+        // information_schema for `_definitions` and errors with the
+        // canonical "does not exist" wording when the table is missing.
+        // It does NOT touch `_definitions` itself — bind-time-safe on a
+        // never-bootstrapped RO DB.
+        let g = definitions_table_guard_select("sales");
+        assert!(
+            g.contains("information_schema.tables"),
+            "missing information_schema guard: {g}"
+        );
+        assert!(
+            g.contains("table_schema = 'semantic_layer'"),
+            "guard missing schema predicate: {g}"
+        );
+        assert!(
+            g.contains("table_name = '_definitions'"),
+            "guard missing table predicate: {g}"
+        );
+        assert!(
+            g.contains("error('semantic view ''sales'' does not exist')"),
+            "missing canonical wording: {g}"
+        );
+        // Must NOT touch `semantic_layer._definitions` directly — that's
+        // the whole point of running this BEFORE the row guard / DML.
+        assert!(
+            !g.contains("FROM semantic_layer._definitions"),
+            "table guard must not bind against _definitions (defeats the purpose): {g}"
+        );
+        assert!(g.trim_start().starts_with("SELECT "), "not a SELECT: {g}");
+        assert!(!g.contains(';'), "guard must not include ';' itself: {g}");
+    }
+
+    #[test]
+    fn definitions_table_guard_escapes_quotes_in_name() {
+        // Quote-doubling for embedded `'` inside the canonical error
+        // wording — same convention as `existence_guard_select`.
+        let g = definitions_table_guard_select("O''Brien");
+        assert!(
+            g.contains("error('semantic view ''O''Brien'' does not exist')"),
+            "error message wrong: {g}"
+        );
     }
 
     #[test]
