@@ -11,9 +11,7 @@ use crate::model::SemanticViewDefinition;
 // data_type, synonyms, comment).
 //
 // data_type is whatever was persisted in the JSON definition (empty on
-// v0.10.0 fresh CREATEs because Plan 03 removed CREATE-time type inference;
-// the read-side type cache in src/type_cache.rs is wired up in the single-
-// view variants `show_semantic_dimensions` / `show_columns` / `describe`).
+// v0.10.0 fresh CREATEs because Plan 03 removed CREATE-time type inference).
 
 /// # Safety
 ///

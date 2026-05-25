@@ -34,13 +34,6 @@ use super::error::QueryError;
 //     * For dim+metric queries: prefer DDL-time persisted types if present
 //       (back-compat for v0.7.1-era catalog rows); fall back to LIMIT 0
 //       probe on per-call conn otherwise.
-//     The type_cache module (`src/type_cache.rs`) is intentionally NOT
-//     consumed here — the per-bind LIMIT 0 cost is well under a
-//     millisecond and the cache adds complexity (fingerprint over the
-//     JSON, lookup_or_probe wiring) without a measured win for the
-//     existing test surface. The cache stays available for a future
-//     follow-up if benchmarks ever justify it; tracked as TECH-DEBT in
-//     the BATCH2-SUMMARY.
 //   - `build_execution_sql()` wrapping for HUGEINT→BIGINT casts etc.
 //
 // The dispatcher returns a flat binary buffer to the C++ side encoding
@@ -488,89 +481,6 @@ pub(crate) fn normalize_type_id(t: u32) -> u32 {
         HUGEINT => BIGINT,
         UHUGEINT => UBIGINT,
         _ => t,
-    }
-}
-
-/// Convert a DuckDB type ID (u32) to a human-readable display name for
-/// DESCRIBE/SHOW output (DATA_TYPE property).
-///
-/// Returns `None` for types where setting `output_type` would introduce a
-/// lossy CAST wrapper (DECIMAL loses precision, LIST/ARRAY loses child type).
-/// For these types, `output_type` remains `None` and DESCRIBE shows empty.
-///
-/// Returns `Some("TYPE_NAME")` for types where CAST is safe (no-op).
-///
-/// Phase 65 (Plan 03): no in-tree caller after the CREATE-time type
-/// inference paths were removed from `enrich_definition_for_create`
-/// (D-16/D-17). Kept alive for Plan 05's read-side bind callbacks
-/// which will re-probe at SHOW / DESCRIBE / `semantic_view()` bind time.
-#[allow(dead_code)]
-pub(crate) fn type_id_to_display_name(type_id: u32) -> Option<&'static str> {
-    const BOOLEAN: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN;
-    const TINYINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT;
-    const SMALLINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT;
-    const INTEGER: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER;
-    const BIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT;
-    const UTINYINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT;
-    const USMALLINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT;
-    const UINTEGER: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER;
-    const UBIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT;
-    const FLOAT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT;
-    const DOUBLE: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE;
-    const TIMESTAMP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP;
-    const DATE: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE;
-    const TIME: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIME;
-    const INTERVAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL;
-    const HUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT;
-    const UHUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT;
-    const VARCHAR: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR;
-    const BLOB: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB;
-    const TIMESTAMP_S: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S;
-    const TIMESTAMP_MS: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS;
-    const TIMESTAMP_NS: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS;
-    const TIMESTAMP_TZ: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ;
-    const ENUM: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_ENUM;
-    const UUID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID;
-    const UNION: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UNION;
-    const BIT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIT;
-    const TIME_TZ: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIME_TZ;
-    const STRUCT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT;
-    const MAP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP;
-    const INVALID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID;
-
-    match type_id {
-        BOOLEAN => Some("BOOLEAN"),
-        TINYINT => Some("TINYINT"),
-        SMALLINT => Some("SMALLINT"),
-        INTEGER => Some("INTEGER"),
-        BIGINT | HUGEINT => Some("BIGINT"),
-        UTINYINT => Some("UTINYINT"),
-        USMALLINT => Some("USMALLINT"),
-        UINTEGER => Some("UINTEGER"),
-        UBIGINT | UHUGEINT => Some("UBIGINT"),
-        FLOAT => Some("FLOAT"),
-        DOUBLE => Some("DOUBLE"),
-        DATE => Some("DATE"),
-        TIME => Some("TIME"),
-        INTERVAL => Some("INTERVAL"),
-        TIMESTAMP => Some("TIMESTAMP"),
-        TIMESTAMP_S => Some("TIMESTAMP_S"),
-        TIMESTAMP_MS => Some("TIMESTAMP_MS"),
-        TIMESTAMP_NS => Some("TIMESTAMP_NS"),
-        TIMESTAMP_TZ => Some("TIMESTAMPTZ"),
-        VARCHAR => Some("VARCHAR"),
-        BLOB => Some("BLOB"),
-        ENUM => Some("VARCHAR"), // enum values are strings
-        UUID => Some("UUID"),
-        BIT => Some("BIT"),
-        TIME_TZ => Some("TIMETZ"),
-        STRUCT | MAP => Some("VARCHAR"),
-        // Parameterized/lossy types — skip to avoid invalid CAST
-        UNION => None,
-        INVALID => None,
-        // DECIMAL: bare "DECIMAL" defaults to (18,3), lossy
-        // LIST/ARRAY: bare type loses child type info
-        _ => None,
     }
 }
 
