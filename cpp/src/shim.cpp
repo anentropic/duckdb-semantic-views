@@ -730,15 +730,26 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
-// __sv_compute_create_from_yaml — Phase 65 Plan 04 (Task 2 Step B)
+// __sv_compute_create_from_yaml — Phase 65 Plan 04 (Task 2 Step B) +
+//                                  Phase 65.1 Plan 07 (CR-01 D-01..D-03)
 // ---------------------------------------------------------------------------
 // Helper table function registered via `sv_register_table_function`. The bind
-// callback opens `Connection probe(*context.db)`, reads the YAML file via a
-// parameterized `read_text(?)` query (path comes through as a typed `Value`,
-// so there is no SQL-injection surface), then calls the Rust FFI helper
+// callback reads the YAML file directly through DuckDB's `FileSystem` API
+// (`FileSystem::GetFileSystem(context).OpenFile(path, FileFlags::FILE_FLAGS_READ)`
+// → `GetFileSize` → `Read`). It then calls the Rust FFI helper
 // `sv_compute_create_from_yaml_rust` to parse + enrich + serialize the YAML
 // into a metadata-less JSON definition. The exec callback emits the JSON
 // as a single VARCHAR row.
+//
+// Phase 65.1 D-01..D-03 (CR-01): the previous shape used
+// `Connection probe(*context.db)` + `Query("SELECT content FROM
+// read_text('<path>')")`, which required SQL-quote-doubling on the path. That
+// surface is gone: the file is now read directly via the `FileSystem` API.
+// `LocalFileSystem` continues to honour the global `enable_external_access`
+// DBConfig option when no `FileOpener` is supplied, so the access gate is
+// preserved by construction. The four `BinderException` paths below all
+// retain the `"FROM YAML FILE failed: "` prefix pinned by
+// `test/sql/phase53_yaml_file.test`.
 //
 // The outer parser_override INSERT (src/parse.rs::rewrite_yaml_file_create,
 // landed in Task 4) wraps the helper TF's row via `json_merge_patch(new_def,
@@ -770,50 +781,36 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
     bd->kind      = input.inputs[2].GetValue<int32_t>();
     bd->comment   = input.inputs[3].GetValue<string>();
 
-    // Read the YAML file via a per-call Connection. `read_text(?)` honors
-    // DuckDB's `enable_external_access` setting and other path-resolution
-    // safeguards — we don't introduce a new file-I/O surface.
-    //
-    // SQL safety: the path comes through as a typed `Value` (input.inputs[0]
-    // is a parameterized VARCHAR bound by the outer parser_override SELECT,
-    // not concatenated from user input here). We escape any embedded single
-    // quotes when embedding the path into the read_text(...) SQL string so
-    // a pathological path string ("a'b.yaml") doesn't break the SELECT — the
-    // standard SQL doubling convention. We use Connection::Query here
-    // (returning MaterializedQueryResult directly) rather than the Prepare/
-    // Execute path because the latter returns a non-materialized QueryResult
-    // that triggers an InternalException when down-cast.
-    std::string path_escaped = bd->file_path;
-    {
-        size_t pos = 0;
-        while ((pos = path_escaped.find('\'', pos)) != std::string::npos) {
-            path_escaped.replace(pos, 1, "''");
-            pos += 2;
-        }
-    }
-    Connection probe(*context.db);
-    std::string read_sql =
-        "SELECT content FROM read_text('" + path_escaped + "')";
-    auto result = probe.Query(read_sql);
-    if (result->HasError()) {
-        // The "FROM YAML FILE failed" prefix matches the v0.9.0 wording
-        // pinned by test/sql/phase53_yaml_file.test ("file not found"
-        // and "enable_external_access=false" cases).
+    // Phase 65.1 D-01..D-03 (CR-01): read the YAML file directly via the
+    // `FileSystem` API rather than `Connection::Query("SELECT content FROM
+    // read_text('<path>')")`. The SQL surface — including its quote-doubling
+    // escape — is gone; `LocalFileSystem` honours `enable_external_access`
+    // natively when no `FileOpener` is supplied, so the access gate is
+    // preserved by construction. Every throw below keeps the
+    // `"FROM YAML FILE failed: "` prefix pinned by
+    // `test/sql/phase53_yaml_file.test`.
+    auto &fs = FileSystem::GetFileSystem(context);
+    unique_ptr<FileHandle> handle;
+    try {
+        handle = fs.OpenFile(bd->file_path, FileFlags::FILE_FLAGS_READ);
+    } catch (const std::exception &e) {
         throw BinderException(
-            "FROM YAML FILE failed: " + result->GetError());
+            std::string("FROM YAML FILE failed: ") + e.what());
     }
-    if (result->RowCount() == 0) {
+    int64_t size = fs.GetFileSize(*handle);
+    if (size < 0) {
         throw BinderException(
-            "FROM YAML FILE failed: no content returned from '" +
+            "FROM YAML FILE failed: GetFileSize returned -1 for '" +
             bd->file_path + "'");
     }
-    Value content_val = result->GetValue(0, 0);
-    if (content_val.IsNull()) {
+    std::string yaml_content(static_cast<size_t>(size), '\0');
+    int64_t got = (size == 0) ? 0
+                              : fs.Read(*handle, yaml_content.data(), size);
+    if (got != size) {
         throw BinderException(
-            "FROM YAML FILE failed: NULL content from '" +
-            bd->file_path + "'");
+            "FROM YAML FILE failed: short read (" + std::to_string(got) +
+            " of " + std::to_string(size) + ") for '" + bd->file_path + "'");
     }
-    std::string yaml_content = content_val.GetValue<string>();
 
     // Bridge into Rust to parse + enrich + serialize. The Rust side enforces
     // YAML_SIZE_CAP (1 MiB) inside from_yaml_with_size_cap, so we deliberately
