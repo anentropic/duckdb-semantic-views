@@ -43,6 +43,79 @@
 use libduckdb_sys as ffi;
 use std::ffi::CString;
 
+/// Borrowed `duckdb_connection` handle. The bridge contract: this handle is
+/// owned by a stack `Connection probe(*context.db)` constructed in a C++
+/// bind/exec callback. The Rust side MUST NOT call `duckdb_disconnect` —
+/// doing so would `delete` a stack object (UB).
+///
+/// This newtype enforces the contract at compile time (Phase 65.1 D-10 /
+/// WR-05): `ffi::duckdb_disconnect` accepts `*mut ffi::duckdb_connection`,
+/// not `*mut BorrowedConnection`, so the call simply does not type-check.
+/// Even though `BorrowedConnection` is `#[repr(transparent)]` wrapping
+/// `duckdb_connection`, Rust newtype distinctness blocks the coercion at
+/// the type level. Defence in depth alongside the AST-walk guard at
+/// `tests/no_long_lived_conn.rs`.
+///
+/// Construct via the unsafe [`BorrowedConnection::new`] constructor at the
+/// FFI boundary; access the raw handle via [`BorrowedConnection::as_raw`]
+/// only for further FFI calls (`duckdb_query`, `duckdb_prepare`, ...).
+///
+/// # Negative compile coverage
+///
+/// The following snippet must fail to compile because `duckdb_disconnect`
+/// takes `*mut duckdb_connection`, and `&mut BorrowedConnection` cannot be
+/// coerced to that type — exactly the regression this newtype guards
+/// against. The doctest uses a mutable binding so the failure is the
+/// intended type mismatch, NOT an immutable-binding error.
+///
+/// ```compile_fail
+/// use semantic_views::ddl::read_ffi::BorrowedConnection;
+/// let mut b: BorrowedConnection = unsafe { std::mem::zeroed() };
+/// // duckdb_disconnect takes *mut duckdb_connection. &mut BorrowedConnection
+/// // is NOT *mut duckdb_connection, even though BorrowedConnection is
+/// // #[repr(transparent)] wrapping duckdb_connection.
+/// unsafe { libduckdb_sys::duckdb_disconnect(&mut b) };
+/// ```
+#[repr(transparent)]
+pub struct BorrowedConnection(ffi::duckdb_connection);
+
+impl BorrowedConnection {
+    /// Wrap a raw FFI handle as a borrowed connection.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that `conn` outlives this `BorrowedConnection`
+    /// and that no other code path will call `duckdb_disconnect(conn)` while
+    /// this borrow is live. Typical usage: construct immediately on entry to
+    /// an `extern "C"` dispatcher from the raw `conn` parameter passed by the
+    /// C++ bind/exec callback.
+    #[must_use]
+    pub unsafe fn new(conn: ffi::duckdb_connection) -> Self {
+        Self(conn)
+    }
+
+    /// Access the underlying raw handle for further FFI calls
+    /// (`duckdb_query`, `duckdb_prepare`, etc.). The caller MUST NOT pass
+    /// the returned handle to `duckdb_disconnect`.
+    #[must_use]
+    pub fn as_raw(&self) -> ffi::duckdb_connection {
+        self.0
+    }
+
+    /// Whether the wrapped handle is null. Cheaper than constructing a
+    /// `CatalogReader` just to discover the bind callback handed us a
+    /// null connection.
+    #[must_use]
+    pub fn is_null(&self) -> bool {
+        self.0.is_null()
+    }
+}
+// Deliberately NO Drop, NO Clone, NO Copy, NO trait impls that could lead
+// to disconnect — the type-level guard depends on the call surface staying
+// minimal. Do not add `query()` / `prepare()` convenience methods here;
+// they would encourage passing BorrowedConnection around without
+// unwrapping intent at each FFI boundary.
+
 /// Probe whether `semantic_layer._definitions` exists on the given borrowed
 /// connection. Returns `false` if the schema/table is missing OR if the
 /// probe query itself fails (defensive — never raises). Mirrors the Phase
