@@ -46,3 +46,40 @@ At the end of every milestone, before tagging:
 - `just build` — debug build (extension binary)
 - `cargo test` — runs without the extension feature (in-memory DuckDB)
 - `just test-sql` — requires a fresh `just build` to pick up code changes
+
+## Build/test command rules (non-negotiable)
+
+These two rules have previously caused multi-hour agent stalls. They apply to every
+command in this project's build/test surface: `just build`, `just test-sql`, `just test-all`,
+`just ci`, `cargo build`, `cargo test`, `cargo nextest run`, `cargo fmt`, `cargo check`,
+`cargo clippy`, `uv run test/integration/*.py`.
+
+**Rule 1 — Never pipe long-running commands to bare `tail -N`.** The macOS pipe buffer fills,
+`tail` waits for EOF that never arrives until the producer exits, and the run appears hung for
+5-30 minutes. Always redirect to a file first, then tail the file:
+
+```bash
+cmd > /tmp/claude/x.log 2>&1
+RC=$?
+tail -100 /tmp/claude/x.log
+```
+
+This applies to ANY command above and any cargo/just/sqllogictest invocation that runs longer
+than a few seconds.
+
+**Rule 2 — Use `dangerouslyDisableSandbox: true` for the listed build/test commands when
+needed.** The project's Makefile invokes `mktemp` which writes to `/var/folders/.../T/`
+(macOS hardcoded), which the sandbox may block depending on session snapshot. If you see
+`mktemp: mkstemp failed ... Operation not permitted`, use the sandbox bypass directly for
+that command — no need to ask. The bypass is pre-approved for the build/test command list
+above and ONLY those commands.
+
+If a command not on the list needs the bypass, halt and ask first.
+
+## Code editing rules
+
+- Pre-commit hook runs `cargo fmt --check` + clippy. If a commit fails on fmt-check, run
+  `cargo fmt`, re-stage, and retry. Never use `--no-verify`.
+- New sqllogictest files must be added to `test/sql/TEST_LIST` or the runner will skip them.
+- For `statement error` assertions in sqllogictest, use the block form (`---- separator` +
+  substring), not inline regex — the runner does not support inline form.
