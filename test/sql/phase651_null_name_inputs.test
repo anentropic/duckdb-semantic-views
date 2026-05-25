@@ -1,39 +1,31 @@
-# Phase 65.1 stub — populated by Plan 09 (IN-05 D-25). DO NOT delete;
-# runner will skip this file if removed from TEST_LIST.
+# Phase 65.1 Plan 09 (IN-05, D-25) — null name vector input handling for
+# scalar functions accepting a view-name argument.
 #
-# IN-05: scalar functions accepting a view name vector must short-circuit
-# null inputs to NULL rather than raising or treating the literal string
-# "NULL" as a lookup key. Plan 09 will add the null-guard branches and
-# replace the stub assertion below with the canonical three coverage
-# triples (D-25).
-#
-# Future assertions (Plan 09 populates):
-#   B1: SELECT read_yaml_from_semantic_view(NULL) IS NULL  →  TRUE
-#   B2: SELECT get_ddl(NULL, 'x') IS NULL                  →  TRUE
-#   B3: SELECT get_ddl('SEMANTIC_VIEW', NULL) IS NULL      →  TRUE
+# Each scalar function takes a view name (or related lookup key) as a
+# VARCHAR argument. When the argument is NULL the function MUST short-
+# circuit to NULL rather than raise or treat the literal string "NULL"
+# as a lookup key.
 
 require semantic_views
 
 statement ok
 LOAD semantic_views;
 
-# Stub no-op so the runner does not error on an empty file.
-statement ok
-SELECT 1;
+# --- read_yaml_from_semantic_view: single name argument --------------------
 
-# == Future assertions (Plan 09 — IN-05 D-25) ================================
-# query I
-# SELECT read_yaml_from_semantic_view(NULL) IS NULL
-# ----
-# true
-#
-# query I
-# SELECT get_ddl(NULL, 'x') IS NULL
-# ----
-# true
-#
-# query I
-# SELECT get_ddl('SEMANTIC_VIEW', NULL) IS NULL
-# ----
-# true
-# ============================================================================
+query I
+SELECT read_yaml_from_semantic_view(NULL) IS NULL
+----
+true
+
+# --- get_ddl: (object_type, object_name) - either arg NULL → NULL ----------
+
+query I
+SELECT get_ddl(NULL, 'x') IS NULL
+----
+true
+
+query I
+SELECT get_ddl('SEMANTIC_VIEW', NULL) IS NULL
+----
+true
