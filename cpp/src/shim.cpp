@@ -2307,8 +2307,12 @@ struct SemanticViewGlobalState : public GlobalTableFunctionState {
 // LogicalType is constructed from the type_id directly (matching the
 // behaviour of `type_from_duckdb_type_u32` on the Rust side).
 //
-// On any probe failure, falls back to declaring all columns by type_id
-// alone — same fallback ladder as the legacy bind.
+// Probe failures (DuckDB error from the LIMIT 0 query) and column-count
+// mismatches now raise BinderException with full diagnostic text instead
+// of silently falling back to a type_id-only declaration (Phase 65.1
+// Plan 11 / WR-07 / D-14). The previous fallback masked real DDL-level
+// errors (broken FACTS / METRICS expressions referencing nonexistent
+// columns) behind a DECIMAL(18,3) placeholder at query time.
 static std::vector<LogicalType> sv_resolve_output_logical_types(
     ClientContext &context,
     const std::vector<SemanticViewColumnInfo> &cols,
@@ -2342,12 +2346,20 @@ static std::vector<LogicalType> sv_resolve_output_logical_types(
     Connection probe(*context.db);
     std::string limit0_sql = "SELECT * FROM (" + execution_sql + ") __sv_probe LIMIT 0";
     auto probe_result = probe.Query(limit0_sql);
-    if (probe_result->HasError() || probe_result->types.size() != cols.size()) {
-        // Fall back to type_id-only declaration if the probe fails.
-        for (const auto &c : cols) {
-            out.emplace_back(sv_logical_type_from_c_type_id(c.type_id));
-        }
-        return out;
+    if (probe_result->HasError()) {
+        // Phase 65.1 Plan 11 / WR-07 / D-14: surface the underlying DuckDB
+        // error verbatim. No silent fallback to a type_id-only declaration.
+        throw BinderException(
+            "semantic_view: failed to infer column types via LIMIT 0 probe: " +
+            probe_result->GetError());
+    }
+    if (probe_result->types.size() != cols.size()) {
+        // Phase 65.1 Plan 11 / WR-07 / D-14: distinct diagnostic naming
+        // both counts so a future contributor can see which side disagrees.
+        throw BinderException(
+            "semantic_view: LIMIT 0 probe returned " +
+            std::to_string(probe_result->types.size()) +
+            " columns, expected " + std::to_string(cols.size()));
     }
 
     for (idx_t i = 0; i < cols.size(); ++i) {
