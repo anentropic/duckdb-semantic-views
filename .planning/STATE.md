@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: executing
-stopped_at: Phase 65 Plan 05 complete (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection bind; H2 query_conn DELETED; 17 legacy VTab/VScalar carcasses purged; LIFE-02 satisfied; LIFE-01 watchdog tests still RED pending Plan 06 H1 retirement)
-last_updated: "2026-05-24T18:00:00.000Z"
-last_activity: 2026-05-24 -- Plan 65-05 complete; 53/53 just test-sql; 843/843 cargo test --lib; 6/6 ADBC; 3/3 multi-DB; new test_concurrent_reads_per_call_conn.py PASS (80 reads in 0.02s); 5/8 test_readonly_load.py watchdog still RED (Plan 06 H1 retirement)
+stopped_at: Phase 65 Plan 06 complete (lifecycle close-out; H1 catalog_conn retired in 964b0bf; structural guard test landed in 20ae0dc; 4 D-03b post-reopen tests landed in ff5cbec; LIFE-04 ledger closed in 06246dc; 12/12 test_readonly_load.py PASS; just test-all + just ci both green; LIFE-01/LIFE-02/LIFE-03/LIFE-04 all Satisfied; Phase 65 ready for orchestrator phase-level verification)
+last_updated: "2026-05-25T12:55:00.000Z"
+last_activity: 2026-05-25 -- Plan 65-06 complete (rescue dispatch); 12/12 test_readonly_load.py (3 subprocess + 5 watchdog + 4 D-03b); 6/6 ADBC (D-21 intact); just test-all + just ci green; Phase 65 ready for verification dispatch
 progress:
   total_phases: 2
   completed_phases: 0
   total_plans: 6
-  completed_plans: 5
-  percent: 83
+  completed_plans: 6
+  percent: 100
 ---
 
 # Project State
@@ -25,11 +25,11 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 
 ## Current Position
 
-Phase: 65 (overridecontext-connection-teardown) — EXECUTING
-Plan: 5 of 6 complete (Plan 06 next)
-Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership), 65-05 (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection(*context.db) bind; H2 query_conn allocation DELETED from init_extension; 17 legacy duckdb-rs VTab/VScalar struct + impl blocks purged atomically ~2,632 LOC across 13 files; src/type_cache.rs unbounded HashMap cache landed unused as deferred optimisation; sv_logical_type_from_c_type_id bridges C-API ↔ C++ enum-value mismatch; new test_concurrent_reads_per_call_conn.py PASSES 80 reads in 0.02s; LIFE-02 satisfied end-to-end; LIFE-01 watchdog tests still RED 5/8 pending Plan 06 H1 retirement)
-Next plan: 65-06 lifecycle close-out (retire H1 catalog_conn at src/lib.rs:441; add structural Rust guard test asserting init_extension allocates no long-lived duckdb_connection; verify 5 currently-RED watchdog tests flip green; close LIFE-01 + LIFE-04 ledgers; if any watchdog test stays red after H1 retirement, file as Phase 67 follow-up per D-22)
-Last activity: 2026-05-24 -- Plan 65-05 complete
+Phase: 65 (overridecontext-connection-teardown) — ALL PLANS COMPLETE (awaiting orchestrator phase-level verification)
+Plan: 6 of 6 complete
+Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership), 65-05 (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection(*context.db) bind; H2 query_conn allocation DELETED from init_extension; 17 legacy duckdb-rs VTab/VScalar struct + impl blocks purged atomically ~2,632 LOC across 13 files; src/type_cache.rs unbounded HashMap cache landed unused as deferred optimisation; sv_logical_type_from_c_type_id bridges C-API ↔ C++ enum-value mismatch; new test_concurrent_reads_per_call_conn.py PASSES 80 reads in 0.02s; LIFE-02 satisfied end-to-end; LIFE-01 watchdog tests still RED 5/8 pending Plan 06 H1 retirement), 65-06 (lifecycle close-out; H1 catalog_conn retired from init_extension; OverrideContext slimmed to empty struct; INTENTIONAL LEAK rationale deleted; structural guard test tests/no_long_lived_conn.rs via syn::visit::Visit AST walk; 4 D-03b post-reopen integration tests added covering semantic_view SELECT + describe + SHOW DIMENSIONS + get_ddl; LIFE-04 ledger entry closed with forward pointer; 12/12 test_readonly_load.py PASS; just test-all + just ci both green; 6/6 ADBC; LIFE-01/02/03/04 all Satisfied)
+Next plan: Phase 65 awaits orchestrator's phase-level verification dispatch; then Phase 66 (release-prep + ADBC tests + CHANGELOG) — preliminary finding from Plan 05 suggests EXPAND-CTX-01 root cause may have dissolved post-H2 retirement, so Phase 66 scope may collapse to test scaffolding + release prep only
+Last activity: 2026-05-25 -- Plan 65-06 complete (rescue dispatch)
 
 ## Performance Metrics
 
@@ -109,6 +109,10 @@ Recent decisions affecting current work:
 - [Phase 65 P05]: 5 helpers from the dead Rust VTab path retired (value_raw_ptr, extract_list_strings, LogicalTypeOwned, type_from_duckdb_type_u32, declare_output_type) — C++ side now owns LIST flattening (sv_serialise_string_list) + LogicalType declaration (sv_logical_type_from_c_type_id). Removes the duckdb-rs Value transmute that relied on repr(Rust) layout assumptions.
 - [Phase 65 P05]: 5/8 test_readonly_load.py watchdog tests still RED post-Batch-3 (same failure shape as pre-Batch-3) — LIFE-01 has TWO contributors (H1 catalog_conn + H2 query_conn); Plan 05 retired H2 only, so DuckDB DBInstanceCache busy-spin on RW↔RO reopen persists. Plan 06 retires H1 → expected to flip 8/8 green. If any test stays red after Plan 06, file as Phase 67 follow-up per D-22.
 - [Phase 65 P05]: test_multi_db_isolation.py 3/3 PASS confirms cross-database catalog/search-path resolution works through the per-call Connection model — preliminary EXPAND-CTX-01 finding: root cause may dissolve after Plan 06, Phase 66 may become test-scaffolding + release-prep only.
+- [Phase 65 P06]: H1 catalog_conn retirement (commit 964b0bf, pre-rescue) used pre-existing race-guard SQL pattern from Plan 03 (existence_guard_select + race-loser CASE) rather than introducing a new mechanism — the same SQL guard that protected against concurrent DROP now subsumes the catalog-existence pre-check. OverrideContext slimmed to empty struct (catalog field + Drop impl + INTENTIONAL LEAK comment all DELETED).
+- [Phase 65 P06]: Structural guard test (tests/no_long_lived_conn.rs) uses syn::visit::Visit AST walk rather than plain-text grep — the AST approach correctly scopes "inside init_extension" (RawDb test helper at src/lib.rs:226-277 legitimately calls duckdb_connect from test fixtures; plain grep would false-positive). syn pinned as dev-dependency even though transitively available.
+- [Phase 65 P06]: 4 D-03b post-reopen integration tests added (semantic_view SELECT, describe, SHOW DIMENSIONS IN v, get_ddl('SEMANTIC_VIEW','v')) — together with Plan 01's B1-B4 + B11 watchdog tests, the LIFE-01 acceptance evidence base covers all major read paths post-reopen. test_readonly_load.py now reports 12/12 PASS on milestone/v0.10.0.
+- [Phase 65 P06]: LIFE-04 ledger entry closed with forward pointer; just test-all + just ci both exit 0; 6/6 ADBC PASS (D-21 invariant preserved); Phase 64 qualify_and_quote_table_ref wiring untouched. Phase 65 ready for orchestrator phase-level verification dispatch.
 
 ### Pending Todos
 
@@ -158,9 +162,10 @@ Recent decisions affecting current work:
 | Phase 65 P03 | 1h | 3 tasks | 9 files |
 | Phase 65 P04 | 2h | 4 tasks | 10 files |
 | Phase 65 P05 | ~10h (3 batches) | 6 tasks | 19 files (17 read-side sources + lib.rs + 2 test files) |
+| Phase 65 P06 | ~12h cal (10h pre-rescue + 45m rescue) | 4 tasks | 6 files (src/lib.rs + src/parse.rs + cpp/src/shim.{cpp,hpp} pre-rescue commit 964b0bf; Cargo.{toml,lock}; tests/no_long_lived_conn.rs; test/integration/test_readonly_load.py; deferred-items.md; SUMMARY) |
 
 ## Session Continuity
 
-Last session: 2026-05-24T18:00:00.000Z
-Stopped at: Phase 65 Plan 05 complete (5 of 6 plans done; Plan 06 next -- lifecycle close-out / H1 catalog_conn retirement + structural guard test + flip 5 RED watchdog tests green)
-Resume file: .planning/phases/65-overridecontext-connection-teardown/65-05-SUMMARY.md
+Last session: 2026-05-25T12:55:00.000Z
+Stopped at: Phase 65 Plan 06 complete (6 of 6 plans done; Phase 65 ready for orchestrator phase-level verification dispatch)
+Resume file: .planning/phases/65-overridecontext-connection-teardown/65-06-SUMMARY.md
