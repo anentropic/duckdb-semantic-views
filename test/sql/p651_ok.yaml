@@ -1,0 +1,14 @@
+base_table: t1
+tables:
+  - alias: t
+    table: t1
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: t.region
+    source_table: t
+metrics:
+  - name: row_count
+    expr: COUNT(*)
+    source_table: t
