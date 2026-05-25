@@ -861,23 +861,15 @@ static void sv_create_from_yaml_function(
     TableFunctionInput &data_p,
     DataChunk &output) {
     auto &bd = data_p.bind_data->Cast<CreateFromYamlBindData>();
-    // Without an init_local callback registered, data_p.local_state is
-    // nullptr. Use an instance bit on the bind data instead — but bind
-    // data is shared across executions, so for parallel safety we register
-    // init_local. (Currently sv_register_parser_hooks passes nullptr for
-    // init_cb on this helper; flip the registration to use the init_local
-    // path so multiple executions in the same statement don't double-emit.)
     auto *state_p = data_p.local_state.get();
     if (state_p == nullptr) {
-        // No local state — fall back to single-emit using a one-shot
-        // pattern keyed on output cardinality. The helper TF is bound and
-        // executed once per outer INSERT so this is safe in practice for
-        // the v0.10.0 surface; if a future caller invokes it inside a
-        // streaming context, init_local should be wired in
-        // sv_register_parser_hooks.
-        output.SetValue(0, 0, Value(bd.new_def));
-        output.SetCardinality(1);
-        return;
+        // Registration refuses null init_cb at registration time per
+        // Phase 65.1 D-05 (see `sv_register_table_function` in this file).
+        // Reaching this branch indicates a corrupted TableFunctionInput;
+        // fail loud rather than risk an unbounded row stream (Phase 65.1
+        // D-04, CR-02).
+        throw InternalException(
+            "sv_create_from_yaml_function: local_state missing despite init_local registration");
     }
     auto &state = state_p->Cast<CreateFromYamlLocalState>();
     if (state.emitted) {
@@ -1061,18 +1053,13 @@ static void sv_list_semantic_views_function(
     auto &bd = data_p.bind_data->Cast<ListSemanticViewsBindData>();
     auto *state_p = data_p.local_state.get();
     if (state_p == nullptr) {
-        // Defensive: same pattern as sv_create_from_yaml_function.
-        idx_t n = bd.rows.size();
-        for (idx_t i = 0; i < n; ++i) {
-            output.SetValue(0, i, Value(bd.rows[i].created_on));
-            output.SetValue(1, i, Value(bd.rows[i].name));
-            output.SetValue(2, i, Value(bd.rows[i].kind));
-            output.SetValue(3, i, Value(bd.rows[i].database_name));
-            output.SetValue(4, i, Value(bd.rows[i].schema_name));
-            output.SetValue(5, i, Value(bd.rows[i].comment));
-        }
-        output.SetCardinality(n);
-        return;
+        // Registration refuses null init_cb at registration time per
+        // Phase 65.1 D-05 (see `sv_register_table_function` in this file).
+        // Reaching this branch indicates a corrupted TableFunctionInput;
+        // fail loud rather than risk an unbounded row stream (Phase 65.1
+        // D-04, CR-02).
+        throw InternalException(
+            "sv_list_semantic_views_function: local_state missing despite init_local registration");
     }
     auto &state = state_p->Cast<ListSemanticViewsLocalState>();
     if (state.emitted) {
@@ -1171,19 +1158,19 @@ static void sv_emit_varchar_rows(
     DataChunk &output) {
     auto &bd = data_p.bind_data->Cast<SvVarcharBindData>();
     auto *state_p = data_p.local_state.get();
-    // Phase 65.1 Plan 02a D-06: removed the misleading single-shot
-    // semantics comment that previously sat here. Without local state
-    // this code path would re-emit every chunk; the CR-02 fix (Plan 08)
-    // re-shapes the callback to throw when state_p is null, and D-05
-    // (Plan 02a) refuses null init_cb at registration so the null-state
-    // path is unreachable in production.
-    if (state_p) {
-        auto &state = state_p->Cast<SvVarcharLocalState>();
-        if (state.emitted) {
-            output.SetCardinality(0);
-            return;
-        }
-        state.emitted = true;
+    if (state_p == nullptr) {
+        // Registration refuses null init_cb at registration time per
+        // Phase 65.1 D-05 (see `sv_register_table_function` in this file).
+        // Reaching this branch indicates a corrupted TableFunctionInput;
+        // fail loud rather than risk an unbounded row stream (Phase 65.1
+        // D-04, CR-02).
+        throw InternalException(
+            "sv_emit_varchar_rows: local_state missing despite init_local registration");
+    }
+    auto &state = state_p->Cast<SvVarcharLocalState>();
+    if (state.emitted) {
+        output.SetCardinality(0);
+        return;
     }
     idx_t n = bd.rows.size();
     for (idx_t i = 0; i < n; ++i) {
@@ -1193,6 +1180,7 @@ static void sv_emit_varchar_rows(
         }
     }
     output.SetCardinality(n);
+    state.emitted = true;
 }
 
 // VARCHAR-rows-with-trailing-BOOL shape (used by
@@ -1241,13 +1229,19 @@ static void sv_emit_varchar_bool_rows(
     DataChunk &output) {
     auto &bd = data_p.bind_data->Cast<SvVarcharBoolBindData>();
     auto *state_p = data_p.local_state.get();
-    if (state_p) {
-        auto &state = state_p->Cast<SvVarcharLocalState>();
-        if (state.emitted) {
-            output.SetCardinality(0);
-            return;
-        }
-        state.emitted = true;
+    if (state_p == nullptr) {
+        // Registration refuses null init_cb at registration time per
+        // Phase 65.1 D-05 (see `sv_register_table_function` in this file).
+        // Reaching this branch indicates a corrupted TableFunctionInput;
+        // fail loud rather than risk an unbounded row stream (Phase 65.1
+        // D-04, CR-02).
+        throw InternalException(
+            "sv_emit_varchar_bool_rows: local_state missing despite init_local registration");
+    }
+    auto &state = state_p->Cast<SvVarcharLocalState>();
+    if (state.emitted) {
+        output.SetCardinality(0);
+        return;
     }
     idx_t n = bd.rows.size();
     for (idx_t i = 0; i < n; ++i) {
@@ -1259,6 +1253,7 @@ static void sv_emit_varchar_bool_rows(
         output.SetValue(strs.size(), i, Value::BOOLEAN(bd.rows[i].second));
     }
     output.SetCardinality(n);
+    state.emitted = true;
 }
 
 // Common idiom for the bind callback: open Connection, run Rust dispatcher
