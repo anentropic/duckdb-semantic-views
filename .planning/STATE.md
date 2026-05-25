@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: ready_to_plan
-stopped_at: Phase 65 Plan 06 complete (6 of 6 plans done; Phase 65 ready for orchestrator phase-level verification dispatch)
-last_updated: "2026-05-25T17:11:46.974Z"
+stopped_at: Phase 65.1 Plan 05 complete (WR-04 concurrent-writes integration test)
+last_updated: "2026-05-25T18:38:43.938Z"
 last_activity: 2026-05-25
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 19
-  completed_plans: 12
+  completed_plans: 13
   percent: 33
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 ## Current Position
 
 Phase: 65.1 (phase-65-code-review-remediation) — EXECUTING
-Plan: 4 of 14
+Plan: 5 of 14
 Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership), 65-05 (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection(*context.db) bind; H2 query_conn allocation DELETED from init_extension; 17 legacy duckdb-rs VTab/VScalar struct + impl blocks purged atomically ~2,632 LOC across 13 files; src/type_cache.rs unbounded HashMap cache landed unused as deferred optimisation; sv_logical_type_from_c_type_id bridges C-API ↔ C++ enum-value mismatch; new test_concurrent_reads_per_call_conn.py PASSES 80 reads in 0.02s; LIFE-02 satisfied end-to-end; LIFE-01 watchdog tests still RED 5/8 pending Plan 06 H1 retirement), 65-06 (lifecycle close-out; H1 catalog_conn retired from init_extension; OverrideContext slimmed to empty struct; INTENTIONAL LEAK rationale deleted; structural guard test tests/no_long_lived_conn.rs via syn::visit::Visit AST walk; 4 D-03b post-reopen integration tests added covering semantic_view SELECT + describe + SHOW DIMENSIONS + get_ddl; LIFE-04 ledger entry closed with forward pointer; 12/12 test_readonly_load.py PASS; just test-all + just ci both green; 6/6 ADBC; LIFE-01/02/03/04 all Satisfied)
 Next plan: /gsd:plan-phase 65.1
 Last activity: 2026-05-25
@@ -118,6 +118,9 @@ Recent decisions affecting current work:
 - [Phase ?]: [Phase 65.1 P02a]: C ABI rework for sv_register_table_function + sv_register_scalar_function — trailing (char *error_buf, size_t error_buf_len) pair per D-08/D-09; D-05 null-init_cb refusal; D-06 (void)emitted deletion; all 17 wrappers updated; fprintf(stderr) count 17→3 (3 remaining in out-of-scope sv_register_parser_hooks); just build exit 0; 844/844 cargo test --lib
 - [Phase 65.1 P03a]: BorrowedConnection newtype lands with W-02-fixed compile_fail doctest; 15 ddl/ dispatcher sites + helpers (probe_catalog_table_present, CatalogReader::new) migrated to &BorrowedConnection wrap-on-entry; IN-06 D-26 absorbed (duplicate probe + write_err in src/ddl/list.rs DELETED, canonical home is src/ddl/read_ffi.rs)
 - [Phase 65.1 P03a]: Minimum-touch boundary preserved for src/query/{explain,table_function}.rs; only the CatalogReader::new callsite line wrapped inline, Plan 03b owns the full wrap-on-entry migration of those 2 query/ dispatchers plus AST guard extension in tests/no_long_lived_conn.rs for duckdb_disconnect walks
+- [Phase ?]: [Phase 65.1 P05]: WR-04 concurrent writes test landed; five-bucket categorisation (success + already_exists + constraint_violation + tuple_conflict + unknown_error); ALTER uses IF EXISTS for clean DROP-then-ALTER no-op; final-state subset invariant
+- [Phase ?]: [Phase 65.1 P05]: Second PK-violation wording observed under race-guard rewrite (commit-time TransactionContext shape, distinct from TECH-DEBT 23 single-statement check-time shape); both categorise as constraint_violation. TECH-DEBT 23 should be amended to mention both wordings
+- [Phase ?]: [Phase 65.1 P05]: DuckDB optimistic-concurrency 'Conflict on tuple deletion' on racing DROPs/ALTERs against same _definitions row is documented upstream behaviour (semantic-views ride the same serialisation contract as any DDL on _definitions PK); classified as tuple_conflict bucket, not an extension-side bug
 
 ### Pending Todos
 
@@ -171,9 +174,10 @@ Recent decisions affecting current work:
 | Phase 65.1 P01 | 12min | 3 tasks | 7 files |
 | Phase 65.1 P02a | 30min | 1 tasks | 2 files |
 | Phase 65.1 P03a | 25min | 2 tasks | 14 files |
+| Phase 65.1 P05 | 18min | 1 tasks | 1 files |
 
 ## Session Continuity
 
-Last session: 2026-05-25T17:11:03.608Z
-Stopped at: Phase 65 Plan 06 complete (6 of 6 plans done; Phase 65 ready for orchestrator phase-level verification dispatch)
+Last session: 2026-05-25T18:38:25.270Z
+Stopped at: Phase 65.1 Plan 05 complete (WR-04 concurrent-writes integration test)
 Resume file: None
