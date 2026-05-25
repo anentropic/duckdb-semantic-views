@@ -9,7 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Changed
+
+- `semantic_view(...)` and the `SHOW`/`DESCRIBE` family now raise a clear `Binder Error` when DuckDB's column-type inference fails at bind time. Previously the bind path fell back to `VARCHAR` or `DECIMAL(18,3)` silently, masking the underlying problem. If a query that previously succeeded with the wrong column type now fails, the error message will name the underlying cause — typically a missing source table, a broken `expr`, or a permissions issue surfaced by the expanded SQL.
+
+### Removed
+
+- Internal `type_cache` module and `type_id_to_display_name` helper. Both were unused after the read-side rebuild in v0.10.0 and have been deleted (~317 LOC purge). No user-visible API impact.
+
+### Fixed
+
+- `DROP SEMANTIC VIEW` and `ALTER SEMANTIC VIEW` against a read-only database that was never bootstrapped now report `semantic view 'X' does not exist`. Previously the lower-level `Catalog Error: Table _definitions does not exist` leaked through.
+- Extension registration failures during `LOAD semantic_views` now surface the underlying DuckDB exception message in the user-visible error. Previously the message was dropped and callers saw only a generic `Failed to register …`, which made ADBC, JDBC, and Python users unable to diagnose load-time failures.
+- `LOAD semantic_views` is now idempotent. Repeated loads in the same process no longer accumulate duplicate parser-extension hooks in `DBConfig`.
+- Removed unreachable single-shot fallback branches in four table-function exec callbacks that would have produced unbounded row streams if local state were ever absent. Table-function registration now refuses callbacks without an `init_local`, so the invariant is enforced at registration time rather than papered over per call.
+
+### Security
+
+- Eliminated a SQL-injection surface in the `CREATE SEMANTIC VIEW v FROM YAML FILE '<path>'` helper. The path argument is now read via DuckDB's `FileSystem` API directly, removing the `SELECT content FROM read_text('…')` indirection that relied on quote-doubling. `enable_external_access` gating is preserved natively by `LocalFileSystem`.
 
 ## [0.9.0] - 2026-05-17
 
