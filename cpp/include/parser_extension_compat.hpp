@@ -38,7 +38,37 @@ namespace duckdb {
 
 // Forward declarations
 class ExtensionCallbackManager;
+class ExtensionCallbackRegistry;
 class ParserExtension;
+
+//===--------------------------------------------------------------------===//
+// ExtensionCallbackIteratorHelper<T> (Phase 65.1 Plan 12 — WR-09 D-21)
+//===--------------------------------------------------------------------===//
+// Minimal re-declaration mirroring `duckdb.cpp:120801-120818`. Layout must
+// match the amalgamation under ODR: { const vector<T> &, shared_ptr<...> }.
+// We only need the `begin()`/`end()` iterators (inline) to support
+// range-for over `ParserExtensions()` from the WR-09 idempotence check.
+// The constructor/destructor are non-inline in the amalgamation; we only
+// receive instances by value from `ParserExtensions()` so we don't need
+// to construct them ourselves.
+template <class T>
+class ExtensionCallbackIteratorHelper {
+public:
+	ExtensionCallbackIteratorHelper(const vector<T> &vec, shared_ptr<ExtensionCallbackRegistry> callback_registry);
+	~ExtensionCallbackIteratorHelper();
+
+private:
+	const vector<T> &vec;
+	shared_ptr<ExtensionCallbackRegistry> callback_registry;
+
+public:
+	typename vector<T>::const_iterator begin() { // NOLINT: match stl API
+		return vec.cbegin();
+	}
+	typename vector<T>::const_iterator end() { // NOLINT: match stl API
+		return vec.cend();
+	}
+};
 
 //===--------------------------------------------------------------------===//
 // ParserExtensionInfo
@@ -194,10 +224,19 @@ public:
 //===--------------------------------------------------------------------===//
 // ExtensionCallbackManager
 //===--------------------------------------------------------------------===//
+// Phase 65.1 Plan 12 (WR-09 D-21): extended with `ParserExtensions()` to
+// expose the public read-side iterator the WR-09 idempotence check uses
+// before calling `ParserExtension::Register`. Matches the public surface
+// at `duckdb.cpp:120772-120795` for the methods we link against. We do
+// not re-declare the full private layout (mutex + shared_ptr<registry>);
+// shim.cpp only obtains references via `DBConfig::GetCallbackManager()`
+// and never constructs one itself, so layout-faithfulness is unnecessary.
 class ExtensionCallbackManager {
 public:
 	static ExtensionCallbackManager &Get(DatabaseInstance &db);
 	void Register(ParserExtension extension);
+	ExtensionCallbackIteratorHelper<ParserExtension> ParserExtensions() const;
+	bool HasParserExtensions() const;
 };
 
 //===--------------------------------------------------------------------===//

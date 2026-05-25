@@ -2655,34 +2655,78 @@ extern "C" {
                 return false;
             }
 
-            ParserExtension ext;
-            ext.parser_override = sv_parser_override;
-            // Phase 62 Plan 03: parse_function is the error-reporting layer.
-            // parser_override owns the success path (rewrite + re-parse on the
-            // caller's connection — transactional). When parser_override
-            // defers (rc=2), the default parser fails on the unrecognised
-            // prefix and DuckDB calls sv_parse_stub, which re-runs validation
-            // and returns DISPLAY_EXTENSION_ERROR with `error_location` so
-            // ParserException::SyntaxError renders `LINE 1: … ^` (caret).
-            // sv_plan_unreachable is the required sibling — sv_parse_stub
-            // never returns PARSE_SUCCESSFUL so it should never fire.
-            ext.parse_function  = sv_parse_stub;
-            ext.plan_function   = sv_plan_unreachable;
-            // duckdb::shared_ptr<T> doesn't have an upcast constructor, so we
-            // build the std::shared_ptr<ParserExtensionInfo> first (allocates
-            // the SemanticViewsParserInfo and immediately upcasts) then hand
-            // it to duckdb::shared_ptr's std-interop constructor.
-            std::shared_ptr<ParserExtensionInfo> info_std(
-                new SemanticViewsParserInfo(rust_state));
-            ext.parser_info = duckdb::shared_ptr<ParserExtensionInfo>(info_std);
             auto &config = DBConfig::GetConfig(db);
-            ParserExtension::Register(config, ext);
 
-            // FALLBACK_OVERRIDE: hook runs before default parser; misses
-            // fall through cleanly. Caret regression (TECH-DEBT 22) is
-            // resolved by parse_function above — sv_parse_stub renders
-            // `LINE 1: ... ^` for every CREATE/DROP/ALTER validation error.
-            config.SetOption("allow_parser_override_extension", Value("FALLBACK"));
+            // Phase 65.1 Plan 12 (WR-09 D-21): idempotence check across
+            // same-process repeat LOAD semantic_views. `ParserExtension::Register`
+            // unconditionally appends to `DBConfig::parser_extensions` (no dedup
+            // API), so without this guard every LOAD grows the list by one entry
+            // pointing at the same `sv_parser_override` — an unbounded "soft leak"
+            // surfaced by 65-REVIEW.md WR-09.
+            //
+            // We iterate the public read-side iterator
+            // `DBConfig::GetCallbackManager().ParserExtensions()`
+            // (cpp/include/duckdb.cpp:281157) and compare each existing entry's
+            // `parser_override` function pointer against the file-static
+            // `sv_parser_override` symbol. Function-pointer equality is portable
+            // ISO C++ here because `sv_parser_override` is a file-static C++
+            // function defined in this same TU — both sides of the `==` see the
+            // identical pointer value.
+            //
+            // CRITICAL: the entire `ParserExtension ext; ...; Register(...)` block
+            // — including the `SemanticViewsParserInfo` allocation — must be guarded.
+            // Allocating a fresh `info_std` on the skip path would re-introduce
+            // the parser_info shared_ptr leak called out in RESEARCH lines 706-710.
+            //
+            // The target is same-process repeat LOAD (e.g. a long-lived host
+            // re-invoking `LOAD semantic_views` across sessions, or partial-failure
+            // retries during `init_extension`). The theoretical concurrent-thread
+            // LOAD race between the iterator check and `Register` is documented
+            // as out of scope for v0.10.0 — see WR-09 Pitfall 3 / RESEARCH.md
+            // lines 668-714. Hitting it would require user code to LOAD the
+            // extension from two threads simultaneously, which is atypical for
+            // DuckDB's extension-load API.
+            //
+            // Helper-TF registrations below use `OnCreateConflict::ALTER_ON_CONFLICT`
+            // and are naturally idempotent — no analog guard needed there.
+            auto &cbmgr = config.GetCallbackManager();
+            bool already_registered = false;
+            for (auto &existing : cbmgr.ParserExtensions()) {
+                if (existing.parser_override == sv_parser_override) {
+                    already_registered = true;
+                    break;
+                }
+            }
+
+            if (!already_registered) {
+                ParserExtension ext;
+                ext.parser_override = sv_parser_override;
+                // Phase 62 Plan 03: parse_function is the error-reporting layer.
+                // parser_override owns the success path (rewrite + re-parse on the
+                // caller's connection — transactional). When parser_override
+                // defers (rc=2), the default parser fails on the unrecognised
+                // prefix and DuckDB calls sv_parse_stub, which re-runs validation
+                // and returns DISPLAY_EXTENSION_ERROR with `error_location` so
+                // ParserException::SyntaxError renders `LINE 1: … ^` (caret).
+                // sv_plan_unreachable is the required sibling — sv_parse_stub
+                // never returns PARSE_SUCCESSFUL so it should never fire.
+                ext.parse_function  = sv_parse_stub;
+                ext.plan_function   = sv_plan_unreachable;
+                // duckdb::shared_ptr<T> doesn't have an upcast constructor, so we
+                // build the std::shared_ptr<ParserExtensionInfo> first (allocates
+                // the SemanticViewsParserInfo and immediately upcasts) then hand
+                // it to duckdb::shared_ptr's std-interop constructor.
+                std::shared_ptr<ParserExtensionInfo> info_std(
+                    new SemanticViewsParserInfo(rust_state));
+                ext.parser_info = duckdb::shared_ptr<ParserExtensionInfo>(info_std);
+                ParserExtension::Register(config, ext);
+
+                // FALLBACK_OVERRIDE: hook runs before default parser; misses
+                // fall through cleanly. Caret regression (TECH-DEBT 22) is
+                // resolved by parse_function above — sv_parse_stub renders
+                // `LINE 1: ... ^` for every CREATE/DROP/ALTER validation error.
+                config.SetOption("allow_parser_override_extension", Value("FALLBACK"));
+            }
 
             // Phase 65 Plan 04 (Task 2 Step B): register the
             // `__sv_compute_create_from_yaml` helper TF via the C++ Catalog
