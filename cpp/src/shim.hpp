@@ -44,6 +44,48 @@ bool sv_register_parser_hooks(
     duckdb_database db_handle,
     char *error_buf, size_t error_buf_len);
 
+// Phase 65.1 Plan 12 Task 3 (D-21 + B-07 plan-checker fix): structural
+// verification helper for the WR-09 parser-hook dedup. Returns the count
+// of parser-extensions in the given DBConfig whose `parser_override`
+// function pointer matches the file-static `sv_parser_override` symbol.
+// Returns -1 on failure (with the underlying message in `error_buf`, per
+// the WR-02 ABI convention).
+//
+// We chose to expose this as a PUBLIC helper (option (a) per the
+// plan-checker B-07 fix in 65.1-12-PLAN.md) rather than gating behind
+// cfg(test)/cfg(debug_assertions) plumbing — read-only iteration over
+// `DBConfig::GetCallbackManager().ParserExtensions()` is harmless in
+// production binaries, and gating the helper would require conditional
+// compilation in the C++ shim for marginal benefit. The plan rejected
+// option (b) "behavioural-only with manual annotation" (the original
+// B-07 silent failure) and option (c) "private __sv_debug_* helper
+// gated behind cfg(test)" (awkward gating in the C++ TU + no real
+// production-safety win).
+//
+// This helper exists primarily so the Rust integration test
+// `tests/parser_hook_idempotent.rs` has a stable, named symbol to
+// reference structurally (the cargo-test FFI path cannot exercise the
+// extension binary directly — see that file's docstring for the
+// `duckdb/loadable-extension` stub constraint).
+//
+// Parameters:
+//   db_handle      — DuckDB C API database handle (unwrapped internally to
+//                    a `DatabaseInstance &`).
+//   error_buf      — caller-allocated writable buffer of `error_buf_len`
+//                    bytes. On failure (null db handle / std::exception),
+//                    the helper writes a NUL-terminated diagnostic via
+//                    snprintf (truncates within the cap). Pass a non-null
+//                    buffer; null + 0 is tolerated (diagnostic dropped).
+//   error_buf_len  — capacity of `error_buf` in bytes.
+//
+// Returns the count on success (>= 0); -1 on failure with the underlying
+// message in `error_buf`. Thread safety: read-only iteration over
+// `cbmgr.ParserExtensions()`, same as the dedup-check loop inside
+// `sv_register_parser_hooks` itself.
+int32_t sv_count_parser_extensions(
+    duckdb_database db_handle,
+    char *error_buf, size_t error_buf_len);
+
 // Phase 65 Plan 04 (A2 resolution) — register a table function via the C++
 // Catalog API so its bind callback receives a native `ClientContext &`.
 //

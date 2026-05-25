@@ -2787,3 +2787,69 @@ extern "C" {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// sv_count_parser_extensions -- Phase 65.1 Plan 12 Task 3 (D-21 + B-07
+// plan-checker fix) structural verification helper.
+// ---------------------------------------------------------------------------
+// Counts entries in `DBConfig::GetCallbackManager().ParserExtensions()`
+// whose `parser_override` function pointer equals the file-static
+// `sv_parser_override` symbol. Used by
+// `tests/parser_hook_idempotent.rs` as a stable, named symbol the
+// structural test can reference (the cargo-test FFI path cannot
+// exercise the extension binary directly under the
+// `duckdb/loadable-extension` stubs; see that test's docstring).
+//
+// Option (a) per the B-07 plan-checker fix in 65.1-12-PLAN.md: PUBLIC
+// helper (no cfg(test) gating). Read-only iteration is harmless in
+// production binaries and gating would require conditional-compilation
+// plumbing in the C++ TU for marginal benefit.
+//
+// Returns >= 0 on success (the count); -1 on failure with the message
+// in `error_buf`. Same error_buf convention as the WR-02 ABI.
+extern "C" {
+    int32_t sv_count_parser_extensions(
+        duckdb_database db_handle,
+        char *error_buf, size_t error_buf_len) {
+        try {
+            if (db_handle == nullptr) {
+                if (error_buf != nullptr && error_buf_len > 0) {
+                    snprintf(error_buf, error_buf_len,
+                        "sv_count_parser_extensions: null db_handle");
+                }
+                return -1;
+            }
+            auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
+                db_handle->internal_ptr);
+            if (wrapper == nullptr) {
+                if (error_buf != nullptr && error_buf_len > 0) {
+                    snprintf(error_buf, error_buf_len,
+                        "sv_count_parser_extensions: null DatabaseWrapper");
+                }
+                return -1;
+            }
+            auto &db = *wrapper->database->instance;
+            auto &config = DBConfig::GetConfig(db);
+            auto &cbmgr = config.GetCallbackManager();
+            int32_t count = 0;
+            for (auto &existing : cbmgr.ParserExtensions()) {
+                if (existing.parser_override == sv_parser_override) {
+                    ++count;
+                }
+            }
+            return count;
+        } catch (const std::exception &e) {
+            if (error_buf != nullptr && error_buf_len > 0) {
+                snprintf(error_buf, error_buf_len,
+                    "sv_count_parser_extensions failed: %s", e.what());
+            }
+            return -1;
+        } catch (...) {
+            if (error_buf != nullptr && error_buf_len > 0) {
+                snprintf(error_buf, error_buf_len,
+                    "sv_count_parser_extensions failed: unknown C++ exception");
+            }
+            return -1;
+        }
+    }
+}
