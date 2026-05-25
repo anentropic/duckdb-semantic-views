@@ -13,6 +13,7 @@ setup:
     cargo install cargo-deny --locked
     cargo install cargo-llvm-cov --locked
     cargo install cargo-fuzz --locked
+    cargo install cargo-sweep --locked
     git submodule update --init --recursive
     make configure
     @echo "Running cargo test to install cargo-husky hooks..."
@@ -194,6 +195,14 @@ update-headers:
 clean:
     make clean
     cargo clean
+
+# Reclaim stale target artifacts older than 14 days without invalidating current build cache.
+# Intended for milestone completion (see CLAUDE.md "Milestone Completion"). Auto-installs cargo-sweep on first run.
+clean-stale:
+    @command -v cargo-sweep >/dev/null 2>&1 || cargo install cargo-sweep
+    @echo "Sweeping target/ artifacts not touched in 14 days..."
+    cargo sweep --time 14
+    @echo "Done. Current build cache preserved; next incremental build remains fast."
 
 # Check Sphinx documentation builds without warnings (mirrors CI)
 docs-check:

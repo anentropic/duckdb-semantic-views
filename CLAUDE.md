@@ -40,6 +40,7 @@ At the end of every milestone, before tagging:
    - **Audience**: this file is also rendered verbatim as the docs site Release Notes page (`docs/changelog.md` includes it via MyST). Avoid GSD/phase-internal vocabulary in user-facing bullets; if implementation detail belongs anywhere it's inline within the relevant `Added`/`Changed`/`Fixed` bullet, not as its own subhead.
 2. **Add example file** — New Python example under `examples/` demoing the milestone's features.
 3. **Bump version** — Update Cargo.toml + description.yml.
+4. **Reclaim disk** — Run `just clean-stale` after the milestone tag is pushed. This uses `cargo-sweep` to evict target/ artifacts older than 14 days without invalidating the current build cache, so the next milestone's first build stays incremental. The DuckDB amalgamation produces ~30 GB of cumulative build-script output per toolchain rev across a milestone — left unchecked this fills the disk within a few milestones. Do **not** run `just clean` (full `cargo clean`) at milestone boundaries; the cold-rebuild cost (~10 min for the amalgamation) isn't worth it relative to `clean-stale`.
 
 ## Build
 
