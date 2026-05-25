@@ -124,10 +124,12 @@ impl BorrowedConnection {
 ///
 /// # Safety
 ///
-/// `conn` must be a valid `duckdb_connection`. The handle is borrowed and
-/// must outlive this call — the typical caller is a bind dispatcher running
-/// inside a C++ bind callback that owns a stack `Connection probe(*context.db)`.
-pub unsafe fn probe_catalog_table_present(conn: ffi::duckdb_connection) -> bool {
+/// `borrowed` must wrap a valid `duckdb_connection`. The handle is borrowed
+/// and must outlive this call — the typical caller is a bind dispatcher
+/// running inside a C++ bind callback that owns a stack `Connection
+/// probe(*context.db)`.
+pub unsafe fn probe_catalog_table_present(borrowed: &BorrowedConnection) -> bool {
+    let conn = borrowed.as_raw();
     let sql = match CString::new(
         "SELECT 1 FROM information_schema.tables \
          WHERE table_schema = 'semantic_layer' AND table_name = '_definitions' LIMIT 1",

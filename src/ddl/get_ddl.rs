@@ -45,10 +45,13 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
-    use crate::ddl::read_ffi::{probe_catalog_table_present, publish_owned_buffer, write_err};
+    use crate::ddl::read_ffi::{
+        probe_catalog_table_present, publish_owned_buffer, write_err, BorrowedConnection,
+    };
     use std::panic::AssertUnwindSafe;
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if conn.is_null() {
+        let borrowed = BorrowedConnection::new(conn);
+        if borrowed.is_null() {
             write_err(error_buf, error_buf_len, "duckdb_connection is null");
             return 1_u8;
         }
@@ -84,7 +87,7 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
             return 1_u8;
         }
 
-        let reader = CatalogReader::new(conn, probe_catalog_table_present(conn));
+        let reader = CatalogReader::new(&borrowed, probe_catalog_table_present(&borrowed));
         let json = match reader.lookup(name) {
             Ok(Some(j)) => j,
             Ok(None) => {

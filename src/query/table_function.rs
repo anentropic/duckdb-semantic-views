@@ -178,7 +178,11 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
             return 1_u8;
         }
 
-        let reader = CatalogReader::new(conn, probe_catalog_table_present(conn));
+        // Phase 65.1 Plan 03a: minimal BorrowedConnection wrap to keep build
+        // green after the helper signatures migrated to &BorrowedConnection.
+        // Full wrap-on-entry migration of this dispatcher lands in Plan 03b.
+        let borrowed = crate::ddl::read_ffi::BorrowedConnection::new(conn);
+        let reader = CatalogReader::new(&borrowed, probe_catalog_table_present(&borrowed));
         let json_str = match reader.lookup(&view_name) {
             Ok(Some(j)) => j,
             Ok(None) => {

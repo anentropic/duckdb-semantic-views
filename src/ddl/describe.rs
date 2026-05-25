@@ -26,10 +26,12 @@ pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
 ) -> u8 {
     use crate::ddl::read_ffi::{
         probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
+        BorrowedConnection,
     };
     use std::panic::AssertUnwindSafe;
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if conn.is_null() {
+        let borrowed = BorrowedConnection::new(conn);
+        if borrowed.is_null() {
             write_err(error_buf, error_buf_len, "duckdb_connection is null");
             return 1_u8;
         }
@@ -45,7 +47,7 @@ pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
                 return 1_u8;
             }
         };
-        let reader = CatalogReader::new(conn, probe_catalog_table_present(conn));
+        let reader = CatalogReader::new(&borrowed, probe_catalog_table_present(&borrowed));
         let json = match reader.lookup(&name) {
             Ok(Some(j)) => j,
             Ok(None) => {

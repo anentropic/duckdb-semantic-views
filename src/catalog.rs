@@ -87,6 +87,8 @@ mod reader {
 
     use libduckdb_sys as ffi;
 
+    use crate::ddl::read_ffi::BorrowedConnection;
+
     /// Read-side handle for `semantic_layer._definitions`.
     ///
     /// Wraps a raw `duckdb_connection` ("catalog connection") created at
@@ -112,9 +114,16 @@ mod reader {
     unsafe impl Sync for CatalogReader {}
 
     impl CatalogReader {
-        pub fn new(conn: ffi::duckdb_connection, catalog_table_present: bool) -> Self {
+        /// Construct a `CatalogReader` from a borrowed connection (D-10 / WR-05).
+        ///
+        /// The handle is extracted via `borrowed.as_raw()` and stored as a raw
+        /// pointer in the reader. `CatalogReader` never disconnects — the
+        /// underlying lifetime is owned by the caller's stack `Connection`
+        /// (the BORROW contract documented at module scope of
+        /// `src/ddl/read_ffi.rs`).
+        pub fn new(borrowed: &BorrowedConnection, catalog_table_present: bool) -> Self {
             Self {
-                conn,
+                conn: borrowed.as_raw(),
                 catalog_table_present,
             }
         }
@@ -587,7 +596,9 @@ mod tests {
         // the short-circuit must return Ok(None) before any FFI call, so
         // the null pointer is never dereferenced.
         use crate::catalog::CatalogReader;
-        let reader = CatalogReader::new(std::ptr::null_mut(), false);
+        use crate::ddl::read_ffi::BorrowedConnection;
+        let borrowed = unsafe { BorrowedConnection::new(std::ptr::null_mut()) };
+        let reader = CatalogReader::new(&borrowed, false);
         let result = reader.lookup("any_view");
         assert!(
             matches!(result, Ok(None)),
@@ -601,7 +612,9 @@ mod tests {
     fn list_all_returns_empty_when_table_missing() {
         // Phase 63 (RO-03): catalog_table_present=false must short-circuit.
         use crate::catalog::CatalogReader;
-        let reader = CatalogReader::new(std::ptr::null_mut(), false);
+        use crate::ddl::read_ffi::BorrowedConnection;
+        let borrowed = unsafe { BorrowedConnection::new(std::ptr::null_mut()) };
+        let reader = CatalogReader::new(&borrowed, false);
         let result = reader.list_all();
         assert!(
             matches!(result, Ok(ref v) if v.is_empty()),
@@ -615,7 +628,9 @@ mod tests {
     fn list_names_returns_empty_when_table_missing() {
         // Phase 63 (RO-03): catalog_table_present=false must short-circuit.
         use crate::catalog::CatalogReader;
-        let reader = CatalogReader::new(std::ptr::null_mut(), false);
+        use crate::ddl::read_ffi::BorrowedConnection;
+        let borrowed = unsafe { BorrowedConnection::new(std::ptr::null_mut()) };
+        let reader = CatalogReader::new(&borrowed, false);
         let result = reader.list_names();
         assert!(
             matches!(result, Ok(ref v) if v.is_empty()),

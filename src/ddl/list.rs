@@ -85,9 +85,15 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
+    use crate::ddl::read_ffi::{probe_catalog_table_present, write_err, BorrowedConnection};
     use std::panic::AssertUnwindSafe;
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if conn.is_null() {
+        // Wrap the raw FFI handle in a BorrowedConnection at the boundary
+        // (D-10 / WR-05). Everything below this point goes through &borrowed
+        // or borrowed.as_raw(); the raw `conn` parameter is shadowed and
+        // never used again.
+        let borrowed = BorrowedConnection::new(conn);
+        if borrowed.is_null() {
             write_err(error_buf, error_buf_len, "duckdb_connection is null");
             return 1_u8;
         }
@@ -96,11 +102,11 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
         // connection. Cheap (single query); matches Phase 63's RO-load
         // short-circuit semantics so an attached read-only DB without a
         // bootstrapped catalog returns 0 rows instead of an error.
-        let table_present = probe_catalog_table_present(conn);
+        let table_present = probe_catalog_table_present(&borrowed);
 
-        // Wrap the borrowed handle. CatalogReader::new only stores the
-        // raw pointer — no transfer of ownership.
-        let reader = CatalogReader::new(conn, table_present);
+        // CatalogReader::new only stores the raw pointer extracted via
+        // borrowed.as_raw() — no transfer of ownership.
+        let reader = CatalogReader::new(&borrowed, table_present);
         let entries = match reader.list_all() {
             Ok(e) => e,
             Err(e) => {
@@ -183,48 +189,11 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
     }
 }
 
-/// Probe whether `semantic_layer._definitions` exists on the given borrowed
-/// connection. Returns `false` if the schema/table is missing OR if the
-/// probe query itself fails (defensive — never raises). Mirrors the Phase
-/// 63 read-only short-circuit logic at `src/lib.rs:393-403`.
-#[cfg(feature = "extension")]
-unsafe fn probe_catalog_table_present(conn: libduckdb_sys::duckdb_connection) -> bool {
-    use libduckdb_sys as ffi;
-    use std::ffi::CString;
-    let sql = match CString::new(
-        "SELECT 1 FROM information_schema.tables \
-         WHERE table_schema = 'semantic_layer' AND table_name = '_definitions' LIMIT 1",
-    ) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let mut result: ffi::duckdb_result = std::mem::zeroed();
-    let rc = ffi::duckdb_query(conn, sql.as_ptr(), &mut result);
-    let present = if rc == ffi::DuckDBSuccess {
-        ffi::duckdb_row_count(&mut result) > 0
-    } else {
-        false
-    };
-    ffi::duckdb_destroy_result(&mut result);
-    present
-}
-
-/// Write a NUL-terminated error message into the C-side `error_buf`,
-/// truncating to `buf_len - 1` payload bytes. Matches the convention in
-/// `src/ddl/alter_helpers_ffi.rs::write_error_buf`.
-#[cfg(feature = "extension")]
-unsafe fn write_err(buf: *mut u8, buf_len: usize, msg: &str) {
-    if buf.is_null() || buf_len == 0 {
-        return;
-    }
-    let max = buf_len.saturating_sub(1);
-    let bytes = msg.as_bytes();
-    let n = bytes.len().min(max);
-    if n > 0 {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
-    }
-    *buf.add(n) = 0;
-}
+// Phase 65.1 Plan 03a (IN-06 / D-26): the module-local duplicates of
+// `probe_catalog_table_present` and `write_err` were DELETED. The canonical
+// definitions in `src/ddl/read_ffi.rs` are imported at each call site.
+// Single source of truth + the BorrowedConnection migration on the
+// canonical version flows to all 17 read-side dispatchers.
 
 // ---------------------------------------------------------------------------
 // Legacy Rust VTab `ListSemanticViewsVTab` RETIRED — Phase 65 Plan 05 Batch 3
@@ -271,16 +240,18 @@ pub unsafe extern "C" fn sv_list_terse_semantic_views_bind_rust(
 ) -> u8 {
     use crate::ddl::read_ffi::{
         probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
+        BorrowedConnection,
     };
     use std::panic::AssertUnwindSafe;
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if conn.is_null() {
+        let borrowed = BorrowedConnection::new(conn);
+        if borrowed.is_null() {
             write_err(error_buf, error_buf_len, "duckdb_connection is null");
             return 1_u8;
         }
 
-        let table_present = probe_catalog_table_present(conn);
-        let reader = CatalogReader::new(conn, table_present);
+        let table_present = probe_catalog_table_present(&borrowed);
+        let reader = CatalogReader::new(&borrowed, table_present);
         let entries = match reader.list_all() {
             Ok(e) => e,
             Err(e) => {
