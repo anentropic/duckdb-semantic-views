@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: ready_to_plan
-stopped_at: Phase 65 complete (9/5) — ready to discuss Phase 66
-last_updated: 2026-05-25T12:21:38.101Z
-last_activity: 2026-05-25 -- Plan 65-06 complete (rescue dispatch); 12/12 test_readonly_load.py (3 subprocess + 5 watchdog + 4 D-03b); 6/6 ADBC (D-21 intact); just test-all + just ci green; Phase 65 ready for verification dispatch
+stopped_at: Phase 65 Plan 06 complete (6 of 6 plans done; Phase 65 ready for orchestrator phase-level verification dispatch)
+last_updated: "2026-05-25T13:19:55.907Z"
+last_activity: 2026-05-25
 progress:
-  total_phases: 2
-  completed_phases: 0
-  total_plans: 6
-  completed_plans: 20
-  percent: 0
+  total_phases: 3
+  completed_phases: 1
+  total_plans: 5
+  completed_plans: 9
+  percent: 33
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 
 ## Current Position
 
-Phase: 66
+Phase: 65.1
 Plan: Not started
 Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership), 65-05 (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection(*context.db) bind; H2 query_conn allocation DELETED from init_extension; 17 legacy duckdb-rs VTab/VScalar struct + impl blocks purged atomically ~2,632 LOC across 13 files; src/type_cache.rs unbounded HashMap cache landed unused as deferred optimisation; sv_logical_type_from_c_type_id bridges C-API ↔ C++ enum-value mismatch; new test_concurrent_reads_per_call_conn.py PASSES 80 reads in 0.02s; LIFE-02 satisfied end-to-end; LIFE-01 watchdog tests still RED 5/8 pending Plan 06 H1 retirement), 65-06 (lifecycle close-out; H1 catalog_conn retired from init_extension; OverrideContext slimmed to empty struct; INTENTIONAL LEAK rationale deleted; structural guard test tests/no_long_lived_conn.rs via syn::visit::Visit AST walk; 4 D-03b post-reopen integration tests added covering semantic_view SELECT + describe + SHOW DIMENSIONS + get_ddl; LIFE-04 ledger entry closed with forward pointer; 12/12 test_readonly_load.py PASS; just test-all + just ci both green; 6/6 ADBC; LIFE-01/02/03/04 all Satisfied)
-Next plan: Phase 65 awaits orchestrator's phase-level verification dispatch; then Phase 66 (release-prep + ADBC tests + CHANGELOG) — preliminary finding from Plan 05 suggests EXPAND-CTX-01 root cause may have dissolved post-H2 retirement, so Phase 66 scope may collapse to test scaffolding + release prep only
+Next plan: /gsd:plan-phase 65.1
 Last activity: 2026-05-25
 
 ## Performance Metrics
@@ -45,6 +45,7 @@ Last activity: 2026-05-25
 
 - Phase 64 added: Fix CREATE SEMANTIC VIEW quoted identifier handling (downstream bug; quoted FQN stored verbatim, lookup by short name fails, expansion re-quotes producing triple quotes). Folded into v0.9.0 — milestone reopened pre-tag since maintainer squash-merge had not yet happened.
 - v0.9.1 opened 2026-05-21 as a two-phase patch milestone; reframed 2026-05-23 to v0.10.0 after the B-prime architecture for Phase 65 was empirically eliminated (EXEC-TIME-RC1 spike). New architectural premise: preserve `parser_override` (only DuckDB v1.5.2 mechanism that delivers transactional DDL), eliminate the catalog reads that drive the need for a connection inside parser_override (drop PK auto-inference, move metadata to SQL expressions in INSERT, fold existence checks into ON CONFLICT, defer type inference to read-side bind callbacks), and use the rewrite-to-UPDATE-with-TF-subquery pattern (ALTER-RC0) for ALTER and CREATE FROM YAML FILE. Read-path callbacks migrate to C++ Catalog API registration (READ-BIND-RC0) so they gain ClientContext for per-call Connection. Both long-lived connections retire. Phase 66 scope re-evaluation pending Phase 65 re-plan (the H2 catalog-search-path divergence may dissolve once query_conn is retired). See `.planning/phases/65-overridecontext-connection-teardown/65-BPRIME-ARCHIVE-NOTE.md` for the full pivot rationale.
+- Phase 65.1 inserted after Phase 65: Phase 65 Code Review Remediation (URGENT)
 
 ### Decisions
 
