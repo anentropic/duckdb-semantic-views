@@ -33,7 +33,16 @@ extern "C" {
 // compatibility with `sv_parser_override_rust`'s `ctx_ptr` parameter —
 // no long-lived `duckdb_connection` is owned by the extension after
 // this plan.
-bool sv_register_parser_hooks(duckdb_database db_handle);
+//
+// Phase 65.1 Plan 10 (WR-06 D-12/D-13): trailing
+// `(char *error_buf, size_t error_buf_len)` pair surfaces both the
+// BORROW-contract runtime probe failure and the helper-TF registration
+// failure via the ABI-stable channel — matching the 17 read-side
+// dispatchers and the `sv_register_table_function` / `sv_register_scalar_function`
+// helpers.
+bool sv_register_parser_hooks(
+    duckdb_database db_handle,
+    char *error_buf, size_t error_buf_len);
 
 // Phase 65 Plan 04 (A2 resolution) — register a table function via the C++
 // Catalog API so its bind callback receives a native `ClientContext &`.

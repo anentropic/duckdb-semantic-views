@@ -328,10 +328,17 @@ mod extension {
     // `is_file_backed` args are gone — parser_override paths are
     // pure-SQL and consume neither.
     extern "C" {
-        // Phase 65 Plan 06: sv_register_parser_hooks itself does NOT carry the
-        // error_buf trailing pair yet — Phase 65.1 Plan 10 (WR-06) introduces
-        // it together with the runtime layout probe. Leave the signature as-is.
-        fn sv_register_parser_hooks(db_handle: ffi::duckdb_database) -> bool;
+        // Phase 65.1 Plan 10 (WR-06 D-12/D-13): sv_register_parser_hooks now
+        // carries the `(error_buf, error_buf_len)` trailing pair — matching
+        // the 17 read-side dispatchers and the registration helpers — so the
+        // BORROW-contract runtime probe failure and helper-TF registration
+        // failure surface through the ABI-stable channel via
+        // `decode_register_err_buf`.
+        fn sv_register_parser_hooks(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
 
         // Phase 65 Plan 05 (Task 1 / Wave 0 bridge spike) — register the
         // `list_semantic_views()` table function via the C++ Catalog API
@@ -544,8 +551,32 @@ mod extension {
         // shim attaches an (empty) OverrideContext to SemanticViewsParserInfo
         // for FFI shape compatibility; no per-DB state is carried any more
         // since H1 catalog_conn was retired in this plan.
-        if !unsafe { sv_register_parser_hooks(db_handle) } {
-            return Err("Failed to register parser hooks via C++ helper".into());
+        //
+        // Phase 65.1 Plan 10 (WR-06 D-12/D-13): allocate a per-site stack
+        // buffer for the diagnostic. The C++ side writes:
+        //   - "bridge contract broken — ..." if the BORROW-contract runtime
+        //     probe fails (representation drift the file-scope static_assert
+        //     would miss);
+        //   - the `__sv_compute_create_from_yaml` helper TF registration
+        //     diagnostic (forwarded from sv_register_table_function's own
+        //     error_buf) on registration failure;
+        //   - the std::exception::what() text on any other failure path.
+        // We decode via the same helper used by the 17 read-side
+        // registrations so ADBC/JDBC/Python callers see the underlying
+        // diagnostic instead of a bare "failed".
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_parser_hooks(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register parser hooks via C++ helper: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
         }
 
         // Register table DDL read functions (list_semantic_views, describe_semantic_view).

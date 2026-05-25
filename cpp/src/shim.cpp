@@ -34,6 +34,25 @@
 using namespace duckdb;
 
 // ---------------------------------------------------------------------------
+// BORROW-contract bridge guard (Phase 65.1 Plan 10, WR-06, D-12)
+// ---------------------------------------------------------------------------
+// The `reinterpret_cast<duckdb_connection>(Connection*)` pattern used at ~20
+// bind/exec callback sites in this file (e.g. shim.cpp:993, 1285, 1311, …)
+// depends on `duckdb_connection` being layout-compatible with a single
+// pointer. This compile-time guard catches DuckDB ABI drift that would
+// change the size of `duckdb_connection` (e.g. wrapping it in a struct with
+// extra fields). The complementary runtime probe in `sv_register_parser_hooks`
+// catches representation drift the size check would miss (e.g. an indirection
+// through `internal_ptr`).
+//
+// See cpp/src/shim.cpp BORROW contract docs and
+// .planning/phases/65-overridecontext-connection-teardown/65-REVIEW.md WR-06.
+static_assert(sizeof(duckdb_connection) == sizeof(void*),
+    "duckdb_connection must be pointer-sized — bridge contract broken; "
+    "see cpp/src/shim.cpp BORROW contract docs and 65-REVIEW.md WR-06 / "
+    "Phase 65.1 D-12");
+
+// ---------------------------------------------------------------------------
 // Rust FFI declarations (defined in src/parse.rs)
 // ---------------------------------------------------------------------------
 extern "C" {
@@ -2566,8 +2585,17 @@ extern "C" {
 // but the struct is empty — preserved for FFI shape compatibility with
 // sv_parser_override_rust's ctx_ptr parameter and the dynamic_cast
 // null-guard pattern in sv_parser_override / sv_parse_stub.
+//
+// Phase 65.1 Plan 10 (WR-06 D-12/D-13): the signature now carries the
+// trailing `(char *error_buf, size_t error_buf_len)` pair — matching the
+// 17 read-side dispatchers — so registration failures and BORROW-contract
+// probe failures surface through the ABI-stable channel into the Rust
+// caller's diagnostic. A runtime probe right after the wrapper unwrap
+// catches representation drift the file-scope `static_assert` cannot.
 extern "C" {
-    bool sv_register_parser_hooks(duckdb_database db_handle) {
+    bool sv_register_parser_hooks(
+        duckdb_database db_handle,
+        char *error_buf, size_t error_buf_len) {
         try {
             // duckdb_database -> internal_ptr -> DatabaseWrapper ->
             //   shared_ptr<DuckDB> -> shared_ptr<DatabaseInstance>
@@ -2575,10 +2603,43 @@ extern "C" {
                 db_handle->internal_ptr);
             auto &db = *wrapper->database->instance;
 
+            // Phase 65.1 Plan 10 (WR-06 D-12 runtime probe). The file-scope
+            // `static_assert(sizeof(duckdb_connection) == sizeof(void*))`
+            // catches size drift; this probe catches representation drift
+            // that an equal-size change would miss (e.g. wrapping the
+            // pointer in a struct with the same layout but different
+            // semantics). Failure refuses the LOAD entirely so no
+            // semantic_views state survives a broken bridge — better than
+            // discovering the breakage on the first user query.
+            //
+            // The `Connection probe` is stack-allocated; its dtor runs at
+            // scope exit. The bridged `handle` becomes invalid but is not
+            // touched after the SELECT 1 round-trip.
+            {
+                Connection probe(db);
+                auto handle = reinterpret_cast<duckdb_connection>(&probe);
+                duckdb_result r;
+                auto rc = duckdb_query(handle, "SELECT 1", &r);
+                if (rc != DuckDBSuccess) {
+                    duckdb_destroy_result(&r);
+                    if (error_buf != nullptr && error_buf_len > 0) {
+                        snprintf(error_buf, error_buf_len,
+                            "bridge contract broken — duckdb_connection layout "
+                            "assumption failed at load time. DuckDB ABI may have "
+                            "changed; refusing to load semantic_views extension.");
+                    }
+                    return false;
+                }
+                duckdb_destroy_result(&r);
+            }
+
             void *rust_state = sv_make_override_context();
             if (!rust_state) {
-                fprintf(stderr,
-                    "sv_register_parser_hooks: sv_make_override_context returned null\n");
+                if (error_buf != nullptr && error_buf_len > 0) {
+                    snprintf(error_buf, error_buf_len,
+                        "sv_register_parser_hooks: sv_make_override_context "
+                        "returned null");
+                }
                 return false;
             }
 
@@ -2631,15 +2692,15 @@ extern "C" {
                     LogicalType::VARCHAR,  // view_name
                     LogicalType::VARCHAR,  // comment (empty = none)
                 };
-                // Phase 65.1 Plan 02a: sv_register_table_function now
-                // requires a `(error_buf, error_buf_len)` trailing pair.
-                // sv_register_parser_hooks itself does not (yet) accept
-                // an error_buf parameter — that is Plan 10 (WR-06)
-                // territory. Until then we use a local stack buffer and
-                // forward the diagnostic to stderr ON FAILURE ONLY
-                // (matches the pre-existing behaviour of this specific
-                // call site; D-09 applies to the helpers themselves,
-                // not to this still-stderr-bound caller).
+                // Phase 65.1 Plan 02a: sv_register_table_function requires a
+                // `(error_buf, error_buf_len)` trailing pair.
+                //
+                // Phase 65.1 Plan 10 (WR-06 D-13): sv_register_parser_hooks
+                // now carries its own error_buf; forward the helper TF's
+                // diagnostic into the parent buffer so the Rust caller
+                // surfaces it through `decode_register_err_buf`. The local
+                // buffer is needed because the helper writes via snprintf
+                // and may truncate independently of our outer buffer's size.
                 char helper_err[1024];
                 std::memset(helper_err, 0, sizeof(helper_err));
                 if (!sv_register_table_function(
@@ -2650,17 +2711,22 @@ extern "C" {
                         sv_create_from_yaml_function,
                         sv_create_from_yaml_init_local,
                         helper_err, sizeof(helper_err))) {
-                    fprintf(stderr,
-                        "sv_register_parser_hooks: failed to register "
-                        "__sv_compute_create_from_yaml helper TF: %s\n",
-                        helper_err);
+                    if (error_buf != nullptr && error_buf_len > 0) {
+                        snprintf(error_buf, error_buf_len,
+                            "sv_register_parser_hooks: failed to register "
+                            "__sv_compute_create_from_yaml helper TF: %s",
+                            helper_err);
+                    }
                     return false;
                 }
             }
 
             return true;
         } catch (const std::exception &e) {
-            fprintf(stderr, "sv_register_parser_hooks failed: %s\n", e.what());
+            if (error_buf != nullptr && error_buf_len > 0) {
+                snprintf(error_buf, error_buf_len,
+                    "sv_register_parser_hooks failed: %s", e.what());
+            }
             return false;
         }
     }
