@@ -856,6 +856,17 @@ static unique_ptr<LocalTableFunctionState> sv_create_from_yaml_init_local(
     return make_uniq<CreateFromYamlLocalState>();
 }
 
+// Phase 65.1 D-07 (IN-01 refresh): this TF's single-shot emission is enforced
+// via `init_local` — `sv_create_from_yaml_init_local` (defined just above)
+// constructs the `CreateFromYamlLocalState` flag that the exec callback below
+// reads to decide whether to emit. `sv_register_table_function` refuses null
+// `init_cb` at registration time per Phase 65.1 D-05 (registration helper
+// surfaces the refusal text "init_cb is mandatory" via the error_buf), so
+// reaching the `InternalException` branch in the exec callback is a
+// corrupted-state diagnostic rather than a normal failure mode. The earlier
+// recommendation that previously lived here (to rewire registration through
+// the init_local callback) is retired — D-05 enforcement (Plan 02) and D-04
+// fallback removal (Plan 08) closed it.
 static void sv_create_from_yaml_function(
     ClientContext & /*context*/,
     TableFunctionInput &data_p,
