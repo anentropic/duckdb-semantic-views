@@ -123,3 +123,125 @@ fn init_extension_has_no_duckdb_connect_call() {
         f.found_call_sites
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 65.1 Plan 03b (D-11 / WR-05) — defence-in-depth AST walker for
+// `duckdb_disconnect` calls anywhere in `src/`.
+// ---------------------------------------------------------------------------
+//
+// The BorrowedConnection newtype (Phase 65.1 D-10, src/ddl/read_ffi.rs) is
+// the primary type-level guard: `ffi::duckdb_disconnect` accepts
+// `*mut duckdb_connection`, and `&mut BorrowedConnection` cannot coerce to
+// that type, so the call fails to type-check. This walker is the second
+// layer: it scans every `.rs` file under `src/` for any call expression
+// whose terminal path segment is `duckdb_disconnect`, and fails the test
+// if any are found. The combination of (a) newtype at the type system and
+// (b) AST guard at the syntax layer makes accidental reintroduction
+// essentially impossible without conscious circumvention.
+//
+// Same known limitation as the `Finder` above: this walker matches the
+// terminal path segment literally and does NOT resolve `use … as` aliases.
+// Documented per Phase 65 D-22 (bounded scope with signal surfacing).
+
+/// Allow-list of `(file_path, full_call_path)` pairs that legitimately call
+/// `duckdb_disconnect`. The single legitimate case in this crate today is
+/// the `RawDb` test fixture in `src/lib.rs::test_helpers`, which OWNS its
+/// `duckdb_database` + `duckdb_connection` pair (via `duckdb_open` +
+/// `duckdb_connect` in `open_in_memory`) and releases them in `Drop`. That
+/// is the canonical OWN-and-release pattern — NOT a BORROW. The
+/// BorrowedConnection guard concerns the borrow case (handles received via
+/// FFI from `Connection probe(*context.db)` on the C++ side); test fixtures
+/// that allocate their own handle are out of its scope.
+///
+/// Every entry here is a deliberate exception. Adding to this list during
+/// code review should require explicit justification ("this site owns the
+/// handle and releases it; no borrow is involved").
+const ALLOWED_DISCONNECT_SITES: &[(&str, &str)] = &[
+    // src/lib.rs::test_helpers::RawDb::Drop — owns the connection allocated
+    // by RawDb::open_in_memory (paired with duckdb_open + duckdb_connect).
+    // Test-only module (`#[cfg(not(feature = "extension"))]`).
+    ("src/lib.rs", "ffi::duckdb_disconnect"),
+];
+
+/// Walks all of `src/` looking for any call expression whose last path
+/// segment is the identifier `duckdb_disconnect`. The BorrowedConnection
+/// newtype prevents these at the type level; this AST guard is defence in
+/// depth and produces a clear diagnostic on regression. Allowed sites are
+/// filtered via `ALLOWED_DISCONNECT_SITES` above.
+struct DisconnectFinder {
+    /// (source_file_path, full_call_path) for every match found.
+    found_call_sites: Vec<(String, String)>,
+    current_file: String,
+}
+
+impl<'ast> Visit<'ast> for DisconnectFinder {
+    fn visit_expr_call(&mut self, c: &'ast ExprCall) {
+        if let syn::Expr::Path(p) = &*c.func {
+            if let Some(last) = p.path.segments.last() {
+                if last.ident == "duckdb_disconnect" {
+                    let segs: Vec<String> = p
+                        .path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect();
+                    self.found_call_sites
+                        .push((self.current_file.clone(), segs.join("::")));
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, c);
+    }
+}
+
+#[test]
+fn no_duckdb_disconnect_anywhere_in_src() {
+    let mut finder = DisconnectFinder {
+        found_call_sites: Vec::new(),
+        current_file: String::new(),
+    };
+
+    for entry in walkdir::WalkDir::new("src/") {
+        let entry = entry.expect("walkdir entry");
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = match std::fs::read_to_string(entry.path()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let file = match syn::parse_str::<syn::File>(&src) {
+            Ok(f) => f,
+            // Skip unparseable files — should not happen in src/, but a
+            // hard panic here would mask the real signal. The
+            // type-level BorrowedConnection guard still covers them.
+            Err(_) => continue,
+        };
+        finder.current_file = entry.path().display().to_string();
+        finder.visit_file(&file);
+    }
+
+    // Filter out documented OWN-and-release sites (paired duckdb_open +
+    // duckdb_connect + duckdb_disconnect + duckdb_close on a self-owned
+    // handle — typically Drop impls). See ALLOWED_DISCONNECT_SITES.
+    finder.found_call_sites.retain(|(file, path)| {
+        !ALLOWED_DISCONNECT_SITES
+            .iter()
+            .any(|(allowed_file, allowed_path)| file == allowed_file && path == allowed_path)
+    });
+
+    assert!(
+        finder.found_call_sites.is_empty(),
+        "duckdb_disconnect call sites found in src/: {:#?}. \
+         The BorrowedConnection newtype (Phase 65.1 D-10, \
+         src/ddl/read_ffi.rs) makes `ffi::duckdb_disconnect(&mut borrowed)` \
+         fail to type-check by design — a raw `ffi::duckdb_connection` \
+         should never be disconnected by Rust code in this crate. The \
+         per-call `Connection probe(*context.db)` constructed on the C++ \
+         side owns its handle and tears itself down via ~Connection() at \
+         scope exit. See \
+         .planning/phases/65.1-phase-65-code-review-remediation/65.1-CONTEXT.md \
+         (D-10 + D-11) for the full record.",
+        finder.found_call_sites
+    );
+}
