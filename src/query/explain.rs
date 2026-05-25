@@ -52,13 +52,14 @@ use super::table_function::{execute_sql_raw, read_varchar_from_vector};
 /// `Vec<String>`. Returns `None` on truncation / overflow (the C++ side
 /// surfaces this as rc=1 via the dispatcher).
 unsafe fn parse_string_list(buf: *const u8, len: usize) -> Option<Vec<String>> {
-    if buf.is_null() || len < 4 {
-        if buf.is_null() && len == 0 {
-            return Some(Vec::new());
-        }
-        if len < 4 {
-            return None;
-        }
+    // Handle null buffer explicitly before len-check so a pathological
+    // (null, len > 0) FFI call cannot fall through to from_raw_parts(null, len),
+    // which is UB. Mirrors src/query/table_function.rs::sv_parse_string_list.
+    if buf.is_null() {
+        return if len == 0 { Some(Vec::new()) } else { None };
+    }
+    if len < 4 {
+        return None;
     }
     let slice = std::slice::from_raw_parts(buf, len);
     let mut off = 0usize;
