@@ -61,6 +61,44 @@ blocker.
 
 ## In-process RW→RO reopen of the same DB hangs (Phase 62 OverrideContext leak)
 
+**Status:** RESOLVED in v0.10.0 (2026-05-25) — Phase 65.
+
+**Resolution:** Phase 65 retired both long-lived extension-owned
+`duckdb_connection` handles that kept the DuckDB `Database` alive past
+the caller's `close()`:
+
+- **H1 catalog_conn** (`src/lib.rs:386-410`, the
+  `duckdb_connect(db_handle, &mut catalog_conn)` allocated in
+  `init_extension` for `OverrideContext.catalog`) — retired in Plan 06
+  (commit `964b0bf`).
+- **H2 query_conn** (`src/lib.rs:498-507`, the second
+  `duckdb_connect` allocated in `init_extension` for `QueryState`) —
+  retired in Plan 05.
+
+The architectural shift was to eliminate catalog reads inside the
+`parser_override` hook (Plan 03) rather than relocate them, then
+migrate all 17 read-side bind callbacks (Plan 05) to the C++ Catalog
+API shim where each bind opens a per-call `Connection(*context.db)`.
+With no long-lived handle in `init_extension`, `DBInstanceCache::
+GetInstanceInternal` no longer busy-spins on the next in-process
+reopen.
+
+**Regression protection:** Structural Rust unit test
+`tests/no_long_lived_conn.rs` (Plan 06 Task 2) walks `src/lib.rs` via
+`syn::visit::Visit` and asserts `init_extension` contains no
+`duckdb_connect` call. CI gate against re-introduction.
+
+**Watchdog evidence:** `test/integration/test_readonly_load.py` tests
+B1-B4 + B11 (Plan 01) + 4 D-03b post-reopen tests (Plan 06 Task 3) all
+flip from FAIL on v0.9.0 baseline to PASS on milestone/v0.10.0.
+
+**Forward pointer:** `.planning/phases/65-overridecontext-connection-teardown/`
+(65-CONTEXT.md, 65-RESEARCH.md, 65-01..06 per-plan SUMMARYs).
+
+---
+
+### Original report (for historical reference)
+
 Discovered during Plan 02 Task 1 (Python integration test). Sequence
 that reproduces:
 
