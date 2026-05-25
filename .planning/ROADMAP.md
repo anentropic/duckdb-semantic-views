@@ -256,7 +256,7 @@ Plans (in wave order):
 - [x] 65.1-05-PLAN.md (Wave 1) — WR-04: concurrent writes integration test (CREATE/DROP/ALTER race coverage)
 - [x] 65.1-02b-PLAN.md (Wave 2) — WR-02 Rust-side: src/lib.rs call sites cascade + populate registration_error_surfaces.rs test (W-01 typed stubs, no transmute)
 - [x] 65.1-03b-PLAN.md (Wave 2) — WR-05 query/ side: 2 query/ dispatcher migration + DisconnectFinder AST guard extension
-- [ ] 65.1-04-PLAN.md (Wave 2) — WR-03: outer-CASE guard for never-bootstrapped RO DROP/ALTER + integration test (W-06 IF EXISTS pinned)
+- [x] 65.1-04-PLAN.md (Wave 2) — WR-03: outer-CASE guard for never-bootstrapped RO DROP/ALTER + integration test (W-06 IF EXISTS pinned)
 - [ ] 65.1-07-PLAN.md (Wave 3) — CR-01 + IN-04: FileSystem-direct YAML read + kind-param removal + access-gating sqllogictest
 - [ ] 65.1-08-PLAN.md (Wave 3) — CR-02 (D-04) + IN-01: converge 4 exec callbacks single-shot + stale comment refresh
 - [ ] 65.1-09-PLAN.md (Wave 3) — IN-02/IN-03 + IN-05: type_cache deletion + null-name sqllogictest (IN-06 moved to 03a)
