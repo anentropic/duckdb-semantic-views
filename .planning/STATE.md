@@ -4,13 +4,13 @@ milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: ready_to_plan
 stopped_at: "Phase 65.1 Plan 04 complete (WR-03 fix: definitions_table_guard_select)"
-last_updated: "2026-05-25T22:57:23.815Z"
+last_updated: "2026-05-25T23:17:11.066Z"
 last_activity: 2026-05-25
 progress:
   total_phases: 3
   completed_phases: 1
   total_plans: 19
-  completed_plans: 21
+  completed_plans: 22
   percent: 33
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 ## Current Position
 
 Phase: 65.1 (phase-65-code-review-remediation) — EXECUTING
-Plan: 12 of 14
+Plan: 13 of 14
 Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership), 65-05 (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection(*context.db) bind; H2 query_conn allocation DELETED from init_extension; 17 legacy duckdb-rs VTab/VScalar struct + impl blocks purged atomically ~2,632 LOC across 13 files; src/type_cache.rs unbounded HashMap cache landed unused as deferred optimisation; sv_logical_type_from_c_type_id bridges C-API ↔ C++ enum-value mismatch; new test_concurrent_reads_per_call_conn.py PASSES 80 reads in 0.02s; LIFE-02 satisfied end-to-end; LIFE-01 watchdog tests still RED 5/8 pending Plan 06 H1 retirement), 65-06 (lifecycle close-out; H1 catalog_conn retired from init_extension; OverrideContext slimmed to empty struct; INTENTIONAL LEAK rationale deleted; structural guard test tests/no_long_lived_conn.rs via syn::visit::Visit AST walk; 4 D-03b post-reopen integration tests added covering semantic_view SELECT + describe + SHOW DIMENSIONS + get_ddl; LIFE-04 ledger entry closed with forward pointer; 12/12 test_readonly_load.py PASS; just test-all + just ci both green; 6/6 ADBC; LIFE-01/02/03/04 all Satisfied)
 Next plan: /gsd:plan-phase 65.1
 Last activity: 2026-05-25
@@ -193,10 +193,11 @@ Recent decisions affecting current work:
 | Phase 65.1 P09 | 15min | 2 tasks | 5 files |
 | Phase 65.1 P10 | 25min | 1 tasks | 3 files |
 | Phase 65.1 P11 | 12min | 3 tasks | 3 files |
+| Phase 65.1 P12 | 40min | 3 tasks | 5 files |
 
 ## Session Continuity
 
-Last session: 2026-05-25T22:57:14.465Z
+Last session: 2026-05-25T23:17:01.371Z
 Stopped at: Phase 65.1 Plan 04 complete (WR-03 fix: definitions_table_guard_select)
 Resume file: 
 None
