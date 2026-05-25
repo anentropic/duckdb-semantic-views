@@ -559,6 +559,14 @@ static ParserExtensionPlanResult sv_plan_unreachable(
 // callbacks off `query_conn` (H2).
 //
 // Header declaration in cpp/src/shim.hpp.
+// Phase 65.1 Plan 02a (WR-02 D-08/D-09 + CR-02 D-05) — registration
+// failures surface via the `(error_buf, error_buf_len)` trailing pair,
+// the same ABI-stable channel used by `sv_parser_override_rust`
+// (shim.cpp:57-61). Per D-09 there is NO stderr write — ADBC/JDBC/Python
+// callers may have redirected stderr; `error_buf` is the only reliable
+// path. D-05: `init_cb == nullptr` is rejected at registration time
+// (forces every TF onto the single-shot-via-local-state path so the
+// double-emit / unbounded-loop hazard in CR-02 cannot recur).
 extern "C" {
     bool sv_register_table_function(
         duckdb_database db_handle,
@@ -567,19 +575,35 @@ extern "C" {
         size_t arg_count,
         table_function_bind_t bind_cb,
         table_function_t exec_cb,
-        table_function_init_local_t init_cb) {
+        table_function_init_local_t init_cb,
+        char *error_buf, size_t error_buf_len) {
+        // D-05 enforced shape: every required callback (including
+        // init_cb — tightened from "may be null" pre-Phase-65.1) is
+        // checked at the top before any allocation. Guard the snprintf
+        // calls against a null/zero-cap buffer.
+        auto write_err = [error_buf, error_buf_len](const char *fmt,
+                                                    const char *arg1) {
+            if (error_buf == nullptr || error_buf_len == 0) {
+                return;
+            }
+            snprintf(error_buf, error_buf_len, fmt, arg1 ? arg1 : "(null)");
+        };
         try {
             if (db_handle == nullptr || name == nullptr ||
-                bind_cb == nullptr || exec_cb == nullptr) {
-                fprintf(stderr,
-                    "sv_register_table_function: null required argument\n");
+                bind_cb == nullptr || exec_cb == nullptr ||
+                init_cb == nullptr) {
+                write_err(
+                    "sv_register_table_function('%s'): null required "
+                    "argument (init_cb is mandatory)",
+                    name);
                 return false;
             }
             auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
                 db_handle->internal_ptr);
             if (wrapper == nullptr) {
-                fprintf(stderr,
-                    "sv_register_table_function: null DatabaseWrapper\n");
+                write_err(
+                    "sv_register_table_function('%s'): null DatabaseWrapper",
+                    name);
                 return false;
             }
             auto &db = *wrapper->database->instance;
@@ -591,9 +615,8 @@ extern "C" {
             }
 
             // Six-arg TableFunction ctor: (name, args, function, bind,
-            // init_global, init_local). init_global is nullptr; init_local
-            // may be null when the helper TF has no per-execution local
-            // state (e.g. simple one-row emitters like the YAML helper).
+            // init_global, init_local). init_global is nullptr; init_cb
+            // (init_local) is now mandatory per D-05 — refused above.
             TableFunction tf(
                 std::string(name),
                 std::move(args),
@@ -613,14 +636,16 @@ extern "C" {
             system_catalog.CreateTableFunction(txn, info);
             return true;
         } catch (const std::exception &e) {
-            fprintf(stderr,
-                "sv_register_table_function('%s') failed: %s\n",
-                name ? name : "(null)", e.what());
+            if (error_buf != nullptr && error_buf_len > 0) {
+                snprintf(error_buf, error_buf_len,
+                    "sv_register_table_function('%s') failed: %s",
+                    name ? name : "(null)", e.what());
+            }
             return false;
         } catch (...) {
-            fprintf(stderr,
-                "sv_register_table_function('%s') failed: unknown exception\n",
-                name ? name : "(null)");
+            write_err(
+                "sv_register_table_function('%s') failed: unknown C++ exception",
+                name);
             return false;
         }
     }
@@ -636,6 +661,10 @@ extern "C" {
 // `register_scalar_function_with_state`.
 //
 // Header declaration in cpp/src/shim.hpp.
+// Phase 65.1 Plan 02a (WR-02 D-08/D-09) — see sv_register_table_function
+// for the rationale. Scalar functions have no `init_local` concept, so
+// D-05 (null-init refusal) does NOT apply here; the required-arg set
+// stays db_handle / name / exec_cb.
 extern "C" {
     bool sv_register_scalar_function(
         duckdb_database db_handle,
@@ -643,18 +672,28 @@ extern "C" {
         const LogicalType *arg_types,
         size_t arg_count,
         LogicalType return_type,
-        scalar_function_t exec_cb) {
+        scalar_function_t exec_cb,
+        char *error_buf, size_t error_buf_len) {
+        auto write_err = [error_buf, error_buf_len](const char *fmt,
+                                                    const char *arg1) {
+            if (error_buf == nullptr || error_buf_len == 0) {
+                return;
+            }
+            snprintf(error_buf, error_buf_len, fmt, arg1 ? arg1 : "(null)");
+        };
         try {
             if (db_handle == nullptr || name == nullptr || exec_cb == nullptr) {
-                fprintf(stderr,
-                    "sv_register_scalar_function: null required argument\n");
+                write_err(
+                    "sv_register_scalar_function('%s'): null required argument",
+                    name);
                 return false;
             }
             auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
                 db_handle->internal_ptr);
             if (wrapper == nullptr) {
-                fprintf(stderr,
-                    "sv_register_scalar_function: null DatabaseWrapper\n");
+                write_err(
+                    "sv_register_scalar_function('%s'): null DatabaseWrapper",
+                    name);
                 return false;
             }
             auto &db = *wrapper->database->instance;
@@ -675,14 +714,16 @@ extern "C" {
             system_catalog.CreateFunction(txn, info);
             return true;
         } catch (const std::exception &e) {
-            fprintf(stderr,
-                "sv_register_scalar_function('%s') failed: %s\n",
-                name ? name : "(null)", e.what());
+            if (error_buf != nullptr && error_buf_len > 0) {
+                snprintf(error_buf, error_buf_len,
+                    "sv_register_scalar_function('%s') failed: %s",
+                    name ? name : "(null)", e.what());
+            }
             return false;
         } catch (...) {
-            fprintf(stderr,
-                "sv_register_scalar_function('%s') failed: unknown exception\n",
-                name ? name : "(null)");
+            write_err(
+                "sv_register_scalar_function('%s') failed: unknown C++ exception",
+                name);
             return false;
         }
     }
@@ -1059,7 +1100,8 @@ static void sv_list_semantic_views_function(
 }
 
 extern "C" {
-    bool sv_register_list_semantic_views(duckdb_database db_handle) {
+    bool sv_register_list_semantic_views(duckdb_database db_handle,
+                                         char *error_buf, size_t error_buf_len) {
         // Zero-argument table function — no arg_types array.
         return sv_register_table_function(
             db_handle,
@@ -1067,7 +1109,8 @@ extern "C" {
             /*arg_types*/ nullptr, /*arg_count*/ 0,
             sv_list_semantic_views_bind,
             sv_list_semantic_views_function,
-            sv_list_semantic_views_init_local);
+            sv_list_semantic_views_init_local,
+            error_buf, error_buf_len);
     }
 }
 
@@ -1135,7 +1178,12 @@ static void sv_emit_varchar_rows(
     DataChunk &output) {
     auto &bd = data_p.bind_data->Cast<SvVarcharBindData>();
     auto *state_p = data_p.local_state.get();
-    bool emitted = false;
+    // Phase 65.1 Plan 02a D-06: removed the misleading single-shot
+    // semantics comment that previously sat here. Without local state
+    // this code path would re-emit every chunk; the CR-02 fix (Plan 08)
+    // re-shapes the callback to throw when state_p is null, and D-05
+    // (Plan 02a) refuses null init_cb at registration so the null-state
+    // path is unreachable in production.
     if (state_p) {
         auto &state = state_p->Cast<SvVarcharLocalState>();
         if (state.emitted) {
@@ -1143,9 +1191,7 @@ static void sv_emit_varchar_rows(
             return;
         }
         state.emitted = true;
-        emitted = true;
     }
-    (void)emitted;  // single-shot semantics — even without local state we emit once per bind
     idx_t n = bd.rows.size();
     for (idx_t i = 0; i < n; ++i) {
         const auto &row = bd.rows[i];
@@ -1360,14 +1406,16 @@ static unique_ptr<FunctionData> sv_list_terse_semantic_views_bind(
 }
 
 extern "C" {
-    bool sv_register_list_terse_semantic_views(duckdb_database db_handle) {
+    bool sv_register_list_terse_semantic_views(duckdb_database db_handle,
+                                               char *error_buf, size_t error_buf_len) {
         return sv_register_table_function(
             db_handle,
             "list_terse_semantic_views",
             /*arg_types*/ nullptr, /*arg_count*/ 0,
             sv_list_terse_semantic_views_bind,
             sv_emit_varchar_rows,
-            sv_varchar_init_local);
+            sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
 }
 
@@ -1402,12 +1450,14 @@ static unique_ptr<FunctionData> sv_show_semantic_dimensions_all_bind(
 }
 
 extern "C" {
-    bool sv_register_show_semantic_dimensions_all(duckdb_database db_handle) {
+    bool sv_register_show_semantic_dimensions_all(duckdb_database db_handle,
+                                                  char *error_buf, size_t error_buf_len) {
         return sv_register_table_function(
             db_handle, "show_semantic_dimensions_all",
             nullptr, 0,
             sv_show_semantic_dimensions_all_bind,
-            sv_emit_varchar_rows, sv_varchar_init_local);
+            sv_emit_varchar_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
 }
 
@@ -1441,12 +1491,14 @@ static unique_ptr<FunctionData> sv_show_semantic_metrics_all_bind(
 }
 
 extern "C" {
-    bool sv_register_show_semantic_metrics_all(duckdb_database db_handle) {
+    bool sv_register_show_semantic_metrics_all(duckdb_database db_handle,
+                                               char *error_buf, size_t error_buf_len) {
         return sv_register_table_function(
             db_handle, "show_semantic_metrics_all",
             nullptr, 0,
             sv_show_semantic_metrics_all_bind,
-            sv_emit_varchar_rows, sv_varchar_init_local);
+            sv_emit_varchar_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
 }
 
@@ -1480,12 +1532,14 @@ static unique_ptr<FunctionData> sv_show_semantic_facts_all_bind(
 }
 
 extern "C" {
-    bool sv_register_show_semantic_facts_all(duckdb_database db_handle) {
+    bool sv_register_show_semantic_facts_all(duckdb_database db_handle,
+                                             char *error_buf, size_t error_buf_len) {
         return sv_register_table_function(
             db_handle, "show_semantic_facts_all",
             nullptr, 0,
             sv_show_semantic_facts_all_bind,
-            sv_emit_varchar_rows, sv_varchar_init_local);
+            sv_emit_varchar_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
 }
 
@@ -1520,12 +1574,14 @@ static unique_ptr<FunctionData> sv_show_semantic_materializations_all_bind(
 }
 
 extern "C" {
-    bool sv_register_show_semantic_materializations_all(duckdb_database db_handle) {
+    bool sv_register_show_semantic_materializations_all(duckdb_database db_handle,
+                                                        char *error_buf, size_t error_buf_len) {
         return sv_register_table_function(
             db_handle, "show_semantic_materializations_all",
             nullptr, 0,
             sv_show_semantic_materializations_all_bind,
-            sv_emit_varchar_rows, sv_varchar_init_local);
+            sv_emit_varchar_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
 }
 
@@ -1718,61 +1774,75 @@ static unique_ptr<FunctionData> sv_show_semantic_dimensions_for_metric_bind(
 }
 
 extern "C" {
-    bool sv_register_show_columns_in_semantic_view(duckdb_database db_handle) {
+    bool sv_register_show_columns_in_semantic_view(duckdb_database db_handle,
+                                                   char *error_buf, size_t error_buf_len) {
         LogicalType args[] = {LogicalType::VARCHAR};
         return sv_register_table_function(
             db_handle, "show_columns_in_semantic_view",
             args, 1,
             sv_show_columns_in_semantic_view_bind,
-            sv_emit_varchar_rows, sv_varchar_init_local);
+            sv_emit_varchar_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
-    bool sv_register_describe_semantic_view(duckdb_database db_handle) {
+    bool sv_register_describe_semantic_view(duckdb_database db_handle,
+                                            char *error_buf, size_t error_buf_len) {
         LogicalType args[] = {LogicalType::VARCHAR};
         return sv_register_table_function(
             db_handle, "describe_semantic_view",
             args, 1,
             sv_describe_semantic_view_bind,
-            sv_emit_varchar_rows, sv_varchar_init_local);
+            sv_emit_varchar_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
-    bool sv_register_show_semantic_dimensions(duckdb_database db_handle) {
+    bool sv_register_show_semantic_dimensions(duckdb_database db_handle,
+                                              char *error_buf, size_t error_buf_len) {
         LogicalType args[] = {LogicalType::VARCHAR};
         return sv_register_table_function(
             db_handle, "show_semantic_dimensions",
             args, 1,
             sv_show_semantic_dimensions_bind,
-            sv_emit_varchar_rows, sv_varchar_init_local);
+            sv_emit_varchar_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
-    bool sv_register_show_semantic_metrics(duckdb_database db_handle) {
+    bool sv_register_show_semantic_metrics(duckdb_database db_handle,
+                                           char *error_buf, size_t error_buf_len) {
         LogicalType args[] = {LogicalType::VARCHAR};
         return sv_register_table_function(
             db_handle, "show_semantic_metrics",
             args, 1,
             sv_show_semantic_metrics_bind,
-            sv_emit_varchar_rows, sv_varchar_init_local);
+            sv_emit_varchar_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
-    bool sv_register_show_semantic_facts(duckdb_database db_handle) {
+    bool sv_register_show_semantic_facts(duckdb_database db_handle,
+                                         char *error_buf, size_t error_buf_len) {
         LogicalType args[] = {LogicalType::VARCHAR};
         return sv_register_table_function(
             db_handle, "show_semantic_facts",
             args, 1,
             sv_show_semantic_facts_bind,
-            sv_emit_varchar_rows, sv_varchar_init_local);
+            sv_emit_varchar_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
-    bool sv_register_show_semantic_materializations(duckdb_database db_handle) {
+    bool sv_register_show_semantic_materializations(duckdb_database db_handle,
+                                                    char *error_buf, size_t error_buf_len) {
         LogicalType args[] = {LogicalType::VARCHAR};
         return sv_register_table_function(
             db_handle, "show_semantic_materializations",
             args, 1,
             sv_show_semantic_materializations_bind,
-            sv_emit_varchar_rows, sv_varchar_init_local);
+            sv_emit_varchar_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
-    bool sv_register_show_semantic_dimensions_for_metric(duckdb_database db_handle) {
+    bool sv_register_show_semantic_dimensions_for_metric(duckdb_database db_handle,
+                                                         char *error_buf, size_t error_buf_len) {
         LogicalType args[] = {LogicalType::VARCHAR, LogicalType::VARCHAR};
         return sv_register_table_function(
             db_handle, "show_semantic_dimensions_for_metric",
             args, 2,
             sv_show_semantic_dimensions_for_metric_bind,
-            sv_emit_varchar_bool_rows, sv_varchar_init_local);
+            sv_emit_varchar_bool_rows, sv_varchar_init_local,
+            error_buf, error_buf_len);
     }
 }
 
@@ -1895,21 +1965,25 @@ static void sv_read_yaml_from_semantic_view_exec(DataChunk &args,
 }
 
 extern "C" {
-    bool sv_register_get_ddl(duckdb_database db_handle) {
+    bool sv_register_get_ddl(duckdb_database db_handle,
+                             char *error_buf, size_t error_buf_len) {
         LogicalType args[] = {LogicalType::VARCHAR, LogicalType::VARCHAR};
         return sv_register_scalar_function(
             db_handle, "get_ddl",
             args, 2,
             LogicalType::VARCHAR,
-            sv_get_ddl_exec);
+            sv_get_ddl_exec,
+            error_buf, error_buf_len);
     }
-    bool sv_register_read_yaml_from_semantic_view(duckdb_database db_handle) {
+    bool sv_register_read_yaml_from_semantic_view(duckdb_database db_handle,
+                                                  char *error_buf, size_t error_buf_len) {
         LogicalType args[] = {LogicalType::VARCHAR};
         return sv_register_scalar_function(
             db_handle, "read_yaml_from_semantic_view",
             args, 1,
             LogicalType::VARCHAR,
-            sv_read_yaml_from_semantic_view_exec);
+            sv_read_yaml_from_semantic_view_exec,
+            error_buf, error_buf_len);
     }
 }
 
@@ -2036,13 +2110,26 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
 // Borrow contract identical to sv_register_table_function: callbacks
 // receive `ClientContext &` and the bind opens per-call Connections —
 // no long-lived extension-owned `duckdb_connection`.
-static bool sv_register_explain_semantic_view_impl(duckdb_database db_handle) {
+// Phase 65.1 Plan 02a (WR-02 D-08/D-09) — hand-built impl writes
+// failures directly into the supplied `error_buf` via snprintf instead
+// of stderr, mirroring `sv_register_table_function`. The buffer
+// argument is forwarded by `sv_register_explain_semantic_view` below;
+// init_extension (Plan 02b) supplies it.
+static bool sv_register_explain_semantic_view_impl(duckdb_database db_handle,
+                                                   char *error_buf,
+                                                   size_t error_buf_len) {
+    auto write_err = [error_buf, error_buf_len](const char *msg) {
+        if (error_buf == nullptr || error_buf_len == 0) {
+            return;
+        }
+        snprintf(error_buf, error_buf_len, "%s", msg);
+    };
     try {
         auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
             db_handle->internal_ptr);
         if (wrapper == nullptr) {
-            fprintf(stderr,
-                "sv_register_explain_semantic_view: null DatabaseWrapper\n");
+            write_err(
+                "sv_register_explain_semantic_view: null DatabaseWrapper");
             return false;
         }
         auto &db = *wrapper->database->instance;
@@ -2071,19 +2158,23 @@ static bool sv_register_explain_semantic_view_impl(duckdb_database db_handle) {
         system_catalog.CreateTableFunction(txn, info);
         return true;
     } catch (const std::exception &e) {
-        fprintf(stderr,
-            "sv_register_explain_semantic_view failed: %s\n", e.what());
+        if (error_buf != nullptr && error_buf_len > 0) {
+            snprintf(error_buf, error_buf_len,
+                "sv_register_explain_semantic_view failed: %s", e.what());
+        }
         return false;
     } catch (...) {
-        fprintf(stderr,
-            "sv_register_explain_semantic_view failed: unknown exception\n");
+        write_err(
+            "sv_register_explain_semantic_view failed: unknown C++ exception");
         return false;
     }
 }
 
 extern "C" {
-    bool sv_register_explain_semantic_view(duckdb_database db_handle) {
-        return sv_register_explain_semantic_view_impl(db_handle);
+    bool sv_register_explain_semantic_view(duckdb_database db_handle,
+                                           char *error_buf, size_t error_buf_len) {
+        return sv_register_explain_semantic_view_impl(
+            db_handle, error_buf, error_buf_len);
     }
 }
 
@@ -2403,13 +2494,24 @@ static void sv_semantic_view_function(
 // `named_parameters` map can be populated for `dimensions` / `metrics` /
 // `facts`. Also passes `init_global` because semantic_view's exec needs
 // per-execution global state (the materialised query result).
-static bool sv_register_semantic_view_impl(duckdb_database db_handle) {
+// Phase 65.1 Plan 02a (WR-02 D-08/D-09) — see
+// `sv_register_explain_semantic_view_impl` for the rationale. Same
+// snprintf-into-error_buf convention; no stderr writes.
+static bool sv_register_semantic_view_impl(duckdb_database db_handle,
+                                           char *error_buf,
+                                           size_t error_buf_len) {
+    auto write_err = [error_buf, error_buf_len](const char *msg) {
+        if (error_buf == nullptr || error_buf_len == 0) {
+            return;
+        }
+        snprintf(error_buf, error_buf_len, "%s", msg);
+    };
     try {
         auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
             db_handle->internal_ptr);
         if (wrapper == nullptr) {
-            fprintf(stderr,
-                "sv_register_semantic_view: null DatabaseWrapper\n");
+            write_err(
+                "sv_register_semantic_view: null DatabaseWrapper");
             return false;
         }
         auto &db = *wrapper->database->instance;
@@ -2435,19 +2537,23 @@ static bool sv_register_semantic_view_impl(duckdb_database db_handle) {
         system_catalog.CreateTableFunction(txn, info);
         return true;
     } catch (const std::exception &e) {
-        fprintf(stderr,
-            "sv_register_semantic_view failed: %s\n", e.what());
+        if (error_buf != nullptr && error_buf_len > 0) {
+            snprintf(error_buf, error_buf_len,
+                "sv_register_semantic_view failed: %s", e.what());
+        }
         return false;
     } catch (...) {
-        fprintf(stderr,
-            "sv_register_semantic_view failed: unknown exception\n");
+        write_err(
+            "sv_register_semantic_view failed: unknown C++ exception");
         return false;
     }
 }
 
 extern "C" {
-    bool sv_register_semantic_view(duckdb_database db_handle) {
-        return sv_register_semantic_view_impl(db_handle);
+    bool sv_register_semantic_view(duckdb_database db_handle,
+                                   char *error_buf, size_t error_buf_len) {
+        return sv_register_semantic_view_impl(
+            db_handle, error_buf, error_buf_len);
     }
 }
 
@@ -2522,16 +2628,29 @@ extern "C" {
                     LogicalType::INTEGER,  // kind (0/1/2)
                     LogicalType::VARCHAR,  // comment (empty = none)
                 };
+                // Phase 65.1 Plan 02a: sv_register_table_function now
+                // requires a `(error_buf, error_buf_len)` trailing pair.
+                // sv_register_parser_hooks itself does not (yet) accept
+                // an error_buf parameter — that is Plan 10 (WR-06)
+                // territory. Until then we use a local stack buffer and
+                // forward the diagnostic to stderr ON FAILURE ONLY
+                // (matches the pre-existing behaviour of this specific
+                // call site; D-09 applies to the helpers themselves,
+                // not to this still-stderr-bound caller).
+                char helper_err[1024];
+                std::memset(helper_err, 0, sizeof(helper_err));
                 if (!sv_register_table_function(
                         db_handle,
                         "__sv_compute_create_from_yaml",
                         arg_types, 4,
                         sv_create_from_yaml_bind,
                         sv_create_from_yaml_function,
-                        sv_create_from_yaml_init_local)) {
+                        sv_create_from_yaml_init_local,
+                        helper_err, sizeof(helper_err))) {
                     fprintf(stderr,
                         "sv_register_parser_hooks: failed to register "
-                        "__sv_compute_create_from_yaml helper TF\n");
+                        "__sv_compute_create_from_yaml helper TF: %s\n",
+                        helper_err);
                     return false;
                 }
             }
