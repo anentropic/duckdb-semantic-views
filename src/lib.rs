@@ -549,11 +549,10 @@ mod extension {
         // carcasses that previously fed off `QueryState` are deleted
         // alongside this allocation.
         //
-        // H1 `catalog_conn` at line ~441 above is still allocated +
-        // consumed by `sv_register_parser_hooks` only. Plan 06 retires
-        // H1 + adds the structural guard test that asserts no
-        // long-lived `duckdb_connection` allocations remain in
-        // `init_extension`.
+        // H1 `catalog_conn` RETIRED — Phase 65 Plan 06. `sv_register_parser_hooks`
+        // now takes only `db_handle` (no catalog_conn arg). `tests/no_long_lived_conn.rs`
+        // is the structural guard that asserts no long-lived `duckdb_connection`
+        // allocations remain in `init_extension`.
 
         // Phase 65 Plan 05 Task 6 (Wave 6): semantic_view migrated off
         // the duckdb-rs `register_table_function_with_extra_info` path
