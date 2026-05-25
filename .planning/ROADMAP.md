@@ -263,7 +263,7 @@ Plans (in wave order):
 - [x] 65.1-10-PLAN.md (Wave 4) — WR-06: layout static_assert + load-time runtime probe via WR-02 error_buf
 - [x] 65.1-11-PLAN.md (Wave 5) — WR-07/WR-08: BinderException on probe failure + try_infer_schema Result promotion + sqllogictest
 - [x] 65.1-12-PLAN.md (Wave 5) — WR-09: idempotent parser-hook registration + LOAD-twice integration test + structural verification (B-07: sv_count_parser_extensions FFI helper)
-- [ ] 65.1-06-PLAN.md (Wave 6) — D-27 CHANGELOG entries (Security/Changed/Fixed/Removed) — moved to last wave per B-08 (entries describe shipped behaviour, not in-flight)
+- [x] 65.1-06-PLAN.md (Wave 6) — D-27 CHANGELOG entries (Security/Changed/Fixed/Removed) — moved to last wave per B-08 (entries describe shipped behaviour, not in-flight)
 
 **Source artifact:** `.planning/phases/65-overridecontext-connection-teardown/65-REVIEW.md` (committed in `6c1dbd6`). WR-01 already addressed in `ae17f4b` (UB closure in `parse_string_list`) — exclude from this phase scope.
 
