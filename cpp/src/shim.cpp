@@ -115,11 +115,6 @@ extern "C" {
     //                     "no comment provided" (the helper leaves
     //                     `def.comment` untouched in that case so the
     //                     YAML's own `comment:` field, if any, survives).
-    //   kind            — 0 = CREATE, 1 = OR REPLACE, 2 = IF NOT EXISTS.
-    //                     Currently unused by the Rust helper (the outer
-    //                     parser_override INSERT shape encodes ON CONFLICT
-    //                     behaviour) but threaded for forward compat with
-    //                     future variants whose enrichment differs.
     //   out_ptr/out_len — on rc=0, point to a heap-owned UTF-8 buffer
     //                     (NOT NUL-terminated) holding the JSON definition.
     //                     Caller MUST release via `sv_free_buffer` with
@@ -134,11 +129,15 @@ extern "C" {
     //   2 — enrichment / validation error; error_buf populated.
     //   3 — internal error (panic across FFI, allocation failure, etc.);
     //       error_buf populated.
+    // Phase 65.1 Plan 07 (IN-04 D-24): `kind` parameter removed — the outer
+    // parser_override INSERT shape (OR IGNORE / OR REPLACE / plain) already
+    // encodes ON CONFLICT behaviour, so the helper itself does not branch on
+    // it. Three-arg helper TF signature matches: (file_path, view_name,
+    // comment).
     uint8_t sv_compute_create_from_yaml_rust(
         const uint8_t *content_ptr, size_t content_len,
         const uint8_t *name_ptr, size_t name_len,
         const uint8_t *comment_ptr, size_t comment_len,
-        uint8_t kind,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
 
@@ -762,7 +761,6 @@ struct CreateFromYamlBindData : public TableFunctionData {
     std::string file_path;
     std::string view_name;
     std::string comment;
-    int32_t kind = 0;
     std::string new_def;
 };
 
@@ -778,8 +776,7 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
     auto bd = make_uniq<CreateFromYamlBindData>();
     bd->file_path = input.inputs[0].GetValue<string>();
     bd->view_name = input.inputs[1].GetValue<string>();
-    bd->kind      = input.inputs[2].GetValue<int32_t>();
-    bd->comment   = input.inputs[3].GetValue<string>();
+    bd->comment   = input.inputs[2].GetValue<string>();
 
     // Phase 65.1 D-01..D-03 (CR-01): read the YAML file directly via the
     // `FileSystem` API rather than `Connection::Query("SELECT content FROM
@@ -828,7 +825,6 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
         bd->view_name.size(),
         reinterpret_cast<const uint8_t *>(bd->comment.data()),
         bd->comment.size(),
-        static_cast<uint8_t>(bd->kind),
         &out_ptr,
         &out_len,
         error_buf,
@@ -2619,10 +2615,14 @@ extern "C" {
             // now()/current_database()/current_schema() on the caller's
             // connection, preserving D-21 transactional contract.
             {
+                // Phase 65.1 Plan 07 (IN-04 D-24): helper TF slimmed to
+                // 3 args — (file_path, view_name, comment). The previous
+                // `kind` INTEGER parameter was redundant with the outer
+                // parser_override INSERT shape (OR IGNORE / OR REPLACE /
+                // plain) and the Rust helper ignored it.
                 LogicalType arg_types[] = {
                     LogicalType::VARCHAR,  // file_path
                     LogicalType::VARCHAR,  // view_name
-                    LogicalType::INTEGER,  // kind (0/1/2)
                     LogicalType::VARCHAR,  // comment (empty = none)
                 };
                 // Phase 65.1 Plan 02a: sv_register_table_function now
@@ -2639,7 +2639,7 @@ extern "C" {
                 if (!sv_register_table_function(
                         db_handle,
                         "__sv_compute_create_from_yaml",
-                        arg_types, 4,
+                        arg_types, 3,
                         sv_create_from_yaml_bind,
                         sv_create_from_yaml_function,
                         sv_create_from_yaml_init_local,

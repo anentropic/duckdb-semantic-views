@@ -1981,10 +1981,14 @@ fn rewrite_yaml_file_create(payload: &str) -> Result<Option<String>, ParseError>
     })?;
     let comment = parts.next().unwrap_or("");
 
-    let (kind, or_replace, if_not_exists) = match kind_str {
-        "0" => (0_i32, false, false),
-        "1" => (1_i32, true, false),
-        "2" => (2_i32, false, true),
+    // Phase 65.1 Plan 07 (IN-04 D-24): `kind` is no longer threaded into the
+    // helper TF — the outer INSERT shape (OR IGNORE / OR REPLACE / plain)
+    // already encodes ON CONFLICT behaviour. We still decode `kind_str` from
+    // the sentinel because the chosen INSERT shape below depends on it.
+    let (or_replace, if_not_exists) = match kind_str {
+        "0" => (false, false),
+        "1" => (true, false),
+        "2" => (false, true),
         _ => {
             return Err(ParseError {
                 message: format!("Internal error: unknown YAML FILE kind '{kind_str}'"),
@@ -2027,7 +2031,7 @@ fn rewrite_yaml_file_create(payload: &str) -> Result<Option<String>, ParseError>
         .to_string();
     let helper_from = format!(
         "FROM __sv_compute_create_from_yaml('{path_escaped}', \
-            '{name_escaped}', {kind}, '{comment_escaped}')"
+            '{name_escaped}', '{comment_escaped}')"
     );
 
     // Three INSERT shapes mirror the inline CREATE path

@@ -88,9 +88,6 @@ unsafe fn publish_owned_string(s: String, out_ptr: *mut *mut u8, out_len: *mut u
 ///   When `len == 0` the helper leaves `def.comment` untouched so the
 ///   YAML's own `comment:` field (if any) survives. When `len > 0` the
 ///   supplied comment overrides the YAML's comment.
-/// * `_kind` — 0 = CREATE, 1 = OR REPLACE, 2 = IF NOT EXISTS. Currently
-///   unused by this helper (the outer parser_override INSERT shape
-///   encodes ON CONFLICT behaviour) but threaded for forward compat.
 /// * `out_ptr`/`out_len` — on rc=0, point to a heap-owned UTF-8 buffer
 ///   containing the JSON. Caller MUST release via `sv_free_buffer`.
 /// * `error_buf`/`error_buf_len` — on rc != 0, gets a NUL-terminated
@@ -124,7 +121,6 @@ pub unsafe extern "C" fn sv_compute_create_from_yaml_rust(
     name_len: usize,
     comment_ptr: *const u8,
     comment_len: usize,
-    _kind: u8,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
     error_buf: *mut u8,
@@ -230,12 +226,7 @@ mod tests {
     /// Convenience: call the FFI function, return rc + new_def (if any) +
     /// error message (if any). Frees the heap-owned buffer via the FFI
     /// `sv_free_buffer` path to mirror real C++ caller behaviour.
-    unsafe fn call(
-        yaml: &str,
-        name: &str,
-        comment: Option<&str>,
-        kind: u8,
-    ) -> (u8, Option<String>, String) {
+    unsafe fn call(yaml: &str, name: &str, comment: Option<&str>) -> (u8, Option<String>, String) {
         let mut out_ptr: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
         let mut err_buf = vec![0u8; 1024];
@@ -252,7 +243,6 @@ mod tests {
             name.len(),
             comment_ptr,
             comment_len,
-            kind,
             &mut out_ptr,
             &mut out_len,
             err_buf.as_mut_ptr(),
@@ -295,7 +285,7 @@ metrics:
     #[test]
     fn happy_path_returns_metadata_less_json() {
         unsafe {
-            let (rc, def, err) = call(VALID_YAML, "v", None, 0);
+            let (rc, def, err) = call(VALID_YAML, "v", None);
             assert_eq!(rc, 0, "expected rc=0, got rc={rc} err={err}");
             let json = def.expect("rc=0 should populate new_def");
             // Should contain dimensions/metrics from the YAML.
@@ -321,7 +311,7 @@ metrics:
     #[test]
     fn comment_clause_overrides_yaml_comment() {
         unsafe {
-            let (rc, def, _err) = call(VALID_YAML, "v", Some("override-me"), 0);
+            let (rc, def, _err) = call(VALID_YAML, "v", Some("override-me"));
             assert_eq!(rc, 0);
             let json = def.unwrap();
             assert!(
@@ -334,7 +324,7 @@ metrics:
     #[test]
     fn invalid_yaml_returns_rc1_with_error() {
         unsafe {
-            let (rc, def, err) = call("not: valid: yaml: at all: :", "v", None, 0);
+            let (rc, def, err) = call("not: valid: yaml: at all: :", "v", None);
             assert_eq!(rc, 1, "expected rc=1, got rc={rc}");
             assert!(def.is_none());
             assert!(!err.is_empty(), "expected error message");
@@ -346,7 +336,7 @@ metrics:
         unsafe {
             // 1 MiB + 1 byte — exceeds YAML_SIZE_CAP.
             let oversized = "a".repeat(crate::model::SemanticViewDefinition::YAML_SIZE_CAP + 1);
-            let (rc, _def, err) = call(&oversized, "big", None, 0);
+            let (rc, _def, err) = call(&oversized, "big", None);
             assert_eq!(rc, 1);
             assert!(err.contains("exceeds"), "expected size-cap message: {err}");
         }
@@ -355,7 +345,7 @@ metrics:
     #[test]
     fn empty_name_returns_rc1() {
         unsafe {
-            let (rc, _def, err) = call(VALID_YAML, "", None, 0);
+            let (rc, _def, err) = call(VALID_YAML, "", None);
             assert_eq!(rc, 1);
             assert!(err.contains("name"), "expected name-related error: {err}");
         }
@@ -373,7 +363,6 @@ metrics:
                 b"v".as_ptr(),
                 1,
                 std::ptr::null(),
-                0,
                 0,
                 &mut out_ptr,
                 &mut out_len,
