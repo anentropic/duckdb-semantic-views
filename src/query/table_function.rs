@@ -291,30 +291,27 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
 
         let (column_names, column_type_ids): (Vec<String>, Vec<u32>) = if !facts.is_empty() {
             let limit0_sql = format!("{expanded_sql} LIMIT 0");
-            if let Some((names, types)) = try_infer_schema(&borrowed, &limit0_sql) {
-                let type_ids: Vec<u32> =
-                    types.iter().map(|t| normalize_type_id(*t as u32)).collect();
-                (names, type_ids)
-            } else {
-                let mut names = Vec::new();
-                for dim_name in &dimensions {
-                    let canonical = def
-                        .dimensions
-                        .iter()
-                        .find(|d| d.name.eq_ignore_ascii_case(dim_name))
-                        .map_or_else(|| dim_name.clone(), |d| d.name.clone());
-                    names.push(canonical);
+            // Phase 65.1 Plan 11 / WR-08 / D-15: surface probe failures
+            // via the error_buf cascade. No silent vec![0u32; names.len()]
+            // fallback to DUCKDB_TYPE_INVALID — that masked broken FACTS
+            // expressions behind a VARCHAR placeholder at query time.
+            match try_infer_schema(&borrowed, &limit0_sql) {
+                Ok((names, types)) => {
+                    let type_ids: Vec<u32> =
+                        types.iter().map(|t| normalize_type_id(*t as u32)).collect();
+                    (names, type_ids)
                 }
-                for fact_name in &facts {
-                    let canonical = def
-                        .facts
-                        .iter()
-                        .find(|f| f.name.eq_ignore_ascii_case(fact_name))
-                        .map_or_else(|| fact_name.clone(), |f| f.name.clone());
-                    names.push(canonical);
+                Err(msg) => {
+                    write_err(
+                        error_buf,
+                        error_buf_len,
+                        &format!(
+                            "semantic_view: type inference failed for query \
+                             `{limit0_sql}`: {msg}"
+                        ),
+                    );
+                    return 1_u8;
                 }
-                let type_ids = vec![0u32; names.len()];
-                (names, type_ids)
             }
         } else if !type_map.is_empty() {
             let mut names = Vec::new();
@@ -346,30 +343,25 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
             (names, type_ids)
         } else {
             let limit0_sql = format!("{expanded_sql} LIMIT 0");
-            if let Some((names, types)) = try_infer_schema(&borrowed, &limit0_sql) {
-                let type_ids: Vec<u32> =
-                    types.iter().map(|t| normalize_type_id(*t as u32)).collect();
-                (names, type_ids)
-            } else {
-                let mut names = Vec::new();
-                for dim_name in &dimensions {
-                    let canonical = def
-                        .dimensions
-                        .iter()
-                        .find(|d| d.name.eq_ignore_ascii_case(dim_name))
-                        .map_or_else(|| dim_name.clone(), |d| d.name.clone());
-                    names.push(canonical);
+            // Phase 65.1 Plan 11 / WR-08 / D-15: same surface as the
+            // facts-path above; no silent DUCKDB_TYPE_INVALID fallback.
+            match try_infer_schema(&borrowed, &limit0_sql) {
+                Ok((names, types)) => {
+                    let type_ids: Vec<u32> =
+                        types.iter().map(|t| normalize_type_id(*t as u32)).collect();
+                    (names, type_ids)
                 }
-                for met_name in &metrics {
-                    let canonical = def
-                        .metrics
-                        .iter()
-                        .find(|m| m.name.eq_ignore_ascii_case(met_name))
-                        .map_or_else(|| met_name.clone(), |m| m.name.clone());
-                    names.push(canonical);
+                Err(msg) => {
+                    write_err(
+                        error_buf,
+                        error_buf_len,
+                        &format!(
+                            "semantic_view: type inference failed for query \
+                             `{limit0_sql}`: {msg}"
+                        ),
+                    );
+                    return 1_u8;
                 }
-                let type_ids = vec![0u32; names.len()];
-                (names, type_ids)
             }
         };
 
@@ -613,7 +605,12 @@ fn build_execution_sql(
 
 /// Attempt to infer column names and types by executing a LIMIT 0 query.
 ///
-/// Returns `None` if the query fails for any reason.
+/// Returns `Err(msg)` with the underlying `execute_sql_raw` error text when
+/// the LIMIT 0 probe fails. Phase 65.1 Plan 11 / WR-08 / D-15: callers
+/// surface the error via `write_err` + return rc=1, which the C++ binder
+/// re-raises as `BinderException`. The previous `Option` return type
+/// swallowed the diagnostic via `.ok()?`, masking broken DDL behind a
+/// silent VARCHAR placeholder for `DUCKDB_TYPE_INVALID`.
 ///
 /// # Safety
 ///
@@ -622,8 +619,8 @@ fn build_execution_sql(
 pub(crate) unsafe fn try_infer_schema(
     borrowed: &crate::ddl::read_ffi::BorrowedConnection,
     sql: &str,
-) -> Option<(Vec<String>, Vec<ffi::duckdb_type>)> {
-    let mut result = execute_sql_raw(borrowed.as_raw(), sql).ok()?;
+) -> Result<(Vec<String>, Vec<ffi::duckdb_type>), String> {
+    let mut result = execute_sql_raw(borrowed.as_raw(), sql)?;
 
     let col_count = ffi::duckdb_column_count(&mut result) as usize;
     let mut names = Vec::with_capacity(col_count);
@@ -643,7 +640,7 @@ pub(crate) unsafe fn try_infer_schema(
     }
 
     ffi::duckdb_destroy_result(&mut result);
-    Some((names, types))
+    Ok((names, types))
 }
 
 // ---------------------------------------------------------------------------
