@@ -581,6 +581,152 @@ def test_in_process_readonly_then_readwrite():
             rw.close()
 
 
+def test_in_process_bootstrap_then_readonly_semantic_view_select():
+    """D-03b #1 (LIFE-01 / criterion 3): post-reopen semantic_view() SELECT.
+
+    B1 prologue (in-process bootstrap, close, watchdog-wrapped RO reopen)
+    plus a post-reopen ``semantic_view('v', dimensions := [...], metrics
+    := [...])`` SELECT. Exercises the read-side
+    ``semantic_view_bind`` / exec callbacks against an RO connection that
+    was reopened in the same process — the exact failure shape on the
+    v0.9.0 baseline (LIFE-01 hang in DBInstanceCache::GetInstanceInternal).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "sv_select.duckdb")
+        w = open_writable(db)
+        w.execute("CREATE TABLE t (i INT, j INT)")
+        w.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        w.execute(
+            "CREATE SEMANTIC VIEW v AS "
+            "  TABLES (t1 AS t PRIMARY KEY (i)) "
+            "  DIMENSIONS (t1.i AS t1.i) "
+            "  METRICS (t1.s AS SUM(t1.j))"
+        )
+        w.close()
+        del w
+        gc.collect()
+
+        ro, elapsed = _connect_with_watchdog(
+            db,
+            watchdog_seconds=5.0,
+            read_only=True,
+            config=_connect_config(),
+        )
+        try:
+            assert elapsed < 5.0, f"RO reopen took {elapsed:.2f}s (>=5.0)"
+            ro.execute("LOAD semantic_views")
+            rows = ro.execute(
+                "SELECT i, s FROM semantic_view("
+                "  'v', dimensions := ['t1.i'], metrics := ['t1.s']"
+                ") ORDER BY i"
+            ).fetchall()
+            assert rows == [(1, 10), (2, 20)], f"unexpected rows: {rows}"
+        finally:
+            ro.close()
+
+
+def test_in_process_bootstrap_then_readonly_describe():
+    """D-03b #2 (LIFE-01 / criterion 3): post-reopen describe_semantic_view().
+
+    Exercises the ``describe_semantic_view`` bind callback (Plan 05
+    migration target) against an in-process RW->RO reopened connection.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "sv_describe.duckdb")
+        w = open_writable(db)
+        w.execute("CREATE TABLE t (i INT)")
+        w.execute(_minimal_create_sql("v"))
+        w.close()
+        del w
+        gc.collect()
+
+        ro, elapsed = _connect_with_watchdog(
+            db,
+            watchdog_seconds=5.0,
+            read_only=True,
+            config=_connect_config(),
+        )
+        try:
+            assert elapsed < 5.0, f"RO reopen took {elapsed:.2f}s (>=5.0)"
+            ro.execute("LOAD semantic_views")
+            rows = ro.execute(
+                "FROM describe_semantic_view('v')"
+            ).fetchall()
+            assert len(rows) > 0, "describe_semantic_view returned no rows"
+        finally:
+            ro.close()
+
+
+def test_in_process_bootstrap_then_readonly_show_dimensions():
+    """D-03b #3 (LIFE-01 / criterion 3): post-reopen SHOW SEMANTIC DIMENSIONS.
+
+    Representative SHOW command — exercises the SHOW dispatch path's
+    bind callback against an in-process RW->RO reopened connection.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "sv_show.duckdb")
+        w = open_writable(db)
+        w.execute("CREATE TABLE t (i INT)")
+        w.execute(_minimal_create_sql("v"))
+        w.close()
+        del w
+        gc.collect()
+
+        ro, elapsed = _connect_with_watchdog(
+            db,
+            watchdog_seconds=5.0,
+            read_only=True,
+            config=_connect_config(),
+        )
+        try:
+            assert elapsed < 5.0, f"RO reopen took {elapsed:.2f}s (>=5.0)"
+            ro.execute("LOAD semantic_views")
+            rows = ro.execute("SHOW SEMANTIC DIMENSIONS IN v").fetchall()
+            assert len(rows) > 0, "SHOW SEMANTIC DIMENSIONS returned no rows"
+            # The dimension we declared is `t1.i AS t1.i` — look for `i`
+            # in the row tuples regardless of column position.
+            assert any("i" in str(r) for r in rows), (
+                f"expected 'i' in SHOW DIMENSIONS rows, got: {rows}"
+            )
+        finally:
+            ro.close()
+
+
+def test_in_process_bootstrap_then_readonly_get_ddl():
+    """D-03b #4 (LIFE-01 / criterion 3): post-reopen get_ddl() round-trip.
+
+    Exercises the ``get_ddl`` scalar function (Plan 05 migration target)
+    against an in-process RW->RO reopened connection.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = str(Path(tmp) / "sv_getddl.duckdb")
+        w = open_writable(db)
+        w.execute("CREATE TABLE t (i INT)")
+        w.execute(_minimal_create_sql("v"))
+        w.close()
+        del w
+        gc.collect()
+
+        ro, elapsed = _connect_with_watchdog(
+            db,
+            watchdog_seconds=5.0,
+            read_only=True,
+            config=_connect_config(),
+        )
+        try:
+            assert elapsed < 5.0, f"RO reopen took {elapsed:.2f}s (>=5.0)"
+            ro.execute("LOAD semantic_views")
+            # get_ddl takes (kind, name) — kind 'SEMANTIC_VIEW' selects
+            # the semantic-view DDL emitter.
+            ddl = ro.execute("SELECT get_ddl('SEMANTIC_VIEW', 'v')").fetchone()[0]
+            assert "CREATE OR REPLACE SEMANTIC VIEW" in ddl, (
+                f"expected CREATE OR REPLACE SEMANTIC VIEW in ddl, got: {ddl}"
+            )
+            assert "v" in ddl, f"expected view name 'v' in ddl, got: {ddl}"
+        finally:
+            ro.close()
+
+
 def test_repeated_load_close_no_busy_spin():
     """B11 (LIFE-02 audit): 50 sequential file-backed bootstrap+close cycles.
 
@@ -646,6 +792,18 @@ if __name__ == "__main__":
         run_test("test_in_process_bootstrap_then_readonly_existing", test_in_process_bootstrap_then_readonly_existing),
         run_test("test_in_process_load_only_then_readonly",          test_in_process_load_only_then_readonly),
         run_test("test_in_process_readonly_then_readwrite",          test_in_process_readonly_then_readwrite),
+        # Plan 06 D-03b post-reopen tests — exercise the read-side bind
+        # callbacks (semantic_view / describe / SHOW / get_ddl) against an
+        # in-process RW->RO reopened connection. All four must pass on
+        # milestone/v0.10.0 (LIFE-01 / ROADMAP success criterion 3).
+        run_test("test_in_process_bootstrap_then_readonly_semantic_view_select",
+                 test_in_process_bootstrap_then_readonly_semantic_view_select),
+        run_test("test_in_process_bootstrap_then_readonly_describe",
+                 test_in_process_bootstrap_then_readonly_describe),
+        run_test("test_in_process_bootstrap_then_readonly_show_dimensions",
+                 test_in_process_bootstrap_then_readonly_show_dimensions),
+        run_test("test_in_process_bootstrap_then_readonly_get_ddl",
+                 test_in_process_bootstrap_then_readonly_get_ddl),
         run_test("test_repeated_load_close_no_busy_spin",            test_repeated_load_close_no_busy_spin),
     ]
     passed = sum(results)
