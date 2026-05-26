@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use crate::model::{Dimension, Metric, SemanticViewDefinition};
 
-use super::resolution::{quote_ident, quote_table_ref};
+use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 
 /// Attempt to route a query to a materialization table.
 ///
@@ -68,6 +68,7 @@ pub(crate) fn try_route_materialization(
         if mat_dims == req_dims && mat_mets == req_mets {
             return Some(build_materialized_sql(
                 &mat.table,
+                def,
                 resolved_dims,
                 resolved_mets,
             ));
@@ -129,7 +130,12 @@ pub(crate) fn find_routing_materialization_name<'a>(
 /// The materialization table is expected to have columns named after the
 /// dimension and metric names. The SQL simply selects them by name,
 /// applying `output_type` casts when declared.
-fn build_materialized_sql(table: &str, dims: &[&Dimension], mets: &[&Metric]) -> String {
+fn build_materialized_sql(
+    table: &str,
+    def: &SemanticViewDefinition,
+    dims: &[&Dimension],
+    mets: &[&Metric],
+) -> String {
     let mut items: Vec<String> = Vec::with_capacity(dims.len() + mets.len());
 
     for dim in dims {
@@ -154,7 +160,7 @@ fn build_materialized_sql(table: &str, dims: &[&Dimension], mets: &[&Metric]) ->
     sql.push_str("SELECT\n");
     sql.push_str(&items.join(",\n"));
     sql.push_str("\nFROM ");
-    sql.push_str(&quote_table_ref(table));
+    sql.push_str(&qualify_and_quote_table_ref(table, def));
     sql
 }
 
