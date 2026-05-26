@@ -2645,16 +2645,6 @@ extern "C" {
                 duckdb_destroy_result(&r);
             }
 
-            void *rust_state = sv_make_override_context();
-            if (!rust_state) {
-                if (error_buf != nullptr && error_buf_len > 0) {
-                    snprintf(error_buf, error_buf_len,
-                        "sv_register_parser_hooks: sv_make_override_context "
-                        "returned null");
-                }
-                return false;
-            }
-
             auto &config = DBConfig::GetConfig(db);
 
             // Phase 65.1 Plan 12 (WR-09 D-21): idempotence check across
@@ -2674,9 +2664,13 @@ extern "C" {
             // identical pointer value.
             //
             // CRITICAL: the entire `ParserExtension ext; ...; Register(...)` block
-            // — including the `SemanticViewsParserInfo` allocation — must be guarded.
-            // Allocating a fresh `info_std` on the skip path would re-introduce
-            // the parser_info shared_ptr leak called out in RESEARCH lines 706-710.
+            // — including the `SemanticViewsParserInfo` allocation AND the
+            // `sv_make_override_context()` allocation — must be guarded. The
+            // `OverrideContext` allocation is taken into the `SemanticViewsParserInfo`
+            // dtor for cleanup; on the skip path no ctor runs, so any allocation
+            // performed before the guard would leak unboundedly across repeated
+            // re-LOAD cycles (the precise leak shape WR-09 / CR-01 (65.1) was
+            // meant to fix).
             //
             // The target is same-process repeat LOAD (e.g. a long-lived host
             // re-invoking `LOAD semantic_views` across sessions, or partial-failure
@@ -2699,6 +2693,29 @@ extern "C" {
             }
 
             if (!already_registered) {
+                // Phase 65.1 CR-01: allocation must live INSIDE the dedup
+                // guard. `sv_make_override_context()` returns a heap-allocated
+                // `Box<OverrideContext>` whose ownership is transferred to
+                // `SemanticViewsParserInfo` below; the dtor of that
+                // shared_ptr-managed object frees it via
+                // `sv_drop_override_context`. On the `already_registered`
+                // skip path the ctor never runs, so any allocation hoisted
+                // above this guard would be permanently leaked — one
+                // `OverrideContext` per redundant LOAD, unbounded over a
+                // long-lived host process. This is the exact leak shape
+                // WR-09 was supposed to fix; the original Plan 12 patch
+                // moved the allocation guard around the `Register` call but
+                // left the allocation itself outside.
+                void *rust_state = sv_make_override_context();
+                if (!rust_state) {
+                    if (error_buf != nullptr && error_buf_len > 0) {
+                        snprintf(error_buf, error_buf_len,
+                            "sv_register_parser_hooks: sv_make_override_context "
+                            "returned null");
+                    }
+                    return false;
+                }
+
                 ParserExtension ext;
                 ext.parser_override = sv_parser_override;
                 // Phase 62 Plan 03: parse_function is the error-reporting layer.

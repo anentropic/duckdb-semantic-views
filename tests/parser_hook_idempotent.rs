@@ -223,13 +223,20 @@ fn parser_hook_register_is_idempotent() {
     );
 
     // -----------------------------------------------------------------------
-    // Assertion 5: dedup check guards both the ParserExtension build AND
-    //              the SemanticViewsParserInfo allocation, so the skip path
-    //              does not leak a fresh parser_info shared_ptr.
+    // Assertion 5: dedup check guards the full allocation chain — both the
+    //              `sv_make_override_context()` heap allocation AND the
+    //              `SemanticViewsParserInfo` allocation must live inside the
+    //              `if (!already_registered)` block. Either one outside the
+    //              guard leaks unboundedly per redundant LOAD.
     //
-    // We verify this structurally by checking that the
-    // `SemanticViewsParserInfo` allocation appears AFTER the
-    // `if (!already_registered)` guard within the function body.
+    // Phase 65.1 CR-01: the original Plan 12 patch put the
+    // `SemanticViewsParserInfo` allocation behind the guard but left
+    // `sv_make_override_context()` ABOVE it — so every redundant LOAD still
+    // leaked a fresh `Box<OverrideContext>` (one allocation per re-LOAD,
+    // unbounded). This assertion now pins BOTH allocations behind the guard.
+    //
+    // We verify this structurally by checking that both call sites appear
+    // AFTER the `if (!already_registered)` guard within the function body.
     // -----------------------------------------------------------------------
     let guard_idx = register_body.find("if (!already_registered)").expect(
         "Plan 12 Task 1 — sv_register_parser_hooks must contain \
@@ -247,6 +254,23 @@ fn parser_hook_register_is_idempotent() {
          must appear AFTER the `if (!already_registered)` guard so the \
          skip path does not leak a fresh parser_info shared_ptr. \
          guard_idx={guard_idx}, info_idx={info_idx}"
+    );
+    let make_ctx_idx = register_body.find("sv_make_override_context(").expect(
+        "Phase 65.1 CR-01 — sv_register_parser_hooks must still call \
+             `sv_make_override_context()` on the registration path; if you \
+             removed that call the parser_override hook has no Rust-side \
+             state to dispatch through",
+    );
+    assert!(
+        make_ctx_idx > guard_idx,
+        "Phase 65.1 CR-01 — `sv_make_override_context()` allocation must \
+         appear AFTER the `if (!already_registered)` guard. On the skip \
+         path no SemanticViewsParserInfo ctor runs to take ownership of \
+         the returned `Box<OverrideContext>`, so any allocation hoisted \
+         above the guard leaks one OverrideContext per redundant LOAD — \
+         unbounded across a long-lived host process. This is the precise \
+         leak shape WR-09 / CR-01 (65.1) was meant to fix. \
+         guard_idx={guard_idx}, make_ctx_idx={make_ctx_idx}"
     );
 
     // -----------------------------------------------------------------------
