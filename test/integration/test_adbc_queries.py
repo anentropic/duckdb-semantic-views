@@ -276,7 +276,7 @@ def test_semi_additive_non_default_schema(extension_path: Path, ext_dir: str, tm
             CREATE SEMANTIC VIEW inv_view AS
               TABLES (i AS staging.inventory PRIMARY KEY (id))
               DIMENSIONS (i.warehouse AS i.warehouse)
-              METRICS (i.latest_qty AS MIN_BY(i.qty, i.snapshot_date))
+              METRICS (i.earliest_qty AS MIN_BY(i.qty, i.snapshot_date))
             """,
         )
         conn.commit()
@@ -284,7 +284,7 @@ def test_semi_additive_non_default_schema(extension_path: Path, ext_dir: str, tm
         rows = _scalar(
             conn,
             "SELECT COUNT(*) FROM semantic_view('inv_view', "
-            "dimensions := ['warehouse'], metrics := ['latest_qty'])",
+            "dimensions := ['warehouse'], metrics := ['earliest_qty'])",
         )
         assert rows == 2, f"expected 2 rows, got {rows}"
     finally:
