@@ -310,10 +310,10 @@ Note: REL-01/REL-02/REL-03 deferred to milestone close per `feedback_defer_relea
 **Goal:** Tighten the sqllogictest regression net around rewritten expansion SQL (the layer Phase 66 retrofitted but only smoke-tested at the ADBC boundary) and clear the small batch of tech-debt and Phase 66 review-pass cleanup items that are mechanical fixes blocking real edge cases or hygiene. Final technical phase of v0.10.0; release prep handled at milestone close, NOT in this phase.
 **Requirements**: phase scope defined entirely by 67-CONTEXT.md decisions D-01..D-18 (no formal requirement IDs in REQUIREMENTS.md)
 **Depends on:** Phase 66
-**Plans:** 2/4 plans executed
+**Plans:** 4/4 plans complete
 
 Plans:
 - [x] 67-01-PLAN.md — Expansion-SQL shape coverage (A1+A2+A3+A4): new phase67_qualified_emission.test fixture + shape assertions added to phase46/47/48
-- [ ] 67-02-PLAN.md — Body parser quoted-identifier fix (B5 / TECH-DEBT #24): port find_identifier_end to parse_single_table_entry + audit grep + new phase67_quoted_source_tables.test
+- [x] 67-02-PLAN.md — Body parser quoted-identifier fix (B5 / TECH-DEBT #24): port find_identifier_end to parse_single_table_entry + audit grep + new phase67_quoted_source_tables.test
 - [x] 67-03-PLAN.md — Phase 66 review-pass cleanup batch (C1+C2+C3): WR-02 reclassification + WR-01 sentinel-keep rationale + IN-02 FORCE INSTALL hardening
-- [ ] 67-04-PLAN.md — latest_qty / MIN_BY semantics resolution (C4): investigate scenario 4 then rename latest_qty -> earliest_qty if standard MIN_BY semantics confirmed
+- [x] 67-04-PLAN.md — latest_qty / MIN_BY semantics resolution (C4): investigate scenario 4 then rename latest_qty -> earliest_qty if standard MIN_BY semantics confirmed
