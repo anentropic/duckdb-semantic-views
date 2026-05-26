@@ -1,3 +1,18 @@
+## Resolution (v0.10.0)
+
+Fixed by Phase 66 (EXPAND-CTX-01..03). Semantic view expansion now calls
+`qualify_and_quote_table_ref` (see `src/expand/resolution.rs`) at every emission site —
+the main expand path, FACTS, semi-additive metrics, window metrics, and materialization
+routing — emitting fully-qualified `"database"."schema"."table"` references that resolve
+regardless of the per-call Connection's catalog/schema defaults. The regression is
+guarded by `test/integration/test_adbc_queries.py`, runnable via `just test-adbc-queries`.
+
+See commits: b55936f, b116553, 9fe1ae5
+
+---
+
+[original content below]
+
 The actual error when the xfail mark is removed:
 
 > adbc_driver_manager.ProgrammingError: Catalog Error: Table with name sales_data does not exist!
