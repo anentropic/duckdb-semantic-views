@@ -113,6 +113,17 @@ from a count-only sanity check to a value-content regression guard — a
 maintainer should confirm the sentinel approach matches their long-term
 intent for this scenario.
 
+**Sentinel-keep design call (Phase 67 Plan 03 Task 2):**
+
+The sentinel-value fix landed in commit `7669878` is retained. The trade-off considered:
+
+- The original `COUNT(*) == 2` assertion already discriminated routing-vs-fallback in scenario 6: raw expansion over the source `sales` table produces 3 rows (`US`, `EU`, `APAC` — see scenario setup), so a silent fall-back to raw expansion would have failed the count check.
+- The sentinel values `('US', -1.00), ('EU', -2.00)` (replacing the original `('US', 100.00), ('EU', 200.00)` that coincide with `SUM(s.amount) GROUP BY region`) make a routing failure fail FASTER (on the scalar value check) and more DIAGNOSTICALLY (the test name + assertion message immediately surface the value mismatch rather than the count discrepancy).
+- The "value test" objection is technically present (the assertion now compares a specific scalar, not just a row count), but minor in context: sentinels are smoke values chosen to be impossible-from-raw-expansion, not domain assertions about correct materialization arithmetic. They function as canaries, not as value-correctness tests.
+- The cleaner alternative (revert to `COUNT(*) == 2` with the 3-row source) loses the failure-mode-precision benefit and gains nothing. The split-the-difference alternative (one sentinel for smoke, then count) over-engineers a single-scenario test.
+
+Design call recorded so the call is recoverable. No code change in this task; the sentinel fix from commit `7669878` stands.
+
 ## Reclassified Post-Phase-66 (not a defect)
 
 ### WR-02: All scenarios assert row count only, not row content
