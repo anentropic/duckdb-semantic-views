@@ -2917,10 +2917,20 @@ extern "C" {
             auto &db = *wrapper->database->instance;
             auto &config = DBConfig::GetConfig(db);
             auto &cbmgr = config.GetCallbackManager();
+            // Phase 65.1 IN-02: saturate the counter at INT32_MAX rather
+            // than wrapping. The documented contract is "returns >= 0 on
+            // success; -1 on failure" — silent wrap to a negative value
+            // would be misinterpreted as a registration failure by the
+            // structural test. Reaching INT32_MAX is only plausible if
+            // WR-09's dedup guard fails badly and the list grows
+            // unbounded across re-LOAD cycles, but the saturation is
+            // cheap defence-in-depth.
             int32_t count = 0;
             for (auto &existing : cbmgr.ParserExtensions()) {
                 if (existing.parser_override == sv_parser_override) {
-                    ++count;
+                    if (count < INT32_MAX) {
+                        ++count;
+                    }
                 }
             }
             return count;
