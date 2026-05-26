@@ -255,12 +255,21 @@ fn parser_hook_register_is_idempotent() {
          skip path does not leak a fresh parser_info shared_ptr. \
          guard_idx={guard_idx}, info_idx={info_idx}"
     );
-    let make_ctx_idx = register_body.find("sv_make_override_context(").expect(
-        "Phase 65.1 CR-01 — sv_register_parser_hooks must still call \
-             `sv_make_override_context()` on the registration path; if you \
-             removed that call the parser_override hook has no Rust-side \
-             state to dispatch through",
-    );
+    // Search for the actual call site, not a comment mention. The
+    // assignment-prefixed needle `void *rust_state = sv_make_override_context(`
+    // discriminates the executable statement from any documentation
+    // references to the function above the guard.
+    let make_ctx_idx = register_body
+        .find("void *rust_state = sv_make_override_context(")
+        .expect(
+            "Phase 65.1 CR-01 — sv_register_parser_hooks must still call \
+             `void *rust_state = sv_make_override_context()` on the \
+             registration path; if you removed or renamed that \
+             assignment the parser_override hook has no Rust-side state \
+             to dispatch through. (We anchor on the assignment-prefixed \
+             form to discriminate from any comment references to the \
+             same function name.)",
+        );
     assert!(
         make_ctx_idx > guard_idx,
         "Phase 65.1 CR-01 — `sv_make_override_context()` allocation must \
