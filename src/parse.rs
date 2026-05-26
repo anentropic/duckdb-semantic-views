@@ -2648,7 +2648,7 @@ pub unsafe extern "C" fn sv_parser_override_rust(
                 let _ = (error_out, error_out_len); // unused under Phase 62
                 2 // not ours, defer to default parser
             }
-            Err(_err) => {
+            Err(err) => {
                 // Phase 62: defer to default parser → `sv_parse_stub`
                 // (registered as `parse_function`) re-runs validation and
                 // returns DISPLAY_EXTENSION_ERROR with caret position. The
@@ -2657,7 +2657,27 @@ pub unsafe extern "C" fn sv_parser_override_rust(
                 // ParserException::SyntaxError caret rendering is reachable
                 // again via the parse_function code path. Resolves
                 // TECH-DEBT 22.
-                let _ = (error_out, error_out_len); // unused under Phase 62
+                //
+                // Phase 65.1 WR-06: preserve the original Err message in
+                // `error_out` even though the C++ side currently ignores
+                // the rc=2 channel. `rewrite_to_native_sql` can fail in
+                // non-deterministic ways (e.g. JSON serialisation, the
+                // metadata-via-SQL now() rendering, the unreachable
+                // 'internal error' dispatch paths). If the second
+                // invocation under sv_parse_stub produces a different
+                // error than this one — because catalog state changed
+                // mid-call, or a transient panic-caught failure
+                // reproduces differently — the user otherwise loses any
+                // trace of the first failure. The buffer is heap-allocated
+                // and the cost is sub-microsecond; keeping the channel
+                // populated lets future tooling (debug-build flag,
+                // tracing hook) surface both errors without another ABI
+                // change. Safety: error_out_len is the caller's declared
+                // capacity; write_error_to_buffer respects it and
+                // truncates at a char boundary.
+                if !error_out.is_null() && error_out_len > 0 {
+                    write_error_to_buffer(error_out, error_out_len, &err.message);
+                }
                 2
             }
         }
