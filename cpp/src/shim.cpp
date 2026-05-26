@@ -843,6 +843,24 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
             "FROM YAML FILE failed: GetFileSize returned -1 for '" +
             bd->file_path + "'");
     }
+    // Phase 65.1 IN-04: fail-fast on hostile file sizes BEFORE allocating
+    // `std::string(size, '\0')`. The Rust side enforces a 1 MiB cap via
+    // `from_yaml_with_size_cap`, but without a C++ pre-check a multi-GB
+    // YAML path would allocate that many bytes of std::string storage,
+    // run the read, hand the buffer to Rust, and only then get rejected
+    // — practical outcome on a memory-constrained host is OOM kill. The
+    // C++ cap is intentionally LOOSER than the Rust cap (16 MiB vs
+    // 1 MiB) so the Rust limit remains the single source of truth for
+    // legitimate sizing decisions; this cap exists purely as
+    // defence-in-depth against a hostile or accidentally-pathological
+    // file size.
+    constexpr int64_t MAX_YAML_BYTES = 16 * 1024 * 1024;
+    if (size > MAX_YAML_BYTES) {
+        throw BinderException(
+            "FROM YAML FILE failed: file '" + bd->file_path + "' is " +
+            std::to_string(size) + " bytes (max " +
+            std::to_string(MAX_YAML_BYTES) + ")");
+    }
     std::string yaml_content(static_cast<size_t>(size), '\0');
     int64_t got = (size == 0) ? 0
                               : fs.Read(*handle, yaml_content.data(), size);
@@ -853,9 +871,11 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
     }
 
     // Bridge into Rust to parse + enrich + serialize. The Rust side enforces
-    // YAML_SIZE_CAP (1 MiB) inside from_yaml_with_size_cap, so we deliberately
-    // do NOT pre-check size here — keeps the cap as a single source of truth
-    // on the Rust side.
+    // YAML_SIZE_CAP (1 MiB) inside from_yaml_with_size_cap, which remains the
+    // single source of truth for the legitimate size limit. The 16 MiB
+    // pre-check above is defence-in-depth against a hostile file size that
+    // would balloon the std::string allocation before Rust gets a chance to
+    // reject it.
     char *out_ptr = nullptr;
     size_t out_len = 0;
     char error_buf[1024];
