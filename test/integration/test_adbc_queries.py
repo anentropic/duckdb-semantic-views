@@ -14,40 +14,22 @@
 """
 ADBC end-to-end SELECT FROM semantic_view(...) regression test (EXPAND-CTX-02).
 
-Phase 66 / Plan 01: scaffolding lands ahead of the EXPAND-CTX-01 migration.
-
 This file exercises seven scenarios that together cover every code path which
-emits a physical table reference during semantic-view expansion. Five of the
-seven (scenarios 3-7) exercise expansion paths that still call
-``quote_table_ref(...)`` on ``milestone/v0.10.0`` HEAD — they are gated by the
-``SKIP_UNTIL_PLAN_02`` constant and will be un-skipped in a single edit by
-Plan 02 (flip ``MIGRATION_LANDED = True``) at the same commit that lands the
-migration of the seven unmigrated call sites in
-``src/expand/{sql_gen,semi_additive,window,materialization}.rs``.
+emits a physical table reference during semantic-view expansion. Phase 66
+migrated the previously unmigrated call sites in
+``src/expand/{sql_gen,semi_additive,window,materialization}.rs`` from
+``quote_table_ref`` to ``qualify_and_quote_table_ref``; this test is the
+regression guard against re-introduction of unqualified emission.
 
 Scenarios (per Phase 66 CONTEXT.md D-08):
 
-    1. main expansion path, default schema (memory.main)            -- ACTIVE
-    2. main expansion path, non-default schema (staging)            -- ACTIVE
-    3. FACTS feature path, non-default schema base table             -- SKIP
-    4. semi-additive metric, non-default schema base table           -- SKIP
-    5. window metric, non-default schema base table                  -- SKIP
-    6. materialization routing to non-default-schema target          -- SKIP
-    7. multi-DB ATTACH + FACTS metric on attached DB's table         -- SKIP
-
-D-09 manual baseline gate
--------------------------
-After Plan 02's migration is staged locally (but not yet committed),
-flipping ``MIGRATION_LANDED = True`` at the top of this file and running
-``just test-adbc-queries`` against pre-migration HEAD MUST reproduce
-``Catalog Error: Table with name <name> does not exist!`` for scenarios
-3-7. Record the failing output as Plan 02's verification evidence
-BEFORE applying the migration. This baseline reproduction is the
-acceptance evidence for EXPAND-CTX-02; CI does NOT enforce it (the
-skipped scenarios neither pass nor fail in the normal run).
-
-Plan 02 is then expected to flip the same flag green: with the migration
-applied AND ``MIGRATION_LANDED = True``, all 7 scenarios PASS.
+    1. main expansion path, default schema (memory.main)
+    2. main expansion path, non-default schema (staging)
+    3. FACTS feature path, non-default schema base table
+    4. semi-additive metric, non-default schema base table
+    5. window metric, non-default schema base table
+    6. materialization routing to non-default-schema target
+    7. multi-DB ATTACH + FACTS metric on attached DB's table
 
 Sandbox note (CLAUDE.md Rule 2)
 --------------------------------
@@ -61,7 +43,7 @@ Usage:
     just test-adbc-queries
 
 Exit codes:
-    0 = all non-skipped scenarios passed (skipped scenarios do not fail)
+    0 = all scenarios passed
     1 = at least one scenario failed
 """
 
@@ -78,26 +60,6 @@ from test_ducklake_helpers import get_ext_dir, get_extension_path
 import adbc_driver_duckdb
 import adbc_driver_manager
 import adbc_driver_manager.dbapi
-
-
-# --------------------------------------------------------------------------
-# Skip gating
-# --------------------------------------------------------------------------
-#
-# Scenarios 3-7 exercise expansion paths that still emit unqualified
-# ``FROM "<table>"`` on milestone/v0.10.0 HEAD. They would fail with
-# ``Catalog Error: Table with name X does not exist!`` on a pre-migration
-# baseline. Plan 02 flips MIGRATION_LANDED = True in the same diff that
-# migrates the seven sites; CI then runs all seven scenarios.
-
-SKIP_UNTIL_PLAN_02 = (
-    "Phase 66 Plan 02: requires qualify_and_quote_table_ref migration of "
-    "FACTS/semi-additive/window/materialization sites"
-)
-
-# Plan 02 will flip this to True at the same commit that lands the migration
-# of the seven unmigrated call sites in src/expand/.
-MIGRATION_LANDED = True
 
 
 def _connect_adbc(db_path: str, extension_dir: str):
@@ -512,15 +474,14 @@ def test_attach_facts_path(extension_path: Path, ext_dir: str, tmp_path: Path) -
 # --------------------------------------------------------------------------
 
 
-# Map: scenario function -> True if currently gated by SKIP_UNTIL_PLAN_02
 _SCENARIOS = [
-    (test_main_path_default_schema,                       False),
-    (test_main_path_non_default_schema,                   False),
-    (test_facts_non_default_schema,                       True),
-    (test_semi_additive_non_default_schema,               True),
-    (test_window_non_default_schema,                      True),
-    (test_materialization_routing_non_default_schema_target, True),
-    (test_attach_facts_path,                              True),
+    test_main_path_default_schema,
+    test_main_path_non_default_schema,
+    test_facts_non_default_schema,
+    test_semi_additive_non_default_schema,
+    test_window_non_default_schema,
+    test_materialization_routing_non_default_schema_target,
+    test_attach_facts_path,
 ]
 
 
@@ -534,15 +495,9 @@ def run_tests() -> int:
     ext_dir = get_ext_dir()
     passed = 0
     failed = 0
-    skipped = 0
 
-    for fn, skip_until_plan_02 in _SCENARIOS:
+    for fn in _SCENARIOS:
         name = fn.__name__
-        if skip_until_plan_02 and not MIGRATION_LANDED:
-            print(f"SKIP: {name} -- {SKIP_UNTIL_PLAN_02}")
-            skipped += 1
-            continue
-
         print(f"RUN:  {name}")
         with tempfile.TemporaryDirectory(prefix="sv_adbc_q_") as tmp:
             try:
@@ -555,7 +510,7 @@ def run_tests() -> int:
                 failed += 1
 
     print()
-    print(f"Results: {passed} passed, {failed} failed, {skipped} skipped")
+    print(f"Results: {passed} passed, {failed} failed")
     return 0 if failed == 0 else 1
 
 
