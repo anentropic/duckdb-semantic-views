@@ -379,9 +379,14 @@ def test_materialization_routing_non_default_schema_target(
             "CREATE TABLE agg.daily_revenue ("
             "region VARCHAR, total DECIMAL(18,2))",
         )
+        # Seed sentinel values that could NEVER arise from raw expansion
+        # over `sales` (where SUM(amount) GROUP BY region would yield
+        # 100.00 / 200.00). Asserting the sentinel proves the query was
+        # routed to agg.daily_revenue, not silently fell back to raw
+        # expansion.
         _execute(
             conn,
-            "INSERT INTO agg.daily_revenue VALUES ('US', 100.00), ('EU', 200.00)",
+            "INSERT INTO agg.daily_revenue VALUES ('US', -1.00), ('EU', -2.00)",
         )
 
         _execute(
@@ -405,12 +410,23 @@ def test_materialization_routing_non_default_schema_target(
         # Query matching the materialization's exact dim/metric set routes
         # to agg.daily_revenue. Pre-migration the materialization emits
         # unqualified "FROM \"daily_revenue\"" which fails to resolve.
-        rows = _scalar(
-            conn,
-            "SELECT COUNT(*) FROM semantic_view('rev_view', "
-            "dimensions := ['region'], metrics := ['total'])",
+        # Post-migration, the sentinel value -1.00 proves routing actually
+        # occurred (raw expansion would return 100.00 from SUM(s.amount)).
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT total FROM semantic_view('rev_view', "
+                "dimensions := ['region'], metrics := ['total']) "
+                "WHERE region = 'US'"
+            )
+            row = cur.fetchone()
+        assert row is not None, "expected one row for region='US', got none"
+        val = row[0]
+        # Compare via float() to remain Decimal-agnostic; sentinel is
+        # negative and could never arise from raw expansion of sales.
+        assert float(val) == -1.0, (
+            f"expected sentinel -1.00 from materialization routing, got {val} "
+            "(likely raw expansion of sales)"
         )
-        assert rows == 2, f"expected 2 rows, got {rows}"
     finally:
         conn.close()
 
