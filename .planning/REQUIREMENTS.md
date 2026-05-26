@@ -29,8 +29,10 @@ Phase 64 (v0.9.0) introduced `qualify_and_quote_table_ref` in `src/expand/resolu
 
 ### Release (REL)
 
-- [ ] **REL-01**: `CHANGELOG.md` has a `## [0.9.1]` section under `### Fixed` describing both fixes in user-facing terms; the `[Unreleased]` block is reset to `_No unreleased changes yet._`; the bottom-of-file compare link is updated (`[0.9.1]` and updated `[Unreleased]` link target).
-- [ ] **REL-02**: `Cargo.toml` and `description.yml` bumped to `0.9.1`. `just test-all` and `just ci` green on the milestone branch.
+- [ ] **REL-01**: `CHANGELOG.md` has a `## [0.10.0]` section describing the milestone in user-facing terms (LIFE-01..04 read-only-reopen fix; EXPAND-CTX-01..03 expansion qualification defense-in-depth); the `[Unreleased]` block is reset to `_No unreleased changes yet._`; the bottom-of-file compare link is updated (`[0.10.0]` and updated `[Unreleased]` link target). (Texts above mention `v0.9.1` because the milestone was reframed mid-flight; user-facing release is `v0.10.0`.)
+- [ ] **REL-02**: `Cargo.toml` and `description.yml` bumped to `0.10.0`. `just test-all` and `just ci` green on the milestone branch.
+- [ ] **REL-03**: New Python example file under `examples/` demonstrating the v0.10.0 read-only-reopen story and the cross-connection expansion fix (matching the style of `basic_ddl_and_query.py`, `advanced_features.py`, etc.).
+- [ ] **REL-04**: DuckDB dependency bumped from `v1.5.2` → `v1.5.3`: `.duckdb-version`, `.github/workflows/BuildAll.yml` and `BuildQuick.yml` ref tags + `duckdb_version` / `ci_tools_version`, `Cargo.toml` (`duckdb = "=1.10503.0"`, `libduckdb-sys = "=1.10503.0"`), and `Cargo.lock`. The DuckDB Version Monitor flagged v1.5.3 compat break (`FlatVector::as_mut_slice` became `unsafe`) on PR #34 against `main`; the failing call site was eliminated by Phase 65's read-elimination architecture, so the milestone-close bump should land cleanly. PR #34 closed as superseded.
 
 ## Traceability
 
@@ -43,10 +45,12 @@ Phase 64 (v0.9.0) introduced `qualify_and_quote_table_ref` in `src/expand/resolu
 | EXPAND-CTX-01 | Phase 66 | Complete |
 | EXPAND-CTX-02 | Phase 66 | Complete |
 | EXPAND-CTX-03 | Phase 66 | Complete |
-| REL-01        | Phase 66 | Pending |
-| REL-02        | Phase 66 | Pending |
+| REL-01        | Milestone close | Pending |
+| REL-02        | Milestone close | Pending |
+| REL-03        | Milestone close | Pending |
+| REL-04        | Milestone close | Pending |
 
-Coverage: 9/9 requirements mapped (100%).
+Coverage: 11/11 requirements mapped (100%).
 
 ## v2 / Future / Out of Scope
 
