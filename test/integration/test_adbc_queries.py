@@ -94,7 +94,11 @@ def _scalar(conn, sql: str):
 
 def _bootstrap_extension(conn, extension_path: Path) -> None:
     """Install + load the extension on a fresh ADBC connection, then commit."""
-    _execute(conn, f"FORCE INSTALL '{extension_path}'")
+    # IN-02: escape single-quotes for SQL string literal (path may contain '
+    # though project-internal paths today don't). DuckDB-recognised escape
+    # inside a single-quoted string literal is doubling the single quote.
+    extension_path_sql = str(extension_path).replace("'", "''")
+    _execute(conn, f"FORCE INSTALL '{extension_path_sql}'")
     _execute(conn, "LOAD semantic_views")
     conn.commit()
 
