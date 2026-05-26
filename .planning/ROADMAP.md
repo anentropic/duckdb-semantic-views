@@ -291,7 +291,7 @@ Plans (in wave order):
 Plans:
 **Wave 1**
 
-- [ ] 66-01-PLAN.md (Wave 1) — Test scaffolding: `test/integration/test_adbc_queries.py` + `just test-adbc-queries` recipe + `test-all` wiring (scenarios 3-7 SKIP-gated pending Plan 02)
+- [x] 66-01-PLAN.md (Wave 1) — Test scaffolding: `test/integration/test_adbc_queries.py` + `just test-adbc-queries` recipe + `test-all` wiring (scenarios 3-7 SKIP-gated pending Plan 02)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
