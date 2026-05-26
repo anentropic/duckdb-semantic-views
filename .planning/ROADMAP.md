@@ -216,10 +216,12 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
 ### Phase Details
 
 ### Phase 65: OverrideContext Connection Teardown (read-elimination architecture)
+
 **Goal**: Retire both long-lived extension-owned `duckdb_connection` handles (H1 catalog_conn AND H2 query_conn) so the in-process RW→RO reopen hang resolves, while preserving v0.8.0 transactional DDL semantics byte-identical. Achieved by eliminating the catalog reads inside `parser_override` rather than porting `parser_override` to a different callback shape, plus migrating read-path callbacks to the C++ Catalog API registration shim so they gain ClientContext for per-call Connection.
 **Depends on**: Nothing (first phase of v0.10.0)
 **Requirements**: LIFE-01, LIFE-02, LIFE-03, LIFE-04
 **Architecture (locked, pending fresh /gsd-discuss-phase formalization)**:
+
   - `parser_override` PRESERVED. It is the only DuckDB v1.5.2 mechanism returning `vector<unique_ptr<SQLStatement>>` to the binder so writes land on the caller's transaction. Empirically: every alternative (`parse_function`+`plan_function`, `context.Query` from any extension callback, `Connection(*context.db).Query` for writes) fails one of the two non-negotiable constraints (D-20 transactional DDL or liveness via context_lock). See 65-OPTION-B-SPIKE.md, 65-EXEC-TIME-SPIKE.md.
   - **Catalog reads INSIDE `parser_override` are eliminated**, not relocated:
     - PK auto-inference from `duckdb_constraints()` deleted (`src/ddl/define.rs::resolve_pk_from_catalog`). Snowflake-aligned: PK in semantic views is a logical user assertion, not a physical catalog import. Users declare `PRIMARY KEY (cols)` or `UNIQUE (cols)` explicitly in TABLES, or use explicit `REFERENCES target(cols)` shorthand. Removing the auto-fallback is a correctness improvement.
@@ -228,13 +230,17 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
     - DDL-time type inference (LIMIT 0 probes, typeof per fact) defers to read-side bind callbacks (which have ClientContext under the C++ Catalog API registration). SHOW/DESCRIBE probe lazily on first use.
   - **ALTER and CREATE FROM YAML FILE** use the rewrite-to-UPDATE-with-table-function-subquery pattern (ALTER-RC0): `parser_override` emits `UPDATE _definitions SET definition = (SELECT new_def FROM __sv_compute_*(args)) WHERE name = ?`; inner table function (registered via C++ Catalog API) has ClientContext, opens per-call `Connection(*context.db)` to read current state and compute new value; outer UPDATE writes transactionally on caller's conn. Validated empirically by 65-ALTER-REWRITE-SPIKE.md.
   - **Read-path callbacks** (`list`, `describe`, `show_columns`, `show_dims`, `show_dims_for_metric`, `show_metrics`, `show_facts`, `show_materializations`, `get_ddl`, `read_yaml`, `semantic_view`, `explain_semantic_view`) migrate from duckdb-rs's `register_table_function_with_extra_info` to the C++ Catalog API shim `sv_register_table_function` (Plan 02 partial). Bind callbacks gain ClientContext; each opens per-call `Connection(*context.db)`. `query_conn` retires once all 12 callbacks migrate.
+
 **Success Criteria** (what must be TRUE):
+
   1. In the same Python process, after a writable connection that did `LOAD semantic_views` and `CREATE SEMANTIC VIEW` is closed, a subsequent `duckdb.connect(path, read_only=True)` against the same path returns within 5 seconds — verified both on a freshly bootstrapped DB and on a previously bootstrapped DB (LIFE-01).
   2. v0.8.0 transactional DDL semantics preserved byte-identical (CREATE/DROP/ALTER inside user BEGIN/COMMIT still participate in the transaction); existing Phase 58 ADBC transactional tests stay green.
   3. `test/integration/test_readonly_load.py` includes new `test_in_process_bootstrap_then_readonly` scenarios that exercise CREATE-then-close-then-reopen-readonly + read-side variants (SELECT through `semantic_view()`, `list`/`describe`/`show` after close); all guarded by watchdog; all fail on v0.9.0 baseline and pass on v0.10.0.
   4. Both long-lived extension-owned `duckdb_connection` handles (H1 catalog_conn, H2 query_conn) are retired from `init_extension`. Structural Rust unit test fails CI if anyone re-introduces a long-lived native handle.
   5. PK auto-inference removal documented in CHANGELOG as a behavior change (users relying on the fallback get a clear error pointing to the explicit-declaration alternative).
+
 **Plans**:
+
   - 65-01 (DONE — `65-01-SUMMARY.md`): ConnGuard scaffolding + 5 watchdog tests (B1..B4 + B11) — ConnGuard later deleted by 65-03 D-02; watchdog tests retained for Plan 06 verification.
   - 65-02 (PARTIAL — `65-02-PARTIAL-SUMMARY.md`): sv_register_table_function C++ Catalog API shim; OverrideContext db_handle plumbing rewritten back to v0.9.0 shape by 65-03 D-01. Shim infrastructure surviving for Plans 04/05 consumption.
   - 65-03 (DONE — `65-03-SUMMARY.md`): parser_override slimming wave. Reverted Plan 02 partial damage; deleted conn_guard.rs (D-02), resolve_pk_from_catalog (D-05); moved CREATE-time metadata to SQL via json_merge_patch on caller's conn (D-16, metadata-via-SQL); added D-06 hard error path; deferred type inference to read-side (D-17). parser_override CREATE path has ZERO catalog reads. H1 catalog_conn allocation still present at src/lib.rs:386-410 but unused by CREATE path; Plan 06 retires the allocation. 49/49 sqllogictest; 933/933 nextest; 6/6 ADBC transactions; D-03 watchdog tests still TimeoutError as expected (flip green at Plan 06).
@@ -250,6 +256,7 @@ Full details: [milestones/v0.9.0-ROADMAP.md](milestones/v0.9.0-ROADMAP.md)
 **Plans:** 14 plans (originally 12; Plan 02 split into 02a/02b and Plan 03 split into 03a/03b per plan-checker B-05/B-06)
 
 Plans (in wave order):
+
 - [x] 65.1-01-PLAN.md (Wave 1) — Wave 0 test scaffolds (8 stub files + TEST_LIST registration)
 - [x] 65.1-02a-PLAN.md (Wave 1) — WR-02 C-side: registration error_buf ABI + null-init refusal + D-06 comment delete (shim.cpp + shim.hpp)
 - [x] 65.1-03a-PLAN.md (Wave 1) — WR-05 ddl/ side: BorrowedConnection newtype + 15 ddl/ dispatcher migration + IN-06 dedup absorbed
@@ -268,15 +275,32 @@ Plans (in wave order):
 **Source artifact:** `.planning/phases/65-overridecontext-connection-teardown/65-REVIEW.md` (committed in `6c1dbd6`). WR-01 already addressed in `ae17f4b` (UB closure in `parse_string_list`) — exclude from this phase scope.
 
 ### Phase 66: Expansion Qualification Across All Paths + ADBC Tests
+
 **Goal**: Make `FROM semantic_view(...)` work through ADBC and any other client whose catalog/schema search path diverges from the extension's `query_conn` — and ship the milestone (CHANGELOG, version bump, CI green).
 **Depends on**: Phase 65
 **Requirements**: EXPAND-CTX-01, EXPAND-CTX-02, EXPAND-CTX-03, REL-01, REL-02, REL-03 (REL-03 was the v0.9.1-specific release prep; carries over to v0.10.0)
 **Scope reassessment pending Phase 65**: The original EXPAND-CTX-01..03 requirements assumed `query_conn` (the long-lived H2 handle) would still exist and the fix was qualifying table references at SQL-emission time to bridge the catalog-search-path gap between query_conn and the caller's conn. Under read-elimination, `query_conn` retires entirely and read-path callbacks open per-call `Connection(*context.db)` from the caller's ClientContext — so they inherit the caller's catalog/schema search path natively. The EXPAND-CTX root cause likely dissolves. Empirical verification via the ADBC test suite (REL-01..02) will confirm; the phase shape may shrink to test scaffolding + release prep only.
 **Success Criteria** (what must be TRUE):
+
   1. Through `adbc_driver_duckdb`, `SELECT … FROM semantic_view(...)` returns rows (not a `Catalog Error: Table with name X does not exist`) against semantic views exercising the main expansion path, FACTS, semi-additive metrics, window metrics, and a multi-database `ATTACH` scenario.
   2. A new `test/integration/test_adbc_queries.py` (runnable via `just test-adbc-queries`) covers those five scenarios end-to-end; it fails on the v0.9.0 baseline and passes on v0.10.0, serving as the regression guard.
   3. `_notes/error_with_adbc.md` is either removed or updated to point at the v0.10.0 fix.
   4. A user who installs v0.10.0 sees a `## [0.10.0]` section in `CHANGELOG.md` describing both fixes under `### Fixed` (plus the PK auto-inference removal under `### Changed`), with the `[Unreleased]` block reset and compare links updated; `Cargo.toml` and `description.yml` report `0.10.0`; `just test-all` and `just ci` are green on `milestone/v0.10.0`.
-**Plans**: TBD
+
+**Plans**: 3 plans
+Plans:
+**Wave 1**
+
+- [ ] 66-01-PLAN.md (Wave 1) — Test scaffolding: `test/integration/test_adbc_queries.py` + `just test-adbc-queries` recipe + `test-all` wiring (scenarios 3-7 SKIP-gated pending Plan 02)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 66-02-PLAN.md (Wave 2) — Migrate 7 expand-path sites to `qualify_and_quote_table_ref`; signature-change `build_materialized_sql`; update phase57_introspection.test fixture; un-skip ADBC scenarios; D-09 baseline evidence captured
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 66-03-PLAN.md (Wave 3) — Append `## Resolution (v0.10.0)` to `_notes/error_with_adbc.md`; final quality-gate confirmation
+
+Note: REL-01/REL-02/REL-03 deferred to milestone close per `feedback_defer_release_tasks.md` — not in Phase 66 scope.
 
 </details>
