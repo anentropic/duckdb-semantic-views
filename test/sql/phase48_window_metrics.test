@@ -87,6 +87,27 @@ NYC	2024-01-04	2024	17.5
 NYC	2024-01-05	2024	20.0
 
 # ========================================
+# Phase 67 A3: shape assertions pinning window metric OVER frame emission
+# Pin `OVER (PARTITION BY`, `NULLS LAST`, and qualified 3-part FROM
+# in the expanded SQL of avg_qty (PARTITION BY EXCLUDING date ORDER BY date ASC NULLS LAST).
+# ========================================
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p48_sales_view', dimensions := ['store', 'date', 'year'], metrics := ['avg_qty']) WHERE explain_output LIKE '%OVER (PARTITION BY%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p48_sales_view', dimensions := ['store', 'date', 'year'], metrics := ['avg_qty']) WHERE explain_output LIKE '%NULLS LAST%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p48_sales_view', dimensions := ['store', 'date', 'year'], metrics := ['avg_qty']) WHERE explain_output LIKE '%FROM "memory"."main"."p48_sales"%';
+----
+true
+
+# ========================================
 # Test 3: Query LAG window metric
 # First row per partition should be NULL (no previous row)
 # ========================================
