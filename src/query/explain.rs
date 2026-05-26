@@ -49,42 +49,69 @@ use super::table_function::{execute_sql_raw, read_varchar_from_vector};
 //       populated.
 
 /// Parse a length-prefixed list-of-VARCHAR wire-format buffer back into a
-/// `Vec<String>`. Returns `None` on truncation / overflow (the C++ side
-/// surfaces this as rc=1 via the dispatcher).
-unsafe fn parse_string_list(buf: *const u8, len: usize) -> Option<Vec<String>> {
+/// `Vec<String>`. Returns an `Err(diagnostic)` on truncation / overflow /
+/// trailing bytes; the C++ side surfaces this as rc=1 via the dispatcher.
+///
+/// Phase 65.1 WR-05: returns `Result<_, String>` so the dispatcher can
+/// surface "expected u32 at offset N of M" or "trailing N bytes after
+/// count C" details, matching the diagnostic shape of the C++
+/// `sv_parse_varchar_payload`. The previous `Option<Vec<String>>` shape
+/// only let the dispatcher report a flat "malformed X payload" error
+/// with no detail — unactionable for an FFI-shape regression.
+unsafe fn parse_string_list(buf: *const u8, len: usize) -> Result<Vec<String>, String> {
     // Handle null buffer explicitly before len-check so a pathological
     // (null, len > 0) FFI call cannot fall through to from_raw_parts(null, len),
     // which is UB. Mirrors src/query/table_function.rs::sv_parse_string_list.
     if buf.is_null() {
-        return if len == 0 { Some(Vec::new()) } else { None };
+        return if len == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(format!("null buffer but len={len} (FFI shape drift)"))
+        };
     }
     if len < 4 {
-        return None;
+        return Err(format!(
+            "buffer too short for count prefix: len={len} (expected >= 4)"
+        ));
     }
     let slice = std::slice::from_raw_parts(buf, len);
     let mut off = 0usize;
-    let read_u32 = |slice: &[u8], off: &mut usize| -> Option<u32> {
+    let read_u32 = |slice: &[u8], off: &mut usize| -> Result<u32, String> {
         if *off + 4 > slice.len() {
-            return None;
+            return Err(format!(
+                "expected u32 at offset {} of {} (truncated)",
+                *off,
+                slice.len()
+            ));
         }
-        let v = u32::from_le_bytes(slice[*off..*off + 4].try_into().ok()?);
+        let v = u32::from_le_bytes(slice[*off..*off + 4].try_into().map_err(
+            |e: std::array::TryFromSliceError| format!("u32 decode failed at offset {}: {e}", *off),
+        )?);
         *off += 4;
-        Some(v)
+        Ok(v)
     };
     let count = read_u32(slice, &mut off)? as usize;
     let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        let n = read_u32(slice, &mut off)? as usize;
+    for i in 0..count {
+        let n = read_u32(slice, &mut off)
+            .map_err(|e| format!("reading length for element {i} of {count}: {e}"))?
+            as usize;
         if off + n > slice.len() {
-            return None;
+            return Err(format!(
+                "element {i} of {count} declares length {n} but only {} bytes remain at offset {off}",
+                slice.len().saturating_sub(off)
+            ));
         }
         out.push(String::from_utf8_lossy(&slice[off..off + n]).into_owned());
         off += n;
     }
     if off != len {
-        return None;
+        return Err(format!(
+            "trailing {} bytes after count {count} (consumed {off} of {len})",
+            len - off
+        ));
     }
-    Some(out)
+    Ok(out)
 }
 
 /// # Safety
@@ -152,23 +179,35 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
         };
 
         let dimensions = match parse_string_list(dims_ptr, dims_len) {
-            Some(v) => v,
-            None => {
-                write_err(error_buf, error_buf_len, "malformed `dimensions` payload");
+            Ok(v) => v,
+            Err(detail) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("malformed `dimensions` payload: {detail}"),
+                );
                 return 1_u8;
             }
         };
         let metrics = match parse_string_list(metrics_ptr, metrics_len) {
-            Some(v) => v,
-            None => {
-                write_err(error_buf, error_buf_len, "malformed `metrics` payload");
+            Ok(v) => v,
+            Err(detail) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("malformed `metrics` payload: {detail}"),
+                );
                 return 1_u8;
             }
         };
         let facts = match parse_string_list(facts_ptr, facts_len) {
-            Some(v) => v,
-            None => {
-                write_err(error_buf, error_buf_len, "malformed `facts` payload");
+            Ok(v) => v,
+            Err(detail) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("malformed `facts` payload: {detail}"),
+                );
                 return 1_u8;
             }
         };
