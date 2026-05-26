@@ -299,7 +299,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 66-03-PLAN.md (Wave 3) — Append `## Resolution (v0.10.0)` to `_notes/error_with_adbc.md`; final quality-gate confirmation
+- [x] 66-03-PLAN.md (Wave 3) — Append `## Resolution (v0.10.0)` to `_notes/error_with_adbc.md`; final quality-gate confirmation
 
 Note: REL-01/REL-02/REL-03 deferred to milestone close per `feedback_defer_release_tasks.md` — not in Phase 66 scope.
 

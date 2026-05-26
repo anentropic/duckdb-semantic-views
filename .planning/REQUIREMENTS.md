@@ -25,7 +25,7 @@ Phase 64 (v0.9.0) introduced `qualify_and_quote_table_ref` in `src/expand/resolu
 
 - [x] **EXPAND-CTX-01**: Every expansion site that emits a physical table reference uses `qualify_and_quote_table_ref` (or an equivalent qualifier) — not the raw `quote_table_ref`. Sites in scope: `src/expand/sql_gen.rs:181, 224, 244` (fact-query path), `src/expand/semi_additive.rs:195, 220, 238`, `src/expand/window.rs:156, 181, 199`, `src/expand/materialization.rs:157`. After the fix, no unqualified `FROM "<table>"` shape appears in the expansion output of any view that has `database_name` / `schema_name` metadata.
 - [x] **EXPAND-CTX-02**: ADBC end-to-end query test (`test/integration/test_adbc_queries.py`, runnable via `just test-adbc-queries`) covers `SELECT … FROM semantic_view(...)` through `adbc_driver_duckdb` for at least: (a) main expansion path, (b) a view with FACTS, (c) a view with a semi-additive metric, (d) a view with a window metric, (e) a multi-database `ATTACH 'other.db' AS db2; CREATE SEMANTIC VIEW db2.main.v AS …; FROM semantic_view('db2.main.v', …)` scenario. The test must fail without the EXPAND-CTX-01 changes and pass with them.
-- [ ] **EXPAND-CTX-03**: `_notes/error_with_adbc.md` is either deleted (resolved) or updated with the resolution and a pointer to the v0.9.1 fix.
+- [x] **EXPAND-CTX-03**: `_notes/error_with_adbc.md` is either deleted (resolved) or updated with the resolution and a pointer to the v0.9.1 fix.
 
 ### Release (REL)
 
@@ -42,7 +42,7 @@ Phase 64 (v0.9.0) introduced `qualify_and_quote_table_ref` in `src/expand/resolu
 | LIFE-04       | Phase 65 | **Satisfied (Plan 06 ledger close)** |
 | EXPAND-CTX-01 | Phase 66 | Complete |
 | EXPAND-CTX-02 | Phase 66 | Complete |
-| EXPAND-CTX-03 | Phase 66 | Pending |
+| EXPAND-CTX-03 | Phase 66 | Complete |
 | REL-01        | Phase 66 | Pending |
 | REL-02        | Phase 66 | Pending |
 
