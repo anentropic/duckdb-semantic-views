@@ -105,6 +105,10 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 - ✓ Caret-position rendering for validation errors: `parse_function` reintroduced purely as the error-reporting layer (`parser_override` keeps the success/transactional path); validation errors render as `Parser Error: ... LINE 1: ... ^`. Bounded multi-DB LRU removed; `OverrideContext` direct-attached to `SemanticViewsParserInfo` (lifetime-tied to `DBConfig`). Resolves TECH-DEBT items 20 + 22. — v0.8.0 (Phase 62)
 
+- ✓ OverrideContext connection teardown: both long-lived `duckdb_connection` handles (`query_conn` H2 + `catalog_conn` H1) retired from `init_extension`; 17 read-side function registrations migrated from duckdb-rs to C++ Catalog API via `sv_register_table_function` shim with per-call `Connection(*context.db)` under the BORROW contract. In-process `connect(path) → LOAD → CREATE → close → connect(path, read_only=True)` no longer hangs. `tests/no_long_lived_conn.rs` AST guard prevents regression. — v0.10.0 (Phase 65)
+
+- ✓ Code review remediation: 10 Critical + Warning findings from Phase 65 REVIEW.md addressed across 14 plans, plus 1 Critical + 7 Warning findings introduced during the remediation itself (caught by a follow-up review pass) fixed. Surface area: SQL-injection elimination in YAML-FILE TF (FileSystem-direct read), C ABI `(error_buf, error_buf_len)` cascade across all `sv_register_*` shims, `BorrowedConnection` newtype + `DisconnectFinder` AST guard, BORROW-contract `static_assert` + load-time runtime probe, hard `BinderException` on previously-silent fallbacks, idempotent parser-hook registration. — v0.10.0 (Phase 65.1)
+
 ### Active
 
 **Current milestone: v0.10.0 — Connection-Lifecycle & Catalog-Context Fixes**
@@ -222,7 +226,7 @@ Originally opened 2026-05-21 as v0.9.1 patch milestone. Reframed 2026-05-23 to v
 ## Evolution
 
 This document evolves at phase transitions and milestone boundaries.
-Last updated: 2026-05-23 — milestone reframed v0.9.1 → v0.10.0 after B-prime architecture eliminated; read-elimination architecture is the new direction.
+Last updated: 2026-05-26 — Phase 65.1 (code review remediation) complete. Phase 65 OverrideContext teardown + Phase 65.1 remediation both shipped; next is Phase 66 (Expansion qualification + ADBC tests + milestone finisher).
 
 **After each phase transition** (via `/gsd:transition`):
 1. Requirements invalidated? → Move to Out of Scope with reason
