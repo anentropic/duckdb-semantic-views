@@ -7,7 +7,7 @@ stopped_at: Phase 66 Plan 03 complete (EXPAND-CTX-03 close-out note; Phase 66 re
 last_updated: "2026-05-26T15:23:40.626Z"
 last_activity: 2026-05-26
 progress:
-  total_phases: 3
+  total_phases: 2
   completed_phases: 3
   total_plans: 22
   completed_plans: 26
