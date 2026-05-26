@@ -616,6 +616,20 @@ extern "C" {
                     name);
                 return false;
             }
+            // Phase 65.1 WR-01: symmetric null guard for arg_types when the
+            // caller declares a non-zero arg_count. The header at
+            // cpp/src/shim.hpp documents arg_types "may be null when
+            // arg_count == 0"; without this check a buggy caller passing
+            // (nullptr, > 0) would segfault inside the loop below — far
+            // from the bug site. Matches the D-05/D-08/D-09 hardening
+            // pattern already applied to the other input arguments.
+            if (arg_count > 0 && arg_types == nullptr) {
+                write_err(
+                    "sv_register_table_function('%s'): arg_count > 0 but "
+                    "arg_types is null",
+                    name);
+                return false;
+            }
             auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
                 db_handle->internal_ptr);
             if (wrapper == nullptr) {
@@ -703,6 +717,16 @@ extern "C" {
             if (db_handle == nullptr || name == nullptr || exec_cb == nullptr) {
                 write_err(
                     "sv_register_scalar_function('%s'): null required argument",
+                    name);
+                return false;
+            }
+            // Phase 65.1 WR-01: symmetric null guard for arg_types when the
+            // caller declares a non-zero arg_count. Same contract as the
+            // table-function sibling above.
+            if (arg_count > 0 && arg_types == nullptr) {
+                write_err(
+                    "sv_register_scalar_function('%s'): arg_count > 0 but "
+                    "arg_types is null",
                     name);
                 return false;
             }
