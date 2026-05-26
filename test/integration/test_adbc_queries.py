@@ -229,12 +229,13 @@ def test_main_path_non_default_schema(extension_path: Path, ext_dir: str, tmp_pa
 
 
 def test_facts_non_default_schema(extension_path: Path, ext_dir: str, tmp_path: Path) -> None:
-    """Scenario 3 — FACTS path, non-default schema base table. SKIP_UNTIL_PLAN_02.
+    """Scenario 3 — FACTS path, non-default schema base table. ACTIVE.
 
     Regression guard for ``src/expand/sql_gen.rs:181, 224, 244`` (fact-query
-    path). Pre-migration this emits ``FROM "sales"`` against a per-call
-    ``Connection(*context.db)`` whose default schema is ``main`` — fails with
-    ``Catalog Error: Table with name sales does not exist!``.
+    path). After the Phase 66 migration these sites use
+    ``qualify_and_quote_table_ref``; this scenario fails with
+    ``Catalog Error: Table with name sales does not exist!`` if a regression
+    re-introduces unqualified emission.
     """
     db_path = str(tmp_path / "scenario3.duckdb")
     conn = _connect_adbc(db_path, ext_dir)
@@ -273,12 +274,13 @@ def test_facts_non_default_schema(extension_path: Path, ext_dir: str, tmp_path: 
 
 
 def test_semi_additive_non_default_schema(extension_path: Path, ext_dir: str, tmp_path: Path) -> None:
-    """Scenario 4 — semi-additive metric, non-default schema base table. SKIP_UNTIL_PLAN_02.
+    """Scenario 4 — semi-additive metric, non-default schema base table. ACTIVE.
 
     Regression guard for ``src/expand/semi_additive.rs:195, 220, 238``.
-    A ``MIN_BY(qty, snapshot_date)`` semi-additive metric emits inner subqueries
-    that currently use ``quote_table_ref`` — fails on non-default-schema base
-    table pre-migration.
+    A ``MIN_BY(qty, snapshot_date)`` semi-additive metric emits inner
+    subqueries that, post-migration, use ``qualify_and_quote_table_ref``;
+    a regression to ``quote_table_ref`` would fail on the non-default-schema
+    base table.
     """
     db_path = str(tmp_path / "scenario4.duckdb")
     conn = _connect_adbc(db_path, ext_dir)
@@ -324,10 +326,11 @@ def test_semi_additive_non_default_schema(extension_path: Path, ext_dir: str, tm
 
 
 def test_window_non_default_schema(extension_path: Path, ext_dir: str, tmp_path: Path) -> None:
-    """Scenario 5 — window metric, non-default schema base table. SKIP_UNTIL_PLAN_02.
+    """Scenario 5 — window metric, non-default schema base table. ACTIVE.
 
     Regression guard for ``src/expand/window.rs:156, 181, 199``. Window-metric
-    inner CTEs emit ``quote_table_ref`` references pre-migration.
+    inner CTEs use ``qualify_and_quote_table_ref`` post-migration; a regression
+    to ``quote_table_ref`` would fail on the non-default-schema base table.
     """
     db_path = str(tmp_path / "scenario5.duckdb")
     conn = _connect_adbc(db_path, ext_dir)
@@ -379,11 +382,12 @@ def test_window_non_default_schema(extension_path: Path, ext_dir: str, tmp_path:
 def test_materialization_routing_non_default_schema_target(
     extension_path: Path, ext_dir: str, tmp_path: Path
 ) -> None:
-    """Scenario 6 — materialization routing to non-default-schema target. SKIP_UNTIL_PLAN_02.
+    """Scenario 6 — materialization routing to non-default-schema target. ACTIVE.
 
     Regression guard for ``src/expand/materialization.rs:157``. The
     materialization's ``target_table => 'agg.daily_revenue'`` is emitted
-    unqualified pre-migration; query routed to the materialization fails.
+    fully qualified post-migration; a regression to unqualified emission
+    would cause the routed query to fail catalog resolution.
     """
     db_path = str(tmp_path / "scenario6.duckdb")
     conn = _connect_adbc(db_path, ext_dir)
@@ -450,7 +454,7 @@ def test_materialization_routing_non_default_schema_target(
 
 
 def test_attach_facts_path(extension_path: Path, ext_dir: str, tmp_path: Path) -> None:
-    """Scenario 7 — multi-DB ATTACH + FACTS metric on attached DB table. SKIP_UNTIL_PLAN_02.
+    """Scenario 7 — multi-DB ATTACH + FACTS metric on attached DB table. ACTIVE.
 
     Regression guard for the cross-catalog interaction with the FACTS path
     (``sql_gen.rs:181, 224, 244``). The other DB is pre-created via a side
