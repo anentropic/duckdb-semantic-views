@@ -27,7 +27,7 @@ use crate::model::{Metric, NonAdditiveDim, NullsOrder, SemanticViewDefinition, S
 use crate::util::replace_word_boundary;
 
 use super::join_resolver::{resolve_joins_pkfk, synthesize_on_clause, synthesize_on_clause_scoped};
-use super::resolution::{quote_ident, quote_table_ref};
+use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 use super::types::ExpandError;
 
 /// Generate CTE-based expansion SQL for queries containing semi-additive metrics.
@@ -192,7 +192,7 @@ pub(super) fn expand_semi_additive(
 
     // CTE FROM clause (same logic as expand())
     sql.push_str("\n    FROM ");
-    sql.push_str(&quote_table_ref(def.base_table()));
+    sql.push_str(&qualify_and_quote_table_ref(def.base_table(), def));
     if let Some(base_ref) = def.tables.first() {
         sql.push_str(" AS ");
         sql.push_str(&quote_ident(&base_ref.alias));
@@ -217,7 +217,7 @@ pub(super) fn expand_semi_additive(
                 .find(|t| t.alias.to_ascii_lowercase() == bare_alias);
             let physical_table = table_ref.map_or(bare_alias, |t| t.table.as_str());
             sql.push_str("\n    LEFT JOIN ");
-            sql.push_str(&quote_table_ref(physical_table));
+            sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
             sql.push_str(" AS ");
             sql.push_str(&quote_ident(alias));
             sql.push_str(" ON ");
@@ -235,7 +235,7 @@ pub(super) fn expand_semi_additive(
                 .find(|t| t.alias.to_ascii_lowercase() == *alias);
             let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
             sql.push_str("\n    LEFT JOIN ");
-            sql.push_str(&quote_table_ref(physical_table));
+            sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
             sql.push_str(" AS ");
             sql.push_str(&quote_ident(alias));
             sql.push_str(" ON ");
