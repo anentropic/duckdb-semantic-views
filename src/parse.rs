@@ -344,26 +344,35 @@ fn function_name(kind: DdlKind) -> &'static str {
 /// the opening and closing quotes.
 ///
 /// Handles SQL-style escaping: `''` inside quotes represents a literal `'`.
+///
+/// Phase 65.1 WR-04: walks the input as a `char` stream (UTF-8 scalar values)
+/// rather than as raw bytes — the previous `bytes[pos] as char` cast
+/// silently corrupted any non-ASCII codepoint into its Latin-1 supplement
+/// equivalent, mangling e.g. Cyrillic / CJK / emoji / smart-quote payloads
+/// in `SHOW ... LIKE '<pattern>'` or `ALTER ... SET COMMENT = '<text>'`.
 fn extract_quoted_string(input: &str) -> Result<(String, usize), String> {
-    let bytes = input.as_bytes();
-    if bytes.is_empty() || bytes[0] != b'\'' {
-        return Err("Expected single-quoted string".to_string());
+    let mut chars = input.char_indices();
+    match chars.next() {
+        Some((_, '\'')) => {}
+        _ => return Err("Expected single-quoted string".to_string()),
     }
-    let mut pos = 1;
     let mut result = String::new();
-    while pos < bytes.len() {
-        if bytes[pos] == b'\'' {
-            if pos + 1 < bytes.len() && bytes[pos + 1] == b'\'' {
+    while let Some((i, ch)) = chars.next() {
+        if ch == '\'' {
+            // Peek without consuming; only advance the real iterator on a hit.
+            let mut peek = chars.clone();
+            if matches!(peek.next(), Some((_, '\''))) {
                 // Escaped quote: '' -> '
                 result.push('\'');
-                pos += 2;
+                chars = peek;
             } else {
-                // End of string
-                return Ok((result, pos + 1));
+                // End of string. `i` is the byte offset of the closing
+                // quote; closing quote is one byte (ASCII '\''), so total
+                // consumed = i + 1.
+                return Ok((result, i + 1));
             }
         } else {
-            result.push(bytes[pos] as char);
-            pos += 1;
+            result.push(ch);
         }
     }
     Err("Unterminated single-quoted string".to_string())
@@ -1084,23 +1093,32 @@ fn extract_view_comment(text: &str) -> Result<(Option<String>, &str), ParseError
                 position: None,
             });
         }
-        // Extract the quoted string handling '' escaping
-        let bytes = after_eq.as_bytes();
-        let mut i = 1; // skip opening quote
+        // Extract the quoted string handling '' escaping.
+        //
+        // Phase 65.1 WR-04: walk as `char` stream (UTF-8 scalar values)
+        // rather than raw bytes — the previous `bytes[i] as char` cast
+        // silently mangled non-ASCII characters in the comment body.
+        // We skip the opening quote (one ASCII byte) and iterate from
+        // byte offset 1 via `char_indices()` against `&after_eq[1..]`,
+        // adjusting reported offsets back to `after_eq` space.
+        let mut chars = after_eq[1..].char_indices();
         let mut value = String::new();
-        while i < bytes.len() {
-            if bytes[i] == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+        while let Some((rel_i, ch)) = chars.next() {
+            if ch == '\'' {
+                let mut peek = chars.clone();
+                if matches!(peek.next(), Some((_, '\''))) {
                     value.push('\'');
-                    i += 2;
+                    chars = peek;
                     continue;
                 }
-                // Closing quote found
-                let remaining = &after_eq[i + 1..];
+                // Closing quote found. `rel_i` is offset into `after_eq[1..]`;
+                // absolute offset of the closing quote in `after_eq` is
+                // `rel_i + 1`; the slice after the closing quote starts at
+                // `rel_i + 2` (closing quote is one ASCII byte).
+                let remaining = &after_eq[rel_i + 2..];
                 return Ok((Some(value), remaining));
             }
-            value.push(bytes[i] as char);
-            i += 1;
+            value.push(ch);
         }
         Err(ParseError {
             message: "Unclosed single-quoted string in view-level COMMENT.".to_string(),
@@ -1288,20 +1306,33 @@ fn extract_single_quoted(input: &str) -> Result<(String, usize), ParseError> {
             position: None,
         });
     }
+    // Phase 65.1 WR-04: walk as `char` stream (UTF-8 scalar values) rather
+    // than raw bytes — the previous `bytes[i] as char` cast silently
+    // corrupted non-ASCII file paths (e.g. paths containing CJK or
+    // accented characters) before they reached the FileSystem-direct YAML
+    // read path. The user would see a confusing "file not found" instead
+    // of the expected open.
+    //
+    // Skip the opening quote (one ASCII byte) and iterate over
+    // `input[1..]`, then adjust reported byte offsets back to `input`
+    // space for the consumed-length return value.
     let mut result = String::new();
-    let mut i = 1; // skip opening quote
-    let bytes = input.as_bytes();
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+    let mut chars = input[1..].char_indices();
+    while let Some((rel_i, ch)) = chars.next() {
+        if ch == '\'' {
+            let mut peek = chars.clone();
+            if matches!(peek.next(), Some((_, '\''))) {
                 result.push('\'');
-                i += 2;
+                chars = peek;
             } else {
-                return Ok((result, i + 1));
+                // `rel_i` is offset into `input[1..]`; absolute byte
+                // position of the closing quote in `input` is `rel_i + 1`;
+                // total bytes consumed (including both quotes) is
+                // `rel_i + 2` since the closing quote is one ASCII byte.
+                return Ok((result, rel_i + 2));
             }
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            result.push(ch);
         }
     }
     Err(ParseError {
@@ -4019,6 +4050,44 @@ mod tests {
             assert!(result.is_err());
         }
 
+        // Phase 65.1 WR-04: round-trip non-ASCII payloads through the
+        // quoted-string extractor. The previous `bytes[pos] as char`
+        // implementation silently corrupted multi-byte UTF-8 sequences
+        // into the Latin-1 supplement region (U+0080..U+00FF).
+        #[test]
+        fn test_extract_quoted_string_utf8_cyrillic() {
+            let input = "'Привет'"; // Russian "Hello"
+            let (s, n) = extract_quoted_string(input).unwrap();
+            assert_eq!(s, "Привет");
+            assert_eq!(n, input.len());
+        }
+
+        #[test]
+        fn test_extract_quoted_string_utf8_cjk_and_emoji() {
+            let input = "'你好 🦆'";
+            let (s, n) = extract_quoted_string(input).unwrap();
+            assert_eq!(s, "你好 🦆");
+            assert_eq!(n, input.len());
+        }
+
+        #[test]
+        fn test_extract_quoted_string_utf8_em_dash_and_smart_quotes() {
+            let input = "'a — b “c” d'";
+            let (s, n) = extract_quoted_string(input).unwrap();
+            assert_eq!(s, "a — b “c” d");
+            assert_eq!(n, input.len());
+        }
+
+        #[test]
+        fn test_extract_quoted_string_utf8_escaped_quotes_around_nonascii() {
+            // SQL '' escaping preserved when the surrounding payload is
+            // non-ASCII.
+            let input = "'café ''noir'''";
+            let (s, n) = extract_quoted_string(input).unwrap();
+            assert_eq!(s, "café 'noir'");
+            assert_eq!(n, input.len());
+        }
+
         // --- build_filter_suffix tests ---
 
         #[test]
@@ -4814,6 +4883,59 @@ $$"#;
             "Error: {}",
             err.message
         );
+    }
+
+    // Phase 65.1 WR-04: round-trip non-ASCII payloads through the
+    // FROM YAML FILE quoted-path extractor. The Plan 07 FileSystem-direct
+    // YAML read path makes this matter: the path string is passed
+    // verbatim to LocalFileSystem::OpenFile, so corrupted bytes would
+    // surface as "file not found" rather than the user's expected open.
+    #[test]
+    fn test_extract_single_quoted_utf8_cjk_path() {
+        let input = "'/tmp/数据/视图.yaml'";
+        let (content, consumed) = extract_single_quoted(input).unwrap();
+        assert_eq!(content, "/tmp/数据/视图.yaml");
+        assert_eq!(consumed, input.len());
+    }
+
+    #[test]
+    fn test_extract_single_quoted_utf8_accented_path() {
+        let input = "'/Users/café/définition.yaml'";
+        let (content, consumed) = extract_single_quoted(input).unwrap();
+        assert_eq!(content, "/Users/café/définition.yaml");
+        assert_eq!(consumed, input.len());
+    }
+
+    #[test]
+    fn test_extract_single_quoted_utf8_emoji_path() {
+        let input = "'/tmp/🦆-data.yaml'";
+        let (content, consumed) = extract_single_quoted(input).unwrap();
+        assert_eq!(content, "/tmp/🦆-data.yaml");
+        assert_eq!(consumed, input.len());
+    }
+
+    // Phase 65.1 WR-04: extract_view_comment lives further up the file
+    // and is tested implicitly through the validate_create_body
+    // round-trip. Add a direct non-ASCII test here.
+    #[test]
+    fn test_extract_view_comment_utf8_cyrillic() {
+        let (comment, remaining) = extract_view_comment("COMMENT = 'Привет, мир'").unwrap();
+        assert_eq!(comment.as_deref(), Some("Привет, мир"));
+        assert_eq!(remaining, "");
+    }
+
+    #[test]
+    fn test_extract_view_comment_utf8_emoji_and_em_dash() {
+        let (comment, remaining) = extract_view_comment("COMMENT = '🦆 — quack' AS (...)").unwrap();
+        assert_eq!(comment.as_deref(), Some("🦆 — quack"));
+        assert_eq!(remaining, " AS (...)");
+    }
+
+    #[test]
+    fn test_extract_view_comment_utf8_escaped_quotes_around_nonascii() {
+        let (comment, remaining) = extract_view_comment("COMMENT = 'café ''noir'''").unwrap();
+        assert_eq!(comment.as_deref(), Some("café 'noir'"));
+        assert_eq!(remaining, "");
     }
 
     #[test]
