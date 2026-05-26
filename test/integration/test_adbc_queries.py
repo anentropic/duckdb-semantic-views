@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -544,8 +545,9 @@ def run_tests() -> int:
                 fn(extension_path, ext_dir, Path(tmp))
                 print("  PASS")
                 passed += 1
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 (intentional broad catch in test runner)
                 print(f"  FAIL: {type(e).__name__}: {e}")
+                traceback.print_exc()
                 failed += 1
 
     print()
