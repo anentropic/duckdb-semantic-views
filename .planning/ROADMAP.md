@@ -295,7 +295,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 66-02-PLAN.md (Wave 2) — Migrate 7 expand-path sites to `qualify_and_quote_table_ref`; signature-change `build_materialized_sql`; update phase57_introspection.test fixture; un-skip ADBC scenarios; D-09 baseline evidence captured
+- [x] 66-02-PLAN.md (Wave 2) — Migrate 7 expand-path sites to `qualify_and_quote_table_ref`; signature-change `build_materialized_sql`; update phase57_introspection.test fixture; un-skip ADBC scenarios; D-09 baseline evidence captured
 
 **Wave 3** *(blocked on Wave 2 completion)*
 

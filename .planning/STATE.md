@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: ready_to_plan
-stopped_at: "Phase 65.1 Plan 04 complete (WR-03 fix: definitions_table_guard_select)"
-last_updated: "2026-05-26T14:40:06.996Z"
+stopped_at: Phase 66 Plan 02 complete (EXPAND-CTX-01/02 migration + ADBC 7/7 green)
+last_updated: "2026-05-26T15:05:52.734Z"
 last_activity: 2026-05-26
 progress:
   total_phases: 3
   completed_phases: 2
   total_plans: 22
-  completed_plans: 24
+  completed_plans: 25
   percent: 67
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-05-21)
 ## Current Position
 
 Phase: 66 (expansion-qualification-adbc-tests) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership), 65-05 (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection(*context.db) bind; H2 query_conn allocation DELETED from init_extension; 17 legacy duckdb-rs VTab/VScalar struct + impl blocks purged atomically ~2,632 LOC across 13 files; src/type_cache.rs unbounded HashMap cache landed unused as deferred optimisation; sv_logical_type_from_c_type_id bridges C-API ↔ C++ enum-value mismatch; new test_concurrent_reads_per_call_conn.py PASSES 80 reads in 0.02s; LIFE-02 satisfied end-to-end; LIFE-01 watchdog tests still RED 5/8 pending Plan 06 H1 retirement), 65-06 (lifecycle close-out; H1 catalog_conn retired from init_extension; OverrideContext slimmed to empty struct; INTENTIONAL LEAK rationale deleted; structural guard test tests/no_long_lived_conn.rs via syn::visit::Visit AST walk; 4 D-03b post-reopen integration tests added covering semantic_view SELECT + describe + SHOW DIMENSIONS + get_ddl; LIFE-04 ledger entry closed with forward pointer; 12/12 test_readonly_load.py PASS; just test-all + just ci both green; 6/6 ADBC; LIFE-01/02/03/04 all Satisfied)
 Next plan: /gsd:plan-phase 65.1
 Last activity: 2026-05-26
@@ -134,6 +134,9 @@ Recent decisions affecting current work:
 - [Phase ?]: Plan 11 WR-07/WR-08 hard-error promotion: throw BinderException + Result<_, String> for silent type-inference fallbacks; distinct wordings preserved
 - [Phase ?]: Phase 66 Plan 01: ADBC end-to-end query test scaffolding with 7 scenarios; 5 gated by SKIP_UNTIL_PLAN_02 + MIGRATION_LANDED boolean — Plan 02 un-skips with one-line edit at migration commit. 2 PASS / 5 SKIP / 0 FAIL on milestone/v0.10.0 HEAD; test-adbc-queries recipe wired into test-all aggregate.
 - [Phase ?]: Phase 66 Plan 01: Scenario 6 (materialization routing) seeds agg.daily_revenue with expected aggregate rows so migration's pre/post divergence is observable; without seed rows both states return zero rows, producing a false negative.
+- [Phase ?]: Phase 66 Plan 02: 10 expand-path migration sites all on qualify_and_quote_table_ref; defense-in-depth Phase 64 completion (sql_gen 3+3 / semi_additive 3 / window 3 / materialization 1 with build_materialized_sql signature thread)
+- [Phase ?]: Phase 66 Plan 02: D-09 baseline reinterpretation — EXPAND-CTX-01 root cause dissolved by Phase 65 per-call Connection(*context.db); migration retains defense-in-depth value. Plan 01 scaffolding had 4 DDL bugs (FACTS clause-order x2, ROW_NUMBER x1, materialization grammar x1) auto-fixed under Rule 3
+- [Phase ?]: Phase 66 Plan 02: scenario 7 uses explicit base-table qualifier (s AS db2.main.sales) because CREATE-time metadata records database_name=current_database() not view home db; multi-DB CREATE metadata fix tracked as Phase 67+ follow-up
 
 ### Pending Todos
 
@@ -198,10 +201,11 @@ Recent decisions affecting current work:
 | Phase 65.1 P12 | 40min | 3 tasks | 5 files |
 | Phase 65.1 P06 | 5min | 1 tasks | 1 files |
 | Phase 66 P01 | 20m | 2 tasks | 2 files |
+| Phase 66 P02 | 30m | 5 tasks | 6 files |
 
 ## Session Continuity
 
-Last session: 2026-05-26T14:39:51.290Z
-Stopped at: Phase 65.1 Plan 04 complete (WR-03 fix: definitions_table_guard_select)
+Last session: 2026-05-26T15:05:52.727Z
+Stopped at: Phase 66 Plan 02 complete (EXPAND-CTX-01/02 migration + ADBC 7/7 green)
 Resume file: 
 None
