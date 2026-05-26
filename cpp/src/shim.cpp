@@ -2494,8 +2494,23 @@ static void sv_semantic_view_function(
 
     // Validate column count — defensive against a planner inserting projections
     // we didn't anticipate. The legacy Rust impl had a Mutex + col_count check;
-    // for the C++ path we rely on the bind-time schema agreement.
-    idx_t n_cols = std::min<idx_t>(chunk->ColumnCount(), bd.columns.size());
+    // for the C++ path the bind-time schema agreement is authoritative.
+    //
+    // Phase 65.1 WR-02: previously this took `std::min(chunk->ColumnCount(),
+    // bd.columns.size())` and silently truncated on mismatch, leaving any
+    // unfilled output slots with default-constructed Vector contents that
+    // are not guaranteed to be NULL-marked — readers downstream could see
+    // garbage. Replace with an explicit mismatch error so a future planner
+    // change that violates the bind contract fails loud at first emission
+    // rather than producing silently-wrong data.
+    if (chunk->ColumnCount() != bd.columns.size()) {
+        throw InternalException(
+            "semantic_view: column count mismatch — chunk has " +
+            std::to_string(chunk->ColumnCount()) + " columns, bind declared " +
+            std::to_string(bd.columns.size()) +
+            " (please report this bug)");
+    }
+    idx_t n_cols = chunk->ColumnCount();
 
     // Copy each column into the output chunk via Vector::Reference (zero-copy
     // when types match exactly; falls back to a cast when build_execution_sql
