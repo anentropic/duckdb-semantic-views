@@ -542,7 +542,7 @@ def run_tests() -> int:
         with tempfile.TemporaryDirectory(prefix="sv_adbc_q_") as tmp:
             try:
                 fn(extension_path, ext_dir, Path(tmp))
-                print(f"  PASS")
+                print("  PASS")
                 passed += 1
             except Exception as e:
                 print(f"  FAIL: {type(e).__name__}: {e}")
