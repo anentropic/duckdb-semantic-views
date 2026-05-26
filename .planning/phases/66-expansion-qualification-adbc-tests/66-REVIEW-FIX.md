@@ -5,8 +5,9 @@ review_path: .planning/phases/66-expansion-qualification-adbc-tests/66-REVIEW.md
 iteration: 1
 findings_in_scope: 6
 fixed: 5
-skipped: 1
-status: partial
+skipped: 0
+reclassified_post_phase66: 1
+status: complete
 ---
 
 # Phase 66: Code Review Fix Report
@@ -16,9 +17,10 @@ status: partial
 **Iteration:** 1
 
 **Summary:**
-- Findings in scope: 6 (all Warning-tier — Info findings deferred per `fix_scope=critical_warning`)
-- Fixed: 5 (WR-01, WR-03, WR-04, WR-05, WR-06)
-- Skipped: 1 (WR-02 — needs-design-decision)
+- Findings in scope: 6 (all Warning-tier — Info findings deferred per `fix_scope=critical_warning`).
+- Fixed: 5 (WR-01, WR-03, WR-04, WR-05, WR-06).
+- Skipped at original fix time: 1 (WR-02 — needs-design-decision).
+- Reclassified in Phase 67 Plan 03 Task 1 to `not-a-defect` per Phase 66 CONTEXT.md D-08/D-09 (see new section below). Skipped count after reclassification: 0.
 
 Each fix was committed atomically on a dedicated worktree branch
 (`gsd-reviewfix/66-63879`) and verified via `just test-adbc-queries`
@@ -111,11 +113,26 @@ from a count-only sanity check to a value-content regression guard — a
 maintainer should confirm the sentinel approach matches their long-term
 intent for this scenario.
 
-## Skipped Issues
+## Reclassified Post-Phase-66 (not a defect)
 
 ### WR-02: All scenarios assert row count only, not row content
 
 **File:** `test/integration/test_adbc_queries.py:177-182, 220-225, 264-269, 315-320, 366-373, 441-446, 495-500`
+**Original disposition:** `skipped: needs-design-decision` (Phase 66 fix pass).
+**Reclassified disposition:** `not-a-defect` (Phase 67 Plan 03 Task 1).
+
+**Disposition (post-Phase-66 reclassification):** `not-a-defect`.
+
+**Rationale:** Per Phase 66 CONTEXT.md D-08 and D-09, the ADBC integration tests in `test_adbc_queries.py` are catalog-resolution regression guards, not value-correctness tests. Their purpose is to catch the failure class `Catalog Error: Table with name X does not exist!` arising from unqualified `quote_table_ref` emission on a per-call Connection whose default catalog/schema search path diverges from `memory.main`. Count-only assertions are sufficient for that purpose: if a regression breaks qualified emission, the count-only assertion fails with a Catalog Error before the count is even computed; if a regression returns wrong rows with right cardinality (the case WR-02 worries about), that is a value-correctness regression and belongs to the SQL-layer fixture set, not the ADBC catalog-resolution guard.
+
+The value-correctness regression surface that WR-02 names is covered (or will be) by `test/sql/phase67_qualified_emission.test` (Phase 67 Plan 01 A1) and the existing fixture-level behavioural tests in `phase47_semi_additive.test` and `phase48_window_metrics.test`. Per the project's stated testing strategy ("primarily test for expected re-written SQL", see SCOPE.md), value-correctness lives at the sqllogictest layer not the ADBC layer.
+
+Reclassified in Phase 67 Plan 03 Task 1.
+
+---
+
+**Historical context (preserved from original skip):**
+
 **Reason:** `needs-design-decision`
 **Original issue:** Every scenario uses `COUNT(*)` only. Scenarios 4
 (semi-additive `MIN_BY`) and 5 (window `AVG(...) OVER`) in particular
@@ -147,10 +164,11 @@ could pass with completely wrong row content but the right cardinality.
    `Catalog Error`, which is the primary thing this test file is
    guarding against.
 
-**Recommended follow-up:** open a tech-debt entry to land per-scenario
-value assertions in a follow-up commit, derived by a maintainer who
-can confirm the expected semi-additive and window output values
-against the documented v0.7.0 / v0.6.0 metric semantics.
+**Recommended follow-up (superseded by reclassification above):** the original recommendation was to open a tech-debt entry to land per-scenario value assertions in a follow-up commit. With the reclassification per D-08/D-09, value-correctness is owned by the sqllogictest layer (Phase 67 Plan 01 A1 + existing phase47/48 fixtures) and the ADBC layer correctly remains count-only.
+
+## Skipped Issues
+
+_(empty after Phase 67 Plan 03 reclassification of WR-02)_
 
 ---
 
