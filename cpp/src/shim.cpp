@@ -2301,11 +2301,25 @@ struct SemanticViewGlobalState : public GlobalTableFunctionState {
     idx_t emitted_chunks = 0;
 };
 
-// Look up DECIMAL/LIST/ENUM logical types via a LIMIT-0 probe on a per-call
-// Connection. Returns a per-column LogicalType for every column in the
-// declared schema; for columns whose type_id isn't DECIMAL/LIST/ENUM, the
-// LogicalType is constructed from the type_id directly (matching the
-// behaviour of `type_from_duckdb_type_u32` on the Rust side).
+// Look up DECIMAL/LIST logical types via a LIMIT-0 probe. Returns a
+// per-column LogicalType for every column in the declared schema; for
+// columns whose type_id isn't DECIMAL/LIST, the LogicalType is constructed
+// from the type_id directly (matching the behaviour of
+// `type_from_duckdb_type_u32` on the Rust side).
+//
+// Phase 65.1 WR-03: ENUM is intentionally declared as VARCHAR via
+// `sv_logical_type_from_c_type_id` (see that helper) — the LIMIT-0 probe
+// is NOT required for ENUM. The earlier comment claiming otherwise was a
+// maintenance trap.
+//
+// Phase 65.1 WR-07: takes the caller's per-bind Connection by reference
+// rather than opening a fresh one. This eliminates one ctor/dtor pair
+// per `semantic_view(...)` invocation when DECIMAL/LIST is present and,
+// more importantly, ensures the bind-time LIMIT-0 query runs on the same
+// Connection (and therefore the same transaction/catalog snapshot) as
+// the Rust dispatcher's catalog reads. Previously the FFI dispatcher
+// borrowed one Connection while this helper opened a second — two
+// separate Connections viewing potentially different uncommitted state.
 //
 // Probe failures (DuckDB error from the LIMIT 0 query) and column-count
 // mismatches now raise BinderException with full diagnostic text instead
@@ -2314,7 +2328,7 @@ struct SemanticViewGlobalState : public GlobalTableFunctionState {
 // errors (broken FACTS / METRICS expressions referencing nonexistent
 // columns) behind a DECIMAL(18,3) placeholder at query time.
 static std::vector<LogicalType> sv_resolve_output_logical_types(
-    ClientContext &context,
+    Connection &probe,
     const std::vector<SemanticViewColumnInfo> &cols,
     const std::string &execution_sql) {
     std::vector<LogicalType> out;
@@ -2322,10 +2336,11 @@ static std::vector<LogicalType> sv_resolve_output_logical_types(
 
     bool needs_logical_probe = false;
     for (const auto &c : cols) {
-        // C-API DUCKDB_TYPE_* enum values from duckdb.h. These three need
+        // C-API DUCKDB_TYPE_* enum values from duckdb.h. These two need
         // logical-type metadata to declare correctly: DECIMAL needs
-        // width+scale; LIST needs child type; ENUM declares as VARCHAR but
-        // the LIMIT-0 confirms presence.
+        // width+scale; LIST needs child type. ENUM is intentionally
+        // declared as VARCHAR via sv_logical_type_from_c_type_id, so no
+        // probe is needed for it (Phase 65.1 WR-03).
         if (c.type_id == DUCKDB_TYPE_DECIMAL ||
             c.type_id == DUCKDB_TYPE_LIST) {
             needs_logical_probe = true;
@@ -2341,9 +2356,10 @@ static std::vector<LogicalType> sv_resolve_output_logical_types(
         return out;
     }
 
-    // Slow path: run LIMIT 0 on the per-call Connection to extract logical
-    // type metadata for DECIMAL/LIST columns.
-    Connection probe(*context.db);
+    // Slow path: run LIMIT 0 on the caller-supplied Connection to extract
+    // logical type metadata for DECIMAL/LIST columns. Reusing the bind's
+    // Connection (rather than opening a fresh one) preserves the
+    // transaction/catalog snapshot the FFI dispatcher already borrowed.
     std::string limit0_sql = "SELECT * FROM (" + execution_sql + ") __sv_probe LIMIT 0";
     auto probe_result = probe.Query(limit0_sql);
     if (probe_result->HasError()) {
@@ -2438,11 +2454,14 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
     }
     bd->expanded_sql_for_error = bd->execution_sql;
 
-    // Resolve declared logical types — runs a second LIMIT-0 probe on a
-    // per-call Connection if any DECIMAL/LIST/ENUM column is in the
-    // schema (so width/scale/child-type can be honoured).
+    // Resolve declared logical types — runs a LIMIT-0 probe on the SAME
+    // Connection the FFI dispatcher already borrowed, if any DECIMAL/LIST
+    // column is in the schema (so width/scale/child-type can be honoured).
+    // Phase 65.1 WR-07: reusing `probe` here avoids a second Connection
+    // ctor/dtor pair and keeps both queries on the same
+    // transaction/catalog snapshot.
     auto declared_types = sv_resolve_output_logical_types(
-        context, bd->columns, bd->execution_sql);
+        probe, bd->columns, bd->execution_sql);
     for (idx_t i = 0; i < bd->columns.size(); ++i) {
         return_types.push_back(declared_types[i]);
         names.push_back(bd->columns[i].name);
