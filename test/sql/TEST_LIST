@@ -55,3 +55,4 @@ test/sql/phase651_yaml_filesystem_access_gating.test
 test/sql/phase651_null_name_inputs.test
 test/sql/phase651_bind_probe_hard_errors.test
 test/sql/phase67_qualified_emission.test
+test/sql/phase67_quoted_source_tables.test
