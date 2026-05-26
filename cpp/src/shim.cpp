@@ -2691,13 +2691,24 @@ extern "C" {
                 duckdb_result r;
                 auto rc = duckdb_query(handle, "SELECT 1", &r);
                 if (rc != DuckDBSuccess) {
-                    duckdb_destroy_result(&r);
+                    // Phase 65.1 IN-01: surface the underlying DuckDB error
+                    // text and clarify that the probe failure can stem from
+                    // either ABI drift (the original BORROW-contract concern)
+                    // OR a transient DB error at LOAD time (shutdown in
+                    // progress, OOM, etc.). The diagnostic must list both
+                    // possible causes so an operator hitting a non-bridge
+                    // failure isn't misled into chasing an ABI regression.
+                    const char *err_text = duckdb_result_error(&r);
                     if (error_buf != nullptr && error_buf_len > 0) {
                         snprintf(error_buf, error_buf_len,
-                            "bridge contract broken — duckdb_connection layout "
-                            "assumption failed at load time. DuckDB ABI may have "
-                            "changed; refusing to load semantic_views extension.");
+                            "bridge contract probe failed (duckdb_query "
+                            "SELECT 1 returned %d): %s. Possible causes: "
+                            "duckdb_connection ABI drift OR transient DB "
+                            "error at LOAD time; refusing to load "
+                            "semantic_views extension.",
+                            (int)rc, err_text ? err_text : "(no detail)");
                     }
+                    duckdb_destroy_result(&r);
                     return false;
                 }
                 duckdb_destroy_result(&r);
