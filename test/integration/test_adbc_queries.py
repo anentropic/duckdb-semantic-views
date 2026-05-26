@@ -96,7 +96,7 @@ SKIP_UNTIL_PLAN_02 = (
 
 # Plan 02 will flip this to True at the same commit that lands the migration
 # of the seven unmigrated call sites in src/expand/.
-MIGRATION_LANDED = False
+MIGRATION_LANDED = True
 
 
 def _connect_adbc(db_path: str, extension_dir: str):
@@ -255,16 +255,16 @@ def test_facts_non_default_schema(extension_path: Path, ext_dir: str, tmp_path: 
             """
             CREATE SEMANTIC VIEW staging_view AS
               TABLES (s AS staging.sales PRIMARY KEY (id))
+              FACTS (s.net_amount AS s.amount * 1.0)
               DIMENSIONS (s.region AS s.region)
-              FACTS (s.amount AS s.amount)
-            """,
+""",
         )
         conn.commit()
 
         rows = _scalar(
             conn,
             "SELECT COUNT(*) FROM semantic_view('staging_view', "
-            "dimensions := ['region'], facts := ['amount'])",
+            "dimensions := ['region'], facts := ['net_amount'])",
         )
         assert rows == 2, f"expected 2 rows, got {rows}"
     finally:
@@ -354,18 +354,22 @@ def test_window_non_default_schema(extension_path: Path, ext_dir: str, tmp_path:
             """
             CREATE SEMANTIC VIEW evt_view AS
               TABLES (e AS staging.events PRIMARY KEY (id))
-              DIMENSIONS (e.user_id AS e.user_id)
-              METRICS (e.row_n AS ROW_NUMBER() OVER (PARTITION BY e.user_id ORDER BY e.event_time))
-            """,
+              DIMENSIONS (e.user_id AS e.user_id, e.event_time AS e.event_time)
+              METRICS (
+                PRIVATE e.total_amount AS SUM(e.amount),
+                e.running_avg AS AVG(total_amount) OVER (PARTITION BY EXCLUDING event_time ORDER BY event_time ASC NULLS LAST)
+              )
+""",
         )
         conn.commit()
 
         rows = _scalar(
             conn,
             "SELECT COUNT(*) FROM semantic_view('evt_view', "
-            "dimensions := ['user_id'], metrics := ['row_n'])",
+            "dimensions := ['user_id', 'event_time'], metrics := ['running_avg'])",
         )
-        # Window metrics emit one row per source row (not per dimension group).
+        # Window metric emits one row per (user_id, event_time) group: 3 distinct
+        # source rows → 3 result rows.
         assert rows == 3, f"expected 3 rows, got {rows}"
     finally:
         conn.close()
@@ -421,12 +425,13 @@ def test_materialization_routing_non_default_schema_target(
               DIMENSIONS (s.region AS s.region)
               METRICS (s.total AS SUM(s.amount))
               MATERIALIZATIONS (
-                m AS agg.daily_revenue (
-                  DIMENSIONS (region)
+                m AS (
+                  TABLE agg.daily_revenue,
+                  DIMENSIONS (region),
                   METRICS (total)
                 )
               )
-            """,
+""",
         )
         conn.commit()
 
@@ -480,17 +485,17 @@ def test_attach_facts_path(extension_path: Path, ext_dir: str, tmp_path: Path) -
             conn,
             """
             CREATE SEMANTIC VIEW db2.main.attached_view AS
-              TABLES (s AS sales PRIMARY KEY (id))
+              TABLES (s AS db2.main.sales PRIMARY KEY (id))
+              FACTS (s.net_amount AS s.amount * 1.0)
               DIMENSIONS (s.region AS s.region)
-              FACTS (s.amount AS s.amount)
-            """,
+""",
         )
         conn.commit()
 
         rows = _scalar(
             conn,
             "SELECT COUNT(*) FROM semantic_view('db2.main.attached_view', "
-            "dimensions := ['region'], facts := ['amount'])",
+            "dimensions := ['region'], facts := ['net_amount'])",
         )
         assert rows == 2, f"expected 2 rows, got {rows}"
     finally:
