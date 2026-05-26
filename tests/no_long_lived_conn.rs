@@ -224,10 +224,20 @@ fn no_duckdb_disconnect_anywhere_in_src() {
     // Filter out documented OWN-and-release sites (paired duckdb_open +
     // duckdb_connect + duckdb_disconnect + duckdb_close on a self-owned
     // handle — typically Drop impls). See ALLOWED_DISCONNECT_SITES.
+    //
+    // Phase 65.1 IN-03: track which allow-list entries actually matched a
+    // call site so a stale entry (e.g. allowed call site moved or deleted)
+    // surfaces as a test failure instead of silently weakening the guard
+    // for any future code legitimately added at the recorded path.
+    let mut matched = vec![false; ALLOWED_DISCONNECT_SITES.len()];
     finder.found_call_sites.retain(|(file, path)| {
-        !ALLOWED_DISCONNECT_SITES
-            .iter()
-            .any(|(allowed_file, allowed_path)| file == allowed_file && path == allowed_path)
+        for (idx, (allowed_file, allowed_path)) in ALLOWED_DISCONNECT_SITES.iter().enumerate() {
+            if file == allowed_file && path == allowed_path {
+                matched[idx] = true;
+                return false;
+            }
+        }
+        true
     });
 
     assert!(
@@ -244,4 +254,23 @@ fn no_duckdb_disconnect_anywhere_in_src() {
          (D-10 + D-11) for the full record.",
         finder.found_call_sites
     );
+
+    // Phase 65.1 IN-03: every allow-list entry must have matched at least
+    // one call site. If a permitted call site is moved or deleted and the
+    // exception is left behind, the entry quietly becomes a free pass for
+    // any future code added at that (file, path) coordinate. Failing the
+    // test forces the allow-list to stay tightly aligned with the actual
+    // call graph.
+    for (idx, (file, path)) in ALLOWED_DISCONNECT_SITES.iter().enumerate() {
+        assert!(
+            matched[idx],
+            "ALLOWED_DISCONNECT_SITES entry ({file:?}, {path:?}) matched \
+             zero call sites — the documented call site appears to have \
+             moved or been deleted. Remove the stale exception from \
+             ALLOWED_DISCONNECT_SITES in tests/no_long_lived_conn.rs (or \
+             update it to point at the new location) so the guard does \
+             not silently grant a free pass for future code added at \
+             this coordinate."
+        );
+    }
 }
