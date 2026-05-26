@@ -4,6 +4,7 @@
 //! into a `SemanticViewDefinition`.
 
 use crate::errors::ParseError;
+use crate::ident::find_identifier_end;
 use crate::model::{
     AccessModifier, Cardinality, Dimension, Fact, Join, Materialization, Metric, NonAdditiveDim,
     NullsOrder, SortOrder, TableRef, WindowOrderBy, WindowSpec,
@@ -680,30 +681,61 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     let after_as = rest[2..].trim_start();
     let after_as_offset = rest_offset + 2 + (rest[2..].len() - after_as.len());
 
-    // Step 3: find "PRIMARY KEY" (case-insensitive, any whitespace between words)
-    let upper = after_as.to_ascii_uppercase();
-    let pk_pos = find_primary_key(&upper);
-
-    let (table_name, pk_columns, after_pk_text) = if let Some((pk_start, pk_end)) = pk_pos {
-        let table_name = after_as[..pk_start].trim();
-        if table_name.is_empty() {
+    // Step 3: capture the source-table name using identifier-aware tokenisation
+    // (Phase 67 Plan 02 / TECH-DEBT #24). Walk dot-separated segments via
+    // `find_identifier_end` so quoted identifiers with internal whitespace
+    // (including a quoted segment that happens to contain the literal
+    // `PRIMARY KEY` substring) survive intact. This MUST run before we look
+    // for the PRIMARY KEY / UNIQUE trailing keywords — otherwise the
+    // case-insensitive scan over the whole `after_as` slice can match a
+    // `PRIMARY KEY` substring INSIDE a quoted source-table name.
+    let mut name_end = 0usize;
+    loop {
+        let segment_end = find_identifier_end(&after_as[name_end..], /* allow_paren = */ true);
+        if segment_end == 0 {
             return Err(ParseError {
                 message: format!(
                     "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
                 ),
-                position: Some(after_as_offset),
+                position: Some(after_as_offset + name_end),
             });
         }
-        let after_pk = after_as[pk_end..].trim_start();
+        name_end += segment_end;
+        if name_end < after_as.len() && after_as.as_bytes()[name_end] == b'.' {
+            name_end += 1; // consume dot, continue to next segment
+            continue;
+        }
+        break;
+    }
+    let table_name = after_as[..name_end].trim();
+    if table_name.is_empty() {
+        return Err(ParseError {
+            message: format!(
+                "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
+            ),
+            position: Some(after_as_offset),
+        });
+    }
+    let after_name = &after_as[name_end..];
+    let after_name_offset = after_as_offset + name_end;
+
+    // Step 3a: now search ONLY the post-name slice for the optional
+    // PRIMARY KEY / UNIQUE trailing clauses. `name_end` was computed via
+    // identifier-aware tokenisation so we can safely uppercase the rest.
+    let upper_after_name = after_name.to_ascii_uppercase();
+    let pk_pos = find_primary_key(&upper_after_name);
+
+    let (pk_columns, after_pk_text) = if let Some((_pk_start, pk_end)) = pk_pos {
+        let after_pk = after_name[pk_end..].trim_start();
         if !after_pk.starts_with('(') {
             return Err(ParseError {
                 message: "Expected '(' after PRIMARY KEY in TABLES clause.".to_string(),
-                position: Some(after_as_offset + pk_end),
+                position: Some(after_name_offset + pk_end),
             });
         }
         let pk_body = extract_paren_content(after_pk).ok_or_else(|| ParseError {
             message: "Unclosed '(' in PRIMARY KEY column list.".to_string(),
-            position: Some(after_as_offset + pk_end),
+            position: Some(after_name_offset + pk_end),
         })?;
         let pk_columns: Vec<String> = pk_body
             .split(',')
@@ -714,29 +746,21 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
         // balanced parens exist. The closing ')' must be present in after_pk.
         let close = after_pk.find(')').unwrap();
         let remainder = &after_pk[close + 1..];
-        (table_name, pk_columns, remainder)
+        (pk_columns, remainder)
     } else {
-        // No PRIMARY KEY -- fact table. Table name is before UNIQUE keyword (if any).
-        let unique_pos = find_unique(&upper);
-        let table_name = if let Some((u_start, _)) = unique_pos {
-            after_as[..u_start].trim()
-        } else {
-            after_as.trim()
-        };
-        if table_name.is_empty() {
-            return Err(ParseError {
-                message: format!(
-                    "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
-                ),
-                position: Some(after_as_offset),
-            });
-        }
+        // No PRIMARY KEY -- fact table. UNIQUE clause (if any) starts after the
+        // already-captured table name.
+        let unique_pos = find_unique(&upper_after_name);
         let remainder = if let Some((u_start, _)) = unique_pos {
-            &after_as[u_start..]
+            &after_name[u_start..]
         } else {
+            // No PK, no UNIQUE: preserve the original byte-for-byte
+            // semantics that surfaced trailing text only when a UNIQUE
+            // keyword was present. Trailing text in the bare case is
+            // unsupported by the legacy parser and remains so.
             ""
         };
-        (table_name, vec![], remainder)
+        (vec![], remainder)
     };
 
     // Step 4: parse zero or more UNIQUE constraints from after_pk_text
@@ -2535,6 +2559,81 @@ mod tests {
         assert_eq!(result[0].alias, "o");
         assert_eq!(result[0].table, "orders");
         assert!(result[0].pk_columns.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 67 Plan 02 / TECH-DEBT #24: identifier-aware tokenisation of the
+    // source-table-name slot. Quoted identifiers with internal whitespace —
+    // including ones that contain the literal `PRIMARY KEY` substring — must
+    // survive intact through `parse_single_table_entry`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_table_entry_quoted_with_internal_whitespace() {
+        // Quoted name with embedded space; trailing PRIMARY KEY clause.
+        let result = parse_tables_clause("o AS \"my orders\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "\"my orders\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_quoted_containing_primary_key_substring() {
+        // Canonical TECH-DEBT #24 bug: a quoted source-table name that
+        // contains the literal `PRIMARY KEY` substring must NOT be split by
+        // the case-insensitive PRIMARY-KEY substring search. The fix is to
+        // capture the identifier FIRST using `find_identifier_end`, then run
+        // PRIMARY KEY detection only on the post-name slice.
+        let result =
+            parse_tables_clause("o AS \"weird PRIMARY KEY name\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "\"weird PRIMARY KEY name\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_3part_quoted_fqn_with_whitespace() {
+        // 3-part fully-qualified name with internal whitespace in two
+        // segments. The dot-separated walk in the new identifier-aware
+        // tokeniser must traverse all three segments and preserve the
+        // verbatim byte sequence.
+        let result =
+            parse_tables_clause("o AS \"my db\".\"schema\".\"my table\" PRIMARY KEY (id)", 0)
+                .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "\"my db\".\"schema\".\"my table\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_regression_no_whitespace() {
+        // Regression baseline for the happy path: unquoted dot-qualified
+        // name with no whitespace anywhere in the source-table slot.
+        // Byte-for-byte identical to the pre-fix `parse_tables_schema_qualified`
+        // assertion shape.
+        let result = parse_tables_clause("o AS schema.t PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "schema.t");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_quoted_with_unique_no_pk() {
+        // No PK, trailing UNIQUE clause after a quoted-with-whitespace name.
+        // Exercises the no-PK branch of the post-name keyword search.
+        let result = parse_tables_clause("f AS \"fact stage\" UNIQUE (email)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "f");
+        assert_eq!(result[0].table, "\"fact stage\"");
+        assert!(result[0].pk_columns.is_empty());
+        assert_eq!(
+            result[0].unique_constraints,
+            vec![vec!["email".to_string()]]
+        );
     }
 
     // -----------------------------------------------------------------------

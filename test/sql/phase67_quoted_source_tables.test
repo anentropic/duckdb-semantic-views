@@ -1,0 +1,156 @@
+# Phase 67 Plan 02 — TECH-DEBT #24 regression fixture.
+#
+# Verifies that the TABLES (...) clause source-table-name slot survives
+# quoted identifiers with internal whitespace, multi-part FQNs with
+# embedded spaces, and the pathological case of a quoted name that
+# itself contains the literal `PRIMARY KEY` substring.
+#
+# Cites:
+#  - 67-CONTEXT.md D-09..D-11 (B5 surgery scope, helper reuse, fixture
+#    placement decision)
+#  - TECH-DEBT.md #24 (the closed bug)
+#  - src/body_parser.rs::parse_single_table_entry (the fixed site —
+#    now consumes the source-table-name slot via
+#    ident::find_identifier_end before running the PRIMARY KEY /
+#    UNIQUE keyword scan over the post-name slice)
+#  - test/sql/phase64_quoted_idents.test (closest analog — Phase 64
+#    quoted-identifier fixture; mirrors the same structure)
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# ------------------------------------------------------------------------
+# Scenario 1 — Quoted source-table name with internal whitespace.
+# Full CREATE -> query -> expansion roundtrip.
+# ------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE "my orders" (id INTEGER PRIMARY KEY, region VARCHAR, amount DECIMAL(18,2));
+
+statement ok
+INSERT INTO "my orders" VALUES (1, 'US', 100.00), (2, 'EU', 200.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_quoted_src AS
+  TABLES (o AS "my orders" PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+# Smoke: query against the view succeeds and returns rows.
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_quoted_src', dimensions := ['region'], metrics := ['total']);
+----
+true
+
+# Shape: expansion preserves the internal-whitespace quoted name through to FROM.
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_quoted_src', dimensions := ['region'], metrics := ['total']) WHERE explain_output LIKE '%FROM "memory"."main"."my orders"%';
+----
+true
+
+# ------------------------------------------------------------------------
+# Scenario 2 — Multi-part quoted FQN with internal whitespace in two
+# segments. Exercises the dot-separated identifier walk.
+# ------------------------------------------------------------------------
+
+statement ok
+CREATE SCHEMA "stage 2";
+
+statement ok
+CREATE TABLE "stage 2"."my orders" (id INTEGER PRIMARY KEY, region VARCHAR, amount DECIMAL(18,2));
+
+statement ok
+INSERT INTO "stage 2"."my orders" VALUES (1, 'US', 100.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_quoted_fqn AS
+  TABLES (o AS "stage 2"."my orders" PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_quoted_fqn', dimensions := ['region'], metrics := ['total']);
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_quoted_fqn', dimensions := ['region'], metrics := ['total']) WHERE explain_output LIKE '%"stage 2"."my orders"%';
+----
+true
+
+# ------------------------------------------------------------------------
+# Scenario 3 — Canonical TECH-DEBT #24 case: a quoted source-table name
+# that CONTAINS the literal `PRIMARY KEY` substring. Pre-fix, the
+# case-insensitive PRIMARY KEY scan over the whole post-AS slice would
+# match the inner-quoted keyword and split mid-identifier.
+# ------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE "weird PRIMARY KEY name" (id INTEGER PRIMARY KEY, region VARCHAR, amount DECIMAL(18,2));
+
+statement ok
+INSERT INTO "weird PRIMARY KEY name" VALUES (1, 'US', 100.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_pk_in_name AS
+  TABLES (o AS "weird PRIMARY KEY name" PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_pk_in_name', dimensions := ['region'], metrics := ['total']);
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_pk_in_name', dimensions := ['region'], metrics := ['total']) WHERE explain_output LIKE '%FROM "memory"."main"."weird PRIMARY KEY name"%';
+----
+true
+
+# ------------------------------------------------------------------------
+# Scenario 4 — Regression baseline: unquoted, no-whitespace source-table
+# name. Proves the fix did not regress the happy path.
+# ------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE p67_plain_orders (id INTEGER PRIMARY KEY, region VARCHAR, amount DECIMAL(18,2));
+
+statement ok
+INSERT INTO p67_plain_orders VALUES (1, 'US', 100.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_plain AS
+  TABLES (o AS p67_plain_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_plain', dimensions := ['region'], metrics := ['total']);
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_plain', dimensions := ['region'], metrics := ['total']) WHERE explain_output LIKE '%"p67_plain_orders"%';
+----
+true
+
+# ------------------------------------------------------------------------
+# Cleanup
+# ------------------------------------------------------------------------
+
+statement ok
+DROP SEMANTIC VIEW p67_quoted_src;
+
+statement ok
+DROP SEMANTIC VIEW p67_quoted_fqn;
+
+statement ok
+DROP SEMANTIC VIEW p67_pk_in_name;
+
+statement ok
+DROP SEMANTIC VIEW p67_plain;
+
+statement ok
+DROP SCHEMA "stage 2" CASCADE;
