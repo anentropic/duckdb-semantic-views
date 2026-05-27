@@ -326,6 +326,6 @@ Plans:
 **Plans:** 3 plans
 
 Plans:
-- [ ] 68-01-PLAN.md — Phase 67 REVIEW mechanical fixes (A1+A3 bundled, A2, A4, A5, A6, A7): body_parser surgical edits + sqllogictest fixture polish + ADBC SQL-escape parity
+- [x] 68-01-PLAN.md — Phase 67 REVIEW mechanical fixes (A1+A3 bundled, A2, A4, A5, A6, A7): body_parser surgical edits + sqllogictest fixture polish + ADBC SQL-escape parity
 - [ ] 68-02-PLAN.md — PR #35 Copilot review fixes (C1, C2, C3): UTF-8-safe body slice + turbofish-catching transmute needle + delete unused p651_ok.yaml fixture
 - [ ] 68-03-PLAN.md — TECH-DEBT #25 structural port (B1, B2): identifier-aware tokenisation in parse_non_additive_dims and parse_window_spec OVER ORDER BY + 2 new sqllogictest fixtures registered in TEST_LIST

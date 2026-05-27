@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v0.10.0
 milestone_name: Connection-Lifecycle & Catalog-Context Fixes
 status: milestone_complete
-stopped_at: Milestone complete (Phase 67 was final phase)
-last_updated: 2026-05-27T08:58:08.032Z
-last_activity: 2026-05-26 -- Phase 67 execution started
+stopped_at: Phase 68 Plan 01 complete (A1+A3 bundle + A2 + A4 + A5 + A6 + A7)
+last_updated: 2026-05-27T15:35:00.000Z
+last_activity: 2026-05-27 -- Phase 68 Plan 01 complete
 progress:
   total_phases: 3
   completed_phases: 3
   total_plans: 22
-  completed_plans: 41
+  completed_plans: 42
   percent: 100
 ---
 
@@ -21,15 +21,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-21)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Milestone complete
+**Current focus:** Phase 68 — Pre-Tag Cleanup (Plan 01 complete; Plans 02, 03 pending)
 
 ## Current Position
 
-Phase: 67
-Plan: Not started
+Phase: 68 (pre-tag-cleanup-phase-67-review-pr-35-code-review-follow-ups) — EXECUTING
+Plan: 2 of 3 (Plan 01 complete)
 Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership), 65-05 (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection(*context.db) bind; H2 query_conn allocation DELETED from init_extension; 17 legacy duckdb-rs VTab/VScalar struct + impl blocks purged atomically ~2,632 LOC across 13 files; src/type_cache.rs unbounded HashMap cache landed unused as deferred optimisation; sv_logical_type_from_c_type_id bridges C-API ↔ C++ enum-value mismatch; new test_concurrent_reads_per_call_conn.py PASSES 80 reads in 0.02s; LIFE-02 satisfied end-to-end; LIFE-01 watchdog tests still RED 5/8 pending Plan 06 H1 retirement), 65-06 (lifecycle close-out; H1 catalog_conn retired from init_extension; OverrideContext slimmed to empty struct; INTENTIONAL LEAK rationale deleted; structural guard test tests/no_long_lived_conn.rs via syn::visit::Visit AST walk; 4 D-03b post-reopen integration tests added covering semantic_view SELECT + describe + SHOW DIMENSIONS + get_ddl; LIFE-04 ledger entry closed with forward pointer; 12/12 test_readonly_load.py PASS; just test-all + just ci both green; 6/6 ADBC; LIFE-01/02/03/04 all Satisfied)
-Next plan: /gsd:plan-phase 65.1
-Last activity: 2026-05-27
+Next plan: /gsd-execute-phase 68 (continue with Plan 02 + Plan 03)
+Last activity: 2026-05-27 -- Phase 68 Plan 01 complete (A1+A3 bundle, A2, A4, A5, A6, A7 — 3 atomic commits ec30473, 224b5cf, 7a99ff9)
 
 ## Performance Metrics
 
@@ -140,6 +140,13 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 66 Plan 02: scenario 7 uses explicit base-table qualifier (s AS db2.main.sales) because CREATE-time metadata records database_name=current_database() not view home db; multi-DB CREATE metadata fix tracked as Phase 67+ follow-up
 - [Phase ?]: Phase 66 Plan 03: D-11 close-out applied — _notes/error_with_adbc.md opens with ## Resolution (v0.10.0) section citing qualify_and_quote_table_ref, test_adbc_queries.py, and Plan 02 commit SHAs (b55936f, b116553, 9fe1ae5); original 28-line downstream content preserved verbatim below divider; file NOT archived (D-11 archiving optional)
 - [Phase ?]: Phase 66 Plan 03: Phase 66 complete across all 3 plans; EXPAND-CTX-01/02/03 all satisfied; ready for /gsd-verify-work 66
+- [Phase 68 P01]: A1+A3 land as one atomic commit (ec30473) — A3 collapse first, then A1 keyword-guard at the clean site; pre-Phase-67 error message restored verbatim per CONTEXT.md D-03
+- [Phase 68 P01]: A1 keyword set is `PRIMARY|UNIQUE|FOREIGN|REFERENCES|NOT` (D-03 authoritative over REVIEW.md draft `PRIMARY|UNIQUE|COMMENT|WITH`)
+- [Phase 68 P01]: A4 helper `is_quoting_balanced` mirrors find_identifier_end's doubled-quote `""` escape rule — a naive `s.matches('"').count() % 2` is incorrect because doubled-quote escapes are balanced
+- [Phase 68 P01]: A2 ADBC SQL-string escape parity is local (no shared `_quote_sql_literal` helper introduced); variable name `other_db_path_sql` matches `extension_path_sql` line-100 convention byte-for-byte
+- [Phase 68 P01]: A5 ships both sqllogictest Scenario 5 (`staging."my orders"`) and a Rust unit `test_parse_single_table_entry_mixed_quoted_and_bare` covering both `staging."my orders"` AND symmetric `"my db".sch.t`
+- [Phase 68 P01]: A7 aligns find_primary_key's three word-boundary checks with find_unique's `_`-exclusion — pure defensive consolidation, no observable behaviour change on existing fixtures
+- [Phase 68 P01]: 146 body_parser unit tests PASS (up from 141 pre-plan; 5 new); 58/58 sqllogictests PASS including Phase 67 fixture with extended Scenario 5 + 3 base-table DROP cleanup rows
 
 ### Pending Todos
 
@@ -206,10 +213,11 @@ Recent decisions affecting current work:
 | Phase 66 P01 | 20m | 2 tasks | 2 files |
 | Phase 66 P02 | 30m | 5 tasks | 6 files |
 | Phase 66 P03 | 10 | 1 tasks | 1 files |
+| Phase 68 P01 | 25m | 3 tasks | 3 files |
 
 ## Session Continuity
 
-Last session: 2026-05-26T15:23:29.056Z
-Stopped at: Phase 66 Plan 02 complete (EXPAND-CTX-01/02 migration + ADBC 7/7 green)
+Last session: 2026-05-27T15:35:00.000Z
+Stopped at: Phase 68 Plan 01 complete (A1+A3 bundle, A2, A4, A5, A6, A7 — body_parser surgical edits + sqllogictest Scenario 5 + ADBC line-470 escape parity)
 Resume file: 
 None
