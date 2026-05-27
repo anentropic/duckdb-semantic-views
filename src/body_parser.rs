@@ -682,32 +682,46 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     let after_as_offset = rest_offset + 2 + (rest[2..].len() - after_as.len());
 
     // Step 3: capture the source-table name using identifier-aware tokenisation
-    // (Phase 67 Plan 02 / TECH-DEBT #24). Walk dot-separated segments via
-    // `find_identifier_end` so quoted identifiers with internal whitespace
-    // (including a quoted segment that happens to contain the literal
-    // `PRIMARY KEY` substring) survive intact. This MUST run before we look
-    // for the PRIMARY KEY / UNIQUE trailing keywords — otherwise the
-    // case-insensitive scan over the whole `after_as` slice can match a
-    // `PRIMARY KEY` substring INSIDE a quoted source-table name.
-    let mut name_end = 0usize;
-    loop {
-        let segment_end = find_identifier_end(&after_as[name_end..], /* allow_paren = */ true);
-        if segment_end == 0 {
-            return Err(ParseError {
-                message: format!(
-                    "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
-                ),
-                position: Some(after_as_offset + name_end),
-            });
-        }
-        name_end += segment_end;
-        if name_end < after_as.len() && after_as.as_bytes()[name_end] == b'.' {
-            name_end += 1; // consume dot, continue to next segment
-            continue;
-        }
-        break;
+    // (Phase 67 Plan 02 / TECH-DEBT #24). `find_identifier_end` natively walks
+    // across dots while outside quoted regions (verified by the
+    // `fqn_with_quoted_parts_runs_to_whitespace` doctest in `src/ident.rs`), so
+    // a single call captures `schema.tbl`, `"my db"."schema"."col"`, etc. The
+    // earlier dot-rejoin loop arm was unreachable (Phase 68 A3 collapse).
+    // This MUST run before we look for the PRIMARY KEY / UNIQUE trailing
+    // keywords — otherwise the case-insensitive scan over the whole `after_as`
+    // slice can match a `PRIMARY KEY` substring INSIDE a quoted source-table
+    // name.
+    let name_end = find_identifier_end(after_as, /* allow_paren = */ true);
+    if name_end == 0 {
+        return Err(ParseError {
+            message: format!(
+                "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
+            ),
+            position: Some(after_as_offset),
+        });
     }
-    let table_name = after_as[..name_end].trim();
+    // Phase 68 A1 (D-03): reject bare reserved keywords captured as the
+    // source-table name. Without this guard `o AS PRIMARY KEY (id)` would
+    // succeed at `find_identifier_end` (capturing `PRIMARY` up to the
+    // following whitespace) and the downstream PRIMARY-KEY scan over
+    // `" KEY (id)"` would fail to find the keyword (already eaten), producing
+    // a confusing "table 'PRIMARY' does not exist" downstream. The literal
+    // pre-Phase-67 error message is the contract — see Phase 68 CONTEXT.md
+    // D-03 for the authoritative keyword set.
+    let captured = after_as[..name_end].trim();
+    let upper_captured = captured.to_ascii_uppercase();
+    if matches!(
+        upper_captured.as_str(),
+        "PRIMARY" | "UNIQUE" | "FOREIGN" | "REFERENCES" | "NOT"
+    ) {
+        return Err(ParseError {
+            message: format!(
+                "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
+            ),
+            position: Some(after_as_offset),
+        });
+    }
+    let table_name = captured;
     if table_name.is_empty() {
         return Err(ParseError {
             message: format!(
@@ -2634,6 +2648,53 @@ mod tests {
             result[0].unique_constraints,
             vec![vec!["email".to_string()]]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 A1 (D-03): bare reserved keywords (PRIMARY, UNIQUE, FOREIGN,
+    // REFERENCES, NOT) appearing in the source-table-name slot must surface
+    // the pre-Phase-67 literal error message. The keyword set is authoritative
+    // per Phase 68 CONTEXT.md D-03; the REVIEW.md draft list is informational.
+    // -----------------------------------------------------------------------
+    const A1_EXPECTED_MESSAGE: &str =
+        "Missing physical table name after AS for alias 'o' in TABLES clause.";
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_primary() {
+        let err = parse_tables_clause("o AS PRIMARY KEY (id)", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_unique() {
+        let err = parse_tables_clause("o AS UNIQUE (id)", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_foreign() {
+        let err = parse_tables_clause("o AS FOREIGN KEY (id)", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_references() {
+        let err = parse_tables_clause("o AS REFERENCES other(id)", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_not() {
+        let err = parse_tables_clause("o AS NOT NULL", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_lowercase() {
+        // Guard is case-insensitive — `primary` must trigger it just like
+        // `PRIMARY` (Phase 68 D-03).
+        let err = parse_tables_clause("o AS primary KEY (id)", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
     }
 
     // -----------------------------------------------------------------------
