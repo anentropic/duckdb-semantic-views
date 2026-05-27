@@ -317,3 +317,13 @@ Plans:
 - [x] 67-02-PLAN.md — Body parser quoted-identifier fix (B5 / TECH-DEBT #24): port find_identifier_end to parse_single_table_entry + audit grep + new phase67_quoted_source_tables.test
 - [x] 67-03-PLAN.md — Phase 66 review-pass cleanup batch (C1+C2+C3): WR-02 reclassification + WR-01 sentinel-keep rationale + IN-02 FORCE INSTALL hardening
 - [x] 67-04-PLAN.md — latest_qty / MIN_BY semantics resolution (C4): investigate scenario 4 then rename latest_qty -> earliest_qty if standard MIN_BY semantics confirmed
+
+### Phase 68: Pre-Tag Cleanup: Phase 67 Review + PR #35 Code Review Follow-ups
+
+**Goal:** [To be planned]
+**Requirements**: TBD
+**Depends on:** Phase 67
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 68 to break down)
