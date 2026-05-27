@@ -323,9 +323,9 @@ Plans:
 **Goal:** Close out Phase 67 REVIEW.md mechanical fixes (A1-A7), TECH-DEBT #25 sibling split_whitespace sites (B1-B2), and PR #35 Copilot review comments (C1-C3) before v0.10.0 milestone tag.
 **Requirements**: None — Phase 68 is review-derived hygiene indexed by SCOPE.md IDs (A1-A7, B1-B2, C1-C3), not REQ IDs.
 **Depends on:** Phase 67
-**Plans:** 3 plans
+**Plans:** 3/3 plans complete
 
 Plans:
 - [x] 68-01-PLAN.md — Phase 67 REVIEW mechanical fixes (A1+A3 bundled, A2, A4, A5, A6, A7): body_parser surgical edits + sqllogictest fixture polish + ADBC SQL-escape parity
 - [x] 68-02-PLAN.md — PR #35 Copilot review fixes (C1, C2, C3): UTF-8-safe body slice + turbofish-catching transmute needle + delete unused p651_ok.yaml fixture
-- [ ] 68-03-PLAN.md — TECH-DEBT #25 structural port (B1, B2): identifier-aware tokenisation in parse_non_additive_dims and parse_window_spec OVER ORDER BY + 2 new sqllogictest fixtures registered in TEST_LIST
+- [x] 68-03-PLAN.md — TECH-DEBT #25 structural port (B1, B2): identifier-aware tokenisation in parse_non_additive_dims and parse_window_spec OVER ORDER BY + 2 new sqllogictest fixtures registered in TEST_LIST
