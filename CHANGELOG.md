@@ -9,24 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.10.0] - 2026-05-27
+
+Connection-lifecycle and ADBC fixes. Two downstream regressions reported against v0.8.0/v0.9.0 — an in-process `read_only=True` reopen that hung indefinitely, and `SELECT … FROM semantic_view(...)` failing with `Catalog Error: Table X does not exist` through ADBC — were both rooted in extension-owned long-lived `duckdb_connection` handles whose catalog/schema search path diverged from the caller's. v0.10.0 retires both long-lived handles and moves every read-side callback to a per-call `Connection(*context.db)` that inherits the caller's context natively. The two symptoms resolve as consequences. PK auto-inference from `duckdb_constraints()` is removed in the same release as the architectural pivot (see Changed).
+
 ### Changed
 
+- **In-process `read_only=True` reopen no longer hangs.** After a writable handle that did `LOAD semantic_views` + `CREATE SEMANTIC VIEW` is closed, a subsequent `duckdb.connect(path, read_only=True)` against the same path returns within milliseconds in the same Python process. Previously the reopen hung indefinitely (>45 s observed) because the extension's long-lived catalog connection kept the `Database` alive past the caller's `close()`. Both extension-owned long-lived `duckdb_connection` handles (catalog read connection and query expansion connection) are retired from `init_extension`; every read-side and DDL-rewrite callback now opens its own per-call `Connection(*context.db)` borrowed from the caller's `ClientContext`. A structural Rust test (`tests/no_long_lived_conn.rs`) fails CI if anyone re-introduces a long-lived native handle inside `init_extension`.
+- **`SELECT … FROM semantic_view(...)` now works through ADBC and other clients with diverging catalog search paths.** All seven physical-table emission sites in the expansion engine (main expansion, FACTS, semi-additive metrics, window metrics, materialization routing, and `EXPLAIN SEMANTIC VIEW`) now emit fully-qualified `database.schema.table` references. Previously the main expansion path was qualified (since v0.9.0) but the four feature paths still emitted unqualified `FROM "table"` references that resolved against the extension's separate connection; through ADBC the caller's catalog search path was not visible to the extension's connection, surfacing as `Catalog Error: Table X does not exist`. A new `just test-adbc-queries` recipe runs seven end-to-end ADBC scenarios covering main / FACTS / semi-additive / window / materialization / multi-DB ATTACH; all pass on v0.10.0 and fail on v0.9.0.
+- **PK auto-inference from `duckdb_constraints()` removed (BREAKING).** When `TABLES (a AS t)` declared no `PRIMARY KEY` and `t` had a physical PK in the catalog, the extension previously imported the catalog PK at DDL-time. This auto-fallback is gone: PRIMARY KEY in a semantic view is now treated as a logical user assertion (the Snowflake-aligned model), not a physical catalog import. Users must explicitly declare `PRIMARY KEY (cols)` or `UNIQUE (cols)` in the TABLES clause, or use `REFERENCES target(cols)` shorthand on the foreign side. The DDL fails fast with a clear "primary key required" error pointing at the explicit-declaration alternative. Migration: add the explicit `PRIMARY KEY (...)` clause to any TABLES entry that previously relied on the auto-fallback.
 - `semantic_view(...)` and the `SHOW`/`DESCRIBE` family now raise a clear `Binder Error` when DuckDB's column-type inference fails at bind time. Previously the bind path fell back to `VARCHAR` or `DECIMAL(18,3)` silently, masking the underlying problem. If a query that previously succeeded with the wrong column type now fails, the error message will name the underlying cause — typically a missing source table, a broken `expr`, or a permissions issue surfaced by the expanded SQL.
-
-### Removed
-
-- Internal `type_cache` module and `type_id_to_display_name` helper. Both were unused after the read-side rebuild in v0.10.0 and have been deleted (~317 LOC purge). No user-visible API impact.
 
 ### Fixed
 
 - `DROP SEMANTIC VIEW` and `ALTER SEMANTIC VIEW` against a read-only database that was never bootstrapped now report `semantic view 'X' does not exist`. Previously the lower-level `Catalog Error: Table _definitions does not exist` leaked through.
 - Extension registration failures during `LOAD semantic_views` now surface the underlying DuckDB exception message in the user-visible error. Previously the message was dropped and callers saw only a generic `Failed to register …`, which made ADBC, JDBC, and Python users unable to diagnose load-time failures.
 - `LOAD semantic_views` is now idempotent. Repeated loads in the same process no longer accumulate duplicate parser-extension hooks in `DBConfig`.
+- Quoted source-table references with embedded whitespace or SQL keywords in the `TABLES (...)` clause (e.g. `TABLES (a AS "my table" PRIMARY KEY (id))`) are now parsed correctly. Previously the body parser tokenised on whitespace before respecting quoted-identifier boundaries, causing the source-table name to be truncated. Resolves TECH-DEBT #24.
+- Non-additive dimension lists and window `OVER (ORDER BY ...)` clauses are now tokenised with identifier-quoting awareness, so quoted columns containing whitespace or commas no longer split across tokens.
 - Removed unreachable single-shot fallback branches in four table-function exec callbacks that would have produced unbounded row streams if local state were ever absent. Table-function registration now refuses callbacks without an `init_local`, so the invariant is enforced at registration time rather than papered over per call.
 
 ### Security
 
 - Eliminated a SQL-injection surface in the `CREATE SEMANTIC VIEW v FROM YAML FILE '<path>'` helper. The path argument is now read via DuckDB's `FileSystem` API directly, removing the `SELECT content FROM read_text('…')` indirection that relied on quote-doubling. `enable_external_access` gating is preserved natively by `LocalFileSystem`.
+
+### Removed
+
+- Internal `type_cache` module and `type_id_to_display_name` helper. Both were unused after the read-side rebuild in v0.10.0 and have been deleted (~317 LOC purge). No user-visible API impact.
 
 ## [0.9.0] - 2026-05-17
 
@@ -286,7 +297,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.7.1...v0.7.2
