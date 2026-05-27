@@ -216,115 +216,131 @@ def test_concurrent_writes_per_call_conn() -> bool:
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = str(Path(tmpdir) / "concurrent_writes.duckdb")
         master = open_master(db_path)
-        for stmt in SETUP_SQL:
-            master.execute(stmt)
+        cursors: list = []
+        try:
+            for stmt in SETUP_SQL:
+                master.execute(stmt)
 
-        cursors = [master.cursor() for _ in range(NUM_THREADS)]
-        results = [WorkerResult(idx=i) for i in range(NUM_THREADS)]
-        gate = threading.Event()
-        threads = [
-            threading.Thread(
-                target=worker,
-                args=(cursors[i], i, results[i], gate, VIEW_NAMES),
-            )
-            for i in range(NUM_THREADS)
-        ]
+            cursors = [master.cursor() for _ in range(NUM_THREADS)]
+            results = [WorkerResult(idx=i) for i in range(NUM_THREADS)]
+            gate = threading.Event()
+            threads = [
+                threading.Thread(
+                    target=worker,
+                    args=(cursors[i], i, results[i], gate, VIEW_NAMES),
+                )
+                for i in range(NUM_THREADS)
+            ]
 
-        for t in threads:
-            t.start()
+            for t in threads:
+                t.start()
 
-        start = time.monotonic()
-        gate.set()
+            start = time.monotonic()
+            gate.set()
 
-        for t in threads:
-            t.join(timeout=WALL_BUDGET_SECONDS + 5)
+            for t in threads:
+                t.join(timeout=WALL_BUDGET_SECONDS + 5)
 
-        elapsed = time.monotonic() - start
+            elapsed = time.monotonic() - start
 
-        # 1. No thread may hang past the wall budget + slack.
-        for t, r in zip(threads, results):
-            if t.is_alive():
+            # 1. No thread may hang past the wall budget + slack.
+            for t, r in zip(threads, results):
+                if t.is_alive():
+                    print(
+                        f"FAIL: thread {r.idx} did not finish within "
+                        f"{WALL_BUDGET_SECONDS + 5:.1f}s wall budget + slack"
+                    )
+                    return False
+
+            # 2. Wall budget honoured.
+            if elapsed > WALL_BUDGET_SECONDS + 5:
                 print(
-                    f"FAIL: thread {r.idx} did not finish within "
-                    f"{WALL_BUDGET_SECONDS + 5:.1f}s wall budget + slack"
+                    f"FAIL: {NUM_THREADS}×{CALLS_PER_THREAD} concurrent writes "
+                    f"took {elapsed:.1f}s (budget {WALL_BUDGET_SECONDS:.1f}s + 5s slack)"
                 )
                 return False
 
-        # 2. Wall budget honoured.
-        if elapsed > WALL_BUDGET_SECONDS + 5:
-            print(
-                f"FAIL: {NUM_THREADS}×{CALLS_PER_THREAD} concurrent writes "
-                f"took {elapsed:.1f}s (budget {WALL_BUDGET_SECONDS:.1f}s + 5s slack)"
-            )
-            return False
+            # 3. Worker liveness — each worker must have reached its terminal
+            #    ok=True assignment. A False here means the worker exited early
+            #    via the wall-budget guard (recorded under unknown_errors).
+            not_ok = [r for r in results if not r.ok]
+            if not_ok:
+                for r in not_ok:
+                    print(
+                        f"FAIL: thread {r.idx} did not complete cleanly; "
+                        f"unknown_errors={r.unknown_errors!r}"
+                    )
+                return False
 
-        # 3. Worker liveness — each worker must have reached its terminal
-        #    ok=True assignment. A False here means the worker exited early
-        #    via the wall-budget guard (recorded under unknown_errors).
-        not_ok = [r for r in results if not r.ok]
-        if not_ok:
-            for r in not_ok:
+            # 4. Zero unknown_error outcomes — known races (already_exists,
+            #    constraint_violation) are documented behaviour and contribute
+            #    nothing to this assertion.
+            unknown_total = 0
+            for r in results:
+                if r.unknown_errors:
+                    unknown_total += len(r.unknown_errors)
+                    for line in r.unknown_errors:
+                        print(f"FAIL: {line}")
+            if unknown_total > 0:
                 print(
-                    f"FAIL: thread {r.idx} did not complete cleanly; "
-                    f"unknown_errors={r.unknown_errors!r}"
+                    f"FAIL: {unknown_total} unknown_error outcomes across "
+                    f"{NUM_THREADS} threads"
                 )
-            return False
+                return False
 
-        # 4. Zero unknown_error outcomes — known races (already_exists,
-        #    constraint_violation) are documented behaviour and contribute
-        #    nothing to this assertion.
-        unknown_total = 0
-        for r in results:
-            if r.unknown_errors:
-                unknown_total += len(r.unknown_errors)
-                for line in r.unknown_errors:
-                    print(f"FAIL: {line}")
-        if unknown_total > 0:
+            # 5. Final-state check: list_semantic_views() output must be a
+            #    subset of the union of every success-marked CREATE. This
+            #    catches "spurious rows" — a final view name we never claim
+            #    to have created. We intentionally do NOT require equality
+            #    with (CREATEs - DROPs); race ordering means a thread's CREATE
+            #    can be followed by another thread's DROP and vice versa, so
+            #    the strict subset check is the robust invariant (see
+            #    Pitfall 4 / Assumption A4 in 65.1-RESEARCH.md).
+            union_creates: set = set()
+            for r in results:
+                union_creates.update(r.create_successes)
+
+            final_rows = master.execute(
+                "SELECT name FROM list_semantic_views() ORDER BY name"
+            ).fetchall()
+            final_names = {row[0] for row in final_rows}
+
+            spurious = final_names - union_creates
+            if spurious:
+                print(
+                    f"FAIL: list_semantic_views() contains rows not present in "
+                    f"the union of success-marked CREATEs: {sorted(spurious)!r}; "
+                    f"union_creates={sorted(union_creates)!r}; "
+                    f"final_names={sorted(final_names)!r}"
+                )
+                return False
+
+            total_success = sum(r.success for r in results)
+            total_already = sum(r.already_exists for r in results)
+            total_pk = sum(r.constraint_violation for r in results)
+            total_conflict = sum(r.tuple_conflict for r in results)
             print(
-                f"FAIL: {unknown_total} unknown_error outcomes across "
-                f"{NUM_THREADS} threads"
+                f"PASS: {NUM_THREADS} threads × {CALLS_PER_THREAD} ops = "
+                f"{NUM_THREADS * CALLS_PER_THREAD} calls in {elapsed:.2f}s; "
+                f"success={total_success} already_exists={total_already} "
+                f"constraint_violation={total_pk} tuple_conflict={total_conflict}; "
+                f"final views={sorted(final_names)!r}"
             )
-            return False
-
-        # 5. Final-state check: list_semantic_views() output must be a
-        #    subset of the union of every success-marked CREATE. This
-        #    catches "spurious rows" — a final view name we never claim
-        #    to have created. We intentionally do NOT require equality
-        #    with (CREATEs - DROPs); race ordering means a thread's CREATE
-        #    can be followed by another thread's DROP and vice versa, so
-        #    the strict subset check is the robust invariant (see
-        #    Pitfall 4 / Assumption A4 in 65.1-RESEARCH.md).
-        union_creates: set = set()
-        for r in results:
-            union_creates.update(r.create_successes)
-
-        final_rows = master.execute(
-            "SELECT name FROM list_semantic_views() ORDER BY name"
-        ).fetchall()
-        final_names = {row[0] for row in final_rows}
-
-        spurious = final_names - union_creates
-        if spurious:
-            print(
-                f"FAIL: list_semantic_views() contains rows not present in "
-                f"the union of success-marked CREATEs: {sorted(spurious)!r}; "
-                f"union_creates={sorted(union_creates)!r}; "
-                f"final_names={sorted(final_names)!r}"
-            )
-            return False
-
-        total_success = sum(r.success for r in results)
-        total_already = sum(r.already_exists for r in results)
-        total_pk = sum(r.constraint_violation for r in results)
-        total_conflict = sum(r.tuple_conflict for r in results)
-        print(
-            f"PASS: {NUM_THREADS} threads × {CALLS_PER_THREAD} ops = "
-            f"{NUM_THREADS * CALLS_PER_THREAD} calls in {elapsed:.2f}s; "
-            f"success={total_success} already_exists={total_already} "
-            f"constraint_violation={total_pk} tuple_conflict={total_conflict}; "
-            f"final views={sorted(final_names)!r}"
-        )
-        return True
+            return True
+        finally:
+            # Close cursors before master so the tempdir cleanup at context
+            # exit isn't blocked by held DuckDB handles (notably on Windows
+            # where the DB file is locked). Suppress per-handle errors to
+            # avoid masking the underlying test outcome.
+            for c in cursors:
+                try:
+                    c.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                master.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def main() -> int:
