@@ -1,0 +1,102 @@
+# Phase 68 Plan 03 (B1) / TECH-DEBT #25: NON ADDITIVE BY accepts quoted
+# identifiers with literal whitespace AND dotted paths (D-08). Mirrors the
+# Phase 67 Plan 02 / TECH-DEBT #24 fix to parse_single_table_entry — the
+# split_whitespace shred at the dim_name slot is replaced with the
+# identifier-aware find_identifier_end helper.
+
+require semantic_views
+
+statement ok
+CREATE TABLE p68_b1_orders (id BIGINT, "order date" DATE, qty BIGINT);
+
+statement ok
+INSERT INTO p68_b1_orders VALUES (1, DATE '2026-01-01', 10), (2, DATE '2026-01-02', 20);
+
+# ========================================
+# Scenario 1 — quoted identifier with internal whitespace as NAB dimension
+# Before the B1 fix, split_whitespace would shred `"order date"` into two
+# tokens (`"order` + `date"`) and parse_non_additive_dims would fail with
+# "Unexpected token 'DATE"' in NON ADDITIVE BY dimension entry".
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW p68_b1_v1 AS
+  TABLES (o AS p68_b1_orders PRIMARY KEY (id))
+  DIMENSIONS (o."order date" AS o."order date")
+  METRICS (o.qty_sum NON ADDITIVE BY ("order date" DESC) AS SUM(o.qty))
+
+# Query returns rows (snapshot per "order date" — but the only-NAB-dim case
+# without grouping returns the latest snapshot row).
+query I
+SELECT count(*) > 0 FROM semantic_view('p68_b1_v1', metrics := ['qty_sum']);
+----
+true
+
+# Round-trip: GET_DDL preserves the quoted-whitespace NAB dim verbatim.
+# (Renderer expands DESC to "DESC NULLS FIRST" — DESC defaults to NULLS FIRST.)
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p68_b1_v1') LIKE '%NON ADDITIVE BY ("order date" DESC NULLS FIRST)%';
+----
+true
+
+# ========================================
+# Scenario 2 — dotted path in NAB dim, DDL-level (D-08 contract extension)
+#
+# `o."order date"` must be parsed AND name-resolved to the dimension whose
+# (source_alias, name) is (`o`, `"order date"`). End-to-end semi-additive query
+# expansion for dotted-NA-dim is NOT validated here — semi_additive expansion
+# emits the raw NA dim text into the ROW_NUMBER() OVER ORDER BY of the
+# snapshot CTE, which produces `"o.""order date"""` (single-quoted-identifier
+# shape) instead of `"o"."order date"`. The expand-side dotted-path emission
+# fix is out of scope for Plan 03 (D-10 renegotiation: pure-DDL validation
+# closes the contract test surface without expanding into expand/semi_additive.rs).
+# Coverage at the parser + name-resolution layer is the planner's narrowed
+# scope (per B1 Step C note).
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW p68_b1_v2 AS
+  TABLES (o AS p68_b1_orders PRIMARY KEY (id))
+  DIMENSIONS (o."order date" AS o."order date")
+  METRICS (o.qty_sum NON ADDITIVE BY (o."order date" DESC) AS SUM(o.qty))
+
+# Round-trip: dotted path preserved in stored DDL (the post-parse + serialise
+# + deserialise pipeline carries the dotted form through verbatim).
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p68_b1_v2') LIKE '%NON ADDITIVE BY (o."order date" DESC NULLS FIRST)%';
+----
+true
+
+# DESCRIBE confirms the NA dim text is captured verbatim.
+query T
+SELECT property_value FROM describe_semantic_view('p68_b1_v2') WHERE property = 'NON_ADDITIVE_BY';
+----
+o."order date" DESC NULLS FIRST
+
+# ========================================
+# Scenario 3 — unterminated quoted identifier surfaces a structured error
+# Before B1, find_identifier_end would saturate at input.len() and the
+# malformed identifier would flow downstream as a "dimension does not match"
+# error. Post-B1, is_quoting_balanced surfaces a parser-level error first.
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW p68_b1_bad AS
+  TABLES (o AS p68_b1_orders PRIMARY KEY (id))
+  DIMENSIONS (o."order date" AS o."order date")
+  METRICS (o.qty_sum NON ADDITIVE BY ("unclosed DESC) AS SUM(o.qty))
+----
+Unterminated quoted identifier
+
+# ========================================
+# Cleanup
+# ========================================
+
+statement ok
+DROP SEMANTIC VIEW p68_b1_v1;
+
+statement ok
+DROP SEMANTIC VIEW p68_b1_v2;
+
+statement ok
+DROP TABLE p68_b1_orders;

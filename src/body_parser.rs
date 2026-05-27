@@ -92,6 +92,40 @@ fn suggest_clause_keyword(word: &str) -> Option<&'static str> {
     best.map(|(_, kw)| kw)
 }
 
+/// Phase 68 B1 (D-08): split a qualified identifier at the first dot that
+/// falls OUTSIDE a double-quoted region. Returns `Some((alias, name))` if a
+/// split-eligible dot exists, else `None`. Doubled-quote `""` inside `"..."`
+/// is treated as an escape (mirrors `is_quoting_balanced` / `find_identifier_end`).
+///
+/// Examples:
+/// - `"o.x"` → `Some(("o", "x"))`
+/// - `"o.\"order date\""` → `Some(("o", "\"order date\""))`
+/// - `"\"a.b\""` → `None` (the dot is inside the quoted region)
+/// - `"bare"` → `None` (no dot)
+fn split_qualified_identifier(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut in_quote = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                // Doubled-quote escape — stay inside the quoted region.
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote && b == b'.' {
+            return Some((&s[..i], &s[i + 1..]));
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Split `body` at depth-0 commas, respecting nested parens and single-quoted strings.
 /// Returns `Vec<(start_offset_in_body, trimmed_slice)>`. Trailing empty entries discarded.
 pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
@@ -444,11 +478,26 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
         .collect();
 
     // Phase 47: Validate NON ADDITIVE BY dimension references
+    // Phase 68 B1 / D-08: accept dotted-path qualifier `alias.dim_name` in
+    // addition to the bare `dim_name` form. The dotted form is split at the
+    // first depth-0 dot OUTSIDE a quoted region (so `"a.b"` stays atomic but
+    // `o."order date"` splits into `o` + `"order date"`).
     for metric in &metrics {
         for na in &metric.non_additive_by {
-            let dim_exists = dimensions
-                .iter()
-                .any(|d| d.name.eq_ignore_ascii_case(&na.dimension));
+            let dim_exists = dimensions.iter().any(|d| {
+                if d.name.eq_ignore_ascii_case(&na.dimension) {
+                    return true;
+                }
+                // D-08 dotted-path acceptance: if NA dim is `alias.name`,
+                // match against (source_table, name).
+                if let Some((alias_part, name_part)) = split_qualified_identifier(&na.dimension) {
+                    if let Some(ref src) = d.source_table {
+                        return src.eq_ignore_ascii_case(alias_part)
+                            && d.name.eq_ignore_ascii_case(name_part);
+                    }
+                }
+                false
+            });
             if !dim_exists {
                 let available_dims: Vec<String> =
                     dimensions.iter().map(|d| d.name.clone()).collect();
@@ -1460,6 +1509,12 @@ fn find_non_additive_by_keyword(upper_text: &str) -> Option<usize> {
 
 /// Parse the dimension entries inside a NON ADDITIVE BY (...) clause.
 /// Each entry: `dim_name [ASC|DESC] [NULLS FIRST|LAST]`
+///
+/// Phase 68 Plan 03 (B1) / TECH-DEBT #25: `dim_name` is captured via
+/// identifier-aware tokenisation (`find_identifier_end`) so quoted identifiers
+/// containing literal whitespace AND dotted paths (`table.col`, D-08) survive
+/// intact. The modifier suffix (`ASC|DESC|NULLS FIRST|LAST`) is then
+/// `split_whitespace`-tokenised since the suffix has no quoted identifiers.
 fn parse_non_additive_dims(
     content: &str,
     base_offset: usize,
@@ -1471,19 +1526,35 @@ fn parse_non_additive_dims(
         if entry_text.is_empty() {
             continue; // trailing comma
         }
-        let parts: Vec<&str> = entry_text.split_whitespace().collect();
-        if parts.is_empty() {
+        // Phase 68 B1: identifier-aware capture of dim_name. `allow_paren=false`
+        // because NAB entries have no parens inside identifiers.
+        let name_end = find_identifier_end(entry_text, /* allow_paren = */ false);
+        if name_end == 0 {
             return Err(ParseError {
                 message: "Empty dimension in NON ADDITIVE BY clause".to_string(),
                 position: Some(base_offset + start),
             });
         }
-        let dim_name = parts[0].to_string();
+        // Phase 68 B1: reject unterminated quoted identifiers — mirrors the
+        // TABLES-clause A4 check. `find_identifier_end` saturates at
+        // `input.len()` on an unterminated `"`, so without this guard the
+        // malformed name would flow downstream.
+        if !is_quoting_balanced(&entry_text[..name_end]) {
+            return Err(ParseError {
+                message: format!(
+                    "Unterminated quoted identifier in NON ADDITIVE BY dimension entry '{entry_text}'."
+                ),
+                position: Some(base_offset + start),
+            });
+        }
+        let dim_name = entry_text[..name_end].trim().to_string();
+        let suffix = entry_text[name_end..].trim();
+        let parts: Vec<&str> = suffix.split_whitespace().collect();
         let upper_parts: Vec<String> = parts.iter().map(|p| p.to_ascii_uppercase()).collect();
         let mut order = SortOrder::Asc;
         let mut nulls = NullsOrder::Last;
         let mut has_explicit_nulls = false;
-        let mut i = 1;
+        let mut i = 0;
         while i < upper_parts.len() {
             match upper_parts[i].as_str() {
                 "ASC" => {
@@ -2821,6 +2892,91 @@ mod tests {
         assert_eq!(result[0].alias, "o");
         assert_eq!(result[0].table, "\"my db\".sch.t");
         assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 Plan 03 (B1) / TECH-DEBT #25: identifier-aware tokenisation of
+    // the dim_name slot inside `NON ADDITIVE BY (...)`. Quoted identifiers with
+    // internal whitespace AND dotted paths (`table.col`, D-08) must survive
+    // intact through `parse_non_additive_dims`. `parse_non_additive_dims` is
+    // private — exercise via the public `parse_metrics_clause` entry.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_non_additive_dims_quoted_identifier_with_whitespace() {
+        // Quoted dim_name with embedded space. DESC defaults to NULLS FIRST.
+        let result = parse_metrics_clause(
+            "a.balance NON ADDITIVE BY (\"my dim\" DESC) AS SUM(a.balance)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        // MetricEntry tuple: non_additive_by is at index 7.
+        let na_vec = &result[0].7;
+        assert_eq!(na_vec.len(), 1);
+        let na = &na_vec[0];
+        assert_eq!(na.dimension, "\"my dim\"");
+        assert_eq!(na.order, SortOrder::Desc);
+        assert_eq!(na.nulls, NullsOrder::First); // DESC default
+    }
+
+    #[test]
+    fn test_parse_non_additive_dims_dotted_path() {
+        // Dotted-path dim_name (D-08 contract extension): `o."my dim"` must be
+        // captured as a single identifier including the dot. Two-entry clause
+        // confirms comma splitting still works.
+        let result = parse_metrics_clause(
+            "a.balance NON ADDITIVE BY (o.\"my dim\" ASC NULLS LAST, c2 DESC) AS SUM(a.balance)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let na_vec = &result[0].7;
+        assert_eq!(na_vec.len(), 2);
+
+        let na0 = &na_vec[0];
+        assert_eq!(na0.dimension, "o.\"my dim\"");
+        assert_eq!(na0.order, SortOrder::Asc);
+        assert_eq!(na0.nulls, NullsOrder::Last);
+
+        let na1 = &na_vec[1];
+        assert_eq!(na1.dimension, "c2");
+        assert_eq!(na1.order, SortOrder::Desc);
+        assert_eq!(na1.nulls, NullsOrder::First); // DESC default
+    }
+
+    #[test]
+    fn test_parse_non_additive_dims_unterminated_quote() {
+        // Unterminated quoted dim_name must surface a structured ParseError
+        // with the expected wording. Mirrors the A4 TABLES-clause contract.
+        let err = parse_metrics_clause(
+            "a.balance NON ADDITIVE BY (\"unclosed DESC) AS SUM(a.balance)",
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "Expected unterminated-quote error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_non_additive_dims_regression_bare_no_whitespace() {
+        // Regression baseline for the pre-existing happy path: bare unquoted
+        // dim_name with ASC/DESC modifier. Mirrors phase47_semi_additive.test.
+        let result = parse_metrics_clause(
+            "a.balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let na_vec = &result[0].7;
+        assert_eq!(na_vec.len(), 1);
+        let na = &na_vec[0];
+        assert_eq!(na.dimension, "report_date");
+        assert_eq!(na.order, SortOrder::Desc);
+        assert_eq!(na.nulls, NullsOrder::First); // DESC default
     }
 
     // -----------------------------------------------------------------------
