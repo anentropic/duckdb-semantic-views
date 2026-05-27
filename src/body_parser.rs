@@ -119,7 +119,17 @@ fn split_qualified_identifier(s: &str) -> Option<(&str, &str)> {
             continue;
         }
         if !in_quote && b == b'.' {
-            return Some((&s[..i], &s[i + 1..]));
+            let alias = &s[..i];
+            let name = &s[i + 1..];
+            // WR-01 (Phase 68 review): reject malformed inputs where either side
+            // of the split is empty (e.g. leading `.foo` or trailing `foo.`).
+            // Today's callers tolerate `Some(("", "foo"))` because every parsed
+            // dimension carries a non-empty `source_table`, but the helper is a
+            // leaf utility and a future caller deserves a clean None.
+            if alias.is_empty() || name.is_empty() {
+                return None;
+            }
+            return Some((alias, name));
         }
         i += 1;
     }
