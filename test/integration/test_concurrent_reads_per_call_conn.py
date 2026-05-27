@@ -114,75 +114,91 @@ def test_concurrent_reads_per_call_conn() -> bool:
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = str(Path(tmpdir) / "concurrent_reads.duckdb")
         master = open_master(db_path)
-        for stmt in SETUP_SQL:
-            master.execute(stmt)
+        cursors: list = []
+        try:
+            for stmt in SETUP_SQL:
+                master.execute(stmt)
 
-        cursors = [master.cursor() for _ in range(NUM_THREADS)]
-        results = [WorkerResult(i) for i in range(NUM_THREADS)]
-        gate = threading.Event()
-        threads = [
-            threading.Thread(target=worker, args=(cursors[i], results[i], gate))
-            for i in range(NUM_THREADS)
-        ]
+            cursors = [master.cursor() for _ in range(NUM_THREADS)]
+            results = [WorkerResult(i) for i in range(NUM_THREADS)]
+            gate = threading.Event()
+            threads = [
+                threading.Thread(target=worker, args=(cursors[i], results[i], gate))
+                for i in range(NUM_THREADS)
+            ]
 
-        for t in threads:
-            t.start()
+            for t in threads:
+                t.start()
 
-        start = time.monotonic()
-        gate.set()
+            start = time.monotonic()
+            gate.set()
 
-        for t in threads:
-            t.join(timeout=WALL_BUDGET_SECONDS + 5)
+            for t in threads:
+                t.join(timeout=WALL_BUDGET_SECONDS + 5)
 
-        elapsed = time.monotonic() - start
+            elapsed = time.monotonic() - start
 
-        # 1. All threads must have completed within the wall budget.
-        for t, r in zip(threads, results):
-            if t.is_alive():
-                print(f"FAIL: thread {r.idx} did not finish within budget")
+            # 1. All threads must have completed within the wall budget.
+            for t, r in zip(threads, results):
+                if t.is_alive():
+                    print(f"FAIL: thread {r.idx} did not finish within budget")
+                    return False
+
+            # 2. All 80 calls must have succeeded.
+            failures = [r for r in results if not r.ok]
+            if failures:
+                for r in failures:
+                    print(f"FAIL: thread {r.idx} raised: {r.error!r}")
                 return False
 
-        # 2. All 80 calls must have succeeded.
-        failures = [r for r in results if not r.ok]
-        if failures:
-            for r in failures:
-                print(f"FAIL: thread {r.idx} raised: {r.error!r}")
-            return False
-
-        # 3. All 80 calls must have produced identical row sets.
-        all_snapshots = [snap for r in results for snap in r.rows_seen]
-        if len(all_snapshots) != NUM_THREADS * CALLS_PER_THREAD:
-            print(
-                f"FAIL: expected {NUM_THREADS * CALLS_PER_THREAD} row snapshots, "
-                f"got {len(all_snapshots)}"
-            )
-            return False
-        baseline = all_snapshots[0]
-        for i, snap in enumerate(all_snapshots[1:], start=1):
-            if snap != baseline:
+            # 3. All 80 calls must have produced identical row sets.
+            all_snapshots = [snap for r in results for snap in r.rows_seen]
+            if len(all_snapshots) != NUM_THREADS * CALLS_PER_THREAD:
                 print(
-                    f"FAIL: snapshot {i} diverges from baseline.\n"
-                    f"  baseline: {baseline!r}\n"
-                    f"  snapshot: {snap!r}"
+                    f"FAIL: expected {NUM_THREADS * CALLS_PER_THREAD} row snapshots, "
+                    f"got {len(all_snapshots)}"
+                )
+                return False
+            baseline = all_snapshots[0]
+            for i, snap in enumerate(all_snapshots[1:], start=1):
+                if snap != baseline:
+                    print(
+                        f"FAIL: snapshot {i} diverges from baseline.\n"
+                        f"  baseline: {baseline!r}\n"
+                        f"  snapshot: {snap!r}"
+                    )
+                    return False
+
+            # 4. Wall budget guard — catches a regression where per-call
+            #    Connection construction becomes serialised behind a shared mutex.
+            if elapsed > WALL_BUDGET_SECONDS:
+                print(
+                    f"FAIL: {NUM_THREADS}×{CALLS_PER_THREAD} concurrent calls took "
+                    f"{elapsed:.1f}s (budget {WALL_BUDGET_SECONDS:.1f}s) — possible "
+                    f"serialisation regression"
                 )
                 return False
 
-        # 4. Wall budget guard — catches a regression where per-call
-        #    Connection construction becomes serialised behind a shared mutex.
-        if elapsed > WALL_BUDGET_SECONDS:
             print(
-                f"FAIL: {NUM_THREADS}×{CALLS_PER_THREAD} concurrent calls took "
-                f"{elapsed:.1f}s (budget {WALL_BUDGET_SECONDS:.1f}s) — possible "
-                f"serialisation regression"
+                f"PASS: {NUM_THREADS} threads × {CALLS_PER_THREAD} calls = "
+                f"{NUM_THREADS * CALLS_PER_THREAD} reads in {elapsed:.2f}s; "
+                f"all row sets identical."
             )
-            return False
-
-        print(
-            f"PASS: {NUM_THREADS} threads × {CALLS_PER_THREAD} calls = "
-            f"{NUM_THREADS * CALLS_PER_THREAD} reads in {elapsed:.2f}s; "
-            f"all row sets identical."
-        )
-        return True
+            return True
+        finally:
+            # Close cursors before master so the tempdir cleanup at context
+            # exit isn't blocked by held DuckDB handles (notably on Windows
+            # where the DB file is locked). Suppress per-handle errors to
+            # avoid masking the underlying test outcome.
+            for c in cursors:
+                try:
+                    c.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                master.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def main() -> int:
