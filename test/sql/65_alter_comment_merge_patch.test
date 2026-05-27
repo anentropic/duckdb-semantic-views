@@ -1,0 +1,237 @@
+# Phase 65 (v0.10.0) Plan 04 -- Wave 2.
+#
+# ALTER SEMANTIC VIEW SET/UNSET COMMENT now rides a pure-SQL UPDATE on
+# the caller's connection using DuckDB's json_merge_patch. No more
+# Rust-side catalog.lookup() / deserialize / mutate / reserialize round
+# trip. The Wave 0 spike (65_json_merge_patch_smoke.test) confirmed that
+# DuckDB v1.5.2 honors RFC-7396 null-as-delete semantics, which is what
+# UNSET COMMENT relies on (constant patch `{"comment":null}`).
+#
+# Behavioural properties pinned (covers Tests 1-4 + 7 from PLAN behaviours):
+#   B1: SET COMMENT updates the persisted JSON's comment field.
+#   B2: UNSET COMMENT removes the comment key entirely.
+#   B3: Race-guard wording on non-existent view (non-IF-EXISTS).
+#   B4: Special characters round-trip (single-quote, double-quote, backslash).
+#   B5: ALTER+ROLLBACK leaves the comment field intact (D-21 transactional
+#       semantics on the json_merge_patch UPDATE).
+#
+# Requirements covered: LIFE-02 (parser_override has zero catalog reads
+# under the read-elimination architecture; only catalog.exists remains
+# for the friendly "does not exist" pre-check, retired by Plan 06).
+#
+# Note: cross-database ALTER coverage (ATTACH 'db2'; ALTER ON db2.v) is
+# out of scope here -- the v0.9.0 extension only initializes the
+# semantic_layer._definitions schema on the database that LOAD was
+# called against. Cross-db semantic-view storage is a separate
+# architectural concern tracked under Phase 66 follow-ups, NOT a
+# regression of Plan 04's pure-SQL UPDATE shape.
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# ============================================================
+# Setup
+# ============================================================
+
+statement ok
+CREATE TABLE p65_sales (id INTEGER PRIMARY KEY, amount DOUBLE);
+
+statement ok
+INSERT INTO p65_sales VALUES (1, 100.0), (2, 250.0);
+
+statement ok
+CREATE SEMANTIC VIEW p65_sv
+  COMMENT = 'initial'
+AS
+  TABLES (o AS p65_sales PRIMARY KEY (id))
+  DIMENSIONS (o.id AS o.id)
+  METRICS (o.total AS SUM(o.amount))
+
+query T
+SELECT comment FROM list_semantic_views() WHERE name = 'p65_sv'
+----
+initial
+
+# ============================================================
+# B1: SET COMMENT updates the comment via json_merge_patch.
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW p65_sv SET COMMENT = 'replaced'
+
+query T
+SELECT comment FROM list_semantic_views() WHERE name = 'p65_sv'
+----
+replaced
+
+# The rest of the persisted JSON survives (sibling keys preserved per
+# RFC-7396 merge semantics). Verify the metrics still work end-to-end.
+query R
+SELECT total FROM semantic_view('p65_sv', metrics := ['total'])
+----
+350.0
+
+# ============================================================
+# B2: UNSET COMMENT removes the comment key entirely.
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW p65_sv UNSET COMMENT
+
+query T
+SELECT comment FROM list_semantic_views() WHERE name = 'p65_sv'
+----
+(empty)
+
+# Sibling JSON keys must still be intact -- the view is still queryable.
+query R
+SELECT total FROM semantic_view('p65_sv', metrics := ['total'])
+----
+350.0
+
+# Re-setting after unset works.
+statement ok
+ALTER SEMANTIC VIEW p65_sv SET COMMENT = 'back again'
+
+query T
+SELECT comment FROM list_semantic_views() WHERE name = 'p65_sv'
+----
+back again
+
+# ============================================================
+# B3: Non-IF-EXISTS on missing view surfaces "does not exist" (matches
+#     phase45 byte-identical -- this is the catalog.exists pre-check
+#     wording, retired by Plan 06).
+# ============================================================
+
+statement error
+ALTER SEMANTIC VIEW does_not_exist_view SET COMMENT = 'noop'
+----
+does not exist
+
+statement error
+ALTER SEMANTIC VIEW does_not_exist_view UNSET COMMENT
+----
+does not exist
+
+# IF EXISTS is silent.
+statement ok
+ALTER SEMANTIC VIEW IF EXISTS does_not_exist_view SET COMMENT = 'noop'
+
+statement ok
+ALTER SEMANTIC VIEW IF EXISTS does_not_exist_view UNSET COMMENT
+
+# ============================================================
+# B4: Special characters round-trip through the JSON+SQL escape stack.
+#     The Rust side uses serde_json::to_string for JSON escaping (handles
+#     `"` and `\`) then escape_sql_arg for SQL escaping (handles `'`).
+# ============================================================
+
+# Single quote (Snowflake-style escaping `''` in DDL surface).
+statement ok
+ALTER SEMANTIC VIEW p65_sv SET COMMENT = 'it''s tricky'
+
+query T
+SELECT comment FROM list_semantic_views() WHERE name = 'p65_sv'
+----
+it's tricky
+
+# Double quote in the comment (lands inside the JSON literal as `\"`).
+statement ok
+ALTER SEMANTIC VIEW p65_sv SET COMMENT = 'has "quoted" word'
+
+query T
+SELECT comment FROM list_semantic_views() WHERE name = 'p65_sv'
+----
+has "quoted" word
+
+# Backslash plus a mix of escape-prone chars.
+statement ok
+ALTER SEMANTIC VIEW p65_sv SET COMMENT = 'mix \ "and" ''quotes'''
+
+query T
+SELECT comment FROM list_semantic_views() WHERE name = 'p65_sv'
+----
+mix \ "and" 'quotes'
+
+statement ok
+ALTER SEMANTIC VIEW p65_sv UNSET COMMENT
+
+# ============================================================
+# B5: ALTER SET COMMENT inside BEGIN/ROLLBACK leaves comment unchanged
+#     (D-21 transactional invariant -- the json_merge_patch UPDATE runs
+#     on the caller's connection so it participates in BEGIN/ROLLBACK).
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW p65_sv SET COMMENT = 'before tx'
+
+query T
+SELECT comment FROM list_semantic_views() WHERE name = 'p65_sv'
+----
+before tx
+
+statement ok
+BEGIN
+
+statement ok
+ALTER SEMANTIC VIEW p65_sv SET COMMENT = 'inside tx'
+
+# Inside the txn, the caller's own SELECT on _definitions sees the
+# uncommitted patch (list_semantic_views() reads via the extension's
+# catalog connection which is committed-only -- TECH-DEBT 19, retires
+# under Plan 05).
+query T
+SELECT json_extract_string(definition, '$.comment')
+FROM semantic_layer._definitions WHERE name = 'p65_sv'
+----
+inside tx
+
+statement ok
+ROLLBACK
+
+# After rollback the pre-tx comment is restored -- the UPDATE
+# participated in the caller's transaction (D-21 invariant).
+query T
+SELECT json_extract_string(definition, '$.comment')
+FROM semantic_layer._definitions WHERE name = 'p65_sv'
+----
+before tx
+
+# Same for UNSET COMMENT.
+statement ok
+BEGIN
+
+statement ok
+ALTER SEMANTIC VIEW p65_sv UNSET COMMENT
+
+# After UNSET, the comment key is removed from the JSON (RFC-7396
+# null-as-delete). json_extract_string returns NULL when the key is
+# absent.
+query I
+SELECT json_extract_string(definition, '$.comment') IS NULL
+FROM semantic_layer._definitions WHERE name = 'p65_sv'
+----
+true
+
+statement ok
+ROLLBACK
+
+# After rollback the comment is restored.
+query T
+SELECT json_extract_string(definition, '$.comment')
+FROM semantic_layer._definitions WHERE name = 'p65_sv'
+----
+before tx
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p65_sv
+
+statement ok
+DROP TABLE p65_sales

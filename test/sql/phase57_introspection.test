@@ -73,7 +73,7 @@ SELECT explain_output FROM explain_semantic_view('p57_no_mat_view', dimensions :
 query I
 SELECT explain_output FROM explain_semantic_view('p57_mat_view', dimensions := ['region'], metrics := ['total_revenue', 'order_count']) WHERE explain_output LIKE 'FROM%p57_agg_region%'
 ----
-FROM "p57_agg_region"
+FROM "memory"."main"."p57_agg_region"
 
 # ============================================================
 # INTR-02: DESCRIBE SEMANTIC VIEW with materializations

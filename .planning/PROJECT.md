@@ -105,20 +105,33 @@ A DuckDB user can define a semantic view once and query it with any combination 
 
 - ✓ Caret-position rendering for validation errors: `parse_function` reintroduced purely as the error-reporting layer (`parser_override` keeps the success/transactional path); validation errors render as `Parser Error: ... LINE 1: ... ^`. Bounded multi-DB LRU removed; `OverrideContext` direct-attached to `SemanticViewsParserInfo` (lifetime-tied to `DBConfig`). Resolves TECH-DEBT items 20 + 22. — v0.8.0 (Phase 62)
 
+- ✓ OverrideContext connection teardown: both long-lived `duckdb_connection` handles (`query_conn` H2 + `catalog_conn` H1) retired from `init_extension`; 17 read-side function registrations migrated from duckdb-rs to C++ Catalog API via `sv_register_table_function` shim with per-call `Connection(*context.db)` under the BORROW contract. In-process `connect(path) → LOAD → CREATE → close → connect(path, read_only=True)` no longer hangs. `tests/no_long_lived_conn.rs` AST guard prevents regression. — v0.10.0 (Phase 65)
+
+- ✓ Code review remediation: 10 Critical + Warning findings from Phase 65 REVIEW.md addressed across 14 plans, plus 1 Critical + 7 Warning findings introduced during the remediation itself (caught by a follow-up review pass) fixed. Surface area: SQL-injection elimination in YAML-FILE TF (FileSystem-direct read), C ABI `(error_buf, error_buf_len)` cascade across all `sv_register_*` shims, `BorrowedConnection` newtype + `DisconnectFinder` AST guard, BORROW-contract `static_assert` + load-time runtime probe, hard `BinderException` on previously-silent fallbacks, idempotent parser-hook registration. — v0.10.0 (Phase 65.1)
+
 ### Active
 
-**Current milestone: v0.9.0 — Read-Only Database LOAD Support**
+**Current milestone: v0.10.0 — Connection-Lifecycle & Catalog-Context Fixes**
 
-**Goal:** Allow `LOAD semantic_views` on a read-only DuckDB database so that previously-defined semantic views can be queried; let DDL fail naturally with DuckDB's standard "cannot write to read-only database" error.
+Originally opened 2026-05-21 as v0.9.1 patch milestone. Reframed 2026-05-23 to v0.10.0 after the B-prime architecture for Phase 65 was empirically eliminated by `65-EXEC-TIME-SPIKE.md` (no DuckDB v1.5.2 API surface delivers both transactional DDL on the caller's connection AND per-call `Connection(*context.db)` reads from the same callback). Read-elimination architecture replaces B-prime; see `.planning/phases/65-overridecontext-connection-teardown/65-BPRIME-ARCHIVE-NOTE.md` for the full pivot rationale.
+
+**Goal:** Stop the extension's long-lived connections (`catalog_conn` H1 + `query_conn` H2) from blocking real user workflows. Two downstream-reported regressions that both trace back to the extension owning connections separate from the caller's.
+
+**Architecture (locked):**
+
+- Preserve `parser_override` as the sole DDL entry point — only DuckDB v1.5.2 mechanism that delivers transactional DDL on the caller's connection.
+- Eliminate the catalog reads inside `parser_override` rather than relocating them: drop PK auto-inference (Snowflake-aligned: PK in semantic views is a logical user assertion, not a physical-catalog import); move metadata to SQL expressions in the rewritten INSERT; fold existence checks into ON CONFLICT / DELETE RETURNING race-guards; defer type inference to read-side bind callbacks.
+- ALTER and CREATE FROM YAML FILE use the rewrite-to-UPDATE-with-table-function-subquery pattern (`65-ALTER-REWRITE-SPIKE.md` ALTER-RC0).
+- Read-path callbacks migrate to C++ Catalog API registration (`65-READ-PATH-SPIKE.md` READ-BIND-RC0) so they gain ClientContext and open per-call Connection.
+- Both long-lived connections retire. v0.8.0 transactional DDL semantics preserved byte-identical.
 
 **Target features:**
 
-- [ ] Detect read-only access mode at extension LOAD via `current_setting('access_mode')` and skip `init_catalog` write paths (schema + table CREATE, v0.1.0 companion-file migration)
-- [ ] `CatalogReader` gracefully tolerates a missing `semantic_layer._definitions` table (probe at LOAD; short-circuit `lookup`/`list_all`/`list_names` to "empty" / "not found" when the catalog table is absent)
-- [ ] `list_semantic_views()`, `describe_semantic_view()`, and `FROM semantic_view(...)` work end-to-end on a previously-bootstrapped read-only database
-- [ ] DDL (`CREATE`/`DROP`/`ALTER SEMANTIC VIEW`) on a read-only database surfaces DuckDB's native read-only error — no custom wrapper required
-- [ ] Documentation (CHANGELOG, transactional-ddl explanation page, CREATE/DROP/ALTER reference notes, README) covers the new behavior and the bootstrap-then-reopen workflow
-- [ ] New `examples/readonly_load.py` demonstrating bootstrap-writable → reopen-read-only → query → DDL-fails-cleanly
+- [ ] In-process `connect(path) → CREATE SEMANTIC VIEW → close → connect(path, read_only=True)` returns immediately instead of hanging. Regression guard: same-process bootstrap-then-RO integration test with watchdog.
+- [ ] `FROM semantic_view(...)` succeeds through ADBC and any other client with a divergent catalog/schema search path. Likely resolves transitively under read-elimination (per-call `Connection(*context.db)` inherits caller's search path natively); empirical verification via Phase 66 ADBC test suite.
+- [ ] ADBC end-to-end query test (`SELECT … FROM semantic_view(...)` through `adbc_driver_duckdb`) covering at minimum: main expansion, FACTS query, semi-additive metric, window metric, and multi-database `ATTACH` scenario.
+- [ ] PK auto-inference removal documented under CHANGELOG `### Changed` — small behavior change for users who relied on the catalog fallback; error path guides them to explicit `PRIMARY KEY (cols)` / `UNIQUE (cols)` declaration.
+- [ ] CHANGELOG `[0.10.0]` section documents all changes; `Cargo.toml` + `description.yml` bumped to 0.10.0.
 
 ### Out of Scope
 
@@ -213,8 +226,7 @@ A DuckDB user can define a semantic view once and query it with any combination 
 ## Evolution
 
 This document evolves at phase transitions and milestone boundaries.
-
-Last updated: 2026-05-17 (v0.9.0 milestone reopened pre-tag for Phase 64 quoted-identifier bugfix; now 2 phases, 8 plans complete)
+Last updated: 2026-05-26 — Phase 65.1 (code review remediation) complete. Phase 65 OverrideContext teardown + Phase 65.1 remediation both shipped; next is Phase 66 (Expansion qualification + ADBC tests + milestone finisher).
 
 **After each phase transition** (via `/gsd:transition`):
 1. Requirements invalidated? → Move to Out of Scope with reason
@@ -230,4 +242,4 @@ Last updated: 2026-05-17 (v0.9.0 milestone reopened pre-tag for Phase 64 quoted-
 4. Update Context with current state
 
 ---
-*Last updated: 2026-05-17 — v0.9.0 in progress (reopened pre-tag): Phase 63 Read-Only LOAD (4 plans, RO-01..05 + DOC-01..05 + TEST-01..03 + REL-01) + Phase 64 Quoted Identifier Bugfix (4 plans, QID-01..07, 838 unit tests + 47 sqllogictests + 3 regression). v0.8.0 prior summary: 5 phases (58-62), 8 plans, 0 REQ-IDs (interior architecture), audit passed 5/5 phases + 7/7 cross-phase integration.*
+*Last updated: 2026-05-23 — milestone reframed v0.9.1 → v0.10.0. Originally opened 2026-05-21 as a two-phase patch milestone for the two downstream-reported regressions (RW→RO reopen hang from Phase 63 deferred-items; ADBC / cross-connection catalog resolution from `_notes/error_with_adbc.md`). On 2026-05-23 the B-prime architecture for Phase 65 was empirically eliminated by `65-EXEC-TIME-SPIKE.md`; `65-ALTER-REWRITE-SPIKE.md` validated the read-elimination architecture (preserve parser_override + eliminate the reads inside it; use rewrite-to-UPDATE-with-TF-subquery for ALTER + CREATE FROM YAML FILE; migrate read-path to C++ Catalog API for ClientContext access). Scope expanded sufficiently that the patch-version framing no longer fit; reframed to v0.10.0. Prior v0.9.0 shipped 2026-05-17 with Phase 63 Read-Only LOAD + Phase 64 Quoted-Identifier Bugfix.*

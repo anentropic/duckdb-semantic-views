@@ -4,9 +4,7 @@ use crate::util::{replace_word_boundary, suggest_closest};
 use super::facts::{inline_derived_metrics, inline_facts, toposort_facts};
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::{resolve_joins_pkfk, synthesize_on_clause, synthesize_on_clause_scoped};
-use super::resolution::{
-    find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident, quote_table_ref,
-};
+use super::resolution::{find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident};
 use super::role_playing::find_using_context;
 use super::types::{ExpandError, QueryRequest};
 
@@ -178,7 +176,7 @@ fn expand_facts(
 
     // 6. FROM clause — same pattern as expand().
     sql.push_str("\nFROM ");
-    sql.push_str(&quote_table_ref(def.base_table()));
+    sql.push_str(&qualify_and_quote_table_ref(def.base_table(), def));
     if let Some(base_ref) = def.tables.first() {
         sql.push_str(" AS ");
         sql.push_str(&quote_ident(&base_ref.alias));
@@ -221,7 +219,7 @@ fn expand_facts(
             .find(|t| t.alias.to_ascii_lowercase() == *alias);
         let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
         sql.push_str("\nLEFT JOIN ");
-        sql.push_str(&quote_table_ref(physical_table));
+        sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
         sql.push_str(" AS ");
         sql.push_str(&quote_ident(alias));
         sql.push_str(" ON ");
@@ -241,7 +239,7 @@ fn expand_facts(
             .find(|t| t.alias.to_ascii_lowercase() == *alias);
         let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
         sql.push_str("\nLEFT JOIN ");
-        sql.push_str(&quote_table_ref(physical_table));
+        sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
         sql.push_str(" AS ");
         sql.push_str(&quote_ident(alias));
         sql.push_str(" ON ");

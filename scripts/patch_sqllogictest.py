@@ -3,6 +3,11 @@
 Patch duckdb_sqllogictest to:
   1. Support notwindows/windows require directives.
   2. Handle EXTENSION statement types for parser extension query results.
+  3. Extend the post-restart setting-replay skip list to cover DuckDB
+     internal/system settings that newer DuckDB versions mark as immutable
+     after database init (e.g. __delta_only_variant_encoding_enabled,
+     allow_community_extensions, disable_database_invalidation,
+     force_variant_shredding, vacuum_rebuild_indexes).
 
 Idempotent — safe to run on every test invocation.
 
@@ -90,6 +95,43 @@ def main() -> None:
 
         content = content.replace(SEARCH_2, REPLACE_2, 1)
         applied.append("extension")
+
+    # --- Patch 3: Extend the post-restart setting-replay skip list ---
+    # The runner re-applies cached settings after `restart`, skipping a small
+    # built-in list. Newer DuckDB versions mark additional settings as
+    # immutable post-init; replaying them raises Invalid Input Error and
+    # cascades failure to every subsequent test file in the same runner
+    # process. Extend the skip list to cover them.
+
+    if "__delta_only_variant_encoding_enabled" not in content:
+        SEARCH_3 = (
+            "                'duckdb_api',\n"
+            "            ]:\n"
+            "                # Can not be set after initialization\n"
+            "                continue\n"
+        )
+        REPLACE_3 = (
+            "                'duckdb_api',\n"
+            "                '__delta_only_variant_encoding_enabled',\n"
+            "                'allow_community_extensions',\n"
+            "                'disable_database_invalidation',\n"
+            "                'force_variant_shredding',\n"
+            "                'vacuum_rebuild_indexes',\n"
+            "            ]:\n"
+            "                # Can not be set after initialization\n"
+            "                continue\n"
+        )
+
+        if SEARCH_3 not in content:
+            print(
+                "ERROR: restart-skip patch anchor not found — package may have been updated. "
+                "Inspect configure/venv/.../duckdb_sqllogictest/result.py and update this script.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        content = content.replace(SEARCH_3, REPLACE_3, 1)
+        applied.append("restart-skip")
 
     if applied:
         result_py.write_text(content, encoding="utf-8")

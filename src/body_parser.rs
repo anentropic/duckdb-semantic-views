@@ -4,6 +4,7 @@
 //! into a `SemanticViewDefinition`.
 
 use crate::errors::ParseError;
+use crate::ident::find_identifier_end;
 use crate::model::{
     AccessModifier, Cardinality, Dimension, Fact, Join, Materialization, Metric, NonAdditiveDim,
     NullsOrder, SortOrder, TableRef, WindowOrderBy, WindowSpec,
@@ -89,6 +90,59 @@ fn suggest_clause_keyword(word: &str) -> Option<&'static str> {
         }
     }
     best.map(|(_, kw)| kw)
+}
+
+/// Phase 68 B1 (D-08): split a qualified identifier at the FIRST dot that
+/// falls OUTSIDE a double-quoted region. Returns
+/// `Some((before_first_dot, after_first_dot))` if a split-eligible dot
+/// exists, else `None`. The `after_first_dot` slice may itself contain
+/// further dots (and/or quoted regions); this helper does NOT recursively
+/// split — callers that need 3+ segment handling must re-invoke or do their
+/// own scanning. Doubled-quote `""` inside `"..."` is treated as an escape
+/// (mirrors `is_quoting_balanced` / `find_identifier_end`).
+///
+/// Returns `None` if either side of the split would be empty (WR-01).
+///
+/// Examples:
+/// - `"o.x"` → `Some(("o", "x"))`
+/// - `"o.\"order date\""` → `Some(("o", "\"order date\""))`
+/// - `"\"a.b\""` → `None` (the dot is inside the quoted region)
+/// - `"bare"` → `None` (no dot)
+/// - `".foo"` / `"foo."` → `None` (empty side, WR-01)
+/// - `"db.sch.\"tbl\""` → `Some(("db", "sch.\"tbl\""))` (WR-02: caller
+///   must handle further splitting if 3+ segments are expected)
+fn split_qualified_identifier(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut in_quote = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                // Doubled-quote escape — stay inside the quoted region.
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote && b == b'.' {
+            let alias = &s[..i];
+            let name = &s[i + 1..];
+            // WR-01 (Phase 68 review): reject malformed inputs where either side
+            // of the split is empty (e.g. leading `.foo` or trailing `foo.`).
+            // Today's callers tolerate `Some(("", "foo"))` because every parsed
+            // dimension carries a non-empty `source_table`, but the helper is a
+            // leaf utility and a future caller deserves a clean None.
+            if alias.is_empty() || name.is_empty() {
+                return None;
+            }
+            return Some((alias, name));
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Split `body` at depth-0 commas, respecting nested parens and single-quoted strings.
@@ -443,11 +497,26 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
         .collect();
 
     // Phase 47: Validate NON ADDITIVE BY dimension references
+    // Phase 68 B1 / D-08: accept dotted-path qualifier `alias.dim_name` in
+    // addition to the bare `dim_name` form. The dotted form is split at the
+    // first depth-0 dot OUTSIDE a quoted region (so `"a.b"` stays atomic but
+    // `o."order date"` splits into `o` + `"order date"`).
     for metric in &metrics {
         for na in &metric.non_additive_by {
-            let dim_exists = dimensions
-                .iter()
-                .any(|d| d.name.eq_ignore_ascii_case(&na.dimension));
+            let dim_exists = dimensions.iter().any(|d| {
+                if d.name.eq_ignore_ascii_case(&na.dimension) {
+                    return true;
+                }
+                // D-08 dotted-path acceptance: if NA dim is `alias.name`,
+                // match against (source_table, name).
+                if let Some((alias_part, name_part)) = split_qualified_identifier(&na.dimension) {
+                    if let Some(ref src) = d.source_table {
+                        return src.eq_ignore_ascii_case(alias_part)
+                            && d.name.eq_ignore_ascii_case(name_part);
+                    }
+                }
+                false
+            });
             if !dim_exists {
                 let available_dims: Vec<String> =
                     dimensions.iter().map(|d| d.name.clone()).collect();
@@ -515,10 +584,21 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
                 }
             }
             // Validate ORDER BY dimension references
+            // Phase 68 B2 / D-08: accept dotted-path qualifier `alias.dim_name`
+            // in addition to the bare `dim_name` form (mirrors NAB resolver).
             for ob in &ws.order_by {
-                let dim_exists = dimensions
-                    .iter()
-                    .any(|d| d.name.eq_ignore_ascii_case(&ob.expr));
+                let dim_exists = dimensions.iter().any(|d| {
+                    if d.name.eq_ignore_ascii_case(&ob.expr) {
+                        return true;
+                    }
+                    if let Some((alias_part, name_part)) = split_qualified_identifier(&ob.expr) {
+                        if let Some(ref src) = d.source_table {
+                            return src.eq_ignore_ascii_case(alias_part)
+                                && d.name.eq_ignore_ascii_case(name_part);
+                        }
+                    }
+                    false
+                });
                 if !dim_exists {
                     let available_dims: Vec<String> =
                         dimensions.iter().map(|d| d.name.clone()).collect();
@@ -680,30 +760,89 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     let after_as = rest[2..].trim_start();
     let after_as_offset = rest_offset + 2 + (rest[2..].len() - after_as.len());
 
-    // Step 3: find "PRIMARY KEY" (case-insensitive, any whitespace between words)
-    let upper = after_as.to_ascii_uppercase();
-    let pk_pos = find_primary_key(&upper);
+    // Step 3: capture the source-table name using identifier-aware tokenisation
+    // (Phase 67 Plan 02 / TECH-DEBT #24). `find_identifier_end` natively walks
+    // across dots while outside quoted regions (verified by the
+    // `fqn_with_quoted_parts_runs_to_whitespace` doctest in `src/ident.rs`), so
+    // a single call captures `schema.tbl`, `"my db"."schema"."col"`, etc. The
+    // earlier dot-rejoin loop arm was unreachable (Phase 68 A3 collapse).
+    // This MUST run before we look for the PRIMARY KEY / UNIQUE trailing
+    // keywords — otherwise the case-insensitive scan over the whole `after_as`
+    // slice can match a `PRIMARY KEY` substring INSIDE a quoted source-table
+    // name.
+    let name_end = find_identifier_end(after_as, /* allow_paren = */ true);
+    if name_end == 0 {
+        return Err(ParseError {
+            message: format!(
+                "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
+            ),
+            position: Some(after_as_offset),
+        });
+    }
+    // Phase 68 A1 (D-03): reject bare reserved keywords captured as the
+    // source-table name. Without this guard `o AS PRIMARY KEY (id)` would
+    // succeed at `find_identifier_end` (capturing `PRIMARY` up to the
+    // following whitespace) and the downstream PRIMARY-KEY scan over
+    // `" KEY (id)"` would fail to find the keyword (already eaten), producing
+    // a confusing "table 'PRIMARY' does not exist" downstream. The literal
+    // pre-Phase-67 error message is the contract — see Phase 68 CONTEXT.md
+    // D-03 for the authoritative keyword set.
+    let captured = after_as[..name_end].trim();
+    let upper_captured = captured.to_ascii_uppercase();
+    if matches!(
+        upper_captured.as_str(),
+        "PRIMARY" | "UNIQUE" | "FOREIGN" | "REFERENCES" | "NOT"
+    ) {
+        return Err(ParseError {
+            message: format!(
+                "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
+            ),
+            position: Some(after_as_offset),
+        });
+    }
+    let table_name = captured;
+    if table_name.is_empty() {
+        return Err(ParseError {
+            message: format!(
+                "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
+            ),
+            position: Some(after_as_offset),
+        });
+    }
+    // Phase 68 A4: reject unterminated quoted source-table names. `find_identifier_end`
+    // saturates at input.len() on an unterminated quote rather than surfacing an
+    // error, so `o AS "unclosed` would otherwise pass through as `table_name =
+    // "\"unclosed"` and corrupt downstream catalog lookups. The doubled-quote
+    // escape `""` is balanced — mirror src/ident.rs::find_identifier_end's escape
+    // rule via the private `is_quoting_balanced` helper.
+    if !is_quoting_balanced(&after_as[..name_end]) {
+        return Err(ParseError {
+            message: format!(
+                "Unterminated quoted identifier in source-table name for alias '{alias}' in TABLES clause.",
+            ),
+            position: Some(after_as_offset),
+        });
+    }
+    let after_name = &after_as[name_end..];
+    let after_name_offset = after_as_offset + name_end;
 
-    let (table_name, pk_columns, after_pk_text) = if let Some((pk_start, pk_end)) = pk_pos {
-        let table_name = after_as[..pk_start].trim();
-        if table_name.is_empty() {
-            return Err(ParseError {
-                message: format!(
-                    "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
-                ),
-                position: Some(after_as_offset),
-            });
-        }
-        let after_pk = after_as[pk_end..].trim_start();
+    // Step 3a: now search ONLY the post-name slice for the optional
+    // PRIMARY KEY / UNIQUE trailing clauses. `name_end` was computed via
+    // identifier-aware tokenisation so we can safely uppercase the rest.
+    let upper_after_name = after_name.to_ascii_uppercase();
+    let pk_pos = find_primary_key(&upper_after_name);
+
+    let (pk_columns, after_pk_text) = if let Some((_pk_start, pk_end)) = pk_pos {
+        let after_pk = after_name[pk_end..].trim_start();
         if !after_pk.starts_with('(') {
             return Err(ParseError {
                 message: "Expected '(' after PRIMARY KEY in TABLES clause.".to_string(),
-                position: Some(after_as_offset + pk_end),
+                position: Some(after_name_offset + pk_end),
             });
         }
         let pk_body = extract_paren_content(after_pk).ok_or_else(|| ParseError {
             message: "Unclosed '(' in PRIMARY KEY column list.".to_string(),
-            position: Some(after_as_offset + pk_end),
+            position: Some(after_name_offset + pk_end),
         })?;
         let pk_columns: Vec<String> = pk_body
             .split(',')
@@ -714,29 +853,21 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
         // balanced parens exist. The closing ')' must be present in after_pk.
         let close = after_pk.find(')').unwrap();
         let remainder = &after_pk[close + 1..];
-        (table_name, pk_columns, remainder)
+        (pk_columns, remainder)
     } else {
-        // No PRIMARY KEY -- fact table. Table name is before UNIQUE keyword (if any).
-        let unique_pos = find_unique(&upper);
-        let table_name = if let Some((u_start, _)) = unique_pos {
-            after_as[..u_start].trim()
-        } else {
-            after_as.trim()
-        };
-        if table_name.is_empty() {
-            return Err(ParseError {
-                message: format!(
-                    "Missing physical table name after AS for alias '{alias}' in TABLES clause.",
-                ),
-                position: Some(after_as_offset),
-            });
-        }
+        // No PRIMARY KEY -- fact table. UNIQUE clause (if any) starts after the
+        // already-captured table name.
+        let unique_pos = find_unique(&upper_after_name);
         let remainder = if let Some((u_start, _)) = unique_pos {
-            &after_as[u_start..]
+            &after_name[u_start..]
         } else {
+            // No PK, no UNIQUE: preserve the original byte-for-byte
+            // semantics that surfaced trailing text only when a UNIQUE
+            // keyword was present. Trailing text in the bare case is
+            // unsupported by the legacy parser and remains so.
             ""
         };
-        (table_name, vec![], remainder)
+        (vec![], remainder)
     };
 
     // Step 4: parse zero or more UNIQUE constraints from after_pk_text
@@ -784,6 +915,31 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
         comment: annotations.comment,
         synonyms: annotations.synonyms,
     })
+}
+
+/// Phase 68 A4: returns `true` if `s` has balanced double-quote runs, treating
+/// a doubled-quote `""` inside a quoted region as an escape (does NOT close).
+/// Mirrors the escape rule used by `src/ident.rs::find_identifier_end` so the
+/// two callers agree on what counts as "balanced". A naive
+/// `s.matches('"').count() % 2 == 0` is incorrect because it double-counts
+/// escaped quotes; this helper walks bytes explicitly.
+fn is_quoting_balanced(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                // Doubled-quote escape inside a quoted region — skip both
+                // bytes without toggling the in_quote state.
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+        }
+        i += 1;
+    }
+    !in_quote
 }
 
 /// Find "UNIQUE" keyword with word-boundary matching in `upper_text`.
@@ -854,10 +1010,16 @@ fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
     while i + 7 <= bytes.len() {
         // Look for "PRIMARY"
         if &upper_text[i..i + 7] == "PRIMARY" {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            // Phase 68 A7: align word-boundary checks with `find_unique` —
+            // `_` is a valid identifier continuation byte, so exclude it from
+            // the "non-identifier" boundary set in all three checks below.
+            let before_ok =
+                i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
             let after_primary = i + 7;
             if before_ok
-                && (after_primary == bytes.len() || !bytes[after_primary].is_ascii_alphanumeric())
+                && (after_primary == bytes.len()
+                    || (!bytes[after_primary].is_ascii_alphanumeric()
+                        && bytes[after_primary] != b'_'))
             {
                 // Skip whitespace between PRIMARY and KEY
                 let mut j = after_primary;
@@ -867,8 +1029,8 @@ fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
                 // Match "KEY"
                 if j + 3 <= bytes.len() && &upper_text[j..j + 3] == "KEY" {
                     let after_key = j + 3;
-                    let after_ok =
-                        after_key == bytes.len() || !bytes[after_key].is_ascii_alphanumeric();
+                    let after_ok = after_key == bytes.len()
+                        || (!bytes[after_key].is_ascii_alphanumeric() && bytes[after_key] != b'_');
                     if after_ok {
                         return Some((i, after_key));
                     }
@@ -1377,6 +1539,12 @@ fn find_non_additive_by_keyword(upper_text: &str) -> Option<usize> {
 
 /// Parse the dimension entries inside a NON ADDITIVE BY (...) clause.
 /// Each entry: `dim_name [ASC|DESC] [NULLS FIRST|LAST]`
+///
+/// Phase 68 Plan 03 (B1) / TECH-DEBT #25: `dim_name` is captured via
+/// identifier-aware tokenisation (`find_identifier_end`) so quoted identifiers
+/// containing literal whitespace AND dotted paths (`table.col`, D-08) survive
+/// intact. The modifier suffix (`ASC|DESC|NULLS FIRST|LAST`) is then
+/// `split_whitespace`-tokenised since the suffix has no quoted identifiers.
 fn parse_non_additive_dims(
     content: &str,
     base_offset: usize,
@@ -1388,19 +1556,35 @@ fn parse_non_additive_dims(
         if entry_text.is_empty() {
             continue; // trailing comma
         }
-        let parts: Vec<&str> = entry_text.split_whitespace().collect();
-        if parts.is_empty() {
+        // Phase 68 B1: identifier-aware capture of dim_name. `allow_paren=false`
+        // because NAB entries have no parens inside identifiers.
+        let name_end = find_identifier_end(entry_text, /* allow_paren = */ false);
+        if name_end == 0 {
             return Err(ParseError {
                 message: "Empty dimension in NON ADDITIVE BY clause".to_string(),
                 position: Some(base_offset + start),
             });
         }
-        let dim_name = parts[0].to_string();
+        // Phase 68 B1: reject unterminated quoted identifiers — mirrors the
+        // TABLES-clause A4 check. `find_identifier_end` saturates at
+        // `input.len()` on an unterminated `"`, so without this guard the
+        // malformed name would flow downstream.
+        if !is_quoting_balanced(&entry_text[..name_end]) {
+            return Err(ParseError {
+                message: format!(
+                    "Unterminated quoted identifier in NON ADDITIVE BY dimension entry '{entry_text}'."
+                ),
+                position: Some(base_offset + start),
+            });
+        }
+        let dim_name = entry_text[..name_end].trim().to_string();
+        let suffix = entry_text[name_end..].trim();
+        let parts: Vec<&str> = suffix.split_whitespace().collect();
         let upper_parts: Vec<String> = parts.iter().map(|p| p.to_ascii_uppercase()).collect();
         let mut order = SortOrder::Asc;
         let mut nulls = NullsOrder::Last;
         let mut has_explicit_nulls = false;
-        let mut i = 1;
+        let mut i = 0;
         while i < upper_parts.len() {
             match upper_parts[i].as_str() {
                 "ASC" => {
@@ -1698,20 +1882,36 @@ fn parse_over_content(
             };
 
             // Parse ORDER BY entries using same pattern as non_additive_by
+            // Phase 68 Plan 03 (B2) / TECH-DEBT #25: identifier-aware
+            // tokenisation of the column-reference slot. The post-port
+            // contract narrows the slot from "any expression" to
+            // "identifier (possibly quoted, possibly dotted)" — RESEARCH §B2
+            // confirmed no existing fixture uses function-call expressions
+            // here, so this is a defense-in-depth narrowing, not a regression.
             let entries = split_at_depth0_commas(order_text);
             for (start, entry_text) in entries {
                 let entry_text = entry_text.trim();
                 if entry_text.is_empty() {
                     continue;
                 }
-                let parts: Vec<&str> = entry_text.split_whitespace().collect();
-                if parts.is_empty() {
+                let name_end = find_identifier_end(entry_text, /* allow_paren = */ false);
+                if name_end == 0 {
                     continue;
                 }
-                let dim_name = parts[0].to_string();
+                if !is_quoting_balanced(&entry_text[..name_end]) {
+                    return Err(ParseError {
+                        message: format!(
+                            "Unterminated quoted identifier in OVER ORDER BY entry '{entry_text}'."
+                        ),
+                        position: Some(base_offset + start),
+                    });
+                }
+                let dim_name = entry_text[..name_end].trim().to_string();
+                let suffix = entry_text[name_end..].trim();
+                let parts: Vec<&str> = suffix.split_whitespace().collect();
                 let mut sort = SortOrder::Asc;
                 let mut nulls = NullsOrder::Last;
-                let mut idx = 1;
+                let mut idx = 0;
                 while idx < parts.len() {
                     match parts[idx].to_ascii_uppercase().as_str() {
                         "ASC" => {
@@ -2535,6 +2735,374 @@ mod tests {
         assert_eq!(result[0].alias, "o");
         assert_eq!(result[0].table, "orders");
         assert!(result[0].pk_columns.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 67 Plan 02 / TECH-DEBT #24: identifier-aware tokenisation of the
+    // source-table-name slot. Quoted identifiers with internal whitespace —
+    // including ones that contain the literal `PRIMARY KEY` substring — must
+    // survive intact through `parse_single_table_entry`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_table_entry_quoted_with_internal_whitespace() {
+        // Quoted name with embedded space; trailing PRIMARY KEY clause.
+        let result = parse_tables_clause("o AS \"my orders\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "\"my orders\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_quoted_containing_primary_key_substring() {
+        // Canonical TECH-DEBT #24 bug: a quoted source-table name that
+        // contains the literal `PRIMARY KEY` substring must NOT be split by
+        // the case-insensitive PRIMARY-KEY substring search. The fix is to
+        // capture the identifier FIRST using `find_identifier_end`, then run
+        // PRIMARY KEY detection only on the post-name slice.
+        let result =
+            parse_tables_clause("o AS \"weird PRIMARY KEY name\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "\"weird PRIMARY KEY name\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_3part_quoted_fqn_with_whitespace() {
+        // 3-part fully-qualified name with internal whitespace in two
+        // segments. The dot-separated walk in the new identifier-aware
+        // tokeniser must traverse all three segments and preserve the
+        // verbatim byte sequence.
+        let result =
+            parse_tables_clause("o AS \"my db\".\"schema\".\"my table\" PRIMARY KEY (id)", 0)
+                .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "\"my db\".\"schema\".\"my table\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_regression_no_whitespace() {
+        // Regression baseline for the happy path: unquoted dot-qualified
+        // name with no whitespace anywhere in the source-table slot.
+        // Byte-for-byte identical to the pre-fix `parse_tables_schema_qualified`
+        // assertion shape.
+        let result = parse_tables_clause("o AS schema.t PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "schema.t");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_quoted_with_unique_no_pk() {
+        // No PK, trailing UNIQUE clause after a quoted-with-whitespace name.
+        // Exercises the no-PK branch of the post-name keyword search.
+        let result = parse_tables_clause("f AS \"fact stage\" UNIQUE (email)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "f");
+        assert_eq!(result[0].table, "\"fact stage\"");
+        assert!(result[0].pk_columns.is_empty());
+        assert_eq!(
+            result[0].unique_constraints,
+            vec![vec!["email".to_string()]]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 A1 (D-03): bare reserved keywords (PRIMARY, UNIQUE, FOREIGN,
+    // REFERENCES, NOT) appearing in the source-table-name slot must surface
+    // the pre-Phase-67 literal error message. The keyword set is authoritative
+    // per Phase 68 CONTEXT.md D-03; the REVIEW.md draft list is informational.
+    // -----------------------------------------------------------------------
+    const A1_EXPECTED_MESSAGE: &str =
+        "Missing physical table name after AS for alias 'o' in TABLES clause.";
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_primary() {
+        let err = parse_tables_clause("o AS PRIMARY KEY (id)", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_unique() {
+        let err = parse_tables_clause("o AS UNIQUE (id)", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_foreign() {
+        let err = parse_tables_clause("o AS FOREIGN KEY (id)", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_references() {
+        let err = parse_tables_clause("o AS REFERENCES other(id)", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_not() {
+        let err = parse_tables_clause("o AS NOT NULL", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_reserved_keyword_after_as_lowercase() {
+        // Guard is case-insensitive — `primary` must trigger it just like
+        // `PRIMARY` (Phase 68 D-03).
+        let err = parse_tables_clause("o AS primary KEY (id)", 0).unwrap_err();
+        assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 A4: unterminated quoted source-table identifier in TABLES
+    // clause must surface a structured ParseError, never silently flow
+    // through as a malformed name. Doubled-quote `""` is an escape and must
+    // NOT trip the balanced-quote check.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_table_entry_unterminated_quote() {
+        let err = parse_tables_clause("o AS \"unclosed", 0).unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "expected unterminated-quote error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_quoted_with_doubled_escape_balanced() {
+        // `"a""b"` is balanced — doubled-quote is an escape inside the quoted
+        // region, so this must parse successfully.
+        let result = parse_tables_clause("o AS \"a\"\"b\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "\"a\"\"b\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_unbalanced_after_doubled_escape() {
+        // `"a""b` opens, escapes, then never closes — odd unescaped quote
+        // count, must be rejected.
+        let err = parse_tables_clause("o AS \"a\"\"b PRIMARY KEY (id)", 0).unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "expected unterminated-quote error, got: {}",
+            err.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 A7: `find_primary_key`'s three word-boundary checks align with
+    // `find_unique`'s `_`-exclusion pattern. Identifiers like `my_PRIMARY`
+    // (prefix) or `PRIMARY KEY_extra` (suffix) must NOT match.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_primary_key_word_boundary_underscore() {
+        // Underscore-prefixed: `_PRIMARY` should not match because `_` is now
+        // excluded from the before-boundary set.
+        assert!(find_primary_key(&"my_PRIMARY KEY".to_ascii_uppercase()).is_none());
+        // Underscore-suffixed on KEY: `KEY_extra` should not match.
+        assert!(find_primary_key(&"PRIMARY KEY_extra".to_ascii_uppercase()).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 A5: mixed bare/quoted dot-qualified source-table names must
+    // parse correctly. The dot-walk inside `find_identifier_end` already
+    // handles this case (its `fqn_with_quoted_parts_runs_to_whitespace`
+    // doctest covers it at the helper level); these tests pin the
+    // parse_tables_clause contract end-to-end.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_table_entry_mixed_quoted_and_bare() {
+        // Bare schema segment followed by quoted-with-whitespace table segment.
+        let result = parse_tables_clause("o AS staging.\"my orders\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "staging.\"my orders\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+
+        // Symmetric case: quoted-with-whitespace database segment, then bare
+        // schema + bare table.
+        let result = parse_tables_clause("o AS \"my db\".sch.t PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "\"my db\".sch.t");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 Plan 03 (B1) / TECH-DEBT #25: identifier-aware tokenisation of
+    // the dim_name slot inside `NON ADDITIVE BY (...)`. Quoted identifiers with
+    // internal whitespace AND dotted paths (`table.col`, D-08) must survive
+    // intact through `parse_non_additive_dims`. `parse_non_additive_dims` is
+    // private — exercise via the public `parse_metrics_clause` entry.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_non_additive_dims_quoted_identifier_with_whitespace() {
+        // Quoted dim_name with embedded space. DESC defaults to NULLS FIRST.
+        let result = parse_metrics_clause(
+            "a.balance NON ADDITIVE BY (\"my dim\" DESC) AS SUM(a.balance)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        // MetricEntry tuple: non_additive_by is at index 7.
+        let na_vec = &result[0].7;
+        assert_eq!(na_vec.len(), 1);
+        let na = &na_vec[0];
+        assert_eq!(na.dimension, "\"my dim\"");
+        assert_eq!(na.order, SortOrder::Desc);
+        assert_eq!(na.nulls, NullsOrder::First); // DESC default
+    }
+
+    #[test]
+    fn test_parse_non_additive_dims_dotted_path() {
+        // Dotted-path dim_name (D-08 contract extension): `o."my dim"` must be
+        // captured as a single identifier including the dot. Two-entry clause
+        // confirms comma splitting still works.
+        let result = parse_metrics_clause(
+            "a.balance NON ADDITIVE BY (o.\"my dim\" ASC NULLS LAST, c2 DESC) AS SUM(a.balance)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let na_vec = &result[0].7;
+        assert_eq!(na_vec.len(), 2);
+
+        let na0 = &na_vec[0];
+        assert_eq!(na0.dimension, "o.\"my dim\"");
+        assert_eq!(na0.order, SortOrder::Asc);
+        assert_eq!(na0.nulls, NullsOrder::Last);
+
+        let na1 = &na_vec[1];
+        assert_eq!(na1.dimension, "c2");
+        assert_eq!(na1.order, SortOrder::Desc);
+        assert_eq!(na1.nulls, NullsOrder::First); // DESC default
+    }
+
+    #[test]
+    fn test_parse_non_additive_dims_unterminated_quote() {
+        // Unterminated quoted dim_name must surface a structured ParseError
+        // with the expected wording. Mirrors the A4 TABLES-clause contract.
+        let err = parse_metrics_clause(
+            "a.balance NON ADDITIVE BY (\"unclosed DESC) AS SUM(a.balance)",
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "Expected unterminated-quote error, got: {}",
+            err.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 Plan 03 (B2) / TECH-DEBT #25: identifier-aware tokenisation of
+    // the OVER ORDER BY column-reference slot. Quoted identifiers with
+    // internal whitespace AND dotted paths (`table.col`, D-08) must survive
+    // intact through `parse_over_content` / `parse_window_over_clause`.
+    // `parse_window_spec` / `parse_over_content` is private — exercise via the
+    // public `parse_metrics_clause` entry which routes a window-metric expression
+    // through `parse_window_over_clause`. The parsed `WindowSpec.order_by` is at
+    // tuple index 8 of `MetricEntry`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_window_spec_quoted_order_by() {
+        // Quoted identifier with embedded space in OVER ORDER BY entry.
+        let result = parse_metrics_clause(
+            "s.running AS AVG(qty) OVER (PARTITION BY EXCLUDING r ORDER BY \"order date\" ASC NULLS LAST)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        // MetricEntry tuple: window_spec is at index 8.
+        let ws = result[0].8.as_ref().expect("window_spec must be Some");
+        assert_eq!(ws.order_by.len(), 1);
+        let ob = &ws.order_by[0];
+        assert_eq!(ob.expr, "\"order date\"");
+        assert_eq!(ob.order, SortOrder::Asc);
+        assert_eq!(ob.nulls, NullsOrder::Last);
+    }
+
+    #[test]
+    fn test_parse_window_spec_dotted_order_by() {
+        // Dotted-path column ref (D-08): `o."order date"` must be captured as a
+        // single identifier including the dot.
+        let result = parse_metrics_clause(
+            "s.running AS AVG(qty) OVER (PARTITION BY EXCLUDING r ORDER BY o.\"order date\" DESC)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let ws = result[0].8.as_ref().expect("window_spec must be Some");
+        assert_eq!(ws.order_by.len(), 1);
+        let ob = &ws.order_by[0];
+        assert_eq!(ob.expr, "o.\"order date\"");
+        assert_eq!(ob.order, SortOrder::Desc);
+        // DESC defaults to NULLS FIRST in window ORDER BY arm (matches NAB).
+        assert_eq!(ob.nulls, NullsOrder::First);
+    }
+
+    #[test]
+    fn test_parse_window_spec_unterminated_quote_order_by() {
+        // Unterminated quoted column ref surfaces structured ParseError.
+        let err = parse_metrics_clause(
+            "s.running AS AVG(qty) OVER (PARTITION BY EXCLUDING r ORDER BY \"unclosed ASC)",
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "Expected unterminated-quote error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_window_spec_regression_bare_order_by() {
+        // Regression baseline: bare unquoted column ref. Mirrors phase48.
+        let result = parse_metrics_clause(
+            "s.running AS AVG(qty) OVER (PARTITION BY EXCLUDING r ORDER BY order_date ASC NULLS LAST)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let ws = result[0].8.as_ref().expect("window_spec must be Some");
+        assert_eq!(ws.order_by.len(), 1);
+        let ob = &ws.order_by[0];
+        assert_eq!(ob.expr, "order_date");
+        assert_eq!(ob.order, SortOrder::Asc);
+        assert_eq!(ob.nulls, NullsOrder::Last);
+    }
+
+    #[test]
+    fn test_parse_non_additive_dims_regression_bare_no_whitespace() {
+        // Regression baseline for the pre-existing happy path: bare unquoted
+        // dim_name with ASC/DESC modifier. Mirrors phase47_semi_additive.test.
+        let result = parse_metrics_clause(
+            "a.balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let na_vec = &result[0].7;
+        assert_eq!(na_vec.len(), 1);
+        let na = &na_vec[0];
+        assert_eq!(na.dimension, "report_date");
+        assert_eq!(na.order, SortOrder::Desc);
+        assert_eq!(na.nulls, NullsOrder::First); // DESC default
     }
 
     // -----------------------------------------------------------------------

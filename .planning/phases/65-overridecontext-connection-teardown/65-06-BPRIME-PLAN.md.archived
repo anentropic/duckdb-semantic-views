@@ -1,0 +1,440 @@
+---
+phase: 65-overridecontext-connection-teardown
+plan: 06
+type: execute
+wave: 5
+depends_on: [65-03, 65-04, 65-05]
+files_modified:
+  - src/lib.rs
+  - src/conn_guard.rs
+  - test/integration/test_readonly_load.py
+  - .planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md
+  - .planning/phases/65-overridecontext-connection-teardown/65-VALIDATION.md
+  - TECH-DEBT.md
+autonomous: true
+requirements:
+  - LIFE-01
+  - LIFE-03
+  - LIFE-04
+tags:
+  - duckdb
+  - rust
+  - lifecycle
+  - life-04
+  - structural-guards
+  - tech-debt
+
+must_haves:
+  truths:
+    - "src/lib.rs::init_extension contains ZERO uncommented `duckdb_connect(db_handle, ...)` calls (TEMP-PLAN-04 + historical H1 + H2 all retired)"
+    - "A structural grep guard exists as a Rust unit test (under #[cfg(feature = \"extension\")]) that fails if anyone reintroduces `duckdb_connect` into init_extension or a module-level OnceLock<duckdb_database> / OnceLock<duckdb_connection> / thread_local! anywhere in src/"
+    - "All 5 in-process watchdog tests (B1, B2, B3, B4, B11 — added in Plan 01) PASS — duckdb.connect(path, read_only=True) returns within 5 seconds after in-process bootstrap; LIFE-01 closed"
+    - "New read-side watchdog test variants exist for representative read functions (semantic_view query + list_semantic_views + describe_semantic_view); same bootstrap → close → reconnect-readonly cycle completes within 5 seconds; closes the D-22 read-side variant requirement"
+    - ":memory: smoke test exists per RESEARCH §9.3"
+    - "deferred-items.md is updated in place: the `## In-process RW→RO reopen of the same DB hangs (Phase 62 OverrideContext leak)` section gains a closing line `**Resolved in v0.9.1 Phase 65 (B-prime architecture).**` with forward pointers to milestone/v0.9.1 SUMMARY paths; LIFE-04 closed"
+    - "TECH-DEBT.md gains TECH-DEBT 25 entry (cached-db_handle Phase 62 defect) per CONTEXT D-15 / D-22 — status: naturally resolved by B-prime"
+    - "TECH-DEBT.md gains TECH-DEBT 26 entry (or appends to TECH-DEBT 19) acknowledging the duckdb-rs BindInfo gap that necessitated the C++ Catalog API registration workaround"
+    - "just test-all is GREEN end-to-end on milestone/v0.9.1"
+  artifacts:
+    - path: "src/lib.rs"
+      provides: "init_extension free of long-lived duckdb_connection opens"
+      contains: "PHASE-65-GUARD"
+    - path: ".planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md"
+      provides: "LIFE-04 closure entry"
+      contains: "Resolved in v0.9.1 Phase 65"
+    - path: "TECH-DEBT.md"
+      provides: "TECH-DEBT 25 + 26 entries"
+      contains: "TECH-DEBT 25"
+  key_links:
+    - from: "test/integration/test_readonly_load.py"
+      to: "B1..B4 + B11 watchdog tests flip green"
+      via: "B-prime architecture eliminates the busy-spin root cause"
+      pattern: "_connect_with_watchdog"
+    - from: "src/lib.rs structural guard"
+      to: "future regression prevention"
+      via: "Rust unit test reads its own src/ at compile time"
+      pattern: "PHASE-65-GUARD"
+---
+
+<objective>
+Retire the last remaining long-lived `duckdb_connection` opens in `init_extension` (the TEMP-PLAN-04 marker carrying over from Plan 03); add a structural Rust unit test that fails CI if anyone re-introduces long-lived native handles; verify the B1..B4 + B11 watchdog tests flip green (LIFE-01 final gate); add new read-side watchdog test variants (D-22 scope expansion); add a `:memory:` smoke test (RESEARCH §9.3); update `deferred-items.md` in place (LIFE-04); file TECH-DEBT 25 (cached-db_handle defect) + TECH-DEBT 26 (BindInfo gap) per D-15 / D-22; run `just test-all` to certify the milestone branch.
+
+Purpose: This is the LIFE-04 close-out. After Plan 06, the phase goal is achieved: ZERO long-lived extension-owned `duckdb_connection` survives extension-LOAD scope; in-process RW→RO reopens within 5 seconds; all watchdog tests green; full quality gate green.
+
+Output: src/lib.rs's init_extension is connection-free; structural guard test in place; LIFE-04 ledger entry closed; TECH-DEBT entries filed; quality gate green.
+</objective>
+
+<execution_context>
+@/Users/paul/.claude/get-shit-done/workflows/execute-plan.md
+@/Users/paul/.claude/get-shit-done/templates/summary.md
+</execution_context>
+
+<context>
+@.planning/PROJECT.md
+@.planning/STATE.md
+@.planning/REQUIREMENTS.md
+@.planning/phases/65-overridecontext-connection-teardown/65-CONTEXT.md
+@.planning/phases/65-overridecontext-connection-teardown/65-RESEARCH.md
+@.planning/phases/65-overridecontext-connection-teardown/65-VALIDATION.md
+@.planning/phases/65-overridecontext-connection-teardown/65-03-SUMMARY.md
+@.planning/phases/65-overridecontext-connection-teardown/65-04-SUMMARY.md
+@.planning/phases/65-overridecontext-connection-teardown/65-05-SUMMARY.md
+@.planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md
+@TECH-DEBT.md
+@CLAUDE.md
+</context>
+
+<tasks>
+
+<task type="auto">
+  <name>Task 1: Delete TEMP-PLAN-04 conn from init_extension + add structural PHASE-65-GUARD Rust unit test</name>
+  <files>
+    src/lib.rs
+    src/conn_guard.rs
+    .planning/phases/65-overridecontext-connection-teardown/65-VALIDATION.md
+  </files>
+  <read_first>
+    src/lib.rs
+    src/conn_guard.rs
+    .planning/phases/65-overridecontext-connection-teardown/65-03-SUMMARY.md
+    .planning/phases/65-overridecontext-connection-teardown/65-04-SUMMARY.md
+    .planning/phases/65-overridecontext-connection-teardown/65-05-SUMMARY.md
+    .planning/phases/65-overridecontext-connection-teardown/65-RESEARCH.md
+  </read_first>
+  <behavior>
+    - The TEMP-PLAN-04 marker in src/lib.rs (the `catalog_conn_temp` open kept alive by Plan 03 for the still-unported read functions) has ZERO consumers after Plans 04 + 05 ship. This task DELETES the open + the associated `catalog_reader_legacy` value + the TEMP-PLAN-04 marker comment.
+    - Same for any residual H2 query_conn remnant if Plan 05 left one — verify and delete.
+    - Add a `// PHASE-65-GUARD` marker comment near the top of `init_extension` documenting the B-prime invariant.
+    - Add a Rust unit test under `#[cfg(all(test, feature = "extension"))]` in src/conn_guard.rs that uses `include_str!` to read src/lib.rs at compile time and asserts ZERO uncommented `duckdb_connect(` occurrences in the init_extension body. Same test asserts no module-level `OnceLock<usize>` / `OnceLock<duckdb_database>` / `OnceLock<duckdb_connection>` / `thread_local!` in src/lib.rs, src/catalog.rs, src/parse.rs.
+  </behavior>
+  <action>
+    1) Read src/lib.rs::init_extension end-to-end. Identify any surviving long-lived `duckdb_connect(db_handle, ...)` call. If Plans 04/05 retired everything cleanly, this should be the TEMP-PLAN-04 catalog_conn_temp open from Plan 03 (and only that).
+
+    2) DELETE:
+       - The `let mut catalog_conn_temp ...; duckdb_connect(db_handle, &mut catalog_conn_temp); ...` block.
+       - The `let catalog_reader_legacy = CatalogReader::new(catalog_conn_temp, …);` line.
+       - The TEMP-PLAN-04 marker comment block from Plan 03.
+
+    3) ADD a `// PHASE-65-GUARD` block in init_extension's body, after the `con: &Connection` binding and before the catalog_table_present probe. Content (Rust comment block):
+       ```
+       // PHASE-65-GUARD (B-prime): init_extension MUST NOT open any
+       // long-lived duckdb_connection. All catalog reads + execute paths
+       // go through per-call C++ Connection(*context.db) via
+       // sv_register_table_function and sv_register_scalar_function
+       // (cpp/src/shim.cpp). The structural guard test in
+       // src/conn_guard.rs::no_long_lived_conn_audit enforces this
+       // invariant on every cargo build. See Phase 65 RESEARCH §16.2 / §17.
+       ```
+
+    4) ADD to src/conn_guard.rs (or a new `#[cfg(all(test, feature = "extension"))] mod no_long_lived_conn_audit { ... }` sub-module at file end):
+       - `const LIB_RS: &str = include_str!("lib.rs");`
+       - `const CATALOG_RS: &str = include_str!("catalog.rs");`
+       - `const PARSE_RS: &str = include_str!("parse.rs");`
+       - Test `init_extension_has_no_duckdb_connect()`: locate `fn init_extension(` in LIB_RS; find body via brace-matching; strip line comments (`split("//").next()`); assert `!stripped.contains("duckdb_connect(")`.
+       - Test `no_module_level_oncelock_or_thread_local()`: iterate the three sources × forbidden patterns (`OnceLock<usize>`, `OnceLock<duckdb_database>`, `OnceLock<duckdb_connection>`, `OnceLock<libduckdb_sys::duckdb_database>`, `OnceLock<libduckdb_sys::duckdb_connection>`, `thread_local!`); per-line strip comments; assert no occurrence.
+       - Test `phase_65_guard_marker_present()`: assert `LIB_RS.contains("PHASE-65-GUARD")` ≥ 1 (defends against accidental removal of the marker itself).
+
+    5) Update `.planning/phases/65-overridecontext-connection-teardown/65-VALIDATION.md` B13 row (WARNING 7 — VALIDATION.md was authored before B-prime locked). The current row reads:
+       > B13 | LIFE-02 (structural) | `OverrideContext` carries `db_handle: duckdb_database`, NOT `duckdb_connection` / `CatalogReader`. Static guard or compile-time / grep audit | …
+
+       Replace its Behaviour cell with:
+       > OverrideContext carries `catalog_table_present + is_file_backed` only — NO `db_handle` / `duckdb_connection` / `CatalogReader` field.
+
+       Update the Automated Command cell to reference a grep audit of the OverrideContext struct definition that asserts the forbidden tokens are absent.
+
+       Acceptance criterion: `grep -E 'db_handle|duckdb_connection|CatalogReader' src/parse.rs | grep -v '//' | wc -l == 0` — measured against the OverrideContext struct only (use a context-aware grep or grep within the struct's brace range; the simpler form `grep -A 10 'pub struct OverrideContext' src/parse.rs | grep -v '//' | grep -cE 'db_handle|duckdb_connection|CatalogReader'` == 0 is acceptable).
+
+       NOTE: This update only modifies the VALIDATION.md document; it does not change source files. Commit the VALIDATION.md edit as a separate commit `docs(65-06): align VALIDATION.md B13 with B-prime OverrideContext shape`.
+
+    6) Build verification IN FOREGROUND:
+       - `cargo build` exits 0; `cargo build --features extension --no-default-features` exits 0; `just build` exits 0.
+       - `cargo test --lib --features extension --no-default-features no_long_lived_conn_audit > $TMPDIR/65_06_t1_audit.log 2>&1; grep "test result: ok" $TMPDIR/65_06_t1_audit.log` — 3 tests pass.
+       - `just test-sql > $TMPDIR/65_06_t1_sql.log 2>&1; tail -50 $TMPDIR/65_06_t1_sql.log` — 47/47 PASS.
+       - VALIDATION.md B13 update verifiable: `grep -A 10 'pub struct OverrideContext' src/parse.rs | grep -v '//' | grep -cE 'db_handle|duckdb_connection|CatalogReader'` returns 0; `grep -c 'catalog_table_present.*is_file_backed only' .planning/phases/65-overridecontext-connection-teardown/65-VALIDATION.md` >= 1.
+
+    Commit: `feat(65-06): retire TEMP-PLAN-04 catalog_conn_temp; add structural PHASE-65-GUARD test`.
+  </action>
+  <verify>
+    <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && [ "$(grep -E 'let mut (catalog_conn|query_conn|catalog_conn_temp):' src/lib.rs | grep -v '^[[:space:]]*//' | wc -l)" -eq 0 ] && grep -c "PHASE-65-GUARD" src/lib.rs | grep -E "^[1-9]" && grep -c "init_extension_has_no_duckdb_connect" src/conn_guard.rs | grep -E "^[1-9]" && cargo test --lib --features extension --no-default-features no_long_lived_conn_audit > $TMPDIR/65_06_t1_audit.log 2>&1 && grep -E "test result: ok" $TMPDIR/65_06_t1_audit.log && just build > $TMPDIR/65_06_t1_build.log 2>&1 && just test-sql > $TMPDIR/65_06_t1_sql.log 2>&1 && tail -5 $TMPDIR/65_06_t1_sql.log | grep -E "47/47|47 tests"</automated>
+  </verify>
+  <acceptance_criteria>
+    - No long-lived conn opens in init_extension: `grep -E "let mut (catalog_conn|query_conn|catalog_conn_temp):" src/lib.rs | grep -v "^[[:space:]]*//"` returns 0 matches.
+    - PHASE-65-GUARD marker present: `grep -c "PHASE-65-GUARD" src/lib.rs` ≥ 1.
+    - Structural guard tests present: `grep -E "fn init_extension_has_no_duckdb_connect|fn no_module_level_oncelock_or_thread_local|fn phase_65_guard_marker_present" src/conn_guard.rs` returns ≥ 3 matches.
+    - Structural guard tests pass: `cargo test --lib --features extension --no-default-features no_long_lived_conn_audit` reports `test result: ok` with ≥ 3 tests.
+    - Build green; sqllogictest 47/47 PASS.
+    - TEMP-PLAN-04 marker comment gone: `grep -c "TEMP-PLAN-04" src/lib.rs` == 0.
+  </acceptance_criteria>
+  <done>
+    init_extension is free of long-lived duckdb_connection opens. The PHASE-65-GUARD structural test fails CI if anyone reintroduces them. The phase goal is achieved at the source level.
+  </done>
+</task>
+
+<task type="auto" tdd="true">
+  <name>Task 2: Add read-side watchdog test variants + :memory: smoke test; verify all B1..B11 + new tests pass</name>
+  <files>
+    test/integration/test_readonly_load.py
+  </files>
+  <read_first>
+    test/integration/test_readonly_load.py
+    .planning/phases/65-overridecontext-connection-teardown/65-RESEARCH.md
+    .planning/phases/65-overridecontext-connection-teardown/65-VALIDATION.md
+    .planning/phases/65-overridecontext-connection-teardown/65-CONTEXT.md
+  </read_first>
+  <behavior>
+    - Four new tests added to test/integration/test_readonly_load.py:
+      1. `test_in_process_bootstrap_then_readonly_select_semantic_view` — bootstrap → close → connect(read_only=True) → LOAD → `SELECT * FROM semantic_view('v', dimensions:=['t1.i'], metrics:=['t1.c'])` completes within 5s, returns ≥1 row.
+      2. `test_in_process_bootstrap_then_readonly_list_semantic_views` — same shape but SELECT FROM list_semantic_views().
+      3. `test_in_process_bootstrap_then_readonly_describe_semantic_view` — same shape using describe_semantic_view('v').
+      4. `test_in_process_memory_db_round_trip` — `:memory:` LOAD + CREATE + SELECT + close + new in-memory connect completes without hang (RESEARCH §9.3).
+    - All four integrated with the existing `run_test` aggregator in main().
+    - Critically: all Plan 01 tests (B1..B4 + B11) MUST now PASS on milestone/v0.9.1. The whole-file run must report 0 failures.
+  </behavior>
+  <action>
+    Extend `test/integration/test_readonly_load.py` with 4 new tests. Reuse the Plan 01 `_connect_with_watchdog` helper. Sample (mirror B1):
+
+    `test_in_process_bootstrap_then_readonly_select_semantic_view`:
+    - tempfile.TemporaryDirectory(); db path = "fresh.duckdb".
+    - `w = open_writable(db)`; create TABLE t (i INT, v INT); INSERT 3 rows; `CREATE SEMANTIC VIEW v AS TABLES (t1 AS t PRIMARY KEY (i)) DIMENSIONS (t1.i AS t1.i) METRICS (t1.c AS COUNT(*), t1.s AS SUM(t1.v))`.
+    - w.close(); del w; gc.collect().
+    - `ro, elapsed = _connect_with_watchdog(db, watchdog_seconds=5, read_only=True)`. Assert elapsed < 5.0.
+    - `ro.execute("LOAD semantic_views")`. Run `SELECT * FROM semantic_view('v', dimensions := ['t1.i'], metrics := ['t1.c'])`; assert len(rows) > 0.
+    - ro.close() in finally.
+
+    `test_in_process_bootstrap_then_readonly_list_semantic_views`: same setup, but the inner query is `SELECT name FROM list_semantic_views()`; assert `[("v",)]`.
+
+    `test_in_process_bootstrap_then_readonly_describe_semantic_view`: same setup, inner query `SELECT * FROM describe_semantic_view('v')`; assert ≥1 row.
+
+    `test_in_process_memory_db_round_trip`:
+    - `c = duckdb.connect(":memory:")`; LOAD; create TABLE + INSERT + CREATE SEMANTIC VIEW; SELECT FROM semantic_view → assert rows; SELECT FROM list_semantic_views → assert name. c.close().
+    - `c2 = duckdb.connect(":memory:")` (fresh in-memory — no state from c1). LOAD. SELECT FROM list_semantic_views → assert []. c2.close().
+
+    Register all four in main()'s `run_test(...)` aggregator (after the existing B1..B4/B11 group).
+
+    Build verification IN FOREGROUND:
+    - `python -m py_compile test/integration/test_readonly_load.py` exits 0.
+    - `just build > $TMPDIR/65_06_t2_build.log 2>&1` exits 0 (extension binary up to date).
+    - Run the file standalone: `uv run test/integration/test_readonly_load.py > $TMPDIR/65_06_t2_run.log 2>&1; tail -50 $TMPDIR/65_06_t2_run.log`. The run summary MUST report 0 failures. All Plan 01 tests (B1..B4 + B11) must be GREEN — this is LIFE-01's final gate.
+
+    Commit: `test(65-06): read-side + :memory: watchdog test variants; LIFE-01 final gate`.
+  </action>
+  <verify>
+    <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && python -c "import ast,sys; t=ast.parse(open('test/integration/test_readonly_load.py').read()); names={n.name for n in ast.walk(t) if isinstance(n, ast.FunctionDef)}; required={'test_in_process_bootstrap_then_readonly_select_semantic_view','test_in_process_bootstrap_then_readonly_list_semantic_views','test_in_process_bootstrap_then_readonly_describe_semantic_view','test_in_process_memory_db_round_trip'}; missing=required-names; sys.exit(0 if not missing else (print('MISSING:',missing) or 1))" && just build > $TMPDIR/65_06_t2_build.log 2>&1 && uv run test/integration/test_readonly_load.py > $TMPDIR/65_06_t2_run.log 2>&1 && grep -E "Failures: 0|0 failures|all tests passed|all .* tests passed" $TMPDIR/65_06_t2_run.log</automated>
+  </verify>
+  <acceptance_criteria>
+    - Four new test functions defined in test/integration/test_readonly_load.py (verify via AST check).
+    - All four registered in main() `run_test(...)` aggregator.
+    - File parses cleanly (`python -m py_compile`).
+    - Standalone run: `uv run test/integration/test_readonly_load.py` exits 0; the summary indicates 0 failures.
+    - Plan 01 B1..B4 + B11 tests PASS in this run (LIFE-01 closed). Verify by inspecting the log for the test names + PASS markers.
+    - Each new test completes within 5s wall-clock per inner watchdog (their elapsed assertions assert < 5.0).
+  </acceptance_criteria>
+  <done>
+    All in-process watchdog tests (Plan 01's B1..B4 + B11 + four new ones from this task) pass. LIFE-01 is closed empirically.
+  </done>
+</task>
+
+<task type="auto">
+  <name>Task 3: Update deferred-items.md (LIFE-04) + file TECH-DEBT 25 + TECH-DEBT 26; run just test-all final gate</name>
+  <files>
+    .planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md
+    TECH-DEBT.md
+  </files>
+  <read_first>
+    .planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md
+    TECH-DEBT.md
+    .planning/phases/65-overridecontext-connection-teardown/65-CONTEXT.md
+    .planning/phases/65-overridecontext-connection-teardown/65-RESEARCH.md
+  </read_first>
+  <behavior>
+    - deferred-items.md (Phase 63's file): the `## In-process RW→RO reopen of the same DB hangs (Phase 62 OverrideContext leak)` section is updated in place with a closing paragraph that explicitly says "Resolved in v0.9.1 Phase 65 (B-prime architecture)" and points to milestone/v0.9.1 + Plan SUMMARY paths. The original section body is preserved — DO NOT delete it; append resolution.
+    - TECH-DEBT.md gains a new TECH-DEBT 25 entry per CONTEXT D-15 / D-22: "cached-`duckdb_database` Phase 62 defect — the C-API `duckdb_connect(stashed_db_handle)` path returns rc=1 from request-lifecycle threads while `Connection(*context.db)` succeeds. Root cause: `duckdb_database` pointer cached at extension-load time becomes stale / wrong DatabaseWrapper by query time. Resolution: naturally resolved by Phase 65 B-prime (no cached db_handle anywhere). Evidence: 65-OPTION-B-SPIKE.md Probe 1 vs Probe 2 split."
+    - TECH-DEBT.md gains TECH-DEBT 26 (or appends to existing TECH-DEBT 19): "duckdb-rs BindInfo does not expose ClientContext or duckdb_database. Workaround: Phase 65 registers read-side table functions through C++ Catalog API (`Catalog::GetSystemCatalog(db).CreateTableFunction(CreateTableFunctionInfo{...})`) directly, bypassing duckdb-rs's `register_table_function_with_extra_info`. Function bodies stay in Rust behind a thin FFI shim. The workaround adds ~150 LOC of C++ shim + Rust FFI surface. Resolution path: upstream duckdb-rs PR to expose `BindInfo::client_context()` or equivalent. Phase 65 evidence: Plan 01 Spike A6."
+    - `just test-all` is GREEN end-to-end on milestone/v0.9.1.
+  </behavior>
+  <action>
+    1) Read the existing `## In-process RW→RO reopen of the same DB hangs (Phase 62 OverrideContext leak)` section in `.planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md` (locate via grep `In-process RW→RO reopen` — read the full section to its terminating heading). Preserve the existing content. APPEND a new paragraph at the end of the section:
+
+       ```
+       **Resolved in v0.9.1 Phase 65 (B-prime architecture).** Eliminated all long-lived
+       extension-owned `duckdb_connection` handles. Catalog reads now run on per-call
+       C++ `Connection(*context.db)` derived from the caller's live `ClientContext`,
+       scope-bounded by `ConnGuard` RAII (Rust) and `unique_ptr<Connection>` (C++).
+       The catalog WRITE (CREATE/DROP/ALTER) still rides the Phase 58 rewrite-to-native
+       path onto the caller's conn through the binder, preserving v0.8.0 transactional
+       DDL semantics byte-identical.
+
+       References:
+       - `.planning/phases/65-overridecontext-connection-teardown/65-CONTEXT.md` (B-prime architecture)
+       - `.planning/phases/65-overridecontext-connection-teardown/65-RESEARCH.md` §16 + §17 (mechanism + handle audit)
+       - `.planning/phases/65-overridecontext-connection-teardown/65-OPTION-B-SPIKE.md` (PLAN-THREAD-RC0 empirical evidence)
+       - `.planning/phases/65-overridecontext-connection-teardown/65-READ-PATH-SPIKE.md` (READ-BIND-RC0 empirical evidence)
+       - `.planning/phases/65-overridecontext-connection-teardown/65-06-SUMMARY.md` (close-out)
+       ```
+
+    2) Read TECH-DEBT.md to find the existing numbering / formatting convention. Then APPEND two new entries at the end (or in numerical order if entries are numerically grouped — match existing style).
+
+       TECH-DEBT 25 entry (full template — use whatever format matches existing entries):
+       ```
+       ## TECH-DEBT 25 — cached `duckdb_database` pointer Phase 62 defect (naturally resolved by Phase 65 B-prime)
+
+       **Status:** Resolved in v0.9.1 Phase 65.
+       **Filed:** 2026-05-XX (during Phase 65 close-out per CONTEXT D-15 / D-22).
+
+       Phase 62 (v0.8.0) stashed the `duckdb_database` opaque pointer on
+       `OverrideContext` at extension-load time. By query time the C-API path
+       `duckdb_connect(stashed_db_handle)` returns rc=1 across all lifecycle
+       phases (parse / bind / plan), while the C++ direct path
+       `Connection(*context.db)` succeeds. Empirically isolated by
+       `65-OPTION-B-SPIKE.md` Probe 1 vs Probe 2 split (same thread, same
+       DatabaseInstance, microseconds apart, opposite results).
+
+       Root cause: `duckdb_database` is reinterpreted as `DatabaseWrapper *`
+       inside the C-API; by the time the request runs, the wrapper's internal
+       `shared_ptr<DuckDB>` either points at a different DatabaseInstance than
+       the live `context.db` or has been silently invalidated.
+
+       **Resolution:** Phase 65 B-prime architecture never caches `db_handle`.
+       All catalog reads and writes derive `Connection` from the live
+       `ClientContext &` at call time. No cached pointer survives any callback's
+       stack frame.
+
+       **References:**
+       - `.planning/phases/65-overridecontext-connection-teardown/65-OPTION-B-SPIKE.md`
+       - `.planning/phases/65-overridecontext-connection-teardown/65-CONTEXT.md` (D-15)
+       - `.planning/phases/65-overridecontext-connection-teardown/65-RESEARCH.md` §16.3
+       ```
+
+       TECH-DEBT 26 entry (or extend existing TECH-DEBT 19 — author's call; the simpler shape is a new entry):
+       ```
+       ## TECH-DEBT 26 — duckdb-rs BindInfo does not expose ClientContext / duckdb_database
+
+       **Status:** Open (workaround shipped in Phase 65; upstream fix would simplify the surface).
+       **Filed:** 2026-05-XX (during Phase 65 close-out per CONTEXT D-22).
+
+       `duckdb::vtab::BindInfo` (the `&BindInfo` argument to the
+       `register_table_function_with_extra_info` bind callback) does not expose
+       the underlying `ClientContext &` or a way to obtain a `duckdb_database`.
+       This forced Phase 65 to register the 14 read-side table functions + 2
+       scalars directly through the C++ Catalog API
+       (`Catalog::GetSystemCatalog(db).CreateTableFunction(CreateTableFunctionInfo{...})`),
+       bypassing duckdb-rs entirely. Function bodies stay in Rust behind a thin
+       FFI shim; only the registration plumbing moves into C++.
+
+       The workaround adds ~150 LOC of C++ shim + Rust FFI surface (see
+       `cpp/src/shim.cpp::sv_register_table_function` and per-function
+       trampolines). It is correct and performant, but represents technical
+       debt: any future read-side function added to the extension MUST go
+       through the C++ shim until upstream duckdb-rs exposes a way for bind
+       callbacks to reach `ClientContext &`.
+
+       **Resolution path:** Upstream duckdb-rs PR to expose a method like
+       `BindInfo::client_context() -> &ClientContext` or, at minimum,
+       `BindInfo::database_handle() -> duckdb_database`. With that exposure
+       the C++ Catalog API workaround can retire and registration shifts
+       back to idiomatic duckdb-rs.
+
+       **References:**
+       - Plan 01 Spike A6 (`65-01-SPIKES.md`): empirical confirmation that
+         `BindInfo` has no such accessor in duckdb-rs 1.10502.0.
+       - `65-RESEARCH.md` §16.6 (C++ Catalog API registration template).
+       - `65-READ-PATH-SPIKE.md` (READ-BIND-RC0): empirical viability of the
+         workaround.
+
+       **Related to (potentially supersedes):** TECH-DEBT 19 — DESCRIBE/SHOW
+       read committed state was blocked on the same BindInfo gap. Under
+       Phase 65 B-prime, DESCRIBE/SHOW now run on per-call probe connections
+       derived from `*context.db`. They still see only committed state (the
+       per-call conn inherits committed state at open time). TECH-DEBT 19's
+       behaviour is unchanged from v0.9.0; it stays open until BindInfo
+       exposes the live ClientContext, at which point both 19 and 26 close
+       together.
+       ```
+
+    3) Run the FINAL QUALITY GATE: `just test-all`. Per CLAUDE.md this is the only acceptable phase verification gate (NOT just `cargo test`). Foreground execution only.
+
+       ```bash
+       just test-all > $TMPDIR/65_06_t3_test_all.log 2>&1
+       echo "exit_code=$?"
+       tail -100 $TMPDIR/65_06_t3_test_all.log
+       ```
+
+       Expected outcome: exit code 0. All four test categories report green:
+       - Rust unit tests (cargo test): ≥ 839 passing.
+       - Proptests: green.
+       - sqllogictest: 47/47 PASS.
+       - DuckLake CI: green.
+
+       If `just test-all` exits non-zero, the phase is NOT complete. Diagnose the failing test category from the log; categorise the failure (regression / test-environment / pre-existing); fix or document. Pre-existing failures unrelated to Phase 65 may be deferred to TECH-DEBT (the deferred-items.md from Phase 63 already documents clippy + bundled-feature test gaps; consult it).
+
+    Commit: `docs(65-06): LIFE-04 closure — deferred-items + TECH-DEBT 25 + 26 + just test-all green`.
+  </action>
+  <verify>
+    <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && grep -c "Resolved in v0.9.1 Phase 65" .planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md | grep -E "^[1-9]" && grep -c "TECH-DEBT 25" TECH-DEBT.md | grep -E "^[1-9]" && grep -c "TECH-DEBT 26\|BindInfo" TECH-DEBT.md | grep -E "^[1-9]" && just test-all > $TMPDIR/65_06_t3_test_all.log 2>&1 && tail -5 $TMPDIR/65_06_t3_test_all.log</automated>
+  </verify>
+  <acceptance_criteria>
+    - deferred-items.md updated: `grep -c "Resolved in v0.9.1 Phase 65" .planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md` ≥ 1.
+    - deferred-items.md preserves original entry: `grep -c "In-process RW→RO reopen" .planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md` ≥ 1 (original section heading still present).
+    - TECH-DEBT 25 entry present: `grep -c "TECH-DEBT 25" TECH-DEBT.md` ≥ 1 and `grep -c "cached.*duckdb_database\|cached.*db_handle" TECH-DEBT.md` ≥ 1.
+    - TECH-DEBT 26 entry present (or 19 extended): `grep -E "TECH-DEBT 26|BindInfo" TECH-DEBT.md` returns ≥ 1 match.
+    - `just test-all` exits 0 (the phase-level quality gate per CLAUDE.md). Log captured in $TMPDIR.
+    - All four test categories report green in the log (cargo test, proptest, sqllogictest 47/47, DuckLake CI).
+  </acceptance_criteria>
+  <done>
+    LIFE-04 ledger closed in place. TECH-DEBT 25 + 26 entries filed (per D-15 / D-22 — bounded scope with signal surfacing). `just test-all` is green end-to-end. The phase is complete at the test level; Plan 07 handles the SUMMARY + final cleanup.
+  </done>
+</task>
+
+</tasks>
+
+<threat_model>
+## Trust Boundaries
+
+| Boundary | Description |
+|----------|-------------|
+| init_extension at LOAD ↔ all subsequent callbacks | After Plan 06, init_extension owns NO duckdb_connection — every callback derives its own per-call from `*context.db` |
+| Structural guard test ↔ future commits | The Rust unit test runs on every cargo build/test cycle; CI enforces the invariant |
+
+## STRIDE Threat Register
+
+| Threat ID | Category | Component | Disposition | Mitigation Plan |
+|-----------|----------|-----------|-------------|-----------------|
+| T-65-06-01 | Tampering | Future commit reintroduces a long-lived duckdb_connect into init_extension | mitigate | `init_extension_has_no_duckdb_connect` Rust unit test (Task 1) fails CI immediately. |
+| T-65-06-02 | Tampering | Future commit caches a `duckdb_database` in a module-level OnceLock or thread_local | mitigate | `no_module_level_oncelock_or_thread_local` test (Task 1) fails CI. |
+| T-65-06-03 | Information Disclosure | TECH-DEBT entries leak project-internal details if shared externally | accept | TECH-DEBT.md is committed to the public repo by design; entries are at the same level of detail as existing entries 19/20/21. |
+| T-65-06-SC | Tampering | No new crate dependencies | accept | Documentation + structural test only. |
+</threat_model>
+
+<verification>
+After all three tasks complete:
+
+1. `cargo test --lib --features extension --no-default-features no_long_lived_conn_audit` reports 3+ tests passing (structural guards green).
+2. `uv run test/integration/test_readonly_load.py` exits 0; B1..B4 + B11 + 4 new tests all green.
+3. `just test-all` exits 0 (full quality gate per CLAUDE.md).
+4. `grep -c "Resolved in v0.9.1 Phase 65" .planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md` ≥ 1 (LIFE-04 closed).
+5. `grep -c "TECH-DEBT 25" TECH-DEBT.md` ≥ 1 and `grep -c "TECH-DEBT 26\|BindInfo" TECH-DEBT.md` ≥ 1.
+6. `grep -E "let mut (catalog_conn|query_conn|catalog_conn_temp):" src/lib.rs | grep -v "^[[:space:]]*//"` returns 0 matches (no long-lived conn in init_extension).
+7. `grep -c "PHASE-65-GUARD" src/lib.rs` ≥ 1 and `grep -c "PHASE-65-GUARD" src/parse.rs` ≥ 1 (markers consistent with Plan 03's struct-level marker + Plan 06's init_extension marker).
+</verification>
+
+<success_criteria>
+- TEMP-PLAN-04 catalog_conn_temp retired from init_extension.
+- Structural Rust guard test enforces "no long-lived conn / no OnceLock<db_handle> / no thread_local!" on every cargo test.
+- All Plan 01 watchdog tests (B1..B4 + B11) pass on milestone/v0.9.1 — LIFE-01 closed.
+- Four new read-side + :memory: watchdog tests pass — D-22 read-side variants closed.
+- deferred-items.md ledger entry resolved in place — LIFE-04 closed.
+- TECH-DEBT 25 + 26 filed per D-15 / D-22 (bounded scope with signal surfacing).
+- `just test-all` green end-to-end (phase quality gate per CLAUDE.md).
+</success_criteria>
+
+<output>
+Create `.planning/phases/65-overridecontext-connection-teardown/65-06-SUMMARY.md` when done. The summary MUST:
+- State that init_extension is now connection-free; show the diff (lines deleted + PHASE-65-GUARD marker added).
+- List the structural guard tests + their assertion targets.
+- Confirm all Plan 01 watchdog tests (B1..B4 + B11) now PASS — paste the test summary line from the `uv run` log.
+- Confirm `just test-all` exit code 0 + the four category statuses.
+- Document the deferred-items.md update with the appended paragraph in full.
+- Document the TECH-DEBT 25 + 26 entries' opening lines.
+- Note any deviation from CONTEXT D-14..D-22 or RESEARCH §16/§17 and why.
+- State the remaining work for Plan 07 (close-out / dead code cleanup / SUMMARY commit) — IF Plan 07 is taken; otherwise note that Plan 06 is the final plan and Plan 07 can be skipped per planner discretion.
+</output>

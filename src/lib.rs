@@ -295,44 +295,207 @@ pub mod ddl;
 /// failed due to unresolved C++ symbols from -fvisibility=hidden in the host.
 #[cfg(feature = "extension")]
 mod extension {
-    use std::ptr;
     use std::sync::Arc;
 
     use duckdb::{Connection, Result};
     use libduckdb_sys as ffi;
     use std::error::Error;
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
 
-    use crate::{
-        catalog::init_catalog,
-        ddl::{
-            describe::DescribeSemanticViewVTab,
-            get_ddl::GetDdlScalar,
-            list::{ListSemanticViewsVTab, ListTerseSemanticViewsVTab},
-            read_yaml::ReadYamlFromSemanticViewScalar,
-            show_columns::ShowColumnsInSemanticViewVTab,
-            show_dims::{ShowSemanticDimensionsAllVTab, ShowSemanticDimensionsVTab},
-            show_dims_for_metric::ShowDimensionsForMetricVTab,
-            show_facts::{ShowSemanticFactsAllVTab, ShowSemanticFactsVTab},
-            show_materializations::{
-                ShowSemanticMaterializationsAllVTab, ShowSemanticMaterializationsVTab,
-            },
-            show_metrics::{ShowSemanticMetricsAllVTab, ShowSemanticMetricsVTab},
-        },
-        query::explain::ExplainSemanticViewVTab,
-        query::table_function::{QueryState, SemanticViewVTab},
-    };
+    use crate::catalog::init_catalog;
+    // Phase 65 Plan 05 (complete after Batch 3 cleanup): all 17 read-side
+    // registrations now go through the C++ Catalog API path:
+    //  - Wave 0: list_semantic_views (bridge spike)
+    //  - Wave 1: list_terse + 4 "_all" variants
+    //  - Wave 2: describe + show_columns + 4 single-view SHOW variants +
+    //            show_dimensions_for_metric
+    //  - Wave 3: get_ddl + read_yaml_from_semantic_view (scalars)
+    //  - Wave 5: explain_semantic_view
+    //  - Wave 6: semantic_view
+    // The legacy duckdb-rs `register_table_function_with_extra_info` /
+    // `register_scalar_function_with_state` registrations were deleted
+    // together with the H2 query_conn allocation in the Plan 05 Batch 3
+    // cleanup commit. Phase 65 Plan 06 retires H1 catalog_conn as well —
+    // `init_extension` no longer allocates any long-lived extension-owned
+    // `duckdb_connection`. `tests/no_long_lived_conn.rs` is the
+    // structural guard that fails CI if any future change re-introduces
+    // one inside `init_extension`.
 
     // C++ helper for parser hook registration (defined in cpp/src/shim.cpp).
-    // Phase 62: catalog_conn + is_file_backed are bundled into an
-    // OverrideContext (see src/parse.rs::sv_make_override_context) and
-    // attached to the C++ SemanticViewsParserInfo. The legacy
-    // db_token-LRU lookup is gone (TECH-DEBT 20).
+    // Phase 65 Plan 06: signature slimmed to `(db_handle)` after H1
+    // catalog_conn retirement. The legacy `catalog_conn` and
+    // `is_file_backed` args are gone — parser_override paths are
+    // pure-SQL and consume neither.
     extern "C" {
+        // Phase 65.1 Plan 10 (WR-06 D-12/D-13): sv_register_parser_hooks now
+        // carries the `(error_buf, error_buf_len)` trailing pair — matching
+        // the 17 read-side dispatchers and the registration helpers — so the
+        // BORROW-contract runtime probe failure and helper-TF registration
+        // failure surface through the ABI-stable channel via
+        // `decode_register_err_buf`.
         fn sv_register_parser_hooks(
             db_handle: ffi::duckdb_database,
-            catalog_conn: ffi::duckdb_connection,
-            is_file_backed: bool,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
         ) -> bool;
+
+        // Phase 65 Plan 05 (Task 1 / Wave 0 bridge spike) — register the
+        // `list_semantic_views()` table function via the C++ Catalog API
+        // path. The bind callback opens a per-call `Connection(*context.db)`
+        // and bridges to the Rust dispatcher
+        // `sv_list_semantic_views_bind_rust` (defined in src/ddl/list.rs)
+        // by casting the stack `Connection *` to `duckdb_connection`. See
+        // `65-05-SPIKE-SUMMARY.md` for the bridge mechanism and the LOC
+        // extrapolation for the remaining 16 read-side migrations.
+        //
+        // Phase 65.1 Plan 02a/02b (WR-02 D-08/D-09): trailing
+        // `(error_buf, error_buf_len)` pair surfaces registration failures
+        // via the ABI-stable channel — `sv_register_table_function`'s
+        // diagnostic flows through the wrapper into the caller's buffer.
+        fn sv_register_list_semantic_views(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+
+        // Phase 65 Plan 05 Task 2 (Wave 1) — register the migrated
+        // `list_terse_semantic_views()` table function via the C++ Catalog
+        // API. 5-column subset of list_semantic_views.
+        fn sv_register_list_terse_semantic_views(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+
+        // Phase 65 Plan 05 Task 2 (Wave 1) — register the migrated zero-arg
+        // "_all" TFs via the C++ Catalog API. Bind callbacks open per-call
+        // Connection(*context.db) and bridge to the matching
+        // sv_show_<name>_all_bind_rust dispatcher.
+        fn sv_register_show_semantic_dimensions_all(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+        fn sv_register_show_semantic_metrics_all(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+        fn sv_register_show_semantic_facts_all(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+        fn sv_register_show_semantic_materializations_all(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+
+        // Phase 65 Plan 05 Task 3 (Wave 2) — register the migrated
+        // single-arg (view name) TFs via the C++ Catalog API. The
+        // dimensions_for_metric variant additionally takes a metric name.
+        fn sv_register_show_columns_in_semantic_view(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+        fn sv_register_describe_semantic_view(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+        fn sv_register_show_semantic_dimensions(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+        fn sv_register_show_semantic_metrics(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+        fn sv_register_show_semantic_facts(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+        fn sv_register_show_semantic_materializations(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+        fn sv_register_show_semantic_dimensions_for_metric(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+
+        // Phase 65 Plan 05 Task 4 (Wave 3) — register the migrated read-side
+        // scalars via the C++ Catalog API. Exec callbacks open per-call
+        // `Connection probe(*state.GetContext().db)` and bridge to the
+        // matching Rust dispatchers (sv_get_ddl_exec_rust /
+        // sv_read_yaml_from_semantic_view_exec_rust). Borrow contract is
+        // identical to the bind-side dispatchers.
+        fn sv_register_get_ddl(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+        fn sv_register_read_yaml_from_semantic_view(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+
+        // Phase 65 Plan 05 Task 5 (Wave 5) — register the migrated
+        // `explain_semantic_view` table function via the C++ Catalog API.
+        // Bind opens a per-call `Connection(*context.db)` and dispatches to
+        // `sv_explain_semantic_view_bind_rust` in `src/query/explain.rs`.
+        // Replaces the duckdb-rs `register_table_function_with_extra_info`
+        // path that previously fed off the long-lived `QueryState`.
+        fn sv_register_explain_semantic_view(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+
+        // Phase 65 Plan 05 Task 6 (Wave 6) — register the migrated
+        // `semantic_view` table function via the C++ Catalog API. Bind
+        // opens a per-call `Connection(*context.db)` and dispatches to
+        // `sv_semantic_view_bind_rust` in `src/query/table_function.rs`.
+        // Replaces the duckdb-rs `register_table_function_with_extra_info`
+        // path that previously fed off the long-lived `QueryState`. The
+        // H2 `query_conn` allocation site at lines ~540 below is still
+        // present pending the Plan 05 Batch 3 cleanup commit which
+        // deletes it together with the dead VTab carcasses.
+        fn sv_register_semantic_view(
+            db_handle: ffi::duckdb_database,
+            error_buf: *mut c_char,
+            error_buf_len: usize,
+        ) -> bool;
+    }
+
+    /// Decode a `[0u8; 1024]` registration error buffer into an owned `String`,
+    /// trimming at the first NUL. Returns `"(no error text)"` if the buffer
+    /// is empty so the caller never emits a misleading bare-colon suffix.
+    ///
+    /// Phase 65.1 Plan 02b (WR-02 D-08/D-09): paired with the snprintf-into-
+    /// `error_buf` convention on the C++ side of every `sv_register_*` helper.
+    fn decode_register_err_buf(buf: &[u8]) -> String {
+        // SAFETY: `buf` is a valid byte slice owned by the caller; the C side
+        // wrote a NUL-terminated string via snprintf, truncating within
+        // `buf.len()`. `CStr::from_ptr` reads up to (but not including) the
+        // terminating NUL.
+        let msg = unsafe { CStr::from_ptr(buf.as_ptr().cast::<c_char>()) }
+            .to_string_lossy()
+            .into_owned();
+        if msg.is_empty() {
+            "(no error text)".to_string()
+        } else {
+            msg
+        }
     }
 
     /// Core initialization logic, called with both the high-level Connection and
@@ -375,143 +538,350 @@ mod extension {
         // Initialize the persistent catalog (schema + table + companion-file migration).
         init_catalog(con, &db_path, is_read_only)?;
 
-        // Dedicated connection for catalog queries (`duckdb_constraints()`
-        // lookups, `_definitions` reads, CREATE-time enrichment, etc.).
-        // Always created for both file-backed and in-memory databases.
-        // Distinct from the user's main connection so reads on this handle
-        // never block on the user's transaction or execution lock.
-        let mut catalog_conn: ffi::duckdb_connection = ptr::null_mut();
-        let rc = unsafe { ffi::duckdb_connect(db_handle, &mut catalog_conn) };
-        if rc != ffi::DuckDBSuccess {
-            return Err("Failed to create catalog connection".into());
-        }
+        // Phase 65 Plan 06: H1 catalog_conn allocation RETIRED. The
+        // parser_override path is now pure-SQL on the caller's connection
+        // — existence checks use a `SELECT CASE WHEN NOT EXISTS THEN
+        // error() ELSE TRUE END; <DML>` two-statement guard that runs
+        // snapshot-consistent with the DML. No long-lived extension-owned
+        // `duckdb_connection` is allocated in `init_extension` after this
+        // plan; `tests/no_long_lived_conn.rs` is the structural guard
+        // that fails CI if anyone re-introduces one.
 
-        // Phase 63: When read-only, probe for semantic_layer._definitions
-        // ONCE so reader-path methods can short-circuit cleanly. Writable
-        // path always has the table (init_catalog just CREATE'd it), so we
-        // skip the probe to avoid an extra query on the hot path.
-        let catalog_table_present: bool = if is_read_only {
-            con.query_row(
-                "SELECT 1 FROM information_schema.tables \
-                 WHERE table_schema = 'semantic_layer' AND table_name = '_definitions' LIMIT 1",
-                [],
-                |row| row.get::<_, i32>(0),
+        // Register parser_override hook BEFORE table functions. The C++
+        // shim attaches an (empty) OverrideContext to SemanticViewsParserInfo
+        // for FFI shape compatibility; no per-DB state is carried any more
+        // since H1 catalog_conn was retired in this plan.
+        //
+        // Phase 65.1 Plan 10 (WR-06 D-12/D-13): allocate a per-site stack
+        // buffer for the diagnostic. The C++ side writes:
+        //   - "bridge contract broken — ..." if the BORROW-contract runtime
+        //     probe fails (representation drift the file-scope static_assert
+        //     would miss);
+        //   - the `__sv_compute_create_from_yaml` helper TF registration
+        //     diagnostic (forwarded from sv_register_table_function's own
+        //     error_buf) on registration failure;
+        //   - the std::exception::what() text on any other failure path.
+        // We decode via the same helper used by the 17 read-side
+        // registrations so ADBC/JDBC/Python callers see the underlying
+        // diagnostic instead of a bare "failed".
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_parser_hooks(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
             )
-            .is_ok()
-        } else {
-            true
-        };
-
-        let catalog_reader =
-            crate::catalog::CatalogReader::new(catalog_conn, catalog_table_present);
-
-        // Register parser_override hook BEFORE table functions. Phase 62:
-        // the catalog connection + is_file_backed flag are bundled into an
-        // OverrideContext (allocated by sv_make_override_context inside the
-        // C++ shim) and attached directly to SemanticViewsParserInfo. No
-        // global LRU map — lifetime is tied to DBConfig.
-        // `is_file_backed` gates DDL-time type inference (LIMIT 0 probes
-        // only run on file-backed DBs — matches v0.7.1 design).
-        let is_file_backed = db_path.as_ref() != ":memory:";
-        if !unsafe { sv_register_parser_hooks(db_handle, catalog_conn, is_file_backed) } {
-            return Err("Failed to register parser hooks via C++ helper".into());
+        } {
+            return Err(format!(
+                "Failed to register parser hooks via C++ helper: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
         }
 
         // Register table DDL read functions (list_semantic_views, describe_semantic_view).
-        con.register_table_function_with_extra_info::<ListSemanticViewsVTab, _>(
-            "list_semantic_views",
-            &catalog_reader,
-        )?;
-        con.register_table_function_with_extra_info::<ListTerseSemanticViewsVTab, _>(
-            "list_terse_semantic_views",
-            &catalog_reader,
-        )?;
-        con.register_table_function_with_extra_info::<ShowColumnsInSemanticViewVTab, _>(
-            "show_columns_in_semantic_view",
-            &catalog_reader,
-        )?;
-        con.register_table_function_with_extra_info::<DescribeSemanticViewVTab, _>(
-            "describe_semantic_view",
-            &catalog_reader,
-        )?;
-
-        // SHOW SEMANTIC DIMENSIONS
-        con.register_table_function_with_extra_info::<ShowSemanticDimensionsVTab, _>(
-            "show_semantic_dimensions",
-            &catalog_reader,
-        )?;
-        con.register_table_function_with_extra_info::<ShowSemanticDimensionsAllVTab, _>(
-            "show_semantic_dimensions_all",
-            &catalog_reader,
-        )?;
-
-        // SHOW SEMANTIC DIMENSIONS FOR METRIC
-        con.register_table_function_with_extra_info::<ShowDimensionsForMetricVTab, _>(
-            "show_semantic_dimensions_for_metric",
-            &catalog_reader,
-        )?;
-
-        // SHOW SEMANTIC METRICS
-        con.register_table_function_with_extra_info::<ShowSemanticMetricsVTab, _>(
-            "show_semantic_metrics",
-            &catalog_reader,
-        )?;
-        con.register_table_function_with_extra_info::<ShowSemanticMetricsAllVTab, _>(
-            "show_semantic_metrics_all",
-            &catalog_reader,
-        )?;
-
-        // SHOW SEMANTIC FACTS
-        con.register_table_function_with_extra_info::<ShowSemanticFactsVTab, _>(
-            "show_semantic_facts",
-            &catalog_reader,
-        )?;
-        con.register_table_function_with_extra_info::<ShowSemanticFactsAllVTab, _>(
-            "show_semantic_facts_all",
-            &catalog_reader,
-        )?;
-
-        // SHOW SEMANTIC MATERIALIZATIONS
-        con.register_table_function_with_extra_info::<ShowSemanticMaterializationsVTab, _>(
-            "show_semantic_materializations",
-            &catalog_reader,
-        )?;
-        con.register_table_function_with_extra_info::<ShowSemanticMaterializationsAllVTab, _>(
-            "show_semantic_materializations_all",
-            &catalog_reader,
-        )?;
-
-        // Register GET_DDL scalar function.
-        con.register_scalar_function_with_state::<GetDdlScalar>("get_ddl", &catalog_reader)?;
-
-        // Register READ_YAML_FROM_SEMANTIC_VIEW scalar function.
-        con.register_scalar_function_with_state::<ReadYamlFromSemanticViewScalar>(
-            "read_yaml_from_semantic_view",
-            &catalog_reader,
-        )?;
-
-        // Create a NEW connection for the semantic_view table function.
-        let mut query_conn: ffi::duckdb_connection = ptr::null_mut();
-        let rc = unsafe { ffi::duckdb_connect(db_handle, &mut query_conn) };
-        if rc != ffi::DuckDBSuccess {
-            return Err("Failed to create query connection for semantic_view".into());
+        //
+        // Phase 65 Plan 05 Task 1 (Wave 0 bridge spike): list_semantic_views
+        // is registered via the C++ Catalog API path so its bind callback
+        // receives a native ClientContext& and can open per-call
+        // Connection(*context.db) instead of consuming the long-lived
+        // catalog_reader. See cpp/src/shim.cpp::sv_register_list_semantic_views
+        // and src/ddl/list.rs::sv_list_semantic_views_bind_rust.
+        //
+        // Phase 65.1 Plan 02b (WR-02 D-08/D-09): each registration site
+        // allocates a 1024-byte stack buffer for the C-side diagnostic.
+        // On failure, the buffer text is appended to the returned error
+        // via `decode_register_err_buf` so ADBC/JDBC/Python callers (which
+        // may have redirected stderr) see the underlying DuckDB exception
+        // message instead of a bare "failed" with no context.
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_list_semantic_views(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register list_semantic_views via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+        // Phase 65 Plan 05 Task 2 (Wave 1): list_terse_semantic_views
+        // migrated to the C++ Catalog API path.
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_list_terse_semantic_views(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register list_terse_semantic_views via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+        // Phase 65 Plan 05 Task 3 (Wave 2): single-arg TF group migrated to
+        // the C++ Catalog API path.
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_show_columns_in_semantic_view(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register show_columns_in_semantic_view via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_describe_semantic_view(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register describe_semantic_view via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
         }
 
-        // Register the semantic_view table function.
-        let query_state = QueryState {
-            catalog: catalog_reader,
-            conn: query_conn,
-        };
-        con.register_table_function_with_extra_info::<SemanticViewVTab, _>(
-            "semantic_view",
-            &query_state,
-        )?;
+        // SHOW SEMANTIC DIMENSIONS
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_show_semantic_dimensions(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register show_semantic_dimensions via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_show_semantic_dimensions_all(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register show_semantic_dimensions_all via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
 
-        // Register the explain_semantic_view table function.
-        con.register_table_function_with_extra_info::<ExplainSemanticViewVTab, _>(
-            "explain_semantic_view",
-            &query_state,
-        )?;
+        // SHOW SEMANTIC DIMENSIONS FOR METRIC
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_show_semantic_dimensions_for_metric(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register show_semantic_dimensions_for_metric via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+
+        // SHOW SEMANTIC METRICS
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_show_semantic_metrics(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register show_semantic_metrics via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_show_semantic_metrics_all(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register show_semantic_metrics_all via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+
+        // SHOW SEMANTIC FACTS
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_show_semantic_facts(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register show_semantic_facts via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_show_semantic_facts_all(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register show_semantic_facts_all via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+
+        // SHOW SEMANTIC MATERIALIZATIONS
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_show_semantic_materializations(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register show_semantic_materializations via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_show_semantic_materializations_all(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register show_semantic_materializations_all via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+
+        // Phase 65 Plan 05 Task 4 (Wave 3): GET_DDL +
+        // READ_YAML_FROM_SEMANTIC_VIEW migrated to the C++ Catalog API
+        // path. Each exec callback opens a per-call
+        // `Connection probe(*state.GetContext().db)` and bridges to the
+        // Rust dispatcher; no long-lived `catalog_reader` is consumed by
+        // the read path after Plan 05 Wave 3 (H1 retirement still
+        // pending — Plan 06).
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_get_ddl(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register get_ddl via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_read_yaml_from_semantic_view(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register read_yaml_from_semantic_view via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+
+        // H2 query_conn RETIRED — Phase 65 Plan 05 Batch 3. Both
+        // `semantic_view` and `explain_semantic_view` now register via
+        // the C++ Catalog API (`sv_register_semantic_view` and
+        // `sv_register_explain_semantic_view` below) and open per-call
+        // `Connection(*context.db)` from the bind callback. No live
+        // read-side code path consumes a long-lived extension-owned
+        // `duckdb_connection`. The 17 legacy VTab/VScalar struct
+        // carcasses that previously fed off `QueryState` are deleted
+        // alongside this allocation.
+        //
+        // H1 `catalog_conn` RETIRED — Phase 65 Plan 06. `sv_register_parser_hooks`
+        // now takes only `db_handle` (no catalog_conn arg). `tests/no_long_lived_conn.rs`
+        // is the structural guard that asserts no long-lived `duckdb_connection`
+        // allocations remain in `init_extension`.
+
+        // Phase 65 Plan 05 Task 6 (Wave 6): semantic_view migrated off
+        // the duckdb-rs `register_table_function_with_extra_info` path
+        // to the C++ Catalog API. The bind callback opens a per-call
+        // `Connection(*context.db)`; `init_global` opens a separate
+        // per-call Connection for the materialised query; both drop
+        // before any exec call. No long-lived extension-owned
+        // duckdb_connection is consumed by this path.
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_semantic_view(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register semantic_view via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
+
+        // Phase 65 Plan 05 Task 5 (Wave 5): explain_semantic_view migrated
+        // off the duckdb-rs `register_table_function_with_extra_info` path
+        // to the C++ Catalog API. The bind callback opens a per-call
+        // `Connection(*context.db)` instead of consuming H2/`query_state`.
+        let mut error_buf = [0u8; 1024];
+        if !unsafe {
+            sv_register_explain_semantic_view(
+                db_handle,
+                error_buf.as_mut_ptr().cast::<c_char>(),
+                error_buf.len(),
+            )
+        } {
+            return Err(format!(
+                "Failed to register explain_semantic_view via C++ Catalog API: {}",
+                decode_register_err_buf(&error_buf)
+            )
+            .into());
+        }
 
         Ok(())
     }

@@ -4,13 +4,15 @@
 # via the parameterized prepared statement persistence layer. Exercises
 # CREATE, SHOW, DROP across a restart boundary.
 #
-# NOTE: This test is EXCLUDED from test/sql/TEST_LIST because the Python
-# sqllogictest runner cannot reload an external extension after the
-# `restart` directive in a file-backed database: the extension's
+# NOTE: This test lives under test/sql/_excluded/ (not test/sql/) because
+# the Python sqllogictest runner cannot reload an external extension after
+# the `restart` directive in a file-backed database: the extension's
 # init_catalog SQL runs during LOAD, which may conflict with the runner's
-# DB-level lock held during restart.
+# DB-level lock held during restart. The runner discovers all *.test files
+# under its --test-dir, so the file is moved out rather than just omitted
+# from TEST_LIST.
 #
-# Run manually: sqllogictest test/sql/phase42_persistence.test
+# Run manually: sqllogictest test/sql/_excluded/phase42_persistence.test
 #
 # Related: test/sql/phase2_restart.test (original persistence test)
 # Requirements covered: TIDY-06
@@ -58,11 +60,15 @@ SELECT name FROM list_semantic_views();
 ----
 persist_roundtrip
 
-# Verify SHOW SEMANTIC DIMENSIONS works after restart
+# Verify SHOW SEMANTIC DIMENSIONS works after restart.
+# CREATE used `e.type AS event_type`. Per Snowflake DDL the dimension NAME
+# is the LHS-without-namespace (`type`) and `event_type` is the expression
+# (which SHOW SEMANTIC DIMENSIONS does not render in this 8-col form).
+# DB column reflects the file-backed __TEST_DIR__/phase42_persist.db name.
 query TTTTTTTT
 SHOW SEMANTIC DIMENSIONS IN persist_roundtrip;
 ----
-memory	main	persist_roundtrip	events	event_type	(empty)	[]	(empty)
+phase42_persist	main	persist_roundtrip	events	type	(empty)	[]	(empty)
 
 # Drop the view (exercises persist_drop with parameterized DELETE)
 statement ok

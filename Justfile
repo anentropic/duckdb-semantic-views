@@ -13,6 +13,7 @@ setup:
     cargo install cargo-deny --locked
     cargo install cargo-llvm-cov --locked
     cargo install cargo-fuzz --locked
+    cargo install cargo-sweep --locked
     git submodule update --init --recursive
     make configure
     @echo "Running cargo test to install cargo-husky hooks..."
@@ -110,6 +111,16 @@ test-caret: build
 test-adbc: build
     uv run test/integration/test_adbc_transactions.py
 
+# Run ADBC end-to-end query tests against the built extension.
+# Exercises SELECT ... FROM semantic_view(...) through adbc_driver_duckdb
+# across main expand path, FACTS, semi-additive, window, materialization
+# routing, non-default-schema base tables, and multi-DB ATTACH. Regression
+# guard for EXPAND-CTX-01..03 (v0.10.0). Scenarios 3-7 are gated by
+# SKIP_UNTIL_PLAN_02 until Phase 66 Plan 02 lands the qualify_and_quote_table_ref
+# migration of the FACTS/semi-additive/window/materialization sites.
+test-adbc-queries: build
+    uv run test/integration/test_adbc_queries.py
+
 # Run regression test for the v0.8.0 silent-truncation FFI buffer bug.
 # Creates a semantic view large enough that the rewritten INSERT exceeds
 # the legacy 64 KB shim buffer; pre-fix this would have produced a
@@ -139,13 +150,20 @@ test-readonly: build
 # Concurrent CREATE on the same view name from two threads. PK constraint
 # on _definitions(name) serializes the inserts; exactly one must succeed.
 # Also indirectly exercises the v0.8.0 race-guard pattern for DROP/ALTER.
+# Phase 65.1 adds two per-call Connection regressions covering the
+# read-side (concurrent SHOW SEMANTIC ... reads) and write-side
+# (concurrent CREATE/DROP/ALTER on overlapping names) of the per-call
+# Connection model — both must run in CI so the borrow contract is
+# guarded under contention.
 test-concurrent: build
     uv run test/integration/test_concurrent_ddl.py
+    uv run test/integration/test_concurrent_reads_per_call_conn.py
+    uv run test/integration/test_concurrent_writes_per_call_conn.py
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC + large-view + multi-DB + read-only + concurrent
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
 # _ensure-test-deps runs early to catch pip version mismatches before slow builds.
-test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc test-large-view test-multi-db test-readonly test-concurrent
+test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent
 
 # Check that fuzz targets compile (requires nightly)
 check-fuzz:
@@ -194,6 +212,14 @@ update-headers:
 clean:
     make clean
     cargo clean
+
+# Reclaim stale target artifacts older than 14 days without invalidating current build cache.
+# Intended for milestone completion (see CLAUDE.md "Milestone Completion"). Auto-installs cargo-sweep on first run.
+clean-stale:
+    @command -v cargo-sweep >/dev/null 2>&1 || cargo install cargo-sweep
+    @echo "Sweeping target/ artifacts not touched in 14 days..."
+    cargo sweep --time 14
+    @echo "Done. Current build cache preserved; next incremental build remains fast."
 
 # Check Sphinx documentation builds without warnings (mirrors CI)
 docs-check:

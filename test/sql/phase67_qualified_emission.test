@@ -1,0 +1,566 @@
+# Phase 67 A1: regression guard over qualify_and_quote_table_ref across
+# all five rewritten expand paths × two trust-boundary conditions
+# (non-default schema, attached DB).
+#
+# Cites:
+#  - CONTEXT.md D-03..D-08 (LIKE-pattern idiom, no inline regex, no negative
+#    assertions, semantic_view smoke check per D-05).
+#  - test/sql/phase4_query.test:191-204 (canonical LIKE-fragment idiom).
+#  - src/expand/{sql_gen,semi_additive,window,materialization}.rs migrated
+#    sites by Phase 66; this fixture pins their qualified emission at the
+#    sqllogictest layer (the gap Phase 66 only smoke-tested via ADBC).
+#
+# Two distinct qualification paths exercised:
+#  - PREPEND path (qualify_and_quote_table_ref's prepend branch):
+#    TABLES clause names a BARE table and the def's database_name/schema_name
+#    (captured at CREATE time via current_database()/current_schema()) are
+#    non-default; emission becomes 3-part `"db"."schema"."table"`.
+#  - PASS-THROUGH path (qualify_and_quote_table_ref's already-qualified branch):
+#    TABLES clause names a 3-part `db.schema.table` (e.g. ATTACHed DB); emission
+#    preserves user qualifier as `"db"."schema"."table"`.
+# Each scenario asserts the 3-part `<db>.<schema>.<table>` substring per the
+# plan's must-have, exercising either the prepend or the pass-through branch.
+
+require semantic_views
+
+# ============================================================
+# Schemas / databases used by this fixture
+# ============================================================
+
+statement ok
+CREATE SCHEMA p67_main;
+
+statement ok
+CREATE SCHEMA p67_facts;
+
+statement ok
+CREATE SCHEMA p67_semi;
+
+statement ok
+CREATE SCHEMA p67_win;
+
+statement ok
+CREATE SCHEMA p67_mat;
+
+# ============================================================
+# Scenario A1.1 — Main expand path × non-default schema (PREPEND path)
+# `USE p67_main` makes p67_main the current schema at CREATE time so
+# the def's schema_name is captured as `p67_main`. Bare table names
+# in the TABLES clause then trigger the 3-part prepend emission
+# (src/expand/sql_gen.rs:497).
+# ============================================================
+
+statement ok
+USE memory.p67_main;
+
+statement ok
+CREATE TABLE sales (id INTEGER PRIMARY KEY, region VARCHAR, amount DECIMAL(18,2));
+
+statement ok
+INSERT INTO sales VALUES (1, 'US', 100.00), (2, 'EU', 200.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_main_sch AS
+TABLES (s AS sales PRIMARY KEY (id))
+DIMENSIONS (s.region AS s.region)
+METRICS (s.total AS SUM(s.amount));
+
+statement ok
+USE memory.main;
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_main.p67_main_sch', dimensions := ['region'], metrics := ['total']) WHERE explain_output LIKE '%FROM "memory"."p67_main"."sales"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_main.p67_main_sch', dimensions := ['region'], metrics := ['total']);
+----
+true
+
+# ============================================================
+# Scenario A1.2 — Main expand path × ATTACHed DB (PASS-THROUGH path)
+# User-written 3-part `db2.main.sales2` short-circuits the prepend branch
+# and emits as `"db2"."main"."sales2"` via quote_table_ref.
+# ============================================================
+
+statement ok
+ATTACH ':memory:' AS db2;
+
+statement ok
+CREATE TABLE db2.main.sales2 (id INTEGER PRIMARY KEY, region VARCHAR, amount DECIMAL(18,2));
+
+statement ok
+INSERT INTO db2.main.sales2 VALUES (1, 'US', 50.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_main_db2 AS
+TABLES (s AS db2.main.sales2 PRIMARY KEY (id))
+DIMENSIONS (s.region AS s.region)
+METRICS (s.total AS SUM(s.amount));
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_main_db2', dimensions := ['region'], metrics := ['total']) WHERE explain_output LIKE '%FROM "db2"."main"."sales2"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_main_db2', dimensions := ['region'], metrics := ['total']);
+----
+true
+
+statement ok
+DROP SEMANTIC VIEW p67_main_db2;
+
+statement ok
+DETACH db2;
+
+# ============================================================
+# Scenario A1.3 — FACTS path × non-default schema (PREPEND)
+# ============================================================
+
+statement ok
+USE memory.p67_facts;
+
+statement ok
+CREATE TABLE line_items (id INTEGER PRIMARY KEY, product VARCHAR, quantity INTEGER, price DECIMAL(10,2), discount DECIMAL(5,2));
+
+statement ok
+INSERT INTO line_items VALUES
+    (1, 'Widget', 10, 100.00, 0.10),
+    (2, 'Gadget', 5, 50.00, 0.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_facts_sch AS
+TABLES (li AS line_items PRIMARY KEY (id))
+FACTS (li.net_price AS li.price * (1 - li.discount))
+DIMENSIONS (li.product AS li.product);
+
+statement ok
+USE memory.main;
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_facts.p67_facts_sch', facts := ['net_price'], dimensions := ['product']) WHERE explain_output LIKE '%FROM "memory"."p67_facts"."line_items"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_facts.p67_facts_sch', facts := ['net_price'], dimensions := ['product']);
+----
+true
+
+# ============================================================
+# Scenario A1.4 — FACTS path × ATTACHed DB (PASS-THROUGH)
+# ============================================================
+
+statement ok
+ATTACH ':memory:' AS db2;
+
+statement ok
+CREATE TABLE db2.main.line_items2 (id INTEGER PRIMARY KEY, product VARCHAR, quantity INTEGER, price DECIMAL(10,2));
+
+statement ok
+INSERT INTO db2.main.line_items2 VALUES (1, 'Widget', 3, 100.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_facts_db2 AS
+TABLES (li AS db2.main.line_items2 PRIMARY KEY (id))
+FACTS (li.subtotal AS li.price * li.quantity)
+DIMENSIONS (li.product AS li.product);
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_facts_db2', facts := ['subtotal'], dimensions := ['product']) WHERE explain_output LIKE '%FROM "db2"."main"."line_items2"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_facts_db2', facts := ['subtotal'], dimensions := ['product']);
+----
+true
+
+statement ok
+DROP SEMANTIC VIEW p67_facts_db2;
+
+statement ok
+DETACH db2;
+
+# ============================================================
+# Scenario A1.5 — Semi-additive snapshot CTE × non-default schema (PREPEND)
+# customer_name not in NA group so __sv_rn snapshot fires
+# (src/expand/semi_additive.rs:195).
+# ============================================================
+
+statement ok
+USE memory.p67_semi;
+
+statement ok
+CREATE TABLE accounts (
+    id INTEGER PRIMARY KEY,
+    customer_name VARCHAR,
+    report_date DATE,
+    balance DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO accounts VALUES
+    (1, 'Alice', '2024-01-01', 100.00),
+    (2, 'Alice', '2024-01-02', 150.00),
+    (3, 'Bob',   '2024-01-01', 200.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_semi_sch AS
+TABLES (a AS accounts PRIMARY KEY (id))
+DIMENSIONS (
+    a.customer_name AS a.customer_name,
+    a.report_date AS a.report_date
+)
+METRICS (
+    a.latest_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+);
+
+statement ok
+USE memory.main;
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_semi.p67_semi_sch', dimensions := ['customer_name'], metrics := ['latest_balance']) WHERE explain_output LIKE '%ROW_NUMBER() OVER%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_semi.p67_semi_sch', dimensions := ['customer_name'], metrics := ['latest_balance']) WHERE explain_output LIKE '%FROM "memory"."p67_semi"."accounts"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_semi.p67_semi_sch', dimensions := ['customer_name'], metrics := ['latest_balance']);
+----
+true
+
+# ============================================================
+# Scenario A1.6 — Semi-additive × ATTACHed DB (PASS-THROUGH)
+# ============================================================
+
+statement ok
+ATTACH ':memory:' AS db2;
+
+statement ok
+CREATE TABLE db2.main.accounts2 (
+    id INTEGER PRIMARY KEY,
+    customer_name VARCHAR,
+    report_date DATE,
+    balance DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO db2.main.accounts2 VALUES
+    (1, 'Alice', '2024-01-01', 100.00),
+    (2, 'Alice', '2024-01-02', 150.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_semi_db2 AS
+TABLES (a AS db2.main.accounts2 PRIMARY KEY (id))
+DIMENSIONS (
+    a.customer_name AS a.customer_name,
+    a.report_date AS a.report_date
+)
+METRICS (
+    a.latest_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+);
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_semi_db2', dimensions := ['customer_name'], metrics := ['latest_balance']) WHERE explain_output LIKE '%ROW_NUMBER() OVER%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_semi_db2', dimensions := ['customer_name'], metrics := ['latest_balance']) WHERE explain_output LIKE '%FROM "db2"."main"."accounts2"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_semi_db2', dimensions := ['customer_name'], metrics := ['latest_balance']);
+----
+true
+
+statement ok
+DROP SEMANTIC VIEW p67_semi_db2;
+
+statement ok
+DETACH db2;
+
+# ============================================================
+# Scenario A1.7 — Window metric × non-default schema (PREPEND)
+# (src/expand/window.rs:156, 181, 199)
+# ============================================================
+
+statement ok
+USE memory.p67_win;
+
+statement ok
+CREATE TABLE sales (
+    id INTEGER PRIMARY KEY,
+    store VARCHAR,
+    sale_date DATE,
+    quantity INTEGER
+);
+
+statement ok
+INSERT INTO sales VALUES
+    (1, 'NYC', '2024-01-01', 10),
+    (2, 'NYC', '2024-01-02', 20),
+    (3, 'LA',  '2024-01-01', 5);
+
+statement ok
+CREATE SEMANTIC VIEW p67_win_sch AS
+TABLES (s AS sales PRIMARY KEY (id))
+DIMENSIONS (
+    s.store AS s.store,
+    s.sale_date AS s.sale_date
+)
+METRICS (
+    PRIVATE s.total_qty AS SUM(s.quantity),
+    s.avg_qty AS AVG(total_qty) OVER (PARTITION BY EXCLUDING sale_date ORDER BY sale_date ASC NULLS LAST)
+);
+
+statement ok
+USE memory.main;
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_win.p67_win_sch', dimensions := ['store', 'sale_date'], metrics := ['avg_qty']) WHERE explain_output LIKE '%OVER (PARTITION BY%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_win.p67_win_sch', dimensions := ['store', 'sale_date'], metrics := ['avg_qty']) WHERE explain_output LIKE '%FROM "memory"."p67_win"."sales"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_win.p67_win_sch', dimensions := ['store', 'sale_date'], metrics := ['avg_qty']);
+----
+true
+
+# ============================================================
+# Scenario A1.8 — Window metric × ATTACHed DB (PASS-THROUGH)
+# ============================================================
+
+statement ok
+ATTACH ':memory:' AS db2;
+
+statement ok
+CREATE TABLE db2.main.sales_win (
+    id INTEGER PRIMARY KEY,
+    store VARCHAR,
+    sale_date DATE,
+    quantity INTEGER
+);
+
+statement ok
+INSERT INTO db2.main.sales_win VALUES
+    (1, 'NYC', '2024-01-01', 10),
+    (2, 'NYC', '2024-01-02', 20);
+
+statement ok
+CREATE SEMANTIC VIEW p67_win_db2 AS
+TABLES (s AS db2.main.sales_win PRIMARY KEY (id))
+DIMENSIONS (
+    s.store AS s.store,
+    s.sale_date AS s.sale_date
+)
+METRICS (
+    PRIVATE s.total_qty AS SUM(s.quantity),
+    s.avg_qty AS AVG(total_qty) OVER (PARTITION BY EXCLUDING sale_date ORDER BY sale_date ASC NULLS LAST)
+);
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_win_db2', dimensions := ['store', 'sale_date'], metrics := ['avg_qty']) WHERE explain_output LIKE '%OVER (PARTITION BY%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_win_db2', dimensions := ['store', 'sale_date'], metrics := ['avg_qty']) WHERE explain_output LIKE '%FROM "db2"."main"."sales_win"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_win_db2', dimensions := ['store', 'sale_date'], metrics := ['avg_qty']);
+----
+true
+
+statement ok
+DROP SEMANTIC VIEW p67_win_db2;
+
+statement ok
+DETACH db2;
+
+# ============================================================
+# Scenario A1.9 — Materialization routing × non-default schema (PREPEND)
+# Two assertions:
+#  - Routing hit emits qualified FROM to the materialization target
+#    (src/expand/materialization.rs:163)
+#  - Routing miss falls back to raw expansion which emits qualified
+#    FROM to the base table (src/expand/sql_gen.rs:497)
+# ============================================================
+
+statement ok
+USE memory.p67_mat;
+
+statement ok
+CREATE TABLE orders (id INTEGER PRIMARY KEY, region VARCHAR, status VARCHAR, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO orders VALUES
+    (1, 'US', 'shipped', 100.00),
+    (2, 'EU', 'pending', 200.00);
+
+statement ok
+CREATE TABLE agg_region (region VARCHAR, total_revenue DECIMAL(10,2));
+
+statement ok
+INSERT INTO agg_region VALUES ('US', 100.00), ('EU', 200.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_mat_sch AS
+TABLES (
+    o AS orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.status AS o.status
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount)
+)
+MATERIALIZATIONS (
+    region_agg AS (
+        TABLE agg_region,
+        DIMENSIONS (region),
+        METRICS (total_revenue)
+    )
+);
+
+statement ok
+USE memory.main;
+
+# Routing hit (region/total_revenue match the materialization)
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_mat.p67_mat_sch', dimensions := ['region'], metrics := ['total_revenue']) WHERE explain_output LIKE '%FROM "memory"."p67_mat"."agg_region"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_mat.p67_mat_sch', dimensions := ['region'], metrics := ['total_revenue']);
+----
+true
+
+# Routing miss (status dim not covered → raw expand on base table)
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_mat.p67_mat_sch', dimensions := ['region', 'status'], metrics := ['total_revenue']) WHERE explain_output LIKE '%FROM "memory"."p67_mat"."orders"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_mat.p67_mat_sch', dimensions := ['region', 'status'], metrics := ['total_revenue']);
+----
+true
+
+# ============================================================
+# Scenario A1.10 — Materialization routing × ATTACHed DB (PASS-THROUGH)
+# ============================================================
+
+statement ok
+ATTACH ':memory:' AS db2;
+
+statement ok
+CREATE TABLE db2.main.orders_mat (id INTEGER PRIMARY KEY, region VARCHAR, status VARCHAR, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO db2.main.orders_mat VALUES (1, 'US', 'shipped', 100.00);
+
+statement ok
+CREATE TABLE db2.main.agg_region_mat (region VARCHAR, total_revenue DECIMAL(10,2));
+
+statement ok
+INSERT INTO db2.main.agg_region_mat VALUES ('US', 100.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_mat_db2 AS
+TABLES (
+    o AS db2.main.orders_mat PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.status AS o.status
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount)
+)
+MATERIALIZATIONS (
+    region_agg AS (
+        TABLE db2.main.agg_region_mat,
+        DIMENSIONS (region),
+        METRICS (total_revenue)
+    )
+);
+
+# Routing hit
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_mat_db2', dimensions := ['region'], metrics := ['total_revenue']) WHERE explain_output LIKE '%FROM "db2"."main"."agg_region_mat"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_mat_db2', dimensions := ['region'], metrics := ['total_revenue']);
+----
+true
+
+# Routing miss → base table
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_mat_db2', dimensions := ['region', 'status'], metrics := ['total_revenue']) WHERE explain_output LIKE '%FROM "db2"."main"."orders_mat"%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_mat_db2', dimensions := ['region', 'status'], metrics := ['total_revenue']);
+----
+true
+
+statement ok
+DROP SEMANTIC VIEW p67_mat_db2;
+
+statement ok
+DETACH db2;
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p67_mat.p67_mat_sch;
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p67_win.p67_win_sch;
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p67_semi.p67_semi_sch;
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p67_facts.p67_facts_sch;
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p67_main.p67_main_sch;
+
+statement ok
+DROP SCHEMA p67_mat CASCADE;
+
+statement ok
+DROP SCHEMA p67_win CASCADE;
+
+statement ok
+DROP SCHEMA p67_semi CASCADE;
+
+statement ok
+DROP SCHEMA p67_facts CASCADE;
+
+statement ok
+DROP SCHEMA p67_main CASCADE;

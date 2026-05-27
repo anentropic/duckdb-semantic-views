@@ -7,11 +7,13 @@
 #
 # Uses native CREATE SEMANTIC VIEW ... AS ... DDL syntax exclusively.
 #
-# NOTE: This test is EXCLUDED from test/sql/TEST_LIST (the standard make test
-# run) because the Python sqllogictest runner cannot reload an external
-# extension after the `restart` directive in a file-backed database: the
-# extension's init_catalog SQL runs during LOAD, which may conflict with
-# the runner's DB-level lock held during restart.
+# NOTE: This test lives under test/sql/_excluded/ (not test/sql/) because
+# the Python sqllogictest runner cannot reload an external extension after
+# the `restart` directive in a file-backed database: the extension's
+# init_catalog SQL runs during LOAD, which may conflict with the runner's
+# DB-level lock held during restart. The runner discovers all *.test files
+# under its --test-dir, so the file is moved out rather than just omitted
+# from TEST_LIST.
 #
 # Restart persistence is verified separately via `cargo test` Rust integration
 # tests. When this issue is resolved, re-add this file to TEST_LIST.

@@ -1,0 +1,211 @@
+DUCKDB_EXTENSION_NAME=semantic_views DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=v1.5.2 cargo build   --no-default-features --features extension
+./configure/venv/bin/python3 -c "from pathlib import Path;Path('./build/debug/extension/semantic_views').mkdir(parents=True, exist_ok=True)"
+./configure/venv/bin/python3 -c "import shutil;shutil.copyfile('./target/debug/libsemantic_views.dylib', './build/debug/libsemantic_views.dylib')"
+./configure/venv/bin/python3 extension-ci-tools/scripts/append_extension_metadata.py \
+			-l ./build/debug/libsemantic_views.dylib \
+			-o ./build/debug/semantic_views.duckdb_extension \
+			-n semantic_views \
+			-dv v1.5.2 \
+			-evf configure/extension_version.txt \
+			-pf configure/platform.txt --abi-type C_STRUCT_UNSTABLE
+Creating extension binary:
+ - Input file: ./build/debug/libsemantic_views.dylib
+ - Output file: ./build/debug/semantic_views.duckdb_extension
+ - Metadata:
+   - FIELD8 (unused)            = EMPTY
+   - FIELD7 (unused)            = EMPTY
+   - FIELD6 (unused)            = EMPTY
+   - FIELD5 (abi_type)          = C_STRUCT_UNSTABLE
+   - FIELD4 (extension_version) = 853f044
+   - FIELD3 (duckdb_version)    = v1.5.2
+   - FIELD2 (duckdb_platform)   = osx_arm64
+   - FIELD1 (header signature)  = 4 (special value to identify a duckdb extension)
+./configure/venv/bin/python3 -c "import shutil;shutil.copyfile('./build/debug/semantic_views.duckdb_extension', './build/debug/extension/semantic_views/semantic_views.duckdb_extension')"
+patch_sqllogictest: already applied.
+Running DEBUG tests..
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase4_query.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase20_extended_ddl.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase21_error_reporting.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase25_keyword_body.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase26_join_resolution.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase27_qualified_refs.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase28_e2e.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase29_facts.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase30_derived_metrics.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase31_fan_trap.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase32_role_playing.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase33_cardinality_inference.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase34_1_alter_rename.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase34_1_show_commands.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase34_1_show_dims_for_metric.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase34_1_1_show_filtering.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase39_metadata_storage.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase41_describe.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase43_metadata.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase44_show_metadata.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase44_describe_metadata.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase44_show_terse_scope.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase44_show_columns.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase45_alter_comment.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase45_get_ddl.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase46_wildcard.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase46_fact_query.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase47_semi_additive.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase48_window_metrics.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/peg_compat.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase52_yaml_ddl.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase53_yaml_file.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase54_materializations.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase55_materialization_routing.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase56_yaml_export.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase57_introspection.test
+FAILED: test/sql/quick_260430_vdz_leading_comments.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/v080_transactional_ddl.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/error_caret_create.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/error_caret_drop.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/error_caret_alter.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/error_caret_multiline.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/error_caret_unicode.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/lru_removed_isolation.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/extension_reload.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/readonly_load.test
+[1/49] test/sql/phase27_qualified_refs.test
+test/sql/phase27_qualified_refs.test:20 Query unexpectedly failed: Parser Error: catalog connection failed: duckdb_connect failed (rc=1)
+ERROR
+FAILED: test/sql/phase64_quoted_idents.test
+47 tests run, 47 failed

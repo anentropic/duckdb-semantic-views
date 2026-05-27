@@ -1,0 +1,97 @@
+# Phase 65 (v0.10.0) — D-06 hard error: missing PRIMARY KEY + FK reference.
+#
+# Snowflake-aligned: PRIMARY KEY in a semantic view's TABLES clause is a
+# LOGICAL user assertion. v0.9.0's fallback to duckdb_constraints() for
+# tables without explicit PRIMARY KEY is GONE (D-05). When a TABLES entry
+# has no `PRIMARY KEY (cols)` / `UNIQUE (cols)` declared AND a RELATIONSHIPS
+# entry references it (with or without explicit ref columns), CREATE fails
+# fast with an actionable message telling the user exactly what to add.
+#
+# Behavioural properties pinned:
+#   B1: CREATE SEMANTIC VIEW with FK reference (no explicit ref cols) to a
+#       PK-less target fails with the D-06 template message (substring match
+#       on the actionable text plus the v0.10.0 CHANGELOG parenthetical).
+#   B2: CREATE SEMANTIC VIEW with FK reference (WITH explicit ref cols) to a
+#       PK-less and UNIQUE-less target fails with the same D-06 template.
+#   B3: The same view declared with `PRIMARY KEY (cols)` on the target
+#       succeeds — no false-positive on the new error path.
+#
+# Requirements covered: LIFE-02 (D-06 hard error path).
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+statement ok
+CREATE TABLE p65_orders (order_id INTEGER, total DECIMAL(10,2));
+
+statement ok
+CREATE TABLE p65_items (item_id INTEGER, order_id INTEGER, qty INTEGER);
+
+# B1: implicit REFERENCES (no col list). orders has NO PRIMARY KEY in the
+# TABLES clause. D-06 hard error must fire with the actionable substring.
+statement error
+CREATE SEMANTIC VIEW v_bad1
+  AS
+    TABLES (
+      o AS p65_orders,
+      i AS p65_items
+    )
+    RELATIONSHIPS (
+      i_to_o AS i(order_id) REFERENCES o
+    )
+    DIMENSIONS (
+      o.order_id AS order_id
+    )
+    METRICS (
+      o.total AS SUM(o.total)
+    )
+----
+has no PRIMARY KEY declared but is referenced by FK in
+
+# B2: explicit REFERENCES with column list, but target still has no PK or
+# UNIQUE declared. D-06 hard error must still fire (Phase 65 enrichment
+# wraps the CARD-03 case in the more actionable D-06 message).
+statement error
+CREATE SEMANTIC VIEW v_bad2
+  AS
+    TABLES (
+      o AS p65_orders,
+      i AS p65_items
+    )
+    RELATIONSHIPS (
+      i_to_o AS i(order_id) REFERENCES o(order_id)
+    )
+    DIMENSIONS (
+      o.order_id AS order_id
+    )
+    METRICS (
+      o.total AS SUM(o.total)
+    )
+----
+(v0.10.0: physical-catalog PK auto-inference removed -- see CHANGELOG.)
+
+# B3: same view, but orders declares PRIMARY KEY (order_id) -- succeeds.
+statement ok
+CREATE SEMANTIC VIEW v_good
+  AS
+    TABLES (
+      o AS p65_orders PRIMARY KEY (order_id),
+      i AS p65_items
+    )
+    RELATIONSHIPS (
+      i_to_o AS i(order_id) REFERENCES o(order_id)
+    )
+    DIMENSIONS (
+      o.order_id AS order_id
+    )
+    METRICS (
+      o.total AS SUM(o.total)
+    )
+
+# Verify the good view is queryable.
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'v_good'
+----
+1

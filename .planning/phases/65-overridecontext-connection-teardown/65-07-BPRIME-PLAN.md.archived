@@ -1,0 +1,496 @@
+---
+phase: 65-overridecontext-connection-teardown
+plan: 07
+type: execute
+wave: 6
+depends_on: [65-06]
+files_modified:
+  - src/parse.rs
+  - src/lib.rs
+  - cpp/src/shim.cpp
+  - cpp/src/shim.hpp
+  - src/ddl/list.rs
+  - src/ddl/describe.rs
+  - src/ddl/show_columns.rs
+  - src/ddl/show_dims.rs
+  - src/ddl/show_dims_for_metric.rs
+  - src/ddl/show_metrics.rs
+  - src/ddl/show_facts.rs
+  - src/ddl/show_materializations.rs
+  - src/ddl/get_ddl.rs
+  - src/ddl/read_yaml.rs
+  - src/query/table_function.rs
+  - src/query/explain.rs
+autonomous: true
+requirements:
+  - LIFE-02
+tags:
+  - close-out
+  - cleanup
+  - dead-code
+  - verification
+
+must_haves:
+  truths:
+    - "All dead VTab / VScalar trait impls retired by Plans 04/05 are physically deleted from src/ddl/*.rs and src/query/*.rs — no #[allow(dead_code)] survivors"
+    - "OverrideContext is at its final B-prime shape (catalog_table_present + is_file_backed only, OR retired entirely if no callbacks read it)"
+    - "All Phase 65 #[allow(dead_code)] / #[allow(unused_imports)] suppressions added by Plan 01 (per 65-01-SUMMARY.md decisions 2 + 3 — on ConnGuard::open / raw and the crate-root re-export) are REMOVED — ConnGuard methods are now used in production code by Plan 03's sv_emit_native_sql_rust and Plans 04/05's bind callbacks (verify uses exist before removing allow-attributes)"
+    - "Phase 58 ADBC transactional DDL tests pass byte-identical green (final regression gate — D-20 non-negotiable)"
+    - "Phase 62 caret-rendering tests pass byte-identical green (final regression gate)"
+    - "just ci is green end-to-end (lint + test-all + fuzz compile + docs-check)"
+    - "Phase 65 SUMMARY.md exists and aggregates Plans 02-07 outcomes"
+  artifacts:
+    - path: ".planning/phases/65-overridecontext-connection-teardown/65-SUMMARY.md"
+      provides: "Phase-level rollup of all 6 plans"
+      contains: "Phase 65 — OverrideContext Connection Teardown — Phase Summary"
+  key_links:
+    - from: ".planning/phases/65-overridecontext-connection-teardown/65-SUMMARY.md"
+      to: "65-01..65-06 Plan SUMMARY.md files"
+      via: "concise rollup of each plan's outcome"
+      pattern: "65-0\\d-SUMMARY"
+---
+
+<objective>
+Close-out plan: delete dead VTab / VScalar trait impls left behind by Plans 04 + 05 (which marked them dead-code rather than removing); remove Phase 65 `#[allow(dead_code)]` / `#[allow(unused_imports)]` suppressions added in Plan 01 (those exist because the Plan 01 ConnGuard methods had no consumers yet — Plans 02-05 made them used; verify before removing); confirm the Phase 58 ADBC transactional DDL tests and Phase 62 caret rendering tests are byte-identical green; run `just ci` for the strictest quality gate (clippy pedantic + fmt + cargo-deny + fuzz compile + docs-check); produce a phase-level SUMMARY.md aggregating all 6 plans' outcomes.
+
+Purpose: Tidy up. Plan 06 made `just test-all` green, but plans 04 and 05 may have left dead VTab impls or `#[allow(...)]` attributes that clutter the diff. This plan strips them. The phase-level SUMMARY captures the architectural story for future readers (and Phase 66 planning).
+
+If Plan 06's deviations were minimal and no `#[allow]` attributes survived, Plan 07's first three tasks may be no-ops — in which case skip directly to the SUMMARY task. This plan is OPTIONAL per CONTEXT D-22 plan structure sketch.
+
+Output: Cleaner source tree; `just ci` green; phase SUMMARY.md.
+</objective>
+
+<execution_context>
+@/Users/paul/.claude/get-shit-done/workflows/execute-plan.md
+@/Users/paul/.claude/get-shit-done/templates/summary.md
+</execution_context>
+
+<context>
+@.planning/PROJECT.md
+@.planning/STATE.md
+@.planning/phases/65-overridecontext-connection-teardown/65-CONTEXT.md
+@.planning/phases/65-overridecontext-connection-teardown/65-RESEARCH.md
+@.planning/phases/65-overridecontext-connection-teardown/65-01-SUMMARY.md
+@.planning/phases/65-overridecontext-connection-teardown/65-02-SUMMARY.md
+@.planning/phases/65-overridecontext-connection-teardown/65-03-SUMMARY.md
+@.planning/phases/65-overridecontext-connection-teardown/65-04-SUMMARY.md
+@.planning/phases/65-overridecontext-connection-teardown/65-05-SUMMARY.md
+@.planning/phases/65-overridecontext-connection-teardown/65-06-SUMMARY.md
+@CLAUDE.md
+</context>
+
+<tasks>
+
+<task type="auto">
+  <name>Task 1: Delete dead VTab / VScalar trait impls; remove Phase 65 allow-attributes</name>
+  <files>
+    src/conn_guard.rs
+    src/ddl/list.rs
+    src/ddl/describe.rs
+    src/ddl/show_columns.rs
+    src/ddl/show_dims.rs
+    src/ddl/show_dims_for_metric.rs
+    src/ddl/show_metrics.rs
+    src/ddl/show_facts.rs
+    src/ddl/show_materializations.rs
+    src/ddl/get_ddl.rs
+    src/ddl/read_yaml.rs
+    src/ddl/mod.rs
+    src/query/table_function.rs
+    src/query/explain.rs
+    src/query/mod.rs
+    src/lib.rs
+  </files>
+  <read_first>
+    src/conn_guard.rs
+    src/ddl/list.rs
+    src/ddl/describe.rs
+    src/query/table_function.rs
+    src/query/explain.rs
+    .planning/phases/65-overridecontext-connection-teardown/65-04-SUMMARY.md
+    .planning/phases/65-overridecontext-connection-teardown/65-05-SUMMARY.md
+  </read_first>
+  <behavior>
+    - Any `impl VTab for <Name>VTab { ... }` block left in src/ddl/*.rs or src/query/*.rs from before Plans 04/05 — DELETED entirely.
+    - Any `impl VScalar for <Name>Scalar { ... }` block in src/ddl/get_ddl.rs / src/ddl/read_yaml.rs — DELETED entirely.
+    - Any `#[allow(dead_code)]` attribute that was added by Plans 04/05 to silence intermediate-state warnings is removed; clippy pedantic should pass without them.
+    - Plan 01's `#[allow(dead_code)]` on `impl ConnGuard { open / raw }` (added by Plan 01 deviation #2 per 65-01-SUMMARY.md) is REMOVED. `ConnGuard::open` is now called from `sv_emit_native_sql_rust` (Plan 03) plus the bind/scalar bodies (Plans 04/05); `raw` is used inside `CatalogReader::new(guard.raw(), …)` at those same call sites. Verify each method has a real production caller via grep before removing the allow-attribute.
+    - Plan 01's `#[allow(unused_imports)]` on the `pub(crate) use inner::ConnGuard;` re-export (decision #3 per 65-01-SUMMARY.md) is REMOVED — the re-export is consumed by Plans 03/04/05.
+    - All `use duckdb::vtab::*` and `use duckdb::core::*` imports that became unused after the VTab impl deletion are removed. Same for any `use crate::catalog::CatalogReader;` that's no longer referenced after the VTab impl was deleted.
+    - clippy pedantic stays green (no new warnings introduced; allow-attribute removal does not regress anything).
+  </behavior>
+  <action>
+    1) Inventory dead impls. Run:
+       ```bash
+       grep -rEn "^impl VTab for |^impl VScalar for " src/ | tee $TMPDIR/65_07_t1_dead_impls.log
+       ```
+       Cross-reference against the 15 functions ported by Plans 04/05 (list_*, show_*, describe_*, get_ddl, read_yaml_from_semantic_view, semantic_view, explain_semantic_view). Each match represents a dead impl to remove. For each match, identify the matching `struct <Name>VTab;` declaration — the struct itself is dead and goes too.
+
+    2) Inventory leftover allow-attributes:
+       ```bash
+       grep -rEn "#\[allow\(dead_code\)\]|#\[allow\(unused_imports\)\]" src/conn_guard.rs src/ddl/ src/query/ src/lib.rs
+       ```
+       For each match: identify the symbol it suppresses; verify there is a production caller in src/lib.rs or one of the Plan 02-06 FFI entrypoints; if a caller exists, REMOVE the allow-attribute. If no caller exists (true dead code surviving Plan 04/05's port), DELETE the symbol itself.
+
+    3) Apply deletions. For each VTab impl + struct pair:
+       - Delete the `impl VTab for <Name>VTab { ... }` block.
+       - Delete the `struct <Name>VTab;` (or `pub struct <Name>VTab;`) declaration.
+       - Delete any helper types (BindData, InitData) that are now exclusively referenced by the deleted impl. NB: Plans 04/05 reused the existing BindData types for the new FFI symbols, so most BindData survive — verify each before deleting.
+       - Delete any orphaned `pub use` re-exports in src/ddl/mod.rs / src/query/mod.rs.
+       - Delete now-unused imports (`use duckdb::vtab::*;`, `use crate::catalog::CatalogReader;` if unused, etc.).
+
+    4) For src/conn_guard.rs:
+       - Remove the `#[allow(dead_code)]` on `impl ConnGuard { ... }`.
+       - Remove the `#[allow(unused_imports)]` on the `pub(crate) use inner::ConnGuard;` re-export.
+       - Verify both methods are now used in production: `grep -rEn "ConnGuard::open" src/` should show production callers (sv_emit_native_sql_rust + the FFI bind bodies). Same for `.raw()`.
+
+    5) Build verification IN FOREGROUND:
+       - `cargo build` exits 0; `cargo build --features extension --no-default-features` exits 0.
+       - `cargo clippy --lib --all-targets -- -D warnings` exits 0 (NB: pre-existing 89 clippy errors per Phase 63 deferred-items.md may still be present; this plan does NOT clear those — the goal is "no NEW Phase 65 warnings". If Plan 07's deletion of dead impls happens to clear some pre-existing warnings, document in 65-07-SUMMARY.md).
+       - `just build` exits 0.
+       - `just test-sql > $TMPDIR/65_07_t1_sql.log 2>&1; tail -50` — 47/47 PASS.
+       - `cargo test --lib --features extension --no-default-features no_long_lived_conn_audit` still passes (Plan 06's structural guard).
+
+    Commit: `refactor(65-07): delete dead VTab/VScalar impls + Phase 65 allow-attributes`.
+  </action>
+  <verify>
+    <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && [ "$(grep -rE '^impl VTab for ' src/ddl/ src/query/ 2>/dev/null | wc -l)" -eq 0 ] && [ "$(grep -rE '^impl VScalar for ' src/ddl/ 2>/dev/null | wc -l)" -eq 0 ] && [ "$(grep -E '#\[allow\(dead_code\)\]' src/conn_guard.rs | wc -l)" -eq 0 ] && cargo build --features extension --no-default-features > $TMPDIR/65_07_t1_build.log 2>&1 && just test-sql > $TMPDIR/65_07_t1_sql.log 2>&1 && tail -5 $TMPDIR/65_07_t1_sql.log | grep -E "47/47|47 tests"</automated>
+  </verify>
+  <acceptance_criteria>
+    - Zero `impl VTab for ` blocks remain in src/ddl/ or src/query/: `grep -rE "^impl VTab for " src/ddl/ src/query/` returns 0 matches.
+    - Zero `impl VScalar for ` blocks remain in src/ddl/: `grep -rE "^impl VScalar for " src/ddl/` returns 0 matches.
+    - Plan 01's allow-attributes on ConnGuard removed: `grep -E "#\[allow\(dead_code\)\]" src/conn_guard.rs` returns 0 matches.
+    - ConnGuard::open + raw have real production callers: `grep -rEn "ConnGuard::open" src/` returns ≥ 1 match outside src/conn_guard.rs; same for `.raw()`.
+    - Build green in both feature modes; `just build` exits 0.
+    - sqllogictest 47/47 PASS.
+    - Structural guard still passes: `cargo test --lib --features extension --no-default-features no_long_lived_conn_audit` exits 0.
+    - clippy pedantic does NOT regress vs. the baseline (89 pre-existing per Phase 63 deferred-items.md). Verify with `cargo clippy --lib --all-targets -- -D warnings 2>&1 | grep -c "^error\|^warning" | tee $TMPDIR/65_07_t1_clippy.log`; record the count in 65-07-SUMMARY.md.
+  </acceptance_criteria>
+  <done>
+    Dead code is gone. Plan 01's allow-attributes are gone. Build still green. The src/ddl/ + src/query/ source tree now reflects pure B-prime — no duckdb-rs VTab residue.
+  </done>
+</task>
+
+<task type="auto">
+  <name>Task 2: Final regression gates — Phase 58 ADBC transactional + Phase 62 caret + just ci</name>
+  <files>
+    .planning/phases/65-overridecontext-connection-teardown/65-07-VERIFICATION.md
+  </files>
+  <read_first>
+    .planning/phases/65-overridecontext-connection-teardown/65-CONTEXT.md
+    .planning/phases/65-overridecontext-connection-teardown/65-06-SUMMARY.md
+    CLAUDE.md
+  </read_first>
+  <behavior>
+    - Run Phase 58 ADBC transactional DDL tests in isolation and capture the output. They MUST pass byte-identical green (D-20 non-negotiable). Compare against the v0.9.0 baseline if possible.
+    - Run Phase 62 caret-rendering tests in isolation. They MUST pass byte-identical green.
+    - Run `just ci` for the strictest gate (clippy pedantic + fmt + cargo-deny + fuzz compile + docs-check). If pre-existing clippy errors are present (per Phase 63 deferred-items.md), `just ci` may fail on them — that's acceptable as a pre-existing condition; document in 65-07-VERIFICATION.md but do NOT gate Plan 07 on the pre-existing failure count exceeding baseline. The gate is "no NEW failures introduced by Plans 02-07".
+    - Capture all log outputs into a single `65-07-VERIFICATION.md` deliverable so reviewers can confirm the regression record.
+  </behavior>
+  <action>
+    1) Run each regression gate in foreground and capture logs:
+
+       ```bash
+       # Phase 58 ADBC transactional DDL
+       just test-adbc > $TMPDIR/65_07_t2_adbc.log 2>&1
+       echo "adbc_exit=$?" >> $TMPDIR/65_07_t2_summary.log
+       tail -20 $TMPDIR/65_07_t2_adbc.log >> $TMPDIR/65_07_t2_summary.log
+
+       # Phase 62 caret rendering
+       just test-caret > $TMPDIR/65_07_t2_caret.log 2>&1
+       echo "caret_exit=$?" >> $TMPDIR/65_07_t2_summary.log
+       tail -20 $TMPDIR/65_07_t2_caret.log >> $TMPDIR/65_07_t2_summary.log
+
+       # Phase 61 multi-DB isolation
+       just test-multi-db > $TMPDIR/65_07_t2_multi_db.log 2>&1 || true
+       echo "multi_db_exit=$?" >> $TMPDIR/65_07_t2_summary.log
+       tail -20 $TMPDIR/65_07_t2_multi_db.log >> $TMPDIR/65_07_t2_summary.log
+
+       # Phase 60 concurrent
+       just test-concurrent > $TMPDIR/65_07_t2_concurrent.log 2>&1 || true
+       echo "concurrent_exit=$?" >> $TMPDIR/65_07_t2_summary.log
+       tail -20 $TMPDIR/65_07_t2_concurrent.log >> $TMPDIR/65_07_t2_summary.log
+
+       # The strictest gate
+       just ci > $TMPDIR/65_07_t2_ci.log 2>&1
+       echo "ci_exit=$?" >> $TMPDIR/65_07_t2_summary.log
+       tail -50 $TMPDIR/65_07_t2_ci.log >> $TMPDIR/65_07_t2_summary.log
+       ```
+
+       NB: per CLAUDE.md feedback (`feedback_no_tail_on_long_commands.md`), each long-running command writes to its own log file first, then `tail` extracts the summary. No piping of `just ci` to `tail` directly.
+
+    2) Write `.planning/phases/65-overridecontext-connection-teardown/65-07-VERIFICATION.md` with sections:
+       - `## Phase 58 ADBC Transactional DDL` — exit code + last-20 lines of output. Status: PASS / FAIL.
+       - `## Phase 62 Caret Rendering` — same shape.
+       - `## Phase 61 Multi-DB Isolation` — same.
+       - `## Phase 60 Concurrent CREATE` — same.
+       - `## just ci` (the strictest gate) — exit code + last-50 lines.
+       - `## Pre-existing clippy / test-environment failures` — list any failures that match the patterns documented in Phase 63's deferred-items.md (89 clippy errors, 5 bundled-feature-gated test compile failures). For each, state whether the count is at-or-below the Phase 63 baseline (acceptable) or above (NEW regression, must investigate).
+       - `## Watchdog test status` — paste the test summary from `uv run test/integration/test_readonly_load.py` (Plan 06 Task 2 already ran this — re-run here for the verification record).
+
+    3) The plan is acceptable as long as:
+       - `just test-adbc`, `just test-caret`, `just test-multi-db`, `just test-concurrent` all exit 0.
+       - `just ci` either exits 0 OR fails only on pre-existing issues documented in Phase 63 deferred-items.md (verify by line-count vs. baseline). If `just ci` introduces any NEW clippy warning or test failure attributable to Plans 02-07, this task does NOT pass — diagnose and fix.
+
+    Commit: `docs(65-07): VERIFICATION.md — phase-level regression evidence`.
+  </action>
+  <verify>
+    <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && test -f .planning/phases/65-overridecontext-connection-teardown/65-07-VERIFICATION.md && grep -E "Phase 58 ADBC|Phase 62 Caret|just ci" .planning/phases/65-overridecontext-connection-teardown/65-07-VERIFICATION.md && just test-adbc > $TMPDIR/65_07_t2_adbc.log 2>&1 && just test-caret > $TMPDIR/65_07_t2_caret.log 2>&1</automated>
+  </verify>
+  <acceptance_criteria>
+    - File `.planning/phases/65-overridecontext-connection-teardown/65-07-VERIFICATION.md` exists with at least 6 section headings (5 regression gates + pre-existing-issues + watchdog status).
+    - All four regression test commands exit 0 individually: `just test-adbc`, `just test-caret`, `just test-multi-db`, `just test-concurrent`.
+    - `just ci` exits 0 OR the VERIFICATION.md document explicitly explains why the failures are pre-existing (with a line-count baseline comparison against Phase 63 deferred-items.md's documented 89 clippy errors).
+    - VERIFICATION.md contains exit codes for each regression gate and the last N lines of each log.
+    - The watchdog test summary from `uv run test/integration/test_readonly_load.py` shows 0 failures (B1..B4 + B11 + Plan 06 Task 2's 4 new tests all green).
+  </acceptance_criteria>
+  <done>
+    All regression gates are verified. The VERIFICATION.md file is the audit trail for "Phase 65 did not regress anything from Phases 58, 60, 61, 62, 63".
+  </done>
+</task>
+
+<task type="auto">
+  <name>Task 3: Write phase-level 65-SUMMARY.md aggregating Plans 02-07</name>
+  <files>
+    .planning/phases/65-overridecontext-connection-teardown/65-SUMMARY.md
+  </files>
+  <read_first>
+    .planning/phases/65-overridecontext-connection-teardown/65-CONTEXT.md
+    .planning/phases/65-overridecontext-connection-teardown/65-RESEARCH.md
+    .planning/phases/65-overridecontext-connection-teardown/65-01-SUMMARY.md
+    .planning/phases/65-overridecontext-connection-teardown/65-02-SUMMARY.md
+    .planning/phases/65-overridecontext-connection-teardown/65-03-SUMMARY.md
+    .planning/phases/65-overridecontext-connection-teardown/65-04-SUMMARY.md
+    .planning/phases/65-overridecontext-connection-teardown/65-05-SUMMARY.md
+    .planning/phases/65-overridecontext-connection-teardown/65-06-SUMMARY.md
+    .planning/phases/65-overridecontext-connection-teardown/65-07-VERIFICATION.md
+    .planning/REQUIREMENTS.md
+    .planning/ROADMAP.md
+  </read_first>
+  <behavior>
+    - `65-SUMMARY.md` rolls up the architectural story + each plan's outcome + the final requirements traceability matrix (LIFE-01..04) + a forward pointer for Phase 66.
+    - Reader audience: future-self and Phase 66 planner. Length target: ~200-300 lines of markdown.
+    - Standard GSD SUMMARY frontmatter (phase metadata + tech-stack changes + key files + decisions).
+  </behavior>
+  <action>
+    Write `.planning/phases/65-overridecontext-connection-teardown/65-SUMMARY.md`. Use the template @$HOME/.claude/get-shit-done/templates/summary.md if present; otherwise use this structure:
+
+    ```markdown
+    ---
+    phase: 65-overridecontext-connection-teardown
+    status: shipped
+    architecture: B-prime
+    completed: 2026-05-XX
+    branch: milestone/v0.9.1
+    plans_completed: 7
+    requirements_closed: [LIFE-01, LIFE-02, LIFE-03, LIFE-04]
+
+    tags: [duckdb, rust, cpp, ffi, lifecycle, b-prime, transactional-ddl-preserved]
+
+    tech-stack:
+      added: []
+      patterns:
+        - "B-prime architecture: per-call C++ Connection(*context.db) from every callback that has ClientContext &"
+        - "C++ Catalog API registration (Catalog::GetSystemCatalog(db).CreateTableFunction) for read-side functions"
+        - "Box-across-FFI for SvRustBindData / SvRustBindDataWithConn"
+        - "Manual LE encoding for SemanticViewParseData::payload across the Rust↔C++ FFI"
+        - "Per-call ConnGuard RAII (Rust) + unique_ptr<Connection> (C++) for query-scoped lifetimes"
+
+    decisions:
+      - "D-14 LOCKED — per-call C++ Connection(*context.db) at every callback that has ClientContext &"
+      - "D-15 LOCKED — cached-db_handle is the root Phase 62 defect (TECH-DEBT 25 filed)"
+      - "D-16 LOCKED — read-side scope folded in (14+2 functions on C++ Catalog API path)"
+      - "D-17 LOCKED — Plan 02 partial reverted in Plan 02 Task 1"
+      - "D-18 LOCKED — Plan 01 stayed intact"
+      - "D-19 LOCKED — Phase 66 scope re-evaluation deferred until after Phase 65"
+      - "D-20 LOCKED — transactional DDL non-negotiable; preserved byte-identical"
+      - "D-21 LOCKED — no time pressure; fold-in scope expansion accepted"
+      - "D-22 LOCKED — bounded scope with signal surfacing; TECH-DEBT 25 + 26 filed"
+
+    key-files:
+      created:
+        - "src/conn_guard.rs (Plan 01)"
+        - "cpp/src/shim.cpp::sv_register_table_function (Plan 02)"
+        - "cpp/src/shim.cpp::sv_register_scalar_function (Plan 05)"
+        - ".planning/phases/65-overridecontext-connection-teardown/65-{01..07}-SUMMARY.md"
+      modified:
+        - "src/lib.rs (init_extension free of long-lived conn)"
+        - "src/parse.rs (OverrideContext slim shape; sv_emit_native_sql_rust)"
+        - "cpp/src/shim.cpp (deregister sv_parser_override; promote sv_parse_function + sv_plan_function; C++ Catalog API registration shims)"
+        - "src/ddl/*.rs (10 files — FFI bind bodies for read-side functions)"
+        - "src/query/table_function.rs + explain.rs (semantic_view + explain_semantic_view FFI ports)"
+        - "test/integration/test_readonly_load.py (B1..B4 + B11 + 4 new read-side variants)"
+        - ".planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md (LIFE-04 closure)"
+        - "TECH-DEBT.md (TECH-DEBT 25 + 26 filed)"
+    ---
+
+    # Phase 65 — OverrideContext Connection Teardown — Phase Summary
+
+    ## Architectural Pivot: B-prime
+
+    Phase 65 retired ALL long-lived extension-owned `duckdb_connection` handles from the
+    `semantic_views` extension. Under B-prime, every callback that receives `ClientContext &`
+    opens a fresh `Connection(*context.db)` inside a `ConnGuard` RAII wrapper for its
+    catalog-read needs, and drops the guard before returning. The catalog WRITE (CREATE /
+    DROP / ALTER) still rides the Phase 58 rewrite-to-native pattern onto the caller's conn
+    through the binder — preserving v0.8.0 transactional DDL byte-identical.
+
+    The path to B-prime traversed two falsified alternatives:
+    - Option A (per-call duckdb_connect from sv_parser_override) failed on the parse thread (D-10, 43-of-47 sqllogictest regression).
+    - Option A2 (context.Query from sv_plan_function) deadlocked on ClientContext::context_lock (`A2-DEADLOCK`).
+    - Option B (per-call duckdb_connect from sv_plan_function) failed for the same C-API cached-db_handle reason (`PLAN-THREAD-RC1`).
+    - Option B-prime (per-call C++ Connection(*context.db)) succeeded at every lifecycle phase tested (`PLAN-THREAD-RC0`, `READ-BIND-RC0`).
+
+    See `65-RESEARCH.md` §16 + §17 for the full mechanism + handle audit; `65-OPTION-B-SPIKE.md`
+    and `65-READ-PATH-SPIKE.md` for empirical evidence.
+
+    ## Plans Completed
+
+    | Plan | Wave | Outcome |
+    |------|------|---------|
+    | 65-01 | 1 | ConnGuard RAII + watchdog test scaffolding (B1..B4 + B11) + Wave-0 spike evidence — SHIPPED |
+    | 65-02 | 1 | Reverted Plan 02 partial + added sv_register_table_function C++ helper + trampolines |
+    | 65-03 | 2 | Deregistered sv_parser_override; promoted sv_parse_function + sv_plan_function; retired H1 catalog_conn |
+    | 65-04 | 3 | Ported 7 read-side functions (list_*, show_*, dims, metrics, facts) to C++ Catalog API |
+    | 65-05 | 3 | Ported 6 + 2 remaining read functions + scalars; retired H2 query_conn |
+    | 65-06 | 4 | Retired TEMP-PLAN-04 conn; structural guard test; LIFE-04 + TECH-DEBT 25/26; just test-all GREEN |
+    | 65-07 | 5 | Close-out: dead code cleanup + final regression verification (just ci) + this SUMMARY |
+
+    ## Requirements Traceability
+
+    | ID | Status | Evidence |
+    |----|--------|----------|
+    | LIFE-01 | CLOSED | B1..B4 + B11 + 4 new read-side watchdog tests all pass; in-process RW→RO returns within 5s. See 65-06-SUMMARY.md + uv run output. |
+    | LIFE-02 | CLOSED | B-prime mechanism documented in 65-RESEARCH.md §16; trade-off record in §8 + §16.5. PHASE-65-GUARD structural test enforces invariant. |
+    | LIFE-03 | CLOSED | test_in_process_bootstrap_then_readonly + variants in test/integration/test_readonly_load.py (Plan 01 + Plan 06). |
+    | LIFE-04 | CLOSED | .planning/milestones/v0.9.0-phases/63-readonly-database-load-support/deferred-items.md updated in place (Plan 06 Task 3). |
+
+    ## TECH-DEBT Filed
+
+    - **TECH-DEBT 25** — cached-`duckdb_database` Phase 62 defect (naturally resolved by Phase 65 B-prime).
+    - **TECH-DEBT 26** — duckdb-rs BindInfo does not expose ClientContext / duckdb_database (workaround shipped; upstream PR is the eventual resolution; likely supersedes TECH-DEBT 19).
+
+    ## Architectural Diff (v0.9.0 → v0.9.1 Phase 65)
+
+    | Aspect | v0.9.0 | v0.9.1 (B-prime) |
+    |--------|--------|------------------|
+    | catalog_conn (H1) | Long-lived, opened at LOAD, leaks Database lifetime | RETIRED; per-call C++ Connection probe in sv_plan_function |
+    | query_conn (H2) | Long-lived, opened at LOAD | RETIRED; per-call C++ Connection inside SvRustBindDataWithConn for semantic_view + explain_semantic_view (query-scoped) |
+    | sv_parser_override | Owned the success path; called rewrite_* with cached conn | DEREGISTERED; default parser dispatches to sv_parse_function on unrecognised prefix |
+    | sv_parse_function | Error-reporting only (Phase 62 caret path) | Success-path entry: structural parse + payload stash; caret path preserved |
+    | sv_plan_function | Unreachable (placeholder body) | Success-path entry: per-call C++ Connection probe + native SQL emission via Rust |
+    | Read-side functions | duckdb-rs `register_table_function_with_extra_info` with shared CatalogReader (carrying H1 conn) | C++ Catalog API `CreateTableFunction` with per-call Connection in trampoline bind |
+    | Scalars (get_ddl, read_yaml) | duckdb-rs `register_scalar_function_with_state` | C++ `sv_register_scalar_function` with per-call Connection in trampoline invoke |
+    | OverrideContext | `{catalog: CatalogReader, is_file_backed}` — long-lived conn | `{catalog_table_present, is_file_backed}` — stateless config |
+    | Transactional DDL | INSERT on caller's conn via ParserExtensionPlanResult | UNCHANGED — INSERT still rides binder onto caller's conn |
+    | LIFE-01 (in-process RW→RO) | Busy-spin > 45s | Returns within 5s on every tested combination |
+
+    ## Files Touched (Phase Total)
+
+    - **Rust:** 14 files (src/lib.rs, src/parse.rs, src/conn_guard.rs, src/catalog.rs, src/ddl/*.rs × 8, src/query/*.rs × 2)
+    - **C++:** 2 files (cpp/src/shim.cpp, cpp/src/shim.hpp)
+    - **Tests:** 1 file (test/integration/test_readonly_load.py — 5 + 4 = 9 new tests)
+    - **Docs:** 3 files (deferred-items.md, TECH-DEBT.md, .planning/phases/65-*/*.md)
+
+    ## Build / Test Status (Final)
+
+    See 65-07-VERIFICATION.md for full log captures.
+
+    - `cargo build` / `cargo build --features extension --no-default-features` / `just build`: GREEN
+    - `just test-sql`: 47/47 PASS
+    - `just test-caret`: GREEN
+    - `just test-adbc`: GREEN (D-20 non-negotiable preserved)
+    - `just test-multi-db`: GREEN
+    - `just test-concurrent`: GREEN
+    - `uv run test/integration/test_readonly_load.py`: 9 new tests + existing subprocess tests all GREEN
+    - `just test-all`: GREEN end-to-end (CLAUDE.md quality gate)
+    - `just ci`: GREEN (or pre-existing clippy baseline — see 65-07-VERIFICATION.md)
+
+    ## Next Phase
+
+    Phase 66 — Expansion Qualification Across All Paths + ADBC Tests + Milestone Close-out.
+
+    Per CONTEXT D-19 (LOCKED), Phase 66's scope is to be re-evaluated AFTER Phase 65 lands.
+    Strong prior: B-prime eliminates the H2 long-lived-conn root cause of ADBC's
+    catalog-search-path divergence. Under B-prime, all expansion + read-side queries run on
+    the caller's conn with the caller's search path; EXPAND-CTX-01..03 may become unnecessary.
+    Phase 66 plan creation deferred until ADBC end-to-end tests are run against the new
+    architecture.
+
+    Remaining Phase 66 requirements that are NOT plausibly absorbed:
+    - REL-01 (CHANGELOG entry for v0.9.1)
+    - REL-02 (Cargo.toml + description.yml bump to 0.9.1; just test-all + just ci green on tag)
+
+    If EXPAND-CTX-01..03 are absorbed by B-prime, Phase 66 simplifies to "REL-only + ADBC
+    verification test".
+
+    ## Phase Notes
+
+    [Any architectural follow-ups, surprise findings during execution, etc.]
+    ```
+
+    NB: the bracketed `[Any architectural follow-ups...]` section at the end is for the executor to fill in based on what actually happened during Plans 02-07. Common surprises to call out: (a) `make_uniq<Connection>` ownership transfer ergonomics across the FFI (Plan 05 Task 4), (b) the exact final shape of OverrideContext (Plan 03), (c) any pre-existing clippy errors that Plan 07 Task 1's dead-code deletion accidentally resolved (Plan 07 Task 1's clippy report compared against Phase 63's documented baseline).
+
+    Commit: `docs(65-07): Phase 65 SUMMARY — B-prime architectural pivot complete`.
+  </action>
+  <verify>
+    <automated>cd /Users/paul/Documents/Dev/Personal/duckdb-semantic-views && test -f .planning/phases/65-overridecontext-connection-teardown/65-SUMMARY.md && grep -E "B-prime|LIFE-01|LIFE-04|TECH-DEBT 25|Phase 65 Summary" .planning/phases/65-overridecontext-connection-teardown/65-SUMMARY.md | wc -l | grep -E "^[5-9]|^[1-9][0-9]"</automated>
+  </verify>
+  <acceptance_criteria>
+    - File `.planning/phases/65-overridecontext-connection-teardown/65-SUMMARY.md` exists.
+    - Frontmatter present with `phase`, `status: shipped`, `architecture: B-prime`, `plans_completed: 7`, `requirements_closed: [LIFE-01, LIFE-02, LIFE-03, LIFE-04]`.
+    - Sections present: Architectural Pivot, Plans Completed, Requirements Traceability, TECH-DEBT Filed, Architectural Diff, Files Touched, Build/Test Status, Next Phase.
+    - Each plan (02..07) referenced in the Plans Completed table.
+    - References to canonical evidence files: 65-OPTION-B-SPIKE.md, 65-READ-PATH-SPIKE.md, 65-RESEARCH.md, 65-07-VERIFICATION.md.
+    - Update ROADMAP.md to flip Phase 65 from `🚧` to `✅` and update the "1/~6 plans" count to "7/7 plans" (or however many plans actually shipped). (One-line edit; included in this task's commit.)
+  </acceptance_criteria>
+  <done>
+    The phase-level SUMMARY captures the architectural story; ROADMAP.md is updated; Phase 65 is closed.
+  </done>
+</task>
+
+</tasks>
+
+<threat_model>
+## Trust Boundaries
+
+| Boundary | Description |
+|----------|-------------|
+| Phase 65 plans 02-07 ↔ later milestones | The SUMMARY.md is the durable record for Phase 66 + future-self readers |
+
+## STRIDE Threat Register
+
+| Threat ID | Category | Component | Disposition | Mitigation Plan |
+|-----------|----------|-----------|-------------|-----------------|
+| T-65-07-01 | Repudiation | Future readers unable to reconstruct the architectural pivot rationale | mitigate | 65-SUMMARY.md (Task 3) explicitly references the spike evidence + the alternative-options elimination chain. Also linked from deferred-items.md (Plan 06) and TECH-DEBT.md entries. |
+| T-65-07-SC | Tampering | No new dependencies | accept | Documentation + cleanup only. |
+</threat_model>
+
+<verification>
+After all three tasks complete:
+
+1. No dead VTab / VScalar impls remain in src/ddl/ + src/query/.
+2. No Phase 65 `#[allow(dead_code)]` / `#[allow(unused_imports)]` attributes survive in src/conn_guard.rs.
+3. `cargo build` + `just build` exit 0; `just test-sql` 47/47 PASS; structural guard test from Plan 06 still passes.
+4. All regression gates documented in 65-07-VERIFICATION.md with exit codes + log tails.
+5. `just ci` exits 0 OR fails only on pre-existing clippy errors (Phase 63 deferred-items.md baseline).
+6. 65-SUMMARY.md exists with all required sections.
+7. ROADMAP.md updated to flip Phase 65 to shipped status.
+</verification>
+
+<success_criteria>
+- Dead VTab/VScalar impls removed; Plan 01 allow-attributes removed.
+- Final regression evidence captured in 65-07-VERIFICATION.md.
+- Phase-level 65-SUMMARY.md authored.
+- ROADMAP.md updated.
+- `just ci` green or pre-existing-baseline-only failures.
+</success_criteria>
+
+<output>
+Create `.planning/phases/65-overridecontext-connection-teardown/65-07-SUMMARY.md` when done. The summary MUST:
+- State whether Plan 07 was a no-op (Plans 04/05/06 left no dead code or allow-attributes) or had real cleanup work (with the count of deleted impls + removed attributes).
+- Link to 65-07-VERIFICATION.md.
+- Link to 65-SUMMARY.md (the phase-level rollup).
+- Confirm ROADMAP.md was updated.
+- Note any deviation from this plan and why.
+</output>

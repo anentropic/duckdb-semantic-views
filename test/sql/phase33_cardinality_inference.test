@@ -470,12 +470,17 @@ statement ok
 DROP TABLE p33_customers;
 
 # ============================================================
-# PK-Optional Tests: PRIMARY KEY resolved from DuckDB catalog
+# PK-Required Tests: PRIMARY KEY MUST be declared in TABLES clause
+# ============================================================
+# Phase 65 (v0.10.0) D-05/D-06: v0.9.0's auto-inference of PRIMARY KEY
+# from `duckdb_constraints()` is removed. PRIMARY KEY is now a LOGICAL
+# user assertion in the TABLES clause -- Snowflake-aligned. Tests below
+# declare PRIMARY KEY explicitly in TABLES; the "no PK declared" path
+# is exercised by test/sql/65_pk_error.test.
 # ============================================================
 
 # ============================================================
-# PKOpt Test 1: PK from catalog -- basic
-# Physical table has PRIMARY KEY constraint, TABLES clause omits it.
+# PKReq Test 1: Explicit PRIMARY KEY in TABLES clause -- basic
 # ============================================================
 
 statement ok
@@ -493,8 +498,8 @@ INSERT INTO p33_pkopt_orders VALUES (1, 1, 100.0), (2, 2, 200.0), (3, 1, 50.0);
 statement ok
 CREATE SEMANTIC VIEW p33_pkopt_basic AS
   TABLES (
-    c AS p33_pkopt_customers,
-    o AS p33_pkopt_orders
+    c AS p33_pkopt_customers PRIMARY KEY (id),
+    o AS p33_pkopt_orders PRIMARY KEY (id)
   )
   RELATIONSHIPS (
     order_to_customer AS o(customer_id) REFERENCES c
@@ -516,7 +521,7 @@ statement ok
 DROP SEMANTIC VIEW p33_pkopt_basic;
 
 # ============================================================
-# PKOpt Test 2: PK from catalog -- composite PK
+# PKReq Test 2: Composite PRIMARY KEY declared in TABLES
 # ============================================================
 
 statement ok
@@ -534,7 +539,7 @@ INSERT INTO p33_pkopt_ship_details VALUES (1, 1, 'UPS'), (1, 2, 'FedEx'), (2, 1,
 statement ok
 CREATE SEMANTIC VIEW p33_pkopt_composite AS
   TABLES (
-    s AS p33_pkopt_shipments,
+    s AS p33_pkopt_shipments PRIMARY KEY (order_id, line_id),
     d AS p33_pkopt_ship_details PRIMARY KEY (ship_order_id, ship_line_id)
   )
   RELATIONSHIPS (
@@ -593,9 +598,13 @@ statement ok
 DROP SEMANTIC VIEW p33_pkopt_explicit;
 
 # ============================================================
-# PKOpt Test 4: No catalog PK -- error at CREATE time
-# Physical table has no PK constraint. TABLES clause omits PK.
-# Catalog lookup finds nothing. Error fires during CREATE.
+# PKReq Test 4: Target without PRIMARY KEY in TABLES -- D-06 hard error
+# Phase 65 (v0.10.0): the FK target table has no PRIMARY KEY (or UNIQUE)
+# declared in TABLES. CREATE fails with the D-06 actionable message.
+# (Note: in v0.9.0 this also errored, but with the generic
+# "Table 'X' has no PRIMARY KEY. Specify referenced columns explicitly"
+# template; v0.10.0's message is more actionable and points at the
+# explicit PRIMARY KEY (cols) declaration.)
 # ============================================================
 
 statement ok
@@ -604,7 +613,7 @@ CREATE TABLE p33_pkopt_logs (msg VARCHAR, ts TIMESTAMP);
 statement error
 CREATE SEMANTIC VIEW p33_pkopt_log_source AS
   TABLES (
-    o AS p33_pkopt_orders,
+    o AS p33_pkopt_orders PRIMARY KEY (id),
     l AS p33_pkopt_logs
   )
   RELATIONSHIPS (
@@ -617,19 +626,19 @@ CREATE SEMANTIC VIEW p33_pkopt_log_source AS
     o.order_count AS COUNT(*)
   );
 ----
-has no PRIMARY KEY
+has no PRIMARY KEY declared but is referenced by FK in
 
 statement ok
 DROP TABLE p33_pkopt_logs;
 
 # ============================================================
-# PKOpt Test 5: Mixed -- some with PK in DDL, some from catalog
+# PKReq Test 5: Mixed -- all declared explicitly in TABLES
 # ============================================================
 
 statement ok
 CREATE SEMANTIC VIEW p33_pkopt_mixed AS
   TABLES (
-    c AS p33_pkopt_customers,
+    c AS p33_pkopt_customers PRIMARY KEY (id),
     o AS p33_pkopt_orders PRIMARY KEY (id)
   )
   RELATIONSHIPS (
@@ -652,14 +661,14 @@ statement ok
 DROP SEMANTIC VIEW p33_pkopt_mixed;
 
 # ============================================================
-# PKOpt Test 6: DESCRIBE shows correct cardinality after catalog PK
+# PKReq Test 6: DESCRIBE shows correct cardinality with explicit PK
 # ============================================================
 
 statement ok
 CREATE SEMANTIC VIEW p33_pkopt_describe AS
   TABLES (
-    c AS p33_pkopt_customers,
-    o AS p33_pkopt_orders
+    c AS p33_pkopt_customers PRIMARY KEY (id),
+    o AS p33_pkopt_orders PRIMARY KEY (id)
   )
   RELATIONSHIPS (
     order_to_customer AS o(customer_id) REFERENCES c
@@ -671,7 +680,7 @@ CREATE SEMANTIC VIEW p33_pkopt_describe AS
     o.revenue AS SUM(o.amount)
   );
 
-# 8 TABLE (PK auto-detected from catalog) + 4 REL + 3 DIM + 3 METRIC + 1 ACCESS_MODIFIER = 19 rows
+# 8 TABLE (explicit PK in TABLES) + 4 REL + 3 DIM + 3 METRIC + 1 ACCESS_MODIFIER = 19 rows
 query I
 SELECT COUNT(*) FROM describe_semantic_view('p33_pkopt_describe');
 ----

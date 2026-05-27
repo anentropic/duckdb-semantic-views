@@ -1,0 +1,49 @@
+# Phase 65 (v0.10.0) Plan 04 -- Wave 0 spike.
+#
+# Empirical verification that DuckDB v1.5.2 `json_merge_patch` honors
+# RFC-7396 semantics, in particular the "null in patch = delete key"
+# behaviour that ALTER UNSET COMMENT depends on for the pure-SQL
+# json_merge_patch UPDATE rewrite (Task 3 of this plan).
+#
+# Per locked resolution A1, this is a ~5-minute gate: if any assertion
+# below fails on DuckDB v1.5.2, Task 3's UNSET COMMENT mechanism must be
+# redesigned (likely to a regenerate-via-helper-TF path) before any of
+# the production rewrites land. The planner halts and replans.
+#
+# Behavioural properties pinned:
+#   B1: null in patch removes the key from the result.
+#   B2: scalar overwrite case (foundation for SET COMMENT).
+#   B3: null-as-delete on a `comment`-shaped key alongside other keys.
+#   B4: null in patch on an absent key is a no-op (RFC-7396 semantics).
+#
+# Requirements covered: LIFE-02 prerequisite verification.
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# B1: null-as-delete on the simplest case.
+query T
+SELECT json_merge_patch('{"a":1,"b":2}'::JSON, '{"b":null}'::JSON)
+----
+{"a":1}
+
+# B2: scalar overwrite (foundation for SET COMMENT).
+query T
+SELECT json_merge_patch('{"comment":"old"}'::JSON, '{"comment":"new"}'::JSON)
+----
+{"comment":"new"}
+
+# B3: null-as-delete on a real-shaped object with sibling keys preserved
+# (the exact pattern UNSET COMMENT relies on -- comment goes, rest stay).
+query T
+SELECT json_merge_patch('{"comment":"old","other":42}'::JSON, '{"comment":null}'::JSON)
+----
+{"other":42}
+
+# B4: null in patch on an absent key is a no-op per RFC-7396.
+query T
+SELECT json_merge_patch('{}'::JSON, '{"a":null}'::JSON)
+----
+{}

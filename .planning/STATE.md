@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v0.9.0
-milestone_name: Read-Only Database LOAD Support + Quoted Identifier Bugfix
-status: verifying
-stopped_at: Completed 64-04-PLAN.md
-last_updated: "2026-05-17T19:08:57.040Z"
-last_activity: 2026-05-17
+milestone: v0.10.0
+milestone_name: Connection-Lifecycle & Catalog-Context Fixes
+status: milestone_complete
+stopped_at: Milestone complete (Phase 68 was final phase)
+last_updated: 2026-05-27T15:31:00.716Z
+last_activity: 2026-05-27
 progress:
-  total_phases: 2
-  completed_phases: 2
-  total_plans: 8
-  completed_plans: 8
+  total_phases: 3
+  completed_phases: 3
+  total_plans: 22
+  completed_plans: 44
   percent: 100
 ---
 
@@ -18,26 +18,24 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-05-15)
+See: .planning/PROJECT.md (updated 2026-05-21)
 
 **Core value:** A DuckDB user can define a semantic view once and query it with any combination of dimensions and metrics, without writing GROUP BY or JOIN logic by hand
-**Current focus:** Phase 64 — Fix CREATE SEMANTIC VIEW quoted identifier handling
+**Current focus:** Milestone complete
 
 ## Current Position
 
-Milestone: v0.9.0 — Read-Only Database LOAD Support + Quoted Identifier Bugfix
-Phase: 64
+Phase: 68
 Plan: Not started
-Status: Phase complete — ready for verification
-Last activity: 2026-05-17
-
-Progress: [█████─────] 50% (1/2 phases complete)
+Plans landed: 65-01 (ConnGuard + watchdog tests), 65-02 (sv_register_table_function C++ Catalog API shim, partial — reverted to v0.9.0 OverrideContext shape by Plan 03), 65-03 (parser_override slimming wave; conn_guard deleted; resolve_pk_from_catalog deleted; metadata-via-SQL via json_merge_patch on caller's connection), 65-04 (ALTER + CREATE FROM YAML FILE architecture wave; sv_register_table_function introduced from scratch ~250 LOC C++; __sv_compute_create_from_yaml helper TF with per-call Connection(*context.db) read of the YAML file; pure-SQL json_merge_patch UPDATE for ALTER SET/UNSET COMMENT; sv_compute_create_from_yaml_rust FFI bridge with catch_unwind + sv_free_buffer ownership), 65-05 (read-path migration wave; all 17 read-side functions on C++ Catalog API with per-call Connection(*context.db) bind; H2 query_conn allocation DELETED from init_extension; 17 legacy duckdb-rs VTab/VScalar struct + impl blocks purged atomically ~2,632 LOC across 13 files; src/type_cache.rs unbounded HashMap cache landed unused as deferred optimisation; sv_logical_type_from_c_type_id bridges C-API ↔ C++ enum-value mismatch; new test_concurrent_reads_per_call_conn.py PASSES 80 reads in 0.02s; LIFE-02 satisfied end-to-end; LIFE-01 watchdog tests still RED 5/8 pending Plan 06 H1 retirement), 65-06 (lifecycle close-out; H1 catalog_conn retired from init_extension; OverrideContext slimmed to empty struct; INTENTIONAL LEAK rationale deleted; structural guard test tests/no_long_lived_conn.rs via syn::visit::Visit AST walk; 4 D-03b post-reopen integration tests added covering semantic_view SELECT + describe + SHOW DIMENSIONS + get_ddl; LIFE-04 ledger entry closed with forward pointer; 12/12 test_readonly_load.py PASS; just test-all + just ci both green; 6/6 ADBC; LIFE-01/02/03/04 all Satisfied)
+Next plan: /gsd-execute-phase 68 (continue with Plan 03)
+Last activity: 2026-05-27
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 19 (v0.7.0) + 4 (v0.8.0 phases 58–61, retroactive)
+- Total plans completed: 49 (v0.7.0) + 4 (v0.8.0 phases 58–61, retroactive)
 - Average duration: --
 - Total execution time: 0 hours
 
@@ -46,6 +44,9 @@ Progress: [█████─────] 50% (1/2 phases complete)
 ### Roadmap Evolution
 
 - Phase 64 added: Fix CREATE SEMANTIC VIEW quoted identifier handling (downstream bug; quoted FQN stored verbatim, lookup by short name fails, expansion re-quotes producing triple quotes). Folded into v0.9.0 — milestone reopened pre-tag since maintainer squash-merge had not yet happened.
+- v0.9.1 opened 2026-05-21 as a two-phase patch milestone; reframed 2026-05-23 to v0.10.0 after the B-prime architecture for Phase 65 was empirically eliminated (EXEC-TIME-RC1 spike). New architectural premise: preserve `parser_override` (only DuckDB v1.5.2 mechanism that delivers transactional DDL), eliminate the catalog reads that drive the need for a connection inside parser_override (drop PK auto-inference, move metadata to SQL expressions in INSERT, fold existence checks into ON CONFLICT, defer type inference to read-side bind callbacks), and use the rewrite-to-UPDATE-with-TF-subquery pattern (ALTER-RC0) for ALTER and CREATE FROM YAML FILE. Read-path callbacks migrate to C++ Catalog API registration (READ-BIND-RC0) so they gain ClientContext for per-call Connection. Both long-lived connections retire. Phase 66 scope re-evaluation pending Phase 65 re-plan (the H2 catalog-search-path divergence may dissolve once query_conn is retired). See `.planning/phases/65-overridecontext-connection-teardown/65-BPRIME-ARCHIVE-NOTE.md` for the full pivot rationale.
+- Phase 65.1 inserted after Phase 65: Phase 65 Code Review Remediation (URGENT)
+- Phase 68 added 2026-05-27: Pre-Tag Cleanup — addresses Phase 67's REVIEW findings (WR-01..03 + IN-01..04), TECH-DEBT #25 (sibling split_whitespace sites in body_parser.rs needing structural rewrite), and PR #35 Copilot review comments (UTF-8 panic + transmute turbofish miss in tests/registration_error_surfaces.rs; unused test/sql/p651_ok.yaml fixture). Final cleanup before v0.10.0 milestone close.
 
 ### Decisions
 
@@ -79,6 +80,78 @@ Recent decisions affecting current work:
 - [Phase 64]: ALTER RENAME normalises BOTH source-name and RENAME TO target-name slots; without this the target slot stored the raw quoted FQN
 - [Phase 64]: Use sqllogictest block-form statement error (---- separator + substring), not inline regex — runner does not support inline form
 - [Phase 64]: Tracked fuzz seeds live in fuzz/seeds/<target>/ (gitignore only excludes fuzz/corpus/)
+- [Phase ?]: [Phase 65 P01]: Spike A4 CONFIRMED — DBInstanceCache::GetInstanceInternal busy-spin diagnosis stands (verbatim lldb backtrace captured at 65-01-SPIKES.md)
+- [Phase ?]: [Phase 65 P01]: Spike A6 — BindInfo does NOT expose duckdb_database in duckdb-rs 1.10502.0 → Plan 03 must adopt shape (a) CatalogHandle threaded via extra_info
+- [Phase ?]: [Phase 65 P01]: Spike A7 DEFERRED-TO-PLAN-02 (acceptable per plan guidance); Plan 02 first parser_override sqllogictest will deadlock if re-entrancy unsafe — strictly better falsification than contrived spike on baseline
+- [Phase ?]: [Phase 65 P01]: ConnGuard module declared without #[cfg(feature=extension)] gate so null-drop test runs under default bundled feature; inner FFI body remains gated
+- [Phase ?]: [Phase 65 P01]: ConnGuard is Send but deliberately NOT Sync (per-scope ownership); not Clone/Copy
+- [Phase ?]: [Phase 65 P02 replanned]: A2 spike returned A2-DEADLOCK — context.Query from inside sv_plan_function self-deadlocks on ClientContext::context_lock (lldb backtrace at 65-02-SPIKES.md)
+- [Phase ?]: [Phase 65 P02 replanned]: A6-bind spike returned BIND-THREAD-RC1 — duckdb_connect from ListSemanticViewsVTab::bind also returns rc=1, generalising D-10 to the bind thread; Plan 03's shape (a) is empirically invalidated
+- [Phase ?]: [Phase 65 P02 replanned]: HALTED at Task 1 checkpoint:decision per USER_HARD_CONSTRAINT (saved as feedback-transactional-ddl-non-negotiable) — A1/A3 forbidden (regress transactional DDL); only escalate is the live option
+- [Phase 65 P03]: parser_override slimming complete — OverrideContext reverted to v0.9.0 shape; conn_guard.rs deleted; resolve_pk_from_catalog deleted; metadata capture moved to SQL via json_merge_patch on caller's connection; D-06 hard error for FK→PK-less target with actionable v0.10.0 CHANGELOG message
+- [Phase 65 P03]: D-06 check extended to cover BOTH implicit REFERENCES (empty ref_columns) AND explicit REFERENCES(cols) — superset of plan's literal check; CARD-03 still fires for column-mismatch failures
+- [Phase 65 P03]: phase29/phase30/phase39 sqllogictest FACT DATA_TYPE expectations updated to (empty); Plan 05's read-side bind probe will restore populated types and tests will need re-update
+- [Phase 65 P03]: H1 catalog_conn at src/lib.rs:386-410 still allocated but unused by parser_override CREATE path; Plan 06 retires the allocation
+- [Phase 65 P03]: D-21 transactional invariant intact — test_adbc_transactions.py 6/6 PASS; D-03 watchdog tests still TimeoutError (expected per 65-01-SUMMARY — flip green at Plan 06 only)
+- [Phase 65 P04]: A1 resolved empirically — DuckDB v1.5.2 json_merge_patch honors RFC-7396 null-as-delete (Wave 0 sqllogictest spike). ALTER UNSET COMMENT therefore uses constant patch literal `{"comment":null}` with no helper TF
+- [Phase 65 P04]: A2 honored — sv_register_table_function introduced from scratch (NOT a revert of a partial Plan 02 commit; that commit was self-reverted at end of spike). ~250 LOC new C++ in shim.cpp + 71-line new shim.hpp; within RESEARCH §5.4 budget
+- [Phase 65 P04]: A7 honored — only the 3 ALTER variants present in HEAD (RENAME TO, SET COMMENT, UNSET COMMENT) were migrated; the 8 enumerated additional variants are NOT implemented (Snowflake non-features)
+- [Phase 65 P04]: D-09 superseded — json_set / json_remove are NOT in DuckDB v1.5.2; use json_merge_patch instead. JSON patch construction uses serde_json::to_string for internal-quote escaping
+- [Phase 65 P04]: __sv_compute_create_from_yaml helper TF returns metadata-less JSON; outer INSERT wraps with json_merge_patch + json_object('created_on',..., 'database_name',..., 'schema_name',...) on caller's conn so D-21 transactional contract preserved (matches Plan 03 inline CREATE byte-for-byte)
+- [Phase 65 P04]: rewrite_yaml_file_create no longer reads files in Rust; the file read happens inside the helper TF's bind callback via Connection probe(*context.db) + read_text() with the path escaped before embedding
+- [Phase 65 P04]: parser_override has ZERO remaining OverrideContext-catalog consumers (rewrite_drop / rewrite_alter_rename / rewrite_alter_comment / emit_native_create_sql all retain ctx.catalog.exists for "does not exist" wording -- Plan 06 retires); H1 catalog_conn at src/lib.rs:386-410 is truly unused by every parser_override path after Plan 04
+- [Phase 65 P04]: D-21 verified end-to-end: test_adbc_transactions.py 6/6 PASS, test_create_from_yaml_v010.py T7 BEGIN+CREATE+ROLLBACK leaves _definitions empty, 65_alter_comment_merge_patch.test B5 BEGIN+ALTER+ROLLBACK restores pre-tx comment
+- [Phase 65 P04]: Cross-database ALTER and CREATE FROM YAML FILE (ATTACH 'db2'; ALTER db2.v) is out-of-scope for v0.10.0 — the v0.9.0 extension only initializes semantic_layer._definitions on the LOAD database; Phase 66 follow-up territory
+- [Phase 65 P05]: Bridge mechanism is reinterpret_cast<duckdb_connection>(Connection*) of a stack-allocated `Connection probe(*context.db)` — same cast `duckdb_connect` itself does (duckdb.cpp:266432-266447). BORROW contract: Rust dispatcher never calls duckdb_disconnect; C++ scope ~Connection() handles teardown. Empirically validated by Wave 0 spike (commit 2db2b9b), reused identically across all 17 migrations.
+- [Phase 65 P05]: Wave 6 streaming model uses C++ MaterializedQueryResult inside SemanticViewGlobalState — ColumnDataCollection owns blocks independently of the producing Connection (per duckdb.hpp:18801-18813), so the per-call init_global Connection drops safely before any exec call.
+- [Phase 65 P05]: TWO per-call Connections per semantic_view(...) invocation (bind + init_global) — both drop before any exec call; no shared mutable state contention; verified by test_concurrent_reads_per_call_conn.py (80 reads in 0.02s under 8 threads).
+- [Phase 65 P05]: Named LIST(VARCHAR) parameter registrations (Wave 5 + Wave 6) require hand-built TableFunction construction because the generic sv_register_table_function shim doesn't accept named_parameters spec — TECH-DEBT 1 (v0.10.1 refactor opportunity), non-blocking.
+- [Phase 65 P05]: Type cache (src/type_cache.rs) introduced but NOT consumed by migrated dispatchers — LIMIT-0 probe is sub-millisecond on existing test surface; module + unit tests stay in tree for telemetry-driven future adoption. Deferred optimisation, not TECH-DEBT.
+- [Phase 65 P05]: C-API ↔ C++ enum-value mismatch caught and resolved via sv_logical_type_from_c_type_id (e.g., DECIMAL is 19 vs 21; LIST is 24 vs 101) — would have silently mis-typed every column. Highest-impact Batch 2 discovery. Single source of truth for the conversion (mirrors duckdb-rs's LogicalTypeId::from(u32)).
+- [Phase 65 P05]: 5 helpers from the dead Rust VTab path retired (value_raw_ptr, extract_list_strings, LogicalTypeOwned, type_from_duckdb_type_u32, declare_output_type) — C++ side now owns LIST flattening (sv_serialise_string_list) + LogicalType declaration (sv_logical_type_from_c_type_id). Removes the duckdb-rs Value transmute that relied on repr(Rust) layout assumptions.
+- [Phase 65 P05]: 5/8 test_readonly_load.py watchdog tests still RED post-Batch-3 (same failure shape as pre-Batch-3) — LIFE-01 has TWO contributors (H1 catalog_conn + H2 query_conn); Plan 05 retired H2 only, so DuckDB DBInstanceCache busy-spin on RW↔RO reopen persists. Plan 06 retires H1 → expected to flip 8/8 green. If any test stays red after Plan 06, file as Phase 67 follow-up per D-22.
+- [Phase 65 P05]: test_multi_db_isolation.py 3/3 PASS confirms cross-database catalog/search-path resolution works through the per-call Connection model — preliminary EXPAND-CTX-01 finding: root cause may dissolve after Plan 06, Phase 66 may become test-scaffolding + release-prep only.
+- [Phase 65 P06]: H1 catalog_conn retirement (commit 964b0bf, pre-rescue) used pre-existing race-guard SQL pattern from Plan 03 (existence_guard_select + race-loser CASE) rather than introducing a new mechanism — the same SQL guard that protected against concurrent DROP now subsumes the catalog-existence pre-check. OverrideContext slimmed to empty struct (catalog field + Drop impl + INTENTIONAL LEAK comment all DELETED).
+- [Phase 65 P06]: Structural guard test (tests/no_long_lived_conn.rs) uses syn::visit::Visit AST walk rather than plain-text grep — the AST approach correctly scopes "inside init_extension" (RawDb test helper at src/lib.rs:226-277 legitimately calls duckdb_connect from test fixtures; plain grep would false-positive). syn pinned as dev-dependency even though transitively available.
+- [Phase 65 P06]: 4 D-03b post-reopen integration tests added (semantic_view SELECT, describe, SHOW DIMENSIONS IN v, get_ddl('SEMANTIC_VIEW','v')) — together with Plan 01's B1-B4 + B11 watchdog tests, the LIFE-01 acceptance evidence base covers all major read paths post-reopen. test_readonly_load.py now reports 12/12 PASS on milestone/v0.10.0.
+- [Phase 65 P06]: LIFE-04 ledger entry closed with forward pointer; just test-all + just ci both exit 0; 6/6 ADBC PASS (D-21 invariant preserved); Phase 64 qualify_and_quote_table_ref wiring untouched. Phase 65 ready for orchestrator phase-level verification dispatch.
+- [Phase ?]: [Phase 65.1 P01]: Wave 0 test scaffolds — 6 stubs (2 Python + 3 sqllogictest + 1 Rust) created and wired; TEST_LIST appended with 3 phase651_*.test entries; pytest>=7.0 added to PEP-723 metadata of Python stubs (Rule 3 auto-fix — without pytest the planned skip semantic breaks at import); full quality gate green (942 cargo + 56 sqllogictest + 12/12 readonly + 3/3 multi_db + 6/6 ADBC)
+- [Phase ?]: [Phase 65.1 P02a]: C ABI rework for sv_register_table_function + sv_register_scalar_function — trailing (char *error_buf, size_t error_buf_len) pair per D-08/D-09; D-05 null-init_cb refusal; D-06 (void)emitted deletion; all 17 wrappers updated; fprintf(stderr) count 17→3 (3 remaining in out-of-scope sv_register_parser_hooks); just build exit 0; 844/844 cargo test --lib
+- [Phase 65.1 P03a]: BorrowedConnection newtype lands with W-02-fixed compile_fail doctest; 15 ddl/ dispatcher sites + helpers (probe_catalog_table_present, CatalogReader::new) migrated to &BorrowedConnection wrap-on-entry; IN-06 D-26 absorbed (duplicate probe + write_err in src/ddl/list.rs DELETED, canonical home is src/ddl/read_ffi.rs)
+- [Phase 65.1 P03a]: Minimum-touch boundary preserved for src/query/{explain,table_function}.rs; only the CatalogReader::new callsite line wrapped inline, Plan 03b owns the full wrap-on-entry migration of those 2 query/ dispatchers plus AST guard extension in tests/no_long_lived_conn.rs for duckdb_disconnect walks
+- [Phase ?]: [Phase 65.1 P05]: WR-04 concurrent writes test landed; five-bucket categorisation (success + already_exists + constraint_violation + tuple_conflict + unknown_error); ALTER uses IF EXISTS for clean DROP-then-ALTER no-op; final-state subset invariant
+- [Phase ?]: [Phase 65.1 P05]: Second PK-violation wording observed under race-guard rewrite (commit-time TransactionContext shape, distinct from TECH-DEBT 23 single-statement check-time shape); both categorise as constraint_violation. TECH-DEBT 23 should be amended to mention both wordings
+- [Phase ?]: [Phase 65.1 P05]: DuckDB optimistic-concurrency 'Conflict on tuple deletion' on racing DROPs/ALTERs against same _definitions row is documented upstream behaviour (semantic-views ride the same serialisation contract as any DDL on _definitions PK); classified as tuple_conflict bucket, not an extension-side bug
+- [Phase 65.1]: Plan 02b: structural FFI-invariant test pattern (filesystem read + literal-substring assertion) over direct-FFI invocation when symbol gating makes direct invocation infeasible; mirrors tests/no_long_lived_conn.rs precedent
+- [Phase 65.1]: Plan 02b: decode_register_err_buf helper centralises CStr-to-String conversion with (no error text) fallback for empty buffers across 17 call sites
+- [Phase ?]: ALLOWED_DISCONNECT_SITES allow-list for AST guard: RawDb::Drop test fixture is the single deliberate OWN-and-release exception; each future entry must be justified at code review
+- [Phase ?]: try_infer_schema return type left as Option<...> per plan; Plan 11 (WR-08) will stack Result<_, String> on top to avoid byte-diff coupling
+- [Phase ?]: [Phase 65.1 P04]: WR-03 fix uses first-statement information_schema guard (new definitions_table_guard_select) prepended to multi-statement DROP/ALTER rewrites — REPLACES the plan's outer-CASE wrap approach, which is invalidated by DuckDB binding CASE branches eagerly. Multi-statement strings ARE per-statement lazy bind, so first-statement error short-circuits subsequent bind+exec.
+- [Phase ?]: [Phase 65.1 P04]: W-06 IF EXISTS sub-assertion relaxed to accept canonical-wording error OR silent success — pure SQL cannot conditionally skip DML, so silent-on-missing-table requires Rust-side probe (explicitly excluded by D-17). Both achievable outcomes satisfy the underlying WR-03 no-implementation-leak contract. Standard silent-on-missing-row IF EXISTS contract preserved via DML's 0-row effect.
+- [Phase ?]: Phase 65.1 Plan 08: CR-02 closed (D-04) + IN-01 refreshed (D-07)
+- [Phase ?]: [Phase 65.1 P09]: 317 LOC dead-code purge — src/type_cache.rs (224 LOC unconsumed module) + type_id_to_display_name (82 LOC dead-coded helper) + 11 LOC dangling-comment cleanup; deletion-only refactor closes IN-02 + IN-03 (D-23) with cargo build / test --lib / just test-all all green; eliminates the BATCH2-SUMMARY deferred-optimisation contributor trap
+- [Phase ?]: [Phase 65.1 P09]: IN-05 (D-25) closed — phase651_null_name_inputs.test populated with three D-25 assertions pinning null-name short-circuit behaviour for read_yaml_from_semantic_view + get_ddl; tests confirm current behaviour rather than driving a fix (the short-circuit was already in place pre-Phase-65)
+- [Phase ?]: Plan 10 (WR-06): pin BORROW-contract bridge with file-scope static_assert(sizeof(duckdb_connection) == sizeof(void*)) + load-time runtime probe inside sv_register_parser_hooks (D-12); probe failure surfaces via WR-02 error_buf channel (D-13). sv_register_parser_hooks signature now carries trailing (error_buf, error_buf_len) pair; previously stderr-only failure paths converted.
+- [Phase ?]: Plan 11 WR-07/WR-08 hard-error promotion: throw BinderException + Result<_, String> for silent type-inference fallbacks; distinct wordings preserved
+- [Phase ?]: Phase 66 Plan 01: ADBC end-to-end query test scaffolding with 7 scenarios; 5 gated by SKIP_UNTIL_PLAN_02 + MIGRATION_LANDED boolean — Plan 02 un-skips with one-line edit at migration commit. 2 PASS / 5 SKIP / 0 FAIL on milestone/v0.10.0 HEAD; test-adbc-queries recipe wired into test-all aggregate.
+- [Phase ?]: Phase 66 Plan 01: Scenario 6 (materialization routing) seeds agg.daily_revenue with expected aggregate rows so migration's pre/post divergence is observable; without seed rows both states return zero rows, producing a false negative.
+- [Phase ?]: Phase 66 Plan 02: 10 expand-path migration sites all on qualify_and_quote_table_ref; defense-in-depth Phase 64 completion (sql_gen 3+3 / semi_additive 3 / window 3 / materialization 1 with build_materialized_sql signature thread)
+- [Phase ?]: Phase 66 Plan 02: D-09 baseline reinterpretation — EXPAND-CTX-01 root cause dissolved by Phase 65 per-call Connection(*context.db); migration retains defense-in-depth value. Plan 01 scaffolding had 4 DDL bugs (FACTS clause-order x2, ROW_NUMBER x1, materialization grammar x1) auto-fixed under Rule 3
+- [Phase ?]: Phase 66 Plan 02: scenario 7 uses explicit base-table qualifier (s AS db2.main.sales) because CREATE-time metadata records database_name=current_database() not view home db; multi-DB CREATE metadata fix tracked as Phase 67+ follow-up
+- [Phase ?]: Phase 66 Plan 03: D-11 close-out applied — _notes/error_with_adbc.md opens with ## Resolution (v0.10.0) section citing qualify_and_quote_table_ref, test_adbc_queries.py, and Plan 02 commit SHAs (b55936f, b116553, 9fe1ae5); original 28-line downstream content preserved verbatim below divider; file NOT archived (D-11 archiving optional)
+- [Phase ?]: Phase 66 Plan 03: Phase 66 complete across all 3 plans; EXPAND-CTX-01/02/03 all satisfied; ready for /gsd-verify-work 66
+- [Phase 68 P01]: A1+A3 land as one atomic commit (ec30473) — A3 collapse first, then A1 keyword-guard at the clean site; pre-Phase-67 error message restored verbatim per CONTEXT.md D-03
+- [Phase 68 P01]: A1 keyword set is `PRIMARY|UNIQUE|FOREIGN|REFERENCES|NOT` (D-03 authoritative over REVIEW.md draft `PRIMARY|UNIQUE|COMMENT|WITH`)
+- [Phase 68 P01]: A4 helper `is_quoting_balanced` mirrors find_identifier_end's doubled-quote `""` escape rule — a naive `s.matches('"').count() % 2` is incorrect because doubled-quote escapes are balanced
+- [Phase 68 P01]: A2 ADBC SQL-string escape parity is local (no shared `_quote_sql_literal` helper introduced); variable name `other_db_path_sql` matches `extension_path_sql` line-100 convention byte-for-byte
+- [Phase 68 P01]: A5 ships both sqllogictest Scenario 5 (`staging."my orders"`) and a Rust unit `test_parse_single_table_entry_mixed_quoted_and_bare` covering both `staging."my orders"` AND symmetric `"my db".sch.t`
+- [Phase 68 P01]: A7 aligns find_primary_key's three word-boundary checks with find_unique's `_`-exclusion — pure defensive consolidation, no observable behaviour change on existing fixtures
+- [Phase 68 P01]: 146 body_parser unit tests PASS (up from 141 pre-plan; 5 new); 58/58 sqllogictests PASS including Phase 67 fixture with extended Scenario 5 + 3 base-table DROP cleanup rows
+- [Phase 68 P02]: C1+C2 bundled as a single atomic commit (3a957db) — body.get(..400).unwrap_or(body) replaces &body[..body.len().min(400)] for panic-safety on the error-formatter path; transmute needle drops trailing '(' so it catches both bare std::mem::transmute(...) and turbofish std::mem::transmute::<T, U>(...) forms; plan-checker substring-match invariant preserved
+- [Phase 68 P02]: C3 deletion (b61c91f) — test/sql/p651_ok.yaml removed; .gitignore amended to cover the runtime artefact rewritten by phase651_yaml_filesystem_access_gating.test's COPY TO '__TEST_DIR__/p651_ok.yaml' (Rule 3 auto-fix — sqllogictest runner resolves __TEST_DIR__ to test/sql/, so the file regenerates on every full run and would otherwise re-appear as untracked after each `just test-sql`)
+- [Phase 68 P02]: 58/58 sqllogictests PASS post-deletion (phase651_yaml_filesystem_access_gating still exercises the runtime COPY contract, which is the actual gating test surface per D-13); registration_error_surfaces test still 1 PASS
+- [Phase ?]: [Phase 68 P03]: B1+B2 land identifier-aware tokenisation at the two sibling split_whitespace sites (TECH-DEBT #25) — parse_non_additive_dims + parse_over_content ORDER BY arm. D-08 dotted-path resolver acceptance via new split_qualified_identifier helper applied at both NAB and window ORDER BY dim-validators
+- [Phase ?]: [Phase 68 P03]: D-10 renegotiation — Scenario 2 of both fixtures narrowed to DDL+round-trip validation; expand-side dotted-path emission (semi-additive + window) produces wrong quoting shape and is deferred (v0.10.1+ territory, orthogonal to TECH-DEBT #25 parser-layer port)
 
 ### Pending Todos
 
@@ -107,6 +180,7 @@ Recent decisions affecting current work:
 | 260331-ta2 | Release recipe for CE registry | 2026-03-31 | 0390bab |
 | 260412-v5h | Generate complete CHANGELOG.md | 2026-04-12 | d42d240 |
 | 260430-vdz | Fix parser hook to skip leading SQL comments (-- and /* */) before prefix matching | 2026-04-30 | edf5196 |
+| 260527-p9t | Address Copilot PR #35 review items (CatalogReader lifetime, test cleanup, shim comment, just recipe) | 2026-05-27 | 541a5d0 |
 | Phase 51 P01 | 20min | 2 tasks | 6 files |
 | Phase 55 P01 | 18min | 2 tasks | 6 files |
 | Phase 56 P01 | 25min | 2 tasks | 8 files |
@@ -123,9 +197,35 @@ Recent decisions affecting current work:
 | Phase 64 P02 | 7 | 2 tasks | 2 files |
 | Phase 64 P03 | 8 | 2 tasks | 1 files |
 | Phase 64 P04 | 6 | 3 tasks | 12 files |
+| Phase 65 P01 | 31min | 3 tasks | 5 files |
+| Phase 65 P02 (replanned, halted) | ~30min | 2 of 6 tasks (Wave-0 spikes only) | 1 file (SPIKES.md only — both spikes reverted to disk-empty before commit) |
+| Phase 65 P03 | 1h | 3 tasks | 9 files |
+| Phase 65 P04 | 2h | 4 tasks | 10 files |
+| Phase 65 P05 | ~10h (3 batches) | 6 tasks | 19 files (17 read-side sources + lib.rs + 2 test files) |
+| Phase 65 P06 | ~12h cal (10h pre-rescue + 45m rescue) | 4 tasks | 6 files (src/lib.rs + src/parse.rs + cpp/src/shim.{cpp,hpp} pre-rescue commit 964b0bf; Cargo.{toml,lock}; tests/no_long_lived_conn.rs; test/integration/test_readonly_load.py; deferred-items.md; SUMMARY) |
+| Phase 65.1 P01 | 12min | 3 tasks | 7 files |
+| Phase 65.1 P02a | 30min | 1 tasks | 2 files |
+| Phase 65.1 P03a | 25min | 2 tasks | 14 files |
+| Phase 65.1 P05 | 18min | 1 tasks | 1 files |
+| Phase 65.1 P02b | 15min | 2 tasks | 2 files |
+| Phase 65.1 P03b | 18min | 2 tasks | 4 files |
+| Phase 65.1 P04 | 40min | 2 tasks | 2 files |
+| Phase 65.1 P08 | 10min | 2 tasks | 1 files |
+| Phase 65.1 P09 | 15min | 2 tasks | 5 files |
+| Phase 65.1 P10 | 25min | 1 tasks | 3 files |
+| Phase 65.1 P11 | 12min | 3 tasks | 3 files |
+| Phase 65.1 P12 | 40min | 3 tasks | 5 files |
+| Phase 65.1 P06 | 5min | 1 tasks | 1 files |
+| Phase 66 P01 | 20m | 2 tasks | 2 files |
+| Phase 66 P02 | 30m | 5 tasks | 6 files |
+| Phase 66 P03 | 10 | 1 tasks | 1 files |
+| Phase 68 P01 | 25m | 3 tasks | 3 files |
+| Phase 68 P02 | 6m | 2 tasks | 3 files |
+| Phase 68 P03 | 23m | 3 tasks | 4 files |
 
 ## Session Continuity
 
-Last session: 2026-05-17T15:51:49.700Z
-Stopped at: Completed 64-04-PLAN.md
-Resume file: None
+Last session: 2026-05-27T15:16:33.377Z
+Stopped at: Phase 68 Plan 02 complete (C1+C2 bundle, C3 deletion — registration_error_surfaces panic-safety + turbofish needle + dead-fixture removal with runtime-artefact gitignore)
+Resume file: 
+None

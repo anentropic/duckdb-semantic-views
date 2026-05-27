@@ -1,0 +1,107 @@
+# Phase 68 Plan 03 (B2) / TECH-DEBT #25: OVER ORDER BY accepts quoted
+# identifiers with literal whitespace AND dotted paths (D-08). Sibling of B1
+# fix to parse_non_additive_dims — the split_whitespace shred at the
+# column-reference slot is replaced with the identifier-aware
+# find_identifier_end helper.
+
+require semantic_views
+
+statement ok
+CREATE TABLE p68_b2_orders (id BIGINT, region VARCHAR, "order date" DATE, amount DOUBLE);
+
+statement ok
+INSERT INTO p68_b2_orders VALUES
+  (1, 'US', DATE '2026-01-01', 100.0),
+  (2, 'US', DATE '2026-01-02', 150.0),
+  (3, 'EU', DATE '2026-01-01', 200.0);
+
+# ========================================
+# Scenario 1 — quoted identifier with internal whitespace in OVER ORDER BY
+# Before B2, split_whitespace would shred `"order date"` into two tokens
+# (`"order` + `date"`) and parse_over_content would treat `"order` as the
+# column ref and the rest as an "unexpected" modifier (or silently stop).
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW p68_b2_v1 AS
+  TABLES (o AS p68_b2_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region, o."order date" AS o."order date")
+  METRICS (
+    PRIVATE o.total AS SUM(o.amount),
+    o.running_total AS SUM(total) OVER (PARTITION BY EXCLUDING region ORDER BY "order date" ASC NULLS LAST)
+  )
+
+# Round-trip: GET_DDL preserves the quoted-whitespace column ref verbatim.
+# (Renderer omits explicit ASC since it's the default — output is
+# `ORDER BY "order date" NULLS LAST`.)
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p68_b2_v1') LIKE '%ORDER BY "order date" NULLS LAST%';
+----
+true
+
+# explain_semantic_view confirms the quoted column ref reaches the generated
+# SQL intact (i.e., the parse layer did not shred it). EXCLUDING dim `region`
+# must be in the query since PARTITION BY EXCLUDING is set on it.
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p68_b2_v1', dimensions := ['region', '"order date"'], metrics := ['running_total']) WHERE explain_output LIKE '%"order date"%';
+----
+true
+
+# ========================================
+# Scenario 2 — dotted path in OVER ORDER BY, DDL-level (D-08 extension)
+#
+# `o."order date"` must be captured as a single identifier including the dot
+# through the parser. Like B1 Scenario 2, end-to-end query expansion for
+# dotted-window-ORDER-BY is NOT validated here — the window expand path emits
+# the raw ORDER BY entry text into the OVER clause; the rendered SQL needs
+# `"o"."order date"` shape rather than the parser's stored `o."order date"`
+# pre-quote-normalisation. The expand-side dotted-path emission fix is out of
+# scope for Plan 03 (D-10 renegotiation). Coverage at the parser + DDL
+# round-trip layer is the planner's narrowed scope.
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW p68_b2_v2 AS
+  TABLES (o AS p68_b2_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region, o."order date" AS o."order date")
+  METRICS (
+    PRIVATE o.total AS SUM(o.amount),
+    o.running_total AS SUM(total) OVER (PARTITION BY EXCLUDING region ORDER BY o."order date" ASC NULLS LAST)
+  )
+
+# Round-trip: dotted path preserved in stored DDL.
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'p68_b2_v2') LIKE '%ORDER BY o."order date" NULLS LAST%';
+----
+true
+
+# ========================================
+# Scenario 3 — unterminated quoted identifier surfaces a structured error
+# Before B2, find_identifier_end would saturate at input.len() and the
+# malformed identifier would flow downstream. Post-B2, is_quoting_balanced
+# surfaces a parser-level error first.
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW p68_b2_bad AS
+  TABLES (o AS p68_b2_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region, o."order date" AS o."order date")
+  METRICS (
+    PRIVATE o.total AS SUM(o.amount),
+    o.running_total AS SUM(total) OVER (PARTITION BY EXCLUDING region ORDER BY "unclosed ASC)
+  )
+----
+Unterminated quoted identifier
+
+# ========================================
+# Cleanup
+# ========================================
+
+statement ok
+DROP SEMANTIC VIEW p68_b2_v1;
+
+statement ok
+DROP SEMANTIC VIEW p68_b2_v2;
+
+statement ok
+DROP TABLE p68_b2_orders;

@@ -1,12 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_void;
-use std::sync::Mutex;
 
-use duckdb::{
-    core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId},
-    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value},
-};
+use duckdb::vtab::Value;
 use libduckdb_sys as ffi;
 
 use crate::catalog::CatalogReader;
@@ -18,83 +13,442 @@ use crate::util::suggest_closest;
 use super::error::QueryError;
 
 // ---------------------------------------------------------------------------
-// QueryState -- stored as extra_info on the table function
+// Phase 65 Plan 05 Task 6 (Wave 6) — sv_semantic_view_bind_rust
 // ---------------------------------------------------------------------------
+//
+// FFI dispatcher for the migrated
+// `semantic_view(view_name, dimensions := [...], metrics := [...], facts := [...])`
+// table function. The C++ bind callback (`sv_semantic_view_bind` in
+// `cpp/src/shim.cpp`) opens a per-call `Connection probe(*context.db)`,
+// flattens the three optional LIST(VARCHAR) named parameters into the
+// length-prefixed wire format (same encoding as the Wave 5 explain
+// migration), and invokes this dispatcher. Same `reinterpret_cast` bridge
+// + BORROW contract as the 15 prior migrations.
+//
+// Responsibilities of the Rust side:
+//   - Catalog lookup (name normalisation, view-not-found suggestion).
+//   - Wildcard expansion + `QueryRequest` construction.
+//   - `expand::expand()` → expanded SQL.
+//   - Column-type inference at read-side bind time per D-16/D-17:
+//     * For fact queries: always probe via LIMIT 0 on the per-call conn.
+//     * For dim+metric queries: prefer DDL-time persisted types if present
+//       (back-compat for v0.7.1-era catalog rows); fall back to LIMIT 0
+//       probe on per-call conn otherwise.
+//   - `build_execution_sql()` wrapping for HUGEINT→BIGINT casts etc.
+//
+// The dispatcher returns a flat binary buffer to the C++ side encoding
+// the schema + execution_sql for bind to declare output columns and the
+// init_global callback to run the query. Wire format:
+//
+//   u32 n_cols (little-endian)
+//   for each col:
+//     u32 byte_len + bytes (column name, UTF-8)
+//     u32 type_id (little-endian; already passed through normalize_type_id)
+//   u32 byte_len + bytes (execution_sql, UTF-8)
+//
+// Return codes mirror the Wave 5 dispatcher:
+//   0 — success; (out_ptr, out_len) populated.
+//   1 — user-visible error; error_buf populated (raised as BinderException).
+//   2 — internal error (panic across FFI); error_buf populated.
 
-/// Shared state for the `semantic_query` table function.
+// Phase 65.1 WR-05: returns Result<_, String> so the dispatcher can
+// surface byte-offset / element-index detail in the user message,
+// matching the diagnostic shape of the C++ sv_parse_varchar_payload
+// helpers. Sibling of src/query/explain.rs::parse_string_list.
+unsafe fn sv_parse_string_list(buf: *const u8, len: usize) -> Result<Vec<String>, String> {
+    if buf.is_null() {
+        return if len == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(format!("null buffer but len={len} (FFI shape drift)"))
+        };
+    }
+    if len < 4 {
+        return Err(format!(
+            "buffer too short for count prefix: len={len} (expected >= 4)"
+        ));
+    }
+    let slice = std::slice::from_raw_parts(buf, len);
+    let mut off = 0usize;
+    let read_u32 = |slice: &[u8], off: &mut usize| -> Result<u32, String> {
+        if *off + 4 > slice.len() {
+            return Err(format!(
+                "expected u32 at offset {} of {} (truncated)",
+                *off,
+                slice.len()
+            ));
+        }
+        let v = u32::from_le_bytes(slice[*off..*off + 4].try_into().map_err(
+            |e: std::array::TryFromSliceError| format!("u32 decode failed at offset {}: {e}", *off),
+        )?);
+        *off += 4;
+        Ok(v)
+    };
+    let count = read_u32(slice, &mut off)? as usize;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let n = read_u32(slice, &mut off)
+            .map_err(|e| format!("reading length for element {i} of {count}: {e}"))?
+            as usize;
+        if off + n > slice.len() {
+            return Err(format!(
+                "element {i} of {count} declares length {n} but only {} bytes remain at offset {off}",
+                slice.len().saturating_sub(off)
+            ));
+        }
+        out.push(String::from_utf8_lossy(&slice[off..off + n]).into_owned());
+        off += n;
+    }
+    if off != len {
+        return Err(format!(
+            "trailing {} bytes after count {count} (consumed {off} of {len})",
+            len - off
+        ));
+    }
+    Ok(out)
+}
+
+/// # Safety
 ///
-/// Carries a catalog reader (queries `semantic_layer._definitions` via a
-/// dedicated catalog connection) and a raw `duckdb_connection` handle for
-/// executing expanded SQL via the C API. Both connections are created
-/// independently of the host connection by calling `duckdb_connect` on the
-/// same database handle, avoiding lock conflicts with the host during query
-/// execution.
-#[derive(Clone)]
-pub struct QueryState {
-    pub catalog: CatalogReader,
-    /// Raw connection handle for SQL execution.
-    pub conn: ffi::duckdb_connection,
-}
+/// `conn` is a borrowed handle (do NOT disconnect). Wire-format payloads
+/// described above; `name_ptr` must point to `name_len` UTF-8 bytes.
+#[cfg(feature = "extension")]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn sv_semantic_view_bind_rust(
+    conn: ffi::duckdb_connection,
+    name_ptr: *const u8,
+    name_len: usize,
+    dims_ptr: *const u8,
+    dims_len: usize,
+    metrics_ptr: *const u8,
+    metrics_len: usize,
+    facts_ptr: *const u8,
+    facts_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    error_buf: *mut u8,
+    error_buf_len: usize,
+) -> u8 {
+    use crate::ddl::read_ffi::{
+        probe_catalog_table_present, publish_owned_buffer, write_err, BorrowedConnection,
+    };
+    use std::panic::AssertUnwindSafe;
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // Wrap-on-entry (Phase 65.1 D-10 / WR-05). The raw `conn` parameter
+        // is shadowed; everything downstream goes through `&borrowed` or
+        // `borrowed.as_raw()`. `ffi::duckdb_disconnect` does not type-check
+        // against `&mut BorrowedConnection`, enforcing the BORROW contract.
+        let borrowed = BorrowedConnection::new(conn);
+        if borrowed.is_null() {
+            write_err(error_buf, error_buf_len, "duckdb_connection is null");
+            return 1_u8;
+        }
+        if name_ptr.is_null() {
+            write_err(error_buf, error_buf_len, "view name pointer is null");
+            return 1_u8;
+        }
+        let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
+        let view_name_raw = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
+                return 1_u8;
+            }
+        };
+        let view_name = match crate::ident::normalize_view_name(&view_name_raw) {
+            Ok(s) => s,
+            Err(e) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("Invalid view name '{view_name_raw}': {e}"),
+                );
+                return 1_u8;
+            }
+        };
 
-// SAFETY: The `duckdb_connection` raw pointer is an opaque handle managed by DuckDB.
-// It was created during `extension_entrypoint` and lives for the database session lifetime.
-// DuckDB manages internal synchronization for connections.
-unsafe impl Send for QueryState {}
-unsafe impl Sync for QueryState {}
+        let dimensions = match sv_parse_string_list(dims_ptr, dims_len) {
+            Ok(v) => v,
+            Err(detail) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("malformed `dimensions` payload: {detail}"),
+                );
+                return 1_u8;
+            }
+        };
+        let metrics = match sv_parse_string_list(metrics_ptr, metrics_len) {
+            Ok(v) => v,
+            Err(detail) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("malformed `metrics` payload: {detail}"),
+                );
+                return 1_u8;
+            }
+        };
+        let facts = match sv_parse_string_list(facts_ptr, facts_len) {
+            Ok(v) => v,
+            Err(detail) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("malformed `facts` payload: {detail}"),
+                );
+                return 1_u8;
+            }
+        };
 
-// ---------------------------------------------------------------------------
-// BindData / InitData
-// ---------------------------------------------------------------------------
+        if dimensions.is_empty() && metrics.is_empty() && facts.is_empty() {
+            write_err(
+                error_buf,
+                error_buf_len,
+                &QueryError::EmptyRequest {
+                    view_name: view_name.clone(),
+                }
+                .to_string(),
+            );
+            return 1_u8;
+        }
 
-/// Data computed at bind time: the expanded SQL, output schema, and metadata.
-pub struct SemanticViewBindData {
-    /// The SQL query generated by `expand()`, ready for display (e.g., EXPLAIN).
-    expanded_sql: String,
-    /// The SQL actually executed at query time. May wrap `expanded_sql` with
-    /// explicit type casts to ensure runtime column types match bind declarations
-    /// (handles HUGEINT→BIGINT optimizer changes and STRUCT/MAP→VARCHAR).
-    execution_sql: String,
-    /// Output column names (dimensions first, then metrics).
-    column_names: Vec<String>,
-    /// DuckDB type enums (as u32) for each output column, parallel to column_names.
-    /// `DUCKDB_TYPE_INVALID` (0) signals VARCHAR fallback for that column.
-    /// Retained for diagnostic purposes (e.g., future EXPLAIN enhancements).
-    #[allow(dead_code)]
-    column_type_ids: Vec<u32>,
-}
+        let reader = CatalogReader::new(&borrowed, probe_catalog_table_present(&borrowed));
+        let json_str = match reader.lookup(&view_name) {
+            Ok(Some(j)) => j,
+            Ok(None) => {
+                let available = reader.list_names().unwrap_or_default();
+                let suggestion = suggest_closest(&view_name, &available);
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::ViewNotFound {
+                        name: view_name,
+                        suggestion,
+                        available,
+                    }
+                    .to_string(),
+                );
+                return 1_u8;
+            }
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
 
-// SAFETY: All fields are `Send + Sync` types.
-unsafe impl Send for SemanticViewBindData {}
-unsafe impl Sync for SemanticViewBindData {}
+        let def = match SemanticViewDefinition::from_json(&view_name, &json_str) {
+            Ok(d) => d,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e.to_string());
+                return 1_u8;
+            }
+        };
 
-/// Mutable state for streaming result chunks during query execution.
-struct StreamingState {
-    result: ffi::duckdb_result,
-    chunk_count: usize,
-    col_count: usize,
-    current_chunk: usize,
-}
+        let dimensions = match expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension) {
+            Ok(v) => v,
+            Err(e) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::ExpandFailed {
+                        source: crate::expand::ExpandError::EmptyRequest {
+                            view_name: format!("{view_name}: {e}"),
+                        },
+                    }
+                    .to_string(),
+                );
+                return 1_u8;
+            }
+        };
+        let metrics = match expand_wildcards(&metrics, &def, &WildcardItemType::Metric) {
+            Ok(v) => v,
+            Err(e) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::ExpandFailed {
+                        source: crate::expand::ExpandError::EmptyRequest {
+                            view_name: format!("{view_name}: {e}"),
+                        },
+                    }
+                    .to_string(),
+                );
+                return 1_u8;
+            }
+        };
+        let facts = match expand_wildcards(&facts, &def, &WildcardItemType::Fact) {
+            Ok(v) => v,
+            Err(e) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::ExpandFailed {
+                        source: crate::expand::ExpandError::EmptyRequest {
+                            view_name: format!("{view_name}: {e}"),
+                        },
+                    }
+                    .to_string(),
+                );
+                return 1_u8;
+            }
+        };
 
-// SAFETY: duckdb_result contains raw pointers but is only accessed single-threaded
-// through the Mutex in func() calls. DuckDB table functions run on a single thread
-// per scan.
-unsafe impl Send for StreamingState {}
+        let req = QueryRequest {
+            dimensions: dimensions
+                .iter()
+                .map(|s| crate::expand::DimensionName::new(s.clone()))
+                .collect(),
+            metrics: metrics
+                .iter()
+                .map(|s| crate::expand::MetricName::new(s.clone()))
+                .collect(),
+            facts: facts.clone(),
+        };
+        let expanded_sql = match expand(&view_name, &def, &req) {
+            Ok(s) => s,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &QueryError::from(e).to_string());
+                return 1_u8;
+            }
+        };
 
-impl Drop for StreamingState {
-    fn drop(&mut self) {
-        unsafe { ffi::duckdb_destroy_result(&mut self.result) }
+        // Type inference — same fall-back ladder as the legacy bind, but
+        // every LIMIT-0 probe now runs on the per-call connection (`conn`)
+        // instead of the long-lived `state.conn` (H2). The DDL-time
+        // persisted-types branch stays as a back-compat fast path for
+        // v0.7.1-era catalog rows where `column_type_names` may still be
+        // populated; new definitions land with empty vecs (Plan 03 D-16).
+        let type_map: HashMap<String, u32> = def
+            .inferred_types()
+            .map(|(name, t)| (name.to_ascii_lowercase(), normalize_type_id(t)))
+            .collect();
+
+        let (column_names, column_type_ids): (Vec<String>, Vec<u32>) = if !facts.is_empty() {
+            let limit0_sql = format!("{expanded_sql} LIMIT 0");
+            // Phase 65.1 Plan 11 / WR-08 / D-15: surface probe failures
+            // via the error_buf cascade. No silent vec![0u32; names.len()]
+            // fallback to DUCKDB_TYPE_INVALID — that masked broken FACTS
+            // expressions behind a VARCHAR placeholder at query time.
+            match try_infer_schema(&borrowed, &limit0_sql) {
+                Ok((names, types)) => {
+                    let type_ids: Vec<u32> =
+                        types.iter().map(|t| normalize_type_id(*t as u32)).collect();
+                    (names, type_ids)
+                }
+                Err(msg) => {
+                    write_err(
+                        error_buf,
+                        error_buf_len,
+                        &format!(
+                            "semantic_view: type inference failed for query \
+                             `{limit0_sql}`: {msg}"
+                        ),
+                    );
+                    return 1_u8;
+                }
+            }
+        } else if !type_map.is_empty() {
+            let mut names = Vec::new();
+            let mut type_ids = Vec::new();
+            for dim_name in &dimensions {
+                let canonical = def
+                    .dimensions
+                    .iter()
+                    .find(|d| d.name.eq_ignore_ascii_case(dim_name))
+                    .map_or_else(|| dim_name.clone(), |d| d.name.clone());
+                let t = *type_map
+                    .get(&canonical.to_ascii_lowercase())
+                    .unwrap_or(&0u32);
+                names.push(canonical);
+                type_ids.push(t);
+            }
+            for met_name in &metrics {
+                let canonical = def
+                    .metrics
+                    .iter()
+                    .find(|m| m.name.eq_ignore_ascii_case(met_name))
+                    .map_or_else(|| met_name.clone(), |m| m.name.clone());
+                let t = *type_map
+                    .get(&canonical.to_ascii_lowercase())
+                    .unwrap_or(&0u32);
+                names.push(canonical);
+                type_ids.push(t);
+            }
+            (names, type_ids)
+        } else {
+            let limit0_sql = format!("{expanded_sql} LIMIT 0");
+            // Phase 65.1 Plan 11 / WR-08 / D-15: same surface as the
+            // facts-path above; no silent DUCKDB_TYPE_INVALID fallback.
+            match try_infer_schema(&borrowed, &limit0_sql) {
+                Ok((names, types)) => {
+                    let type_ids: Vec<u32> =
+                        types.iter().map(|t| normalize_type_id(*t as u32)).collect();
+                    (names, type_ids)
+                }
+                Err(msg) => {
+                    write_err(
+                        error_buf,
+                        error_buf_len,
+                        &format!(
+                            "semantic_view: type inference failed for query \
+                             `{limit0_sql}`: {msg}"
+                        ),
+                    );
+                    return 1_u8;
+                }
+            }
+        };
+
+        // Build execution SQL with casts where needed (HUGEINT→BIGINT etc).
+        let execution_sql = build_execution_sql(&expanded_sql, &column_names, &column_type_ids);
+
+        // Serialise schema + execution_sql into a flat binary buffer.
+        let n_cols = column_names.len() as u32;
+        let cap = 4 // n_cols
+            + column_names.iter().map(|n| 4 + n.len()).sum::<usize>()
+            + column_type_ids.len() * 4
+            + 4 + execution_sql.len();
+        let mut buf: Vec<u8> = Vec::with_capacity(cap);
+        buf.extend_from_slice(&n_cols.to_le_bytes());
+        for (name, tid) in column_names.iter().zip(column_type_ids.iter()) {
+            let nl = name.len() as u32;
+            buf.extend_from_slice(&nl.to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.extend_from_slice(&tid.to_le_bytes());
+        }
+        let sql_len = execution_sql.len() as u32;
+        buf.extend_from_slice(&sql_len.to_le_bytes());
+        buf.extend_from_slice(execution_sql.as_bytes());
+
+        publish_owned_buffer(buf, out_ptr, out_len);
+        0_u8
+    }));
+    match result {
+        Ok(rc) => rc,
+        Err(_) => {
+            use crate::ddl::read_ffi::write_err;
+            write_err(
+                error_buf,
+                error_buf_len,
+                "internal error: panic inside sv_semantic_view_bind_rust",
+            );
+            2
+        }
     }
 }
 
-/// State tracked during function execution.
-pub struct SemanticViewInitData {
-    /// Streaming state: `None` before first `func()` call, `Some` during streaming.
-    inner: Mutex<Option<StreamingState>>,
-}
-
-// SAFETY: Mutex provides interior mutability; StreamingState is Send.
-unsafe impl Send for SemanticViewInitData {}
-unsafe impl Sync for SemanticViewInitData {}
+// ---------------------------------------------------------------------------
+// Legacy `QueryState` + `SemanticViewBindData` + `StreamingState` +
+// `SemanticViewInitData` RETIRED — Phase 65 Plan 05 Batch 3. The C++
+// Catalog API path (`sv_register_semantic_view`) carries its own
+// BindData / GlobalState struct on the C++ side; the Rust dispatcher
+// `sv_semantic_view_bind_rust` only serialises the wire format and
+// returns. The `MaterializedQueryResult` lives in `SemanticViewGlobalState`
+// on the C++ side (see `cpp/src/shim.cpp`) and outlives the per-call
+// Connection that produced it.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // FFI helpers
@@ -128,67 +482,17 @@ pub(crate) unsafe fn execute_sql_raw(
     Ok(result)
 }
 
-/// Extract the raw `duckdb_value` pointer from a `duckdb::vtab::Value`.
-///
-/// The `Value` struct has a single field `ptr: duckdb_value` (which is `*mut c_void`),
-/// but it is `pub(crate)` and inaccessible from external crates.  Since both types
-/// are exactly one pointer wide, transmute is a safe layout conversion.
-///
-/// The returned pointer is valid only for the lifetime of the `Value` (it is NOT
-/// destroyed; the `Value` still owns it).
-///
-/// # Safety
-///
-/// Relies on `duckdb::vtab::Value` layout being a single `duckdb_value` field.
-/// This is stable for `duckdb = "=1.4.4"`.
-pub(crate) unsafe fn value_raw_ptr(value: &Value) -> ffi::duckdb_value {
-    // Value is repr(Rust) with one field: duckdb_value (*mut c_void).
-    // Reading the pointer without taking ownership.
-    let ptr_to_value = std::ptr::from_ref(value).cast::<ffi::duckdb_value>();
-    std::ptr::read(ptr_to_value)
-}
-
-/// Extract string elements from a DuckDB LIST(VARCHAR) value.
-///
-/// Uses the C API `duckdb_get_list_size` and `duckdb_get_list_child` to iterate
-/// the list, then `duckdb_get_varchar` on each child element.
-///
-/// # Safety
-///
-/// `value` must represent a LIST(VARCHAR) value.
-pub(crate) unsafe fn extract_list_strings(value: &Value) -> Vec<String> {
-    let value_ptr = value_raw_ptr(value);
-    let size = ffi::duckdb_get_list_size(value_ptr);
-    let mut result = Vec::with_capacity(size as usize);
-    for i in 0..size {
-        let child = ffi::duckdb_get_list_child(value_ptr, i);
-        let cstr = ffi::duckdb_get_varchar(child);
-        if !cstr.is_null() {
-            let s = CStr::from_ptr(cstr).to_string_lossy().into_owned();
-            ffi::duckdb_free(cstr.cast::<c_void>());
-            result.push(s);
-        }
-        ffi::duckdb_destroy_value(&mut { child });
-    }
-    result
-}
-
-// ---------------------------------------------------------------------------
-// Type mapping helpers
-// ---------------------------------------------------------------------------
-
-/// RAII wrapper for `ffi::duckdb_logical_type` handles.
-///
-/// Automatically calls `duckdb_destroy_logical_type` when dropped.
-struct LogicalTypeOwned(ffi::duckdb_logical_type);
-
-impl Drop for LogicalTypeOwned {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { ffi::duckdb_destroy_logical_type(&mut self.0) };
-        }
-    }
-}
+// `value_raw_ptr`, `extract_list_strings`, `LogicalTypeOwned`,
+// `type_from_duckdb_type_u32`, `declare_output_type` RETIRED — Phase 65
+// Plan 05 Batch 3. All five helpers belonged to the legacy
+// `SemanticViewVTab` Rust path. The C++ Catalog API path
+// (`sv_register_semantic_view`) flattens LIST(VARCHAR) named params
+// inside `cpp/src/shim.cpp::sv_serialise_string_list` and declares
+// output logical types via the C++ helper
+// `sv_logical_type_from_c_type_id` (see BATCH2-SUMMARY for the C-API ↔
+// C++ enum-value mismatch story). Their removal also retires the
+// duckdb-rs `Value`-pointer transmute that depended on
+// `repr(Rust)` layout assumptions of `duckdb::vtab::Value`.
 
 /// Normalize HUGEINT/UHUGEINT type IDs to BIGINT/UBIGINT.
 ///
@@ -205,140 +509,6 @@ pub(crate) fn normalize_type_id(t: u32) -> u32 {
         HUGEINT => BIGINT,
         UHUGEINT => UBIGINT,
         _ => t,
-    }
-}
-
-/// Convert a DuckDB type ID (u32) to a human-readable display name for
-/// DESCRIBE/SHOW output (DATA_TYPE property).
-///
-/// Returns `None` for types where setting `output_type` would introduce a
-/// lossy CAST wrapper (DECIMAL loses precision, LIST/ARRAY loses child type).
-/// For these types, `output_type` remains `None` and DESCRIBE shows empty.
-///
-/// Returns `Some("TYPE_NAME")` for types where CAST is safe (no-op).
-pub(crate) fn type_id_to_display_name(type_id: u32) -> Option<&'static str> {
-    const BOOLEAN: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN;
-    const TINYINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT;
-    const SMALLINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT;
-    const INTEGER: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER;
-    const BIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT;
-    const UTINYINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT;
-    const USMALLINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT;
-    const UINTEGER: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER;
-    const UBIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT;
-    const FLOAT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT;
-    const DOUBLE: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE;
-    const TIMESTAMP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP;
-    const DATE: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE;
-    const TIME: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIME;
-    const INTERVAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL;
-    const HUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT;
-    const UHUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT;
-    const VARCHAR: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR;
-    const BLOB: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB;
-    const TIMESTAMP_S: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S;
-    const TIMESTAMP_MS: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS;
-    const TIMESTAMP_NS: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS;
-    const TIMESTAMP_TZ: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ;
-    const ENUM: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_ENUM;
-    const UUID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID;
-    const UNION: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UNION;
-    const BIT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIT;
-    const TIME_TZ: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIME_TZ;
-    const STRUCT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT;
-    const MAP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP;
-    const INVALID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID;
-
-    match type_id {
-        BOOLEAN => Some("BOOLEAN"),
-        TINYINT => Some("TINYINT"),
-        SMALLINT => Some("SMALLINT"),
-        INTEGER => Some("INTEGER"),
-        BIGINT | HUGEINT => Some("BIGINT"),
-        UTINYINT => Some("UTINYINT"),
-        USMALLINT => Some("USMALLINT"),
-        UINTEGER => Some("UINTEGER"),
-        UBIGINT | UHUGEINT => Some("UBIGINT"),
-        FLOAT => Some("FLOAT"),
-        DOUBLE => Some("DOUBLE"),
-        DATE => Some("DATE"),
-        TIME => Some("TIME"),
-        INTERVAL => Some("INTERVAL"),
-        TIMESTAMP => Some("TIMESTAMP"),
-        TIMESTAMP_S => Some("TIMESTAMP_S"),
-        TIMESTAMP_MS => Some("TIMESTAMP_MS"),
-        TIMESTAMP_NS => Some("TIMESTAMP_NS"),
-        TIMESTAMP_TZ => Some("TIMESTAMPTZ"),
-        VARCHAR => Some("VARCHAR"),
-        BLOB => Some("BLOB"),
-        ENUM => Some("VARCHAR"), // enum values are strings
-        UUID => Some("UUID"),
-        BIT => Some("BIT"),
-        TIME_TZ => Some("TIMETZ"),
-        STRUCT | MAP => Some("VARCHAR"),
-        // Parameterized/lossy types — skip to avoid invalid CAST
-        UNION => None,
-        INVALID => None,
-        // DECIMAL: bare "DECIMAL" defaults to (18,3), lossy
-        // LIST/ARRAY: bare type loses child type info
-        _ => None,
-    }
-}
-
-/// Convert a raw `ffi::duckdb_type` (u32) to a `LogicalTypeHandle`.
-///
-/// DECIMAL, LIST, ENUM, and STRUCT/MAP/complex types need the logical type handle
-/// for accurate metadata; they are handled separately via `declare_output_type`.
-/// INVALID (0) falls back to VARCHAR.
-fn type_from_duckdb_type_u32(t: u32) -> LogicalTypeHandle {
-    // Named constants matching libduckdb-sys DUCKDB_TYPE_DUCKDB_TYPE_* values.
-    const INVALID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID;
-    const STRUCT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT;
-    const MAP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP;
-    match t {
-        // Complex types with no flat binary representation fall back to VARCHAR.
-        INVALID | STRUCT | MAP => LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        // All other types map directly via the type_id.
-        // Note: HUGEINT/UHUGEINT should already be normalized to BIGINT/UBIGINT
-        // via normalize_type_id() before reaching here.
-        _ => LogicalTypeHandle::from(LogicalTypeId::from(t)),
-    }
-}
-
-/// Declare the output type for a column, using logical type metadata for DECIMAL/LIST/ENUM.
-///
-/// For complex types that need logical type metadata (DECIMAL width/scale, LIST child type,
-/// ENUM → VARCHAR), this function reads the metadata and returns the correct output type.
-/// All other types delegate to `type_from_duckdb_type_u32`.
-///
-/// # Safety
-///
-/// `logical_type` must be a valid `duckdb_logical_type` handle for column `type_id`.
-unsafe fn declare_output_type(
-    logical_type: ffi::duckdb_logical_type,
-    type_id: u32,
-) -> LogicalTypeHandle {
-    const DECIMAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL;
-    const LIST: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST;
-    const ENUM: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_ENUM;
-
-    match type_id {
-        DECIMAL => {
-            let width = ffi::duckdb_decimal_width(logical_type);
-            let scale = ffi::duckdb_decimal_scale(logical_type);
-            LogicalTypeHandle::decimal(width, scale)
-        }
-        LIST => {
-            let child_lt = LogicalTypeOwned(ffi::duckdb_list_type_child_type(logical_type));
-            let child_type_id = ffi::duckdb_get_type_id(child_lt.0) as u32;
-            let child_lth = LogicalTypeHandle::from(LogicalTypeId::from(child_type_id));
-            LogicalTypeHandle::list(&child_lth)
-        }
-        ENUM => {
-            // ENUM output is declared as VARCHAR — users see string values, not ordinals.
-            LogicalTypeHandle::from(LogicalTypeId::Varchar)
-        }
-        _ => type_from_duckdb_type_u32(type_id),
     }
 }
 
@@ -457,426 +627,13 @@ fn build_execution_sql(
 }
 
 // ---------------------------------------------------------------------------
-// VTab implementation
+// Legacy `SemanticViewVTab` (duckdb-rs `VTab` impl) RETIRED — Phase 65 Plan 05
+// Batch 3. The C++ Catalog API path (`sv_register_semantic_view` →
+// `sv_semantic_view_bind_rust` above) is the sole registration target.
+// The MaterializedQueryResult lives in `SemanticViewGlobalState` on the C++
+// side and outlives the per-call Connection that produced it (see
+// `cpp/src/shim.cpp` and 65-05-BATCH2-SUMMARY.md for the streaming model).
 // ---------------------------------------------------------------------------
-
-/// The `semantic_query` table function.
-///
-/// Registered as a single generic function that accepts a view name as a
-/// positional parameter and optional `dimensions` / `metrics` as named
-/// `LIST(VARCHAR)` parameters.
-///
-/// Usage:
-/// ```sql
-/// FROM semantic_query('my_view', dimensions := ['region'], metrics := ['total_revenue'])
-/// ```
-pub struct SemanticViewVTab;
-
-impl VTab for SemanticViewVTab {
-    type BindData = SemanticViewBindData;
-    type InitData = SemanticViewInitData;
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
-            // 1. Extract the view name (positional parameter 0).
-            //    Normalise quoted/qualified forms (e.g. `semantic_view('"v"', ...)`
-            //    or `semantic_view('"db"."sch"."v"', ...)`) to the bare key so
-            //    the catalog lookup below matches the row inserted by CREATE.
-            //    This mirrors the DDL-side capture-site normalisation in
-            //    `src/parse.rs` (Phase 64).
-            let view_name_raw = bind.get_parameter(0).to_string();
-            let view_name = crate::ident::normalize_view_name(&view_name_raw).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!(
-                    "Invalid view name '{view_name_raw}': {e}"
-                ))
-            })?;
-
-            // 2. Extract dimensions and metrics from named LIST(VARCHAR) parameters.
-            //    Use the raw duckdb_value FFI to iterate list elements.
-            let dimensions = match bind.get_named_parameter("dimensions") {
-                Some(ref val) => unsafe { extract_list_strings(val) },
-                None => vec![],
-            };
-            let metrics = match bind.get_named_parameter("metrics") {
-                Some(ref val) => unsafe { extract_list_strings(val) },
-                None => vec![],
-            };
-            let facts = match bind.get_named_parameter("facts") {
-                Some(ref val) => unsafe { extract_list_strings(val) },
-                None => vec![],
-            };
-
-            // 3. Validate: at least one dimension, metric, or fact.
-            if dimensions.is_empty() && metrics.is_empty() && facts.is_empty() {
-                let err: Box<dyn std::error::Error> = Box::new(QueryError::EmptyRequest {
-                    view_name: view_name.clone(),
-                });
-                return Err(err);
-            }
-
-            // 4. Look up view definition in the catalog.
-            let state_ptr = bind.get_extra_info::<QueryState>();
-            let state = unsafe { &*state_ptr };
-            let json_str = match state
-                .catalog
-                .lookup(&view_name)
-                .map_err(Box::<dyn std::error::Error>::from)?
-            {
-                Some(j) => j,
-                None => {
-                    let available = state
-                        .catalog
-                        .list_names()
-                        .map_err(Box::<dyn std::error::Error>::from)?;
-                    let suggestion = suggest_closest(&view_name, &available);
-                    let err: Box<dyn std::error::Error> = Box::new(QueryError::ViewNotFound {
-                        name: view_name,
-                        suggestion,
-                        available,
-                    });
-                    return Err(err);
-                }
-            };
-
-            // 5. Parse definition, expand wildcards, and expand.
-            let def = SemanticViewDefinition::from_json(&view_name, &json_str)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-
-            // 5a. Expand table_alias.* wildcards before constructing the query request.
-            let dimensions = expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension)
-                .map_err(|e| -> Box<dyn std::error::Error> {
-                    Box::new(QueryError::ExpandFailed {
-                        source: crate::expand::ExpandError::EmptyRequest {
-                            view_name: format!("{view_name}: {e}"),
-                        },
-                    })
-                })?;
-            let metrics = expand_wildcards(&metrics, &def, &WildcardItemType::Metric).map_err(
-                |e| -> Box<dyn std::error::Error> {
-                    Box::new(QueryError::ExpandFailed {
-                        source: crate::expand::ExpandError::EmptyRequest {
-                            view_name: format!("{view_name}: {e}"),
-                        },
-                    })
-                },
-            )?;
-            let facts = expand_wildcards(&facts, &def, &WildcardItemType::Fact).map_err(
-                |e| -> Box<dyn std::error::Error> {
-                    Box::new(QueryError::ExpandFailed {
-                        source: crate::expand::ExpandError::EmptyRequest {
-                            view_name: format!("{view_name}: {e}"),
-                        },
-                    })
-                },
-            )?;
-
-            let req = QueryRequest {
-                dimensions: dimensions
-                    .iter()
-                    .map(|s| crate::expand::DimensionName::new(s.clone()))
-                    .collect(),
-                metrics: metrics
-                    .iter()
-                    .map(|s| crate::expand::MetricName::new(s.clone()))
-                    .collect(),
-                facts: facts.clone(),
-            };
-            let expanded_sql = expand(&view_name, &def, &req)
-                .map_err(|e| -> Box<dyn std::error::Error> { Box::new(QueryError::from(e)) })?;
-
-            // 6. Resolve output column names and types.
-            //    Primary path: use DDL-time stored type data (column_type_names + column_types_inferred).
-            //    Fallback path: run LIMIT 0 at bind time (in-memory DB or inference failed at DDL time).
-            //    Full fallback: derive names from definition, all VARCHAR.
-            let type_map: HashMap<String, u32> = def
-                .inferred_types()
-                .map(|(name, t)| (name.to_ascii_lowercase(), normalize_type_id(t)))
-                .collect();
-
-            let (column_names, column_type_ids) = if !facts.is_empty() {
-                // Fact queries: use LIMIT 0 for type inference (facts use per-fact output_type
-                // strings, not the column_types_inferred map).
-                let limit0_sql = format!("{expanded_sql} LIMIT 0");
-                if let Some((names, types)) = unsafe { try_infer_schema(state.conn, &limit0_sql) } {
-                    let type_ids: Vec<u32> =
-                        types.iter().map(|t| normalize_type_id(*t as u32)).collect();
-                    (names, type_ids)
-                } else {
-                    // Full fallback: derive names from definition, all VARCHAR.
-                    let mut names = Vec::new();
-                    for dim_name in &dimensions {
-                        let canonical = def
-                            .dimensions
-                            .iter()
-                            .find(|d| d.name.eq_ignore_ascii_case(dim_name))
-                            .map_or_else(|| dim_name.clone(), |d| d.name.clone());
-                        names.push(canonical);
-                    }
-                    for fact_name in &facts {
-                        let canonical = def
-                            .facts
-                            .iter()
-                            .find(|f| f.name.eq_ignore_ascii_case(fact_name))
-                            .map_or_else(|| fact_name.clone(), |f| f.name.clone());
-                        names.push(canonical);
-                    }
-                    let type_ids = vec![0u32; names.len()];
-                    (names, type_ids)
-                }
-            } else if !type_map.is_empty() {
-                // Primary path: DDL-time inference stored both names and types.
-                // Derive column names from requested dims+metrics (expand() order),
-                // look up each name in the DDL-time type map. No LIMIT 0 at query time.
-                let mut names = Vec::new();
-                let mut type_ids = Vec::new();
-                for dim_name in &dimensions {
-                    let canonical = def
-                        .dimensions
-                        .iter()
-                        .find(|d| d.name.eq_ignore_ascii_case(dim_name))
-                        .map_or_else(|| dim_name.clone(), |d| d.name.clone());
-                    let t = *type_map
-                        .get(&canonical.to_ascii_lowercase())
-                        .unwrap_or(&0u32);
-                    names.push(canonical);
-                    type_ids.push(t);
-                }
-                for met_name in &metrics {
-                    let canonical = def
-                        .metrics
-                        .iter()
-                        .find(|m| m.name.eq_ignore_ascii_case(met_name))
-                        .map_or_else(|| met_name.clone(), |m| m.name.clone());
-                    let t = *type_map
-                        .get(&canonical.to_ascii_lowercase())
-                        .unwrap_or(&0u32);
-                    names.push(canonical);
-                    type_ids.push(t);
-                }
-                (names, type_ids)
-            } else {
-                // Fallback path: in-memory DB or DDL inference failed.
-                // Run try_infer_schema on the per-query expanded SQL (bind-time, safe on state.conn).
-                let limit0_sql = format!("{expanded_sql} LIMIT 0");
-                if let Some((names, types)) = unsafe { try_infer_schema(state.conn, &limit0_sql) } {
-                    let type_ids: Vec<u32> =
-                        types.iter().map(|t| normalize_type_id(*t as u32)).collect();
-                    (names, type_ids)
-                } else {
-                    // Full fallback: derive names from definition, all VARCHAR (0 = INVALID).
-                    let mut names = Vec::new();
-                    for dim_name in &dimensions {
-                        let canonical = def
-                            .dimensions
-                            .iter()
-                            .find(|d| d.name.eq_ignore_ascii_case(dim_name))
-                            .map_or_else(|| dim_name.clone(), |d| d.name.clone());
-                        names.push(canonical);
-                    }
-                    for met_name in &metrics {
-                        let canonical = def
-                            .metrics
-                            .iter()
-                            .find(|m| m.name.eq_ignore_ascii_case(met_name))
-                            .map_or_else(|| met_name.clone(), |m| m.name.clone());
-                        names.push(canonical);
-                    }
-                    let type_ids = vec![0u32; names.len()];
-                    (names, type_ids)
-                }
-            };
-
-            // 7. Declare typed output columns.
-            //    For DECIMAL/LIST/ENUM: we need the logical type for metadata.
-            //    Check if any column requires a LIMIT-0 query for logical type metadata.
-            const DECIMAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL;
-            const LIST: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST;
-            const ENUM: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_ENUM;
-
-            let needs_logical_types = column_type_ids
-                .iter()
-                .any(|&t| t == DECIMAL || t == LIST || t == ENUM);
-
-            if needs_logical_types {
-                // Run a LIMIT 0 query to get logical type handles for columns that need them.
-                let limit0_sql = format!("{expanded_sql} LIMIT 0");
-                if let Ok(mut limit0_result) = unsafe { execute_sql_raw(state.conn, &limit0_sql) } {
-                    for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
-                        let col_pos =
-                            column_names.iter().position(|n| n == name).unwrap_or(0) as ffi::idx_t;
-                        if type_id == DECIMAL || type_id == LIST || type_id == ENUM {
-                            let lt = LogicalTypeOwned(unsafe {
-                                ffi::duckdb_column_logical_type(&mut limit0_result, col_pos)
-                            });
-                            let out_type = unsafe { declare_output_type(lt.0, type_id) };
-                            bind.add_result_column(name, out_type);
-                        } else {
-                            bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
-                        }
-                    }
-                    unsafe { ffi::duckdb_destroy_result(&mut limit0_result) };
-                } else {
-                    // LIMIT 0 failed — fall back to basic type mapping for all columns.
-                    for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
-                        bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
-                    }
-                }
-            } else {
-                // No DECIMAL/LIST/ENUM — fast path, no LIMIT 0 needed.
-                for (name, &type_id) in column_names.iter().zip(column_type_ids.iter()) {
-                    bind.add_result_column(name, type_from_duckdb_type_u32(type_id));
-                }
-            }
-
-            // 8. Build execution SQL with type casts for columns that may have
-            //    runtime type mismatches (HUGEINT→BIGINT, STRUCT/MAP→VARCHAR).
-            let execution_sql = build_execution_sql(&expanded_sql, &column_names, &column_type_ids);
-
-            Ok(SemanticViewBindData {
-                expanded_sql,
-                execution_sql,
-                column_names,
-                column_type_ids,
-            })
-        }))
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(SemanticViewInitData {
-            inner: Mutex::new(None),
-        })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        crate::util::catch_unwind_to_result(std::panic::AssertUnwindSafe(|| {
-            let init_data = func.get_init_data();
-            let bind_data = func.get_bind_data();
-
-            let mut guard = init_data
-                .inner
-                .lock()
-                .map_err(|_| Box::<dyn std::error::Error>::from("query state lock poisoned"))?;
-
-            // First call: execute the query and store the result for streaming.
-            if guard.is_none() {
-                let state = unsafe { &*func.get_extra_info::<QueryState>() };
-                let mut result = unsafe {
-                    execute_sql_raw(state.conn, &bind_data.execution_sql).map_err(
-                        |e| -> Box<dyn std::error::Error> {
-                            Box::new(QueryError::SqlExecution {
-                                expanded_sql: bind_data.expanded_sql.clone(),
-                                duckdb_error: e,
-                            })
-                        },
-                    )?
-                };
-                let chunk_count = unsafe { ffi::duckdb_result_chunk_count(result) } as usize;
-                let col_count = unsafe { ffi::duckdb_column_count(&mut result) } as usize;
-                *guard = Some(StreamingState {
-                    result,
-                    chunk_count,
-                    col_count,
-                    current_chunk: 0,
-                });
-            }
-
-            let streaming = guard.as_mut().unwrap();
-
-            // All chunks consumed — signal end of stream.
-            if streaming.current_chunk >= streaming.chunk_count {
-                output.set_len(0);
-                return Ok(());
-            }
-
-            // Get the next source chunk.
-            let src_chunk = unsafe {
-                ffi::duckdb_result_get_chunk(
-                    streaming.result,
-                    streaming.current_chunk as ffi::idx_t,
-                )
-            };
-            streaming.current_chunk += 1;
-
-            if src_chunk.is_null() {
-                output.set_len(0);
-                return Ok(());
-            }
-
-            let row_count = unsafe { ffi::duckdb_data_chunk_get_size(src_chunk) } as usize;
-            if row_count == 0 {
-                unsafe { ffi::duckdb_destroy_data_chunk(&mut { src_chunk }) };
-                output.set_len(0);
-                return Ok(());
-            }
-
-            // Zero-copy transfer: reference each source vector into the output chunk.
-            let out_ptr = output.get_ptr();
-            let n_cols = streaming.col_count.min(bind_data.column_names.len());
-            for col_idx in 0..n_cols {
-                let src_vec =
-                    unsafe { ffi::duckdb_data_chunk_get_vector(src_chunk, col_idx as ffi::idx_t) };
-                let dst_vec =
-                    unsafe { ffi::duckdb_data_chunk_get_vector(out_ptr, col_idx as ffi::idx_t) };
-
-                // Runtime type validation: compare source and destination vector types.
-                let src_lt =
-                    LogicalTypeOwned(unsafe { ffi::duckdb_vector_get_column_type(src_vec) });
-                let dst_lt =
-                    LogicalTypeOwned(unsafe { ffi::duckdb_vector_get_column_type(dst_vec) });
-                let src_tid = unsafe { ffi::duckdb_get_type_id(src_lt.0) } as u32;
-                let dst_tid = unsafe { ffi::duckdb_get_type_id(dst_lt.0) } as u32;
-
-                if src_tid != dst_tid {
-                    let col_name = bind_data
-                        .column_names
-                        .get(col_idx)
-                        .map_or("?", |n| n.as_str());
-                    unsafe { ffi::duckdb_destroy_data_chunk(&mut { src_chunk }) };
-                    let err: Box<dyn std::error::Error> = Box::new(QueryError::TypeMismatch {
-                        column_index: col_idx,
-                        column_name: col_name.to_string(),
-                        source_type_id: src_tid,
-                        dest_type_id: dst_tid,
-                    });
-                    return Err(err);
-                }
-
-                unsafe { ffi::duckdb_vector_reference_vector(dst_vec, src_vec) };
-            }
-            output.set_len(row_count);
-
-            // Source chunk can be destroyed — vectors share ownership via reference.
-            unsafe { ffi::duckdb_destroy_data_chunk(&mut { src_chunk }) };
-
-            Ok(())
-        }))
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        // Positional parameter: view_name (VARCHAR)
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
-
-    fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
-        Some(vec![
-            (
-                "dimensions".to_string(),
-                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-            ),
-            (
-                "metrics".to_string(),
-                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-            ),
-            (
-                "facts".to_string(),
-                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar)),
-            ),
-        ])
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Schema inference
@@ -884,16 +641,22 @@ impl VTab for SemanticViewVTab {
 
 /// Attempt to infer column names and types by executing a LIMIT 0 query.
 ///
-/// Returns `None` if the query fails for any reason.
+/// Returns `Err(msg)` with the underlying `execute_sql_raw` error text when
+/// the LIMIT 0 probe fails. Phase 65.1 Plan 11 / WR-08 / D-15: callers
+/// surface the error via `write_err` + return rc=1, which the C++ binder
+/// re-raises as `BinderException`. The previous `Option` return type
+/// swallowed the diagnostic via `.ok()?`, masking broken DDL behind a
+/// silent VARCHAR placeholder for `DUCKDB_TYPE_INVALID`.
 ///
 /// # Safety
 ///
-/// `conn` must be a valid `duckdb_connection`.
+/// The underlying `duckdb_connection` accessed via `borrowed.as_raw()` must
+/// be valid for the lifetime of the borrow.
 pub(crate) unsafe fn try_infer_schema(
-    conn: ffi::duckdb_connection,
+    borrowed: &crate::ddl::read_ffi::BorrowedConnection,
     sql: &str,
-) -> Option<(Vec<String>, Vec<ffi::duckdb_type>)> {
-    let mut result = execute_sql_raw(conn, sql).ok()?;
+) -> Result<(Vec<String>, Vec<ffi::duckdb_type>), String> {
+    let mut result = execute_sql_raw(borrowed.as_raw(), sql)?;
 
     let col_count = ffi::duckdb_column_count(&mut result) as usize;
     let mut names = Vec::with_capacity(col_count);
@@ -913,7 +676,7 @@ pub(crate) unsafe fn try_infer_schema(
     }
 
     ffi::duckdb_destroy_result(&mut result);
-    Some((names, types))
+    Ok((names, types))
 }
 
 // ---------------------------------------------------------------------------

@@ -130,7 +130,7 @@ RELATIONSHIP	order_to_customer	p29_orders	FOREIGN_KEY	["customer_id"]
 RELATIONSHIP	order_to_customer	p29_orders	REF_KEY	["id"]
 FACT	net_price	p29_line_items	TABLE	p29_line_items
 FACT	net_price	p29_line_items	EXPRESSION	li.extended_price * (1 - li.discount)
-FACT	net_price	p29_line_items	DATA_TYPE	DECIMAL(18,4)
+FACT	net_price	p29_line_items	DATA_TYPE	(empty)
 FACT	net_price	p29_line_items	ACCESS_MODIFIER	PUBLIC
 FACT	tax_amount	p29_line_items	TABLE	p29_line_items
 FACT	tax_amount	p29_line_items	EXPRESSION	li.net_price * li.tax_rate

@@ -1,0 +1,143 @@
+# Phase 65.1 Plan 07 (CR-01 D-01..D-03) — enable_external_access gating
+# for the FileSystem-direct YAML read path.
+#
+# CR-01: SQL injection in __sv_compute_create_from_yaml was eliminated by
+# replacing `Connection::Query("SELECT content FROM read_text('<path>')")`
+# with a direct DuckDB `FileSystem::OpenFile` call (D-01). The
+# `enable_external_access` setting is honoured by LocalFileSystem natively
+# (D-02), so the new path stays gated on the same setting as the old one.
+# The helper TF stays named `__sv_compute_create_from_yaml` (D-03).
+#
+# This test pins:
+#   B1 (positive control)  — with the default `enable_external_access`,
+#       `CREATE SEMANTIC VIEW v FROM YAML FILE '<path>'` succeeds.
+#   B2 (inline regression) — once `enable_external_access = false` is set,
+#       `CREATE SEMANTIC VIEW v_inline FROM YAML 'metric: ...'` still
+#       succeeds because no file I/O is involved (gating is FILE-variant
+#       only).
+#   B3 (negative)          — with `enable_external_access = false`,
+#       `CREATE SEMANTIC VIEW v_blocked FROM YAML FILE '<path>'` is
+#       rejected with the stable `FROM YAML FILE failed:` prefix.
+#
+# Ordering note: `SET enable_external_access = false` cannot be re-enabled
+# while the database is running (see phase53_yaml_file.test:186-189), so
+# the positive control (B1) and any other file-using setup must happen
+# BEFORE the SET statement, and the negative case (B3) is last.
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+# Setup: backing table used by both the FILE and the inline YAML.
+statement ok
+CREATE TABLE t1 (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO t1 VALUES (1, 'east'), (2, 'west');
+
+# Write a valid YAML definition file for the positive control.
+statement ok
+COPY (SELECT 'base_table: t1
+tables:
+  - alias: t
+    table: t1
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: t.region
+    source_table: t
+metrics:
+  - name: row_count
+    expr: COUNT(*)
+    source_table: t' AS content)
+TO '__TEST_DIR__/p651_ok.yaml' (FORMAT CSV, HEADER FALSE, QUOTE '');
+
+# ---------------------------------------------------------------
+# B1 — POSITIVE CONTROL (gate still permissive)
+# ---------------------------------------------------------------
+# Confirms the FileSystem-direct read path is functional, not just
+# permissive of the gate.
+
+statement ok
+CREATE SEMANTIC VIEW v_ok FROM YAML FILE '__TEST_DIR__/p651_ok.yaml'
+
+query R
+SELECT row_count FROM semantic_view('v_ok', metrics := ['row_count'])
+----
+2
+
+# Cleanup the positive-control view before flipping the gate so DROP runs
+# under the same access mode that created it.
+statement ok
+DROP SEMANTIC VIEW v_ok
+
+# ---------------------------------------------------------------
+# Flip the access gate. This is irreversible for the rest of the
+# session — every assertion below this line runs with the gate OFF.
+# ---------------------------------------------------------------
+
+statement ok
+SET enable_external_access = false
+
+# ---------------------------------------------------------------
+# B2 — INLINE regression (no file I/O, CREATE must still succeed)
+# ---------------------------------------------------------------
+# Confirms the gating is FILE-variant only. INLINE FROM YAML uses
+# the in-process parser path with no FileSystem call, so the CREATE
+# is not subject to the `enable_external_access` setting.
+#
+# Note: we only assert that the CREATE itself succeeds. Querying the
+# view via `semantic_view(...)` after the gate is closed exercises
+# DuckDB internals (ValueRelation expansion via per-call connection)
+# that can independently trip the access gate — that path is out of
+# scope for this CR-01 test, which only pins the helper-TF's read
+# call.
+
+statement ok
+CREATE SEMANTIC VIEW v_inline FROM YAML $$
+base_table: t1
+tables:
+  - alias: t
+    table: t1
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: t.region
+    source_table: t
+metrics:
+  - name: row_count
+    expr: COUNT(*)
+    source_table: t
+$$
+
+# ---------------------------------------------------------------
+# B3 — NEGATIVE (file-variant blocked by the access gate)
+# ---------------------------------------------------------------
+# The FileSystem-direct path returns whatever LocalFileSystem raises
+# when `enable_external_access` is off. The wording is owned by
+# DuckDB and may evolve, but the `FROM YAML FILE failed:` prefix is
+# this extension's wrapper — pinned by phase53_yaml_file.test and
+# preserved across all four throw paths in sv_create_from_yaml_bind.
+
+statement error
+CREATE SEMANTIC VIEW v_blocked FROM YAML FILE '__TEST_DIR__/p651_ok.yaml'
+----
+FROM YAML FILE failed:
+
+# Same wording for a nonexistent path under the closed gate — the gate
+# check fires before the path is even resolved.
+statement error
+CREATE SEMANTIC VIEW v_blocked2 FROM YAML FILE '/tmp/nonexistent_phase651.yaml'
+----
+FROM YAML FILE failed:
+
+# Cleanup the inline view (DROP itself does not touch the filesystem,
+# so it is unaffected by the closed gate).
+statement ok
+DROP SEMANTIC VIEW v_inline
+
+statement ok
+DROP TABLE t1

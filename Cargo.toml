@@ -1,6 +1,6 @@
 [package]
 name = "semantic_views"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "DuckDB extension providing semantic views — a declarative layer for dimensions, measures, and relationships"
 license = "MIT"
@@ -42,6 +42,20 @@ cc = { version = "1", optional = true }
 
 [dev-dependencies]
 proptest = "1.11"
+# `syn` powers `tests/no_long_lived_conn.rs` — Phase 65 (v0.10.0) Plan 06's
+# structural guard that asserts `init_extension` allocates no long-lived
+# `duckdb_connection`. The `full` feature is needed for function-body parsing;
+# `visit` for the AST walker trait. Transitively available via several
+# duckdb-rs build deps, but pinned explicitly here so the guard test does
+# not regress if those deps drop syn.
+syn = { version = "2", features = ["full", "visit"] }
+# `walkdir` powers `tests/no_long_lived_conn.rs::no_duckdb_disconnect_anywhere_in_src`
+# — Phase 65.1 (v0.10.0) Plan 03b's defence-in-depth AST walker that scans
+# every `src/**/*.rs` file for `duckdb_disconnect` call sites. The
+# BorrowedConnection newtype (D-10) is the primary type-level guard; this
+# walker (D-11) catches any path that bypasses the newtype (e.g., a raw
+# `ffi::duckdb_connection` re-introduced inadvertently).
+walkdir = "2"
 
 [dev-dependencies.cargo-husky]
 version = "1"

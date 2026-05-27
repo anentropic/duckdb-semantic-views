@@ -1,0 +1,106 @@
+# Phase 65 (v0.10.0) Plan 03 — metadata-via-SQL upgrade for CREATE.
+#
+# CREATE-time metadata (created_on, database_name, schema_name) is no
+# longer populated by enrich_definition_for_create on the parser_override
+# side. Instead, the rewritten INSERT embeds a `json_merge_patch(<def>,
+# json_object('created_on', strftime(now(), '%Y-%m-%dT%H:%M:%SZ'),
+# 'database_name', current_database(), 'schema_name', current_schema()))`
+# sub-expression so DuckDB resolves the values on the caller's
+# connection at INSERT-time. This is the load-bearing change that lets
+# parser_override eliminate its catalog reads (D-16, read-elimination
+# architecture).
+#
+# Behavioural properties pinned:
+#   B1: After CREATE SEMANTIC VIEW v, list_semantic_views() reports
+#       database_name = current_database() of the caller's connection.
+#   B2: After CREATE SEMANTIC VIEW v, list_semantic_views() reports
+#       schema_name = current_schema() of the caller's connection.
+#   B3: created_on is non-null and contains the strftime sentinel
+#       characters ('T' separator from ISO-8601, 'Z' suffix for UTC).
+#   B4: CREATE OR REPLACE re-captures metadata fresh on each replace.
+#
+# Requirements covered: LIFE-02 (parser_override has zero catalog reads
+# under the read-elimination architecture).
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+statement ok
+CREATE TABLE p65_md_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2));
+
+statement ok
+CREATE SEMANTIC VIEW v_md AS
+  TABLES (
+    o AS p65_md_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.order_id AS o.id
+  )
+  METRICS (
+    o.total AS SUM(o.amount)
+  )
+
+# B1: database_name matches the caller's current_database()
+query I
+SELECT count(*) FROM list_semantic_views()
+WHERE name = 'v_md' AND database_name = current_database()
+----
+1
+
+# B2: schema_name matches the caller's current_schema()
+query I
+SELECT count(*) FROM list_semantic_views()
+WHERE name = 'v_md' AND schema_name = current_schema()
+----
+1
+
+# B3: created_on is non-null and ISO-8601-shaped (contains 'T' and ends 'Z')
+query I
+SELECT count(*) FROM list_semantic_views()
+WHERE name = 'v_md'
+  AND created_on IS NOT NULL
+  AND created_on LIKE '%T%Z'
+----
+1
+
+# B4: CREATE OR REPLACE updates created_on on the caller's connection.
+# Capture the pre-replace timestamp, then after a sleep replace and
+# confirm the value changed.
+statement ok
+CREATE TABLE _p65_md_capture AS
+  SELECT created_on AS old_ts FROM list_semantic_views() WHERE name = 'v_md'
+
+# strftime resolution is whole-second; ensure a measurable gap before replacing.
+statement ok
+SELECT pg_sleep(1.1)
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW v_md AS
+  TABLES (
+    o AS p65_md_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.order_id AS o.id
+  )
+  METRICS (
+    o.total AS SUM(o.amount)
+  )
+
+query I
+SELECT count(*) FROM list_semantic_views() lsv
+JOIN _p65_md_capture cap ON 1=1
+WHERE lsv.name = 'v_md'
+  AND lsv.created_on > cap.old_ts
+----
+1
+
+statement ok
+DROP TABLE _p65_md_capture
+
+statement ok
+DROP SEMANTIC VIEW v_md
+
+statement ok
+DROP TABLE p65_md_orders
