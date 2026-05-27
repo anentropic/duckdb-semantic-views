@@ -467,7 +467,9 @@ def test_attach_facts_path(extension_path: Path, ext_dir: str, tmp_path: Path) -
     try:
         _bootstrap_extension(conn, extension_path)
 
-        _execute(conn, f"ATTACH '{other_db_path}' AS db2")
+        # A2 (Phase 68): SQL-string escape parity with line 100
+        other_db_path_sql = str(other_db_path).replace("'", "''")
+        _execute(conn, f"ATTACH '{other_db_path_sql}' AS db2")
         _execute(
             conn,
             """

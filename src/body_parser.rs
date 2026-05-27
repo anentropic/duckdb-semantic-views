@@ -2798,6 +2798,32 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Phase 68 A5: mixed bare/quoted dot-qualified source-table names must
+    // parse correctly. The dot-walk inside `find_identifier_end` already
+    // handles this case (its `fqn_with_quoted_parts_runs_to_whitespace`
+    // doctest covers it at the helper level); these tests pin the
+    // parse_tables_clause contract end-to-end.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_table_entry_mixed_quoted_and_bare() {
+        // Bare schema segment followed by quoted-with-whitespace table segment.
+        let result = parse_tables_clause("o AS staging.\"my orders\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "staging.\"my orders\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+
+        // Symmetric case: quoted-with-whitespace database segment, then bare
+        // schema + bare table.
+        let result = parse_tables_clause("o AS \"my db\".sch.t PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "\"my db\".sch.t");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    // -----------------------------------------------------------------------
     // parse_relationships_clause tests
     // -----------------------------------------------------------------------
 

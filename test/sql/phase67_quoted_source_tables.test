@@ -137,6 +137,37 @@ SELECT count(*) > 0 FROM explain_semantic_view('p67_plain', dimensions := ['regi
 true
 
 # ------------------------------------------------------------------------
+# Scenario 5 (Phase 68 A5) — Mixed bare/quoted dot-qualified source-table
+# name. Exercises the parser's ability to walk one bare segment followed
+# by one quoted-with-whitespace segment in a single source-table identifier.
+# ------------------------------------------------------------------------
+
+statement ok
+CREATE SCHEMA staging;
+
+statement ok
+CREATE TABLE staging."my orders" (id INTEGER PRIMARY KEY, region VARCHAR, amount DECIMAL(18,2));
+
+statement ok
+INSERT INTO staging."my orders" VALUES (1, 'US', 100.00), (2, 'EU', 250.00);
+
+statement ok
+CREATE SEMANTIC VIEW p67_mixed_quoting AS
+  TABLES (o AS staging."my orders" PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+query I
+SELECT count(*) > 0 FROM semantic_view('p67_mixed_quoting', dimensions := ['region'], metrics := ['total']);
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p67_mixed_quoting', dimensions := ['region'], metrics := ['total']) WHERE explain_output LIKE '%"staging"."my orders"%';
+----
+true
+
+# ------------------------------------------------------------------------
 # Cleanup
 # ------------------------------------------------------------------------
 
@@ -153,4 +184,22 @@ statement ok
 DROP SEMANTIC VIEW p67_plain;
 
 statement ok
+DROP SEMANTIC VIEW p67_mixed_quoting;
+
+statement ok
 DROP SCHEMA "stage 2" CASCADE;
+
+# Phase 68 A6 — drop the 3 default-schema base tables that previous
+# scenarios left behind, plus the staging schema introduced by Scenario 5.
+
+statement ok
+DROP TABLE IF EXISTS "my orders";
+
+statement ok
+DROP TABLE IF EXISTS "weird PRIMARY KEY name";
+
+statement ok
+DROP TABLE IF EXISTS p67_plain_orders;
+
+statement ok
+DROP SCHEMA staging CASCADE;
