@@ -1922,11 +1922,15 @@ extern "C" {
 // MUST NOT call `duckdb_disconnect`) is identical to the TF dispatchers —
 // see `src/ddl/read_ffi.rs` module docs.
 //
-// Per-row Connection construction (rather than per-chunk) keeps the
-// dispatcher shape uniform with the TF migrations and avoids edge cases
-// where a single chunk mixes view names that need different catalog probes.
-// Cost: scalar usage in practice is one or two rows (`SELECT GET_DDL(...)`)
-// — the Connection ctor is sub-millisecond per the READ-PATH-SPIKE evidence.
+// Per-chunk Connection construction (one `Connection probe` per exec call,
+// reused across every row in the chunk) keeps the dispatcher shape uniform
+// with the TF migrations: each call into the C++ exec callback gets a
+// fresh stack-owned Connection bound to the caller's Database, and every
+// row in the chunk borrows that same handle through the reinterpret_cast
+// bridge. Scalar usage in practice is one or two rows
+// (`SELECT GET_DDL(...)`), so amortising the Connection ctor across the
+// chunk is essentially free even at chunk size 1 — and the ctor itself is
+// sub-millisecond per the READ-PATH-SPIKE evidence.
 
 // Common helper: copy a Rust-owned UTF-8 buffer into the result Vector at
 // `row_idx` via StringVector::AddString (which allocates inside the Vector's
