@@ -132,7 +132,7 @@ fn init_extension_surfaces_registration_error_buf() {
         "Plan 02a D-05 refusal text missing — `sv_register_table_function` body must contain \
          the literal `init_cb is mandatory` so a null `init_cb` is rejected at registration time \
          and the message reaches the caller via `error_buf`. Body excerpt (first 400 chars): {}",
-        &body[..body.len().min(400)],
+        body.get(..400).unwrap_or(body),
     );
 
     // 2. D-08/D-09 ABI shape: the header must include the trailing
@@ -161,7 +161,9 @@ fn init_extension_surfaces_registration_error_buf() {
         // Constructed at runtime so we can still grep this file for the
         // literal token to confirm coverage, while the assertion below
         // looks only at non-comment lines.
-        let parts = ["std::", "mem::", "transmute("];
+        // C2 (Phase 68): no trailing '(' — needle now catches both bare std::mem::transmute(...)
+        // and turbofish std::mem::transmute::<T, U>(...) forms. Turbofish is the real footgun.
+        let parts = ["std::", "mem::", "transmute"];
         parts.concat()
     };
     let offending: Vec<&str> = self_src
