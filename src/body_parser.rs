@@ -730,6 +730,20 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
             position: Some(after_as_offset),
         });
     }
+    // Phase 68 A4: reject unterminated quoted source-table names. `find_identifier_end`
+    // saturates at input.len() on an unterminated quote rather than surfacing an
+    // error, so `o AS "unclosed` would otherwise pass through as `table_name =
+    // "\"unclosed"` and corrupt downstream catalog lookups. The doubled-quote
+    // escape `""` is balanced — mirror src/ident.rs::find_identifier_end's escape
+    // rule via the private `is_quoting_balanced` helper.
+    if !is_quoting_balanced(&after_as[..name_end]) {
+        return Err(ParseError {
+            message: format!(
+                "Unterminated quoted identifier in source-table name for alias '{alias}' in TABLES clause.",
+            ),
+            position: Some(after_as_offset),
+        });
+    }
     let after_name = &after_as[name_end..];
     let after_name_offset = after_as_offset + name_end;
 
@@ -824,6 +838,31 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     })
 }
 
+/// Phase 68 A4: returns `true` if `s` has balanced double-quote runs, treating
+/// a doubled-quote `""` inside a quoted region as an escape (does NOT close).
+/// Mirrors the escape rule used by `src/ident.rs::find_identifier_end` so the
+/// two callers agree on what counts as "balanced". A naive
+/// `s.matches('"').count() % 2 == 0` is incorrect because it double-counts
+/// escaped quotes; this helper walks bytes explicitly.
+fn is_quoting_balanced(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                // Doubled-quote escape inside a quoted region — skip both
+                // bytes without toggling the in_quote state.
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+        }
+        i += 1;
+    }
+    !in_quote
+}
+
 /// Find "UNIQUE" keyword with word-boundary matching in `upper_text`.
 /// Returns `(start, end)` byte offsets where start points at 'U' and end is past 'E'.
 fn find_unique(upper_text: &str) -> Option<(usize, usize)> {
@@ -892,10 +931,16 @@ fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
     while i + 7 <= bytes.len() {
         // Look for "PRIMARY"
         if &upper_text[i..i + 7] == "PRIMARY" {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            // Phase 68 A7: align word-boundary checks with `find_unique` —
+            // `_` is a valid identifier continuation byte, so exclude it from
+            // the "non-identifier" boundary set in all three checks below.
+            let before_ok =
+                i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
             let after_primary = i + 7;
             if before_ok
-                && (after_primary == bytes.len() || !bytes[after_primary].is_ascii_alphanumeric())
+                && (after_primary == bytes.len()
+                    || (!bytes[after_primary].is_ascii_alphanumeric()
+                        && bytes[after_primary] != b'_'))
             {
                 // Skip whitespace between PRIMARY and KEY
                 let mut j = after_primary;
@@ -905,8 +950,8 @@ fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
                 // Match "KEY"
                 if j + 3 <= bytes.len() && &upper_text[j..j + 3] == "KEY" {
                     let after_key = j + 3;
-                    let after_ok =
-                        after_key == bytes.len() || !bytes[after_key].is_ascii_alphanumeric();
+                    let after_ok = after_key == bytes.len()
+                        || (!bytes[after_key].is_ascii_alphanumeric() && bytes[after_key] != b'_');
                     if after_ok {
                         return Some((i, after_key));
                     }
@@ -2695,6 +2740,61 @@ mod tests {
         // `PRIMARY` (Phase 68 D-03).
         let err = parse_tables_clause("o AS primary KEY (id)", 0).unwrap_err();
         assert_eq!(err.message, A1_EXPECTED_MESSAGE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 A4: unterminated quoted source-table identifier in TABLES
+    // clause must surface a structured ParseError, never silently flow
+    // through as a malformed name. Doubled-quote `""` is an escape and must
+    // NOT trip the balanced-quote check.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_table_entry_unterminated_quote() {
+        let err = parse_tables_clause("o AS \"unclosed", 0).unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "expected unterminated-quote error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_quoted_with_doubled_escape_balanced() {
+        // `"a""b"` is balanced — doubled-quote is an escape inside the quoted
+        // region, so this must parse successfully.
+        let result = parse_tables_clause("o AS \"a\"\"b\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "\"a\"\"b\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_unbalanced_after_doubled_escape() {
+        // `"a""b` opens, escapes, then never closes — odd unescaped quote
+        // count, must be rejected.
+        let err = parse_tables_clause("o AS \"a\"\"b PRIMARY KEY (id)", 0).unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "expected unterminated-quote error, got: {}",
+            err.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 A7: `find_primary_key`'s three word-boundary checks align with
+    // `find_unique`'s `_`-exclusion pattern. Identifiers like `my_PRIMARY`
+    // (prefix) or `PRIMARY KEY_extra` (suffix) must NOT match.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_primary_key_word_boundary_underscore() {
+        // Underscore-prefixed: `_PRIMARY` should not match because `_` is now
+        // excluded from the before-boundary set.
+        assert!(find_primary_key(&"my_PRIMARY KEY".to_ascii_uppercase()).is_none());
+        // Underscore-suffixed on KEY: `KEY_extra` should not match.
+        assert!(find_primary_key(&"PRIMARY KEY_extra".to_ascii_uppercase()).is_none());
     }
 
     // -----------------------------------------------------------------------
