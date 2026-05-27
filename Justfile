@@ -150,8 +150,15 @@ test-readonly: build
 # Concurrent CREATE on the same view name from two threads. PK constraint
 # on _definitions(name) serializes the inserts; exactly one must succeed.
 # Also indirectly exercises the v0.8.0 race-guard pattern for DROP/ALTER.
+# Phase 65.1 adds two per-call Connection regressions covering the
+# read-side (concurrent SHOW SEMANTIC ... reads) and write-side
+# (concurrent CREATE/DROP/ALTER on overlapping names) of the per-call
+# Connection model — both must run in CI so the borrow contract is
+# guarded under contention.
 test-concurrent: build
     uv run test/integration/test_concurrent_ddl.py
+    uv run test/integration/test_concurrent_reads_per_call_conn.py
+    uv run test/integration/test_concurrent_writes_per_call_conn.py
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC + large-view + multi-DB + read-only + concurrent
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
