@@ -180,6 +180,7 @@ Recent decisions affecting current work:
 | 260331-ta2 | Release recipe for CE registry | 2026-03-31 | 0390bab |
 | 260412-v5h | Generate complete CHANGELOG.md | 2026-04-12 | d42d240 |
 | 260430-vdz | Fix parser hook to skip leading SQL comments (-- and /* */) before prefix matching | 2026-04-30 | edf5196 |
+| 260527-p9t | Address Copilot PR #35 review items (CatalogReader lifetime, test cleanup, shim comment, just recipe) | 2026-05-27 | 541a5d0 |
 | Phase 51 P01 | 20min | 2 tasks | 6 files |
 | Phase 55 P01 | 18min | 2 tasks | 6 files |
 | Phase 56 P01 | 25min | 2 tasks | 8 files |
