@@ -565,10 +565,21 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
                 }
             }
             // Validate ORDER BY dimension references
+            // Phase 68 B2 / D-08: accept dotted-path qualifier `alias.dim_name`
+            // in addition to the bare `dim_name` form (mirrors NAB resolver).
             for ob in &ws.order_by {
-                let dim_exists = dimensions
-                    .iter()
-                    .any(|d| d.name.eq_ignore_ascii_case(&ob.expr));
+                let dim_exists = dimensions.iter().any(|d| {
+                    if d.name.eq_ignore_ascii_case(&ob.expr) {
+                        return true;
+                    }
+                    if let Some((alias_part, name_part)) = split_qualified_identifier(&ob.expr) {
+                        if let Some(ref src) = d.source_table {
+                            return src.eq_ignore_ascii_case(alias_part)
+                                && d.name.eq_ignore_ascii_case(name_part);
+                        }
+                    }
+                    false
+                });
                 if !dim_exists {
                     let available_dims: Vec<String> =
                         dimensions.iter().map(|d| d.name.clone()).collect();
@@ -1852,20 +1863,36 @@ fn parse_over_content(
             };
 
             // Parse ORDER BY entries using same pattern as non_additive_by
+            // Phase 68 Plan 03 (B2) / TECH-DEBT #25: identifier-aware
+            // tokenisation of the column-reference slot. The post-port
+            // contract narrows the slot from "any expression" to
+            // "identifier (possibly quoted, possibly dotted)" — RESEARCH §B2
+            // confirmed no existing fixture uses function-call expressions
+            // here, so this is a defense-in-depth narrowing, not a regression.
             let entries = split_at_depth0_commas(order_text);
             for (start, entry_text) in entries {
                 let entry_text = entry_text.trim();
                 if entry_text.is_empty() {
                     continue;
                 }
-                let parts: Vec<&str> = entry_text.split_whitespace().collect();
-                if parts.is_empty() {
+                let name_end = find_identifier_end(entry_text, /* allow_paren = */ false);
+                if name_end == 0 {
                     continue;
                 }
-                let dim_name = parts[0].to_string();
+                if !is_quoting_balanced(&entry_text[..name_end]) {
+                    return Err(ParseError {
+                        message: format!(
+                            "Unterminated quoted identifier in OVER ORDER BY entry '{entry_text}'."
+                        ),
+                        position: Some(base_offset + start),
+                    });
+                }
+                let dim_name = entry_text[..name_end].trim().to_string();
+                let suffix = entry_text[name_end..].trim();
+                let parts: Vec<&str> = suffix.split_whitespace().collect();
                 let mut sort = SortOrder::Asc;
                 let mut nulls = NullsOrder::Last;
-                let mut idx = 1;
+                let mut idx = 0;
                 while idx < parts.len() {
                     match parts[idx].to_ascii_uppercase().as_str() {
                         "ASC" => {
@@ -2959,6 +2986,86 @@ mod tests {
             "Expected unterminated-quote error, got: {}",
             err.message
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 68 Plan 03 (B2) / TECH-DEBT #25: identifier-aware tokenisation of
+    // the OVER ORDER BY column-reference slot. Quoted identifiers with
+    // internal whitespace AND dotted paths (`table.col`, D-08) must survive
+    // intact through `parse_over_content` / `parse_window_over_clause`.
+    // `parse_window_spec` / `parse_over_content` is private — exercise via the
+    // public `parse_metrics_clause` entry which routes a window-metric expression
+    // through `parse_window_over_clause`. The parsed `WindowSpec.order_by` is at
+    // tuple index 8 of `MetricEntry`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_window_spec_quoted_order_by() {
+        // Quoted identifier with embedded space in OVER ORDER BY entry.
+        let result = parse_metrics_clause(
+            "s.running AS AVG(qty) OVER (PARTITION BY EXCLUDING r ORDER BY \"order date\" ASC NULLS LAST)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        // MetricEntry tuple: window_spec is at index 8.
+        let ws = result[0].8.as_ref().expect("window_spec must be Some");
+        assert_eq!(ws.order_by.len(), 1);
+        let ob = &ws.order_by[0];
+        assert_eq!(ob.expr, "\"order date\"");
+        assert_eq!(ob.order, SortOrder::Asc);
+        assert_eq!(ob.nulls, NullsOrder::Last);
+    }
+
+    #[test]
+    fn test_parse_window_spec_dotted_order_by() {
+        // Dotted-path column ref (D-08): `o."order date"` must be captured as a
+        // single identifier including the dot.
+        let result = parse_metrics_clause(
+            "s.running AS AVG(qty) OVER (PARTITION BY EXCLUDING r ORDER BY o.\"order date\" DESC)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let ws = result[0].8.as_ref().expect("window_spec must be Some");
+        assert_eq!(ws.order_by.len(), 1);
+        let ob = &ws.order_by[0];
+        assert_eq!(ob.expr, "o.\"order date\"");
+        assert_eq!(ob.order, SortOrder::Desc);
+        // DESC defaults to NULLS FIRST in window ORDER BY arm (matches NAB).
+        assert_eq!(ob.nulls, NullsOrder::First);
+    }
+
+    #[test]
+    fn test_parse_window_spec_unterminated_quote_order_by() {
+        // Unterminated quoted column ref surfaces structured ParseError.
+        let err = parse_metrics_clause(
+            "s.running AS AVG(qty) OVER (PARTITION BY EXCLUDING r ORDER BY \"unclosed ASC)",
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "Expected unterminated-quote error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_window_spec_regression_bare_order_by() {
+        // Regression baseline: bare unquoted column ref. Mirrors phase48.
+        let result = parse_metrics_clause(
+            "s.running AS AVG(qty) OVER (PARTITION BY EXCLUDING r ORDER BY order_date ASC NULLS LAST)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let ws = result[0].8.as_ref().expect("window_spec must be Some");
+        assert_eq!(ws.order_by.len(), 1);
+        let ob = &ws.order_by[0];
+        assert_eq!(ob.expr, "order_date");
+        assert_eq!(ob.order, SortOrder::Asc);
+        assert_eq!(ob.nulls, NullsOrder::Last);
     }
 
     #[test]
