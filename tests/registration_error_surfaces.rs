@@ -148,32 +148,44 @@ fn init_extension_surfaces_registration_error_buf() {
     // 3. W-01 invariant: this very file must not invoke the transmute
     //    intrinsic on the bind/exec callback function pointers. The
     //    structural test path naturally satisfies the invariant (it
-    //    doesn't invoke any FFI at all). The runtime needle below is
-    //    built via concatenation so neither the assertion code nor the
-    //    docstring contain the literal adjacent token sequence — that
-    //    keeps the plan-checker's `grep -q` returning zero hits while
-    //    still catching the invocation pattern if a future contributor
-    //    pastes one in.
+    //    doesn't invoke any FFI at all).
+    //
+    //    WR-03 (Phase 68 review): the original needle only matched the
+    //    single textual idiom `std::mem::transmute`; semantically
+    //    equivalent forms (`core::mem::transmute`, unqualified
+    //    `mem::transmute` after `use std::mem;`, the bare `transmute`
+    //    intrinsic after `use std::mem::transmute;`) silently bypassed
+    //    the guard. The needle set below covers all three qualifying
+    //    paths. Needles are constructed at runtime via concatenation
+    //    so this assertion source itself contains no adjacent token
+    //    sequence that would re-trigger the guard, and the plan-checker
+    //    `grep -q "std" + "::mem::transmute"` still returns zero hits.
     let self_src =
         fs::read_to_string(Path::new(&manifest_dir).join("tests/registration_error_surfaces.rs"))
             .expect("read tests/registration_error_surfaces.rs");
-    let transmute_needle = {
-        // Constructed at runtime so we can still grep this file for the
-        // literal token to confirm coverage, while the assertion below
-        // looks only at non-comment lines.
-        // C2 (Phase 68): no trailing '(' — needle now catches both bare std::mem::transmute(...)
-        // and turbofish std::mem::transmute::<T, U>(...) forms. Turbofish is the real footgun.
-        let parts = ["std::", "mem::", "transmute"];
-        parts.concat()
-    };
+    // Needles cover the three qualifying paths to the FFI intrinsic:
+    //   * `std::mem::transmute(...)` / `std::mem::transmute::<T,U>(...)`
+    //   * `core::mem::transmute(...)` (Rust 2021+ re-exports `core::mem`)
+    //   * unqualified `mem::transmute(...)` (after `use std::mem;`)
+    // Each needle is built at runtime via array concat so this file's
+    // source never contains an adjacent `std::mem::transmute` token
+    // sequence in non-comment code — preserving the plan-checker
+    // `grep -q "std" + "::mem::transmute"` zero-hits invariant.
+    let needles: Vec<String> = vec![
+        ["std::", "mem::", "transmute"].concat(),
+        ["core::", "mem::", "transmute"].concat(),
+        ["mem::", "transmute"].concat(),
+    ];
     let offending: Vec<&str> = self_src
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
-        .filter(|line| line.contains(&transmute_needle))
+        .filter(|line| needles.iter().any(|n| line.contains(n.as_str())))
         .collect();
     assert!(
         offending.is_empty(),
-        "Plan 02b W-01 invariant violated — this test must not invoke transmute on FFI \
-         function pointers (typed stubs only). Offending lines: {offending:?}",
+        "Plan 02b W-01 / WR-03 invariant violated — this test must not invoke \
+         the FFI intrinsic on callback function pointers (typed stubs only). \
+         Matched any of: std::mem::*, core::mem::*, or bare mem::* qualified \
+         path. Offending lines: {offending:?}",
     );
 }
