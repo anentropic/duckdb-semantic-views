@@ -92,16 +92,25 @@ fn suggest_clause_keyword(word: &str) -> Option<&'static str> {
     best.map(|(_, kw)| kw)
 }
 
-/// Phase 68 B1 (D-08): split a qualified identifier at the first dot that
-/// falls OUTSIDE a double-quoted region. Returns `Some((alias, name))` if a
-/// split-eligible dot exists, else `None`. Doubled-quote `""` inside `"..."`
-/// is treated as an escape (mirrors `is_quoting_balanced` / `find_identifier_end`).
+/// Phase 68 B1 (D-08): split a qualified identifier at the FIRST dot that
+/// falls OUTSIDE a double-quoted region. Returns
+/// `Some((before_first_dot, after_first_dot))` if a split-eligible dot
+/// exists, else `None`. The `after_first_dot` slice may itself contain
+/// further dots (and/or quoted regions); this helper does NOT recursively
+/// split — callers that need 3+ segment handling must re-invoke or do their
+/// own scanning. Doubled-quote `""` inside `"..."` is treated as an escape
+/// (mirrors `is_quoting_balanced` / `find_identifier_end`).
+///
+/// Returns `None` if either side of the split would be empty (WR-01).
 ///
 /// Examples:
 /// - `"o.x"` → `Some(("o", "x"))`
 /// - `"o.\"order date\""` → `Some(("o", "\"order date\""))`
 /// - `"\"a.b\""` → `None` (the dot is inside the quoted region)
 /// - `"bare"` → `None` (no dot)
+/// - `".foo"` / `"foo."` → `None` (empty side, WR-01)
+/// - `"db.sch.\"tbl\""` → `Some(("db", "sch.\"tbl\""))` (WR-02: caller
+///   must handle further splitting if 3+ segments are expected)
 fn split_qualified_identifier(s: &str) -> Option<(&str, &str)> {
     let bytes = s.as_bytes();
     let mut i = 0;
