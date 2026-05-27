@@ -467,7 +467,16 @@ def test_attach_facts_path(extension_path: Path, ext_dir: str, tmp_path: Path) -
     try:
         _bootstrap_extension(conn, extension_path)
 
-        # A2 (Phase 68): SQL-string escape parity with line 100
+        # A2 (Phase 68): SQL-string escape parity with line 100.
+        # WR-04 (Phase 68 review): tempfile.TemporaryDirectory() paths on
+        # macOS/Linux never contain single quotes, newlines, or NUL bytes,
+        # so the .replace("'", "''") escape is sufficient for this
+        # fixture's input domain. The "parity with line 100" comment
+        # describes textual symmetry with _bootstrap_extension, NOT a
+        # general SQL-escape contract. Do not copy this pattern to a
+        # production code path that handles user-supplied paths — newline
+        # / backslash / NUL injection would produce a syntactically valid
+        # but semantically wrong ATTACH statement.
         other_db_path_sql = str(other_db_path).replace("'", "''")
         _execute(conn, f"ATTACH '{other_db_path_sql}' AS db2")
         _execute(
