@@ -180,25 +180,27 @@ CREATE SEMANTIC VIEW p29_cycle AS
 cycle detected in facts
 
 # ============================================================
-# Test 7: Error -- fact self-reference
+# Test 7: A fact whose expression references its own name is a
+# column reference (identity passthrough), NOT a self-cycle.
 # ============================================================
 
-statement error
-CREATE SEMANTIC VIEW p29_self_ref AS
+statement ok
+CREATE SEMANTIC VIEW p29_self_named AS
   TABLES (
     o AS p29_orders PRIMARY KEY (id)
   )
   FACTS (
-    o.a AS o.a + 1
+    o.customer_id AS o.customer_id
   )
   DIMENSIONS (
     o.region AS o.region
   )
   METRICS (
-    o.total AS SUM(o.a)
+    o.total AS SUM(o.customer_id)
   );
-----
-cycle detected in facts
+
+statement ok
+DROP SEMANTIC VIEW p29_self_named;
 
 # ============================================================
 # Test 8: Error -- facts source table not in TABLES

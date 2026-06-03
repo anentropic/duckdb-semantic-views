@@ -68,6 +68,56 @@ pub fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) ->
     result
 }
 
+/// Replace word-boundary occurrences of *any* needle in `needles` with `replacement`,
+/// in a single left-to-right pass.
+///
+/// At each position the needles are tried in the given order — put the more specific
+/// (e.g. qualified `alias.name`) needle first so it wins over a shorter one (`name`).
+/// On a match the replacement is emitted and scanning resumes *after* the matched
+/// needle: the inserted replacement text is never re-scanned.
+///
+/// This matters when the replacement itself contains one of the needles. For an
+/// identity fact (`name` whose expression is the qualified column `alias.name`), two
+/// sequential [`replace_word_boundary`] calls — qualified then unqualified — would
+/// double-substitute (`alias.name` -> `(alias.name)` -> `(alias.(alias.name))`).
+/// A single combined pass avoids that.
+#[must_use]
+pub fn replace_word_boundary_any(haystack: &str, needles: &[&str], replacement: &str) -> String {
+    let h_bytes = haystack.as_bytes();
+    let mut result = String::with_capacity(haystack.len());
+    let mut i = 0;
+
+    while i < h_bytes.len() {
+        let mut matched = false;
+        for &needle in needles {
+            let n_bytes = needle.as_bytes();
+            let n_len = n_bytes.len();
+            if n_len == 0 || i + n_len > h_bytes.len() {
+                continue;
+            }
+            if &h_bytes[i..i + n_len] == n_bytes {
+                let before_ok = i == 0 || is_word_boundary_char(h_bytes[i - 1]);
+                let after_ok =
+                    i + n_len == h_bytes.len() || is_word_boundary_char(h_bytes[i + n_len]);
+                if before_ok && after_ok {
+                    result.push_str(replacement);
+                    i += n_len;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            // Advance by a full UTF-8 char so `i` stays on a char boundary.
+            let ch = haystack[i..].chars().next().unwrap();
+            result.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+
+    result
+}
+
 /// Check if a byte is a word-boundary character (NOT alphanumeric or underscore).
 #[must_use]
 pub fn is_word_boundary_char(b: u8) -> bool {
@@ -176,6 +226,55 @@ mod tests {
     fn replace_word_boundary_empty_needle() {
         let result = replace_word_boundary("abc", "", "x");
         assert_eq!(result, "abc");
+    }
+
+    // -------------------------------------------------------------------
+    // replace_word_boundary_any tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn replace_any_qualified_wins_over_unqualified() {
+        // Qualified needle is tried first; the unqualified `unit_price` inside the
+        // emitted replacement must NOT be re-scanned (no double substitution).
+        let result = replace_word_boundary_any(
+            "s.unit_price",
+            &["s.unit_price", "unit_price"],
+            "(s.unit_price)",
+        );
+        assert_eq!(result, "(s.unit_price)");
+    }
+
+    #[test]
+    fn replace_any_unqualified_fallback() {
+        // When only the unqualified form appears, it still matches.
+        let result =
+            replace_word_boundary_any("SUM(unit_price)", &["s.unit_price", "unit_price"], "(x)");
+        assert_eq!(result, "SUM((x))");
+    }
+
+    #[test]
+    fn replace_any_inside_qualified_metric() {
+        // Metric referencing an identity fact by its qualified column.
+        let result = replace_word_boundary_any(
+            "SUM(s.unit_price)",
+            &["s.unit_price", "unit_price"],
+            "(s.unit_price)",
+        );
+        assert_eq!(result, "SUM((s.unit_price))");
+    }
+
+    #[test]
+    fn replace_any_no_substring_match() {
+        let result =
+            replace_word_boundary_any("unit_price_total", &["s.unit_price", "unit_price"], "(x)");
+        assert_eq!(result, "unit_price_total");
+    }
+
+    #[test]
+    fn replace_any_utf8_passthrough() {
+        // Non-ASCII, non-matching content must not panic and must round-trip.
+        let result = replace_word_boundary_any("héllo + unit_price", &["unit_price"], "(x)");
+        assert_eq!(result, "héllo + (x)");
     }
 
     // -------------------------------------------------------------------

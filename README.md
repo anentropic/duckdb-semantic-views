@@ -144,6 +144,13 @@ SELECT * FROM explain_semantic_view('analytics',
 
 Name common row-level calculations once and reference them in metrics. Facts are inlined into metric expressions at expansion time.
 
+> **Clause direction:** like Snowflake, each entry is `alias.<logical_name> AS <sql_expression>` —
+> the **name comes before `AS`**, the SQL expression after. This is the reverse of a plain SQL
+> `expression AS alias`. The logical name is what you query (`facts := ['net_price']`) and what
+> `DESCRIBE` returns as the column. A fact may be named after its own column —
+> `FACTS (s.unit_price AS s.unit_price)` defines a passthrough fact `unit_price`. The same
+> direction applies to `DIMENSIONS` and `METRICS`.
+
 ```sql
 CREATE SEMANTIC VIEW sales AS
 TABLES (

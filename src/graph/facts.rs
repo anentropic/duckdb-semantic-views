@@ -73,7 +73,7 @@ pub fn validate_facts(def: &SemanticViewDefinition) -> Result<(), String> {
     let fact_names: Vec<&str> = def.facts.iter().map(|f| f.name.as_str()).collect();
 
     // 2. Build fact dependency DAG and check for cycles
-    let (edges, in_degree) = build_fact_dag(def, &fact_names)?;
+    let (edges, in_degree) = build_fact_dag(def, &fact_names);
 
     // 3. Check that all referenced facts exist
     check_fact_references_exist(&edges, &fact_names)?;
@@ -111,10 +111,10 @@ fn check_fact_source_tables(def: &SemanticViewDefinition) -> Result<(), String> 
 type FactDag<'a> = (HashMap<&'a str, Vec<&'a str>>, HashMap<&'a str, usize>);
 
 /// Build fact dependency DAG from expressions. Returns `(edges, in_degree)`.
-fn build_fact_dag<'a>(
-    def: &'a SemanticViewDefinition,
-    fact_names: &[&'a str],
-) -> Result<FactDag<'a>, String> {
+///
+/// A fact referencing its own name is treated as a column reference and produces no
+/// edge; genuine multi-fact cycles are detected later by [`check_fact_cycles`].
+fn build_fact_dag<'a>(def: &'a SemanticViewDefinition, fact_names: &[&'a str]) -> FactDag<'a> {
     let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
 
@@ -126,10 +126,12 @@ fn build_fact_dag<'a>(
         let refs = find_fact_references(&fact.expr, fact_names);
         for &referenced in &refs {
             if referenced == fact.name.as_str() {
-                return Err(format!(
-                    "cycle detected in facts: {} -> {}",
-                    fact.name, fact.name
-                ));
+                // A fact's own name appearing in its own expression is a reference
+                // to the physical column, not a self-dependency — e.g. the identity
+                // passthrough fact `s.unit_price AS s.unit_price`. Skip the self-edge
+                // (mirrors `toposort_facts`, which already does `if dep_idx == i`).
+                // Genuine multi-fact cycles (A->B->A) are still caught below.
+                continue;
             }
             edges
                 .entry(fact.name.as_str())
@@ -139,7 +141,7 @@ fn build_fact_dag<'a>(
         }
     }
 
-    Ok((edges, in_degree))
+    (edges, in_degree)
 }
 
 /// Check that all fact names referenced in edges actually exist.
@@ -341,15 +343,41 @@ mod tests {
     }
 
     #[test]
-    fn validate_facts_self_reference_cycle() {
+    fn validate_facts_self_named_is_not_a_cycle() {
+        // A fact whose expression references its own name is NOT a self-cycle: the
+        // bare name resolves to the physical column at query time. This is the
+        // identity/passthrough shape, and an expression like `recursive + 1` simply
+        // reads column `recursive`. Validation must accept it.
         let def = make_def_with_facts(
             vec![("o", "orders")],
             vec![("recursive", "recursive + 1", "o")],
         );
-        let err = validate_facts(&def).unwrap_err();
         assert!(
-            err.contains("cycle detected in facts"),
-            "Expected self-reference cycle error, got: {err}"
+            validate_facts(&def).is_ok(),
+            "Self-named fact should be accepted (column reference, not self-cycle)"
+        );
+    }
+
+    #[test]
+    fn validate_facts_identity_passthrough() {
+        // The canonical passthrough: fact named after its backing column, both
+        // unqualified and qualified expression forms.
+        let def_unqualified = make_def_with_facts(
+            vec![("s", "sales")],
+            vec![("unit_price", "unit_price", "s")],
+        );
+        assert!(
+            validate_facts(&def_unqualified).is_ok(),
+            "Identity fact `s.unit_price AS unit_price` should validate"
+        );
+
+        let def_qualified = make_def_with_facts(
+            vec![("s", "sales")],
+            vec![("unit_price", "s.unit_price", "s")],
+        );
+        assert!(
+            validate_facts(&def_qualified).is_ok(),
+            "Identity fact `s.unit_price AS s.unit_price` should validate"
         );
     }
 
