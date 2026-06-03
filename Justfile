@@ -267,7 +267,8 @@ release:
     sed -i '' "s/^  version: .*/  version: $VERSION/" description.yml
     git add description.yml
     git commit -m "chore: update description.yml for v$VERSION release"
-    echo "Committed description.yml update"
+    git push origin main
+    echo "Committed and pushed description.yml update to main"
     # --- Copy to CE fork and open PR ---
     CE_REPO="${CE_REPO:-$HOME/Documents/Dev/Sources/community-extensions}"
     if [ ! -d "$CE_REPO" ]; then
