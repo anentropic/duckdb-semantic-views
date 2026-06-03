@@ -14,6 +14,12 @@ updates:
       github-actions:
         patterns:
           - "*"
+    ignore:
+      # DuckDB-coupled: this reusable workflow is version-locked to the DuckDB
+      # release line and must track .duckdb-version manually. Kept under project
+      # control and never auto-bumped (cf. DuckDBVersionMonitor.yml, and the
+      # duckdb/libduckdb-sys ignore in the cargo ecosystem below).
+      - dependency-name: "duckdb/extension-ci-tools/*"
 
   - package-ecosystem: "cargo"
     directory: "/"
@@ -23,6 +29,10 @@ updates:
       rust-dependencies:
         patterns:
           - "*"
-        exclude-patterns:
-          - "duckdb"
-          - "libduckdb-sys"
+    ignore:
+      # DuckDB-coupled: pinned exactly (version = "=x.y.z") and bumped in lockstep
+      # with .duckdb-version by DuckDBVersionMonitor.yml. Never auto-bumped here —
+      # an individual Dependabot PR would decouple the crate from the DuckDB pin.
+      # (ignore also auto-excludes these from the rust-dependencies group.)
+      - dependency-name: "duckdb"
+      - dependency-name: "libduckdb-sys"

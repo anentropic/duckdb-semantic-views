@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes yet._
 
+## [0.10.1] - 2026-06-03
+
+### Fixed
+
+- **Community-extension build now loads on DuckDB 1.5.3.** The v0.10.0 binary published to the community-extensions registry was compiled against DuckDB 1.5.2 (the `duckdb`/`libduckdb-sys` crates were pinned to `=1.10502.0`) and stamped for v1.5.2, so on DuckDB 1.5.3 `INSTALL semantic_views FROM community; LOAD semantic_views;` failed with `The file was built specifically for DuckDB version 'v1.5.2' and can only be loaded with that version of DuckDB`. All DuckDB version pins are bumped to 1.5.3 — `.duckdb-version`, the `duckdb`/`libduckdb-sys` crates, the distribution workflows, and the Python test/example headers — so the rebuilt extension targets and loads on DuckDB 1.5.3. No functional or API changes from 0.10.0.
+
 ## [0.10.0] - 2026-05-27
 
 Connection-lifecycle and ADBC fixes. Two downstream regressions reported against v0.8.0/v0.9.0 — an in-process `read_only=True` reopen that hung indefinitely, and `SELECT … FROM semantic_view(...)` failing with `Catalog Error: Table X does not exist` through ADBC — were both rooted in extension-owned long-lived `duckdb_connection` handles whose catalog/schema search path diverged from the caller's. v0.10.0 retires both long-lived handles and moves every read-side callback to a per-call `Connection(*context.db)` that inherits the caller's context natively. The two symptoms resolve as consequences. PK auto-inference from `duckdb_constraints()` is removed in the same release as the architectural pivot (see Changed).
@@ -297,7 +303,8 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.7.2...v0.8.0
