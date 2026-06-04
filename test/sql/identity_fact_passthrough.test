@@ -1,0 +1,98 @@
+# Identity / passthrough fact: a fact named after its own backing column.
+#
+# Regression for v0.10.2: `FACTS (s.unit_price AS s.unit_price)` must
+#   1. CREATE (the self-name is a column reference, not a self-cycle), and
+#   2. expand to a single column reference, NOT the double-substituted
+#      `(s.(s.unit_price))`, so DESCRIBE returns the declared fact name.
+
+require semantic_views
+
+statement ok
+CREATE TABLE idf_sales (id INTEGER, unit_price INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO idf_sales VALUES (1, 100, 'East'), (2, 200, 'East'), (3, 150, 'West');
+
+# ============================================================
+# CREATE with an identity passthrough fact (qualified expression)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW idf_v AS
+  TABLES (
+    s AS idf_sales PRIMARY KEY (id)
+  )
+  FACTS (
+    s.unit_price AS s.unit_price
+  )
+  DIMENSIONS (
+    s.region AS s.region
+  )
+  METRICS (
+    s.total_price AS SUM(s.unit_price)
+  );
+
+# ============================================================
+# DESCRIBE returns the declared fact name as the output column
+# ============================================================
+
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM semantic_view('idf_v', facts := ['unit_price']));
+----
+unit_price
+
+# ============================================================
+# The fact query returns the underlying column values (unaggregated)
+# ============================================================
+
+query I
+FROM semantic_view('idf_v', facts := ['unit_price'])
+ORDER BY 1;
+----
+100
+150
+200
+
+# ============================================================
+# A metric referencing the identity fact aggregates correctly
+# (no expression corruption: SUM(s.unit_price), not SUM(s.(s.unit_price)))
+# ============================================================
+
+query TI rowsort
+SELECT * FROM semantic_view('idf_v', dimensions := ['region'], metrics := ['total_price']);
+----
+East	300
+West	150
+
+# ============================================================
+# CREATE also accepts the unqualified expression form
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW idf_v2 AS
+  TABLES (
+    s AS idf_sales PRIMARY KEY (id)
+  )
+  FACTS (
+    s.unit_price AS unit_price
+  )
+  DIMENSIONS (
+    s.region AS s.region
+  )
+  METRICS (
+    s.total_price AS SUM(s.unit_price)
+  );
+
+query I
+FROM semantic_view('idf_v2', facts := ['unit_price'])
+ORDER BY 1;
+----
+100
+150
+200
+
+statement ok
+DROP SEMANTIC VIEW idf_v2;
+
+statement ok
+DROP SEMANTIC VIEW idf_v;

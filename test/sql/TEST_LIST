@@ -58,3 +58,4 @@ test/sql/phase67_qualified_emission.test
 test/sql/phase67_quoted_source_tables.test
 test/sql/phase68_quoted_idents_non_additive.test
 test/sql/phase68_quoted_idents_window.test
+test/sql/identity_fact_passthrough.test

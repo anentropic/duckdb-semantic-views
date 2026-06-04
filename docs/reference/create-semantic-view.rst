@@ -221,19 +221,19 @@ Declares named row-level expressions. Facts are inlined into metric expressions 
 **Parameters:**
 
 - ``PRIVATE``, optional. When present, the fact cannot be queried directly via ``facts := [...]`` but can still be referenced in metric expressions.
-- ``<alias>.<fact_name>``, the table alias and fact name. Facts are scoped to a single table.
-- ``<row_level_expression>``, any SQL expression that operates on individual rows. Must not contain aggregate functions.
+- ``<alias>.<fact_name>``, the table alias and fact name, appearing **before** ``AS``. Facts are scoped to a single table. The fact name is what you query (``facts := ['net_price']``) and what ``DESCRIBE`` returns as the output column. As in Snowflake, the entry reads ``name AS expression`` — the reverse of a plain SQL ``expression AS alias``.
+- ``<row_level_expression>``, the SQL expression **after** ``AS``: any expression that operates on individual rows. Must not contain aggregate functions. A fact may be named after its own backing column (``s.unit_price AS s.unit_price``), giving a passthrough fact.
 - ``COMMENT = '<text>'``, optional. A human-readable description.
 - ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
 
 **Fact chaining:**
 
-Facts can reference other facts by name. The extension resolves dependencies in topological order and inlines them recursively. Circular references are rejected at define time.
+Facts can reference other facts by name. The extension resolves dependencies in topological order and inlines them recursively. Circular references between distinct facts are rejected at define time. A fact whose expression contains its *own* name (``s.unit_price AS s.unit_price``) is treated as a reference to the physical column, not a self-cycle.
 
 **Validation rules:**
 
 - Aggregate functions (``SUM``, ``COUNT``, ``AVG``, ``MIN``, ``MAX``, etc.) in fact expressions are rejected.
-- Circular fact references are rejected.
+- Circular references between distinct facts are rejected (a fact referencing its own name resolves to the physical column).
 
 
 .. _ref-create-dimensions:

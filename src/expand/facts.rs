@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::model::Fact;
-use crate::util::{is_word_boundary_char, replace_word_boundary};
+use crate::util::{is_word_boundary_char, replace_word_boundary, replace_word_boundary_any};
 
 /// Maximum allowed nesting depth for derived metric resolution.
 /// Prevents stack overflow from deeply nested metric chains that pass
@@ -170,15 +170,18 @@ pub(super) fn inline_facts(expr: &str, facts: &[Fact], topo_order: &[usize]) -> 
         let fact = &facts[idx];
         let mut resolved_expr = fact.expr.clone();
 
-        // Inline any already-resolved facts into this fact's expression
+        // Inline any already-resolved facts into this fact's expression.
+        // Qualified (`alias.name`) and unqualified (`name`) forms are replaced in a
+        // single pass so a replacement containing the unqualified name is not
+        // re-scanned (see `replace_word_boundary_any`).
         for (name, replacement) in &resolved {
-            // Try qualified form: source_table.name
-            if let Some(ref st) = fact.source_table {
-                let qualified = format!("{st}.{name}");
-                resolved_expr = replace_word_boundary(&resolved_expr, &qualified, replacement);
+            let qualified = fact.source_table.as_ref().map(|st| format!("{st}.{name}"));
+            let mut needles: Vec<&str> = Vec::with_capacity(2);
+            if let Some(ref q) = qualified {
+                needles.push(q);
             }
-            // Unqualified form
-            resolved_expr = replace_word_boundary(&resolved_expr, name, replacement);
+            needles.push(name);
+            resolved_expr = replace_word_boundary_any(&resolved_expr, &needles, replacement);
         }
 
         // Store as parenthesized
@@ -192,13 +195,19 @@ pub(super) fn inline_facts(expr: &str, facts: &[Fact], topo_order: &[usize]) -> 
     for &idx in topo_order {
         let fact = &facts[idx];
         if let Some(replacement) = resolved.get(&fact.name) {
-            // Try qualified form first: source_table.name
-            if let Some(ref st) = fact.source_table {
-                let qualified = format!("{st}.{}", fact.name);
-                result = replace_word_boundary(&result, &qualified, replacement);
+            // Replace qualified (`alias.name`) and unqualified (`name`) forms in a
+            // single pass. Sequential calls would double-substitute an identity
+            // fact whose replacement contains its own unqualified name.
+            let qualified = fact
+                .source_table
+                .as_ref()
+                .map(|st| format!("{st}.{}", fact.name));
+            let mut needles: Vec<&str> = Vec::with_capacity(2);
+            if let Some(ref q) = qualified {
+                needles.push(q);
             }
-            // Unqualified form
-            result = replace_word_boundary(&result, &fact.name, replacement);
+            needles.push(&fact.name);
+            result = replace_word_boundary_any(&result, &needles, replacement);
         }
     }
 
@@ -713,6 +722,37 @@ mod tests {
         assert!(
             result.contains("price * (1 - discount)"),
             "Should replace qualified form o.net_price, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_inline_facts_identity_qualified_no_double_sub() {
+        // Identity passthrough: fact `unit_price` whose expression is the qualified
+        // column `s.unit_price`. The SELECT path passes the fact's own expr through
+        // inline_facts. It must NOT double-substitute into `(s.(s.unit_price))`.
+        let mut fact = make_fact("unit_price", "s.unit_price");
+        fact.source_table = Some("s".to_string());
+        let facts = vec![fact];
+        let topo = vec![0];
+        let result = inline_facts("s.unit_price", &facts, &topo);
+        assert_eq!(
+            result, "(s.unit_price)",
+            "Identity fact must resolve to its column once, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_inline_facts_identity_referenced_by_metric() {
+        // A metric referencing an identity fact by its qualified column must inline
+        // cleanly to a single column reference.
+        let mut fact = make_fact("unit_price", "s.unit_price");
+        fact.source_table = Some("s".to_string());
+        let facts = vec![fact];
+        let topo = vec![0];
+        let result = inline_facts("SUM(s.unit_price)", &facts, &topo);
+        assert_eq!(
+            result, "SUM((s.unit_price))",
+            "Metric over identity fact must inline once, got: {result}"
         );
     }
 
