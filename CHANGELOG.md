@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.10.2] - 2026-06-04
+
 ### Fixed
 
 - **Passthrough facts named after their own column now work.** A fact whose expression references its own name — the natural 1:1 passthrough, e.g. `FACTS (s.unit_price AS s.unit_price)` — was rejected at `CREATE` time with `cycle detected in facts: unit_price -> unit_price`, and even when the expression differed slightly it expanded incorrectly. Two issues are fixed: (1) a fact's own name in its own expression is now treated as a reference to the physical column, not a self-cycle (genuine cycles between distinct facts are still rejected); and (2) fact-reference inlining replaced the qualified (`alias.name`) and unqualified (`name`) forms in two sequential passes, so for an identity fact the second pass re-scanned the first's output and produced corrupt SQL (`s.unit_price` → `(s.(s.unit_price))`) — replacement now happens in a single non-re-scanning pass. `DESCRIBE SELECT * FROM semantic_view('v', facts := ['unit_price'])` returns the declared fact name as the output column. Note: as in Snowflake, each clause entry reads `name AS expression` (logical name before `AS`, SQL expression after) — the reverse of a plain SQL `expression AS alias`.
@@ -305,7 +309,8 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.8.0...v0.9.0
