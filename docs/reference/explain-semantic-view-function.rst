@@ -83,7 +83,7 @@ The header includes a ``-- Materialization:`` line that reports the routing deci
 - ``-- Materialization: none`` when no materialization matches, or when the view has no materializations declared.
 
 .. versionadded:: 0.7.0
-   The ``-- Materialization:`` header line was added in v0.7.0.
+   The ``-- Materialization:`` header line.
 
 
 .. _ref-explain-examples:

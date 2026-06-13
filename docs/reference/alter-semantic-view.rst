@@ -49,7 +49,7 @@ Statement Variants
 
 .. note::
 
-   Since v0.8.0 ``ALTER`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the previous name and comment). Since v0.8.0, the non-``IF EXISTS`` forms additionally raise ``semantic view '<name>' was concurrently dropped`` if another process drops the view at the same time, instead of silently succeeding. ``IF EXISTS`` keeps its silent-no-op behaviour. See :ref:`explanation-transactional-ddl`.
+   ``ALTER`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the previous name and comment). The non-``IF EXISTS`` forms raise ``semantic view '<name>' was concurrently dropped`` if another process drops the view at the same time, instead of silently succeeding. ``IF EXISTS`` keeps its silent-no-op behaviour. See :ref:`explanation-transactional-ddl`.
 
 .. note::
 
