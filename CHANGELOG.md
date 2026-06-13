@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes yet._
 
+## [0.10.3] - 2026-06-13
+
+### Fixed
+
+- **Windows community-extension build fixed against the updated MSVC toolchain.** The vendored DuckDB amalgamation bundles `fmt` 6.1.2, which on MSVC selected `stdext::checked_array_iterator` (under `#ifdef _SECURE_SCL`). Recent Microsoft STL versions removed that symbol entirely, so the `windows-latest` build began failing to compile the amalgamation with `error C2653: 'stdext': is not a class or namespace name`. The Windows build-time patch applied to `duckdb.cpp` now disables that branch so `fmt` takes its portable raw-pointer path — the same code every non-Windows platform already compiled. No functional or API changes from 0.10.2; this only restores the Windows build so the community-extensions registry can keep producing a Windows binary as new DuckDB versions ship.
+
 ## [0.10.2] - 2026-06-04
 
 ### Fixed
@@ -309,7 +315,8 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.3...HEAD
+[0.10.3]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.9.0...v0.10.0
