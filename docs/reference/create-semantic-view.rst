@@ -108,7 +108,7 @@ All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` 
 
 .. note::
 
-   Since v0.8.0 all four ``CREATE`` body variants participate in your surrounding transaction. ``BEGIN ... ROLLBACK`` discards an uncommitted ``CREATE``. See :ref:`explanation-transactional-ddl`.
+   All four ``CREATE`` body variants participate in your surrounding transaction. ``BEGIN ... ROLLBACK`` discards an uncommitted ``CREATE``. See :ref:`explanation-transactional-ddl`.
 
 .. note::
 
@@ -257,6 +257,10 @@ Declares named grouping expressions available for queries.
 - ``<expression>``, any SQL expression. Can be a simple column reference (``o.region``) or a computed expression (``date_trunc('month', o.ordered_at)``).
 - ``COMMENT = '<text>'``, optional. A human-readable description.
 - ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
+
+.. note::
+
+   **Column qualification in expressions.** The ``<alias>.<dim_name>`` on the left of ``AS`` (the logical name) must always carry its table-alias prefix. Column references *inside the expression* on the right of ``AS`` may be either qualified (``o.region``) or unqualified (``region``). Unqualified references resolve fine in single-table views, but in multi-table views they can raise an ambiguity error when more than one joined table exposes the same column name. Qualifying expression columns (``alias.column``) is recommended — it is unambiguous in every case, which is why all examples in these docs use it. The same rule applies to ``METRICS`` and ``FACTS`` expressions.
 
 **Validation rules:**
 
