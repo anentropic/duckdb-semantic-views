@@ -315,6 +315,10 @@ fn main() {
 /// - `interface` → `struct` (`objbase.h`): conflicts with `MultiFileReader` `interface`
 ///   variable names (line ~65873+).
 ///
+/// A third, unrelated MSVC conflict is also handled here (Patch 3): the bundled `fmt` 6.1.2
+/// references `stdext::checked_array_iterator`, which recent MSVC STL versions removed. That
+/// patch flips the `#ifdef _SECURE_SCL` guard to take `fmt`'s portable raw-pointer path.
+///
 /// The fix adds explicit `#undef` blocks after each `<windows.h>` include, following
 /// the same pattern `DuckDB` already uses for `CreateDirectory`/`MoveFile`/`RemoveDirectory`
 /// in the same file. We patch at build time (not at commit time) because `duckdb.cpp`
@@ -408,6 +412,42 @@ fn patch_duckdb_cpp_for_windows() -> String {
             "cargo:warning=duckdb.cpp Win32 patch 2 skipped: expected marker not found. \
                   This may indicate a DuckDB version change — verify interface macro is not \
                   causing build failures."
+        );
+        content
+    };
+
+    // --- Patch 3: neutralize fmt's removed-MSVC-API reference ---
+    //
+    // The bundled fmt 6.1.2 (FMT_VERSION 60102, ~line 16639) selects a checked iterator on
+    // MSVC via:
+    //
+    //   #ifdef _SECURE_SCL
+    //   template <typename T> using checked_ptr = stdext::checked_array_iterator<T*>;
+    //   ...
+    //   #else
+    //   template <typename T> using checked_ptr = T*;   // portable path
+    //   #endif
+    //
+    // `_SECURE_SCL` is defined by the MSVC STL headers whenever they are included, so MSVC
+    // always takes the first branch. Recent MSVC STL versions REMOVED stdext::checked_array_iterator
+    // entirely (the stdext namespace no longer exists), so that branch fails to compile with
+    //   error C2653: 'stdext': is not a class or namespace name
+    // This is a hard removal, not a deprecation, so no _SILENCE_* macro restores it, and the
+    // `#ifdef` guard (defined-ness, not value) means -D_SECURE_SCL=0 would still take it.
+    //
+    // We flip the guard to `#if 0` so the compiler takes fmt's portable `checked_ptr = T*`
+    // path — exactly what every non-Windows platform already compiles, and what release builds
+    // want (checked iterators are a debug-only aid). The stdext reference becomes dead code.
+    let patch3_before = "#ifdef _SECURE_SCL\n// Make a checked iterator to avoid MSVC warnings.\ntemplate <typename T> using checked_ptr = stdext::checked_array_iterator<T*>;";
+    let patch3_after = "#if 0 // semantic-views patch: stdext::checked_array_iterator removed from modern MSVC STL — force fmt's portable raw-pointer path\n// Make a checked iterator to avoid MSVC warnings.\ntemplate <typename T> using checked_ptr = stdext::checked_array_iterator<T*>;";
+
+    let content = if content.contains(patch3_before) {
+        content.replace(patch3_before, patch3_after)
+    } else {
+        println!(
+            "cargo:warning=duckdb.cpp Win32 patch 3 skipped: expected _SECURE_SCL marker not \
+                  found. This may indicate a DuckDB/fmt version change — verify \
+                  stdext::checked_array_iterator is not causing build failures."
         );
         content
     };
