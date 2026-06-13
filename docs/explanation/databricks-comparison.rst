@@ -202,7 +202,7 @@ Databricks uses ``MEASURES`` for aggregate columns. DuckDB Semantic Views uses `
 Dimension Expressions
 ---------------------
 
-In Databricks, dimensions can be simple column references (``region``) without explicit expressions. In DuckDB Semantic Views, every dimension requires an explicit expression with a table-alias prefix: ``o.region AS o.region``. Computed dimensions use any SQL expression: ``o.month AS date_trunc('month', o.order_date)``.
+In Databricks, dimensions can be simple column references (``region``) without explicit expressions. In DuckDB Semantic Views, every dimension is written as ``<logical_name> AS <expression>``, where the logical name (left of ``AS``) must carry a table-alias prefix: ``o.region AS o.region``. The expression on the right of ``AS`` is any SQL expression — its column references may be qualified (``o.region``) or unqualified (``region``), though qualifying them avoids ambiguity in multi-table views. Computed dimensions use any SQL expression: ``o.month AS date_trunc('month', o.order_date)``.
 
 
 .. _explanation-db-unique-duckdb:

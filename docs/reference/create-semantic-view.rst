@@ -258,6 +258,10 @@ Declares named grouping expressions available for queries.
 - ``COMMENT = '<text>'``, optional. A human-readable description.
 - ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
 
+.. note::
+
+   **Column qualification in expressions.** The ``<alias>.<dim_name>`` on the left of ``AS`` (the logical name) must always carry its table-alias prefix. Column references *inside the expression* on the right of ``AS`` may be either qualified (``o.region``) or unqualified (``region``). Unqualified references resolve fine in single-table views, but in multi-table views they can raise an ambiguity error when more than one joined table exposes the same column name. Qualifying expression columns (``alias.column``) is recommended — it is unambiguous in every case, which is why all examples in these docs use it. The same rule applies to ``METRICS`` and ``FACTS`` expressions.
+
 **Validation rules:**
 
 - Dimension names must be unique within the view (case-insensitive). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
