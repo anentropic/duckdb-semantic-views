@@ -9,7 +9,7 @@ Transactional DDL and Known Limitations
 
 .. versionadded:: 0.8.0
 
-In v0.8.0, ``CREATE``, ``DROP``, and ``ALTER SEMANTIC VIEW`` became fully transactional: they participate in your surrounding ``BEGIN`` / ``COMMIT`` / ``ROLLBACK`` block the way ordinary DuckDB DDL does. ADBC, dbt-duckdb, and any other transaction-aware client now behave the way you'd expect.
+``CREATE``, ``DROP``, and ``ALTER SEMANTIC VIEW`` are fully transactional: they participate in your surrounding ``BEGIN`` / ``COMMIT`` / ``ROLLBACK`` block the way ordinary DuckDB DDL does. ADBC, dbt-duckdb, and any other transaction-aware client behave the way you'd expect.
 
 This page explains what to expect day to day, and a short list of edge cases worth knowing about. Most of the edge cases only surface in unusual situations -- multiple processes touching the same database file at the same time, or scripts that explicitly toggle DuckDB's experimental PEG parser.
 
@@ -42,8 +42,6 @@ You can wrap DDL in ``BEGIN`` / ``COMMIT`` and rely on the rollback semantics:
    -- the view is still called order_metrics.
 
 This applies to every ``CREATE`` body variant: the ``AS`` keyword body, inline ``FROM YAML $$ ... $$``, ``FROM YAML FILE '<path>'``, and the ``CREATE OR REPLACE`` / ``IF NOT EXISTS`` modifiers. ``ALTER`` covers ``RENAME TO``, ``SET COMMENT``, and ``UNSET COMMENT``.
-
-Before v0.8.0 these statements committed independently of the surrounding transaction, which meant ``ROLLBACK`` could not undo them. If you wrote DDL with that older behaviour in mind, you can simplify -- the transaction now does what it looks like it does.
 
 
 .. _explanation-txn-ddl-write-visibility:
@@ -169,10 +167,6 @@ The typical pattern for shipping a read-only database with pre-defined semantic 
        "SELECT * FROM semantic_view('orders', dimensions := ['region'], metrics := ['total'])"
    ).fetchall()
 
-.. note::
-
-   The v0.1.0 → v0.2.0 companion-file migration cannot run on a read-only database. The migration INSERTs the contents of a sidecar ``<db>.semantic_views`` file into ``semantic_layer._definitions`` and then deletes the sidecar -- both writes. If you have a database that was last opened with a release older than v0.2.0 (March 2026) and has never been opened by a newer release, open it once writable to complete the migration before reverting to read-only. Practical impact is near-zero because any database touched by v0.2.0+ has already been migrated.
-
 
 .. _explanation-txn-ddl-peg:
 
@@ -202,9 +196,9 @@ If you don't touch ``disable_peg_parser`` you'll never see this. The extension i
 Summary
 ========
 
-For most users, the everyday-visible v0.8.x changes are:
+For most users, the everyday-visible behaviour is:
 
-- ``BEGIN ... ROLLBACK`` now genuinely rolls back ``CREATE``, ``DROP``, and ``ALTER SEMANTIC VIEW``. This is the headline improvement.
+- ``BEGIN ... ROLLBACK`` genuinely rolls back ``CREATE``, ``DROP``, and ``ALTER SEMANTIC VIEW``.
 
 The other items on this page only matter in specific situations:
 
@@ -214,7 +208,7 @@ The other items on this page only matter in specific situations:
 
 See also:
 
-- :ref:`explanation-txn-ddl-readonly` -- read-only database support, bootstrap-then-reopen workflow, and the v0.1.0 migration limitation.
+- :ref:`explanation-txn-ddl-readonly` -- read-only database support and the bootstrap-then-reopen workflow.
 - :ref:`ref-create-semantic-view` -- syntax for all four ``CREATE`` body forms.
 - :ref:`ref-drop-semantic-view` -- ``DROP`` and ``DROP IF EXISTS``.
 - :ref:`ref-alter-semantic-view` -- ``ALTER`` variants.

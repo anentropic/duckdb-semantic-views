@@ -106,7 +106,7 @@ When a match is found, the extension generates a simple ``SELECT ... FROM <mater
 
 .. warning::
 
-   Superset matching is not supported in v0.7.0. If a materialization covers ``[region]`` + ``[revenue, order_count]`` and a query requests only ``[region]`` + ``[revenue]``, the materialization does **not** match. The query falls back to standard expansion.
+   Superset matching is not supported. If a materialization covers ``[region]`` + ``[revenue, order_count]`` and a query requests only ``[region]`` + ``[revenue]``, the materialization does **not** match. The query falls back to standard expansion.
 
 
 .. _howto-materializations-multiple:

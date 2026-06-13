@@ -108,7 +108,7 @@ All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` 
 
 .. note::
 
-   Since v0.8.0 all four ``CREATE`` body variants participate in your surrounding transaction. ``BEGIN ... ROLLBACK`` discards an uncommitted ``CREATE``. See :ref:`explanation-transactional-ddl`.
+   All four ``CREATE`` body variants participate in your surrounding transaction. ``BEGIN ... ROLLBACK`` discards an uncommitted ``CREATE``. See :ref:`explanation-transactional-ddl`.
 
 .. note::
 
