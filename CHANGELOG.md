@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.10.4] - 2026-06-27
+
 ### Changed
 
 - DuckDB version pin bumped to `v1.5.4`.
@@ -317,7 +321,8 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.3...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.4...HEAD
+[0.10.4]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.0...v0.10.1
