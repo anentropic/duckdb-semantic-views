@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Changed
+
+- DuckDB version pin bumped to `v1.5.4`.
 
 ## [0.10.3] - 2026-06-13
 
