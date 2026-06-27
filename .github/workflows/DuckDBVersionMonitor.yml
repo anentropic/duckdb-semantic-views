@@ -13,7 +13,7 @@ jobs:
     name: Check for new DuckDB latest release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
           submodules: recursive
@@ -190,7 +190,7 @@ jobs:
             echo "Branch duckdb/1.4.x does not exist — skipping LTS check."
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: steps.branch_check.outputs.exists == 'true'
         with:
           ref: duckdb/1.4.x

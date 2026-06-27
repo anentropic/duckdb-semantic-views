@@ -30,7 +30,7 @@ jobs:
       matrix:
         target: [fuzz_json_parse, fuzz_sql_expand, fuzz_query_names, fuzz_ddl_parse]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz
 

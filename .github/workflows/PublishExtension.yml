@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release          # <- required-reviewer gate
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0          # need tags + full history for changelog/compare
