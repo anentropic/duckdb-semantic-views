@@ -1,0 +1,173 @@
+name: Publish Extension
+
+# Gated, post-merge republish to the DuckDB community-extensions registry.
+#
+# This is the piece the DuckDB Version Monitor deliberately does NOT do: it bumps
+# the pin and opens a PR, but publishing a new registry artifact has to happen
+# AFTER that PR merges (the published description.yml `ref` must point at a commit
+# that exists on `main`). This workflow performs that release:
+#
+#   gate -> version bump -> changelog roll -> tag -> description.yml sync -> CE PR
+#
+# It is intentionally MANUAL (workflow_dispatch) and runs in the `release`
+# environment so a required reviewer must approve each publish. The approval is
+# where a human confirms the registry is ready (see the registry-pin gate below).
+#
+# ── Required repo setup (one-time) ────────────────────────────────────────────
+#   * An Environment named `release` with required reviewers
+#     (Settings -> Environments). This is the human gate.
+#   * Secret CE_PUBLISH_PAT: a PAT with `repo` scope that can push to your fork
+#     `anentropic/community-extensions` AND open PRs against
+#     `duckdb/community-extensions`. Falls back to VERSION_MONITOR_PAT.
+#   * If `main` is branch-protected, the token above must be allowed to push the
+#     release commits + tag to `main` (or relax protection for this actor).
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.10.4). Leave blank to auto-bump the patch component of the current Cargo.toml version."
+        required: false
+        default: ""
+      dry_run:
+        description: "Build the release locally and show the diff, but do not push, tag, or open the CE PR."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CE_FORK: anentropic/community-extensions
+  CE_BRANCH: semantic-views
+  CE_UPSTREAM: duckdb/community-extensions
+
+jobs:
+  publish:
+    name: Publish to community-extensions
+    runs-on: ubuntu-latest
+    environment: release          # <- required-reviewer gate
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0          # need tags + full history for changelog/compare
+          token: ${{ secrets.CE_PUBLISH_PAT || secrets.VERSION_MONITOR_PAT || secrets.GITHUB_TOKEN }}
+
+      # 1. Resolve current + next version --------------------------------------
+      - name: Resolve versions
+        id: ver
+        run: |
+          CUR=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ -z "$CUR" ]; then echo "could not read version from Cargo.toml" >&2; exit 1; fi
+          IN="${{ github.event.inputs.version }}"
+          if [ -n "$IN" ]; then
+            NEXT="$IN"
+          else
+            IFS=. read -r MA MI PA <<< "$CUR"
+            NEXT="${MA}.${MI}.$((PA + 1))"
+          fi
+          echo "current=$CUR"   >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT"     >> "$GITHUB_OUTPUT"
+          echo "prev_tag=v$CUR" >> "$GITHUB_OUTPUT"
+          echo "Publishing v$NEXT (previous v$CUR)"
+
+      # 2. GATE: our DuckDB pin must match the registry's build pin -------------
+      #    The registry builds every extension against a single maintainer-pinned
+      #    DuckDB version (the `DUCKDB_VERSION` default in its build.yml). Submitting
+      #    a descriptor whose source pins a newer DuckDB than the registry targets
+      #    just produces a failing registry build. Fail fast here instead.
+      - name: Gate — registry DuckDB pin equality
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OURS=$(cat .duckdb-version)
+          BUILD_YML=$(gh api repos/${{ env.CE_UPSTREAM }}/contents/.github/workflows/build.yml --jq '.content' | base64 -d)
+          REG=$(printf '%s\n' "$BUILD_YML" | grep -m1 'DUCKDB_VERSION:' | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' | tail -1)
+          echo "repo pin (.duckdb-version): $OURS"
+          echo "registry pin (build.yml):  $REG"
+          if [ -z "$REG" ]; then
+            echo "::error::could not parse registry DUCKDB_VERSION from build.yml" ; exit 1
+          fi
+          if [ "$OURS" != "$REG" ]; then
+            echo "::error::repo pins $OURS but the community-extensions registry builds against $REG. Wait for the registry to roll forward to $OURS (or align the repo pin) before publishing."
+            exit 1
+          fi
+          echo "Registry pin matches — safe to publish."
+
+      # 3. Changelog roll + version bump in this repo --------------------------
+      - name: Roll changelog and bump version
+        run: |
+          NEXT="${{ steps.ver.outputs.next }}"
+          PREV_TAG="${{ steps.ver.outputs.prev_tag }}"
+          DATE=$(date -u +%Y-%m-%d)
+          python3 scripts/changelog_release.py "$NEXT" "$DATE" "$PREV_TAG"
+          # Cargo.toml: first `version = "..."` line is the package version.
+          sed -i "0,/^version = \"/{s/^version = \"[^\"]*\"/version = \"$NEXT\"/}" Cargo.toml
+          # Keep Cargo.lock's own-package entry in sync (no cargo run needed).
+          sed -i "/^name = \"semantic_views\"$/{n;s/^version = \".*\"/version = \"$NEXT\"/}" Cargo.lock
+          sed -i "s/^  version: .*/  version: $NEXT/" description.yml
+
+      - name: Show diff (dry run inspection)
+        run: git --no-pager diff
+
+      # 4. Commit + tag the release, then sync description.yml ref --------------
+      #    Mirrors `just release`: the release commit is tagged, then a follow-up
+      #    commit sets description.yml `ref:` to the tagged commit's SHA.
+      - name: Commit, tag, and push
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          NEXT="${{ steps.ver.outputs.next }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add CHANGELOG.md Cargo.toml Cargo.lock description.yml
+          git commit -m "chore: release v$NEXT"
+          git tag "v$NEXT"
+          SHA=$(git rev-parse HEAD)
+
+          # Point description.yml at the tagged release commit, then commit that.
+          sed -i "s/^  ref: .*/  ref: $SHA/" description.yml
+          git add description.yml
+          git commit -m "chore: update description.yml for v$NEXT release"
+
+          git push origin main
+          git push origin "v$NEXT"
+          echo "RELEASE_SHA=$SHA" >> "$GITHUB_ENV"
+
+      # 5. Open the community-extensions PR from the fork ----------------------
+      - name: Open community-extensions PR
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.CE_PUBLISH_PAT || secrets.VERSION_MONITOR_PAT }}
+        run: |
+          NEXT="${{ steps.ver.outputs.next }}"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${CE_FORK}.git" ce-fork
+          cd ce-fork
+          git remote add upstream "https://github.com/${CE_UPSTREAM}.git"
+          git fetch upstream main
+          # Fresh branch off upstream/main so the PR is a clean one-file change.
+          git checkout -B "$CE_BRANCH" upstream/main
+          mkdir -p extensions/semantic_views
+          cp ../description.yml extensions/semantic_views/description.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add extensions/semantic_views/description.yml
+          git commit -m "Update semantic_views to v$NEXT"
+          git push --force -u origin "$CE_BRANCH"
+          gh pr create \
+            --repo "$CE_UPSTREAM" \
+            --head "anentropic:$CE_BRANCH" \
+            --base main \
+            --title "Update semantic_views to v$NEXT" \
+            --body "Update semantic_views extension to v$NEXT (ref: ${RELEASE_SHA}). Built against the registry's current DuckDB pin."
+
+      - name: Summary
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          echo "### Published v${{ steps.ver.outputs.next }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tag pushed: \`v${{ steps.ver.outputs.next }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- description.yml ref: \`${RELEASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- community-extensions PR opened from \`anentropic:${CE_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
