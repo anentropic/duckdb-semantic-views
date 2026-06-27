@@ -93,6 +93,15 @@ jobs:
           # Download new amalgamation
           just update-headers
 
+      - name: Record changelog entry
+        if: steps.latest.outputs.is_new == 'true'
+        run: |
+          VER="${{ steps.latest.outputs.latest }}"
+          # Idempotent: re-running for the same version is a no-op (the monitor
+          # force-pushes its branch weekly). The publish workflow later rolls this
+          # [Unreleased] bullet into a versioned section at release time.
+          python3 scripts/changelog_add_bullet.py Changed "DuckDB version pin bumped to \`${VER}\`."
+
       - name: Build and test against new DuckDB version
         if: steps.latest.outputs.is_new == 'true'
         id: build
@@ -255,6 +264,12 @@ jobs:
 
           # Download new amalgamation
           just update-headers
+
+      - name: Record changelog entry (LTS)
+        if: steps.lts.outputs.is_new == 'true'
+        run: |
+          VER="${{ steps.lts.outputs.latest }}"
+          python3 scripts/changelog_add_bullet.py Changed "DuckDB LTS version pin bumped to \`${VER}\`."
 
       - name: Build and test against new LTS version
         if: steps.lts.outputs.is_new == 'true'
