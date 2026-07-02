@@ -58,8 +58,13 @@ pub fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) ->
                 continue;
             }
         }
-        result.push(haystack[i..].chars().next().unwrap());
-        i += 1;
+        // Advance by a full UTF-8 char so `i` stays on a char boundary
+        // (byte-wise advance both duplicated multi-byte chars in the output
+        // and panicked slicing `haystack[i..]` mid-codepoint — MS-3,
+        // code-review 2026-07-02; mirrors `replace_word_boundary_any`).
+        let ch = haystack[i..].chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
     }
     // Append remaining bytes that are shorter than needle
     if i < haystack.len() {
@@ -190,6 +195,41 @@ mod tests {
     fn replace_word_boundary_match_with_addition() {
         let result = replace_word_boundary("net_price + tax", "net_price", "(a + b)");
         assert_eq!(result, "(a + b) + tax");
+    }
+
+    #[test]
+    fn replace_word_boundary_non_ascii_haystack_no_panic_no_duplication() {
+        // MS-3 regression: byte-wise advance through a multi-byte char
+        // panicked on the next `haystack[i..]` slice ("byte index N is not
+        // a char boundary") and duplicated the char where it didn't panic.
+        // Reachable at query time via fact/derived-metric inlining over any
+        // expression containing non-ASCII (string literals, identifiers).
+        let result = replace_word_boundary("héllo + net_price", "net_price", "(x)");
+        assert_eq!(result, "héllo + (x)");
+
+        let result = replace_word_boundary("concat(city, ' – ') || net_price", "net_price", "(x)");
+        assert_eq!(result, "concat(city, ' – ') || (x)");
+
+        // Non-ASCII with no match at all must round-trip unchanged.
+        let result = replace_word_boundary("'São Paulo' || 'café'", "net_price", "(x)");
+        assert_eq!(result, "'São Paulo' || 'café'");
+    }
+
+    proptest! {
+        // Any (haystack, needle, replacement) triple must not panic, and a
+        // haystack containing no ASCII needle occurrence must round-trip
+        // byte-identical (guards the char-boundary advance).
+        #[test]
+        fn replace_word_boundary_never_panics_on_unicode(
+            haystack in "\\PC{0,40}",
+            needle in "[a-z_]{1,8}",
+            replacement in "\\PC{0,12}",
+        ) {
+            let out = replace_word_boundary(&haystack, &needle, &replacement);
+            if !haystack.contains(&needle) {
+                prop_assert_eq!(out, haystack);
+            }
+        }
     }
 
     #[test]

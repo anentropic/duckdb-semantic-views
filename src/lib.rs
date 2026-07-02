@@ -944,25 +944,34 @@ mod extension {
             semantic_views_init_c_api_internal(info, access)
         }));
 
+        // FF-7 (code-review 2026-07-02): these arms run AFTER catch_unwind
+        // has returned, so a panic here (e.g. `.unwrap()` on a null
+        // `set_error`) would unwind out of this extern "C" fn — a guaranteed
+        // process abort in the host. A null callback instead degrades to a
+        // message-less failed load.
         match init_result {
             Ok(Ok(val)) => val,
             Ok(Err(x)) => {
-                let error_c_string = std::ffi::CString::new(x.to_string());
-                match error_c_string {
-                    Ok(e) => {
-                        (*access).set_error.unwrap()(info, e.as_ptr());
-                    }
-                    Err(_e) => {
-                        let error_alloc_failure = c"An error occurred but the extension failed to allocate memory for an error string";
-                        (*access).set_error.unwrap()(info, error_alloc_failure.as_ptr());
+                if let Some(set_error) = (*access).set_error {
+                    let error_c_string = std::ffi::CString::new(x.to_string());
+                    match error_c_string {
+                        Ok(e) => {
+                            set_error(info, e.as_ptr());
+                        }
+                        Err(_e) => {
+                            let error_alloc_failure = c"An error occurred but the extension failed to allocate memory for an error string";
+                            set_error(info, error_alloc_failure.as_ptr());
+                        }
                     }
                 }
                 false
             }
             Err(_panic) => {
-                let panic_msg =
-                    c"Extension init panicked unexpectedly. This is a bug in semantic_views.";
-                (*access).set_error.unwrap()(info, panic_msg.as_ptr());
+                if let Some(set_error) = (*access).set_error {
+                    let panic_msg =
+                        c"Extension init panicked unexpectedly. This is a bug in semantic_views.";
+                    set_error(info, panic_msg.as_ptr());
+                }
                 false
             }
         }

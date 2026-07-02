@@ -178,11 +178,17 @@ test-yaml-file-create: build
 test-readonly-fresh-drop: build
     uv run test/integration/test_drop_on_fresh_readonly_clear_error.py
 
+# Chunked-emission regression (MS-1, code-review 2026-07-02): bind-materialized
+# TFs (list/show/describe family) must emit >2048-row result sets across
+# multiple DataChunks instead of overflowing one chunk's capacity.
+test-chunk-boundary: build
+    uv run test/integration/test_chunk_boundary.py
+
 # All Python integration suites against the built extension. This is the
 # exact set the `python-integration` CI job runs (IntegrationChecks.yml) —
 # keep the two in sync by editing THIS recipe, not the workflow.
 # (test-ducklake-ci is excluded: it has its own dedicated CI job.)
-test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-readonly-fresh-drop
+test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-readonly-fresh-drop test-chunk-boundary
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + all Python integration suites
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.

@@ -990,7 +990,13 @@ struct ListSemanticViewsBindData : public TableFunctionData {
 };
 
 struct ListSemanticViewsLocalState : public LocalTableFunctionState {
-    bool emitted = false;
+    // Next row to emit. Bind-materialized row sets can exceed one
+    // DataChunk's capacity (STANDARD_VECTOR_SIZE = 2048), so the exec
+    // callback must emit in chunks and resume from this cursor — a
+    // single-shot `emitted` flag overflowed the chunk for >2048 rows
+    // (writes past the vector's data buffer; no bounds check in
+    // release builds).
+    idx_t next_row = 0;
 };
 
 // Helper: read a little-endian u32 from buf[offset..offset+4] and advance.
@@ -1136,21 +1142,24 @@ static void sv_list_semantic_views_function(
             "sv_list_semantic_views_function: local_state missing despite init_local registration");
     }
     auto &state = state_p->Cast<ListSemanticViewsLocalState>();
-    if (state.emitted) {
+    idx_t total = bd.rows.size();
+    if (state.next_row >= total) {
         output.SetCardinality(0);
         return;
     }
-    idx_t n = bd.rows.size();
-    for (idx_t i = 0; i < n; ++i) {
-        output.SetValue(0, i, Value(bd.rows[i].created_on));
-        output.SetValue(1, i, Value(bd.rows[i].name));
-        output.SetValue(2, i, Value(bd.rows[i].kind));
-        output.SetValue(3, i, Value(bd.rows[i].database_name));
-        output.SetValue(4, i, Value(bd.rows[i].schema_name));
-        output.SetValue(5, i, Value(bd.rows[i].comment));
+    idx_t remaining = total - state.next_row;
+    idx_t count = remaining < STANDARD_VECTOR_SIZE ? remaining : STANDARD_VECTOR_SIZE;
+    for (idx_t i = 0; i < count; ++i) {
+        const auto &row = bd.rows[state.next_row + i];
+        output.SetValue(0, i, Value(row.created_on));
+        output.SetValue(1, i, Value(row.name));
+        output.SetValue(2, i, Value(row.kind));
+        output.SetValue(3, i, Value(row.database_name));
+        output.SetValue(4, i, Value(row.schema_name));
+        output.SetValue(5, i, Value(row.comment));
     }
-    output.SetCardinality(n);
-    state.emitted = true;
+    output.SetCardinality(count);
+    state.next_row += count;
 }
 
 extern "C" {
@@ -1188,7 +1197,11 @@ struct SvVarcharBindData : public TableFunctionData {
 };
 
 struct SvVarcharLocalState : public LocalTableFunctionState {
-    bool emitted = false;
+    // Next row to emit — see ListSemanticViewsLocalState::next_row for why
+    // this is a cursor and not a single-shot flag (chunked emission past
+    // STANDARD_VECTOR_SIZE rows). Shared by sv_emit_varchar_rows and
+    // sv_emit_varchar_bool_rows.
+    idx_t next_row = 0;
 };
 
 // Parse a length-prefixed VARCHAR wire-format payload into bd.rows. The
@@ -1242,19 +1255,21 @@ static void sv_emit_varchar_rows(
             "sv_emit_varchar_rows: local_state missing despite init_local registration");
     }
     auto &state = state_p->Cast<SvVarcharLocalState>();
-    if (state.emitted) {
+    idx_t total = bd.rows.size();
+    if (state.next_row >= total) {
         output.SetCardinality(0);
         return;
     }
-    idx_t n = bd.rows.size();
-    for (idx_t i = 0; i < n; ++i) {
-        const auto &row = bd.rows[i];
+    idx_t remaining = total - state.next_row;
+    idx_t count = remaining < STANDARD_VECTOR_SIZE ? remaining : STANDARD_VECTOR_SIZE;
+    for (idx_t i = 0; i < count; ++i) {
+        const auto &row = bd.rows[state.next_row + i];
         for (size_t c = 0; c < row.size(); ++c) {
             output.SetValue(c, i, Value(row[c]));
         }
     }
-    output.SetCardinality(n);
-    state.emitted = true;
+    output.SetCardinality(count);
+    state.next_row += count;
 }
 
 // VARCHAR-rows-with-trailing-BOOL shape (used by
@@ -1313,21 +1328,23 @@ static void sv_emit_varchar_bool_rows(
             "sv_emit_varchar_bool_rows: local_state missing despite init_local registration");
     }
     auto &state = state_p->Cast<SvVarcharLocalState>();
-    if (state.emitted) {
+    idx_t total = bd.rows.size();
+    if (state.next_row >= total) {
         output.SetCardinality(0);
         return;
     }
-    idx_t n = bd.rows.size();
-    for (idx_t i = 0; i < n; ++i) {
-        const auto &strs = bd.rows[i].first;
+    idx_t remaining = total - state.next_row;
+    idx_t count = remaining < STANDARD_VECTOR_SIZE ? remaining : STANDARD_VECTOR_SIZE;
+    for (idx_t i = 0; i < count; ++i) {
+        const auto &strs = bd.rows[state.next_row + i].first;
         for (size_t c = 0; c < strs.size(); ++c) {
             output.SetValue(c, i, Value(strs[c]));
         }
         // BOOLEAN trailing column at index strs.size().
-        output.SetValue(strs.size(), i, Value::BOOLEAN(bd.rows[i].second));
+        output.SetValue(strs.size(), i, Value::BOOLEAN(bd.rows[state.next_row + i].second));
     }
-    output.SetCardinality(n);
-    state.emitted = true;
+    output.SetCardinality(count);
+    state.next_row += count;
 }
 
 // Common idiom for the bind callback: open Connection, run Rust dispatcher
