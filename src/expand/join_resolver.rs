@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::graph::RelationshipGraph;
 use crate::model::{Join, SemanticViewDefinition, TableRef};
 
 use super::facts::{collect_derived_metric_source_tables, collect_derived_metric_using};
-use super::resolution::quote_ident;
+use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 
 /// Synthesize an ON clause from PK/FK column declarations (Phase 26).
 ///
@@ -58,67 +58,197 @@ pub(super) fn synthesize_on_clause_scoped(
     pairs.join(" AND ")
 }
 
+/// A join edge chosen by the resolver, in emission order.
+///
+/// Carries everything the emitters need to render the JOIN clause directly:
+/// no re-searching `def.joins` by alias (SG-2) and no re-parsing of scoped
+/// alias strings at `__` (SG-12).
+pub(super) struct ResolvedJoin<'a> {
+    /// SQL alias emitted after `AS` — the bare table alias (lowercased) or a
+    /// role-playing scoped alias in the documented `{bare}__{rel}` format.
+    pub emit_alias: String,
+    /// The bare (lowercased) table alias, used to look up the physical table
+    /// name in `def.tables`.
+    pub bare_alias: String,
+    /// The join edge connecting `emit_alias` to an already-emitted table.
+    pub join: &'a Join,
+    /// Whether `emit_alias` is a role-playing scoped alias. Scoped joins put
+    /// the scoped alias on the PK side of the synthesized ON clause.
+    pub scoped: bool,
+}
+
+/// Render `LEFT JOIN` clauses for resolver-selected edges onto `sql`.
+///
+/// `prefix` carries the newline + indentation + keyword for the emission site
+/// (e.g. `"\nLEFT JOIN "` in flat queries, `"\n    LEFT JOIN "` inside CTEs).
+pub(super) fn push_join_clauses(
+    sql: &mut String,
+    joins: &[ResolvedJoin<'_>],
+    def: &SemanticViewDefinition,
+    prefix: &str,
+) {
+    for rj in joins {
+        let table_ref = def
+            .tables
+            .iter()
+            .find(|t| t.alias.to_ascii_lowercase() == rj.bare_alias);
+        let physical_table = table_ref.map_or(rj.bare_alias.as_str(), |t| t.table.as_str());
+        sql.push_str(prefix);
+        sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
+        sql.push_str(" AS ");
+        sql.push_str(&quote_ident(&rj.emit_alias));
+        sql.push_str(" ON ");
+        if rj.scoped {
+            sql.push_str(&synthesize_on_clause_scoped(
+                rj.join,
+                &def.tables,
+                &rj.emit_alias,
+            ));
+        } else {
+            sql.push_str(&synthesize_on_clause(rj.join, &def.tables));
+        }
+    }
+}
+
+/// Undirected BFS from the graph root over PK/FK join edges.
+///
+/// Returns, for each reachable non-root alias, its tree parent (the neighbor
+/// on the path toward the root) and the `Join` edge connecting the two. This
+/// is the edge the emitters must use for the alias's ON clause: any other join
+/// mentioning the alias would reference a table that is not yet (or never)
+/// joined (SG-2). Traversing edges in both directions also covers tables on
+/// the FK side of the root (SG-10).
+fn build_tree_parents<'a>(
+    def: &'a SemanticViewDefinition,
+    root: &str,
+) -> HashMap<String, (String, &'a Join)> {
+    let mut tree_parent: HashMap<String, (String, &'a Join)> = HashMap::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(root.to_string());
+    let mut queue: VecDeque<String> = VecDeque::new();
+    queue.push_back(root.to_string());
+    while let Some(current) = queue.pop_front() {
+        // Visit edges in declaration order for determinism.
+        for join in &def.joins {
+            if join.fk_columns.is_empty() {
+                continue; // Legacy join -- not part of the PK/FK graph
+            }
+            let from = join.from_alias.to_ascii_lowercase();
+            let to = join.table.to_ascii_lowercase();
+            let neighbor = if from == current {
+                to
+            } else if to == current {
+                from
+            } else {
+                continue;
+            };
+            if visited.insert(neighbor.clone()) {
+                tree_parent.insert(neighbor.clone(), (current.clone(), join));
+                queue.push_back(neighbor.clone());
+            }
+        }
+    }
+    tree_parent
+}
+
+/// Append a bare-alias join to `result`, choosing the connecting edge.
+///
+/// Reachable aliases use their BFS tree edge. Aliases disconnected from the
+/// root (degenerate definitions that predate stricter validation) fall back to
+/// the first declared join mentioning the alias; aliases with no join at all
+/// are skipped, matching the previous emitters' behavior.
+fn push_bare_join<'a>(
+    result: &mut Vec<ResolvedJoin<'a>>,
+    def: &'a SemanticViewDefinition,
+    tree_parent: &HashMap<String, (String, &'a Join)>,
+    alias: String,
+) {
+    let join = if let Some((_, join)) = tree_parent.get(&alias) {
+        *join
+    } else {
+        let Some(join) = def.joins.iter().find(|j| {
+            j.table.to_ascii_lowercase() == alias || j.from_alias.to_ascii_lowercase() == alias
+        }) else {
+            return;
+        };
+        join
+    };
+    result.push(ResolvedJoin {
+        emit_alias: alias.clone(),
+        bare_alias: alias,
+        join,
+        scoped: false,
+    });
+}
+
 /// Resolve which joins are needed using graph-based PK/FK resolution (Phase 26+32).
 ///
-/// Builds a `RelationshipGraph` from the definition, collects needed table aliases
-/// from resolved dimensions and metrics, walks reverse edges to include transitive
-/// intermediaries, and returns aliases in topological order (root-outward).
+/// Builds a `RelationshipGraph` from the definition, collects needed table
+/// aliases from resolved dimensions, metrics, and fact source tables, includes
+/// every table on the path between the root and a needed alias (in both edge
+/// directions — SG-10), and returns structured join edges in emission order:
+/// each edge's ON clause references only the new alias and already-emitted
+/// tables (SG-2).
+///
+/// `fact_source_tables` carries fact source aliases for the facts path
+/// (`expand_facts`); other callers pass `&[]`. Fact-driven joins are appended
+/// after dimension-driven joins, preserving the historical clause order.
 ///
 /// Phase 32: When metrics have `using_relationships`, generates scoped aliases
-/// (`{to_alias}__{rel_name}`) instead of bare aliases. Scoped aliases are placed
-/// after the corresponding bare alias position in topological order.
+/// (`{to_alias}__{rel_name}`) instead of bare aliases. Scoped joins are placed
+/// after all bare joins, sorted by alias for deterministic output.
 #[allow(clippy::too_many_lines)]
-pub(super) fn resolve_joins_pkfk(
-    def: &SemanticViewDefinition,
+pub(super) fn resolve_joins_pkfk<'a>(
+    def: &'a SemanticViewDefinition,
     resolved_dims: &[&crate::model::Dimension],
     resolved_mets: &[&crate::model::Metric],
-) -> Vec<String> {
+    fact_source_tables: &[String],
+) -> Vec<ResolvedJoin<'a>> {
     let Ok(graph) = RelationshipGraph::from_definition(def) else {
         return Vec::new(); // Graph was validated at define time
     };
 
     let root = &graph.root;
 
-    // Phase 32: Collect scoped aliases from metrics with USING relationships.
-    let mut scoped_aliases: Vec<String> = Vec::new();
+    // Phase 32: Collect scoped joins from metrics with USING relationships.
+    // Each entry carries the scoped alias and the resolved Join edge, so the
+    // emitters never re-derive the relationship from the alias string (SG-12).
+    let mut scoped_joins: Vec<(String, &Join)> = Vec::new();
     // Also track which bare aliases are role-playing (have multiple relationships).
     let mut role_playing_bare_aliases: HashSet<String> = HashSet::new();
+
+    let add_scoped = |scoped_joins: &mut Vec<(String, &'a Join)>,
+                      role_playing: &mut HashSet<String>,
+                      using_rel: &str| {
+        let using_rel_lower = using_rel.to_ascii_lowercase();
+        if let Some(join) = def.joins.iter().find(|j| {
+            j.name
+                .as_ref()
+                .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
+        }) {
+            let to_alias = join.table.to_ascii_lowercase();
+            let scoped = format!("{to_alias}__{using_rel_lower}");
+            if !scoped_joins.iter().any(|(s, _)| *s == scoped) {
+                scoped_joins.push((scoped, join));
+            }
+            role_playing.insert(to_alias);
+        }
+    };
 
     for met in resolved_mets {
         if !met.using_relationships.is_empty() {
             for using_rel in &met.using_relationships {
-                // Find the join for this relationship name
-                let using_rel_lower = using_rel.to_ascii_lowercase();
-                if let Some(join) = def.joins.iter().find(|j| {
-                    j.name
-                        .as_ref()
-                        .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
-                }) {
-                    let to_alias = join.table.to_ascii_lowercase();
-                    let scoped = format!("{to_alias}__{using_rel_lower}");
-                    if !scoped_aliases.contains(&scoped) {
-                        scoped_aliases.push(scoped);
-                    }
-                    role_playing_bare_aliases.insert(to_alias);
-                }
+                add_scoped(&mut scoped_joins, &mut role_playing_bare_aliases, using_rel);
             }
         } else if met.source_table.is_none() {
             // Derived metric: walk transitive USING relationships
             let transitive_using = collect_derived_metric_using(met, &def.metrics);
             for using_rel in transitive_using {
-                let using_rel_lower = using_rel.to_ascii_lowercase();
-                if let Some(join) = def.joins.iter().find(|j| {
-                    j.name
-                        .as_ref()
-                        .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
-                }) {
-                    let to_alias = join.table.to_ascii_lowercase();
-                    let scoped = format!("{to_alias}__{using_rel_lower}");
-                    if !scoped_aliases.contains(&scoped) {
-                        scoped_aliases.push(scoped);
-                    }
-                    role_playing_bare_aliases.insert(to_alias);
-                }
+                add_scoped(
+                    &mut scoped_joins,
+                    &mut role_playing_bare_aliases,
+                    &using_rel,
+                );
             }
         }
     }
@@ -167,37 +297,119 @@ pub(super) fn resolve_joins_pkfk(
         }
     }
 
-    // If no bare aliases or scoped aliases needed, return empty
-    if needed.is_empty() && scoped_aliases.is_empty() {
+    // Fact source tables (facts path only), in declaration order.
+    let mut fact_needed: Vec<String> = Vec::new();
+    for st in fact_source_tables {
+        let alias = st.to_ascii_lowercase();
+        if alias != *root && !fact_needed.contains(&alias) {
+            fact_needed.push(alias);
+        }
+    }
+
+    // If no bare aliases, fact aliases, or scoped aliases needed, return empty
+    if needed.is_empty() && scoped_joins.is_empty() && fact_needed.is_empty() {
         return Vec::new();
     }
 
-    // Walk reverse edges to include transitive intermediaries for bare aliases.
-    let mut all_needed: HashSet<String> = needed.clone();
-    let mut to_visit: Vec<String> = needed.into_iter().collect();
-    while let Some(current) = to_visit.pop() {
-        if let Some(parents) = graph.reverse.get(&current) {
-            for parent in parents {
-                if parent != root && all_needed.insert(parent.clone()) {
-                    to_visit.push(parent.clone());
+    // Map each reachable alias to its connecting edge on the path to the root.
+    let tree_parent = build_tree_parents(def, root);
+
+    // Include every table on the path between the root and each needed alias.
+    let mut all_needed: HashSet<String> = HashSet::new();
+    for alias in &needed {
+        if tree_parent.contains_key(alias) {
+            // Reachable: walk the parent chain to the root, adding intermediaries.
+            let mut current = alias.clone();
+            while current != *root && all_needed.insert(current.clone()) {
+                let Some((parent, _)) = tree_parent.get(&current) else {
+                    break;
+                };
+                current = parent.clone();
+            }
+        } else {
+            // Disconnected from the root (degenerate definition): legacy
+            // reverse-edge walk, preserving pre-existing emission behavior.
+            all_needed.insert(alias.clone());
+            let mut to_visit = vec![alias.clone()];
+            while let Some(current) = to_visit.pop() {
+                if let Some(parents) = graph.reverse.get(&current) {
+                    for parent in parents {
+                        if parent != root && all_needed.insert(parent.clone()) {
+                            to_visit.push(parent.clone());
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Build the result: bare aliases in topo order, then scoped aliases after.
+    // Base ordering: topological order over the PK/FK graph.
     let Ok(topo_order) = graph.toposort() else {
         return Vec::new(); // Should not happen -- validated at define time
     };
-
-    let mut result: Vec<String> = topo_order
+    let mut ordered: Vec<String> = topo_order
         .into_iter()
         .filter(|alias| all_needed.contains(alias))
         .collect();
 
-    // Sort scoped aliases for deterministic output, then append
-    scoped_aliases.sort();
-    result.extend(scoped_aliases);
+    // Stable re-sort: each reachable alias's tree parent must be emitted first
+    // (or be the root). Kahn order already satisfies this for root-outward
+    // trees; FK-side chains below the root need the fix (SG-10).
+    let mut emission: Vec<String> = Vec::with_capacity(ordered.len());
+    while !ordered.is_empty() {
+        let pos = ordered
+            .iter()
+            .position(|alias| match tree_parent.get(alias) {
+                Some((parent, _)) => parent == root || !ordered.contains(parent),
+                None => true, // Disconnected: no ordering constraint
+            });
+        // Reachable aliases always have their full parent chain included, so
+        // some alias is always emittable; fall back to the front defensively.
+        emission.push(ordered.remove(pos.unwrap_or(0)));
+    }
+
+    let mut result: Vec<ResolvedJoin<'a>> = Vec::new();
+    for alias in emission {
+        push_bare_join(&mut result, def, &tree_parent, alias);
+    }
+
+    // Fact-driven joins: appended after dimension-driven joins, each with its
+    // path intermediaries in root-outward order (SG-10 on the facts path).
+    for alias in fact_needed {
+        if result.iter().any(|rj| rj.emit_alias == alias) {
+            continue;
+        }
+        if tree_parent.contains_key(&alias) {
+            let mut path: Vec<String> = Vec::new();
+            let mut current = alias;
+            while current != *root {
+                path.push(current.clone());
+                let Some((parent, _)) = tree_parent.get(&current) else {
+                    break;
+                };
+                current = parent.clone();
+            }
+            for path_alias in path.into_iter().rev() {
+                if result.iter().any(|rj| rj.emit_alias == path_alias) {
+                    continue;
+                }
+                push_bare_join(&mut result, def, &tree_parent, path_alias);
+            }
+        } else {
+            push_bare_join(&mut result, def, &tree_parent, alias);
+        }
+    }
+
+    // Sort scoped joins by alias for deterministic output, then append.
+    scoped_joins.sort_by(|a, b| a.0.cmp(&b.0));
+    for (scoped_alias, join) in scoped_joins {
+        result.push(ResolvedJoin {
+            bare_alias: join.table.to_ascii_lowercase(),
+            emit_alias: scoped_alias,
+            join,
+            scoped: true,
+        });
+    }
 
     result
 }
@@ -358,7 +570,7 @@ mod tests {
         let def = orders_view();
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = resolve_joins_pkfk(&def, &resolved_dims, &resolved_mets);
+        let result = resolve_joins_pkfk(&def, &resolved_dims, &resolved_mets, &[]);
         assert!(result.is_empty(), "No joins should produce empty result");
     }
 
@@ -377,10 +589,11 @@ mod tests {
             );
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = resolve_joins_pkfk(&def, &resolved_dims, &resolved_mets);
+        let result = resolve_joins_pkfk(&def, &resolved_dims, &resolved_mets, &[]);
         assert!(
-            result.contains(&"customers".to_string()),
-            "Should include customers join, got: {result:?}"
+            result.iter().any(|rj| rj.emit_alias == "customers"),
+            "Should include customers join, got: {:?}",
+            result.iter().map(|rj| &rj.emit_alias).collect::<Vec<_>>()
         );
     }
 
@@ -412,10 +625,13 @@ mod tests {
             );
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = resolve_joins_pkfk(&def, &resolved_dims, &resolved_mets);
+        let result = resolve_joins_pkfk(&def, &resolved_dims, &resolved_mets, &[]);
         assert!(
-            result.iter().any(|a| a.contains("airports__dep_airport")),
-            "Should include scoped alias airports__dep_airport, got: {result:?}"
+            result
+                .iter()
+                .any(|rj| rj.emit_alias == "airports__dep_airport" && rj.scoped),
+            "Should include scoped alias airports__dep_airport, got: {:?}",
+            result.iter().map(|rj| &rj.emit_alias).collect::<Vec<_>>()
         );
     }
 }

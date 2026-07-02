@@ -29,6 +29,10 @@ Extensions so far:
   - SG-3 (single-pass derived-metric inlining): `net_revenue` is derived
     from metrics whose expressions contain a column (`o.amount`) named
     like another metric (`amount`) — the exact re-scan poison scenario.
+  - SG-2 (declaration-order-independent join emission): the `cat_name`
+    dimension is two joins away (orders -> products -> categories) with
+    the p->cat relationship declared FIRST — pre-fix this emitted a
+    forward-referencing join and dropped the o->p connecting join.
 
 Usage:
     uv run test/integration/test_differential.py
@@ -55,11 +59,18 @@ N_PRODUCTS = 30
 N_ORDERS = 4000
 
 # Dimension name -> (semantic dim name, reference SQL expr, table needed)
+# `cat_name` lives two joins away (orders -> products -> categories) and its
+# relationship is DECLARED FIRST in the view DDL — the SG-2 poison ordering:
+# pre-fix, join emission picked the first declared join mentioning an alias,
+# emitting `products ON p.category_id = cat.id` as a forward reference and
+# dropping the o->p connecting join entirely.
 DIMS = {
     "region": ("region", "o.region", None),
     "tier": ("tier", "c.tier", "c"),
     "category": ("category", "p.category", "p"),
+    "cat_name": ("cat_name", "cat.cat_name", "cat"),
 }
+N_CATEGORIES = 8
 
 # Metric name -> reference SQL aggregate (all on the base table — see SCOPE).
 # `amount` deliberately shares its name with the orders.amount COLUMN, and
@@ -82,7 +93,11 @@ METRICS = {
 def seed_schema(conn) -> None:
     rng = random.Random(SEED)
     conn.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name VARCHAR, tier VARCHAR)")
-    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name VARCHAR, category VARCHAR)")
+    conn.execute("CREATE TABLE categories (id INTEGER PRIMARY KEY, cat_name VARCHAR)")
+    conn.execute(
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, name VARCHAR, "
+        "category VARCHAR, category_id INTEGER)"
+    )
     conn.execute(
         "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, "
         "product_id INTEGER, region VARCHAR, amount DECIMAL(10,2), qty INTEGER)"
@@ -94,11 +109,14 @@ def seed_schema(conn) -> None:
             "INSERT INTO customers VALUES (?, ?, ?)",
             [i, f"cust_{i}", rng.choice(tiers)],
         )
+    for i in range(N_CATEGORIES):
+        conn.execute("INSERT INTO categories VALUES (?, ?)", [i, f"cat_{i}"])
     cats = ["alpha", "beta", "gamma"]
     for i in range(N_PRODUCTS):
+        cat_id = None if rng.random() < 0.10 else rng.randrange(N_CATEGORIES)
         conn.execute(
-            "INSERT INTO products VALUES (?, ?, ?)",
-            [i, f"prod_{i}", rng.choice(cats)],
+            "INSERT INTO products VALUES (?, ?, ?, ?)",
+            [i, f"prod_{i}", rng.choice(cats), cat_id],
         )
 
     regions = ["east", "west", "north", "south"]
@@ -116,16 +134,19 @@ CREATE SEMANTIC VIEW diff_sv AS
   TABLES (
     o AS orders PRIMARY KEY (id),
     c AS customers PRIMARY KEY (id),
-    p AS products PRIMARY KEY (id)
+    p AS products PRIMARY KEY (id),
+    cat AS categories PRIMARY KEY (id)
   )
   RELATIONSHIPS (
+    product_category AS p(category_id) REFERENCES cat,
     order_customer AS o(customer_id) REFERENCES c,
     order_product AS o(product_id) REFERENCES p
   )
   DIMENSIONS (
     o.region AS o.region,
     c.tier AS c.tier,
-    p.category AS p.category
+    p.category AS p.category,
+    cat.cat_name AS cat.cat_name
   )
   METRICS (
     o.revenue AS SUM(o.amount),
@@ -145,10 +166,14 @@ def reference_sql(dims: list[str], mets: list[str]) -> str:
     select_items = [DIMS[d][1] for d in dims] + [METRICS[m] for m in mets]
     joins = []
     needed = {DIMS[d][2] for d in dims} - {None}
+    if "cat" in needed:
+        needed.add("p")  # categories hangs off products
     if "c" in needed:
         joins.append("LEFT JOIN customers c ON o.customer_id = c.id")
     if "p" in needed:
         joins.append("LEFT JOIN products p ON o.product_id = p.id")
+    if "cat" in needed:
+        joins.append("LEFT JOIN categories cat ON p.category_id = cat.id")
     sql = f"SELECT {'DISTINCT ' if not mets else ''}{', '.join(select_items)}\n"
     sql += "FROM orders o\n" + "\n".join(joins)
     if dims and mets:

@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::model::{Metric, NullsOrder, SemanticViewDefinition, SortOrder};
 use crate::util::replace_word_boundary;
 
-use super::join_resolver::{resolve_joins_pkfk, synthesize_on_clause, synthesize_on_clause_scoped};
+use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 use super::types::ExpandError;
 
@@ -160,49 +160,8 @@ pub(super) fn expand_window_metrics(
     }
 
     // CTE JOINs
-    let ordered_aliases = resolve_joins_pkfk(def, resolved_dims, resolved_mets);
-    for alias in &ordered_aliases {
-        if let Some(sep_pos) = alias.find("__") {
-            let rel_name = &alias[sep_pos + 2..];
-            let Some(join) = def.joins.iter().find(|j| {
-                j.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(rel_name))
-            }) else {
-                continue;
-            };
-            let bare_alias = &alias[..sep_pos];
-            let table_ref = def
-                .tables
-                .iter()
-                .find(|t| t.alias.to_ascii_lowercase() == bare_alias);
-            let physical_table = table_ref.map_or(bare_alias, |t| t.table.as_str());
-            sql.push_str("\n    LEFT JOIN ");
-            sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
-            sql.push_str(" AS ");
-            sql.push_str(&quote_ident(alias));
-            sql.push_str(" ON ");
-            sql.push_str(&synthesize_on_clause_scoped(join, &def.tables, alias));
-        } else {
-            let Some(join) = def.joins.iter().find(|j| {
-                j.table.to_ascii_lowercase() == *alias
-                    || j.from_alias.to_ascii_lowercase() == *alias
-            }) else {
-                continue;
-            };
-            let table_ref = def
-                .tables
-                .iter()
-                .find(|t| t.alias.to_ascii_lowercase() == *alias);
-            let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
-            sql.push_str("\n    LEFT JOIN ");
-            sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
-            sql.push_str(" AS ");
-            sql.push_str(&quote_ident(alias));
-            sql.push_str(" ON ");
-            sql.push_str(&synthesize_on_clause(join, &def.tables));
-        }
-    }
+    let resolved_joins = resolve_joins_pkfk(def, resolved_dims, resolved_mets, &[]);
+    push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
 
     // CTE GROUP BY (all dimension columns)
     if !resolved_dims.is_empty() {
