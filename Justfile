@@ -184,11 +184,18 @@ test-readonly-fresh-drop: build
 test-chunk-boundary: build
     uv run test/integration/test_chunk_boundary.py
 
+# Differential harness (TC-2, code-review 2026-07-02): semantic_view() results
+# vs independent hand-written SQL over a seeded randomized star schema, every
+# bounded dims×metrics combination. R1 fix PRs extend it with the scenarios
+# they repair.
+test-differential: build
+    uv run test/integration/test_differential.py
+
 # All Python integration suites against the built extension. This is the
 # exact set the `python-integration` CI job runs (IntegrationChecks.yml) —
 # keep the two in sync by editing THIS recipe, not the workflow.
 # (test-ducklake-ci is excluded: it has its own dedicated CI job.)
-test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-readonly-fresh-drop test-chunk-boundary
+test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-readonly-fresh-drop test-chunk-boundary test-differential
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + all Python integration suites
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
