@@ -160,27 +160,72 @@ test-concurrent: build
     uv run test/integration/test_concurrent_reads_per_call_conn.py
     uv run test/integration/test_concurrent_writes_per_call_conn.py
 
-# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + vtab crash + caret position + ADBC + large-view + multi-DB + read-only + concurrent
+# `LOAD semantic_views` twice in one process must be idempotent (parser-hook
+# re-registration guard, WR-09 D-21). Behavioral half of the structural test
+# in tests/parser_hook_idempotent.rs — both must stay wired.
+test-load-idempotent: build
+    uv run test/integration/test_load_extension_twice_idempotent.py
+
+# DDL-time type inference (LIMIT 0 probe) against a file-backed DB:
+# dimension/metric output_type inference, DECIMAL passthrough, SHOW/DESCRIBE
+# data_type surfacing, derived-metric and multi-table inference.
+test-type-inference: build
+    uv run test/integration/test_type_inference.py
+
+# CREATE SEMANTIC VIEW ... FROM YAML FILE under the v0.10.0 read-elimination
+# architecture (Phase 65 Plan 04 D-11): OR REPLACE / IF NOT EXISTS, friendly
+# error surfaces, YAML size cap, transactional rollback, get_ddl round-trip.
+test-yaml-file-create: build
+    uv run test/integration/test_create_from_yaml_v010.py
+
+# DROP/ALTER SEMANTIC VIEW on a fresh read-only DB that was never bootstrapped
+# must surface the canonical "semantic view 'X' does not exist" wording, not a
+# raw `_definitions` catalog leak (Phase 65.1 Plan 04, WR-03 D-18).
+test-readonly-fresh-drop: build
+    uv run test/integration/test_drop_on_fresh_readonly_clear_error.py
+
+# All Python integration suites against the built extension. This is the
+# exact set the `python-integration` CI job runs (IntegrationChecks.yml) —
+# keep the two in sync by editing THIS recipe, not the workflow.
+# (test-ducklake-ci is excluded: it has its own dedicated CI job.)
+test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-type-inference test-yaml-file-create test-readonly-fresh-drop
+
+# Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + all Python integration suites
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
 # _ensure-test-deps runs early to catch pip version mismatches before slow builds.
-test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent
+test-all: _ensure-test-deps test-rust test-sql test-ducklake-ci test-integration
 
 # Check that fuzz targets compile (requires nightly)
 check-fuzz:
     cargo +nightly check --manifest-path fuzz/Cargo.toml
 
-# Run the full CI suite locally (lint + test + fuzz check)
-ci: lint test-all check-fuzz docs-check
+# Verify test/sql/TEST_LIST matches the .test files on disk. The sqllogictest
+# runner executes ONLY files named in TEST_LIST, so a .test file missing from
+# it is silently skipped — this check makes that a hard error (CI runs it too).
+check-test-list:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! diff <(find test/sql -maxdepth 1 -name '*.test' | sort) <(sort test/sql/TEST_LIST); then
+      echo "ERROR: test/sql/TEST_LIST is out of sync with test/sql/*.test" >&2
+      echo "  (diff above: '<' = on disk but not in TEST_LIST, '>' = in TEST_LIST but not on disk)" >&2
+      exit 1
+    fi
+
+# Run the full CI suite locally (lint + test-list sync + test + fuzz check)
+ci: lint check-test-list test-all check-fuzz docs-check
 
 # Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
 fuzz target="fuzz_json_parse" time="300":
     cargo +nightly fuzz run {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{time}}
 
-# Run all three fuzz targets sequentially (5 min each, 15 min total)
+# Run all six fuzz targets sequentially (5 min each, 30 min total)
 fuzz-all time="300":
     cargo +nightly fuzz run fuzz_json_parse fuzz/corpus/fuzz_json_parse fuzz/seeds/fuzz_json_parse -- -max_total_time={{time}}
     cargo +nightly fuzz run fuzz_sql_expand fuzz/corpus/fuzz_sql_expand fuzz/seeds/fuzz_sql_expand -- -max_total_time={{time}}
     cargo +nightly fuzz run fuzz_query_names fuzz/corpus/fuzz_query_names fuzz/seeds/fuzz_query_names -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_ddl_parse fuzz/corpus/fuzz_ddl_parse fuzz/seeds/fuzz_ddl_parse -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_yaml_parse fuzz/corpus/fuzz_yaml_parse fuzz/seeds/fuzz_yaml_parse -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_parser_override_ffi fuzz/corpus/fuzz_parser_override_ffi fuzz/seeds/fuzz_parser_override_ffi -- -max_total_time={{time}}
 
 # Minimize corpus for a fuzz target (removes inputs that don't add coverage)
 fuzz-cmin target="fuzz_json_parse":

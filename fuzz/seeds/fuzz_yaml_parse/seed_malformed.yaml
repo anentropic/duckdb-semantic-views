@@ -1,0 +1,5 @@
+tables: [
+  - alias: : :
+    "unterminated
+dimensions
+  metrics: {a: [}

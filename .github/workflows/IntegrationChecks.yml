@@ -35,6 +35,33 @@ jobs:
         env:
           SEMANTIC_VIEWS_EXTENSION_PATH: build/debug/semantic_views.duckdb_extension
 
+  python-integration:
+    name: Python integration suites (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build extension
+        run: make configure debug
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      # Runs the same suite list as local `just test-all` (minus test-rust /
+      # test-sql / test-ducklake-ci, which have their own CI jobs). The list
+      # itself lives in the Justfile's `test-integration` recipe so local dev
+      # and CI cannot drift.
+      - name: Run Python integration suites
+        run: just test-integration
+
   docs-check:
     name: Docs build check
     runs-on: ubuntu-latest

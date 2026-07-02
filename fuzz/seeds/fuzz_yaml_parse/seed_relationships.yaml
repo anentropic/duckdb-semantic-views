@@ -1,0 +1,27 @@
+base_table: orders
+tables:
+  - alias: o
+    table: orders
+    pk_columns:
+      - id
+  - alias: c
+    table: customers
+    pk_columns:
+      - id
+joins:
+  - name: order_customer
+    from_alias: o
+    fk_columns:
+      - customer_id
+    table: c
+    ref_columns:
+      - id
+dimensions:
+  - name: tier
+    expr: c.tier
+    source_table: c
+metrics:
+  - name: order_count
+    expr: count(*)
+    source_table: o
+comment: star schema with one relationship

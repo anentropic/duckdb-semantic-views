@@ -1,0 +1,2 @@
+/* leading block comment */ -- and a line comment
+DESCRIBE SEMANTIC VIEW analytics
