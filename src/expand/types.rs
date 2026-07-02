@@ -237,6 +237,21 @@ pub enum ExpandError {
         dimension_table: String,
         relationship_name: String,
     },
+    /// Two queried metrics sit at different grains (source tables) and the
+    /// join path between those tables crosses a fan-out edge: joining both
+    /// source tables multiplies `metric_table`'s rows, silently inflating
+    /// `metric_name` (fan trap / chasm trap between metric grains).
+    MetricFanTrap {
+        view_name: String,
+        metric_name: String,
+        metric_table: String,
+        other_metric_name: String,
+        other_metric_table: String,
+        relationship_name: String,
+    },
+    /// The stored definition's relationship graph could not be rebuilt at
+    /// query time, so safety checks (fan-trap detection) cannot run.
+    UncheckableDefinition { view_name: String, reason: String },
     /// A dimension from a role-playing table is ambiguous because multiple
     /// relationships reach that table and no co-queried metric provides USING
     /// context to disambiguate.
@@ -363,6 +378,33 @@ impl fmt::Display for ExpandError {
                      This would inflate aggregation results. \
                      Remove the dimension, use a metric from the same table, or restructure the \
                      relationship."
+                )
+            }
+            Self::MetricFanTrap {
+                view_name,
+                metric_name,
+                metric_table,
+                other_metric_name,
+                other_metric_table,
+                relationship_name,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': fan trap detected -- metric '{metric_name}' \
+                     (table '{metric_table}') and metric '{other_metric_name}' (table \
+                     '{other_metric_table}') aggregate at different grains: joining their source \
+                     tables via relationship '{relationship_name}' (many-to-one cardinality) \
+                     duplicates rows of '{metric_table}' and would inflate '{metric_name}'. \
+                     Query the metrics separately, or restructure the relationship."
+                )
+            }
+            Self::UncheckableDefinition { view_name, reason } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': cannot verify the query is safe from fan traps \
+                     -- the stored definition's relationship graph could not be built: {reason}. \
+                     The definition likely predates current validation rules; re-create it with \
+                     CREATE OR REPLACE SEMANTIC VIEW."
                 )
             }
             Self::AmbiguousPath {

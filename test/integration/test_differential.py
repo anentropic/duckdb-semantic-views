@@ -292,6 +292,53 @@ def run_harness() -> int:
                         print(f"  first differing row: got={g!r} want={w!r}")
                         break
 
+    # --- Multi-grain guard (SG-1): mixing grains must ERROR, not inflate ----
+    # A separate view with a metric on a ManyToOne child of the base: the
+    # pre-fix engine silently joined the child and inflated the base-grain
+    # SUM per child row. Post-fix the request must raise the fan-trap error.
+    # (item_count alone is NOT compared against reference SQL here until
+    # SG-8 — COUNT(*) over LEFT JOIN NULL-extension — lands.)
+    conn.execute(
+        "CREATE TABLE line_items (id INTEGER PRIMARY KEY, order_id INTEGER, "
+        "line_amount DECIMAL(10,2))"
+    )
+    conn.execute(
+        "INSERT INTO line_items SELECT s.range, s.range % 500, 5.00 "
+        "FROM range(1500) s"
+    )
+    conn.execute(
+        "CREATE SEMANTIC VIEW diff_mg AS "
+        "TABLES (o AS orders PRIMARY KEY (id), li AS line_items PRIMARY KEY (id)) "
+        "RELATIONSHIPS (li_order AS li(order_id) REFERENCES o) "
+        "DIMENSIONS (o.region AS o.region) "
+        "METRICS (o.revenue AS SUM(o.amount), li.item_count AS COUNT(*))"
+    )
+    total += 2
+    try:
+        conn.execute(
+            "SELECT * FROM semantic_view('diff_mg', metrics := ['revenue', 'item_count'])"
+        ).fetchall()
+        failures += 1
+        print("FAIL multi-grain: expected fan-trap error, query succeeded")
+    except Exception as exc:  # noqa: BLE001
+        if "fan trap detected" in str(exc):
+            print("  PASS: multi-grain metric pair raises fan-trap error")
+        else:
+            failures += 1
+            print(f"FAIL multi-grain: wrong error: {exc}")
+    # Base-grain metric alone must still prune the child join and match.
+    got = normalize(
+        conn.execute(
+            "SELECT * FROM semantic_view('diff_mg', metrics := ['revenue'])"
+        ).fetchall()
+    )
+    want = normalize(conn.execute("SELECT SUM(amount) FROM orders").fetchall())
+    if rows_equal(got, want):
+        print("  PASS: base-grain metric alone matches (child join pruned)")
+    else:
+        failures += 1
+        print(f"FAIL multi-grain: revenue-alone mismatch got={got} want={want}")
+
     print()
     print(f"Ran {total} dims×metrics combinations over {N_ORDERS} orders "
           f"({N_CUSTOMERS} customers, {N_PRODUCTS} products, seed={SEED})")

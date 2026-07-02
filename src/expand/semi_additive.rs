@@ -30,6 +30,25 @@ use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 use super::types::ExpandError;
 
+/// Returns true when `met` is an ACTIVE semi-additive metric for a query over
+/// `queried_dim_names` (lowercased): it has a NON ADDITIVE BY clause and at
+/// least one of its NA dims is NOT in the queried dimension set, so it takes
+/// the `ROW_NUMBER`-CTE snapshot path. When ALL NA dims are queried, the
+/// metric is "effectively regular" (Snowflake semantics) and takes the
+/// standard aggregation path.
+///
+/// This is THE routing predicate — shared by `expand()` (CTE dispatch),
+/// `expand_semi_additive` (per-metric classification), and the fan-trap check
+/// (which must skip exactly the metrics that take the CTE path, SG-6) so the
+/// three cannot drift.
+pub(super) fn is_active_semi_additive(met: &Metric, queried_dim_names: &HashSet<String>) -> bool {
+    !met.non_additive_by.is_empty()
+        && met
+            .non_additive_by
+            .iter()
+            .any(|na| !queried_dim_names.contains(&na.dimension.to_ascii_lowercase()))
+}
+
 /// Generate CTE-based expansion SQL for queries containing semi-additive metrics.
 ///
 /// Called from `expand()` when `has_active_semi_additive` is true.
@@ -56,14 +75,9 @@ pub(super) fn expand_semi_additive(
         .map(|d| d.name.to_ascii_lowercase())
         .collect();
 
-    // Classify each metric as active semi-additive
-    let is_active_semi = |met: &Metric| -> bool {
-        !met.non_additive_by.is_empty()
-            && met
-                .non_additive_by
-                .iter()
-                .any(|na| !queried_dim_names.contains(&na.dimension.to_ascii_lowercase()))
-    };
+    // Classify each metric as active semi-additive (shared routing predicate)
+    let is_active_semi =
+        |met: &Metric| -> bool { is_active_semi_additive(met, &queried_dim_names) };
 
     // 1. Identify distinct NON ADDITIVE BY dimension sets for ACTIVE metrics only.
     let na_groups = collect_na_groups(resolved_mets, &queried_dim_names);
@@ -286,15 +300,8 @@ fn collect_na_groups(
 ) -> Vec<NaGroup> {
     let mut groups: Vec<(Vec<String>, Vec<NonAdditiveDim>, Vec<usize>)> = Vec::new();
     for (idx, met) in resolved_mets.iter().enumerate() {
-        if met.non_additive_by.is_empty() {
-            continue;
-        }
-        // Skip effectively-regular metrics (all NA dims in query)
-        let all_na_in_query = met
-            .non_additive_by
-            .iter()
-            .all(|na| queried_dim_names.contains(&na.dimension.to_ascii_lowercase()));
-        if all_na_in_query {
+        // Skip regular and effectively-regular metrics (shared routing predicate)
+        if !is_active_semi_additive(met, queried_dim_names) {
             continue;
         }
         let key: Vec<String> = met
@@ -371,7 +378,7 @@ fn get_rn_column_for_metric(met_idx: usize, na_groups: &[NaGroup]) -> String {
 #[cfg(test)]
 mod tests {
     use crate::expand::test_helpers::{minimal_def, orders_view, TestFixtureExt};
-    use crate::expand::{expand, DimensionName, MetricName, QueryRequest};
+    use crate::expand::{expand, DimensionName, ExpandError, MetricName, QueryRequest};
     use crate::model::{NullsOrder, SortOrder};
 
     use super::{extract_aggregate_func, extract_aggregate_inner};
@@ -631,13 +638,19 @@ mod tests {
         );
     }
 
-    /// Fan trap check skips semi-additive metrics.
+    /// SG-6 (code review 2026-07-02): a semi-additive metric whose NA dims
+    /// are ALL in the queried dimensions is "effectively regular" — it takes
+    /// the standard aggregation path (never the `ROW_NUMBER` CTE), so it MUST
+    /// get the standard fan-trap check. The previous unconditional
+    /// `non_additive_by`-non-empty skip let this query silently inflate.
+    /// (The CTE-path skip is pinned by
+    /// `fan_trap::tests::test_check_fan_traps_semi_additive_cte_path_skipped`.)
     #[test]
-    fn test_fan_trap_skips_semi_additive() {
-        // Create a multi-table view where a regular metric on table c
-        // queried with dim on table a would cause fan trap (a -> c is many-to-one,
-        // dim on a means traversing c->a which is one-to-many fan-out direction).
-        // But with semi-additive, it should be skipped.
+    fn test_fan_trap_checks_effectively_regular_semi_additive() {
+        // Multi-table view where the metric on table c queried with a dim on
+        // table a causes a fan trap (a -> c is many-to-one; the dim on a
+        // means traversing c -> a, the fan-out direction). The metric's only
+        // NA dim (acct_name) IS queried, so it acts as a regular aggregate.
         let def = orders_view()
             .with_table("customers", "customers", &[])
             .clear_dimensions()
@@ -658,12 +671,12 @@ mod tests {
             metrics: vec![MetricName::new("total_balance")],
         };
 
-        // This should NOT return a FanTrap error because semi-additive metrics are skipped
+        // Effectively-regular semi-additive metrics get the standard check.
         let result = expand("test_view", &def, &req);
         assert!(
-            result.is_ok(),
-            "Semi-additive metric should skip fan trap: {:?}",
-            result.err()
+            matches!(result, Err(ExpandError::FanTrap { .. })),
+            "Effectively-regular semi-additive metric over a fanning join \
+             must be a fan trap error, got: {result:?}"
         );
     }
 

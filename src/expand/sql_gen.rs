@@ -339,17 +339,15 @@ pub fn expand(
     // Phase 47: Check if any resolved metric ACTUALLY needs semi-additive expansion.
     // A semi-additive metric only needs CTE treatment when at least one of its
     // NA dims is NOT in the queried dimension set. When ALL NA dims are in the
-    // query, the metric acts as regular (Snowflake semantics).
+    // query, the metric acts as regular (Snowflake semantics). The predicate
+    // is shared with expand_semi_additive and the fan-trap check (SG-6).
     let queried_dim_names: std::collections::HashSet<String> = resolved_dims
         .iter()
         .map(|d| d.name.to_ascii_lowercase())
         .collect();
-    let has_active_semi_additive = resolved_mets.iter().any(|m| {
-        !m.non_additive_by.is_empty()
-            && m.non_additive_by
-                .iter()
-                .any(|na| !queried_dim_names.contains(&na.dimension.to_ascii_lowercase()))
-    });
+    let has_active_semi_additive = resolved_mets
+        .iter()
+        .any(|m| super::semi_additive::is_active_semi_additive(m, &queried_dim_names));
 
     if has_active_semi_additive {
         return super::semi_additive::expand_semi_additive(

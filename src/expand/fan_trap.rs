@@ -1,52 +1,50 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::model::{Cardinality, SemanticViewDefinition};
+use crate::model::{Cardinality, Metric, SemanticViewDefinition};
 
 use super::facts::collect_derived_metric_source_tables;
+use super::semi_additive::is_active_semi_additive;
 use super::types::ExpandError;
 
-/// Check for fan traps: a metric aggregating across a one-to-many boundary.
+/// Cardinality map: `(from_lower, to_lower)` -> (worst-case cardinality,
+/// name of a relationship carrying that cardinality).
+type CardMap = HashMap<(String, String), (Cardinality, String)>;
+
+/// Check for fan traps: an aggregation whose input rows are multiplied by a
+/// one-to-many join boundary.
 ///
-/// Walks the join path between each (metric source, dimension source) pair
-/// and checks whether any edge is traversed in the fan-out direction.
-/// Returns `Err(ExpandError::FanTrap)` with details if a fan-out is detected.
+/// Two checks run over the same relationship/cardinality machinery:
+///
+/// 1. **metric × dimension**: walks the join path between each
+///    (metric source, dimension source) pair and errors when any edge is
+///    traversed in the fan-out direction (`ExpandError::FanTrap`).
+/// 2. **metric × metric** (SG-1, code review 2026-07-02): join resolution
+///    joins EVERY queried metric's source table, so two metrics at different
+///    grains double-count whenever the join path between their source tables
+///    crosses a fan-out edge — a classic fan trap (root metric + `ManyToOne`
+///    child metric) or chasm trap (metrics on two different child tables of
+///    one root). Errors with `ExpandError::MetricFanTrap`.
+///    Policy (remediation plan): erroring on multi-grain metric combinations
+///    is correct for now; per-grain CTE aggregation is future work.
 ///
 /// # Fan-out direction
 ///
 /// For an edge `(from_alias, to_alias)` with cardinality:
 /// - `ManyToOne`: from->to is safe (many go to one), to->from is fan-out
 /// - `OneToOne`: both directions are safe
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::too_many_lines)]
 pub(super) fn check_fan_traps(
     view_name: &str,
     def: &SemanticViewDefinition,
     resolved_dims: &[&crate::model::Dimension],
-    resolved_mets: &[&crate::model::Metric],
+    resolved_mets: &[&Metric],
 ) -> Result<(), ExpandError> {
     if def.joins.is_empty() {
         return Ok(());
     }
 
-    let Ok(graph) = crate::graph::RelationshipGraph::from_definition(def) else {
-        return Ok(()); // Graph was validated at define time
-    };
-
-    // Build cardinality map: (from_lower, to_lower) -> (Cardinality, relationship_name)
-    let card_map: HashMap<(String, String), (Cardinality, String)> = def
-        .joins
-        .iter()
-        .filter(|j| !j.fk_columns.is_empty())
-        .map(|j| {
-            let rel_name = j.name.as_deref().unwrap_or(&j.from_alias).to_string();
-            (
-                (
-                    j.from_alias.to_ascii_lowercase(),
-                    j.table.to_ascii_lowercase(),
-                ),
-                (j.cardinality, rel_name),
-            )
-        })
-        .collect();
+    let graph = build_relationship_graph(view_name, def)?;
+    let card_map = build_card_map(def);
 
     // Build parent map for tree path finding.
     // In a validated tree, each non-root node has exactly one parent via the reverse map.
@@ -57,32 +55,31 @@ pub(super) fn check_fan_traps(
         }
     }
 
+    let queried_dim_names: HashSet<String> = resolved_dims
+        .iter()
+        .map(|d| d.name.to_ascii_lowercase())
+        .collect();
+
     // For each metric + dimension pair, check for fan-out on the join path.
     for met in resolved_mets {
-        // Phase 47: Skip fan trap check for semi-additive metrics.
-        // The ROW_NUMBER CTE inherently handles fan-out by selecting one row
-        // per partition, making fan trap detection unnecessary.
-        if !met.non_additive_by.is_empty() {
+        // SG-6 (code review 2026-07-02): skip ONLY metrics that actually take
+        // the ROW_NUMBER-CTE snapshot path for THIS request (active
+        // semi-additive: at least one NA dim absent from the queried dims —
+        // the same predicate `expand()` routes on, shared via
+        // `is_active_semi_additive` so the two cannot drift). The CTE path is
+        // assumed to neutralize fan-out by selecting one row per partition;
+        // that assumption is itself unproven (ROW_NUMBER ties, co-queried
+        // regular metrics — SG-4/SG-5 rework will revisit it).
+        // Effectively-regular semi-additive metrics (all NA dims queried)
+        // take the standard aggregation path and get the standard check.
+        // Window metrics are NOT skipped: their inner aggregate is computed
+        // over the already-fanned join, so fan-out inflates it before the
+        // window function runs.
+        if is_active_semi_additive(met, &queried_dim_names) {
             continue;
         }
 
-        // Phase 48: Skip fan trap check for window function metrics.
-        // Window metrics operate on pre-aggregated CTE results, so fan-out
-        // is handled by the inner aggregation step.
-        if met.is_window() {
-            continue;
-        }
-
-        // Get source tables for this metric
-        let met_tables: Vec<String> = if let Some(ref st) = met.source_table {
-            vec![st.to_ascii_lowercase()]
-        } else {
-            // Derived metric: walk dependency graph to find transitive base metric source tables
-            collect_derived_metric_source_tables(met, &def.metrics)
-                .into_iter()
-                .map(|s| s.to_ascii_lowercase())
-                .collect()
-        };
+        let met_tables = metric_grain_tables(met, def);
 
         for dim in resolved_dims {
             let Some(ref dim_table_raw) = dim.source_table else {
@@ -101,8 +98,7 @@ pub(super) fn check_fan_traps(
                 let dim_ancestors = ancestors_to_root(&dim_table, &parent_map);
 
                 // Find the lowest common ancestor (LCA)
-                let dim_ancestor_set: std::collections::HashSet<&String> =
-                    dim_ancestors.iter().collect();
+                let dim_ancestor_set: HashSet<&String> = dim_ancestors.iter().collect();
                 let lca = met_ancestors
                     .iter()
                     .find(|a| dim_ancestor_set.contains(a))
@@ -112,24 +108,249 @@ pub(super) fn check_fan_traps(
                     continue; // No common ancestor (shouldn't happen in a tree)
                 };
 
-                // Build path: met_table -> ... -> LCA -> ... -> dim_table
-                // Check edges from met_table up to LCA
-                if let Some(err) =
-                    check_path_up(met_table, &lca, &parent_map, &card_map, view_name, met, dim)
-                {
-                    return Err(err);
+                // Build path: met_table -> ... -> LCA -> ... -> dim_table,
+                // then scan the up-leg and down-leg for a fanning edge.
+                let up_path = path_to_ancestor(met_table, &lca, &parent_map);
+                let down_path = path_from_ancestor_to_node(&lca, &dim_table, &dim_ancestors);
+                let fanning = fanning_edge_on_path(&up_path, &card_map)
+                    .or_else(|| fanning_edge_on_path(&down_path, &card_map));
+                if let Some(rel_name) = fanning {
+                    return Err(ExpandError::FanTrap {
+                        view_name: view_name.to_string(),
+                        metric_name: met.name.clone(),
+                        metric_table: met
+                            .source_table
+                            .clone()
+                            .unwrap_or_else(|| met_table.clone()),
+                        dimension_name: dim.name.clone(),
+                        dimension_table: dim_table_raw.clone(),
+                        relationship_name: rel_name,
+                    });
                 }
-                // Check edges from LCA down to dim_table
-                // We need the path from LCA down to dim_table. Build it from dim_ancestors.
-                let path_down = path_from_ancestor_to_node(&lca, &dim_table, &dim_ancestors);
-                if let Some(err) = check_path_down(&path_down, &card_map, view_name, met, dim) {
-                    return Err(err);
+            }
+        }
+    }
+
+    // SG-1 (code review 2026-07-02): metric × metric grain check.
+    // For each ordered pair (A, B) of queried metrics, treat B's source table
+    // the way a dimension table is treated above: if the join path from A's
+    // grain table to B's grain table crosses a fan-out edge in the direction
+    // that multiplies A's rows, A's aggregate would be silently inflated.
+    // Metrics with no source table (base-table metrics) sit at the root grain
+    // and participate — they are the ones inflated by joins to child tables.
+    let adjacency = build_adjacency(def);
+    let grains: Vec<Vec<String>> = resolved_mets
+        .iter()
+        .map(|m| {
+            let tables = metric_grain_tables(m, def);
+            if tables.is_empty() {
+                vec![graph.root.clone()]
+            } else {
+                tables
+            }
+        })
+        .collect();
+
+    for (i, met_a) in resolved_mets.iter().enumerate() {
+        // Same SG-6 skip as above: only the potentially-inflated side is
+        // skipped when it takes the CTE snapshot path. A CTE-handled metric
+        // still participates as the OTHER side (its source table is still
+        // joined, fanning co-queried metrics).
+        if is_active_semi_additive(met_a, &queried_dim_names) {
+            continue;
+        }
+        for (j, met_b) in resolved_mets.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            for table_a in &grains[i] {
+                for table_b in &grains[j] {
+                    if table_a == table_b {
+                        continue; // Same grain, no fan-out possible
+                    }
+                    // Tables not connected by PK/FK edges (e.g. legacy joins
+                    // with no FK metadata) cannot be analyzed — mirror the
+                    // met×dim behavior and skip rather than error.
+                    let Some(path) = find_path(table_a, table_b, &adjacency) else {
+                        continue;
+                    };
+                    if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
+                        return Err(ExpandError::MetricFanTrap {
+                            view_name: view_name.to_string(),
+                            metric_name: met_a.name.clone(),
+                            metric_table: table_a.clone(),
+                            other_metric_name: met_b.name.clone(),
+                            other_metric_table: table_b.clone(),
+                            relationship_name: rel_name,
+                        });
+                    }
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Build the relationship graph, surfacing construction failure as an error.
+///
+/// SG-7 (code review 2026-07-02): previously a failed graph build silently
+/// SKIPPED the fan-trap safety check (`return Ok(())`), so queries over
+/// legacy/invalid stored definitions produced mis-aggregated results with no
+/// warning. The correct bias for a safety check is loud failure.
+#[allow(clippy::result_large_err)]
+fn build_relationship_graph(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+) -> Result<crate::graph::RelationshipGraph, ExpandError> {
+    crate::graph::RelationshipGraph::from_definition(def).map_err(|reason| {
+        ExpandError::UncheckableDefinition {
+            view_name: view_name.to_string(),
+            reason,
+        }
+    })
+}
+
+/// Build the cardinality map keyed by `(from_lower, to_lower)`.
+///
+/// SG-16 (code review 2026-07-02): multiple named relationships may connect
+/// the same table pair (role-playing). For fan detection the WORST case must
+/// win: if ANY edge between the pair is `ManyToOne` (fan-capable when
+/// traversed PK-side -> FK-side), the pair is treated as `ManyToOne`, and the
+/// recorded relationship name is that of a `ManyToOne` edge so error messages
+/// cite a relationship that actually fans. Previously the last-declared edge
+/// simply overwrote earlier ones, so a `OneToOne` declared after a
+/// `ManyToOne` masked the fan-out (declaration-order dependent).
+fn build_card_map(def: &SemanticViewDefinition) -> CardMap {
+    let mut card_map: CardMap = HashMap::new();
+    for join in def.joins.iter().filter(|j| !j.fk_columns.is_empty()) {
+        let key = (
+            join.from_alias.to_ascii_lowercase(),
+            join.table.to_ascii_lowercase(),
+        );
+        let rel_name = join.name.as_deref().unwrap_or(&join.from_alias).to_string();
+        match card_map.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((join.cardinality, rel_name));
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if e.get().0 == Cardinality::OneToOne && join.cardinality == Cardinality::ManyToOne
+                {
+                    e.insert((join.cardinality, rel_name));
+                }
+            }
+        }
+    }
+    card_map
+}
+
+/// Source tables (lowercased, sorted, deduped) whose rows feed `met`'s
+/// aggregation — the metric's "grain".
+///
+/// - Base metric with `source_table`: that table.
+/// - Derived metric (`source_table == None`): transitive base-metric source
+///   tables via the dependency graph.
+/// - Window metric: additionally the INNER metric's source tables — the inner
+///   aggregate is what is computed over the joined row set (the window
+///   function itself runs over the pre-aggregated CTE), so the inner metric's
+///   grain is what fan-out inflates.
+fn metric_grain_tables(met: &Metric, def: &SemanticViewDefinition) -> Vec<String> {
+    let mut tables: Vec<String> = if let Some(ref st) = met.source_table {
+        vec![st.to_ascii_lowercase()]
+    } else {
+        // Derived metric: walk dependency graph to find transitive base metric source tables
+        collect_derived_metric_source_tables(met, &def.metrics)
+            .into_iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect()
+    };
+    if let Some(ref ws) = met.window_spec {
+        if !ws.inner_metric.eq_ignore_ascii_case(&met.name) {
+            if let Some(inner) = def
+                .metrics
+                .iter()
+                .find(|m| m.name.eq_ignore_ascii_case(&ws.inner_metric))
+            {
+                if let Some(ref st) = inner.source_table {
+                    tables.push(st.to_ascii_lowercase());
+                } else {
+                    tables.extend(
+                        collect_derived_metric_source_tables(inner, &def.metrics)
+                            .into_iter()
+                            .map(|s| s.to_ascii_lowercase()),
+                    );
+                }
+            }
+        }
+    }
+    tables.sort_unstable();
+    tables.dedup();
+    tables
+}
+
+/// Undirected adjacency over relationship edges (lowercased aliases), built
+/// in declaration order for deterministic traversal.
+fn build_adjacency(def: &SemanticViewDefinition) -> HashMap<String, Vec<String>> {
+    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    for join in def.joins.iter().filter(|j| !j.fk_columns.is_empty()) {
+        let from = join.from_alias.to_ascii_lowercase();
+        let to = join.table.to_ascii_lowercase();
+        if from == to {
+            continue; // Self-references are rejected by graph construction
+        }
+        let entry = adjacency.entry(from.clone()).or_default();
+        if !entry.contains(&to) {
+            entry.push(to.clone());
+        }
+        let entry = adjacency.entry(to).or_default();
+        if !entry.contains(&from) {
+            entry.push(from);
+        }
+    }
+    adjacency
+}
+
+/// Find a path between two table aliases treating relationship edges as
+/// undirected (BFS). In a validated relationship tree the path is unique;
+/// role-playing multi-edges between one pair are collapsed to a single
+/// adjacency entry (their cardinality is collapsed to the worst case in the
+/// card map). Returns `None` when the tables are not connected (e.g. legacy
+/// joins carrying no FK metadata).
+fn find_path(
+    start: &str,
+    goal: &str,
+    adjacency: &HashMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    if start == goal {
+        return Some(vec![start.to_string()]);
+    }
+    let mut prev: HashMap<String, String> = HashMap::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    visited.insert(start.to_string());
+    queue.push_back(start.to_string());
+    while let Some(node) = queue.pop_front() {
+        let Some(neighbors) = adjacency.get(&node) else {
+            continue;
+        };
+        for neighbor in neighbors {
+            if visited.insert(neighbor.clone()) {
+                prev.insert(neighbor.clone(), node.clone());
+                if neighbor == goal {
+                    let mut path = vec![goal.to_string()];
+                    let mut current = goal;
+                    while let Some(p) = prev.get(current) {
+                        path.push(p.clone());
+                        current = p;
+                    }
+                    path.reverse();
+                    return Some(path);
+                }
+                queue.push_back(neighbor.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Walk from `node` to the root through the parent map, returning the chain
@@ -142,6 +363,52 @@ pub(crate) fn ancestors_to_root(node: &str, parent_map: &HashMap<String, String>
         current = parent.clone();
     }
     chain
+}
+
+/// Build the chain `[start, parent, ..., ancestor]` by walking the parent
+/// map. Stops early (returning a partial chain) if the parent chain breaks
+/// before reaching `ancestor`.
+fn path_to_ancestor(
+    start: &str,
+    ancestor: &str,
+    parent_map: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut path = vec![start.to_string()];
+    let mut current = start.to_string();
+    while current != ancestor {
+        let Some(parent) = parent_map.get(&current) else {
+            break;
+        };
+        path.push(parent.clone());
+        current = parent.clone();
+    }
+    path
+}
+
+/// Scan consecutive pairs along `path` for an edge traversed in the fan-out
+/// direction, returning the fanning relationship's name.
+///
+/// The card map stores edges as `(from, to)` = (FK side, PK side). Traversing
+/// a pair `(a, b)` when the stored edge is `(a, b)` follows the FK forward
+/// (many rows -> one row: safe). Traversing when the stored edge is `(b, a)`
+/// goes from the PK side to the FK side, which multiplies rows when the edge
+/// is `ManyToOne`. `OneToOne` edges are safe in both directions.
+fn fanning_edge_on_path(path: &[String], card_map: &CardMap) -> Option<String> {
+    for window in path.windows(2) {
+        let a = &window[0];
+        let b = &window[1];
+        if card_map.contains_key(&(a.clone(), b.clone())) {
+            // Edge is a -> b (a has FK pointing to b): forward direction,
+            // no fan-out possible.
+        } else if let Some((card, rel_name)) = card_map.get(&(b.clone(), a.clone())) {
+            // Edge is b -> a (b has FK pointing to a). Walking a -> b means
+            // traversing this edge in REVERSE: ManyToOne reverse = fan-out.
+            if *card == Cardinality::ManyToOne {
+                return Some(rel_name.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Validate that all tables referenced by a fact query are on the same
@@ -179,9 +446,8 @@ pub(super) fn validate_fact_table_path(
         return Ok(()); // Single table or empty — trivially valid
     }
 
-    let Ok(graph) = crate::graph::RelationshipGraph::from_definition(def) else {
-        return Ok(()); // Graph was validated at define time
-    };
+    // SG-7: an unbuildable graph is an error, not a skipped check.
+    let graph = build_relationship_graph(view_name, def)?;
 
     // Build parent map from reverse adjacency
     let mut parent_map: HashMap<String, String> = HashMap::new();
@@ -229,93 +495,6 @@ fn path_from_ancestor_to_node(
     } else {
         vec![ancestor.to_string(), target.to_string()]
     }
-}
-
-/// Check edges going UP from `start` to `ancestor` (toward root).
-/// Walking up means: at each step, current -> parent. The actual edge in the
-/// graph might be current->parent (forward edge) or parent->current (forward edge).
-///
-/// Returns `None` if no fan-out, `Some(ExpandError)` if fan-out detected.
-fn check_path_up(
-    start: &str,
-    ancestor: &str,
-    parent_map: &HashMap<String, String>,
-    card_map: &HashMap<(String, String), (Cardinality, String)>,
-    view_name: &str,
-    met: &crate::model::Metric,
-    dim: &crate::model::Dimension,
-) -> Option<ExpandError> {
-    let mut current = start.to_string();
-    while current != ancestor {
-        let Some(parent) = parent_map.get(&current) else {
-            break;
-        };
-        // Determine which direction this edge goes in the card_map.
-        // The graph stores edges as from_alias -> to_alias (FK -> PK).
-        // So either (current, parent) or (parent, current) is in the map.
-        if let Some((_card, _rel_name)) = card_map.get(&(current.clone(), parent.clone())) {
-            // Edge is current -> parent (current has FK pointing to parent)
-            // Walking current -> parent: this is the forward direction of the edge.
-            // ManyToOne forward = safe, OneToOne = safe -- no fan-out possible going forward
-        } else if let Some((card, rel_name)) = card_map.get(&(parent.clone(), current.clone())) {
-            // Edge is parent -> current (parent has FK pointing to current)
-            // Walking current -> parent means traversing this edge in REVERSE.
-            // ManyToOne reverse = fan-out, OneToOne = safe
-            if *card == Cardinality::ManyToOne {
-                let met_table = met.source_table.as_deref().unwrap_or(&current);
-                return Some(ExpandError::FanTrap {
-                    view_name: view_name.to_string(),
-                    metric_name: met.name.clone(),
-                    metric_table: met_table.to_string(),
-                    dimension_name: dim.name.clone(),
-                    dimension_table: dim.source_table.as_deref().unwrap_or("").to_string(),
-                    relationship_name: rel_name.clone(),
-                });
-            }
-        }
-        current = parent.clone();
-    }
-    None
-}
-
-/// Check edges going DOWN a path (from ancestor toward target).
-/// The path is [ancestor, ..., target]. For each consecutive pair (a, b),
-/// check the traversal direction vs cardinality.
-///
-/// Returns `None` if no fan-out, `Some(ExpandError)` if fan-out detected.
-fn check_path_down(
-    path: &[String],
-    card_map: &HashMap<(String, String), (Cardinality, String)>,
-    view_name: &str,
-    met: &crate::model::Metric,
-    dim: &crate::model::Dimension,
-) -> Option<ExpandError> {
-    for window in path.windows(2) {
-        let a = &window[0];
-        let b = &window[1];
-        // Walking a -> b (downward in the tree, away from root)
-        if let Some((_card, _rel_name)) = card_map.get(&(a.clone(), b.clone())) {
-            // Edge is a -> b (a has FK pointing to b)
-            // Walking a -> b: forward direction
-            // ManyToOne forward = safe, OneToOne = safe -- no fan-out possible going forward
-        } else if let Some((card, rel_name)) = card_map.get(&(b.clone(), a.clone())) {
-            // Edge is b -> a (b has FK pointing to a)
-            // Walking a -> b means traversing this edge in REVERSE.
-            // ManyToOne reverse = fan-out, OneToOne = safe
-            if *card == Cardinality::ManyToOne {
-                let met_table = met.source_table.as_deref().unwrap_or("").to_string();
-                return Some(ExpandError::FanTrap {
-                    view_name: view_name.to_string(),
-                    metric_name: met.name.clone(),
-                    metric_table: met_table,
-                    dimension_name: dim.name.clone(),
-                    dimension_table: dim.source_table.as_deref().unwrap_or("").to_string(),
-                    relationship_name: rel_name.clone(),
-                });
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -449,9 +628,16 @@ mod tests {
         );
     }
 
+    /// SG-6: a semi-additive metric whose NA dims are ALL in the queried
+    /// dimensions is effectively regular — it takes the standard aggregation
+    /// path (no `ROW_NUMBER` CTE), so it MUST get the standard fan-trap check.
+    /// Previously any non-empty `non_additive_by` skipped the check
+    /// unconditionally, letting this query silently inflate.
     #[test]
-    fn test_check_fan_traps_skips_semi_additive() {
-        // Same fan-out scenario, but the metric has non_additive_by set.
+    fn test_check_fan_traps_semi_additive_regular_path_checked() {
+        // Fan-out topology: metric on orders, dim on line_items reached by
+        // reversing a ManyToOne edge. The metric's only NA dim (item_name)
+        // IS queried, so the metric acts as a regular aggregate.
         let def = minimal_def("orders", "item_name", "name", "total", "sum(amount)")
             .with_table("orders", "orders", &["id"])
             .with_table("line_items", "line_items", &["id"])
@@ -475,14 +661,61 @@ mod tests {
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
         let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
         assert!(
-            result.is_ok(),
-            "Semi-additive metrics should skip fan trap check, got: {result:?}"
+            matches!(result, Err(ExpandError::FanTrap { .. })),
+            "Effectively-regular semi-additive metric must get the standard \
+             fan-trap check, got: {result:?}"
         );
     }
 
+    /// SG-6: a semi-additive metric with at least one NA dim NOT in the
+    /// queried dims takes the ROW_NUMBER-CTE snapshot path, which is assumed
+    /// to neutralize fan-out (one row per partition survives) — pinned here.
+    /// NOTE: that assumption is itself unproven (`ROW_NUMBER` ties, co-queried
+    /// regular metrics); the SG-4/SG-5 semi-additive rework will revisit it.
     #[test]
-    fn test_check_fan_traps_skips_window() {
-        // Same fan-out scenario, but the metric has window_spec set.
+    fn test_check_fan_traps_semi_additive_cte_path_skipped() {
+        let def = minimal_def("orders", "item_name", "name", "total", "sum(amount)")
+            .with_table("orders", "orders", &["id"])
+            .with_table("line_items", "line_items", &["id"])
+            .with_dimension("item_name", "name", Some("line_items"))
+            .with_dimension("report_date", "report_date", Some("orders"))
+            .with_metric("total_sourced", "sum(amount)", Some("orders"))
+            .with_non_additive_by(
+                "total_sourced",
+                &[("report_date", SortOrder::Desc, NullsOrder::First)],
+            )
+            .with_pkfk_join(
+                "items_to_orders",
+                "line_items",
+                "orders",
+                &["order_id"],
+                &["id"],
+            );
+        let mut def = def;
+        def.dimensions.retain(|d| d.source_table.is_some());
+        def.metrics.retain(|m| m.source_table.is_some());
+        // Query only item_name: report_date (the NA dim) is NOT queried, so
+        // the metric is ACTIVE semi-additive and takes the CTE path.
+        let resolved_dims: Vec<&_> = def
+            .dimensions
+            .iter()
+            .filter(|d| d.name == "item_name")
+            .collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        assert!(
+            result.is_ok(),
+            "Active (CTE-path) semi-additive metrics skip the fan trap check, got: {result:?}"
+        );
+    }
+
+    /// SG-6: window metrics get the standard fan-trap check — the inner
+    /// aggregate is computed over the already-fanned join, so it is inflated
+    /// before the window function runs. Previously `is_window()` skipped the
+    /// check unconditionally.
+    #[test]
+    fn test_check_fan_traps_window_metric_fanning_dim_errors() {
+        // Metric (inner aggregate) on orders (root), dim on a fanning child.
         let def = minimal_def("orders", "item_name", "name", "total", "sum(amount)")
             .with_table("orders", "orders", &["id"])
             .with_table("line_items", "line_items", &["id"])
@@ -510,9 +743,240 @@ mod tests {
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
         let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
         assert!(
-            result.is_ok(),
-            "Window metrics should skip fan trap check, got: {result:?}"
+            matches!(result, Err(ExpandError::FanTrap { .. })),
+            "Window metrics must get the standard fan-trap check, got: {result:?}"
         );
+    }
+
+    /// Window metric in the SAFE direction (metric on the FK/child side, dim
+    /// on the referenced parent) stays allowed — guards against over-blocking
+    /// after the SG-6 skip removal.
+    #[test]
+    fn test_check_fan_traps_window_metric_safe_direction_ok() {
+        let def = minimal_def("orders", "cust_name", "name", "total", "sum(amount)")
+            .with_table("orders", "orders", &["id"])
+            .with_table("customers", "customers", &["id"])
+            .with_dimension("cust_name", "name", Some("customers"))
+            .with_metric("total_sourced", "sum(amount)", Some("orders"))
+            .with_window_spec(
+                "total_sourced",
+                WindowSpec {
+                    window_function: "AVG".to_string(),
+                    inner_metric: "total_sourced".to_string(),
+                    ..Default::default()
+                },
+            )
+            .with_pkfk_join(
+                "orders_customers",
+                "orders",
+                "customers",
+                &["customer_id"],
+                &["id"],
+            );
+        let mut def = def;
+        def.dimensions.retain(|d| d.source_table.is_some());
+        def.metrics.retain(|m| m.source_table.is_some());
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        assert!(
+            result.is_ok(),
+            "Window metric over a forward ManyToOne edge is safe, got: {result:?}"
+        );
+    }
+
+    /// SG-1: two metrics at different grains, no dimensions. `order_total`
+    /// aggregates the root table; `item_count` aggregates a `ManyToOne` child.
+    /// Joining both source tables multiplies the root's rows per child row,
+    /// silently inflating `order_total` — must error naming both metrics.
+    #[test]
+    fn test_check_fan_traps_metric_metric_multi_grain_errors() {
+        let def = minimal_def("o", "d", "d", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("li", "line_items", &["id"])
+            .with_metric("order_total", "SUM(o.amount)", Some("o"))
+            .with_metric("item_count", "COUNT(*)", Some("li"))
+            .with_pkfk_join("items_to_orders", "li", "o", &["order_id"], &["id"]);
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &[], &resolved_mets);
+        match result {
+            Err(ExpandError::MetricFanTrap {
+                metric_name,
+                metric_table,
+                other_metric_name,
+                other_metric_table,
+                relationship_name,
+                ..
+            }) => {
+                assert_eq!(metric_name, "order_total", "inflated metric");
+                assert_eq!(metric_table, "o");
+                assert_eq!(other_metric_name, "item_count");
+                assert_eq!(other_metric_table, "li");
+                assert_eq!(relationship_name, "items_to_orders");
+            }
+            other => panic!("Expected MetricFanTrap, got: {other:?}"),
+        }
+    }
+
+    /// SG-1 (chasm trap): metrics on two different child tables of one root.
+    /// FROM root LEFT JOIN `child_a` LEFT JOIN `child_b` builds a cross product
+    /// per root row — both aggregates inflate. Must error.
+    #[test]
+    fn test_check_fan_traps_metric_metric_chasm_trap_errors() {
+        let def = minimal_def("o", "d", "d", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("li", "line_items", &["id"])
+            .with_table("pay", "payments", &["id"])
+            .with_metric("item_total", "SUM(li.amount)", Some("li"))
+            .with_metric("payment_total", "SUM(pay.amount)", Some("pay"))
+            .with_pkfk_join("items_to_orders", "li", "o", &["order_id"], &["id"])
+            .with_pkfk_join("payments_to_orders", "pay", "o", &["order_id"], &["id"]);
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &[], &resolved_mets);
+        match result {
+            Err(ExpandError::MetricFanTrap {
+                metric_name,
+                other_metric_name,
+                ..
+            }) => {
+                assert_eq!(metric_name, "item_total");
+                assert_eq!(other_metric_name, "payment_total");
+            }
+            other => panic!("Expected MetricFanTrap for chasm trap, got: {other:?}"),
+        }
+    }
+
+    /// SG-1 guard: same-grain multi-metric queries stay allowed, including a
+    /// base-table metric with no `source_table` (which resolves to the root
+    /// grain) and root-ward dimension joins (`ManyToOne` toward a parent never
+    /// fans).
+    #[test]
+    fn test_check_fan_traps_metric_metric_same_grain_allowed() {
+        let def = minimal_def("orders", "cust_name", "name", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("customers", "customers", &["id"])
+            .with_dimension("cust_name", "name", Some("customers"))
+            .with_metric("total", "sum(amount)", Some("orders"))
+            .with_metric("cnt", "count(*)", None) // base metric -> root grain
+            .with_pkfk_join(
+                "orders_customers",
+                "orders",
+                "customers",
+                &["customer_id"],
+                &["id"],
+            );
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        assert!(
+            result.is_ok(),
+            "Same-grain metrics with a root-ward dim join must be allowed, got: {result:?}"
+        );
+    }
+
+    /// SG-1: an unqualified base-table metric (`source_table` = None) sits at
+    /// the ROOT grain and participates in the metric×metric check — it is
+    /// exactly the metric inflated by joining a `ManyToOne` child.
+    #[test]
+    fn test_check_fan_traps_metric_metric_base_metric_participates() {
+        let def = minimal_def("o", "d", "d", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("li", "line_items", &["id"])
+            .with_metric("order_total", "SUM(amount)", None) // base -> root grain "o"
+            .with_metric("item_count", "COUNT(*)", Some("li"))
+            .with_pkfk_join("items_to_orders", "li", "o", &["order_id"], &["id"]);
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &[], &resolved_mets);
+        match result {
+            Err(ExpandError::MetricFanTrap {
+                metric_name,
+                metric_table,
+                other_metric_name,
+                ..
+            }) => {
+                assert_eq!(metric_name, "order_total");
+                assert_eq!(metric_table, "o", "base metric resolves to the root grain");
+                assert_eq!(other_metric_name, "item_count");
+            }
+            other => panic!("Expected MetricFanTrap, got: {other:?}"),
+        }
+    }
+
+    /// SG-7: a definition whose relationship graph cannot be rebuilt (here: a
+    /// self-referencing join) must ERROR, not silently skip the safety check.
+    #[test]
+    fn test_check_fan_traps_unbuildable_graph_errors() {
+        let def = minimal_def("orders", "region", "region", "total", "sum(amount)").with_pkfk_join(
+            "self_ref",
+            "orders",
+            "orders",
+            &["parent_id"],
+            &["id"],
+        );
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        match result {
+            Err(ExpandError::UncheckableDefinition { view_name, reason }) => {
+                assert_eq!(view_name, "test");
+                assert!(
+                    reason.contains("cannot reference itself"),
+                    "reason should carry the graph error: {reason}"
+                );
+            }
+            other => panic!("Expected UncheckableDefinition, got: {other:?}"),
+        }
+        // Same for the fact-path validator (only reached with >= 2 tables).
+        let result = validate_fact_table_path("test", &def, &["a".to_string()], &["b".to_string()]);
+        assert!(
+            matches!(result, Err(ExpandError::UncheckableDefinition { .. })),
+            "validate_fact_table_path must also error on an unbuildable graph, got: {result:?}"
+        );
+    }
+
+    /// SG-16: two named relationships between the same table pair with
+    /// differing cardinalities (role-playing). The fan-out must be detected
+    /// regardless of declaration order, and the error must name the
+    /// relationship that actually fans (the `ManyToOne` one).
+    #[test]
+    fn test_check_fan_traps_role_playing_worst_case_cardinality() {
+        for m2o_first in [true, false] {
+            let mut def = minimal_def("orders", "item_name", "name", "total", "sum(amount)")
+                .with_table("orders", "orders", &["id"])
+                .with_table("line_items", "line_items", &["id"])
+                .with_dimension("item_name", "name", Some("line_items"))
+                .with_metric("total", "sum(amount)", Some("orders"))
+                .with_pkfk_join("rel_m2o", "line_items", "orders", &["order_id"], &["id"])
+                .with_pkfk_join("rel_o2o", "line_items", "orders", &["id"], &["id"]);
+            def.dimensions.retain(|d| d.source_table.is_some());
+            def.metrics.retain(|m| m.source_table.is_some());
+            let n = def.joins.len();
+            def.joins[n - 1].cardinality = Cardinality::OneToOne;
+            if !m2o_first {
+                def.joins.swap(n - 2, n - 1);
+            }
+            let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+            let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+            let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+            match result {
+                Err(ExpandError::FanTrap {
+                    relationship_name, ..
+                }) => {
+                    assert_eq!(
+                        relationship_name, "rel_m2o",
+                        "error must name the fanning relationship (m2o_first={m2o_first})"
+                    );
+                }
+                other => panic!(
+                    "Fan-out must be detected regardless of declaration order \
+                     (m2o_first={m2o_first}), got: {other:?}"
+                ),
+            }
+        }
     }
 
     #[test]
