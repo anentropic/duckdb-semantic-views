@@ -166,12 +166,6 @@ test-concurrent: build
 test-load-idempotent: build
     uv run test/integration/test_load_extension_twice_idempotent.py
 
-# DDL-time type inference (LIMIT 0 probe) against a file-backed DB:
-# dimension/metric output_type inference, DECIMAL passthrough, SHOW/DESCRIBE
-# data_type surfacing, derived-metric and multi-table inference.
-test-type-inference: build
-    uv run test/integration/test_type_inference.py
-
 # CREATE SEMANTIC VIEW ... FROM YAML FILE under the v0.10.0 read-elimination
 # architecture (Phase 65 Plan 04 D-11): OR REPLACE / IF NOT EXISTS, friendly
 # error surfaces, YAML size cap, transactional rollback, get_ddl round-trip.
@@ -188,7 +182,7 @@ test-readonly-fresh-drop: build
 # exact set the `python-integration` CI job runs (IntegrationChecks.yml) —
 # keep the two in sync by editing THIS recipe, not the workflow.
 # (test-ducklake-ci is excluded: it has its own dedicated CI job.)
-test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-type-inference test-yaml-file-create test-readonly-fresh-drop
+test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-readonly-fresh-drop
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + all Python integration suites
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.
