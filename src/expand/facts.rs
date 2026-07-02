@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::model::Fact;
-use crate::util::{is_word_boundary_char, replace_word_boundary, replace_word_boundary_any};
+use crate::util::{is_word_boundary_char, replace_word_boundary_any, replace_word_boundary_pairs};
 
 /// Maximum allowed nesting depth for derived metric resolution.
 /// Prevents stack overflow from deeply nested metric chains that pass
@@ -353,15 +353,30 @@ pub(super) fn inline_derived_metrics(
     for idx in derived_topo {
         let met = derived[idx].1;
         // Start with the raw expression, with facts inlined first
-        let mut expr = if facts.is_empty() {
+        let raw_expr = if facts.is_empty() {
             met.expr.clone()
         } else {
             inline_facts(&met.expr, facts, fact_topo_order)
         };
-        // Replace each known metric name with its resolved expression (parenthesized)
-        for (name, replacement) in &resolved {
-            expr = replace_word_boundary(&expr, name, &format!("({replacement})"));
-        }
+        // Replace every known metric name with its resolved expression
+        // (parenthesized) in ONE combined left-to-right pass. Sequential
+        // per-name replace_word_boundary calls iterated the HashMap in
+        // nondeterministic order and re-scanned earlier substitutions: a
+        // metric named like a column used in another metric's expression
+        // (`revenue` vs `SUM(o.revenue)` — `.` is a word boundary) was
+        // double-substituted into invalid nested-aggregate SQL on a
+        // hash-seed-dependent fraction of runs (SG-3, code-review
+        // 2026-07-02). Pair order is deterministic (longest needle first,
+        // then lexicographic), mirroring `inline_facts`.
+        let expr = {
+            let mut entries: Vec<(&str, String)> = resolved
+                .iter()
+                .map(|(name, replacement)| (name.as_str(), format!("({replacement})")))
+                .collect();
+            entries.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+            let pairs: Vec<(&str, &str)> = entries.iter().map(|(n, r)| (*n, r.as_str())).collect();
+            replace_word_boundary_pairs(&raw_expr, &pairs)
+        };
         resolved.insert(met.name.to_ascii_lowercase(), expr);
     }
 
@@ -480,6 +495,48 @@ mod tests {
     #[test]
     fn max_derivation_depth_constant() {
         assert_eq!(MAX_DERIVATION_DEPTH, 64);
+    }
+
+    #[test]
+    fn inline_derived_metrics_name_matching_column_is_not_double_substituted() {
+        // SG-3 regression (code-review 2026-07-02): metric `revenue` also
+        // appears as the column reference `o.revenue` inside `tax`'s
+        // expression (`.` is a word boundary). The old sequential per-name
+        // substitution re-scanned inserted text in HashMap iteration order:
+        // when `tax` happened to be inlined first, the subsequent `revenue`
+        // pass also matched `revenue` inside the freshly inserted
+        // `SUM(o.revenue * 0.1)`, corrupting the expression into invalid
+        // nested-aggregate SQL on a hash-seed-dependent fraction of runs.
+        // The single combined pass must produce this exact expression, every
+        // run.
+        let metrics = vec![
+            make_metric("revenue", "SUM(o.revenue)", Some("o")),
+            make_metric("tax", "SUM(o.revenue * 0.1)", Some("o")),
+            make_metric("after_tax", "revenue - tax", None),
+        ];
+        let resolved = inline_derived_metrics(&metrics, &[], &[]).unwrap();
+        assert_eq!(
+            resolved.get("after_tax").unwrap(),
+            "(SUM(o.revenue)) - (SUM(o.revenue * 0.1))"
+        );
+    }
+
+    #[test]
+    fn inline_derived_metrics_chained_derived_not_rescanned() {
+        // A derived metric referencing another derived metric: the inner
+        // resolution is inserted verbatim and must not be re-scanned even
+        // though it contains the names of other metrics.
+        let metrics = vec![
+            make_metric("revenue", "SUM(o.revenue)", Some("o")),
+            make_metric("cost", "SUM(o.cost)", Some("o")),
+            make_metric("profit", "revenue - cost", None),
+            make_metric("margin", "profit / revenue", None),
+        ];
+        let resolved = inline_derived_metrics(&metrics, &[], &[]).unwrap();
+        assert_eq!(
+            resolved.get("margin").unwrap(),
+            "((SUM(o.revenue)) - (SUM(o.cost))) / (SUM(o.revenue))"
+        );
     }
 
     #[test]

@@ -25,6 +25,11 @@ fan-out SG-1, COUNT(*) on child tables SG-8, semi-additive ties SG-4, …)
 are intentionally NOT generated here yet — each R1 fix PR must extend
 this harness with the scenario it repairs, using this file's helpers.
 
+Extensions so far:
+  - SG-3 (single-pass derived-metric inlining): `net_revenue` is derived
+    from metrics whose expressions contain a column (`o.amount`) named
+    like another metric (`amount`) — the exact re-scan poison scenario.
+
 Usage:
     uv run test/integration/test_differential.py
 
@@ -56,13 +61,21 @@ DIMS = {
     "category": ("category", "p.category", "p"),
 }
 
-# Metric name -> reference SQL aggregate (all on the base table — see SCOPE)
+# Metric name -> reference SQL aggregate (all on the base table — see SCOPE).
+# `amount` deliberately shares its name with the orders.amount COLUMN, and
+# `net_revenue` is a derived metric whose resolution inlines `tax_total`
+# (whose expression contains `o.amount`): the SG-3 poison scenario — pre-fix,
+# derived-metric inlining could re-scan inserted text and corrupt this into
+# invalid SQL on a hash-seed-dependent fraction of runs.
 METRICS = {
     "revenue": "SUM(o.amount)",
     "order_count": "COUNT(*)",
     "avg_amount": "AVG(o.amount)",
     "max_qty": "MAX(o.qty)",
     "min_amount": "MIN(o.amount)",
+    "amount": "SUM(o.amount)",
+    "tax_total": "SUM(o.amount * 0.1)",
+    "net_revenue": "SUM(o.amount) - SUM(o.amount * 0.1)",
 }
 
 
@@ -119,7 +132,10 @@ CREATE SEMANTIC VIEW diff_sv AS
     o.order_count AS COUNT(*),
     o.avg_amount AS AVG(o.amount),
     o.max_qty AS MAX(o.qty),
-    o.min_amount AS MIN(o.amount)
+    o.min_amount AS MIN(o.amount),
+    o.amount AS SUM(o.amount),
+    o.tax_total AS SUM(o.amount * 0.1),
+    net_revenue AS revenue - tax_total
   )
 """
 

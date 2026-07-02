@@ -88,13 +88,34 @@ pub fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) ->
 /// A single combined pass avoids that.
 #[must_use]
 pub fn replace_word_boundary_any(haystack: &str, needles: &[&str], replacement: &str) -> String {
+    let pairs: Vec<(&str, &str)> = needles.iter().map(|&n| (n, replacement)).collect();
+    replace_word_boundary_pairs(haystack, &pairs)
+}
+
+/// Replace word-boundary occurrences of each needle with its *own* replacement,
+/// in a single left-to-right pass.
+///
+/// Same scanning semantics as [`replace_word_boundary_any`] — at each position
+/// the pairs are tried in the given order, and on a match scanning resumes
+/// *after* the matched needle so inserted replacement text is never re-scanned.
+/// Callers that need deterministic output for overlapping needles should order
+/// the pairs deterministically (e.g. longest needle first, then lexicographic).
+///
+/// This is the safe substitution primitive for derived-metric inlining (SG-3,
+/// code-review 2026-07-02): sequential per-name [`replace_word_boundary`]
+/// calls re-scan earlier substitutions, so a metric name that also appears as
+/// a column reference inside another metric's resolved expression (`revenue`
+/// inside `SUM(o.revenue)` — `.` is a word boundary) got double-substituted
+/// into invalid nested-aggregate SQL, dependent on hash-map iteration order.
+#[must_use]
+pub fn replace_word_boundary_pairs(haystack: &str, pairs: &[(&str, &str)]) -> String {
     let h_bytes = haystack.as_bytes();
     let mut result = String::with_capacity(haystack.len());
     let mut i = 0;
 
     while i < h_bytes.len() {
         let mut matched = false;
-        for &needle in needles {
+        for &(needle, replacement) in pairs {
             let n_bytes = needle.as_bytes();
             let n_len = n_bytes.len();
             if n_len == 0 || i + n_len > h_bytes.len() {
@@ -213,6 +234,35 @@ mod tests {
         // Non-ASCII with no match at all must round-trip unchanged.
         let result = replace_word_boundary("'São Paulo' || 'café'", "net_price", "(x)");
         assert_eq!(result, "'São Paulo' || 'café'");
+    }
+
+    #[test]
+    fn replace_word_boundary_pairs_distinct_replacements_single_pass() {
+        let pairs = [
+            ("revenue", "(SUM(o.revenue))"),
+            ("tax", "(SUM(o.revenue * 0.1))"),
+        ];
+        let result = replace_word_boundary_pairs("revenue - tax", &pairs);
+        assert_eq!(result, "(SUM(o.revenue)) - (SUM(o.revenue * 0.1))");
+    }
+
+    #[test]
+    fn replace_word_boundary_pairs_inserted_text_not_rescanned() {
+        // "b"'s replacement contains needle "a" at a word boundary; a second
+        // scan over inserted text would corrupt it.
+        let pairs = [("a", "(X)"), ("b", "(a + 1)")];
+        let result = replace_word_boundary_pairs("a + b", &pairs);
+        assert_eq!(result, "(X) + (a + 1)");
+    }
+
+    #[test]
+    fn replace_word_boundary_any_still_shares_semantics_with_pairs() {
+        // _any delegates to _pairs; identical inputs must stay identical.
+        let via_any = replace_word_boundary_any("x + y", &["x", "y"], "(z)");
+        let pairs = [("x", "(z)"), ("y", "(z)")];
+        let via_pairs = replace_word_boundary_pairs("x + y", &pairs);
+        assert_eq!(via_any, via_pairs);
+        assert_eq!(via_any, "(z) + (z)");
     }
 
     proptest! {
