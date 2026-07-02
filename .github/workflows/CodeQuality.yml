@@ -26,6 +26,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # The sqllogictest runner executes ONLY files named in TEST_LIST; a
+      # .test file missing from it is silently skipped. Mirrors `just check-test-list`.
+      - name: Check test/sql/TEST_LIST is in sync with test/sql/*.test
+        run: |
+          if ! diff <(find test/sql -maxdepth 1 -name '*.test' | sort) <(sort test/sql/TEST_LIST); then
+            echo "::error::test/sql/TEST_LIST is out of sync with test/sql/*.test ('<' = on disk only, '>' = in TEST_LIST only)"
+            exit 1
+          fi
+
       - name: Check formatting (rustfmt)
         run: cargo fmt --check
 

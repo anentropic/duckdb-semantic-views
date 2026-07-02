@@ -1,0 +1,1 @@
+SELECT * FROM semantic_view('v', dimensions := ['region'], metrics := ['revenue']) WHERE region = 'East' ORDER BY 1 LIMIT 10;

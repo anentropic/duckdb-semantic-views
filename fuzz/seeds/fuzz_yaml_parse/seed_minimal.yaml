@@ -1,0 +1,14 @@
+base_table: orders
+tables:
+  - alias: o
+    table: orders
+    pk_columns:
+      - id
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: revenue
+    expr: SUM(o.amount)
+    source_table: o

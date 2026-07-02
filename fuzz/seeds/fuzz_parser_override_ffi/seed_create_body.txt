@@ -1,0 +1,1 @@
+CREATE SEMANTIC VIEW v COMMENT = 'orders analytics' AS TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (id)) RELATIONSHIPS (order_customer AS o(customer_id) REFERENCES c) DIMENSIONS (o.region AS o.region COMMENT = 'sales region', c.tier AS c.tier) METRICS (o.revenue AS SUM(o.amount), o.order_count AS COUNT(*));
