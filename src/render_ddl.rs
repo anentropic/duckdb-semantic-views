@@ -82,12 +82,43 @@ fn emit_relationships(out: &mut String, def: &SemanticViewDefinition) {
         out.push_str(&join.fk_columns.join(", "));
         out.push_str(") REFERENCES ");
         out.push_str(&join.table);
+        // RT-1 (code-review 2026-07-02): a relationship declared against a
+        // UNIQUE key (or any explicit column list differing from the
+        // target's PRIMARY KEY) must render its `(ref_columns)` — omitting
+        // them makes re-parsing resolve to the target's PK, silently
+        // rewiring join semantics. When ref_columns match the target PK the
+        // list is redundant and is omitted for the historical compact form.
+        if !join.ref_columns.is_empty() && !ref_columns_match_target_pk(def, join) {
+            out.push('(');
+            out.push_str(&join.ref_columns.join(", "));
+            out.push(')');
+        }
         if i + 1 < def.joins.len() {
             out.push(',');
         }
         out.push('\n');
     }
     out.push_str(")\n");
+}
+
+/// Do `join.ref_columns` equal the target table's PRIMARY KEY columns
+/// (case-insensitive, order-sensitive)? Returns `false` when the target
+/// table cannot be found — the explicit list is then emitted defensively.
+fn ref_columns_match_target_pk(def: &SemanticViewDefinition, join: &crate::model::Join) -> bool {
+    let target_lower = join.table.to_ascii_lowercase();
+    let Some(target) = def
+        .tables
+        .iter()
+        .find(|t| t.alias.to_ascii_lowercase() == target_lower)
+    else {
+        return false;
+    };
+    target.pk_columns.len() == join.ref_columns.len()
+        && target
+            .pk_columns
+            .iter()
+            .zip(&join.ref_columns)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 /// Emit FACTS clause entries.
@@ -300,9 +331,12 @@ pub fn render_create_ddl(name: &str, def: &SemanticViewDefinition) -> Result<Str
 
     let mut out = String::with_capacity(512);
 
-    // Header
+    // Header. The stored name is bare (quotes were stripped at CREATE), so
+    // re-quote when a bare emission would not round-trip — unquoted names
+    // fold to lowercase on re-parse (PA-8), and names with whitespace /
+    // dots / specials would mis-parse entirely (RT-2).
     out.push_str("CREATE OR REPLACE SEMANTIC VIEW ");
-    out.push_str(name);
+    out.push_str(&crate::expand::quote_ident_if_needed(name));
 
     // View-level comment
     emit_comment(&mut out, def.comment.as_ref());
@@ -371,6 +405,96 @@ mod tests {
         assert!(ddl.contains("o AS orders PRIMARY KEY (id)"));
         assert!(ddl.contains("o.region AS o.region"));
         assert!(ddl.contains("o.revenue AS SUM(o.amount)"));
+    }
+
+    // -------------------------------------------------------------------
+    // RT-1 (code-review 2026-07-02): ref_columns rendering
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_ref_columns_emitted_when_differing_from_target_pk() {
+        // Relationship declared against a UNIQUE key: REFERENCES c(alt_key)
+        // must render its column list — bare `REFERENCES c` re-parses to the
+        // PK and silently rewires the join.
+        let mut def = minimal_def();
+        def.tables.push(TableRef {
+            alias: "c".to_string(),
+            table: "customers".to_string(),
+            pk_columns: vec!["id".to_string()],
+            unique_constraints: vec![vec!["alt_key".to_string()]],
+            ..Default::default()
+        });
+        def.joins.push(Join {
+            table: "c".to_string(),
+            from_alias: "o".to_string(),
+            fk_columns: vec!["customer_alt".to_string()],
+            ref_columns: vec!["alt_key".to_string()],
+            name: Some("o_to_c".to_string()),
+            ..Default::default()
+        });
+        let ddl = render_create_ddl("v", &def).unwrap();
+        assert!(
+            ddl.contains("o_to_c AS o(customer_alt) REFERENCES c(alt_key)"),
+            "ref_columns must be emitted: {ddl}"
+        );
+    }
+
+    #[test]
+    fn test_ref_columns_omitted_when_matching_target_pk() {
+        // Historical compact form: when ref_columns equal the target PK the
+        // list is redundant on re-parse.
+        let mut def = minimal_def();
+        def.tables.push(TableRef {
+            alias: "c".to_string(),
+            table: "customers".to_string(),
+            pk_columns: vec!["id".to_string()],
+            ..Default::default()
+        });
+        def.joins.push(Join {
+            table: "c".to_string(),
+            from_alias: "o".to_string(),
+            fk_columns: vec!["customer_id".to_string()],
+            ref_columns: vec!["id".to_string()],
+            name: Some("o_to_c".to_string()),
+            ..Default::default()
+        });
+        let ddl = render_create_ddl("v", &def).unwrap();
+        assert!(
+            ddl.contains("o_to_c AS o(customer_id) REFERENCES c\n")
+                || ddl.contains("o_to_c AS o(customer_id) REFERENCES c,"),
+            "PK-matching ref_columns stay omitted: {ddl}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // RT-2 (code-review 2026-07-02): view-name quoting in the header
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_view_name_quoted_when_needed() {
+        let def = minimal_def();
+        // Mixed case (created quoted, stored case-preserved).
+        let ddl = render_create_ddl("Sales", &def).unwrap();
+        assert!(ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW \"Sales\""));
+        // Whitespace.
+        let ddl = render_create_ddl("my view", &def).unwrap();
+        assert!(ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW \"my view\""));
+        // Dot.
+        let ddl = render_create_ddl("a.b", &def).unwrap();
+        assert!(ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW \"a.b\""));
+        // Non-ASCII.
+        let ddl = render_create_ddl("café", &def).unwrap();
+        assert!(ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW \"café\""));
+        // Embedded quote escapes.
+        let ddl = render_create_ddl("wei\"rd", &def).unwrap();
+        assert!(ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW \"wei\"\"rd\""));
+    }
+
+    #[test]
+    fn test_view_name_bare_when_safe() {
+        let def = minimal_def();
+        let ddl = render_create_ddl("orders_sv_42", &def).unwrap();
+        assert!(ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW orders_sv_42 "));
     }
 
     #[test]

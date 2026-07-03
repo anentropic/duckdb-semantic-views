@@ -17,6 +17,33 @@ pub fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Double-quote `ident` only when a bare emission would not round-trip.
+///
+/// A name is bare-safe iff it matches `[a-z_][a-z0-9_]*` — anything else
+/// (uppercase letters, whitespace, dots, quotes, non-ASCII, leading digits,
+/// empty) must be quoted: bare view names fold to lowercase on re-parse
+/// (PA-8), so an unquoted mixed-case or special-character name silently
+/// resolves to a different view or fails to parse (RT-2, code-review
+/// 2026-07-02).
+///
+/// Used by `render_ddl` for the stored (bare, quote-stripped) view name so
+/// `get_ddl` output re-parses to the same catalog key while common
+/// lowercase names keep rendering unquoted.
+#[must_use]
+pub fn quote_ident_if_needed(ident: &str) -> String {
+    let bytes = ident.as_bytes();
+    let bare_safe = !bytes.is_empty()
+        && !bytes[0].is_ascii_digit()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_');
+    if bare_safe {
+        ident.to_string()
+    } else {
+        quote_ident(ident)
+    }
+}
+
 /// Quote a potentially dot-qualified table reference, normalising already-quoted input.
 ///
 /// Delegates to [`crate::ident::parse_qualified_identifier`] so we operate on the
