@@ -144,18 +144,31 @@ pub fn replace_word_boundary_pairs(haystack: &str, pairs: &[(&str, &str)]) -> St
     result
 }
 
-/// Is `b` a word-boundary byte — i.e. NOT an identifier-continuation byte?
+/// Is `b` an identifier-continuation byte?
 ///
-/// Identifier continuation is ASCII alphanumerics, `_`, AND all non-ASCII
-/// bytes (>= 0x80): `DuckDB` identifiers may contain any non-ASCII
-/// character, so a needle must not match inside a unicode-bearing name
-/// (`id` inside `idΩ`, PR #50 review). This is the exact inverse of the DDL
-/// scanners' `body_parser::scan::is_ident_continuation`; the two agree so
-/// that fact/derived-metric inlining and dependency detection use the same
-/// notion of an identifier as the parser.
+/// **This is the single source of truth for "what byte continues a SQL
+/// identifier"** across the whole crate — the DDL keyword scanners
+/// (`body_parser::scan::is_ident_continuation` delegates here), the
+/// prefix matcher (`parse::match_keyword_prefix`), and fact/derived-metric
+/// inlining ([`is_word_boundary_char`], its inverse) all resolve through it.
+/// Keeping one definition is what prevents the recurring boundary-drift
+/// bug class (PR #50 review): a keyword must not match immediately before
+/// an identifier byte, or `AS`/`BY`/`id` matches inside `ASx`/`BYé`/`idΩ`.
+///
+/// Continuation = ASCII alphanumerics, `_`, AND every non-ASCII byte
+/// (>= 0x80): `DuckDB` identifiers may contain any non-ASCII character, so
+/// UTF-8 lead/continuation bytes are identifier bytes, never boundaries.
+#[must_use]
+pub fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Is `b` a word-boundary byte — i.e. NOT an [`is_ident_byte`]? The
+/// primitive used by [`replace_word_boundary`] and the `facts.rs` name /
+/// COUNT matchers so inlining shares the parser's notion of an identifier.
 #[must_use]
 pub fn is_word_boundary_char(b: u8) -> bool {
-    !b.is_ascii_alphanumeric() && b != b'_' && b < 0x80
+    !is_ident_byte(b)
 }
 
 /// Does `s` start with the ASCII keyword `kw`, case-insensitively?
@@ -617,6 +630,24 @@ mod tests {
     // -------------------------------------------------------------------
     // starts_with_keyword_ci tests
     // -------------------------------------------------------------------
+
+    #[test]
+    fn ident_byte_is_the_single_boundary_definition() {
+        // is_word_boundary_char is exactly the inverse of is_ident_byte, and
+        // the classification is: ASCII alnum / `_` / all non-ASCII bytes are
+        // identifier bytes; ASCII punctuation and whitespace are boundaries.
+        for b in 0u8..=255 {
+            assert_eq!(is_word_boundary_char(b), !is_ident_byte(b), "byte {b}");
+        }
+        for &b in b"aZ0_" {
+            assert!(is_ident_byte(b));
+        }
+        assert!(is_ident_byte(0xC3)); // UTF-8 lead byte (é etc.)
+        assert!(is_ident_byte(0xA9)); // UTF-8 continuation byte
+        for &b in b" \t.,()\";'" {
+            assert!(!is_ident_byte(b), "byte {b} must be a boundary");
+        }
+    }
 
     #[test]
     fn keyword_ci_matches_case_insensitively() {

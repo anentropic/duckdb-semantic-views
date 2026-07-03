@@ -13,7 +13,9 @@ use crate::body_parser::parse_keyword_body;
 use crate::errors::ParseError;
 use crate::ident::{find_identifier_end, normalize_view_name};
 use crate::model::{Cardinality, Join, TableRef};
-use crate::util::{extract_single_quoted_prefix, starts_with_keyword_ci, SingleQuoteError};
+use crate::util::{
+    extract_single_quoted_prefix, is_ident_byte, starts_with_keyword_ci, SingleQuoteError,
+};
 
 // ---------------------------------------------------------------------------
 // OverrideContext — Phase 65 Plan 06: empty struct (no state).
@@ -131,11 +133,8 @@ fn match_keyword_prefix(input: &[u8], keywords: &[&[u8]]) -> Option<usize> {
     // Non-ASCII bytes (>= 0x80) are identifier continuation in DuckDB, so
     // they are NOT boundaries either; ASCII punctuation (whitespace, `(`,
     // `;`, `"`) is a legitimate token boundary and stays accepted.
-    if pos < input.len() {
-        let b = input[pos];
-        if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 {
-            return None;
-        }
+    if pos < input.len() && is_ident_byte(input[pos]) {
+        return None;
     }
     Some(pos)
 }
@@ -604,10 +603,7 @@ fn parse_show_filter_clauses<'a>(
         // continuation (mirrors match_keyword_prefix), so WITH_x / WITHé do
         // not match the keyword.
         let with_boundary_ok = starts_with_keyword_ci(rest, "WITH")
-            && (rest.len() == 4 || {
-                let b = rest.as_bytes()[4];
-                !b.is_ascii_alphanumeric() && b != b'_' && b < 0x80
-            });
+            && (rest.len() == 4 || !is_ident_byte(rest.as_bytes()[4]));
         if !with_boundary_ok {
             return Err(format!(
                 "Expected STARTS WITH. \
@@ -1103,50 +1099,59 @@ fn validate_alter(
             position: Some(trim_offset + plen),
         });
     }
-    let name_end = after_prefix
-        .find(|c: char| c.is_whitespace())
-        .ok_or_else(|| ParseError {
+    // Quote-aware name capture + word-boundary sub-op matching, sharing
+    // `find_identifier_end` and `match_keyword_prefix` with `rewrite_alter`
+    // so the validate and rewrite passes agree on the ALTER grammar. The
+    // previous hand-rolled `find(whitespace)` + single-space
+    // `starts_with("RENAME TO")` drifted from the (PA-10-fixed) rewriter:
+    // it split quoted names at their inner space (`"my view"`) and rejected
+    // flexible inter-keyword whitespace (`RENAME  TO`) that the rewriter
+    // accepts (PR #50 self-review).
+    let name_end = find_identifier_end(after_prefix, /* allow_paren = */ false);
+    let rest = after_prefix[name_end..].trim();
+    if rest.is_empty() {
+        return Err(ParseError {
             message: "Missing ALTER operation after view name. Supported: RENAME TO, SET COMMENT, UNSET COMMENT.".to_string(),
             position: Some(trim_offset + plen + after_prefix.len()),
-        })?;
-    let rest = after_prefix[name_end..].trim();
-    let rest_upper = rest.to_ascii_uppercase();
+        });
+    }
+    let op_pos = Some(trim_offset + plen + name_end);
+    let rb = rest.as_bytes();
 
-    if rest_upper.starts_with("RENAME TO") {
-        let new_name_str = rest["RENAME TO".len()..].trim();
-        if new_name_str.is_empty() {
+    if let Some(consumed) = match_keyword_prefix(rb, &[b"rename", b"to"]) {
+        if rest[consumed..].trim().is_empty() {
             return Err(ParseError {
                 message: "Missing new name after RENAME TO.".to_string(),
                 position: Some(trim_offset + plen + after_prefix.len()),
             });
         }
-    } else if rest_upper.starts_with("SET COMMENT") {
-        let after_set_comment = rest["SET COMMENT".len()..].trim_start();
+    } else if let Some(consumed) = match_keyword_prefix(rb, &[b"set", b"comment"]) {
+        let after_set_comment = rest[consumed..].trim_start();
         if !after_set_comment.starts_with('=') {
             return Err(ParseError {
                 message: "Expected '=' after SET COMMENT.".to_string(),
-                position: Some(trim_offset + plen + name_end),
+                position: op_pos,
             });
         }
         let after_eq = after_set_comment[1..].trim_start();
         if !after_eq.starts_with('\'') {
             return Err(ParseError {
                 message: "Expected single-quoted string after SET COMMENT =.".to_string(),
-                position: Some(trim_offset + plen + name_end),
+                position: op_pos,
             });
         }
         let _ = extract_quoted_string(after_eq).map_err(|e| ParseError {
             message: format!("Invalid comment string: {e}"),
-            position: Some(trim_offset + plen + name_end),
+            position: op_pos,
         })?;
-    } else if rest_upper.starts_with("UNSET COMMENT") {
+    } else if match_keyword_prefix(rb, &[b"unset", b"comment"]).is_some() {
         // Valid -- no further arguments needed
     } else {
         return Err(ParseError {
             message:
                 "Unsupported ALTER operation. Supported: RENAME TO, SET COMMENT, UNSET COMMENT."
                     .to_string(),
-            position: Some(trim_offset + plen + name_end),
+            position: op_pos,
         });
     }
     Ok(())
@@ -1160,11 +1165,8 @@ fn extract_view_comment(text: &str) -> Result<(Option<String>, &str), ParseError
     let upper = text.to_ascii_uppercase();
     if upper.starts_with("COMMENT") {
         // Verify word boundary (not e.g. COMMENTARY, COMMENT_x, COMMENTé —
-        // `_` and non-ASCII bytes are identifier continuation)
-        if text.len() > 7 && {
-            let b = text.as_bytes()[7];
-            b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
-        } {
+        // `_` and non-ASCII bytes are identifier continuation).
+        if text.len() > 7 && is_ident_byte(text.as_bytes()[7]) {
             return Ok((None, text));
         }
         let after_kw = text[7..].trim_start();
@@ -3667,6 +3669,35 @@ mod tests {
         assert!(rewrite_ddl("ALTER SEMANTIC VIEW a RENAME TO x oops").is_err());
         assert!(rewrite_ddl("ALTER SEMANTIC VIEW a SET COMMENT = 'x' oops").is_err());
         assert!(rewrite_ddl("ALTER SEMANTIC VIEW a UNSET COMMENT oops").is_err());
+    }
+
+    #[test]
+    fn test_validate_alter_agrees_with_rewriter() {
+        // PR #50 self-review: validate_alter was a second, drifted grammar
+        // implementation — it required single-space sub-ops and split
+        // quoted names at their inner space, so validate_and_rewrite (which
+        // validates BEFORE rewriting) rejected inputs the rewriter accepts.
+        // Flexible inter-keyword whitespace must pass the full pipeline.
+        for q in [
+            "ALTER SEMANTIC VIEW v RENAME  TO w",
+            "ALTER SEMANTIC VIEW v RENAME\tTO w",
+            "ALTER SEMANTIC VIEW v SET   COMMENT = 'x'",
+            "ALTER SEMANTIC VIEW v UNSET\tCOMMENT",
+        ] {
+            assert!(
+                validate_and_rewrite(q).is_ok(),
+                "validate_and_rewrite rejected valid ALTER: {q}"
+            );
+        }
+        // A quoted view name with an inner space must survive the validate
+        // pass (previously split at the space -> "Unsupported ALTER").
+        let sql = validate_and_rewrite("ALTER SEMANTIC VIEW \"my view\" RENAME TO w")
+            .unwrap()
+            .expect("statement is ours");
+        assert_eq!(
+            sql,
+            "SELECT * FROM alter_semantic_view_rename('my view', 'w')"
+        );
     }
 
     #[test]

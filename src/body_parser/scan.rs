@@ -203,15 +203,15 @@ pub(super) fn split_qualified_identifier(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Is `b` an identifier-continuation byte? ASCII alphanumerics, `_`, and
-/// all non-ASCII bytes (>= 0x80 — `DuckDB` identifiers may contain any
-/// non-ASCII character) continue an identifier; anything else is a word
-/// boundary. Post-keyword boundary checks must use this rather than a bare
-/// `is_ascii_alphanumeric()` test, or `BY_foo` / `BYé` mis-tokenizes as the
-/// keyword `BY` ending early (PR #50 review; mirrors the rule in
-/// `parse.rs::match_keyword_prefix`).
+/// Is `b` an identifier-continuation byte? Post-keyword boundary checks must
+/// use this rather than a bare `is_ascii_alphanumeric()` test, or `BY_foo` /
+/// `BYé` mis-tokenizes as the keyword `BY` ending early (PR #50 review).
+///
+/// Thin alias for [`crate::util::is_ident_byte`], the crate-wide single
+/// source of truth for identifier bytes — kept under this name so the many
+/// scanner call sites read naturally.
 pub(super) fn is_ident_continuation(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+    crate::util::is_ident_byte(b)
 }
 
 /// Phase 68 A4: returns `true` if `s` has balanced double-quote runs, treating
