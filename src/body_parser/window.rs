@@ -141,12 +141,20 @@ fn parse_over_content(
             .filter(|s| !s.is_empty())
             .collect();
 
-        remaining = match end_of_dims {
-            Some(end) => after_pbe[end..].trim(),
-            None => "",
+        // Slice BOTH content and its ASCII-uppercased twin (identical byte
+        // offsets) from the same absolute bounds. Deriving the start via
+        // `content.len() - remaining.len()` assumed `remaining` was a strict
+        // suffix; `.trim()` also strips trailing whitespace, so that start
+        // would skip the remainder's leading bytes if any trailing
+        // whitespace were present. Today `content` is pre-trimmed so no live
+        // bug, but offset-based slicing is correct independent of that
+        // invariant (PR #50 review).
+        let (rem_start, rem_end) = match end_of_dims {
+            Some(end) => trimmed_bounds(content, pbe_pos + end),
+            None => (content.len(), content.len()),
         };
-        let content_start = content.len() - remaining.len();
-        remaining_upper = upper_content[content_start..].trim();
+        remaining = &content[rem_start..rem_end];
+        remaining_upper = &upper_content[rem_start..rem_end];
     } else if let Some(pb_pos) = find_partition_by(upper_content) {
         // Plain PARTITION BY (without EXCLUDING)
         let after_pb = &content[pb_pos..];
@@ -165,12 +173,13 @@ fn parse_over_content(
             .filter(|s| !s.is_empty())
             .collect();
 
-        remaining = match end_of_dims {
-            Some(end) => after_pb[end..].trim(),
-            None => "",
+        // Offset-based slicing (see the EXCLUDING branch above).
+        let (rem_start, rem_end) = match end_of_dims {
+            Some(end) => trimmed_bounds(content, pb_pos + end),
+            None => (content.len(), content.len()),
         };
-        let content_start = content.len() - remaining.len();
-        remaining_upper = upper_content[content_start..].trim();
+        remaining = &content[rem_start..rem_end];
+        remaining_upper = &upper_content[rem_start..rem_end];
     }
 
     // Look for ORDER BY
@@ -248,6 +257,19 @@ fn parse_over_content(
     };
 
     Ok((excluding_dims, partition_dims, order_by, frame_clause))
+}
+
+/// Absolute `[start, end)` byte offsets of `s[base..].trim()` within `s`.
+///
+/// Lets a caller slice `s` and its ASCII-uppercased twin (identical byte
+/// offsets) from the same bounds, avoiding the `len()`-subtraction pitfall:
+/// `trim()` strips both ends, so `s.len() - s[base..].trim().len()` skips
+/// the remainder's leading bytes whenever trailing whitespace is present.
+fn trimmed_bounds(s: &str, base: usize) -> (usize, usize) {
+    let raw = &s[base..];
+    let start = base + (raw.len() - raw.trim_start().len());
+    let end = start + raw.trim().len();
+    (start, end)
 }
 
 /// Find "PARTITION BY" (without EXCLUDING) in uppercase text.
@@ -452,4 +474,40 @@ pub(super) fn parse_order_by_modifiers(
         nulls = NullsOrder::First;
     }
     Ok((order, nulls))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trimmed_bounds;
+
+    #[test]
+    fn trimmed_bounds_no_whitespace() {
+        let s = "ORDER BY d";
+        assert_eq!(trimmed_bounds(s, 0), (0, s.len()));
+    }
+
+    #[test]
+    fn trimmed_bounds_leading_only() {
+        // base points before "   ORDER BY d"; start skips the 3 leading
+        // spaces, end is the full string length (no trailing ws).
+        let s = "xyz   ORDER BY d";
+        let (start, end) = trimmed_bounds(s, 3);
+        assert_eq!(&s[start..end], "ORDER BY d");
+    }
+
+    #[test]
+    fn trimmed_bounds_leading_and_trailing() {
+        // The old `len() - remaining.len()` start computation skipped the
+        // two trailing spaces' worth of leading bytes here (PR #50 review).
+        let s = "xyz  ORDER BY d  ";
+        let (start, end) = trimmed_bounds(s, 3);
+        assert_eq!(&s[start..end], "ORDER BY d");
+    }
+
+    #[test]
+    fn trimmed_bounds_all_whitespace_suffix() {
+        let s = "abc   ";
+        let (start, end) = trimmed_bounds(s, 3);
+        assert_eq!(start, end, "empty trimmed remainder -> zero-length span");
+    }
 }

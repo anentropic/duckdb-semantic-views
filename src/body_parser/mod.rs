@@ -1090,6 +1090,39 @@ mod tests {
     }
 
     #[test]
+    fn test_over_partition_and_order_by_with_interior_whitespace() {
+        // PR #50 review: the remainder after PARTITION BY dims was located
+        // by len() subtraction over a trim()med slice. Exercise the full
+        // PARTITION BY -> ORDER BY -> frame path with generous interior
+        // whitespace so ORDER BY / frame detection must survive the
+        // remainder-offset computation.
+        let result = parse_metrics_clause(
+            "s.r AS SUM(qty) OVER (PARTITION BY region   ORDER BY d ASC NULLS LAST   ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+            0,
+        )
+        .unwrap();
+        let ws = result[0].8.as_ref().expect("window spec");
+        assert_eq!(ws.partition_dims, vec!["region"]);
+        assert_eq!(ws.order_by.len(), 1, "ORDER BY must survive: {ws:?}");
+        assert_eq!(ws.order_by[0].expr, "d");
+        assert_eq!(
+            ws.frame_clause.as_deref(),
+            Some("ROWS BETWEEN 1 PRECEDING AND CURRENT ROW")
+        );
+
+        // EXCLUDING branch, same shape.
+        let result = parse_metrics_clause(
+            "s.r AS SUM(qty) OVER (PARTITION BY EXCLUDING region   ORDER BY d DESC)",
+            0,
+        )
+        .unwrap();
+        let ws = result[0].8.as_ref().expect("window spec");
+        assert_eq!(ws.excluding_dims, vec!["region"]);
+        assert_eq!(ws.order_by.len(), 1);
+        assert_eq!(ws.order_by[0].expr, "d");
+    }
+
+    #[test]
     fn test_non_additive_by_flexible_spacing() {
         // PA-10: the keyword offset was hardcoded as 16 ("NON ADDITIVE BY"
         // + one space), rejecting the no-space `BY(d)` form and extra
