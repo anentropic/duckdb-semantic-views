@@ -4670,5 +4670,58 @@ FROM \"orders\" AS \"orders\"";
                 "single relationship stays unambiguous: {sql}"
             );
         }
+
+        #[test]
+        fn test_facts_path_convergent_parent_dimension_not_ambiguous() {
+            // Two relationships converging on the same target from DIFFERENT
+            // source tables (`li -> orders`, `pay -> orders`) is NOT
+            // role-playing: the parent joins as one bare instance and the
+            // path walk picks the unique connecting edge. The SG-17 check
+            // over-fired here (it counted inbound relationships without
+            // grouping by source), breaking plain child-fact +
+            // parent-dimension queries — the regression surfaced in
+            // test/sql/phase46_fact_query.test (p46f_fan_test).
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("li", "line_items", &["id"])
+                .with_table("pay", "payments", &["id"])
+                .with_dimension("region", "orders.region", Some("orders"))
+                .with_fact("net_price", "li.price", "li")
+                .with_pkfk_join("li_to_o", "li", "orders", &["order_id"], &["id"])
+                .with_pkfk_join("pay_to_o", "pay", "orders", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec!["net_price".to_string()],
+                dimensions: vec![DimensionName::new("region")],
+                metrics: vec![],
+            };
+            let sql = expand("orders", &def, &req)
+                .expect("convergent parent must not raise AmbiguousPath");
+            assert!(sql.contains("net_price"), "fact survives: {sql}");
+        }
+
+        #[test]
+        fn test_metrics_path_convergent_parent_dimension_not_ambiguous() {
+            // Same shape through the metrics path (find_using_context is
+            // shared): a metric on one child + a dimension on the shared
+            // parent, no USING context anywhere.
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("li", "line_items", &["id"])
+                .with_table("pay", "payments", &["id"])
+                .with_dimension("region", "orders.region", Some("orders"))
+                .with_metric("revenue", "SUM(li.price)", Some("li"))
+                .with_pkfk_join("li_to_o", "li", "orders", &["order_id"], &["id"])
+                .with_pkfk_join("pay_to_o", "pay", "orders", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("region")],
+                metrics: vec![MetricName::new("revenue")],
+            };
+            let sql = expand("orders", &def, &req)
+                .expect("convergent parent must not raise AmbiguousPath");
+            assert!(sql.contains("SUM"), "metric survives: {sql}");
+        }
     }
 }
