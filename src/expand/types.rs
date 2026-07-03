@@ -328,6 +328,17 @@ pub enum ExpandError {
         metric_expr: String,
         reason: String,
     },
+    /// A `COUNT(*)` metric on a non-base source table cannot be made safe
+    /// (SG-8). Synthesized joins are LEFT JOINs, so the source table is
+    /// NULL-extended by one row per unmatched base row and `COUNT(*)` would
+    /// silently over-count. The expansion rewrites such metrics to
+    /// `COUNT(<first PK column>)`, which requires the source table to declare
+    /// a PRIMARY KEY.
+    CountStarRequiresPrimaryKey {
+        view_name: String,
+        metric_name: String,
+        table_alias: String,
+    },
 }
 
 impl fmt::Display for ExpandError {
@@ -576,6 +587,22 @@ impl fmt::Display for ExpandError {
                      (expression: {metric_expr}) cannot be expanded: {reason}. NON ADDITIVE BY \
                      snapshot expansion requires the metric to be a single aggregate call \
                      SUM/COUNT/AVG/MIN/MAX(<expression>) without '*' or DISTINCT."
+                )
+            }
+            Self::CountStarRequiresPrimaryKey {
+                view_name,
+                metric_name,
+                table_alias,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': metric '{metric_name}' uses COUNT(*) on joined \
+                     table '{table_alias}'. The generated LEFT JOIN produces one NULL-extended \
+                     row per base-table row with no match in '{table_alias}', which COUNT(*) \
+                     would count -- so the expansion rewrites COUNT(*) to COUNT(<primary key>) \
+                     for non-base tables, but table '{table_alias}' has no PRIMARY KEY declared \
+                     in the TABLES clause. Add PRIMARY KEY (cols) to '{table_alias}' or use an \
+                     explicit column: COUNT({table_alias}.<column>)."
                 )
             }
         }

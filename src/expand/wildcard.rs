@@ -18,6 +18,12 @@ pub enum WildcardItemType {
 /// (matches Snowflake behavior). PRIVATE metrics and facts are excluded from
 /// expansion. Dimensions have no access modifier and are always included.
 /// Duplicates (from wildcard + explicit overlap) are removed.
+///
+/// Items declared without a table qualifier (`source_table == None`) are
+/// base-table items everywhere else in the expansion layer, so they are
+/// included when the wildcard alias is the base/root (first declared) table's
+/// alias (SG-15). Both spellings — `source_table == Some(base_alias)` and
+/// `source_table == None` — expand identically under `base_alias.*`.
 pub fn expand_wildcards(
     items: &[String],
     def: &SemanticViewDefinition,
@@ -55,14 +61,19 @@ pub fn expand_wildcards(
                         .join(", ")
                 ));
             }
+            // SG-15: items declared without a source table are base-table
+            // items; `base_alias.*` must include them.
+            let is_base_alias = def
+                .tables
+                .first()
+                .is_some_and(|t| t.alias.eq_ignore_ascii_case(alias));
+            let on_table = |source_table: Option<&str>| -> bool {
+                source_table.map_or(is_base_alias, |st| st.eq_ignore_ascii_case(alias))
+            };
             match item_type {
                 WildcardItemType::Dimension => {
                     for dim in &def.dimensions {
-                        if dim
-                            .source_table
-                            .as_deref()
-                            .is_some_and(|st| st.eq_ignore_ascii_case(alias))
-                        {
+                        if on_table(dim.source_table.as_deref()) {
                             let key = dim.name.to_ascii_lowercase();
                             if seen.insert(key) {
                                 result.push(dim.name.clone());
@@ -72,10 +83,7 @@ pub fn expand_wildcards(
                 }
                 WildcardItemType::Metric => {
                     for met in &def.metrics {
-                        if met
-                            .source_table
-                            .as_deref()
-                            .is_some_and(|st| st.eq_ignore_ascii_case(alias))
+                        if on_table(met.source_table.as_deref())
                             && met.access != AccessModifier::Private
                         {
                             let key = met.name.to_ascii_lowercase();
@@ -87,10 +95,7 @@ pub fn expand_wildcards(
                 }
                 WildcardItemType::Fact => {
                     for fact in &def.facts {
-                        if fact
-                            .source_table
-                            .as_deref()
-                            .is_some_and(|st| st.eq_ignore_ascii_case(alias))
+                        if on_table(fact.source_table.as_deref())
                             && fact.access != AccessModifier::Private
                         {
                             let key = fact.name.to_ascii_lowercase();
@@ -267,5 +272,85 @@ mod tests {
         let items = vec!["region".to_string(), "status".to_string()];
         let result = expand_wildcards(&items, &def, &WildcardItemType::Dimension).unwrap();
         assert_eq!(result, vec!["region", "status"]);
+    }
+
+    // -------------------------------------------------------------------
+    // SG-15 (code review 2026-07-02): base-alias wildcards must include
+    // items declared WITHOUT a source table (base-table items).
+    // -------------------------------------------------------------------
+
+    /// Base table `o` with items in BOTH spellings: `source_table == None`
+    /// (unqualified declaration) and `source_table == Some("o")`.
+    fn base_none_def() -> SemanticViewDefinition {
+        let mut def = test_def();
+        def.dimensions.push(Dimension {
+            name: "order_year".to_string(),
+            expr: "year(order_date)".to_string(),
+            source_table: None,
+            ..Default::default()
+        });
+        def.metrics.push(Metric {
+            name: "base_count".to_string(),
+            expr: "count(*)".to_string(),
+            source_table: None,
+            access: AccessModifier::Public,
+            ..Default::default()
+        });
+        def.facts.push(Fact {
+            name: "base_flag".to_string(),
+            expr: "flag".to_string(),
+            source_table: None,
+            access: AccessModifier::Public,
+            ..Default::default()
+        });
+        def
+    }
+
+    #[test]
+    fn test_base_alias_wildcard_includes_unqualified_dimensions() {
+        let def = base_none_def();
+        let items = vec!["o.*".to_string()];
+        let result = expand_wildcards(&items, &def, &WildcardItemType::Dimension).unwrap();
+        // Both spellings expand under the base alias: Some("o") dims AND the
+        // unqualified (None) dim.
+        assert_eq!(result, vec!["region", "status", "order_year"]);
+    }
+
+    #[test]
+    fn test_non_base_alias_wildcard_excludes_unqualified_dimensions() {
+        let def = base_none_def();
+        let items = vec!["li.*".to_string()];
+        let result = expand_wildcards(&items, &def, &WildcardItemType::Dimension).unwrap();
+        assert_eq!(
+            result,
+            vec!["product"],
+            "None-source items are base-table items, not li items"
+        );
+    }
+
+    #[test]
+    fn test_base_alias_wildcard_includes_unqualified_metrics() {
+        let def = base_none_def();
+        let items = vec!["o.*".to_string()];
+        let result = expand_wildcards(&items, &def, &WildcardItemType::Metric).unwrap();
+        // order_count (Some "o") + base_count (None); secret_metric stays
+        // excluded (PRIVATE).
+        assert_eq!(result, vec!["order_count", "base_count"]);
+    }
+
+    #[test]
+    fn test_base_alias_wildcard_includes_unqualified_facts() {
+        let def = base_none_def();
+        let items = vec!["o.*".to_string()];
+        let result = expand_wildcards(&items, &def, &WildcardItemType::Fact).unwrap();
+        assert_eq!(result, vec!["base_flag"]);
+    }
+
+    #[test]
+    fn test_base_alias_wildcard_case_insensitive() {
+        let def = base_none_def();
+        let items = vec!["O.*".to_string()];
+        let result = expand_wildcards(&items, &def, &WildcardItemType::Dimension).unwrap();
+        assert_eq!(result, vec!["region", "status", "order_year"]);
     }
 }

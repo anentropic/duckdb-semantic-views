@@ -1,7 +1,9 @@
 use crate::model::{AccessModifier, SemanticViewDefinition};
 use crate::util::{replace_word_boundary, suggest_closest};
 
-use super::facts::{inline_derived_metrics, inline_facts, toposort_facts};
+use super::facts::{
+    collect_transitive_metric_names, inline_derived_metrics, inline_facts, toposort_facts,
+};
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident};
@@ -13,6 +15,11 @@ use super::types::{ExpandError, QueryRequest};
 ///
 /// Generic helper that deduplicates the resolution pattern used for
 /// dimensions, metrics, and facts.
+///
+/// Duplicate detection keys on the RESOLVED item's identity, not the raw
+/// request string (SG-14): `region` and `o.region` resolve to the same
+/// dimension and are rejected as duplicates instead of emitting the same
+/// column twice.
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn resolve_names<'a, T, N: AsRef<str>>(
     names: &[N],
@@ -26,12 +33,9 @@ fn resolve_names<'a, T, N: AsRef<str>>(
     make_private_err: impl Fn(String, String) -> ExpandError,
 ) -> Result<Vec<&'a T>, ExpandError> {
     let mut resolved = Vec::with_capacity(names.len());
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<*const T> = std::collections::HashSet::new();
     for name in names {
         let name_str = name.as_ref();
-        if !seen.insert(name_str.to_ascii_lowercase()) {
-            return Err(make_dup_err(view_name.to_string(), name_str.to_string()));
-        }
         let item = find_fn(name_str).ok_or_else(|| {
             let avail = available_fn();
             let suggestion = suggest_fn(name_str);
@@ -42,6 +46,9 @@ fn resolve_names<'a, T, N: AsRef<str>>(
                 suggestion,
             )
         })?;
+        if !seen.insert(std::ptr::from_ref(item)) {
+            return Err(make_dup_err(view_name.to_string(), name_str.to_string()));
+        }
         if is_private(item) {
             return Err(make_private_err(
                 view_name.to_string(),
@@ -138,6 +145,17 @@ fn expand_facts(
         .filter_map(|d| d.source_table.clone())
         .collect();
     validate_fact_table_path(view_name, def, &fact_tables, &dim_tables)?;
+
+    // 3b. Role-playing ambiguity detection (SG-17), mirroring the metrics
+    // path in expand(). Fact queries carry no metrics, so there is never a
+    // USING context to disambiguate: a dimension on a table reached by
+    // multiple named relationships always raises AmbiguousPath here — the
+    // same error the metrics path raises when no co-queried metric supplies
+    // USING. Previously the facts path skipped this check and silently bound
+    // the dimension to an arbitrary relationship edge.
+    for dim in &resolved_dims {
+        let _ = find_using_context(view_name, def, dim, &[])?;
+    }
 
     // 4. Resolve fact expressions via DAG inlining (fact-to-fact dependencies).
     let topo_order = toposort_facts(&def.facts).map_err(|e| ExpandError::CycleDetected {
@@ -317,13 +335,36 @@ pub fn expand(
         view_name: view_name.to_string(),
         cycle_description: e,
     })?;
-    let resolved_exprs =
-        inline_derived_metrics(&def.metrics, &def.facts, &topo_order).map_err(|e| {
-            ExpandError::CycleDetected {
-                view_name: view_name.to_string(),
-                cycle_description: e,
-            }
+    let resolved = inline_derived_metrics(&def.metrics, &def.facts, &topo_order, &def.tables)
+        .map_err(|e| ExpandError::CycleDetected {
+            view_name: view_name.to_string(),
+            cycle_description: e,
         })?;
+
+    // SG-8: fail loudly when a REQUESTED metric (directly, via a derived
+    // metric, or as a window metric's inner aggregate) depends on a COUNT(*)
+    // that could not be rewritten to COUNT(<pk>) — a non-base source table
+    // with no PRIMARY KEY declared. Emitting it as-is would count
+    // NULL-extended LEFT JOIN rows (one per childless base row).
+    if !resolved.count_star_no_pk.is_empty() {
+        for met in &resolved_mets {
+            for name in collect_transitive_metric_names(met, &def.metrics) {
+                if let Some(table_alias) = resolved.count_star_no_pk.get(&name) {
+                    let metric_name = def
+                        .metrics
+                        .iter()
+                        .find(|m| m.name.eq_ignore_ascii_case(&name))
+                        .map_or(name.clone(), |m| m.name.clone());
+                    return Err(ExpandError::CountStarRequiresPrimaryKey {
+                        view_name: view_name.to_string(),
+                        metric_name,
+                        table_alias: table_alias.clone(),
+                    });
+                }
+            }
+        }
+    }
+    let resolved_exprs = resolved.exprs;
 
     // Phase 31: Check for fan traps before generating SQL.
     check_fan_traps(view_name, def, &resolved_dims, &resolved_mets)?;
@@ -2094,7 +2135,9 @@ GROUP BY
                     window_spec: None,
                 },
             ];
-            let resolved = inline_derived_metrics(&metrics, &[], &[]).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+                .unwrap()
+                .exprs;
             assert_eq!(
                 resolved.get("profit").unwrap(),
                 "(SUM(amount)) - (SUM(unit_cost))"
@@ -2153,7 +2196,9 @@ GROUP BY
                     window_spec: None,
                 },
             ];
-            let resolved = inline_derived_metrics(&metrics, &[], &[]).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+                .unwrap()
+                .exprs;
             assert_eq!(
                 resolved.get("profit").unwrap(),
                 "(SUM(amount)) - (SUM(unit_cost))"
@@ -2202,7 +2247,9 @@ GROUP BY
                 access: AccessModifier::Public,
             }];
             let topo_order = toposort_facts(&facts).unwrap();
-            let resolved = inline_derived_metrics(&metrics, &facts, &topo_order).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &facts, &topo_order, &[])
+                .unwrap()
+                .exprs;
             assert_eq!(
                 resolved.get("revenue").unwrap(),
                 "SUM((extended_price * (1 - discount)))"
@@ -2265,7 +2312,9 @@ GROUP BY
                     window_spec: None,
                 },
             ];
-            let resolved = inline_derived_metrics(&metrics, &[], &[]).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+                .unwrap()
+                .exprs;
             assert_eq!(
                 resolved.get("margin").unwrap(),
                 "((SUM(x)) - (SUM(y))) / (SUM(x))"
@@ -2312,7 +2361,9 @@ GROUP BY
                     window_spec: None,
                 },
             ];
-            let resolved = inline_derived_metrics(&metrics, &[], &[]).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+                .unwrap()
+                .exprs;
             assert_eq!(
                 resolved.get("derived").unwrap(),
                 "(SUM(amount)) + (SUM(total))"
@@ -4186,6 +4237,437 @@ GROUP BY
             assert!(
                 sql.contains("\"f\".\"departure_code\" = \"a__dep_airport\".\"airport_code\""),
                 "ON clause must use the scoped alias on the PK side: {sql}"
+            );
+        }
+    }
+
+    // ===================================================================
+    // Code review 2026-07-02 remediation: SG-8 (COUNT(*) on non-base
+    // tables), SG-14 (qualified-name resolution), SG-17 (facts-path
+    // role-playing ambiguity).
+    // ===================================================================
+
+    mod count_star_rewrite_tests {
+        use super::*;
+        use crate::expand::test_helpers::{orders_view, TestFixtureExt};
+        use crate::model::WindowSpec;
+
+        /// `orders` (base) + `line_items` child with a declared PK.
+        fn child_count_def() -> crate::model::SemanticViewDefinition {
+            orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_dimension("region", "region", None)
+                .with_table("li", "line_items", &["id"])
+                .with_metric("item_count", "COUNT(*)", Some("li"))
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"])
+        }
+
+        #[test]
+        fn test_child_count_star_rewritten_exact_sql() {
+            // SG-8: COUNT(*) on the LEFT-JOINed child must count the child's
+            // PK, not NULL-extended rows (one per childless order).
+            let def = child_count_def();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("item_count")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+SELECT
+    COUNT(\"li\".\"id\") AS \"item_count\"
+FROM \"orders\" AS \"orders\"
+LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"orders\".\"id\"";
+            assert_eq!(sql, expected);
+        }
+
+        #[test]
+        fn test_child_count_star_rewritten_with_base_dimension() {
+            let def = child_count_def();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("region")],
+                metrics: vec![MetricName::new("item_count")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("COUNT(\"li\".\"id\") AS \"item_count\""),
+                "child COUNT(*) must be rewritten to COUNT(pk): {sql}"
+            );
+            assert!(sql.contains("GROUP BY"), "grouped query expected: {sql}");
+        }
+
+        #[test]
+        fn test_base_table_count_star_unchanged() {
+            // Metrics on the base table keep plain COUNT(*): the base table
+            // is never NULL-extended by the synthesized LEFT JOINs.
+            let def = child_count_def().with_metric("order_count", "COUNT(*)", Some("orders"));
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("order_count")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+SELECT
+    COUNT(*) AS \"order_count\"
+FROM \"orders\" AS \"orders\"";
+            assert_eq!(sql, expected);
+        }
+
+        #[test]
+        fn test_unqualified_count_star_metric_unchanged() {
+            // Legacy single-table shape: metric declared without a source
+            // table (None) is a base-table/derived metric — no rewrite.
+            let def = orders_view();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("order_count")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("count(*) AS \"order_count\""),
+                "COUNT(*) without a non-base source table must be preserved: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_child_count_star_without_pk_errors() {
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("li", "line_items", &[]) // no PK declared
+                .with_metric("item_count", "COUNT(*)", Some("li"))
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("item_count")],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match &err {
+                ExpandError::CountStarRequiresPrimaryKey {
+                    view_name,
+                    metric_name,
+                    table_alias,
+                } => {
+                    assert_eq!(view_name, "orders");
+                    assert_eq!(metric_name, "item_count");
+                    assert_eq!(table_alias, "li");
+                }
+                other => panic!("Expected CountStarRequiresPrimaryKey, got: {other}"),
+            }
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no PRIMARY KEY declared") && msg.contains("COUNT(*)"),
+                "error must explain the rewrite requirement: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_unrelated_metric_still_works_when_sibling_count_star_lacks_pk() {
+            // The no-PK failure is scoped to queries that actually use the
+            // metric: other metrics on the same view keep working.
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("li", "line_items", &[]) // no PK declared
+                .with_metric("item_count", "COUNT(*)", Some("li"))
+                .with_metric("revenue", "SUM(li.amount)", Some("li"))
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("revenue")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(sql.contains("SUM(li.amount)"), "SQL: {sql}");
+        }
+
+        #[test]
+        fn test_derived_metric_reaching_no_pk_count_star_errors() {
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("li", "line_items", &[]) // no PK declared
+                .with_metric("item_count", "COUNT(*)", Some("li"))
+                .with_metric("double_items", "item_count * 2", None)
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("double_items")],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match &err {
+                ExpandError::CountStarRequiresPrimaryKey { metric_name, .. } => {
+                    assert_eq!(
+                        metric_name, "item_count",
+                        "error must name the failing base metric"
+                    );
+                }
+                other => panic!("Expected CountStarRequiresPrimaryKey, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_derived_metric_inherits_rewritten_count_star() {
+            let def = child_count_def().with_metric("double_items", "item_count * 2", None);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("double_items")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("(COUNT(\"li\".\"id\")) * 2 AS \"double_items\""),
+                "derived metric must inline the REWRITTEN child count: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_window_inner_aggregate_gets_rewrite() {
+            // Window path: the inner aggregate is emitted from the shared
+            // resolved expressions, so the rewrite must appear in the CTE.
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("li", "line_items", &["id"])
+                .with_dimension("product", "li.product", Some("li"))
+                .with_metric("item_count", "COUNT(*)", Some("li"))
+                .with_metric("rolling_items", "AVG(item_count)", None)
+                .with_window_spec(
+                    "rolling_items",
+                    WindowSpec {
+                        window_function: "AVG".to_string(),
+                        inner_metric: "item_count".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("product")],
+                metrics: vec![MetricName::new("rolling_items")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("COUNT(\"li\".\"id\") AS \"item_count\""),
+                "window CTE inner aggregate must use the rewritten count: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_semi_additive_co_query_uses_rewritten_count() {
+            // Semi-additive path: a same-grain COUNT(*) co-metric on the
+            // child table decomposes into a CTE capture of the child PK and
+            // an outer COUNT over it (NULL-extended rows excluded). The
+            // base-table COUNT(*) rejection in parse_snapshot_aggregate is
+            // untouched (covered by semi_additive tests).
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_dimension("customer_id", "customer_id", None)
+                .with_table("li", "line_items", &["id"])
+                .with_dimension("report_date", "li.report_date", Some("li"))
+                .with_metric("balance", "SUM(li.balance)", Some("li"))
+                .with_metric("txn_count", "COUNT(*)", Some("li"))
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"])
+                .with_non_additive_by(
+                    "balance",
+                    &[(
+                        "report_date",
+                        crate::model::SortOrder::Desc,
+                        crate::model::NullsOrder::First,
+                    )],
+                );
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("customer_id")],
+                metrics: vec![MetricName::new("balance"), MetricName::new("txn_count")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("\"li\".\"id\" AS \"__sv_reg_1\""),
+                "CTE must capture the rewritten count argument: {sql}"
+            );
+            assert!(
+                sql.contains("COUNT(\"__sv_reg_1\") AS \"txn_count\""),
+                "outer select must re-aggregate the captured PK column: {sql}"
+            );
+        }
+    }
+
+    mod qualified_name_resolution_tests {
+        use super::*;
+        use crate::expand::test_helpers::{orders_view, TestFixtureExt};
+
+        #[test]
+        fn test_qualified_dimension_wrong_table_errors() {
+            // SG-14: no fallback to "any dimension with that bare name".
+            let def = orders_view();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("x.region")],
+                metrics: vec![MetricName::new("total_revenue")],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match err {
+                ExpandError::UnknownDimension { name, .. } => {
+                    assert_eq!(name, "x.region");
+                }
+                other => panic!("Expected UnknownDimension, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_qualified_metric_wrong_table_errors() {
+            let def = orders_view().clear_metrics().with_metric(
+                "total_revenue",
+                "sum(amount)",
+                Some("orders"),
+            );
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("x.total_revenue")],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match err {
+                ExpandError::UnknownMetric { name, .. } => {
+                    assert_eq!(name, "x.total_revenue");
+                }
+                other => panic!("Expected UnknownMetric, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_base_alias_qualification_matches_unqualified_declaration() {
+            // A dimension declared without a source table is a base-table
+            // item; qualifying the request with the base alias must resolve.
+            let def = orders_view();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("orders.region")],
+                metrics: vec![MetricName::new("total_revenue")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(sql.contains("region AS \"region\""), "SQL: {sql}");
+        }
+
+        #[test]
+        fn test_bare_and_qualified_same_dimension_rejected_as_duplicate() {
+            // SG-14: the duplicate check keys on the RESOLVED item, so
+            // `region` and `orders.region` cannot emit the column twice.
+            let def = orders_view();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![
+                    DimensionName::new("region"),
+                    DimensionName::new("orders.region"),
+                ],
+                metrics: vec![],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match err {
+                ExpandError::DuplicateDimension { name, .. } => {
+                    assert_eq!(name, "orders.region");
+                }
+                other => panic!("Expected DuplicateDimension, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_bare_and_qualified_same_metric_rejected_as_duplicate() {
+            let def = orders_view().clear_metrics().with_metric(
+                "total_revenue",
+                "sum(amount)",
+                Some("orders"),
+            );
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![
+                    MetricName::new("total_revenue"),
+                    MetricName::new("orders.total_revenue"),
+                ],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match err {
+                ExpandError::DuplicateMetric { name, .. } => {
+                    assert_eq!(name, "orders.total_revenue");
+                }
+                other => panic!("Expected DuplicateMetric, got: {other}"),
+            }
+        }
+    }
+
+    mod facts_path_role_playing_tests {
+        use super::*;
+        use crate::expand::test_helpers::{orders_view, TestFixtureExt};
+
+        fn role_playing_facts_def(two_rels: bool) -> crate::model::SemanticViewDefinition {
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("a", "airports", &["code"])
+                .with_dimension("city", "a.city", Some("a"))
+                .with_fact("order_note", "orders.note", "orders")
+                .with_pkfk_join("dep_airport", "orders", "a", &["dep_code"], &["code"]);
+            if two_rels {
+                def.with_pkfk_join("arr_airport", "orders", "a", &["arr_code"], &["code"])
+            } else {
+                def
+            }
+        }
+
+        #[test]
+        fn test_facts_path_role_playing_dimension_raises_ambiguous_path() {
+            // SG-17: the facts path must run the same role-playing ambiguity
+            // detection as the metrics path. With two named relationships to
+            // `a` and no USING context (facts cannot supply one), the
+            // dimension is ambiguous — previously it silently bound to an
+            // arbitrary edge.
+            let def = role_playing_facts_def(true);
+            let req = QueryRequest {
+                facts: vec!["order_note".to_string()],
+                dimensions: vec![DimensionName::new("city")],
+                metrics: vec![],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match err {
+                ExpandError::AmbiguousPath {
+                    dimension_name,
+                    dimension_table,
+                    available_relationships,
+                    ..
+                } => {
+                    assert_eq!(dimension_name, "city");
+                    assert_eq!(dimension_table, "a");
+                    assert!(
+                        available_relationships.contains(&"dep_airport".to_string())
+                            && available_relationships.contains(&"arr_airport".to_string()),
+                        "both relationships must be listed: {available_relationships:?}"
+                    );
+                }
+                other => panic!("Expected AmbiguousPath, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_facts_path_single_relationship_dimension_ok() {
+            let def = role_playing_facts_def(false);
+            let req = QueryRequest {
+                facts: vec!["order_note".to_string()],
+                dimensions: vec![DimensionName::new("city")],
+                metrics: vec![],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN \"airports\" AS \"a\""),
+                "single relationship stays unambiguous: {sql}"
             );
         }
     }

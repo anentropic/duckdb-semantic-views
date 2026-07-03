@@ -118,20 +118,23 @@ Unclosed parenthesis
 
 .. _ref-err-name-uniqueness:
 
-Duplicate dimension name
-------------------------
+Duplicate or colliding names
+----------------------------
 
 .. code-block:: text
 
-   duplicate dimension name '<name>'
+   duplicate name '<name>': <kind> '<name>' collides with <kind> '<other>'
+   -- dimension, metric, and fact names share one namespace and are
+   case-insensitive
 
-**Cause:** Two or more dimensions in the same semantic view share the same name. The comparison is case-insensitive, so ``region`` and ``Region`` are considered duplicates.
+**Cause:** Two items in the same semantic view share a name. Dimensions, metrics, and facts are resolved from one namespace at query time, so the collision may be within a kind (two metrics named ``revenue``) or across kinds (a dimension and a metric both named ``amount``). The comparison is case-insensitive, so ``region`` and ``Region`` collide.
 
-**Fix:** Rename one of the dimensions so that all dimension names are unique (ignoring case).
+**Fix:** Rename one of the items so that every dimension, metric, and fact name is unique (ignoring case).
 
 .. code-block:: sql
 
-   -- This will fail: "duplicate dimension name 'Region'"
+   -- This will fail: "duplicate name 'Region': dimension 'Region' collides
+   -- with dimension 'region' ..."
    DIMENSIONS (
        o.region AS o.region,
        c.Region AS c.sales_region
@@ -143,33 +146,10 @@ Duplicate dimension name
        c.customer_region AS c.sales_region
    )
 
-
-Duplicate metric name
----------------------
-
-.. code-block:: text
-
-   duplicate metric name '<name>'
-
-**Cause:** Two or more metrics (base or derived) in the same semantic view share the same name. The comparison is case-insensitive.
-
-**Fix:** Rename one of the metrics so that all metric names are unique (ignoring case).
-
-
-Dimension-metric name collision
--------------------------------
-
-.. code-block:: text
-
-   name '<name>' is used as both a dimension and a metric
-
-**Cause:** A dimension and a metric share the same name. The comparison is case-insensitive, so a dimension named ``amount`` and a metric named ``Amount`` collide.
-
-**Fix:** Rename either the dimension or the metric so that names are unique across both categories.
-
 .. code-block:: sql
 
-   -- This will fail: "name 'amount' is used as both a dimension and a metric"
+   -- This will fail: "duplicate name 'Amount': metric 'Amount' collides
+   -- with dimension 'amount' ..."
    DIMENSIONS (
        o.amount AS o.amount_category
    )
@@ -187,7 +167,7 @@ Dimension-metric name collision
 
 .. note::
 
-   All three name uniqueness checks run at ``CREATE`` time, before the view definition is persisted. They are independent of the query-time duplicate checks described in :ref:`the next section <ref-err-query>`, which catch the same dimension or metric being requested twice in a single ``semantic_view()`` call.
+   The name uniqueness check runs at ``CREATE`` (and ``ALTER``) time, before the view definition is persisted. It is independent of the query-time duplicate checks described in :ref:`the next section <ref-err-query>`, which catch the same dimension or metric being requested twice in a single ``semantic_view()`` call. Semantic views created before this check existed keep working at query time: lookups resolve to the first declaration.
 
 
 Graph validation errors
@@ -561,9 +541,27 @@ Duplicate dimension or metric
 
    semantic view '<view>': duplicate metric '<name>'
 
-**Cause:** The same dimension or metric name appears more than once in the request.
+**Cause:** The same dimension or metric appears more than once in the request. Duplicates are detected on the *resolved* item, so requesting both the bare and the table-qualified spelling of the same item (``'region'`` and ``'o.region'``) is also rejected.
 
 **Fix:** Remove the duplicate from the ``dimensions`` or ``metrics`` list.
+
+
+COUNT(*) on a joined table requires a PRIMARY KEY
+-------------------------------------------------
+
+.. code-block:: text
+
+   semantic view '<view>': metric '<name>' uses COUNT(*) on joined table
+   '<alias>'. The generated LEFT JOIN produces one NULL-extended row per
+   base-table row with no match in '<alias>', which COUNT(*) would count --
+   so the expansion rewrites COUNT(*) to COUNT(<primary key>) for non-base
+   tables, but table '<alias>' has no PRIMARY KEY declared in the TABLES
+   clause. Add PRIMARY KEY (cols) to '<alias>' or use an explicit column:
+   COUNT(<alias>.<column>).
+
+**Cause:** A queried metric (directly, via a derived metric, or as a window metric's inner aggregate) is ``COUNT(*)`` on a table other than the base table. Generated joins are ``LEFT JOIN``\ s, so ``COUNT(*)`` would also count the NULL-extended row produced for each base row with no match — silently inflating the result. The expansion protects against this by rewriting ``COUNT(*)`` to ``COUNT(<first primary key column>)`` for non-base source tables, which requires the table to declare a ``PRIMARY KEY``.
+
+**Fix:** Declare ``PRIMARY KEY (<cols>)`` for the metric's source table in the ``TABLES`` clause, or define the metric as ``COUNT(<alias>.<column>)`` over a NOT NULL column.
 
 
 Fan trap detected

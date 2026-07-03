@@ -322,6 +322,61 @@ CREATE SEMANTIC VIEW p30_avg_agg AS
 must not contain aggregate function
 
 # ============================================================
+# Test 13 (SG-13, code review 2026-07-02): name uniqueness is enforced
+# unconditionally at define time. Duplicate BASE metrics used to be
+# accepted silently when no derived metric existed (the old check was
+# gated on derived metrics); cross-kind collisions (dimension/metric,
+# fact/dimension) emitted duplicate output columns at query time.
+# Names are case-insensitive across one shared namespace.
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW p30_dup_base_metrics AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.revenue AS SUM(o.id),
+    o.Revenue AS SUM(o.id * 2)
+  );
+----
+duplicate name 'Revenue'
+
+statement error
+CREATE SEMANTIC VIEW p30_dup_dim_metric AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.region AS COUNT(o.region)
+  );
+----
+metric 'region' collides with dimension 'region'
+
+statement error
+CREATE SEMANTIC VIEW p30_dup_fact_dim AS
+  TABLES (
+    o AS p30_orders PRIMARY KEY (id)
+  )
+  FACTS (
+    o.region AS o.region
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.revenue AS SUM(o.id)
+  );
+----
+fact 'region' collides with dimension 'region'
+
+# ============================================================
 # Cleanup
 # ============================================================
 

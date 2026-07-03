@@ -339,6 +339,45 @@ def run_harness() -> int:
         failures += 1
         print(f"FAIL multi-grain: revenue-alone mismatch got={got} want={want}")
 
+    # Child-grain COUNT(*) alone (SG-8): the engine rewrites COUNT(*) to
+    # COUNT(<child pk>) so NULL-extended rows from childless parents are not
+    # counted. Reference uses COUNT(li.id) — the semantically correct count.
+    # (Orders 500+ in the fixture have no line items.)
+    total += 2
+    got = normalize(
+        conn.execute(
+            "SELECT * FROM semantic_view('diff_mg', metrics := ['item_count'])"
+        ).fetchall()
+    )
+    want = normalize(
+        conn.execute(
+            "SELECT COUNT(li.id) FROM orders o "
+            "LEFT JOIN line_items li ON li.order_id = o.id"
+        ).fetchall()
+    )
+    if rows_equal(got, want):
+        print("  PASS: child-grain COUNT(*) alone matches COUNT(pk) reference")
+    else:
+        failures += 1
+        print(f"FAIL SG-8: item_count-alone mismatch got={got} want={want}")
+    got = normalize(
+        conn.execute(
+            "SELECT * FROM semantic_view('diff_mg', "
+            "dimensions := ['region'], metrics := ['item_count'])"
+        ).fetchall()
+    )
+    want = normalize(
+        conn.execute(
+            "SELECT o.region, COUNT(li.id) FROM orders o "
+            "LEFT JOIN line_items li ON li.order_id = o.id GROUP BY 1"
+        ).fetchall()
+    )
+    if rows_equal(got, want):
+        print("  PASS: child-grain COUNT(*) by region matches COUNT(pk) reference")
+    else:
+        failures += 1
+        print(f"FAIL SG-8: item_count-by-region mismatch got={got} want={want}")
+
     print()
     print(f"Ran {total} dims×metrics combinations over {N_ORDERS} orders "
           f"({N_CUSTOMERS} customers, {N_PRODUCTS} products, seed={SEED})")

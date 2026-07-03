@@ -1,0 +1,130 @@
+# SG-8 (code review 2026-07-02): COUNT(*) on a non-base source table.
+# All synthesized joins are LEFT JOINs, so a childless base row NULL-extends
+# the child table and COUNT(*) silently over-counted by one per childless
+# parent. The expansion now rewrites COUNT(*) to COUNT(<pk>) for non-base
+# source tables; if the source table declares no PRIMARY KEY the query
+# errors instead of returning an inflated count.
+
+require semantic_views
+
+# ============================================================
+# Setup: orders with one CHILDLESS order (id 3)
+# ============================================================
+
+statement ok
+CREATE TABLE sg8_orders (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO sg8_orders VALUES (1, 'East'), (2, 'West'), (3, 'East');
+
+statement ok
+CREATE TABLE sg8_line_items (id INTEGER, order_id INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO sg8_line_items VALUES (1, 1, 2), (2, 1, 3), (3, 2, 5);
+
+statement ok
+CREATE SEMANTIC VIEW sg8_sales AS
+  TABLES (
+    o AS sg8_orders PRIMARY KEY (id),
+    li AS sg8_line_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    li.item_count AS COUNT(*)
+  );
+
+# ============================================================
+# Test 1: metric alone. 3 line items exist; the join produces 4 rows
+# (order 3 is NULL-extended). COUNT(*) used to return 4; the COUNT(pk)
+# rewrite returns the true count 3.
+# ============================================================
+
+query I
+SELECT * FROM semantic_view('sg8_sales', metrics := ['item_count']);
+----
+3
+
+# ============================================================
+# Test 2: grouped by region. East = orders 1 (2 items) + 3 (childless,
+# contributes NO items -- previously counted as 1). West = order 2 (1 item).
+# ============================================================
+
+query TI rowsort
+SELECT * FROM semantic_view('sg8_sales', dimensions := ['region'], metrics := ['item_count']);
+----
+East	2
+West	1
+
+# ============================================================
+# Test 3: without a PRIMARY KEY on the child table the rewrite is
+# impossible -- the query errors instead of silently over-counting.
+# (CREATE succeeds: li is the FK source, so D-06 does not require a PK.)
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW sg8_nopk AS
+  TABLES (
+    o AS sg8_orders PRIMARY KEY (id),
+    li AS sg8_line_items
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    li.item_count AS COUNT(*)
+  );
+
+statement error
+SELECT * FROM semantic_view('sg8_nopk', metrics := ['item_count']);
+----
+COUNT(*) on joined table 'li'
+
+# ============================================================
+# Test 4: base-table COUNT(*) is untouched (the base table is never
+# NULL-extended by the synthesized LEFT JOINs).
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW sg8_base AS
+  TABLES (
+    o AS sg8_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.order_count AS COUNT(*)
+  );
+
+query I
+SELECT * FROM semantic_view('sg8_base', metrics := ['order_count']);
+----
+3
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW sg8_sales;
+
+statement ok
+DROP SEMANTIC VIEW sg8_nopk;
+
+statement ok
+DROP SEMANTIC VIEW sg8_base;
+
+statement ok
+DROP TABLE sg8_line_items;
+
+statement ok
+DROP TABLE sg8_orders;

@@ -122,7 +122,12 @@ pub fn enrich_definition_for_create(
         ));
     }
 
-    // 3. Graph validations.
+    // 3. Graph validations. Name uniqueness runs first (SG-13): dimensions,
+    //    metrics, and facts share one request namespace at query time, so
+    //    collisions -- within a kind or across kinds, case-insensitive --
+    //    are rejected at define time. Read paths keep first-match behavior
+    //    for legacy catalog rows that predate this check.
+    crate::graph::validate_name_uniqueness(&def)?;
     crate::graph::validate_graph(&def)?;
     crate::graph::validate_facts(&def)?;
     crate::graph::validate_derived_metrics(&def)?;

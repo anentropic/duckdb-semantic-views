@@ -3944,6 +3944,39 @@ mod tests {
             );
         }
 
+        #[cfg(feature = "extension")]
+        #[test]
+        fn enrich_rejects_cross_kind_name_collision() {
+            // SG-13 (code review 2026-07-02): dimension/metric/fact names
+            // share one request namespace, so define-time validation
+            // (enrich_definition_for_create -> validate_name_uniqueness)
+            // must reject a dimension and metric sharing a name, even when
+            // no derived metrics exist (the old check was gated on them).
+            let def = crate::model::SemanticViewDefinition {
+                tables: vec![make_table("orders", &["id"], &[])],
+                dimensions: vec![crate::model::Dimension {
+                    name: "region".to_string(),
+                    expr: "orders.region".to_string(),
+                    source_table: Some("orders".to_string()),
+                    ..Default::default()
+                }],
+                metrics: vec![crate::model::Metric {
+                    name: "REGION".to_string(),
+                    expr: "count(orders.region)".to_string(),
+                    source_table: Some("orders".to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let err = crate::ddl::define::enrich_definition_for_create("v_dup", def)
+                .expect_err("cross-kind name collision must be rejected at define time");
+            assert!(
+                err.contains("duplicate name 'REGION'")
+                    && err.contains("metric 'REGION' collides with dimension 'region'"),
+                "SG-13 error shape mismatch: {err}"
+            );
+        }
+
         #[test]
         fn infers_one_to_one_from_pk_match() {
             // orders PK is (id), FK is (id) -> OneToOne
