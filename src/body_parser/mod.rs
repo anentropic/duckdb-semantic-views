@@ -991,6 +991,56 @@ mod tests {
     }
 
     #[test]
+    fn test_keyword_boundaries_reject_underscore_and_non_ascii_continuation() {
+        // PR #50 review: post-keyword boundary checks after BY / EXCLUDING
+        // accepted `_` and non-ASCII bytes as boundaries, so `BY_foo` /
+        // `EXCLUDING_foo` mis-tokenized as the keyword ending early. Such
+        // identifiers must NOT activate the keyword.
+        let r = parse_metrics_clause("a.bal NON ADDITIVE BY_x (d) AS SUM(a.bal)", 0);
+        if let Ok(v) = r {
+            assert!(
+                v[0].7.is_empty(),
+                "BY_x must not match the NON ADDITIVE BY keyword"
+            );
+        }
+
+        let r = parse_metrics_clause(
+            "s.r AS SUM(t) OVER (PARTITION BY_x ORDER BY d ASC NULLS LAST)",
+            0,
+        );
+        if let Ok(v) = r {
+            let ws = v[0].8.as_ref().expect("window spec");
+            assert!(
+                ws.partition_dims.is_empty(),
+                "PARTITION BY_x must not match PARTITION BY: {:?}",
+                ws.partition_dims
+            );
+        }
+
+        let r = parse_metrics_clause(
+            "s.r AS SUM(t) OVER (PARTITION BY EXCLUDING_x ORDER BY d ASC NULLS LAST)",
+            0,
+        );
+        if let Ok(v) = r {
+            let ws = v[0].8.as_ref().expect("window spec");
+            assert!(
+                ws.excluding_dims.is_empty(),
+                "EXCLUDING_x must not match EXCLUDING: {:?}",
+                ws.excluding_dims
+            );
+        }
+
+        // The legitimate forms keep working.
+        let v = parse_metrics_clause(
+            "s.r AS SUM(t) OVER (PARTITION BY EXCLUDING region ORDER BY d ASC NULLS LAST)",
+            0,
+        )
+        .unwrap();
+        let ws = v[0].8.as_ref().expect("window spec");
+        assert_eq!(ws.excluding_dims, vec!["region"]);
+    }
+
+    #[test]
     fn test_non_additive_by_flexible_spacing() {
         // PA-10: the keyword offset was hardcoded as 16 ("NON ADDITIVE BY"
         // + one space), rejecting the no-space `BY(d)` form and extra

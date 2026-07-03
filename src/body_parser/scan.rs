@@ -203,6 +203,17 @@ pub(super) fn split_qualified_identifier(s: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Is `b` an identifier-continuation byte? ASCII alphanumerics, `_`, and
+/// all non-ASCII bytes (>= 0x80 — `DuckDB` identifiers may contain any
+/// non-ASCII character) continue an identifier; anything else is a word
+/// boundary. Post-keyword boundary checks must use this rather than a bare
+/// `is_ascii_alphanumeric()` test, or `BY_foo` / `BYé` mis-tokenizes as the
+/// keyword `BY` ending early (PR #50 review; mirrors the rule in
+/// `parse.rs::match_keyword_prefix`).
+pub(super) fn is_ident_continuation(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
 /// Phase 68 A4: returns `true` if `s` has balanced double-quote runs, treating
 /// a doubled-quote `""` inside a quoted region as an escape (does NOT close).
 /// Mirrors the escape rule used by `src/ident.rs::find_identifier_end` so the

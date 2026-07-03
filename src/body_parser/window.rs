@@ -1,7 +1,8 @@
 //! Window-metric OVER clause parsing and the shared ORDER-BY modifier loop.
 
 use super::scan::{
-    extract_paren_content, find_depth0_keyword, find_keyword_ci, is_quoting_balanced,
+    extract_paren_content, find_depth0_keyword, find_keyword_ci, is_ident_continuation,
+    is_quoting_balanced,
 };
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
@@ -258,11 +259,13 @@ fn find_partition_by(upper_text: &str) -> Option<usize> {
         let abs_pos = search_from + pos;
         let after_partition = upper_text[abs_pos + 9..].trim_start();
         if let Some(rest) = after_partition.strip_prefix("BY") {
-            if rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric() {
+            // Word boundary after BY: `_` and non-ASCII bytes continue an
+            // identifier (BY_foo is not the keyword BY).
+            if rest.is_empty() || !is_ident_continuation(rest.as_bytes()[0]) {
                 let rest = rest.trim_start();
                 // Make sure this is NOT PARTITION BY EXCLUDING
                 if rest.starts_with("EXCLUDING")
-                    && (rest.len() == 9 || !rest.as_bytes()[9].is_ascii_alphanumeric())
+                    && (rest.len() == 9 || !is_ident_continuation(rest.as_bytes()[9]))
                 {
                     // This is PARTITION BY EXCLUDING, skip
                     search_from = abs_pos + 9;
@@ -286,10 +289,12 @@ fn find_partition_by_excluding(upper_text: &str) -> Option<usize> {
         let abs_pos = search_from + pos;
         let after_partition = upper_text[abs_pos + 9..].trim_start();
         if let Some(rest) = after_partition.strip_prefix("BY") {
-            if rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric() {
+            // Word boundary after BY / EXCLUDING: `_` and non-ASCII bytes
+            // continue an identifier.
+            if rest.is_empty() || !is_ident_continuation(rest.as_bytes()[0]) {
                 let rest = rest.trim_start();
                 if let Some(rest2) = rest.strip_prefix("EXCLUDING") {
-                    if rest2.is_empty() || !rest2.as_bytes()[0].is_ascii_alphanumeric() {
+                    if rest2.is_empty() || !is_ident_continuation(rest2.as_bytes()[0]) {
                         // Return offset past EXCLUDING
                         let excluding_end = upper_text.len() - rest2.len();
                         return Some(excluding_end);

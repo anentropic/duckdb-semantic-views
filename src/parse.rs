@@ -593,8 +593,14 @@ fn parse_show_filter_clauses<'a>(
         && (rest.len() == 6 || rest.as_bytes()[6].is_ascii_whitespace())
     {
         rest = rest[6..].trim_start();
+        // Word boundary after WITH: `_` and non-ASCII bytes are identifier
+        // continuation (mirrors match_keyword_prefix), so WITH_x / WITHé do
+        // not match the keyword.
         let with_boundary_ok = starts_with_keyword_ci(rest, "WITH")
-            && (rest.len() == 4 || !rest.as_bytes()[4].is_ascii_alphanumeric());
+            && (rest.len() == 4 || {
+                let b = rest.as_bytes()[4];
+                !b.is_ascii_alphanumeric() && b != b'_' && b < 0x80
+            });
         if !with_boundary_ok {
             return Err(format!(
                 "Expected STARTS WITH. \
@@ -3657,6 +3663,10 @@ mod tests {
         // STARTSWITH / LIMIT5 used to be accepted without a word boundary.
         assert!(rewrite_ddl("SHOW SEMANTIC VIEWS STARTSWITH 'a'").is_err());
         assert!(rewrite_ddl("SHOW SEMANTIC VIEWS LIMIT5").is_err());
+        // `_` and non-ASCII bytes are identifier continuation, not
+        // boundaries (PR #50 review).
+        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITH_x 'a'").is_err());
+        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITHé 'a'").is_err());
         // The legal forms still parse.
         let sql = rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITH 'a' LIMIT 5").unwrap();
         assert_eq!(

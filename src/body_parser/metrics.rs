@@ -2,8 +2,8 @@
 
 use super::annotations::{parse_leading_access_modifier, parse_trailing_annotations};
 use super::scan::{
-    extract_paren_content, find_keyword_ci, find_live_byte, is_quoting_balanced,
-    unterminated_quote_error,
+    extract_paren_content, find_keyword_ci, find_live_byte, is_ident_continuation,
+    is_quoting_balanced, unterminated_quote_error,
 };
 use super::window::{parse_order_by_modifiers, parse_window_over_clause, OrderModifierContext};
 use super::{split_at_depth0_commas, MetricEntry};
@@ -56,8 +56,9 @@ fn find_non_additive_by_keyword(upper_text: &str) -> Option<(usize, usize)> {
         if let Some(rest) = after_non.strip_prefix("ADDITIVE") {
             let after_additive = rest.trim_start();
             if let Some(after_by) = after_additive.strip_prefix("BY") {
-                // Verify BY has word boundary
-                if after_by.is_empty() || !after_by.as_bytes()[0].is_ascii_alphanumeric() {
+                // Verify BY has a word boundary: `_` and non-ASCII bytes
+                // continue an identifier (BY_foo is not the keyword BY).
+                if after_by.is_empty() || !is_ident_continuation(after_by.as_bytes()[0]) {
                     // `after_by` is a suffix slice of `upper_text`, so the
                     // offset one past "BY" falls out of the lengths.
                     let end = upper_text.len() - after_by.len();
