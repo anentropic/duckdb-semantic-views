@@ -1,0 +1,436 @@
+//! Low-level byte/keyword scanning helpers shared by the clause parsers.
+
+/// Byte-scan state for SQL text: tracks single-quoted string literals and
+/// double-quoted identifiers, honouring the SQL escape doubling (`''` inside
+/// a string, `""` inside a quoted identifier).
+///
+/// This is the ONE quote-tracking implementation for every depth-0 scanner
+/// in this module (PA-6, code-review 2026-07-02): scanners that tracked only
+/// single quotes — or nothing — mis-split on quoted identifiers containing
+/// commas / parens / dots (`o."a,b"`, `o AS "tbl)x"`, `"a.b"`) and matched
+/// keywords inside string literals (PA-3: a `COMMENT = 'the PRIMARY KEY (id)
+/// lives here'` fabricated a primary key from comment text).
+///
+/// Multi-byte UTF-8 is safe by construction: only ASCII bytes are compared,
+/// and continuation bytes (>= 0x80) never equal an ASCII quote.
+#[derive(Default, Clone, Copy)]
+pub(super) struct QuoteState {
+    pub(super) in_string: bool,
+    pub(super) in_ident: bool,
+}
+
+impl QuoteState {
+    /// Consume the byte at `i`, updating quote state. Returns
+    /// `(next_index, is_live_code)` where `is_live_code` is true only when
+    /// byte `i` is outside every quoted region and is not itself a quote
+    /// delimiter. Escape pairs are consumed whole (`next_index == i + 2`).
+    pub(super) fn step(&mut self, bytes: &[u8], i: usize) -> (usize, bool) {
+        let b = bytes[i];
+        if self.in_string {
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    return (i + 2, false); // '' escape — stay in string
+                }
+                self.in_string = false;
+            }
+            (i + 1, false)
+        } else if self.in_ident {
+            if b == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    return (i + 2, false); // "" escape — stay in ident
+                }
+                self.in_ident = false;
+            }
+            (i + 1, false)
+        } else {
+            match b {
+                b'\'' => {
+                    self.in_string = true;
+                    (i + 1, false)
+                }
+                b'"' => {
+                    self.in_ident = true;
+                    (i + 1, false)
+                }
+                _ => (i + 1, true),
+            }
+        }
+    }
+}
+
+/// Scan `s` to completion and return the final quote state. Used by entry
+/// parsers to reject unterminated `"..."` / `'...'` regions up front with a
+/// precise error — the quote-aware scanners otherwise swallow everything
+/// after the orphan quote and surface a misleading structural error
+/// ("Expected 'AS' keyword") instead.
+fn final_quote_state(s: &str) -> QuoteState {
+    let bytes = s.as_bytes();
+    let mut st = QuoteState::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, _) = st.step(bytes, i);
+        i = next;
+    }
+    st
+}
+
+/// Reject an entry whose quoting never closes. Returns the error message
+/// noun for the open region, if any.
+pub(super) fn unterminated_quote_error(s: &str) -> Option<&'static str> {
+    let st = final_quote_state(s);
+    if st.in_ident {
+        Some("Unterminated quoted identifier")
+    } else if st.in_string {
+        Some("Unterminated string literal")
+    } else {
+        None
+    }
+}
+
+/// Find the first *live-code* occurrence of ASCII byte `needle` in `s` —
+/// i.e. outside single-quoted strings and double-quoted identifiers. The
+/// quote-aware replacement for `str::find` at the alias/name dot-splits
+/// (PA-6: `"a.b"` must not split at its inner dot).
+pub(super) fn find_live_byte(s: &str, needle: u8) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut st = QuoteState::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if live && bytes[i] == needle {
+            return Some(i);
+        }
+        i = next;
+    }
+    None
+}
+
+/// Split `body` at depth-0 commas, respecting nested parens, single-quoted
+/// strings, and double-quoted identifiers.
+/// Returns `Vec<(start_offset_in_body, trimmed_slice)>`. Trailing empty entries discarded.
+pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
+    let mut entries = Vec::new();
+    let mut depth: i32 = 0;
+    let mut st = QuoteState::default();
+    let mut start = 0;
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if live {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b',' if depth == 0 => {
+                    let entry = body[start..i].trim();
+                    if !entry.is_empty() {
+                        entries.push((start, entry));
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i = next;
+    }
+    let tail = body[start..].trim();
+    if !tail.is_empty() {
+        entries.push((start, tail));
+    }
+    entries
+}
+
+/// Split `s` at the first ASCII whitespace, returning `(first_token, rest)`.
+/// If no whitespace found, returns `(s, "")`.
+pub(super) fn split_first_token(s: &str) -> (&str, &str) {
+    if let Some(pos) = s.find(|c: char| c.is_ascii_whitespace()) {
+        (&s[..pos], &s[pos..])
+    } else {
+        (s, "")
+    }
+}
+
+/// Phase 68 B1 (D-08): split a qualified identifier at the FIRST dot that
+/// falls OUTSIDE a double-quoted region. Returns
+/// `Some((before_first_dot, after_first_dot))` if a split-eligible dot
+/// exists, else `None`. The `after_first_dot` slice may itself contain
+/// further dots (and/or quoted regions); this helper does NOT recursively
+/// split — callers that need 3+ segment handling must re-invoke or do their
+/// own scanning. Doubled-quote `""` inside `"..."` is treated as an escape
+/// (mirrors `is_quoting_balanced` / `find_identifier_end`).
+///
+/// Returns `None` if either side of the split would be empty (WR-01).
+///
+/// Examples:
+/// - `"o.x"` → `Some(("o", "x"))`
+/// - `"o.\"order date\""` → `Some(("o", "\"order date\""))`
+/// - `"\"a.b\""` → `None` (the dot is inside the quoted region)
+/// - `"bare"` → `None` (no dot)
+/// - `".foo"` / `"foo."` → `None` (empty side, WR-01)
+/// - `"db.sch.\"tbl\""` → `Some(("db", "sch.\"tbl\""))` (WR-02: caller
+///   must handle further splitting if 3+ segments are expected)
+pub(super) fn split_qualified_identifier(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut in_quote = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                // Doubled-quote escape — stay inside the quoted region.
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote && b == b'.' {
+            let alias = &s[..i];
+            let name = &s[i + 1..];
+            // WR-01 (Phase 68 review): reject malformed inputs where either side
+            // of the split is empty (e.g. leading `.foo` or trailing `foo.`).
+            // Today's callers tolerate `Some(("", "foo"))` because every parsed
+            // dimension carries a non-empty `source_table`, but the helper is a
+            // leaf utility and a future caller deserves a clean None.
+            if alias.is_empty() || name.is_empty() {
+                return None;
+            }
+            return Some((alias, name));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Phase 68 A4: returns `true` if `s` has balanced double-quote runs, treating
+/// a doubled-quote `""` inside a quoted region as an escape (does NOT close).
+/// Mirrors the escape rule used by `src/ident.rs::find_identifier_end` so the
+/// two callers agree on what counts as "balanced". A naive
+/// `s.matches('"').count() % 2 == 0` is incorrect because it double-counts
+/// escaped quotes; this helper walks bytes explicitly.
+pub(super) fn is_quoting_balanced(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                // Doubled-quote escape inside a quoted region — skip both
+                // bytes without toggling the in_quote state.
+                i += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+        }
+        i += 1;
+    }
+    !in_quote
+}
+
+/// Extract content inside the outermost `(...)` of `s` (which must start with `(`).
+/// Returns the content between the first `(` and its matching `)`, or `None` if unbalanced.
+/// Quote-aware: brackets inside `'...'` string literals and `"..."` quoted
+/// identifiers are inert (PA-6).
+pub(super) fn extract_paren_content(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'(' {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut st = QuoteState::default();
+    let mut start = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if live {
+            match bytes[i] {
+                b'(' => {
+                    depth += 1;
+                    if depth == 1 {
+                        start = Some(i + 1);
+                    }
+                }
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&s[start.unwrap()..i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i = next;
+    }
+    None
+}
+
+/// Requires the keyword to be preceded by whitespace (or be at start) and
+/// followed by whitespace or end-of-string. Returns byte offset into `upper_text`.
+///
+/// Quote-aware (PA-3/PA-6): keyword text inside `'...'` string literals or
+/// `"..."` quoted identifiers does not match.
+pub(super) fn find_keyword_ci(upper_text: &str, keyword: &str) -> Option<usize> {
+    let kw_len = keyword.len();
+    let text_len = upper_text.len();
+    if text_len < kw_len {
+        return None;
+    }
+    let kw_bytes = keyword.as_bytes();
+    let text_bytes = upper_text.as_bytes();
+    let mut st = QuoteState::default();
+    let mut i = 0;
+    while i < text_len {
+        let (next, live) = st.step(text_bytes, i);
+        // Byte comparison — `i` advances one byte at a time, so a string
+        // slice here panics mid-codepoint on non-ASCII input (PA-1).
+        if live && i + kw_len <= text_len && &text_bytes[i..i + kw_len] == kw_bytes {
+            // Check boundary: preceded by non-identifier char (or start), followed by non-identifier char (or end).
+            // Underscore is a valid identifier character, so it must NOT count as a word boundary.
+            let before_ok = i == 0 || {
+                let c = text_bytes[i - 1];
+                !c.is_ascii_alphanumeric() && c != b'_'
+            };
+            let after_ok = i + kw_len == text_len || {
+                let c = text_bytes[i + kw_len];
+                !c.is_ascii_alphanumeric() && c != b'_'
+            };
+            if before_ok && after_ok {
+                return Some(i);
+            }
+        }
+        i = next;
+    }
+    None
+}
+
+/// Find a keyword at depth-0 in a string (not inside parens or string literals).
+/// Returns byte offset of the keyword start.
+pub(super) fn find_depth0_keyword(
+    upper_text: &str,
+    raw_text: &str,
+    keyword: &str,
+) -> Option<usize> {
+    let bytes = upper_text.as_bytes();
+    let kw_len = keyword.len();
+    if bytes.len() < kw_len {
+        return None;
+    }
+    let raw_bytes = raw_text.as_bytes();
+    let mut depth: i32 = 0;
+    let mut st = QuoteState::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Quote state tracks the RAW text (quotes live at identical offsets
+        // in the uppercased copy, but scan the original for clarity).
+        let (next, live) = st.step(raw_bytes, i);
+        if live {
+            match raw_bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0
+                && i + kw_len <= bytes.len()
+                // Byte comparison — `i` advances one byte at a time, so a string
+                // slice here panics mid-codepoint on non-ASCII input (PA-1).
+                && &bytes[i..i + kw_len] == keyword.as_bytes()
+            {
+                let before_ok = i == 0 || {
+                    let c = bytes[i - 1];
+                    !c.is_ascii_alphanumeric() && c != b'_'
+                };
+                let after_ok = i + kw_len == bytes.len() || {
+                    let c = bytes[i + kw_len];
+                    !c.is_ascii_alphanumeric() && c != b'_'
+                };
+                if before_ok && after_ok {
+                    return Some(i);
+                }
+            }
+        }
+        i = next;
+    }
+    None
+}
+
+/// Find the byte position of a keyword (already uppercased) in `upper_text`.
+/// Find "PRIMARY KEY" with any amount of whitespace between the two words.
+/// Returns `(start, end)` byte offsets into `upper_text`, where `upper_text` is already uppercased.
+/// `start` points at 'P', `end` points past 'Y' (exclusive).
+pub(super) fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
+    let bytes = upper_text.as_bytes();
+    let mut st = QuoteState::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if !live || i + 7 > bytes.len() {
+            i = next;
+            continue;
+        }
+        // Look for "PRIMARY". Compare BYTES, not string slices: `i` advances
+        // one byte at a time, so `&upper_text[i..]` panics mid-codepoint on
+        // non-ASCII input (PA-1). A multi-byte char can never byte-match an
+        // ASCII keyword, so byte comparison is also correct. Quote-aware
+        // (PA-3): `COMMENT = 'the PRIMARY KEY (id) lives here'` must not
+        // fabricate a primary key from string-literal text.
+        if &bytes[i..i + 7] == b"PRIMARY" {
+            // Phase 68 A7: align word-boundary checks with `find_unique` —
+            // `_` is a valid identifier continuation byte, so exclude it from
+            // the "non-identifier" boundary set in all three checks below.
+            let before_ok =
+                i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+            let after_primary = i + 7;
+            if before_ok
+                && (after_primary == bytes.len()
+                    || (!bytes[after_primary].is_ascii_alphanumeric()
+                        && bytes[after_primary] != b'_'))
+            {
+                // Skip whitespace between PRIMARY and KEY
+                let mut j = after_primary;
+                while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+                    j += 1;
+                }
+                // Match "KEY"
+                if j + 3 <= bytes.len() && &bytes[j..j + 3] == b"KEY" {
+                    let after_key = j + 3;
+                    let after_ok = after_key == bytes.len()
+                        || (!bytes[after_key].is_ascii_alphanumeric() && bytes[after_key] != b'_');
+                    if after_ok {
+                        return Some((i, after_key));
+                    }
+                }
+            }
+        }
+        i = next;
+    }
+    None
+}
+
+/// Find "UNIQUE" keyword with word-boundary matching in `upper_text`.
+/// Returns `(start, end)` byte offsets where start points at 'U' and end is past 'E'.
+///
+/// Quote-aware (PA-3): a `UNIQUE` inside a `'...'` string literal (e.g. a
+/// COMMENT payload) or a `"..."` quoted identifier does not match.
+pub(super) fn find_unique(upper_text: &str) -> Option<(usize, usize)> {
+    let bytes = upper_text.as_bytes();
+    let kw = b"UNIQUE";
+    let kw_len = kw.len(); // 6
+    let mut st = QuoteState::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if live && i + kw_len <= bytes.len() && &bytes[i..i + kw_len] == kw {
+            let before_ok =
+                i == 0 || { !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_' };
+            let after_ok = i + kw_len == bytes.len() || {
+                !bytes[i + kw_len].is_ascii_alphanumeric() && bytes[i + kw_len] != b'_'
+            };
+            if before_ok && after_ok {
+                return Some((i, i + kw_len));
+            }
+        }
+        i = next;
+    }
+    None
+}
