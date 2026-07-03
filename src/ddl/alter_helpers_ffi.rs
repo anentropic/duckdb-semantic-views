@@ -23,46 +23,18 @@
 //!   * Heap-owned UTF-8 buffers are allocated as `Box<[u8]>::into_raw` and
 //!     released by the caller via `sv_free_buffer(ptr, len)` with the exact
 //!     (ptr, len) pair Rust returned. The buffer is NOT NUL-terminated.
-//!   * Error messages are written to a fixed-size `error_buf` via
-//!     [`write_error_buf`], capped at `error_buf_len - 1` bytes with a
-//!     NUL terminator.
+//!   * Error messages are written to a fixed-size `error_buf` via the
+//!     shared [`crate::ffi_util::write_error_to_buffer`], capped at
+//!     `error_buf_len - 1` bytes (on a UTF-8 char boundary) with a NUL
+//!     terminator. Buffer publication uses the shared both-or-drop
+//!     [`crate::ffi_util::publish_owned_string`] (ST-4 consolidation —
+//!     this module's local copies truncated mid-codepoint and leaked on
+//!     null out-pointers).
 
+#[cfg(feature = "extension")]
+use crate::ffi_util::{publish_owned_string, write_error_to_buffer as write_error_buf};
 #[cfg(feature = "extension")]
 use std::panic::AssertUnwindSafe;
-
-/// Write a NUL-terminated error message into a fixed-size buffer, capping
-/// at `buf_len - 1` payload bytes so the trailing NUL always fits. No-op if
-/// `buf_len == 0` or `buf` is null.
-#[cfg(feature = "extension")]
-unsafe fn write_error_buf(buf: *mut u8, buf_len: usize, msg: &str) {
-    if buf.is_null() || buf_len == 0 {
-        return;
-    }
-    let max_payload = buf_len.saturating_sub(1);
-    let bytes = msg.as_bytes();
-    let n = bytes.len().min(max_payload);
-    if n > 0 {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
-    }
-    *buf.add(n) = 0;
-}
-
-/// Move an owned UTF-8 string onto the heap via `Box<[u8]>::into_raw` and
-/// publish the (ptr, len) pair to the C++ caller. Caller releases via
-/// `sv_free_buffer(ptr, len)` with the exact pair returned here. The buffer
-/// is NOT NUL-terminated.
-#[cfg(feature = "extension")]
-unsafe fn publish_owned_string(s: String, out_ptr: *mut *mut u8, out_len: *mut usize) {
-    let boxed: Box<[u8]> = s.into_bytes().into_boxed_slice();
-    let len = boxed.len();
-    let raw = Box::into_raw(boxed) as *mut u8;
-    if !out_ptr.is_null() {
-        *out_ptr = raw;
-    }
-    if !out_len.is_null() {
-        *out_len = len;
-    }
-}
 
 /// FFI entry point: parse + enrich + serialize a YAML semantic-view definition.
 ///

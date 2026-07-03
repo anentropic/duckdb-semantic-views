@@ -1008,8 +1008,11 @@ fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
     let bytes = upper_text.as_bytes();
     let mut i = 0;
     while i + 7 <= bytes.len() {
-        // Look for "PRIMARY"
-        if &upper_text[i..i + 7] == "PRIMARY" {
+        // Look for "PRIMARY". Compare BYTES, not string slices: `i` advances
+        // one byte at a time, so `&upper_text[i..]` panics mid-codepoint on
+        // non-ASCII input (PA-1). A multi-byte char can never byte-match an
+        // ASCII keyword, so byte comparison is also correct.
+        if &bytes[i..i + 7] == b"PRIMARY" {
             // Phase 68 A7: align word-boundary checks with `find_unique` —
             // `_` is a valid identifier continuation byte, so exclude it from
             // the "non-identifier" boundary set in all three checks below.
@@ -1027,7 +1030,7 @@ fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
                     j += 1;
                 }
                 // Match "KEY"
-                if j + 3 <= bytes.len() && &upper_text[j..j + 3] == "KEY" {
+                if j + 3 <= bytes.len() && &bytes[j..j + 3] == b"KEY" {
                     let after_key = j + 3;
                     let after_ok = after_key == bytes.len()
                         || (!bytes[after_key].is_ascii_alphanumeric() && bytes[after_key] != b'_');
@@ -1050,9 +1053,13 @@ fn find_keyword_ci(upper_text: &str, keyword: &str) -> Option<usize> {
     if text_len < kw_len {
         return None;
     }
+    let kw_bytes = keyword.as_bytes();
+    let text_bytes = upper_text.as_bytes();
     let mut i = 0;
     while i + kw_len <= text_len {
-        if &upper_text[i..i + kw_len] == keyword {
+        // Byte comparison — `i` advances one byte at a time, so a string
+        // slice here panics mid-codepoint on non-ASCII input (PA-1).
+        if &text_bytes[i..i + kw_len] == kw_bytes {
             // Check boundary: preceded by non-identifier char (or start), followed by non-identifier char (or end).
             // Underscore is a valid identifier character, so it must NOT count as a word boundary.
             let before_ok = i == 0 || {
@@ -1074,34 +1081,26 @@ fn find_keyword_ci(upper_text: &str, keyword: &str) -> Option<usize> {
 
 /// Extract a single-quoted string value, handling '' escape sequences.
 /// Input starts with the opening quote: 'text here'
-/// Returns the unescaped string content.
+/// Returns the unescaped string content. Text after the closing quote is
+/// ignored (COMMENT extraction hands this function the whole annotation
+/// tail, e.g. `'x' WITH SYNONYMS = (...)`).
+///
+/// Thin adapter over the shared UTF-8-correct extractor: this used to be
+/// the byte-wise copy that the WR-04 fix missed, Latin-1-izing every
+/// non-ASCII codepoint in COMMENT/SYNONYMS payloads (PA-2, code-review
+/// 2026-07-02).
 fn extract_single_quoted_string(s: &str) -> Result<String, ParseError> {
-    if !s.starts_with('\'') {
-        return Err(ParseError {
+    match crate::util::extract_single_quoted_prefix(s) {
+        Ok((content, _consumed)) => Ok(content),
+        Err(crate::util::SingleQuoteError::NotQuoted) => Err(ParseError {
             message: "Expected single-quoted string.".to_string(),
             position: None,
-        });
+        }),
+        Err(crate::util::SingleQuoteError::Unterminated) => Err(ParseError {
+            message: "Unclosed single-quoted string.".to_string(),
+            position: None,
+        }),
     }
-    let bytes = s.as_bytes();
-    let mut result = String::new();
-    let mut i = 1; // skip opening quote
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                result.push('\'');
-                i += 2;
-                continue;
-            }
-            // Closing quote
-            return Ok(result);
-        }
-        result.push(bytes[i] as char);
-        i += 1;
-    }
-    Err(ParseError {
-        message: "Unclosed single-quoted string.".to_string(),
-        position: None,
-    })
 }
 
 /// Parse comma-separated single-quoted strings from inside parentheses.
@@ -1767,7 +1766,9 @@ fn find_depth0_keyword(upper_text: &str, raw_text: &str, keyword: &str) -> Optio
         if depth == 0
             && !in_string
             && i + kw_len <= bytes.len()
-            && &upper_text[i..i + kw_len] == keyword
+            // Byte comparison — `i` advances one byte at a time, so a string
+            // slice here panics mid-codepoint on non-ASCII input (PA-1).
+            && &bytes[i..i + kw_len] == keyword.as_bytes()
         {
             let before_ok = i == 0 || {
                 let c = bytes[i - 1];
@@ -2912,6 +2913,58 @@ mod tests {
         assert!(find_primary_key(&"my_PRIMARY KEY".to_ascii_uppercase()).is_none());
         // Underscore-suffixed on KEY: `KEY_extra` should not match.
         assert!(find_primary_key(&"PRIMARY KEY_extra".to_ascii_uppercase()).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // PA-1 / PA-2 regressions (code-review 2026-07-02): byte-indexed keyword
+    // scanning panicked mid-codepoint on non-ASCII input, and the local
+    // single-quote extractor Latin-1-ized non-ASCII COMMENT / SYNONYMS
+    // payloads (`'café'` → `cafÃ©`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_keyword_ci_non_ascii_no_panic() {
+        // `é` uppercases to `É` (both 2 bytes); scanning must not panic and
+        // must still find the keyword after the multi-byte run.
+        let upper = "ÉÉÉ AS x".to_string();
+        assert_eq!(find_keyword_ci(&upper, "AS"), Some(7));
+        // No match at all — pure multi-byte text.
+        assert_eq!(find_keyword_ci("東京東京", "AS"), None);
+    }
+
+    #[test]
+    fn test_find_primary_key_non_ascii_no_panic() {
+        assert!(find_primary_key("ΩΩ NO PK HERE Ω").is_none());
+        let upper = "\"CAFÉ\" PRIMARY KEY (ID)".to_string();
+        let (start, end) = find_primary_key(&upper).expect("PRIMARY KEY found");
+        assert_eq!(&upper[start..end], "PRIMARY KEY");
+    }
+
+    #[test]
+    fn test_comment_annotation_non_ascii_payload_survives() {
+        // PA-2: the pre-fix extractor stored 'café et plus' as mojibake.
+        let (expr, ann) =
+            parse_trailing_annotations("SUM(o.amount) COMMENT = 'café et plus'").unwrap();
+        assert_eq!(expr, "SUM(o.amount)");
+        assert_eq!(ann.comment.as_deref(), Some("café et plus"));
+    }
+
+    #[test]
+    fn test_synonyms_annotation_non_ascii_payload_survives() {
+        let (expr, ann) =
+            parse_trailing_annotations("o.city WITH SYNONYMS = ('ciudad', 'stadt', '都市')")
+                .unwrap();
+        assert_eq!(expr, "o.city");
+        assert_eq!(ann.synonyms, vec!["ciudad", "stadt", "都市"]);
+    }
+
+    #[test]
+    fn test_annotation_scan_non_ascii_expression_no_panic() {
+        // Multi-byte chars ahead of the annotation keywords exercise the
+        // depth-0 scanner's byte loop.
+        let (expr, ann) = parse_trailing_annotations("concat(city, ' – ') COMMENT = 'ok'").unwrap();
+        assert_eq!(expr, "concat(city, ' – ')");
+        assert_eq!(ann.comment.as_deref(), Some("ok"));
     }
 
     // -----------------------------------------------------------------------

@@ -13,6 +13,7 @@ use crate::body_parser::parse_keyword_body;
 use crate::errors::ParseError;
 use crate::ident::{find_identifier_end, normalize_view_name};
 use crate::model::{Cardinality, Join, TableRef};
+use crate::util::{extract_single_quoted_prefix, starts_with_keyword_ci, SingleQuoteError};
 
 // ---------------------------------------------------------------------------
 // OverrideContext — Phase 65 Plan 06: empty struct (no state).
@@ -121,6 +122,20 @@ fn match_keyword_prefix(input: &[u8], keywords: &[&[u8]]) -> Option<usize> {
             return None;
         }
         pos += kw.len();
+    }
+    // Require a word boundary after the FINAL keyword. Inter-keyword
+    // boundaries are already enforced by the mandatory whitespace above,
+    // but without this check `CREATE SEMANTIC VIEWfoo` matched, and the
+    // plural typo `DROP SEMANTIC VIEWS` matched the `DROP SEMANTIC VIEW`
+    // prefix and dropped a view named `s` (PA-4, code-review 2026-07-02).
+    // Non-ASCII bytes (>= 0x80) are identifier continuation in DuckDB, so
+    // they are NOT boundaries either; ASCII punctuation (whitespace, `(`,
+    // `;`, `"`) is a legitimate token boundary and stays accepted.
+    if pos < input.len() {
+        let b = input[pos];
+        if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 {
+            return None;
+        }
     }
     Some(pos)
 }
@@ -288,10 +303,29 @@ pub fn detect_semantic_view_ddl(query: &str) -> u8 {
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
-/// Extract just the view name from a name-only DDL statement (DROP, DESCRIBE).
+/// How [`extract_name_only`] treats text after the view name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trailing {
+    /// The statement ends at the view name — any trailing text is an error
+    /// (PA-5, code-review 2026-07-02: `DROP SEMANTIC VIEW a b c` used to
+    /// execute and silently discard `b c`; `DESCRIBE ... a CASCADE` silently
+    /// ignored the `CASCADE`).
+    Reject,
+    /// Trailing text is the caller's problem (ALTER: the sub-operation
+    /// follows the name).
+    Allow,
+}
+
+/// Extract just the view name from a name-only DDL statement (DROP, DESCRIBE,
+/// SHOW COLUMNS; ALTER uses [`Trailing::Allow`] since its sub-operation
+/// follows the name).
 ///
 /// `prefix_len` is the byte length of the already-matched prefix.
-fn extract_name_only(trimmed: &str, prefix_len: usize) -> Result<String, String> {
+fn extract_name_only(
+    trimmed: &str,
+    prefix_len: usize,
+    trailing: Trailing,
+) -> Result<String, String> {
     let after_prefix = trimmed[prefix_len..].trim();
     if after_prefix.is_empty() {
         return Err("Missing view name".to_string());
@@ -304,6 +338,12 @@ fn extract_name_only(trimmed: &str, prefix_len: usize) -> Result<String, String>
     let raw_name = &after_prefix[..name_end];
     if raw_name.is_empty() {
         return Err("Missing view name".to_string());
+    }
+    if trailing == Trailing::Reject {
+        let rest = after_prefix[name_end..].trim();
+        if !rest.is_empty() {
+            return Err(format!("Unexpected tokens after view name: '{rest}'"));
+        }
     }
     let name = normalize_view_name(raw_name).map_err(|e| format!("Invalid view name: {e}"))?;
     Ok(name)
@@ -345,37 +385,17 @@ fn function_name(kind: DdlKind) -> &'static str {
 ///
 /// Handles SQL-style escaping: `''` inside quotes represents a literal `'`.
 ///
-/// Phase 65.1 WR-04: walks the input as a `char` stream (UTF-8 scalar values)
-/// rather than as raw bytes — the previous `bytes[pos] as char` cast
-/// silently corrupted any non-ASCII codepoint into its Latin-1 supplement
-/// equivalent, mangling e.g. Cyrillic / CJK / emoji / smart-quote payloads
-/// in `SHOW ... LIKE '<pattern>'` or `ALTER ... SET COMMENT = '<text>'`.
+/// Thin adapter over the shared UTF-8-correct extractor (ST-4 consolidation;
+/// originally fixed here as Phase 65.1 WR-04) mapping errors to this call
+/// site's message wording.
 fn extract_quoted_string(input: &str) -> Result<(String, usize), String> {
-    let mut chars = input.char_indices();
-    match chars.next() {
-        Some((_, '\'')) => {}
-        _ => return Err("Expected single-quoted string".to_string()),
-    }
-    let mut result = String::new();
-    while let Some((i, ch)) = chars.next() {
-        if ch == '\'' {
-            // Peek without consuming; only advance the real iterator on a hit.
-            let mut peek = chars.clone();
-            if matches!(peek.next(), Some((_, '\''))) {
-                // Escaped quote: '' -> '
-                result.push('\'');
-                chars = peek;
-            } else {
-                // End of string. `i` is the byte offset of the closing
-                // quote; closing quote is one byte (ASCII '\''), so total
-                // consumed = i + 1.
-                return Ok((result, i + 1));
-            }
-        } else {
-            result.push(ch);
+    extract_single_quoted_prefix(input).map_err(|e| {
+        match e {
+            SingleQuoteError::NotQuoted => "Expected single-quoted string",
+            SingleQuoteError::Unterminated => "Unterminated single-quoted string",
         }
-    }
-    Err("Unterminated single-quoted string".to_string())
+        .to_string()
+    })
 }
 
 /// Build optional WHERE and LIMIT suffix for a SHOW rewrite.
@@ -440,13 +460,11 @@ fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), Stri
     let after_in = rest[2..].trim_start();
 
     // Try to match a keyword (SCHEMA or DATABASE) followed by an identifier.
-    let (keyword, kw_len, label) = if after_in.len() >= 6
-        && after_in[..6].eq_ignore_ascii_case("SCHEMA")
+    let (keyword, kw_len, label) = if starts_with_keyword_ci(after_in, "SCHEMA")
         && (after_in.len() == 6 || after_in.as_bytes()[6].is_ascii_whitespace())
     {
         ("SCHEMA", 6, "schema")
-    } else if after_in.len() >= 8
-        && after_in[..8].eq_ignore_ascii_case("DATABASE")
+    } else if starts_with_keyword_ci(after_in, "DATABASE")
         && (after_in.len() == 8 || after_in.as_bytes()[8].is_ascii_whitespace())
     {
         ("DATABASE", 8, "database")
@@ -478,7 +496,7 @@ fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), Stri
 /// Returns `(remaining_text, metric_name)`.
 fn parse_for_metric<'a>(rest: &'a str, entity: &str) -> Result<(&'a str, &'a str), String> {
     let after_for = rest[3..].trim_start();
-    if after_for.len() < 6 || !after_for[..6].eq_ignore_ascii_case("METRIC") {
+    if !starts_with_keyword_ci(after_for, "METRIC") {
         return Err("Expected FOR METRIC after view name. \
              Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] \
              [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
@@ -522,7 +540,7 @@ fn parse_show_filter_clauses<'a>(
     };
 
     // 1. Check for LIKE keyword
-    if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("LIKE") {
+    if starts_with_keyword_ci(rest, "LIKE") {
         // Ensure it's followed by whitespace (not just a prefix match)
         if rest.len() == 4 || rest.as_bytes()[4].is_ascii_whitespace() {
             rest = rest[4..].trim_start();
@@ -533,8 +551,7 @@ fn parse_show_filter_clauses<'a>(
     }
 
     // 2. Check for IN keyword
-    if rest.len() >= 2
-        && rest[..2].eq_ignore_ascii_case("IN")
+    if starts_with_keyword_ci(rest, "IN")
         && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
     {
         if kind == DdlKind::Show || kind == DdlKind::ShowTerse {
@@ -554,7 +571,7 @@ fn parse_show_filter_clauses<'a>(
     }
 
     // 3. Check for FOR METRIC (only for ShowDimensions)
-    if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case("FOR") {
+    if starts_with_keyword_ci(rest, "FOR") {
         if kind != DdlKind::ShowDimensions {
             return Err(format!(
                 "FOR METRIC is only valid for SHOW SEMANTIC DIMENSIONS, not SHOW SEMANTIC {entity}"
@@ -566,9 +583,9 @@ fn parse_show_filter_clauses<'a>(
     }
 
     // 4. Check for STARTS WITH
-    if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case("STARTS") {
+    if starts_with_keyword_ci(rest, "STARTS") {
         rest = rest[6..].trim_start();
-        if rest.len() < 4 || !rest[..4].eq_ignore_ascii_case("WITH") {
+        if !starts_with_keyword_ci(rest, "WITH") {
             return Err(format!(
                 "Expected STARTS WITH. \
                  Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
@@ -581,7 +598,7 @@ fn parse_show_filter_clauses<'a>(
     }
 
     // 5. Check for LIMIT
-    if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("LIMIT") {
+    if starts_with_keyword_ci(rest, "LIMIT") {
         rest = rest[5..].trim_start();
         let token_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let token = &rest[..token_end];
@@ -707,7 +724,7 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
         }
         // Name-only forms (DROP, DESCRIBE, SHOW COLUMNS IN SEMANTIC VIEW)
         DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe | DdlKind::ShowColumns => {
-            let name = extract_name_only(trimmed, plen)?;
+            let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
             let safe_name = name.replace('\'', "''");
             Ok(format!("SELECT * FROM {fn_name}('{safe_name}')"))
         }
@@ -802,13 +819,14 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
                 normalize_view_name(raw_name).map_err(|e| format!("Invalid view name: {e}"))?;
             Ok(Some(name))
         }
-        DdlKind::Drop
-        | DdlKind::DropIfExists
-        | DdlKind::Describe
-        | DdlKind::ShowColumns
-        | DdlKind::Alter
-        | DdlKind::AlterIfExists => {
-            let name = extract_name_only(trimmed, plen)?;
+        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe | DdlKind::ShowColumns => {
+            let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
+            Ok(Some(name))
+        }
+        // ALTER: the sub-operation (RENAME TO / SET COMMENT / ...) follows
+        // the name, so trailing text is expected here.
+        DdlKind::Alter | DdlKind::AlterIfExists => {
+            let name = extract_name_only(trimmed, plen, Trailing::Allow)?;
             Ok(Some(name))
         }
         DdlKind::Show | DdlKind::ShowTerse => Ok(None),
@@ -822,8 +840,7 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
             }
             let mut rest = after_prefix;
             // Skip LIKE clause if present (LIKE appears before IN)
-            if rest.len() >= 4
-                && rest[..4].eq_ignore_ascii_case("LIKE")
+            if starts_with_keyword_ci(rest, "LIKE")
                 && (rest.len() == 4 || rest.as_bytes()[4].is_ascii_whitespace())
             {
                 rest = rest[4..].trim_start();
@@ -835,8 +852,7 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
                 }
             }
             // Check for IN keyword
-            if rest.len() >= 2
-                && rest[..2].eq_ignore_ascii_case("IN")
+            if starts_with_keyword_ci(rest, "IN")
                 && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
             {
                 let after_in = rest[2..].trim();
@@ -1297,46 +1313,20 @@ fn rewrite_ddl_keyword_body(
 ///
 /// Returns `(unescaped_content, bytes_consumed)` on success.
 /// Handles SQL-standard escaped single quotes (`''` -> `'`).
+///
+/// Thin adapter over the shared UTF-8-correct extractor (ST-4 consolidation;
+/// originally fixed here as Phase 65.1 WR-04) mapping errors to this call
+/// site's FILE-path message wording.
 fn extract_single_quoted(input: &str) -> Result<(String, usize), ParseError> {
-    if !input.starts_with('\'') {
-        return Err(ParseError {
-            message: "Expected single-quoted file path after FILE keyword. \
-                      Use: FROM YAML FILE '/path/to/file.yaml'"
+    extract_single_quoted_prefix(input).map_err(|e| ParseError {
+        message: match e {
+            SingleQuoteError::NotQuoted => "Expected single-quoted file path after FILE keyword. \
+                 Use: FROM YAML FILE '/path/to/file.yaml'"
                 .to_string(),
-            position: None,
-        });
-    }
-    // Phase 65.1 WR-04: walk as `char` stream (UTF-8 scalar values) rather
-    // than raw bytes — the previous `bytes[i] as char` cast silently
-    // corrupted non-ASCII file paths (e.g. paths containing CJK or
-    // accented characters) before they reached the FileSystem-direct YAML
-    // read path. The user would see a confusing "file not found" instead
-    // of the expected open.
-    //
-    // Skip the opening quote (one ASCII byte) and iterate over
-    // `input[1..]`, then adjust reported byte offsets back to `input`
-    // space for the consumed-length return value.
-    let mut result = String::new();
-    let mut chars = input[1..].char_indices();
-    while let Some((rel_i, ch)) = chars.next() {
-        if ch == '\'' {
-            let mut peek = chars.clone();
-            if matches!(peek.next(), Some((_, '\''))) {
-                result.push('\'');
-                chars = peek;
-            } else {
-                // `rel_i` is offset into `input[1..]`; absolute byte
-                // position of the closing quote in `input` is `rel_i + 1`;
-                // total bytes consumed (including both quotes) is
-                // `rel_i + 2` since the closing quote is one ASCII byte.
-                return Ok((result, rel_i + 2));
+            SingleQuoteError::Unterminated => {
+                "Unterminated file path string (missing closing single quote)".to_string()
             }
-        } else {
-            result.push(ch);
-        }
-    }
-    Err(ParseError {
-        message: "Unterminated file path string (missing closing single quote)".to_string(),
+        },
         position: None,
     })
 }
@@ -1582,74 +1572,19 @@ pub(crate) fn infer_cardinality(
 // FFI entry points (extension feature-gated)
 // ---------------------------------------------------------------------------
 
-/// Write an error message into a fixed-size, caller-owned byte buffer.
-/// Null-terminated, truncated to `len - 1` bytes.
-///
-/// Use only for short, bounded strings (error messages). For unboundedly
-/// large outputs (rewritten SQL) use `leak_string_to_c_buffer` +
-/// `sv_free_buffer` instead — silently truncating SQL produced confusing
-/// downstream parser errors (see v0.8.0 buffer-truncation fix).
-///
-/// # Safety
-///
-/// `buf` must point to a writable buffer of at least `len` bytes.
-///
-/// Phase 62 Plan 03 made this the live error-emit path for
-/// `sv_parse_function_rust` (rc=1 / rc=3). It used to be dead under the
-/// v0.8.0 `FALLBACK_OVERRIDE` synthesised-`SELECT error` workaround, which
-/// has been deleted now that `parse_function` re-renders the caret.
+// The error writer, buffer leak/reclaim, and publish helpers all live in
+// `crate::ffi_util` (ST-4 consolidation) — this module used to carry its
+// own copies, which was how the FF-5 truncation divergence happened.
+// Convention: `write_error_to_buffer` only for short, bounded strings
+// (error messages); unboundedly large outputs (rewritten SQL) go through
+// `publish_owned_string` + `sv_free_buffer` — silently truncating SQL
+// produced confusing downstream parser errors (v0.8.0 buffer-truncation
+// fix).
 #[cfg(any(feature = "extension", test))]
-unsafe fn write_error_to_buffer(buf: *mut u8, len: usize, s: &str) {
-    if buf.is_null() || len == 0 {
-        return;
-    }
-    let max_copy = len - 1; // reserve space for null terminator
-    let mut copy_len = s.len().min(max_copy);
-    // Walk back to a UTF-8 char boundary so a multi-byte codepoint straddling
-    // the truncation point is dropped whole rather than producing an invalid
-    // UTF-8 tail in the C string. is_char_boundary(0) is always true.
-    while !s.is_char_boundary(copy_len) {
-        copy_len -= 1;
-    }
-    std::ptr::copy_nonoverlapping(s.as_ptr(), buf, copy_len);
-    *buf.add(copy_len) = 0; // null terminate
-}
+use crate::ffi_util::write_error_to_buffer;
 
-/// Convert an owned `String` into a heap-allocated byte buffer that the C++
-/// caller takes ownership of. Caller must release via `sv_free_buffer`.
-///
-/// Returns `(ptr, len)`. The buffer is **not** NUL-terminated — the C++
-/// side reads exactly `len` bytes. This avoids any silent truncation cap
-/// regardless of how large the rewritten SQL becomes.
-///
-/// Uses `Box<[u8]>` rather than a leaked `Vec` because `Vec::shrink_to_fit`
-/// is only a hint — the allocator may keep excess capacity, which would
-/// make the matching `Vec::from_raw_parts(ptr, len, len)` in `reclaim_c_buffer`
-/// undefined behaviour in release builds. `into_boxed_slice` actually
-/// guarantees `len == capacity`.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-fn leak_string_to_c_buffer(s: String) -> (*mut u8, usize) {
-    let boxed: Box<[u8]> = s.into_bytes().into_boxed_slice();
-    let len = boxed.len();
-    let ptr = Box::into_raw(boxed).cast::<u8>();
-    (ptr, len)
-}
-
-/// Reclaim a buffer produced by `leak_string_to_c_buffer`.
-///
-/// # Safety
-///
-/// `ptr`/`len` must be the exact pair returned by an earlier call to
-/// `leak_string_to_c_buffer` (or its FFI exports), and may only be released
-/// once.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-unsafe fn reclaim_c_buffer(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
-    drop(Box::from_raw(slice));
-}
+#[cfg(feature = "extension")]
+use crate::ffi_util::reclaim_c_buffer;
 
 /// FFI export: free a heap buffer produced by an earlier
 /// `sv_parser_override_rust` success return.
@@ -1670,8 +1605,7 @@ pub unsafe extern "C" fn sv_free_buffer(ptr: *mut u8, len: usize) {
 }
 
 /// Internal helper: publish an owned `String` to the FFI out-parameters.
-/// On null out-pointers the buffer is dropped instead of leaked, so a
-/// misbehaving C++ caller cannot induce a memory leak through us.
+/// Both-or-drop contract (see [`crate::ffi_util::publish_owned_bytes`]).
 ///
 /// # Safety
 ///
@@ -1680,12 +1614,7 @@ pub unsafe extern "C" fn sv_free_buffer(ptr: *mut u8, len: usize) {
 /// as "drop and skip writing."
 #[cfg(feature = "extension")]
 unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len: *mut usize) {
-    if sql_out_ptr.is_null() || sql_out_len.is_null() {
-        return; // dropping `sql` here releases the heap allocation
-    }
-    let (ptr, len) = leak_string_to_c_buffer(sql);
-    *sql_out_ptr = ptr;
-    *sql_out_len = len;
+    crate::ffi_util::publish_owned_string(sql, sql_out_ptr, sql_out_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -3222,6 +3151,8 @@ mod tests {
 
     #[test]
     fn leak_and_reclaim_round_trips_arbitrary_string() {
+        use crate::ffi_util::{leak_bytes_to_c_buffer, reclaim_c_buffer};
+
         let original = "INSERT INTO _definitions VALUES ('x', '...');".repeat(4096);
         assert!(
             original.len() > 64 * 1024,
@@ -3229,7 +3160,7 @@ mod tests {
         );
 
         let original_clone = original.clone();
-        let (ptr, len) = leak_string_to_c_buffer(original);
+        let (ptr, len) = leak_bytes_to_c_buffer(original.into_bytes());
         assert!(!ptr.is_null());
         assert_eq!(len, original_clone.len());
 
@@ -3238,23 +3169,6 @@ mod tests {
         assert_eq!(recovered, original_clone.as_bytes());
 
         // Free.
-        unsafe { reclaim_c_buffer(ptr, len) };
-    }
-
-    #[test]
-    fn reclaim_null_pointer_is_safe() {
-        // sv_free_buffer must accept null pointers as a no-op so the C++
-        // RAII guard can be unconditionally invoked even when the FFI
-        // call returned an error path.
-        unsafe { reclaim_c_buffer(std::ptr::null_mut(), 0) };
-        unsafe { reclaim_c_buffer(std::ptr::null_mut(), 99) };
-    }
-
-    #[test]
-    fn leak_handles_empty_string() {
-        let (ptr, len) = leak_string_to_c_buffer(String::new());
-        assert_eq!(len, 0);
-        // Empty Vec may have dangling-but-aligned ptr; reclaim must not crash.
         unsafe { reclaim_c_buffer(ptr, len) };
     }
 
@@ -3485,6 +3399,100 @@ mod tests {
     fn test_rewrite_drop_missing_name() {
         let err = rewrite_ddl("DROP SEMANTIC VIEW").unwrap_err();
         assert!(err.contains("Missing view name"), "got: {err}");
+    }
+
+    // ===================================================================
+    // PA-4 (code-review 2026-07-02): prefix keywords require a trailing
+    // word boundary. `DROP SEMANTIC VIEWS` (plural typo) used to match the
+    // `DROP SEMANTIC VIEW` prefix and drop a view named `s` [verified];
+    // `CREATE SEMANTIC VIEWfoo` parsed as CREATE.
+    // ===================================================================
+
+    #[test]
+    fn test_prefix_requires_trailing_word_boundary() {
+        // The plural typo must NOT be detected as ours at all — DuckDB's
+        // own parser error is the correct surface.
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEWS x"),
+            PARSE_NOT_OURS
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEWS"),
+            PARSE_NOT_OURS
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("CREATE SEMANTIC VIEWfoo (TABLES (o AS orders))"),
+            PARSE_NOT_OURS
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("DESCRIBE SEMANTIC VIEWER x"),
+            PARSE_NOT_OURS
+        );
+        // Non-ASCII continuation is an identifier character in DuckDB, not
+        // a boundary.
+        assert_eq!(
+            detect_semantic_view_ddl("SHOW SEMANTIC VIEWSé"),
+            PARSE_NOT_OURS
+        );
+        // Digits and underscore are identifier continuation too.
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEW2 x"),
+            PARSE_NOT_OURS
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEW_ x"),
+            PARSE_NOT_OURS
+        );
+    }
+
+    #[test]
+    fn test_prefix_accepts_punctuation_boundaries() {
+        // `(`, `;`, `"` and end-of-input are legitimate token boundaries.
+        assert_eq!(
+            detect_semantic_view_ddl("SHOW SEMANTIC VIEWS"),
+            PARSE_DETECTED
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("SHOW SEMANTIC VIEWS;"),
+            PARSE_DETECTED
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEW\"my view\""),
+            PARSE_DETECTED
+        );
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW\"my view\"").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('my view')");
+    }
+
+    // ===================================================================
+    // PA-5 (code-review 2026-07-02): name-only forms must reject trailing
+    // garbage instead of executing and silently discarding it.
+    // ===================================================================
+
+    #[test]
+    fn test_name_only_forms_reject_trailing_garbage() {
+        for q in [
+            "DROP SEMANTIC VIEW a b c",
+            "DROP SEMANTIC VIEW IF EXISTS a b",
+            "DESCRIBE SEMANTIC VIEW a CASCADE",
+            "SHOW COLUMNS IN SEMANTIC VIEW a b",
+        ] {
+            let err = rewrite_ddl(q).unwrap_err();
+            assert!(
+                err.contains("Unexpected tokens after view name"),
+                "expected trailing-garbage error for {q}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_ddl_name_rejects_trailing_garbage_but_allows_alter_ops() {
+        assert!(extract_ddl_name("DROP SEMANTIC VIEW a b c").is_err());
+        // ALTER legitimately has text after the name.
+        assert_eq!(
+            extract_ddl_name("ALTER SEMANTIC VIEW a RENAME TO b").unwrap(),
+            Some("a".to_string())
+        );
     }
 
     #[test]
@@ -4331,6 +4339,45 @@ mod tests {
             assert_eq!(
                 sql,
                 "SELECT * FROM list_semantic_views() WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 3"
+            );
+        }
+
+        // --- PA-1 regression: non-ASCII trailing tokens must error cleanly ---
+
+        #[test]
+        fn test_show_views_non_ascii_trailing_tokens_error_not_panic() {
+            // Pre-fix: `rest[..4]` sliced "aΩΩ" mid-codepoint and panicked
+            // ("byte index 4 is not a char boundary"), surfacing as
+            // "internal error (panic)" at the FFI boundary.
+            let err = rewrite_ddl("SHOW SEMANTIC VIEWS aΩΩ").unwrap_err();
+            assert!(err.contains("Unexpected tokens"), "got: {err}");
+
+            // Every clause scanner position: 2, 3, 4, 5, 6-byte prefixes.
+            for q in [
+                "SHOW SEMANTIC VIEWS Ω",
+                "SHOW SEMANTIC VIEWS ΩΩΩ",
+                "SHOW SEMANTIC DIMENSIONS éé",
+                "SHOW SEMANTIC METRICS 東京",
+                "SHOW SEMANTIC FACTS ☕☕☕",
+            ] {
+                let result = rewrite_ddl(q);
+                assert!(result.is_err(), "expected clean error for {q}");
+            }
+        }
+
+        #[test]
+        fn test_extract_ddl_name_non_ascii_no_panic() {
+            // Same PA-1 pattern in extract_ddl_name's LIKE/IN skipper.
+            let result = extract_ddl_name("SHOW SEMANTIC DIMENSIONS aΩΩ");
+            assert!(matches!(result, Ok(None)), "got: {result:?}");
+        }
+
+        #[test]
+        fn test_show_views_like_non_ascii_pattern_roundtrips() {
+            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS LIKE '%café%'").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM list_semantic_views() WHERE name ILIKE '%café%'"
             );
         }
 

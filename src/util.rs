@@ -150,6 +150,73 @@ pub fn is_word_boundary_char(b: u8) -> bool {
     !b.is_ascii_alphanumeric() && b != b'_'
 }
 
+/// Does `s` start with the ASCII keyword `kw`, case-insensitively?
+///
+/// Compares raw *bytes*, so it is safe on any UTF-8 input: the old
+/// `s[..kw.len()].eq_ignore_ascii_case(kw)` pattern panicked ("byte index N
+/// is not a char boundary") whenever a multi-byte character straddled the
+/// keyword length (PA-1, code-review 2026-07-02 — e.g. `SHOW SEMANTIC VIEWS
+/// aΩΩ`). A multi-byte character can never byte-match an ASCII keyword, so
+/// the comparison is also *correct* on non-ASCII input: it simply fails.
+///
+/// After a `true` return, slicing `s` at `kw.len()` is guaranteed safe —
+/// the matched prefix is pure ASCII, so `kw.len()` lands on a char boundary.
+#[must_use]
+pub fn starts_with_keyword_ci(s: &str, kw: &str) -> bool {
+    let n = kw.len();
+    s.len() >= n && s.as_bytes()[..n].eq_ignore_ascii_case(kw.as_bytes())
+}
+
+/// Failure modes of [`extract_single_quoted_prefix`]. Callers map these onto
+/// their local error types/messages (`ParseError` in the body parser, plain
+/// `String` in the SHOW-clause parser).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleQuoteError {
+    /// The input does not begin with `'`.
+    NotQuoted,
+    /// No unescaped closing `'` before end of input.
+    Unterminated,
+}
+
+/// Extract a single-quoted SQL string literal from the start of `input`.
+///
+/// Returns `(unescaped_content, bytes_consumed)` where `bytes_consumed`
+/// includes both the opening and closing quotes. SQL-standard escaping is
+/// honoured: `''` inside the literal is a single literal `'`. Content after
+/// the closing quote is not inspected — callers decide what trailing text
+/// means.
+///
+/// Walks the input as a `char` stream (UTF-8 scalar values), never as raw
+/// bytes: this is the single shared implementation mandated by ST-4
+/// (code-review 2026-07-02). Two earlier per-site copies cast
+/// `bytes[i] as char`, silently Latin-1-izing every non-ASCII codepoint
+/// (`'café'` → `cafÃ©` — WR-04/PA-2); do not re-inline this logic.
+pub fn extract_single_quoted_prefix(input: &str) -> Result<(String, usize), SingleQuoteError> {
+    let mut chars = input.char_indices();
+    match chars.next() {
+        Some((_, '\'')) => {}
+        _ => return Err(SingleQuoteError::NotQuoted),
+    }
+    let mut result = String::new();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '\'' {
+            // Peek without consuming; only advance the real iterator on a hit.
+            let mut peek = chars.clone();
+            if matches!(peek.next(), Some((_, '\''))) {
+                result.push('\'');
+                chars = peek;
+            } else {
+                // `i` is the byte offset of the closing quote; the quote is
+                // one ASCII byte, so total consumed = i + 1.
+                return Ok((result, i + 1));
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    Err(SingleQuoteError::Unterminated)
+}
+
 /// Wrap a closure in `catch_unwind`, converting panics to `Box<dyn Error>`.
 ///
 /// Used at FFI boundaries to prevent Rust panics from unwinding through C++ frames
@@ -365,6 +432,98 @@ mod tests {
         // Non-ASCII, non-matching content must not panic and must round-trip.
         let result = replace_word_boundary_any("héllo + unit_price", &["unit_price"], "(x)");
         assert_eq!(result, "héllo + (x)");
+    }
+
+    // -------------------------------------------------------------------
+    // starts_with_keyword_ci tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn keyword_ci_matches_case_insensitively() {
+        assert!(starts_with_keyword_ci("LIKE 'x'", "LIKE"));
+        assert!(starts_with_keyword_ci("like 'x'", "LIKE"));
+        assert!(starts_with_keyword_ci("LiKe", "LIKE"));
+    }
+
+    #[test]
+    fn keyword_ci_rejects_shorter_input() {
+        assert!(!starts_with_keyword_ci("LIK", "LIKE"));
+        assert!(!starts_with_keyword_ci("", "LIKE"));
+    }
+
+    #[test]
+    fn keyword_ci_no_panic_on_multibyte_straddle() {
+        // "aΩΩ" is 5 bytes; byte 4 is mid-Ω. The old slice pattern panicked
+        // here (PA-1); byte comparison just fails.
+        assert!(!starts_with_keyword_ci("aΩΩ", "LIKE"));
+        assert!(!starts_with_keyword_ci("Ωx", "IN"));
+    }
+
+    // -------------------------------------------------------------------
+    // extract_single_quoted_prefix tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn quoted_prefix_basic() {
+        let (s, n) = extract_single_quoted_prefix("'abc' rest").unwrap();
+        assert_eq!(s, "abc");
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn quoted_prefix_escaped_quote() {
+        let (s, n) = extract_single_quoted_prefix("'a''b'").unwrap();
+        assert_eq!(s, "a'b");
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn quoted_prefix_empty_literal() {
+        let (s, n) = extract_single_quoted_prefix("''").unwrap();
+        assert_eq!(s, "");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn quoted_prefix_non_ascii_content_survives() {
+        // PA-2 regression: the per-site copies Latin-1-ized this to "cafÃ©".
+        let (s, n) = extract_single_quoted_prefix("'café et plus'").unwrap();
+        assert_eq!(s, "café et plus");
+        assert_eq!(n, "'café et plus'".len());
+
+        let (s, _) = extract_single_quoted_prefix("'東京 ☕'").unwrap();
+        assert_eq!(s, "東京 ☕");
+    }
+
+    #[test]
+    fn quoted_prefix_errors() {
+        assert_eq!(
+            extract_single_quoted_prefix("abc"),
+            Err(SingleQuoteError::NotQuoted)
+        );
+        assert_eq!(
+            extract_single_quoted_prefix("'abc"),
+            Err(SingleQuoteError::Unterminated)
+        );
+        assert_eq!(
+            extract_single_quoted_prefix(""),
+            Err(SingleQuoteError::NotQuoted)
+        );
+    }
+
+    proptest! {
+        // Round-trip: escaping then extracting returns the original content
+        // and consumes exactly the literal, for arbitrary unicode content.
+        #[test]
+        fn quoted_prefix_roundtrips_arbitrary_content(
+            content in "\\PC{0,40}",
+            tail in "[ a-zA-Z]{0,10}",
+        ) {
+            let literal = format!("'{}'{}", content.replace('\'', "''"), tail);
+            let (extracted, consumed) = extract_single_quoted_prefix(&literal).unwrap();
+            prop_assert_eq!(&extracted, &content);
+            prop_assert_eq!(&literal[consumed..], &tail);
+        }
     }
 
     // -------------------------------------------------------------------

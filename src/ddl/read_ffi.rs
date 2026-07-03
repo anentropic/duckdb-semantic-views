@@ -149,24 +149,18 @@ pub unsafe fn probe_catalog_table_present(borrowed: &BorrowedConnection) -> bool
 }
 
 /// Write a NUL-terminated error message into the C-side `error_buf`,
-/// truncating to `buf_len - 1` payload bytes. Matches the convention in
-/// `src/ddl/alter_helpers_ffi.rs::write_error_buf` and `src/ddl/list.rs`.
+/// truncating to at most `buf_len - 1` payload bytes on a UTF-8 char
+/// boundary. Thin alias for the shared [`crate::ffi_util::write_error_to_buffer`]
+/// (ST-4 consolidation) kept for the ~100 dispatcher call sites; the local
+/// copy it replaced truncated mid-codepoint, producing invalid UTF-8 in
+/// `BinderException` text (FF-5).
 ///
 /// # Safety
 ///
 /// `buf` must be either null OR point to writable storage of at least
 /// `buf_len` bytes.
 pub unsafe fn write_err(buf: *mut u8, buf_len: usize, msg: &str) {
-    if buf.is_null() || buf_len == 0 {
-        return;
-    }
-    let max = buf_len.saturating_sub(1);
-    let bytes = msg.as_bytes();
-    let n = bytes.len().min(max);
-    if n > 0 {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n);
-    }
-    *buf.add(n) = 0;
+    crate::ffi_util::write_error_to_buffer(buf, buf_len, msg);
 }
 
 /// Serialize a vector of VARCHAR rows into the wire format described above.
@@ -221,21 +215,18 @@ pub fn serialize_varchar_bool_rows(rows: &[(Vec<String>, bool)]) -> Vec<u8> {
 /// `sv_free_buffer(ptr, len)` using the exact `(ptr, len)` pair this function
 /// returns.
 ///
+/// Thin alias for the shared [`crate::ffi_util::publish_owned_bytes`] (ST-4
+/// consolidation), which uses the both-or-drop contract: if either
+/// out-pointer is null the buffer is dropped and neither slot is written.
+/// The local copy it replaced leaked the buffer and could desync
+/// `(ptr, len)` by writing only one slot.
+///
 /// # Safety
 ///
-/// `out_ptr` and `out_len` must be writable pointers (or null — in which
-/// case the buffer leaks; defensive only). The function transfers
-/// allocation ownership across the FFI boundary.
+/// Either both `out_ptr` and `out_len` point to writable slots, or the call
+/// is treated as "drop and skip writing".
 pub unsafe fn publish_owned_buffer(buf: Vec<u8>, out_ptr: *mut *mut u8, out_len: *mut usize) {
-    let boxed: Box<[u8]> = buf.into_boxed_slice();
-    let len = boxed.len();
-    let raw = Box::into_raw(boxed) as *mut u8;
-    if !out_ptr.is_null() {
-        *out_ptr = raw;
-    }
-    if !out_len.is_null() {
-        *out_len = len;
-    }
+    crate::ffi_util::publish_owned_bytes(buf, out_ptr, out_len);
 }
 
 #[cfg(test)]

@@ -78,24 +78,32 @@ pub fn parse_qualified_identifier(input: &str) -> Result<Vec<String>, String> {
 
         if bytes[pos] == b'"' {
             // Quoted part — scan to matching closing quote, honouring "" escape.
+            // Byte-scan for the ASCII quote (a UTF-8 continuation byte can
+            // never equal 0x22) but accumulate content by slicing the
+            // original `&str` between quote positions: the previous
+            // `bytes[pos] as char` push Latin-1-ized every non-ASCII
+            // codepoint (`"café"` stored as `cafÃ©` — PA-2, code-review
+            // 2026-07-02).
             pos += 1;
             let mut buf = String::new();
+            let mut seg_start = pos;
             loop {
                 if pos >= bytes.len() {
                     return Err("unterminated quoted identifier".to_string());
                 }
                 if bytes[pos] == b'"' {
+                    buf.push_str(&input[seg_start..pos]);
                     // Look ahead for escape `""`.
                     if pos + 1 < bytes.len() && bytes[pos + 1] == b'"' {
                         buf.push('"');
                         pos += 2;
+                        seg_start = pos;
                         continue;
                     }
                     // Closing quote consumed.
                     pos += 1;
                     break;
                 }
-                buf.push(bytes[pos] as char);
                 pos += 1;
             }
             if buf.is_empty() {
@@ -292,6 +300,24 @@ mod tests {
         #[test]
         fn dot_inside_quoted_part() {
             assert_eq!(parse_qualified_identifier("\"a.b\"").unwrap(), vec!["a.b"],);
+        }
+
+        #[test]
+        fn non_ascii_quoted_part_survives_unmangled() {
+            // PA-2 regression: the byte-wise loop stored `"café"` as the
+            // Latin-1-ized `cafÃ©`.
+            assert_eq!(
+                parse_qualified_identifier("\"café\"").unwrap(),
+                vec!["café"],
+            );
+            assert_eq!(
+                parse_qualified_identifier("\"東京\".\"wéird name\"").unwrap(),
+                vec!["東京", "wéird name"],
+            );
+            assert_eq!(
+                parse_qualified_identifier("\"a☕\"\"b\"").unwrap(),
+                vec![r#"a☕"b"#],
+            );
         }
 
         #[test]
