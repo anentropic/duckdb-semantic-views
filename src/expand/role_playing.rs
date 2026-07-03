@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::model::SemanticViewDefinition;
 
 use super::facts::collect_derived_metric_using;
@@ -35,7 +37,7 @@ pub(super) fn relationships_to_table(
 /// child-fact + parent-dimension queries.
 pub(super) fn is_role_playing_target(def: &SemanticViewDefinition, target_alias: &str) -> bool {
     let target_lower = target_alias.to_ascii_lowercase();
-    let mut seen_from: Vec<String> = Vec::new();
+    let mut seen_from: HashSet<String> = HashSet::new();
     for j in &def.joins {
         if j.fk_columns.is_empty()
             || j.name.is_none()
@@ -43,11 +45,12 @@ pub(super) fn is_role_playing_target(def: &SemanticViewDefinition, target_alias:
         {
             continue;
         }
-        let from = j.from_alias.to_ascii_lowercase();
-        if seen_from.contains(&from) {
+        // A second relationship from the same source table to this target is
+        // what makes it role-playing. `insert` returns false when the alias
+        // was already present — linear time, no O(n²) `Vec::contains` scan.
+        if !seen_from.insert(j.from_alias.to_ascii_lowercase()) {
             return true;
         }
-        seen_from.push(from);
     }
     false
 }
