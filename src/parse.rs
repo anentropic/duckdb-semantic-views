@@ -500,7 +500,11 @@ fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), Stri
 /// Returns `(remaining_text, metric_name)`.
 fn parse_for_metric<'a>(rest: &'a str, entity: &str) -> Result<(&'a str, &'a str), String> {
     let after_for = rest[3..].trim_start();
-    if !starts_with_keyword_ci(after_for, "METRIC") {
+    // Word boundary after METRIC: `FOR METRICS x` must not parse as the
+    // METRIC keyword followed by a metric named `s x` (PR #50 review).
+    let metric_boundary_ok = starts_with_keyword_ci(after_for, "METRIC")
+        && (after_for.len() == 6 || after_for.as_bytes()[6].is_ascii_whitespace());
+    if !metric_boundary_ok {
         return Err("Expected FOR METRIC after view name. \
              Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] \
              [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
@@ -575,8 +579,11 @@ fn parse_show_filter_clauses<'a>(
         }
     }
 
-    // 3. Check for FOR METRIC (only for ShowDimensions)
-    if starts_with_keyword_ci(rest, "FOR") {
+    // 3. Check for FOR METRIC (only for ShowDimensions). Word boundary
+    // enforced so e.g. FOREIGN does not match FOR (PR #50 review).
+    if starts_with_keyword_ci(rest, "FOR")
+        && (rest.len() == 3 || rest.as_bytes()[3].is_ascii_whitespace())
+    {
         if kind != DdlKind::ShowDimensions {
             return Err(format!(
                 "FOR METRIC is only valid for SHOW SEMANTIC DIMENSIONS, not SHOW SEMANTIC {entity}"
@@ -1152,8 +1159,12 @@ fn validate_alter(
 fn extract_view_comment(text: &str) -> Result<(Option<String>, &str), ParseError> {
     let upper = text.to_ascii_uppercase();
     if upper.starts_with("COMMENT") {
-        // Verify word boundary (not e.g. COMMENTARY)
-        if text.len() > 7 && text.as_bytes()[7].is_ascii_alphanumeric() {
+        // Verify word boundary (not e.g. COMMENTARY, COMMENT_x, COMMENTé —
+        // `_` and non-ASCII bytes are identifier continuation)
+        if text.len() > 7 && {
+            let b = text.as_bytes()[7];
+            b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+        } {
             return Ok((None, text));
         }
         let after_kw = text[7..].trim_start();
@@ -3656,6 +3667,22 @@ mod tests {
         assert!(rewrite_ddl("ALTER SEMANTIC VIEW a RENAME TO x oops").is_err());
         assert!(rewrite_ddl("ALTER SEMANTIC VIEW a SET COMMENT = 'x' oops").is_err());
         assert!(rewrite_ddl("ALTER SEMANTIC VIEW a UNSET COMMENT oops").is_err());
+    }
+
+    #[test]
+    fn test_for_metric_requires_boundaries() {
+        // FOREIGN must not match the FOR clause keyword (PR #50 review).
+        let err = rewrite_ddl("SHOW SEMANTIC VIEWS FOREIGN").unwrap_err();
+        assert!(err.contains("Unexpected tokens"), "got: {err}");
+        // METRICS must not match METRIC (the metric would have been 's').
+        let err = rewrite_ddl("SHOW SEMANTIC DIMENSIONS IN v FOR METRICS revenue").unwrap_err();
+        assert!(err.contains("Expected FOR METRIC"), "got: {err}");
+        // The legal form still parses.
+        let sql = rewrite_ddl("SHOW SEMANTIC DIMENSIONS IN v FOR METRIC revenue").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM show_semantic_dimensions_for_metric('v', 'revenue')"
+        );
     }
 
     #[test]

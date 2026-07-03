@@ -298,14 +298,8 @@ pub(super) fn find_keyword_ci(upper_text: &str, keyword: &str) -> Option<usize> 
         if live && i + kw_len <= text_len && &text_bytes[i..i + kw_len] == kw_bytes {
             // Check boundary: preceded by non-identifier char (or start), followed by non-identifier char (or end).
             // Underscore is a valid identifier character, so it must NOT count as a word boundary.
-            let before_ok = i == 0 || {
-                let c = text_bytes[i - 1];
-                !c.is_ascii_alphanumeric() && c != b'_'
-            };
-            let after_ok = i + kw_len == text_len || {
-                let c = text_bytes[i + kw_len];
-                !c.is_ascii_alphanumeric() && c != b'_'
-            };
+            let before_ok = i == 0 || !is_ident_continuation(text_bytes[i - 1]);
+            let after_ok = i + kw_len == text_len || !is_ident_continuation(text_bytes[i + kw_len]);
             if before_ok && after_ok {
                 return Some(i);
             }
@@ -347,14 +341,9 @@ pub(super) fn find_depth0_keyword(
                 // slice here panics mid-codepoint on non-ASCII input (PA-1).
                 && &bytes[i..i + kw_len] == keyword.as_bytes()
             {
-                let before_ok = i == 0 || {
-                    let c = bytes[i - 1];
-                    !c.is_ascii_alphanumeric() && c != b'_'
-                };
-                let after_ok = i + kw_len == bytes.len() || {
-                    let c = bytes[i + kw_len];
-                    !c.is_ascii_alphanumeric() && c != b'_'
-                };
+                let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
+                let after_ok =
+                    i + kw_len == bytes.len() || !is_ident_continuation(bytes[i + kw_len]);
                 if before_ok && after_ok {
                     return Some(i);
                 }
@@ -389,13 +378,10 @@ pub(super) fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
             // Phase 68 A7: align word-boundary checks with `find_unique` —
             // `_` is a valid identifier continuation byte, so exclude it from
             // the "non-identifier" boundary set in all three checks below.
-            let before_ok =
-                i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+            let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
             let after_primary = i + 7;
             if before_ok
-                && (after_primary == bytes.len()
-                    || (!bytes[after_primary].is_ascii_alphanumeric()
-                        && bytes[after_primary] != b'_'))
+                && (after_primary == bytes.len() || !is_ident_continuation(bytes[after_primary]))
             {
                 // Skip whitespace between PRIMARY and KEY
                 let mut j = after_primary;
@@ -405,8 +391,8 @@ pub(super) fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
                 // Match "KEY"
                 if j + 3 <= bytes.len() && &bytes[j..j + 3] == b"KEY" {
                     let after_key = j + 3;
-                    let after_ok = after_key == bytes.len()
-                        || (!bytes[after_key].is_ascii_alphanumeric() && bytes[after_key] != b'_');
+                    let after_ok =
+                        after_key == bytes.len() || !is_ident_continuation(bytes[after_key]);
                     if after_ok {
                         return Some((i, after_key));
                     }
@@ -432,11 +418,8 @@ pub(super) fn find_unique(upper_text: &str) -> Option<(usize, usize)> {
     while i < bytes.len() {
         let (next, live) = st.step(bytes, i);
         if live && i + kw_len <= bytes.len() && &bytes[i..i + kw_len] == kw {
-            let before_ok =
-                i == 0 || { !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_' };
-            let after_ok = i + kw_len == bytes.len() || {
-                !bytes[i + kw_len].is_ascii_alphanumeric() && bytes[i + kw_len] != b'_'
-            };
+            let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
+            let after_ok = i + kw_len == bytes.len() || !is_ident_continuation(bytes[i + kw_len]);
             if before_ok && after_ok {
                 return Some((i, i + kw_len));
             }

@@ -891,6 +891,17 @@ mod tests {
     }
 
     #[test]
+    fn test_keyword_not_matched_before_non_ascii_continuation() {
+        // PR #50 review: keyword boundary checks treated non-ASCII bytes as
+        // boundaries, so COMMENT matched inside the identifier `commenté`
+        // and the annotation scanner truncated the expression.
+        let entries = parse_qualified_entries("o.x AS o.commenté", 0, false, "dimensions").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].2, "o.commenté");
+        assert_eq!(entries[0].3, None);
+    }
+
+    #[test]
     fn test_quoted_comment_column_usable_in_expression() {
         // PA-9 companion: a column literally named `comment` is usable at
         // depth 0 when quoted — the annotation scanner must not treat the

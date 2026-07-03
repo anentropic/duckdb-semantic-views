@@ -1,6 +1,6 @@
 //! MATERIALIZATIONS clause parsing.
 
-use super::scan::{extract_paren_content, split_first_token, QuoteState};
+use super::scan::{extract_paren_content, is_ident_continuation, split_first_token, QuoteState};
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
 use crate::model::Materialization;
@@ -162,15 +162,10 @@ fn find_sub_keyword_positions(upper: &str) -> Vec<(&'static str, usize)> {
                 for &kw in keywords {
                     let kb = kw.as_bytes();
                     if i + kb.len() <= bytes.len() && &bytes[i..i + kb.len()] == kb {
-                        let before_ok = i == 0 || {
-                            let b = bytes[i - 1];
-                            !b.is_ascii_alphanumeric() && b != b'_'
-                        };
+                        let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
                         let after_pos = i + kb.len();
-                        let after_ok = after_pos >= bytes.len() || {
-                            let b = bytes[after_pos];
-                            !b.is_ascii_alphanumeric() && b != b'_'
-                        };
+                        let after_ok =
+                            after_pos >= bytes.len() || !is_ident_continuation(bytes[after_pos]);
                         if before_ok && after_ok {
                             positions.push((kw, i));
                             break;

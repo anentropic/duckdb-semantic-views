@@ -1,6 +1,6 @@
 //! Trailing COMMENT / WITH SYNONYMS annotations and leading access modifiers.
 
-use super::scan::{extract_paren_content, find_keyword_ci, QuoteState};
+use super::scan::{extract_paren_content, find_keyword_ci, is_ident_continuation, QuoteState};
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
 use crate::model::AccessModifier;
@@ -95,28 +95,16 @@ pub(super) fn parse_trailing_annotations(
             if depth == 0 {
                 // Check for COMMENT keyword with word boundaries
                 if i + 7 <= bytes.len() && &upper_bytes[i..i + 7] == b"COMMENT" {
-                    let before_ok = i == 0 || {
-                        let c = bytes[i - 1];
-                        !c.is_ascii_alphanumeric() && c != b'_'
-                    };
-                    let after_ok = i + 7 == bytes.len() || {
-                        let c = bytes[i + 7];
-                        !c.is_ascii_alphanumeric() && c != b'_'
-                    };
+                    let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
+                    let after_ok = i + 7 == bytes.len() || !is_ident_continuation(bytes[i + 7]);
                     if before_ok && after_ok && annotation_start.is_none() {
                         annotation_start = Some(i);
                     }
                 }
                 // Check for WITH keyword (for WITH SYNONYMS)
                 if i + 4 <= bytes.len() && &upper_bytes[i..i + 4] == b"WITH" {
-                    let before_ok = i == 0 || {
-                        let c = bytes[i - 1];
-                        !c.is_ascii_alphanumeric() && c != b'_'
-                    };
-                    let after_ok = i + 4 == bytes.len() || {
-                        let c = bytes[i + 4];
-                        !c.is_ascii_alphanumeric() && c != b'_'
-                    };
+                    let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
+                    let after_ok = i + 4 == bytes.len() || !is_ident_continuation(bytes[i + 4]);
                     if before_ok && after_ok {
                         // Verify it's WITH SYNONYMS, not just any WITH
                         let after_with = upper[i + 4..].trim_start();
