@@ -144,10 +144,18 @@ pub fn replace_word_boundary_pairs(haystack: &str, pairs: &[(&str, &str)]) -> St
     result
 }
 
-/// Check if a byte is a word-boundary character (NOT alphanumeric or underscore).
+/// Is `b` a word-boundary byte — i.e. NOT an identifier-continuation byte?
+///
+/// Identifier continuation is ASCII alphanumerics, `_`, AND all non-ASCII
+/// bytes (>= 0x80): `DuckDB` identifiers may contain any non-ASCII
+/// character, so a needle must not match inside a unicode-bearing name
+/// (`id` inside `idΩ`, PR #50 review). This is the exact inverse of the DDL
+/// scanners' `body_parser::scan::is_ident_continuation`; the two agree so
+/// that fact/derived-metric inlining and dependency detection use the same
+/// notion of an identifier as the parser.
 #[must_use]
 pub fn is_word_boundary_char(b: u8) -> bool {
-    !b.is_ascii_alphanumeric() && b != b'_'
+    !b.is_ascii_alphanumeric() && b != b'_' && b < 0x80
 }
 
 /// Does `s` start with the ASCII keyword `kw`, case-insensitively?
@@ -457,6 +465,22 @@ mod tests {
         // Non-ASCII with no match at all must round-trip unchanged.
         let result = replace_word_boundary("'São Paulo' || 'café'", "net_price", "(x)");
         assert_eq!(result, "'São Paulo' || 'café'");
+    }
+
+    #[test]
+    fn replace_word_boundary_does_not_match_inside_unicode_identifier() {
+        // PR #50 review: non-ASCII bytes are identifier continuation, so the
+        // ASCII needle must NOT match where a unicode char abuts it
+        // (`id` inside `idΩ` / `Ωid`) — these are single identifiers.
+        assert_eq!(replace_word_boundary("idΩ", "id", "(x)"), "idΩ");
+        assert_eq!(replace_word_boundary("Ωid", "id", "(x)"), "Ωid");
+        assert_eq!(
+            replace_word_boundary("caféid + 1", "id", "(x)"),
+            "caféid + 1"
+        );
+        // A genuine boundary (ASCII punctuation / whitespace) still matches.
+        assert_eq!(replace_word_boundary("café.id", "id", "(x)"), "café.(x)");
+        assert_eq!(replace_word_boundary("Ω id", "id", "(x)"), "Ω (x)");
     }
 
     #[test]
