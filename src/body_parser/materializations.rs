@@ -46,8 +46,11 @@ fn parse_single_materialization_entry(
     }
     let rest = rest.trim();
 
-    // Expect "AS"
-    if !rest.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("AS")) {
+    // Expect "AS", with a trailing word boundary — `AS(...)` is legal
+    // (punctuation boundary) but `ASx` is not (PR #50 review).
+    let as_ok = rest.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("AS"))
+        && (rest.len() == 2 || !is_ident_continuation(rest.as_bytes()[2]));
+    if !as_ok {
         return Err(ParseError {
             message: format!(
                 "Expected 'AS' after materialization name '{name}' in MATERIALIZATIONS clause."

@@ -2,7 +2,8 @@
 
 use super::annotations::parse_trailing_annotations;
 use super::scan::{
-    extract_paren_content, find_primary_key, find_unique, is_quoting_balanced, split_first_token,
+    extract_paren_content, find_primary_key, find_unique, is_ident_continuation,
+    is_quoting_balanced, split_first_token,
 };
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
@@ -48,8 +49,12 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     let rest = rest.trim();
     let rest_offset = entry_offset + entry.len() - rest.len();
 
-    // Step 2: expect "AS" keyword
-    if !rest.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("AS")) {
+    // Step 2: expect "AS" keyword, with a trailing word boundary —
+    // `ASschema.table` / `ASX` must not match (PR #50 review). Punctuation
+    // like `"` stays a legal boundary (`AS"my table"`).
+    let as_ok = rest.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("AS"))
+        && (rest.len() == 2 || !is_ident_continuation(rest.as_bytes()[2]));
+    if !as_ok {
         return Err(ParseError {
             message: format!("Expected 'AS' after table alias '{alias}' in TABLES clause."),
             position: Some(rest_offset),

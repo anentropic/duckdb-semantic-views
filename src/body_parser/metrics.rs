@@ -177,7 +177,16 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<MetricE
     // Phase 48: Detect and parse OVER clause from the expression text.
     // The OVER clause is part of the expression for window metrics, e.g.:
     //   AVG(total_qty) OVER (PARTITION BY EXCLUDING d1, d2 ORDER BY d1)
-    let (expr, window_spec) = parse_window_over_clause(&expr, entry_offset)?;
+    // Base the reported positions at the expression's own offset within the
+    // entry (leading access modifier + AS + whitespace), not the entry start
+    // — otherwise OVER-clause error carets point at the metric name
+    // (PR #50 review).
+    let after_as_slice = &entry_after_access[as_pos + 2..];
+    let expr_offset = (entry.len() - entry_after_access.len())
+        + as_pos
+        + 2
+        + (after_as_slice.len() - after_as_slice.trim_start().len());
+    let (expr, window_spec) = parse_window_over_clause(&expr, entry_offset + expr_offset)?;
 
     if before_as.is_empty() {
         return Err(ParseError {

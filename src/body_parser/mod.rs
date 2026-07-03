@@ -1052,6 +1052,44 @@ mod tests {
     }
 
     #[test]
+    fn test_as_keyword_requires_boundary_in_tables_and_materializations() {
+        // PR #50 review: `AS` was matched as a raw 2-byte prefix, so
+        // `ASorders` / `ASx` were treated as the AS keyword ending early.
+        let err = parse_tables_clause("o ASorders PRIMARY KEY (id)", 0).unwrap_err();
+        assert!(
+            err.message.contains("Expected 'AS'"),
+            "got: {}",
+            err.message
+        );
+        let err = parse_materializations_clause("m1 ASx (TABLE t, DIMENSIONS (d))", 0).unwrap_err();
+        assert!(
+            err.message.contains("Expected 'AS'"),
+            "got: {}",
+            err.message
+        );
+        // Punctuation stays a legal boundary: AS"quoted" and AS( work.
+        let result = parse_tables_clause("o AS\"my tbl\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result[0].table, "\"my tbl\"");
+        let result = parse_materializations_clause("m1 AS(TABLE t, DIMENSIONS (d))", 0).unwrap();
+        assert_eq!(result[0].table, "t");
+    }
+
+    #[test]
+    fn test_over_clause_error_position_is_expression_relative() {
+        // PR #50 review: OVER-clause errors were based at the entry start,
+        // so carets pointed at the metric name instead of the expression.
+        // Entry: "s.r AS SUM(t) OVER bad" — expr starts at byte 7, OVER at
+        // byte 7 within the expr, error points just past "OVER" (byte 18).
+        let err = parse_metrics_clause("s.r AS SUM(t) OVER bad", 0).unwrap_err();
+        assert!(
+            err.message.contains("Expected '(' after OVER"),
+            "got: {}",
+            err.message
+        );
+        assert_eq!(err.position, Some(18), "caret must sit after OVER");
+    }
+
+    #[test]
     fn test_non_additive_by_flexible_spacing() {
         // PA-10: the keyword offset was hardcoded as 16 ("NON ADDITIVE BY"
         // + one space), rejecting the no-space `BY(d)` form and extra
