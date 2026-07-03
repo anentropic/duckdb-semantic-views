@@ -145,29 +145,128 @@ fn split_qualified_identifier(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Split `body` at depth-0 commas, respecting nested parens and single-quoted strings.
+/// Byte-scan state for SQL text: tracks single-quoted string literals and
+/// double-quoted identifiers, honouring the SQL escape doubling (`''` inside
+/// a string, `""` inside a quoted identifier).
+///
+/// This is the ONE quote-tracking implementation for every depth-0 scanner
+/// in this module (PA-6, code-review 2026-07-02): scanners that tracked only
+/// single quotes — or nothing — mis-split on quoted identifiers containing
+/// commas / parens / dots (`o."a,b"`, `o AS "tbl)x"`, `"a.b"`) and matched
+/// keywords inside string literals (PA-3: a `COMMENT = 'the PRIMARY KEY (id)
+/// lives here'` fabricated a primary key from comment text).
+///
+/// Multi-byte UTF-8 is safe by construction: only ASCII bytes are compared,
+/// and continuation bytes (>= 0x80) never equal an ASCII quote.
+#[derive(Default, Clone, Copy)]
+struct QuoteState {
+    in_string: bool,
+    in_ident: bool,
+}
+
+impl QuoteState {
+    /// Consume the byte at `i`, updating quote state. Returns
+    /// `(next_index, is_live_code)` where `is_live_code` is true only when
+    /// byte `i` is outside every quoted region and is not itself a quote
+    /// delimiter. Escape pairs are consumed whole (`next_index == i + 2`).
+    fn step(&mut self, bytes: &[u8], i: usize) -> (usize, bool) {
+        let b = bytes[i];
+        if self.in_string {
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    return (i + 2, false); // '' escape — stay in string
+                }
+                self.in_string = false;
+            }
+            (i + 1, false)
+        } else if self.in_ident {
+            if b == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    return (i + 2, false); // "" escape — stay in ident
+                }
+                self.in_ident = false;
+            }
+            (i + 1, false)
+        } else {
+            match b {
+                b'\'' => {
+                    self.in_string = true;
+                    (i + 1, false)
+                }
+                b'"' => {
+                    self.in_ident = true;
+                    (i + 1, false)
+                }
+                _ => (i + 1, true),
+            }
+        }
+    }
+}
+
+/// Scan `s` to completion and return the final quote state. Used by entry
+/// parsers to reject unterminated `"..."` / `'...'` regions up front with a
+/// precise error — the quote-aware scanners otherwise swallow everything
+/// after the orphan quote and surface a misleading structural error
+/// ("Expected 'AS' keyword") instead.
+fn final_quote_state(s: &str) -> QuoteState {
+    let bytes = s.as_bytes();
+    let mut st = QuoteState::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, _) = st.step(bytes, i);
+        i = next;
+    }
+    st
+}
+
+/// Reject an entry whose quoting never closes. Returns the error message
+/// noun for the open region, if any.
+fn unterminated_quote_error(s: &str) -> Option<&'static str> {
+    let st = final_quote_state(s);
+    if st.in_ident {
+        Some("Unterminated quoted identifier")
+    } else if st.in_string {
+        Some("Unterminated string literal")
+    } else {
+        None
+    }
+}
+
+/// Find the first *live-code* occurrence of ASCII byte `needle` in `s` —
+/// i.e. outside single-quoted strings and double-quoted identifiers. The
+/// quote-aware replacement for `str::find` at the alias/name dot-splits
+/// (PA-6: `"a.b"` must not split at its inner dot).
+fn find_live_byte(s: &str, needle: u8) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut st = QuoteState::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if live && bytes[i] == needle {
+            return Some(i);
+        }
+        i = next;
+    }
+    None
+}
+
+/// Split `body` at depth-0 commas, respecting nested parens, single-quoted
+/// strings, and double-quoted identifiers.
 /// Returns `Vec<(start_offset_in_body, trimmed_slice)>`. Trailing empty entries discarded.
 pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
     let mut entries = Vec::new();
     let mut depth: i32 = 0;
-    let mut in_string = false;
+    let mut st = QuoteState::default();
     let mut start = 0;
     let bytes = body.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let ch = bytes[i] as char;
-        if ch == '\'' {
-            // Handle escaped single quotes: '' inside a string
-            if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                i += 2;
-                continue;
-            }
-            in_string = !in_string;
-        } else if !in_string {
-            match ch {
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => depth -= 1,
-                ',' if depth == 0 => {
+        let (next, live) = st.step(bytes, i);
+        if live {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b',' if depth == 0 => {
                     let entry = body[start..i].trim();
                     if !entry.is_empty() {
                         entries.push((start, entry));
@@ -177,7 +276,7 @@ pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
                 _ => {}
             }
         }
-        i += 1;
+        i = next;
     }
     let tail = body[start..].trim();
     if !tail.is_empty() {
@@ -291,22 +390,18 @@ fn find_clause_bounds<'a>(
         let open_paren_pos = i;
         i += 1; // skip '('
 
-        // Find matching ')' with depth tracking
+        // Find matching ')' with depth tracking, skipping quoted regions so
+        // a bracket inside `'...'` or `"..."` (e.g. `o AS "tbl)x"`) cannot
+        // close the clause early (PA-6).
         let content_start = i;
         let mut depth: i32 = 1;
-        let mut in_string = false;
+        let mut st = QuoteState::default();
         while i < bytes.len() {
-            let ch = bytes[i] as char;
-            if ch == '\'' {
-                if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_string = !in_string;
-            } else if !in_string {
-                match ch {
-                    '(' | '[' | '{' => depth += 1,
-                    ')' | ']' | '}' => {
+            let (next, live) = st.step(bytes, i);
+            if live {
+                match bytes[i] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => {
                         depth -= 1;
                         if depth == 0 {
                             break;
@@ -315,13 +410,24 @@ fn find_clause_bounds<'a>(
                     _ => {}
                 }
             }
-            i += 1;
+            i = next;
         }
 
         if depth != 0 {
             let kw_upper = keyword.to_ascii_uppercase();
+            // Distinguish "a quote never closed, swallowing the rest of the
+            // body" from a genuinely missing ')' — the quote-aware scan
+            // otherwise reports the misleading unclosed-paren error for
+            // unterminated quotes.
+            let message = if st.in_ident {
+                format!("Unterminated quoted identifier in clause '{kw_upper}'.")
+            } else if st.in_string {
+                format!("Unterminated string literal in clause '{kw_upper}'.")
+            } else {
+                format!("Unclosed '(' for clause '{kw_upper}'.")
+            };
             return Err(ParseError {
-                message: format!("Unclosed '(' for clause '{kw_upper}'."),
+                message,
                 position: Some(base_offset + open_paren_pos),
             });
         }
@@ -849,25 +955,19 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty())
             .collect();
-        // SAFETY: extract_paren_content succeeded above (returned Some), confirming
-        // balanced parens exist. The closing ')' must be present in after_pk.
-        let close = after_pk.find(')').unwrap();
+        // extract_paren_content requires after_pk to start with '(' and is
+        // quote-aware, so the matching close is exactly one byte past the
+        // content — a naive find(')') would stop at a ')' inside a quoted
+        // column name (PA-6).
+        let close = 1 + pk_body.len();
         let remainder = &after_pk[close + 1..];
         (pk_columns, remainder)
     } else {
-        // No PRIMARY KEY -- fact table. UNIQUE clause (if any) starts after the
-        // already-captured table name.
-        let unique_pos = find_unique(&upper_after_name);
-        let remainder = if let Some((u_start, _)) = unique_pos {
-            &after_name[u_start..]
-        } else {
-            // No PK, no UNIQUE: preserve the original byte-for-byte
-            // semantics that surfaced trailing text only when a UNIQUE
-            // keyword was present. Trailing text in the bare case is
-            // unsupported by the legacy parser and remains so.
-            ""
-        };
-        (vec![], remainder)
+        // No PRIMARY KEY -- fact table. Hand the whole post-name slice to
+        // the UNIQUE/annotation steps below. (Previously the bare no-PK /
+        // no-UNIQUE case hard-set the remainder to "" — silently dropping
+        // table-level COMMENT / WITH SYNONYMS annotations, PA-9.)
+        (vec![], after_name)
     };
 
     // Step 4: parse zero or more UNIQUE constraints from after_pk_text
@@ -895,17 +995,27 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
                 .filter(|c| !c.is_empty())
                 .collect();
             unique_constraints.push(cols);
-            // SAFETY: extract_paren_content succeeded above (returned Some), confirming
-            // balanced parens exist. The closing ')' must be present in after_unique_kw.
-            let close = after_unique_kw.find(')').unwrap();
+            // Quote-aware close (see the PRIMARY KEY branch above).
+            let close = 1 + cols_str.len();
             remaining = &after_unique_kw[close + 1..];
         } else {
             break;
         }
     }
 
-    // Phase 43: Parse trailing COMMENT / WITH SYNONYMS annotations after constraints
-    let (_, annotations) = parse_trailing_annotations(remaining)?;
+    // Phase 43: Parse trailing COMMENT / WITH SYNONYMS annotations after constraints.
+    // Any non-annotation text left over is an error rather than silently
+    // discarded (PA-9 companion: `o AS orders garbage COMMENT = 'x'`).
+    let (leftover, annotations) = parse_trailing_annotations(remaining)?;
+    if !leftover.trim().is_empty() {
+        return Err(ParseError {
+            message: format!(
+                "Unexpected text '{}' after table declaration for alias '{alias}' in TABLES clause.",
+                leftover.trim()
+            ),
+            position: Some(entry_offset),
+        });
+    }
 
     Ok(TableRef {
         alias: alias.to_string(),
@@ -944,13 +1054,18 @@ fn is_quoting_balanced(s: &str) -> bool {
 
 /// Find "UNIQUE" keyword with word-boundary matching in `upper_text`.
 /// Returns `(start, end)` byte offsets where start points at 'U' and end is past 'E'.
+///
+/// Quote-aware (PA-3): a `UNIQUE` inside a `'...'` string literal (e.g. a
+/// COMMENT payload) or a `"..."` quoted identifier does not match.
 fn find_unique(upper_text: &str) -> Option<(usize, usize)> {
     let bytes = upper_text.as_bytes();
     let kw = b"UNIQUE";
     let kw_len = kw.len(); // 6
+    let mut st = QuoteState::default();
     let mut i = 0;
-    while i + kw_len <= bytes.len() {
-        if &bytes[i..i + kw_len] == kw {
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if live && i + kw_len <= bytes.len() && &bytes[i..i + kw_len] == kw {
             let before_ok =
                 i == 0 || { !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_' };
             let after_ok = i + kw_len == bytes.len() || {
@@ -960,34 +1075,35 @@ fn find_unique(upper_text: &str) -> Option<(usize, usize)> {
                 return Some((i, i + kw_len));
             }
         }
-        i += 1;
+        i = next;
     }
     None
 }
 
 /// Extract content inside the outermost `(...)` of `s` (which must start with `(`).
 /// Returns the content between the first `(` and its matching `)`, or `None` if unbalanced.
+/// Quote-aware: brackets inside `'...'` string literals and `"..."` quoted
+/// identifiers are inert (PA-6).
 fn extract_paren_content(s: &str) -> Option<&str> {
     let bytes = s.as_bytes();
     if bytes.is_empty() || bytes[0] != b'(' {
         return None;
     }
     let mut depth = 0i32;
-    let mut in_string = false;
+    let mut st = QuoteState::default();
     let mut start = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        let ch = b as char;
-        if ch == '\'' {
-            in_string = !in_string;
-        } else if !in_string {
-            match ch {
-                '(' => {
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if live {
+            match bytes[i] {
+                b'(' => {
                     depth += 1;
                     if depth == 1 {
                         start = Some(i + 1);
                     }
                 }
-                ')' => {
+                b')' => {
                     depth -= 1;
                     if depth == 0 {
                         return Some(&s[start.unwrap()..i]);
@@ -996,6 +1112,7 @@ fn extract_paren_content(s: &str) -> Option<&str> {
                 _ => {}
             }
         }
+        i = next;
     }
     None
 }
@@ -1006,12 +1123,20 @@ fn extract_paren_content(s: &str) -> Option<&str> {
 /// `start` points at 'P', `end` points past 'Y' (exclusive).
 fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
     let bytes = upper_text.as_bytes();
+    let mut st = QuoteState::default();
     let mut i = 0;
-    while i + 7 <= bytes.len() {
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if !live || i + 7 > bytes.len() {
+            i = next;
+            continue;
+        }
         // Look for "PRIMARY". Compare BYTES, not string slices: `i` advances
         // one byte at a time, so `&upper_text[i..]` panics mid-codepoint on
         // non-ASCII input (PA-1). A multi-byte char can never byte-match an
-        // ASCII keyword, so byte comparison is also correct.
+        // ASCII keyword, so byte comparison is also correct. Quote-aware
+        // (PA-3): `COMMENT = 'the PRIMARY KEY (id) lives here'` must not
+        // fabricate a primary key from string-literal text.
         if &bytes[i..i + 7] == b"PRIMARY" {
             // Phase 68 A7: align word-boundary checks with `find_unique` —
             // `_` is a valid identifier continuation byte, so exclude it from
@@ -1040,13 +1165,16 @@ fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
                 }
             }
         }
-        i += 1;
+        i = next;
     }
     None
 }
 
 /// Requires the keyword to be preceded by whitespace (or be at start) and
 /// followed by whitespace or end-of-string. Returns byte offset into `upper_text`.
+///
+/// Quote-aware (PA-3/PA-6): keyword text inside `'...'` string literals or
+/// `"..."` quoted identifiers does not match.
 fn find_keyword_ci(upper_text: &str, keyword: &str) -> Option<usize> {
     let kw_len = keyword.len();
     let text_len = upper_text.len();
@@ -1055,26 +1183,28 @@ fn find_keyword_ci(upper_text: &str, keyword: &str) -> Option<usize> {
     }
     let kw_bytes = keyword.as_bytes();
     let text_bytes = upper_text.as_bytes();
+    let mut st = QuoteState::default();
     let mut i = 0;
-    while i + kw_len <= text_len {
+    while i < text_len {
+        let (next, live) = st.step(text_bytes, i);
         // Byte comparison — `i` advances one byte at a time, so a string
         // slice here panics mid-codepoint on non-ASCII input (PA-1).
-        if &text_bytes[i..i + kw_len] == kw_bytes {
+        if live && i + kw_len <= text_len && &text_bytes[i..i + kw_len] == kw_bytes {
             // Check boundary: preceded by non-identifier char (or start), followed by non-identifier char (or end).
             // Underscore is a valid identifier character, so it must NOT count as a word boundary.
             let before_ok = i == 0 || {
-                let c = upper_text.as_bytes()[i - 1];
+                let c = text_bytes[i - 1];
                 !c.is_ascii_alphanumeric() && c != b'_'
             };
             let after_ok = i + kw_len == text_len || {
-                let c = upper_text.as_bytes()[i + kw_len];
+                let c = text_bytes[i + kw_len];
                 !c.is_ascii_alphanumeric() && c != b'_'
             };
             if before_ok && after_ok {
                 return Some(i);
             }
         }
-        i += 1;
+        i = next;
     }
     None
 }
@@ -1135,66 +1265,63 @@ fn parse_trailing_annotations(text: &str) -> Result<(String, ParsedAnnotations),
     let upper = text.to_ascii_uppercase();
 
     // Find the FIRST occurrence of COMMENT or WITH SYNONYMS at depth-0 with word boundaries.
-    // Scan forward tracking depth to find annotation region start.
+    // Scan forward tracking depth to find annotation region start. Quote-aware
+    // (PA-6/PA-9): keyword text inside `'...'` string literals or `"..."`
+    // quoted identifiers does not match — a column literally named `comment`
+    // is usable at depth 0 when quoted (`o."comment"`).
     let mut depth: i32 = 0;
-    let mut in_string = false;
+    let mut st = QuoteState::default();
     let bytes = text.as_bytes();
     let upper_bytes = upper.as_bytes();
     let mut annotation_start: Option<usize> = None;
     let mut i = 0;
 
     while i < bytes.len() {
-        let ch = bytes[i] as char;
-        if ch == '\'' {
-            if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                i += 2;
-                continue;
-            }
-            in_string = !in_string;
-        } else if !in_string {
-            match ch {
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => depth -= 1,
+        let (next, live) = st.step(bytes, i);
+        if live {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
                 _ => {}
             }
-        }
 
-        // At depth 0, outside string, check for COMMENT or WITH keyword
-        if depth == 0 && !in_string {
-            // Check for COMMENT keyword with word boundaries
-            if i + 7 <= bytes.len() && &upper_bytes[i..i + 7] == b"COMMENT" {
-                let before_ok = i == 0 || {
-                    let c = bytes[i - 1];
-                    !c.is_ascii_alphanumeric() && c != b'_'
-                };
-                let after_ok = i + 7 == bytes.len() || {
-                    let c = bytes[i + 7];
-                    !c.is_ascii_alphanumeric() && c != b'_'
-                };
-                if before_ok && after_ok && annotation_start.is_none() {
-                    annotation_start = Some(i);
-                }
-            }
-            // Check for WITH keyword (for WITH SYNONYMS)
-            if i + 4 <= bytes.len() && &upper_bytes[i..i + 4] == b"WITH" {
-                let before_ok = i == 0 || {
-                    let c = bytes[i - 1];
-                    !c.is_ascii_alphanumeric() && c != b'_'
-                };
-                let after_ok = i + 4 == bytes.len() || {
-                    let c = bytes[i + 4];
-                    !c.is_ascii_alphanumeric() && c != b'_'
-                };
-                if before_ok && after_ok {
-                    // Verify it's WITH SYNONYMS, not just any WITH
-                    let after_with = upper[i + 4..].trim_start();
-                    if after_with.starts_with("SYNONYMS") && annotation_start.is_none() {
+            // At depth 0, outside quoted regions, check for COMMENT or WITH keyword
+            if depth == 0 {
+                // Check for COMMENT keyword with word boundaries
+                if i + 7 <= bytes.len() && &upper_bytes[i..i + 7] == b"COMMENT" {
+                    let before_ok = i == 0 || {
+                        let c = bytes[i - 1];
+                        !c.is_ascii_alphanumeric() && c != b'_'
+                    };
+                    let after_ok = i + 7 == bytes.len() || {
+                        let c = bytes[i + 7];
+                        !c.is_ascii_alphanumeric() && c != b'_'
+                    };
+                    if before_ok && after_ok && annotation_start.is_none() {
                         annotation_start = Some(i);
+                    }
+                }
+                // Check for WITH keyword (for WITH SYNONYMS)
+                if i + 4 <= bytes.len() && &upper_bytes[i..i + 4] == b"WITH" {
+                    let before_ok = i == 0 || {
+                        let c = bytes[i - 1];
+                        !c.is_ascii_alphanumeric() && c != b'_'
+                    };
+                    let after_ok = i + 4 == bytes.len() || {
+                        let c = bytes[i + 4];
+                        !c.is_ascii_alphanumeric() && c != b'_'
+                    };
+                    if before_ok && after_ok {
+                        // Verify it's WITH SYNONYMS, not just any WITH
+                        let after_with = upper[i + 4..].trim_start();
+                        if after_with.starts_with("SYNONYMS") && annotation_start.is_none() {
+                            annotation_start = Some(i);
+                        }
                     }
                 }
             }
         }
-        i += 1;
+        i = next;
     }
 
     let (expr_text, annotation_text) = if let Some(start) = annotation_start {
@@ -1746,43 +1873,38 @@ fn find_depth0_keyword(upper_text: &str, raw_text: &str, keyword: &str) -> Optio
     }
     let raw_bytes = raw_text.as_bytes();
     let mut depth: i32 = 0;
-    let mut in_string = false;
+    let mut st = QuoteState::default();
     let mut i = 0;
     while i < bytes.len() {
-        let ch = raw_bytes[i] as char;
-        if ch == '\'' {
-            if in_string && i + 1 < bytes.len() && raw_bytes[i + 1] == b'\'' {
-                i += 2;
-                continue;
-            }
-            in_string = !in_string;
-        } else if !in_string {
-            match ch {
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => depth -= 1,
+        // Quote state tracks the RAW text (quotes live at identical offsets
+        // in the uppercased copy, but scan the original for clarity).
+        let (next, live) = st.step(raw_bytes, i);
+        if live {
+            match raw_bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
                 _ => {}
             }
-        }
-        if depth == 0
-            && !in_string
-            && i + kw_len <= bytes.len()
-            // Byte comparison — `i` advances one byte at a time, so a string
-            // slice here panics mid-codepoint on non-ASCII input (PA-1).
-            && &bytes[i..i + kw_len] == keyword.as_bytes()
-        {
-            let before_ok = i == 0 || {
-                let c = bytes[i - 1];
-                !c.is_ascii_alphanumeric() && c != b'_'
-            };
-            let after_ok = i + kw_len == bytes.len() || {
-                let c = bytes[i + kw_len];
-                !c.is_ascii_alphanumeric() && c != b'_'
-            };
-            if before_ok && after_ok {
-                return Some(i);
+            if depth == 0
+                && i + kw_len <= bytes.len()
+                // Byte comparison — `i` advances one byte at a time, so a string
+                // slice here panics mid-codepoint on non-ASCII input (PA-1).
+                && &bytes[i..i + kw_len] == keyword.as_bytes()
+            {
+                let before_ok = i == 0 || {
+                    let c = bytes[i - 1];
+                    !c.is_ascii_alphanumeric() && c != b'_'
+                };
+                let after_ok = i + kw_len == bytes.len() || {
+                    let c = bytes[i + kw_len];
+                    !c.is_ascii_alphanumeric() && c != b'_'
+                };
+                if before_ok && after_ok {
+                    return Some(i);
+                }
             }
         }
-        i += 1;
+        i = next;
     }
     None
 }
@@ -2066,6 +2188,15 @@ fn find_frame_start(upper_text: &str) -> Option<usize> {
 fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<MetricEntry, ParseError> {
     let entry = entry.trim();
 
+    // Unterminated quoting swallows the rest of the entry under the
+    // quote-aware scanners — reject it up front with a precise error.
+    if let Some(noun) = unterminated_quote_error(entry) {
+        return Err(ParseError {
+            message: format!("{noun} in metric entry '{entry}'."),
+            position: Some(entry_offset),
+        });
+    }
+
     // Phase 43: Check for leading PRIVATE/PUBLIC keyword
     let (access, entry_after_access) = parse_leading_access_modifier(entry);
 
@@ -2167,8 +2298,10 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<MetricE
         before_na
     };
 
-    // Check for dot to distinguish qualified vs unqualified
-    if let Some(dot_pos) = final_name_portion.find('.') {
+    // Check for dot to distinguish qualified vs unqualified. Quote-aware
+    // (PA-6): a dot inside a quoted name (`"a.b"`) is not a qualifier
+    // separator.
+    if let Some(dot_pos) = find_live_byte(final_name_portion, b'.') {
         // Qualified: alias.name
         let source_alias = final_name_portion[..dot_pos].trim().to_string();
         let bare_name = final_name_portion[dot_pos + 1..].trim().to_string();
@@ -2285,6 +2418,15 @@ fn parse_single_qualified_entry(
 ) -> Result<QualifiedEntry, ParseError> {
     let entry = entry.trim();
 
+    // Unterminated quoting swallows the rest of the entry under the
+    // quote-aware scanners — reject it up front with a precise error.
+    if let Some(noun) = unterminated_quote_error(entry) {
+        return Err(ParseError {
+            message: format!("{noun} in {clause_name} entry '{entry}'."),
+            position: Some(entry_offset),
+        });
+    }
+
     // Phase 43: Check for leading PRIVATE/PUBLIC keyword
     let (access, entry_after_access) = parse_leading_access_modifier(entry);
     if access == AccessModifier::Private && !allow_access_modifier {
@@ -2318,8 +2460,9 @@ fn parse_single_qualified_entry(
         }
     }
 
-    // Find first '.' to split alias.bare_name
-    let dot_pos = entry_after_access.find('.').ok_or_else(|| ParseError {
+    // Find first live '.' to split alias.bare_name — quote-aware (PA-6):
+    // a dot inside a quoted name (`"a.b"`) is not a qualifier separator.
+    let dot_pos = find_live_byte(entry_after_access, b'.').ok_or_else(|| ParseError {
         message: format!(
             "Expected 'alias.name' qualified identifier, got '{entry}'. Each dimension/metric entry must have the form 'alias.name AS expr'.",
         ),
@@ -2965,6 +3108,125 @@ mod tests {
         let (expr, ann) = parse_trailing_annotations("concat(city, ' – ') COMMENT = 'ok'").unwrap();
         assert_eq!(expr, "concat(city, ' – ')");
         assert_eq!(ann.comment.as_deref(), Some("ok"));
+    }
+
+    // -----------------------------------------------------------------------
+    // PA-3 (code-review 2026-07-02): keyword scanners must not match inside
+    // string literals. Pre-fix, a COMMENT payload mentioning PRIMARY KEY
+    // fabricated pk_columns from comment text and discarded the comment.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_primary_key_inside_comment_string_not_fabricated() {
+        let result =
+            parse_tables_clause("o AS orders COMMENT = 'the PRIMARY KEY (id) lives here'", 0)
+                .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].pk_columns, Vec::<String>::new());
+        assert_eq!(
+            result[0].comment.as_deref(),
+            Some("the PRIMARY KEY (id) lives here")
+        );
+    }
+
+    #[test]
+    fn test_unique_inside_comment_string_not_fabricated() {
+        let result = parse_tables_clause(
+            "o AS orders PRIMARY KEY (id) COMMENT = 'a UNIQUE (x) mention'",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+        assert!(result[0].unique_constraints.is_empty());
+        assert_eq!(result[0].comment.as_deref(), Some("a UNIQUE (x) mention"));
+    }
+
+    // -----------------------------------------------------------------------
+    // PA-9 (code-review 2026-07-02): table-level COMMENT / WITH SYNONYMS on a
+    // table with no PK/UNIQUE used to be silently dropped (remainder was
+    // hard-set to ""), and trailing junk was silently ignored.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_no_pk_table_comment_and_synonyms_preserved() {
+        let result = parse_tables_clause(
+            "li AS line_items COMMENT = 'fact rows' WITH SYNONYMS = ('items', 'lines')",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].pk_columns, Vec::<String>::new());
+        assert_eq!(result[0].comment.as_deref(), Some("fact rows"));
+        assert_eq!(result[0].synonyms, vec!["items", "lines"]);
+    }
+
+    #[test]
+    fn test_table_entry_trailing_garbage_errors() {
+        let err = parse_tables_clause("o AS orders garbage COMMENT = 'x'", 0).unwrap_err();
+        assert!(
+            err.message.contains("Unexpected text"),
+            "expected trailing-garbage error, got: {}",
+            err.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PA-6 (code-review 2026-07-02): depth-0 scanners must honour
+    // double-quoted identifiers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_split_commas_ignores_comma_inside_quoted_ident() {
+        let entries = split_at_depth0_commas("o.x AS o.\"a,b\", o.y AS o.c");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, "o.x AS o.\"a,b\"");
+        assert_eq!(entries[1].1, "o.y AS o.c");
+    }
+
+    #[test]
+    fn test_quoted_ident_with_paren_does_not_close_clause() {
+        // `"tbl)x"` inside TABLES must not close the TABLES clause early.
+        let def = parse_keyword_body(
+            "AS TABLES (o AS \"tbl)x\" PRIMARY KEY (id)) DIMENSIONS (o.d AS o.c)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(def.tables.len(), 1);
+        assert_eq!(def.tables[0].table, "\"tbl)x\"");
+        assert_eq!(def.dimensions.len(), 1);
+    }
+
+    #[test]
+    fn test_dot_inside_quoted_name_not_a_qualifier() {
+        // Dimension bare name `"a.b"` — the inner dot is not a separator.
+        let entries = parse_qualified_entries("o.\"a.b\" AS o.c", 0, false, "dimensions").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "o");
+        assert_eq!(entries[0].1, "\"a.b\"");
+    }
+
+    #[test]
+    fn test_quoted_comment_column_usable_in_expression() {
+        // PA-9 companion: a column literally named `comment` is usable at
+        // depth 0 when quoted — the annotation scanner must not treat the
+        // quoted identifier as the COMMENT keyword.
+        let entries =
+            parse_qualified_entries("o.note AS o.\"comment\"", 0, false, "dimensions").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].2, "o.\"comment\"");
+        assert_eq!(entries[0].3, None);
+    }
+
+    #[test]
+    fn test_unterminated_quote_in_dimension_entry_errors() {
+        let err =
+            parse_qualified_entries("o.x AS o.\"unclosed", 0, false, "dimensions").unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "got: {}",
+            err.message
+        );
     }
 
     // -----------------------------------------------------------------------

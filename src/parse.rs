@@ -281,6 +281,10 @@ fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
 /// returns, vertical tabs, form feeds) between prefix keywords.
 #[must_use]
 pub fn detect_ddl_kind(query: &str) -> Option<DdlKind> {
+    // PA-7: comment-blind detection — also lets a comment sit between
+    // prefix keywords (`CREATE /* x */ SEMANTIC VIEW`).
+    let blanked = crate::util::blank_sql_comments(query);
+    let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end().trim_end_matches(';').trim();
     detect_ddl_prefix(trimmed).map(|(kind, _)| kind)
@@ -708,6 +712,10 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
 ///
 /// CREATE forms must go through `validate_and_rewrite` -> `rewrite_ddl_keyword_body`.
 fn rewrite_ddl(query: &str) -> Result<String, String> {
+    // PA-7: comment-blind rewriting (idempotent when the caller already
+    // blanked; only allocates when comments are present).
+    let blanked = crate::util::blank_sql_comments(query);
+    let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end();
     let trimmed = trimmed.trim_end_matches(';').trim();
@@ -792,6 +800,9 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
 /// DESCRIBE), and `Ok(None)` for SHOW (no name). Returns `Err` if the query
 /// is not a semantic view DDL statement or is malformed.
 pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
+    // PA-7: comment-blind name extraction.
+    let blanked = crate::util::blank_sql_comments(query);
+    let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end();
     let trimmed = trimmed.trim_end_matches(';').trim();
@@ -901,6 +912,9 @@ const DDL_PREFIXES: &[&str] = &[
 /// prefix. Returns `None` if no near-miss is found.
 #[must_use]
 pub fn detect_near_miss(query: &str) -> Option<ParseError> {
+    // PA-7: comment-blind near-miss detection.
+    let blanked = crate::util::blank_sql_comments(query);
+    let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end();
     let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
@@ -951,6 +965,13 @@ pub fn detect_near_miss(query: &str) -> Option<ParseError> {
 /// - `Ok(None)` -- not a semantic view DDL statement
 /// - `Err(ParseError)` -- validation error with message and optional position
 pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
+    // PA-7: blank comments once at the entry point (byte-length-preserving,
+    // so every error-caret position stays valid for the original query).
+    // Downstream scanners and captured expressions never see comment text —
+    // a trailing `-- oops` can no longer be absorbed into a stored
+    // expression or rename target.
+    let blanked = crate::util::blank_sql_comments(query);
+    let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end();
     let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
@@ -3508,6 +3529,69 @@ mod tests {
         );
         let sql = rewrite_ddl("DROP SEMANTIC VIEW\"my view\"").unwrap();
         assert_eq!(sql, "SELECT * FROM drop_semantic_view('my view')");
+    }
+
+    // ===================================================================
+    // PA-7 (code-review 2026-07-02): SQL comments are blanked once at the
+    // entry points, so they can no longer corrupt scanning state or be
+    // absorbed into stored expressions / rename targets.
+    // ===================================================================
+
+    #[test]
+    fn test_trailing_comment_after_name_is_ignored() {
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW a -- trailing comment").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('a')");
+    }
+
+    #[test]
+    fn test_alter_rename_trailing_comment_not_absorbed() {
+        // Pre-fix this renamed the view to `x -- oops`.
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a RENAME TO x -- oops").unwrap();
+        assert_eq!(sql, "SELECT * FROM alter_semantic_view_rename('a', 'x')");
+    }
+
+    #[test]
+    fn test_comment_between_prefix_keywords() {
+        assert_eq!(
+            detect_semantic_view_ddl("DROP /* which? */ SEMANTIC VIEW a"),
+            PARSE_DETECTED
+        );
+        let sql = rewrite_ddl("DROP /* which? */ SEMANTIC VIEW a").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('a')");
+    }
+
+    #[test]
+    fn test_comment_markers_inside_string_survive() {
+        // `--` inside a COMMENT string literal is content, not a comment.
+        let sql =
+            rewrite_ddl("ALTER SEMANTIC VIEW a SET COMMENT = 'keep -- this /* too */'").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM alter_semantic_view_set_comment('a', 'keep -- this /* too */')"
+        );
+    }
+
+    #[test]
+    fn test_nested_block_comment_fully_skipped() {
+        // Block comments nest per the SQL standard (PA-10).
+        let sql =
+            rewrite_ddl("/* outer /* inner */ still comment */ DROP SEMANTIC VIEW a").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('a')");
+    }
+
+    #[test]
+    fn test_comment_inside_create_body_not_stored() {
+        // A line comment inside the AS-body must not leak into the stored
+        // expression (pre-fix it commented out generated SQL downstream).
+        let result = validate_and_rewrite(
+            "CREATE SEMANTIC VIEW v AS TABLES (o AS orders PRIMARY KEY (id)) \
+             DIMENSIONS (o.d AS o.region /* region code */)",
+        );
+        let sql = result.unwrap().expect("statement is ours");
+        assert!(
+            !sql.contains("region code"),
+            "comment text leaked into rewrite: {sql}"
+        );
     }
 
     // ===================================================================

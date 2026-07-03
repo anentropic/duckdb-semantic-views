@@ -167,6 +167,162 @@ pub fn starts_with_keyword_ci(s: &str, kw: &str) -> bool {
     s.len() >= n && s.as_bytes()[..n].eq_ignore_ascii_case(kw.as_bytes())
 }
 
+/// Blank SQL comments out of `input`, byte-for-byte length-preserving.
+///
+/// Every byte of a comment — `-- ...` to end of line (the newline itself is
+/// kept), and `/* ... */` including the delimiters — is replaced with a
+/// space. Block comments NEST, matching `PostgreSQL`/`DuckDB` semantics (the SQL
+/// standard): `/* a /* b */ c */` is one comment. An unterminated block
+/// comment blanks to end of input.
+///
+/// Comment markers inside `'...'` string literals (with `''` escape),
+/// `"..."` quoted identifiers (with `""` escape), and `$tag$ ... $tag$`
+/// dollar-quoted strings are inert, and quote characters inside comments are
+/// inert.
+///
+/// Because the output length equals the input length and all replaced
+/// regions are bounded by ASCII delimiters, every byte offset into the
+/// output is valid for the input — error-caret positions computed on the
+/// blanked text reference the original query correctly.
+///
+/// This is the single comment-handling pass for the DDL surface (PA-7,
+/// code-review 2026-07-02): applied once at the parse entry points it makes
+/// every downstream scanner comment-immune, stops trailing comments being
+/// absorbed into stored expressions (`ALTER ... RENAME TO x -- oops` renamed
+/// to `x -- oops`), and fixes non-nesting block-comment handling (PA-10).
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn blank_sql_comments(input: &str) -> std::borrow::Cow<'_, str> {
+    #[derive(PartialEq)]
+    enum St {
+        Code,
+        InString,
+        InIdent,
+    }
+
+    let bytes = input.as_bytes();
+    let mut out: Option<Vec<u8>> = None; // allocated lazily on first comment
+    let mut st = St::Code;
+    let mut dollar_tag: Option<&[u8]> = None;
+    let mut i = 0;
+
+    // Try to read a dollar-quote opener `$tag$` at `i`; returns the tag
+    // including both `$` delimiters.
+    let read_dollar_tag = |i: usize| -> Option<&[u8]> {
+        if bytes[i] != b'$' {
+            return None;
+        }
+        let mut j = i + 1;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            // A tag may not START with a digit ($1 is a parameter, not a tag).
+            if j == i + 1 && bytes[j].is_ascii_digit() {
+                return None;
+            }
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'$' {
+            Some(&bytes[i..=j])
+        } else {
+            None
+        }
+    };
+
+    while i < bytes.len() {
+        if let Some(tag) = dollar_tag {
+            // Inside $tag$ ... $tag$ — scan for the closing tag.
+            if bytes[i] == b'$' && bytes[i..].starts_with(tag) {
+                i += tag.len();
+                dollar_tag = None;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        match st {
+            St::InString => {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    st = St::Code;
+                }
+                i += 1;
+            }
+            St::InIdent => {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    st = St::Code;
+                }
+                i += 1;
+            }
+            St::Code => match bytes[i] {
+                b'\'' => {
+                    st = St::InString;
+                    i += 1;
+                }
+                b'"' => {
+                    st = St::InIdent;
+                    i += 1;
+                }
+                b'$' => {
+                    if let Some(tag) = read_dollar_tag(i) {
+                        i += tag.len();
+                        dollar_tag = Some(tag);
+                    } else {
+                        i += 1;
+                    }
+                }
+                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                    // Line comment: blank to (not including) the newline.
+                    let buf = out.get_or_insert_with(|| bytes.to_vec());
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        buf[i] = b' ';
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    // Block comment — nesting; unterminated blanks to end.
+                    let buf = out.get_or_insert_with(|| bytes.to_vec());
+                    let mut depth = 0usize;
+                    while i < bytes.len() {
+                        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            buf[i] = b' ';
+                            buf[i + 1] = b' ';
+                            i += 2;
+                        } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            buf[i] = b' ';
+                            buf[i + 1] = b' ';
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        } else {
+                            buf[i] = b' ';
+                            i += 1;
+                        }
+                    }
+                }
+                _ => i += 1,
+            },
+        }
+    }
+
+    match out {
+        // Only whole comment regions (bounded by ASCII delimiters) were
+        // overwritten with ASCII spaces, so the buffer remains valid UTF-8.
+        Some(buf) => std::borrow::Cow::Owned(
+            String::from_utf8(buf).expect("blanking comment bytes preserves UTF-8 validity"),
+        ),
+        None => std::borrow::Cow::Borrowed(input),
+    }
+}
+
 /// Failure modes of [`extract_single_quoted_prefix`]. Callers map these onto
 /// their local error types/messages (`ParseError` in the body parser, plain
 /// `String` in the SHOW-clause parser).
@@ -457,6 +613,94 @@ mod tests {
         // here (PA-1); byte comparison just fails.
         assert!(!starts_with_keyword_ci("aΩΩ", "LIKE"));
         assert!(!starts_with_keyword_ci("Ωx", "IN"));
+    }
+
+    // -------------------------------------------------------------------
+    // blank_sql_comments tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn blank_comments_no_comments_borrows() {
+        let s = "SELECT 1";
+        assert!(matches!(
+            blank_sql_comments(s),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn blank_comments_line_comment() {
+        let out = blank_sql_comments("DROP SEMANTIC VIEW a -- oops\n;");
+        assert_eq!(out, "DROP SEMANTIC VIEW a        \n;");
+        assert_eq!(out.len(), "DROP SEMANTIC VIEW a -- oops\n;".len());
+    }
+
+    #[test]
+    fn blank_comments_block_comment_nested() {
+        // Nested per SQL standard (PostgreSQL/DuckDB behaviour).
+        let out = blank_sql_comments("a /* x /* y */ z */ b");
+        assert_eq!(out, "a                   b");
+    }
+
+    #[test]
+    fn blank_comments_unterminated_block_blanks_to_end() {
+        let out = blank_sql_comments("a /* never closed");
+        assert_eq!(out, "a                ");
+    }
+
+    #[test]
+    fn blank_comments_markers_inside_string_inert() {
+        let s = "COMMENT = 'a -- not a comment /* neither */'";
+        assert_eq!(blank_sql_comments(s), s);
+    }
+
+    #[test]
+    fn blank_comments_markers_inside_quoted_ident_inert() {
+        let s = "\"weird--name\" AS x";
+        assert_eq!(blank_sql_comments(s), s);
+    }
+
+    #[test]
+    fn blank_comments_markers_inside_dollar_quotes_inert() {
+        // YAML bodies ride in $$...$$ — '--' sequences inside must survive.
+        let s = "FROM YAML $$name: v\n# yaml comment\nvalue: a--b$$";
+        assert_eq!(blank_sql_comments(s), s);
+        let s = "FROM YAML $tag$ -- inert $tag$";
+        assert_eq!(blank_sql_comments(s), s);
+    }
+
+    #[test]
+    fn blank_comments_dollar_parameter_not_a_tag() {
+        // $1 is a parameter, not a dollar-quote opener; the comment after it
+        // must still be blanked.
+        let out = blank_sql_comments("WHERE x = $1 -- c");
+        assert_eq!(out, "WHERE x = $1     ");
+    }
+
+    #[test]
+    fn blank_comments_quote_inside_comment_inert() {
+        // An apostrophe inside a comment must not open a string region.
+        let out = blank_sql_comments("a -- don't\nb 'lit'");
+        assert_eq!(out, "a         \nb 'lit'");
+    }
+
+    #[test]
+    fn blank_comments_multibyte_inside_comment() {
+        let input = "x -- café ☕\ny";
+        let out = blank_sql_comments(input);
+        assert_eq!(out.len(), input.len());
+        assert!(out.starts_with("x  "));
+        assert!(out.ends_with("\ny"));
+        // Result must be valid UTF-8 by construction (checked by the type),
+        // and the non-comment text intact.
+        assert_eq!(&out[input.len() - 1..], "y");
+    }
+
+    #[test]
+    fn blank_comments_escaped_quote_in_string() {
+        let s = "'it''s -- fine' -- real";
+        let out = blank_sql_comments(s);
+        assert_eq!(out, "'it''s -- fine'        ");
     }
 
     // -------------------------------------------------------------------
