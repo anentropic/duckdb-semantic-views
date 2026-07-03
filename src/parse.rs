@@ -523,6 +523,7 @@ fn parse_for_metric<'a>(rest: &'a str, entity: &str) -> Result<(&'a str, &'a str
 /// Parse optional SHOW SEMANTIC filter clauses from text after the prefix.
 ///
 /// Clause order (Snowflake): LIKE, IN, FOR METRIC, STARTS WITH, LIMIT.
+#[allow(clippy::too_many_lines)]
 fn parse_show_filter_clauses<'a>(
     after_prefix: &'a str,
     kind: DdlKind,
@@ -586,10 +587,15 @@ fn parse_show_filter_clauses<'a>(
         for_metric = Some(metric_name);
     }
 
-    // 4. Check for STARTS WITH
-    if starts_with_keyword_ci(rest, "STARTS") {
+    // 4. Check for STARTS WITH. Word boundaries enforced (PA-10:
+    // `STARTSWITH 'a'` used to be accepted).
+    if starts_with_keyword_ci(rest, "STARTS")
+        && (rest.len() == 6 || rest.as_bytes()[6].is_ascii_whitespace())
+    {
         rest = rest[6..].trim_start();
-        if !starts_with_keyword_ci(rest, "WITH") {
+        let with_boundary_ok = starts_with_keyword_ci(rest, "WITH")
+            && (rest.len() == 4 || !rest.as_bytes()[4].is_ascii_alphanumeric());
+        if !with_boundary_ok {
             return Err(format!(
                 "Expected STARTS WITH. \
                  Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
@@ -601,8 +607,11 @@ fn parse_show_filter_clauses<'a>(
         rest = rest[consumed..].trim_start();
     }
 
-    // 5. Check for LIMIT
-    if starts_with_keyword_ci(rest, "LIMIT") {
+    // 5. Check for LIMIT. Word boundary enforced (PA-10: `LIMIT5` used to
+    // be accepted).
+    if starts_with_keyword_ci(rest, "LIMIT")
+        && (rest.len() == 5 || rest.as_bytes()[5].is_ascii_whitespace())
+    {
         rest = rest[5..].trim_start();
         let token_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let token = &rest[..token_end];
@@ -654,7 +663,6 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
     let view_name =
         normalize_view_name(raw_view_name).map_err(|e| format!("Invalid view name: {e}"))?;
     let rest = after_prefix[name_end..].trim();
-    let rest_upper = rest.to_ascii_uppercase();
     let safe_name = view_name.replace('\'', "''");
 
     let if_exists_suffix = if kind == DdlKind::AlterIfExists {
@@ -663,10 +671,24 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
         ""
     };
 
-    if rest_upper.starts_with("RENAME TO") {
-        let new_name_raw = rest["RENAME TO".len()..].trim();
-        if new_name_raw.is_empty() {
+    // Sub-operation keyword matching rides match_keyword_prefix so any
+    // amount of whitespace separates the keywords (PA-10: the old
+    // starts_with("RENAME TO") required exactly one space) and a trailing
+    // word boundary is enforced (PA-4 contract).
+    if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"rename", b"to"]) {
+        let after_op = rest[consumed..].trim();
+        if after_op.is_empty() {
             return Err("Missing new name after RENAME TO".to_string());
+        }
+        // Capture the (possibly quoted) new name, then reject trailing
+        // garbage — `RENAME TO x oops` must not rename to `x oops` (PA-5).
+        let new_name_end = find_identifier_end(after_op, false);
+        let new_name_raw = &after_op[..new_name_end];
+        let trailing = after_op[new_name_end..].trim();
+        if !trailing.is_empty() {
+            return Err(format!(
+                "Unexpected tokens after new view name in RENAME TO: '{trailing}'"
+            ));
         }
         let new_name = normalize_view_name(new_name_raw)
             .map_err(|e| format!("Invalid new view name in RENAME TO: {e}"))?;
@@ -675,8 +697,8 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
         Ok(format!(
             "SELECT * FROM {alter_fn}('{safe_name}', '{safe_new}')"
         ))
-    } else if rest_upper.starts_with("SET COMMENT") {
-        let after_set_comment = rest["SET COMMENT".len()..].trim_start();
+    } else if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"set", b"comment"]) {
+        let after_set_comment = rest[consumed..].trim_start();
         if !after_set_comment.starts_with('=') {
             return Err("Expected '=' after SET COMMENT".to_string());
         }
@@ -685,15 +707,27 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
             return Err("Expected single-quoted string after SET COMMENT =".to_string());
         }
         // Extract the quoted string handling '' escaping
-        let (comment_value, _consumed) =
+        let (comment_value, consumed_lit) =
             extract_quoted_string(after_eq).map_err(|e| format!("Invalid comment string: {e}"))?;
+        let trailing = after_eq[consumed_lit..].trim();
+        if !trailing.is_empty() {
+            return Err(format!(
+                "Unexpected tokens after SET COMMENT string: '{trailing}'"
+            ));
+        }
         // Re-escape for SQL embedding
         let safe_comment = comment_value.replace('\'', "''");
         let alter_fn = format!("alter_semantic_view_set_comment{if_exists_suffix}");
         Ok(format!(
             "SELECT * FROM {alter_fn}('{safe_name}', '{safe_comment}')"
         ))
-    } else if rest_upper.starts_with("UNSET COMMENT") {
+    } else if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"unset", b"comment"]) {
+        let trailing = rest[consumed..].trim();
+        if !trailing.is_empty() {
+            return Err(format!(
+                "Unexpected tokens after UNSET COMMENT: '{trailing}'"
+            ));
+        }
         let alter_fn = format!("alter_semantic_view_unset_comment{if_exists_suffix}");
         Ok(format!("SELECT * FROM {alter_fn}('{safe_name}')"))
     } else {
@@ -3591,6 +3625,43 @@ mod tests {
         assert!(
             !sql.contains("region code"),
             "comment text leaked into rewrite: {sql}"
+        );
+    }
+
+    // ===================================================================
+    // PA-10 (code-review 2026-07-02): boundary/whitespace nits.
+    // ===================================================================
+
+    #[test]
+    fn test_alter_subops_tolerate_multiple_spaces() {
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a RENAME  \t TO b").unwrap();
+        assert_eq!(sql, "SELECT * FROM alter_semantic_view_rename('a', 'b')");
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a SET   COMMENT = 'x'").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM alter_semantic_view_set_comment('a', 'x')"
+        );
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a UNSET\tCOMMENT").unwrap();
+        assert_eq!(sql, "SELECT * FROM alter_semantic_view_unset_comment('a')");
+    }
+
+    #[test]
+    fn test_alter_subops_reject_trailing_garbage() {
+        assert!(rewrite_ddl("ALTER SEMANTIC VIEW a RENAME TO x oops").is_err());
+        assert!(rewrite_ddl("ALTER SEMANTIC VIEW a SET COMMENT = 'x' oops").is_err());
+        assert!(rewrite_ddl("ALTER SEMANTIC VIEW a UNSET COMMENT oops").is_err());
+    }
+
+    #[test]
+    fn test_starts_with_and_limit_require_boundaries() {
+        // STARTSWITH / LIMIT5 used to be accepted without a word boundary.
+        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS STARTSWITH 'a'").is_err());
+        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS LIMIT5").is_err());
+        // The legal forms still parse.
+        let sql = rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITH 'a' LIMIT 5").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM list_semantic_views() WHERE name LIKE 'a%' LIMIT 5"
         );
     }
 

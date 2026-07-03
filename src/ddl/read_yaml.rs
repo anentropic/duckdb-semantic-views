@@ -20,8 +20,14 @@ use crate::render_yaml::render_yaml_export;
 
 /// Extract the bare view name from a potentially qualified name.
 /// Supports: `"view_name"`, `"schema.view_name"`, `"database.schema.view_name"`.
-fn resolve_bare_name(input: &str) -> &str {
-    input.rsplit('.').next().unwrap_or(input)
+///
+/// Delegates to [`crate::ident::normalize_view_name`] (PA-10, code-review
+/// 2026-07-02): the previous naive `rsplit('.')` split inside quoted parts,
+/// so `"a.b"` resolved to `b"` instead of `a.b`. Falls back to the input
+/// verbatim when it does not parse as an identifier (legacy behaviour for
+/// malformed names — the lookup then fails with "does not exist").
+fn resolve_bare_name(input: &str) -> String {
+    crate::ident::normalize_view_name(input).unwrap_or_else(|_| input.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -73,7 +79,7 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
         let bare_name = resolve_bare_name(raw_name);
 
         let reader = CatalogReader::new(&borrowed, probe_catalog_table_present(&borrowed));
-        let json = match reader.lookup(bare_name) {
+        let json = match reader.lookup(&bare_name) {
             Ok(Some(j)) => j,
             Ok(None) => {
                 write_err(
@@ -147,5 +153,20 @@ mod tests {
     #[test]
     fn resolve_bare_name_empty() {
         assert_eq!(resolve_bare_name(""), "");
+    }
+
+    #[test]
+    fn resolve_bare_name_quoted_dot_not_split() {
+        // PA-10: the old rsplit('.') split inside the quoted part.
+        assert_eq!(resolve_bare_name("\"a.b\""), "a.b");
+        assert_eq!(resolve_bare_name("main.\"my view\""), "my view");
+    }
+
+    #[test]
+    fn resolve_bare_name_folds_unquoted() {
+        // PA-8 consistency: unquoted references fold to lowercase like
+        // every other lookup path.
+        assert_eq!(resolve_bare_name("MyView"), "myview");
+        assert_eq!(resolve_bare_name("\"MyView\""), "MyView");
     }
 }
