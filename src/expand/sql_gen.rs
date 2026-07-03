@@ -1,9 +1,11 @@
 use crate::model::{AccessModifier, SemanticViewDefinition};
 use crate::util::{replace_word_boundary, suggest_closest};
 
-use super::facts::{inline_derived_metrics, inline_facts, toposort_facts};
+use super::facts::{
+    collect_transitive_metric_names, inline_derived_metrics, inline_facts, toposort_facts,
+};
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
-use super::join_resolver::{resolve_joins_pkfk, synthesize_on_clause, synthesize_on_clause_scoped};
+use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident};
 use super::role_playing::find_using_context;
 use super::types::{ExpandError, QueryRequest};
@@ -13,6 +15,11 @@ use super::types::{ExpandError, QueryRequest};
 ///
 /// Generic helper that deduplicates the resolution pattern used for
 /// dimensions, metrics, and facts.
+///
+/// Duplicate detection keys on the RESOLVED item's identity, not the raw
+/// request string (SG-14): `region` and `o.region` resolve to the same
+/// dimension and are rejected as duplicates instead of emitting the same
+/// column twice.
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn resolve_names<'a, T, N: AsRef<str>>(
     names: &[N],
@@ -26,12 +33,9 @@ fn resolve_names<'a, T, N: AsRef<str>>(
     make_private_err: impl Fn(String, String) -> ExpandError,
 ) -> Result<Vec<&'a T>, ExpandError> {
     let mut resolved = Vec::with_capacity(names.len());
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<*const T> = std::collections::HashSet::new();
     for name in names {
         let name_str = name.as_ref();
-        if !seen.insert(name_str.to_ascii_lowercase()) {
-            return Err(make_dup_err(view_name.to_string(), name_str.to_string()));
-        }
         let item = find_fn(name_str).ok_or_else(|| {
             let avail = available_fn();
             let suggestion = suggest_fn(name_str);
@@ -42,6 +46,9 @@ fn resolve_names<'a, T, N: AsRef<str>>(
                 suggestion,
             )
         })?;
+        if !seen.insert(std::ptr::from_ref(item)) {
+            return Err(make_dup_err(view_name.to_string(), name_str.to_string()));
+        }
         if is_private(item) {
             return Err(make_private_err(
                 view_name.to_string(),
@@ -139,6 +146,17 @@ fn expand_facts(
         .collect();
     validate_fact_table_path(view_name, def, &fact_tables, &dim_tables)?;
 
+    // 3b. Role-playing ambiguity detection (SG-17), mirroring the metrics
+    // path in expand(). Fact queries carry no metrics, so there is never a
+    // USING context to disambiguate: a dimension on a table reached by
+    // multiple named relationships always raises AmbiguousPath here — the
+    // same error the metrics path raises when no co-queried metric supplies
+    // USING. Previously the facts path skipped this check and silently bound
+    // the dimension to an arbitrary relationship edge.
+    for dim in &resolved_dims {
+        let _ = find_using_context(view_name, def, dim, &[])?;
+    }
+
     // 4. Resolve fact expressions via DAG inlining (fact-to-fact dependencies).
     let topo_order = toposort_facts(&def.facts).map_err(|e| ExpandError::CycleDetected {
         view_name: view_name.to_string(),
@@ -182,69 +200,16 @@ fn expand_facts(
         sql.push_str(&quote_ident(&base_ref.alias));
     }
 
-    // 7. JOIN clauses — resolve required joins for fact + dim tables.
-    // Build temporary Metric slice as empty (no metrics in fact queries)
-    let empty_mets: Vec<&crate::model::Metric> = vec![];
-    let ordered_aliases = resolve_joins_pkfk(def, &resolved_dims, &empty_mets);
-
-    // Also ensure fact source tables are included in join resolution.
-    let mut fact_aliases: Vec<String> = Vec::new();
-    for fact in &resolved_facts {
-        if let Some(ref st) = fact.source_table {
-            let lower = st.to_ascii_lowercase();
-            if !ordered_aliases
-                .iter()
-                .any(|a| a.to_ascii_lowercase() == lower)
-                && !fact_aliases.contains(&lower)
-                && def
-                    .tables
-                    .first()
-                    .is_none_or(|t| t.alias.to_ascii_lowercase() != lower)
-            {
-                fact_aliases.push(lower);
-            }
-        }
-    }
-
-    // Emit joins from resolve_joins_pkfk
-    for alias in &ordered_aliases {
-        let Some(join) = def.joins.iter().find(|j| {
-            j.table.to_ascii_lowercase() == *alias || j.from_alias.to_ascii_lowercase() == *alias
-        }) else {
-            continue;
-        };
-        let table_ref = def
-            .tables
-            .iter()
-            .find(|t| t.alias.to_ascii_lowercase() == *alias);
-        let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
-        sql.push_str("\nLEFT JOIN ");
-        sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
-        sql.push_str(" AS ");
-        sql.push_str(&quote_ident(alias));
-        sql.push_str(" ON ");
-        sql.push_str(&synthesize_on_clause(join, &def.tables));
-    }
-
-    // Emit additional joins for fact source tables not covered by dim resolution
-    for alias in &fact_aliases {
-        let Some(join) = def.joins.iter().find(|j| {
-            j.table.to_ascii_lowercase() == *alias || j.from_alias.to_ascii_lowercase() == *alias
-        }) else {
-            continue;
-        };
-        let table_ref = def
-            .tables
-            .iter()
-            .find(|t| t.alias.to_ascii_lowercase() == *alias);
-        let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
-        sql.push_str("\nLEFT JOIN ");
-        sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
-        sql.push_str(" AS ");
-        sql.push_str(&quote_ident(alias));
-        sql.push_str(" ON ");
-        sql.push_str(&synthesize_on_clause(join, &def.tables));
-    }
+    // 7. JOIN clauses — resolve required joins for dim + fact source tables.
+    // Fact queries have no metrics; fact source tables are resolved through
+    // the same path walk as dimensions (SG-10) and their joins are appended
+    // after the dimension-driven joins.
+    let fact_sources: Vec<String> = resolved_facts
+        .iter()
+        .filter_map(|f| f.source_table.clone())
+        .collect();
+    let resolved_joins = resolve_joins_pkfk(def, &resolved_dims, &[], &fact_sources);
+    push_join_clauses(&mut sql, &resolved_joins, def, "\nLEFT JOIN ");
 
     // NO GROUP BY — fact queries are unaggregated
 
@@ -370,13 +335,36 @@ pub fn expand(
         view_name: view_name.to_string(),
         cycle_description: e,
     })?;
-    let resolved_exprs =
-        inline_derived_metrics(&def.metrics, &def.facts, &topo_order).map_err(|e| {
-            ExpandError::CycleDetected {
-                view_name: view_name.to_string(),
-                cycle_description: e,
-            }
+    let resolved = inline_derived_metrics(&def.metrics, &def.facts, &topo_order, &def.tables)
+        .map_err(|e| ExpandError::CycleDetected {
+            view_name: view_name.to_string(),
+            cycle_description: e,
         })?;
+
+    // SG-8: fail loudly when a REQUESTED metric (directly, via a derived
+    // metric, or as a window metric's inner aggregate) depends on a COUNT(*)
+    // that could not be rewritten to COUNT(<pk>) — a non-base source table
+    // with no PRIMARY KEY declared. Emitting it as-is would count
+    // NULL-extended LEFT JOIN rows (one per childless base row).
+    if !resolved.count_star_no_pk.is_empty() {
+        for met in &resolved_mets {
+            for name in collect_transitive_metric_names(met, &def.metrics) {
+                if let Some(table_alias) = resolved.count_star_no_pk.get(&name) {
+                    let metric_name = def
+                        .metrics
+                        .iter()
+                        .find(|m| m.name.eq_ignore_ascii_case(&name))
+                        .map_or(name.clone(), |m| m.name.clone());
+                    return Err(ExpandError::CountStarRequiresPrimaryKey {
+                        view_name: view_name.to_string(),
+                        metric_name,
+                        table_alias: table_alias.clone(),
+                    });
+                }
+            }
+        }
+    }
+    let resolved_exprs = resolved.exprs;
 
     // Phase 31: Check for fan traps before generating SQL.
     check_fan_traps(view_name, def, &resolved_dims, &resolved_mets)?;
@@ -392,17 +380,15 @@ pub fn expand(
     // Phase 47: Check if any resolved metric ACTUALLY needs semi-additive expansion.
     // A semi-additive metric only needs CTE treatment when at least one of its
     // NA dims is NOT in the queried dimension set. When ALL NA dims are in the
-    // query, the metric acts as regular (Snowflake semantics).
+    // query, the metric acts as regular (Snowflake semantics). The predicate
+    // is shared with expand_semi_additive and the fan-trap check (SG-6).
     let queried_dim_names: std::collections::HashSet<String> = resolved_dims
         .iter()
         .map(|d| d.name.to_ascii_lowercase())
         .collect();
-    let has_active_semi_additive = resolved_mets.iter().any(|m| {
-        !m.non_additive_by.is_empty()
-            && m.non_additive_by
-                .iter()
-                .any(|na| !queried_dim_names.contains(&na.dimension.to_ascii_lowercase()))
-    });
+    let has_active_semi_additive = resolved_mets
+        .iter()
+        .any(|m| super::semi_additive::is_active_semi_additive(m, &queried_dim_names));
 
     if has_active_semi_additive {
         return super::semi_additive::expand_semi_additive(
@@ -503,55 +489,10 @@ pub fn expand(
     }
 
     // Join resolution via PK/FK graph (legacy resolve_joins removed in Phase 27).
-    // Phase 32: ordered_aliases may contain scoped aliases like "a__dep_airport".
-    let ordered_aliases = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets);
-    for alias in &ordered_aliases {
-        // Phase 32: Check if this is a scoped alias (contains "__").
-        if let Some(sep_pos) = alias.find("__") {
-            let rel_name = &alias[sep_pos + 2..];
-            // Find the Join by relationship name.
-            let Some(join) = def.joins.iter().find(|j| {
-                j.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(rel_name))
-            }) else {
-                continue;
-            };
-            // Find physical table name from the bare alias (before __).
-            let bare_alias = &alias[..sep_pos];
-            let table_ref = def
-                .tables
-                .iter()
-                .find(|t| t.alias.to_ascii_lowercase() == bare_alias);
-            let physical_table = table_ref.map_or(bare_alias, |t| t.table.as_str());
-            sql.push_str("\nLEFT JOIN ");
-            sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
-            sql.push_str(" AS ");
-            sql.push_str(&quote_ident(alias));
-            sql.push_str(" ON ");
-            sql.push_str(&synthesize_on_clause_scoped(join, &def.tables, alias));
-        } else {
-            // Standard bare alias join (non-role-playing).
-            let Some(join) = def.joins.iter().find(|j| {
-                j.table.to_ascii_lowercase() == *alias
-                    || j.from_alias.to_ascii_lowercase() == *alias
-            }) else {
-                continue;
-            };
-            // Find the TableRef for this alias to get the physical table name.
-            let table_ref = def
-                .tables
-                .iter()
-                .find(|t| t.alias.to_ascii_lowercase() == *alias);
-            let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
-            sql.push_str("\nLEFT JOIN ");
-            sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
-            sql.push_str(" AS ");
-            sql.push_str(&quote_ident(alias));
-            sql.push_str(" ON ");
-            sql.push_str(&synthesize_on_clause(join, &def.tables));
-        }
-    }
+    // The resolver returns structured edges in emission order; role-playing
+    // scoped joins (e.g. "a__dep_airport") follow the bare joins.
+    let resolved_joins = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets, &[]);
+    push_join_clauses(&mut sql, &resolved_joins, def, "\nLEFT JOIN ");
 
     // 7. GROUP BY (only when both dimensions and metrics are present).
     //    Use ordinal positions (GROUP BY 1, 2, ...) instead of expressions to avoid
@@ -2194,7 +2135,9 @@ GROUP BY
                     window_spec: None,
                 },
             ];
-            let resolved = inline_derived_metrics(&metrics, &[], &[]).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+                .unwrap()
+                .exprs;
             assert_eq!(
                 resolved.get("profit").unwrap(),
                 "(SUM(amount)) - (SUM(unit_cost))"
@@ -2253,7 +2196,9 @@ GROUP BY
                     window_spec: None,
                 },
             ];
-            let resolved = inline_derived_metrics(&metrics, &[], &[]).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+                .unwrap()
+                .exprs;
             assert_eq!(
                 resolved.get("profit").unwrap(),
                 "(SUM(amount)) - (SUM(unit_cost))"
@@ -2302,7 +2247,9 @@ GROUP BY
                 access: AccessModifier::Public,
             }];
             let topo_order = toposort_facts(&facts).unwrap();
-            let resolved = inline_derived_metrics(&metrics, &facts, &topo_order).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &facts, &topo_order, &[])
+                .unwrap()
+                .exprs;
             assert_eq!(
                 resolved.get("revenue").unwrap(),
                 "SUM((extended_price * (1 - discount)))"
@@ -2365,7 +2312,9 @@ GROUP BY
                     window_spec: None,
                 },
             ];
-            let resolved = inline_derived_metrics(&metrics, &[], &[]).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+                .unwrap()
+                .exprs;
             assert_eq!(
                 resolved.get("margin").unwrap(),
                 "((SUM(x)) - (SUM(y))) / (SUM(x))"
@@ -2412,7 +2361,9 @@ GROUP BY
                     window_spec: None,
                 },
             ];
-            let resolved = inline_derived_metrics(&metrics, &[], &[]).unwrap();
+            let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+                .unwrap()
+                .exprs;
             assert_eq!(
                 resolved.get("derived").unwrap(),
                 "(SUM(amount)) + (SUM(total))"
@@ -4063,6 +4014,660 @@ GROUP BY
             assert!(
                 sql.contains("DECIMAL(10,2)"),
                 "Must include output type: {sql}"
+            );
+        }
+    }
+
+    /// Regression tests for the join-emission overhaul (code review 2026-07-02,
+    /// findings SG-2, SG-10, SG-12): the resolver returns structured edges, so
+    /// the join emitted for an alias is always the edge connecting it to an
+    /// already-emitted table, independent of relationship declaration order,
+    /// and scoped role-playing aliases are never re-parsed from strings.
+    mod join_emission_regression_tests {
+        use super::*;
+        use crate::expand::test_helpers::TestFixtureExt;
+        use crate::model::SemanticViewDefinition;
+
+        /// li (base) -> o -> c chain with configurable relationship
+        /// declaration order.
+        fn li_o_c_def(o_to_c_first: bool) -> SemanticViewDefinition {
+            let def = SemanticViewDefinition::default()
+                .with_table("li", "line_items", &["id"])
+                .with_table("o", "orders", &["id"])
+                .with_table("c", "customers", &["id"])
+                .with_dimension("customer_name", "c.name", Some("c"))
+                .with_metric("total_qty", "sum(li.qty)", Some("li"));
+            if o_to_c_first {
+                def.with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"])
+                    .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"])
+            } else {
+                def.with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"])
+                    .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"])
+            }
+        }
+
+        /// SG-2: the join emitted for alias `o` must be the edge that connects
+        /// `o` to the already-emitted base (li -> o), not whichever declared
+        /// relationship mentions `o` first (o -> c would forward-reference the
+        /// not-yet-joined `c`). Both declaration orders must produce identical
+        /// SQL with no forward references and no dropped joins.
+        #[test]
+        fn sg2_join_selection_is_declaration_order_independent() {
+            let expected = "\
+SELECT
+    c.name AS \"customer_name\",
+    sum(li.qty) AS \"total_qty\"
+FROM \"line_items\" AS \"li\"
+LEFT JOIN \"orders\" AS \"o\" ON \"li\".\"order_id\" = \"o\".\"id\"
+LEFT JOIN \"customers\" AS \"c\" ON \"o\".\"customer_id\" = \"c\".\"id\"
+GROUP BY
+    1";
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("customer_name")],
+                metrics: vec![MetricName::new("total_qty")],
+            };
+            let sql_a = expand("test", &li_o_c_def(true), &req).unwrap();
+            let sql_b = expand("test", &li_o_c_def(false), &req).unwrap();
+            assert_eq!(sql_a, expected, "o->c declared first must be correct");
+            assert_eq!(sql_b, expected, "li->o declared first must be correct");
+        }
+
+        /// SG-2: a child table (`li`) with FKs to two parents (`p` declared
+        /// first, then `o` = base). Query needing only the li -> o edge must
+        /// emit it — not the first-declared li -> p edge, whose ON clause
+        /// would reference the never-joined `p`.
+        #[test]
+        fn sg2_two_parent_child_picks_connecting_edge() {
+            let def = SemanticViewDefinition::default()
+                .with_table("o", "orders", &["id"])
+                .with_table("li", "line_items", &["id"])
+                .with_table("p", "products", &["id"])
+                .with_dimension("region", "o.region", Some("o"))
+                .with_metric("qty", "sum(li.qty)", Some("li"))
+                .with_pkfk_join("li_to_p", "li", "p", &["product_id"], &["id"])
+                .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("region")],
+                metrics: vec![MetricName::new("qty")],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            let expected = "\
+SELECT
+    o.region AS \"region\",
+    sum(li.qty) AS \"qty\"
+FROM \"orders\" AS \"o\"
+LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"o\".\"id\"
+GROUP BY
+    1";
+            assert_eq!(sql, expected, "must join li via li->o, not li->p");
+            assert!(
+                !sql.contains("\"p\"."),
+                "ON clause must not reference the never-joined p: {sql}"
+            );
+        }
+
+        /// ld -> li -> o (base) chain: metric two hops below the root.
+        fn ld_li_o_def() -> SemanticViewDefinition {
+            SemanticViewDefinition::default()
+                .with_table("o", "orders", &["id"])
+                .with_table("li", "line_items", &["id"])
+                .with_table("ld", "line_item_details", &["id"])
+                .with_dimension("region", "o.region", Some("o"))
+                .with_metric("detail_qty", "sum(ld.qty)", Some("ld"))
+                .with_fact("detail_amount", "ld.amount", "ld")
+                .with_pkfk_join("ld_to_li", "ld", "li", &["line_item_id"], &["id"])
+                .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"])
+        }
+
+        /// SG-10: a needed table two hops below the root must pull in its
+        /// intermediate (`li`) and join in dependency order (li before ld),
+        /// with each ON clause referencing only already-joined tables.
+        #[test]
+        fn sg10_fk_side_chain_includes_intermediate_join() {
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("region")],
+                metrics: vec![MetricName::new("detail_qty")],
+            };
+            let sql = expand("test", &ld_li_o_def(), &req).unwrap();
+            let expected = "\
+SELECT
+    o.region AS \"region\",
+    sum(ld.qty) AS \"detail_qty\"
+FROM \"orders\" AS \"o\"
+LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"o\".\"id\"
+LEFT JOIN \"line_item_details\" AS \"ld\" ON \"ld\".\"line_item_id\" = \"li\".\"id\"
+GROUP BY
+    1";
+            assert_eq!(sql, expected);
+
+            // Reversed declaration order must produce the same SQL.
+            let mut def_rev = ld_li_o_def();
+            def_rev.joins.reverse();
+            let sql_rev = expand("test", &def_rev, &req).unwrap();
+            assert_eq!(sql_rev, expected, "declaration order must not matter");
+        }
+
+        /// SG-10 (facts path): `expand_facts` previously joined only the
+        /// fact's direct source table with no path walk; the intermediate
+        /// `li` join was missing entirely.
+        #[test]
+        fn sg10_fact_source_chain_includes_intermediate_join() {
+            let req = QueryRequest {
+                facts: vec!["detail_amount".to_string()],
+                dimensions: vec![],
+                metrics: vec![],
+            };
+            let sql = expand("test", &ld_li_o_def(), &req).unwrap();
+            let expected = "\
+SELECT
+    ld.amount AS \"detail_amount\"
+FROM \"orders\" AS \"o\"
+LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"o\".\"id\"
+LEFT JOIN \"line_item_details\" AS \"ld\" ON \"ld\".\"line_item_id\" = \"li\".\"id\"";
+            assert_eq!(sql, expected);
+        }
+
+        /// SG-12: a user table alias containing `__` is a bare alias, not a
+        /// role-playing scoped alias. It must be joined normally — previously
+        /// the emitter re-parsed the alias at the first `__`, looked up a
+        /// relationship named after the suffix, and silently dropped the join.
+        #[test]
+        fn sg12_bare_alias_containing_double_underscore_joins_normally() {
+            let def = SemanticViewDefinition::default()
+                .with_table("o", "orders", &["id"])
+                .with_table("my__dim", "dim_table", &["id"])
+                .with_dimension("dim_name", "my__dim.name", Some("my__dim"))
+                .with_metric("cnt", "count(*)", Some("o"))
+                .with_pkfk_join("o_to_dim", "o", "my__dim", &["dim_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("dim_name")],
+                metrics: vec![MetricName::new("cnt")],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            let expected = "\
+SELECT
+    my__dim.name AS \"dim_name\",
+    count(*) AS \"cnt\"
+FROM \"orders\" AS \"o\"
+LEFT JOIN \"dim_table\" AS \"my__dim\" ON \"o\".\"dim_id\" = \"my__dim\".\"id\"
+GROUP BY
+    1";
+            assert_eq!(sql, expected);
+        }
+
+        /// SG-12: role-playing scoped aliases keep the documented
+        /// `{alias}__{relationship}` SQL alias format, and the scoped alias is
+        /// used on the PK side of the ON clause.
+        #[test]
+        fn sg12_role_playing_scoped_alias_format_preserved() {
+            let def = SemanticViewDefinition::default()
+                .with_table("f", "flights", &["flight_id"])
+                .with_table("a", "airports", &["airport_code"])
+                .with_dimension("city", "a.city", Some("a"))
+                .with_metric("departure_count", "COUNT(*)", Some("f"))
+                .with_using_relationship("departure_count", &["dep_airport"])
+                .with_pkfk_join(
+                    "dep_airport",
+                    "f",
+                    "a",
+                    &["departure_code"],
+                    &["airport_code"],
+                )
+                .with_pkfk_join(
+                    "arr_airport",
+                    "f",
+                    "a",
+                    &["arrival_code"],
+                    &["airport_code"],
+                );
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("city")],
+                metrics: vec![MetricName::new("departure_count")],
+            };
+            let sql = expand("test", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN \"airports\" AS \"a__dep_airport\""),
+                "Scoped alias format {{alias}}__{{rel}} must be preserved: {sql}"
+            );
+            assert!(
+                sql.contains("\"f\".\"departure_code\" = \"a__dep_airport\".\"airport_code\""),
+                "ON clause must use the scoped alias on the PK side: {sql}"
+            );
+        }
+    }
+
+    // ===================================================================
+    // Code review 2026-07-02 remediation: SG-8 (COUNT(*) on non-base
+    // tables), SG-14 (qualified-name resolution), SG-17 (facts-path
+    // role-playing ambiguity).
+    // ===================================================================
+
+    mod count_star_rewrite_tests {
+        use super::*;
+        use crate::expand::test_helpers::{orders_view, TestFixtureExt};
+        use crate::model::WindowSpec;
+
+        /// `orders` (base) + `line_items` child with a declared PK.
+        fn child_count_def() -> crate::model::SemanticViewDefinition {
+            orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_dimension("region", "region", None)
+                .with_table("li", "line_items", &["id"])
+                .with_metric("item_count", "COUNT(*)", Some("li"))
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"])
+        }
+
+        #[test]
+        fn test_child_count_star_rewritten_exact_sql() {
+            // SG-8: COUNT(*) on the LEFT-JOINed child must count the child's
+            // PK, not NULL-extended rows (one per childless order).
+            let def = child_count_def();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("item_count")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+SELECT
+    COUNT(\"li\".\"id\") AS \"item_count\"
+FROM \"orders\" AS \"orders\"
+LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"orders\".\"id\"";
+            assert_eq!(sql, expected);
+        }
+
+        #[test]
+        fn test_child_count_star_rewritten_with_base_dimension() {
+            let def = child_count_def();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("region")],
+                metrics: vec![MetricName::new("item_count")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("COUNT(\"li\".\"id\") AS \"item_count\""),
+                "child COUNT(*) must be rewritten to COUNT(pk): {sql}"
+            );
+            assert!(sql.contains("GROUP BY"), "grouped query expected: {sql}");
+        }
+
+        #[test]
+        fn test_base_table_count_star_unchanged() {
+            // Metrics on the base table keep plain COUNT(*): the base table
+            // is never NULL-extended by the synthesized LEFT JOINs.
+            let def = child_count_def().with_metric("order_count", "COUNT(*)", Some("orders"));
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("order_count")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            let expected = "\
+SELECT
+    COUNT(*) AS \"order_count\"
+FROM \"orders\" AS \"orders\"";
+            assert_eq!(sql, expected);
+        }
+
+        #[test]
+        fn test_unqualified_count_star_metric_unchanged() {
+            // Legacy single-table shape: metric declared without a source
+            // table (None) is a base-table/derived metric — no rewrite.
+            let def = orders_view();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("order_count")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("count(*) AS \"order_count\""),
+                "COUNT(*) without a non-base source table must be preserved: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_child_count_star_without_pk_errors() {
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("li", "line_items", &[]) // no PK declared
+                .with_metric("item_count", "COUNT(*)", Some("li"))
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("item_count")],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match &err {
+                ExpandError::CountStarRequiresPrimaryKey {
+                    view_name,
+                    metric_name,
+                    table_alias,
+                } => {
+                    assert_eq!(view_name, "orders");
+                    assert_eq!(metric_name, "item_count");
+                    assert_eq!(table_alias, "li");
+                }
+                other => panic!("Expected CountStarRequiresPrimaryKey, got: {other}"),
+            }
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no PRIMARY KEY declared") && msg.contains("COUNT(*)"),
+                "error must explain the rewrite requirement: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_unrelated_metric_still_works_when_sibling_count_star_lacks_pk() {
+            // The no-PK failure is scoped to queries that actually use the
+            // metric: other metrics on the same view keep working.
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("li", "line_items", &[]) // no PK declared
+                .with_metric("item_count", "COUNT(*)", Some("li"))
+                .with_metric("revenue", "SUM(li.amount)", Some("li"))
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("revenue")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(sql.contains("SUM(li.amount)"), "SQL: {sql}");
+        }
+
+        #[test]
+        fn test_derived_metric_reaching_no_pk_count_star_errors() {
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("li", "line_items", &[]) // no PK declared
+                .with_metric("item_count", "COUNT(*)", Some("li"))
+                .with_metric("double_items", "item_count * 2", None)
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("double_items")],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match &err {
+                ExpandError::CountStarRequiresPrimaryKey { metric_name, .. } => {
+                    assert_eq!(
+                        metric_name, "item_count",
+                        "error must name the failing base metric"
+                    );
+                }
+                other => panic!("Expected CountStarRequiresPrimaryKey, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_derived_metric_inherits_rewritten_count_star() {
+            let def = child_count_def().with_metric("double_items", "item_count * 2", None);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("double_items")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("(COUNT(\"li\".\"id\")) * 2 AS \"double_items\""),
+                "derived metric must inline the REWRITTEN child count: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_window_inner_aggregate_gets_rewrite() {
+            // Window path: the inner aggregate is emitted from the shared
+            // resolved expressions, so the rewrite must appear in the CTE.
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("li", "line_items", &["id"])
+                .with_dimension("product", "li.product", Some("li"))
+                .with_metric("item_count", "COUNT(*)", Some("li"))
+                .with_metric("rolling_items", "AVG(item_count)", None)
+                .with_window_spec(
+                    "rolling_items",
+                    WindowSpec {
+                        window_function: "AVG".to_string(),
+                        inner_metric: "item_count".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("product")],
+                metrics: vec![MetricName::new("rolling_items")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("COUNT(\"li\".\"id\") AS \"item_count\""),
+                "window CTE inner aggregate must use the rewritten count: {sql}"
+            );
+        }
+
+        #[test]
+        fn test_semi_additive_co_query_uses_rewritten_count() {
+            // Semi-additive path: a same-grain COUNT(*) co-metric on the
+            // child table decomposes into a CTE capture of the child PK and
+            // an outer COUNT over it (NULL-extended rows excluded). The
+            // base-table COUNT(*) rejection in parse_snapshot_aggregate is
+            // untouched (covered by semi_additive tests).
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_dimension("customer_id", "customer_id", None)
+                .with_table("li", "line_items", &["id"])
+                .with_dimension("report_date", "li.report_date", Some("li"))
+                .with_metric("balance", "SUM(li.balance)", Some("li"))
+                .with_metric("txn_count", "COUNT(*)", Some("li"))
+                .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"])
+                .with_non_additive_by(
+                    "balance",
+                    &[(
+                        "report_date",
+                        crate::model::SortOrder::Desc,
+                        crate::model::NullsOrder::First,
+                    )],
+                );
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("customer_id")],
+                metrics: vec![MetricName::new("balance"), MetricName::new("txn_count")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("\"li\".\"id\" AS \"__sv_reg_1\""),
+                "CTE must capture the rewritten count argument: {sql}"
+            );
+            assert!(
+                sql.contains("COUNT(\"__sv_reg_1\") AS \"txn_count\""),
+                "outer select must re-aggregate the captured PK column: {sql}"
+            );
+        }
+    }
+
+    mod qualified_name_resolution_tests {
+        use super::*;
+        use crate::expand::test_helpers::{orders_view, TestFixtureExt};
+
+        #[test]
+        fn test_qualified_dimension_wrong_table_errors() {
+            // SG-14: no fallback to "any dimension with that bare name".
+            let def = orders_view();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("x.region")],
+                metrics: vec![MetricName::new("total_revenue")],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match err {
+                ExpandError::UnknownDimension { name, .. } => {
+                    assert_eq!(name, "x.region");
+                }
+                other => panic!("Expected UnknownDimension, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_qualified_metric_wrong_table_errors() {
+            let def = orders_view().clear_metrics().with_metric(
+                "total_revenue",
+                "sum(amount)",
+                Some("orders"),
+            );
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![MetricName::new("x.total_revenue")],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match err {
+                ExpandError::UnknownMetric { name, .. } => {
+                    assert_eq!(name, "x.total_revenue");
+                }
+                other => panic!("Expected UnknownMetric, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_base_alias_qualification_matches_unqualified_declaration() {
+            // A dimension declared without a source table is a base-table
+            // item; qualifying the request with the base alias must resolve.
+            let def = orders_view();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("orders.region")],
+                metrics: vec![MetricName::new("total_revenue")],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(sql.contains("region AS \"region\""), "SQL: {sql}");
+        }
+
+        #[test]
+        fn test_bare_and_qualified_same_dimension_rejected_as_duplicate() {
+            // SG-14: the duplicate check keys on the RESOLVED item, so
+            // `region` and `orders.region` cannot emit the column twice.
+            let def = orders_view();
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![
+                    DimensionName::new("region"),
+                    DimensionName::new("orders.region"),
+                ],
+                metrics: vec![],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match err {
+                ExpandError::DuplicateDimension { name, .. } => {
+                    assert_eq!(name, "orders.region");
+                }
+                other => panic!("Expected DuplicateDimension, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_bare_and_qualified_same_metric_rejected_as_duplicate() {
+            let def = orders_view().clear_metrics().with_metric(
+                "total_revenue",
+                "sum(amount)",
+                Some("orders"),
+            );
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![],
+                metrics: vec![
+                    MetricName::new("total_revenue"),
+                    MetricName::new("orders.total_revenue"),
+                ],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match err {
+                ExpandError::DuplicateMetric { name, .. } => {
+                    assert_eq!(name, "orders.total_revenue");
+                }
+                other => panic!("Expected DuplicateMetric, got: {other}"),
+            }
+        }
+    }
+
+    mod facts_path_role_playing_tests {
+        use super::*;
+        use crate::expand::test_helpers::{orders_view, TestFixtureExt};
+
+        fn role_playing_facts_def(two_rels: bool) -> crate::model::SemanticViewDefinition {
+            let def = orders_view()
+                .clear_dimensions()
+                .clear_metrics()
+                .with_table("a", "airports", &["code"])
+                .with_dimension("city", "a.city", Some("a"))
+                .with_fact("order_note", "orders.note", "orders")
+                .with_pkfk_join("dep_airport", "orders", "a", &["dep_code"], &["code"]);
+            if two_rels {
+                def.with_pkfk_join("arr_airport", "orders", "a", &["arr_code"], &["code"])
+            } else {
+                def
+            }
+        }
+
+        #[test]
+        fn test_facts_path_role_playing_dimension_raises_ambiguous_path() {
+            // SG-17: the facts path must run the same role-playing ambiguity
+            // detection as the metrics path. With two named relationships to
+            // `a` and no USING context (facts cannot supply one), the
+            // dimension is ambiguous — previously it silently bound to an
+            // arbitrary edge.
+            let def = role_playing_facts_def(true);
+            let req = QueryRequest {
+                facts: vec!["order_note".to_string()],
+                dimensions: vec![DimensionName::new("city")],
+                metrics: vec![],
+            };
+            let err = expand("orders", &def, &req).unwrap_err();
+            match err {
+                ExpandError::AmbiguousPath {
+                    dimension_name,
+                    dimension_table,
+                    available_relationships,
+                    ..
+                } => {
+                    assert_eq!(dimension_name, "city");
+                    assert_eq!(dimension_table, "a");
+                    assert!(
+                        available_relationships.contains(&"dep_airport".to_string())
+                            && available_relationships.contains(&"arr_airport".to_string()),
+                        "both relationships must be listed: {available_relationships:?}"
+                    );
+                }
+                other => panic!("Expected AmbiguousPath, got: {other}"),
+            }
+        }
+
+        #[test]
+        fn test_facts_path_single_relationship_dimension_ok() {
+            let def = role_playing_facts_def(false);
+            let req = QueryRequest {
+                facts: vec!["order_note".to_string()],
+                dimensions: vec![DimensionName::new("city")],
+                metrics: vec![],
+            };
+            let sql = expand("orders", &def, &req).unwrap();
+            assert!(
+                sql.contains("LEFT JOIN \"airports\" AS \"a\""),
+                "single relationship stays unambiguous: {sql}"
             );
         }
     }

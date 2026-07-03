@@ -123,6 +123,21 @@ FROM semantic_view('p46_analytics', dimensions := ['*'], metrics := ['o.order_co
 ----
 unqualified wildcard
 
+# SG-14 (code review 2026-07-02): a qualified name whose table part doesn't
+# match errors instead of silently resolving to another table's item
+# ('region' lives on o, not li).
+statement error
+FROM semantic_view('p46_analytics', dimensions := ['li.region'], metrics := ['o.order_count']);
+----
+unknown dimension 'li.region'
+
+# SG-14: bare + qualified spellings of the SAME dimension are a duplicate
+# request (previously both passed the seen-set and emitted the column twice).
+statement error
+FROM semantic_view('p46_analytics', dimensions := ['region', 'o.region'], metrics := ['o.order_count']);
+----
+duplicate dimension 'o.region'
+
 # ============================================================
 # explain_semantic_view with wildcards
 # ============================================================

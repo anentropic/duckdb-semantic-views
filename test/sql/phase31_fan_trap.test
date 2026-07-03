@@ -81,6 +81,19 @@ SELECT * FROM semantic_view('p31_sales', dimensions := ['status'], metrics := ['
 fan trap detected
 
 # ============================================================
+# Test 3b (SG-1, code review 2026-07-02): metric x metric fan trap.
+# order_count (from o) + revenue (from li) sit at different grains:
+# joining li multiplies o's rows per line item, silently inflating
+# order_count (East would count 2 instead of 1). No dimension is needed
+# to trigger the join -- multi-grain metric combinations are blocked.
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('p31_sales', metrics := ['order_count', 'revenue']);
+----
+fan trap detected
+
+# ============================================================
 # Test 4: Safe query -- metric from li, dimension from c
 # li.revenue (from li) + c.segment (from c): li->o->c is ManyToOne chain, safe
 # Enterprise: SUM(100+200) = 300, SMB: SUM(150) = 150

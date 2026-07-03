@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use duckdb::{Connection, Result};
+use duckdb::Connection;
 
 // Extension appended to the DuckDB file path to form the v0.1.0 companion file.
 // Used only in the one-time migration below. After the migration runs, the
@@ -28,7 +28,11 @@ const V010_COMPANION_EXT: &str = "semantic_views";
 /// companion-file migration (which INSERTs into the table) can run.
 /// Reader-path code in `CatalogReader` short-circuits separately when
 /// the table is genuinely absent. See 63-RESEARCH.md §3 Q2.
-pub fn init_catalog(con: &Connection, db_path: &str, is_read_only: bool) -> Result<()> {
+pub fn init_catalog(
+    con: &Connection,
+    db_path: &str,
+    is_read_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if is_read_only {
         return Ok(());
     }
@@ -53,19 +57,43 @@ pub fn init_catalog(con: &Connection, db_path: &str, is_read_only: bool) -> Resu
             p
         };
         if migration_path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&migration_path) {
-                if let Ok(migrated) =
-                    serde_json::from_str::<std::collections::HashMap<String, String>>(&contents)
-                {
-                    for (name, def) in &migrated {
-                        con.execute(
-                            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
-                            duckdb::params![name, def],
-                        )?;
-                    }
-                }
+            let contents = std::fs::read_to_string(&migration_path).map_err(|e| {
+                format!(
+                    "semantic_views: cannot read v0.1.0 companion file '{}': {e}. \
+                     The file was left in place — fix its permissions (or move it \
+                     away to skip migration) and re-LOAD.",
+                    migration_path.display()
+                )
+            })?;
+            let migrated: std::collections::HashMap<String, String> =
+                serde_json::from_str(&contents).map_err(|e| {
+                    format!(
+                        "semantic_views: v0.1.0 companion file '{}' is not valid JSON: {e}. \
+                         The file was left in place so its definitions are not lost — \
+                         repair it (or move it away to skip migration) and re-LOAD.",
+                        migration_path.display()
+                    )
+                })?;
+            for (name, def) in &migrated {
+                con.execute(
+                    "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
+                    duckdb::params![name, def],
+                )?;
             }
-            let _ = std::fs::remove_file(&migration_path);
+            // Delete ONLY after a fully successful import. Pre-fix the file was
+            // removed even when unreadable or corrupt, permanently destroying
+            // the user's pre-v0.2 definitions. A failed delete must also be an
+            // error: if the file survives, every subsequent LOAD re-imports
+            // this (now stale) snapshot over newer definitions via
+            // INSERT OR REPLACE.
+            std::fs::remove_file(&migration_path).map_err(|e| {
+                format!(
+                    "semantic_views: imported v0.1.0 companion file '{}' but could \
+                     not delete it: {e}. Delete it manually before the next LOAD to \
+                     avoid re-importing stale definitions.",
+                    migration_path.display()
+                )
+            })?;
         }
     }
 
@@ -453,6 +481,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn migration_corrupt_companion_file_errors_and_survives() {
+        // MS-2 (code-review 2026-07-02): pre-fix, an unreadable or corrupt
+        // v0.1.0 companion file was silently DELETED without importing —
+        // permanent loss of pre-v0.2 definitions. Post-fix init_catalog must
+        // error, and the file must be left in place for the user to repair.
+        let tmp = std::env::temp_dir();
+        let db_path_buf = tmp.join("test_ms2_corrupt.duckdb");
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
+        let companion = tmp.join("test_ms2_corrupt.duckdb.semantic_views");
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(&companion);
+
+        std::fs::write(&companion, "{not valid json").unwrap();
+        let con = Connection::open(db_path).expect("open file-backed DB");
+        let err = init_catalog(&con, db_path, false)
+            .expect_err("corrupt companion file must fail the load");
+        assert!(
+            err.to_string().contains("not valid JSON"),
+            "error should name the problem, got: {err}"
+        );
+        assert!(
+            companion.exists(),
+            "corrupt companion file must be left in place, not deleted"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(&companion);
+    }
+
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn migration_valid_companion_file_imports_then_deletes() {
+        let tmp = std::env::temp_dir();
+        let db_path_buf = tmp.join("test_ms2_valid.duckdb");
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
+        let companion = tmp.join("test_ms2_valid.duckdb.semantic_views");
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(&companion);
+
+        std::fs::write(
+            &companion,
+            r#"{"orders": "{\"base_table\":\"orders\",\"dimensions\":[],\"metrics\":[]}"}"#,
+        )
+        .unwrap();
+        let con = Connection::open(db_path).expect("open file-backed DB");
+        init_catalog(&con, db_path, false).expect("valid companion file imports cleanly");
+
+        let count: i64 = con
+            .query_row(
+                "SELECT count(*) FROM semantic_layer._definitions WHERE name = 'orders'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "companion definition should be imported");
+        assert!(
+            !companion.exists(),
+            "companion file should be deleted after a successful import"
+        );
+
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[cfg(not(feature = "extension"))]

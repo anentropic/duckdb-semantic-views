@@ -181,7 +181,8 @@ pub struct Metric {
     #[serde(default, skip_serializing_if = "AccessModifier::is_default")]
     pub access: AccessModifier,
     /// Dimensions this metric is non-additive by (snapshot aggregation).
-    /// When non-empty, expansion uses `ROW_NUMBER` CTE for snapshot selection.
+    /// When non-empty, expansion uses a `RANK`-based CTE for snapshot
+    /// selection (rows tied at the snapshot value all aggregate).
     /// Old stored JSON without this field deserializes with empty Vec.
     /// Not serialized when empty to preserve backward-compatible JSON.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

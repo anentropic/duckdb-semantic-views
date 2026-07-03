@@ -332,7 +332,7 @@ Declares named aggregation expressions, derived metrics, semi-additive metrics, 
            NON ADDITIVE BY (report_date DESC NULLS FIRST)
    )
 
-When a query does not include the non-additive dimension, the extension generates a CTE with ``ROW_NUMBER`` to select one snapshot row per group before aggregating. When the non-additive dimension is included in the query, the metric behaves as a standard additive metric.
+When a query does not include the non-additive dimension, the extension generates a CTE with ``RANK`` to select the snapshot rows per group before aggregating (rows tied at the snapshot ordering value all aggregate). When the non-additive dimension is included in the query, the metric behaves as a standard additive metric.
 
 See :ref:`howto-semi-additive` for details.
 

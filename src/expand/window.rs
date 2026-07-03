@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::model::{Metric, NullsOrder, SemanticViewDefinition, SortOrder};
 use crate::util::replace_word_boundary;
 
-use super::join_resolver::{resolve_joins_pkfk, synthesize_on_clause, synthesize_on_clause_scoped};
+use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 use super::types::ExpandError;
 
@@ -160,49 +160,8 @@ pub(super) fn expand_window_metrics(
     }
 
     // CTE JOINs
-    let ordered_aliases = resolve_joins_pkfk(def, resolved_dims, resolved_mets);
-    for alias in &ordered_aliases {
-        if let Some(sep_pos) = alias.find("__") {
-            let rel_name = &alias[sep_pos + 2..];
-            let Some(join) = def.joins.iter().find(|j| {
-                j.name
-                    .as_ref()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(rel_name))
-            }) else {
-                continue;
-            };
-            let bare_alias = &alias[..sep_pos];
-            let table_ref = def
-                .tables
-                .iter()
-                .find(|t| t.alias.to_ascii_lowercase() == bare_alias);
-            let physical_table = table_ref.map_or(bare_alias, |t| t.table.as_str());
-            sql.push_str("\n    LEFT JOIN ");
-            sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
-            sql.push_str(" AS ");
-            sql.push_str(&quote_ident(alias));
-            sql.push_str(" ON ");
-            sql.push_str(&synthesize_on_clause_scoped(join, &def.tables, alias));
-        } else {
-            let Some(join) = def.joins.iter().find(|j| {
-                j.table.to_ascii_lowercase() == *alias
-                    || j.from_alias.to_ascii_lowercase() == *alias
-            }) else {
-                continue;
-            };
-            let table_ref = def
-                .tables
-                .iter()
-                .find(|t| t.alias.to_ascii_lowercase() == *alias);
-            let physical_table = table_ref.map_or(alias.as_str(), |t| t.table.as_str());
-            sql.push_str("\n    LEFT JOIN ");
-            sql.push_str(&qualify_and_quote_table_ref(physical_table, def));
-            sql.push_str(" AS ");
-            sql.push_str(&quote_ident(alias));
-            sql.push_str(" ON ");
-            sql.push_str(&synthesize_on_clause(join, &def.tables));
-        }
-    }
+    let resolved_joins = resolve_joins_pkfk(def, resolved_dims, resolved_mets, &[]);
+    push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
 
     // CTE GROUP BY (all dimension columns)
     if !resolved_dims.is_empty() {
@@ -313,7 +272,7 @@ pub(super) fn expand_window_metrics(
 #[cfg(test)]
 mod tests {
     use crate::expand::test_helpers::{minimal_def, orders_view, TestFixtureExt};
-    use crate::expand::{expand, DimensionName, MetricName, QueryRequest};
+    use crate::expand::{expand, DimensionName, ExpandError, MetricName, QueryRequest};
     use crate::model::{NullsOrder, SortOrder, WindowOrderBy, WindowSpec};
 
     /// Single window metric with 3 dims -- CTE with GROUP BY all dims,
@@ -644,11 +603,17 @@ mod tests {
         );
     }
 
-    /// Fan trap check skips window metrics.
+    /// SG-6 (code review 2026-07-02): window metrics get the standard
+    /// fan-trap check. The previous unconditional `is_window()` skip was
+    /// based on the incorrect premise that the CTE pre-aggregation handles
+    /// fan-out — but the CTE's inner aggregate is computed OVER the
+    /// already-fanned join, so it is inflated before the window function
+    /// runs. This fixture (metric grain on `c`, dims on `a`, where a->c is
+    /// `ManyToOne`) fans `c`'s rows and must now error.
     #[test]
-    fn test_fan_trap_skips_window_metrics() {
-        // Multi-table view: window metric crosses many-to-one boundary.
-        // Without fan trap skip, this would error. With skip, it should succeed.
+    fn test_fan_trap_checks_window_metrics() {
+        // Multi-table view: window metric crosses many-to-one boundary
+        // in the fan-out direction.
         let def = orders_view()
             .with_table("customers", "customers", &[])
             .clear_dimensions()
@@ -682,12 +647,11 @@ mod tests {
             metrics: vec![MetricName::new("total_balance")],
         };
 
-        // Should NOT return a FanTrap error because window metrics are skipped
+        // Window metrics are checked like any other aggregate: fan-out error.
         let result = expand("test_view", &def, &req);
         assert!(
-            result.is_ok(),
-            "Window metric should skip fan trap: {:?}",
-            result.err()
+            matches!(result, Err(ExpandError::FanTrap { .. })),
+            "Window metric over a fanning join must be a fan trap error, got: {result:?}"
         );
     }
 

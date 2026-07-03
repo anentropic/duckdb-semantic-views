@@ -154,7 +154,7 @@ Routing Exclusions
 
 Two kinds of metrics are **always excluded** from materialization routing, even when a materialization declaration covers them:
 
-- **Semi-additive metrics** (declared with ``NON ADDITIVE BY``): These require snapshot selection logic (ROW_NUMBER CTE) that cannot be pre-computed in a materialization table.
+- **Semi-additive metrics** (declared with ``NON ADDITIVE BY``): These require snapshot selection logic (RANK CTE) that cannot be pre-computed in a materialization table.
 - **Window metrics** (declared with ``OVER``): These require CTE-based window expansion that depends on the queried dimensions.
 
 When a query includes any semi-additive or window metric, the extension skips all materializations and falls back to standard expansion, regardless of whether a matching materialization exists.
@@ -273,6 +273,34 @@ The ``MATERIALIZATIONS`` clause must appear after ``METRICS``. Move it to the en
 Each materialization entry must declare at least one dimension or one metric. A materialization with only a ``TABLE`` and neither ``DIMENSIONS`` nor ``METRICS`` is rejected.
 
 See :ref:`ref-error-messages` for the full list of materialization validation errors.
+
+
+.. _howto-materializations-staleness:
+
+Staleness and validation caveats
+================================
+
+Materialization tables are user-owned pre-aggregations. The routing engine
+matches a request against a materialization by **name sets only** -- it does
+not validate that the table's contents agree with the view's current metric
+expressions, nor that the table is fresh:
+
+- If you redefine a metric's expression with ``CREATE OR REPLACE SEMANTIC
+  VIEW`` but keep the metric name, routed queries keep returning the old
+  pre-aggregated numbers until you rebuild the table.
+- If the base tables change after the pre-aggregation was built, routed
+  results are stale until you rebuild it.
+- A missing or misnamed column in the materialization table surfaces as a
+  binder error at query time (the routed SQL selects columns by dimension
+  and metric name).
+
+Rebuild materialization tables whenever the underlying data or the view
+definition changes. Use :ref:`ref-explain-semantic-view` to confirm whether
+a given request routes to a materialization or falls back to raw expansion.
+
+Dimensions-only routed queries apply ``SELECT DISTINCT``, matching the raw
+expansion path's semantics, so duplicate rows in a pre-aggregation table do
+not change dimension listings.
 
 
 .. _howto-materializations-related:

@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::model::Fact;
-use crate::util::{is_word_boundary_char, replace_word_boundary, replace_word_boundary_any};
+use crate::model::{Fact, TableRef};
+use crate::util::{is_word_boundary_char, replace_word_boundary_any, replace_word_boundary_pairs};
+
+use super::resolution::quote_ident;
 
 /// Maximum allowed nesting depth for derived metric resolution.
 /// Prevents stack overflow from deeply nested metric chains that pass
@@ -214,6 +216,93 @@ pub(super) fn inline_facts(expr: &str, facts: &[Fact], topo_order: &[usize]) -> 
     result
 }
 
+/// Replace every `COUNT(*)` call in `expr` with `COUNT(<replacement_arg>)`.
+///
+/// Matches `count` case-insensitively at a word boundary, followed by
+/// optional whitespace, `(`, optional whitespace, `*`, optional whitespace,
+/// `)` — i.e. `COUNT(*)`, `count( * )`, etc. The original casing of the
+/// function name is preserved; only the argument is replaced. Occurrences
+/// inside single-quoted SQL string literals are left untouched.
+///
+/// Returns `None` when the expression contains no `COUNT(*)` call.
+pub(super) fn rewrite_count_star(expr: &str, replacement_arg: &str) -> Option<String> {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() + replacement_arg.len());
+    let mut copied = 0usize; // byte offset copied into `out` so far
+    let mut pos = 0usize;
+    let mut in_string = false;
+    let mut changed = false;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if byte == b'\'' {
+            in_string = !in_string;
+            pos += 1;
+            continue;
+        }
+        if in_string {
+            pos += 1;
+            continue;
+        }
+        if (byte == b'c' || byte == b'C')
+            && pos + 5 <= bytes.len()
+            && bytes[pos..pos + 5].eq_ignore_ascii_case(b"count")
+            && (pos == 0 || is_word_boundary_char(bytes[pos - 1]))
+        {
+            let mut open_paren = pos + 5;
+            while open_paren < bytes.len() && bytes[open_paren].is_ascii_whitespace() {
+                open_paren += 1;
+            }
+            if open_paren < bytes.len() && bytes[open_paren] == b'(' {
+                let mut star = open_paren + 1;
+                while star < bytes.len() && bytes[star].is_ascii_whitespace() {
+                    star += 1;
+                }
+                if star < bytes.len() && bytes[star] == b'*' {
+                    let mut close_paren = star + 1;
+                    while close_paren < bytes.len() && bytes[close_paren].is_ascii_whitespace() {
+                        close_paren += 1;
+                    }
+                    if close_paren < bytes.len() && bytes[close_paren] == b')' {
+                        // All scanned offsets sit on ASCII bytes, so slicing
+                        // is char-boundary safe. Copy through the `(`, swap
+                        // the `*` (and its padding) for the replacement.
+                        out.push_str(&expr[copied..=open_paren]);
+                        out.push_str(replacement_arg);
+                        out.push(')');
+                        copied = close_paren + 1;
+                        pos = close_paren + 1;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        pos += 1;
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&expr[copied..]);
+    Some(out)
+}
+
+/// Resolved metric expressions plus SG-8 rewrite failures.
+///
+/// Produced by [`inline_derived_metrics`]. `count_star_no_pk` is keyed by
+/// lowercased metric name and holds the lowercased source-table alias of each
+/// base metric whose `COUNT(*)` could NOT be rewritten (non-base source table
+/// with no PRIMARY KEY declared). Erroring is the caller's job so that only
+/// queries which actually use such a metric fail — unrelated metrics on the
+/// same view keep working.
+#[derive(Debug)]
+pub(super) struct ResolvedMetricExprs {
+    /// Lowercased metric name -> fully-resolved expression.
+    pub exprs: HashMap<String, String>,
+    /// Lowercased metric name -> lowercased source-table alias for metrics
+    /// with an unrewritable `COUNT(*)` (SG-8).
+    pub count_star_no_pk: HashMap<String, String>,
+}
+
 /// Topologically sort derived metrics by their inter-dependencies.
 ///
 /// Uses Kahn's algorithm. Only derived-to-derived edges are considered;
@@ -303,27 +392,70 @@ fn toposort_derived(
 /// Resolve all metric expressions: inline facts into base metrics, then inline
 /// base/derived metric references into derived metrics in topological order.
 ///
-/// Returns a map from lowercased metric name to its fully-resolved expression.
+/// Returns a map from lowercased metric name to its fully-resolved expression,
+/// plus the SG-8 rewrite failures (see [`ResolvedMetricExprs`]).
 ///
 /// Processing order:
-/// 1. Base metrics (`source_table.is_some()`): inline facts, store resolved expression
+/// 1. Base metrics (`source_table.is_some()`): inline facts, apply the SG-8
+///    `COUNT(*)` rewrite (below), store resolved expression
 /// 2. Derived metrics (`source_table.is_none()`): topologically sort by inter-metric deps,
 ///    then for each derived metric, replace all known metric name references with
 ///    parenthesized resolved expressions
+///
+/// # SG-8: `COUNT(*)` rewrite for non-base source tables
+///
+/// All synthesized joins are LEFT JOINs, so a metric sourced on a table other
+/// than the base/root table sees one NULL-extended row per base row with no
+/// match — `COUNT(*)` silently over-counts by one per childless parent. For
+/// every base metric whose `source_table` is not the first declared table,
+/// `COUNT(*)` is rewritten to `COUNT("<alias>"."<pk>")` using the FIRST
+/// PRIMARY KEY column declared for that table (NULL-extended rows have a NULL
+/// PK and are excluded from the count). The alias is lowercased to match the
+/// alias emitted in the JOIN clause. Metrics on the base table keep plain
+/// `COUNT(*)` — the base table is never NULL-extended. Because the rewrite
+/// runs here, at the shared base-metric resolution step, it propagates to
+/// every emission path that consumes resolved expressions: the main
+/// aggregation path, derived-metric inlining, semi-additive co-query
+/// decomposition, and window-metric inner aggregates. If the source table has
+/// no PRIMARY KEY declared the rewrite is impossible; the metric is recorded
+/// in `count_star_no_pk` and the caller errors when (and only when) a query
+/// actually uses it.
 pub(super) fn inline_derived_metrics(
     metrics: &[crate::model::Metric],
     facts: &[Fact],
     fact_topo_order: &[usize],
-) -> Result<HashMap<String, String>, String> {
+    tables: &[TableRef],
+) -> Result<ResolvedMetricExprs, String> {
     let mut resolved: HashMap<String, String> = HashMap::new();
+    let mut count_star_no_pk: HashMap<String, String> = HashMap::new();
+    let base_alias = tables.first().map(|t| t.alias.to_ascii_lowercase());
 
     // Step 1: Resolve base metrics (have source_table) with fact inlining
     for met in metrics.iter().filter(|m| m.source_table.is_some()) {
-        let expr = if facts.is_empty() {
+        let mut expr = if facts.is_empty() {
             met.expr.clone()
         } else {
             inline_facts(&met.expr, facts, fact_topo_order)
         };
+        // SG-8: COUNT(*) on a non-base source table (see doc comment above).
+        if let Some(ref st) = met.source_table {
+            let st_lower = st.to_ascii_lowercase();
+            if base_alias.as_deref() != Some(st_lower.as_str()) {
+                let pk = tables
+                    .iter()
+                    .find(|t| t.alias.to_ascii_lowercase() == st_lower)
+                    .and_then(|t| t.pk_columns.first());
+                if let Some(pk) = pk {
+                    let qualified_pk = format!("{}.{}", quote_ident(&st_lower), quote_ident(pk));
+                    if let Some(rewritten) = rewrite_count_star(&expr, &qualified_pk) {
+                        expr = rewritten;
+                    }
+                } else if rewrite_count_star(&expr, "*").is_some() {
+                    // No PK declared (or unknown alias): rewrite impossible.
+                    count_star_no_pk.insert(met.name.to_ascii_lowercase(), st_lower);
+                }
+            }
+        }
         resolved.insert(met.name.to_ascii_lowercase(), expr);
     }
 
@@ -335,7 +467,10 @@ pub(super) fn inline_derived_metrics(
         .collect();
 
     if derived.is_empty() {
-        return Ok(resolved);
+        return Ok(ResolvedMetricExprs {
+            exprs: resolved,
+            count_star_no_pk,
+        });
     }
 
     // Step 3: Topologically sort derived metrics and inline in order
@@ -353,19 +488,106 @@ pub(super) fn inline_derived_metrics(
     for idx in derived_topo {
         let met = derived[idx].1;
         // Start with the raw expression, with facts inlined first
-        let mut expr = if facts.is_empty() {
+        let raw_expr = if facts.is_empty() {
             met.expr.clone()
         } else {
             inline_facts(&met.expr, facts, fact_topo_order)
         };
-        // Replace each known metric name with its resolved expression (parenthesized)
-        for (name, replacement) in &resolved {
-            expr = replace_word_boundary(&expr, name, &format!("({replacement})"));
-        }
+        // Replace every known metric name with its resolved expression
+        // (parenthesized) in ONE combined left-to-right pass. Sequential
+        // per-name replace_word_boundary calls iterated the HashMap in
+        // nondeterministic order and re-scanned earlier substitutions: a
+        // metric named like a column used in another metric's expression
+        // (`revenue` vs `SUM(o.revenue)` — `.` is a word boundary) was
+        // double-substituted into invalid nested-aggregate SQL on a
+        // hash-seed-dependent fraction of runs (SG-3, code-review
+        // 2026-07-02). Pair order is deterministic (longest needle first,
+        // then lexicographic), mirroring `inline_facts`.
+        let expr = {
+            let mut entries: Vec<(&str, String)> = resolved
+                .iter()
+                .map(|(name, replacement)| (name.as_str(), format!("({replacement})")))
+                .collect();
+            entries.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+            let pairs: Vec<(&str, &str)> = entries.iter().map(|(n, r)| (*n, r.as_str())).collect();
+            replace_word_boundary_pairs(&raw_expr, &pairs)
+        };
         resolved.insert(met.name.to_ascii_lowercase(), expr);
     }
 
-    Ok(resolved)
+    Ok(ResolvedMetricExprs {
+        exprs: resolved,
+        count_star_no_pk,
+    })
+}
+
+/// True when `expr_lower` references `name` at a word boundary.
+///
+/// Both arguments must already be lowercased. Shared byte-scan used by the
+/// transitive metric walks.
+fn references_name(expr_lower: &str, name: &str) -> bool {
+    let expr_bytes = expr_lower.as_bytes();
+    let name_bytes = name.as_bytes();
+    let name_len = name_bytes.len();
+    let mut pos = 0;
+    while pos + name_len <= expr_bytes.len() {
+        if &expr_bytes[pos..pos + name_len] == name_bytes {
+            let before_ok = pos == 0 || is_word_boundary_char(expr_bytes[pos - 1]);
+            let after_ok = pos + name_len == expr_bytes.len()
+                || is_word_boundary_char(expr_bytes[pos + name_len]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        pos += 1;
+    }
+    false
+}
+
+/// Collect the lowercased names of `met` and every metric it transitively
+/// depends on: derived metrics contribute the metric names referenced in
+/// their expressions; window metrics contribute their inner metric.
+///
+/// Used by the SG-8 check in `expand()` to decide whether a requested metric
+/// reaches a base metric whose `COUNT(*)` could not be rewritten.
+pub(super) fn collect_transitive_metric_names(
+    met: &crate::model::Metric,
+    all_metrics: &[crate::model::Metric],
+) -> HashSet<String> {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = vec![met.name.to_ascii_lowercase()];
+
+    let name_map: HashMap<String, &crate::model::Metric> = all_metrics
+        .iter()
+        .map(|m| (m.name.to_ascii_lowercase(), m))
+        .collect();
+    let all_names: Vec<String> = all_metrics
+        .iter()
+        .map(|m| m.name.to_ascii_lowercase())
+        .collect();
+
+    while let Some(current_name) = stack.pop() {
+        if !visited.insert(current_name.clone()) {
+            continue;
+        }
+        let Some(current_met) = name_map.get(&current_name) else {
+            continue;
+        };
+        if let Some(ref ws) = current_met.window_spec {
+            stack.push(ws.inner_metric.to_ascii_lowercase());
+        }
+        if current_met.source_table.is_none() {
+            // Derived metric: find referenced metric names and push to stack
+            let expr_lower = current_met.expr.to_ascii_lowercase();
+            for name in &all_names {
+                if *name != current_name && references_name(&expr_lower, name) {
+                    stack.push(name.clone());
+                }
+            }
+        }
+    }
+
+    visited
 }
 
 /// Collect source tables needed by a derived metric by walking the metric
@@ -483,12 +705,58 @@ mod tests {
     }
 
     #[test]
+    fn inline_derived_metrics_name_matching_column_is_not_double_substituted() {
+        // SG-3 regression (code-review 2026-07-02): metric `revenue` also
+        // appears as the column reference `o.revenue` inside `tax`'s
+        // expression (`.` is a word boundary). The old sequential per-name
+        // substitution re-scanned inserted text in HashMap iteration order:
+        // when `tax` happened to be inlined first, the subsequent `revenue`
+        // pass also matched `revenue` inside the freshly inserted
+        // `SUM(o.revenue * 0.1)`, corrupting the expression into invalid
+        // nested-aggregate SQL on a hash-seed-dependent fraction of runs.
+        // The single combined pass must produce this exact expression, every
+        // run.
+        let metrics = vec![
+            make_metric("revenue", "SUM(o.revenue)", Some("o")),
+            make_metric("tax", "SUM(o.revenue * 0.1)", Some("o")),
+            make_metric("after_tax", "revenue - tax", None),
+        ];
+        let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+            .unwrap()
+            .exprs;
+        assert_eq!(
+            resolved.get("after_tax").unwrap(),
+            "(SUM(o.revenue)) - (SUM(o.revenue * 0.1))"
+        );
+    }
+
+    #[test]
+    fn inline_derived_metrics_chained_derived_not_rescanned() {
+        // A derived metric referencing another derived metric: the inner
+        // resolution is inserted verbatim and must not be re-scanned even
+        // though it contains the names of other metrics.
+        let metrics = vec![
+            make_metric("revenue", "SUM(o.revenue)", Some("o")),
+            make_metric("cost", "SUM(o.cost)", Some("o")),
+            make_metric("profit", "revenue - cost", None),
+            make_metric("margin", "profit / revenue", None),
+        ];
+        let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+            .unwrap()
+            .exprs;
+        assert_eq!(
+            resolved.get("margin").unwrap(),
+            "((SUM(o.revenue)) - (SUM(o.cost))) / (SUM(o.revenue))"
+        );
+    }
+
+    #[test]
     fn inline_derived_metrics_cycle_returns_err() {
         let metrics = vec![
             make_metric("a", "b + 1", None),
             make_metric("b", "a + 1", None),
         ];
-        let result = inline_derived_metrics(&metrics, &[], &[]);
+        let result = inline_derived_metrics(&metrics, &[], &[], &[]);
         assert!(result.is_err(), "Cycle should produce error");
         let err = result.unwrap_err();
         assert!(err.contains("cycle"), "Error should mention cycle: {err}");
@@ -501,9 +769,9 @@ mod tests {
             make_metric("cost", "SUM(unit_cost)", Some("o")),
             make_metric("profit", "revenue - cost", None),
         ];
-        let result = inline_derived_metrics(&metrics, &[], &[]);
+        let result = inline_derived_metrics(&metrics, &[], &[], &[]);
         assert!(result.is_ok(), "Non-cyclic should succeed");
-        let resolved = result.unwrap();
+        let resolved = result.unwrap().exprs;
         assert_eq!(
             resolved.get("profit").unwrap(),
             "(SUM(amount)) - (SUM(unit_cost))"
@@ -523,12 +791,149 @@ mod tests {
                 None,
             ));
         }
-        let result = inline_derived_metrics(&metrics, &[], &[]);
+        let result = inline_derived_metrics(&metrics, &[], &[], &[]);
         assert!(result.is_err(), "Depth exceeding limit should error");
         let err = result.unwrap_err();
         assert!(
             err.contains("nesting depth") && err.contains("maximum"),
             "Error should mention depth limit: {err}"
+        );
+    }
+
+    // --- rewrite_count_star tests (SG-8) ---
+
+    fn make_table(alias: &str, pk: &[&str]) -> TableRef {
+        TableRef {
+            alias: alias.to_string(),
+            table: alias.to_string(),
+            pk_columns: pk.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rewrite_count_star_basic() {
+        assert_eq!(
+            rewrite_count_star("COUNT(*)", "\"li\".\"id\"").as_deref(),
+            Some("COUNT(\"li\".\"id\")")
+        );
+    }
+
+    #[test]
+    fn rewrite_count_star_preserves_case_and_handles_spaces() {
+        assert_eq!(
+            rewrite_count_star("count( * )", "\"li\".\"id\"").as_deref(),
+            Some("count(\"li\".\"id\")")
+        );
+        assert_eq!(
+            rewrite_count_star("Count (*)", "x").as_deref(),
+            Some("Count (x)")
+        );
+    }
+
+    #[test]
+    fn rewrite_count_star_inside_larger_expression() {
+        assert_eq!(
+            rewrite_count_star("COUNT(*) * 2 + COUNT(*)", "\"li\".\"id\"").as_deref(),
+            Some("COUNT(\"li\".\"id\") * 2 + COUNT(\"li\".\"id\")")
+        );
+    }
+
+    #[test]
+    fn rewrite_count_star_none_when_absent() {
+        assert!(rewrite_count_star("COUNT(li.id)", "x").is_none());
+        assert!(rewrite_count_star("SUM(amount)", "x").is_none());
+        // `*` as multiplication, not a star argument
+        assert!(rewrite_count_star("COUNT(a * b)", "x").is_none());
+    }
+
+    #[test]
+    fn rewrite_count_star_skips_string_literals_and_word_boundaries() {
+        // Inside a single-quoted literal: untouched.
+        assert!(rewrite_count_star("'COUNT(*)'", "x").is_none());
+        // `miscount(*)` is not `count` at a word boundary.
+        assert!(rewrite_count_star("miscount(*)", "x").is_none());
+    }
+
+    // --- inline_derived_metrics COUNT(*) rewrite tests (SG-8) ---
+
+    #[test]
+    fn inline_derived_metrics_rewrites_count_star_on_non_base_table() {
+        let tables = vec![make_table("o", &["id"]), make_table("li", &["id"])];
+        let metrics = vec![make_metric("item_count", "COUNT(*)", Some("li"))];
+        let resolved = inline_derived_metrics(&metrics, &[], &[], &tables).unwrap();
+        assert_eq!(
+            resolved.exprs.get("item_count").unwrap(),
+            "COUNT(\"li\".\"id\")"
+        );
+        assert!(resolved.count_star_no_pk.is_empty());
+    }
+
+    #[test]
+    fn inline_derived_metrics_keeps_count_star_on_base_table() {
+        let tables = vec![make_table("o", &["id"]), make_table("li", &["id"])];
+        let metrics = vec![make_metric("order_count", "COUNT(*)", Some("o"))];
+        let resolved = inline_derived_metrics(&metrics, &[], &[], &tables).unwrap();
+        assert_eq!(resolved.exprs.get("order_count").unwrap(), "COUNT(*)");
+        assert!(resolved.count_star_no_pk.is_empty());
+    }
+
+    #[test]
+    fn inline_derived_metrics_records_no_pk_failure() {
+        // li declares no PRIMARY KEY: the rewrite is impossible and the
+        // metric is recorded so the caller can error when it is queried.
+        let tables = vec![make_table("o", &["id"]), make_table("li", &[])];
+        let metrics = vec![make_metric("item_count", "COUNT(*)", Some("li"))];
+        let resolved = inline_derived_metrics(&metrics, &[], &[], &tables).unwrap();
+        assert_eq!(resolved.exprs.get("item_count").unwrap(), "COUNT(*)");
+        assert_eq!(
+            resolved
+                .count_star_no_pk
+                .get("item_count")
+                .map(String::as_str),
+            Some("li")
+        );
+    }
+
+    #[test]
+    fn inline_derived_metrics_rewrite_propagates_into_derived() {
+        // The rewrite runs at base-metric resolution, BEFORE derived-metric
+        // inlining, so derived metrics inherit the rewritten text.
+        let tables = vec![make_table("o", &["id"]), make_table("li", &["li_id"])];
+        let metrics = vec![
+            make_metric("item_count", "COUNT(*)", Some("li")),
+            make_metric("double_items", "item_count * 2", None),
+        ];
+        let resolved = inline_derived_metrics(&metrics, &[], &[], &tables).unwrap();
+        assert_eq!(
+            resolved.exprs.get("double_items").unwrap(),
+            "(COUNT(\"li\".\"li_id\")) * 2"
+        );
+    }
+
+    // --- collect_transitive_metric_names tests (SG-8 check support) ---
+
+    #[test]
+    fn collect_transitive_metric_names_derived_and_window() {
+        let mut window_met = make_metric("rolling_items", "AVG(item_count)", None);
+        window_met.window_spec = Some(crate::model::WindowSpec {
+            window_function: "AVG".to_string(),
+            inner_metric: "item_count".to_string(),
+            ..Default::default()
+        });
+        let metrics = vec![
+            make_metric("item_count", "COUNT(*)", Some("li")),
+            make_metric("double_items", "item_count * 2", None),
+            window_met,
+        ];
+        let via_derived = collect_transitive_metric_names(&metrics[1], &metrics);
+        assert!(via_derived.contains("double_items"));
+        assert!(via_derived.contains("item_count"));
+        let via_window = collect_transitive_metric_names(&metrics[2], &metrics);
+        assert!(via_window.contains("rolling_items"));
+        assert!(
+            via_window.contains("item_count"),
+            "window metrics must chase their inner metric: {via_window:?}"
         );
     }
 

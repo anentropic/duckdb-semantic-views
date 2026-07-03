@@ -157,7 +157,15 @@ fn build_materialized_sql(
     }
 
     let mut sql = String::with_capacity(128);
-    sql.push_str("SELECT\n");
+    if mets.is_empty() {
+        // Dims-only requests emit SELECT DISTINCT on the normal expansion
+        // path; a routed query must match those semantics — a materialization
+        // table containing duplicate rows would otherwise silently change
+        // results (SG-11, code-review 2026-07-02).
+        sql.push_str("SELECT DISTINCT\n");
+    } else {
+        sql.push_str("SELECT\n");
+    }
     sql.push_str(&items.join(",\n"));
     sql.push_str("\nFROM ");
     sql.push_str(&qualify_and_quote_table_ref(table, def));
@@ -486,6 +494,42 @@ mod tests {
         assert!(
             try_route_materialization(&def, &dims, &mets).is_none(),
             "dims-only query should not match mat that has metrics"
+        );
+    }
+
+    // ================================================
+    // Dims-only routed queries apply SELECT DISTINCT (SG-11)
+    // ================================================
+
+    #[test]
+    fn dims_only_routed_query_selects_distinct() {
+        let def =
+            orders_view().with_materialization("region_list", "region_table", &["region"], &[]);
+        let dims = resolve_dims(&def, &["region"]);
+        let mets: Vec<&Metric> = vec![];
+        let sql = try_route_materialization(&def, &dims, &mets)
+            .expect("dims-only mat should match dims-only query");
+        assert!(
+            sql.starts_with("SELECT DISTINCT"),
+            "dims-only routed SQL must apply DISTINCT to match the raw \
+             expansion path's semantics (SG-11): {sql}"
+        );
+    }
+
+    #[test]
+    fn routed_query_with_metrics_does_not_select_distinct() {
+        let def = orders_view().with_materialization(
+            "region_agg",
+            "agg_table",
+            &["region"],
+            &["total_revenue"],
+        );
+        let dims = resolve_dims(&def, &["region"]);
+        let mets = resolve_mets(&def, &["total_revenue"]);
+        let sql = try_route_materialization(&def, &dims, &mets).expect("exact match should route");
+        assert!(
+            sql.starts_with("SELECT\n"),
+            "routed SQL with metrics must not apply DISTINCT: {sql}"
         );
     }
 

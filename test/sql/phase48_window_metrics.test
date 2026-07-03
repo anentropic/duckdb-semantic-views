@@ -208,9 +208,11 @@ METRIC	avg_qty	p48_sales	WINDOW_SPEC	AVG(total_qty) OVER (PARTITION BY EXCLUDING
 METRIC	qty_lag	p48_sales	WINDOW_SPEC	LAG(total_qty, 1) OVER (PARTITION BY EXCLUDING date ORDER BY date)
 
 # ========================================
-# Test 9: Fan trap skip for window metrics
-# Create a view where metric crosses many-to-one boundary
-# Window metric should NOT trigger fan trap error
+# Test 9: Window metric over a safe many-to-one join direction
+# SG-6 (code review 2026-07-02): window metrics no longer skip the fan trap
+# check — their inner aggregate is computed over the joined rows. This query
+# stays valid because the metric's grain is on o (the FK side); joining o to
+# its parent c (o->c many-to-one, forward direction) never fans o's rows.
 # ========================================
 
 statement ok
@@ -251,8 +253,7 @@ METRICS (
     o.running_avg AS AVG(total_amount) OVER (PARTITION BY EXCLUDING order_date ORDER BY order_date ASC NULLS LAST)
 )
 
-# This would be a fan trap for regular aggregate on o queried with c.customer_name,
-# but window metrics skip fan trap check.
+# Metric grain on o (child), dims on c (parent) and o: safe direction, no error.
 query TTR rowsort
 SELECT * FROM semantic_view('p48_fan_view', dimensions := ['customer_name', 'order_date'], metrics := ['running_avg']);
 ----

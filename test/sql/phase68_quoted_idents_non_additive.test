@@ -45,7 +45,7 @@ true
 # `o."order date"` must be parsed AND name-resolved to the dimension whose
 # (source_alias, name) is (`o`, `"order date"`). End-to-end semi-additive query
 # expansion for dotted-NA-dim is NOT validated here — semi_additive expansion
-# emits the raw NA dim text into the ROW_NUMBER() OVER ORDER BY of the
+# emits the raw NA dim text into the RANK() OVER ORDER BY of the
 # snapshot CTE, which produces `"o.""order date"""` (single-quoted-identifier
 # shape) instead of `"o"."order date"`. The expand-side dotted-path emission
 # fix is out of scope for Plan 03 (D-10 renegotiation: pure-DDL validation

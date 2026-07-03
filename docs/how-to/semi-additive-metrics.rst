@@ -105,7 +105,7 @@ Snapshot Behavior
 The semi-additive expansion depends on whether the non-additive dimensions are present in the query:
 
 **Non-additive dimension NOT in query (active):**
-   The extension generates a CTE with ``ROW_NUMBER() OVER (PARTITION BY <queried dims> ORDER BY <NA dims>)`` to select one snapshot row per group, then aggregates over the filtered rows. This is the snapshot selection behavior.
+   The extension generates a CTE with ``RANK() OVER (PARTITION BY <queried dims> ORDER BY <NA dims>)`` to select the snapshot rows per group, then aggregates over the filtered rows. ``RANK()`` means every row tied at the snapshot ordering value (e.g. several accounts sharing the same latest date within a group) shares rank 1 and is included in the aggregation. This is the snapshot selection behavior.
 
 .. code-block:: sql
 
@@ -128,6 +128,8 @@ The semi-additive expansion depends on whether the non-additive dimensions are p
 
 **Mixed regular and semi-additive metrics:**
    Regular metrics and semi-additive metrics can coexist in the same query. The CTE includes both, but only the semi-additive metrics get the ``CASE WHEN __sv_rn = 1`` conditional aggregation. Regular metrics aggregate over all rows.
+
+   Every metric in such a query (including the semi-additive metric itself) must be a single aggregate call ``SUM/COUNT/AVG/MIN/MAX(<expression>)`` -- the CTE decomposes each metric into a per-row column plus an outer re-aggregation. Shapes that cannot be decomposed (``COUNT(*)``, ``DISTINCT`` aggregates, arithmetic around the aggregate like ``SUM(x) * 0.1``, ``COALESCE``-wrapped aggregates, derived metrics) produce a clear error telling you to query them separately from the semi-additive metric.
 
 
 .. _howto-semi-additive-verify:
@@ -152,7 +154,7 @@ The ``sql`` column shows the generated query:
        SELECT
            "accounts"."customer_id",
            "accounts"."balance",
-           ROW_NUMBER() OVER (
+           RANK() OVER (
                PARTITION BY "accounts"."customer_id"
                ORDER BY "accounts"."report_date" DESC NULLS FIRST
            ) AS __sv_rn
@@ -164,7 +166,7 @@ The ``sql`` column shows the generated query:
    FROM __sv_snapshot
    GROUP BY "customer_id"
 
-The CTE assigns a row number per ``customer_id`` ordered by ``report_date DESC``, so row 1 is the latest snapshot. The outer query then aggregates only those latest rows via ``CASE WHEN __sv_rn = 1``.
+The CTE assigns a rank per ``customer_id`` ordered by ``report_date DESC``, so rank 1 is the latest snapshot -- including every row tied at that latest value. The outer query then aggregates only those latest rows via ``CASE WHEN __sv_rn = 1``.
 
 
 .. _howto-semi-additive-restrictions:
@@ -189,4 +191,4 @@ Troubleshooting
    Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to verify whether the CTE is generated. If all Non-additive dimensions are in the query, the metric behaves as a regular additive metric and no CTE is produced. Remove the Non-additive dimension from the query to activate snapshot selection.
 
 **Performance with multiple Non-Additive dimension sets**
-   When multiple semi-additive metrics have different ``NON ADDITIVE BY`` dimensions, each gets its own ``ROW_NUMBER`` column in the CTE (``__sv_rn_1``, ``__sv_rn_2``, etc.). This is functionally correct but adds window function overhead.
+   When multiple semi-additive metrics have different ``NON ADDITIVE BY`` dimensions, each gets its own ``RANK`` column in the CTE (``__sv_rn_1``, ``__sv_rn_2``, etc.). This is functionally correct but adds window function overhead.

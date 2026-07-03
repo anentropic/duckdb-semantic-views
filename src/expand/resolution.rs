@@ -98,11 +98,34 @@ pub fn qualify_and_quote_table_ref(table: &str, def: &SemanticViewDefinition) ->
     parts.join(".")
 }
 
+/// True when a qualified request's table part matches an item's declared
+/// `source_table` (case-insensitive). Items declared WITHOUT a table
+/// qualifier (`source_table == None`) are base-table items everywhere else in
+/// the expansion layer, so they match when the requested alias is the
+/// base/root (first declared) table's alias.
+fn source_table_matches(
+    source_table: Option<&str>,
+    alias: &str,
+    def: &SemanticViewDefinition,
+) -> bool {
+    match source_table {
+        Some(st) => st.eq_ignore_ascii_case(alias),
+        None => def
+            .tables
+            .first()
+            .is_some_and(|t| t.alias.eq_ignore_ascii_case(alias)),
+    }
+}
+
 /// Look up a dimension by name using case-insensitive matching.
 ///
 /// Supports table-qualified names: if `name` contains a '.' (e.g., "o.region"),
-/// splits into (alias, `bare_name`) and also matches `source_table == alias`.
-/// Falls back to `bare_name` lookup if no qualified match is found.
+/// splits into (alias, `bare_name`) and matches only dimensions whose
+/// `source_table` is that alias (unqualified declarations count as the base
+/// table). There is deliberately NO fallback to a bare-name match when the
+/// table part doesn't match (SG-14): `x.region` must not silently resolve to
+/// a `region` dimension on some other table — the caller surfaces the
+/// standard unknown-dimension error (with suggestions) instead.
 pub(super) fn find_dimension<'a>(
     def: &'a SemanticViewDefinition,
     name: &str,
@@ -110,19 +133,10 @@ pub(super) fn find_dimension<'a>(
     if let Some(dot_pos) = name.find('.') {
         let alias = &name[..dot_pos];
         let bare = &name[dot_pos + 1..];
-        // Try qualified lookup: bare_name match AND source_table == alias
-        if let Some(d) = def.dimensions.iter().find(|d| {
+        def.dimensions.iter().find(|d| {
             d.name.eq_ignore_ascii_case(bare)
-                && d.source_table
-                    .as_deref()
-                    .is_some_and(|st| st.eq_ignore_ascii_case(alias))
-        }) {
-            return Some(d);
-        }
-        // Fall back to bare_name only (backward compat)
-        def.dimensions
-            .iter()
-            .find(|d| d.name.eq_ignore_ascii_case(bare))
+                && source_table_matches(d.source_table.as_deref(), alias, def)
+        })
     } else {
         def.dimensions
             .iter()
@@ -133,8 +147,10 @@ pub(super) fn find_dimension<'a>(
 /// Look up a metric by name using case-insensitive matching.
 ///
 /// Supports table-qualified names: if `name` contains a '.' (e.g., "o.revenue"),
-/// splits into (alias, `bare_name`) and also matches `source_table == alias`.
-/// Falls back to `bare_name` lookup if no qualified match is found.
+/// splits into (alias, `bare_name`) and matches only metrics whose
+/// `source_table` is that alias (unqualified declarations count as the base
+/// table). As with [`find_dimension`], there is NO fallback to a bare-name
+/// match when the table part doesn't match (SG-14).
 pub(super) fn find_metric<'a>(
     def: &'a SemanticViewDefinition,
     name: &str,
@@ -142,17 +158,10 @@ pub(super) fn find_metric<'a>(
     if let Some(dot_pos) = name.find('.') {
         let alias = &name[..dot_pos];
         let bare = &name[dot_pos + 1..];
-        if let Some(m) = def.metrics.iter().find(|m| {
+        def.metrics.iter().find(|m| {
             m.name.eq_ignore_ascii_case(bare)
-                && m.source_table
-                    .as_deref()
-                    .is_some_and(|st| st.eq_ignore_ascii_case(alias))
-        }) {
-            return Some(m);
-        }
-        def.metrics
-            .iter()
-            .find(|m| m.name.eq_ignore_ascii_case(bare))
+                && source_table_matches(m.source_table.as_deref(), alias, def)
+        })
     } else {
         def.metrics
             .iter()
@@ -162,7 +171,9 @@ pub(super) fn find_metric<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{qualify_and_quote_table_ref, quote_ident, quote_table_ref};
+    use super::{
+        find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident, quote_table_ref,
+    };
     use crate::model::SemanticViewDefinition;
 
     /// Minimal SemanticViewDefinition fixture with optional db_name / schema_name.
@@ -183,6 +194,109 @@ mod tests {
             database_name: db.map(str::to_string),
             schema_name: schema.map(str::to_string),
             comment: None,
+        }
+    }
+
+    mod find_lookup_tests {
+        use super::*;
+        use crate::model::{Dimension, Metric, TableRef};
+
+        /// Base table `o` + joined table `c`. `region` lives on `c`;
+        /// `status` is declared without a source table (base-table item);
+        /// metric `revenue` lives on `c`, metric `order_count` is
+        /// unqualified (None).
+        fn lookup_def() -> SemanticViewDefinition {
+            let mut def = def_with_db_schema(None, None);
+            def.tables = vec![
+                TableRef {
+                    alias: "o".to_string(),
+                    table: "orders".to_string(),
+                    ..Default::default()
+                },
+                TableRef {
+                    alias: "c".to_string(),
+                    table: "customers".to_string(),
+                    ..Default::default()
+                },
+            ];
+            def.dimensions = vec![
+                Dimension {
+                    name: "region".to_string(),
+                    expr: "c.region".to_string(),
+                    source_table: Some("c".to_string()),
+                    ..Default::default()
+                },
+                Dimension {
+                    name: "status".to_string(),
+                    expr: "status".to_string(),
+                    source_table: None,
+                    ..Default::default()
+                },
+            ];
+            def.metrics = vec![
+                Metric {
+                    name: "revenue".to_string(),
+                    expr: "sum(c.amount)".to_string(),
+                    source_table: Some("c".to_string()),
+                    ..Default::default()
+                },
+                Metric {
+                    name: "order_count".to_string(),
+                    expr: "count(*)".to_string(),
+                    source_table: None,
+                    ..Default::default()
+                },
+            ];
+            def
+        }
+
+        #[test]
+        fn qualified_dimension_matching_table_resolves() {
+            let def = lookup_def();
+            let d = find_dimension(&def, "c.region").expect("c.region must resolve");
+            assert_eq!(d.name, "region");
+        }
+
+        #[test]
+        fn qualified_dimension_wrong_table_returns_none() {
+            // SG-14: no silent fallback to a dimension on another table.
+            let def = lookup_def();
+            assert!(find_dimension(&def, "o.region").is_none());
+            assert!(find_dimension(&def, "warehouse.region").is_none());
+        }
+
+        #[test]
+        fn base_alias_matches_unqualified_dimension() {
+            // `status` has source_table == None (base-table item), so the
+            // base alias qualifies it; a non-base alias does not.
+            let def = lookup_def();
+            assert!(find_dimension(&def, "o.status").is_some());
+            assert!(find_dimension(&def, "O.STATUS").is_some());
+            assert!(find_dimension(&def, "c.status").is_none());
+        }
+
+        #[test]
+        fn qualified_metric_wrong_table_returns_none() {
+            let def = lookup_def();
+            assert!(find_metric(&def, "c.revenue").is_some());
+            assert!(find_metric(&def, "o.revenue").is_none());
+            assert!(find_metric(&def, "x.revenue").is_none());
+        }
+
+        #[test]
+        fn base_alias_matches_unqualified_metric() {
+            let def = lookup_def();
+            assert!(find_metric(&def, "o.order_count").is_some());
+            assert!(find_metric(&def, "c.order_count").is_none());
+        }
+
+        #[test]
+        fn bare_lookup_unchanged() {
+            let def = lookup_def();
+            assert!(find_dimension(&def, "region").is_some());
+            assert!(find_dimension(&def, "STATUS").is_some());
+            assert!(find_metric(&def, "revenue").is_some());
+            assert!(find_dimension(&def, "nonexistent").is_none());
         }
     }
 

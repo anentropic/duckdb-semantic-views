@@ -237,6 +237,21 @@ pub enum ExpandError {
         dimension_table: String,
         relationship_name: String,
     },
+    /// Two queried metrics sit at different grains (source tables) and the
+    /// join path between those tables crosses a fan-out edge: joining both
+    /// source tables multiplies `metric_table`'s rows, silently inflating
+    /// `metric_name` (fan trap / chasm trap between metric grains).
+    MetricFanTrap {
+        view_name: String,
+        metric_name: String,
+        metric_table: String,
+        other_metric_name: String,
+        other_metric_table: String,
+        relationship_name: String,
+    },
+    /// The stored definition's relationship graph could not be rebuilt at
+    /// query time, so safety checks (fan-trap detection) cannot run.
+    UncheckableDefinition { view_name: String, reason: String },
     /// A dimension from a role-playing table is ambiguous because multiple
     /// relationships reach that table and no co-queried metric provides USING
     /// context to disambiguate.
@@ -292,6 +307,37 @@ pub enum ExpandError {
         view_name: String,
         depth: usize,
         max_depth: usize,
+    },
+    /// A metric co-queried with an active semi-additive metric cannot be
+    /// decomposed for the snapshot CTE (SG-5). The CTE captures each metric's
+    /// inner expression per row and re-aggregates it outside the snapshot
+    /// filter, which is only sound for a single bare aggregate call
+    /// `FUNC(args)` with FUNC in SUM/COUNT/AVG/MIN/MAX, no `*`, no DISTINCT.
+    SemiAdditiveCoQueryUnsupported {
+        view_name: String,
+        metric_name: String,
+        metric_expr: String,
+        semi_metric_name: String,
+        reason: String,
+    },
+    /// An active semi-additive metric's own expression cannot be decomposed
+    /// for the snapshot CTE (same shape requirements as co-queried metrics).
+    SemiAdditiveUnsupportedExpression {
+        view_name: String,
+        metric_name: String,
+        metric_expr: String,
+        reason: String,
+    },
+    /// A `COUNT(*)` metric on a non-base source table cannot be made safe
+    /// (SG-8). Synthesized joins are LEFT JOINs, so the source table is
+    /// NULL-extended by one row per unmatched base row and `COUNT(*)` would
+    /// silently over-count. The expansion rewrites such metrics to
+    /// `COUNT(<first PK column>)`, which requires the source table to declare
+    /// a PRIMARY KEY.
+    CountStarRequiresPrimaryKey {
+        view_name: String,
+        metric_name: String,
+        table_alias: String,
     },
 }
 
@@ -363,6 +409,33 @@ impl fmt::Display for ExpandError {
                      This would inflate aggregation results. \
                      Remove the dimension, use a metric from the same table, or restructure the \
                      relationship."
+                )
+            }
+            Self::MetricFanTrap {
+                view_name,
+                metric_name,
+                metric_table,
+                other_metric_name,
+                other_metric_table,
+                relationship_name,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': fan trap detected -- metric '{metric_name}' \
+                     (table '{metric_table}') and metric '{other_metric_name}' (table \
+                     '{other_metric_table}') aggregate at different grains: joining their source \
+                     tables via relationship '{relationship_name}' (many-to-one cardinality) \
+                     duplicates rows of '{metric_table}' and would inflate '{metric_name}'. \
+                     Query the metrics separately, or restructure the relationship."
+                )
+            }
+            Self::UncheckableDefinition { view_name, reason } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': cannot verify the query is safe from fan traps \
+                     -- the stored definition's relationship graph could not be built: {reason}. \
+                     The definition likely predates current validation rules; re-create it with \
+                     CREATE OR REPLACE SEMANTIC VIEW."
                 )
             }
             Self::AmbiguousPath {
@@ -483,6 +556,53 @@ impl fmt::Display for ExpandError {
                     f,
                     "semantic view '{view_name}': derived metric nesting depth {depth} exceeds \
                      maximum allowed depth of {max_depth}"
+                )
+            }
+            Self::SemiAdditiveCoQueryUnsupported {
+                view_name,
+                metric_name,
+                metric_expr,
+                semi_metric_name,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': metric '{metric_name}' (expression: \
+                     {metric_expr}) cannot be co-queried with semi-additive metric \
+                     '{semi_metric_name}': {reason}. Snapshot expansion for NON ADDITIVE BY \
+                     requires every co-queried metric to be a single aggregate call \
+                     SUM/COUNT/AVG/MIN/MAX(<expression>) without '*', DISTINCT, or surrounding \
+                     expression text. Query '{metric_name}' and '{semi_metric_name}' separately."
+                )
+            }
+            Self::SemiAdditiveUnsupportedExpression {
+                view_name,
+                metric_name,
+                metric_expr,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': semi-additive metric '{metric_name}' \
+                     (expression: {metric_expr}) cannot be expanded: {reason}. NON ADDITIVE BY \
+                     snapshot expansion requires the metric to be a single aggregate call \
+                     SUM/COUNT/AVG/MIN/MAX(<expression>) without '*' or DISTINCT."
+                )
+            }
+            Self::CountStarRequiresPrimaryKey {
+                view_name,
+                metric_name,
+                table_alias,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': metric '{metric_name}' uses COUNT(*) on joined \
+                     table '{table_alias}'. The generated LEFT JOIN produces one NULL-extended \
+                     row per base-table row with no match in '{table_alias}', which COUNT(*) \
+                     would count -- so the expansion rewrites COUNT(*) to COUNT(<primary key>) \
+                     for non-base tables, but table '{table_alias}' has no PRIMARY KEY declared \
+                     in the TABLES clause. Add PRIMARY KEY (cols) to '{table_alias}' or use an \
+                     explicit column: COUNT({table_alias}.<column>)."
                 )
             }
         }
