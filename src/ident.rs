@@ -44,6 +44,10 @@
 /// between dots (`a..b`), leading dots, or trailing garbage after a closing
 /// quote.
 ///
+/// Case is preserved for every part; callers that need fold-to-lowercase
+/// semantics for bare parts use [`parse_qualified_identifier_with_quoting`]
+/// to learn which parts were quoted.
+///
 /// # Examples
 ///
 /// ```ignore
@@ -56,11 +60,21 @@
 /// assert_eq!(parse_qualified_identifier("\"with\"\"q\"").unwrap(), vec![r#"with"q"#]);
 /// ```
 pub fn parse_qualified_identifier(input: &str) -> Result<Vec<String>, String> {
+    Ok(parse_qualified_identifier_with_quoting(input)?
+        .into_iter()
+        .map(|(part, _)| part)
+        .collect())
+}
+
+/// [`parse_qualified_identifier`] variant that also reports, per part,
+/// whether it was written `"quoted"` in the input. The quotedness flag is
+/// what decides case-folding at [`normalize_view_name`].
+pub fn parse_qualified_identifier_with_quoting(input: &str) -> Result<Vec<(String, bool)>, String> {
     if input.is_empty() {
         return Err("empty identifier".to_string());
     }
     let bytes = input.as_bytes();
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<(String, bool)> = Vec::new();
     let mut pos: usize = 0;
 
     loop {
@@ -109,7 +123,7 @@ pub fn parse_qualified_identifier(input: &str) -> Result<Vec<String>, String> {
             if buf.is_empty() {
                 return Err("empty quoted identifier (\"\")".to_string());
             }
-            parts.push(buf);
+            parts.push((buf, true));
         } else {
             // Bare part — read until '.', '"', or end-of-input.
             let start = pos;
@@ -128,7 +142,7 @@ pub fn parse_qualified_identifier(input: &str) -> Result<Vec<String>, String> {
             // Safe: bare parts contain only single-byte ASCII excluding '.', '"'.
             // We accept any non-`.`/`"` byte verbatim here; non-ASCII bytes are
             // copied through as UTF-8 because we sliced the original &str.
-            parts.push(input[start..pos].to_string());
+            parts.push((input[start..pos].to_string(), false));
         }
 
         // AfterPart: must be '.' (more) or end-of-input (done).
@@ -145,25 +159,50 @@ pub fn parse_qualified_identifier(input: &str) -> Result<Vec<String>, String> {
     }
 }
 
-/// Convenience: return the bare unquoted *last* part of a dot-qualified
+/// Convenience: return the normalised *last* part of a dot-qualified
 /// identifier. This is the lookup key stored in
 /// `semantic_layer._definitions(name)`.
+///
+/// Case normalisation (PA-8, code-review 2026-07-02): an UNQUOTED name is
+/// folded to ASCII lowercase; a `"quoted"` name preserves its exact case.
+/// This is the Snowflake identifier contract (fold unquoted, preserve
+/// quoted) with `DuckDB`'s lowercase fold direction, and it applies uniformly
+/// because every view-name consumer — DDL capture sites, guard/DML
+/// emission, and the `semantic_view()` / `explain_semantic_view()` lookup
+/// arguments — resolves names through this function. Previously unquoted
+/// names were byte-exact case-sensitive (`CREATE ... Sales` then
+/// `DROP ... sales` → "does not exist"), diverging from both `DuckDB` and
+/// Snowflake.
+///
+/// Migration note: definitions created before v0.11 with unquoted
+/// mixed-case names are stored under their original casing and must now be
+/// referenced quoted (`"Sales"`) — or dropped and recreated — because an
+/// unquoted reference folds to lowercase before lookup.
 ///
 /// # Examples
 ///
 /// ```ignore
 /// use semantic_views::ident::normalize_view_name;
 /// assert_eq!(normalize_view_name("orders_sv").unwrap(), "orders_sv");
+/// assert_eq!(normalize_view_name("Orders_SV").unwrap(), "orders_sv");
+/// assert_eq!(normalize_view_name("\"Orders_SV\"").unwrap(), "Orders_SV");
 /// assert_eq!(
 ///     normalize_view_name("\"memory\".\"main\".\"orders_sv\"").unwrap(),
 ///     "orders_sv",
 /// );
 /// ```
 pub fn normalize_view_name(input: &str) -> Result<String, String> {
-    let parts = parse_qualified_identifier(input)?;
+    let parts = parse_qualified_identifier_with_quoting(input)?;
     parts
         .into_iter()
         .next_back()
+        .map(|(part, quoted)| {
+            if quoted {
+                part
+            } else {
+                part.to_ascii_lowercase()
+            }
+        })
         .ok_or_else(|| "empty identifier".to_string())
 }
 
@@ -388,6 +427,46 @@ mod tests {
         #[test]
         fn bare_returns_self() {
             assert_eq!(normalize_view_name("orders_sv").unwrap(), "orders_sv");
+        }
+
+        // --- PA-8 (code-review 2026-07-02): fold unquoted, preserve quoted ---
+
+        #[test]
+        fn unquoted_mixed_case_folds_to_lowercase() {
+            assert_eq!(normalize_view_name("Sales").unwrap(), "sales");
+            assert_eq!(normalize_view_name("ORDERS_SV").unwrap(), "orders_sv");
+            assert_eq!(normalize_view_name("main.Sales").unwrap(), "sales");
+        }
+
+        #[test]
+        fn quoted_mixed_case_preserved() {
+            assert_eq!(normalize_view_name("\"Sales\"").unwrap(), "Sales");
+            assert_eq!(normalize_view_name("\"ORDERS SV\"").unwrap(), "ORDERS SV");
+            assert_eq!(
+                normalize_view_name("main.\"Sales\"").unwrap(),
+                "Sales",
+                "quotedness is per-part: only the last part decides"
+            );
+        }
+
+        #[test]
+        fn fold_is_ascii_only() {
+            // Non-ASCII in a bare part passes through unfolded — ASCII fold
+            // matches DuckDB's identifier semantics and avoids locale
+            // surprises.
+            assert_eq!(normalize_view_name("Ärger").unwrap(), "Ärger");
+        }
+
+        #[test]
+        fn quoting_flags_reported_per_part() {
+            assert_eq!(
+                parse_qualified_identifier_with_quoting("db.\"Sch\".V").unwrap(),
+                vec![
+                    ("db".to_string(), false),
+                    ("Sch".to_string(), true),
+                    ("V".to_string(), false),
+                ],
+            );
         }
 
         #[test]

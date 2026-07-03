@@ -9,7 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Changed
+
+- **View name case normalization**: unquoted view names now fold to lowercase in every DDL statement and in `semantic_view()` / `explain_semantic_view()` lookup arguments, so `CREATE SEMANTIC VIEW Sales` and `DROP SEMANTIC VIEW SALES` refer to the same view. Quoted names (`"Sales"`) preserve exact case, matching the Snowflake identifier contract with DuckDB's lowercase fold direction. Previously unquoted names were byte-exact case-sensitive. **Migration**: views created earlier with unquoted mixed-case names are stored under their original casing — reference them quoted (`"Sales"`), or drop and recreate them.
+
+### Fixed
+
+- Non-ASCII input no longer panics or corrupts: keyword scanning over UTF-8 text (`SHOW SEMANTIC VIEWS aΩΩ`, bodies containing multi-byte characters) previously raised "internal error (panic)", and `COMMENT` / `WITH SYNONYMS` payloads and quoted identifiers containing non-ASCII characters (`'café'`, `"café"`) were silently stored as mojibake. Error messages truncated to the FFI buffer are now cut on a character boundary instead of producing invalid UTF-8.
+- DDL prefix keywords now require a word boundary: `DROP SEMANTIC VIEWS` (plural typo) no longer silently drops a view named `s`, and `CREATE SEMANTIC VIEWfoo` is no longer recognised.
+- Name-only statements (`DROP` / `DESCRIBE` / `SHOW COLUMNS IN SEMANTIC VIEW`) now error on trailing garbage (`DROP SEMANTIC VIEW a b c`) instead of executing and silently discarding it.
+- Fact and metric queries combining a child-table fact/metric with a dimension on a shared parent table no longer raise a spurious ambiguity error when the parent is referenced by multiple child tables (regression in the previous role-playing ambiguity hardening).
 
 ## [0.10.4] - 2026-06-27
 

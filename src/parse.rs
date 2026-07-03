@@ -1812,13 +1812,13 @@ fn emit_native_create_sql(
     or_replace: bool,
     if_not_exists: bool,
 ) -> Result<Option<String>, ParseError> {
-    // Defensive normalisation — idempotent on already-normalised input from
-    // validate_create_body (the only happy-path caller). Guarantees `name`
-    // is the bare view identifier byte-for-byte matching the catalog PK,
-    // regardless of how this function was called. Cost: one strdup + a
-    // state-machine pass (~tens of ns on typical view names) — negligible
-    // relative to the catalog INSERT this function performs.
-    let name = normalize_view_name(name).map_err(|e| ParseError {
+    // Defensive validation — `name` arrives already normalised (bare,
+    // case-folded if it was unquoted) from validate_create_body via the
+    // function-call round-trip. Re-quote before re-normalising so this pass
+    // is a true no-op on normalised input: normalising the BARE name again
+    // would fold a case-preserved quoted name (`"SalesView"` → `salesview`,
+    // PA-8) and split a dotted name (`"a.b"` → `b`).
+    let name = normalize_view_name(&crate::expand::quote_ident(name)).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         position: None,
     })?;
@@ -1957,12 +1957,12 @@ fn rewrite_yaml_file_create(payload: &str) -> Result<Option<String>, ParseError>
         }
     };
 
-    // Normalise the view name once so subsequent escape_sql_arg lands on the
-    // bare identifier (matches emit_native_create_sql's defensive
-    // normalisation). The helper TF re-normalises internally via
-    // SemanticViewDefinition::from_yaml_with_size_cap, but we need the bare
-    // name to embed in the outer INSERT's name column anyway.
-    let name = normalize_view_name(name).map_err(|e| ParseError {
+    // Defensive validation of the sentinel-carried name (matches
+    // emit_native_create_sql): re-quote before re-normalising so the pass
+    // is a no-op on the already-normalised bare name — re-normalising it
+    // bare would fold a case-preserved quoted name (PA-8) or split a
+    // dotted one.
+    let name = normalize_view_name(&crate::expand::quote_ident(name)).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         position: None,
     })?;
@@ -3393,6 +3393,52 @@ mod tests {
     fn test_rewrite_name_with_single_quote() {
         let sql = rewrite_ddl("DROP SEMANTIC VIEW it's_a_view").unwrap();
         assert_eq!(sql, "SELECT * FROM drop_semantic_view('it''s_a_view')");
+    }
+
+    // ===================================================================
+    // PA-8 (code-review 2026-07-02): unquoted view names fold to lowercase
+    // at every DDL capture site; quoted names preserve case. Previously
+    // unquoted names were byte-exact case-sensitive (CREATE ... Sales /
+    // DROP ... sales -> "does not exist"), diverging from both DuckDB and
+    // Snowflake.
+    // ===================================================================
+
+    #[test]
+    fn test_unquoted_names_fold_to_lowercase_across_ddl_forms() {
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW Sales").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('sales')");
+
+        let sql = rewrite_ddl("DESCRIBE SEMANTIC VIEW SALES").unwrap();
+        assert_eq!(sql, "SELECT * FROM describe_semantic_view('sales')");
+
+        assert_eq!(
+            extract_ddl_name("CREATE SEMANTIC VIEW Sales (body)").unwrap(),
+            Some("sales".to_string())
+        );
+
+        // ALTER folds both the target and the RENAME TO name.
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW Sales RENAME TO NewSales").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM alter_semantic_view_rename('sales', 'newsales')"
+        );
+    }
+
+    #[test]
+    fn test_quoted_names_preserve_case_across_ddl_forms() {
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW \"Sales\"").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('Sales')");
+
+        assert_eq!(
+            extract_ddl_name("CREATE SEMANTIC VIEW \"Sales\" (body)").unwrap(),
+            Some("Sales".to_string())
+        );
+
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW \"Sales\" RENAME TO \"NewSales\"").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM alter_semantic_view_rename('Sales', 'NewSales')"
+        );
     }
 
     #[test]
