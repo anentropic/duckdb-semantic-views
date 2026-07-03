@@ -592,15 +592,29 @@ mod tests {
                 .join(".")
         }
 
+        /// Identifier-part alphabet: printable ASCII (including `"`, `.`,
+        /// space) PLUS a unicode arm and keyword arms (TC-3, code-review
+        /// 2026-07-02 — the previous ASCII-only alphabet systematically
+        /// missed the shapes behind PA-1/PA-2).
+        fn arb_part() -> impl Strategy<Value = String> {
+            prop_oneof![
+                3 => "[\\x20-\\x7E]{1,16}".boxed(),
+                2 => "[a-zA-ZéàçßΩλ東京日本語☕ \".]{1,10}".boxed(),
+                1 => prop::sample::select(vec![
+                    "SELECT".to_string(),
+                    "PRIMARY KEY".to_string(),
+                    "café".to_string(),
+                    "wéird name".to_string(),
+                ]).boxed(),
+            ]
+        }
+
         proptest! {
             /// parse(emit(v)) == Ok(v) for any 1..=4-part vector of
-            /// non-empty printable-ASCII strings (including ", ., space).
+            /// non-empty parts across the full alphabet.
             #[test]
             fn parse_emit_roundtrip_is_identity(
-                parts in prop::collection::vec(
-                    "[\\x20-\\x7E]{1,16}",
-                    1..=4,
-                )
+                parts in prop::collection::vec(arb_part(), 1..=4)
             ) {
                 let emitted = emit_via_quote_ident(&parts);
                 let parsed = parse_qualified_identifier(&emitted);
@@ -615,13 +629,12 @@ mod tests {
         }
 
         proptest! {
-            /// normalize_view_name(emit(v)) == Ok(v.last()).
+            /// normalize_view_name(emit(v)) == Ok(v.last()). All parts are
+            /// emitted QUOTED via quote_ident, so PA-8 case folding never
+            /// applies — the exact content round-trips.
             #[test]
             fn normalize_returns_last_part(
-                parts in prop::collection::vec(
-                    "[\\x20-\\x7E]{1,16}",
-                    1..=4,
-                )
+                parts in prop::collection::vec(arb_part(), 1..=4)
             ) {
                 let emitted = emit_via_quote_ident(&parts);
                 let normalised = normalize_view_name(&emitted);
@@ -632,6 +645,26 @@ mod tests {
                     "normalize failed for parts={:?}, emitted={:?}",
                     parts,
                     emitted,
+                );
+            }
+        }
+
+        proptest! {
+            /// Bare (unquoted) names fold to ASCII lowercase (PA-8), and
+            /// folding then quoting round-trips through normalize.
+            #[test]
+            fn bare_names_fold_to_lowercase(
+                name in "[A-Za-z_][A-Za-z0-9_]{0,16}"
+            ) {
+                let folded = name.to_ascii_lowercase();
+                prop_assert_eq!(
+                    normalize_view_name(&name),
+                    Ok(folded.clone()),
+                );
+                // Quoting the folded name preserves it exactly.
+                prop_assert_eq!(
+                    normalize_view_name(&quote_ident(&folded)),
+                    Ok(folded),
                 );
             }
         }

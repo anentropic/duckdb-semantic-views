@@ -44,3 +44,13 @@ doc = false
 name = "fuzz_parser_override_ffi"
 path = "fuzz_targets/fuzz_parser_override_ffi.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_keyword_body"
+path = "fuzz_targets/fuzz_keyword_body.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_render_roundtrip"
+path = "fuzz_targets/fuzz_render_roundtrip.rs"
+doc = false

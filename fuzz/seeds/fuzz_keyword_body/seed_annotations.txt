@@ -1,0 +1,1 @@
+AS TABLES (o AS orders PRIMARY KEY (id) COMMENT = 'orders table' WITH SYNONYMS = ('sales', 'órdenes')) DIMENSIONS (o.region AS o.region COMMENT = 'the PRIMARY KEY (id) lives here') METRICS (PRIVATE o.total AS SUM(o.amount) COMMENT = 'café ☕')

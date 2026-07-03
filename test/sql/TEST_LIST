@@ -60,4 +60,5 @@ test/sql/phase68_quoted_idents_non_additive.test
 test/sql/phase68_quoted_idents_window.test
 test/sql/quick_260430_vdz_leading_comments.test
 test/sql/readonly_load.test
+test/sql/rt_weird_names.test
 test/sql/v080_transactional_ddl.test

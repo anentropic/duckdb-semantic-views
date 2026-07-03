@@ -334,6 +334,79 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
+// TC-3 (code-review 2026-07-02): quoted / unicode / keyword name arms. The
+// original arb_view_name() alphabet is uniformly [a-z_][a-z0-9_]* — exactly
+// the shapes that never trip PA-1/PA-2/PA-8.
+// ---------------------------------------------------------------------------
+
+/// Hostile view-name content that must ride inside `"..."` quoting:
+/// whitespace, dots, uppercase, keywords, non-ASCII, embedded quotes.
+fn arb_hostile_name_content() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // whitespace / punctuation / uppercase ASCII
+        "[A-Za-z][A-Za-z0-9 ,.()_-]{0,12}",
+        // non-ASCII
+        "[a-zéàçΩ東京☕][a-zéàçΩ東京☕ ]{0,8}",
+        // keywords and grammar-colliding shapes
+        prop::sample::select(vec![
+            "SELECT".to_string(),
+            "drop semantic view".to_string(),
+            "PRIMARY KEY (id)".to_string(),
+            "wéird name".to_string(),
+            "we\"ird".to_string(),
+        ]),
+    ]
+    .prop_filter(
+        "content must survive trim and not end with whitespace",
+        |s| !s.trim().is_empty() && s.trim() == s,
+    )
+}
+
+proptest! {
+    /// Quoted hostile names round-trip through name extraction with exact
+    /// content (case preserved, no mojibake, no truncation at inner
+    /// whitespace/dots) for every name-only form.
+    #[test]
+    fn extract_name_quoted_hostile_names(
+        form_idx in 0..3usize,
+        content in arb_hostile_name_content(),
+    ) {
+        let (prefix, _kind, fn_name) = NAME_ONLY_FORMS[form_idx];
+        let quoted = format!("\"{}\"", content.replace('"', "\"\""));
+        let ddl = format!("{prefix} {quoted}");
+        let extracted = extract_ddl_name(&ddl).unwrap();
+        prop_assert_eq!(extracted, Some(content.clone()));
+
+        // The rewrite embeds the bare content, single-quote-escaped.
+        let sql = rewrite_result(&ddl).unwrap();
+        let expected = format!("SELECT * FROM {fn_name}('{}')", content.replace('\'', "''"));
+        prop_assert_eq!(sql, expected);
+    }
+
+    /// Unquoted mixed-case names fold to lowercase (PA-8) at extraction.
+    #[test]
+    fn extract_name_unquoted_folds(
+        form_idx in 0..3usize,
+        name in "[A-Za-z_][A-Za-z0-9_]{0,20}",
+    ) {
+        let (prefix, _kind, _fn_name) = NAME_ONLY_FORMS[form_idx];
+        let ddl = format!("{prefix} {name}");
+        let extracted = extract_ddl_name(&ddl).unwrap();
+        prop_assert_eq!(extracted, Some(name.to_ascii_lowercase()));
+    }
+}
+
+/// validate_and_rewrite adapter: name-only forms route through the same
+/// public entry the parser hook uses.
+fn rewrite_result(ddl: &str) -> Result<String, String> {
+    match validate_and_rewrite(ddl) {
+        Ok(Some(sql)) => Ok(sql),
+        Ok(None) => Err("not ours".to_string()),
+        Err(e) => Err(e.message),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Position invariant properties (TEST-03)
 // ---------------------------------------------------------------------------
 

@@ -1,0 +1,66 @@
+# RT-3 / TC-3 (code-review 2026-07-02): end-to-end coverage for a quoted,
+# non-ASCII, whitespace-bearing view name through the full lifecycle:
+# CREATE -> query -> DESCRIBE -> GET_DDL -> DROP.
+#
+# Exercises PA-2 (UTF-8 identifier storage), PA-8 (quoted-name case/content
+# preservation), and RT-2 (render_ddl re-quotes the name so GET_DDL output
+# re-parses to the same catalog key).
+
+require semantic_views
+
+statement ok
+CREATE TABLE rtw_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), city VARCHAR);
+
+statement ok
+INSERT INTO rtw_orders VALUES (1, 100.00, 'São Paulo'), (2, 50.00, 'Tōkyō');
+
+statement ok
+CREATE SEMANTIC VIEW "wéird name" AS
+  TABLES (o AS rtw_orders PRIMARY KEY (id))
+  DIMENSIONS (o.city AS o.city COMMENT = 'cidade / 都市')
+  METRICS (o.total AS SUM(o.amount));
+
+# Name stored exactly as quoted (no mojibake, case/space preserved).
+query I
+SELECT name FROM list_semantic_views();
+----
+wéird name
+
+# Query through the quoted lookup argument.
+query II
+FROM semantic_view('"wéird name"', dimensions := ['city'], metrics := ['total'])
+ORDER BY 1;
+----
+São Paulo	100.00
+Tōkyō	50.00
+
+# DESCRIBE with the quoted identifier.
+statement ok
+DESCRIBE SEMANTIC VIEW "wéird name";
+
+# Non-ASCII COMMENT payload survives storage and DESCRIBE output (PA-2).
+query I
+SELECT count(*) FROM describe_semantic_view('wéird name')
+WHERE property = 'COMMENT' AND property_value = 'cidade / 都市';
+----
+1
+
+# GET_DDL emits a re-quoted header that re-parses to the same name.
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'wéird name') LIKE '%CREATE OR REPLACE SEMANTIC VIEW "wéird name"%';
+----
+true
+
+# The non-ASCII comment survives into the rendered DDL.
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'wéird name') LIKE '%cidade / 都市%';
+----
+true
+
+statement ok
+DROP SEMANTIC VIEW "wéird name";
+
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+0

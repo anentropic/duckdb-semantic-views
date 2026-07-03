@@ -13,11 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **View name case normalization**: unquoted view names now fold to lowercase in every DDL statement and in `semantic_view()` / `explain_semantic_view()` lookup arguments, so `CREATE SEMANTIC VIEW Sales` and `DROP SEMANTIC VIEW SALES` refer to the same view. Quoted names (`"Sales"`) preserve exact case, matching the Snowflake identifier contract with DuckDB's lowercase fold direction. Previously unquoted names were byte-exact case-sensitive. **Migration**: views created earlier with unquoted mixed-case names are stored under their original casing — reference them quoted (`"Sales"`), or drop and recreate them.
 
+### Added
+
+- Machine-checked round-trip guarantee between `CREATE SEMANTIC VIEW` parsing and `GET_DDL` rendering: a property test asserts `parse(render(definition)) == definition` over generated definitions (including quoted, unicode, and keyword-bearing identifiers), and two new fuzz targets exercise the body parser directly and enforce render/parse fixpoint stability.
+
 ### Fixed
 
 - Non-ASCII input no longer panics or corrupts: keyword scanning over UTF-8 text (`SHOW SEMANTIC VIEWS aΩΩ`, bodies containing multi-byte characters) previously raised "internal error (panic)", and `COMMENT` / `WITH SYNONYMS` payloads and quoted identifiers containing non-ASCII characters (`'café'`, `"café"`) were silently stored as mojibake. Error messages truncated to the FFI buffer are now cut on a character boundary instead of producing invalid UTF-8.
 - DDL prefix keywords now require a word boundary: `DROP SEMANTIC VIEWS` (plural typo) no longer silently drops a view named `s`, and `CREATE SEMANTIC VIEWfoo` is no longer recognised.
-- Name-only statements (`DROP` / `DESCRIBE` / `SHOW COLUMNS IN SEMANTIC VIEW`) now error on trailing garbage (`DROP SEMANTIC VIEW a b c`) instead of executing and silently discarding it.
+- Name-only statements (`DROP` / `DESCRIBE` / `SHOW COLUMNS IN SEMANTIC VIEW`) now error on trailing garbage (`DROP SEMANTIC VIEW a b c`) instead of executing and silently discarding it; `ALTER` sub-operations do the same and now tolerate arbitrary whitespace between keywords.
+- Body scanners are now quote- and string-aware: a `COMMENT = 'the PRIMARY KEY (id) lives here'` no longer fabricates a primary key from comment text; quoted identifiers containing commas, parens, or dots (`"a,b"`, `"tbl)x"`, `"a.b"`) no longer mis-split entries, close clauses early, or split at the inner dot; table-level `COMMENT` / `WITH SYNONYMS` on tables without PK/UNIQUE are stored instead of silently dropped; a column literally named `comment` is usable when quoted.
+- SQL comments are handled correctly across the DDL surface: trailing comments are no longer absorbed into stored expressions or `ALTER ... RENAME TO` targets, comment text can no longer corrupt clause scanning, comments may appear between prefix keywords, and block comments nest per the SQL standard.
+- `GET_DDL` output now re-parses to the same definition: relationships declared against a `UNIQUE` key render their `REFERENCES (columns)` list (previously dropped, silently rewiring the join to the primary key on re-parse), and view names that need quoting (mixed case, whitespace, non-ASCII) are quoted in the rendered header.
+- `SHOW ... STARTS WITH` / `LIMIT` require word boundaries (`STARTSWITH`, `LIMIT5` are rejected); `NON ADDITIVE BY` accepts flexible whitespace including the no-space `BY(dim)` form; `READ_YAML_FROM_SEMANTIC_VIEW` resolves qualified names with quote awareness instead of splitting at dots inside quoted parts.
 - Fact and metric queries combining a child-table fact/metric with a dimension on a shared parent table no longer raise a spurious ambiguity error when the parent is referenced by multiple child tables (regression in the previous role-playing ambiguity hardening).
 
 ## [0.10.4] - 2026-06-27
