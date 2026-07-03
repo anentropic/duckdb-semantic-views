@@ -102,8 +102,17 @@ fn emit_relationships(out: &mut String, def: &SemanticViewDefinition) {
 }
 
 /// Do `join.ref_columns` equal the target table's PRIMARY KEY columns
-/// (case-insensitive, order-sensitive)? Returns `false` when the target
-/// table cannot be found — the explicit list is then emitted defensively.
+/// (order-sensitive)? Returns `false` when the target table cannot be found
+/// — the explicit list is then emitted defensively.
+///
+/// Column names are compared on their LOGICAL identity: a bare name folds
+/// to lowercase (bare identifiers are case-insensitive), while a `"quoted"`
+/// name compares by its exact unquoted content (quoted identifiers are
+/// case-sensitive — `"Id"` != `"ID"`, but `id` == `"id"`). Comparing
+/// case-insensitively across the board could wrongly omit `ref_columns`
+/// and change join semantics on re-parse (PR #50 review). A false NEGATIVE
+/// here merely emits a redundant column list, so ties break toward
+/// emitting.
 fn ref_columns_match_target_pk(def: &SemanticViewDefinition, join: &crate::model::Join) -> bool {
     let target_lower = join.table.to_ascii_lowercase();
     let Some(target) = def
@@ -118,7 +127,18 @@ fn ref_columns_match_target_pk(def: &SemanticViewDefinition, join: &crate::model
             .pk_columns
             .iter()
             .zip(&join.ref_columns)
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            .all(|(a, b)| logical_ident(a) == logical_ident(b))
+}
+
+/// Reduce a stored column identifier to its logical form: strip `"..."`
+/// quoting (unescaping `""`) for quoted names, fold bare names to ASCII
+/// lowercase.
+fn logical_ident(s: &str) -> String {
+    if let Some(inner) = s.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+        inner.replace("\"\"", "\"")
+    } else {
+        s.to_ascii_lowercase()
+    }
 }
 
 /// Emit FACTS clause entries.
@@ -464,6 +484,61 @@ mod tests {
                 || ddl.contains("o_to_c AS o(customer_id) REFERENCES c,"),
             "PK-matching ref_columns stay omitted: {ddl}"
         );
+    }
+
+    #[test]
+    fn test_ref_columns_quoted_case_difference_is_emitted() {
+        // Quoted identifiers are case-sensitive: `"ID"` does not equal the
+        // PK column `"Id"`, so the explicit list must be emitted (PR #50
+        // review — case-insensitive comparison wrongly omitted it).
+        let mut def = minimal_def();
+        def.tables.push(TableRef {
+            alias: "c".to_string(),
+            table: "customers".to_string(),
+            pk_columns: vec!["\"Id\"".to_string()],
+            ..Default::default()
+        });
+        def.joins.push(Join {
+            table: "c".to_string(),
+            from_alias: "o".to_string(),
+            fk_columns: vec!["customer_id".to_string()],
+            ref_columns: vec!["\"ID\"".to_string()],
+            name: Some("o_to_c".to_string()),
+            ..Default::default()
+        });
+        let ddl = render_create_ddl("v", &def).unwrap();
+        assert!(
+            ddl.contains("REFERENCES c(\"ID\")"),
+            "quoted case-differing ref_columns must be emitted: {ddl}"
+        );
+    }
+
+    #[test]
+    fn test_ref_columns_bare_vs_quoted_logical_match_is_omitted() {
+        // Bare `id` and quoted `"id"` are the same logical identifier, and
+        // bare names compare case-insensitively — both omit the list.
+        for (pk, rc) in [("\"id\"", "id"), ("id", "ID")] {
+            let mut def = minimal_def();
+            def.tables.push(TableRef {
+                alias: "c".to_string(),
+                table: "customers".to_string(),
+                pk_columns: vec![pk.to_string()],
+                ..Default::default()
+            });
+            def.joins.push(Join {
+                table: "c".to_string(),
+                from_alias: "o".to_string(),
+                fk_columns: vec!["customer_id".to_string()],
+                ref_columns: vec![rc.to_string()],
+                name: Some("o_to_c".to_string()),
+                ..Default::default()
+            });
+            let ddl = render_create_ddl("v", &def).unwrap();
+            assert!(
+                ddl.contains("REFERENCES c\n") || ddl.contains("REFERENCES c,"),
+                "pk={pk} rc={rc}: logical match must omit the list: {ddl}"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
