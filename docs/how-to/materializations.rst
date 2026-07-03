@@ -154,7 +154,7 @@ Routing Exclusions
 
 Two kinds of metrics are **always excluded** from materialization routing, even when a materialization declaration covers them:
 
-- **Semi-additive metrics** (declared with ``NON ADDITIVE BY``): These require snapshot selection logic (ROW_NUMBER CTE) that cannot be pre-computed in a materialization table.
+- **Semi-additive metrics** (declared with ``NON ADDITIVE BY``): These require snapshot selection logic (RANK CTE) that cannot be pre-computed in a materialization table.
 - **Window metrics** (declared with ``OVER``): These require CTE-based window expansion that depends on the queried dimensions.
 
 When a query includes any semi-additive or window metric, the extension skips all materializations and falls back to standard expansion, regardless of whether a matching materialization exists.

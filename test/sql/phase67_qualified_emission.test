@@ -186,8 +186,8 @@ DETACH db2;
 
 # ============================================================
 # Scenario A1.5 — Semi-additive snapshot CTE × non-default schema (PREPEND)
-# customer_name not in NA group so __sv_rn snapshot fires
-# (src/expand/semi_additive.rs:195).
+# customer_name not in NA group so the __sv_rn RANK snapshot fires
+# (src/expand/semi_additive.rs).
 # ============================================================
 
 statement ok
@@ -222,7 +222,7 @@ statement ok
 USE memory.main;
 
 query I
-SELECT count(*) > 0 FROM explain_semantic_view('p67_semi.p67_semi_sch', dimensions := ['customer_name'], metrics := ['latest_balance']) WHERE explain_output LIKE '%ROW_NUMBER() OVER%';
+SELECT count(*) > 0 FROM explain_semantic_view('p67_semi.p67_semi_sch', dimensions := ['customer_name'], metrics := ['latest_balance']) WHERE explain_output LIKE '%RANK() OVER%';
 ----
 true
 
@@ -268,7 +268,7 @@ METRICS (
 );
 
 query I
-SELECT count(*) > 0 FROM explain_semantic_view('p67_semi_db2', dimensions := ['customer_name'], metrics := ['latest_balance']) WHERE explain_output LIKE '%ROW_NUMBER() OVER%';
+SELECT count(*) > 0 FROM explain_semantic_view('p67_semi_db2', dimensions := ['customer_name'], metrics := ['latest_balance']) WHERE explain_output LIKE '%RANK() OVER%';
 ----
 true
 

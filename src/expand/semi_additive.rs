@@ -2,8 +2,11 @@
 //!
 //! When any requested metric has a non-empty `non_additive_by` field AND at least
 //! one of its NA dims is NOT in the queried dimensions, the expansion wraps the
-//! base query in a CTE that uses `ROW_NUMBER()` to select snapshot rows before
-//! aggregation.
+//! base query in a CTE that uses `RANK()` to select snapshot rows before
+//! aggregation. `RANK()` — not `ROW_NUMBER()` — so that when the fact grain is
+//! finer than the queried dims (e.g. several accounts per customer, each with a
+//! row at the same latest date), ALL rows tied at the snapshot ordering value
+//! share rank 1 and aggregate together, deterministically (SG-4).
 //!
 //! **Effectively-regular classification (Snowflake semantics):**
 //! A semi-additive metric whose ALL NA dims are present in the queried dimensions
@@ -14,9 +17,18 @@
 //!
 //! The strategy for active semi-additive metrics:
 //! - Single CTE (`__sv_snapshot`) containing all raw columns needed
-//! - `ROW_NUMBER() OVER (PARTITION BY non-NA-dims ORDER BY NA-dims) AS __sv_rn`
+//! - `RANK() OVER (PARTITION BY non-NA-dims ORDER BY NA-dims) AS __sv_rn`
+//!   (the `__sv_rn` column name predates the RANK switch and is pinned by
+//!   sqllogictests -- keep it)
 //! - Outer SELECT: regular/effectively-regular metrics use plain aggregation,
 //!   active semi-additive metrics use `SUM(CASE WHEN __sv_rn = 1 THEN raw_val END)`
+//!
+//! Because the CTE decomposes every metric into an inner-expression capture plus
+//! an outer re-aggregation, every metric in the query must be a single bare
+//! aggregate call `FUNC(args)`. Anything else (arithmetic-wrapped, `COUNT(*)`,
+//! DISTINCT, `COALESCE`-wrapped, multi-aggregate derived metrics) cannot be
+//! decomposed and is rejected with a clear error instead of silently mangled
+//! (SG-5).
 //!
 //! When multiple semi-additive metrics have different NON ADDITIVE BY dimensions,
 //! each gets its own `__sv_rn_N` column in the CTE.
@@ -33,7 +45,7 @@ use super::types::ExpandError;
 /// Returns true when `met` is an ACTIVE semi-additive metric for a query over
 /// `queried_dim_names` (lowercased): it has a NON ADDITIVE BY clause and at
 /// least one of its NA dims is NOT in the queried dimension set, so it takes
-/// the `ROW_NUMBER`-CTE snapshot path. When ALL NA dims are queried, the
+/// the `RANK`-CTE snapshot path. When ALL NA dims are queried, the
 /// metric is "effectively regular" (Snowflake semantics) and takes the
 /// standard aggregation path.
 ///
@@ -53,11 +65,7 @@ pub(super) fn is_active_semi_additive(met: &Metric, queried_dim_names: &HashSet<
 ///
 /// Called from `expand()` when `has_active_semi_additive` is true.
 /// Receives already-resolved dims, metrics, expressions, and scoped aliases.
-#[allow(
-    clippy::too_many_lines,
-    clippy::result_large_err,
-    clippy::unnecessary_wraps
-)]
+#[allow(clippy::too_many_lines, clippy::result_large_err)]
 pub(super) fn expand_semi_additive(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -66,7 +74,6 @@ pub(super) fn expand_semi_additive(
     resolved_exprs: &HashMap<String, String>,
     dim_scoped_aliases: &[Option<String>],
 ) -> Result<String, ExpandError> {
-    let _ = view_name; // reserved for future error messages
     let mut sql = String::with_capacity(512);
 
     // Build set of queried dimension names for classification
@@ -81,6 +88,45 @@ pub(super) fn expand_semi_additive(
 
     // 1. Identify distinct NON ADDITIVE BY dimension sets for ACTIVE metrics only.
     let na_groups = collect_na_groups(resolved_mets, &queried_dim_names);
+
+    // 2. SG-5: validate every metric expression BEFORE emitting any SQL. The
+    //    snapshot CTE decomposes each metric into an inner-expression capture
+    //    (CTE column) plus an outer re-aggregation, which is only sound for a
+    //    single bare aggregate call. Anything else was previously mangled
+    //    silently (dropped arithmetic, star/DISTINCT arguments emitted as
+    //    broken CTE columns) -- reject it with a clear error instead.
+    let semi_metric_name = resolved_mets
+        .iter()
+        .find(|m| is_active_semi(m))
+        .map_or_else(String::new, |m| m.name.clone());
+    let mut decomposed: Vec<(String, String)> = Vec::with_capacity(resolved_mets.len());
+    for met in resolved_mets {
+        let resolved_expr = resolved_exprs
+            .get(&met.name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| met.expr.clone());
+        match parse_snapshot_aggregate(&resolved_expr) {
+            Ok(parts) => decomposed.push(parts),
+            Err(reason) => {
+                return Err(if is_active_semi(met) {
+                    ExpandError::SemiAdditiveUnsupportedExpression {
+                        view_name: view_name.to_string(),
+                        metric_name: met.name.clone(),
+                        metric_expr: resolved_expr,
+                        reason,
+                    }
+                } else {
+                    ExpandError::SemiAdditiveCoQueryUnsupported {
+                        view_name: view_name.to_string(),
+                        metric_name: met.name.clone(),
+                        metric_expr: resolved_expr,
+                        semi_metric_name: semi_metric_name.clone(),
+                        reason,
+                    }
+                });
+            }
+        }
+    }
 
     // === CTE ===
     sql.push_str("WITH __sv_snapshot AS (\n    SELECT\n");
@@ -107,27 +153,22 @@ pub(super) fn expand_semi_additive(
         ));
     }
 
-    // Metric raw columns in CTE -- extract inner expression from aggregate
+    // Metric raw columns in CTE -- the validated inner expression of each
+    // metric's aggregate call (decomposed above).
     for (met_idx, met) in resolved_mets.iter().enumerate() {
-        let resolved_expr = resolved_exprs
-            .get(&met.name.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_else(|| met.expr.clone());
-
+        let inner = &decomposed[met_idx].1;
         if is_active_semi(met) {
-            // Active semi-additive: extract inner expression from aggregate
-            let inner =
-                extract_aggregate_inner(&resolved_expr).unwrap_or_else(|| resolved_expr.clone());
+            // Active semi-additive: snapshot-filtered in the outer SELECT
             cte_select_items.push(format!("        {inner} AS \"__sv_semi_{met_idx}\""));
         } else {
-            // Regular or effectively-regular: include raw column reference
-            let inner =
-                extract_aggregate_inner(&resolved_expr).unwrap_or_else(|| resolved_expr.clone());
+            // Regular or effectively-regular: aggregated over all rows
             cte_select_items.push(format!("        {inner} AS \"__sv_reg_{met_idx}\""));
         }
     }
 
-    // ROW_NUMBER columns (one per active NA group)
+    // Snapshot rank columns (one per active NA group). RANK() so that rows
+    // tied on all NA ordering keys share rank 1 and ALL aggregate (SG-4);
+    // ROW_NUMBER() would keep one arbitrary tied row per partition.
     for (group_idx, group) in na_groups.iter().enumerate() {
         let rn_alias = if na_groups.len() == 1 {
             "__sv_rn".to_string()
@@ -157,7 +198,8 @@ pub(super) fn expand_semi_additive(
 
         // ORDER BY: the NA dims with their specified sort order.
         // Use the dimension's raw expression when the NA dim is NOT in the
-        // queried dimensions (it won't have a CTE alias).
+        // queried dimensions (it won't have a CTE alias). That raw expression
+        // may reference a non-base table -- its join is guaranteed below (SG-9).
         let order_items: Vec<String> = group
             .na_dims
             .iter()
@@ -198,7 +240,7 @@ pub(super) fn expand_semi_additive(
         };
 
         cte_select_items.push(format!(
-            "        ROW_NUMBER() OVER ({window_spec}) AS \"{rn_alias}\""
+            "        RANK() OVER ({window_spec}) AS \"{rn_alias}\""
         ));
     }
 
@@ -212,8 +254,13 @@ pub(super) fn expand_semi_additive(
         sql.push_str(&quote_ident(&base_ref.alias));
     }
 
-    // CTE JOINs
-    let resolved_joins = resolve_joins_pkfk(def, resolved_dims, resolved_mets, &[]);
+    // CTE JOINs. SG-9: the snapshot ORDER BY references each active NA dim's
+    // raw expression even when that dim is not queried, so the NA dims'
+    // source tables must be joined too. They are passed through the
+    // resolver's extra-alias parameter, which appends each with its path
+    // intermediaries (aliases already joined for dims/metrics are skipped).
+    let na_dim_sources = collect_na_dim_source_tables(def, &na_groups);
+    let resolved_joins = resolve_joins_pkfk(def, resolved_dims, resolved_mets, &na_dim_sources);
     push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
 
     sql.push_str("\n)\n");
@@ -234,14 +281,11 @@ pub(super) fn expand_semi_additive(
 
     // Metric columns
     for (met_idx, met) in resolved_mets.iter().enumerate() {
-        let resolved_expr = resolved_exprs
-            .get(&met.name.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_else(|| met.expr.clone());
-        let agg_func = extract_aggregate_func(&resolved_expr).unwrap_or("SUM");
+        let agg_func = &decomposed[met_idx].0;
 
         if is_active_semi(met) {
-            // Active semi-additive: wrap in CASE WHEN __sv_rn = 1
+            // Active semi-additive: aggregate only rows at the snapshot rank.
+            // All rows tied at rank 1 contribute (RANK semantics, SG-4).
             let rn_col = get_rn_column_for_metric(met_idx, &na_groups);
             let final_expr =
                 format!("{agg_func}(CASE WHEN \"{rn_col}\" = 1 THEN \"__sv_semi_{met_idx}\" END)");
@@ -324,45 +368,154 @@ fn collect_na_groups(
         .collect()
 }
 
-/// Extract the inner expression from an aggregate function call.
-/// e.g., "SUM(a.balance)" -> Some("a.balance"), "COUNT(*)" -> Some("*"),
-/// "revenue - cost" -> None (not an aggregate).
-fn extract_aggregate_inner(expr: &str) -> Option<String> {
-    let trimmed = expr.trim();
-    let open = trimmed.find('(')?;
-    let close = trimmed.rfind(')')?;
-    if close <= open {
-        return None;
+/// Collect the (lowercased) source-table aliases of every active NA dim,
+/// resolved against the view's declared dimensions (SG-9).
+///
+/// A NA dim that lives on a non-queried, non-base table contributes its
+/// source alias here so the snapshot CTE joins that table (the resolver adds
+/// path intermediaries); otherwise its raw expression in the snapshot ORDER
+/// BY would reference an unjoined table and fail at bind time. Base-table
+/// dims (`source_table == None`) and unresolvable names contribute nothing.
+fn collect_na_dim_source_tables(
+    def: &SemanticViewDefinition,
+    na_groups: &[NaGroup],
+) -> Vec<String> {
+    let mut sources: Vec<String> = Vec::new();
+    for group in na_groups {
+        for nd in &group.na_dims {
+            let Some(dim) = def
+                .dimensions
+                .iter()
+                .find(|d| d.name.eq_ignore_ascii_case(&nd.dimension))
+            else {
+                continue;
+            };
+            if let Some(ref st) = dim.source_table {
+                let alias = st.to_ascii_lowercase();
+                if !sources.contains(&alias) {
+                    sources.push(alias);
+                }
+            }
+        }
     }
-    // Verify the part before '(' looks like a function name (alphanumeric/underscore)
+    sources
+}
+
+/// Aggregate functions the snapshot CTE knows how to decompose into an
+/// inner-expression capture (CTE column) plus an outer re-aggregation.
+const SNAPSHOT_AGG_FUNCS: [&str; 5] = ["SUM", "COUNT", "AVG", "MIN", "MAX"];
+
+/// Validate and decompose a metric expression for the snapshot CTE (SG-5).
+///
+/// Accepts exactly one top-level aggregate call `FUNC(args)` where `FUNC` is
+/// SUM/COUNT/AVG/MIN/MAX (any case), `args` is neither `*` nor
+/// DISTINCT-qualified, and no expression text precedes or follows the call.
+/// Returns `(FUNC as written, inner argument text)` on success, or a
+/// human-readable reason why the expression cannot be decomposed.
+///
+/// The matching-paren scan is parenthesis-depth and quote aware
+/// (single-quoted SQL strings, double-quoted identifiers), so arguments
+/// containing parens or quotes classify correctly.
+fn parse_snapshot_aggregate(expr: &str) -> Result<(String, String), String> {
+    let trimmed = expr.trim();
+    let Some(open) = trimmed.find('(') else {
+        return Err("the expression is not an aggregate function call".to_string());
+    };
     let func_name = trimmed[..open].trim();
     if func_name.is_empty()
         || !func_name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
-        return None;
+        return Err(
+            "the expression does not start with a single aggregate function call".to_string(),
+        );
     }
-    Some(trimmed[open + 1..close].trim().to_string())
+    if !SNAPSHOT_AGG_FUNCS.contains(&func_name.to_ascii_uppercase().as_str()) {
+        return Err(format!(
+            "aggregate function '{func_name}' cannot be decomposed for snapshot aggregation \
+             (supported: SUM, COUNT, AVG, MIN, MAX)"
+        ));
+    }
+    let Some(close) = find_matching_paren(trimmed, open) else {
+        return Err("unbalanced parentheses in the expression".to_string());
+    };
+    let trailing = trimmed[close + 1..].trim();
+    if !trailing.is_empty() {
+        return Err(format!(
+            "expression text follows the aggregate call: '{trailing}'"
+        ));
+    }
+    let inner = trimmed[open + 1..close].trim();
+    if inner.is_empty() {
+        return Err("the aggregate call has no argument".to_string());
+    }
+    if inner == "*" {
+        return Err("star aggregates like COUNT(*) are not supported".to_string());
+    }
+    if starts_with_distinct_keyword(inner) {
+        return Err("DISTINCT aggregates are not supported".to_string());
+    }
+    Ok((func_name.to_string(), inner.to_string()))
 }
 
-/// Extract the aggregate function name from an expression.
-/// e.g., "SUM(a.balance)" -> Some("SUM"), "COUNT(*)" -> Some("COUNT").
-fn extract_aggregate_func(expr: &str) -> Option<&str> {
-    let trimmed = expr.trim();
-    let open = trimmed.find('(')?;
-    let func_name = trimmed[..open].trim();
-    if func_name.is_empty()
-        || !func_name
+/// Byte index of the `)` matching the `(` at byte offset `open`, or `None`
+/// when unbalanced. Parens inside single-quoted SQL strings and double-quoted
+/// identifiers are ignored; the doubled-quote escapes (`''`, `""`) fall out
+/// naturally from toggling the in-quote state on every quote character.
+fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
+    enum Mode {
+        Normal,
+        SingleQuote,
+        DoubleQuote,
+    }
+    let mut mode = Mode::Normal;
+    let mut depth = 0usize;
+    for (i, c) in s[open..].char_indices() {
+        match mode {
+            Mode::Normal => match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(open + i);
+                    }
+                }
+                '\'' => mode = Mode::SingleQuote,
+                '"' => mode = Mode::DoubleQuote,
+                _ => {}
+            },
+            Mode::SingleQuote => {
+                if c == '\'' {
+                    mode = Mode::Normal;
+                }
+            }
+            Mode::DoubleQuote => {
+                if c == '"' {
+                    mode = Mode::Normal;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True when `inner` begins with the `DISTINCT` keyword at a word boundary
+/// (case-insensitive). UTF-8 safe: `get(..8)` returns `None` rather than
+/// panicking when byte 8 is not a char boundary.
+fn starts_with_distinct_keyword(inner: &str) -> bool {
+    let Some(prefix) = inner.get(..8) else {
+        return false;
+    };
+    prefix.eq_ignore_ascii_case("DISTINCT")
+        && inner[8..]
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return None;
-    }
-    Some(func_name)
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
 }
 
-/// Get the `ROW_NUMBER` column name for a given metric index.
+/// Get the snapshot rank column name (`__sv_rn` / `__sv_rn_N`) for a given
+/// metric index.
 fn get_rn_column_for_metric(met_idx: usize, na_groups: &[NaGroup]) -> String {
     if na_groups.len() == 1 {
         return "__sv_rn".to_string();
@@ -381,10 +534,10 @@ mod tests {
     use crate::expand::{expand, DimensionName, ExpandError, MetricName, QueryRequest};
     use crate::model::{NullsOrder, SortOrder};
 
-    use super::{extract_aggregate_func, extract_aggregate_inner};
+    use super::parse_snapshot_aggregate;
 
     /// Single table, one semi-additive metric with NA dim NOT in query.
-    /// Expects CTE with ROW_NUMBER and conditional aggregation.
+    /// Expects CTE with RANK and conditional aggregation.
     #[test]
     fn test_semi_additive_single_metric_single_dim() {
         let def = minimal_def(
@@ -408,9 +561,10 @@ mod tests {
 
         let sql = expand("test_view", &def, &req).unwrap();
         assert!(sql.contains("WITH __sv_snapshot AS"), "SQL: {sql}");
+        assert!(sql.contains("RANK() OVER"), "Should contain RANK: {sql}");
         assert!(
-            sql.contains("ROW_NUMBER() OVER"),
-            "Should contain ROW_NUMBER: {sql}"
+            !sql.contains("ROW_NUMBER"),
+            "ROW_NUMBER drops snapshot ties (SG-4): {sql}"
         );
         assert!(
             sql.contains("PARTITION BY \"customer_id\""),
@@ -461,10 +615,7 @@ mod tests {
             !sql.contains("WITH __sv_snapshot"),
             "Should NOT have CTE when all NA dims in query: {sql}"
         );
-        assert!(
-            !sql.contains("ROW_NUMBER"),
-            "Should NOT have ROW_NUMBER: {sql}"
-        );
+        assert!(!sql.contains("RANK"), "Should NOT have RANK: {sql}");
         // Standard expansion path
         assert!(
             sql.contains("GROUP BY"),
@@ -568,35 +719,372 @@ mod tests {
             !sql.contains("WITH __sv_snapshot"),
             "Regular-only should NOT have CTE: {sql}"
         );
+        assert!(!sql.contains("RANK"), "Regular-only should NOT rank: {sql}");
+    }
+
+    /// SG-5: shapes the snapshot CTE can decompose.
+    #[test]
+    fn test_parse_snapshot_aggregate_accepts_single_aggregate_calls() {
+        assert_eq!(
+            parse_snapshot_aggregate("SUM(a.balance)"),
+            Ok(("SUM".to_string(), "a.balance".to_string()))
+        );
+        // Function case is preserved so previously-valid emissions stay
+        // byte-identical.
+        assert_eq!(
+            parse_snapshot_aggregate("sum(amount)"),
+            Ok(("sum".to_string(), "amount".to_string()))
+        );
+        assert_eq!(
+            parse_snapshot_aggregate("AVG( amount )"),
+            Ok(("AVG".to_string(), "amount".to_string()))
+        );
+        assert_eq!(
+            parse_snapshot_aggregate("COUNT(id)"),
+            Ok(("COUNT".to_string(), "id".to_string()))
+        );
+        assert_eq!(
+            parse_snapshot_aggregate("MIN(price)"),
+            Ok(("MIN".to_string(), "price".to_string()))
+        );
+        assert_eq!(
+            parse_snapshot_aggregate("MAX(price)"),
+            Ok(("MAX".to_string(), "price".to_string()))
+        );
+        // Parens inside a single-quoted string literal do not fool the scan.
+        assert_eq!(
+            parse_snapshot_aggregate("SUM(CASE WHEN note = ')' THEN amount ELSE 0 END)"),
+            Ok((
+                "SUM".to_string(),
+                "CASE WHEN note = ')' THEN amount ELSE 0 END".to_string()
+            ))
+        );
+        // Parens inside a double-quoted identifier do not fool the scan.
+        assert_eq!(
+            parse_snapshot_aggregate("SUM(\"weird)col\")"),
+            Ok(("SUM".to_string(), "\"weird)col\"".to_string()))
+        );
+        // A column merely named like DISTINCT is not the DISTINCT keyword.
+        assert_eq!(
+            parse_snapshot_aggregate("SUM(distinctive_col)"),
+            Ok(("SUM".to_string(), "distinctive_col".to_string()))
+        );
+    }
+
+    /// SG-5: every previously-silently-mangled shape must now be rejected
+    /// with a reason.
+    #[test]
+    fn test_parse_snapshot_aggregate_rejects_undecomposable_shapes() {
+        // Arithmetic-wrapped: the `* 0.1` was silently DROPPED before.
+        let err = parse_snapshot_aggregate("SUM(amount) * 0.1").unwrap_err();
+        assert!(err.contains("follows the aggregate call"), "got: {err}");
+        // COUNT(*): the `*` was emitted as a broken star-alias CTE column.
+        let err = parse_snapshot_aggregate("COUNT(*)").unwrap_err();
+        assert!(err.contains("star aggregates"), "got: {err}");
+        // DISTINCT (either case).
+        let err = parse_snapshot_aggregate("COUNT(DISTINCT x)").unwrap_err();
+        assert!(err.contains("DISTINCT"), "got: {err}");
+        let err = parse_snapshot_aggregate("count(distinct x)").unwrap_err();
+        assert!(err.contains("DISTINCT"), "got: {err}");
+        // COALESCE-wrapped: only the outermost call is considered.
+        let err = parse_snapshot_aggregate("COALESCE(SUM(x), 0)").unwrap_err();
+        assert!(err.contains("cannot be decomposed"), "got: {err}");
+        // Multi-aggregate (inlined derived metric shape).
+        let err = parse_snapshot_aggregate("SUM(revenue) - SUM(cost)").unwrap_err();
+        assert!(err.contains("follows the aggregate call"), "got: {err}");
+        // Leading expression text.
+        let err = parse_snapshot_aggregate("1 + SUM(x)").unwrap_err();
         assert!(
-            !sql.contains("ROW_NUMBER"),
-            "Regular-only should NOT have ROW_NUMBER: {sql}"
+            err.contains("does not start with a single aggregate"),
+            "got: {err}"
+        );
+        // Not an aggregate at all (previously fell back to a hardcoded SUM).
+        let err = parse_snapshot_aggregate("revenue - cost").unwrap_err();
+        assert!(err.contains("not an aggregate function call"), "got: {err}");
+        let err = parse_snapshot_aggregate("42").unwrap_err();
+        assert!(err.contains("not an aggregate function call"), "got: {err}");
+        // Unsupported aggregate function.
+        let err = parse_snapshot_aggregate("STRING_AGG(x, ',')").unwrap_err();
+        assert!(err.contains("cannot be decomposed"), "got: {err}");
+        // Malformed input never panics.
+        let err = parse_snapshot_aggregate("SUM(").unwrap_err();
+        assert!(err.contains("unbalanced parentheses"), "got: {err}");
+        let err = parse_snapshot_aggregate("SUM()").unwrap_err();
+        assert!(err.contains("no argument"), "got: {err}");
+    }
+
+    /// SG-5: a regular metric with an arithmetic-wrapped aggregate co-queried
+    /// with an active semi-additive metric errors instead of silently
+    /// dropping the arithmetic.
+    #[test]
+    fn test_co_query_arithmetic_wrapped_metric_errors() {
+        let def = minimal_def(
+            "accounts",
+            "customer_id",
+            "customer_id",
+            "balance",
+            "SUM(balance)",
+        )
+        .with_dimension("report_date", "report_date", None)
+        .with_metric("discounted", "SUM(amount) * 0.1", None)
+        .with_non_additive_by(
+            "balance",
+            &[("report_date", SortOrder::Desc, NullsOrder::First)],
+        );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("customer_id")],
+            metrics: vec![MetricName::new("discounted"), MetricName::new("balance")],
+        };
+
+        let result = expand("test_view", &def, &req);
+        match result {
+            Err(ExpandError::SemiAdditiveCoQueryUnsupported {
+                metric_name,
+                semi_metric_name,
+                ..
+            }) => {
+                assert_eq!(metric_name, "discounted");
+                assert_eq!(semi_metric_name, "balance");
+            }
+            other => panic!("expected SemiAdditiveCoQueryUnsupported, got: {other:?}"),
+        }
+    }
+
+    /// SG-5: `COUNT(*)` co-queried with an active semi-additive metric errors
+    /// instead of emitting a star-alias CTE column that COUNTs an arbitrary
+    /// (NULL-sensitive) join column.
+    #[test]
+    fn test_co_query_count_star_errors() {
+        let def = minimal_def(
+            "accounts",
+            "customer_id",
+            "customer_id",
+            "balance",
+            "SUM(balance)",
+        )
+        .with_dimension("report_date", "report_date", None)
+        .with_metric("row_count", "COUNT(*)", None)
+        .with_non_additive_by(
+            "balance",
+            &[("report_date", SortOrder::Desc, NullsOrder::First)],
+        );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("customer_id")],
+            metrics: vec![MetricName::new("row_count"), MetricName::new("balance")],
+        };
+
+        let result = expand("test_view", &def, &req);
+        assert!(
+            matches!(
+                result,
+                Err(ExpandError::SemiAdditiveCoQueryUnsupported { .. })
+            ),
+            "COUNT(*) co-query must error, got: {result:?}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("cannot be co-queried with semi-additive metric 'balance'"),
+            "message should name both metrics: {msg}"
+        );
+        assert!(
+            msg.contains("separately"),
+            "message should suggest querying separately: {msg}"
         );
     }
 
-    /// Unit test for extract_aggregate_inner helper.
+    /// SG-5: DISTINCT aggregate co-query errors.
     #[test]
-    fn test_extract_aggregate_inner() {
-        assert_eq!(
-            extract_aggregate_inner("SUM(a.balance)"),
-            Some("a.balance".to_string())
+    fn test_co_query_count_distinct_errors() {
+        let def = minimal_def(
+            "accounts",
+            "customer_id",
+            "customer_id",
+            "balance",
+            "SUM(balance)",
+        )
+        .with_dimension("report_date", "report_date", None)
+        .with_metric("uniq_customers", "COUNT(DISTINCT customer_id)", None)
+        .with_non_additive_by(
+            "balance",
+            &[("report_date", SortOrder::Desc, NullsOrder::First)],
         );
-        assert_eq!(extract_aggregate_inner("COUNT(*)"), Some("*".to_string()));
-        assert_eq!(
-            extract_aggregate_inner("AVG(amount)"),
-            Some("amount".to_string())
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("customer_id")],
+            metrics: vec![
+                MetricName::new("uniq_customers"),
+                MetricName::new("balance"),
+            ],
+        };
+
+        let result = expand("test_view", &def, &req);
+        assert!(
+            matches!(
+                result,
+                Err(ExpandError::SemiAdditiveCoQueryUnsupported { .. })
+            ),
+            "COUNT(DISTINCT ...) co-query must error, got: {result:?}"
         );
-        assert_eq!(extract_aggregate_inner("revenue - cost"), None);
-        assert_eq!(extract_aggregate_inner("42"), None);
     }
 
-    /// Unit test for extract_aggregate_func helper.
+    /// SG-5: COALESCE-wrapped aggregate co-query errors.
     #[test]
-    fn test_extract_aggregate_func() {
-        assert_eq!(extract_aggregate_func("SUM(a.balance)"), Some("SUM"));
-        assert_eq!(extract_aggregate_func("COUNT(*)"), Some("COUNT"));
-        assert_eq!(extract_aggregate_func("AVG(amount)"), Some("AVG"));
-        assert_eq!(extract_aggregate_func("revenue - cost"), None);
+    fn test_co_query_coalesce_wrapped_errors() {
+        let def = minimal_def(
+            "accounts",
+            "customer_id",
+            "customer_id",
+            "balance",
+            "SUM(balance)",
+        )
+        .with_dimension("report_date", "report_date", None)
+        .with_metric("safe_total", "COALESCE(SUM(amount), 0)", None)
+        .with_non_additive_by(
+            "balance",
+            &[("report_date", SortOrder::Desc, NullsOrder::First)],
+        );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("customer_id")],
+            metrics: vec![MetricName::new("safe_total"), MetricName::new("balance")],
+        };
+
+        let result = expand("test_view", &def, &req);
+        assert!(
+            matches!(
+                result,
+                Err(ExpandError::SemiAdditiveCoQueryUnsupported { .. })
+            ),
+            "COALESCE-wrapped co-query must error, got: {result:?}"
+        );
+    }
+
+    /// SG-5: a derived metric (inlines to a multi-aggregate expression)
+    /// co-queried with an active semi-additive metric errors instead of
+    /// falling back to a hardcoded SUM over a mangled column.
+    #[test]
+    fn test_co_query_derived_metric_errors() {
+        let def = minimal_def(
+            "accounts",
+            "customer_id",
+            "customer_id",
+            "balance",
+            "SUM(balance)",
+        )
+        .with_dimension("report_date", "report_date", None)
+        .with_metric("revenue", "SUM(amount)", None)
+        .with_metric("cost_total", "SUM(cost)", None)
+        .with_metric("profit", "revenue - cost_total", None)
+        .with_non_additive_by(
+            "balance",
+            &[("report_date", SortOrder::Desc, NullsOrder::First)],
+        );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("customer_id")],
+            metrics: vec![MetricName::new("profit"), MetricName::new("balance")],
+        };
+
+        let result = expand("test_view", &def, &req);
+        match result {
+            Err(ExpandError::SemiAdditiveCoQueryUnsupported {
+                metric_name,
+                metric_expr,
+                ..
+            }) => {
+                assert_eq!(metric_name, "profit");
+                // The error carries the INLINED expression the CTE would
+                // have had to decompose.
+                assert!(
+                    metric_expr.contains("SUM(amount)") && metric_expr.contains("SUM(cost)"),
+                    "expected inlined derived expression, got: {metric_expr}"
+                );
+            }
+            other => panic!("expected SemiAdditiveCoQueryUnsupported, got: {other:?}"),
+        }
+    }
+
+    /// SG-5: the active semi-additive metric's OWN expression is validated
+    /// too — an arithmetic-wrapped NON ADDITIVE BY metric errors instead of
+    /// silently dropping the arithmetic.
+    #[test]
+    fn test_semi_additive_metric_own_expression_validated() {
+        let def = minimal_def(
+            "accounts",
+            "customer_id",
+            "customer_id",
+            "balance",
+            "SUM(balance) * 2",
+        )
+        .with_dimension("report_date", "report_date", None)
+        .with_non_additive_by(
+            "balance",
+            &[("report_date", SortOrder::Desc, NullsOrder::First)],
+        );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("customer_id")],
+            metrics: vec![MetricName::new("balance")],
+        };
+
+        let result = expand("test_view", &def, &req);
+        match result {
+            Err(ExpandError::SemiAdditiveUnsupportedExpression { metric_name, .. }) => {
+                assert_eq!(metric_name, "balance");
+            }
+            other => panic!("expected SemiAdditiveUnsupportedExpression, got: {other:?}"),
+        }
+    }
+
+    /// SG-9: a NON ADDITIVE BY dim living on a non-queried, non-base table
+    /// must get its source table joined into the snapshot CTE — otherwise the
+    /// snapshot ORDER BY references an unjoined alias and fails at bind time.
+    /// Topology: base `a AS accounts` with `a(date_id) REFERENCES d`, NA dim
+    /// `report_date = d.report_date`, query by a BASE dim only.
+    #[test]
+    fn test_na_dim_on_non_queried_table_joins_its_source() {
+        let mut def = minimal_def(
+            "accounts",
+            "customer_id",
+            "a.customer_id",
+            "balance",
+            "SUM(a.balance)",
+        );
+        def.tables[0].alias = "a".to_string();
+        def.tables[0].pk_columns = vec!["id".to_string()];
+        def.metrics[0].source_table = Some("a".to_string());
+        let def = def
+            .with_table("d", "dates", &["id"])
+            .with_dimension("report_date", "d.report_date", Some("d"))
+            .with_non_additive_by(
+                "balance",
+                &[("report_date", SortOrder::Desc, NullsOrder::First)],
+            )
+            .with_pkfk_join("acct_date", "a", "d", &["date_id"], &["id"]);
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("customer_id")],
+            metrics: vec![MetricName::new("balance")],
+        };
+
+        let sql = expand("test_view", &def, &req).unwrap();
+        assert!(
+            sql.contains("LEFT JOIN \"dates\" AS \"d\" ON \"a\".\"date_id\" = \"d\".\"id\""),
+            "Snapshot CTE must join the NA dim's source table: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY d.report_date DESC NULLS FIRST"),
+            "Snapshot ORDER BY must reference the joined alias: {sql}"
+        );
     }
 
     /// Metrics-only (no dims) semi-additive -> global aggregate with CTE.
@@ -640,7 +1128,7 @@ mod tests {
 
     /// SG-6 (code review 2026-07-02): a semi-additive metric whose NA dims
     /// are ALL in the queried dimensions is "effectively regular" — it takes
-    /// the standard aggregation path (never the `ROW_NUMBER` CTE), so it MUST
+    /// the standard aggregation path (never the snapshot CTE), so it MUST
     /// get the standard fan-trap check. The previous unconditional
     /// `non_additive_by`-non-empty skip let this query silently inflate.
     /// (The CTE-path skip is pinned by
@@ -769,5 +1257,154 @@ mod tests {
             sql.contains("ASC NULLS LAST"),
             "Should have ASC NULLS LAST in ORDER BY: {sql}"
         );
+    }
+
+    /// Data-level tests: execute the generated snapshot SQL against an
+    /// in-memory `DuckDB`. The `extension` feature swaps the bundled API for
+    /// loadable-extension stubs, so these are gated like catalog.rs's tests.
+    #[cfg(not(feature = "extension"))]
+    mod execution {
+        use super::*;
+
+        fn run_by_first_col(sql: &str) -> Vec<(String, f64)> {
+            let con = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+            con.execute_batch(
+                "CREATE TABLE accounts (customer_id VARCHAR, report_date DATE, balance DOUBLE);
+                 INSERT INTO accounts VALUES
+                     ('alice', DATE '2024-01-01', 999.0),
+                     ('alice', DATE '2024-01-02', 100.0),
+                     ('alice', DATE '2024-01-02', 150.0),
+                     ('bob',   NULL,              40.0),
+                     ('bob',   DATE '2024-01-01', 300.0);",
+            )
+            .expect("setup");
+            let wrapped = format!("SELECT * FROM ({sql}) ORDER BY 1");
+            let mut stmt = con.prepare(&wrapped).expect("prepare generated SQL");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })
+                .expect("query");
+            rows.collect::<Result<Vec<_>, _>>().expect("rows")
+        }
+
+        fn snapshot_def(nulls: NullsOrder) -> crate::model::SemanticViewDefinition {
+            minimal_def(
+                "accounts",
+                "customer_id",
+                "customer_id",
+                "balance",
+                "SUM(balance)",
+            )
+            .with_dimension("report_date", "report_date", None)
+            .with_non_additive_by("balance", &[("report_date", SortOrder::Desc, nulls)])
+        }
+
+        fn snapshot_req() -> QueryRequest {
+            QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("customer_id")],
+                metrics: vec![MetricName::new("balance")],
+            }
+        }
+
+        /// SG-4 data-level: alice has TWO rows tied at the latest date
+        /// (2024-01-02: 100.0 and 150.0). RANK gives both rows rank 1, so
+        /// the snapshot sum is 250.0 — deterministically. `ROW_NUMBER` kept
+        /// one arbitrary tied row (100.0 or 150.0, run-to-run
+        /// nondeterministic). bob (NULLS LAST variant): the latest non-NULL
+        /// date wins -> 300.0.
+        #[test]
+        fn test_ties_at_snapshot_all_aggregate() {
+            let sql = expand(
+                "test_view",
+                &snapshot_def(NullsOrder::Last),
+                &snapshot_req(),
+            )
+            .expect("expand");
+            let rows = run_by_first_col(&sql);
+            assert_eq!(rows.len(), 2, "two customers: {rows:?}");
+            assert_eq!(rows[0].0, "alice");
+            assert!(
+                (rows[0].1 - 250.0).abs() < 1e-9,
+                "both tied rows must aggregate (100 + 150), got: {rows:?}"
+            );
+            assert_eq!(rows[1].0, "bob");
+            assert!(
+                (rows[1].1 - 300.0).abs() < 1e-9,
+                "NULLS LAST: latest non-NULL date wins for bob, got: {rows:?}"
+            );
+        }
+
+        /// TC-7 data-level: with DESC NULLS FIRST (the parser default for
+        /// DESC), bob's NULL-dated row outranks the dated row -> 40.0.
+        #[test]
+        fn test_nulls_first_null_row_wins() {
+            let sql = expand(
+                "test_view",
+                &snapshot_def(NullsOrder::First),
+                &snapshot_req(),
+            )
+            .expect("expand");
+            let rows = run_by_first_col(&sql);
+            assert_eq!(rows[1].0, "bob");
+            assert!(
+                (rows[1].1 - 40.0).abs() < 1e-9,
+                "NULLS FIRST: the NULL-dated row must win for bob, got: {rows:?}"
+            );
+        }
+
+        /// SG-9 data-level: NA dim on a non-queried, non-base table. The
+        /// snapshot CTE joins `dates`, the ORDER BY binds to `d.report_date`,
+        /// and each customer's balance snapshots at their latest date.
+        /// customer 10: `date_id` 2 (2024-01-02) is latest -> 150.0
+        /// customer 20: only `date_id` 1 -> 300.0
+        #[test]
+        fn test_na_dim_join_executes() {
+            let mut def = minimal_def(
+                "accounts",
+                "customer_id",
+                "a.customer_id",
+                "balance",
+                "SUM(a.balance)",
+            );
+            def.tables[0].alias = "a".to_string();
+            def.tables[0].pk_columns = vec!["id".to_string()];
+            def.metrics[0].source_table = Some("a".to_string());
+            let def = def
+                .with_table("d", "dates", &["id"])
+                .with_dimension("report_date", "d.report_date", Some("d"))
+                .with_non_additive_by(
+                    "balance",
+                    &[("report_date", SortOrder::Desc, NullsOrder::First)],
+                )
+                .with_pkfk_join("acct_date", "a", "d", &["date_id"], &["id"]);
+
+            let sql = expand("test_view", &def, &snapshot_req()).expect("expand");
+
+            let con = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+            con.execute_batch(
+                "CREATE TABLE dates (id INTEGER, report_date DATE);
+                 INSERT INTO dates VALUES (1, DATE '2024-01-01'), (2, DATE '2024-01-02');
+                 CREATE TABLE accounts (id INTEGER, customer_id INTEGER, date_id INTEGER, balance DOUBLE);
+                 INSERT INTO accounts VALUES
+                     (1, 10, 1, 100.0),
+                     (2, 10, 2, 150.0),
+                     (3, 20, 1, 300.0);",
+            )
+            .expect("setup");
+            let wrapped = format!("SELECT * FROM ({sql}) ORDER BY 1");
+            let mut stmt = con.prepare(&wrapped).expect("prepare generated SQL");
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, f64>(1)?)))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows");
+            assert_eq!(rows.len(), 2, "rows: {rows:?}");
+            assert_eq!(rows[0].0, 10);
+            assert!((rows[0].1 - 150.0).abs() < 1e-9, "rows: {rows:?}");
+            assert_eq!(rows[1].0, 20);
+            assert!((rows[1].1 - 300.0).abs() < 1e-9, "rows: {rows:?}");
+        }
     }
 }

@@ -308,6 +308,26 @@ pub enum ExpandError {
         depth: usize,
         max_depth: usize,
     },
+    /// A metric co-queried with an active semi-additive metric cannot be
+    /// decomposed for the snapshot CTE (SG-5). The CTE captures each metric's
+    /// inner expression per row and re-aggregates it outside the snapshot
+    /// filter, which is only sound for a single bare aggregate call
+    /// `FUNC(args)` with FUNC in SUM/COUNT/AVG/MIN/MAX, no `*`, no DISTINCT.
+    SemiAdditiveCoQueryUnsupported {
+        view_name: String,
+        metric_name: String,
+        metric_expr: String,
+        semi_metric_name: String,
+        reason: String,
+    },
+    /// An active semi-additive metric's own expression cannot be decomposed
+    /// for the snapshot CTE (same shape requirements as co-queried metrics).
+    SemiAdditiveUnsupportedExpression {
+        view_name: String,
+        metric_name: String,
+        metric_expr: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for ExpandError {
@@ -525,6 +545,37 @@ impl fmt::Display for ExpandError {
                     f,
                     "semantic view '{view_name}': derived metric nesting depth {depth} exceeds \
                      maximum allowed depth of {max_depth}"
+                )
+            }
+            Self::SemiAdditiveCoQueryUnsupported {
+                view_name,
+                metric_name,
+                metric_expr,
+                semi_metric_name,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': metric '{metric_name}' (expression: \
+                     {metric_expr}) cannot be co-queried with semi-additive metric \
+                     '{semi_metric_name}': {reason}. Snapshot expansion for NON ADDITIVE BY \
+                     requires every co-queried metric to be a single aggregate call \
+                     SUM/COUNT/AVG/MIN/MAX(<expression>) without '*', DISTINCT, or surrounding \
+                     expression text. Query '{metric_name}' and '{semi_metric_name}' separately."
+                )
+            }
+            Self::SemiAdditiveUnsupportedExpression {
+                view_name,
+                metric_name,
+                metric_expr,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': semi-additive metric '{metric_name}' \
+                     (expression: {metric_expr}) cannot be expanded: {reason}. NON ADDITIVE BY \
+                     snapshot expansion requires the metric to be a single aggregate call \
+                     SUM/COUNT/AVG/MIN/MAX(<expression>) without '*' or DISTINCT."
                 )
             }
         }

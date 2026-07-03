@@ -596,6 +596,37 @@ Ambiguous dimension path
 **Fix:** See :ref:`howto-role-playing`. Add a metric with ``USING (<rel_name>)`` to disambiguate, or use a dimension from a table that is not a role-playing target.
 
 
+Metric cannot be co-queried with a semi-additive metric
+--------------------------------------------------------
+
+.. code-block:: text
+
+   semantic view '<view>': metric '<name>' (expression: <expr>) cannot be
+   co-queried with semi-additive metric '<semi>': <reason>. Snapshot expansion
+   for NON ADDITIVE BY requires every co-queried metric to be a single
+   aggregate call SUM/COUNT/AVG/MIN/MAX(<expression>) without '*', DISTINCT,
+   or surrounding expression text. Query '<name>' and '<semi>' separately.
+
+**Cause:** The query mixes an active semi-additive metric (its ``NON ADDITIVE BY`` dimension is not in the query) with a metric whose expression cannot be decomposed for the snapshot CTE: ``COUNT(*)``, a ``DISTINCT`` aggregate, arithmetic around the aggregate (``SUM(x) * 0.1``), a wrapped aggregate (``COALESCE(SUM(x), 0)``), or a derived metric.
+
+**Fix:** Query the two metrics separately, or redefine the co-queried metric as a single bare aggregate call (e.g. ``COUNT(<pk_column>)`` instead of ``COUNT(*)``).
+
+
+Semi-additive metric expression cannot be expanded
+---------------------------------------------------
+
+.. code-block:: text
+
+   semantic view '<view>': semi-additive metric '<name>' (expression: <expr>)
+   cannot be expanded: <reason>. NON ADDITIVE BY snapshot expansion requires
+   the metric to be a single aggregate call SUM/COUNT/AVG/MIN/MAX(<expression>)
+   without '*' or DISTINCT.
+
+**Cause:** The ``NON ADDITIVE BY`` metric's own expression is not a single decomposable aggregate call, so the snapshot CTE cannot split it into a per-row column plus an outer re-aggregation.
+
+**Fix:** Redefine the metric as a single aggregate call over a plain expression (e.g. ``SUM(a.balance)``).
+
+
 Private metric
 --------------
 

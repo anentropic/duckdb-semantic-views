@@ -183,7 +183,7 @@ MATERIALIZATIONS (
 )
 
 # Semi-additive metric should NOT route to materialization (MAT-04)
-# Falls back to raw expansion with ROW_NUMBER CTE snapshot selection
+# Falls back to raw expansion with RANK CTE snapshot selection
 # Latest amount per region: East -> 150.00 (2024-01-03), West -> 50.00 (2024-01-04)
 query TR rowsort
 SELECT * FROM semantic_view('p55_semi_add', dimensions := ['region'], metrics := ['latest_amount'])
