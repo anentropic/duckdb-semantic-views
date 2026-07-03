@@ -348,8 +348,60 @@ East	777.77
 West	888.88
 
 # ============================================================
-# Section 9: Cleanup
+# Section 9: Dims-only routed queries apply SELECT DISTINCT (SG-11)
 # ============================================================
+
+# The pre-agg table deliberately contains a DUPLICATE 'East' row plus a
+# sentinel 'North' row that does not exist in the base data. The result
+# containing 'North' proves the query routed to the materialization; 'East'
+# appearing once proves the routed SQL applies SELECT DISTINCT, matching
+# the raw expansion path's dims-only semantics.
+
+statement ok
+CREATE TABLE p55_region_list (region VARCHAR);
+
+statement ok
+INSERT INTO p55_region_list VALUES ('East'), ('East'), ('West'), ('North');
+
+statement ok
+CREATE SEMANTIC VIEW p55_dims_routed AS
+TABLES (
+    o AS p55_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.region AS o.region
+)
+METRICS (
+    o.total_revenue AS SUM(o.amount)
+)
+MATERIALIZATIONS (
+    region_list AS (
+        TABLE p55_region_list,
+        DIMENSIONS (region)
+    )
+)
+
+query T rowsort
+SELECT * FROM semantic_view('p55_dims_routed', dimensions := ['region'])
+----
+East
+North
+West
+
+query I
+SELECT count(*) FROM semantic_view('p55_dims_routed', dimensions := ['region'])
+----
+3
+
+# ============================================================
+# Section 10: Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p55_dims_routed
+
+statement ok
+DROP TABLE IF EXISTS p55_region_list
 
 statement ok
 DROP SEMANTIC VIEW IF EXISTS p55_routed
