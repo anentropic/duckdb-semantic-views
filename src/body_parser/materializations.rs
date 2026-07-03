@@ -1,6 +1,6 @@
 //! MATERIALIZATIONS clause parsing.
 
-use super::scan::split_first_token;
+use super::scan::{extract_paren_content, split_first_token, QuoteState};
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
 use crate::model::Materialization;
@@ -64,8 +64,10 @@ fn parse_single_materialization_entry(
             position: None,
         });
     }
-    // Find matching closing paren
-    let sub_body = extract_paren_body(after_as).ok_or_else(|| ParseError {
+    // Find matching closing paren — via the shared quote-aware extractor, so
+    // a ')' inside a quoted identifier or string cannot close the sub-body
+    // early (PA-6).
+    let sub_body = extract_paren_content(after_as).ok_or_else(|| ParseError {
         message: format!("Unclosed '(' for materialization '{name}'."),
         position: None,
     })?;
@@ -133,54 +135,52 @@ fn parse_single_materialization_entry(
     })
 }
 
-/// Extract content between matching outer parentheses.
-/// Returns the content inside `(...)` (excluding the parens), or None if unmatched.
-fn extract_paren_body(s: &str) -> Option<&str> {
-    if !s.starts_with('(') {
-        return None;
-    }
-    let mut depth = 0;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&s[1..i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Find positions of TABLE, DIMENSIONS, METRICS keywords in the uppercased sub-body.
-/// Returns (keyword, `byte_offset`) pairs sorted by position.
+/// Find positions of TABLE, DIMENSIONS, METRICS keywords in the uppercased
+/// sub-body. Returns (keyword, `byte_offset`) pairs sorted by position.
+///
+/// Matches only at depth 0 and outside quoted regions (PA-6): a
+/// dimension/metric name inside a nested `(...)` list, or keyword text
+/// inside `'...'` / `"..."`, must not split the sub-body. The uppercased
+/// copy has identical byte offsets to the raw text (ASCII-only fold), so
+/// quote tracking over it is sound.
 fn find_sub_keyword_positions(upper: &str) -> Vec<(&'static str, usize)> {
     let keywords: &[&str] = &["TABLE", "DIMENSIONS", "METRICS"];
+    let bytes = upper.as_bytes();
     let mut positions = Vec::new();
-    for &kw in keywords {
-        let mut search_from = 0;
-        while let Some(pos) = upper[search_from..].find(kw) {
-            let abs_pos = search_from + pos;
-            // Only match at word boundary (not part of a longer identifier)
-            let before_ok = abs_pos == 0 || {
-                let b = upper.as_bytes()[abs_pos - 1];
-                !b.is_ascii_alphanumeric() && b != b'_'
-            };
-            let after_pos = abs_pos + kw.len();
-            let after_ok = after_pos >= upper.len() || {
-                let b = upper.as_bytes()[after_pos];
-                !b.is_ascii_alphanumeric() && b != b'_'
-            };
-            if before_ok && after_ok {
-                positions.push((kw, abs_pos));
+    let mut st = QuoteState::default();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if live {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ => {}
             }
-            search_from = abs_pos + kw.len();
+            if depth == 0 {
+                for &kw in keywords {
+                    let kb = kw.as_bytes();
+                    if i + kb.len() <= bytes.len() && &bytes[i..i + kb.len()] == kb {
+                        let before_ok = i == 0 || {
+                            let b = bytes[i - 1];
+                            !b.is_ascii_alphanumeric() && b != b'_'
+                        };
+                        let after_pos = i + kb.len();
+                        let after_ok = after_pos >= bytes.len() || {
+                            let b = bytes[after_pos];
+                            !b.is_ascii_alphanumeric() && b != b'_'
+                        };
+                        if before_ok && after_ok {
+                            positions.push((kw, i));
+                            break;
+                        }
+                    }
+                }
+            }
         }
+        i = next;
     }
-    positions.sort_by_key(|&(_, pos)| pos);
     positions
 }
 
@@ -192,7 +192,7 @@ fn extract_paren_list(content: &str) -> Result<Vec<String>, ParseError> {
         return Ok(Vec::new());
     }
     let inner = if content.starts_with('(') {
-        extract_paren_body(content).ok_or_else(|| ParseError {
+        extract_paren_content(content).ok_or_else(|| ParseError {
             message: "Unclosed parenthesis in MATERIALIZATIONS sub-clause.".to_string(),
             position: None,
         })?

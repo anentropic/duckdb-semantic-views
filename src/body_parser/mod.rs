@@ -1151,6 +1151,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_relationships_quoted_paren_in_fk_column() {
+        // PA-6 (PR #50 review): the close paren after the FK list was
+        // located with a naive find(')'), so a quoted FK column containing
+        // ')' truncated the list and mis-parsed the REFERENCES clause.
+        let result =
+            parse_relationships_clause("rel AS o(\"x)y\") REFERENCES c(\"a)b\")", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].fk_columns, vec!["\"x)y\""]);
+        assert_eq!(result[0].table, "c");
+        assert_eq!(result[0].ref_columns, vec!["\"a)b\""]);
+    }
+
+    #[test]
+    fn parse_materializations_quoted_specials_do_not_split() {
+        // PA-6 (PR #50 review): the sub-body paren scan and TABLE /
+        // DIMENSIONS / METRICS keyword scan were not quote- or depth-aware —
+        // a quoted name containing ')' closed the sub-body early, and
+        // keyword text inside quotes or nested parens split it at the wrong
+        // places.
+        let result = parse_materializations_clause(
+            "m1 AS (TABLE \"pre)agg\", DIMENSIONS (\"metrics\", region), METRICS (total))",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "m1");
+        assert_eq!(result[0].table, "\"pre)agg\"");
+        assert_eq!(result[0].dimensions, vec!["\"metrics\"", "region"]);
+        assert_eq!(result[0].metrics, vec!["total"]);
+    }
+
+    #[test]
     fn parse_relationships_error_missing_name() {
         // Entry starts with "AS" — no preceding relationship name
         let result = parse_relationships_clause("AS o(customer_id) REFERENCES c", 0);

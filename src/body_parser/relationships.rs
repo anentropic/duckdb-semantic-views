@@ -1,6 +1,6 @@
 //! RELATIONSHIPS clause parsing.
 
-use super::scan::{extract_paren_content, find_keyword_ci, split_first_token};
+use super::scan::{extract_paren_content, find_keyword_ci, find_live_byte, split_first_token};
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
 use crate::model::{Cardinality, Join};
@@ -89,14 +89,11 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
         .map(|(_, entry)| entry.to_string())
         .collect();
 
-    // Find REFERENCES after the closing paren
-    let close_paren_pos = after_as[paren_pos..]
-        .find(')')
-        .map(|p| paren_pos + p + 1)
-        .ok_or_else(|| ParseError {
-            message: format!("Unclosed '(' in relationship '{rel_name}'."),
-            position: Some(entry_offset),
-        })?;
+    // Find REFERENCES after the closing paren. extract_paren_content is
+    // quote-aware and requires its input to start with '(', so the matching
+    // close is exactly one byte past the content — a naive find(')') would
+    // stop at a ')' inside a quoted FK column name (PA-6).
+    let close_paren_pos = paren_pos + paren_content.len() + 2;
 
     let after_paren = after_as[close_paren_pos..].trim_start();
     let upper_after = after_paren.to_ascii_uppercase();
@@ -115,7 +112,7 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
             ),
             position: Some(entry_offset),
         });
-    } else if let Some(paren_idx) = remaining_after_refs.find('(') {
+    } else if let Some(paren_idx) = find_live_byte(remaining_after_refs, b'(') {
         let before_paren = remaining_after_refs[..paren_idx].trim_end();
         if before_paren.contains(char::is_whitespace) {
             // "target (col)" -- split at first whitespace
@@ -150,9 +147,9 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
             .into_iter()
             .map(|(_, entry)| entry.to_string())
             .collect();
-        // SAFETY: extract_paren_content succeeded above (returned Some), confirming
-        // balanced parens exist. The closing ')' must be present in after_to.
-        let close = after_to.find(')').unwrap();
+        // Quote-aware close (see the FK-list scan above): after_to starts
+        // with '(', so the matching ')' is one byte past the content.
+        let close = 1 + cols_str.len();
         (cols, after_to[close + 1..].trim())
     } else {
         (vec![], after_to)
