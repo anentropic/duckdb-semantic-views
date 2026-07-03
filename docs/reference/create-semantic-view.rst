@@ -108,6 +108,12 @@ All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` 
 
 .. note::
 
+   **View name case.** An unquoted ``<name>`` is folded to lowercase before it is stored, and every later reference — ``DROP`` / ``DESCRIBE`` / ``ALTER`` / ``SHOW COLUMNS`` statements and the :ref:`semantic_view() <ref-semantic-view-function>` lookup argument — folds unquoted names the same way, so ``CREATE SEMANTIC VIEW Sales`` and ``DROP SEMANTIC VIEW SALES`` refer to the same view. A ``"quoted"`` name preserves its exact case and must be referenced quoted. This is the Snowflake identifier contract (fold unquoted, preserve quoted) with DuckDB's lowercase fold direction.
+
+   *Migration:* views created before v0.11 with unquoted mixed-case names are stored under their original casing; reference them quoted (``"Sales"``) or drop and recreate them.
+
+.. note::
+
    All four ``CREATE`` body variants participate in your surrounding transaction. ``BEGIN ... ROLLBACK`` discards an uncommitted ``CREATE``. See :ref:`explanation-transactional-ddl`.
 
 .. note::

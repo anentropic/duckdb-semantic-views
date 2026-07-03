@@ -144,10 +144,254 @@ pub fn replace_word_boundary_pairs(haystack: &str, pairs: &[(&str, &str)]) -> St
     result
 }
 
-/// Check if a byte is a word-boundary character (NOT alphanumeric or underscore).
+/// Is `b` an identifier-continuation byte?
+///
+/// **This is the single source of truth for "what byte continues a SQL
+/// identifier"** across the whole crate — the DDL keyword scanners
+/// (`body_parser::scan::is_ident_continuation` delegates here), the
+/// prefix matcher (`parse::match_keyword_prefix`), and fact/derived-metric
+/// inlining ([`is_word_boundary_char`], its inverse) all resolve through it.
+/// Keeping one definition is what prevents the recurring boundary-drift
+/// bug class (PR #50 review): a keyword must not match immediately before
+/// an identifier byte, or `AS`/`BY`/`id` matches inside `ASx`/`BYé`/`idΩ`.
+///
+/// Continuation = ASCII alphanumerics, `_`, AND every non-ASCII byte
+/// (>= 0x80): `DuckDB` identifiers may contain any non-ASCII character, so
+/// UTF-8 lead/continuation bytes are identifier bytes, never boundaries.
+#[must_use]
+pub fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Is `b` a word-boundary byte — i.e. NOT an [`is_ident_byte`]? The
+/// primitive used by [`replace_word_boundary`] and the `facts.rs` name /
+/// COUNT matchers so inlining shares the parser's notion of an identifier.
 #[must_use]
 pub fn is_word_boundary_char(b: u8) -> bool {
-    !b.is_ascii_alphanumeric() && b != b'_'
+    !is_ident_byte(b)
+}
+
+/// Does `s` start with the ASCII keyword `kw`, case-insensitively?
+///
+/// Compares raw *bytes*, so it is safe on any UTF-8 input: the old
+/// `s[..kw.len()].eq_ignore_ascii_case(kw)` pattern panicked ("byte index N
+/// is not a char boundary") whenever a multi-byte character straddled the
+/// keyword length (PA-1, code-review 2026-07-02 — e.g. `SHOW SEMANTIC VIEWS
+/// aΩΩ`). A multi-byte character can never byte-match an ASCII keyword, so
+/// the comparison is also *correct* on non-ASCII input: it simply fails.
+///
+/// After a `true` return, slicing `s` at `kw.len()` is guaranteed safe —
+/// the matched prefix is pure ASCII, so `kw.len()` lands on a char boundary.
+#[must_use]
+pub fn starts_with_keyword_ci(s: &str, kw: &str) -> bool {
+    let n = kw.len();
+    s.len() >= n && s.as_bytes()[..n].eq_ignore_ascii_case(kw.as_bytes())
+}
+
+/// Blank SQL comments out of `input`, byte-for-byte length-preserving.
+///
+/// Every byte of a comment — `-- ...` to end of line (the newline itself is
+/// kept), and `/* ... */` including the delimiters — is replaced with a
+/// space. Block comments NEST, matching `PostgreSQL`/`DuckDB` semantics (the SQL
+/// standard): `/* a /* b */ c */` is one comment. An unterminated block
+/// comment blanks to end of input.
+///
+/// Comment markers inside `'...'` string literals (with `''` escape),
+/// `"..."` quoted identifiers (with `""` escape), and `$tag$ ... $tag$`
+/// dollar-quoted strings are inert, and quote characters inside comments are
+/// inert.
+///
+/// Because the output length equals the input length and all replaced
+/// regions are bounded by ASCII delimiters, every byte offset into the
+/// output is valid for the input — error-caret positions computed on the
+/// blanked text reference the original query correctly.
+///
+/// This is the single comment-handling pass for the DDL surface (PA-7,
+/// code-review 2026-07-02): applied once at the parse entry points it makes
+/// every downstream scanner comment-immune, stops trailing comments being
+/// absorbed into stored expressions (`ALTER ... RENAME TO x -- oops` renamed
+/// to `x -- oops`), and fixes non-nesting block-comment handling (PA-10).
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn blank_sql_comments(input: &str) -> std::borrow::Cow<'_, str> {
+    #[derive(PartialEq)]
+    enum St {
+        Code,
+        InString,
+        InIdent,
+    }
+
+    let bytes = input.as_bytes();
+    let mut out: Option<Vec<u8>> = None; // allocated lazily on first comment
+    let mut st = St::Code;
+    let mut dollar_tag: Option<&[u8]> = None;
+    let mut i = 0;
+
+    // Try to read a dollar-quote opener `$tag$` at `i`; returns the tag
+    // including both `$` delimiters.
+    let read_dollar_tag = |i: usize| -> Option<&[u8]> {
+        if bytes[i] != b'$' {
+            return None;
+        }
+        let mut j = i + 1;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            // A tag may not START with a digit ($1 is a parameter, not a tag).
+            if j == i + 1 && bytes[j].is_ascii_digit() {
+                return None;
+            }
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'$' {
+            Some(&bytes[i..=j])
+        } else {
+            None
+        }
+    };
+
+    while i < bytes.len() {
+        if let Some(tag) = dollar_tag {
+            // Inside $tag$ ... $tag$ — scan for the closing tag.
+            if bytes[i] == b'$' && bytes[i..].starts_with(tag) {
+                i += tag.len();
+                dollar_tag = None;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        match st {
+            St::InString => {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    st = St::Code;
+                }
+                i += 1;
+            }
+            St::InIdent => {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    st = St::Code;
+                }
+                i += 1;
+            }
+            St::Code => match bytes[i] {
+                b'\'' => {
+                    st = St::InString;
+                    i += 1;
+                }
+                b'"' => {
+                    st = St::InIdent;
+                    i += 1;
+                }
+                b'$' => {
+                    if let Some(tag) = read_dollar_tag(i) {
+                        i += tag.len();
+                        dollar_tag = Some(tag);
+                    } else {
+                        i += 1;
+                    }
+                }
+                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                    // Line comment: blank to (not including) the newline.
+                    let buf = out.get_or_insert_with(|| bytes.to_vec());
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        buf[i] = b' ';
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    // Block comment — nesting; unterminated blanks to end.
+                    let buf = out.get_or_insert_with(|| bytes.to_vec());
+                    let mut depth = 0usize;
+                    while i < bytes.len() {
+                        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                            depth += 1;
+                            buf[i] = b' ';
+                            buf[i + 1] = b' ';
+                            i += 2;
+                        } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                            depth -= 1;
+                            buf[i] = b' ';
+                            buf[i + 1] = b' ';
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        } else {
+                            buf[i] = b' ';
+                            i += 1;
+                        }
+                    }
+                }
+                _ => i += 1,
+            },
+        }
+    }
+
+    match out {
+        // Only whole comment regions (bounded by ASCII delimiters) were
+        // overwritten with ASCII spaces, so the buffer remains valid UTF-8.
+        Some(buf) => std::borrow::Cow::Owned(
+            String::from_utf8(buf).expect("blanking comment bytes preserves UTF-8 validity"),
+        ),
+        None => std::borrow::Cow::Borrowed(input),
+    }
+}
+
+/// Failure modes of [`extract_single_quoted_prefix`]. Callers map these onto
+/// their local error types/messages (`ParseError` in the body parser, plain
+/// `String` in the SHOW-clause parser).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleQuoteError {
+    /// The input does not begin with `'`.
+    NotQuoted,
+    /// No unescaped closing `'` before end of input.
+    Unterminated,
+}
+
+/// Extract a single-quoted SQL string literal from the start of `input`.
+///
+/// Returns `(unescaped_content, bytes_consumed)` where `bytes_consumed`
+/// includes both the opening and closing quotes. SQL-standard escaping is
+/// honoured: `''` inside the literal is a single literal `'`. Content after
+/// the closing quote is not inspected — callers decide what trailing text
+/// means.
+///
+/// Walks the input as a `char` stream (UTF-8 scalar values), never as raw
+/// bytes: this is the single shared implementation mandated by ST-4
+/// (code-review 2026-07-02). Two earlier per-site copies cast
+/// `bytes[i] as char`, silently Latin-1-izing every non-ASCII codepoint
+/// (`'café'` → `cafÃ©` — WR-04/PA-2); do not re-inline this logic.
+pub fn extract_single_quoted_prefix(input: &str) -> Result<(String, usize), SingleQuoteError> {
+    let mut chars = input.char_indices();
+    match chars.next() {
+        Some((_, '\'')) => {}
+        _ => return Err(SingleQuoteError::NotQuoted),
+    }
+    let mut result = String::new();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '\'' {
+            // Peek without consuming; only advance the real iterator on a hit.
+            let mut peek = chars.clone();
+            if matches!(peek.next(), Some((_, '\''))) {
+                result.push('\'');
+                chars = peek;
+            } else {
+                // `i` is the byte offset of the closing quote; the quote is
+                // one ASCII byte, so total consumed = i + 1.
+                return Ok((result, i + 1));
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    Err(SingleQuoteError::Unterminated)
 }
 
 /// Wrap a closure in `catch_unwind`, converting panics to `Box<dyn Error>`.
@@ -234,6 +478,22 @@ mod tests {
         // Non-ASCII with no match at all must round-trip unchanged.
         let result = replace_word_boundary("'São Paulo' || 'café'", "net_price", "(x)");
         assert_eq!(result, "'São Paulo' || 'café'");
+    }
+
+    #[test]
+    fn replace_word_boundary_does_not_match_inside_unicode_identifier() {
+        // PR #50 review: non-ASCII bytes are identifier continuation, so the
+        // ASCII needle must NOT match where a unicode char abuts it
+        // (`id` inside `idΩ` / `Ωid`) — these are single identifiers.
+        assert_eq!(replace_word_boundary("idΩ", "id", "(x)"), "idΩ");
+        assert_eq!(replace_word_boundary("Ωid", "id", "(x)"), "Ωid");
+        assert_eq!(
+            replace_word_boundary("caféid + 1", "id", "(x)"),
+            "caféid + 1"
+        );
+        // A genuine boundary (ASCII punctuation / whitespace) still matches.
+        assert_eq!(replace_word_boundary("café.id", "id", "(x)"), "café.(x)");
+        assert_eq!(replace_word_boundary("Ω id", "id", "(x)"), "Ω (x)");
     }
 
     #[test]
@@ -365,6 +625,204 @@ mod tests {
         // Non-ASCII, non-matching content must not panic and must round-trip.
         let result = replace_word_boundary_any("héllo + unit_price", &["unit_price"], "(x)");
         assert_eq!(result, "héllo + (x)");
+    }
+
+    // -------------------------------------------------------------------
+    // starts_with_keyword_ci tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn ident_byte_is_the_single_boundary_definition() {
+        // is_word_boundary_char is exactly the inverse of is_ident_byte, and
+        // the classification is: ASCII alnum / `_` / all non-ASCII bytes are
+        // identifier bytes; ASCII punctuation and whitespace are boundaries.
+        for b in 0u8..=255 {
+            assert_eq!(is_word_boundary_char(b), !is_ident_byte(b), "byte {b}");
+        }
+        for &b in b"aZ0_" {
+            assert!(is_ident_byte(b));
+        }
+        assert!(is_ident_byte(0xC3)); // UTF-8 lead byte (é etc.)
+        assert!(is_ident_byte(0xA9)); // UTF-8 continuation byte
+        for &b in b" \t.,()\";'" {
+            assert!(!is_ident_byte(b), "byte {b} must be a boundary");
+        }
+    }
+
+    #[test]
+    fn keyword_ci_matches_case_insensitively() {
+        assert!(starts_with_keyword_ci("LIKE 'x'", "LIKE"));
+        assert!(starts_with_keyword_ci("like 'x'", "LIKE"));
+        assert!(starts_with_keyword_ci("LiKe", "LIKE"));
+    }
+
+    #[test]
+    fn keyword_ci_rejects_shorter_input() {
+        assert!(!starts_with_keyword_ci("LIK", "LIKE"));
+        assert!(!starts_with_keyword_ci("", "LIKE"));
+    }
+
+    #[test]
+    fn keyword_ci_no_panic_on_multibyte_straddle() {
+        // "aΩΩ" is 5 bytes; byte 4 is mid-Ω. The old slice pattern panicked
+        // here (PA-1); byte comparison just fails.
+        assert!(!starts_with_keyword_ci("aΩΩ", "LIKE"));
+        assert!(!starts_with_keyword_ci("Ωx", "IN"));
+    }
+
+    // -------------------------------------------------------------------
+    // blank_sql_comments tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn blank_comments_no_comments_borrows() {
+        let s = "SELECT 1";
+        assert!(matches!(
+            blank_sql_comments(s),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn blank_comments_line_comment() {
+        let out = blank_sql_comments("DROP SEMANTIC VIEW a -- oops\n;");
+        assert_eq!(out, "DROP SEMANTIC VIEW a        \n;");
+        assert_eq!(out.len(), "DROP SEMANTIC VIEW a -- oops\n;".len());
+    }
+
+    #[test]
+    fn blank_comments_block_comment_nested() {
+        // Nested per SQL standard (PostgreSQL/DuckDB behaviour).
+        let out = blank_sql_comments("a /* x /* y */ z */ b");
+        assert_eq!(out, "a                   b");
+    }
+
+    #[test]
+    fn blank_comments_unterminated_block_blanks_to_end() {
+        let out = blank_sql_comments("a /* never closed");
+        assert_eq!(out, "a                ");
+    }
+
+    #[test]
+    fn blank_comments_markers_inside_string_inert() {
+        let s = "COMMENT = 'a -- not a comment /* neither */'";
+        assert_eq!(blank_sql_comments(s), s);
+    }
+
+    #[test]
+    fn blank_comments_markers_inside_quoted_ident_inert() {
+        let s = "\"weird--name\" AS x";
+        assert_eq!(blank_sql_comments(s), s);
+    }
+
+    #[test]
+    fn blank_comments_markers_inside_dollar_quotes_inert() {
+        // YAML bodies ride in $$...$$ — '--' sequences inside must survive.
+        let s = "FROM YAML $$name: v\n# yaml comment\nvalue: a--b$$";
+        assert_eq!(blank_sql_comments(s), s);
+        let s = "FROM YAML $tag$ -- inert $tag$";
+        assert_eq!(blank_sql_comments(s), s);
+    }
+
+    #[test]
+    fn blank_comments_dollar_parameter_not_a_tag() {
+        // $1 is a parameter, not a dollar-quote opener; the comment after it
+        // must still be blanked.
+        let out = blank_sql_comments("WHERE x = $1 -- c");
+        assert_eq!(out, "WHERE x = $1     ");
+    }
+
+    #[test]
+    fn blank_comments_quote_inside_comment_inert() {
+        // An apostrophe inside a comment must not open a string region.
+        let out = blank_sql_comments("a -- don't\nb 'lit'");
+        assert_eq!(out, "a         \nb 'lit'");
+    }
+
+    #[test]
+    fn blank_comments_multibyte_inside_comment() {
+        let input = "x -- café ☕\ny";
+        let out = blank_sql_comments(input);
+        assert_eq!(out.len(), input.len());
+        assert!(out.starts_with("x  "));
+        assert!(out.ends_with("\ny"));
+        // Result must be valid UTF-8 by construction (checked by the type),
+        // and the non-comment text intact.
+        assert_eq!(&out[input.len() - 1..], "y");
+    }
+
+    #[test]
+    fn blank_comments_escaped_quote_in_string() {
+        let s = "'it''s -- fine' -- real";
+        let out = blank_sql_comments(s);
+        assert_eq!(out, "'it''s -- fine'        ");
+    }
+
+    // -------------------------------------------------------------------
+    // extract_single_quoted_prefix tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn quoted_prefix_basic() {
+        let (s, n) = extract_single_quoted_prefix("'abc' rest").unwrap();
+        assert_eq!(s, "abc");
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn quoted_prefix_escaped_quote() {
+        let (s, n) = extract_single_quoted_prefix("'a''b'").unwrap();
+        assert_eq!(s, "a'b");
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn quoted_prefix_empty_literal() {
+        let (s, n) = extract_single_quoted_prefix("''").unwrap();
+        assert_eq!(s, "");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn quoted_prefix_non_ascii_content_survives() {
+        // PA-2 regression: the per-site copies Latin-1-ized this to "cafÃ©".
+        let (s, n) = extract_single_quoted_prefix("'café et plus'").unwrap();
+        assert_eq!(s, "café et plus");
+        assert_eq!(n, "'café et plus'".len());
+
+        let (s, _) = extract_single_quoted_prefix("'東京 ☕'").unwrap();
+        assert_eq!(s, "東京 ☕");
+    }
+
+    #[test]
+    fn quoted_prefix_errors() {
+        assert_eq!(
+            extract_single_quoted_prefix("abc"),
+            Err(SingleQuoteError::NotQuoted)
+        );
+        assert_eq!(
+            extract_single_quoted_prefix("'abc"),
+            Err(SingleQuoteError::Unterminated)
+        );
+        assert_eq!(
+            extract_single_quoted_prefix(""),
+            Err(SingleQuoteError::NotQuoted)
+        );
+    }
+
+    proptest! {
+        // Round-trip: escaping then extracting returns the original content
+        // and consumes exactly the literal, for arbitrary unicode content.
+        #[test]
+        fn quoted_prefix_roundtrips_arbitrary_content(
+            content in "\\PC{0,40}",
+            tail in "[ a-zA-Z]{0,10}",
+        ) {
+            let literal = format!("'{}'{}", content.replace('\'', "''"), tail);
+            let (extracted, consumed) = extract_single_quoted_prefix(&literal).unwrap();
+            prop_assert_eq!(&extracted, &content);
+            prop_assert_eq!(&literal[consumed..], &tail);
+        }
     }
 
     // -------------------------------------------------------------------

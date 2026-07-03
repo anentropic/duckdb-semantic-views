@@ -225,7 +225,7 @@ ci: lint check-test-list test-all check-fuzz docs-check
 fuzz target="fuzz_json_parse" time="300":
     cargo +nightly fuzz run {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{time}}
 
-# Run all six fuzz targets sequentially (5 min each, 30 min total)
+# Run all eight fuzz targets sequentially (5 min each, 40 min total)
 fuzz-all time="300":
     cargo +nightly fuzz run fuzz_json_parse fuzz/corpus/fuzz_json_parse fuzz/seeds/fuzz_json_parse -- -max_total_time={{time}}
     cargo +nightly fuzz run fuzz_sql_expand fuzz/corpus/fuzz_sql_expand fuzz/seeds/fuzz_sql_expand -- -max_total_time={{time}}
@@ -233,6 +233,8 @@ fuzz-all time="300":
     cargo +nightly fuzz run fuzz_ddl_parse fuzz/corpus/fuzz_ddl_parse fuzz/seeds/fuzz_ddl_parse -- -max_total_time={{time}}
     cargo +nightly fuzz run fuzz_yaml_parse fuzz/corpus/fuzz_yaml_parse fuzz/seeds/fuzz_yaml_parse -- -max_total_time={{time}}
     cargo +nightly fuzz run fuzz_parser_override_ffi fuzz/corpus/fuzz_parser_override_ffi fuzz/seeds/fuzz_parser_override_ffi -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_keyword_body fuzz/corpus/fuzz_keyword_body fuzz/seeds/fuzz_keyword_body -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_render_roundtrip fuzz/corpus/fuzz_render_roundtrip fuzz/seeds/fuzz_render_roundtrip -- -max_total_time={{time}}
 
 # Minimize corpus for a fuzz target (removes inputs that don't add coverage)
 fuzz-cmin target="fuzz_json_parse":

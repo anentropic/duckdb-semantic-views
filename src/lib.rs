@@ -2,6 +2,7 @@ pub mod body_parser;
 pub mod catalog;
 pub mod errors;
 pub mod expand;
+pub mod ffi_util;
 pub mod graph;
 pub mod ident;
 pub mod model;

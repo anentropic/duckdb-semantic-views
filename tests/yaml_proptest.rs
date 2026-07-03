@@ -9,9 +9,22 @@ use semantic_views::model::{
 // Proptest strategies for model types
 // ---------------------------------------------------------------------------
 
-/// Generate an arbitrary non-empty string (1..=20 alphanumeric chars).
+/// Generate an arbitrary non-empty identifier. The alphabet includes quoted,
+/// unicode, keyword, and whitespace-bearing arms (TC-3, code-review
+/// 2026-07-02 — the previous [a-z][a-z0-9_]* alphabet systematically missed
+/// the shapes behind the UTF-8 and quoting regressions; YAML must round-trip
+/// them all as plain string scalars).
 fn arb_name() -> impl Strategy<Value = String> {
-    "[a-z][a-z0-9_]{0,19}".prop_map(|s| s.to_string())
+    prop_oneof![
+        4 => "[a-z][a-z0-9_]{0,19}".boxed(),
+        1 => "[A-Za-zéàçΩ東京☕][A-Za-zéàçΩ東京☕ _.-]{0,10}".boxed(),
+        1 => "\"[a-zA-Z ,.()]{1,10}\"".boxed(),
+        1 => prop::sample::select(vec![
+            "SELECT".to_string(),
+            "primary key".to_string(),
+            "wéird name".to_string(),
+        ]).boxed(),
+    ]
 }
 
 /// Generate an arbitrary SQL-like expression.
@@ -21,6 +34,7 @@ fn arb_expr() -> impl Strategy<Value = String> {
         arb_name().prop_map(|n| format!("SUM({n})")),
         arb_name().prop_map(|n| format!("COUNT({n})")),
         arb_name().prop_map(|n| format!("AVG({n})")),
+        arb_name().prop_map(|n| format!("concat({n}, ' – ☕')")),
     ]
 }
 

@@ -44,6 +44,10 @@
 /// between dots (`a..b`), leading dots, or trailing garbage after a closing
 /// quote.
 ///
+/// Case is preserved for every part; callers that need fold-to-lowercase
+/// semantics for bare parts use [`parse_qualified_identifier_with_quoting`]
+/// to learn which parts were quoted.
+///
 /// # Examples
 ///
 /// ```ignore
@@ -56,11 +60,21 @@
 /// assert_eq!(parse_qualified_identifier("\"with\"\"q\"").unwrap(), vec![r#"with"q"#]);
 /// ```
 pub fn parse_qualified_identifier(input: &str) -> Result<Vec<String>, String> {
+    Ok(parse_qualified_identifier_with_quoting(input)?
+        .into_iter()
+        .map(|(part, _)| part)
+        .collect())
+}
+
+/// [`parse_qualified_identifier`] variant that also reports, per part,
+/// whether it was written `"quoted"` in the input. The quotedness flag is
+/// what decides case-folding at [`normalize_view_name`].
+pub fn parse_qualified_identifier_with_quoting(input: &str) -> Result<Vec<(String, bool)>, String> {
     if input.is_empty() {
         return Err("empty identifier".to_string());
     }
     let bytes = input.as_bytes();
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<(String, bool)> = Vec::new();
     let mut pos: usize = 0;
 
     loop {
@@ -78,30 +92,38 @@ pub fn parse_qualified_identifier(input: &str) -> Result<Vec<String>, String> {
 
         if bytes[pos] == b'"' {
             // Quoted part — scan to matching closing quote, honouring "" escape.
+            // Byte-scan for the ASCII quote (a UTF-8 continuation byte can
+            // never equal 0x22) but accumulate content by slicing the
+            // original `&str` between quote positions: the previous
+            // `bytes[pos] as char` push Latin-1-ized every non-ASCII
+            // codepoint (`"café"` stored as `cafÃ©` — PA-2, code-review
+            // 2026-07-02).
             pos += 1;
             let mut buf = String::new();
+            let mut seg_start = pos;
             loop {
                 if pos >= bytes.len() {
                     return Err("unterminated quoted identifier".to_string());
                 }
                 if bytes[pos] == b'"' {
+                    buf.push_str(&input[seg_start..pos]);
                     // Look ahead for escape `""`.
                     if pos + 1 < bytes.len() && bytes[pos + 1] == b'"' {
                         buf.push('"');
                         pos += 2;
+                        seg_start = pos;
                         continue;
                     }
                     // Closing quote consumed.
                     pos += 1;
                     break;
                 }
-                buf.push(bytes[pos] as char);
                 pos += 1;
             }
             if buf.is_empty() {
                 return Err("empty quoted identifier (\"\")".to_string());
             }
-            parts.push(buf);
+            parts.push((buf, true));
         } else {
             // Bare part — read until '.', '"', or end-of-input.
             let start = pos;
@@ -120,7 +142,7 @@ pub fn parse_qualified_identifier(input: &str) -> Result<Vec<String>, String> {
             // Safe: bare parts contain only single-byte ASCII excluding '.', '"'.
             // We accept any non-`.`/`"` byte verbatim here; non-ASCII bytes are
             // copied through as UTF-8 because we sliced the original &str.
-            parts.push(input[start..pos].to_string());
+            parts.push((input[start..pos].to_string(), false));
         }
 
         // AfterPart: must be '.' (more) or end-of-input (done).
@@ -137,25 +159,50 @@ pub fn parse_qualified_identifier(input: &str) -> Result<Vec<String>, String> {
     }
 }
 
-/// Convenience: return the bare unquoted *last* part of a dot-qualified
+/// Convenience: return the normalised *last* part of a dot-qualified
 /// identifier. This is the lookup key stored in
 /// `semantic_layer._definitions(name)`.
+///
+/// Case normalisation (PA-8, code-review 2026-07-02): an UNQUOTED name is
+/// folded to ASCII lowercase; a `"quoted"` name preserves its exact case.
+/// This is the Snowflake identifier contract (fold unquoted, preserve
+/// quoted) with `DuckDB`'s lowercase fold direction, and it applies uniformly
+/// because every view-name consumer — DDL capture sites, guard/DML
+/// emission, and the `semantic_view()` / `explain_semantic_view()` lookup
+/// arguments — resolves names through this function. Previously unquoted
+/// names were byte-exact case-sensitive (`CREATE ... Sales` then
+/// `DROP ... sales` → "does not exist"), diverging from both `DuckDB` and
+/// Snowflake.
+///
+/// Migration note: definitions created before v0.11 with unquoted
+/// mixed-case names are stored under their original casing and must now be
+/// referenced quoted (`"Sales"`) — or dropped and recreated — because an
+/// unquoted reference folds to lowercase before lookup.
 ///
 /// # Examples
 ///
 /// ```ignore
 /// use semantic_views::ident::normalize_view_name;
 /// assert_eq!(normalize_view_name("orders_sv").unwrap(), "orders_sv");
+/// assert_eq!(normalize_view_name("Orders_SV").unwrap(), "orders_sv");
+/// assert_eq!(normalize_view_name("\"Orders_SV\"").unwrap(), "Orders_SV");
 /// assert_eq!(
 ///     normalize_view_name("\"memory\".\"main\".\"orders_sv\"").unwrap(),
 ///     "orders_sv",
 /// );
 /// ```
 pub fn normalize_view_name(input: &str) -> Result<String, String> {
-    let parts = parse_qualified_identifier(input)?;
+    let parts = parse_qualified_identifier_with_quoting(input)?;
     parts
         .into_iter()
         .next_back()
+        .map(|(part, quoted)| {
+            if quoted {
+                part
+            } else {
+                part.to_ascii_lowercase()
+            }
+        })
         .ok_or_else(|| "empty identifier".to_string())
 }
 
@@ -295,6 +342,24 @@ mod tests {
         }
 
         #[test]
+        fn non_ascii_quoted_part_survives_unmangled() {
+            // PA-2 regression: the byte-wise loop stored `"café"` as the
+            // Latin-1-ized `cafÃ©`.
+            assert_eq!(
+                parse_qualified_identifier("\"café\"").unwrap(),
+                vec!["café"],
+            );
+            assert_eq!(
+                parse_qualified_identifier("\"東京\".\"wéird name\"").unwrap(),
+                vec!["東京", "wéird name"],
+            );
+            assert_eq!(
+                parse_qualified_identifier("\"a☕\"\"b\"").unwrap(),
+                vec![r#"a☕"b"#],
+            );
+        }
+
+        #[test]
         fn whitespace_inside_quoted_part() {
             assert_eq!(
                 parse_qualified_identifier("\"my table\"").unwrap(),
@@ -362,6 +427,46 @@ mod tests {
         #[test]
         fn bare_returns_self() {
             assert_eq!(normalize_view_name("orders_sv").unwrap(), "orders_sv");
+        }
+
+        // --- PA-8 (code-review 2026-07-02): fold unquoted, preserve quoted ---
+
+        #[test]
+        fn unquoted_mixed_case_folds_to_lowercase() {
+            assert_eq!(normalize_view_name("Sales").unwrap(), "sales");
+            assert_eq!(normalize_view_name("ORDERS_SV").unwrap(), "orders_sv");
+            assert_eq!(normalize_view_name("main.Sales").unwrap(), "sales");
+        }
+
+        #[test]
+        fn quoted_mixed_case_preserved() {
+            assert_eq!(normalize_view_name("\"Sales\"").unwrap(), "Sales");
+            assert_eq!(normalize_view_name("\"ORDERS SV\"").unwrap(), "ORDERS SV");
+            assert_eq!(
+                normalize_view_name("main.\"Sales\"").unwrap(),
+                "Sales",
+                "quotedness is per-part: only the last part decides"
+            );
+        }
+
+        #[test]
+        fn fold_is_ascii_only() {
+            // Non-ASCII in a bare part passes through unfolded — ASCII fold
+            // matches DuckDB's identifier semantics and avoids locale
+            // surprises.
+            assert_eq!(normalize_view_name("Ärger").unwrap(), "Ärger");
+        }
+
+        #[test]
+        fn quoting_flags_reported_per_part() {
+            assert_eq!(
+                parse_qualified_identifier_with_quoting("db.\"Sch\".V").unwrap(),
+                vec![
+                    ("db".to_string(), false),
+                    ("Sch".to_string(), true),
+                    ("V".to_string(), false),
+                ],
+            );
         }
 
         #[test]
@@ -487,15 +592,29 @@ mod tests {
                 .join(".")
         }
 
+        /// Identifier-part alphabet: printable ASCII (including `"`, `.`,
+        /// space) PLUS a unicode arm and keyword arms (TC-3, code-review
+        /// 2026-07-02 — the previous ASCII-only alphabet systematically
+        /// missed the shapes behind PA-1/PA-2).
+        fn arb_part() -> impl Strategy<Value = String> {
+            prop_oneof![
+                3 => "[\\x20-\\x7E]{1,16}".boxed(),
+                2 => "[a-zA-ZéàçßΩλ東京日本語☕ \".]{1,10}".boxed(),
+                1 => prop::sample::select(vec![
+                    "SELECT".to_string(),
+                    "PRIMARY KEY".to_string(),
+                    "café".to_string(),
+                    "wéird name".to_string(),
+                ]).boxed(),
+            ]
+        }
+
         proptest! {
             /// parse(emit(v)) == Ok(v) for any 1..=4-part vector of
-            /// non-empty printable-ASCII strings (including ", ., space).
+            /// non-empty parts across the full alphabet.
             #[test]
             fn parse_emit_roundtrip_is_identity(
-                parts in prop::collection::vec(
-                    "[\\x20-\\x7E]{1,16}",
-                    1..=4,
-                )
+                parts in prop::collection::vec(arb_part(), 1..=4)
             ) {
                 let emitted = emit_via_quote_ident(&parts);
                 let parsed = parse_qualified_identifier(&emitted);
@@ -510,13 +629,12 @@ mod tests {
         }
 
         proptest! {
-            /// normalize_view_name(emit(v)) == Ok(v.last()).
+            /// normalize_view_name(emit(v)) == Ok(v.last()). All parts are
+            /// emitted QUOTED via quote_ident, so PA-8 case folding never
+            /// applies — the exact content round-trips.
             #[test]
             fn normalize_returns_last_part(
-                parts in prop::collection::vec(
-                    "[\\x20-\\x7E]{1,16}",
-                    1..=4,
-                )
+                parts in prop::collection::vec(arb_part(), 1..=4)
             ) {
                 let emitted = emit_via_quote_ident(&parts);
                 let normalised = normalize_view_name(&emitted);
@@ -527,6 +645,26 @@ mod tests {
                     "normalize failed for parts={:?}, emitted={:?}",
                     parts,
                     emitted,
+                );
+            }
+        }
+
+        proptest! {
+            /// Bare (unquoted) names fold to ASCII lowercase (PA-8), and
+            /// folding then quoting round-trips through normalize.
+            #[test]
+            fn bare_names_fold_to_lowercase(
+                name in "[A-Za-z_][A-Za-z0-9_]{0,16}"
+            ) {
+                let folded = name.to_ascii_lowercase();
+                prop_assert_eq!(
+                    normalize_view_name(&name),
+                    Ok(folded.clone()),
+                );
+                // Quoting the folded name preserves it exactly.
+                prop_assert_eq!(
+                    normalize_view_name(&quote_ident(&folded)),
+                    Ok(folded),
                 );
             }
         }

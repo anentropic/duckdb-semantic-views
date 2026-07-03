@@ -28,9 +28,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Keep in sync with fuzz/fuzz_targets/ (all six targets must be listed —
+        # Keep in sync with fuzz/fuzz_targets/ (all eight targets must be listed —
         # fuzz_yaml_parse and fuzz_parser_override_ffi were missing until 2026-07-02).
-        target: [fuzz_json_parse, fuzz_sql_expand, fuzz_query_names, fuzz_ddl_parse, fuzz_yaml_parse, fuzz_parser_override_ffi]
+        target: [fuzz_json_parse, fuzz_sql_expand, fuzz_query_names, fuzz_ddl_parse, fuzz_yaml_parse, fuzz_parser_override_ffi, fuzz_keyword_body, fuzz_render_roundtrip]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly

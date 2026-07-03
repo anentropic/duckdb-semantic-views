@@ -15,7 +15,7 @@ mod window;
 mod test_helpers;
 
 // Public API (matches prior expand.rs surface exactly)
-pub use resolution::{quote_ident, quote_table_ref};
+pub use resolution::{quote_ident, quote_ident_if_needed, quote_table_ref};
 pub use sql_gen::expand;
 pub use types::{DimensionName, ExpandError, MetricName, QueryRequest};
 

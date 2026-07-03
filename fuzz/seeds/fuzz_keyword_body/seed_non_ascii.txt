@@ -1,0 +1,1 @@
+AS TABLES (o AS "тable" PRIMARY KEY ("идентификатор")) DIMENSIONS (o."wéird name" AS o."café") METRICS (o.東京 AS SUM(o.amount))

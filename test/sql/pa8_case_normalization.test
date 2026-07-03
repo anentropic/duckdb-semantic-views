@@ -1,0 +1,89 @@
+# PA-8 (code-review 2026-07-02): view-name case normalization.
+#
+# Unquoted view names fold to ASCII lowercase at every DDL capture site and
+# at the semantic_view() lookup argument; "quoted" names preserve exact case.
+# This matches the Snowflake identifier contract (fold unquoted, preserve
+# quoted) with DuckDB's lowercase fold direction. Previously unquoted names
+# were byte-exact case-sensitive: CREATE ... Sales then DROP ... sales
+# failed with "does not exist".
+
+require semantic_views
+
+statement ok
+CREATE TABLE pa8_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), region VARCHAR);
+
+statement ok
+INSERT INTO pa8_orders VALUES (1, 100.00, 'US'), (2, 50.00, 'EU');
+
+# ============================================================
+# Unquoted mixed-case name folds to lowercase everywhere
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW SalesView AS
+  TABLES (o AS pa8_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+# Stored under the folded name.
+query I
+SELECT name FROM list_semantic_views() WHERE name LIKE '%ales%';
+----
+salesview
+
+# Query lookup folds the same way — every casing reaches the same view.
+query II
+FROM semantic_view('SALESVIEW', dimensions := ['region'], metrics := ['total'])
+ORDER BY 1;
+----
+EU	50.00
+US	100.00
+
+# DESCRIBE with different casing resolves to the same view.
+statement ok
+DESCRIBE SEMANTIC VIEW salesview;
+
+# ALTER and DROP with different casing operate on the same view.
+statement ok
+ALTER SEMANTIC VIEW SALESVIEW SET COMMENT = 'folded';
+
+statement ok
+DROP SEMANTIC VIEW salesVIEW;
+
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+0
+
+# ============================================================
+# Quoted mixed-case name preserves exact case
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW "SalesView" AS
+  TABLES (o AS pa8_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+query I
+SELECT name FROM list_semantic_views();
+----
+SalesView
+
+# An unquoted reference folds to lowercase and does NOT find the
+# case-preserved quoted name.
+statement error
+DROP SEMANTIC VIEW SalesView;
+----
+does not exist
+
+# The quoted reference finds it.
+query II
+FROM semantic_view('"SalesView"', dimensions := ['region'], metrics := ['total'])
+ORDER BY 1;
+----
+EU	50.00
+US	100.00
+
+statement ok
+DROP SEMANTIC VIEW "SalesView";

@@ -1,0 +1,1 @@
+CREATE SEMANTIC VIEW v AS TABLES (o AS orders COMMENT = 'the PRIMARY KEY (id) lives here') DIMENSIONS (o.region AS o.region) METRICS (o.total AS SUM(o.amount) COMMENT = 'has -- and /* inside */')

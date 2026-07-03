@@ -1,0 +1,1 @@
+AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o."a,b" AS o."x)y", o."a.b" AS o."comment")

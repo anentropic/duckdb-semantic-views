@@ -13,6 +13,9 @@ use crate::body_parser::parse_keyword_body;
 use crate::errors::ParseError;
 use crate::ident::{find_identifier_end, normalize_view_name};
 use crate::model::{Cardinality, Join, TableRef};
+use crate::util::{
+    extract_single_quoted_prefix, is_ident_byte, starts_with_keyword_ci, SingleQuoteError,
+};
 
 // ---------------------------------------------------------------------------
 // OverrideContext — Phase 65 Plan 06: empty struct (no state).
@@ -121,6 +124,17 @@ fn match_keyword_prefix(input: &[u8], keywords: &[&[u8]]) -> Option<usize> {
             return None;
         }
         pos += kw.len();
+    }
+    // Require a word boundary after the FINAL keyword. Inter-keyword
+    // boundaries are already enforced by the mandatory whitespace above,
+    // but without this check `CREATE SEMANTIC VIEWfoo` matched, and the
+    // plural typo `DROP SEMANTIC VIEWS` matched the `DROP SEMANTIC VIEW`
+    // prefix and dropped a view named `s` (PA-4, code-review 2026-07-02).
+    // Non-ASCII bytes (>= 0x80) are identifier continuation in DuckDB, so
+    // they are NOT boundaries either; ASCII punctuation (whitespace, `(`,
+    // `;`, `"`) is a legitimate token boundary and stays accepted.
+    if pos < input.len() && is_ident_byte(input[pos]) {
+        return None;
     }
     Some(pos)
 }
@@ -266,6 +280,10 @@ fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
 /// returns, vertical tabs, form feeds) between prefix keywords.
 #[must_use]
 pub fn detect_ddl_kind(query: &str) -> Option<DdlKind> {
+    // PA-7: comment-blind detection — also lets a comment sit between
+    // prefix keywords (`CREATE /* x */ SEMANTIC VIEW`).
+    let blanked = crate::util::blank_sql_comments(query);
+    let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end().trim_end_matches(';').trim();
     detect_ddl_prefix(trimmed).map(|(kind, _)| kind)
@@ -288,10 +306,29 @@ pub fn detect_semantic_view_ddl(query: &str) -> u8 {
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
-/// Extract just the view name from a name-only DDL statement (DROP, DESCRIBE).
+/// How [`extract_name_only`] treats text after the view name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trailing {
+    /// The statement ends at the view name — any trailing text is an error
+    /// (PA-5, code-review 2026-07-02: `DROP SEMANTIC VIEW a b c` used to
+    /// execute and silently discard `b c`; `DESCRIBE ... a CASCADE` silently
+    /// ignored the `CASCADE`).
+    Reject,
+    /// Trailing text is the caller's problem (ALTER: the sub-operation
+    /// follows the name).
+    Allow,
+}
+
+/// Extract just the view name from a name-only DDL statement (DROP, DESCRIBE,
+/// SHOW COLUMNS; ALTER uses [`Trailing::Allow`] since its sub-operation
+/// follows the name).
 ///
 /// `prefix_len` is the byte length of the already-matched prefix.
-fn extract_name_only(trimmed: &str, prefix_len: usize) -> Result<String, String> {
+fn extract_name_only(
+    trimmed: &str,
+    prefix_len: usize,
+    trailing: Trailing,
+) -> Result<String, String> {
     let after_prefix = trimmed[prefix_len..].trim();
     if after_prefix.is_empty() {
         return Err("Missing view name".to_string());
@@ -304,6 +341,12 @@ fn extract_name_only(trimmed: &str, prefix_len: usize) -> Result<String, String>
     let raw_name = &after_prefix[..name_end];
     if raw_name.is_empty() {
         return Err("Missing view name".to_string());
+    }
+    if trailing == Trailing::Reject {
+        let rest = after_prefix[name_end..].trim();
+        if !rest.is_empty() {
+            return Err(format!("Unexpected tokens after view name: '{rest}'"));
+        }
     }
     let name = normalize_view_name(raw_name).map_err(|e| format!("Invalid view name: {e}"))?;
     Ok(name)
@@ -345,37 +388,17 @@ fn function_name(kind: DdlKind) -> &'static str {
 ///
 /// Handles SQL-style escaping: `''` inside quotes represents a literal `'`.
 ///
-/// Phase 65.1 WR-04: walks the input as a `char` stream (UTF-8 scalar values)
-/// rather than as raw bytes — the previous `bytes[pos] as char` cast
-/// silently corrupted any non-ASCII codepoint into its Latin-1 supplement
-/// equivalent, mangling e.g. Cyrillic / CJK / emoji / smart-quote payloads
-/// in `SHOW ... LIKE '<pattern>'` or `ALTER ... SET COMMENT = '<text>'`.
+/// Thin adapter over the shared UTF-8-correct extractor (ST-4 consolidation;
+/// originally fixed here as Phase 65.1 WR-04) mapping errors to this call
+/// site's message wording.
 fn extract_quoted_string(input: &str) -> Result<(String, usize), String> {
-    let mut chars = input.char_indices();
-    match chars.next() {
-        Some((_, '\'')) => {}
-        _ => return Err("Expected single-quoted string".to_string()),
-    }
-    let mut result = String::new();
-    while let Some((i, ch)) = chars.next() {
-        if ch == '\'' {
-            // Peek without consuming; only advance the real iterator on a hit.
-            let mut peek = chars.clone();
-            if matches!(peek.next(), Some((_, '\''))) {
-                // Escaped quote: '' -> '
-                result.push('\'');
-                chars = peek;
-            } else {
-                // End of string. `i` is the byte offset of the closing
-                // quote; closing quote is one byte (ASCII '\''), so total
-                // consumed = i + 1.
-                return Ok((result, i + 1));
-            }
-        } else {
-            result.push(ch);
+    extract_single_quoted_prefix(input).map_err(|e| {
+        match e {
+            SingleQuoteError::NotQuoted => "Expected single-quoted string",
+            SingleQuoteError::Unterminated => "Unterminated single-quoted string",
         }
-    }
-    Err("Unterminated single-quoted string".to_string())
+        .to_string()
+    })
 }
 
 /// Build optional WHERE and LIMIT suffix for a SHOW rewrite.
@@ -440,13 +463,11 @@ fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), Stri
     let after_in = rest[2..].trim_start();
 
     // Try to match a keyword (SCHEMA or DATABASE) followed by an identifier.
-    let (keyword, kw_len, label) = if after_in.len() >= 6
-        && after_in[..6].eq_ignore_ascii_case("SCHEMA")
+    let (keyword, kw_len, label) = if starts_with_keyword_ci(after_in, "SCHEMA")
         && (after_in.len() == 6 || after_in.as_bytes()[6].is_ascii_whitespace())
     {
         ("SCHEMA", 6, "schema")
-    } else if after_in.len() >= 8
-        && after_in[..8].eq_ignore_ascii_case("DATABASE")
+    } else if starts_with_keyword_ci(after_in, "DATABASE")
         && (after_in.len() == 8 || after_in.as_bytes()[8].is_ascii_whitespace())
     {
         ("DATABASE", 8, "database")
@@ -478,7 +499,11 @@ fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), Stri
 /// Returns `(remaining_text, metric_name)`.
 fn parse_for_metric<'a>(rest: &'a str, entity: &str) -> Result<(&'a str, &'a str), String> {
     let after_for = rest[3..].trim_start();
-    if after_for.len() < 6 || !after_for[..6].eq_ignore_ascii_case("METRIC") {
+    // Word boundary after METRIC: `FOR METRICS x` must not parse as the
+    // METRIC keyword followed by a metric named `s x` (PR #50 review).
+    let metric_boundary_ok = starts_with_keyword_ci(after_for, "METRIC")
+        && (after_for.len() == 6 || after_for.as_bytes()[6].is_ascii_whitespace());
+    if !metric_boundary_ok {
         return Err("Expected FOR METRIC after view name. \
              Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] \
              [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
@@ -501,6 +526,7 @@ fn parse_for_metric<'a>(rest: &'a str, entity: &str) -> Result<(&'a str, &'a str
 /// Parse optional SHOW SEMANTIC filter clauses from text after the prefix.
 ///
 /// Clause order (Snowflake): LIKE, IN, FOR METRIC, STARTS WITH, LIMIT.
+#[allow(clippy::too_many_lines)]
 fn parse_show_filter_clauses<'a>(
     after_prefix: &'a str,
     kind: DdlKind,
@@ -522,7 +548,7 @@ fn parse_show_filter_clauses<'a>(
     };
 
     // 1. Check for LIKE keyword
-    if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("LIKE") {
+    if starts_with_keyword_ci(rest, "LIKE") {
         // Ensure it's followed by whitespace (not just a prefix match)
         if rest.len() == 4 || rest.as_bytes()[4].is_ascii_whitespace() {
             rest = rest[4..].trim_start();
@@ -533,8 +559,7 @@ fn parse_show_filter_clauses<'a>(
     }
 
     // 2. Check for IN keyword
-    if rest.len() >= 2
-        && rest[..2].eq_ignore_ascii_case("IN")
+    if starts_with_keyword_ci(rest, "IN")
         && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
     {
         if kind == DdlKind::Show || kind == DdlKind::ShowTerse {
@@ -553,8 +578,11 @@ fn parse_show_filter_clauses<'a>(
         }
     }
 
-    // 3. Check for FOR METRIC (only for ShowDimensions)
-    if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case("FOR") {
+    // 3. Check for FOR METRIC (only for ShowDimensions). Word boundary
+    // enforced so e.g. FOREIGN does not match FOR (PR #50 review).
+    if starts_with_keyword_ci(rest, "FOR")
+        && (rest.len() == 3 || rest.as_bytes()[3].is_ascii_whitespace())
+    {
         if kind != DdlKind::ShowDimensions {
             return Err(format!(
                 "FOR METRIC is only valid for SHOW SEMANTIC DIMENSIONS, not SHOW SEMANTIC {entity}"
@@ -565,10 +593,18 @@ fn parse_show_filter_clauses<'a>(
         for_metric = Some(metric_name);
     }
 
-    // 4. Check for STARTS WITH
-    if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case("STARTS") {
+    // 4. Check for STARTS WITH. Word boundaries enforced (PA-10:
+    // `STARTSWITH 'a'` used to be accepted).
+    if starts_with_keyword_ci(rest, "STARTS")
+        && (rest.len() == 6 || rest.as_bytes()[6].is_ascii_whitespace())
+    {
         rest = rest[6..].trim_start();
-        if rest.len() < 4 || !rest[..4].eq_ignore_ascii_case("WITH") {
+        // Word boundary after WITH: `_` and non-ASCII bytes are identifier
+        // continuation (mirrors match_keyword_prefix), so WITH_x / WITHé do
+        // not match the keyword.
+        let with_boundary_ok = starts_with_keyword_ci(rest, "WITH")
+            && (rest.len() == 4 || !is_ident_byte(rest.as_bytes()[4]));
+        if !with_boundary_ok {
             return Err(format!(
                 "Expected STARTS WITH. \
                  Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
@@ -580,8 +616,11 @@ fn parse_show_filter_clauses<'a>(
         rest = rest[consumed..].trim_start();
     }
 
-    // 5. Check for LIMIT
-    if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case("LIMIT") {
+    // 5. Check for LIMIT. Word boundary enforced (PA-10: `LIMIT5` used to
+    // be accepted).
+    if starts_with_keyword_ci(rest, "LIMIT")
+        && (rest.len() == 5 || rest.as_bytes()[5].is_ascii_whitespace())
+    {
         rest = rest[5..].trim_start();
         let token_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let token = &rest[..token_end];
@@ -633,7 +672,6 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
     let view_name =
         normalize_view_name(raw_view_name).map_err(|e| format!("Invalid view name: {e}"))?;
     let rest = after_prefix[name_end..].trim();
-    let rest_upper = rest.to_ascii_uppercase();
     let safe_name = view_name.replace('\'', "''");
 
     let if_exists_suffix = if kind == DdlKind::AlterIfExists {
@@ -642,10 +680,24 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
         ""
     };
 
-    if rest_upper.starts_with("RENAME TO") {
-        let new_name_raw = rest["RENAME TO".len()..].trim();
-        if new_name_raw.is_empty() {
+    // Sub-operation keyword matching rides match_keyword_prefix so any
+    // amount of whitespace separates the keywords (PA-10: the old
+    // starts_with("RENAME TO") required exactly one space) and a trailing
+    // word boundary is enforced (PA-4 contract).
+    if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"rename", b"to"]) {
+        let after_op = rest[consumed..].trim();
+        if after_op.is_empty() {
             return Err("Missing new name after RENAME TO".to_string());
+        }
+        // Capture the (possibly quoted) new name, then reject trailing
+        // garbage — `RENAME TO x oops` must not rename to `x oops` (PA-5).
+        let new_name_end = find_identifier_end(after_op, false);
+        let new_name_raw = &after_op[..new_name_end];
+        let trailing = after_op[new_name_end..].trim();
+        if !trailing.is_empty() {
+            return Err(format!(
+                "Unexpected tokens after new view name in RENAME TO: '{trailing}'"
+            ));
         }
         let new_name = normalize_view_name(new_name_raw)
             .map_err(|e| format!("Invalid new view name in RENAME TO: {e}"))?;
@@ -654,8 +706,8 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
         Ok(format!(
             "SELECT * FROM {alter_fn}('{safe_name}', '{safe_new}')"
         ))
-    } else if rest_upper.starts_with("SET COMMENT") {
-        let after_set_comment = rest["SET COMMENT".len()..].trim_start();
+    } else if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"set", b"comment"]) {
+        let after_set_comment = rest[consumed..].trim_start();
         if !after_set_comment.starts_with('=') {
             return Err("Expected '=' after SET COMMENT".to_string());
         }
@@ -664,15 +716,27 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
             return Err("Expected single-quoted string after SET COMMENT =".to_string());
         }
         // Extract the quoted string handling '' escaping
-        let (comment_value, _consumed) =
+        let (comment_value, consumed_lit) =
             extract_quoted_string(after_eq).map_err(|e| format!("Invalid comment string: {e}"))?;
+        let trailing = after_eq[consumed_lit..].trim();
+        if !trailing.is_empty() {
+            return Err(format!(
+                "Unexpected tokens after SET COMMENT string: '{trailing}'"
+            ));
+        }
         // Re-escape for SQL embedding
         let safe_comment = comment_value.replace('\'', "''");
         let alter_fn = format!("alter_semantic_view_set_comment{if_exists_suffix}");
         Ok(format!(
             "SELECT * FROM {alter_fn}('{safe_name}', '{safe_comment}')"
         ))
-    } else if rest_upper.starts_with("UNSET COMMENT") {
+    } else if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"unset", b"comment"]) {
+        let trailing = rest[consumed..].trim();
+        if !trailing.is_empty() {
+            return Err(format!(
+                "Unexpected tokens after UNSET COMMENT: '{trailing}'"
+            ));
+        }
         let alter_fn = format!("alter_semantic_view_unset_comment{if_exists_suffix}");
         Ok(format!("SELECT * FROM {alter_fn}('{safe_name}')"))
     } else {
@@ -691,6 +755,10 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
 ///
 /// CREATE forms must go through `validate_and_rewrite` -> `rewrite_ddl_keyword_body`.
 fn rewrite_ddl(query: &str) -> Result<String, String> {
+    // PA-7: comment-blind rewriting (idempotent when the caller already
+    // blanked; only allocates when comments are present).
+    let blanked = crate::util::blank_sql_comments(query);
+    let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end();
     let trimmed = trimmed.trim_end_matches(';').trim();
@@ -707,7 +775,7 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
         }
         // Name-only forms (DROP, DESCRIBE, SHOW COLUMNS IN SEMANTIC VIEW)
         DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe | DdlKind::ShowColumns => {
-            let name = extract_name_only(trimmed, plen)?;
+            let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
             let safe_name = name.replace('\'', "''");
             Ok(format!("SELECT * FROM {fn_name}('{safe_name}')"))
         }
@@ -775,6 +843,9 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
 /// DESCRIBE), and `Ok(None)` for SHOW (no name). Returns `Err` if the query
 /// is not a semantic view DDL statement or is malformed.
 pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
+    // PA-7: comment-blind name extraction.
+    let blanked = crate::util::blank_sql_comments(query);
+    let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end();
     let trimmed = trimmed.trim_end_matches(';').trim();
@@ -802,13 +873,14 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
                 normalize_view_name(raw_name).map_err(|e| format!("Invalid view name: {e}"))?;
             Ok(Some(name))
         }
-        DdlKind::Drop
-        | DdlKind::DropIfExists
-        | DdlKind::Describe
-        | DdlKind::ShowColumns
-        | DdlKind::Alter
-        | DdlKind::AlterIfExists => {
-            let name = extract_name_only(trimmed, plen)?;
+        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe | DdlKind::ShowColumns => {
+            let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
+            Ok(Some(name))
+        }
+        // ALTER: the sub-operation (RENAME TO / SET COMMENT / ...) follows
+        // the name, so trailing text is expected here.
+        DdlKind::Alter | DdlKind::AlterIfExists => {
+            let name = extract_name_only(trimmed, plen, Trailing::Allow)?;
             Ok(Some(name))
         }
         DdlKind::Show | DdlKind::ShowTerse => Ok(None),
@@ -822,8 +894,7 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
             }
             let mut rest = after_prefix;
             // Skip LIKE clause if present (LIKE appears before IN)
-            if rest.len() >= 4
-                && rest[..4].eq_ignore_ascii_case("LIKE")
+            if starts_with_keyword_ci(rest, "LIKE")
                 && (rest.len() == 4 || rest.as_bytes()[4].is_ascii_whitespace())
             {
                 rest = rest[4..].trim_start();
@@ -835,8 +906,7 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
                 }
             }
             // Check for IN keyword
-            if rest.len() >= 2
-                && rest[..2].eq_ignore_ascii_case("IN")
+            if starts_with_keyword_ci(rest, "IN")
                 && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
             {
                 let after_in = rest[2..].trim();
@@ -885,6 +955,9 @@ const DDL_PREFIXES: &[&str] = &[
 /// prefix. Returns `None` if no near-miss is found.
 #[must_use]
 pub fn detect_near_miss(query: &str) -> Option<ParseError> {
+    // PA-7: comment-blind near-miss detection.
+    let blanked = crate::util::blank_sql_comments(query);
+    let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end();
     let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
@@ -935,6 +1008,13 @@ pub fn detect_near_miss(query: &str) -> Option<ParseError> {
 /// - `Ok(None)` -- not a semantic view DDL statement
 /// - `Err(ParseError)` -- validation error with message and optional position
 pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
+    // PA-7: blank comments once at the entry point (byte-length-preserving,
+    // so every error-caret position stays valid for the original query).
+    // Downstream scanners and captured expressions never see comment text —
+    // a trailing `-- oops` can no longer be absorbed into a stored
+    // expression or rename target.
+    let blanked = crate::util::blank_sql_comments(query);
+    let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end();
     let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
@@ -1019,50 +1099,59 @@ fn validate_alter(
             position: Some(trim_offset + plen),
         });
     }
-    let name_end = after_prefix
-        .find(|c: char| c.is_whitespace())
-        .ok_or_else(|| ParseError {
+    // Quote-aware name capture + word-boundary sub-op matching, sharing
+    // `find_identifier_end` and `match_keyword_prefix` with `rewrite_alter`
+    // so the validate and rewrite passes agree on the ALTER grammar. The
+    // previous hand-rolled `find(whitespace)` + single-space
+    // `starts_with("RENAME TO")` drifted from the (PA-10-fixed) rewriter:
+    // it split quoted names at their inner space (`"my view"`) and rejected
+    // flexible inter-keyword whitespace (`RENAME  TO`) that the rewriter
+    // accepts (PR #50 self-review).
+    let name_end = find_identifier_end(after_prefix, /* allow_paren = */ false);
+    let rest = after_prefix[name_end..].trim();
+    if rest.is_empty() {
+        return Err(ParseError {
             message: "Missing ALTER operation after view name. Supported: RENAME TO, SET COMMENT, UNSET COMMENT.".to_string(),
             position: Some(trim_offset + plen + after_prefix.len()),
-        })?;
-    let rest = after_prefix[name_end..].trim();
-    let rest_upper = rest.to_ascii_uppercase();
+        });
+    }
+    let op_pos = Some(trim_offset + plen + name_end);
+    let rb = rest.as_bytes();
 
-    if rest_upper.starts_with("RENAME TO") {
-        let new_name_str = rest["RENAME TO".len()..].trim();
-        if new_name_str.is_empty() {
+    if let Some(consumed) = match_keyword_prefix(rb, &[b"rename", b"to"]) {
+        if rest[consumed..].trim().is_empty() {
             return Err(ParseError {
                 message: "Missing new name after RENAME TO.".to_string(),
                 position: Some(trim_offset + plen + after_prefix.len()),
             });
         }
-    } else if rest_upper.starts_with("SET COMMENT") {
-        let after_set_comment = rest["SET COMMENT".len()..].trim_start();
+    } else if let Some(consumed) = match_keyword_prefix(rb, &[b"set", b"comment"]) {
+        let after_set_comment = rest[consumed..].trim_start();
         if !after_set_comment.starts_with('=') {
             return Err(ParseError {
                 message: "Expected '=' after SET COMMENT.".to_string(),
-                position: Some(trim_offset + plen + name_end),
+                position: op_pos,
             });
         }
         let after_eq = after_set_comment[1..].trim_start();
         if !after_eq.starts_with('\'') {
             return Err(ParseError {
                 message: "Expected single-quoted string after SET COMMENT =.".to_string(),
-                position: Some(trim_offset + plen + name_end),
+                position: op_pos,
             });
         }
         let _ = extract_quoted_string(after_eq).map_err(|e| ParseError {
             message: format!("Invalid comment string: {e}"),
-            position: Some(trim_offset + plen + name_end),
+            position: op_pos,
         })?;
-    } else if rest_upper.starts_with("UNSET COMMENT") {
+    } else if match_keyword_prefix(rb, &[b"unset", b"comment"]).is_some() {
         // Valid -- no further arguments needed
     } else {
         return Err(ParseError {
             message:
                 "Unsupported ALTER operation. Supported: RENAME TO, SET COMMENT, UNSET COMMENT."
                     .to_string(),
-            position: Some(trim_offset + plen + name_end),
+            position: op_pos,
         });
     }
     Ok(())
@@ -1075,8 +1164,9 @@ fn validate_alter(
 fn extract_view_comment(text: &str) -> Result<(Option<String>, &str), ParseError> {
     let upper = text.to_ascii_uppercase();
     if upper.starts_with("COMMENT") {
-        // Verify word boundary (not e.g. COMMENTARY)
-        if text.len() > 7 && text.as_bytes()[7].is_ascii_alphanumeric() {
+        // Verify word boundary (not e.g. COMMENTARY, COMMENT_x, COMMENTé —
+        // `_` and non-ASCII bytes are identifier continuation).
+        if text.len() > 7 && is_ident_byte(text.as_bytes()[7]) {
             return Ok((None, text));
         }
         let after_kw = text[7..].trim_start();
@@ -1297,46 +1387,20 @@ fn rewrite_ddl_keyword_body(
 ///
 /// Returns `(unescaped_content, bytes_consumed)` on success.
 /// Handles SQL-standard escaped single quotes (`''` -> `'`).
+///
+/// Thin adapter over the shared UTF-8-correct extractor (ST-4 consolidation;
+/// originally fixed here as Phase 65.1 WR-04) mapping errors to this call
+/// site's FILE-path message wording.
 fn extract_single_quoted(input: &str) -> Result<(String, usize), ParseError> {
-    if !input.starts_with('\'') {
-        return Err(ParseError {
-            message: "Expected single-quoted file path after FILE keyword. \
-                      Use: FROM YAML FILE '/path/to/file.yaml'"
+    extract_single_quoted_prefix(input).map_err(|e| ParseError {
+        message: match e {
+            SingleQuoteError::NotQuoted => "Expected single-quoted file path after FILE keyword. \
+                 Use: FROM YAML FILE '/path/to/file.yaml'"
                 .to_string(),
-            position: None,
-        });
-    }
-    // Phase 65.1 WR-04: walk as `char` stream (UTF-8 scalar values) rather
-    // than raw bytes — the previous `bytes[i] as char` cast silently
-    // corrupted non-ASCII file paths (e.g. paths containing CJK or
-    // accented characters) before they reached the FileSystem-direct YAML
-    // read path. The user would see a confusing "file not found" instead
-    // of the expected open.
-    //
-    // Skip the opening quote (one ASCII byte) and iterate over
-    // `input[1..]`, then adjust reported byte offsets back to `input`
-    // space for the consumed-length return value.
-    let mut result = String::new();
-    let mut chars = input[1..].char_indices();
-    while let Some((rel_i, ch)) = chars.next() {
-        if ch == '\'' {
-            let mut peek = chars.clone();
-            if matches!(peek.next(), Some((_, '\''))) {
-                result.push('\'');
-                chars = peek;
-            } else {
-                // `rel_i` is offset into `input[1..]`; absolute byte
-                // position of the closing quote in `input` is `rel_i + 1`;
-                // total bytes consumed (including both quotes) is
-                // `rel_i + 2` since the closing quote is one ASCII byte.
-                return Ok((result, rel_i + 2));
+            SingleQuoteError::Unterminated => {
+                "Unterminated file path string (missing closing single quote)".to_string()
             }
-        } else {
-            result.push(ch);
-        }
-    }
-    Err(ParseError {
-        message: "Unterminated file path string (missing closing single quote)".to_string(),
+        },
         position: None,
     })
 }
@@ -1582,74 +1646,19 @@ pub(crate) fn infer_cardinality(
 // FFI entry points (extension feature-gated)
 // ---------------------------------------------------------------------------
 
-/// Write an error message into a fixed-size, caller-owned byte buffer.
-/// Null-terminated, truncated to `len - 1` bytes.
-///
-/// Use only for short, bounded strings (error messages). For unboundedly
-/// large outputs (rewritten SQL) use `leak_string_to_c_buffer` +
-/// `sv_free_buffer` instead — silently truncating SQL produced confusing
-/// downstream parser errors (see v0.8.0 buffer-truncation fix).
-///
-/// # Safety
-///
-/// `buf` must point to a writable buffer of at least `len` bytes.
-///
-/// Phase 62 Plan 03 made this the live error-emit path for
-/// `sv_parse_function_rust` (rc=1 / rc=3). It used to be dead under the
-/// v0.8.0 `FALLBACK_OVERRIDE` synthesised-`SELECT error` workaround, which
-/// has been deleted now that `parse_function` re-renders the caret.
+// The error writer, buffer leak/reclaim, and publish helpers all live in
+// `crate::ffi_util` (ST-4 consolidation) — this module used to carry its
+// own copies, which was how the FF-5 truncation divergence happened.
+// Convention: `write_error_to_buffer` only for short, bounded strings
+// (error messages); unboundedly large outputs (rewritten SQL) go through
+// `publish_owned_string` + `sv_free_buffer` — silently truncating SQL
+// produced confusing downstream parser errors (v0.8.0 buffer-truncation
+// fix).
 #[cfg(any(feature = "extension", test))]
-unsafe fn write_error_to_buffer(buf: *mut u8, len: usize, s: &str) {
-    if buf.is_null() || len == 0 {
-        return;
-    }
-    let max_copy = len - 1; // reserve space for null terminator
-    let mut copy_len = s.len().min(max_copy);
-    // Walk back to a UTF-8 char boundary so a multi-byte codepoint straddling
-    // the truncation point is dropped whole rather than producing an invalid
-    // UTF-8 tail in the C string. is_char_boundary(0) is always true.
-    while !s.is_char_boundary(copy_len) {
-        copy_len -= 1;
-    }
-    std::ptr::copy_nonoverlapping(s.as_ptr(), buf, copy_len);
-    *buf.add(copy_len) = 0; // null terminate
-}
+use crate::ffi_util::write_error_to_buffer;
 
-/// Convert an owned `String` into a heap-allocated byte buffer that the C++
-/// caller takes ownership of. Caller must release via `sv_free_buffer`.
-///
-/// Returns `(ptr, len)`. The buffer is **not** NUL-terminated — the C++
-/// side reads exactly `len` bytes. This avoids any silent truncation cap
-/// regardless of how large the rewritten SQL becomes.
-///
-/// Uses `Box<[u8]>` rather than a leaked `Vec` because `Vec::shrink_to_fit`
-/// is only a hint — the allocator may keep excess capacity, which would
-/// make the matching `Vec::from_raw_parts(ptr, len, len)` in `reclaim_c_buffer`
-/// undefined behaviour in release builds. `into_boxed_slice` actually
-/// guarantees `len == capacity`.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-fn leak_string_to_c_buffer(s: String) -> (*mut u8, usize) {
-    let boxed: Box<[u8]> = s.into_bytes().into_boxed_slice();
-    let len = boxed.len();
-    let ptr = Box::into_raw(boxed).cast::<u8>();
-    (ptr, len)
-}
-
-/// Reclaim a buffer produced by `leak_string_to_c_buffer`.
-///
-/// # Safety
-///
-/// `ptr`/`len` must be the exact pair returned by an earlier call to
-/// `leak_string_to_c_buffer` (or its FFI exports), and may only be released
-/// once.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-unsafe fn reclaim_c_buffer(ptr: *mut u8, len: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
-    drop(Box::from_raw(slice));
-}
+#[cfg(feature = "extension")]
+use crate::ffi_util::reclaim_c_buffer;
 
 /// FFI export: free a heap buffer produced by an earlier
 /// `sv_parser_override_rust` success return.
@@ -1670,8 +1679,7 @@ pub unsafe extern "C" fn sv_free_buffer(ptr: *mut u8, len: usize) {
 }
 
 /// Internal helper: publish an owned `String` to the FFI out-parameters.
-/// On null out-pointers the buffer is dropped instead of leaked, so a
-/// misbehaving C++ caller cannot induce a memory leak through us.
+/// Both-or-drop contract (see [`crate::ffi_util::publish_owned_bytes`]).
 ///
 /// # Safety
 ///
@@ -1680,12 +1688,7 @@ pub unsafe extern "C" fn sv_free_buffer(ptr: *mut u8, len: usize) {
 /// as "drop and skip writing."
 #[cfg(feature = "extension")]
 unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len: *mut usize) {
-    if sql_out_ptr.is_null() || sql_out_len.is_null() {
-        return; // dropping `sql` here releases the heap allocation
-    }
-    let (ptr, len) = leak_string_to_c_buffer(sql);
-    *sql_out_ptr = ptr;
-    *sql_out_len = len;
+    crate::ffi_util::publish_owned_string(sql, sql_out_ptr, sql_out_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1883,13 +1886,13 @@ fn emit_native_create_sql(
     or_replace: bool,
     if_not_exists: bool,
 ) -> Result<Option<String>, ParseError> {
-    // Defensive normalisation — idempotent on already-normalised input from
-    // validate_create_body (the only happy-path caller). Guarantees `name`
-    // is the bare view identifier byte-for-byte matching the catalog PK,
-    // regardless of how this function was called. Cost: one strdup + a
-    // state-machine pass (~tens of ns on typical view names) — negligible
-    // relative to the catalog INSERT this function performs.
-    let name = normalize_view_name(name).map_err(|e| ParseError {
+    // Defensive validation — `name` arrives already normalised (bare,
+    // case-folded if it was unquoted) from validate_create_body via the
+    // function-call round-trip. Re-quote before re-normalising so this pass
+    // is a true no-op on normalised input: normalising the BARE name again
+    // would fold a case-preserved quoted name (`"SalesView"` → `salesview`,
+    // PA-8) and split a dotted name (`"a.b"` → `b`).
+    let name = normalize_view_name(&crate::expand::quote_ident(name)).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         position: None,
     })?;
@@ -2028,12 +2031,12 @@ fn rewrite_yaml_file_create(payload: &str) -> Result<Option<String>, ParseError>
         }
     };
 
-    // Normalise the view name once so subsequent escape_sql_arg lands on the
-    // bare identifier (matches emit_native_create_sql's defensive
-    // normalisation). The helper TF re-normalises internally via
-    // SemanticViewDefinition::from_yaml_with_size_cap, but we need the bare
-    // name to embed in the outer INSERT's name column anyway.
-    let name = normalize_view_name(name).map_err(|e| ParseError {
+    // Defensive validation of the sentinel-carried name (matches
+    // emit_native_create_sql): re-quote before re-normalising so the pass
+    // is a no-op on the already-normalised bare name — re-normalising it
+    // bare would fold a case-preserved quoted name (PA-8) or split a
+    // dotted one.
+    let name = normalize_view_name(&crate::expand::quote_ident(name)).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         position: None,
     })?;
@@ -3222,6 +3225,8 @@ mod tests {
 
     #[test]
     fn leak_and_reclaim_round_trips_arbitrary_string() {
+        use crate::ffi_util::{leak_bytes_to_c_buffer, reclaim_c_buffer};
+
         let original = "INSERT INTO _definitions VALUES ('x', '...');".repeat(4096);
         assert!(
             original.len() > 64 * 1024,
@@ -3229,7 +3234,7 @@ mod tests {
         );
 
         let original_clone = original.clone();
-        let (ptr, len) = leak_string_to_c_buffer(original);
+        let (ptr, len) = leak_bytes_to_c_buffer(original.into_bytes());
         assert!(!ptr.is_null());
         assert_eq!(len, original_clone.len());
 
@@ -3238,23 +3243,6 @@ mod tests {
         assert_eq!(recovered, original_clone.as_bytes());
 
         // Free.
-        unsafe { reclaim_c_buffer(ptr, len) };
-    }
-
-    #[test]
-    fn reclaim_null_pointer_is_safe() {
-        // sv_free_buffer must accept null pointers as a no-op so the C++
-        // RAII guard can be unconditionally invoked even when the FFI
-        // call returned an error path.
-        unsafe { reclaim_c_buffer(std::ptr::null_mut(), 0) };
-        unsafe { reclaim_c_buffer(std::ptr::null_mut(), 99) };
-    }
-
-    #[test]
-    fn leak_handles_empty_string() {
-        let (ptr, len) = leak_string_to_c_buffer(String::new());
-        assert_eq!(len, 0);
-        // Empty Vec may have dangling-but-aligned ptr; reclaim must not crash.
         unsafe { reclaim_c_buffer(ptr, len) };
     }
 
@@ -3481,10 +3469,299 @@ mod tests {
         assert_eq!(sql, "SELECT * FROM drop_semantic_view('it''s_a_view')");
     }
 
+    // ===================================================================
+    // PA-8 (code-review 2026-07-02): unquoted view names fold to lowercase
+    // at every DDL capture site; quoted names preserve case. Previously
+    // unquoted names were byte-exact case-sensitive (CREATE ... Sales /
+    // DROP ... sales -> "does not exist"), diverging from both DuckDB and
+    // Snowflake.
+    // ===================================================================
+
+    #[test]
+    fn test_unquoted_names_fold_to_lowercase_across_ddl_forms() {
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW Sales").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('sales')");
+
+        let sql = rewrite_ddl("DESCRIBE SEMANTIC VIEW SALES").unwrap();
+        assert_eq!(sql, "SELECT * FROM describe_semantic_view('sales')");
+
+        assert_eq!(
+            extract_ddl_name("CREATE SEMANTIC VIEW Sales (body)").unwrap(),
+            Some("sales".to_string())
+        );
+
+        // ALTER folds both the target and the RENAME TO name.
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW Sales RENAME TO NewSales").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM alter_semantic_view_rename('sales', 'newsales')"
+        );
+    }
+
+    #[test]
+    fn test_quoted_names_preserve_case_across_ddl_forms() {
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW \"Sales\"").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('Sales')");
+
+        assert_eq!(
+            extract_ddl_name("CREATE SEMANTIC VIEW \"Sales\" (body)").unwrap(),
+            Some("Sales".to_string())
+        );
+
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW \"Sales\" RENAME TO \"NewSales\"").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM alter_semantic_view_rename('Sales', 'NewSales')"
+        );
+    }
+
     #[test]
     fn test_rewrite_drop_missing_name() {
         let err = rewrite_ddl("DROP SEMANTIC VIEW").unwrap_err();
         assert!(err.contains("Missing view name"), "got: {err}");
+    }
+
+    // ===================================================================
+    // PA-4 (code-review 2026-07-02): prefix keywords require a trailing
+    // word boundary. `DROP SEMANTIC VIEWS` (plural typo) used to match the
+    // `DROP SEMANTIC VIEW` prefix and drop a view named `s` [verified];
+    // `CREATE SEMANTIC VIEWfoo` parsed as CREATE.
+    // ===================================================================
+
+    #[test]
+    fn test_prefix_requires_trailing_word_boundary() {
+        // The plural typo must NOT be detected as ours at all — DuckDB's
+        // own parser error is the correct surface.
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEWS x"),
+            PARSE_NOT_OURS
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEWS"),
+            PARSE_NOT_OURS
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("CREATE SEMANTIC VIEWfoo (TABLES (o AS orders))"),
+            PARSE_NOT_OURS
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("DESCRIBE SEMANTIC VIEWER x"),
+            PARSE_NOT_OURS
+        );
+        // Non-ASCII continuation is an identifier character in DuckDB, not
+        // a boundary.
+        assert_eq!(
+            detect_semantic_view_ddl("SHOW SEMANTIC VIEWSé"),
+            PARSE_NOT_OURS
+        );
+        // Digits and underscore are identifier continuation too.
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEW2 x"),
+            PARSE_NOT_OURS
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEW_ x"),
+            PARSE_NOT_OURS
+        );
+    }
+
+    #[test]
+    fn test_prefix_accepts_punctuation_boundaries() {
+        // `(`, `;`, `"` and end-of-input are legitimate token boundaries.
+        assert_eq!(
+            detect_semantic_view_ddl("SHOW SEMANTIC VIEWS"),
+            PARSE_DETECTED
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("SHOW SEMANTIC VIEWS;"),
+            PARSE_DETECTED
+        );
+        assert_eq!(
+            detect_semantic_view_ddl("DROP SEMANTIC VIEW\"my view\""),
+            PARSE_DETECTED
+        );
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW\"my view\"").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('my view')");
+    }
+
+    // ===================================================================
+    // PA-7 (code-review 2026-07-02): SQL comments are blanked once at the
+    // entry points, so they can no longer corrupt scanning state or be
+    // absorbed into stored expressions / rename targets.
+    // ===================================================================
+
+    #[test]
+    fn test_trailing_comment_after_name_is_ignored() {
+        let sql = rewrite_ddl("DROP SEMANTIC VIEW a -- trailing comment").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('a')");
+    }
+
+    #[test]
+    fn test_alter_rename_trailing_comment_not_absorbed() {
+        // Pre-fix this renamed the view to `x -- oops`.
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a RENAME TO x -- oops").unwrap();
+        assert_eq!(sql, "SELECT * FROM alter_semantic_view_rename('a', 'x')");
+    }
+
+    #[test]
+    fn test_comment_between_prefix_keywords() {
+        assert_eq!(
+            detect_semantic_view_ddl("DROP /* which? */ SEMANTIC VIEW a"),
+            PARSE_DETECTED
+        );
+        let sql = rewrite_ddl("DROP /* which? */ SEMANTIC VIEW a").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('a')");
+    }
+
+    #[test]
+    fn test_comment_markers_inside_string_survive() {
+        // `--` inside a COMMENT string literal is content, not a comment.
+        let sql =
+            rewrite_ddl("ALTER SEMANTIC VIEW a SET COMMENT = 'keep -- this /* too */'").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM alter_semantic_view_set_comment('a', 'keep -- this /* too */')"
+        );
+    }
+
+    #[test]
+    fn test_nested_block_comment_fully_skipped() {
+        // Block comments nest per the SQL standard (PA-10).
+        let sql =
+            rewrite_ddl("/* outer /* inner */ still comment */ DROP SEMANTIC VIEW a").unwrap();
+        assert_eq!(sql, "SELECT * FROM drop_semantic_view('a')");
+    }
+
+    #[test]
+    fn test_comment_inside_create_body_not_stored() {
+        // A line comment inside the AS-body must not leak into the stored
+        // expression (pre-fix it commented out generated SQL downstream).
+        let result = validate_and_rewrite(
+            "CREATE SEMANTIC VIEW v AS TABLES (o AS orders PRIMARY KEY (id)) \
+             DIMENSIONS (o.d AS o.region /* region code */)",
+        );
+        let sql = result.unwrap().expect("statement is ours");
+        assert!(
+            !sql.contains("region code"),
+            "comment text leaked into rewrite: {sql}"
+        );
+    }
+
+    // ===================================================================
+    // PA-10 (code-review 2026-07-02): boundary/whitespace nits.
+    // ===================================================================
+
+    #[test]
+    fn test_alter_subops_tolerate_multiple_spaces() {
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a RENAME  \t TO b").unwrap();
+        assert_eq!(sql, "SELECT * FROM alter_semantic_view_rename('a', 'b')");
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a SET   COMMENT = 'x'").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM alter_semantic_view_set_comment('a', 'x')"
+        );
+        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a UNSET\tCOMMENT").unwrap();
+        assert_eq!(sql, "SELECT * FROM alter_semantic_view_unset_comment('a')");
+    }
+
+    #[test]
+    fn test_alter_subops_reject_trailing_garbage() {
+        assert!(rewrite_ddl("ALTER SEMANTIC VIEW a RENAME TO x oops").is_err());
+        assert!(rewrite_ddl("ALTER SEMANTIC VIEW a SET COMMENT = 'x' oops").is_err());
+        assert!(rewrite_ddl("ALTER SEMANTIC VIEW a UNSET COMMENT oops").is_err());
+    }
+
+    #[test]
+    fn test_validate_alter_agrees_with_rewriter() {
+        // PR #50 self-review: validate_alter was a second, drifted grammar
+        // implementation — it required single-space sub-ops and split
+        // quoted names at their inner space, so validate_and_rewrite (which
+        // validates BEFORE rewriting) rejected inputs the rewriter accepts.
+        // Flexible inter-keyword whitespace must pass the full pipeline.
+        for q in [
+            "ALTER SEMANTIC VIEW v RENAME  TO w",
+            "ALTER SEMANTIC VIEW v RENAME\tTO w",
+            "ALTER SEMANTIC VIEW v SET   COMMENT = 'x'",
+            "ALTER SEMANTIC VIEW v UNSET\tCOMMENT",
+        ] {
+            assert!(
+                validate_and_rewrite(q).is_ok(),
+                "validate_and_rewrite rejected valid ALTER: {q}"
+            );
+        }
+        // A quoted view name with an inner space must survive the validate
+        // pass (previously split at the space -> "Unsupported ALTER").
+        let sql = validate_and_rewrite("ALTER SEMANTIC VIEW \"my view\" RENAME TO w")
+            .unwrap()
+            .expect("statement is ours");
+        assert_eq!(
+            sql,
+            "SELECT * FROM alter_semantic_view_rename('my view', 'w')"
+        );
+    }
+
+    #[test]
+    fn test_for_metric_requires_boundaries() {
+        // FOREIGN must not match the FOR clause keyword (PR #50 review).
+        let err = rewrite_ddl("SHOW SEMANTIC VIEWS FOREIGN").unwrap_err();
+        assert!(err.contains("Unexpected tokens"), "got: {err}");
+        // METRICS must not match METRIC (the metric would have been 's').
+        let err = rewrite_ddl("SHOW SEMANTIC DIMENSIONS IN v FOR METRICS revenue").unwrap_err();
+        assert!(err.contains("Expected FOR METRIC"), "got: {err}");
+        // The legal form still parses.
+        let sql = rewrite_ddl("SHOW SEMANTIC DIMENSIONS IN v FOR METRIC revenue").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM show_semantic_dimensions_for_metric('v', 'revenue')"
+        );
+    }
+
+    #[test]
+    fn test_starts_with_and_limit_require_boundaries() {
+        // STARTSWITH / LIMIT5 used to be accepted without a word boundary.
+        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS STARTSWITH 'a'").is_err());
+        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS LIMIT5").is_err());
+        // `_` and non-ASCII bytes are identifier continuation, not
+        // boundaries (PR #50 review).
+        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITH_x 'a'").is_err());
+        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITHé 'a'").is_err());
+        // The legal forms still parse.
+        let sql = rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITH 'a' LIMIT 5").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM list_semantic_views() WHERE name LIKE 'a%' LIMIT 5"
+        );
+    }
+
+    // ===================================================================
+    // PA-5 (code-review 2026-07-02): name-only forms must reject trailing
+    // garbage instead of executing and silently discarding it.
+    // ===================================================================
+
+    #[test]
+    fn test_name_only_forms_reject_trailing_garbage() {
+        for q in [
+            "DROP SEMANTIC VIEW a b c",
+            "DROP SEMANTIC VIEW IF EXISTS a b",
+            "DESCRIBE SEMANTIC VIEW a CASCADE",
+            "SHOW COLUMNS IN SEMANTIC VIEW a b",
+        ] {
+            let err = rewrite_ddl(q).unwrap_err();
+            assert!(
+                err.contains("Unexpected tokens after view name"),
+                "expected trailing-garbage error for {q}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_ddl_name_rejects_trailing_garbage_but_allows_alter_ops() {
+        assert!(extract_ddl_name("DROP SEMANTIC VIEW a b c").is_err());
+        // ALTER legitimately has text after the name.
+        assert_eq!(
+            extract_ddl_name("ALTER SEMANTIC VIEW a RENAME TO b").unwrap(),
+            Some("a".to_string())
+        );
     }
 
     #[test]
@@ -4331,6 +4608,45 @@ mod tests {
             assert_eq!(
                 sql,
                 "SELECT * FROM list_semantic_views() WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 3"
+            );
+        }
+
+        // --- PA-1 regression: non-ASCII trailing tokens must error cleanly ---
+
+        #[test]
+        fn test_show_views_non_ascii_trailing_tokens_error_not_panic() {
+            // Pre-fix: `rest[..4]` sliced "aΩΩ" mid-codepoint and panicked
+            // ("byte index 4 is not a char boundary"), surfacing as
+            // "internal error (panic)" at the FFI boundary.
+            let err = rewrite_ddl("SHOW SEMANTIC VIEWS aΩΩ").unwrap_err();
+            assert!(err.contains("Unexpected tokens"), "got: {err}");
+
+            // Every clause scanner position: 2, 3, 4, 5, 6-byte prefixes.
+            for q in [
+                "SHOW SEMANTIC VIEWS Ω",
+                "SHOW SEMANTIC VIEWS ΩΩΩ",
+                "SHOW SEMANTIC DIMENSIONS éé",
+                "SHOW SEMANTIC METRICS 東京",
+                "SHOW SEMANTIC FACTS ☕☕☕",
+            ] {
+                let result = rewrite_ddl(q);
+                assert!(result.is_err(), "expected clean error for {q}");
+            }
+        }
+
+        #[test]
+        fn test_extract_ddl_name_non_ascii_no_panic() {
+            // Same PA-1 pattern in extract_ddl_name's LIKE/IN skipper.
+            let result = extract_ddl_name("SHOW SEMANTIC DIMENSIONS aΩΩ");
+            assert!(matches!(result, Ok(None)), "got: {result:?}");
+        }
+
+        #[test]
+        fn test_show_views_like_non_ascii_pattern_roundtrips() {
+            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS LIKE '%café%'").unwrap();
+            assert_eq!(
+                sql,
+                "SELECT * FROM list_semantic_views() WHERE name ILIKE '%café%'"
             );
         }
 
