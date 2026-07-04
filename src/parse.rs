@@ -996,16 +996,138 @@ pub fn detect_near_miss(query: &str) -> Option<ParseError> {
     })
 }
 
-/// Validate a DDL statement and rewrite it if valid.
+/// Structured outcome of parsing/validating a semantic-view DDL statement (AR-2).
 ///
-/// This is the main entry point for the validation layer. CREATE forms go through
-/// the AS-body keyword parser. DROP/DESCRIBE/SHOW forms are rewritten directly.
+/// The parser produces one of these directly. Previously it rendered a legacy
+/// `SELECT * FROM <fn>('arg', ...)` string that `rewrite_to_native_sql`
+/// immediately re-parsed; CREATE additionally round-tripped its definition
+/// through JSON (serialize → escape → re-parse → unescape → deserialize) and the
+/// `FROM YAML FILE` path smuggled its fields through a `\x01`-delimited sentinel
+/// string. Carrying the structured form removes all of that for CREATE and
+/// deletes the sentinel entirely.
+#[derive(Debug)]
+pub enum RewriteAction {
+    /// CREATE from an in-memory definition (AS-body, or inline `FROM YAML $$..$$`).
+    Create {
+        name: String,
+        def: Box<crate::model::SemanticViewDefinition>,
+        mode: CreateMode,
+    },
+    /// CREATE from a YAML file, read + enriched at execution by the
+    /// `__sv_compute_create_from_yaml` helper table function.
+    CreateFromYamlFile {
+        file_path: String,
+        name: String,
+        comment: String,
+        mode: CreateMode,
+    },
+    /// A legacy `SELECT * FROM <fn>(...)` statement still lowered by
+    /// `rewrite_to_native_sql` through `parse_table_function_call`: DROP/ALTER
+    /// (re-parsed into native DML) and read-side DESCRIBE/SHOW (run as-is). A
+    /// follow-up gives these structured variants too.
+    Passthrough(String),
+}
+
+/// CREATE conflict mode, mirroring the three `DdlKind` CREATE variants.
+#[derive(Debug, Clone, Copy)]
+pub enum CreateMode {
+    Create,
+    OrReplace,
+    IfNotExists,
+}
+
+impl CreateMode {
+    fn from_kind(kind: DdlKind) -> Self {
+        match kind {
+            DdlKind::Create => CreateMode::Create,
+            DdlKind::CreateOrReplace => CreateMode::OrReplace,
+            DdlKind::CreateIfNotExists => CreateMode::IfNotExists,
+            _ => unreachable!("CreateMode::from_kind called with non-CREATE kind"),
+        }
+    }
+    // Consumed by `rewrite_to_native_sql` (extension-only) when choosing the
+    // INSERT shape; unused under `cargo test`'s bundled build.
+    #[cfg_attr(not(feature = "extension"), allow(dead_code))]
+    fn or_replace(self) -> bool {
+        matches!(self, CreateMode::OrReplace)
+    }
+    #[cfg_attr(not(feature = "extension"), allow(dead_code))]
+    fn if_not_exists(self) -> bool {
+        matches!(self, CreateMode::IfNotExists)
+    }
+    /// Legacy `*_from_json` function name (`render_legacy` compat only).
+    fn json_fn_name(self) -> &'static str {
+        match self {
+            CreateMode::Create => "create_semantic_view_from_json",
+            CreateMode::OrReplace => "create_or_replace_semantic_view_from_json",
+            CreateMode::IfNotExists => "create_semantic_view_if_not_exists_from_json",
+        }
+    }
+    /// Legacy YAML-FILE sentinel kind number (`render_legacy` compat only).
+    fn kind_num(self) -> u8 {
+        match self {
+            CreateMode::Create => 0,
+            CreateMode::OrReplace => 1,
+            CreateMode::IfNotExists => 2,
+        }
+    }
+}
+
+/// Reproduce the legacy `SELECT * FROM <fn>(...)` / YAML-FILE-sentinel string
+/// form of a `RewriteAction`.
+///
+/// Retained only so `validate_and_rewrite` keeps its string-returning signature
+/// for the existing unit tests; production (`rewrite_to_native_sql`) consumes
+/// the `RewriteAction` directly. A later step migrates those tests to assert on
+/// `RewriteAction` and deletes this shim.
+fn render_legacy(action: &RewriteAction) -> String {
+    match action {
+        RewriteAction::Create { name, def, mode } => {
+            let json = serde_json::to_string(def.as_ref())
+                .expect("SemanticViewDefinition serialization is infallible");
+            let safe_name = name.replace('\'', "''");
+            let safe_json = json.replace('\'', "''");
+            format!(
+                "SELECT * FROM {}('{safe_name}', '{safe_json}')",
+                mode.json_fn_name()
+            )
+        }
+        RewriteAction::CreateFromYamlFile {
+            file_path,
+            name,
+            comment,
+            mode,
+        } => {
+            format!(
+                "__SV_YAML_FILE__{file_path}\x01{}\x01{name}\x01{comment}",
+                mode.kind_num()
+            )
+        }
+        RewriteAction::Passthrough(sql) => sql.clone(),
+    }
+}
+
+/// Validate a DDL statement and rewrite it to legacy `SELECT * FROM fn(...)`
+/// string form.
+///
+/// Thin compatibility wrapper over [`plan_rewrite`] + [`render_legacy`], kept so
+/// the extensive unit tests that assert on the string form keep working.
+/// Production lowering uses `plan_rewrite` directly.
 ///
 /// Returns:
 /// - `Ok(Some(sql))` -- DDL detected and validated, rewritten SQL returned
 /// - `Ok(None)` -- not a semantic view DDL statement
 /// - `Err(ParseError)` -- validation error with message and optional position
 pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
+    Ok(plan_rewrite(query)?.map(|action| render_legacy(&action)))
+}
+
+/// Validate a DDL statement and produce a structured [`RewriteAction`] (AR-2).
+///
+/// This is the main entry point for the validation layer. CREATE forms go through
+/// the AS-body keyword parser and carry their definition structurally;
+/// DROP/DESCRIBE/SHOW/ALTER are carried as `Passthrough` legacy SQL for now.
+pub fn plan_rewrite(query: &str) -> Result<Option<RewriteAction>, ParseError> {
     // PA-7: blank comments once at the entry point (byte-length-preserving,
     // so every error-caret position stays valid for the original query).
     // Downstream scanners and captured expressions never see comment text —
@@ -1036,18 +1158,20 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
                     position: Some(trim_offset + plen),
                 });
             }
-            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
-                message: e,
-                position: Some(trim_offset + plen),
-            })
+            rewrite_ddl(query)
+                .map(|s| Some(RewriteAction::Passthrough(s)))
+                .map_err(|e| ParseError {
+                    message: e,
+                    position: Some(trim_offset + plen),
+                })
         }
         // SHOW [TERSE] SEMANTIC VIEWS: optional filter/scope clauses
-        DdlKind::Show | DdlKind::ShowTerse => {
-            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+        DdlKind::Show | DdlKind::ShowTerse => rewrite_ddl(query)
+            .map(|s| Some(RewriteAction::Passthrough(s)))
+            .map_err(|e| ParseError {
                 message: e,
                 position: Some(trim_offset + plen),
-            })
-        }
+            }),
         // SHOW COLUMNS IN SEMANTIC VIEW: name-only form
         DdlKind::ShowColumns => {
             let after_prefix = trimmed_no_semi[plen..].trim();
@@ -1057,26 +1181,32 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
                     position: Some(trim_offset + plen),
                 });
             }
-            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
-                message: e,
-                position: Some(trim_offset + plen),
-            })
+            rewrite_ddl(query)
+                .map(|s| Some(RewriteAction::Passthrough(s)))
+                .map_err(|e| ParseError {
+                    message: e,
+                    position: Some(trim_offset + plen),
+                })
         }
         // SHOW SEMANTIC DIMENSIONS/METRICS/FACTS/MATERIALIZATIONS: optional IN view_name
         DdlKind::ShowDimensions
         | DdlKind::ShowMetrics
         | DdlKind::ShowFacts
-        | DdlKind::ShowMaterializations => rewrite_ddl(query).map(Some).map_err(|e| ParseError {
-            message: e,
-            position: Some(trim_offset + plen),
-        }),
+        | DdlKind::ShowMaterializations => rewrite_ddl(query)
+            .map(|s| Some(RewriteAction::Passthrough(s)))
+            .map_err(|e| ParseError {
+                message: e,
+                position: Some(trim_offset + plen),
+            }),
         // ALTER forms: validate sub-operation (RENAME TO, SET COMMENT, UNSET COMMENT)
         DdlKind::Alter | DdlKind::AlterIfExists => {
             validate_alter(trimmed_no_semi, trim_offset, plen)?;
-            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
-                message: e,
-                position: Some(trim_offset + plen),
-            })
+            rewrite_ddl(query)
+                .map(|s| Some(RewriteAction::Passthrough(s)))
+                .map_err(|e| ParseError {
+                    message: e,
+                    position: Some(trim_offset + plen),
+                })
         }
     }
 }
@@ -1224,7 +1354,7 @@ fn validate_create_body(
     trim_offset: usize,
     plen: usize,
     kind: DdlKind,
-) -> Result<Option<String>, ParseError> {
+) -> Result<Option<RewriteAction>, ParseError> {
     let after_prefix = trimmed_no_semi[plen..].trim_start();
     if after_prefix.is_empty() {
         return Err(ParseError {
@@ -1280,7 +1410,8 @@ fn validate_create_body(
             + (remaining_after_comment.len() - after_name_trimmed.len());
         let body_offset_in_tns = after_name_in_tns + trimmed_start_in_after_name;
         let body_offset = trim_offset + body_offset_in_tns;
-        return rewrite_ddl_keyword_body(kind, name, after_name_trimmed, body_offset, view_comment);
+        return rewrite_ddl_keyword_body(kind, name, after_name_trimmed, body_offset, view_comment)
+            .map(Some);
     }
     // --- End AS keyword body path ---
 
@@ -1300,11 +1431,11 @@ fn validate_create_body(
             && (yaml_text.len() == 4 || yaml_text.as_bytes()[4].is_ascii_whitespace());
         if is_file {
             let file_text = yaml_text[4..].trim_start();
-            return rewrite_ddl_yaml_file_body(kind, name, file_text, view_comment);
+            return rewrite_ddl_yaml_file_body(kind, name, file_text, view_comment).map(Some);
         }
 
         // Phase 52: FROM YAML $$...$$ inline sub-branch (existing)
-        return rewrite_ddl_yaml_body(kind, name, yaml_text, view_comment);
+        return rewrite_ddl_yaml_body(kind, name, yaml_text, view_comment).map(Some);
     }
     // --- End FROM YAML body path ---
 
@@ -1320,22 +1451,22 @@ fn validate_create_body(
     })
 }
 
-/// Rewrite an AS-body CREATE DDL statement to a JSON-parameterized function call.
+/// Parse an AS-body CREATE statement into a [`RewriteAction::Create`].
 ///
-/// Called when `validate_create_body` detects the `AS` keyword path.
-/// Parses the keyword body via `parse_keyword_body`, serializes to JSON, and embeds in
-/// a `SELECT * FROM create_semantic_view_from_json('name', 'json')` call.
+/// Called when `validate_create_body` detects the `AS` keyword path. Parses the
+/// keyword body via `parse_keyword_body`, infers cardinality, and carries the
+/// resulting `SemanticViewDefinition` structurally to the emission stage.
 fn rewrite_ddl_keyword_body(
     kind: DdlKind,
     name: &str,
     body_text: &str,              // text starting at "AS" (inclusive)
     body_offset: usize,           // byte offset of body_text[0] in original query
     view_comment: Option<String>, // Phase 43: optional view-level COMMENT
-) -> Result<Option<String>, ParseError> {
+) -> Result<RewriteAction, ParseError> {
     // 1. Call parse_keyword_body (body_text starts at "AS"; pass body_offset)
     let mut keyword_body = parse_keyword_body(body_text, body_offset)?;
 
-    // Phase 33: Infer cardinality and resolve ref_columns before serialization.
+    // Phase 33: Infer cardinality and resolve ref_columns.
     crate::graph::infer_cardinality(&keyword_body.tables, &mut keyword_body.relationships)?;
 
     // 2. Construct SemanticViewDefinition from KeywordBody
@@ -1354,27 +1485,14 @@ fn rewrite_ddl_keyword_body(
         comment: view_comment,
     };
 
-    // 3. Serialize to JSON
-    let json = serde_json::to_string(&def).map_err(|e| ParseError {
-        message: format!("Failed to serialize definition: {e}"),
-        position: None,
-    })?;
-
-    // 4. SQL-escape single quotes in name and JSON
-    let safe_name = name.replace('\'', "''");
-    let safe_json = json.replace('\'', "''");
-
-    // 5. Pick the correct _from_json function name based on DDL kind
-    let fn_name = match kind {
-        DdlKind::Create => "create_semantic_view_from_json",
-        DdlKind::CreateOrReplace => "create_or_replace_semantic_view_from_json",
-        DdlKind::CreateIfNotExists => "create_semantic_view_if_not_exists_from_json",
-        _ => unreachable!("rewrite_ddl_keyword_body only called for CREATE forms"),
-    };
-
-    Ok(Some(format!(
-        "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
-    )))
+    // 3. Carry the definition structurally — `rewrite_to_native_sql` hands it
+    //    straight to `emit_native_create_sql` (AR-2: no JSON serialize / re-parse
+    //    / re-deserialize round-trip).
+    Ok(RewriteAction::Create {
+        name: name.to_string(),
+        def: Box::new(def),
+        mode: CreateMode::from_kind(kind),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,20 +1521,20 @@ fn extract_single_quoted(input: &str) -> Result<(String, usize), ParseError> {
     })
 }
 
-/// Generate a sentinel string for C++ shim to intercept and read the file.
+/// Parse a `FROM YAML FILE '<path>'` body into a structured
+/// [`RewriteAction::CreateFromYamlFile`].
 ///
-/// Sentinel format: `__SV_YAML_FILE__<path>\x01<kind>\x01<name>\x01<comment>`
-/// Uses `\x01` (SOH) as field separator instead of `\x00` (NUL) because the
-/// sentinel is passed through C string APIs that treat NUL as a terminator.
-/// `rewrite_to_native_sql` strips the prefix and dispatches to
-/// `rewrite_yaml_file_create`, which calls `read_text()` on the catalog
-/// connection (Rust-side) and then routes through `emit_native_create_sql`.
+/// `rewrite_to_native_sql` hands the fields straight to
+/// `emit_native_create_from_yaml_file`, which emits an INSERT selecting from the
+/// `__sv_compute_create_from_yaml` helper TF (that reads the file at execution).
+/// AR-2 replaced the previous `\x01`-delimited sentinel string (which smuggled
+/// path/kind/name/comment through the `String` return of `validate_and_rewrite`).
 fn rewrite_ddl_yaml_file_body(
     kind: DdlKind,
     name: &str,
     file_text: &str,
     view_comment: Option<String>,
-) -> Result<Option<String>, ParseError> {
+) -> Result<RewriteAction, ParseError> {
     let (file_path, consumed) = extract_single_quoted(file_text)?;
 
     let trailing = file_text[consumed..].trim();
@@ -1436,16 +1554,12 @@ fn rewrite_ddl_yaml_file_body(
         });
     }
 
-    let kind_num = match kind {
-        DdlKind::Create => 0,
-        DdlKind::CreateOrReplace => 1,
-        DdlKind::CreateIfNotExists => 2,
-        _ => unreachable!("rewrite_ddl_yaml_file_body only called for CREATE forms"),
-    };
-    let comment = view_comment.unwrap_or_default();
-    Ok(Some(format!(
-        "__SV_YAML_FILE__{file_path}\x01{kind_num}\x01{name}\x01{comment}"
-    )))
+    Ok(RewriteAction::CreateFromYamlFile {
+        file_path,
+        name: name.to_string(),
+        comment: view_comment.unwrap_or_default(),
+        mode: CreateMode::from_kind(kind),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,17 +1594,18 @@ fn extract_dollar_quoted(input: &str) -> Result<(String, usize), ParseError> {
     Ok((content.to_string(), total))
 }
 
-/// Rewrite a FROM YAML dollar-quoted DDL statement to a JSON-parameterized function call.
+/// Parse a `FROM YAML $$..$$` dollar-quoted CREATE body into a
+/// [`RewriteAction::Create`].
 ///
 /// Called when `validate_create_body` detects the `FROM YAML` keyword path.
 /// Extracts dollar-quoted YAML, deserializes via `from_yaml_with_size_cap()`,
-/// serializes to JSON, and embeds in a `SELECT * FROM create_semantic_view_from_json('name', 'json')` call.
+/// infers cardinality, and carries the `SemanticViewDefinition` structurally.
 fn rewrite_ddl_yaml_body(
     kind: DdlKind,
     name: &str,
     yaml_text: &str,
     view_comment: Option<String>,
-) -> Result<Option<String>, ParseError> {
+) -> Result<RewriteAction, ParseError> {
     let (yaml_content, consumed) = extract_dollar_quoted(yaml_text)?;
 
     let trailing = yaml_text[consumed..].trim();
@@ -1514,22 +1629,11 @@ fn rewrite_ddl_yaml_body(
 
     crate::graph::infer_cardinality(&def.tables, &mut def.joins)?;
 
-    let json = serde_json::to_string(&def).map_err(|e| ParseError {
-        message: format!("Failed to serialize YAML definition: {e}"),
-        position: None,
-    })?;
-
-    let safe_name = name.replace('\'', "''");
-    let safe_json = json.replace('\'', "''");
-    let fn_name = match kind {
-        DdlKind::Create => "create_semantic_view_from_json",
-        DdlKind::CreateOrReplace => "create_or_replace_semantic_view_from_json",
-        DdlKind::CreateIfNotExists => "create_semantic_view_if_not_exists_from_json",
-        _ => unreachable!("rewrite_ddl_yaml_body only called for CREATE forms"),
-    };
-    Ok(Some(format!(
-        "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
-    )))
+    Ok(RewriteAction::Create {
+        name: name.to_string(),
+        def: Box::new(def),
+        mode: CreateMode::from_kind(kind),
+    })
 }
 
 // Cardinality inference (Phase 33) now lives in `crate::graph::cardinality`
@@ -1644,55 +1748,63 @@ pub fn rewrite_to_native_sql(
     _ctx: &OverrideContext,
     query: &str,
 ) -> Result<Option<String>, ParseError> {
-    let Some(tf_sql) = validate_and_rewrite(query)? else {
+    let Some(action) = plan_rewrite(query)? else {
         return Ok(None);
     };
 
-    // YAML FILE produces a sentinel string starting with `__SV_YAML_FILE__`
-    // (path + kind + name + comment). Read the file and route through the
-    // shared CREATE emission path so the INSERT runs on the caller's
-    // connection.
-    if let Some(payload) = tf_sql.strip_prefix("__SV_YAML_FILE__") {
-        return rewrite_yaml_file_create(payload);
-    }
-
-    // Read-side DDL (DESCRIBE / SHOW with WHERE/LIMIT clauses) emits SQL that
-    // doesn't match the `SELECT * FROM fn('arg', ...)` shape. Pass through
-    // unchanged; DuckDB executes the read-side table function on the caller's
-    // connection.
-    let Some(call) = parse_table_function_call(&tf_sql) else {
-        return Ok(Some(tf_sql));
-    };
-
-    // The args returned by parse_table_function_call retain the SQL escaping
-    // produced by validate_and_rewrite (single quotes doubled). They can be
-    // re-embedded as single-quoted strings without further processing.
-    let args = &call.args;
-    match call.fn_name.as_str() {
-        // CREATE forms: enrich the JSON (validation + graph + type
-        // inference handled inside `enrich_definition_for_create` — no
-        // catalog connection needed) then emit native INSERT on the
-        // caller's connection. See `rewrite_create` (extension-only).
-        "create_semantic_view_from_json"
-        | "create_or_replace_semantic_view_from_json"
-        | "create_semantic_view_if_not_exists_from_json" => {
-            rewrite_create(call.fn_name.as_str(), args)
+    match action {
+        // CREATE from an in-memory definition — hand the definition straight to
+        // the shared emission path. AR-2: no JSON serialize → re-parse →
+        // deserialize round-trip; the `SemanticViewDefinition` flows structurally.
+        RewriteAction::Create { name, def, mode } => {
+            emit_native_create_sql(&name, *def, mode.or_replace(), mode.if_not_exists())
         }
-        // DROP / ALTER: pure-SQL race-guard + DML, all on the caller's
-        // connection. See `rewrite_drop_or_alter` (extension-only).
-        "drop_semantic_view"
-        | "drop_semantic_view_if_exists"
-        | "alter_semantic_view_rename"
-        | "alter_semantic_view_rename_if_exists"
-        | "alter_semantic_view_set_comment"
-        | "alter_semantic_view_set_comment_if_exists"
-        | "alter_semantic_view_unset_comment"
-        | "alter_semantic_view_unset_comment_if_exists" => {
-            rewrite_drop_or_alter(call.fn_name.as_str(), args)
+        // CREATE FROM YAML FILE — emit the INSERT that selects from the
+        // `__sv_compute_create_from_yaml` helper TF (which reads the file at
+        // execution). AR-2: no `\x01`-delimited sentinel string.
+        RewriteAction::CreateFromYamlFile {
+            file_path,
+            name,
+            comment,
+            mode,
+        } => emit_native_create_from_yaml_file(
+            &file_path,
+            &name,
+            &comment,
+            mode.or_replace(),
+            mode.if_not_exists(),
+        ),
+        // DROP / ALTER (native DML) and read-side DESCRIBE / SHOW (run as-is):
+        // still lowered from the legacy `SELECT * FROM fn(...)` string via
+        // `parse_table_function_call`. A follow-up structures these too.
+        RewriteAction::Passthrough(tf_sql) => {
+            // Read-side DDL (DESCRIBE / SHOW with WHERE/LIMIT clauses) emits SQL
+            // that doesn't match the `SELECT * FROM fn('arg', ...)` shape. Pass
+            // through unchanged; DuckDB executes the read-side table function on
+            // the caller's connection.
+            let Some(call) = parse_table_function_call(&tf_sql) else {
+                return Ok(Some(tf_sql));
+            };
+            // The args retain the SQL escaping (single quotes doubled) so they
+            // re-embed into single-quoted string literals without further work.
+            match call.fn_name.as_str() {
+                // DROP / ALTER: pure-SQL race-guard + DML on the caller's
+                // connection. See `rewrite_drop_or_alter` (extension-only).
+                "drop_semantic_view"
+                | "drop_semantic_view_if_exists"
+                | "alter_semantic_view_rename"
+                | "alter_semantic_view_rename_if_exists"
+                | "alter_semantic_view_set_comment"
+                | "alter_semantic_view_set_comment_if_exists"
+                | "alter_semantic_view_unset_comment"
+                | "alter_semantic_view_unset_comment_if_exists" => {
+                    rewrite_drop_or_alter(call.fn_name.as_str(), &call.args)
+                }
+                // Read-side table functions (describe_semantic_view, show_*,
+                // list_*, get_ddl, read_yaml_from_semantic_view): pass through.
+                _ => Ok(Some(tf_sql)),
+            }
         }
-        // Read-side table functions (describe_semantic_view, show_*, list_*,
-        // get_ddl, read_yaml_from_semantic_view): pass through.
-        _ => Ok(Some(tf_sql)),
     }
 }
 
@@ -1733,47 +1845,9 @@ fn rewrite_drop_or_alter(fn_name: &str, args: &[String]) -> Result<Option<String
     }
 }
 
-/// CREATE-side native-SQL emission. Phase 65 Plan 06: pure-SQL — no
-/// `CatalogReader` consumed because H1 catalog_conn is retired. The
-/// "already exists" wording is enforced by the CASE+error inside the
-/// rewritten INSERT (snapshot-consistent on the caller's connection).
-#[cfg(feature = "extension")]
-fn rewrite_create(fn_name: &str, args: &[String]) -> Result<Option<String>, ParseError> {
-    if args.len() != 2 {
-        return Err(ParseError {
-            message: format!(
-                "internal error: rewrite_create dispatched with arity={}",
-                args.len()
-            ),
-            position: None,
-        });
-    }
-    let name = unescape_sql_arg(&args[0]);
-    let json = unescape_sql_arg(&args[1]);
-
-    let (or_replace, if_not_exists) = match fn_name {
-        "create_semantic_view_from_json" => (false, false),
-        "create_or_replace_semantic_view_from_json" => (true, false),
-        "create_semantic_view_if_not_exists_from_json" => (false, true),
-        _ => {
-            return Err(ParseError {
-                message: format!("internal error: rewrite_create unknown fn_name='{fn_name}'"),
-                position: None,
-            });
-        }
-    };
-
-    let def =
-        crate::model::SemanticViewDefinition::from_json(&name, &json).map_err(|e| ParseError {
-            message: e,
-            position: None,
-        })?;
-
-    emit_native_create_sql(&name, def, or_replace, if_not_exists)
-}
-
-/// Shared CREATE-emission helper used by both the table-function-style CREATE
-/// path (`rewrite_create`) and the FROM YAML FILE path (`rewrite_yaml_file_create`).
+/// Shared CREATE-emission helper for the in-memory-definition path
+/// (`RewriteAction::Create`). The FROM YAML FILE path uses the sibling
+/// `emit_native_create_from_yaml_file`.
 ///
 /// Steps (Phase 65 Plan 06 — pure-SQL):
 /// 1. Run `enrich_definition_for_create` (validation + graph + serialize
@@ -1797,10 +1871,10 @@ fn emit_native_create_sql(
 ) -> Result<Option<String>, ParseError> {
     // Defensive validation — `name` arrives already normalised (bare,
     // case-folded if it was unquoted) from validate_create_body via the
-    // function-call round-trip. Re-quote before re-normalising so this pass
-    // is a true no-op on normalised input: normalising the BARE name again
-    // would fold a case-preserved quoted name (`"SalesView"` → `salesview`,
-    // PA-8) and split a dotted name (`"a.b"` → `b`).
+    // `RewriteAction::Create` it produced. Re-quote before re-normalising so
+    // this pass is a true no-op on normalised input: normalising the BARE name
+    // again would fold a case-preserved quoted name (`"SalesView"` →
+    // `salesview`, PA-8) and split a dotted name (`"a.b"` → `b`).
     let name = normalize_view_name(&crate::expand::quote_ident(name)).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         position: None,
@@ -1906,45 +1980,21 @@ fn emit_native_create_sql(
 /// bind callback (per-call `Connection(*context.db)`), not on any
 /// long-lived extension-owned connection.
 #[cfg(feature = "extension")]
-fn rewrite_yaml_file_create(payload: &str) -> Result<Option<String>, ParseError> {
-    // Sentinel format: `<path>\x01<kind>\x01<name>\x01<comment>` (the
-    // `__SV_YAML_FILE__` prefix has already been stripped by the caller).
-    let mut parts = payload.splitn(4, '\x01');
-    let file_path = parts.next().ok_or_else(|| ParseError {
-        message: "Internal error: malformed YAML FILE sentinel (missing path)".to_string(),
-        position: None,
-    })?;
-    let kind_str = parts.next().ok_or_else(|| ParseError {
-        message: "Internal error: malformed YAML FILE sentinel (missing kind)".to_string(),
-        position: None,
-    })?;
-    let name = parts.next().ok_or_else(|| ParseError {
-        message: "Internal error: malformed YAML FILE sentinel (missing name)".to_string(),
-        position: None,
-    })?;
-    let comment = parts.next().unwrap_or("");
+fn emit_native_create_from_yaml_file(
+    file_path: &str,
+    name: &str,
+    comment: &str,
+    or_replace: bool,
+    if_not_exists: bool,
+) -> Result<Option<String>, ParseError> {
+    // Phase 65.1 Plan 07 (IN-04 D-24): `kind` is not threaded into the helper
+    // TF — the outer INSERT shape (OR IGNORE / OR REPLACE / plain) already
+    // encodes the ON CONFLICT behaviour, chosen from `or_replace`/`if_not_exists`.
 
-    // Phase 65.1 Plan 07 (IN-04 D-24): `kind` is no longer threaded into the
-    // helper TF — the outer INSERT shape (OR IGNORE / OR REPLACE / plain)
-    // already encodes ON CONFLICT behaviour. We still decode `kind_str` from
-    // the sentinel because the chosen INSERT shape below depends on it.
-    let (or_replace, if_not_exists) = match kind_str {
-        "0" => (false, false),
-        "1" => (true, false),
-        "2" => (false, true),
-        _ => {
-            return Err(ParseError {
-                message: format!("Internal error: unknown YAML FILE kind '{kind_str}'"),
-                position: None,
-            });
-        }
-    };
-
-    // Defensive validation of the sentinel-carried name (matches
-    // emit_native_create_sql): re-quote before re-normalising so the pass
-    // is a no-op on the already-normalised bare name — re-normalising it
-    // bare would fold a case-preserved quoted name (PA-8) or split a
-    // dotted one.
+    // Defensive validation of the name (matches emit_native_create_sql):
+    // re-quote before re-normalising so the pass is a no-op on the
+    // already-normalised bare name — re-normalising it bare would fold a
+    // case-preserved quoted name (PA-8) or split a dotted one.
     let name = normalize_view_name(&crate::expand::quote_ident(name)).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         position: None,
@@ -4972,16 +5022,16 @@ metrics:
     expr: SUM(o.amount)
     source_table: o
 $$"#;
-        let result = rewrite_ddl_yaml_body(DdlKind::Create, "test_view", yaml_text, None).unwrap();
-        let sql = result.unwrap();
+        let action = rewrite_ddl_yaml_body(DdlKind::Create, "test_view", yaml_text, None).unwrap();
+        let sql = render_legacy(&action);
         assert!(sql.starts_with("SELECT * FROM create_semantic_view_from_json('test_view',"));
     }
 
     #[test]
     fn test_yaml_rewrite_create_or_replace() {
         let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
-        let result = rewrite_ddl_yaml_body(DdlKind::CreateOrReplace, "v", yaml_text, None).unwrap();
-        let sql = result.unwrap();
+        let action = rewrite_ddl_yaml_body(DdlKind::CreateOrReplace, "v", yaml_text, None).unwrap();
+        let sql = render_legacy(&action);
         assert!(sql.contains("create_or_replace_semantic_view_from_json"));
     }
 
@@ -4990,7 +5040,7 @@ $$"#;
         let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
         let result =
             rewrite_ddl_yaml_body(DdlKind::CreateIfNotExists, "v", yaml_text, None).unwrap();
-        let sql = result.unwrap();
+        let sql = render_legacy(&result);
         assert!(sql.contains("create_semantic_view_if_not_exists_from_json"));
     }
 
@@ -5022,7 +5072,7 @@ $$"#;
             Some("ddl comment".to_string()),
         )
         .unwrap();
-        let sql = result.unwrap();
+        let sql = render_legacy(&result);
         // DDL comment overrides YAML comment
         assert!(sql.contains("ddl comment"));
     }
@@ -5039,7 +5089,7 @@ dimensions: []
 metrics: []
 $$"#;
         let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
-        let sql = result.unwrap();
+        let sql = render_legacy(&result);
         // base_table should be populated from first table entry
         assert!(sql.contains("orders"));
     }
@@ -5048,7 +5098,7 @@ $$"#;
     fn test_yaml_rewrite_tagged_dollar_quote() {
         let yaml_text = "$yaml$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$yaml$";
         let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
-        assert!(result.is_some());
+        assert!(matches!(result, RewriteAction::Create { .. }));
     }
 
     // ===================================================================
@@ -5222,7 +5272,7 @@ $$"#;
         let result =
             rewrite_ddl_yaml_file_body(DdlKind::Create, "myview", "'/path/to/def.yaml'", None)
                 .unwrap();
-        let sentinel = result.unwrap();
+        let sentinel = render_legacy(&result);
         assert!(sentinel.starts_with("__SV_YAML_FILE__"));
         assert!(sentinel.contains("path/to/def.yaml"));
         assert!(sentinel.contains("\x010\x01myview\x01"));
@@ -5237,7 +5287,7 @@ $$"#;
             Some("a comment".into()),
         )
         .unwrap();
-        let sentinel = result.unwrap();
+        let sentinel = render_legacy(&result);
         assert!(sentinel.contains("\x011\x01v\x01a comment"));
     }
 
@@ -5245,7 +5295,7 @@ $$"#;
     fn test_rewrite_ddl_yaml_file_body_if_not_exists() {
         let result =
             rewrite_ddl_yaml_file_body(DdlKind::CreateIfNotExists, "v", "'/f.yaml'", None).unwrap();
-        let sentinel = result.unwrap();
+        let sentinel = render_legacy(&result);
         assert!(sentinel.contains("\x012\x01v\x01"));
     }
 
@@ -5258,7 +5308,7 @@ $$"#;
             Some("my comment".into()),
         )
         .unwrap();
-        let sentinel = result.unwrap();
+        let sentinel = render_legacy(&result);
         assert!(sentinel.contains("my comment"));
     }
 
