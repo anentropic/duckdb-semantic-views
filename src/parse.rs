@@ -748,7 +748,7 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<RewriteAct
 /// tests that assert on the legacy string form.
 #[cfg(test)]
 fn rewrite_ddl(query: &str) -> Result<String, String> {
-    plan_ddl(query).map(|action| render_legacy(&action))
+    plan_ddl(query).and_then(|action| render_legacy(&action).map_err(|e| e.message))
 }
 
 /// Parse a non-CREATE semantic view DDL statement into a structured
@@ -1111,11 +1111,17 @@ impl CreateMode {
 /// for the existing unit tests; production (`rewrite_to_native_sql`) consumes
 /// the `RewriteAction` directly. A later step migrates those tests to assert on
 /// `RewriteAction` and deletes this shim.
-fn render_legacy(action: &RewriteAction) -> String {
-    match action {
+fn render_legacy(action: &RewriteAction) -> Result<String, ParseError> {
+    let sql = match action {
         RewriteAction::Create { name, def, mode } => {
-            let json = serde_json::to_string(def.as_ref())
-                .expect("SemanticViewDefinition serialization is infallible");
+            // Propagate serialization failure rather than panicking (the
+            // pre-AR-2 rewriters returned a ParseError here); `validate_and_rewrite`
+            // is reachable from the FFI error-reporting path via
+            // `run_validation_for_parse_function`.
+            let json = serde_json::to_string(def.as_ref()).map_err(|e| ParseError {
+                message: format!("Failed to serialize definition: {e}"),
+                position: None,
+            })?;
             let safe_name = name.replace('\'', "''");
             let safe_json = json.replace('\'', "''");
             format!(
@@ -1173,7 +1179,8 @@ fn render_legacy(action: &RewriteAction) -> String {
             )
         }
         RewriteAction::Passthrough(sql) => sql.clone(),
-    }
+    };
+    Ok(sql)
 }
 
 /// `_if_exists` function-name suffix for DROP/ALTER `IF EXISTS` forms.
@@ -1197,14 +1204,18 @@ fn if_exists_suffix(if_exists: bool) -> &'static str {
 /// - `Ok(None)` -- not a semantic view DDL statement
 /// - `Err(ParseError)` -- validation error with message and optional position
 pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
-    Ok(plan_rewrite(query)?.map(|action| render_legacy(&action)))
+    plan_rewrite(query)?
+        .map(|action| render_legacy(&action))
+        .transpose()
 }
 
 /// Validate a DDL statement and produce a structured [`RewriteAction`] (AR-2).
 ///
-/// This is the main entry point for the validation layer. CREATE forms go through
-/// the AS-body keyword parser and carry their definition structurally;
-/// DROP/DESCRIBE/SHOW/ALTER are carried as `Passthrough` legacy SQL for now.
+/// This is the main entry point for the validation layer. CREATE forms carry
+/// their definition structurally (`Create` / `CreateFromYamlFile`); DROP and
+/// ALTER carry structured `Drop` / `AlterRename` / `AlterSetComment` /
+/// `AlterUnsetComment` variants; read-side DESCRIBE / SHOW / SHOW COLUMNS are
+/// carried as `Passthrough` final SQL.
 pub fn plan_rewrite(query: &str) -> Result<Option<RewriteAction>, ParseError> {
     // PA-7: blank comments once at the entry point (byte-length-preserving,
     // so every error-caret position stays valid for the original query).
@@ -2123,7 +2134,7 @@ fn escape_sql_arg(s: &str) -> String {
 /// (as produced by `escape_sql_arg` at the `rewrite_to_native_sql` boundary).
 ///
 /// The emitted statement errors with `semantic view '<name>' does not
-/// exist` when the row is missing from `semantic_layer._definitions`.
+/// exist` when the row is missing from the catalog table (`DEFINITIONS_TABLE`).
 /// Caller appends `;` and the actual DELETE/UPDATE; both run on the
 /// caller's connection in the same transaction so the guard's NOT EXISTS
 /// check is snapshot-consistent with the DML that follows.
@@ -4865,7 +4876,7 @@ metrics:
     source_table: o
 $$"#;
         let action = rewrite_ddl_yaml_body(DdlKind::Create, "test_view", yaml_text, None).unwrap();
-        let sql = render_legacy(&action);
+        let sql = render_legacy(&action).unwrap();
         assert!(sql.starts_with("SELECT * FROM create_semantic_view_from_json('test_view',"));
     }
 
@@ -4873,7 +4884,7 @@ $$"#;
     fn test_yaml_rewrite_create_or_replace() {
         let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
         let action = rewrite_ddl_yaml_body(DdlKind::CreateOrReplace, "v", yaml_text, None).unwrap();
-        let sql = render_legacy(&action);
+        let sql = render_legacy(&action).unwrap();
         assert!(sql.contains("create_or_replace_semantic_view_from_json"));
     }
 
@@ -4882,7 +4893,7 @@ $$"#;
         let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
         let result =
             rewrite_ddl_yaml_body(DdlKind::CreateIfNotExists, "v", yaml_text, None).unwrap();
-        let sql = render_legacy(&result);
+        let sql = render_legacy(&result).unwrap();
         assert!(sql.contains("create_semantic_view_if_not_exists_from_json"));
     }
 
@@ -4914,7 +4925,7 @@ $$"#;
             Some("ddl comment".to_string()),
         )
         .unwrap();
-        let sql = render_legacy(&result);
+        let sql = render_legacy(&result).unwrap();
         // DDL comment overrides YAML comment
         assert!(sql.contains("ddl comment"));
     }
@@ -4931,7 +4942,7 @@ dimensions: []
 metrics: []
 $$"#;
         let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
-        let sql = render_legacy(&result);
+        let sql = render_legacy(&result).unwrap();
         // base_table should be populated from first table entry
         assert!(sql.contains("orders"));
     }
@@ -5114,7 +5125,7 @@ $$"#;
         let result =
             rewrite_ddl_yaml_file_body(DdlKind::Create, "myview", "'/path/to/def.yaml'", None)
                 .unwrap();
-        let sentinel = render_legacy(&result);
+        let sentinel = render_legacy(&result).unwrap();
         assert!(sentinel.starts_with("__SV_YAML_FILE__"));
         assert!(sentinel.contains("path/to/def.yaml"));
         assert!(sentinel.contains("\x010\x01myview\x01"));
@@ -5129,7 +5140,7 @@ $$"#;
             Some("a comment".into()),
         )
         .unwrap();
-        let sentinel = render_legacy(&result);
+        let sentinel = render_legacy(&result).unwrap();
         assert!(sentinel.contains("\x011\x01v\x01a comment"));
     }
 
@@ -5137,7 +5148,7 @@ $$"#;
     fn test_rewrite_ddl_yaml_file_body_if_not_exists() {
         let result =
             rewrite_ddl_yaml_file_body(DdlKind::CreateIfNotExists, "v", "'/f.yaml'", None).unwrap();
-        let sentinel = render_legacy(&result);
+        let sentinel = render_legacy(&result).unwrap();
         assert!(sentinel.contains("\x012\x01v\x01"));
     }
 
@@ -5150,7 +5161,7 @@ $$"#;
             Some("my comment".into()),
         )
         .unwrap();
-        let sentinel = render_legacy(&result);
+        let sentinel = render_legacy(&result).unwrap();
         assert!(sentinel.contains("my comment"));
     }
 
