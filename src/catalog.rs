@@ -17,6 +17,26 @@ use duckdb::Connection;
 // companion file is deleted and this constant is never referenced again at runtime.
 const V010_COMPANION_EXT: &str = "semantic_views";
 
+/// Schema holding the semantic-view catalog table.
+pub const DEFINITIONS_SCHEMA: &str = "semantic_layer";
+/// Bare (unqualified) name of the semantic-view catalog table.
+pub const DEFINITIONS_TABLE_NAME: &str = "_definitions";
+/// Fully-qualified catalog table where all semantic-view definitions are stored.
+///
+/// This is the single source of truth for the table reference; every SQL builder
+/// that reads or writes definitions embeds this constant rather than the literal
+/// string. The `DEFINITIONS_TABLE == DEFINITIONS_SCHEMA.DEFINITIONS_TABLE_NAME`
+/// relationship is asserted by `tests::definitions_table_const_is_consistent`.
+pub const DEFINITIONS_TABLE: &str = "semantic_layer._definitions";
+
+/// Canonical "view does not exist" error wording, shared by every read-side DDL
+/// command so the message stays identical across the surface. The SQL-side guard
+/// selects in `parse.rs` intentionally inline an escaped copy of this wording.
+#[must_use]
+pub fn view_not_found_msg(name: &str) -> String {
+    format!("semantic view '{name}' does not exist")
+}
+
 /// Create the `semantic_layer` schema and `_definitions` table if they do not
 /// exist, and run the v0.1.0 companion-file migration once for file-backed
 /// databases.
@@ -36,13 +56,13 @@ pub fn init_catalog(
     if is_read_only {
         return Ok(());
     }
-    con.execute_batch(
-        "CREATE SCHEMA IF NOT EXISTS semantic_layer;
-         CREATE TABLE IF NOT EXISTS semantic_layer._definitions (
+    con.execute_batch(&format!(
+        "CREATE SCHEMA IF NOT EXISTS {DEFINITIONS_SCHEMA};
+         CREATE TABLE IF NOT EXISTS {DEFINITIONS_TABLE} (
              name       VARCHAR PRIMARY KEY,
              definition VARCHAR
-         );",
-    )?;
+         );"
+    ))?;
 
     // One-time migration: if a v0.1.0 companion file exists alongside the database,
     // import its contents into the table then delete the file.
@@ -76,7 +96,9 @@ pub fn init_catalog(
                 })?;
             for (name, def) in &migrated {
                 con.execute(
-                    "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
+                    &format!(
+                        "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} (name, definition) VALUES (?, ?)"
+                    ),
                     duckdb::params![name, def],
                 )?;
             }
@@ -116,6 +138,7 @@ mod reader {
 
     use libduckdb_sys as ffi;
 
+    use crate::catalog::DEFINITIONS_TABLE;
     use crate::ddl::read_ffi::BorrowedConnection;
 
     /// Read-side handle for `semantic_layer._definitions`.
@@ -301,9 +324,10 @@ mod reader {
         conn: ffi::duckdb_connection,
         name: &str,
     ) -> Result<Option<String>, String> {
-        let c_sql =
-            CString::new("SELECT definition FROM semantic_layer._definitions WHERE name = $1")
-                .map_err(|_| "SQL contains null byte".to_string())?;
+        let c_sql = CString::new(format!(
+            "SELECT definition FROM {DEFINITIONS_TABLE} WHERE name = $1"
+        ))
+        .map_err(|_| "SQL contains null byte".to_string())?;
         let stmt = PreparedStmt::prepare(conn, &c_sql)?;
 
         let c_name = CString::new(name).map_err(|_| "view name contains null byte".to_string())?;
@@ -331,9 +355,10 @@ mod reader {
     unsafe fn execute_list_all(
         conn: ffi::duckdb_connection,
     ) -> Result<Vec<(String, String)>, String> {
-        let c_sql =
-            CString::new("SELECT name, definition FROM semantic_layer._definitions ORDER BY name")
-                .map_err(|_| "SQL contains null byte".to_string())?;
+        let c_sql = CString::new(format!(
+            "SELECT name, definition FROM {DEFINITIONS_TABLE} ORDER BY name"
+        ))
+        .map_err(|_| "SQL contains null byte".to_string())?;
         let mut result = QueryResult::zeroed();
         let rc = ffi::duckdb_query(conn, c_sql.as_ptr(), result.raw_mut());
         if rc != ffi::DuckDBSuccess {
@@ -356,8 +381,10 @@ mod reader {
     /// Names-only counterpart to `execute_list_all`. Skips the `definition`
     /// column so error-path suggestion lookups don't pay for the JSON blobs.
     unsafe fn execute_list_names(conn: ffi::duckdb_connection) -> Result<Vec<String>, String> {
-        let c_sql = CString::new("SELECT name FROM semantic_layer._definitions ORDER BY name")
-            .map_err(|_| "SQL contains null byte".to_string())?;
+        let c_sql = CString::new(format!(
+            "SELECT name FROM {DEFINITIONS_TABLE} ORDER BY name"
+        ))
+        .map_err(|_| "SQL contains null byte".to_string())?;
         let mut result = QueryResult::zeroed();
         let rc = ffi::duckdb_query(conn, c_sql.as_ptr(), result.raw_mut());
         if rc != ffi::DuckDBSuccess {
@@ -385,6 +412,23 @@ mod tests {
     use super::*;
     #[cfg(not(feature = "extension"))]
     use duckdb::Connection;
+
+    #[test]
+    fn definitions_table_const_is_consistent() {
+        assert_eq!(
+            DEFINITIONS_TABLE,
+            format!("{DEFINITIONS_SCHEMA}.{DEFINITIONS_TABLE_NAME}"),
+            "DEFINITIONS_TABLE must equal DEFINITIONS_SCHEMA.DEFINITIONS_TABLE_NAME"
+        );
+    }
+
+    #[test]
+    fn view_not_found_msg_wording() {
+        assert_eq!(
+            view_not_found_msg("sales"),
+            "semantic view 'sales' does not exist"
+        );
+    }
 
     // In-memory `Connection` requires the bundled DuckDB API; the `extension`
     // feature swaps in `loadable-extension` stubs that error at runtime with

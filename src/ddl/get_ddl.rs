@@ -94,7 +94,7 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
                 write_err(
                     error_buf,
                     error_buf_len,
-                    &format!("semantic view '{name}' does not exist"),
+                    &crate::catalog::view_not_found_msg(name),
                 );
                 return 1_u8;
             }

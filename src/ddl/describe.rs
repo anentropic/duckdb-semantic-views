@@ -54,7 +54,7 @@ pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
                 write_err(
                     error_buf,
                     error_buf_len,
-                    &format!("semantic view '{name}' does not exist"),
+                    &crate::catalog::view_not_found_msg(&name),
                 );
                 return 1_u8;
             }

@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 
 use crate::body_parser::parse_keyword_body;
+use crate::catalog::{DEFINITIONS_SCHEMA, DEFINITIONS_TABLE, DEFINITIONS_TABLE_NAME};
 use crate::errors::ParseError;
 use crate::ident::{find_identifier_end, normalize_view_name};
 use crate::model::{Cardinality, Join, TableRef};
@@ -1953,21 +1954,21 @@ fn emit_native_create_sql(
     //     same-transaction guard.
     let sql = if or_replace {
         format!(
-            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) \
+            "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} (name, definition) \
              VALUES ('{name_escaped}', {metadata_patched_definition}) \
              RETURNING name AS view_name"
         )
     } else if if_not_exists {
         format!(
-            "INSERT OR IGNORE INTO semantic_layer._definitions (name, definition) \
+            "INSERT OR IGNORE INTO {DEFINITIONS_TABLE} (name, definition) \
              VALUES ('{name_escaped}', {metadata_patched_definition}) \
              RETURNING name AS view_name"
         )
     } else {
         format!(
-            "INSERT INTO semantic_layer._definitions (name, definition) \
+            "INSERT INTO {DEFINITIONS_TABLE} (name, definition) \
              SELECT \
-               CASE WHEN EXISTS (SELECT 1 FROM semantic_layer._definitions \
+               CASE WHEN EXISTS (SELECT 1 FROM {DEFINITIONS_TABLE} \
                                  WHERE name = '{name_escaped}') \
                     THEN error('semantic view ''{name_escaped}'' already exists; \
                                 use CREATE OR REPLACE SEMANTIC VIEW to overwrite') \
@@ -2077,23 +2078,23 @@ fn rewrite_yaml_file_create(payload: &str) -> Result<Option<String>, ParseError>
     //                    (Phase 60 race-guard pattern carried forward).
     let sql = if or_replace {
         format!(
-            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) \
+            "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} (name, definition) \
              SELECT '{name_escaped}', {metadata_patched} \
              {helper_from} \
              RETURNING name AS view_name"
         )
     } else if if_not_exists {
         format!(
-            "INSERT OR IGNORE INTO semantic_layer._definitions (name, definition) \
+            "INSERT OR IGNORE INTO {DEFINITIONS_TABLE} (name, definition) \
              SELECT '{name_escaped}', {metadata_patched} \
              {helper_from} \
              RETURNING name AS view_name"
         )
     } else {
         format!(
-            "INSERT INTO semantic_layer._definitions (name, definition) \
+            "INSERT INTO {DEFINITIONS_TABLE} (name, definition) \
              SELECT \
-               CASE WHEN EXISTS (SELECT 1 FROM semantic_layer._definitions \
+               CASE WHEN EXISTS (SELECT 1 FROM {DEFINITIONS_TABLE} \
                                  WHERE name = '{name_escaped}') \
                     THEN error('semantic view ''{name_escaped}'' already exists; \
                                 use CREATE OR REPLACE SEMANTIC VIEW to overwrite') \
@@ -2175,8 +2176,8 @@ fn definitions_table_guard_select(name_escaped: &str) -> String {
     format!(
         "SELECT CASE \
               WHEN NOT EXISTS (SELECT 1 FROM information_schema.tables \
-                                WHERE table_schema = 'semantic_layer' \
-                                  AND table_name = '_definitions') \
+                                WHERE table_schema = '{DEFINITIONS_SCHEMA}' \
+                                  AND table_name = '{DEFINITIONS_TABLE_NAME}') \
                 THEN error('semantic view ''{name_escaped}'' does not exist') \
               ELSE TRUE \
             END"
@@ -2187,7 +2188,7 @@ fn definitions_table_guard_select(name_escaped: &str) -> String {
 fn existence_guard_select(name_escaped: &str) -> String {
     format!(
         "SELECT CASE WHEN NOT EXISTS \
-                   (SELECT 1 FROM semantic_layer._definitions WHERE name = '{name_escaped}') \
+                   (SELECT 1 FROM {DEFINITIONS_TABLE} WHERE name = '{name_escaped}') \
                 THEN error('semantic view ''{name_escaped}'' does not exist') \
                 ELSE TRUE END"
     )
@@ -2202,7 +2203,7 @@ fn existence_guard_select(name_escaped: &str) -> String {
 fn rename_collision_guard_select(new_name_escaped: &str) -> String {
     format!(
         "SELECT CASE WHEN EXISTS \
-                   (SELECT 1 FROM semantic_layer._definitions WHERE name = '{new_name_escaped}') \
+                   (SELECT 1 FROM {DEFINITIONS_TABLE} WHERE name = '{new_name_escaped}') \
                 THEN error('semantic view ''{new_name_escaped}'' already exists') \
                 ELSE TRUE END"
     )
@@ -2227,7 +2228,7 @@ fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, P
         let table_guard = definitions_table_guard_select(name_escaped);
         return Ok(Some(format!(
             "{table_guard}; \
-             DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
+             DELETE FROM {DEFINITIONS_TABLE} WHERE name = '{name_escaped}' \
              RETURNING name AS view_name"
         )));
     }
@@ -2250,7 +2251,7 @@ fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, P
     Ok(Some(format!(
         "{table_guard}; \
          {guard}; \
-         DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
+         DELETE FROM {DEFINITIONS_TABLE} WHERE name = '{name_escaped}' \
          RETURNING name AS view_name"
     )))
 }
@@ -2279,7 +2280,7 @@ fn rewrite_alter_rename(
         return Ok(Some(format!(
             "{table_guard}; \
              {collision_guard}; \
-             UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
+             UPDATE {DEFINITIONS_TABLE} SET name = '{new_escaped}' \
              WHERE name = '{old_escaped}' \
              RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
         )));
@@ -2301,7 +2302,7 @@ fn rewrite_alter_rename(
         "{table_guard}; \
          {exist_guard}; \
          {collision_guard}; \
-         UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
+         UPDATE {DEFINITIONS_TABLE} SET name = '{new_escaped}' \
          WHERE name = '{old_escaped}' \
          RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
     )))
@@ -2370,7 +2371,7 @@ fn rewrite_alter_comment(
         let table_guard = definitions_table_guard_select(name_escaped);
         return Ok(Some(format!(
             "{table_guard}; \
-             UPDATE semantic_layer._definitions \
+             UPDATE {DEFINITIONS_TABLE} \
                 SET definition = json_merge_patch(definition::JSON, '{patch_json_for_sql}'::JSON)::VARCHAR \
               WHERE name = '{name_escaped}' \
              RETURNING name, '{status_label}'::VARCHAR AS status"
@@ -2392,7 +2393,7 @@ fn rewrite_alter_comment(
     Ok(Some(format!(
         "{table_guard}; \
          {guard}; \
-         UPDATE semantic_layer._definitions \
+         UPDATE {DEFINITIONS_TABLE} \
             SET definition = json_merge_patch(definition::JSON, '{patch_json_for_sql}'::JSON)::VARCHAR \
           WHERE name = '{name_escaped}' \
          RETURNING name, '{status_label}'::VARCHAR AS status"
