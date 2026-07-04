@@ -1731,6 +1731,20 @@ unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len:
 // `cargo test` (no extension feature) these code paths are excluded entirely
 // (this entry point itself is feature-gated; its sole caller —
 // `sv_parser_override_rust` — is `extension`-only).
+//
+// INVARIANT (AR-5) — purity / idempotence. This function MUST be a pure
+// function of `query` (and committed catalog state): for a given input it
+// must produce the same `Ok(Some)` / `Ok(None)` / `Err(message, position)`
+// result on every call, with no dependence on call order, wall-clock time,
+// `HashMap` iteration order, or any mutable process state. The error-reporting
+// layer depends on this: after the override path runs, DuckDB's failed default
+// parser drives `sv_parse_function_rust`, which calls this function a SECOND
+// time (via `run_validation_for_parse_function`) purely to recover the same
+// `Err` message and caret position the override produced. If the two runs can
+// diverge, the caret error shown to the user no longer matches the rewrite
+// that actually ran. Any future change that reads mutable state or introduces
+// nondeterminism here breaks that contract and must instead cache the first
+// run's `(query -> result)` rather than re-deriving it.
 #[cfg(feature = "extension")]
 pub fn rewrite_to_native_sql(
     _ctx: &OverrideContext,

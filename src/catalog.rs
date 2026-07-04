@@ -56,11 +56,17 @@ pub fn init_catalog(
     if is_read_only {
         return Ok(());
     }
+    // FF-10: `definition` is `NOT NULL`. A SQL-NULL definition is an
+    // unrecoverable-looking state — readers treat a NULL definition as
+    // "view does not exist" while the write-side existence guards see the row
+    // as present, so a manually-tampered NULL row can neither be read nor
+    // re-created. The constraint makes that state unrepresentable for new
+    // catalogs (all writes always supply a definition).
     con.execute_batch(&format!(
         "CREATE SCHEMA IF NOT EXISTS {DEFINITIONS_SCHEMA};
          CREATE TABLE IF NOT EXISTS {DEFINITIONS_TABLE} (
              name       VARCHAR PRIMARY KEY,
-             definition VARCHAR
+             definition VARCHAR NOT NULL
          );"
     ))?;
 
