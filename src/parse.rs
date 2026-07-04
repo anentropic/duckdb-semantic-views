@@ -1086,7 +1086,7 @@ impl CreateMode {
     fn if_not_exists(self) -> bool {
         matches!(self, CreateMode::IfNotExists)
     }
-    /// Legacy `*_from_json` function name (`render_legacy` compat only).
+    /// `*_from_json` function name for the `render_legacy` string form.
     fn json_fn_name(self) -> &'static str {
         match self {
             CreateMode::Create => "create_semantic_view_from_json",
@@ -1094,7 +1094,7 @@ impl CreateMode {
             CreateMode::IfNotExists => "create_semantic_view_if_not_exists_from_json",
         }
     }
-    /// Legacy YAML-FILE sentinel kind number (`render_legacy` compat only).
+    /// YAML-FILE sentinel kind number for the `render_legacy` string form.
     fn kind_num(self) -> u8 {
         match self {
             CreateMode::Create => 0,
@@ -1104,13 +1104,15 @@ impl CreateMode {
     }
 }
 
-/// Reproduce the legacy `SELECT * FROM <fn>(...)` / YAML-FILE-sentinel string
-/// form of a `RewriteAction`.
+/// Render a `RewriteAction` to its `SELECT * FROM <fn>(...)` / YAML-FILE string
+/// form — the stable string view of the rewriter used for testing and
+/// introspection.
 ///
-/// Retained only so `validate_and_rewrite` keeps its string-returning signature
-/// for the existing unit tests; production (`rewrite_to_native_sql`) consumes
-/// the `RewriteAction` directly. A later step migrates those tests to assert on
-/// `RewriteAction` and deletes this shim.
+/// This backs the public [`validate_and_rewrite`] entry point, which the unit,
+/// integration, and proptest suites assert against (the generated fn-call SQL,
+/// including quote-escaping). It is NOT on the execution path: AR-2 removed the
+/// string round-trip from lowering — `rewrite_to_native_sql` consumes the
+/// structured `RewriteAction` directly and never renders this string.
 fn render_legacy(action: &RewriteAction) -> Result<String, ParseError> {
     let sql = match action {
         RewriteAction::Create { name, def, mode } => {
@@ -1192,12 +1194,13 @@ fn if_exists_suffix(if_exists: bool) -> &'static str {
     }
 }
 
-/// Validate a DDL statement and rewrite it to legacy `SELECT * FROM fn(...)`
-/// string form.
+/// Validate a DDL statement and render it to `SELECT * FROM fn(...)` string form.
 ///
-/// Thin compatibility wrapper over [`plan_rewrite`] + [`render_legacy`], kept so
-/// the extensive unit tests that assert on the string form keep working.
-/// Production lowering uses `plan_rewrite` directly.
+/// This is the public string-form entry point the unit, integration, and
+/// proptest suites assert against — it wraps [`plan_rewrite`] + [`render_legacy`]
+/// to give a stable, escaping-visible view of the rewrite. Production lowering
+/// (`rewrite_to_native_sql`) consumes the structured [`RewriteAction`] from
+/// `plan_rewrite` directly and never renders this string.
 ///
 /// Returns:
 /// - `Ok(Some(sql))` -- DDL detected and validated, rewritten SQL returned
