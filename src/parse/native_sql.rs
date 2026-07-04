@@ -15,10 +15,14 @@
 //! module for the FFI entry points; the escape/guard helpers are re-exported
 //! under `#[cfg(test)]` for the parent module's unit tests.
 
-use crate::catalog::{DEFINITIONS_SCHEMA, DEFINITIONS_TABLE, DEFINITIONS_TABLE_NAME};
-
 #[cfg(feature = "extension")]
 use super::{plan_rewrite, OverrideContext, RewriteAction};
+#[cfg(feature = "extension")]
+use crate::catalog::writes::{
+    definitions_table_guard_select, existence_guard_select, rename_collision_guard_select,
+};
+#[cfg(feature = "extension")]
+use crate::catalog::DEFINITIONS_TABLE;
 #[cfg(feature = "extension")]
 use crate::errors::ParseError;
 #[cfg(feature = "extension")]
@@ -381,83 +385,6 @@ pub(crate) fn unescape_sql_arg(s: &str) -> String {
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 pub(crate) fn escape_sql_arg(s: &str) -> String {
     s.replace('\'', "''")
-}
-
-/// Build the existence-guard SELECT for non-IF-EXISTS DROP/ALTER.
-///
-/// `name_escaped` is the view name with single quotes already SQL-doubled
-/// (as produced by `escape_sql_arg` at the `rewrite_to_native_sql` boundary).
-///
-/// The emitted statement errors with `semantic view '<name>' does not
-/// exist` when the row is missing from the catalog table (`DEFINITIONS_TABLE`).
-/// Caller appends `;` and the actual DELETE/UPDATE; both run on the
-/// caller's connection in the same transaction so the guard's NOT EXISTS
-/// check is snapshot-consistent with the DML that follows.
-///
-/// Phase 65 Plan 06: this guard subsumes both (a) the legacy "view never
-/// existed" catalog pre-check (retired with H1 `catalog_conn`) AND (b)
-/// the Phase 60 race-guard for "row dropped between pre-check and DML".
-/// A single "does not exist" message covers both cases — matches the
-/// wording the v0.6.0 sqllogictests pin (`phase20_extended_ddl`,
-/// `phase34_1_alter_rename`, `phase45_alter_comment`, `65_alter_*`).
-///
-/// The CTE form `WITH op AS (DELETE ... RETURNING)` is rejected by `DuckDB`
-/// 1.10.502 with `Parser Error: A CTE needs a SELECT`, so we use a
-/// two-statement string instead. See the smoke test
-/// `catalog::tests::two_statement_guard_then_dml_smoke` for the working shape.
-/// Phase 65.1 Plan 04 (WR-03): outer `information_schema` guard.
-///
-/// Emits a SELECT that errors with the canonical
-/// `semantic view '<name>' does not exist` wording when
-/// `semantic_layer._definitions` is missing (e.g. a fresh RO DB that was
-/// never RW-LOADed, so `init_catalog` never ran). Designed to run as the
-/// FIRST statement in a multi-statement string so the subsequent
-/// statements (which reference `_definitions` directly) never bind on a
-/// never-bootstrapped DB — `DuckDB` binds and executes multi-statement
-/// strings one statement at a time, so a failure here short-circuits the
-/// rest (empirically verified — see Plan 04 SUMMARY for probe notes).
-///
-/// We deliberately do NOT collapse this into a single CASE expression
-/// with `existence_guard_select`: `DuckDB` binds CASE branches eagerly, so
-/// the inner `SELECT 1 FROM semantic_layer._definitions ...` would still
-/// fail to bind on missing-table even if the outer WHEN guarantees it
-/// would never evaluate at runtime.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-pub(crate) fn definitions_table_guard_select(name_escaped: &str) -> String {
-    format!(
-        "SELECT CASE \
-              WHEN NOT EXISTS (SELECT 1 FROM information_schema.tables \
-                                WHERE table_schema = '{DEFINITIONS_SCHEMA}' \
-                                  AND table_name = '{DEFINITIONS_TABLE_NAME}') \
-                THEN error('semantic view ''{name_escaped}'' does not exist') \
-              ELSE TRUE \
-            END"
-    )
-}
-
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-pub(crate) fn existence_guard_select(name_escaped: &str) -> String {
-    format!(
-        "SELECT CASE WHEN NOT EXISTS \
-                   (SELECT 1 FROM {DEFINITIONS_TABLE} WHERE name = '{name_escaped}') \
-                THEN error('semantic view ''{name_escaped}'' does not exist') \
-                ELSE TRUE END"
-    )
-}
-
-/// Build the "target name must NOT already exist" guard for ALTER RENAME.
-/// Errors with `semantic view '<new_name>' already exists` if a row with
-/// the new name is found in `semantic_layer._definitions`. Runs on the
-/// caller's connection in the same transaction as the UPDATE so its
-/// EXISTS check is snapshot-consistent with the DML.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-pub(crate) fn rename_collision_guard_select(new_name_escaped: &str) -> String {
-    format!(
-        "SELECT CASE WHEN EXISTS \
-                   (SELECT 1 FROM {DEFINITIONS_TABLE} WHERE name = '{new_name_escaped}') \
-                THEN error('semantic view ''{new_name_escaped}'' already exists') \
-                ELSE TRUE END"
-    )
 }
 
 #[cfg(feature = "extension")]

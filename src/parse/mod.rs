@@ -47,10 +47,7 @@ mod native_sql;
 #[cfg(feature = "extension")]
 pub(crate) use native_sql::rewrite_to_native_sql;
 #[cfg(test)]
-pub(crate) use native_sql::{
-    definitions_table_guard_select, escape_sql_arg, existence_guard_select,
-    rename_collision_guard_select, unescape_sql_arg,
-};
+pub(crate) use native_sql::{escape_sql_arg, unescape_sql_arg};
 
 mod show_clauses;
 pub(crate) use show_clauses::{build_filter_suffix, parse_show_filter_clauses};
@@ -756,108 +753,6 @@ mod tests {
         ] {
             assert_eq!(unescape_sql_arg(&escape_sql_arg(s)), s);
         }
-    }
-
-    #[test]
-    fn existence_guard_select_emits_not_exists_and_error() {
-        let g = existence_guard_select("sales");
-        assert!(g.contains("NOT EXISTS"), "missing NOT EXISTS: {g}");
-        assert!(
-            g.contains("FROM semantic_layer._definitions WHERE name = 'sales'"),
-            "guard targets wrong table/predicate: {g}"
-        );
-        assert!(
-            g.contains("error('semantic view ''sales'' does not exist')"),
-            "missing error() with 'does not exist' wording: {g}"
-        );
-        // Must be a SELECT (so it can run as the first of two statements
-        // without affecting catalog state when the row is present).
-        assert!(g.trim_start().starts_with("SELECT "), "not a SELECT: {g}");
-        // Must not contain a trailing ';' — the caller appends ';' + DML.
-        assert!(!g.contains(';'), "guard must not include ';' itself: {g}");
-    }
-
-    #[test]
-    fn definitions_table_guard_emits_information_schema_check() {
-        // Phase 65.1 Plan 04 (WR-03): the table-guard SELECT runs as the
-        // FIRST statement of the DROP/ALTER rewrite. It checks
-        // information_schema for `_definitions` and errors with the
-        // canonical "does not exist" wording when the table is missing.
-        // It does NOT touch `_definitions` itself — bind-time-safe on a
-        // never-bootstrapped RO DB.
-        let g = definitions_table_guard_select("sales");
-        assert!(
-            g.contains("information_schema.tables"),
-            "missing information_schema guard: {g}"
-        );
-        assert!(
-            g.contains("table_schema = 'semantic_layer'"),
-            "guard missing schema predicate: {g}"
-        );
-        assert!(
-            g.contains("table_name = '_definitions'"),
-            "guard missing table predicate: {g}"
-        );
-        assert!(
-            g.contains("error('semantic view ''sales'' does not exist')"),
-            "missing canonical wording: {g}"
-        );
-        // Must NOT touch `semantic_layer._definitions` directly — that's
-        // the whole point of running this BEFORE the row guard / DML.
-        assert!(
-            !g.contains("FROM semantic_layer._definitions"),
-            "table guard must not bind against _definitions (defeats the purpose): {g}"
-        );
-        assert!(g.trim_start().starts_with("SELECT "), "not a SELECT: {g}");
-        assert!(!g.contains(';'), "guard must not include ';' itself: {g}");
-    }
-
-    #[test]
-    fn definitions_table_guard_escapes_quotes_in_name() {
-        // Quote-doubling for embedded `'` inside the canonical error
-        // wording — same convention as `existence_guard_select`.
-        let g = definitions_table_guard_select("O''Brien");
-        assert!(
-            g.contains("error('semantic view ''O''Brien'' does not exist')"),
-            "error message wrong: {g}"
-        );
-    }
-
-    #[test]
-    fn existence_guard_select_doubles_quotes_in_name() {
-        // name_escaped already has '' for single quotes; embedding it inside
-        // an outer SQL string literal preserves correct decoding (DuckDB
-        // sees ''X'' as 'X' in the literal). The user-facing error message
-        // must read: semantic view 'O'Brien' does not exist.
-        let g = existence_guard_select("O''Brien");
-        assert!(
-            g.contains("WHERE name = 'O''Brien'"),
-            "WHERE clause wrong: {g}"
-        );
-        assert!(
-            g.contains("error('semantic view ''O''Brien'' does not exist')"),
-            "error message wrong: {g}"
-        );
-    }
-
-    #[test]
-    fn rename_collision_guard_select_emits_exists_and_error() {
-        let g = rename_collision_guard_select("taken");
-        assert!(g.contains("EXISTS"), "missing EXISTS: {g}");
-        assert!(
-            !g.contains("NOT EXISTS"),
-            "must be EXISTS, not NOT EXISTS: {g}"
-        );
-        assert!(
-            g.contains("FROM semantic_layer._definitions WHERE name = 'taken'"),
-            "guard targets wrong table/predicate: {g}"
-        );
-        assert!(
-            g.contains("error('semantic view ''taken'' already exists')"),
-            "missing error() with 'already exists' wording: {g}"
-        );
-        assert!(g.trim_start().starts_with("SELECT "), "not a SELECT: {g}");
-        assert!(!g.contains(';'), "guard must not include ';' itself: {g}");
     }
 
     // ===================================================================

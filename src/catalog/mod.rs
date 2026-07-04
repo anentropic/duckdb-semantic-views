@@ -12,6 +12,9 @@ use std::path::PathBuf;
 
 use duckdb::Connection;
 
+/// Write-side SQL builders (existence/collision guards) for `_definitions`.
+pub(crate) mod writes;
+
 // Extension appended to the DuckDB file path to form the v0.1.0 companion file.
 // Used only in the one-time migration below. After the migration runs, the
 // companion file is deleted and this constant is never referenced again at runtime.
@@ -31,7 +34,8 @@ pub const DEFINITIONS_TABLE: &str = "semantic_layer._definitions";
 
 /// Canonical "view does not exist" error wording, shared by every read-side DDL
 /// command so the message stays identical across the surface. The SQL-side guard
-/// selects in `parse.rs` intentionally inline an escaped copy of this wording.
+/// selects in the sibling [`writes`] module intentionally inline an escaped copy
+/// of this wording.
 #[must_use]
 pub fn view_not_found_msg(name: &str) -> String {
     format!("semantic view '{name}' does not exist")
