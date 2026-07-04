@@ -7,13 +7,10 @@
 // 2. FFI entry points (`sv_parser_override_rust`, `sv_free_buffer`)
 //    feature-gated on `extension`, with `catch_unwind` for panic safety.
 
-use std::collections::HashSet;
-
 use crate::body_parser::parse_keyword_body;
 use crate::catalog::{DEFINITIONS_SCHEMA, DEFINITIONS_TABLE, DEFINITIONS_TABLE_NAME};
 use crate::errors::ParseError;
 use crate::ident::{find_identifier_end, normalize_view_name};
-use crate::model::{Cardinality, Join, TableRef};
 use crate::util::{
     extract_single_quoted_prefix, is_ident_byte, starts_with_keyword_ci, SingleQuoteError,
 };
@@ -1339,7 +1336,7 @@ fn rewrite_ddl_keyword_body(
     let mut keyword_body = parse_keyword_body(body_text, body_offset)?;
 
     // Phase 33: Infer cardinality and resolve ref_columns before serialization.
-    infer_cardinality(&keyword_body.tables, &mut keyword_body.relationships)?;
+    crate::graph::infer_cardinality(&keyword_body.tables, &mut keyword_body.relationships)?;
 
     // 2. Construct SemanticViewDefinition from KeywordBody
     let def = crate::model::SemanticViewDefinition {
@@ -1515,7 +1512,7 @@ fn rewrite_ddl_yaml_body(
         def.comment = Some(c);
     }
 
-    infer_cardinality(&def.tables, &mut def.joins)?;
+    crate::graph::infer_cardinality(&def.tables, &mut def.joins)?;
 
     let json = serde_json::to_string(&def).map_err(|e| ParseError {
         message: format!("Failed to serialize YAML definition: {e}"),
@@ -1535,113 +1532,10 @@ fn rewrite_ddl_yaml_body(
     )))
 }
 
-// ---------------------------------------------------------------------------
-// Phase 33: Cardinality inference
-// ---------------------------------------------------------------------------
-
-/// Infer cardinality for each relationship based on PK/UNIQUE constraints.
-/// Also resolves `ref_columns` (the columns on the target side of the FK reference).
-///
-/// Two checks per relationship:
-/// 1. Resolve `ref_columns`: if empty, use target's PK. If target has no PK, error.
-/// 2. Infer cardinality: if FK columns match PK/UNIQUE on the `from_alias` table,
-///    the relationship is `OneToOne`; otherwise `ManyToOne`.
-pub(crate) fn infer_cardinality(
-    tables: &[TableRef],
-    relationships: &mut [Join],
-) -> Result<(), ParseError> {
-    for join in relationships.iter_mut() {
-        if join.fk_columns.is_empty() {
-            continue;
-        }
-
-        let to_alias_lower = join.table.to_ascii_lowercase();
-        let from_alias_lower = join.from_alias.to_ascii_lowercase();
-
-        // Find target table (REFERENCES target)
-        let target = tables
-            .iter()
-            .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower);
-
-        // Find source table (from_alias side)
-        let source = tables
-            .iter()
-            .find(|t| t.alias.to_ascii_lowercase() == from_alias_lower);
-
-        // Step 1: Resolve ref_columns
-        if join.ref_columns.is_empty() {
-            // REFERENCES target (no column list) -> use target's PK
-            match target {
-                Some(t) if !t.pk_columns.is_empty() => {
-                    join.ref_columns.clone_from(&t.pk_columns);
-                }
-                Some(_) => {
-                    // Target has no PK declared in DDL -- silently skip
-                    // here. Phase 65 (D-05/D-06): the v0.9.0 fallback to
-                    // `resolve_pk_from_catalog` against duckdb_constraints()
-                    // is gone. The empty `ref_columns` is caught in
-                    // `crate::ddl::define::enrich_definition_for_create`
-                    // step 2 with the D-06 hard error pointing the user
-                    // at the missing PRIMARY KEY / UNIQUE declaration in
-                    // the TABLES clause.
-                    continue;
-                }
-                None => {
-                    // Target not found -- will be caught by graph validation later
-                }
-            }
-        }
-        // When ref_columns was set explicitly (REFERENCES target(cols)),
-        // validation against PK/UNIQUE on target happens in graph.rs (CARD-03).
-
-        // Step 2: FK column count must match ref column count
-        if !join.ref_columns.is_empty() && join.fk_columns.len() != join.ref_columns.len() {
-            let rel_name = join.name.as_deref().unwrap_or("?");
-            return Err(ParseError {
-                message: format!(
-                    "FK column count ({}) does not match referenced column count ({}) \
-                     in relationship '{rel_name}'.",
-                    join.fk_columns.len(),
-                    join.ref_columns.len(),
-                ),
-                position: None,
-            });
-        }
-
-        // Step 3: Infer cardinality from FK-side constraints (CARD-04)
-        if let Some(source) = source {
-            let fk_set: HashSet<String> = join
-                .fk_columns
-                .iter()
-                .map(|c| c.to_ascii_lowercase())
-                .collect();
-
-            // Check against source PK
-            let pk_set: HashSet<String> = source
-                .pk_columns
-                .iter()
-                .map(|c| c.to_ascii_lowercase())
-                .collect();
-
-            if !pk_set.is_empty() && fk_set == pk_set {
-                join.cardinality = Cardinality::OneToOne;
-            } else {
-                // Check against source UNIQUE constraints
-                let matches_unique = source.unique_constraints.iter().any(|uc| {
-                    let uc_set: HashSet<String> =
-                        uc.iter().map(|c| c.to_ascii_lowercase()).collect();
-                    fk_set == uc_set
-                });
-                join.cardinality = if matches_unique {
-                    Cardinality::OneToOne
-                } else {
-                    Cardinality::ManyToOne
-                };
-            }
-        }
-    }
-    Ok(())
-}
+// Cardinality inference (Phase 33) now lives in `crate::graph::cardinality`
+// (moved out of `parse` in AR-1 to remove the `ddl` -> `parse` layering
+// inversion — it is semantic-graph logic, not parsing). Callers use
+// `crate::graph::infer_cardinality`.
 
 // ---------------------------------------------------------------------------
 // FFI entry points (extension feature-gated)
@@ -4135,6 +4029,7 @@ mod tests {
 
     mod phase33_inference_tests {
         use super::*;
+        use crate::graph::infer_cardinality;
         use crate::model::{Cardinality, Join, TableRef};
 
         fn make_table(alias: &str, pk: &[&str], unique: &[&[&str]]) -> TableRef {
