@@ -113,7 +113,7 @@ fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), Stri
 /// Parse FOR METRIC clause (only valid for `ShowDimensions`).
 ///
 /// Returns `(remaining_text, metric_name)`.
-fn parse_for_metric<'a>(rest: &'a str, entity: &str) -> Result<(&'a str, &'a str), String> {
+fn parse_for_metric<'a>(rest: &'a str, _entity: &str) -> Result<(&'a str, &'a str), String> {
     let after_for = rest[3..].trim_start();
     // Word boundary after METRIC: `FOR METRICS x` must not parse as the
     // METRIC keyword followed by a metric named `s x` (PR #50 review).
@@ -125,7 +125,6 @@ fn parse_for_metric<'a>(rest: &'a str, entity: &str) -> Result<(&'a str, &'a str
              [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
             .to_string());
     }
-    let _ = entity;
     let after_metric = after_for[6..].trim_start();
     if after_metric.is_empty() {
         return Err("Missing metric name after FOR METRIC".to_string());
@@ -160,6 +159,8 @@ pub(crate) fn parse_show_filter_clauses<'a>(
         DdlKind::Show | DdlKind::ShowTerse => "VIEWS",
         DdlKind::ShowDimensions => "DIMENSIONS",
         DdlKind::ShowMetrics => "METRICS",
+        DdlKind::ShowMaterializations => "MATERIALIZATIONS",
+        // ShowFacts (and any other kind plan_ddl routes here) -> FACTS.
         _ => "FACTS",
     };
 

@@ -200,7 +200,7 @@ pub(crate) fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
 
 /// Detect the DDL kind from a query string.
 ///
-/// Returns `Some(DdlKind)` if the query matches one of the 9 semantic view
+/// Returns `Some(DdlKind)` if the query matches one of the semantic view
 /// DDL prefixes, `None` otherwise. Uses longest-first ordering to avoid
 /// prefix overlap (e.g. "create or replace semantic view" before
 /// "create semantic view").
@@ -220,8 +220,9 @@ pub fn detect_ddl_kind(query: &str) -> Option<DdlKind> {
 
 /// Detect whether a query is any semantic view DDL statement.
 ///
-/// Returns `PARSE_DETECTED` for all 9 DDL forms, `PARSE_NOT_OURS` otherwise.
-/// Handles case variations, leading/trailing whitespace, and trailing semicolons.
+/// Returns `PARSE_DETECTED` for any semantic view DDL form, `PARSE_NOT_OURS`
+/// otherwise. Handles case variations, leading/trailing whitespace, and
+/// trailing semicolons.
 #[must_use]
 pub fn detect_semantic_view_ddl(query: &str) -> u8 {
     if detect_ddl_kind(query).is_some() {
@@ -254,8 +255,8 @@ const DDL_PREFIXES: &[&str] = &[
 /// Detect near-miss DDL prefixes using fuzzy matching.
 ///
 /// If the beginning of the query is close (Levenshtein distance <= 3) to one
-/// of the 7 known DDL prefixes, returns a `ParseError` suggesting the correct
-/// prefix. Returns `None` if no near-miss is found.
+/// of the known DDL prefixes (see `DDL_PREFIXES`), returns a `ParseError`
+/// suggesting the correct prefix. Returns `None` if no near-miss is found.
 #[must_use]
 pub fn detect_near_miss(query: &str) -> Option<ParseError> {
     // PA-7: comment-blind near-miss detection.
