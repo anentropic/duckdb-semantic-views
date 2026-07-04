@@ -6,7 +6,7 @@
 // The same inputs are asserted as permanent regression tests in
 // tests/quoted_idents_regression.rs (workspace-level cargo test).
 use libfuzzer_sys::fuzz_target;
-use semantic_views::parse::{detect_semantic_view_ddl, validate_and_rewrite, PARSE_DETECTED};
+use semantic_views::parse::{detect_semantic_view_ddl, plan_rewrite, PARSE_DETECTED};
 
 fuzz_target!(|data: &[u8]| {
     // Reject invalid UTF-8 — not a crash, just out of scope for this target.
@@ -17,22 +17,10 @@ fuzz_target!(|data: &[u8]| {
     // detect_semantic_view_ddl must never panic regardless of input.
     let detected = detect_semantic_view_ddl(query);
 
-    // If detected as our DDL, validate_and_rewrite must also never panic.
+    // If detected as our DDL, plan_rewrite must also never panic. Its result
+    // (a structured RewriteAction, None, or ParseError) is all acceptable —
+    // only a panic would be a fuzz failure.
     if detected == PARSE_DETECTED {
-        match validate_and_rewrite(query) {
-            Ok(Some(sql)) => {
-                // Rewritten SQL must start with the expected prefix.
-                assert!(
-                    sql.starts_with("SELECT * FROM "),
-                    "Rewritten SQL does not start with 'SELECT * FROM ': {sql}"
-                );
-            }
-            Ok(None) => {
-                // Detection/rewrite disagreement — not a panic, document if seen.
-            }
-            Err(_) => {
-                // Parse error — acceptable, not a panic.
-            }
-        }
+        let _ = plan_rewrite(query);
     }
 });

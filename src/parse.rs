@@ -7,12 +7,10 @@
 // 2. FFI entry points (`sv_parser_override_rust`, `sv_free_buffer`)
 //    feature-gated on `extension`, with `catch_unwind` for panic safety.
 
-use std::collections::HashSet;
-
 use crate::body_parser::parse_keyword_body;
+use crate::catalog::{DEFINITIONS_SCHEMA, DEFINITIONS_TABLE, DEFINITIONS_TABLE_NAME};
 use crate::errors::ParseError;
 use crate::ident::{find_identifier_end, normalize_view_name};
-use crate::model::{Cardinality, Join, TableRef};
 use crate::util::{
     extract_single_quoted_prefix, is_ident_byte, starts_with_keyword_ci, SingleQuoteError,
 };
@@ -658,10 +656,11 @@ fn parse_show_filter_clauses<'a>(
     })
 }
 
-/// Rewrite an ALTER SEMANTIC VIEW sub-operation to a table function call.
-///
-/// Dispatches on RENAME TO, SET COMMENT, and UNSET COMMENT.
-fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, String> {
+/// Parse an ALTER SEMANTIC VIEW sub-operation into a structured
+/// [`RewriteAction`] (RENAME TO → `AlterRename`, SET COMMENT → `AlterSetComment`,
+/// UNSET COMMENT → `AlterUnsetComment`). Names/comment are carried raw; the
+/// emission stage escapes them.
+fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<RewriteAction, String> {
     let after_prefix = trimmed[plen..].trim();
     // Quote-aware delimiter scan so `"my view"` is captured intact (allow_paren=false).
     let name_end = find_identifier_end(after_prefix, false);
@@ -672,13 +671,7 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
     let view_name =
         normalize_view_name(raw_view_name).map_err(|e| format!("Invalid view name: {e}"))?;
     let rest = after_prefix[name_end..].trim();
-    let safe_name = view_name.replace('\'', "''");
-
-    let if_exists_suffix = if kind == DdlKind::AlterIfExists {
-        "_if_exists"
-    } else {
-        ""
-    };
+    let if_exists = kind == DdlKind::AlterIfExists;
 
     // Sub-operation keyword matching rides match_keyword_prefix so any
     // amount of whitespace separates the keywords (PA-10: the old
@@ -701,11 +694,11 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
         }
         let new_name = normalize_view_name(new_name_raw)
             .map_err(|e| format!("Invalid new view name in RENAME TO: {e}"))?;
-        let safe_new = new_name.replace('\'', "''");
-        let alter_fn = format!("alter_semantic_view_rename{if_exists_suffix}");
-        Ok(format!(
-            "SELECT * FROM {alter_fn}('{safe_name}', '{safe_new}')"
-        ))
+        Ok(RewriteAction::AlterRename {
+            name: view_name,
+            new_name,
+            if_exists,
+        })
     } else if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"set", b"comment"]) {
         let after_set_comment = rest[consumed..].trim_start();
         if !after_set_comment.starts_with('=') {
@@ -724,12 +717,11 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
                 "Unexpected tokens after SET COMMENT string: '{trailing}'"
             ));
         }
-        // Re-escape for SQL embedding
-        let safe_comment = comment_value.replace('\'', "''");
-        let alter_fn = format!("alter_semantic_view_set_comment{if_exists_suffix}");
-        Ok(format!(
-            "SELECT * FROM {alter_fn}('{safe_name}', '{safe_comment}')"
-        ))
+        Ok(RewriteAction::AlterSetComment {
+            name: view_name,
+            comment: comment_value,
+            if_exists,
+        })
     } else if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"unset", b"comment"]) {
         let trailing = rest[consumed..].trim();
         if !trailing.is_empty() {
@@ -737,8 +729,10 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
                 "Unexpected tokens after UNSET COMMENT: '{trailing}'"
             ));
         }
-        let alter_fn = format!("alter_semantic_view_unset_comment{if_exists_suffix}");
-        Ok(format!("SELECT * FROM {alter_fn}('{safe_name}')"))
+        Ok(RewriteAction::AlterUnsetComment {
+            name: view_name,
+            if_exists,
+        })
     } else {
         Err(
             "Unsupported ALTER operation. Supported: RENAME TO, SET COMMENT, UNSET COMMENT."
@@ -747,14 +741,13 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
     }
 }
 
-/// Rewrite a name-only or SHOW semantic view DDL statement to its function call.
+/// Parse a non-CREATE semantic view DDL statement into a structured
+/// [`RewriteAction`]:
+/// - DROP → `Drop`; ALTER → `AlterRename` / `AlterSetComment` / `AlterUnsetComment`.
+/// - Read-side DESCRIBE / SHOW / SHOW COLUMNS → `Passthrough` final SQL.
 ///
-/// Handles only:
-/// - Name-only (DROP, DESCRIBE): `SELECT * FROM fn('name')`
-/// - SHOW forms: `SELECT * FROM list_semantic_views()` with optional LIKE/STARTS WITH/LIMIT
-///
-/// CREATE forms must go through `validate_and_rewrite` -> `rewrite_ddl_keyword_body`.
-fn rewrite_ddl(query: &str) -> Result<String, String> {
+/// CREATE forms must go through `plan_rewrite` -> `validate_create_body`.
+fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
     // PA-7: comment-blind rewriting (idempotent when the caller already
     // blanked; only allocates when comments are present).
     let blanked = crate::util::blank_sql_comments(query);
@@ -769,15 +762,26 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
     let fn_name = function_name(kind);
 
     match kind {
-        // CREATE forms no longer supported via rewrite_ddl -- use validate_and_rewrite
+        // CREATE forms no longer supported via plan_ddl -- use plan_rewrite
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
-            Err("CREATE forms must use validate_and_rewrite".to_string())
+            Err("CREATE forms must use plan_rewrite".to_string())
         }
-        // Name-only forms (DROP, DESCRIBE, SHOW COLUMNS IN SEMANTIC VIEW)
-        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe | DdlKind::ShowColumns => {
+        // DROP: native DELETE (structured).
+        DdlKind::Drop | DdlKind::DropIfExists => {
+            let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
+            Ok(RewriteAction::Drop {
+                name,
+                if_exists: kind == DdlKind::DropIfExists,
+            })
+        }
+        // Read-side name-only forms (DESCRIBE, SHOW COLUMNS IN SEMANTIC VIEW):
+        // run the read-side table function as-is.
+        DdlKind::Describe | DdlKind::ShowColumns => {
             let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
             let safe_name = name.replace('\'', "''");
-            Ok(format!("SELECT * FROM {fn_name}('{safe_name}')"))
+            Ok(RewriteAction::Passthrough(format!(
+                "SELECT * FROM {fn_name}('{safe_name}')"
+            )))
         }
         // SHOW SEMANTIC VIEWS/DIMENSIONS/METRICS/FACTS: optional LIKE/IN/FOR METRIC/STARTS WITH/LIMIT
         DdlKind::Show
@@ -826,7 +830,7 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
                 clauses.in_schema,
                 clauses.in_database,
             );
-            Ok(format!("{base}{suffix}"))
+            Ok(RewriteAction::Passthrough(format!("{base}{suffix}")))
         }
         // ALTER: sub-operation dispatch (RENAME TO, SET COMMENT, UNSET COMMENT)
         DdlKind::Alter | DdlKind::AlterIfExists => rewrite_alter(trimmed, plen, kind),
@@ -925,7 +929,7 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Validation layer: ParseError, detect_near_miss, validate_and_rewrite
+// Validation layer: ParseError, detect_near_miss, plan_rewrite
 // ---------------------------------------------------------------------------
 
 /// The DDL prefixes used for near-miss detection.
@@ -998,16 +1002,90 @@ pub fn detect_near_miss(query: &str) -> Option<ParseError> {
     })
 }
 
-/// Validate a DDL statement and rewrite it if valid.
+/// Structured outcome of parsing/validating a semantic-view DDL statement (AR-2).
 ///
-/// This is the main entry point for the validation layer. CREATE forms go through
-/// the AS-body keyword parser. DROP/DESCRIBE/SHOW forms are rewritten directly.
+/// The parser produces one of these directly. Previously it rendered a legacy
+/// `SELECT * FROM <fn>('arg', ...)` string that `rewrite_to_native_sql`
+/// immediately re-parsed; CREATE additionally round-tripped its definition
+/// through JSON (serialize → escape → re-parse → unescape → deserialize) and the
+/// `FROM YAML FILE` path smuggled its fields through a `\x01`-delimited sentinel
+/// string. Carrying the structured form removes all of that for CREATE and
+/// deletes the sentinel entirely.
+#[derive(Debug, PartialEq)]
+pub enum RewriteAction {
+    /// CREATE from an in-memory definition (AS-body, or inline `FROM YAML $$..$$`).
+    Create {
+        name: String,
+        def: Box<crate::model::SemanticViewDefinition>,
+        mode: CreateMode,
+    },
+    /// CREATE from a YAML file, read + enriched at execution by the
+    /// `__sv_compute_create_from_yaml` helper table function.
+    CreateFromYamlFile {
+        file_path: String,
+        name: String,
+        comment: String,
+        mode: CreateMode,
+    },
+    /// DROP — native DELETE against the catalog table.
+    Drop { name: String, if_exists: bool },
+    /// ALTER ... RENAME TO — native UPDATE of the `name` column.
+    AlterRename {
+        name: String,
+        new_name: String,
+        if_exists: bool,
+    },
+    /// ALTER ... SET COMMENT — native UPDATE via `json_merge_patch`.
+    AlterSetComment {
+        name: String,
+        comment: String,
+        if_exists: bool,
+    },
+    /// ALTER ... UNSET COMMENT — native UPDATE via `json_merge_patch`.
+    AlterUnsetComment { name: String, if_exists: bool },
+    /// Read-side DDL (DESCRIBE / SHOW / SHOW COLUMNS) already lowered to final
+    /// `SELECT * FROM <read_side_fn>(...)` SQL that `DuckDB` runs on the caller's
+    /// connection unchanged.
+    Passthrough(String),
+}
+
+/// CREATE conflict mode, mirroring the three `DdlKind` CREATE variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateMode {
+    Create,
+    OrReplace,
+    IfNotExists,
+}
+
+impl CreateMode {
+    fn from_kind(kind: DdlKind) -> Self {
+        match kind {
+            DdlKind::Create => CreateMode::Create,
+            DdlKind::CreateOrReplace => CreateMode::OrReplace,
+            DdlKind::CreateIfNotExists => CreateMode::IfNotExists,
+            _ => unreachable!("CreateMode::from_kind called with non-CREATE kind"),
+        }
+    }
+    // Consumed by `rewrite_to_native_sql` (extension-only) when choosing the
+    // INSERT shape; unused under `cargo test`'s bundled build.
+    #[cfg_attr(not(feature = "extension"), allow(dead_code))]
+    fn or_replace(self) -> bool {
+        matches!(self, CreateMode::OrReplace)
+    }
+    #[cfg_attr(not(feature = "extension"), allow(dead_code))]
+    fn if_not_exists(self) -> bool {
+        matches!(self, CreateMode::IfNotExists)
+    }
+}
+
+/// Validate a DDL statement and produce a structured [`RewriteAction`] (AR-2).
 ///
-/// Returns:
-/// - `Ok(Some(sql))` -- DDL detected and validated, rewritten SQL returned
-/// - `Ok(None)` -- not a semantic view DDL statement
-/// - `Err(ParseError)` -- validation error with message and optional position
-pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
+/// This is the main entry point for the validation layer. CREATE forms carry
+/// their definition structurally (`Create` / `CreateFromYamlFile`); DROP and
+/// ALTER carry structured `Drop` / `AlterRename` / `AlterSetComment` /
+/// `AlterUnsetComment` variants; read-side DESCRIBE / SHOW / SHOW COLUMNS are
+/// carried as `Passthrough` final SQL.
+pub fn plan_rewrite(query: &str) -> Result<Option<RewriteAction>, ParseError> {
     // PA-7: blank comments once at the entry point (byte-length-preserving,
     // so every error-caret position stays valid for the original query).
     // Downstream scanners and captured expressions never see comment text —
@@ -1038,18 +1116,16 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
                     position: Some(trim_offset + plen),
                 });
             }
-            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+            plan_ddl(query).map(Some).map_err(|e| ParseError {
                 message: e,
                 position: Some(trim_offset + plen),
             })
         }
         // SHOW [TERSE] SEMANTIC VIEWS: optional filter/scope clauses
-        DdlKind::Show | DdlKind::ShowTerse => {
-            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
-                message: e,
-                position: Some(trim_offset + plen),
-            })
-        }
+        DdlKind::Show | DdlKind::ShowTerse => plan_ddl(query).map(Some).map_err(|e| ParseError {
+            message: e,
+            position: Some(trim_offset + plen),
+        }),
         // SHOW COLUMNS IN SEMANTIC VIEW: name-only form
         DdlKind::ShowColumns => {
             let after_prefix = trimmed_no_semi[plen..].trim();
@@ -1059,7 +1135,7 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
                     position: Some(trim_offset + plen),
                 });
             }
-            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+            plan_ddl(query).map(Some).map_err(|e| ParseError {
                 message: e,
                 position: Some(trim_offset + plen),
             })
@@ -1068,14 +1144,14 @@ pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
         DdlKind::ShowDimensions
         | DdlKind::ShowMetrics
         | DdlKind::ShowFacts
-        | DdlKind::ShowMaterializations => rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+        | DdlKind::ShowMaterializations => plan_ddl(query).map(Some).map_err(|e| ParseError {
             message: e,
             position: Some(trim_offset + plen),
         }),
         // ALTER forms: validate sub-operation (RENAME TO, SET COMMENT, UNSET COMMENT)
         DdlKind::Alter | DdlKind::AlterIfExists => {
             validate_alter(trimmed_no_semi, trim_offset, plen)?;
-            rewrite_ddl(query).map(Some).map_err(|e| ParseError {
+            plan_ddl(query).map(Some).map_err(|e| ParseError {
                 message: e,
                 position: Some(trim_offset + plen),
             })
@@ -1226,7 +1302,7 @@ fn validate_create_body(
     trim_offset: usize,
     plen: usize,
     kind: DdlKind,
-) -> Result<Option<String>, ParseError> {
+) -> Result<Option<RewriteAction>, ParseError> {
     let after_prefix = trimmed_no_semi[plen..].trim_start();
     if after_prefix.is_empty() {
         return Err(ParseError {
@@ -1282,7 +1358,8 @@ fn validate_create_body(
             + (remaining_after_comment.len() - after_name_trimmed.len());
         let body_offset_in_tns = after_name_in_tns + trimmed_start_in_after_name;
         let body_offset = trim_offset + body_offset_in_tns;
-        return rewrite_ddl_keyword_body(kind, name, after_name_trimmed, body_offset, view_comment);
+        return rewrite_ddl_keyword_body(kind, name, after_name_trimmed, body_offset, view_comment)
+            .map(Some);
     }
     // --- End AS keyword body path ---
 
@@ -1302,11 +1379,11 @@ fn validate_create_body(
             && (yaml_text.len() == 4 || yaml_text.as_bytes()[4].is_ascii_whitespace());
         if is_file {
             let file_text = yaml_text[4..].trim_start();
-            return rewrite_ddl_yaml_file_body(kind, name, file_text, view_comment);
+            return rewrite_ddl_yaml_file_body(kind, name, file_text, view_comment).map(Some);
         }
 
         // Phase 52: FROM YAML $$...$$ inline sub-branch (existing)
-        return rewrite_ddl_yaml_body(kind, name, yaml_text, view_comment);
+        return rewrite_ddl_yaml_body(kind, name, yaml_text, view_comment).map(Some);
     }
     // --- End FROM YAML body path ---
 
@@ -1322,23 +1399,23 @@ fn validate_create_body(
     })
 }
 
-/// Rewrite an AS-body CREATE DDL statement to a JSON-parameterized function call.
+/// Parse an AS-body CREATE statement into a [`RewriteAction::Create`].
 ///
-/// Called when `validate_create_body` detects the `AS` keyword path.
-/// Parses the keyword body via `parse_keyword_body`, serializes to JSON, and embeds in
-/// a `SELECT * FROM create_semantic_view_from_json('name', 'json')` call.
+/// Called when `validate_create_body` detects the `AS` keyword path. Parses the
+/// keyword body via `parse_keyword_body`, infers cardinality, and carries the
+/// resulting `SemanticViewDefinition` structurally to the emission stage.
 fn rewrite_ddl_keyword_body(
     kind: DdlKind,
     name: &str,
     body_text: &str,              // text starting at "AS" (inclusive)
     body_offset: usize,           // byte offset of body_text[0] in original query
     view_comment: Option<String>, // Phase 43: optional view-level COMMENT
-) -> Result<Option<String>, ParseError> {
+) -> Result<RewriteAction, ParseError> {
     // 1. Call parse_keyword_body (body_text starts at "AS"; pass body_offset)
     let mut keyword_body = parse_keyword_body(body_text, body_offset)?;
 
-    // Phase 33: Infer cardinality and resolve ref_columns before serialization.
-    infer_cardinality(&keyword_body.tables, &mut keyword_body.relationships)?;
+    // Phase 33: Infer cardinality and resolve ref_columns.
+    crate::graph::infer_cardinality(&keyword_body.tables, &mut keyword_body.relationships)?;
 
     // 2. Construct SemanticViewDefinition from KeywordBody
     let def = crate::model::SemanticViewDefinition {
@@ -1356,27 +1433,14 @@ fn rewrite_ddl_keyword_body(
         comment: view_comment,
     };
 
-    // 3. Serialize to JSON
-    let json = serde_json::to_string(&def).map_err(|e| ParseError {
-        message: format!("Failed to serialize definition: {e}"),
-        position: None,
-    })?;
-
-    // 4. SQL-escape single quotes in name and JSON
-    let safe_name = name.replace('\'', "''");
-    let safe_json = json.replace('\'', "''");
-
-    // 5. Pick the correct _from_json function name based on DDL kind
-    let fn_name = match kind {
-        DdlKind::Create => "create_semantic_view_from_json",
-        DdlKind::CreateOrReplace => "create_or_replace_semantic_view_from_json",
-        DdlKind::CreateIfNotExists => "create_semantic_view_if_not_exists_from_json",
-        _ => unreachable!("rewrite_ddl_keyword_body only called for CREATE forms"),
-    };
-
-    Ok(Some(format!(
-        "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
-    )))
+    // 3. Carry the definition structurally — `rewrite_to_native_sql` hands it
+    //    straight to `emit_native_create_sql` (AR-2: no JSON serialize / re-parse
+    //    / re-deserialize round-trip).
+    Ok(RewriteAction::Create {
+        name: name.to_string(),
+        def: Box::new(def),
+        mode: CreateMode::from_kind(kind),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,20 +1469,20 @@ fn extract_single_quoted(input: &str) -> Result<(String, usize), ParseError> {
     })
 }
 
-/// Generate a sentinel string for C++ shim to intercept and read the file.
+/// Parse a `FROM YAML FILE '<path>'` body into a structured
+/// [`RewriteAction::CreateFromYamlFile`].
 ///
-/// Sentinel format: `__SV_YAML_FILE__<path>\x01<kind>\x01<name>\x01<comment>`
-/// Uses `\x01` (SOH) as field separator instead of `\x00` (NUL) because the
-/// sentinel is passed through C string APIs that treat NUL as a terminator.
-/// `rewrite_to_native_sql` strips the prefix and dispatches to
-/// `rewrite_yaml_file_create`, which calls `read_text()` on the catalog
-/// connection (Rust-side) and then routes through `emit_native_create_sql`.
+/// `rewrite_to_native_sql` hands the fields straight to
+/// `emit_native_create_from_yaml_file`, which emits an INSERT selecting from the
+/// `__sv_compute_create_from_yaml` helper TF (that reads the file at execution).
+/// AR-2 replaced the previous `\x01`-delimited sentinel string (which smuggled
+/// path/kind/name/comment through the `String` return of `validate_and_rewrite`).
 fn rewrite_ddl_yaml_file_body(
     kind: DdlKind,
     name: &str,
     file_text: &str,
     view_comment: Option<String>,
-) -> Result<Option<String>, ParseError> {
+) -> Result<RewriteAction, ParseError> {
     let (file_path, consumed) = extract_single_quoted(file_text)?;
 
     let trailing = file_text[consumed..].trim();
@@ -1438,16 +1502,12 @@ fn rewrite_ddl_yaml_file_body(
         });
     }
 
-    let kind_num = match kind {
-        DdlKind::Create => 0,
-        DdlKind::CreateOrReplace => 1,
-        DdlKind::CreateIfNotExists => 2,
-        _ => unreachable!("rewrite_ddl_yaml_file_body only called for CREATE forms"),
-    };
-    let comment = view_comment.unwrap_or_default();
-    Ok(Some(format!(
-        "__SV_YAML_FILE__{file_path}\x01{kind_num}\x01{name}\x01{comment}"
-    )))
+    Ok(RewriteAction::CreateFromYamlFile {
+        file_path,
+        name: name.to_string(),
+        comment: view_comment.unwrap_or_default(),
+        mode: CreateMode::from_kind(kind),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1482,17 +1542,18 @@ fn extract_dollar_quoted(input: &str) -> Result<(String, usize), ParseError> {
     Ok((content.to_string(), total))
 }
 
-/// Rewrite a FROM YAML dollar-quoted DDL statement to a JSON-parameterized function call.
+/// Parse a `FROM YAML $$..$$` dollar-quoted CREATE body into a
+/// [`RewriteAction::Create`].
 ///
 /// Called when `validate_create_body` detects the `FROM YAML` keyword path.
 /// Extracts dollar-quoted YAML, deserializes via `from_yaml_with_size_cap()`,
-/// serializes to JSON, and embeds in a `SELECT * FROM create_semantic_view_from_json('name', 'json')` call.
+/// infers cardinality, and carries the `SemanticViewDefinition` structurally.
 fn rewrite_ddl_yaml_body(
     kind: DdlKind,
     name: &str,
     yaml_text: &str,
     view_comment: Option<String>,
-) -> Result<Option<String>, ParseError> {
+) -> Result<RewriteAction, ParseError> {
     let (yaml_content, consumed) = extract_dollar_quoted(yaml_text)?;
 
     let trailing = yaml_text[consumed..].trim();
@@ -1514,133 +1575,19 @@ fn rewrite_ddl_yaml_body(
         def.comment = Some(c);
     }
 
-    infer_cardinality(&def.tables, &mut def.joins)?;
+    crate::graph::infer_cardinality(&def.tables, &mut def.joins)?;
 
-    let json = serde_json::to_string(&def).map_err(|e| ParseError {
-        message: format!("Failed to serialize YAML definition: {e}"),
-        position: None,
-    })?;
-
-    let safe_name = name.replace('\'', "''");
-    let safe_json = json.replace('\'', "''");
-    let fn_name = match kind {
-        DdlKind::Create => "create_semantic_view_from_json",
-        DdlKind::CreateOrReplace => "create_or_replace_semantic_view_from_json",
-        DdlKind::CreateIfNotExists => "create_semantic_view_if_not_exists_from_json",
-        _ => unreachable!("rewrite_ddl_yaml_body only called for CREATE forms"),
-    };
-    Ok(Some(format!(
-        "SELECT * FROM {fn_name}('{safe_name}', '{safe_json}')"
-    )))
+    Ok(RewriteAction::Create {
+        name: name.to_string(),
+        def: Box::new(def),
+        mode: CreateMode::from_kind(kind),
+    })
 }
 
-// ---------------------------------------------------------------------------
-// Phase 33: Cardinality inference
-// ---------------------------------------------------------------------------
-
-/// Infer cardinality for each relationship based on PK/UNIQUE constraints.
-/// Also resolves `ref_columns` (the columns on the target side of the FK reference).
-///
-/// Two checks per relationship:
-/// 1. Resolve `ref_columns`: if empty, use target's PK. If target has no PK, error.
-/// 2. Infer cardinality: if FK columns match PK/UNIQUE on the `from_alias` table,
-///    the relationship is `OneToOne`; otherwise `ManyToOne`.
-pub(crate) fn infer_cardinality(
-    tables: &[TableRef],
-    relationships: &mut [Join],
-) -> Result<(), ParseError> {
-    for join in relationships.iter_mut() {
-        if join.fk_columns.is_empty() {
-            continue;
-        }
-
-        let to_alias_lower = join.table.to_ascii_lowercase();
-        let from_alias_lower = join.from_alias.to_ascii_lowercase();
-
-        // Find target table (REFERENCES target)
-        let target = tables
-            .iter()
-            .find(|t| t.alias.to_ascii_lowercase() == to_alias_lower);
-
-        // Find source table (from_alias side)
-        let source = tables
-            .iter()
-            .find(|t| t.alias.to_ascii_lowercase() == from_alias_lower);
-
-        // Step 1: Resolve ref_columns
-        if join.ref_columns.is_empty() {
-            // REFERENCES target (no column list) -> use target's PK
-            match target {
-                Some(t) if !t.pk_columns.is_empty() => {
-                    join.ref_columns.clone_from(&t.pk_columns);
-                }
-                Some(_) => {
-                    // Target has no PK declared in DDL -- silently skip
-                    // here. Phase 65 (D-05/D-06): the v0.9.0 fallback to
-                    // `resolve_pk_from_catalog` against duckdb_constraints()
-                    // is gone. The empty `ref_columns` is caught in
-                    // `crate::ddl::define::enrich_definition_for_create`
-                    // step 2 with the D-06 hard error pointing the user
-                    // at the missing PRIMARY KEY / UNIQUE declaration in
-                    // the TABLES clause.
-                    continue;
-                }
-                None => {
-                    // Target not found -- will be caught by graph validation later
-                }
-            }
-        }
-        // When ref_columns was set explicitly (REFERENCES target(cols)),
-        // validation against PK/UNIQUE on target happens in graph.rs (CARD-03).
-
-        // Step 2: FK column count must match ref column count
-        if !join.ref_columns.is_empty() && join.fk_columns.len() != join.ref_columns.len() {
-            let rel_name = join.name.as_deref().unwrap_or("?");
-            return Err(ParseError {
-                message: format!(
-                    "FK column count ({}) does not match referenced column count ({}) \
-                     in relationship '{rel_name}'.",
-                    join.fk_columns.len(),
-                    join.ref_columns.len(),
-                ),
-                position: None,
-            });
-        }
-
-        // Step 3: Infer cardinality from FK-side constraints (CARD-04)
-        if let Some(source) = source {
-            let fk_set: HashSet<String> = join
-                .fk_columns
-                .iter()
-                .map(|c| c.to_ascii_lowercase())
-                .collect();
-
-            // Check against source PK
-            let pk_set: HashSet<String> = source
-                .pk_columns
-                .iter()
-                .map(|c| c.to_ascii_lowercase())
-                .collect();
-
-            if !pk_set.is_empty() && fk_set == pk_set {
-                join.cardinality = Cardinality::OneToOne;
-            } else {
-                // Check against source UNIQUE constraints
-                let matches_unique = source.unique_constraints.iter().any(|uc| {
-                    let uc_set: HashSet<String> =
-                        uc.iter().map(|c| c.to_ascii_lowercase()).collect();
-                    fk_set == uc_set
-                });
-                join.cardinality = if matches_unique {
-                    Cardinality::OneToOne
-                } else {
-                    Cardinality::ManyToOne
-                };
-            }
-        }
-    }
-    Ok(())
-}
+// Cardinality inference (Phase 33) now lives in `crate::graph::cardinality`
+// (moved out of `parse` in AR-1 to remove the `ddl` -> `parse` layering
+// inversion — it is semantic-graph logic, not parsing). Callers use
+// `crate::graph::infer_cardinality`.
 
 // ---------------------------------------------------------------------------
 // FFI entry points (extension feature-gated)
@@ -1730,141 +1677,85 @@ unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len:
 // `cargo test` (no extension feature) these code paths are excluded entirely
 // (this entry point itself is feature-gated; its sole caller —
 // `sv_parser_override_rust` — is `extension`-only).
+//
+// INVARIANT (AR-5) — purity / idempotence. This function MUST be a pure
+// function of `query` (and committed catalog state): for a given input it
+// must produce the same `Ok(Some)` / `Ok(None)` / `Err(message, position)`
+// result on every call, with no dependence on call order, wall-clock time,
+// `HashMap` iteration order, or any mutable process state. The error-reporting
+// layer depends on this: after the override path runs, DuckDB's failed default
+// parser drives `sv_parse_function_rust`, which calls this function a SECOND
+// time (via `run_validation_for_parse_function`) purely to recover the same
+// `Err` message and caret position the override produced. If the two runs can
+// diverge, the caret error shown to the user no longer matches the rewrite
+// that actually ran. Any future change that reads mutable state or introduces
+// nondeterminism here breaks that contract and must instead cache the first
+// run's `(query -> result)` rather than re-deriving it.
 #[cfg(feature = "extension")]
 pub fn rewrite_to_native_sql(
     _ctx: &OverrideContext,
     query: &str,
 ) -> Result<Option<String>, ParseError> {
-    let Some(tf_sql) = validate_and_rewrite(query)? else {
+    let Some(action) = plan_rewrite(query)? else {
         return Ok(None);
     };
 
-    // YAML FILE produces a sentinel string starting with `__SV_YAML_FILE__`
-    // (path + kind + name + comment). Read the file and route through the
-    // shared CREATE emission path so the INSERT runs on the caller's
-    // connection.
-    if let Some(payload) = tf_sql.strip_prefix("__SV_YAML_FILE__") {
-        return rewrite_yaml_file_create(payload);
-    }
-
-    // Read-side DDL (DESCRIBE / SHOW with WHERE/LIMIT clauses) emits SQL that
-    // doesn't match the `SELECT * FROM fn('arg', ...)` shape. Pass through
-    // unchanged; DuckDB executes the read-side table function on the caller's
-    // connection.
-    let Some(call) = parse_table_function_call(&tf_sql) else {
-        return Ok(Some(tf_sql));
-    };
-
-    // The args returned by parse_table_function_call retain the SQL escaping
-    // produced by validate_and_rewrite (single quotes doubled). They can be
-    // re-embedded as single-quoted strings without further processing.
-    let args = &call.args;
-    match call.fn_name.as_str() {
-        // CREATE forms: enrich the JSON (validation + graph + type
-        // inference handled inside `enrich_definition_for_create` — no
-        // catalog connection needed) then emit native INSERT on the
-        // caller's connection. See `rewrite_create` (extension-only).
-        "create_semantic_view_from_json"
-        | "create_or_replace_semantic_view_from_json"
-        | "create_semantic_view_if_not_exists_from_json" => {
-            rewrite_create(call.fn_name.as_str(), args)
+    match action {
+        // CREATE from an in-memory definition — hand the definition straight to
+        // the shared emission path. AR-2: no JSON serialize → re-parse →
+        // deserialize round-trip; the `SemanticViewDefinition` flows structurally.
+        RewriteAction::Create { name, def, mode } => {
+            emit_native_create_sql(&name, *def, mode.or_replace(), mode.if_not_exists())
         }
-        // DROP / ALTER: pure-SQL race-guard + DML, all on the caller's
-        // connection. See `rewrite_drop_or_alter` (extension-only).
-        "drop_semantic_view"
-        | "drop_semantic_view_if_exists"
-        | "alter_semantic_view_rename"
-        | "alter_semantic_view_rename_if_exists"
-        | "alter_semantic_view_set_comment"
-        | "alter_semantic_view_set_comment_if_exists"
-        | "alter_semantic_view_unset_comment"
-        | "alter_semantic_view_unset_comment_if_exists" => {
-            rewrite_drop_or_alter(call.fn_name.as_str(), args)
+        // CREATE FROM YAML FILE — emit the INSERT that selects from the
+        // `__sv_compute_create_from_yaml` helper TF (which reads the file at
+        // execution). AR-2: no `\x01`-delimited sentinel string.
+        RewriteAction::CreateFromYamlFile {
+            file_path,
+            name,
+            comment,
+            mode,
+        } => emit_native_create_from_yaml_file(
+            &file_path,
+            &name,
+            &comment,
+            mode.or_replace(),
+            mode.if_not_exists(),
+        ),
+        // DROP / ALTER: pure-SQL race-guard + native DML on the caller's
+        // connection. Names/comment are carried raw; escape at the boundary so
+        // the emission helpers keep receiving already-escaped args.
+        RewriteAction::Drop { name, if_exists } => rewrite_drop(&escape_sql_arg(&name), if_exists),
+        RewriteAction::AlterRename {
+            name,
+            new_name,
+            if_exists,
+        } => rewrite_alter_rename(
+            &escape_sql_arg(&name),
+            &escape_sql_arg(&new_name),
+            if_exists,
+        ),
+        RewriteAction::AlterSetComment {
+            name,
+            comment,
+            if_exists,
+        } => rewrite_alter_comment(
+            &escape_sql_arg(&name),
+            Some(&escape_sql_arg(&comment)),
+            if_exists,
+        ),
+        RewriteAction::AlterUnsetComment { name, if_exists } => {
+            rewrite_alter_comment(&escape_sql_arg(&name), None, if_exists)
         }
-        // Read-side table functions (describe_semantic_view, show_*, list_*,
-        // get_ddl, read_yaml_from_semantic_view): pass through.
-        _ => Ok(Some(tf_sql)),
-    }
-}
-
-/// DROP / ALTER native-SQL emission. Phase 65 Plan 06: all pure-SQL —
-/// no `CatalogReader` consumed because H1 catalog_conn is retired.
-/// Existence wording is provided by `existence_guard_select` which runs
-/// on the caller's connection in the same transaction as the DML.
-#[cfg(feature = "extension")]
-fn rewrite_drop_or_alter(fn_name: &str, args: &[String]) -> Result<Option<String>, ParseError> {
-    match (fn_name, args.len()) {
-        ("drop_semantic_view", 1) => rewrite_drop(&args[0], false),
-        ("drop_semantic_view_if_exists", 1) => rewrite_drop(&args[0], true),
-        ("alter_semantic_view_rename", 2) => rewrite_alter_rename(&args[0], &args[1], false),
-        ("alter_semantic_view_rename_if_exists", 2) => {
-            rewrite_alter_rename(&args[0], &args[1], true)
-        }
-        ("alter_semantic_view_set_comment", 2) => {
-            rewrite_alter_comment(&args[0], Some(&args[1]), false)
-        }
-        ("alter_semantic_view_set_comment_if_exists", 2) => {
-            rewrite_alter_comment(&args[0], Some(&args[1]), true)
-        }
-        ("alter_semantic_view_unset_comment", 1) => rewrite_alter_comment(&args[0], None, false),
-        ("alter_semantic_view_unset_comment_if_exists", 1) => {
-            rewrite_alter_comment(&args[0], None, true)
-        }
-        // Caller pre-filtered to known names; this is unreachable. If hit, it
-        // is an internal dispatch bug — surface as an error instead of
-        // silently producing wrong SQL.
-        _ => Err(ParseError {
-            message: format!(
-                "internal error: rewrite_drop_or_alter dispatched with unknown \
-                 fn_name='{fn_name}' arity={}",
-                args.len()
-            ),
-            position: None,
-        }),
+        // Read-side DDL (DESCRIBE / SHOW / SHOW COLUMNS): DuckDB runs the
+        // read-side table function on the caller's connection unchanged.
+        RewriteAction::Passthrough(sql) => Ok(Some(sql)),
     }
 }
 
-/// CREATE-side native-SQL emission. Phase 65 Plan 06: pure-SQL — no
-/// `CatalogReader` consumed because H1 catalog_conn is retired. The
-/// "already exists" wording is enforced by the CASE+error inside the
-/// rewritten INSERT (snapshot-consistent on the caller's connection).
-#[cfg(feature = "extension")]
-fn rewrite_create(fn_name: &str, args: &[String]) -> Result<Option<String>, ParseError> {
-    if args.len() != 2 {
-        return Err(ParseError {
-            message: format!(
-                "internal error: rewrite_create dispatched with arity={}",
-                args.len()
-            ),
-            position: None,
-        });
-    }
-    let name = unescape_sql_arg(&args[0]);
-    let json = unescape_sql_arg(&args[1]);
-
-    let (or_replace, if_not_exists) = match fn_name {
-        "create_semantic_view_from_json" => (false, false),
-        "create_or_replace_semantic_view_from_json" => (true, false),
-        "create_semantic_view_if_not_exists_from_json" => (false, true),
-        _ => {
-            return Err(ParseError {
-                message: format!("internal error: rewrite_create unknown fn_name='{fn_name}'"),
-                position: None,
-            });
-        }
-    };
-
-    let def =
-        crate::model::SemanticViewDefinition::from_json(&name, &json).map_err(|e| ParseError {
-            message: e,
-            position: None,
-        })?;
-
-    emit_native_create_sql(&name, def, or_replace, if_not_exists)
-}
-
-/// Shared CREATE-emission helper used by both the table-function-style CREATE
-/// path (`rewrite_create`) and the FROM YAML FILE path (`rewrite_yaml_file_create`).
+/// Shared CREATE-emission helper for the in-memory-definition path
+/// (`RewriteAction::Create`). The FROM YAML FILE path uses the sibling
+/// `emit_native_create_from_yaml_file`.
 ///
 /// Steps (Phase 65 Plan 06 — pure-SQL):
 /// 1. Run `enrich_definition_for_create` (validation + graph + serialize
@@ -1888,10 +1779,10 @@ fn emit_native_create_sql(
 ) -> Result<Option<String>, ParseError> {
     // Defensive validation — `name` arrives already normalised (bare,
     // case-folded if it was unquoted) from validate_create_body via the
-    // function-call round-trip. Re-quote before re-normalising so this pass
-    // is a true no-op on normalised input: normalising the BARE name again
-    // would fold a case-preserved quoted name (`"SalesView"` → `salesview`,
-    // PA-8) and split a dotted name (`"a.b"` → `b`).
+    // `RewriteAction::Create` it produced. Re-quote before re-normalising so
+    // this pass is a true no-op on normalised input: normalising the BARE name
+    // again would fold a case-preserved quoted name (`"SalesView"` →
+    // `salesview`, PA-8) and split a dotted name (`"a.b"` → `b`).
     let name = normalize_view_name(&crate::expand::quote_ident(name)).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         position: None,
@@ -1953,21 +1844,21 @@ fn emit_native_create_sql(
     //     same-transaction guard.
     let sql = if or_replace {
         format!(
-            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) \
+            "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} (name, definition) \
              VALUES ('{name_escaped}', {metadata_patched_definition}) \
              RETURNING name AS view_name"
         )
     } else if if_not_exists {
         format!(
-            "INSERT OR IGNORE INTO semantic_layer._definitions (name, definition) \
+            "INSERT OR IGNORE INTO {DEFINITIONS_TABLE} (name, definition) \
              VALUES ('{name_escaped}', {metadata_patched_definition}) \
              RETURNING name AS view_name"
         )
     } else {
         format!(
-            "INSERT INTO semantic_layer._definitions (name, definition) \
+            "INSERT INTO {DEFINITIONS_TABLE} (name, definition) \
              SELECT \
-               CASE WHEN EXISTS (SELECT 1 FROM semantic_layer._definitions \
+               CASE WHEN EXISTS (SELECT 1 FROM {DEFINITIONS_TABLE} \
                                  WHERE name = '{name_escaped}') \
                     THEN error('semantic view ''{name_escaped}'' already exists; \
                                 use CREATE OR REPLACE SEMANTIC VIEW to overwrite') \
@@ -1997,45 +1888,21 @@ fn emit_native_create_sql(
 /// bind callback (per-call `Connection(*context.db)`), not on any
 /// long-lived extension-owned connection.
 #[cfg(feature = "extension")]
-fn rewrite_yaml_file_create(payload: &str) -> Result<Option<String>, ParseError> {
-    // Sentinel format: `<path>\x01<kind>\x01<name>\x01<comment>` (the
-    // `__SV_YAML_FILE__` prefix has already been stripped by the caller).
-    let mut parts = payload.splitn(4, '\x01');
-    let file_path = parts.next().ok_or_else(|| ParseError {
-        message: "Internal error: malformed YAML FILE sentinel (missing path)".to_string(),
-        position: None,
-    })?;
-    let kind_str = parts.next().ok_or_else(|| ParseError {
-        message: "Internal error: malformed YAML FILE sentinel (missing kind)".to_string(),
-        position: None,
-    })?;
-    let name = parts.next().ok_or_else(|| ParseError {
-        message: "Internal error: malformed YAML FILE sentinel (missing name)".to_string(),
-        position: None,
-    })?;
-    let comment = parts.next().unwrap_or("");
+fn emit_native_create_from_yaml_file(
+    file_path: &str,
+    name: &str,
+    comment: &str,
+    or_replace: bool,
+    if_not_exists: bool,
+) -> Result<Option<String>, ParseError> {
+    // Phase 65.1 Plan 07 (IN-04 D-24): `kind` is not threaded into the helper
+    // TF — the outer INSERT shape (OR IGNORE / OR REPLACE / plain) already
+    // encodes the ON CONFLICT behaviour, chosen from `or_replace`/`if_not_exists`.
 
-    // Phase 65.1 Plan 07 (IN-04 D-24): `kind` is no longer threaded into the
-    // helper TF — the outer INSERT shape (OR IGNORE / OR REPLACE / plain)
-    // already encodes ON CONFLICT behaviour. We still decode `kind_str` from
-    // the sentinel because the chosen INSERT shape below depends on it.
-    let (or_replace, if_not_exists) = match kind_str {
-        "0" => (false, false),
-        "1" => (true, false),
-        "2" => (false, true),
-        _ => {
-            return Err(ParseError {
-                message: format!("Internal error: unknown YAML FILE kind '{kind_str}'"),
-                position: None,
-            });
-        }
-    };
-
-    // Defensive validation of the sentinel-carried name (matches
-    // emit_native_create_sql): re-quote before re-normalising so the pass
-    // is a no-op on the already-normalised bare name — re-normalising it
-    // bare would fold a case-preserved quoted name (PA-8) or split a
-    // dotted one.
+    // Defensive validation of the name (matches emit_native_create_sql):
+    // re-quote before re-normalising so the pass is a no-op on the
+    // already-normalised bare name — re-normalising it bare would fold a
+    // case-preserved quoted name (PA-8) or split a dotted one.
     let name = normalize_view_name(&crate::expand::quote_ident(name)).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         position: None,
@@ -2077,23 +1944,23 @@ fn rewrite_yaml_file_create(payload: &str) -> Result<Option<String>, ParseError>
     //                    (Phase 60 race-guard pattern carried forward).
     let sql = if or_replace {
         format!(
-            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) \
+            "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} (name, definition) \
              SELECT '{name_escaped}', {metadata_patched} \
              {helper_from} \
              RETURNING name AS view_name"
         )
     } else if if_not_exists {
         format!(
-            "INSERT OR IGNORE INTO semantic_layer._definitions (name, definition) \
+            "INSERT OR IGNORE INTO {DEFINITIONS_TABLE} (name, definition) \
              SELECT '{name_escaped}', {metadata_patched} \
              {helper_from} \
              RETURNING name AS view_name"
         )
     } else {
         format!(
-            "INSERT INTO semantic_layer._definitions (name, definition) \
+            "INSERT INTO {DEFINITIONS_TABLE} (name, definition) \
              SELECT \
-               CASE WHEN EXISTS (SELECT 1 FROM semantic_layer._definitions \
+               CASE WHEN EXISTS (SELECT 1 FROM {DEFINITIONS_TABLE} \
                                  WHERE name = '{name_escaped}') \
                     THEN error('semantic view ''{name_escaped}'' already exists; \
                                 use CREATE OR REPLACE SEMANTIC VIEW to overwrite') \
@@ -2111,15 +1978,14 @@ fn rewrite_yaml_file_create(payload: &str) -> Result<Option<String>, ParseError>
 //
 // `escape_sql_arg` doubles single quotes so the input can be embedded inside
 // a single-quoted SQL string literal: `O'Brien` → `O''Brien`. `unescape_sql_arg`
-// reverses the doubling for values that arrived already-escaped (typically
-// from `parse_table_function_call::args`, which retains the SQL form so its
-// callers can re-embed without re-escaping).
+// reverses the doubling for values that arrived already-escaped (e.g. the
+// SET COMMENT literal that `rewrite_alter_comment` re-parses as JSON).
 //
 // The pair is unconditionally compiled (no `#[cfg(feature = "extension")]`)
 // so unit tests under `cargo test` can exercise the escaping rules without
 // linking the loadable-extension stubs. They have no FFI dependencies.
 
-/// Undo the SQL `''`-escaping retained in `parse_table_function_call`'s args.
+/// Undo the SQL `''`-escaping of an already-escaped single-quoted-literal value.
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 fn unescape_sql_arg(s: &str) -> String {
     s.replace("''", "'")
@@ -2134,10 +2000,10 @@ fn escape_sql_arg(s: &str) -> String {
 /// Build the existence-guard SELECT for non-IF-EXISTS DROP/ALTER.
 ///
 /// `name_escaped` is the view name with single quotes already SQL-doubled
-/// (matches the form returned by `parse_table_function_call::args`).
+/// (as produced by `escape_sql_arg` at the `rewrite_to_native_sql` boundary).
 ///
 /// The emitted statement errors with `semantic view '<name>' does not
-/// exist` when the row is missing from `semantic_layer._definitions`.
+/// exist` when the row is missing from the catalog table (`DEFINITIONS_TABLE`).
 /// Caller appends `;` and the actual DELETE/UPDATE; both run on the
 /// caller's connection in the same transaction so the guard's NOT EXISTS
 /// check is snapshot-consistent with the DML that follows.
@@ -2175,8 +2041,8 @@ fn definitions_table_guard_select(name_escaped: &str) -> String {
     format!(
         "SELECT CASE \
               WHEN NOT EXISTS (SELECT 1 FROM information_schema.tables \
-                                WHERE table_schema = 'semantic_layer' \
-                                  AND table_name = '_definitions') \
+                                WHERE table_schema = '{DEFINITIONS_SCHEMA}' \
+                                  AND table_name = '{DEFINITIONS_TABLE_NAME}') \
                 THEN error('semantic view ''{name_escaped}'' does not exist') \
               ELSE TRUE \
             END"
@@ -2187,7 +2053,7 @@ fn definitions_table_guard_select(name_escaped: &str) -> String {
 fn existence_guard_select(name_escaped: &str) -> String {
     format!(
         "SELECT CASE WHEN NOT EXISTS \
-                   (SELECT 1 FROM semantic_layer._definitions WHERE name = '{name_escaped}') \
+                   (SELECT 1 FROM {DEFINITIONS_TABLE} WHERE name = '{name_escaped}') \
                 THEN error('semantic view ''{name_escaped}'' does not exist') \
                 ELSE TRUE END"
     )
@@ -2202,7 +2068,7 @@ fn existence_guard_select(name_escaped: &str) -> String {
 fn rename_collision_guard_select(new_name_escaped: &str) -> String {
     format!(
         "SELECT CASE WHEN EXISTS \
-                   (SELECT 1 FROM semantic_layer._definitions WHERE name = '{new_name_escaped}') \
+                   (SELECT 1 FROM {DEFINITIONS_TABLE} WHERE name = '{new_name_escaped}') \
                 THEN error('semantic view ''{new_name_escaped}'' already exists') \
                 ELSE TRUE END"
     )
@@ -2227,7 +2093,7 @@ fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, P
         let table_guard = definitions_table_guard_select(name_escaped);
         return Ok(Some(format!(
             "{table_guard}; \
-             DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
+             DELETE FROM {DEFINITIONS_TABLE} WHERE name = '{name_escaped}' \
              RETURNING name AS view_name"
         )));
     }
@@ -2250,7 +2116,7 @@ fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, P
     Ok(Some(format!(
         "{table_guard}; \
          {guard}; \
-         DELETE FROM semantic_layer._definitions WHERE name = '{name_escaped}' \
+         DELETE FROM {DEFINITIONS_TABLE} WHERE name = '{name_escaped}' \
          RETURNING name AS view_name"
     )))
 }
@@ -2279,7 +2145,7 @@ fn rewrite_alter_rename(
         return Ok(Some(format!(
             "{table_guard}; \
              {collision_guard}; \
-             UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
+             UPDATE {DEFINITIONS_TABLE} SET name = '{new_escaped}' \
              WHERE name = '{old_escaped}' \
              RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
         )));
@@ -2301,7 +2167,7 @@ fn rewrite_alter_rename(
         "{table_guard}; \
          {exist_guard}; \
          {collision_guard}; \
-         UPDATE semantic_layer._definitions SET name = '{new_escaped}' \
+         UPDATE {DEFINITIONS_TABLE} SET name = '{new_escaped}' \
          WHERE name = '{old_escaped}' \
          RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
     )))
@@ -2370,7 +2236,7 @@ fn rewrite_alter_comment(
         let table_guard = definitions_table_guard_select(name_escaped);
         return Ok(Some(format!(
             "{table_guard}; \
-             UPDATE semantic_layer._definitions \
+             UPDATE {DEFINITIONS_TABLE} \
                 SET definition = json_merge_patch(definition::JSON, '{patch_json_for_sql}'::JSON)::VARCHAR \
               WHERE name = '{name_escaped}' \
              RETURNING name, '{status_label}'::VARCHAR AS status"
@@ -2392,139 +2258,11 @@ fn rewrite_alter_comment(
     Ok(Some(format!(
         "{table_guard}; \
          {guard}; \
-         UPDATE semantic_layer._definitions \
+         UPDATE {DEFINITIONS_TABLE} \
             SET definition = json_merge_patch(definition::JSON, '{patch_json_for_sql}'::JSON)::VARCHAR \
           WHERE name = '{name_escaped}' \
          RETURNING name, '{status_label}'::VARCHAR AS status"
     )))
-}
-
-/// Result of parsing a `SELECT * FROM <fn>('arg1'[, 'arg2'])` SQL string.
-///
-/// `args` retains the original SQL escaping (single quotes doubled), so they
-/// can be substituted back into a new single-quoted SQL string verbatim.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-struct TableFunctionCall {
-    fn_name: String,
-    args: Vec<String>,
-}
-
-/// Parse a `SELECT * FROM <fn_name>('arg1'[, 'arg2'])` SQL string.
-///
-/// Returns `None` for SQL that doesn't match this exact shape (e.g. SHOW
-/// forms with WHERE/LIMIT, or unrecognized prefixes). Handles SQL `''`
-/// escaping inside single-quoted args; preserves the `''` form in the
-/// returned strings so callers can re-embed them in new single-quoted SQL
-/// without re-escaping.
-///
-/// v0.8.0 tightened (B4): rejects malformed shapes that earlier silently
-/// swallowed — `foo(,)`, `foo('a',)` (trailing comma), `foo('a' 'b')`
-/// (missing comma between args).
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-fn parse_table_function_call(sql: &str) -> Option<TableFunctionCall> {
-    const PREFIX: &str = "SELECT * FROM ";
-    let rest = sql.strip_prefix(PREFIX)?;
-
-    // Read the function name up to '('.
-    let paren_pos = rest.find('(')?;
-    let fn_name = rest[..paren_pos].trim().to_string();
-    if fn_name.is_empty() || fn_name.contains(char::is_whitespace) {
-        return None;
-    }
-
-    // Body after the opening paren up to the matching closing paren.
-    // The body is a comma-separated list of single-quoted strings; we walk
-    // it tracking quote state so commas inside strings don't split args.
-    let body = &rest[paren_pos + 1..];
-    let mut args: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    let mut chars = body.char_indices();
-    let mut closing_pos: Option<usize> = None;
-    // After the closing `'` of a string literal, only whitespace / `,` / `)`
-    // are valid. A second `'` would have been peeked-and-consumed in the
-    // in_quote branch (doubled-quote escape).
-    let mut just_closed_quote = false;
-    // Tracks whether the most recent unquoted-state event was a `,`. Used to
-    // reject `foo(,)` / `foo('a',)` where a comma is followed by `)` with no
-    // intervening arg.
-    let mut expecting_arg_after_comma = false;
-
-    while let Some((i, ch)) = chars.next() {
-        if in_quote {
-            current.push(ch);
-            if ch == '\'' {
-                // Lookahead for `''` doubled-quote escape.
-                let mut peek = body[i + ch.len_utf8()..].chars();
-                if peek.next() == Some('\'') {
-                    // Consume the second '
-                    current.push('\'');
-                    chars.next();
-                } else {
-                    in_quote = false;
-                    just_closed_quote = true;
-                }
-            }
-        } else {
-            match ch {
-                '\'' => {
-                    // Two adjacent string literals like `'a' 'b'` (no comma)
-                    // are invalid in our generated SQL — reject.
-                    if just_closed_quote {
-                        return None;
-                    }
-                    in_quote = true;
-                    just_closed_quote = false;
-                    expecting_arg_after_comma = false;
-                    current.push(ch);
-                }
-                ',' => {
-                    let trimmed = current.trim();
-                    if trimmed.is_empty() {
-                        // `foo(,...)` — comma without preceding arg.
-                        return None;
-                    }
-                    args.push(strip_outer_quotes(trimmed)?.to_string());
-                    current.clear();
-                    just_closed_quote = false;
-                    expecting_arg_after_comma = true;
-                }
-                ')' => {
-                    if expecting_arg_after_comma {
-                        // `foo('a',)` — trailing comma.
-                        return None;
-                    }
-                    closing_pos = Some(i);
-                    break;
-                }
-                c if c.is_whitespace() => {} // ignore between args
-                _ => return None,            // unexpected non-whitespace, non-quote
-            }
-        }
-    }
-
-    let _ = closing_pos?; // must have found a closing paren
-
-    // Push trailing arg if present (handles single-arg and multi-arg cases).
-    let trailing = current.trim();
-    if !trailing.is_empty() {
-        args.push(strip_outer_quotes(trailing)?.to_string());
-    }
-
-    // Anything after the closing paren must be empty or whitespace.
-    let after = &body[closing_pos? + 1..];
-    if !after.trim().is_empty() {
-        return None;
-    }
-
-    Some(TableFunctionCall { fn_name, args })
-}
-
-/// Strip the outer pair of single quotes, leaving doubled-quote escaping intact.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-fn strip_outer_quotes(s: &str) -> Option<&str> {
-    let inner = s.strip_prefix('\'')?.strip_suffix('\'')?;
-    Some(inner)
 }
 
 /// FFI entry point: construct a heap-boxed (empty) `OverrideContext` and
@@ -2839,7 +2577,10 @@ unsafe fn run_validation_for_parse_function(
     query: &str,
 ) -> Result<Option<String>, ParseError> {
     if ctx_ptr.is_null() {
-        return validate_and_rewrite(query);
+        // Syntax-only fallback (ctx lost). Only the Ok(Some)/Ok(None)/Err shape
+        // matters here — the caller discards the string — so plan without
+        // rendering any SQL.
+        return plan_rewrite(query).map(|opt| opt.map(|_| String::new()));
     }
     let ctx = &*(ctx_ptr as *const OverrideContext);
     rewrite_to_native_sql(ctx, query)
@@ -2854,68 +2595,28 @@ unsafe fn run_validation_for_parse_function(
     _ctx_ptr: *const std::ffi::c_void,
     query: &str,
 ) -> Result<Option<String>, ParseError> {
-    validate_and_rewrite(query)
+    plan_rewrite(query).map(|opt| opt.map(|_| String::new()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ===================================================================
-    // parse_table_function_call — happy-path + B4 tightening (v0.8.0).
-    // Pre-v0.8.0 this silently swallowed `foo(,)` and `foo('a',)` and
-    // accepted `foo('a' 'b')` (missing comma). Now they all return None.
-    // ===================================================================
-
-    #[test]
-    fn parse_tf_call_zero_args() {
-        let r = parse_table_function_call("SELECT * FROM foo()").expect("zero-arg parse");
-        assert_eq!(r.fn_name, "foo");
-        assert!(r.args.is_empty());
+    /// Plan a DDL statement, expecting a recognized, valid statement.
+    fn plan(query: &str) -> RewriteAction {
+        plan_rewrite(query)
+            .expect("valid DDL")
+            .expect("recognized semantic-view DDL statement")
     }
 
-    #[test]
-    fn parse_tf_call_single_arg() {
-        let r = parse_table_function_call("SELECT * FROM foo('a')").expect("single-arg parse");
-        assert_eq!(r.fn_name, "foo");
-        assert_eq!(r.args, vec!["a".to_string()]);
-    }
-
-    #[test]
-    fn parse_tf_call_multi_arg() {
-        let r = parse_table_function_call("SELECT * FROM foo('a', 'b')").expect("multi-arg parse");
-        assert_eq!(r.fn_name, "foo");
-        assert_eq!(r.args, vec!["a".to_string(), "b".to_string()]);
-    }
-
-    #[test]
-    fn parse_tf_call_doubled_quote_inside_arg() {
-        // `'O''Brien'` decodes to `O''Brien` (escaping retained).
-        let r = parse_table_function_call("SELECT * FROM foo('O''Brien')")
-            .expect("doubled-quote parse");
-        assert_eq!(r.args, vec!["O''Brien".to_string()]);
-    }
-
-    #[test]
-    fn parse_tf_call_rejects_lone_comma() {
-        assert!(parse_table_function_call("SELECT * FROM foo(,)").is_none());
-    }
-
-    #[test]
-    fn parse_tf_call_rejects_trailing_comma() {
-        assert!(parse_table_function_call("SELECT * FROM foo('a',)").is_none());
-        assert!(parse_table_function_call("SELECT * FROM foo('a', )").is_none());
-    }
-
-    #[test]
-    fn parse_tf_call_rejects_missing_comma() {
-        assert!(parse_table_function_call("SELECT * FROM foo('a' 'b')").is_none());
-    }
-
-    #[test]
-    fn parse_tf_call_rejects_unknown_prefix() {
-        assert!(parse_table_function_call("INSERT INTO t VALUES ('a')").is_none());
-        assert!(parse_table_function_call("describe_semantic_view('foo')").is_none());
+    /// Plan a read-side DDL statement (DESCRIBE / SHOW / SHOW COLUMNS) and return
+    /// its final `SELECT * FROM <read_side_fn>(...)` SQL, asserting the variant
+    /// is `Passthrough`.
+    fn passthrough_sql(query: &str) -> String {
+        match plan(query) {
+            RewriteAction::Passthrough(sql) => sql,
+            other => panic!("expected RewriteAction::Passthrough, got {other:?}"),
+        }
     }
 
     // ===================================================================
@@ -3431,42 +3132,58 @@ mod tests {
 
     #[test]
     fn test_rewrite_create_rejected() {
-        let err = rewrite_ddl("CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])")
+        let err = plan_ddl("CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])")
             .unwrap_err();
         assert!(
-            err.contains("validate_and_rewrite"),
-            "CREATE forms should be rejected by rewrite_ddl, got: {err}"
+            err.contains("plan_rewrite"),
+            "CREATE forms should be rejected by plan_ddl, got: {err}"
         );
     }
 
     #[test]
     fn test_rewrite_drop() {
-        let sql = rewrite_ddl("DROP SEMANTIC VIEW sales").unwrap();
-        assert_eq!(sql, "SELECT * FROM drop_semantic_view('sales')");
+        assert_eq!(
+            plan("DROP SEMANTIC VIEW sales"),
+            RewriteAction::Drop {
+                name: "sales".to_string(),
+                if_exists: false,
+            }
+        );
     }
 
     #[test]
     fn test_rewrite_drop_if_exists() {
-        let sql = rewrite_ddl("DROP SEMANTIC VIEW IF EXISTS sales").unwrap();
-        assert_eq!(sql, "SELECT * FROM drop_semantic_view_if_exists('sales')");
+        assert_eq!(
+            plan("DROP SEMANTIC VIEW IF EXISTS sales"),
+            RewriteAction::Drop {
+                name: "sales".to_string(),
+                if_exists: true,
+            }
+        );
     }
 
     #[test]
     fn test_rewrite_describe() {
-        let sql = rewrite_ddl("DESCRIBE SEMANTIC VIEW sales").unwrap();
+        let sql = passthrough_sql("DESCRIBE SEMANTIC VIEW sales");
         assert_eq!(sql, "SELECT * FROM describe_semantic_view('sales')");
     }
 
     #[test]
     fn test_rewrite_show() {
-        let sql = rewrite_ddl("SHOW SEMANTIC VIEWS").unwrap();
+        let sql = passthrough_sql("SHOW SEMANTIC VIEWS");
         assert_eq!(sql, "SELECT * FROM list_semantic_views()");
     }
 
     #[test]
     fn test_rewrite_name_with_single_quote() {
-        let sql = rewrite_ddl("DROP SEMANTIC VIEW it's_a_view").unwrap();
-        assert_eq!(sql, "SELECT * FROM drop_semantic_view('it''s_a_view')");
+        // Structured variants carry the RAW name (single quote NOT doubled).
+        assert_eq!(
+            plan("DROP SEMANTIC VIEW it's_a_view"),
+            RewriteAction::Drop {
+                name: "it's_a_view".to_string(),
+                if_exists: false,
+            }
+        );
     }
 
     // ===================================================================
@@ -3479,10 +3196,15 @@ mod tests {
 
     #[test]
     fn test_unquoted_names_fold_to_lowercase_across_ddl_forms() {
-        let sql = rewrite_ddl("DROP SEMANTIC VIEW Sales").unwrap();
-        assert_eq!(sql, "SELECT * FROM drop_semantic_view('sales')");
+        assert_eq!(
+            plan("DROP SEMANTIC VIEW Sales"),
+            RewriteAction::Drop {
+                name: "sales".to_string(),
+                if_exists: false,
+            }
+        );
 
-        let sql = rewrite_ddl("DESCRIBE SEMANTIC VIEW SALES").unwrap();
+        let sql = passthrough_sql("DESCRIBE SEMANTIC VIEW SALES");
         assert_eq!(sql, "SELECT * FROM describe_semantic_view('sales')");
 
         assert_eq!(
@@ -3491,33 +3213,44 @@ mod tests {
         );
 
         // ALTER folds both the target and the RENAME TO name.
-        let sql = rewrite_ddl("ALTER SEMANTIC VIEW Sales RENAME TO NewSales").unwrap();
         assert_eq!(
-            sql,
-            "SELECT * FROM alter_semantic_view_rename('sales', 'newsales')"
+            plan("ALTER SEMANTIC VIEW Sales RENAME TO NewSales"),
+            RewriteAction::AlterRename {
+                name: "sales".to_string(),
+                new_name: "newsales".to_string(),
+                if_exists: false,
+            }
         );
     }
 
     #[test]
     fn test_quoted_names_preserve_case_across_ddl_forms() {
-        let sql = rewrite_ddl("DROP SEMANTIC VIEW \"Sales\"").unwrap();
-        assert_eq!(sql, "SELECT * FROM drop_semantic_view('Sales')");
+        assert_eq!(
+            plan("DROP SEMANTIC VIEW \"Sales\""),
+            RewriteAction::Drop {
+                name: "Sales".to_string(),
+                if_exists: false,
+            }
+        );
 
         assert_eq!(
             extract_ddl_name("CREATE SEMANTIC VIEW \"Sales\" (body)").unwrap(),
             Some("Sales".to_string())
         );
 
-        let sql = rewrite_ddl("ALTER SEMANTIC VIEW \"Sales\" RENAME TO \"NewSales\"").unwrap();
         assert_eq!(
-            sql,
-            "SELECT * FROM alter_semantic_view_rename('Sales', 'NewSales')"
+            plan("ALTER SEMANTIC VIEW \"Sales\" RENAME TO \"NewSales\""),
+            RewriteAction::AlterRename {
+                name: "Sales".to_string(),
+                new_name: "NewSales".to_string(),
+                if_exists: false,
+            }
         );
     }
 
     #[test]
     fn test_rewrite_drop_missing_name() {
-        let err = rewrite_ddl("DROP SEMANTIC VIEW").unwrap_err();
+        let err = plan_ddl("DROP SEMANTIC VIEW").unwrap_err();
         assert!(err.contains("Missing view name"), "got: {err}");
     }
 
@@ -3580,8 +3313,13 @@ mod tests {
             detect_semantic_view_ddl("DROP SEMANTIC VIEW\"my view\""),
             PARSE_DETECTED
         );
-        let sql = rewrite_ddl("DROP SEMANTIC VIEW\"my view\"").unwrap();
-        assert_eq!(sql, "SELECT * FROM drop_semantic_view('my view')");
+        assert_eq!(
+            plan("DROP SEMANTIC VIEW\"my view\""),
+            RewriteAction::Drop {
+                name: "my view".to_string(),
+                if_exists: false,
+            }
+        );
     }
 
     // ===================================================================
@@ -3592,15 +3330,26 @@ mod tests {
 
     #[test]
     fn test_trailing_comment_after_name_is_ignored() {
-        let sql = rewrite_ddl("DROP SEMANTIC VIEW a -- trailing comment").unwrap();
-        assert_eq!(sql, "SELECT * FROM drop_semantic_view('a')");
+        assert_eq!(
+            plan("DROP SEMANTIC VIEW a -- trailing comment"),
+            RewriteAction::Drop {
+                name: "a".to_string(),
+                if_exists: false,
+            }
+        );
     }
 
     #[test]
     fn test_alter_rename_trailing_comment_not_absorbed() {
         // Pre-fix this renamed the view to `x -- oops`.
-        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a RENAME TO x -- oops").unwrap();
-        assert_eq!(sql, "SELECT * FROM alter_semantic_view_rename('a', 'x')");
+        assert_eq!(
+            plan("ALTER SEMANTIC VIEW a RENAME TO x -- oops"),
+            RewriteAction::AlterRename {
+                name: "a".to_string(),
+                new_name: "x".to_string(),
+                if_exists: false,
+            }
+        );
     }
 
     #[test]
@@ -3609,41 +3358,55 @@ mod tests {
             detect_semantic_view_ddl("DROP /* which? */ SEMANTIC VIEW a"),
             PARSE_DETECTED
         );
-        let sql = rewrite_ddl("DROP /* which? */ SEMANTIC VIEW a").unwrap();
-        assert_eq!(sql, "SELECT * FROM drop_semantic_view('a')");
+        assert_eq!(
+            plan("DROP /* which? */ SEMANTIC VIEW a"),
+            RewriteAction::Drop {
+                name: "a".to_string(),
+                if_exists: false,
+            }
+        );
     }
 
     #[test]
     fn test_comment_markers_inside_string_survive() {
         // `--` inside a COMMENT string literal is content, not a comment.
-        let sql =
-            rewrite_ddl("ALTER SEMANTIC VIEW a SET COMMENT = 'keep -- this /* too */'").unwrap();
         assert_eq!(
-            sql,
-            "SELECT * FROM alter_semantic_view_set_comment('a', 'keep -- this /* too */')"
+            plan("ALTER SEMANTIC VIEW a SET COMMENT = 'keep -- this /* too */'"),
+            RewriteAction::AlterSetComment {
+                name: "a".to_string(),
+                comment: "keep -- this /* too */".to_string(),
+                if_exists: false,
+            }
         );
     }
 
     #[test]
     fn test_nested_block_comment_fully_skipped() {
         // Block comments nest per the SQL standard (PA-10).
-        let sql =
-            rewrite_ddl("/* outer /* inner */ still comment */ DROP SEMANTIC VIEW a").unwrap();
-        assert_eq!(sql, "SELECT * FROM drop_semantic_view('a')");
+        assert_eq!(
+            plan("/* outer /* inner */ still comment */ DROP SEMANTIC VIEW a"),
+            RewriteAction::Drop {
+                name: "a".to_string(),
+                if_exists: false,
+            }
+        );
     }
 
     #[test]
     fn test_comment_inside_create_body_not_stored() {
         // A line comment inside the AS-body must not leak into the stored
         // expression (pre-fix it commented out generated SQL downstream).
-        let result = validate_and_rewrite(
+        let RewriteAction::Create { def, .. } = plan(
             "CREATE SEMANTIC VIEW v AS TABLES (o AS orders PRIMARY KEY (id)) \
              DIMENSIONS (o.d AS o.region /* region code */)",
-        );
-        let sql = result.unwrap().expect("statement is ours");
+        ) else {
+            panic!("expected RewriteAction::Create");
+        };
         assert!(
-            !sql.contains("region code"),
-            "comment text leaked into rewrite: {sql}"
+            !def.dimensions
+                .iter()
+                .any(|d| d.expr.contains("region code") || d.name.contains("region code")),
+            "comment text leaked into stored dimension: {def:?}"
         );
     }
 
@@ -3653,22 +3416,36 @@ mod tests {
 
     #[test]
     fn test_alter_subops_tolerate_multiple_spaces() {
-        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a RENAME  \t TO b").unwrap();
-        assert_eq!(sql, "SELECT * FROM alter_semantic_view_rename('a', 'b')");
-        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a SET   COMMENT = 'x'").unwrap();
         assert_eq!(
-            sql,
-            "SELECT * FROM alter_semantic_view_set_comment('a', 'x')"
+            plan("ALTER SEMANTIC VIEW a RENAME  \t TO b"),
+            RewriteAction::AlterRename {
+                name: "a".to_string(),
+                new_name: "b".to_string(),
+                if_exists: false,
+            }
         );
-        let sql = rewrite_ddl("ALTER SEMANTIC VIEW a UNSET\tCOMMENT").unwrap();
-        assert_eq!(sql, "SELECT * FROM alter_semantic_view_unset_comment('a')");
+        assert_eq!(
+            plan("ALTER SEMANTIC VIEW a SET   COMMENT = 'x'"),
+            RewriteAction::AlterSetComment {
+                name: "a".to_string(),
+                comment: "x".to_string(),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            plan("ALTER SEMANTIC VIEW a UNSET\tCOMMENT"),
+            RewriteAction::AlterUnsetComment {
+                name: "a".to_string(),
+                if_exists: false,
+            }
+        );
     }
 
     #[test]
     fn test_alter_subops_reject_trailing_garbage() {
-        assert!(rewrite_ddl("ALTER SEMANTIC VIEW a RENAME TO x oops").is_err());
-        assert!(rewrite_ddl("ALTER SEMANTIC VIEW a SET COMMENT = 'x' oops").is_err());
-        assert!(rewrite_ddl("ALTER SEMANTIC VIEW a UNSET COMMENT oops").is_err());
+        assert!(plan_ddl("ALTER SEMANTIC VIEW a RENAME TO x oops").is_err());
+        assert!(plan_ddl("ALTER SEMANTIC VIEW a SET COMMENT = 'x' oops").is_err());
+        assert!(plan_ddl("ALTER SEMANTIC VIEW a UNSET COMMENT oops").is_err());
     }
 
     #[test]
@@ -3685,31 +3462,32 @@ mod tests {
             "ALTER SEMANTIC VIEW v UNSET\tCOMMENT",
         ] {
             assert!(
-                validate_and_rewrite(q).is_ok(),
-                "validate_and_rewrite rejected valid ALTER: {q}"
+                plan_rewrite(q).is_ok(),
+                "plan_rewrite rejected valid ALTER: {q}"
             );
         }
         // A quoted view name with an inner space must survive the validate
         // pass (previously split at the space -> "Unsupported ALTER").
-        let sql = validate_and_rewrite("ALTER SEMANTIC VIEW \"my view\" RENAME TO w")
-            .unwrap()
-            .expect("statement is ours");
         assert_eq!(
-            sql,
-            "SELECT * FROM alter_semantic_view_rename('my view', 'w')"
+            plan("ALTER SEMANTIC VIEW \"my view\" RENAME TO w"),
+            RewriteAction::AlterRename {
+                name: "my view".to_string(),
+                new_name: "w".to_string(),
+                if_exists: false,
+            }
         );
     }
 
     #[test]
     fn test_for_metric_requires_boundaries() {
         // FOREIGN must not match the FOR clause keyword (PR #50 review).
-        let err = rewrite_ddl("SHOW SEMANTIC VIEWS FOREIGN").unwrap_err();
+        let err = plan_ddl("SHOW SEMANTIC VIEWS FOREIGN").unwrap_err();
         assert!(err.contains("Unexpected tokens"), "got: {err}");
         // METRICS must not match METRIC (the metric would have been 's').
-        let err = rewrite_ddl("SHOW SEMANTIC DIMENSIONS IN v FOR METRICS revenue").unwrap_err();
+        let err = plan_ddl("SHOW SEMANTIC DIMENSIONS IN v FOR METRICS revenue").unwrap_err();
         assert!(err.contains("Expected FOR METRIC"), "got: {err}");
         // The legal form still parses.
-        let sql = rewrite_ddl("SHOW SEMANTIC DIMENSIONS IN v FOR METRIC revenue").unwrap();
+        let sql = passthrough_sql("SHOW SEMANTIC DIMENSIONS IN v FOR METRIC revenue");
         assert_eq!(
             sql,
             "SELECT * FROM show_semantic_dimensions_for_metric('v', 'revenue')"
@@ -3719,14 +3497,14 @@ mod tests {
     #[test]
     fn test_starts_with_and_limit_require_boundaries() {
         // STARTSWITH / LIMIT5 used to be accepted without a word boundary.
-        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS STARTSWITH 'a'").is_err());
-        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS LIMIT5").is_err());
+        assert!(plan_ddl("SHOW SEMANTIC VIEWS STARTSWITH 'a'").is_err());
+        assert!(plan_ddl("SHOW SEMANTIC VIEWS LIMIT5").is_err());
         // `_` and non-ASCII bytes are identifier continuation, not
         // boundaries (PR #50 review).
-        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITH_x 'a'").is_err());
-        assert!(rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITHé 'a'").is_err());
+        assert!(plan_ddl("SHOW SEMANTIC VIEWS STARTS WITH_x 'a'").is_err());
+        assert!(plan_ddl("SHOW SEMANTIC VIEWS STARTS WITHé 'a'").is_err());
         // The legal forms still parse.
-        let sql = rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITH 'a' LIMIT 5").unwrap();
+        let sql = passthrough_sql("SHOW SEMANTIC VIEWS STARTS WITH 'a' LIMIT 5");
         assert_eq!(
             sql,
             "SELECT * FROM list_semantic_views() WHERE name LIKE 'a%' LIMIT 5"
@@ -3746,7 +3524,7 @@ mod tests {
             "DESCRIBE SEMANTIC VIEW a CASCADE",
             "SHOW COLUMNS IN SEMANTIC VIEW a b",
         ] {
-            let err = rewrite_ddl(q).unwrap_err();
+            let err = plan_ddl(q).unwrap_err();
             assert!(
                 err.contains("Unexpected tokens after view name"),
                 "expected trailing-garbage error for {q}, got: {err}"
@@ -3766,7 +3544,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_not_semantic() {
-        let err = rewrite_ddl("SELECT 1").unwrap_err();
+        let err = plan_ddl("SELECT 1").unwrap_err();
         assert!(err.contains("Not a semantic view DDL"), "got: {err}");
     }
 
@@ -3905,15 +3683,14 @@ mod tests {
     }
 
     // ===================================================================
-    // validate_and_rewrite tests
+    // plan_rewrite tests
     // ===================================================================
 
     #[test]
     fn test_validate_and_rewrite_rejects_paren_body() {
         // CLN-01: non-AS-body syntax rejected with clear error
-        let result = validate_and_rewrite(
-            "CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])",
-        );
+        let result =
+            plan_rewrite("CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3925,7 +3702,7 @@ mod tests {
 
     #[test]
     fn test_validate_and_rewrite_not_ours() {
-        let result = validate_and_rewrite("SELECT 1");
+        let result = plan_rewrite("SELECT 1");
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -3933,34 +3710,37 @@ mod tests {
     #[test]
     fn test_validate_and_rewrite_drop() {
         // Non-CREATE forms should pass through without clause validation
-        let result = validate_and_rewrite("DROP SEMANTIC VIEW x");
+        let result = plan_rewrite("DROP SEMANTIC VIEW x");
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
     }
 
     #[test]
     fn test_validate_and_rewrite_show() {
-        let result = validate_and_rewrite("SHOW SEMANTIC VIEWS");
+        let result = plan_rewrite("SHOW SEMANTIC VIEWS");
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
     }
 
     #[test]
     fn test_validate_and_rewrite_describe() {
-        let result = validate_and_rewrite("DESCRIBE SEMANTIC VIEW sv1");
-        assert!(result.is_ok());
-        let sql = result.unwrap();
-        assert!(sql.is_some(), "Expected Some(rewritten SQL) for DESCRIBE");
-    }
-
-    #[test]
-    fn test_validate_and_rewrite_drop_if_exists() {
-        let result = validate_and_rewrite("DROP SEMANTIC VIEW IF EXISTS sv1");
+        let result = plan_rewrite("DESCRIBE SEMANTIC VIEW sv1");
         assert!(result.is_ok());
         let sql = result.unwrap();
         assert!(
             sql.is_some(),
-            "Expected Some(rewritten SQL) for DROP IF EXISTS"
+            "Expected Some(rewritten action) for DESCRIBE"
+        );
+    }
+
+    #[test]
+    fn test_validate_and_rewrite_drop_if_exists() {
+        let result = plan_rewrite("DROP SEMANTIC VIEW IF EXISTS sv1");
+        assert!(result.is_ok());
+        let sql = result.unwrap();
+        assert!(
+            sql.is_some(),
+            "Expected Some(rewritten action) for DROP IF EXISTS"
         );
     }
 
@@ -4033,7 +3813,7 @@ mod tests {
     fn test_parse_error_position_paren_body_rejected() {
         // Non-AS-body syntax returns "Expected 'AS' or 'FROM YAML'" error with position
         let query = "CREATE SEMANTIC VIEW x (tables := [])";
-        let result = validate_and_rewrite(query);
+        let result = plan_rewrite(query);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -4048,7 +3828,7 @@ mod tests {
     fn test_parse_error_position_structural() {
         // For missing name, position should point at end of prefix
         let query = "CREATE SEMANTIC VIEW";
-        let result = validate_and_rewrite(query);
+        let result = plan_rewrite(query);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.position.is_some());
@@ -4064,39 +3844,42 @@ mod tests {
         #[test]
         fn as_body_create_rewrites_to_from_json() {
             let query = "CREATE SEMANTIC VIEW v AS TABLES (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))";
-            let result = validate_and_rewrite(query).unwrap().unwrap();
-            assert!(
-                result.starts_with("SELECT * FROM create_semantic_view_from_json("),
-                "Got: {result}"
-            );
-            assert!(result.contains("'v'"), "Must contain view name: {result}");
+            let RewriteAction::Create { name, mode, .. } = plan(query) else {
+                panic!("expected RewriteAction::Create");
+            };
+            assert_eq!(mode, CreateMode::Create);
+            assert_eq!(name, "v", "Must carry view name");
         }
 
         #[test]
         fn as_body_create_or_replace_rewrites_to_from_json() {
             let query = "CREATE OR REPLACE SEMANTIC VIEW v AS TABLES (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))";
-            let result = validate_and_rewrite(query).unwrap().unwrap();
-            assert!(
-                result.starts_with("SELECT * FROM create_or_replace_semantic_view_from_json("),
-                "Got: {result}"
-            );
+            assert!(matches!(
+                plan(query),
+                RewriteAction::Create {
+                    mode: CreateMode::OrReplace,
+                    ..
+                }
+            ));
         }
 
         #[test]
         fn as_body_create_if_not_exists_rewrites_to_from_json() {
             let query = "CREATE SEMANTIC VIEW IF NOT EXISTS v AS TABLES (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))";
-            let result = validate_and_rewrite(query).unwrap().unwrap();
-            assert!(
-                result.starts_with("SELECT * FROM create_semantic_view_if_not_exists_from_json("),
-                "Got: {result}"
-            );
+            assert!(matches!(
+                plan(query),
+                RewriteAction::Create {
+                    mode: CreateMode::IfNotExists,
+                    ..
+                }
+            ));
         }
 
         #[test]
         fn old_paren_body_is_rejected() {
             // CLN-01: non-AS-body syntax rejected with clear error
             let query = "CREATE SEMANTIC VIEW v (tables := [], dimensions := [])";
-            let result = validate_and_rewrite(query);
+            let result = plan_rewrite(query);
             assert!(result.is_err(), "Paren-body must be rejected: {result:?}");
             let err = result.unwrap_err();
             assert!(
@@ -4109,8 +3892,13 @@ mod tests {
         #[test]
         fn drop_still_rewrites_unchanged() {
             let query = "DROP SEMANTIC VIEW v";
-            let result = validate_and_rewrite(query).unwrap().unwrap();
-            assert_eq!(result, "SELECT * FROM drop_semantic_view('v')");
+            assert_eq!(
+                plan(query),
+                RewriteAction::Drop {
+                    name: "v".to_string(),
+                    if_exists: false,
+                }
+            );
         }
     }
 
@@ -4120,6 +3908,7 @@ mod tests {
 
     mod phase33_inference_tests {
         use super::*;
+        use crate::graph::infer_cardinality;
         use crate::model::{Cardinality, Join, TableRef};
 
         fn make_table(alias: &str, pk: &[&str], unique: &[&[&str]]) -> TableRef {
@@ -4325,15 +4114,16 @@ mod tests {
                          RELATIONSHIPS (r AS o(customer_id) REFERENCES c) \
                          DIMENSIONS (o.region AS region) \
                          METRICS (o.revenue AS SUM(amount))";
-            let result = validate_and_rewrite(query).unwrap().unwrap();
-            // The JSON should contain ref_columns resolved from target PK
-            assert!(
-                result.contains("ref_columns"),
-                "Expected ref_columns in JSON, got: {result}"
-            );
-            assert!(
-                result.contains("cust_id"),
-                "Expected target PK 'cust_id' in ref_columns, got: {result}"
+            let RewriteAction::Create { def, .. } = plan(query) else {
+                panic!("expected RewriteAction::Create");
+            };
+            // The join's ref_columns should be resolved from the target PK.
+            assert_eq!(def.joins.len(), 1, "Expected one join, got: {def:?}");
+            assert_eq!(
+                def.joins[0].ref_columns,
+                vec!["cust_id".to_string()],
+                "Expected target PK 'cust_id' in ref_columns, got: {:?}",
+                def.joins[0].ref_columns
             );
         }
     }
@@ -4493,7 +4283,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_dims_like_cross_view() {
-            let sql = rewrite_ddl("SHOW SEMANTIC DIMENSIONS LIKE '%rev%'").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC DIMENSIONS LIKE '%rev%'");
             assert_eq!(
                 sql,
                 "SELECT * FROM show_semantic_dimensions_all() WHERE name ILIKE '%rev%'"
@@ -4502,9 +4292,9 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_dims_like_in_starts_with_limit() {
-            let sql =
-                rewrite_ddl("SHOW SEMANTIC DIMENSIONS LIKE '%c%' IN v STARTS WITH 'cust' LIMIT 2")
-                    .unwrap();
+            let sql = passthrough_sql(
+                "SHOW SEMANTIC DIMENSIONS LIKE '%c%' IN v STARTS WITH 'cust' LIMIT 2",
+            );
             assert_eq!(
                 sql,
                 "SELECT * FROM show_semantic_dimensions('v') WHERE name ILIKE '%c%' AND name LIKE 'cust%' LIMIT 2"
@@ -4513,7 +4303,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_metrics_starts_with_limit() {
-            let sql = rewrite_ddl("SHOW SEMANTIC METRICS STARTS WITH 'total' LIMIT 1").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC METRICS STARTS WITH 'total' LIMIT 1");
             assert_eq!(
                 sql,
                 "SELECT * FROM show_semantic_metrics_all() WHERE name LIKE 'total%' LIMIT 1"
@@ -4522,16 +4312,15 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_facts_limit() {
-            let sql = rewrite_ddl("SHOW SEMANTIC FACTS LIMIT 10").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC FACTS LIMIT 10");
             assert_eq!(sql, "SELECT * FROM show_semantic_facts_all() LIMIT 10");
         }
 
         #[test]
         fn test_rewrite_show_dims_for_metric_with_all_clauses() {
-            let sql = rewrite_ddl(
+            let sql = passthrough_sql(
                 "SHOW SEMANTIC DIMENSIONS LIKE '%x%' IN v FOR METRIC m STARTS WITH 'a' LIMIT 3",
-            )
-            .unwrap();
+            );
             assert_eq!(
                 sql,
                 "SELECT * FROM show_semantic_dimensions_for_metric('v', 'm') WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 3"
@@ -4540,19 +4329,19 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_dims_like_after_in_error() {
-            let result = rewrite_ddl("SHOW SEMANTIC DIMENSIONS IN v LIKE '%x%'");
+            let result = plan_ddl("SHOW SEMANTIC DIMENSIONS IN v LIKE '%x%'");
             assert!(result.is_err(), "LIKE after IN should error");
         }
 
         #[test]
         fn test_rewrite_show_metrics_limit_non_numeric() {
-            let result = rewrite_ddl("SHOW SEMANTIC METRICS LIMIT abc");
+            let result = plan_ddl("SHOW SEMANTIC METRICS LIMIT abc");
             assert!(result.is_err(), "Non-numeric LIMIT should error");
         }
 
         #[test]
         fn test_rewrite_show_for_metric_on_metrics_error() {
-            let result = rewrite_ddl("SHOW SEMANTIC METRICS IN v FOR METRIC m");
+            let result = plan_ddl("SHOW SEMANTIC METRICS IN v FOR METRIC m");
             assert!(result.is_err(), "FOR METRIC on SHOW METRICS should error");
         }
 
@@ -4574,7 +4363,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_case_insensitive() {
-            let sql = rewrite_ddl("show semantic dimensions like '%x%' in v").unwrap();
+            let sql = passthrough_sql("show semantic dimensions like '%x%' in v");
             assert_eq!(
                 sql,
                 "SELECT * FROM show_semantic_dimensions('v') WHERE name ILIKE '%x%'"
@@ -4585,7 +4374,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_views_like() {
-            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS LIKE '%prod%'").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC VIEWS LIKE '%prod%'");
             assert_eq!(
                 sql,
                 "SELECT * FROM list_semantic_views() WHERE name ILIKE '%prod%'"
@@ -4594,7 +4383,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_views_starts_with_limit() {
-            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS STARTS WITH 'sales' LIMIT 5").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC VIEWS STARTS WITH 'sales' LIMIT 5");
             assert_eq!(
                 sql,
                 "SELECT * FROM list_semantic_views() WHERE name LIKE 'sales%' LIMIT 5"
@@ -4603,8 +4392,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_views_all_clauses() {
-            let sql =
-                rewrite_ddl("SHOW SEMANTIC VIEWS LIKE '%x%' STARTS WITH 'a' LIMIT 3").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC VIEWS LIKE '%x%' STARTS WITH 'a' LIMIT 3");
             assert_eq!(
                 sql,
                 "SELECT * FROM list_semantic_views() WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 3"
@@ -4618,7 +4406,7 @@ mod tests {
             // Pre-fix: `rest[..4]` sliced "aΩΩ" mid-codepoint and panicked
             // ("byte index 4 is not a char boundary"), surfacing as
             // "internal error (panic)" at the FFI boundary.
-            let err = rewrite_ddl("SHOW SEMANTIC VIEWS aΩΩ").unwrap_err();
+            let err = plan_ddl("SHOW SEMANTIC VIEWS aΩΩ").unwrap_err();
             assert!(err.contains("Unexpected tokens"), "got: {err}");
 
             // Every clause scanner position: 2, 3, 4, 5, 6-byte prefixes.
@@ -4629,7 +4417,7 @@ mod tests {
                 "SHOW SEMANTIC METRICS 東京",
                 "SHOW SEMANTIC FACTS ☕☕☕",
             ] {
-                let result = rewrite_ddl(q);
+                let result = plan_ddl(q);
                 assert!(result.is_err(), "expected clean error for {q}");
             }
         }
@@ -4643,7 +4431,7 @@ mod tests {
 
         #[test]
         fn test_show_views_like_non_ascii_pattern_roundtrips() {
-            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS LIKE '%café%'").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC VIEWS LIKE '%café%'");
             assert_eq!(
                 sql,
                 "SELECT * FROM list_semantic_views() WHERE name ILIKE '%café%'"
@@ -4652,7 +4440,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_views_in_requires_schema_or_database() {
-            let result = rewrite_ddl("SHOW SEMANTIC VIEWS IN some_view");
+            let result = plan_ddl("SHOW SEMANTIC VIEWS IN some_view");
             assert!(
                 result.is_err(),
                 "IN without SCHEMA/DATABASE should be rejected for SHOW SEMANTIC VIEWS"
@@ -4666,7 +4454,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_views_in_schema() {
-            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS IN SCHEMA main").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA main");
             assert_eq!(
                 sql,
                 "SELECT * FROM list_semantic_views() WHERE schema_name = 'main'"
@@ -4675,7 +4463,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_views_in_database() {
-            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS IN DATABASE memory").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC VIEWS IN DATABASE memory");
             assert_eq!(
                 sql,
                 "SELECT * FROM list_semantic_views() WHERE database_name = 'memory'"
@@ -4684,13 +4472,13 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_terse() {
-            let sql = rewrite_ddl("SHOW TERSE SEMANTIC VIEWS").unwrap();
+            let sql = passthrough_sql("SHOW TERSE SEMANTIC VIEWS");
             assert_eq!(sql, "SELECT * FROM list_terse_semantic_views()");
         }
 
         #[test]
         fn test_rewrite_show_terse_like() {
-            let sql = rewrite_ddl("SHOW TERSE SEMANTIC VIEWS LIKE '%prod%'").unwrap();
+            let sql = passthrough_sql("SHOW TERSE SEMANTIC VIEWS LIKE '%prod%'");
             assert_eq!(
                 sql,
                 "SELECT * FROM list_terse_semantic_views() WHERE name ILIKE '%prod%'"
@@ -4699,7 +4487,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_terse_in_schema() {
-            let sql = rewrite_ddl("SHOW TERSE SEMANTIC VIEWS IN SCHEMA main").unwrap();
+            let sql = passthrough_sql("SHOW TERSE SEMANTIC VIEWS IN SCHEMA main");
             assert_eq!(
                 sql,
                 "SELECT * FROM list_terse_semantic_views() WHERE schema_name = 'main'"
@@ -4708,7 +4496,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_views_in_schema_like() {
-            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS LIKE '%x%' IN SCHEMA main").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC VIEWS LIKE '%x%' IN SCHEMA main");
             assert_eq!(
                 sql,
                 "SELECT * FROM list_semantic_views() WHERE name ILIKE '%x%' AND schema_name = 'main'"
@@ -4717,13 +4505,13 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_columns_in_semantic_view() {
-            let sql = rewrite_ddl("SHOW COLUMNS IN SEMANTIC VIEW sales").unwrap();
+            let sql = passthrough_sql("SHOW COLUMNS IN SEMANTIC VIEW sales");
             assert_eq!(sql, "SELECT * FROM show_columns_in_semantic_view('sales')");
         }
 
         #[test]
         fn test_rewrite_show_views_for_metric_error() {
-            let result = rewrite_ddl("SHOW SEMANTIC VIEWS FOR METRIC m");
+            let result = plan_ddl("SHOW SEMANTIC VIEWS FOR METRIC m");
             assert!(
                 result.is_err(),
                 "FOR METRIC should be rejected for SHOW SEMANTIC VIEWS"
@@ -4734,7 +4522,7 @@ mod tests {
 
         #[test]
         fn test_rewrite_show_views_no_clauses_regression() {
-            let sql = rewrite_ddl("SHOW SEMANTIC VIEWS").unwrap();
+            let sql = passthrough_sql("SHOW SEMANTIC VIEWS");
             assert_eq!(sql, "SELECT * FROM list_semantic_views()");
         }
     }
@@ -4761,13 +4549,13 @@ mod tests {
 
     #[test]
     fn rewrite_show_materializations_all() {
-        let sql = rewrite_ddl("SHOW SEMANTIC MATERIALIZATIONS").unwrap();
+        let sql = passthrough_sql("SHOW SEMANTIC MATERIALIZATIONS");
         assert_eq!(sql, "SELECT * FROM show_semantic_materializations_all()");
     }
 
     #[test]
     fn rewrite_show_materializations_in_view() {
-        let sql = rewrite_ddl("SHOW SEMANTIC MATERIALIZATIONS IN my_view").unwrap();
+        let sql = passthrough_sql("SHOW SEMANTIC MATERIALIZATIONS IN my_view");
         assert_eq!(
             sql,
             "SELECT * FROM show_semantic_materializations('my_view')"
@@ -4800,55 +4588,50 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod phase43_view_comment_tests {
-        use crate::parse::validate_and_rewrite;
+        use super::*;
 
         #[test]
         fn test_view_comment_parsed() {
-            let result = validate_and_rewrite(
+            let RewriteAction::Create { def, .. } = plan(
                 "CREATE SEMANTIC VIEW my_view COMMENT = 'My view' AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.rev AS SUM(o.amount))"
-            ).unwrap().unwrap();
-            // The JSON should contain the comment
-            assert!(
-                result.contains("My view"),
-                "Generated SQL should contain the comment value: {result}"
-            );
+            ) else {
+                panic!("expected RewriteAction::Create");
+            };
+            // The comment (RAW) should be carried on the definition.
+            assert_eq!(def.comment.as_deref(), Some("My view"));
         }
 
         #[test]
         fn test_view_without_comment() {
-            let result = validate_and_rewrite(
+            let RewriteAction::Create { def, mode, .. } = plan(
                 "CREATE SEMANTIC VIEW my_view AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.rev AS SUM(o.amount))"
-            ).unwrap().unwrap();
-            assert!(
-                result.contains("create_semantic_view_from_json"),
-                "Should use correct function: {result}"
-            );
+            ) else {
+                panic!("expected RewriteAction::Create");
+            };
+            assert_eq!(mode, CreateMode::Create, "Should use plain CREATE mode");
+            assert_eq!(def.comment, None, "No comment should be carried");
         }
 
         #[test]
         fn test_view_comment_escaped_quotes() {
-            let result = validate_and_rewrite(
+            let RewriteAction::Create { def, .. } = plan(
                 "CREATE SEMANTIC VIEW my_view COMMENT = 'It''s great' AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.rev AS SUM(o.amount))"
-            ).unwrap().unwrap();
-            assert!(
-                result.contains("It''s great") || result.contains("It's great"),
-                "Generated SQL should contain the escaped comment: {result}"
-            );
+            ) else {
+                panic!("expected RewriteAction::Create");
+            };
+            // Structured variants carry the RAW (un-escaped) comment.
+            assert_eq!(def.comment.as_deref(), Some("It's great"));
         }
 
         #[test]
         fn test_view_comment_with_create_or_replace() {
-            let result = validate_and_rewrite(
+            let RewriteAction::Create { def, mode, .. } = plan(
                 "CREATE OR REPLACE SEMANTIC VIEW my_view COMMENT = 'Updated' AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.rev AS SUM(o.amount))"
-            ).unwrap().unwrap();
-            assert!(
-                result.contains("Updated"),
-                "Should contain comment: {result}"
-            );
-            assert!(
-                result.contains("create_or_replace"),
-                "Should use OR REPLACE function: {result}"
-            );
+            ) else {
+                panic!("expected RewriteAction::Create");
+            };
+            assert_eq!(def.comment.as_deref(), Some("Updated"));
+            assert_eq!(mode, CreateMode::OrReplace, "Should use OR REPLACE mode");
         }
     }
 
@@ -4898,59 +4681,65 @@ mod tests {
 
     #[test]
     fn test_validate_rewrite_alter_set_comment() {
-        let result = validate_and_rewrite("ALTER SEMANTIC VIEW v SET COMMENT = 'hello'")
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            result,
-            "SELECT * FROM alter_semantic_view_set_comment('v', 'hello')"
+            plan("ALTER SEMANTIC VIEW v SET COMMENT = 'hello'"),
+            RewriteAction::AlterSetComment {
+                name: "v".to_string(),
+                comment: "hello".to_string(),
+                if_exists: false,
+            }
         );
     }
 
     #[test]
     fn test_validate_rewrite_alter_unset_comment() {
-        let result = validate_and_rewrite("ALTER SEMANTIC VIEW v UNSET COMMENT")
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            result,
-            "SELECT * FROM alter_semantic_view_unset_comment('v')"
+            plan("ALTER SEMANTIC VIEW v UNSET COMMENT"),
+            RewriteAction::AlterUnsetComment {
+                name: "v".to_string(),
+                if_exists: false,
+            }
         );
     }
 
     #[test]
     fn test_validate_rewrite_alter_if_exists_set_comment() {
-        let result = validate_and_rewrite("ALTER SEMANTIC VIEW IF EXISTS v SET COMMENT = 'hello'")
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            result,
-            "SELECT * FROM alter_semantic_view_set_comment_if_exists('v', 'hello')"
+            plan("ALTER SEMANTIC VIEW IF EXISTS v SET COMMENT = 'hello'"),
+            RewriteAction::AlterSetComment {
+                name: "v".to_string(),
+                comment: "hello".to_string(),
+                if_exists: true,
+            }
         );
     }
 
     #[test]
     fn test_validate_rewrite_alter_if_exists_unset_comment() {
-        let result = validate_and_rewrite("ALTER SEMANTIC VIEW IF EXISTS v UNSET COMMENT")
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            result,
-            "SELECT * FROM alter_semantic_view_unset_comment_if_exists('v')"
+            plan("ALTER SEMANTIC VIEW IF EXISTS v UNSET COMMENT"),
+            RewriteAction::AlterUnsetComment {
+                name: "v".to_string(),
+                if_exists: true,
+            }
         );
     }
 
     #[test]
     fn test_validate_rewrite_alter_rename_unchanged() {
-        let result = validate_and_rewrite("ALTER SEMANTIC VIEW v RENAME TO w")
-            .unwrap()
-            .unwrap();
-        assert_eq!(result, "SELECT * FROM alter_semantic_view_rename('v', 'w')");
+        assert_eq!(
+            plan("ALTER SEMANTIC VIEW v RENAME TO w"),
+            RewriteAction::AlterRename {
+                name: "v".to_string(),
+                new_name: "w".to_string(),
+                if_exists: false,
+            }
+        );
     }
 
     #[test]
     fn test_validate_rewrite_alter_unsupported_operation() {
-        let err = validate_and_rewrite("ALTER SEMANTIC VIEW v TRUNCATE").unwrap_err();
+        let err = plan_rewrite("ALTER SEMANTIC VIEW v TRUNCATE").unwrap_err();
         assert!(
             err.message
                 .contains("RENAME TO, SET COMMENT, UNSET COMMENT"),
@@ -4961,18 +4750,20 @@ mod tests {
 
     #[test]
     fn test_validate_rewrite_alter_set_comment_escaped_quotes() {
-        let result = validate_and_rewrite("ALTER SEMANTIC VIEW v SET COMMENT = 'it''s a test'")
-            .unwrap()
-            .unwrap();
+        // Structured variants carry the RAW (un-escaped) comment.
         assert_eq!(
-            result,
-            "SELECT * FROM alter_semantic_view_set_comment('v', 'it''s a test')"
+            plan("ALTER SEMANTIC VIEW v SET COMMENT = 'it''s a test'"),
+            RewriteAction::AlterSetComment {
+                name: "v".to_string(),
+                comment: "it's a test".to_string(),
+                if_exists: false,
+            }
         );
     }
 
     #[test]
     fn test_validate_rewrite_alter_missing_operation() {
-        let err = validate_and_rewrite("ALTER SEMANTIC VIEW v").unwrap_err();
+        let err = plan_rewrite("ALTER SEMANTIC VIEW v").unwrap_err();
         assert!(
             err.message
                 .contains("RENAME TO, SET COMMENT, UNSET COMMENT"),
@@ -5062,17 +4853,25 @@ metrics:
     expr: SUM(o.amount)
     source_table: o
 $$"#;
-        let result = rewrite_ddl_yaml_body(DdlKind::Create, "test_view", yaml_text, None).unwrap();
-        let sql = result.unwrap();
-        assert!(sql.starts_with("SELECT * FROM create_semantic_view_from_json('test_view',"));
+        let action = rewrite_ddl_yaml_body(DdlKind::Create, "test_view", yaml_text, None).unwrap();
+        let RewriteAction::Create { name, mode, .. } = action else {
+            panic!("expected RewriteAction::Create, got {action:?}");
+        };
+        assert_eq!(name, "test_view");
+        assert_eq!(mode, CreateMode::Create);
     }
 
     #[test]
     fn test_yaml_rewrite_create_or_replace() {
         let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
-        let result = rewrite_ddl_yaml_body(DdlKind::CreateOrReplace, "v", yaml_text, None).unwrap();
-        let sql = result.unwrap();
-        assert!(sql.contains("create_or_replace_semantic_view_from_json"));
+        let action = rewrite_ddl_yaml_body(DdlKind::CreateOrReplace, "v", yaml_text, None).unwrap();
+        assert!(matches!(
+            action,
+            RewriteAction::Create {
+                mode: CreateMode::OrReplace,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -5080,8 +4879,13 @@ $$"#;
         let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
         let result =
             rewrite_ddl_yaml_body(DdlKind::CreateIfNotExists, "v", yaml_text, None).unwrap();
-        let sql = result.unwrap();
-        assert!(sql.contains("create_semantic_view_if_not_exists_from_json"));
+        assert!(matches!(
+            result,
+            RewriteAction::Create {
+                mode: CreateMode::IfNotExists,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -5112,9 +4916,11 @@ $$"#;
             Some("ddl comment".to_string()),
         )
         .unwrap();
-        let sql = result.unwrap();
+        let RewriteAction::Create { def, .. } = result else {
+            panic!("expected RewriteAction::Create, got {result:?}");
+        };
         // DDL comment overrides YAML comment
-        assert!(sql.contains("ddl comment"));
+        assert_eq!(def.comment.as_deref(), Some("ddl comment"));
     }
 
     #[test]
@@ -5129,16 +4935,18 @@ dimensions: []
 metrics: []
 $$"#;
         let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
-        let sql = result.unwrap();
+        let RewriteAction::Create { def, .. } = result else {
+            panic!("expected RewriteAction::Create, got {result:?}");
+        };
         // base_table should be populated from first table entry
-        assert!(sql.contains("orders"));
+        assert!(def.tables.iter().any(|t| t.table == "orders"));
     }
 
     #[test]
     fn test_yaml_rewrite_tagged_dollar_quote() {
         let yaml_text = "$yaml$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$yaml$";
         let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
-        assert!(result.is_some());
+        assert!(matches!(result, RewriteAction::Create { .. }));
     }
 
     // ===================================================================
@@ -5153,30 +4961,29 @@ tables: []
 dimensions: []
 metrics: []
 $$"#;
-        let result = validate_and_rewrite(query).unwrap();
-        assert!(result.is_some());
-        let sql = result.unwrap();
-        assert!(sql.contains("create_semantic_view_from_json('yaml_test'"));
+        let RewriteAction::Create { name, mode, .. } = plan(query) else {
+            panic!("expected RewriteAction::Create");
+        };
+        assert_eq!(name, "yaml_test");
+        assert_eq!(mode, CreateMode::Create);
     }
 
     #[test]
     fn test_from_yaml_case_insensitive() {
         let query = "CREATE SEMANTIC VIEW v from yaml $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
-        let result = validate_and_rewrite(query).unwrap();
-        assert!(result.is_some());
+        assert!(matches!(plan(query), RewriteAction::Create { .. }));
     }
 
     #[test]
     fn test_from_yaml_mixed_case() {
         let query = "CREATE SEMANTIC VIEW v From Yaml $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
-        let result = validate_and_rewrite(query).unwrap();
-        assert!(result.is_some());
+        assert!(matches!(plan(query), RewriteAction::Create { .. }));
     }
 
     #[test]
     fn test_error_message_mentions_from_yaml() {
         let query = "CREATE SEMANTIC VIEW v SOMETHING_ELSE";
-        let err = validate_and_rewrite(query).unwrap_err();
+        let err = plan_rewrite(query).unwrap_err();
         assert!(
             err.message.contains("FROM YAML"),
             "Error should mention FROM YAML: {}",
@@ -5187,25 +4994,34 @@ $$"#;
     #[test]
     fn test_create_or_replace_from_yaml() {
         let query = "CREATE OR REPLACE SEMANTIC VIEW v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
-        let result = validate_and_rewrite(query).unwrap();
-        let sql = result.unwrap();
-        assert!(sql.contains("create_or_replace_semantic_view_from_json"));
+        assert!(matches!(
+            plan(query),
+            RewriteAction::Create {
+                mode: CreateMode::OrReplace,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_create_if_not_exists_from_yaml() {
         let query = "CREATE SEMANTIC VIEW IF NOT EXISTS v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
-        let result = validate_and_rewrite(query).unwrap();
-        let sql = result.unwrap();
-        assert!(sql.contains("create_semantic_view_if_not_exists_from_json"));
+        assert!(matches!(
+            plan(query),
+            RewriteAction::Create {
+                mode: CreateMode::IfNotExists,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_comment_with_from_yaml() {
         let query = "CREATE SEMANTIC VIEW v COMMENT = 'my comment' FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
-        let result = validate_and_rewrite(query).unwrap();
-        let sql = result.unwrap();
-        assert!(sql.contains("my comment"));
+        let RewriteAction::Create { def, .. } = plan(query) else {
+            panic!("expected RewriteAction::Create");
+        };
+        assert_eq!(def.comment.as_deref(), Some("my comment"));
     }
 
     // ===================================================================
@@ -5312,10 +5128,15 @@ $$"#;
         let result =
             rewrite_ddl_yaml_file_body(DdlKind::Create, "myview", "'/path/to/def.yaml'", None)
                 .unwrap();
-        let sentinel = result.unwrap();
-        assert!(sentinel.starts_with("__SV_YAML_FILE__"));
-        assert!(sentinel.contains("path/to/def.yaml"));
-        assert!(sentinel.contains("\x010\x01myview\x01"));
+        assert_eq!(
+            result,
+            RewriteAction::CreateFromYamlFile {
+                file_path: "/path/to/def.yaml".to_string(),
+                name: "myview".to_string(),
+                comment: String::new(),
+                mode: CreateMode::Create,
+            }
+        );
     }
 
     #[test]
@@ -5327,16 +5148,30 @@ $$"#;
             Some("a comment".into()),
         )
         .unwrap();
-        let sentinel = result.unwrap();
-        assert!(sentinel.contains("\x011\x01v\x01a comment"));
+        assert_eq!(
+            result,
+            RewriteAction::CreateFromYamlFile {
+                file_path: "/f.yaml".to_string(),
+                name: "v".to_string(),
+                comment: "a comment".to_string(),
+                mode: CreateMode::OrReplace,
+            }
+        );
     }
 
     #[test]
     fn test_rewrite_ddl_yaml_file_body_if_not_exists() {
         let result =
             rewrite_ddl_yaml_file_body(DdlKind::CreateIfNotExists, "v", "'/f.yaml'", None).unwrap();
-        let sentinel = result.unwrap();
-        assert!(sentinel.contains("\x012\x01v\x01"));
+        assert_eq!(
+            result,
+            RewriteAction::CreateFromYamlFile {
+                file_path: "/f.yaml".to_string(),
+                name: "v".to_string(),
+                comment: String::new(),
+                mode: CreateMode::IfNotExists,
+            }
+        );
     }
 
     #[test]
@@ -5348,8 +5183,10 @@ $$"#;
             Some("my comment".into()),
         )
         .unwrap();
-        let sentinel = result.unwrap();
-        assert!(sentinel.contains("my comment"));
+        let RewriteAction::CreateFromYamlFile { comment, .. } = result else {
+            panic!("expected RewriteAction::CreateFromYamlFile, got {result:?}");
+        };
+        assert_eq!(comment, "my comment");
     }
 
     #[test]
@@ -5376,36 +5213,32 @@ $$"#;
     #[test]
     fn test_validate_and_rewrite_yaml_file() {
         let query = "CREATE SEMANTIC VIEW v FROM YAML FILE '/test.yaml'";
-        let result = validate_and_rewrite(query).unwrap();
-        let sentinel = result.unwrap();
         assert!(
-            sentinel.starts_with("__SV_YAML_FILE__"),
-            "Expected sentinel prefix, got: {}",
-            sentinel
+            matches!(plan(query), RewriteAction::CreateFromYamlFile { .. }),
+            "Expected CreateFromYamlFile action"
         );
     }
 
     #[test]
     fn test_validate_and_rewrite_yaml_file_case_insensitive() {
         let query = "CREATE SEMANTIC VIEW v from yaml file '/test.yaml'";
-        let result = validate_and_rewrite(query).unwrap();
-        let sentinel = result.unwrap();
-        assert!(sentinel.starts_with("__SV_YAML_FILE__"));
+        assert!(matches!(
+            plan(query),
+            RewriteAction::CreateFromYamlFile { .. }
+        ));
     }
 
     #[test]
     fn test_validate_and_rewrite_yaml_inline_still_works() {
         // Regression: FROM YAML $$...$$ still works after FILE branch is added
         let query = "CREATE SEMANTIC VIEW v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
-        let result = validate_and_rewrite(query).unwrap();
-        let sql = result.unwrap();
-        assert!(sql.contains("create_semantic_view_from_json"));
+        assert!(matches!(plan(query), RewriteAction::Create { .. }));
     }
 
     #[test]
     fn test_error_message_mentions_from_yaml_file() {
         let query = "CREATE SEMANTIC VIEW v SOMETHING_ELSE";
-        let err = validate_and_rewrite(query).unwrap_err();
+        let err = plan_rewrite(query).unwrap_err();
         assert!(
             err.message.contains("FROM YAML FILE"),
             "Error should mention FROM YAML FILE: {}",
@@ -5528,10 +5361,13 @@ $$"#;
     #[test]
     fn validate_and_rewrite_with_leading_comment_succeeds() {
         let q = "/* annotation */ DROP SEMANTIC VIEW v";
-        let result = validate_and_rewrite(q).expect("should not error");
-        assert!(result.is_some(), "expected DDL detection");
-        let sql = result.unwrap();
-        assert!(sql.contains("drop_semantic_view"), "got: {sql}");
+        assert_eq!(
+            plan(q),
+            RewriteAction::Drop {
+                name: "v".to_string(),
+                if_exists: false,
+            }
+        );
     }
 
     #[test]
@@ -5547,7 +5383,7 @@ $$"#;
         // Missing view name -- error position should point at the offset AFTER
         // both the comment AND the prefix, in the ORIGINAL query string.
         let q = "/* hi */ DROP SEMANTIC VIEW";
-        let err = validate_and_rewrite(q).expect_err("should error: missing name");
+        let err = plan_rewrite(q).expect_err("should error: missing name");
         let pos = err.position.expect("position should be set");
         // Position should be inside the original string (not into the stripped slice).
         // The prefix "DROP SEMANTIC VIEW" starts at byte 9 (after "/* hi */ ").
@@ -5606,8 +5442,8 @@ $$"#;
     //
     // Wires `crate::ident::{normalize_view_name, find_identifier_end}` into
     // the five DDL capture sites in this file. Each capture site is
-    // exercised here via its public-facing entry point (rewrite_ddl for
-    // DROP/DESCRIBE/SHOW COLUMNS, validate_and_rewrite for CREATE/ALTER,
+    // exercised here via its public-facing entry point (plan_ddl for
+    // DROP/DESCRIBE/SHOW COLUMNS, plan_rewrite for CREATE/ALTER,
     // extract_ddl_name directly) with quoted and FQN forms — the bare
     // unquoted last part is what reaches the catalog.
     // ===================================================================
@@ -5619,58 +5455,87 @@ $$"#;
 
         #[test]
         fn drop_with_quoted_fqn() {
-            let sql = rewrite_ddl("DROP SEMANTIC VIEW \"db\".\"sch\".\"v\"").unwrap();
-            assert_eq!(sql, "SELECT * FROM drop_semantic_view('v')");
+            assert_eq!(
+                plan("DROP SEMANTIC VIEW \"db\".\"sch\".\"v\""),
+                RewriteAction::Drop {
+                    name: "v".to_string(),
+                    if_exists: false,
+                }
+            );
         }
 
         #[test]
         fn drop_with_quoted_bare() {
-            let sql = rewrite_ddl("DROP SEMANTIC VIEW \"orders_sv\"").unwrap();
-            assert_eq!(sql, "SELECT * FROM drop_semantic_view('orders_sv')");
+            assert_eq!(
+                plan("DROP SEMANTIC VIEW \"orders_sv\""),
+                RewriteAction::Drop {
+                    name: "orders_sv".to_string(),
+                    if_exists: false,
+                }
+            );
         }
 
         #[test]
         fn drop_with_unquoted_fqn() {
-            let sql = rewrite_ddl("DROP SEMANTIC VIEW db.sch.v").unwrap();
-            assert_eq!(sql, "SELECT * FROM drop_semantic_view('v')");
+            assert_eq!(
+                plan("DROP SEMANTIC VIEW db.sch.v"),
+                RewriteAction::Drop {
+                    name: "v".to_string(),
+                    if_exists: false,
+                }
+            );
         }
 
         #[test]
         fn drop_with_partial_quoting() {
-            let sql = rewrite_ddl("DROP SEMANTIC VIEW main.\"orders_sv\"").unwrap();
-            assert_eq!(sql, "SELECT * FROM drop_semantic_view('orders_sv')");
+            assert_eq!(
+                plan("DROP SEMANTIC VIEW main.\"orders_sv\""),
+                RewriteAction::Drop {
+                    name: "orders_sv".to_string(),
+                    if_exists: false,
+                }
+            );
         }
 
         #[test]
         fn drop_with_quoted_whitespace_name() {
             // `"my view"` has an inner space — the quote-aware delimiter
             // scan must NOT truncate mid-quote.
-            let sql = rewrite_ddl("DROP SEMANTIC VIEW \"my view\"").unwrap();
-            assert_eq!(sql, "SELECT * FROM drop_semantic_view('my view')");
+            assert_eq!(
+                plan("DROP SEMANTIC VIEW \"my view\""),
+                RewriteAction::Drop {
+                    name: "my view".to_string(),
+                    if_exists: false,
+                }
+            );
         }
 
         #[test]
         fn drop_if_exists_with_quoted_fqn() {
-            let sql = rewrite_ddl("DROP SEMANTIC VIEW IF EXISTS \"db\".\"sch\".\"v\"").unwrap();
-            assert_eq!(sql, "SELECT * FROM drop_semantic_view_if_exists('v')");
+            assert_eq!(
+                plan("DROP SEMANTIC VIEW IF EXISTS \"db\".\"sch\".\"v\""),
+                RewriteAction::Drop {
+                    name: "v".to_string(),
+                    if_exists: true,
+                }
+            );
         }
 
         #[test]
         fn describe_with_quoted_fqn() {
-            let sql = rewrite_ddl("DESCRIBE SEMANTIC VIEW \"memory\".\"main\".\"v\"").unwrap();
+            let sql = passthrough_sql("DESCRIBE SEMANTIC VIEW \"memory\".\"main\".\"v\"");
             assert_eq!(sql, "SELECT * FROM describe_semantic_view('v')");
         }
 
         #[test]
         fn show_columns_with_quoted_fqn() {
-            let sql =
-                rewrite_ddl("SHOW COLUMNS IN SEMANTIC VIEW \"memory\".\"main\".\"v\"").unwrap();
+            let sql = passthrough_sql("SHOW COLUMNS IN SEMANTIC VIEW \"memory\".\"main\".\"v\"");
             assert_eq!(sql, "SELECT * FROM show_columns_in_semantic_view('v')");
         }
 
         #[test]
         fn drop_with_unterminated_quote_errors() {
-            let err = rewrite_ddl("DROP SEMANTIC VIEW \"foo").unwrap_err();
+            let err = plan_ddl("DROP SEMANTIC VIEW \"foo").unwrap_err();
             assert!(
                 err.contains("Invalid view name") && err.contains("unterminated"),
                 "expected invalid-view-name/unterminated error, got: {err}"
@@ -5738,7 +5603,7 @@ $$"#;
             let q = format!("CREATE SEMANTIC VIEW \"foo {MINIMAL_BODY}");
             // Since the delimiter scan saturates at input.len() inside an
             // unterminated quote, normalize_view_name surfaces the error.
-            let err = validate_and_rewrite(&q).unwrap_err();
+            let err = plan_rewrite(&q).unwrap_err();
             assert!(
                 err.message.contains("Invalid view name") && err.message.contains("unterminated"),
                 "expected invalid-view-name error, got: {}",
@@ -5750,63 +5615,68 @@ $$"#;
 
         #[test]
         fn alter_rename_source_quoted() {
-            let sql = validate_and_rewrite("ALTER SEMANTIC VIEW \"v\" RENAME TO new_name")
-                .unwrap()
-                .unwrap();
             assert_eq!(
-                sql,
-                "SELECT * FROM alter_semantic_view_rename('v', 'new_name')"
+                plan("ALTER SEMANTIC VIEW \"v\" RENAME TO new_name"),
+                RewriteAction::AlterRename {
+                    name: "v".to_string(),
+                    new_name: "new_name".to_string(),
+                    if_exists: false,
+                }
             );
         }
 
         #[test]
         fn alter_rename_target_quoted() {
-            let sql = validate_and_rewrite(
-                "ALTER SEMANTIC VIEW v RENAME TO \"memory\".\"main\".\"new_v\"",
-            )
-            .unwrap()
-            .unwrap();
             assert_eq!(
-                sql,
-                "SELECT * FROM alter_semantic_view_rename('v', 'new_v')"
+                plan("ALTER SEMANTIC VIEW v RENAME TO \"memory\".\"main\".\"new_v\""),
+                RewriteAction::AlterRename {
+                    name: "v".to_string(),
+                    new_name: "new_v".to_string(),
+                    if_exists: false,
+                }
             );
         }
 
         #[test]
         fn alter_rename_both_quoted() {
-            let sql = validate_and_rewrite(
-                "ALTER SEMANTIC VIEW \"memory\".\"main\".\"v\" RENAME TO \"memory\".\"main\".\"new_v\"",
-            )
-            .unwrap()
-            .unwrap();
             assert_eq!(
-                sql,
-                "SELECT * FROM alter_semantic_view_rename('v', 'new_v')"
+                plan(
+                    "ALTER SEMANTIC VIEW \"memory\".\"main\".\"v\" RENAME TO \"memory\".\"main\".\"new_v\""
+                ),
+                RewriteAction::AlterRename {
+                    name: "v".to_string(),
+                    new_name: "new_v".to_string(),
+                    if_exists: false,
+                }
             );
         }
 
         #[test]
         fn alter_set_comment_with_quoted_source() {
-            let sql = validate_and_rewrite("ALTER SEMANTIC VIEW \"v\" SET COMMENT = 'x'")
-                .unwrap()
-                .unwrap();
             assert_eq!(
-                sql,
-                "SELECT * FROM alter_semantic_view_set_comment('v', 'x')"
+                plan("ALTER SEMANTIC VIEW \"v\" SET COMMENT = 'x'"),
+                RewriteAction::AlterSetComment {
+                    name: "v".to_string(),
+                    comment: "x".to_string(),
+                    if_exists: false,
+                }
             );
         }
 
         #[test]
         fn alter_unset_comment_with_quoted_source() {
-            let sql = validate_and_rewrite("ALTER SEMANTIC VIEW \"v\" UNSET COMMENT")
-                .unwrap()
-                .unwrap();
-            assert_eq!(sql, "SELECT * FROM alter_semantic_view_unset_comment('v')");
+            assert_eq!(
+                plan("ALTER SEMANTIC VIEW \"v\" UNSET COMMENT"),
+                RewriteAction::AlterUnsetComment {
+                    name: "v".to_string(),
+                    if_exists: false,
+                }
+            );
         }
 
         #[test]
         fn alter_rename_target_unterminated_quote_errors() {
-            let err = validate_and_rewrite("ALTER SEMANTIC VIEW v RENAME TO \"foo").unwrap_err();
+            let err = plan_rewrite("ALTER SEMANTIC VIEW v RENAME TO \"foo").unwrap_err();
             assert!(
                 err.message.contains("Invalid new view name in RENAME TO"),
                 "expected invalid-new-view-name error, got: {}",

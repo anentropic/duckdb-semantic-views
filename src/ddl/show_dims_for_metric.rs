@@ -67,13 +67,11 @@ pub unsafe extern "C" fn sv_show_semantic_dimensions_for_metric_bind_rust(
             Ok(Some(j)) => j,
             Ok(None) => {
                 let available = reader.list_names().unwrap_or_default();
+                let not_found = crate::catalog::view_not_found_msg(&view_name);
                 let msg = if let Some(suggestion) = suggest_closest(&view_name, &available) {
-                    format!(
-                        "semantic view '{}' does not exist. Did you mean '{}'?",
-                        view_name, suggestion
-                    )
+                    format!("{not_found}. Did you mean '{suggestion}'?")
                 } else {
-                    format!("semantic view '{}' does not exist", view_name)
+                    not_found
                 };
                 write_err(error_buf, error_buf_len, &msg);
                 return 1_u8;

@@ -85,7 +85,7 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
                 write_err(
                     error_buf,
                     error_buf_len,
-                    &format!("semantic view '{bare_name}' does not exist"),
+                    &crate::catalog::view_not_found_msg(&bare_name),
                 );
                 return 1_u8;
             }

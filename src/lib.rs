@@ -13,6 +13,15 @@ pub mod render_ddl;
 pub mod render_yaml;
 pub mod util;
 
+/// Minimum `DuckDB` version this extension declares compatibility with, passed to
+/// `duckdb_rs_extension_api_init` at load time.
+///
+/// This must stay in lockstep with the `DuckDB` version the crate is built and
+/// tested against. The three sources of truth — this constant, the
+/// `.duckdb-version` file, and the pinned `libduckdb-sys` version in
+/// `Cargo.toml` — are asserted consistent by `tests::duckdb_version_pins_agree`.
+pub const MINIMUM_DUCKDB_VERSION: &str = "v1.5.4";
+
 /// Test helpers for integration tests.
 ///
 /// Exposes low-level FFI utilities needed by `tests/output_proptest.rs` which
@@ -899,8 +908,6 @@ mod extension {
     // to `init_extension`.
     // -----------------------------------------------------------------------
 
-    const MINIMUM_DUCKDB_VERSION: &str = "v1.4.4";
-
     /// Internal entrypoint with error handling.
     ///
     /// # Safety
@@ -912,7 +919,7 @@ mod extension {
         access: *const ffi::duckdb_extension_access,
     ) -> std::result::Result<bool, Box<dyn Error>> {
         let have_api_struct =
-            ffi::duckdb_rs_extension_api_init(info, access, MINIMUM_DUCKDB_VERSION).unwrap();
+            ffi::duckdb_rs_extension_api_init(info, access, crate::MINIMUM_DUCKDB_VERSION).unwrap();
 
         if !have_api_struct {
             return Ok(false);
@@ -981,23 +988,58 @@ mod extension {
 
 #[cfg(test)]
 mod tests {
-    /// Guard that `duckdb_value` (used by `value_raw_ptr` transmute in
-    /// `query/table_function.rs`) remains pointer-sized. The full layout
-    /// check against `duckdb::vtab::Value` requires the `extension` feature
-    /// (which enables `duckdb/vscalar`) and is validated during extension
-    /// builds via `just build`.
+    /// Machine-guards the three `DuckDB` version sources of truth against drift
+    /// (AR-8): `MINIMUM_DUCKDB_VERSION`, the `.duckdb-version` file, and the
+    /// pinned `libduckdb-sys` version in `Cargo.toml` must all describe the
+    /// same `DuckDB` release.
     #[test]
-    fn duckdb_value_is_pointer_sized() {
-        use libduckdb_sys as ffi;
+    fn duckdb_version_pins_agree() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+        // `.duckdb-version` is the canonical human-readable version, e.g. "v1.5.4".
+        let version_file =
+            std::fs::read_to_string(std::path::Path::new(manifest_dir).join(".duckdb-version"))
+                .expect("read .duckdb-version");
+        let canonical = version_file.trim();
+
+        // The version declared to the loader must match it verbatim.
         assert_eq!(
-            std::mem::size_of::<ffi::duckdb_value>(),
-            std::mem::size_of::<*mut std::ffi::c_void>(),
-            "duckdb_value is no longer pointer-sized -- value_raw_ptr transmute may be broken"
+            super::MINIMUM_DUCKDB_VERSION,
+            canonical,
+            "MINIMUM_DUCKDB_VERSION disagrees with .duckdb-version"
         );
+
+        // The libduckdb-sys pin encodes the same release as
+        // 1.<major*10000 + minor*100 + patch>.0 (e.g. v1.5.4 -> =1.10504.0).
+        let mut parts = canonical
+            .strip_prefix('v')
+            .unwrap_or(canonical)
+            .split('.')
+            .map(|p| p.parse::<u32>().expect("numeric version component"));
+        let (major, minor, patch) = (
+            parts.next().expect("major"),
+            parts.next().expect("minor"),
+            parts.next().expect("patch"),
+        );
+        let expected_encoded = major * 10000 + minor * 100 + patch;
+
+        let cargo_toml =
+            std::fs::read_to_string(std::path::Path::new(manifest_dir).join("Cargo.toml"))
+                .expect("read Cargo.toml");
+        let pin_line = cargo_toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("libduckdb-sys"))
+            .expect("libduckdb-sys pin line in Cargo.toml");
+        let encoded: u32 = pin_line
+            .split('"')
+            .find(|s| s.starts_with("=1."))
+            .and_then(|pin| pin.trim_start_matches("=1.").split('.').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("could not parse libduckdb-sys pin from: {pin_line}"));
         assert_eq!(
-            std::mem::align_of::<ffi::duckdb_value>(),
-            std::mem::align_of::<*mut std::ffi::c_void>(),
-            "duckdb_value alignment changed -- value_raw_ptr transmute may be broken"
+            encoded, expected_encoded,
+            "libduckdb-sys pin =1.{encoded}.0 disagrees with .duckdb-version {canonical} \
+             (expected =1.{expected_encoded}.0)"
         );
     }
 

@@ -14,7 +14,7 @@
 //! access. The work performed is:
 //!   1. UTF-8 validate the input bytes (was `from_utf8_unchecked` pre-v0.8.0;
 //!      hardened to checked `from_utf8` for B2).
-//!   2. Dispatch to `validate_and_rewrite` — the same entry point that
+//!   2. Dispatch to `plan_rewrite` — the same entry point that
 //!      `rewrite_to_native_sql` invokes for syntactic validation before
 //!      consulting the catalog.
 //!   3. Either return rewritten SQL (DDL accepted) or a `ParseError`
@@ -28,7 +28,7 @@
 //! the C++ side, after parse_function publishes a position).
 
 use libfuzzer_sys::fuzz_target;
-use semantic_views::parse::validate_and_rewrite;
+use semantic_views::parse::plan_rewrite;
 
 fuzz_target!(|data: &[u8]| {
     // Step 1: matches the from_utf8 call inside sv_parser_override_rust.
@@ -41,5 +41,5 @@ fuzz_target!(|data: &[u8]| {
     // Step 2: syntax-only validation pipeline. Must never panic for any
     // input, including queries with embedded NUL bytes, leading
     // whitespace, partial DDL prefixes, or arbitrary garbage.
-    let _ = validate_and_rewrite(query);
+    let _ = plan_rewrite(query);
 });

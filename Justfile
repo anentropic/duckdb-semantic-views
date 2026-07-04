@@ -115,9 +115,9 @@ test-adbc: build
 # Exercises SELECT ... FROM semantic_view(...) through adbc_driver_duckdb
 # across main expand path, FACTS, semi-additive, window, materialization
 # routing, non-default-schema base tables, and multi-DB ATTACH. Regression
-# guard for EXPAND-CTX-01..03 (v0.10.0). Scenarios 3-7 are gated by
-# SKIP_UNTIL_PLAN_02 until Phase 66 Plan 02 lands the qualify_and_quote_table_ref
-# migration of the FACTS/semi-additive/window/materialization sites.
+# guard for EXPAND-CTX-01..03 (v0.10.0). All scenarios run: the
+# qualify_and_quote_table_ref migration of the FACTS/semi-additive/window/
+# materialization sites landed in v0.10.0.
 test-adbc-queries: build
     uv run test/integration/test_adbc_queries.py
 

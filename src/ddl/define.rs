@@ -63,7 +63,7 @@ pub fn enrich_definition_for_create(
     //    `resolve_pk_from_catalog` (D-05). Tables without explicit PRIMARY
     //    KEY in the TABLES clause that are FK-referenced by another table
     //    surface as the D-06 hard error in step 2.
-    crate::parse::infer_cardinality(&def.tables, &mut def.joins).map_err(|e| e.message)?;
+    crate::graph::infer_cardinality(&def.tables, &mut def.joins).map_err(|e| e.message)?;
 
     // 2. Catch joins that reference a target without a PRIMARY KEY (or
     //    UNIQUE constraint) declared in the TABLES clause.

@@ -1,6 +1,6 @@
-# Tech Debt & Deferred Items (v0.1.0 -> v0.5.0)
+# Tech Debt & Deferred Items (v0.1.0 -> v0.10.0)
 
-This document catalogs all accepted design decisions, deferred requirements, known architectural limitations, and test coverage gaps across milestones v0.1.0 through v0.5.0. It serves as the canonical record of trade-offs so that future work does not need to re-discover decisions made during earlier milestones.
+This document catalogs all accepted design decisions, deferred requirements, known architectural limitations, and test coverage gaps across milestones v0.1.0 through v0.10.0. It serves as the canonical record of trade-offs so that future work does not need to re-discover decisions made during earlier milestones.
 
 ## Accepted Design Decisions
 
@@ -230,6 +230,5 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ---
 
-**Date:** 2026-05-03
-**Milestone:** v0.8.0
-**Audit report:** `.planning/milestones/v0.8.0-MILESTONE-AUDIT.md`
+**Last updated:** 2026-07-04 (v0.10.4)
+**Most recent full audit:** v0.8.0 — `.planning/milestones/v0.8.0-MILESTONE-AUDIT.md` (entries #24–#25 added post-audit during v0.10.0)
