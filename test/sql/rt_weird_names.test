@@ -64,3 +64,64 @@ query I
 SELECT count(*) FROM list_semantic_views();
 ----
 0
+
+# ---------------------------------------------------------------------------
+# AR-2 coverage rebuild: a view name containing a single quote must survive the
+# full CREATE -> ALTER RENAME -> ALTER SET COMMENT -> DROP lifecycle. Each DDL
+# emits native DML with the name embedded as a SQL string literal, so this
+# exercises escape_sql_arg's quote-doubling ('it''s_ok') at the emission
+# boundary end-to-end. (Before AR-2 this was pinned by unit assertions on the
+# generated fn-call string; that assertion moved here when RewriteAction became
+# the parser's structured output and names are carried raw.)
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW "it's_ok" AS
+  TABLES (o AS rtw_orders PRIMARY KEY (id))
+  DIMENSIONS (o.city AS o.city)
+  METRICS (o.total AS SUM(o.amount));
+
+# Name stored with the literal single quote (not doubled) in the catalog.
+query I
+SELECT name FROM list_semantic_views();
+----
+it's_ok
+
+# Query lookup with the quoted-identifier argument (single quote doubled in the
+# SQL string literal argument).
+query II
+FROM semantic_view('"it''s_ok"', dimensions := ['city'], metrics := ['total'])
+ORDER BY 1;
+----
+São Paulo	100.00
+Tōkyō	50.00
+
+# ALTER RENAME embeds BOTH the old and new single-quote names in the UPDATE +
+# guard SQL.
+statement ok
+ALTER SEMANTIC VIEW "it's_ok" RENAME TO "it's_fine";
+
+query I
+SELECT name FROM list_semantic_views();
+----
+it's_fine
+
+# ALTER SET COMMENT: name in the guard/UPDATE WHERE, and a comment that itself
+# contains a single quote (json_merge_patch path).
+statement ok
+ALTER SEMANTIC VIEW "it's_fine" SET COMMENT = 'it''s a comment';
+
+query I
+SELECT count(*) FROM describe_semantic_view('it''s_fine')
+WHERE property = 'COMMENT' AND property_value = 'it''s a comment';
+----
+1
+
+# DROP embeds the single-quote name in the DELETE + existence guard.
+statement ok
+DROP SEMANTIC VIEW "it's_fine";
+
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+0

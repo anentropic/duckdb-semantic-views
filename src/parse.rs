@@ -764,7 +764,7 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
     match kind {
         // CREATE forms no longer supported via plan_ddl -- use plan_rewrite
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
-            Err("CREATE forms must use validate_and_rewrite".to_string())
+            Err("CREATE forms must use plan_rewrite".to_string())
         }
         // DROP: native DELETE (structured).
         DdlKind::Drop | DdlKind::DropIfExists => {
@@ -929,7 +929,7 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Validation layer: ParseError, detect_near_miss, validate_and_rewrite
+// Validation layer: ParseError, detect_near_miss, plan_rewrite
 // ---------------------------------------------------------------------------
 
 /// The DDL prefixes used for near-miss detection.
@@ -1076,130 +1076,6 @@ impl CreateMode {
     fn if_not_exists(self) -> bool {
         matches!(self, CreateMode::IfNotExists)
     }
-    /// `*_from_json` function name for the `render_legacy` string form.
-    fn json_fn_name(self) -> &'static str {
-        match self {
-            CreateMode::Create => "create_semantic_view_from_json",
-            CreateMode::OrReplace => "create_or_replace_semantic_view_from_json",
-            CreateMode::IfNotExists => "create_semantic_view_if_not_exists_from_json",
-        }
-    }
-    /// YAML-FILE sentinel kind number for the `render_legacy` string form.
-    fn kind_num(self) -> u8 {
-        match self {
-            CreateMode::Create => 0,
-            CreateMode::OrReplace => 1,
-            CreateMode::IfNotExists => 2,
-        }
-    }
-}
-
-/// Render a `RewriteAction` to its `SELECT * FROM <fn>(...)` / YAML-FILE string
-/// form — the stable string view of the rewriter used for testing and
-/// introspection.
-///
-/// This backs the public [`validate_and_rewrite`] entry point, which the unit,
-/// integration, and proptest suites assert against (the generated fn-call SQL,
-/// including quote-escaping). It is NOT on the execution path: AR-2 removed the
-/// string round-trip from lowering — `rewrite_to_native_sql` consumes the
-/// structured `RewriteAction` directly and never renders this string.
-fn render_legacy(action: &RewriteAction) -> Result<String, ParseError> {
-    let sql = match action {
-        RewriteAction::Create { name, def, mode } => {
-            // Propagate serialization failure rather than panicking (the
-            // pre-AR-2 rewriters returned a ParseError here); `validate_and_rewrite`
-            // is reachable from the FFI error-reporting path via
-            // `run_validation_for_parse_function`.
-            let json = serde_json::to_string(def.as_ref()).map_err(|e| ParseError {
-                message: format!("Failed to serialize definition: {e}"),
-                position: None,
-            })?;
-            let safe_name = name.replace('\'', "''");
-            let safe_json = json.replace('\'', "''");
-            format!(
-                "SELECT * FROM {}('{safe_name}', '{safe_json}')",
-                mode.json_fn_name()
-            )
-        }
-        RewriteAction::CreateFromYamlFile {
-            file_path,
-            name,
-            comment,
-            mode,
-        } => {
-            format!(
-                "__SV_YAML_FILE__{file_path}\x01{}\x01{name}\x01{comment}",
-                mode.kind_num()
-            )
-        }
-        RewriteAction::Drop { name, if_exists } => {
-            format!(
-                "SELECT * FROM drop_semantic_view{}('{}')",
-                if_exists_suffix(*if_exists),
-                name.replace('\'', "''")
-            )
-        }
-        RewriteAction::AlterRename {
-            name,
-            new_name,
-            if_exists,
-        } => {
-            format!(
-                "SELECT * FROM alter_semantic_view_rename{}('{}', '{}')",
-                if_exists_suffix(*if_exists),
-                name.replace('\'', "''"),
-                new_name.replace('\'', "''")
-            )
-        }
-        RewriteAction::AlterSetComment {
-            name,
-            comment,
-            if_exists,
-        } => {
-            format!(
-                "SELECT * FROM alter_semantic_view_set_comment{}('{}', '{}')",
-                if_exists_suffix(*if_exists),
-                name.replace('\'', "''"),
-                comment.replace('\'', "''")
-            )
-        }
-        RewriteAction::AlterUnsetComment { name, if_exists } => {
-            format!(
-                "SELECT * FROM alter_semantic_view_unset_comment{}('{}')",
-                if_exists_suffix(*if_exists),
-                name.replace('\'', "''")
-            )
-        }
-        RewriteAction::Passthrough(sql) => sql.clone(),
-    };
-    Ok(sql)
-}
-
-/// `_if_exists` function-name suffix for DROP/ALTER `IF EXISTS` forms.
-fn if_exists_suffix(if_exists: bool) -> &'static str {
-    if if_exists {
-        "_if_exists"
-    } else {
-        ""
-    }
-}
-
-/// Validate a DDL statement and render it to `SELECT * FROM fn(...)` string form.
-///
-/// This is the public string-form entry point the unit, integration, and
-/// proptest suites assert against — it wraps [`plan_rewrite`] + [`render_legacy`]
-/// to give a stable, escaping-visible view of the rewrite. Production lowering
-/// (`rewrite_to_native_sql`) consumes the structured [`RewriteAction`] from
-/// `plan_rewrite` directly and never renders this string.
-///
-/// Returns:
-/// - `Ok(Some(sql))` -- DDL detected and validated, rewritten SQL returned
-/// - `Ok(None)` -- not a semantic view DDL statement
-/// - `Err(ParseError)` -- validation error with message and optional position
-pub fn validate_and_rewrite(query: &str) -> Result<Option<String>, ParseError> {
-    plan_rewrite(query)?
-        .map(|action| render_legacy(&action))
-        .transpose()
 }
 
 /// Validate a DDL statement and produce a structured [`RewriteAction`] (AR-2).
@@ -2701,7 +2577,10 @@ unsafe fn run_validation_for_parse_function(
     query: &str,
 ) -> Result<Option<String>, ParseError> {
     if ctx_ptr.is_null() {
-        return validate_and_rewrite(query);
+        // Syntax-only fallback (ctx lost). Only the Ok(Some)/Ok(None)/Err shape
+        // matters here — the caller discards the string — so plan without
+        // rendering any SQL.
+        return plan_rewrite(query).map(|opt| opt.map(|_| String::new()));
     }
     let ctx = &*(ctx_ptr as *const OverrideContext);
     rewrite_to_native_sql(ctx, query)
@@ -2716,7 +2595,7 @@ unsafe fn run_validation_for_parse_function(
     _ctx_ptr: *const std::ffi::c_void,
     query: &str,
 ) -> Result<Option<String>, ParseError> {
-    validate_and_rewrite(query)
+    plan_rewrite(query).map(|opt| opt.map(|_| String::new()))
 }
 
 #[cfg(test)]
@@ -3256,7 +3135,7 @@ mod tests {
         let err = plan_ddl("CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])")
             .unwrap_err();
         assert!(
-            err.contains("validate_and_rewrite"),
+            err.contains("plan_rewrite"),
             "CREATE forms should be rejected by plan_ddl, got: {err}"
         );
     }
@@ -3804,7 +3683,7 @@ mod tests {
     }
 
     // ===================================================================
-    // validate_and_rewrite tests
+    // plan_rewrite tests
     // ===================================================================
 
     #[test]
@@ -5563,8 +5442,8 @@ $$"#;
     //
     // Wires `crate::ident::{normalize_view_name, find_identifier_end}` into
     // the five DDL capture sites in this file. Each capture site is
-    // exercised here via its public-facing entry point (rewrite_ddl for
-    // DROP/DESCRIBE/SHOW COLUMNS, validate_and_rewrite for CREATE/ALTER,
+    // exercised here via its public-facing entry point (plan_ddl for
+    // DROP/DESCRIBE/SHOW COLUMNS, plan_rewrite for CREATE/ALTER,
     // extract_ddl_name directly) with quoted and FQN forms — the bare
     // unquoted last part is what reaches the catalog.
     // ===================================================================
