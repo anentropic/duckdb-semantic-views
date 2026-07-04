@@ -272,7 +272,7 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
-    /// Rewrite of CREATE forms via validate_and_rewrite produces correct _from_json function call.
+    /// Rewrite of CREATE forms via plan_rewrite produces a Create action carrying the view name.
     #[test]
     fn rewrite_create_forms(
         form_idx in 0..3usize,
@@ -280,23 +280,20 @@ proptest! {
     ) {
         let (prefix, _kind, _fn_name) = CREATE_FORMS[form_idx];
         let ddl = format!("{prefix}{}", build_as_body_suffix(&name));
-        let result = validate_and_rewrite(&ddl);
+        let result = plan_rewrite(&ddl);
         prop_assert!(
             result.is_ok(),
             "Expected Ok for valid AS-body DDL, got: {:?}",
             result
         );
-        let sql = result.unwrap().unwrap();
-        prop_assert!(
-            sql.starts_with("SELECT * FROM "),
-            "Expected rewrite to start with 'SELECT * FROM ', got: {}",
-            sql
-        );
-        prop_assert!(
-            sql.contains(&format!("'{name}'")),
-            "Expected rewrite to contain view name '{}', got: {}",
-            name, sql
-        );
+        // A rewrite was produced: all three CREATE forms map to
+        // RewriteAction::Create carrying the (bare, normalized) view name.
+        match result.unwrap().unwrap() {
+            RewriteAction::Create { name: n, .. } => {
+                prop_assert_eq!(n, name);
+            }
+            other => prop_assert!(false, "Expected RewriteAction::Create, got: {:?}", other),
+        }
     }
 
     /// extract_ddl_name returns the correct name for CREATE forms.
@@ -377,10 +374,19 @@ proptest! {
         let extracted = extract_ddl_name(&ddl).unwrap();
         prop_assert_eq!(extracted, Some(content.clone()));
 
-        // The rewrite embeds the bare content, single-quote-escaped.
-        let sql = rewrite_result(&ddl).unwrap();
-        let expected = format!("SELECT * FROM {fn_name}('{}')", content.replace('\'', "''"));
-        prop_assert_eq!(sql, expected);
+        // The rewrite embeds the bare content: DROP carries the view name
+        // structurally; DESCRIBE passes through read-side SQL with the name
+        // single-quote-escaped.
+        let action = rewrite_result(&ddl).unwrap();
+        match action {
+            RewriteAction::Drop { name, .. } => prop_assert_eq!(name, content.clone()),
+            RewriteAction::Passthrough(sql) => {
+                let expected =
+                    format!("SELECT * FROM {fn_name}('{}')", content.replace('\'', "''"));
+                prop_assert_eq!(sql, expected);
+            }
+            other => prop_assert!(false, "unexpected rewrite action: {:?}", other),
+        }
     }
 
     /// Unquoted mixed-case names fold to lowercase (PA-8) at extraction.
@@ -396,11 +402,12 @@ proptest! {
     }
 }
 
-/// validate_and_rewrite adapter: name-only forms route through the same
-/// public entry the parser hook uses.
-fn rewrite_result(ddl: &str) -> Result<String, String> {
-    match validate_and_rewrite(ddl) {
-        Ok(Some(sql)) => Ok(sql),
+/// `plan_rewrite` adapter: name-only forms route through the same public entry
+/// the parser hook uses, surfacing the structured `RewriteAction` (or the error
+/// message on failure / "not ours" on a non-match).
+fn rewrite_result(ddl: &str) -> Result<RewriteAction, String> {
+    match plan_rewrite(ddl) {
+        Ok(Some(action)) => Ok(action),
         Ok(None) => Err("not ours".to_string()),
         Err(e) => Err(e.message),
     }
@@ -417,7 +424,7 @@ proptest! {
         spaces in "[ ]{0,20}",
     ) {
         let query = format!("{spaces}CREATE SEMANTIC VIEW x (tbles := [])");
-        let err = validate_and_rewrite(&query).unwrap_err();
+        let err = plan_rewrite(&query).unwrap_err();
         prop_assert!(
             err.message.contains("Expected 'AS' or 'FROM YAML'"),
             "Expected 'Expected AS or FROM YAML' error, got: {}",
@@ -432,7 +439,7 @@ proptest! {
         spaces in "[ ]{0,20}",
     ) {
         let query = format!("{spaces}DROP SEMANTIC VIEW");
-        let err = validate_and_rewrite(&query).unwrap_err();
+        let err = plan_rewrite(&query).unwrap_err();
         let pos = err.position.unwrap();
         // Position should be at or after the end of "DROP SEMANTIC VIEW" in the trimmed query.
         let prefix_len = "drop semantic view".len();
@@ -457,7 +464,7 @@ proptest! {
         name in arb_view_name(),
     ) {
         let query = format!("{spaces}CREATE SEMANTIC VIEW {name}");
-        let err = validate_and_rewrite(&query).unwrap_err();
+        let err = plan_rewrite(&query).unwrap_err();
         let pos = err.position.unwrap();
         // Position should point after the view name.
         prop_assert!(
@@ -472,7 +479,7 @@ proptest! {
         );
     }
 
-    /// validate_and_rewrite returns Ok(Some(_)) for valid AS-body DDL with varying whitespace.
+    /// plan_rewrite returns Ok(Some(_)) for valid AS-body DDL with varying whitespace.
     #[test]
     fn valid_ddl_with_whitespace_succeeds(
         spaces in "[ ]{0,20}",
@@ -481,16 +488,15 @@ proptest! {
         let query = format!(
             "{spaces}CREATE SEMANTIC VIEW{}", build_as_body_suffix(&name)
         );
-        let result = validate_and_rewrite(&query);
+        let result = plan_rewrite(&query);
         prop_assert!(
             result.is_ok(),
             "Expected Ok for valid DDL, got: {:?}",
             result
         );
-        let sql = result.unwrap();
         prop_assert!(
-            sql.is_some(),
-            "Expected Some(sql) for valid DDL"
+            result.unwrap().is_some(),
+            "Expected Some(_) for valid DDL"
         );
     }
 }
@@ -584,34 +590,40 @@ proptest! {
         );
     }
 
-    /// AS-body validate_and_rewrite returns Ok(Some(_)) for valid keyword body,
-    /// and the rewritten SQL uses the create_semantic_view_from_json route with
-    /// the view name embedded as a quoted string.
+    /// AS-body plan_rewrite returns Ok(Some(_)) for valid keyword body,
+    /// producing the CREATE route (RewriteAction::Create, mode Create) with the
+    /// view name carried structurally.
     #[test]
     fn as_body_validate_and_rewrite_succeeds(
         name in arb_view_name(),
     ) {
         let query = format!("CREATE SEMANTIC VIEW{}", build_as_body_suffix(&name));
-        let result = validate_and_rewrite(&query);
+        let result = plan_rewrite(&query);
         prop_assert!(
             result.is_ok(),
             "Expected Ok for valid AS-body DDL, got: {:?}",
             result
         );
-        let sql = result.unwrap();
+        let action = result.unwrap();
         prop_assert!(
-            sql.is_some(),
-            "Expected Some(sql) for valid AS-body DDL"
+            action.is_some(),
+            "Expected Some(_) for valid AS-body DDL"
         );
-        let sql = sql.unwrap();
-        prop_assert!(
-            sql.starts_with("SELECT * FROM create_semantic_view_from_json("),
-            "Expected create_semantic_view_from_json route, got: {sql}"
-        );
-        prop_assert!(
-            sql.contains(&format!("'{name}'")),
-            "Expected view name in rewritten SQL, got: {sql}"
-        );
+        // Plain CREATE takes the create route (mode Create) and embeds the name.
+        match action.unwrap() {
+            RewriteAction::Create {
+                name: n,
+                mode: CreateMode::Create,
+                ..
+            } => {
+                prop_assert_eq!(n, name);
+            }
+            other => prop_assert!(
+                false,
+                "Expected create route (mode Create), got: {:?}",
+                other
+            ),
+        }
     }
 
     /// Error position inside AS-body clause points at the typo byte offset.
@@ -622,7 +634,7 @@ proptest! {
         leading in "[ \t\n]{0,20}",
     ) {
         let query = format!("{leading}CREATE SEMANTIC VIEW x AS TABLSE (t AS orders PRIMARY KEY (id)) DIMENSIONS (t.r AS r) METRICS (t.m AS SUM(1))");
-        let err = validate_and_rewrite(&query).unwrap_err();
+        let err = plan_rewrite(&query).unwrap_err();
         let pos = err.position.unwrap();
         // Position must point at "TABLSE" in the original query.
         prop_assert_eq!(
@@ -660,7 +672,7 @@ proptest! {
              t.rev{sep}AS{sep}SUM(amount)\
              )"
         );
-        let result = validate_and_rewrite(&query);
+        let result = plan_rewrite(&query);
         prop_assert!(
             result.is_ok(),
             "Expected Ok for valid AS-body with sep={sep:?}, got: {:?}",
@@ -684,7 +696,7 @@ proptest! {
             "CREATE SEMANTIC VIEW {name} AS {tables_kw} (t AS orders PRIMARY KEY (id)) \
              {dims_kw} (t.region AS region) {metrics_kw} (t.rev AS SUM(amount))"
         );
-        let result = validate_and_rewrite(&query);
+        let result = plan_rewrite(&query);
         prop_assert!(
             result.is_ok(),
             "Expected Ok for case variant tables={tables_kw} dims={dims_kw} metrics={metrics_kw}, got: {:?}",
@@ -730,8 +742,7 @@ proptest! {
     }
 
     /// For the 3 CREATE forms, replacing prefix spaces with non-space whitespace
-    /// and calling validate_and_rewrite must return Ok(Some(sql)) where sql
-    /// starts with "SELECT * FROM ".
+    /// and calling plan_rewrite must return Ok(Some(RewriteAction::Create { .. })).
     #[test]
     fn prefix_whitespace_rewrite_roundtrip(
         form_idx in 0..3usize,
@@ -741,21 +752,20 @@ proptest! {
         let (prefix, _kind, _fn_name) = CREATE_FORMS[form_idx];
         let rejoined = prefix.split(' ').collect::<Vec<_>>().join(&sep);
         let query = format!("{rejoined}{}", build_as_body_suffix(&name));
-        let result = validate_and_rewrite(&query);
+        let result = plan_rewrite(&query);
         prop_assert!(
             result.is_ok(),
             "Expected Ok for whitespace-variant CREATE prefix, got: {:?}",
             result
         );
-        let sql = result.unwrap();
+        let action = result.unwrap();
         prop_assert!(
-            sql.is_some(),
-            "Expected Some(sql) for whitespace-variant CREATE prefix"
+            action.is_some(),
+            "Expected Some(_) for whitespace-variant CREATE prefix"
         );
-        let sql = sql.unwrap();
         prop_assert!(
-            sql.starts_with("SELECT * FROM "),
-            "Rewritten SQL must start with 'SELECT * FROM ', got: {sql}"
+            matches!(action.unwrap(), RewriteAction::Create { .. }),
+            "Whitespace-variant CREATE prefix must produce a Create action"
         );
     }
 }
@@ -789,11 +799,8 @@ fn test_null_byte_in_name() {
     // The parser must not panic. It may return Ok (if null byte in name is tolerated)
     // or Err (if the name validator rejects it). Either is acceptable.
     let query = "CREATE SEMANTIC VIEW x\x00bad (tables := [], dimensions := [])";
-    let result = std::panic::catch_unwind(|| validate_and_rewrite(query));
-    assert!(
-        result.is_ok(),
-        "validate_and_rewrite panicked on null byte in name"
-    );
+    let result = std::panic::catch_unwind(|| plan_rewrite(query));
+    assert!(result.is_ok(), "plan_rewrite panicked on null byte in name");
 }
 
 #[test]
@@ -802,16 +809,14 @@ fn test_semicolon_in_name() {
     // means the name is everything before ';' or the whole token. Either way, the
     // rewritten SQL must start with "SELECT * FROM " (no raw ';' injected into the wrapper).
     let query = "CREATE SEMANTIC VIEW x;injection (tables := [], dimensions := [])";
-    match validate_and_rewrite(query) {
-        Ok(Some(sql)) => {
-            assert!(
-                sql.starts_with("SELECT * FROM "),
-                "Rewritten SQL must start with SELECT * FROM, got: {sql}"
-            );
-            // The semicolon must not appear outside a SQL string literal in a way
-            // that could terminate the wrapper SELECT statement.
-            // Since the name ends at whitespace/'(', the name is "x;injection" or
-            // the parser hits an error. Either outcome is safe.
+    match plan_rewrite(query) {
+        Ok(Some(_action)) => {
+            // A structured rewrite was produced. The view name is carried as a
+            // struct field (not spliced into a wrapper SELECT string), so a ';'
+            // in the name position cannot terminate any statement — the
+            // injection vector the old string-form guarded against is gone by
+            // construction. Since the name ends at whitespace/'(', the name is
+            // "x;injection" or the parser hits an error; either outcome is safe.
         }
         Ok(None) => {} // Not detected as our DDL — acceptable
         Err(_) => {}   // Parse error — acceptable
@@ -841,10 +846,10 @@ fn test_unicode_homoglyph() {
 fn test_control_char_in_name() {
     // Control characters (0x01-0x1F except whitespace) in view names must not panic.
     let query = "CREATE SEMANTIC VIEW x\x01bad (tables := [], dimensions := [])";
-    let result = std::panic::catch_unwind(|| validate_and_rewrite(query));
+    let result = std::panic::catch_unwind(|| plan_rewrite(query));
     assert!(
         result.is_ok(),
-        "validate_and_rewrite panicked on control char in name"
+        "plan_rewrite panicked on control char in name"
     );
 }
 
@@ -930,10 +935,10 @@ proptest! {
         let query = format!(
             "CREATE SEMANTIC VIEW {name} AS TABLES (t AS orders PRIMARY KEY (id)) {facts_clause} DIMENSIONS (t.region AS region) METRICS (t.rev AS SUM(amount))"
         );
-        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
+        let result = std::panic::catch_unwind(|| plan_rewrite(&query));
         prop_assert!(
             result.is_ok(),
-            "validate_and_rewrite panicked on FACTS clause: {facts_clause}"
+            "plan_rewrite panicked on FACTS clause: {facts_clause}"
         );
         // The result is either Ok(Some(sql)) for valid DDL, Ok(None) for non-DDL, or Err(ParseError)
         // All are acceptable -- the key invariant is no panics.
@@ -951,7 +956,7 @@ proptest! {
              DIMENSIONS (t.region AS region) \
              METRICS (t.rev AS SUM(amount))"
         );
-        let result = validate_and_rewrite(&query);
+        let result = plan_rewrite(&query);
         prop_assert!(
             result.is_ok(),
             "Empty FACTS () should be accepted, got: {:?}",
@@ -989,10 +994,10 @@ proptest! {
              DIMENSIONS (t.region AS region) \
              METRICS (t.{base_name} AS SUM(t.amount), {derived_name} AS {base_name} + 1)"
         );
-        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
+        let result = std::panic::catch_unwind(|| plan_rewrite(&query));
         prop_assert!(
             result.is_ok(),
-            "validate_and_rewrite panicked on derived metric entry"
+            "plan_rewrite panicked on derived metric entry"
         );
     }
 
@@ -1013,10 +1018,10 @@ proptest! {
                       {alias}.{base2} AS COUNT(*), \
                       {derived} AS {base1} + {base2})"
         );
-        let result = std::panic::catch_unwind(|| validate_and_rewrite(&query));
+        let result = std::panic::catch_unwind(|| plan_rewrite(&query));
         prop_assert!(
             result.is_ok(),
-            "validate_and_rewrite panicked on mixed qualified/unqualified metrics"
+            "plan_rewrite panicked on mixed qualified/unqualified metrics"
         );
     }
 }
@@ -1065,7 +1070,7 @@ proptest! {
         let ddl = format!(
             "CREATE SEMANTIC VIEW v AS TABLES ({alias_from} AS orders PRIMARY KEY (id), {alias_to} AS customers PRIMARY KEY (id)) RELATIONSHIPS ({input}) DIMENSIONS ({alias_from}.r AS region) METRICS ({alias_from}.m AS SUM(amount))"
         );
-        let result = validate_and_rewrite(&ddl);
+        let result = plan_rewrite(&ddl);
         prop_assert!(
             result.is_ok(),
             "Failed to parse relationship without cardinality: {:?}",
@@ -1090,7 +1095,7 @@ proptest! {
              DIMENSIONS (a.name AS airport_name) \
              METRICS (f.{metric_name} {using_kw} ({rel_name}) AS COUNT(*))"
         );
-        let result = validate_and_rewrite(&ddl);
+        let result = plan_rewrite(&ddl);
         prop_assert!(
             result.is_ok(),
             "Failed to parse metric with USING clause (rel={}, met={}, kw={}): {:?}",
@@ -1099,17 +1104,23 @@ proptest! {
             using_kw,
             result.unwrap_err()
         );
-        let sql = result.unwrap();
+        let action = result.unwrap();
         prop_assert!(
-            sql.is_some(),
-            "Expected Some(sql) for valid DDL with USING"
+            action.is_some(),
+            "Expected Some(_) for valid DDL with USING"
         );
-        // The rewritten SQL should contain the metric name and using_relationships
-        let sql_str = sql.unwrap();
-        prop_assert!(
-            sql_str.contains("using_relationships"),
-            "Rewritten JSON should contain using_relationships: {sql_str}"
-        );
+        // The serialized definition should carry the USING relationship data —
+        // the same JSON payload the old string form embedded.
+        match action.unwrap() {
+            RewriteAction::Create { def, .. } => {
+                let json = serde_json::to_string(def.as_ref()).unwrap();
+                prop_assert!(
+                    json.contains("using_relationships"),
+                    "Serialized definition should contain using_relationships: {json}"
+                );
+            }
+            other => prop_assert!(false, "Expected RewriteAction::Create, got: {:?}", other),
+        }
     }
 }
 
@@ -1133,7 +1144,7 @@ fn parse_error_position_is_byte_offset_into_user_input_smoke() {
     let bad_token_offset = canonical.find("TABLSE").unwrap();
 
     // Canonical case — no prefix.
-    let err = validate_and_rewrite(canonical).expect_err("should fail on TABLSE");
+    let err = plan_rewrite(canonical).expect_err("should fail on TABLSE");
     let pos = err
         .position
         .expect("position should be set for clause typo");
@@ -1142,7 +1153,7 @@ fn parse_error_position_is_byte_offset_into_user_input_smoke() {
     // Whitespace prefix shifts the position by its byte length.
     let prefixed = format!("   \n\t{canonical}");
     let prefix_len = prefixed.len() - canonical.len();
-    let err2 = validate_and_rewrite(&prefixed).expect_err("should fail with whitespace");
+    let err2 = plan_rewrite(&prefixed).expect_err("should fail with whitespace");
     let pos2 = err2.position.expect("position should be set");
     assert_eq!(
         pos2,
@@ -1153,7 +1164,7 @@ fn parse_error_position_is_byte_offset_into_user_input_smoke() {
     // Line-comment prefix.
     let with_comment = format!("-- a comment\n{canonical}");
     let comment_len = with_comment.len() - canonical.len();
-    let err3 = validate_and_rewrite(&with_comment).expect_err("should fail with comment");
+    let err3 = plan_rewrite(&with_comment).expect_err("should fail with comment");
     let pos3 = err3.position.expect("position should be set");
     assert_eq!(
         pos3,
@@ -1175,7 +1186,7 @@ proptest! {
         let bad_offset = canonical.find("TABLSE").unwrap();
         let full = format!("{prefix}{canonical}");
         let prefix_len = prefix.len();
-        let err = validate_and_rewrite(&full).expect_err("must fail on TABLSE");
+        let err = plan_rewrite(&full).expect_err("must fail on TABLSE");
         let pos = err.position.expect("position should always be set for clause typo");
         prop_assert_eq!(pos, prefix_len + bad_offset);
     }
