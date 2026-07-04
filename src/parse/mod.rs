@@ -2,10 +2,14 @@
 //
 // This module provides two layers:
 // 1. Pure detection/rewrite functions (`detect_semantic_view_ddl`,
-//    `extract_ddl_name`, `validate_and_rewrite`) testable under `cargo test`
+//    `extract_ddl_name`, `plan_rewrite`) testable under `cargo test`
 //    without the extension feature.
 // 2. FFI entry points (`sv_parser_override_rust`, `sv_free_buffer`)
 //    feature-gated on `extension`, with `catch_unwind` for panic safety.
+//
+// Prefix detection lives in the `detect` submodule; SHOW-clause filter
+// parsing in `show_clauses` (AR-1). Both are re-exported below so existing
+// `crate::parse::*` call sites and tests resolve unchanged.
 
 use crate::body_parser::parse_keyword_body;
 use crate::catalog::{DEFINITIONS_SCHEMA, DEFINITIONS_TABLE, DEFINITIONS_TABLE_NAME};
@@ -14,6 +18,15 @@ use crate::ident::{find_identifier_end, normalize_view_name};
 use crate::util::{
     extract_single_quoted_prefix, is_ident_byte, starts_with_keyword_ci, SingleQuoteError,
 };
+
+mod detect;
+pub use detect::{detect_ddl_kind, detect_near_miss, detect_semantic_view_ddl};
+pub(crate) use detect::{
+    detect_ddl_prefix, match_keyword_prefix, skip_leading_whitespace_and_comments,
+};
+
+mod show_clauses;
+pub(crate) use show_clauses::{build_filter_suffix, parse_show_filter_clauses};
 
 // ---------------------------------------------------------------------------
 // OverrideContext — Phase 65 Plan 06: empty struct (no state).
@@ -59,7 +72,7 @@ pub const PARSE_NOT_OURS: u8 = 0;
 pub const PARSE_DETECTED: u8 = 1;
 
 // ---------------------------------------------------------------------------
-// DdlKind enum and detection
+// DdlKind enum
 // ---------------------------------------------------------------------------
 
 /// The supported DDL statement forms for semantic views.
@@ -80,224 +93,6 @@ pub enum DdlKind {
     ShowMetrics,
     ShowFacts,
     ShowMaterializations,
-}
-
-/// Match a fixed sequence of keyword tokens at the start of `input`, tolerating
-/// arbitrary ASCII whitespace between tokens.
-///
-/// Returns `Some(bytes_consumed)` if all keywords matched (case-insensitively),
-/// where `bytes_consumed` is the number of bytes consumed by the keyword prefix
-/// (including inter-keyword whitespace). Returns `None` otherwise.
-///
-/// The match anchors at position 0. Leading whitespace in `input` is consumed
-/// as part of the match (counted in the returned byte count). If the caller has
-/// already trimmed leading whitespace, the returned count is from offset 0 of
-/// the trimmed slice.
-///
-/// Anti-pattern avoided: does NOT scan at increasing offsets (no O(n^2) behavior).
-/// If keyword[0] doesn't match at the start (after whitespace), returns None.
-///
-/// Note: only handles ASCII whitespace (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20).
-/// Unicode whitespace is handled by `DuckDB`'s `StripUnicodeSpaces` before the hook fires.
-fn match_keyword_prefix(input: &[u8], keywords: &[&[u8]]) -> Option<usize> {
-    let mut pos = 0;
-    for (i, &kw) in keywords.iter().enumerate() {
-        // Skip ASCII whitespace (but not before the first keyword -- caller is
-        // responsible for leading whitespace; we skip INTER-keyword whitespace
-        // only for i > 0).
-        if i > 0 {
-            // Require at least one whitespace character between keywords.
-            if pos >= input.len() || !input[pos].is_ascii_whitespace() {
-                return None;
-            }
-            while pos < input.len() && input[pos].is_ascii_whitespace() {
-                pos += 1;
-            }
-        }
-        // Match keyword case-insensitively.
-        if input.len() < pos + kw.len() {
-            return None;
-        }
-        if !input[pos..pos + kw.len()].eq_ignore_ascii_case(kw) {
-            return None;
-        }
-        pos += kw.len();
-    }
-    // Require a word boundary after the FINAL keyword. Inter-keyword
-    // boundaries are already enforced by the mandatory whitespace above,
-    // but without this check `CREATE SEMANTIC VIEWfoo` matched, and the
-    // plural typo `DROP SEMANTIC VIEWS` matched the `DROP SEMANTIC VIEW`
-    // prefix and dropped a view named `s` (PA-4, code-review 2026-07-02).
-    // Non-ASCII bytes (>= 0x80) are identifier continuation in DuckDB, so
-    // they are NOT boundaries either; ASCII punctuation (whitespace, `(`,
-    // `;`, `"`) is a legitimate token boundary and stays accepted.
-    if pos < input.len() && is_ident_byte(input[pos]) {
-        return None;
-    }
-    Some(pos)
-}
-
-/// Return the byte offset of the first character that is neither ASCII whitespace
-/// nor part of a SQL comment. Recognises:
-///   - `-- ... \n` line comments (terminated by newline or end-of-input)
-///   - `/* ... */` block comments (NOT nested -- matches PostgreSQL/DuckDB behaviour)
-///
-/// Designed for prefix-matching: never errors. An unterminated `/* ...` consumes to
-/// end of input (so the keyword match below it will simply fail and fall through
-/// to `PARSE_NOT_OURS`, matching today's behaviour for malformed queries).
-///
-/// Returns the byte offset where real SQL begins, in the *original* slice. Callers
-/// substitute this for the `query.len() - query.trim_start().len()` whitespace
-/// offset so that v0.5.1 error-caret positions continue to reference the original
-/// query string after a leading comment is consumed.
-///
-/// Quick task 260430-vdz: fixes parser hook compatibility with dbt-duckdb (and
-/// any other tool that prepends a query annotation comment).
-fn skip_leading_whitespace_and_comments(input: &str) -> usize {
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    loop {
-        // ASCII whitespace
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        // Line comment: -- ... \n
-        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue; // re-enter loop to consume more whitespace/comments
-        }
-        // Block comment: /* ... */ (non-nesting, Postgres semantics)
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            if i + 1 < bytes.len() {
-                i += 2; // consume "*/"
-            } else {
-                i = bytes.len(); // unterminated -- consume to end
-            }
-            continue;
-        }
-        break;
-    }
-    i
-}
-
-/// Detect the DDL kind and consumed prefix byte count from a query string.
-///
-/// The input must already be trimmed of leading/trailing whitespace and
-/// trailing semicolons. Returns `Some((DdlKind, consumed_bytes))` where
-/// `consumed_bytes` is the number of bytes consumed by the matched prefix
-/// (including any inter-keyword whitespace in the input). Returns `None`
-/// if no prefix matches.
-///
-/// Longest-first ordering prevents prefix overlap.
-fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
-    let b = trimmed.as_bytes();
-
-    // CREATE OR REPLACE SEMANTIC VIEW (5 keywords) -- before CREATE SEMANTIC VIEW
-    if let Some(n) = match_keyword_prefix(b, &[b"create", b"or", b"replace", b"semantic", b"view"])
-    {
-        return Some((DdlKind::CreateOrReplace, n));
-    }
-    // CREATE SEMANTIC VIEW IF NOT EXISTS (6 keywords) -- before CREATE SEMANTIC VIEW
-    if let Some(n) = match_keyword_prefix(
-        b,
-        &[b"create", b"semantic", b"view", b"if", b"not", b"exists"],
-    ) {
-        return Some((DdlKind::CreateIfNotExists, n));
-    }
-    // CREATE SEMANTIC VIEW (3 keywords)
-    if let Some(n) = match_keyword_prefix(b, &[b"create", b"semantic", b"view"]) {
-        return Some((DdlKind::Create, n));
-    }
-    // DROP SEMANTIC VIEW IF EXISTS (5 keywords) -- before DROP SEMANTIC VIEW
-    if let Some(n) = match_keyword_prefix(b, &[b"drop", b"semantic", b"view", b"if", b"exists"]) {
-        return Some((DdlKind::DropIfExists, n));
-    }
-    // DROP SEMANTIC VIEW (3 keywords)
-    if let Some(n) = match_keyword_prefix(b, &[b"drop", b"semantic", b"view"]) {
-        return Some((DdlKind::Drop, n));
-    }
-    // ALTER SEMANTIC VIEW IF EXISTS (5 keywords) -- before ALTER SEMANTIC VIEW
-    if let Some(n) = match_keyword_prefix(b, &[b"alter", b"semantic", b"view", b"if", b"exists"]) {
-        return Some((DdlKind::AlterIfExists, n));
-    }
-    // ALTER SEMANTIC VIEW (3 keywords)
-    if let Some(n) = match_keyword_prefix(b, &[b"alter", b"semantic", b"view"]) {
-        return Some((DdlKind::Alter, n));
-    }
-    // DESCRIBE SEMANTIC VIEW (3 keywords)
-    if let Some(n) = match_keyword_prefix(b, &[b"describe", b"semantic", b"view"]) {
-        return Some((DdlKind::Describe, n));
-    }
-    // SHOW COLUMNS IN SEMANTIC VIEW (5 keywords) -- before all SHOW SEMANTIC matches
-    if let Some(n) = match_keyword_prefix(b, &[b"show", b"columns", b"in", b"semantic", b"view"]) {
-        return Some((DdlKind::ShowColumns, n));
-    }
-    // SHOW TERSE SEMANTIC VIEWS (4 keywords) -- before SHOW SEMANTIC VIEWS
-    if let Some(n) = match_keyword_prefix(b, &[b"show", b"terse", b"semantic", b"views"]) {
-        return Some((DdlKind::ShowTerse, n));
-    }
-    // SHOW SEMANTIC DIMENSIONS (3 keywords) -- before SHOW SEMANTIC VIEWS
-    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"dimensions"]) {
-        return Some((DdlKind::ShowDimensions, n));
-    }
-    // SHOW SEMANTIC METRICS (3 keywords)
-    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"metrics"]) {
-        return Some((DdlKind::ShowMetrics, n));
-    }
-    // SHOW SEMANTIC FACTS (3 keywords)
-    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"facts"]) {
-        return Some((DdlKind::ShowFacts, n));
-    }
-    // SHOW SEMANTIC MATERIALIZATIONS (3 keywords) -- before SHOW SEMANTIC VIEWS
-    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"materializations"]) {
-        return Some((DdlKind::ShowMaterializations, n));
-    }
-    // SHOW SEMANTIC VIEWS (3 keywords)
-    if let Some(n) = match_keyword_prefix(b, &[b"show", b"semantic", b"views"]) {
-        return Some((DdlKind::Show, n));
-    }
-
-    None
-}
-
-/// Detect the DDL kind from a query string.
-///
-/// Returns `Some(DdlKind)` if the query matches one of the 9 semantic view
-/// DDL prefixes, `None` otherwise. Uses longest-first ordering to avoid
-/// prefix overlap (e.g. "create or replace semantic view" before
-/// "create semantic view").
-///
-/// Tolerates arbitrary ASCII whitespace (spaces, tabs, newlines, carriage
-/// returns, vertical tabs, form feeds) between prefix keywords.
-#[must_use]
-pub fn detect_ddl_kind(query: &str) -> Option<DdlKind> {
-    // PA-7: comment-blind detection — also lets a comment sit between
-    // prefix keywords (`CREATE /* x */ SEMANTIC VIEW`).
-    let blanked = crate::util::blank_sql_comments(query);
-    let query = blanked.as_ref();
-    let lead = skip_leading_whitespace_and_comments(query);
-    let trimmed = query[lead..].trim_end().trim_end_matches(';').trim();
-    detect_ddl_prefix(trimmed).map(|(kind, _)| kind)
-}
-
-/// Detect whether a query is any semantic view DDL statement.
-///
-/// Returns `PARSE_DETECTED` for all 9 DDL forms, `PARSE_NOT_OURS` otherwise.
-/// Handles case variations, leading/trailing whitespace, and trailing semicolons.
-#[must_use]
-pub fn detect_semantic_view_ddl(query: &str) -> u8 {
-    if detect_ddl_kind(query).is_some() {
-        PARSE_DETECTED
-    } else {
-        PARSE_NOT_OURS
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -396,263 +191,6 @@ fn extract_quoted_string(input: &str) -> Result<(String, usize), String> {
             SingleQuoteError::Unterminated => "Unterminated single-quoted string",
         }
         .to_string()
-    })
-}
-
-/// Build optional WHERE and LIMIT suffix for a SHOW rewrite.
-///
-/// LIKE maps to `name ILIKE '<escaped>'` (case-insensitive).
-/// STARTS WITH maps to `name LIKE '<escaped>%'` (case-sensitive).
-/// IN SCHEMA maps to `schema_name = '<escaped>'`.
-/// IN DATABASE maps to `database_name = '<escaped>'`.
-/// All conditions combined with AND. LIMIT appended last.
-fn build_filter_suffix(
-    like_pattern: Option<&str>,
-    starts_with: Option<&str>,
-    limit: Option<u64>,
-    in_schema: Option<&str>,
-    in_database: Option<&str>,
-) -> String {
-    let mut parts = Vec::new();
-    if let Some(pattern) = like_pattern {
-        let escaped = pattern.replace('\'', "''");
-        parts.push(format!("name ILIKE '{escaped}'"));
-    }
-    if let Some(prefix) = starts_with {
-        let escaped = prefix.replace('\'', "''");
-        parts.push(format!("name LIKE '{escaped}%'"));
-    }
-    if let Some(schema) = in_schema {
-        let escaped = schema.replace('\'', "''");
-        parts.push(format!("schema_name = '{escaped}'"));
-    }
-    if let Some(db) = in_database {
-        let escaped = db.replace('\'', "''");
-        parts.push(format!("database_name = '{escaped}'"));
-    }
-    let mut suffix = String::new();
-    if !parts.is_empty() {
-        suffix.push_str(" WHERE ");
-        suffix.push_str(&parts.join(" AND "));
-    }
-    if let Some(n) = limit {
-        use std::fmt::Write;
-        let _ = write!(suffix, " LIMIT {n}");
-    }
-    suffix
-}
-
-/// Parsed filter clauses from a SHOW SEMANTIC command.
-struct ShowClauses<'a> {
-    like_pattern: Option<String>,
-    in_view: Option<&'a str>,
-    in_schema: Option<&'a str>,
-    in_database: Option<&'a str>,
-    for_metric: Option<&'a str>,
-    starts_with: Option<String>,
-    limit: Option<u64>,
-}
-
-/// Parse a keyword + identifier pair from text starting with IN.
-///
-/// Checks for `IN SCHEMA <name>` or `IN DATABASE <name>`.
-/// Returns `(remaining_text, in_schema, in_database)`.
-fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), String> {
-    let after_in = rest[2..].trim_start();
-
-    // Try to match a keyword (SCHEMA or DATABASE) followed by an identifier.
-    let (keyword, kw_len, label) = if starts_with_keyword_ci(after_in, "SCHEMA")
-        && (after_in.len() == 6 || after_in.as_bytes()[6].is_ascii_whitespace())
-    {
-        ("SCHEMA", 6, "schema")
-    } else if starts_with_keyword_ci(after_in, "DATABASE")
-        && (after_in.len() == 8 || after_in.as_bytes()[8].is_ascii_whitespace())
-    {
-        ("DATABASE", 8, "database")
-    } else {
-        return Err(
-            "SHOW SEMANTIC VIEWS requires IN SCHEMA <name> or IN DATABASE <name>".to_string(),
-        );
-    };
-
-    let after_kw = after_in[kw_len..].trim_start();
-    if after_kw.is_empty() {
-        return Err(format!("Missing {label} name after IN {keyword}"));
-    }
-    let name_end = after_kw
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(after_kw.len());
-    let name = &after_kw[..name_end];
-    let remaining = after_kw[name_end..].trim_start();
-
-    if keyword == "SCHEMA" {
-        Ok((remaining, Some(name), None))
-    } else {
-        Ok((remaining, None, Some(name)))
-    }
-}
-
-/// Parse FOR METRIC clause (only valid for `ShowDimensions`).
-///
-/// Returns `(remaining_text, metric_name)`.
-fn parse_for_metric<'a>(rest: &'a str, entity: &str) -> Result<(&'a str, &'a str), String> {
-    let after_for = rest[3..].trim_start();
-    // Word boundary after METRIC: `FOR METRICS x` must not parse as the
-    // METRIC keyword followed by a metric named `s x` (PR #50 review).
-    let metric_boundary_ok = starts_with_keyword_ci(after_for, "METRIC")
-        && (after_for.len() == 6 || after_for.as_bytes()[6].is_ascii_whitespace());
-    if !metric_boundary_ok {
-        return Err("Expected FOR METRIC after view name. \
-             Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] \
-             [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
-            .to_string());
-    }
-    let _ = entity;
-    let after_metric = after_for[6..].trim_start();
-    if after_metric.is_empty() {
-        return Err("Missing metric name after FOR METRIC".to_string());
-    }
-    let name_end = after_metric
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(after_metric.len());
-    Ok((
-        after_metric[name_end..].trim_start(),
-        &after_metric[..name_end],
-    ))
-}
-
-/// Parse optional SHOW SEMANTIC filter clauses from text after the prefix.
-///
-/// Clause order (Snowflake): LIKE, IN, FOR METRIC, STARTS WITH, LIMIT.
-#[allow(clippy::too_many_lines)]
-fn parse_show_filter_clauses<'a>(
-    after_prefix: &'a str,
-    kind: DdlKind,
-) -> Result<ShowClauses<'a>, String> {
-    let mut rest = after_prefix.trim();
-    let mut like_pattern: Option<String> = None;
-    let mut in_view: Option<&'a str> = None;
-    let mut in_schema: Option<&'a str> = None;
-    let mut in_database: Option<&'a str> = None;
-    let mut for_metric: Option<&'a str> = None;
-    let mut starts_with: Option<String> = None;
-    let mut limit: Option<u64> = None;
-
-    let entity = match kind {
-        DdlKind::Show | DdlKind::ShowTerse => "VIEWS",
-        DdlKind::ShowDimensions => "DIMENSIONS",
-        DdlKind::ShowMetrics => "METRICS",
-        _ => "FACTS",
-    };
-
-    // 1. Check for LIKE keyword
-    if starts_with_keyword_ci(rest, "LIKE") {
-        // Ensure it's followed by whitespace (not just a prefix match)
-        if rest.len() == 4 || rest.as_bytes()[4].is_ascii_whitespace() {
-            rest = rest[4..].trim_start();
-            let (pattern, consumed) = extract_quoted_string(rest)?;
-            like_pattern = Some(pattern);
-            rest = rest[consumed..].trim_start();
-        }
-    }
-
-    // 2. Check for IN keyword
-    if starts_with_keyword_ci(rest, "IN")
-        && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
-    {
-        if kind == DdlKind::Show || kind == DdlKind::ShowTerse {
-            let (remaining, schema, database) = parse_in_scope(rest)?;
-            rest = remaining;
-            in_schema = schema;
-            in_database = database;
-        } else {
-            rest = rest[2..].trim_start();
-            if rest.is_empty() {
-                return Err("Missing view name after IN".to_string());
-            }
-            let name_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-            in_view = Some(&rest[..name_end]);
-            rest = rest[name_end..].trim_start();
-        }
-    }
-
-    // 3. Check for FOR METRIC (only for ShowDimensions). Word boundary
-    // enforced so e.g. FOREIGN does not match FOR (PR #50 review).
-    if starts_with_keyword_ci(rest, "FOR")
-        && (rest.len() == 3 || rest.as_bytes()[3].is_ascii_whitespace())
-    {
-        if kind != DdlKind::ShowDimensions {
-            return Err(format!(
-                "FOR METRIC is only valid for SHOW SEMANTIC DIMENSIONS, not SHOW SEMANTIC {entity}"
-            ));
-        }
-        let (remaining, metric_name) = parse_for_metric(rest, entity)?;
-        rest = remaining;
-        for_metric = Some(metric_name);
-    }
-
-    // 4. Check for STARTS WITH. Word boundaries enforced (PA-10:
-    // `STARTSWITH 'a'` used to be accepted).
-    if starts_with_keyword_ci(rest, "STARTS")
-        && (rest.len() == 6 || rest.as_bytes()[6].is_ascii_whitespace())
-    {
-        rest = rest[6..].trim_start();
-        // Word boundary after WITH: `_` and non-ASCII bytes are identifier
-        // continuation (mirrors match_keyword_prefix), so WITH_x / WITHé do
-        // not match the keyword.
-        let with_boundary_ok = starts_with_keyword_ci(rest, "WITH")
-            && (rest.len() == 4 || !is_ident_byte(rest.as_bytes()[4]));
-        if !with_boundary_ok {
-            return Err(format!(
-                "Expected STARTS WITH. \
-                 Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
-            ));
-        }
-        rest = rest[4..].trim_start();
-        let (prefix, consumed) = extract_quoted_string(rest)?;
-        starts_with = Some(prefix);
-        rest = rest[consumed..].trim_start();
-    }
-
-    // 5. Check for LIMIT. Word boundary enforced (PA-10: `LIMIT5` used to
-    // be accepted).
-    if starts_with_keyword_ci(rest, "LIMIT")
-        && (rest.len() == 5 || rest.as_bytes()[5].is_ascii_whitespace())
-    {
-        rest = rest[5..].trim_start();
-        let token_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-        let token = &rest[..token_end];
-        let n: u64 = token
-            .parse()
-            .map_err(|_| format!("LIMIT must be a positive integer, got: '{token}'"))?;
-        limit = Some(n);
-        rest = rest[token_end..].trim_start();
-    }
-
-    // 6. If any text remains, error with usage hint
-    if !rest.is_empty() {
-        let usage = if kind == DdlKind::ShowDimensions {
-            format!(
-                "Unexpected tokens: '{rest}'. \
-                 Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
-            )
-        } else {
-            format!(
-                "Unexpected tokens: '{rest}'. \
-                 Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
-            )
-        };
-        return Err(usage);
-    }
-
-    Ok(ShowClauses {
-        like_pattern,
-        in_view,
-        in_schema,
-        in_database,
-        for_metric,
-        starts_with,
-        limit,
     })
 }
 
@@ -929,78 +467,8 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Validation layer: ParseError, detect_near_miss, plan_rewrite
+// Validation layer: ParseError, plan_rewrite
 // ---------------------------------------------------------------------------
-
-/// The DDL prefixes used for near-miss detection.
-const DDL_PREFIXES: &[&str] = &[
-    "create semantic view",
-    "create or replace semantic view",
-    "create semantic view if not exists",
-    "drop semantic view",
-    "drop semantic view if exists",
-    "describe semantic view",
-    "show semantic views",
-    "show terse semantic views",
-    "show columns in semantic view",
-    "alter semantic view",
-    "alter semantic view if exists",
-    "show semantic dimensions",
-    "show semantic dimensions for metric",
-    "show semantic metrics",
-    "show semantic facts",
-    "show semantic materializations",
-];
-
-/// Detect near-miss DDL prefixes using fuzzy matching.
-///
-/// If the beginning of the query is close (Levenshtein distance <= 3) to one
-/// of the 7 known DDL prefixes, returns a `ParseError` suggesting the correct
-/// prefix. Returns `None` if no near-miss is found.
-#[must_use]
-pub fn detect_near_miss(query: &str) -> Option<ParseError> {
-    // PA-7: comment-blind near-miss detection.
-    let blanked = crate::util::blank_sql_comments(query);
-    let query = blanked.as_ref();
-    let lead = skip_leading_whitespace_and_comments(query);
-    let trimmed = query[lead..].trim_end();
-    let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
-    let lower = trimmed_no_semi.to_ascii_lowercase();
-
-    let mut best: Option<(usize, &str)> = None;
-
-    for &prefix in DDL_PREFIXES {
-        // Extract the first N words from the query where N is the number of
-        // words in this DDL prefix. This ensures we compare apples-to-apples
-        // regardless of what follows the prefix in the query.
-        let prefix_word_count = prefix.split_whitespace().count();
-        let query_words: Vec<&str> = lower.split_whitespace().collect();
-        let query_slice_words = &query_words[..query_words.len().min(prefix_word_count)];
-        let query_slice = query_slice_words.join(" ");
-
-        let dist = strsim::levenshtein(&query_slice, prefix);
-        if dist <= 3 {
-            if let Some((best_dist, _)) = best {
-                if dist < best_dist {
-                    best = Some((dist, prefix));
-                }
-            } else {
-                best = Some((dist, prefix));
-            }
-        }
-    }
-
-    best.map(|(_, prefix)| {
-        let trim_offset = lead;
-        ParseError {
-            message: format!(
-                "Unknown statement. Did you mean '{}'?",
-                prefix.to_uppercase()
-            ),
-            position: Some(trim_offset),
-        }
-    })
-}
 
 /// Structured outcome of parsing/validating a semantic-view DDL statement (AR-2).
 ///
