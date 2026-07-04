@@ -656,10 +656,11 @@ fn parse_show_filter_clauses<'a>(
     })
 }
 
-/// Rewrite an ALTER SEMANTIC VIEW sub-operation to a table function call.
-///
-/// Dispatches on RENAME TO, SET COMMENT, and UNSET COMMENT.
-fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, String> {
+/// Parse an ALTER SEMANTIC VIEW sub-operation into a structured
+/// [`RewriteAction`] (RENAME TO → `AlterRename`, SET COMMENT → `AlterSetComment`,
+/// UNSET COMMENT → `AlterUnsetComment`). Names/comment are carried raw; the
+/// emission stage escapes them.
+fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<RewriteAction, String> {
     let after_prefix = trimmed[plen..].trim();
     // Quote-aware delimiter scan so `"my view"` is captured intact (allow_paren=false).
     let name_end = find_identifier_end(after_prefix, false);
@@ -670,13 +671,7 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
     let view_name =
         normalize_view_name(raw_view_name).map_err(|e| format!("Invalid view name: {e}"))?;
     let rest = after_prefix[name_end..].trim();
-    let safe_name = view_name.replace('\'', "''");
-
-    let if_exists_suffix = if kind == DdlKind::AlterIfExists {
-        "_if_exists"
-    } else {
-        ""
-    };
+    let if_exists = kind == DdlKind::AlterIfExists;
 
     // Sub-operation keyword matching rides match_keyword_prefix so any
     // amount of whitespace separates the keywords (PA-10: the old
@@ -699,11 +694,11 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
         }
         let new_name = normalize_view_name(new_name_raw)
             .map_err(|e| format!("Invalid new view name in RENAME TO: {e}"))?;
-        let safe_new = new_name.replace('\'', "''");
-        let alter_fn = format!("alter_semantic_view_rename{if_exists_suffix}");
-        Ok(format!(
-            "SELECT * FROM {alter_fn}('{safe_name}', '{safe_new}')"
-        ))
+        Ok(RewriteAction::AlterRename {
+            name: view_name,
+            new_name,
+            if_exists,
+        })
     } else if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"set", b"comment"]) {
         let after_set_comment = rest[consumed..].trim_start();
         if !after_set_comment.starts_with('=') {
@@ -722,12 +717,11 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
                 "Unexpected tokens after SET COMMENT string: '{trailing}'"
             ));
         }
-        // Re-escape for SQL embedding
-        let safe_comment = comment_value.replace('\'', "''");
-        let alter_fn = format!("alter_semantic_view_set_comment{if_exists_suffix}");
-        Ok(format!(
-            "SELECT * FROM {alter_fn}('{safe_name}', '{safe_comment}')"
-        ))
+        Ok(RewriteAction::AlterSetComment {
+            name: view_name,
+            comment: comment_value,
+            if_exists,
+        })
     } else if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"unset", b"comment"]) {
         let trailing = rest[consumed..].trim();
         if !trailing.is_empty() {
@@ -735,8 +729,10 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
                 "Unexpected tokens after UNSET COMMENT: '{trailing}'"
             ));
         }
-        let alter_fn = format!("alter_semantic_view_unset_comment{if_exists_suffix}");
-        Ok(format!("SELECT * FROM {alter_fn}('{safe_name}')"))
+        Ok(RewriteAction::AlterUnsetComment {
+            name: view_name,
+            if_exists,
+        })
     } else {
         Err(
             "Unsupported ALTER operation. Supported: RENAME TO, SET COMMENT, UNSET COMMENT."
@@ -745,14 +741,23 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<String, St
     }
 }
 
-/// Rewrite a name-only or SHOW semantic view DDL statement to its function call.
+/// Rewrite a name-only / SHOW / ALTER semantic view DDL statement to its legacy
+/// `SELECT * FROM fn(...)` string form.
 ///
-/// Handles only:
-/// - Name-only (DROP, DESCRIBE): `SELECT * FROM fn('name')`
-/// - SHOW forms: `SELECT * FROM list_semantic_views()` with optional LIKE/STARTS WITH/LIMIT
-///
-/// CREATE forms must go through `validate_and_rewrite` -> `rewrite_ddl_keyword_body`.
+/// Thin wrapper over [`plan_ddl`] + [`render_legacy`], kept for the many unit
+/// tests that assert on the legacy string form.
+#[cfg(test)]
 fn rewrite_ddl(query: &str) -> Result<String, String> {
+    plan_ddl(query).map(|action| render_legacy(&action))
+}
+
+/// Parse a non-CREATE semantic view DDL statement into a structured
+/// [`RewriteAction`]:
+/// - DROP → `Drop`; ALTER → `AlterRename` / `AlterSetComment` / `AlterUnsetComment`.
+/// - Read-side DESCRIBE / SHOW / SHOW COLUMNS → `Passthrough` final SQL.
+///
+/// CREATE forms must go through `plan_rewrite` -> `validate_create_body`.
+fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
     // PA-7: comment-blind rewriting (idempotent when the caller already
     // blanked; only allocates when comments are present).
     let blanked = crate::util::blank_sql_comments(query);
@@ -767,15 +772,26 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
     let fn_name = function_name(kind);
 
     match kind {
-        // CREATE forms no longer supported via rewrite_ddl -- use validate_and_rewrite
+        // CREATE forms no longer supported via plan_ddl -- use plan_rewrite
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
             Err("CREATE forms must use validate_and_rewrite".to_string())
         }
-        // Name-only forms (DROP, DESCRIBE, SHOW COLUMNS IN SEMANTIC VIEW)
-        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe | DdlKind::ShowColumns => {
+        // DROP: native DELETE (structured).
+        DdlKind::Drop | DdlKind::DropIfExists => {
+            let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
+            Ok(RewriteAction::Drop {
+                name,
+                if_exists: kind == DdlKind::DropIfExists,
+            })
+        }
+        // Read-side name-only forms (DESCRIBE, SHOW COLUMNS IN SEMANTIC VIEW):
+        // run the read-side table function as-is.
+        DdlKind::Describe | DdlKind::ShowColumns => {
             let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
             let safe_name = name.replace('\'', "''");
-            Ok(format!("SELECT * FROM {fn_name}('{safe_name}')"))
+            Ok(RewriteAction::Passthrough(format!(
+                "SELECT * FROM {fn_name}('{safe_name}')"
+            )))
         }
         // SHOW SEMANTIC VIEWS/DIMENSIONS/METRICS/FACTS: optional LIKE/IN/FOR METRIC/STARTS WITH/LIMIT
         DdlKind::Show
@@ -824,7 +840,7 @@ fn rewrite_ddl(query: &str) -> Result<String, String> {
                 clauses.in_schema,
                 clauses.in_database,
             );
-            Ok(format!("{base}{suffix}"))
+            Ok(RewriteAction::Passthrough(format!("{base}{suffix}")))
         }
         // ALTER: sub-operation dispatch (RENAME TO, SET COMMENT, UNSET COMMENT)
         DdlKind::Alter | DdlKind::AlterIfExists => rewrite_alter(trimmed, plen, kind),
@@ -1021,10 +1037,25 @@ pub enum RewriteAction {
         comment: String,
         mode: CreateMode,
     },
-    /// A legacy `SELECT * FROM <fn>(...)` statement still lowered by
-    /// `rewrite_to_native_sql` through `parse_table_function_call`: DROP/ALTER
-    /// (re-parsed into native DML) and read-side DESCRIBE/SHOW (run as-is). A
-    /// follow-up gives these structured variants too.
+    /// DROP — native DELETE against the catalog table.
+    Drop { name: String, if_exists: bool },
+    /// ALTER ... RENAME TO — native UPDATE of the `name` column.
+    AlterRename {
+        name: String,
+        new_name: String,
+        if_exists: bool,
+    },
+    /// ALTER ... SET COMMENT — native UPDATE via `json_merge_patch`.
+    AlterSetComment {
+        name: String,
+        comment: String,
+        if_exists: bool,
+    },
+    /// ALTER ... UNSET COMMENT — native UPDATE via `json_merge_patch`.
+    AlterUnsetComment { name: String, if_exists: bool },
+    /// Read-side DDL (DESCRIBE / SHOW / SHOW COLUMNS) already lowered to final
+    /// `SELECT * FROM <read_side_fn>(...)` SQL that `DuckDB` runs on the caller's
+    /// connection unchanged.
     Passthrough(String),
 }
 
@@ -1103,7 +1134,54 @@ fn render_legacy(action: &RewriteAction) -> String {
                 mode.kind_num()
             )
         }
+        RewriteAction::Drop { name, if_exists } => {
+            format!(
+                "SELECT * FROM drop_semantic_view{}('{}')",
+                if_exists_suffix(*if_exists),
+                name.replace('\'', "''")
+            )
+        }
+        RewriteAction::AlterRename {
+            name,
+            new_name,
+            if_exists,
+        } => {
+            format!(
+                "SELECT * FROM alter_semantic_view_rename{}('{}', '{}')",
+                if_exists_suffix(*if_exists),
+                name.replace('\'', "''"),
+                new_name.replace('\'', "''")
+            )
+        }
+        RewriteAction::AlterSetComment {
+            name,
+            comment,
+            if_exists,
+        } => {
+            format!(
+                "SELECT * FROM alter_semantic_view_set_comment{}('{}', '{}')",
+                if_exists_suffix(*if_exists),
+                name.replace('\'', "''"),
+                comment.replace('\'', "''")
+            )
+        }
+        RewriteAction::AlterUnsetComment { name, if_exists } => {
+            format!(
+                "SELECT * FROM alter_semantic_view_unset_comment{}('{}')",
+                if_exists_suffix(*if_exists),
+                name.replace('\'', "''")
+            )
+        }
         RewriteAction::Passthrough(sql) => sql.clone(),
+    }
+}
+
+/// `_if_exists` function-name suffix for DROP/ALTER `IF EXISTS` forms.
+fn if_exists_suffix(if_exists: bool) -> &'static str {
+    if if_exists {
+        "_if_exists"
+    } else {
+        ""
     }
 }
 
@@ -1158,20 +1236,16 @@ pub fn plan_rewrite(query: &str) -> Result<Option<RewriteAction>, ParseError> {
                     position: Some(trim_offset + plen),
                 });
             }
-            rewrite_ddl(query)
-                .map(|s| Some(RewriteAction::Passthrough(s)))
-                .map_err(|e| ParseError {
-                    message: e,
-                    position: Some(trim_offset + plen),
-                })
-        }
-        // SHOW [TERSE] SEMANTIC VIEWS: optional filter/scope clauses
-        DdlKind::Show | DdlKind::ShowTerse => rewrite_ddl(query)
-            .map(|s| Some(RewriteAction::Passthrough(s)))
-            .map_err(|e| ParseError {
+            plan_ddl(query).map(Some).map_err(|e| ParseError {
                 message: e,
                 position: Some(trim_offset + plen),
-            }),
+            })
+        }
+        // SHOW [TERSE] SEMANTIC VIEWS: optional filter/scope clauses
+        DdlKind::Show | DdlKind::ShowTerse => plan_ddl(query).map(Some).map_err(|e| ParseError {
+            message: e,
+            position: Some(trim_offset + plen),
+        }),
         // SHOW COLUMNS IN SEMANTIC VIEW: name-only form
         DdlKind::ShowColumns => {
             let after_prefix = trimmed_no_semi[plen..].trim();
@@ -1181,32 +1255,26 @@ pub fn plan_rewrite(query: &str) -> Result<Option<RewriteAction>, ParseError> {
                     position: Some(trim_offset + plen),
                 });
             }
-            rewrite_ddl(query)
-                .map(|s| Some(RewriteAction::Passthrough(s)))
-                .map_err(|e| ParseError {
-                    message: e,
-                    position: Some(trim_offset + plen),
-                })
+            plan_ddl(query).map(Some).map_err(|e| ParseError {
+                message: e,
+                position: Some(trim_offset + plen),
+            })
         }
         // SHOW SEMANTIC DIMENSIONS/METRICS/FACTS/MATERIALIZATIONS: optional IN view_name
         DdlKind::ShowDimensions
         | DdlKind::ShowMetrics
         | DdlKind::ShowFacts
-        | DdlKind::ShowMaterializations => rewrite_ddl(query)
-            .map(|s| Some(RewriteAction::Passthrough(s)))
-            .map_err(|e| ParseError {
-                message: e,
-                position: Some(trim_offset + plen),
-            }),
+        | DdlKind::ShowMaterializations => plan_ddl(query).map(Some).map_err(|e| ParseError {
+            message: e,
+            position: Some(trim_offset + plen),
+        }),
         // ALTER forms: validate sub-operation (RENAME TO, SET COMMENT, UNSET COMMENT)
         DdlKind::Alter | DdlKind::AlterIfExists => {
             validate_alter(trimmed_no_semi, trim_offset, plen)?;
-            rewrite_ddl(query)
-                .map(|s| Some(RewriteAction::Passthrough(s)))
-                .map_err(|e| ParseError {
-                    message: e,
-                    position: Some(trim_offset + plen),
-                })
+            plan_ddl(query).map(Some).map_err(|e| ParseError {
+                message: e,
+                position: Some(trim_offset + plen),
+            })
         }
     }
 }
@@ -1774,74 +1842,34 @@ pub fn rewrite_to_native_sql(
             mode.or_replace(),
             mode.if_not_exists(),
         ),
-        // DROP / ALTER (native DML) and read-side DESCRIBE / SHOW (run as-is):
-        // still lowered from the legacy `SELECT * FROM fn(...)` string via
-        // `parse_table_function_call`. A follow-up structures these too.
-        RewriteAction::Passthrough(tf_sql) => {
-            // Read-side DDL (DESCRIBE / SHOW with WHERE/LIMIT clauses) emits SQL
-            // that doesn't match the `SELECT * FROM fn('arg', ...)` shape. Pass
-            // through unchanged; DuckDB executes the read-side table function on
-            // the caller's connection.
-            let Some(call) = parse_table_function_call(&tf_sql) else {
-                return Ok(Some(tf_sql));
-            };
-            // The args retain the SQL escaping (single quotes doubled) so they
-            // re-embed into single-quoted string literals without further work.
-            match call.fn_name.as_str() {
-                // DROP / ALTER: pure-SQL race-guard + DML on the caller's
-                // connection. See `rewrite_drop_or_alter` (extension-only).
-                "drop_semantic_view"
-                | "drop_semantic_view_if_exists"
-                | "alter_semantic_view_rename"
-                | "alter_semantic_view_rename_if_exists"
-                | "alter_semantic_view_set_comment"
-                | "alter_semantic_view_set_comment_if_exists"
-                | "alter_semantic_view_unset_comment"
-                | "alter_semantic_view_unset_comment_if_exists" => {
-                    rewrite_drop_or_alter(call.fn_name.as_str(), &call.args)
-                }
-                // Read-side table functions (describe_semantic_view, show_*,
-                // list_*, get_ddl, read_yaml_from_semantic_view): pass through.
-                _ => Ok(Some(tf_sql)),
-            }
+        // DROP / ALTER: pure-SQL race-guard + native DML on the caller's
+        // connection. Names/comment are carried raw; escape at the boundary so
+        // the emission helpers keep receiving already-escaped args.
+        RewriteAction::Drop { name, if_exists } => rewrite_drop(&escape_sql_arg(&name), if_exists),
+        RewriteAction::AlterRename {
+            name,
+            new_name,
+            if_exists,
+        } => rewrite_alter_rename(
+            &escape_sql_arg(&name),
+            &escape_sql_arg(&new_name),
+            if_exists,
+        ),
+        RewriteAction::AlterSetComment {
+            name,
+            comment,
+            if_exists,
+        } => rewrite_alter_comment(
+            &escape_sql_arg(&name),
+            Some(&escape_sql_arg(&comment)),
+            if_exists,
+        ),
+        RewriteAction::AlterUnsetComment { name, if_exists } => {
+            rewrite_alter_comment(&escape_sql_arg(&name), None, if_exists)
         }
-    }
-}
-
-/// DROP / ALTER native-SQL emission. Phase 65 Plan 06: all pure-SQL —
-/// no `CatalogReader` consumed because H1 catalog_conn is retired.
-/// Existence wording is provided by `existence_guard_select` which runs
-/// on the caller's connection in the same transaction as the DML.
-#[cfg(feature = "extension")]
-fn rewrite_drop_or_alter(fn_name: &str, args: &[String]) -> Result<Option<String>, ParseError> {
-    match (fn_name, args.len()) {
-        ("drop_semantic_view", 1) => rewrite_drop(&args[0], false),
-        ("drop_semantic_view_if_exists", 1) => rewrite_drop(&args[0], true),
-        ("alter_semantic_view_rename", 2) => rewrite_alter_rename(&args[0], &args[1], false),
-        ("alter_semantic_view_rename_if_exists", 2) => {
-            rewrite_alter_rename(&args[0], &args[1], true)
-        }
-        ("alter_semantic_view_set_comment", 2) => {
-            rewrite_alter_comment(&args[0], Some(&args[1]), false)
-        }
-        ("alter_semantic_view_set_comment_if_exists", 2) => {
-            rewrite_alter_comment(&args[0], Some(&args[1]), true)
-        }
-        ("alter_semantic_view_unset_comment", 1) => rewrite_alter_comment(&args[0], None, false),
-        ("alter_semantic_view_unset_comment_if_exists", 1) => {
-            rewrite_alter_comment(&args[0], None, true)
-        }
-        // Caller pre-filtered to known names; this is unreachable. If hit, it
-        // is an internal dispatch bug — surface as an error instead of
-        // silently producing wrong SQL.
-        _ => Err(ParseError {
-            message: format!(
-                "internal error: rewrite_drop_or_alter dispatched with unknown \
-                 fn_name='{fn_name}' arity={}",
-                args.len()
-            ),
-            position: None,
-        }),
+        // Read-side DDL (DESCRIBE / SHOW / SHOW COLUMNS): DuckDB runs the
+        // read-side table function on the caller's connection unchanged.
+        RewriteAction::Passthrough(sql) => Ok(Some(sql)),
     }
 }
 
@@ -2070,15 +2098,14 @@ fn emit_native_create_from_yaml_file(
 //
 // `escape_sql_arg` doubles single quotes so the input can be embedded inside
 // a single-quoted SQL string literal: `O'Brien` → `O''Brien`. `unescape_sql_arg`
-// reverses the doubling for values that arrived already-escaped (typically
-// from `parse_table_function_call::args`, which retains the SQL form so its
-// callers can re-embed without re-escaping).
+// reverses the doubling for values that arrived already-escaped (e.g. the
+// SET COMMENT literal that `rewrite_alter_comment` re-parses as JSON).
 //
 // The pair is unconditionally compiled (no `#[cfg(feature = "extension")]`)
 // so unit tests under `cargo test` can exercise the escaping rules without
 // linking the loadable-extension stubs. They have no FFI dependencies.
 
-/// Undo the SQL `''`-escaping retained in `parse_table_function_call`'s args.
+/// Undo the SQL `''`-escaping of an already-escaped single-quoted-literal value.
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 fn unescape_sql_arg(s: &str) -> String {
     s.replace("''", "'")
@@ -2093,7 +2120,7 @@ fn escape_sql_arg(s: &str) -> String {
 /// Build the existence-guard SELECT for non-IF-EXISTS DROP/ALTER.
 ///
 /// `name_escaped` is the view name with single quotes already SQL-doubled
-/// (matches the form returned by `parse_table_function_call::args`).
+/// (as produced by `escape_sql_arg` at the `rewrite_to_native_sql` boundary).
 ///
 /// The emitted statement errors with `semantic view '<name>' does not
 /// exist` when the row is missing from `semantic_layer._definitions`.
@@ -2356,134 +2383,6 @@ fn rewrite_alter_comment(
           WHERE name = '{name_escaped}' \
          RETURNING name, '{status_label}'::VARCHAR AS status"
     )))
-}
-
-/// Result of parsing a `SELECT * FROM <fn>('arg1'[, 'arg2'])` SQL string.
-///
-/// `args` retains the original SQL escaping (single quotes doubled), so they
-/// can be substituted back into a new single-quoted SQL string verbatim.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-struct TableFunctionCall {
-    fn_name: String,
-    args: Vec<String>,
-}
-
-/// Parse a `SELECT * FROM <fn_name>('arg1'[, 'arg2'])` SQL string.
-///
-/// Returns `None` for SQL that doesn't match this exact shape (e.g. SHOW
-/// forms with WHERE/LIMIT, or unrecognized prefixes). Handles SQL `''`
-/// escaping inside single-quoted args; preserves the `''` form in the
-/// returned strings so callers can re-embed them in new single-quoted SQL
-/// without re-escaping.
-///
-/// v0.8.0 tightened (B4): rejects malformed shapes that earlier silently
-/// swallowed — `foo(,)`, `foo('a',)` (trailing comma), `foo('a' 'b')`
-/// (missing comma between args).
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-fn parse_table_function_call(sql: &str) -> Option<TableFunctionCall> {
-    const PREFIX: &str = "SELECT * FROM ";
-    let rest = sql.strip_prefix(PREFIX)?;
-
-    // Read the function name up to '('.
-    let paren_pos = rest.find('(')?;
-    let fn_name = rest[..paren_pos].trim().to_string();
-    if fn_name.is_empty() || fn_name.contains(char::is_whitespace) {
-        return None;
-    }
-
-    // Body after the opening paren up to the matching closing paren.
-    // The body is a comma-separated list of single-quoted strings; we walk
-    // it tracking quote state so commas inside strings don't split args.
-    let body = &rest[paren_pos + 1..];
-    let mut args: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    let mut chars = body.char_indices();
-    let mut closing_pos: Option<usize> = None;
-    // After the closing `'` of a string literal, only whitespace / `,` / `)`
-    // are valid. A second `'` would have been peeked-and-consumed in the
-    // in_quote branch (doubled-quote escape).
-    let mut just_closed_quote = false;
-    // Tracks whether the most recent unquoted-state event was a `,`. Used to
-    // reject `foo(,)` / `foo('a',)` where a comma is followed by `)` with no
-    // intervening arg.
-    let mut expecting_arg_after_comma = false;
-
-    while let Some((i, ch)) = chars.next() {
-        if in_quote {
-            current.push(ch);
-            if ch == '\'' {
-                // Lookahead for `''` doubled-quote escape.
-                let mut peek = body[i + ch.len_utf8()..].chars();
-                if peek.next() == Some('\'') {
-                    // Consume the second '
-                    current.push('\'');
-                    chars.next();
-                } else {
-                    in_quote = false;
-                    just_closed_quote = true;
-                }
-            }
-        } else {
-            match ch {
-                '\'' => {
-                    // Two adjacent string literals like `'a' 'b'` (no comma)
-                    // are invalid in our generated SQL — reject.
-                    if just_closed_quote {
-                        return None;
-                    }
-                    in_quote = true;
-                    just_closed_quote = false;
-                    expecting_arg_after_comma = false;
-                    current.push(ch);
-                }
-                ',' => {
-                    let trimmed = current.trim();
-                    if trimmed.is_empty() {
-                        // `foo(,...)` — comma without preceding arg.
-                        return None;
-                    }
-                    args.push(strip_outer_quotes(trimmed)?.to_string());
-                    current.clear();
-                    just_closed_quote = false;
-                    expecting_arg_after_comma = true;
-                }
-                ')' => {
-                    if expecting_arg_after_comma {
-                        // `foo('a',)` — trailing comma.
-                        return None;
-                    }
-                    closing_pos = Some(i);
-                    break;
-                }
-                c if c.is_whitespace() => {} // ignore between args
-                _ => return None,            // unexpected non-whitespace, non-quote
-            }
-        }
-    }
-
-    let _ = closing_pos?; // must have found a closing paren
-
-    // Push trailing arg if present (handles single-arg and multi-arg cases).
-    let trailing = current.trim();
-    if !trailing.is_empty() {
-        args.push(strip_outer_quotes(trailing)?.to_string());
-    }
-
-    // Anything after the closing paren must be empty or whitespace.
-    let after = &body[closing_pos? + 1..];
-    if !after.trim().is_empty() {
-        return None;
-    }
-
-    Some(TableFunctionCall { fn_name, args })
-}
-
-/// Strip the outer pair of single quotes, leaving doubled-quote escaping intact.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-fn strip_outer_quotes(s: &str) -> Option<&str> {
-    let inner = s.strip_prefix('\'')?.strip_suffix('\'')?;
-    Some(inner)
 }
 
 /// FFI entry point: construct a heap-boxed (empty) `OverrideContext` and
@@ -2819,63 +2718,6 @@ unsafe fn run_validation_for_parse_function(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ===================================================================
-    // parse_table_function_call — happy-path + B4 tightening (v0.8.0).
-    // Pre-v0.8.0 this silently swallowed `foo(,)` and `foo('a',)` and
-    // accepted `foo('a' 'b')` (missing comma). Now they all return None.
-    // ===================================================================
-
-    #[test]
-    fn parse_tf_call_zero_args() {
-        let r = parse_table_function_call("SELECT * FROM foo()").expect("zero-arg parse");
-        assert_eq!(r.fn_name, "foo");
-        assert!(r.args.is_empty());
-    }
-
-    #[test]
-    fn parse_tf_call_single_arg() {
-        let r = parse_table_function_call("SELECT * FROM foo('a')").expect("single-arg parse");
-        assert_eq!(r.fn_name, "foo");
-        assert_eq!(r.args, vec!["a".to_string()]);
-    }
-
-    #[test]
-    fn parse_tf_call_multi_arg() {
-        let r = parse_table_function_call("SELECT * FROM foo('a', 'b')").expect("multi-arg parse");
-        assert_eq!(r.fn_name, "foo");
-        assert_eq!(r.args, vec!["a".to_string(), "b".to_string()]);
-    }
-
-    #[test]
-    fn parse_tf_call_doubled_quote_inside_arg() {
-        // `'O''Brien'` decodes to `O''Brien` (escaping retained).
-        let r = parse_table_function_call("SELECT * FROM foo('O''Brien')")
-            .expect("doubled-quote parse");
-        assert_eq!(r.args, vec!["O''Brien".to_string()]);
-    }
-
-    #[test]
-    fn parse_tf_call_rejects_lone_comma() {
-        assert!(parse_table_function_call("SELECT * FROM foo(,)").is_none());
-    }
-
-    #[test]
-    fn parse_tf_call_rejects_trailing_comma() {
-        assert!(parse_table_function_call("SELECT * FROM foo('a',)").is_none());
-        assert!(parse_table_function_call("SELECT * FROM foo('a', )").is_none());
-    }
-
-    #[test]
-    fn parse_tf_call_rejects_missing_comma() {
-        assert!(parse_table_function_call("SELECT * FROM foo('a' 'b')").is_none());
-    }
-
-    #[test]
-    fn parse_tf_call_rejects_unknown_prefix() {
-        assert!(parse_table_function_call("INSERT INTO t VALUES ('a')").is_none());
-        assert!(parse_table_function_call("describe_semantic_view('foo')").is_none());
-    }
 
     // ===================================================================
     // B1 / D6: race-guard SQL shape. Pinned so a future refactor cannot
