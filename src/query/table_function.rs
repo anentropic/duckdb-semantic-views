@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 
-use duckdb::vtab::Value;
 use libduckdb_sys as ffi;
 
 use crate::catalog::CatalogReader;
@@ -744,20 +743,3 @@ pub(crate) unsafe fn read_varchar_from_vector(
 
     String::from_utf8_lossy(bytes).into_owned()
 }
-
-// Compile-time layout guard: fails `just build` (extension feature) if
-// duckdb::vtab::Value size diverges from ffi::duckdb_value. This catches
-// transmute breakage in value_raw_ptr at compile time rather than runtime.
-// A runtime test is not possible because `cargo test` uses the `bundled`
-// feature (no vtab module) and `cargo test --features extension` conflicts
-// with loadable-extension stubs.
-const _: () = {
-    assert!(
-        std::mem::size_of::<Value>() == std::mem::size_of::<ffi::duckdb_value>(),
-        "Value size changed -- value_raw_ptr transmute is broken"
-    );
-    assert!(
-        std::mem::align_of::<Value>() == std::mem::align_of::<ffi::duckdb_value>(),
-        "Value alignment changed -- value_raw_ptr transmute is broken"
-    );
-};
