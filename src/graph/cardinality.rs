@@ -15,7 +15,10 @@ use crate::model::{Cardinality, Join, TableRef};
 /// Also resolves `ref_columns` (the columns on the target side of the FK reference).
 ///
 /// Two checks per relationship:
-/// 1. Resolve `ref_columns`: if empty, use target's PK. If target has no PK, error.
+/// 1. Resolve `ref_columns`: if empty, default to the target's PK. If the target
+///    has no declared PK, this function does not error — it leaves `ref_columns`
+///    empty and skips the relationship; the missing-PK case is raised later as a
+///    hard error during enrichment (`crate::ddl::define::enrich_definition_for_create`).
 /// 2. Infer cardinality: if FK columns match PK/UNIQUE on the `from_alias` table,
 ///    the relationship is `OneToOne`; otherwise `ManyToOne`.
 pub(crate) fn infer_cardinality(
