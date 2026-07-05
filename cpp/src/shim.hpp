@@ -27,12 +27,11 @@ extern "C" {
 // `DBConfig` and system catalog.
 //
 // Phase 65 Plan 06: signature slimmed to `(db_handle)` after H1
-// catalog_conn retirement. The C++ shim attaches an empty
-// `OverrideContext` (allocated via `sv_make_override_context()`) to
-// `SemanticViewsParserInfo::rust_state` purely for FFI shape
-// compatibility with `sv_parser_override_rust`'s `ctx_ptr` parameter —
-// no long-lived `duckdb_connection` is owned by the extension after
-// this plan.
+// catalog_conn retirement. AR-7: the C++ shim attaches an empty
+// `SemanticViewsParserInfo` marker to `ParserExtension::parser_info`
+// solely so the parser hooks can confirm ownership via `dynamic_cast`;
+// no per-DB Rust state and no long-lived `duckdb_connection` is owned by
+// the extension.
 //
 // Phase 65.1 Plan 10 (WR-06 D-12/D-13): trailing
 // `(char *error_buf, size_t error_buf_len)` pair surfaces both the

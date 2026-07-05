@@ -67,14 +67,12 @@ extern "C" {
     //                error_out_len-1 bytes); *sql_out_ptr left untouched.
     //                (Phase 62: unused — Err branches now return rc=2 and
     //                let parse_function render caret via DISPLAY_EXTENSION_ERROR.)
-    //   2 = not ours: defer to default parser. Also used for null ctx_ptr.
+    //   2 = not ours: defer to default parser.
     //
-    // Phase 62: ctx_ptr is an opaque Box<OverrideContext>* produced by
-    // sv_make_override_context. It carries the catalog connection +
-    // is_file_backed flag for THIS database. The legacy db_token LRU
-    // lookup is gone (TECH-DEBT 20).
+    // AR-7: the opaque Box<OverrideContext>* context parameter was removed.
+    // It was empty after Phase 65 Plan 06 moved catalog pre-checks into the
+    // emitted SQL, so the hook no longer needs any per-DB state.
     uint8_t sv_parser_override_rust(
-        const void *ctx_ptr,
         const char *query_ptr, size_t query_len,
         char **sql_out_ptr, size_t *sql_out_len,
         char *error_out, size_t error_out_len);
@@ -93,7 +91,6 @@ extern "C" {
     //       setting reset by disable_peg_parser). error_buf gets an
     //       actionable hint; position_out gets 0.
     uint8_t sv_parse_function_rust(
-        const void *ctx_ptr,
         const char *query_ptr, size_t query_len,
         char *error_buf, size_t error_buf_len,
         uint32_t *position_out);
@@ -102,19 +99,6 @@ extern "C" {
     // Safe to call with a null pointer (no-op). ptr/len must be the exact
     // pair the Rust side returned.
     void sv_free_buffer(char *ptr, size_t len);
-
-    // Box<OverrideContext> ownership FFI. The Rust side allocates a
-    // Box<OverrideContext> (empty struct after Phase 65 Plan 06) and
-    // returns the leaked raw pointer. The C++ shim stashes the pointer
-    // inside SemanticViewsParserInfo::rust_state and hands it back to
-    // sv_parser_override_rust on every parse. ~SemanticViewsParserInfo
-    // calls sv_drop_override_context to free the Rust allocation.
-    //
-    // Plan 06: the struct carries no state — there is no longer a
-    // long-lived duckdb_connection to leak. The Box allocation itself
-    // is reclaimed cleanly by sv_drop_override_context.
-    void *sv_make_override_context();
-    void  sv_drop_override_context(void *ctx_ptr);
 
     // Phase 65 Plan 04 (Task 2 Step C) — Rust FFI bridge for the
     // `__sv_compute_create_from_yaml` helper TF. Reads file content from
@@ -385,24 +369,15 @@ struct SvOwnedBuffer {
     }
 };
 
-// Per-extension-load info struct attached to ParserExtension::parser_info.
-// Holds an opaque Box<OverrideContext>* (rust_state). After Phase 65
-// Plan 06's H1 catalog_conn retirement the OverrideContext is empty —
-// no per-DB state is carried — but the pointer round-trip is preserved
-// so the `dynamic_cast<SemanticViewsParserInfo *>` null-guard pattern
-// in sv_parser_override / sv_parse_stub stays byte-identical with the
-// pre-Plan-06 shape.
-struct SemanticViewsParserInfo : public ParserExtensionInfo {
-    void *rust_state;  // Box<OverrideContext>* opaque pointer (Rust-owned).
-    explicit SemanticViewsParserInfo(void *state) : rust_state(state) {}
-
-    ~SemanticViewsParserInfo() override {
-        if (rust_state) {
-            sv_drop_override_context(rust_state);
-            rust_state = nullptr;
-        }
-    }
-};
+// Per-extension-load marker attached to ParserExtension::parser_info. AR-7:
+// this used to carry an opaque Box<OverrideContext>* (rust_state), but the
+// OverrideContext was empty after Phase 65 Plan 06's H1 catalog_conn
+// retirement, so it now holds no state. It is kept purely as the
+// `dynamic_cast<SemanticViewsParserInfo *>` marker type that `sv_parser_override`
+// uses to confirm the parser_info is ours. (`sv_parse_stub` no longer consults
+// parser_info at all — validation needs no per-DB state — so it ignores the
+// marker.)
+struct SemanticViewsParserInfo : public ParserExtensionInfo {};
 
 // ---------------------------------------------------------------------------
 // Parser-override hook: sv_parser_override
@@ -418,12 +393,12 @@ struct SemanticViewsParserInfo : public ParserExtensionInfo {
 static ParserOverrideResult sv_parser_override(
     ParserExtensionInfo *info, const string &query, ParserOptions &) {
 
-    // Identify the OverrideContext for this DB's catalog. info is the
-    // per-extension-load SemanticViewsParserInfo attached at registration
-    // time; if missing or its Rust state is null we cannot route correctly,
-    // so defer to the default parser.
+    // Confirm this is our parser_info. info is the per-extension-load
+    // SemanticViewsParserInfo attached at registration time; if it isn't ours
+    // (dynamic_cast fails) defer to the default parser. AR-7: there is no
+    // longer any per-DB Rust state to route through.
     auto *sv_info = dynamic_cast<SemanticViewsParserInfo *>(info);
-    if (!sv_info || !sv_info->rust_state) {
+    if (!sv_info) {
         return ParserOverrideResult();
     }
 
@@ -432,7 +407,6 @@ static ParserOverrideResult sv_parser_override(
     memset(error_buf, 0, sizeof(error_buf));
 
     uint8_t rc = sv_parser_override_rust(
-        sv_info->rust_state,
         query.c_str(), query.size(),
         &sql_buf.ptr, &sql_buf.len,
         error_buf, sizeof(error_buf));
@@ -484,19 +458,15 @@ static ParserOverrideResult sv_parser_override(
 //   2 — not ours: DISPLAY_ORIGINAL_ERROR (let the default parser's error stand)
 //   3 — valid-but-override-disabled: actionable hint; position=0
 static ParserExtensionParseResult sv_parse_stub(
-    ParserExtensionInfo *info, const string &query) {
-    auto *sv_info = dynamic_cast<SemanticViewsParserInfo *>(info);
-    // ctx_ptr is unused by sv_parse_function_rust today (validation does
-    // not need the catalog), so a null sv_info / rust_state is OK — we
-    // still get correct rc/error/position. Pass through whatever we have.
-    const void *ctx = (sv_info != nullptr) ? sv_info->rust_state : nullptr;
-
+    ParserExtensionInfo * /*info*/, const string &query) {
+    // AR-7: sv_parse_function_rust no longer takes a context pointer — the
+    // validation path never needed the catalog — so the SemanticViewsParserInfo
+    // marker is not consulted here.
     char error_buf[1024];
     std::memset(error_buf, 0, sizeof(error_buf));
     uint32_t position = UINT32_MAX;
 
     uint8_t rc = sv_parse_function_rust(
-        ctx,
         query.c_str(), query.size(),
         error_buf, sizeof(error_buf),
         &position);
@@ -2708,11 +2678,10 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // Extracts DatabaseInstance& from the C API handle and registers the
 // parser_override hook on DBConfig. Phase 65 Plan 06: signature slimmed
-// to `(db_handle)` after H1 catalog_conn retirement. The
-// SemanticViewsParserInfo's rust_state still holds a Box<OverrideContext>*,
-// but the struct is empty — preserved for FFI shape compatibility with
-// sv_parser_override_rust's ctx_ptr parameter and the dynamic_cast
-// null-guard pattern in sv_parser_override / sv_parse_stub.
+// to `(db_handle)` after H1 catalog_conn retirement. AR-7: the
+// SemanticViewsParserInfo carries no Rust state anymore — it is just the
+// dynamic_cast marker used by sv_parser_override / sv_parse_stub to confirm
+// the parser_info is ours.
 //
 // Phase 65.1 Plan 10 (WR-06 D-12/D-13): the signature now carries the
 // trailing `(char *error_buf, size_t error_buf_len)` pair — matching the
@@ -2791,13 +2760,11 @@ extern "C" {
             // identical pointer value.
             //
             // CRITICAL: the entire `ParserExtension ext; ...; Register(...)` block
-            // — including the `SemanticViewsParserInfo` allocation AND the
-            // `sv_make_override_context()` allocation — must be guarded. The
-            // `OverrideContext` allocation is taken into the `SemanticViewsParserInfo`
-            // dtor for cleanup; on the skip path no ctor runs, so any allocation
-            // performed before the guard would leak unboundedly across repeated
-            // re-LOAD cycles (the precise leak shape WR-09 / CR-01 (65.1) was
-            // meant to fix).
+            // — including the `SemanticViewsParserInfo` allocation — must be
+            // guarded. `Register` unconditionally appends to
+            // `DBConfig::parser_extensions`; on the skip path re-registering
+            // would grow the list unboundedly across repeated re-LOAD cycles
+            // (the precise leak shape WR-09 / CR-01 (65.1) was meant to fix).
             //
             // The target is same-process repeat LOAD (e.g. a long-lived host
             // re-invoking `LOAD semantic_views` across sessions, or partial-failure
@@ -2820,29 +2787,16 @@ extern "C" {
             }
 
             if (!already_registered) {
-                // Phase 65.1 CR-01: allocation must live INSIDE the dedup
-                // guard. `sv_make_override_context()` returns a heap-allocated
-                // `Box<OverrideContext>` whose ownership is transferred to
-                // `SemanticViewsParserInfo` below; the dtor of that
-                // shared_ptr-managed object frees it via
-                // `sv_drop_override_context`. On the `already_registered`
-                // skip path the ctor never runs, so any allocation hoisted
-                // above this guard would be permanently leaked — one
-                // `OverrideContext` per redundant LOAD, unbounded over a
-                // long-lived host process. This is the exact leak shape
-                // WR-09 was supposed to fix; the original Plan 12 patch
-                // moved the allocation guard around the `Register` call but
-                // left the allocation itself outside.
-                void *rust_state = sv_make_override_context();
-                if (!rust_state) {
-                    if (error_buf != nullptr && error_buf_len > 0) {
-                        snprintf(error_buf, error_buf_len,
-                            "sv_register_parser_hooks: sv_make_override_context "
-                            "returned null");
-                    }
-                    return false;
-                }
-
+                // Phase 65.1 CR-01 / WR-09: the `ParserExtension ext; ...;
+                // Register(...)` block — including the `SemanticViewsParserInfo`
+                // allocation — must stay INSIDE the dedup guard.
+                // `ParserExtension::Register` unconditionally appends to
+                // `DBConfig::parser_extensions` (no dedup API), so on the
+                // `already_registered` skip path we must not Register (or
+                // allocate) again — otherwise every redundant LOAD grows the
+                // list by one entry, an unbounded soft leak over a long-lived
+                // host process. AR-7: there is no longer a separate
+                // `sv_make_override_context()` allocation to guard here.
                 ParserExtension ext;
                 ext.parser_override = sv_parser_override;
                 // Phase 62 Plan 03: parse_function is the error-reporting layer.
@@ -2861,7 +2815,7 @@ extern "C" {
                 // the SemanticViewsParserInfo and immediately upcasts) then hand
                 // it to duckdb::shared_ptr's std-interop constructor.
                 std::shared_ptr<ParserExtensionInfo> info_std(
-                    new SemanticViewsParserInfo(rust_state));
+                    new SemanticViewsParserInfo());
                 ext.parser_info = duckdb::shared_ptr<ParserExtensionInfo>(info_std);
                 ParserExtension::Register(config, ext);
 

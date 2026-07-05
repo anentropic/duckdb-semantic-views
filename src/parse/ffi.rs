@@ -1,19 +1,25 @@
 //! FFI entry points for the semantic-view `parser_override` path (AR-1).
 //!
 //! These are the C-ABI symbols the C++ shim (`cpp/src/shim.cpp`) links
-//! against: the `OverrideContext` lifecycle (`sv_make_override_context` /
-//! `sv_drop_override_context`), the parser-override hook
-//! (`sv_parser_override_rust`), the parse-function validation hook
-//! (`sv_parse_function_rust`), and the output-buffer reclaimer
-//! (`sv_free_buffer`). The `run_validation_for_parse_function` bridge and the
-//! `publish_owned_sql` helper live here too.
+//! against: the parser-override hook (`sv_parser_override_rust`), the
+//! parse-function validation hook (`sv_parse_function_rust`), and the
+//! output-buffer reclaimer (`sv_free_buffer`). The
+//! `run_validation_for_parse_function` bridge and the `publish_owned_sql`
+//! helper live here too.
+//!
+//! AR-7: the empty `OverrideContext` lifecycle
+//! (`sv_make_override_context` / `sv_drop_override_context` + the opaque
+//! `ctx_ptr` threaded through the two hooks) was retired. It became a pure
+//! no-op after Phase 65 Plan 06 moved the catalog pre-checks into the
+//! emitted SQL, so the struct, its allocator/deallocator, and the
+//! `SemanticViewsParserInfo::rust_state` round-trip carried no state.
 //!
 //! All of this is `unsafe` C-boundary plumbing, isolated from the pure parse
 //! logic in the sibling modules. The hooks delegate to `plan_rewrite`
 //! (syntax) and `rewrite_to_native_sql` (catalog-aware emission); buffer
-//! handling goes through `crate::ffi_util`. `OverrideContext` and
-//! `sv_free_buffer` are re-exported from the parent module so
-//! `crate::parse::*` paths (and cross-module tests) resolve unchanged.
+//! handling goes through `crate::ffi_util`. `sv_free_buffer` is re-exported
+//! from the parent module so `crate::parse::*` paths (and cross-module tests)
+//! resolve unchanged.
 
 #[cfg(feature = "extension")]
 use super::rewrite_to_native_sql;
@@ -23,46 +29,18 @@ use super::{detect_ddl_kind, detect_near_miss, plan_rewrite};
 use crate::errors::ParseError;
 
 // ---------------------------------------------------------------------------
-// OverrideContext — Phase 65 Plan 06: empty struct (no state).
-// ---------------------------------------------------------------------------
-//
-// Pre-Plan-06 this struct carried a `CatalogReader` wrapping a long-lived
-// `duckdb_connection` allocated in `init_extension` (H1 catalog_conn). That
-// connection was used by `parser_override` rewrite paths (rewrite_drop,
-// rewrite_alter_rename, rewrite_alter_comment, emit_native_create_sql) to
-// run pre-check `catalog.exists()` queries before emitting native SQL with
-// friendly error wording.
-//
-// Phase 65 Plan 06 retires H1 catalog_conn entirely. The pre-check queries
-// are replaced with pure-SQL guards (`SELECT CASE WHEN NOT EXISTS / EXISTS
-// THEN error(...) ELSE TRUE END; <DML>`) that run on the caller's
-// connection in the same transaction as the DML — snapshot-consistent and
-// transactional by construction.
-//
-// The struct is preserved as a zero-sized type only because the FFI
-// surface (`sv_make_override_context` / `sv_drop_override_context` /
-// `SemanticViewsParserInfo::rust_state`) still exists. We could fully
-// retire the FFI entry points and `SemanticViewsParserInfo::rust_state`
-// in a future cleanup; keeping them around as no-ops simplifies the
-// diff and lets the C++ shim keep its `dynamic_cast<SemanticViewsParserInfo *>`
-// null-guard pattern unchanged.
-//
-// No Drop impl is needed — there is nothing to free except the Box
-// allocation itself, which is reclaimed automatically when
-// `sv_drop_override_context` reconstructs the Box via `Box::from_raw`
-// and drops it.
-
-/// Empty marker struct retained for FFI shape compatibility. Carries no
-/// state after Phase 65 Plan 06's H1 catalog_conn retirement.
-///
-/// Owned by the C++ shim as `Box<OverrideContext>` (one per
-/// `SemanticViewsParserInfo`, i.e. one per extension-LOAD-per-DB).
-#[cfg(feature = "extension")]
-pub struct OverrideContext {}
-
-// ---------------------------------------------------------------------------
 // FFI entry points (extension feature-gated)
 // ---------------------------------------------------------------------------
+//
+// AR-7 (was Phase 65 Plan 06): the `OverrideContext` struct and its
+// `sv_make_override_context` / `sv_drop_override_context` allocator pair are
+// gone. Pre-Plan-06 the context carried a `CatalogReader` over a long-lived
+// `duckdb_connection` used for `catalog.exists()` pre-checks; Plan 06 replaced
+// those with pure-SQL guards (`SELECT CASE WHEN [NOT] EXISTS THEN error(...)
+// ELSE TRUE END; <DML>`) that run on the caller's connection in the same
+// transaction. The struct then held no state, so the hooks no longer take an
+// opaque `ctx_ptr` and the C++ `SemanticViewsParserInfo` no longer round-trips
+// a `rust_state` pointer.
 
 // The error writer, buffer leak/reclaim, and publish helpers all live in
 // `crate::ffi_util` (ST-4 consolidation) — this module used to carry its
@@ -109,64 +87,11 @@ unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len:
     crate::ffi_util::publish_owned_string(sql, sql_out_ptr, sql_out_len);
 }
 
-/// FFI entry point: construct a heap-boxed (empty) `OverrideContext` and
-/// return its raw pointer to the C++ shim. The struct is empty after
-/// Phase 65 Plan 06; we retain the FFI surface so the C++ shim's
-/// `SemanticViewsParserInfo::rust_state` round-trip and
-/// `dynamic_cast<...>` null-guard pattern stay byte-identical with the
-/// pre-Plan-06 shape.
-///
-/// # Safety
-///
-/// - The returned pointer must be passed to `sv_drop_override_context`
-///   exactly once when the C++ shim's `SemanticViewsParserInfo` is
-///   destroyed. Never call `sv_drop_override_context` more than once on
-///   the same pointer.
-#[cfg(feature = "extension")]
-#[no_mangle]
-pub unsafe extern "C" fn sv_make_override_context() -> *mut std::ffi::c_void {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let ctx = Box::new(OverrideContext {});
-        Box::into_raw(ctx) as *mut std::ffi::c_void
-    }));
-    result.unwrap_or(std::ptr::null_mut())
-}
-
-/// FFI entry point: re-box and drop the `OverrideContext` allocated by
-/// `sv_make_override_context`. The Rust-side `Box` allocation is freed.
-///
-/// # Safety
-///
-/// - `ctx_ptr` must be a value previously returned by
-///   `sv_make_override_context`, or null.
-/// - Must not be called more than once on the same pointer (use-after-free).
-///
-/// Phase 65 Plan 06: `OverrideContext` is now an empty struct — there is
-/// no longer a duckdb_connection to leak. The Box allocation itself is
-/// reclaimed by the `Box::from_raw` + drop below.
-#[cfg(feature = "extension")]
-#[no_mangle]
-pub unsafe extern "C" fn sv_drop_override_context(ctx_ptr: *mut std::ffi::c_void) {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if ctx_ptr.is_null() {
-            return;
-        }
-        // Re-box and drop. The struct is now empty after Plan 06 — no
-        // long-lived duckdb_connection to leak.
-        let _ = Box::from_raw(ctx_ptr as *mut OverrideContext);
-    }));
-}
-
 /// FFI entry point for parser_override. The sole DDL entry point for the
 /// extension as of v0.8.0 — the legacy parse_function/parse_stub path was
 /// retired. Rewrites recognized semantic-view DDL into native SQL suitable
 /// for re-parsing through DuckDB's own parser and execution on the caller's
 /// connection.
-///
-/// Phase 62: takes an opaque `ctx_ptr` (a `Box<OverrideContext>*` produced
-/// by `sv_make_override_context`) instead of the legacy `db_token` LRU
-/// lookup — the override context now lives directly inside
-/// `SemanticViewsParserInfo` (see `cpp/src/shim.cpp`).
 ///
 /// Returns:
 ///   0 = success: heap-owned native SQL pointer + length written to
@@ -177,13 +102,11 @@ pub unsafe extern "C" fn sv_drop_override_context(ctx_ptr: *mut std::ffi::c_void
 ///       `error_out`. (Currently unused under FALLBACK_OVERRIDE; kept for
 ///       Phase 62 Plan 03 once `parse_function` returns to caret rendering.)
 ///   2 = not ours: defer to default parser. Used both for genuinely
-///       non-semantic SQL, for null `ctx_ptr`, and for the early-return on
-///       null/empty input or invalid UTF-8.
+///       non-semantic SQL and for the early-return on null/empty input or
+///       invalid UTF-8.
 ///
 /// # Safety
 ///
-/// - `ctx_ptr` must be a non-null pointer previously returned by
-///   `sv_make_override_context`, or null. Null returns rc=2.
 /// - `query_ptr` must point to bytes of length `query_len` (validated as
 ///   UTF-8 here; invalid UTF-8 returns 2 rather than triggering UB).
 /// - `sql_out_ptr` must point to a writable `*mut u8` slot, or be null.
@@ -192,7 +115,6 @@ pub unsafe extern "C" fn sv_drop_override_context(ctx_ptr: *mut std::ffi::c_void
 #[cfg(feature = "extension")]
 #[no_mangle]
 pub unsafe extern "C" fn sv_parser_override_rust(
-    ctx_ptr: *const std::ffi::c_void,
     query_ptr: *const u8,
     query_len: usize,
     sql_out_ptr: *mut *mut u8,
@@ -201,9 +123,6 @@ pub unsafe extern "C" fn sv_parser_override_rust(
     error_out_len: usize,
 ) -> u8 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if ctx_ptr.is_null() {
-            return 2_u8; // no context — defer
-        }
         if query_ptr.is_null() || query_len == 0 {
             return 2_u8; // not ours
         }
@@ -215,9 +134,7 @@ pub unsafe extern "C" fn sv_parser_override_rust(
             return 2; // not ours — defer
         };
 
-        let ctx = &*(ctx_ptr as *const OverrideContext);
-
-        match rewrite_to_native_sql(ctx, query) {
+        match rewrite_to_native_sql(query) {
             Ok(Some(sql)) => {
                 publish_owned_sql(sql, sql_out_ptr, sql_out_len);
                 0 // success — native SQL handed to caller
@@ -296,13 +213,16 @@ pub unsafe extern "C" fn sv_parser_override_rust(
 ///     (`SET allow_parser_override_extension='FALLBACK'`); `position_out=0`
 ///     so the caret lands on the `C` of `CREATE` / `D` of `DROP`.
 ///
-/// `ctx_ptr` is the same `Box<OverrideContext>*` handed to
-/// `sv_parser_override_rust`. When non-null we re-run the FULL rewrite
-/// (including catalog-aware existence checks in `rewrite_drop` /
-/// `rewrite_alter`); when null we fall back to syntax-only validation.
-/// This is what lets parse_function reproduce the same error message
-/// `parser_override` saw — including "semantic view '…' does not exist"
-/// for DROP-of-missing — with caret rendering attached.
+/// The extension build re-runs the full rewrite (`rewrite_to_native_sql`); unit
+/// tests (no `extension` feature) fall back to syntax-only validation via
+/// `plan_rewrite`. Either way the purpose is to recover the `ParseError` message
+/// + caret position for a *structurally invalid* DDL statement (e.g. a malformed
+/// CREATE body), reproducing exactly what `parser_override` saw. Catalog-level
+/// conditions — DROP-of-missing, rename-into-an-existing-name — are NOT
+/// rewrite-time errors: `rewrite_drop` / `rewrite_alter_*` emit execution-time
+/// SQL guards, so a well-formed-but-catalog-invalid statement rewrites
+/// successfully (`Ok(Some)`) and its error surfaces when the emitted SQL runs,
+/// not here (such a statement maps to rc=3 if `parser_override` is inactive).
 ///
 /// # Safety
 ///
@@ -316,7 +236,6 @@ pub unsafe extern "C" fn sv_parser_override_rust(
 #[cfg(any(feature = "extension", test))]
 #[no_mangle]
 pub unsafe extern "C" fn sv_parse_function_rust(
-    ctx_ptr: *const std::ffi::c_void,
     query_ptr: *const u8,
     query_len: usize,
     error_out: *mut u8,
@@ -356,12 +275,14 @@ pub unsafe extern "C" fn sv_parse_function_rust(
             return 2_u8; // genuinely not ours
         }
 
-        // Recognised prefix — re-run validation. When ctx_ptr is non-null
-        // (production path) use rewrite_to_native_sql so catalog-level
-        // errors (DROP-of-missing, ALTER-renaming-to-existing-name, …) are
-        // reproduced here just as parser_override saw them. When ctx_ptr
-        // is null (unit tests) fall back to syntax-only validation.
-        let result = run_validation_for_parse_function(ctx_ptr, query);
+        // Recognised prefix — re-run validation to recover the ParseError
+        // wording + caret for a structurally-invalid statement, exactly as
+        // parser_override saw it. Catalog-level conditions (DROP-of-missing,
+        // rename collision) are execution-time SQL guards, not rewrite-time
+        // errors, so they rewrite to Ok(Some) here and are not reproduced.
+        // Unit tests fall back to syntax-only validation (see the two cfg'd
+        // definitions below).
+        let result = run_validation_for_parse_function(query);
 
         match result {
             Ok(Some(_rewritten)) => {
@@ -408,36 +329,25 @@ pub unsafe extern "C" fn sv_parse_function_rust(
 }
 
 /// Re-run validation for the parse_function path. Mirrors what
-/// `sv_parser_override_rust` did at parse time: catalog-aware rewrite when a
-/// context is available, syntax-only validation when not (unit tests + the
-/// future case where the C++ shim has lost its rust_state).
+/// `sv_parser_override_rust` did at parse time (`rewrite_to_native_sql`), so a
+/// structurally-invalid DDL statement surfaces the same `ParseError` wording +
+/// position that parser_override produced. Catalog-level errors (DROP-of-missing,
+/// rename collision) are enforced by guards in the *emitted* SQL at execution
+/// time, so they are not reproduced here — such statements return `Ok(Some(_))`.
 ///
 /// Returning `Ok(Some(_))` means "validation succeeded" — at the
 /// parse_function call site this can only happen when parser_override
 /// itself didn't run, so the caller maps it to rc=3 (actionable hint).
 #[cfg(feature = "extension")]
-unsafe fn run_validation_for_parse_function(
-    ctx_ptr: *const std::ffi::c_void,
-    query: &str,
-) -> Result<Option<String>, ParseError> {
-    if ctx_ptr.is_null() {
-        // Syntax-only fallback (ctx lost). Only the Ok(Some)/Ok(None)/Err shape
-        // matters here — the caller discards the string — so plan without
-        // rendering any SQL.
-        return plan_rewrite(query).map(|opt| opt.map(|_| String::new()));
-    }
-    let ctx = &*(ctx_ptr as *const OverrideContext);
-    rewrite_to_native_sql(ctx, query)
+fn run_validation_for_parse_function(query: &str) -> Result<Option<String>, ParseError> {
+    rewrite_to_native_sql(query)
 }
 
 /// Test-only sibling of `run_validation_for_parse_function` — pure syntax
 /// validation. Under `cargo test` the `extension` feature is OFF (default
-/// features = bundled), so `rewrite_to_native_sql` is unavailable; ctx_ptr
-/// is always null in tests anyway.
+/// features = bundled), so `rewrite_to_native_sql` is unavailable; only the
+/// `Ok(Some)/Ok(None)/Err` shape matters (the caller discards the string).
 #[cfg(all(not(feature = "extension"), test))]
-unsafe fn run_validation_for_parse_function(
-    _ctx_ptr: *const std::ffi::c_void,
-    query: &str,
-) -> Result<Option<String>, ParseError> {
+fn run_validation_for_parse_function(query: &str) -> Result<Option<String>, ParseError> {
     plan_rewrite(query).map(|opt| opt.map(|_| String::new()))
 }

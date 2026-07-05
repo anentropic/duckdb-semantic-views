@@ -405,15 +405,25 @@ fn patch_duckdb_cpp_for_windows() -> String {
         #endif\n\n\
         #endif\n\n#else\n#include <sys/mman.h>";
 
+    // AR-9: a patch-2 miss is a HARD error, not a `cargo:warning`. This
+    // function only runs on Windows builds (build.rs `is_windows` guard), and
+    // the bundled amalgamation is version-pinned, so the marker is present for
+    // every version we ship against. If it moves (a DuckDB bump reshaping the
+    // <windows.h> block) the #undef is silently dropped and the second
+    // windows.h include re-defines the C++ identifier `interface` — the MSVC
+    // build then fails much later with opaque C2xxxx errors far from the cause.
+    // Fail the build here, at the patch site, with an actionable message.
     let content = if content.contains(patch2_before) {
         content.replace(patch2_before, patch2_after)
     } else {
-        println!(
-            "cargo:warning=duckdb.cpp Win32 patch 2 skipped: expected marker not found. \
-                  This may indicate a DuckDB version change — verify interface macro is not \
-                  causing build failures."
+        panic!(
+            "duckdb.cpp Win32 patch 2 FAILED: expected marker not found. The bundled \
+             DuckDB amalgamation changed shape (most likely a version bump), so this \
+             Windows-only #undef patch no longer applies. Left unpatched, the MSVC build \
+             fails later with opaque errors when the second <windows.h> include re-defines \
+             the C++ identifier `interface`. Update `patch2_before` in \
+             build.rs::patch_duckdb_cpp_for_windows to match the new amalgamation."
         );
-        content
     };
 
     // --- Patch 3: neutralize fmt's removed-MSVC-API reference ---
@@ -441,15 +451,21 @@ fn patch_duckdb_cpp_for_windows() -> String {
     let patch3_before = "#ifdef _SECURE_SCL\n// Make a checked iterator to avoid MSVC warnings.\ntemplate <typename T> using checked_ptr = stdext::checked_array_iterator<T*>;";
     let patch3_after = "#if 0 // semantic-views patch: stdext::checked_array_iterator removed from modern MSVC STL — force fmt's portable raw-pointer path\n// Make a checked iterator to avoid MSVC warnings.\ntemplate <typename T> using checked_ptr = stdext::checked_array_iterator<T*>;";
 
+    // AR-9: like patch 2, a patch-3 miss is a HARD error. Without it, MSVC
+    // takes fmt's `stdext::checked_array_iterator` branch — removed from modern
+    // MSVC STL — and fails with `error C2653: 'stdext' is not a namespace`.
+    // Fail loudly at the patch site rather than deep in the fmt headers.
     let content = if content.contains(patch3_before) {
         content.replace(patch3_before, patch3_after)
     } else {
-        println!(
-            "cargo:warning=duckdb.cpp Win32 patch 3 skipped: expected _SECURE_SCL marker not \
-                  found. This may indicate a DuckDB/fmt version change — verify \
-                  stdext::checked_array_iterator is not causing build failures."
+        panic!(
+            "duckdb.cpp Win32 patch 3 FAILED: expected _SECURE_SCL marker not found. The \
+             bundled DuckDB/fmt amalgamation changed shape (most likely a version bump), so \
+             this Windows-only fmt patch no longer applies. Left unpatched, MSVC selects \
+             fmt's removed `stdext::checked_array_iterator` and fails with `error C2653: \
+             'stdext' is not a class or namespace name`. Update `patch3_before` in \
+             build.rs::patch_duckdb_cpp_for_windows to match the new amalgamation."
         );
-        content
     };
 
     std::fs::write(&patched, content).expect("failed to write duckdb_patched.cpp to OUT_DIR");
