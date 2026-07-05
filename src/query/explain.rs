@@ -91,7 +91,13 @@ unsafe fn parse_string_list(buf: *const u8, len: usize) -> Result<Vec<String>, S
         Ok(v)
     };
     let count = read_u32(slice, &mut off)? as usize;
-    let mut out = Vec::with_capacity(count);
+    // FF-6: cap the pre-allocation at the largest element count the buffer
+    // could actually hold. The 4-byte count prefix has already been consumed,
+    // and each remaining element carries at least a 4-byte length prefix, so
+    // the ceiling is `(len - 4) / 4`. A corrupt `count` near u32::MAX would
+    // otherwise request a ~100 GB allocation up front; the per-element bounds
+    // check below still rejects a genuinely truncated payload.
+    let mut out = Vec::with_capacity(count.min(len.saturating_sub(4) / 4));
     for i in 0..count {
         let n = read_u32(slice, &mut off)
             .map_err(|e| format!("reading length for element {i} of {count}: {e}"))?
@@ -346,7 +352,13 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
 
         // Serialise as 1-column VARCHAR rows.
         let rows: Vec<Vec<String>> = lines.into_iter().map(|l| vec![l]).collect();
-        let buf = serialize_varchar_rows(&rows);
+        let buf = match serialize_varchar_rows(&rows) {
+            Ok(b) => b,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
         publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));

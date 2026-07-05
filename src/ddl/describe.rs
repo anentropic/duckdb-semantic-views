@@ -100,7 +100,13 @@ pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
                 r.property_value,
             ]);
         }
-        let buf = serialize_varchar_rows(&rows);
+        let buf = match serialize_varchar_rows(&rows) {
+            Ok(b) => b,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
         publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));

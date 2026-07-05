@@ -163,51 +163,66 @@ pub unsafe fn write_err(buf: *mut u8, buf_len: usize, msg: &str) {
     crate::ffi_util::write_error_to_buffer(buf, buf_len, msg);
 }
 
+/// Encode a length as a little-endian `u32`, erroring rather than clamping
+/// when it exceeds `u32::MAX` (FF-6). A silent `unwrap_or(u32::MAX)` would
+/// write a length prefix that disagrees with the bytes actually appended,
+/// desyncing the header from the payload for every subsequent field on the
+/// C++ read side. The overflow is unreachable for real catalog metadata (a
+/// single row/cell would need >4 GiB), so the error is a hard corruption
+/// signal, not a routine path.
+fn wire_len(n: usize, what: &str) -> Result<u32, String> {
+    u32::try_from(n).map_err(|_| format!("{what} ({n} bytes) exceeds the wire-format u32 limit"))
+}
+
 /// Serialize a vector of VARCHAR rows into the wire format described above.
 ///
 /// `rows` is a `Vec<Vec<String>>` where every inner Vec has the same length
 /// (number of columns). The function does NOT validate that — callers are
 /// expected to construct rectangular row sets.
-#[must_use]
-pub fn serialize_varchar_rows(rows: &[Vec<String>]) -> Vec<u8> {
+///
+/// Returns `Err` if the row count or any cell length overflows the wire
+/// format's `u32` fields (see [`wire_len`]).
+pub fn serialize_varchar_rows(rows: &[Vec<String>]) -> Result<Vec<u8>, String> {
     let cap = 4 + rows
         .iter()
         .map(|r| r.iter().map(|s| 4 + s.len()).sum::<usize>())
         .sum::<usize>();
     let mut buf = Vec::with_capacity(cap);
-    let row_count = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+    let row_count = wire_len(rows.len(), "row count")?;
     buf.extend_from_slice(&row_count.to_le_bytes());
     for row in rows {
         for col in row {
-            let len = u32::try_from(col.len()).unwrap_or(u32::MAX);
+            let len = wire_len(col.len(), "cell")?;
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(col.as_bytes());
         }
     }
-    buf
+    Ok(buf)
 }
 
 /// Serialize a vector of (VARCHAR-cells, BOOL) rows. Each row's strings are
 /// emitted first (same shape as `serialize_varchar_rows`) followed by a
 /// single trailing `u8` (1 = TRUE, 0 = FALSE).
-#[must_use]
-pub fn serialize_varchar_bool_rows(rows: &[(Vec<String>, bool)]) -> Vec<u8> {
+///
+/// Returns `Err` on the same overflow conditions as
+/// [`serialize_varchar_rows`].
+pub fn serialize_varchar_bool_rows(rows: &[(Vec<String>, bool)]) -> Result<Vec<u8>, String> {
     let cap = 4 + rows
         .iter()
         .map(|(strs, _)| strs.iter().map(|s| 4 + s.len()).sum::<usize>() + 1)
         .sum::<usize>();
     let mut buf = Vec::with_capacity(cap);
-    let row_count = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+    let row_count = wire_len(rows.len(), "row count")?;
     buf.extend_from_slice(&row_count.to_le_bytes());
     for (strs, b) in rows {
         for col in strs {
-            let len = u32::try_from(col.len()).unwrap_or(u32::MAX);
+            let len = wire_len(col.len(), "cell")?;
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(col.as_bytes());
         }
         buf.push(u8::from(*b));
     }
-    buf
+    Ok(buf)
 }
 
 /// Hand a heap-owned `Vec<u8>` to the C++ side via the (ptr, len)
@@ -320,14 +335,14 @@ mod tests {
 
     #[test]
     fn serialize_empty_row_set() {
-        let buf = serialize_varchar_rows(&[]);
+        let buf = serialize_varchar_rows(&[]).unwrap();
         assert_eq!(buf, vec![0, 0, 0, 0]);
     }
 
     #[test]
     fn serialize_single_row() {
         let rows = vec![vec!["a".to_string(), "bc".to_string()]];
-        let buf = serialize_varchar_rows(&rows);
+        let buf = serialize_varchar_rows(&rows).unwrap();
         let expected: Vec<u8> = vec![
             1, 0, 0, 0, // row_count = 1
             1, 0, 0, 0,    // len("a") = 1
@@ -344,7 +359,7 @@ mod tests {
             (vec!["x".to_string()], true),
             (vec!["y".to_string()], false),
         ];
-        let buf = serialize_varchar_bool_rows(&rows);
+        let buf = serialize_varchar_bool_rows(&rows).unwrap();
         let expected: Vec<u8> = vec![
             2, 0, 0, 0, // row_count = 2
             1, 0, 0, 0, b'x', 1, // ("x", true)

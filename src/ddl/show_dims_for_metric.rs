@@ -198,7 +198,7 @@ unsafe fn show_dims_for_metric(
             .collect()
     };
     rows.sort_by(|a, b| a.0[1].cmp(&b.0[1]));
-    Ok(serialize_varchar_bool_rows(&rows))
+    serialize_varchar_bool_rows(&rows)
 }
 
 /// Check if a dimension is reachable from a given set of metric source tables
