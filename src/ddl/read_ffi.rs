@@ -229,6 +229,91 @@ pub unsafe fn publish_owned_buffer(buf: Vec<u8>, out_ptr: *mut *mut u8, out_len:
     crate::ffi_util::publish_owned_bytes(buf, out_ptr, out_len);
 }
 
+/// Shared scaffold for the read-side bind/exec dispatchers (ST-2).
+///
+/// Owns the boilerplate every dispatcher repeated verbatim: the
+/// `catch_unwind` guard, the borrowed-connection null check, publishing the
+/// success buffer, writing the error string, and the panic arm. The caller's
+/// `body` does only the interesting work — parse args, read the catalog,
+/// assemble + serialize rows — and returns the serialized wire buffer on
+/// success or an error message.
+///
+/// Return-code contract (unchanged from the hand-written dispatchers):
+/// `0` = success (buffer published), `1` = handled error (message in
+/// `error_buf`), `2` = panic (message in `error_buf`).
+///
+/// # Safety
+///
+/// `conn` is a borrowed handle (see module-level borrow contract); it must
+/// outlive the call and must not be disconnected. `out_ptr`/`out_len` are the
+/// C++ out-parameters for the published buffer; `error_buf`/`error_buf_len`
+/// the C++ diagnostic slot. `panic_label` names the dispatcher for the panic
+/// message.
+pub unsafe fn run_dispatcher<F>(
+    conn: ffi::duckdb_connection,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    error_buf: *mut u8,
+    error_buf_len: usize,
+    panic_label: &str,
+    body: F,
+) -> u8
+where
+    F: FnOnce(&BorrowedConnection) -> Result<Vec<u8>, String>,
+{
+    // AssertUnwindSafe mirrors the per-dispatcher wrapper this replaces: the
+    // captured raw pointers are not `UnwindSafe`, but the catch_unwind here is
+    // purely to convert a panic into rc=2 — no state is observed after unwind.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let borrowed = BorrowedConnection::new(conn);
+        if borrowed.is_null() {
+            write_err(error_buf, error_buf_len, "duckdb_connection is null");
+            return 1_u8;
+        }
+        match body(&borrowed) {
+            Ok(buf) => {
+                publish_owned_buffer(buf, out_ptr, out_len);
+                0_u8
+            }
+            Err(msg) => {
+                write_err(error_buf, error_buf_len, &msg);
+                1_u8
+            }
+        }
+    }));
+    match result {
+        Ok(rc) => rc,
+        Err(_) => {
+            write_err(
+                error_buf,
+                error_buf_len,
+                &format!("internal error: panic inside {panic_label}"),
+            );
+            2
+        }
+    }
+}
+
+/// Decode a `(ptr, len)` string argument passed from the C++ side, checking
+/// for a null pointer and valid UTF-8 (ST-2). `what` names the argument for
+/// the error message (e.g. `"view name"` → `"view name pointer is null"` /
+/// `"view name is not valid UTF-8"`), matching the wording the hand-written
+/// dispatchers used.
+///
+/// # Safety
+///
+/// If non-null, `ptr` must point to `len` readable bytes for the duration of
+/// the call.
+pub unsafe fn read_str_arg(ptr: *const u8, len: usize, what: &str) -> Result<String, String> {
+    if ptr.is_null() {
+        return Err(format!("{what} pointer is null"));
+    }
+    match std::str::from_utf8(std::slice::from_raw_parts(ptr, len)) {
+        Ok(s) => Ok(s.to_string()),
+        Err(_) => Err(format!("{what} is not valid UTF-8")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
