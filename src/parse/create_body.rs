@@ -214,8 +214,6 @@ fn rewrite_ddl_keyword_body(
         joins: keyword_body.relationships,
         facts: keyword_body.facts,
         materializations: keyword_body.materializations,
-        column_type_names: vec![],
-        column_types_inferred: vec![],
         created_on: None,
         database_name: None,
         schema_name: None,

@@ -257,15 +257,6 @@ pub struct Fact {
     pub access: AccessModifier,
 }
 
-/// A column-pair relationship entry for composite or single FK declarations.
-/// Used in the `relationships` DDL parameter's `join_columns` field.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
-pub struct JoinColumn {
-    pub from: String,
-    pub to: String,
-}
-
 /// Cardinality of a relationship between two tables.
 ///
 /// Inferred from PK/UNIQUE constraints at define time (Phase 33).
@@ -316,18 +307,13 @@ impl AccessModifier {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Join {
     pub table: String,
-    /// Legacy field (Phase 10 and earlier): raw SQL ON clause.
-    /// Kept for backward compat with stored JSON. Not written by Phase 11 DDL.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub on: String,
-    /// New field (Phase 11): FK column names from this table to the base table.
-    /// Set by CREATE SEMANTIC VIEW RELATIONSHIPS clause.
-    #[serde(default)]
-    pub from_cols: Vec<String>,
-    /// Phase 11.1: column-pair FK declarations. Replaces `from_cols` for new definitions.
-    /// Old stored JSON without this field deserializes with empty Vec.
-    #[serde(default)]
-    pub join_columns: Vec<JoinColumn>,
+    // AR-4 (PR-2): the pre-Phase-24 FK encodings `on` (raw SQL ON clause),
+    // `from_cols`, and `join_columns` were removed here. They were
+    // deserialize-only backward-compat shims with no runtime reads; current
+    // DDL emits `from_alias` + `fk_columns`. Old stored JSON that still
+    // carries those keys deserializes fine (serde ignores unknown fields),
+    // and the AR-4 upgrade pass / fan-trap guard handle rows that lack the
+    // current FK metadata.
     /// Phase 24: The source table alias from which FK columns are defined.
     /// In `order_to_customer AS o(customer_id) REFERENCES c`, this is `"o"`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -390,18 +376,13 @@ pub struct SemanticViewDefinition {
     /// Not serialized when empty to preserve backward-compatible JSON.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub materializations: Vec<Materialization>,
-    /// Column names from DDL-time LIMIT 0 inference, parallel to `column_types_inferred`.
-    /// Populated by `create_semantic_view` `invoke()`. Empty = no inference ran.
-    /// Used by `bind()` to build a name→type map for subquery column lookups.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub column_type_names: Vec<String>,
-    /// DDL-time inferred column types stored as `ffi::duckdb_type` (u32) values.
-    /// Populated by `create_semantic_view` `invoke()` after running LIMIT 0.
-    /// Parallel to `column_type_names`: `column_type_names[i]` ↔ `column_types_inferred[i]`.
-    /// Empty vec = no inference ran (in-memory DB or inference failed) → VARCHAR fallback.
-    /// `bind()` builds a name→type `HashMap` from both vecs to look up requested columns by name.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub column_types_inferred: Vec<u32>,
+    // AR-4 (PR-2): the parallel DDL-time type-inference vectors
+    // `column_type_names` / `column_types_inferred` were removed here. They
+    // were never populated for post-v0.10.0 rows (D-16/D-17 deferred type
+    // inference to read-side bind), so they were dead for new definitions;
+    // legacy v0.7.1-era rows that still carry the keys now fall through to
+    // the same read-side bind inference as new rows. Old JSON with these
+    // keys deserializes fine (serde ignores unknown fields).
     /// ISO 8601 timestamp of when this semantic view was created.
     /// Captured at define time via `DuckDB` `now()`.
     /// Old stored JSON without this field deserializes to None.
@@ -441,21 +422,6 @@ impl SemanticViewDefinition {
             .iter()
             .map(|t| (t.alias.clone(), t.table.clone()))
             .collect()
-    }
-
-    /// Iterate over inferred column types as (name, `duckdb_type`) pairs.
-    ///
-    /// Zips `column_type_names` and `column_types_inferred`, which are parallel
-    /// vectors populated by DDL-time LIMIT 0 inference. Returns an empty
-    /// iterator if inference did not run (both vecs empty).
-    ///
-    /// This method makes the parallel-vector invariant explicit: callers get
-    /// typed pairs rather than indexing two vecs manually.
-    pub fn inferred_types(&self) -> impl Iterator<Item = (&str, u32)> {
-        self.column_type_names
-            .iter()
-            .map(String::as_str)
-            .zip(self.column_types_inferred.iter().copied())
     }
 }
 
@@ -661,23 +627,16 @@ mod tests {
         }
 
         #[test]
-        fn join_old_format_backwards_compat() {
-            // Old Join with `on` field (Phase 10 and earlier format)
-            let json = r#"{"table":"customers","on":"a.id=b.id"}"#;
+        fn legacy_join_fk_encodings_are_ignored_on_load() {
+            // AR-4 (PR-2): the removed `on` / `from_cols` / `join_columns`
+            // keys must still deserialize — serde ignores unknown fields, so
+            // an old stored Join loads carrying only the current fields.
+            let json = r#"{"table":"customers","on":"a.id=b.id","from_cols":["cid"],
+                "join_columns":[{"from":"cid","to":"id"}],"fk_columns":["cid"],"from_alias":"o"}"#;
             let join: Join = serde_json::from_str(json).unwrap();
             assert_eq!(join.table, "customers");
-            assert_eq!(join.on, "a.id=b.id");
-            assert!(join.from_cols.is_empty(), "from_cols should default to []");
-        }
-
-        #[test]
-        fn join_new_format() {
-            // New Join with `from_cols` (Phase 11 format)
-            let json = r#"{"table":"customers","from_cols":["customer_id"]}"#;
-            let join: Join = serde_json::from_str(json).unwrap();
-            assert_eq!(join.table, "customers");
-            assert_eq!(join.on, "", "on should default to empty string");
-            assert_eq!(join.from_cols, vec!["customer_id"]);
+            assert_eq!(join.from_alias, "o");
+            assert_eq!(join.fk_columns, vec!["cid"]);
         }
 
         #[test]
@@ -731,43 +690,6 @@ mod tests {
         }
 
         #[test]
-        fn join_column_roundtrip() {
-            let jc = JoinColumn {
-                from: "customer_id".to_string(),
-                to: "id".to_string(),
-            };
-            let json = serde_json::to_string(&jc).unwrap();
-            assert_eq!(json, r#"{"from":"customer_id","to":"id"}"#);
-            let rt: JoinColumn = serde_json::from_str(&json).unwrap();
-            assert_eq!(rt.from, "customer_id");
-            assert_eq!(rt.to, "id");
-        }
-
-        #[test]
-        fn join_old_on_format_backwards_compat_with_join_columns_default() {
-            // Old Join with only `on` field — join_columns must default to []
-            let json = r#"{"table":"customers","on":"a.id=b.id"}"#;
-            let join: Join = serde_json::from_str(json).unwrap();
-            assert_eq!(join.table, "customers");
-            assert_eq!(join.on, "a.id=b.id");
-            assert!(
-                join.join_columns.is_empty(),
-                "join_columns should default to [] for old JSON"
-            );
-        }
-
-        #[test]
-        fn join_new_format_with_join_columns() {
-            let json = r#"{"table":"customers","join_columns":[{"from":"customer_id","to":"id"}]}"#;
-            let join: Join = serde_json::from_str(json).unwrap();
-            assert_eq!(join.table, "customers");
-            assert_eq!(join.on, "", "on should default to empty string");
-            assert_eq!(join.join_columns.len(), 1);
-            assert_eq!(join.join_columns[0].from, "customer_id");
-            assert_eq!(join.join_columns[0].to, "id");
-        }
-
-        #[test]
         fn semantic_view_definition_with_tables_roundtrip() {
             let def = SemanticViewDefinition {
                 tables: vec![TableRef {
@@ -782,8 +704,6 @@ mod tests {
                 facts: vec![],
                 materializations: vec![],
 
-                column_type_names: vec![],
-                column_types_inferred: vec![],
                 created_on: None,
                 database_name: None,
                 schema_name: None,
@@ -984,30 +904,6 @@ mod tests {
         }
 
         #[test]
-        fn column_types_inferred_roundtrips() {
-            let def = SemanticViewDefinition {
-                tables: vec![],
-                dimensions: vec![],
-                metrics: vec![],
-
-                joins: vec![],
-                facts: vec![],
-                materializations: vec![],
-
-                column_type_names: vec!["region".to_string(), "revenue".to_string()],
-                column_types_inferred: vec![17u32, 20u32],
-                created_on: None,
-                database_name: None,
-                schema_name: None,
-                comment: None,
-            };
-            let json = serde_json::to_string(&def).unwrap();
-            let rt: SemanticViewDefinition = serde_json::from_str(&json).unwrap();
-            assert_eq!(rt.column_type_names, vec!["region", "revenue"]);
-            assert_eq!(rt.column_types_inferred, vec![17u32, 20u32]);
-        }
-
-        #[test]
         fn old_json_without_output_type_deserializes() {
             // Old JSON without output_type field — must deserialize to None
             let json = r#"{
@@ -1027,17 +923,14 @@ mod tests {
         }
 
         #[test]
-        fn old_json_without_column_types_inferred_deserializes() {
-            // Old JSON without column_type_names or column_types_inferred — must succeed with empty vecs
-            let json = r#"{"base_table": "orders", "dimensions": [], "metrics": []}"#;
-            let def = SemanticViewDefinition::from_json("orders", json).unwrap();
+        fn old_json_with_removed_type_inference_vecs_still_deserializes() {
+            // AR-4 (PR-2): the removed column_type_names / column_types_inferred
+            // keys in a legacy row must be ignored, not rejected.
+            let json = r#"{"base_table": "orders", "dimensions": [], "metrics": [],
+                "column_type_names": ["region"], "column_types_inferred": [17]}"#;
             assert!(
-                def.column_type_names.is_empty(),
-                "column_type_names should default to []"
-            );
-            assert!(
-                def.column_types_inferred.is_empty(),
-                "column_types_inferred should default to []"
+                SemanticViewDefinition::from_json("orders", json).is_ok(),
+                "legacy type-inference keys must be ignored on load"
             );
         }
     }
@@ -1872,8 +1765,6 @@ comment: Revenue analytics view
             assert!(def.tables.is_empty());
             assert!(def.joins.is_empty());
             assert!(def.facts.is_empty());
-            assert!(def.column_type_names.is_empty());
-            assert!(def.column_types_inferred.is_empty());
             assert!(def.created_on.is_none());
             assert!(def.database_name.is_none());
             assert!(def.schema_name.is_none());

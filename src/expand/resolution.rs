@@ -215,8 +215,6 @@ mod tests {
             joins: vec![],
             facts: vec![],
             materializations: vec![],
-            column_type_names: vec![],
-            column_types_inferred: vec![],
             created_on: None,
             database_name: db.map(str::to_string),
             schema_name: schema.map(str::to_string),
