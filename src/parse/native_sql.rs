@@ -10,13 +10,13 @@
 //! The SQL-string escape pair and the guard-SELECT builders are compiled
 //! unconditionally (no `extension` gate) so `cargo test` can exercise the
 //! escaping and guard wording without linking the loadable-extension stubs;
-//! the emission/rewrite functions that consume an `OverrideContext` are
-//! `extension`-gated. `rewrite_to_native_sql` is re-exported from the parent
-//! module for the FFI entry points; the escape/guard helpers are re-exported
-//! under `#[cfg(test)]` for the parent module's unit tests.
+//! the emission/rewrite functions are `extension`-gated. `rewrite_to_native_sql`
+//! is re-exported from the parent module for the FFI entry points; the
+//! escape/guard helpers are re-exported under `#[cfg(test)]` for the parent
+//! module's unit tests.
 
 #[cfg(feature = "extension")]
-use super::{plan_rewrite, OverrideContext, RewriteAction};
+use super::{plan_rewrite, RewriteAction};
 #[cfg(feature = "extension")]
 use crate::catalog::writes::{
     definitions_table_guard_select, existence_guard_select, rename_collision_guard_select,
@@ -59,14 +59,12 @@ use crate::ident::normalize_view_name;
 //       → `Ok(None)`; the C++ shim returns DISPLAY_ORIGINAL_ERROR and DuckDB's
 //         default parser handles it.
 //
-// CREATE/DROP/ALTER need a `CatalogReader` for existence checks; CREATE also
-// runs catalog-side queries during enrichment (PK lookup, LIMIT 0 type
-// inference, fact typing). Phase 62 attaches the `OverrideContext` directly
-// to the C++ `SemanticViewsParserInfo` via an opaque `Box`, so the rewriters
-// take `&OverrideContext` here instead of looking up by token. Under
-// `cargo test` (no extension feature) these code paths are excluded entirely
-// (this entry point itself is feature-gated; its sole caller —
-// `sv_parser_override_rust` — is `extension`-only).
+// AR-7: this used to take `&OverrideContext`, but that struct was empty after
+// Phase 65 Plan 06 moved CREATE/DROP/ALTER existence checks into the emitted
+// SQL (pure-SQL race guards on the caller's connection) — so the parameter was
+// dead and has been removed. Under `cargo test` (no extension feature) this
+// path is excluded entirely (this entry point is feature-gated; its sole
+// caller — `sv_parser_override_rust` — is `extension`-only).
 //
 // INVARIANT (AR-5) — purity / idempotence. This function MUST be a pure
 // function of `query` (and committed catalog state): for a given input it
@@ -82,10 +80,7 @@ use crate::ident::normalize_view_name;
 // nondeterminism here breaks that contract and must instead cache the first
 // run's `(query -> result)` rather than re-deriving it.
 #[cfg(feature = "extension")]
-pub(crate) fn rewrite_to_native_sql(
-    _ctx: &OverrideContext,
-    query: &str,
-) -> Result<Option<String>, ParseError> {
+pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, ParseError> {
     let Some(action) = plan_rewrite(query)? else {
         return Ok(None);
     };
@@ -278,7 +273,7 @@ fn emit_native_create_sql(
 /// caller's connection -- matching `emit_native_create_sql`'s non-YAML
 /// behaviour byte-for-byte.
 ///
-/// Phase 65 Plan 06: pure-SQL, no `OverrideContext` consumed. The YAML
+/// Phase 65 Plan 06: pure-SQL, no extension-owned catalog connection. The YAML
 /// read happens inside the `__sv_compute_create_from_yaml` helper TF's
 /// bind callback (per-call `Connection(*context.db)`), not on any
 /// long-lived extension-owned connection.

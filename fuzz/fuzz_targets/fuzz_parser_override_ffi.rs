@@ -5,9 +5,8 @@
 //!
 //! `sv_parser_override_rust` (the actual FFI symbol) is gated behind the
 //! `extension` feature so it can't be called directly from this target.
-//! `rewrite_to_native_sql` (Phase 62) takes an `&OverrideContext` (a
-//! catalog-aware handle) and is also `extension`-gated; the catalog access
-//! cannot be exercised meaningfully without a live DuckDB.
+//! `rewrite_to_native_sql` is also `extension`-gated and its catalog-aware
+//! emission cannot be exercised meaningfully without a live DuckDB.
 //!
 //! What we DO fuzz here is the syntax-level Rust validation pipeline,
 //! which is what executes inside `parser_override` BEFORE any catalog

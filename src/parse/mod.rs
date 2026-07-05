@@ -36,12 +36,12 @@ pub(crate) use detect::{
 };
 
 mod ffi;
+#[cfg(feature = "extension")]
+pub use ffi::sv_free_buffer;
 #[cfg(test)]
 pub(crate) use ffi::sv_parse_function_rust;
 #[cfg(all(feature = "extension", test))]
-pub(crate) use ffi::{sv_drop_override_context, sv_make_override_context, sv_parser_override_rust};
-#[cfg(feature = "extension")]
-pub use ffi::{sv_free_buffer, OverrideContext};
+pub(crate) use ffi::sv_parser_override_rust;
 
 mod native_sql;
 #[cfg(feature = "extension")]
@@ -780,32 +780,13 @@ mod tests {
     }
 
     // ===================================================================
-    // Phase 65 Plan 06: OverrideContext is now an empty struct — no
-    // long-lived duckdb_connection is carried, so no Drop impl is
-    // needed beyond the default Box reclamation. The pre-Plan-06
-    // `override_context_drop_does_not_disconnect` sentinel test became
-    // moot (there is no inner pointer to disconnect) and was removed.
-    // The FFI round-trip + null-drop tests remain to pin the FFI
-    // shape contract.
+    // AR-7: the empty `OverrideContext` + `sv_make_override_context` /
+    // `sv_drop_override_context` lifecycle was retired (dead after Phase 65
+    // Plan 06 moved catalog pre-checks into the emitted SQL). The FFI
+    // round-trip / null-drop tests that pinned that shape were removed with
+    // it; `sv_parser_override_rust` / `sv_parse_function_rust` no longer take
+    // an opaque context pointer.
     // ===================================================================
-
-    #[cfg(feature = "extension")]
-    #[test]
-    fn sv_make_and_drop_override_context_round_trip() {
-        // FFI ctor allocates an empty Box<OverrideContext> and returns
-        // its raw pointer. The dtor reconstructs the Box and drops it.
-        let ptr = unsafe { sv_make_override_context() };
-        assert!(!ptr.is_null(), "ctor must return non-null for a valid Box");
-        unsafe { sv_drop_override_context(ptr) };
-    }
-
-    #[cfg(feature = "extension")]
-    #[test]
-    fn sv_drop_override_context_handles_null() {
-        // Defensive: null-pointer drop must be a no-op (matches the
-        // C++ shim's `if (rust_state) { ... }` guard pattern).
-        unsafe { sv_drop_override_context(std::ptr::null_mut()) };
-    }
 
     // ===================================================================
     // Phase 62 Plan 03 — sv_parse_function_rust rc=0/1/2/3 contract.
@@ -824,7 +805,6 @@ mod tests {
         let mut position: u32 = u32::MAX;
         let rc = unsafe {
             sv_parse_function_rust(
-                std::ptr::null(),
                 query.as_ptr(),
                 query.len(),
                 error_buf.as_mut_ptr(),
@@ -853,7 +833,6 @@ mod tests {
         let mut position: u32 = u32::MAX;
         let rc = unsafe {
             sv_parse_function_rust(
-                std::ptr::null(),
                 bad.as_ptr(),
                 4, // exclude trailing nul, just 4 invalid bytes
                 error_buf.as_mut_ptr(),
@@ -902,16 +881,12 @@ mod tests {
         // now returns rc=2 (defer) rather than synthesising a SELECT error('...')
         // statement via the deleted sql_throwing helper. parse_function picks
         // up the error reporting via caret rendering.
-        let ctx_ptr = unsafe { sv_make_override_context() };
-        assert!(!ctx_ptr.is_null());
-
         let query = "CREATE SEMANTIC VIEW v AS TABLSE (t);";
         let mut sql_ptr: *mut u8 = std::ptr::null_mut();
         let mut sql_len: usize = 0;
         let mut error_buf = vec![0_u8; 1024];
         let rc = unsafe {
             sv_parser_override_rust(
-                ctx_ptr as *const std::ffi::c_void,
                 query.as_ptr(),
                 query.len(),
                 &mut sql_ptr as *mut *mut u8,
@@ -929,8 +904,6 @@ mod tests {
             "no rewritten SQL must be published on rc=2"
         );
         assert_eq!(sql_len, 0, "no SQL length on rc=2");
-
-        unsafe { sv_drop_override_context(ctx_ptr) };
     }
 
     // ===================================================================
