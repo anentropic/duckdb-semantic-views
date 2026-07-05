@@ -1,8 +1,7 @@
 use proptest::prelude::*;
 use semantic_views::model::{
-    AccessModifier, Cardinality, Dimension, Fact, Join, JoinColumn, Materialization, Metric,
-    NonAdditiveDim, NullsOrder, SemanticViewDefinition, SortOrder, TableRef, WindowOrderBy,
-    WindowSpec,
+    AccessModifier, Cardinality, Dimension, Fact, Join, Materialization, Metric, NonAdditiveDim,
+    NullsOrder, SemanticViewDefinition, SortOrder, TableRef, WindowOrderBy, WindowSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -161,31 +160,21 @@ fn arb_fact() -> impl Strategy<Value = Fact> {
         })
 }
 
-fn arb_join_column() -> impl Strategy<Value = JoinColumn> {
-    (arb_name(), arb_name()).prop_map(|(from, to)| JoinColumn { from, to })
-}
-
 fn arb_join() -> impl Strategy<Value = Join> {
     (
         arb_name(),
         arb_name(),
         proptest::collection::vec(arb_name(), 0..=2),
-        proptest::collection::vec(arb_join_column(), 0..=2),
         arb_cardinality(),
     )
-        .prop_map(
-            |(table, from_alias, fk_columns, join_columns, cardinality)| Join {
-                table,
-                on: String::new(),
-                from_cols: vec![],
-                join_columns,
-                from_alias,
-                fk_columns,
-                ref_columns: vec![],
-                name: None,
-                cardinality,
-            },
-        )
+        .prop_map(|(table, from_alias, fk_columns, cardinality)| Join {
+            table,
+            from_alias,
+            fk_columns,
+            ref_columns: vec![],
+            name: None,
+            cardinality,
+        })
 }
 
 fn arb_materialization() -> impl Strategy<Value = Materialization> {
@@ -222,8 +211,6 @@ fn arb_definition() -> impl Strategy<Value = SemanticViewDefinition> {
                     joins,
                     facts,
                     materializations,
-                    column_type_names: vec![],
-                    column_types_inferred: vec![],
                     created_on: None,
                     database_name: None,
                     schema_name: None,
@@ -272,8 +259,6 @@ proptest! {
 
         // Strip internal fields from original for comparison
         let mut expected = def.clone();
-        expected.column_type_names.clear();
-        expected.column_types_inferred.clear();
         expected.created_on = None;
         expected.database_name = None;
         expected.schema_name = None;

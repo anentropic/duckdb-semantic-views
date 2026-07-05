@@ -12,16 +12,15 @@ use crate::model::SemanticViewDefinition;
 ///
 /// Clones the definition and strips internal runtime fields that are
 /// repopulated at define time:
-/// - `column_type_names` / `column_types_inferred` (DDL-time type inference)
 /// - `created_on` (DDL-time timestamp)
 /// - `database_name` / `schema_name` (connection context)
 ///
 /// After stripping, `serde(skip_serializing_if)` on these fields ensures
-/// they are omitted from the YAML output entirely.
+/// they are omitted from the YAML output entirely. (`schema_version` lives
+/// only in the stored JSON, not on this struct, so it is never rendered
+/// here — see `model::CURRENT_SCHEMA_VERSION`.)
 pub fn render_yaml_export(def: &SemanticViewDefinition) -> Result<String, String> {
     let mut export = def.clone();
-    export.column_type_names.clear();
-    export.column_types_inferred.clear();
     export.created_on = None;
     export.database_name = None;
     export.schema_name = None;
@@ -59,31 +58,11 @@ mod tests {
                 ..Default::default()
             }],
             // Internal fields -- should be stripped
-            column_type_names: vec!["region".to_string(), "revenue".to_string()],
-            column_types_inferred: vec![17, 20],
             created_on: Some("2026-04-20T12:00:00Z".to_string()),
             database_name: Some("mydb".to_string()),
             schema_name: Some("main".to_string()),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn strips_column_type_names() {
-        let yaml = render_yaml_export(&def_with_internals()).unwrap();
-        assert!(
-            !yaml.contains("column_type_names"),
-            "column_type_names should be stripped from YAML: {yaml}"
-        );
-    }
-
-    #[test]
-    fn strips_column_types_inferred() {
-        let yaml = render_yaml_export(&def_with_internals()).unwrap();
-        assert!(
-            !yaml.contains("column_types_inferred"),
-            "column_types_inferred should be stripped from YAML: {yaml}"
-        );
     }
 
     #[test]
@@ -161,8 +140,6 @@ mod tests {
 
         // Build expected: original with internal fields zeroed
         let mut expected = def;
-        expected.column_type_names.clear();
-        expected.column_types_inferred.clear();
         expected.created_on = None;
         expected.database_name = None;
         expected.schema_name = None;

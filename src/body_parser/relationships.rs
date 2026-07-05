@@ -173,8 +173,5 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
         ref_columns,
         name: Some(rel_name.to_string()),
         cardinality: Cardinality::default(), // will be set by inference
-        on: String::new(),
-        from_cols: vec![],
-        join_columns: vec![],
     })
 }

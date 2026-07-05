@@ -61,8 +61,6 @@ pub(super) fn make_def(
         facts: vec![],
         materializations: vec![],
 
-        column_type_names: vec![],
-        column_types_inferred: vec![],
         created_on: None,
         database_name: None,
         schema_name: None,
@@ -104,8 +102,6 @@ pub(super) fn make_def_with_facts(
         joins: vec![],
         materializations: vec![],
 
-        column_type_names: vec![],
-        column_types_inferred: vec![],
         created_on: None,
         database_name: None,
         schema_name: None,
@@ -162,8 +158,6 @@ pub(super) fn make_def_with_derived_metrics(
         facts: vec![],
         materializations: vec![],
 
-        column_type_names: vec![],
-        column_types_inferred: vec![],
         created_on: None,
         database_name: None,
         schema_name: None,
@@ -218,8 +212,6 @@ pub(super) fn make_def_with_named_joins(
         facts: vec![],
         materializations: vec![],
 
-        column_type_names: vec![],
-        column_types_inferred: vec![],
         created_on: None,
         database_name: None,
         schema_name: None,

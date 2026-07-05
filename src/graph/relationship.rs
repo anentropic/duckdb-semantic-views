@@ -533,8 +533,7 @@ mod tests {
             }],
             joins: vec![Join {
                 table: "customers".to_string(),
-                on: "o.customer_id = c.id".to_string(),
-                fk_columns: vec![], // Legacy -- no PK/FK
+                fk_columns: vec![], // Legacy -- no PK/FK metadata
                 ..Default::default()
             }],
             dimensions: vec![],
@@ -542,8 +541,6 @@ mod tests {
             facts: vec![],
             materializations: vec![],
 
-            column_type_names: vec![],
-            column_types_inferred: vec![],
             created_on: None,
             database_name: None,
             schema_name: None,
@@ -720,8 +717,6 @@ mod tests {
                 facts: vec![],
                 materializations: vec![],
 
-                column_type_names: vec![],
-                column_types_inferred: vec![],
                 created_on: None,
                 database_name: None,
                 schema_name: None,

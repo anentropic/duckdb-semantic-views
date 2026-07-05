@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 
 use libduckdb_sys as ffi;
@@ -313,73 +312,18 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
             }
         };
 
-        // Type inference — same fall-back ladder as the legacy bind, but
-        // every LIMIT-0 probe now runs on the per-call connection (`conn`)
-        // instead of the long-lived `state.conn` (H2). The DDL-time
-        // persisted-types branch stays as a back-compat fast path for
-        // v0.7.1-era catalog rows where `column_type_names` may still be
-        // populated; new definitions land with empty vecs (Plan 03 D-16).
-        let type_map: HashMap<String, u32> = def
-            .inferred_types()
-            .map(|(name, t)| (name.to_ascii_lowercase(), normalize_type_id(t)))
-            .collect();
-
-        let (column_names, column_type_ids): (Vec<String>, Vec<u32>) = if !facts.is_empty() {
+        // Type inference: a LIMIT-0 probe on the per-call connection yields
+        // the output column names + types. The probe runs on `conn`, not a
+        // long-lived handle (H2). AR-4 (PR-2) removed the DDL-time
+        // persisted-types fast path (`column_type_names` / `column_types_inferred`
+        // were dead for post-v0.10 rows) — every row now infers at read time,
+        // matching Plan 03 D-16, so this is a single unconditional probe.
+        let (column_names, column_type_ids): (Vec<String>, Vec<u32>) = {
             let limit0_sql = format!("{expanded_sql} LIMIT 0");
-            // Phase 65.1 Plan 11 / WR-08 / D-15: surface probe failures
-            // via the error_buf cascade. No silent vec![0u32; names.len()]
+            // Phase 65.1 Plan 11 / WR-08 / D-15: surface probe failures via
+            // the error_buf cascade. No silent vec![0u32; names.len()]
             // fallback to DUCKDB_TYPE_INVALID — that masked broken FACTS
             // expressions behind a VARCHAR placeholder at query time.
-            match try_infer_schema(&borrowed, &limit0_sql) {
-                Ok((names, types)) => {
-                    let type_ids: Vec<u32> =
-                        types.iter().map(|t| normalize_type_id(*t as u32)).collect();
-                    (names, type_ids)
-                }
-                Err(msg) => {
-                    write_err(
-                        error_buf,
-                        error_buf_len,
-                        &format!(
-                            "semantic_view: type inference failed for query \
-                             `{limit0_sql}`: {msg}"
-                        ),
-                    );
-                    return 1_u8;
-                }
-            }
-        } else if !type_map.is_empty() {
-            let mut names = Vec::new();
-            let mut type_ids = Vec::new();
-            for dim_name in &dimensions {
-                let canonical = def
-                    .dimensions
-                    .iter()
-                    .find(|d| d.name.eq_ignore_ascii_case(dim_name))
-                    .map_or_else(|| dim_name.clone(), |d| d.name.clone());
-                let t = *type_map
-                    .get(&canonical.to_ascii_lowercase())
-                    .unwrap_or(&0u32);
-                names.push(canonical);
-                type_ids.push(t);
-            }
-            for met_name in &metrics {
-                let canonical = def
-                    .metrics
-                    .iter()
-                    .find(|m| m.name.eq_ignore_ascii_case(met_name))
-                    .map_or_else(|| met_name.clone(), |m| m.name.clone());
-                let t = *type_map
-                    .get(&canonical.to_ascii_lowercase())
-                    .unwrap_or(&0u32);
-                names.push(canonical);
-                type_ids.push(t);
-            }
-            (names, type_ids)
-        } else {
-            let limit0_sql = format!("{expanded_sql} LIMIT 0");
-            // Phase 65.1 Plan 11 / WR-08 / D-15: same surface as the
-            // facts-path above; no silent DUCKDB_TYPE_INVALID fallback.
             match try_infer_schema(&borrowed, &limit0_sql) {
                 Ok((names, types)) => {
                     let type_ids: Vec<u32> =
