@@ -254,6 +254,23 @@ fn parser_hook_register_is_idempotent() {
          re-Register the parser extension. guard_idx={guard_idx}, \
          info_idx={info_idx}"
     );
+    // The `Register` call itself is the actual leak vector (it unconditionally
+    // appends to `DBConfig::parser_extensions`), so pin its call site behind
+    // the guard too — anchor on the executable statement, not a comment.
+    let register_idx = register_body
+        .find("ParserExtension::Register(config, ext)")
+        .expect(
+            "Plan 12 Task 1 — sv_register_parser_hooks must call \
+             `ParserExtension::Register(config, ext)` on the registration path",
+        );
+    assert!(
+        register_idx > guard_idx,
+        "Plan 12 Task 1 — `ParserExtension::Register(config, ext)` must appear \
+         AFTER the `if (!already_registered)` guard; on the skip path a second \
+         Register would append a duplicate parser-extension entry, the unbounded \
+         WR-09 soft leak this guard exists to prevent. guard_idx={guard_idx}, \
+         register_idx={register_idx}"
+    );
 
     // -----------------------------------------------------------------------
     // Assertion 6: cite of Phase 65.1 D-21 / WR-09 above the dedup loop.

@@ -373,9 +373,10 @@ struct SvOwnedBuffer {
 // this used to carry an opaque Box<OverrideContext>* (rust_state), but the
 // OverrideContext was empty after Phase 65 Plan 06's H1 catalog_conn
 // retirement, so it now holds no state. It is kept purely as the
-// `dynamic_cast<SemanticViewsParserInfo *>` marker type that the
-// sv_parser_override / sv_parse_stub hooks use to confirm the parser_info is
-// ours.
+// `dynamic_cast<SemanticViewsParserInfo *>` marker type that `sv_parser_override`
+// uses to confirm the parser_info is ours. (`sv_parse_stub` no longer consults
+// parser_info at all — validation needs no per-DB state — so it ignores the
+// marker.)
 struct SemanticViewsParserInfo : public ParserExtensionInfo {};
 
 // ---------------------------------------------------------------------------

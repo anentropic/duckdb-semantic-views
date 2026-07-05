@@ -213,13 +213,16 @@ pub unsafe extern "C" fn sv_parser_override_rust(
 ///     (`SET allow_parser_override_extension='FALLBACK'`); `position_out=0`
 ///     so the caret lands on the `C` of `CREATE` / `D` of `DROP`.
 ///
-/// The extension build re-runs the FULL rewrite (`rewrite_to_native_sql`,
-/// including catalog-aware existence checks in `rewrite_drop` / `rewrite_alter`)
-/// so parse_function reproduces the exact error message `parser_override` saw —
-/// including "semantic view '…' does not exist" for DROP-of-missing — with
-/// caret rendering attached. Unit tests (no `extension` feature) fall back to
-/// syntax-only validation via `plan_rewrite`, since the catalog-aware emission
-/// path is not linked there.
+/// The extension build re-runs the full rewrite (`rewrite_to_native_sql`); unit
+/// tests (no `extension` feature) fall back to syntax-only validation via
+/// `plan_rewrite`. Either way the purpose is to recover the `ParseError` message
+/// + caret position for a *structurally invalid* DDL statement (e.g. a malformed
+/// CREATE body), reproducing exactly what `parser_override` saw. Catalog-level
+/// conditions — DROP-of-missing, rename-into-an-existing-name — are NOT
+/// rewrite-time errors: `rewrite_drop` / `rewrite_alter_*` emit execution-time
+/// SQL guards, so a well-formed-but-catalog-invalid statement rewrites
+/// successfully (`Ok(Some)`) and its error surfaces when the emitted SQL runs,
+/// not here (such a statement maps to rc=3 if `parser_override` is inactive).
 ///
 /// # Safety
 ///
@@ -272,11 +275,13 @@ pub unsafe extern "C" fn sv_parse_function_rust(
             return 2_u8; // genuinely not ours
         }
 
-        // Recognised prefix — re-run validation. The extension build uses
-        // rewrite_to_native_sql so catalog-level errors (DROP-of-missing,
-        // ALTER-renaming-to-existing-name, …) are reproduced here just as
-        // parser_override saw them; unit tests fall back to syntax-only
-        // validation (see the two cfg'd definitions below).
+        // Recognised prefix — re-run validation to recover the ParseError
+        // wording + caret for a structurally-invalid statement, exactly as
+        // parser_override saw it. Catalog-level conditions (DROP-of-missing,
+        // rename collision) are execution-time SQL guards, not rewrite-time
+        // errors, so they rewrite to Ok(Some) here and are not reproduced.
+        // Unit tests fall back to syntax-only validation (see the two cfg'd
+        // definitions below).
         let result = run_validation_for_parse_function(query);
 
         match result {
@@ -324,9 +329,11 @@ pub unsafe extern "C" fn sv_parse_function_rust(
 }
 
 /// Re-run validation for the parse_function path. Mirrors what
-/// `sv_parser_override_rust` did at parse time: the catalog-aware rewrite
-/// (`rewrite_to_native_sql`) so catalog-level errors are reproduced with the
-/// same wording parser_override produced.
+/// `sv_parser_override_rust` did at parse time (`rewrite_to_native_sql`), so a
+/// structurally-invalid DDL statement surfaces the same `ParseError` wording +
+/// position that parser_override produced. Catalog-level errors (DROP-of-missing,
+/// rename collision) are enforced by guards in the *emitted* SQL at execution
+/// time, so they are not reproduced here — such statements return `Ok(Some(_))`.
 ///
 /// Returning `Ok(Some(_))` means "validation succeeded" — at the
 /// parse_function call site this can only happen when parser_override
