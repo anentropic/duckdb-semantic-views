@@ -1,0 +1,64 @@
+# AR-4: schema_version stamp + SG-7 legacy-relationship hard error.
+#
+# Covers the end-to-end integration paths the Rust unit tests cannot:
+#   A. CREATE / CREATE OR REPLACE inject schema_version into the stored JSON
+#      via the parser_override json_merge_patch emission.
+#   B. A legacy definition whose relationship lacks fk_columns is rejected at
+#      query time (SG-7) instead of silently mis-aggregating.
+
+require semantic_views
+
+statement ok
+CREATE TABLE ar4_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), region VARCHAR);
+
+statement ok
+INSERT INTO ar4_orders VALUES (1, 100.00, 'US'), (2, 200.00, 'EU');
+
+statement ok
+CREATE SEMANTIC VIEW ar4_sv
+AS
+  TABLES (o AS ar4_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+
+# A1: the freshly written definition carries schema_version = 1.
+query I
+SELECT CAST(json_extract(definition, '$.schema_version') AS INTEGER)
+FROM semantic_layer._definitions WHERE name = 'ar4_sv'
+----
+1
+
+# A2: CREATE OR REPLACE re-stamps it.
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW ar4_sv
+AS
+  TABLES (o AS ar4_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+
+query I
+SELECT CAST(json_extract(definition, '$.schema_version') AS INTEGER)
+FROM semantic_layer._definitions WHERE name = 'ar4_sv'
+----
+1
+
+# A3: the normal view still queries correctly.
+query TI rowsort
+SELECT region, total FROM semantic_view('ar4_sv', dimensions := ['region'], metrics := ['total'])
+----
+EU	200.00
+US	100.00
+
+# B: inject a legacy row whose relationship carries no fk_columns (the
+# pre-Phase-24 `on`-only encoding), bypassing the parser. Querying it must
+# hard-error rather than silently under-checking fan traps (SG-7).
+statement ok
+INSERT INTO semantic_layer._definitions (name, definition) VALUES (
+  'ar4_legacy',
+  '{"tables":[{"alias":"o","table":"ar4_orders"}],"dimensions":[{"name":"region","expr":"o.region","source_table":"o"}],"metrics":[{"name":"total","expr":"SUM(o.amount)","source_table":"o"}],"joins":[{"table":"c","on":"o.cid = c.id"}]}'
+)
+
+statement error
+SELECT * FROM semantic_view('ar4_legacy', dimensions := ['region'], metrics := ['total'])
+----
+foreign-key column metadata

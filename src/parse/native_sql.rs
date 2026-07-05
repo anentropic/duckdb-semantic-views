@@ -204,13 +204,18 @@ fn emit_native_create_sql(
     // the patch. Phase 39 metadata behaviour is preserved because the
     // enriched JSON omits the three metadata keys (Vec::is_empty /
     // Option::is_none skip_serializing) so the patch is the sole source.
+    // AR-4: stamp the storage-format version alongside the metadata so every
+    // freshly written row records `schema_version`. It is injected here (not
+    // carried on the struct) so it never leaks into YAML export.
+    let schema_version = crate::model::CURRENT_SCHEMA_VERSION;
     let metadata_patched_definition = format!(
         "json_merge_patch( \
             '{enriched_escaped}'::JSON, \
             json_object( \
               'created_on', strftime(now(), '%Y-%m-%dT%H:%M:%SZ'), \
               'database_name', current_database(), \
-              'schema_name', current_schema() \
+              'schema_name', current_schema(), \
+              'schema_version', {schema_version} \
             ) \
          )::VARCHAR"
     );
@@ -311,15 +316,21 @@ fn emit_native_create_from_yaml_file(
     // overrides keys present in the patch. The helper TF's new_def omits the
     // three metadata keys (skip_serializing_if on the struct), so the patch
     // is the sole source -- no risk of overwriting a user-supplied value.
-    let metadata_patched = "json_merge_patch( \
+    // AR-4: stamp schema_version alongside the metadata (see the inline-CREATE
+    // sibling above). Injected here rather than carried on the struct so it
+    // stays out of YAML export.
+    let metadata_patched = format!(
+        "json_merge_patch( \
             new_def::JSON, \
             json_object( \
               'created_on', strftime(now(), '%Y-%m-%dT%H:%M:%SZ'), \
               'database_name', current_database(), \
-              'schema_name', current_schema() \
+              'schema_name', current_schema(), \
+              'schema_version', {schema_version} \
             ) \
-         )::VARCHAR"
-        .to_string();
+         )::VARCHAR",
+        schema_version = crate::model::CURRENT_SCHEMA_VERSION
+    );
     let helper_from = format!(
         "FROM __sv_compute_create_from_yaml('{path_escaped}', \
             '{name_escaped}', '{comment_escaped}')"

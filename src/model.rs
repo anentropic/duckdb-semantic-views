@@ -355,6 +355,17 @@ pub struct Join {
     pub cardinality: Cardinality,
 }
 
+/// Current storage-format version stamped into freshly written definitions
+/// (AR-4). A `schema_version` key is injected into the stored JSON at write
+/// time via the same `json_merge_patch` that records `created_on` etc.
+/// (see `parse::native_sql::emit_native_create_sql`), so it is not a field
+/// on [`SemanticViewDefinition`] — it never appears in YAML export and adds
+/// no construction-site burden. Absent / `0` in stored JSON denotes a
+/// pre-versioning ("legacy") row; the `init_catalog` upgrade pass stamps
+/// completed rows up to this value. Bump when the stored JSON shape changes
+/// in a way the upgrade pass must normalise.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
 /// Top-level definition of a semantic view.
 ///
 /// Stored as JSON in `semantic_layer._definitions`.
@@ -459,6 +470,36 @@ impl SemanticViewDefinition {
             .map_err(|e| format!("invalid definition for semantic view '{name}': {e}"))?;
         Ok(def)
     }
+
+    /// Read the `schema_version` recorded in a stored definition's JSON
+    /// without fully deserializing it (AR-4).
+    ///
+    /// The version lives only in the stored JSON (injected at write time via
+    /// `json_merge_patch`), not on this struct, so it is read with a minimal
+    /// probe. Absent, non-integer, or unparseable JSON all map to `0` — the
+    /// "legacy / pre-versioning" sentinel — so callers treat anything they
+    /// cannot positively identify as current-format as legacy.
+    #[must_use]
+    pub fn stored_schema_version(json: &str) -> u32 {
+        #[derive(Deserialize)]
+        struct Probe {
+            #[serde(default)]
+            schema_version: u32,
+        }
+        serde_json::from_str::<Probe>(json).map_or(0, |p| p.schema_version)
+    }
+
+    /// True when any relationship lacks foreign-key column metadata
+    /// (`fk_columns`) — a legacy (pre-Phase-24) encoding the graph/fan-trap
+    /// machinery silently skips.
+    ///
+    /// Such a row cannot be verified for fan-trap safety (SG-7) and cannot be
+    /// completed by the `init_catalog` upgrade pass, so it is treated as an
+    /// un-upgradeable legacy definition that hard-errors on read.
+    #[must_use]
+    pub fn has_incomplete_relationships(&self) -> bool {
+        self.joins.iter().any(|j| j.fk_columns.is_empty())
+    }
 }
 
 impl SemanticViewDefinition {
@@ -497,6 +538,57 @@ impl SemanticViewDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- AR-4: schema_version probe + incomplete-relationship detection ---
+
+    #[test]
+    fn stored_schema_version_reads_injected_value() {
+        assert_eq!(
+            SemanticViewDefinition::stored_schema_version(r#"{"schema_version":1}"#),
+            1
+        );
+        assert_eq!(
+            SemanticViewDefinition::stored_schema_version(r#"{"schema_version":7,"tables":[]}"#),
+            7
+        );
+    }
+
+    #[test]
+    fn stored_schema_version_absent_or_bad_is_zero() {
+        assert_eq!(
+            SemanticViewDefinition::stored_schema_version(r#"{"tables":[]}"#),
+            0
+        );
+        assert_eq!(SemanticViewDefinition::stored_schema_version("not json"), 0);
+        assert_eq!(
+            SemanticViewDefinition::stored_schema_version(r#"{"schema_version":"x"}"#),
+            0
+        );
+    }
+
+    #[test]
+    fn has_incomplete_relationships_detects_empty_fk() {
+        let mut def = SemanticViewDefinition::default();
+        assert!(!def.has_incomplete_relationships(), "no joins is complete");
+        def.joins.push(Join {
+            table: "c".into(),
+            from_alias: "o".into(),
+            fk_columns: vec!["cid".into()],
+            ..Default::default()
+        });
+        assert!(
+            !def.has_incomplete_relationships(),
+            "join with fk_columns is complete"
+        );
+        def.joins.push(Join {
+            table: "x".into(),
+            ..Default::default()
+        });
+        assert!(
+            def.has_incomplete_relationships(),
+            "join without fk_columns is incomplete"
+        );
+    }
 
     #[test]
     fn valid_definition_roundtrips() {

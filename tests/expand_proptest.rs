@@ -1,6 +1,8 @@
 use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, MetricName, QueryRequest};
-use semantic_views::model::{AccessModifier, Dimension, Join, Metric, SemanticViewDefinition};
+use semantic_views::model::{
+    AccessModifier, Cardinality, Dimension, Join, Metric, SemanticViewDefinition,
+};
 
 // ---------------------------------------------------------------------------
 // Test fixture definitions
@@ -102,14 +104,32 @@ fn simple_definition() -> SemanticViewDefinition {
 /// 3 metrics (2 with source_table), 2 joins, 1 filter.
 fn joined_definition() -> SemanticViewDefinition {
     SemanticViewDefinition {
-        tables: vec![semantic_views::model::TableRef {
-            alias: "orders".to_string(),
-            table: "orders".to_string(),
-            pk_columns: vec![],
-            unique_constraints: vec![],
-            comment: None,
-            synonyms: vec![],
-        }],
+        tables: vec![
+            semantic_views::model::TableRef {
+                alias: "orders".to_string(),
+                table: "orders".to_string(),
+                pk_columns: vec![],
+                unique_constraints: vec![],
+                comment: None,
+                synonyms: vec![],
+            },
+            semantic_views::model::TableRef {
+                alias: "customers".to_string(),
+                table: "customers".to_string(),
+                pk_columns: vec!["id".to_string()],
+                unique_constraints: vec![],
+                comment: None,
+                synonyms: vec![],
+            },
+            semantic_views::model::TableRef {
+                alias: "products".to_string(),
+                table: "products".to_string(),
+                pk_columns: vec!["id".to_string()],
+                unique_constraints: vec![],
+                comment: None,
+                synonyms: vec![],
+            },
+        ],
         dimensions: vec![
             Dimension {
                 name: "region".to_string(),
@@ -188,18 +208,22 @@ fn joined_definition() -> SemanticViewDefinition {
         ],
 
         joins: vec![
+            // OneToOne so the fan-trap safety check passes for every generated
+            // request — this property tests join *exclusion*, not cardinality.
             Join {
                 table: "customers".to_string(),
-                on: "\"orders\".\"customer_id\" = \"customers\".\"id\"".to_string(),
-                from_cols: vec![],
-                join_columns: vec![],
+                from_alias: "orders".to_string(),
+                fk_columns: vec!["customer_id".to_string()],
+                ref_columns: vec!["id".to_string()],
+                cardinality: Cardinality::OneToOne,
                 ..Default::default()
             },
             Join {
                 table: "products".to_string(),
-                on: "\"orders\".\"product_id\" = \"products\".\"id\"".to_string(),
-                from_cols: vec![],
-                join_columns: vec![],
+                from_alias: "orders".to_string(),
+                fk_columns: vec!["product_id".to_string()],
+                ref_columns: vec!["id".to_string()],
+                cardinality: Cardinality::OneToOne,
                 ..Default::default()
             },
         ],
