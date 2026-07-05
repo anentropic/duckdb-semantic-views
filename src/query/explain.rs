@@ -92,11 +92,12 @@ unsafe fn parse_string_list(buf: *const u8, len: usize) -> Result<Vec<String>, S
     };
     let count = read_u32(slice, &mut off)? as usize;
     // FF-6: cap the pre-allocation at the largest element count the buffer
-    // could actually hold (each element carries at least a 4-byte length
-    // prefix). A corrupt `count` near u32::MAX would otherwise request a
-    // ~100 GB allocation up front; the per-element bounds check below still
-    // rejects a genuinely truncated payload.
-    let mut out = Vec::with_capacity(count.min(len / 4));
+    // could actually hold. The 4-byte count prefix has already been consumed,
+    // and each remaining element carries at least a 4-byte length prefix, so
+    // the ceiling is `(len - 4) / 4`. A corrupt `count` near u32::MAX would
+    // otherwise request a ~100 GB allocation up front; the per-element bounds
+    // check below still rejects a genuinely truncated payload.
+    let mut out = Vec::with_capacity(count.min(len.saturating_sub(4) / 4));
     for i in 0..count {
         let n = read_u32(slice, &mut off)
             .map_err(|e| format!("reading length for element {i} of {count}: {e}"))?

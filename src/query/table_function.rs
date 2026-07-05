@@ -84,11 +84,12 @@ unsafe fn sv_parse_string_list(buf: *const u8, len: usize) -> Result<Vec<String>
     };
     let count = read_u32(slice, &mut off)? as usize;
     // FF-6: cap the pre-allocation at the largest element count the buffer
-    // could actually hold (each element carries at least a 4-byte length
-    // prefix). A corrupt `count` near u32::MAX would otherwise request a
-    // ~100 GB allocation up front; the per-element bounds check below still
-    // rejects a genuinely truncated payload.
-    let mut out = Vec::with_capacity(count.min(len / 4));
+    // could actually hold. The 4-byte count prefix has already been consumed,
+    // and each remaining element carries at least a 4-byte length prefix, so
+    // the ceiling is `(len - 4) / 4`. A corrupt `count` near u32::MAX would
+    // otherwise request a ~100 GB allocation up front; the per-element bounds
+    // check below still rejects a genuinely truncated payload.
+    let mut out = Vec::with_capacity(count.min(len.saturating_sub(4) / 4));
     for i in 0..count {
         let n = read_u32(slice, &mut off)
             .map_err(|e| format!("reading length for element {i} of {count}: {e}"))?
@@ -551,6 +552,19 @@ fn serialize_register_payload(
         u32::try_from(n)
             .map_err(|_| format!("{what} ({n} bytes) exceeds the wire-format u32 limit"))
     };
+    // Guard against slice desync: the header writes `n_cols` from
+    // `column_names.len()`, but the body serializes via `zip`, which would
+    // silently truncate to the shorter slice and emit a header that disagrees
+    // with the payload. Today both vectors come from the same
+    // `duckdb_column_count` loop, but reject mismatch explicitly so a future
+    // caller cannot desync the wire format.
+    if column_names.len() != column_type_ids.len() {
+        return Err(format!(
+            "column name count ({}) disagrees with type id count ({})",
+            column_names.len(),
+            column_type_ids.len()
+        ));
+    }
     let n_cols = wire_len(column_names.len(), "column count")?;
     let cap = 4
         + column_names.iter().map(|n| 4 + n.len()).sum::<usize>()
