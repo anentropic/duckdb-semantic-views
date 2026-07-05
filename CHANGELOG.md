@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Machine-checked round-trip guarantee between `CREATE SEMANTIC VIEW` parsing and `GET_DDL` rendering: a property test asserts `parse(render(definition)) == definition` over generated definitions (including quoted, unicode, and keyword-bearing identifiers), and two new fuzz targets exercise the body parser directly and enforce render/parse fixpoint stability.
+- Stored semantic view definitions now carry a storage-format `schema_version`. Freshly created (or replaced) views are stamped with the current version, and a one-time, non-destructive upgrade pass on extension load stamps existing definitions that are verifiably current-format — giving future format changes a clean migration point (following the v0.1.0 companion-file migration precedent).
 
 ### Fixed
 
@@ -27,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `GET_DDL` output now re-parses to the same definition: relationships declared against a `UNIQUE` key render their `REFERENCES (columns)` list (previously dropped, silently rewiring the join to the primary key on re-parse), and view names that need quoting (mixed case, whitespace, non-ASCII) are quoted in the rendered header.
 - `SHOW ... STARTS WITH` / `LIMIT` require word boundaries (`STARTSWITH`, `LIMIT5` are rejected); `NON ADDITIVE BY` accepts flexible whitespace including the no-space `BY(dim)` form; `READ_YAML_FROM_SEMANTIC_VIEW` resolves qualified names with quote awareness instead of splitting at dots inside quoted parts.
 - Fact and metric queries combining a child-table fact/metric with a dimension on a shared parent table no longer raise a spurious ambiguity error when the parent is referenced by multiple child tables (regression in the previous role-playing ambiguity hardening).
+- Querying a semantic view whose stored relationships lack foreign-key column metadata (a legacy pre-Phase-24 definition format) now fails with a clear "re-create it with `CREATE OR REPLACE SEMANTIC VIEW`" error instead of silently skipping the fan-trap safety check and returning mis-aggregated results — the relationship graph builds empty for such rows, so the check would otherwise pass vacuously.
 
 ## [0.10.4] - 2026-06-27
 

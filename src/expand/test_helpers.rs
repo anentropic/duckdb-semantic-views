@@ -138,7 +138,6 @@ pub(super) fn minimal_def(
 pub(super) trait TestFixtureExt {
     fn with_dimension(self, name: &str, expr: &str, source_table: Option<&str>) -> Self;
     fn with_metric(self, name: &str, expr: &str, source_table: Option<&str>) -> Self;
-    fn with_join_on(self, table: &str, on: &str) -> Self;
     fn with_table(self, alias: &str, table: &str, pk_columns: &[&str]) -> Self;
     fn with_fact(self, name: &str, expr: &str, source_table: &str) -> Self;
     fn with_private_fact(self, name: &str, expr: &str, source_table: &str) -> Self;
@@ -193,17 +192,6 @@ impl TestFixtureExt for SemanticViewDefinition {
             access: AccessModifier::Public,
             non_additive_by: vec![],
             window_spec: None,
-        });
-        self
-    }
-
-    fn with_join_on(mut self, table: &str, on: &str) -> Self {
-        self.joins.push(Join {
-            table: table.to_string(),
-            on: on.to_string(),
-            from_cols: vec![],
-            join_columns: vec![],
-            ..Default::default()
         });
         self
     }

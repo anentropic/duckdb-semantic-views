@@ -921,8 +921,9 @@ GROUP BY
         #[test]
         fn test_join_excluded_when_not_needed() {
             let def = orders_view()
+                .with_table("customers", "customers", &["id"])
                 .with_dimension("customer_name", "customers.name", Some("customers"))
-                .with_join_on("customers", "orders.customer_id = customers.id");
+                .with_pkfk_join("cust", "orders", "customers", &["customer_id"], &["id"]);
             // Request only "region" which comes from base table
             let req = QueryRequest {
                 facts: vec![],
@@ -1097,7 +1098,7 @@ GROUP BY
 
     mod phase11_1_expand_tests {
         use super::*;
-        use crate::model::{AccessModifier, JoinColumn, TableRef};
+        use crate::model::{AccessModifier, TableRef};
 
         fn def_with_join_columns() -> crate::model::SemanticViewDefinition {
             crate::model::SemanticViewDefinition {
@@ -1147,13 +1148,13 @@ GROUP BY
                 }],
 
                 joins: vec![crate::model::Join {
-                    table: "customers".to_string(),
-                    on: String::new(),
-                    from_cols: vec![],
-                    join_columns: vec![JoinColumn {
-                        from: "customer_id".to_string(),
-                        to: "id".to_string(),
-                    }],
+                    // Modern (Phase 24) FK encoding: source alias `o`, target
+                    // alias `c`, with fk/ref columns so the fan-trap safety
+                    // check can build the relationship graph (SG-7 / AR-4).
+                    table: "c".to_string(),
+                    from_alias: "o".to_string(),
+                    fk_columns: vec!["customer_id".to_string()],
+                    ref_columns: vec!["id".to_string()],
                     ..Default::default()
                 }],
                 facts: vec![],

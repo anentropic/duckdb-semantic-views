@@ -129,6 +129,62 @@ pub fn init_catalog(
         }
     }
 
+    // AR-4: one-time storage-format upgrade pass. Runs after the v0.1.0
+    // companion import so freshly-imported rows are considered too. Only on
+    // writable DBs (guarded by the is_read_only early-return above).
+    upgrade_definitions_schema(con)?;
+
+    Ok(())
+}
+
+/// One-time `schema_version` upgrade pass over `_definitions` (AR-4).
+///
+/// For every stored row still below [`crate::model::CURRENT_SCHEMA_VERSION`]:
+/// stamp it to the current version **iff** it can be positively verified as
+/// current-format (parses cleanly and every relationship carries `fk_columns`).
+/// Rows that fail to parse, or whose relationships lack FK metadata (legacy
+/// pre-Phase-24 encodings), are left untouched at version 0 — the fan-trap
+/// safety check (`expand::fan_trap`) then hard-errors on read rather than
+/// silently trusting them. Non-destructive: no row is deleted or rewritten
+/// beyond the version stamp.
+///
+/// Idempotent: rows already at the current version are skipped, so subsequent
+/// loads are no-ops. The `schema_version` integer is inlined from a
+/// compile-time constant (no user input), so the `json_object` embed is safe.
+fn upgrade_definitions_schema(con: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    let rows: Vec<(String, String)> = {
+        let mut stmt = con.prepare(&format!("SELECT name, definition FROM {DEFINITIONS_TABLE}"))?;
+        let mapped =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+
+    for (name, json) in rows {
+        if crate::model::SemanticViewDefinition::stored_schema_version(&json)
+            >= crate::model::CURRENT_SCHEMA_VERSION
+        {
+            continue; // already current
+        }
+        // Only stamp rows we can positively verify as current-format. A parse
+        // failure or missing FK metadata => un-upgradeable legacy row; leave it
+        // at version 0 so reads hard-error rather than silently under-checking.
+        let upgradeable = crate::model::SemanticViewDefinition::from_json(&name, &json)
+            .is_ok_and(|def| !def.has_incomplete_relationships());
+        if !upgradeable {
+            continue;
+        }
+        con.execute(
+            &format!(
+                "UPDATE {DEFINITIONS_TABLE} \
+                 SET definition = json_merge_patch(definition::JSON, \
+                     json_object('schema_version', {version}))::VARCHAR \
+                 WHERE name = ?",
+                version = crate::model::CURRENT_SCHEMA_VERSION
+            ),
+            duckdb::params![name],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -517,6 +573,74 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(names, vec!["b".to_string()]);
+    }
+
+    // AR-4: the schema_version upgrade pass stamps verifiable current-format
+    // rows and leaves un-upgradeable legacy rows at version 0.
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn upgrade_stamps_complete_rows_and_skips_incomplete() {
+        use crate::model::{SemanticViewDefinition, CURRENT_SCHEMA_VERSION};
+        let con = in_memory_con();
+        init_catalog(&con, ":memory:", false).unwrap();
+
+        // Complete row: every relationship carries fk_columns, no schema_version.
+        let complete = r#"{"tables":[{"alias":"o","table":"orders","pk_columns":["id"]},
+            {"alias":"c","table":"customers","pk_columns":["id"]}],
+            "dimensions":[],"metrics":[],
+            "joins":[{"table":"c","from_alias":"o","fk_columns":["cid"],"ref_columns":["id"]}]}"#;
+        // Incomplete row: a relationship in the legacy `on`-only encoding (no fk_columns).
+        let incomplete = r#"{"tables":[{"alias":"o","table":"orders"}],
+            "dimensions":[],"metrics":[],
+            "joins":[{"table":"c","on":"o.cid = c.id"}]}"#;
+        // A no-join single-table view: trivially complete, should be stamped.
+        let single = r#"{"tables":[{"alias":"o","table":"orders"}],"dimensions":[],"metrics":[]}"#;
+
+        for (name, def) in [
+            ("complete_v", complete),
+            ("incomplete_v", incomplete),
+            ("single_v", single),
+        ] {
+            con.execute(
+                "INSERT INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
+                duckdb::params![name, def],
+            )
+            .unwrap();
+        }
+
+        // Re-run init_catalog: triggers the one-time upgrade pass.
+        init_catalog(&con, ":memory:", false).unwrap();
+
+        let stored = |name: &str| -> String {
+            con.query_row(
+                "SELECT definition FROM semantic_layer._definitions WHERE name = ?",
+                duckdb::params![name],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            SemanticViewDefinition::stored_schema_version(&stored("complete_v")),
+            CURRENT_SCHEMA_VERSION,
+            "complete row must be stamped current"
+        );
+        assert_eq!(
+            SemanticViewDefinition::stored_schema_version(&stored("single_v")),
+            CURRENT_SCHEMA_VERSION,
+            "no-join view is trivially complete and must be stamped"
+        );
+        assert_eq!(
+            SemanticViewDefinition::stored_schema_version(&stored("incomplete_v")),
+            0,
+            "un-upgradeable legacy row must be left at version 0"
+        );
+
+        // Idempotent: a second pass changes nothing and does not error.
+        init_catalog(&con, ":memory:", false).unwrap();
+        assert_eq!(
+            SemanticViewDefinition::stored_schema_version(&stored("complete_v")),
+            CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[cfg(not(feature = "extension"))]

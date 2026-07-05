@@ -198,11 +198,27 @@ pub(super) fn check_fan_traps(
 /// SKIPPED the fan-trap safety check (`return Ok(())`), so queries over
 /// legacy/invalid stored definitions produced mis-aggregated results with no
 /// warning. The correct bias for a safety check is loud failure.
+///
+/// SG-7 residual (AR-4): a build *failure* was the rare case. The common
+/// legacy hazard is a definition whose relationships lack `fk_columns` — an
+/// empty-FK join is silently skipped by both `RelationshipGraph::from_definition`
+/// and `build_card_map`, so the graph builds *successfully but empty* and the
+/// fan-trap check passes vacuously. Reject such definitions up front so an
+/// un-upgradeable legacy row (which the `init_catalog` upgrade pass leaves at
+/// `schema_version` 0) fails loudly here instead of under-checking.
 #[allow(clippy::result_large_err)]
 fn build_relationship_graph(
     view_name: &str,
     def: &SemanticViewDefinition,
 ) -> Result<crate::graph::RelationshipGraph, ExpandError> {
+    if def.has_incomplete_relationships() {
+        return Err(ExpandError::UncheckableDefinition {
+            view_name: view_name.to_string(),
+            reason: "one or more relationships are missing foreign-key column metadata \
+                     (a legacy pre-Phase-24 definition format)"
+                .to_string(),
+        });
+    }
     crate::graph::RelationshipGraph::from_definition(def).map_err(|reason| {
         ExpandError::UncheckableDefinition {
             view_name: view_name.to_string(),
@@ -936,6 +952,32 @@ mod tests {
             matches!(result, Err(ExpandError::UncheckableDefinition { .. })),
             "validate_fact_table_path must also error on an unbuildable graph, got: {result:?}"
         );
+    }
+
+    /// SG-7 residual (AR-4): a legacy join lacking `fk_columns` builds an empty
+    /// graph *successfully* — the pre-fix check passed vacuously and produced
+    /// mis-aggregated results. It must now ERROR instead.
+    #[test]
+    fn test_check_fan_traps_incomplete_relationships_error() {
+        let mut def = minimal_def("orders", "region", "region", "total", "sum(amount)");
+        def.joins.push(crate::model::Join {
+            table: "customers".to_string(),
+            from_alias: "orders".to_string(),
+            fk_columns: vec![], // legacy: FK metadata never captured
+            ..Default::default()
+        });
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets) {
+            Err(ExpandError::UncheckableDefinition { view_name, reason }) => {
+                assert_eq!(view_name, "test");
+                assert!(
+                    reason.contains("foreign-key column metadata"),
+                    "reason should name the missing FK metadata: {reason}"
+                );
+            }
+            other => panic!("Expected UncheckableDefinition, got: {other:?}"),
+        }
     }
 
     /// SG-16: two named relationships between the same table pair with
