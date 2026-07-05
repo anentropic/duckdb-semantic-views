@@ -87,7 +87,16 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
             return 1_u8;
         }
 
-        let reader = CatalogReader::new(&borrowed, probe_catalog_table_present(&borrowed));
+        // FF-9: surface a probe-query failure as an error distinct from "no
+        // views" instead of silently folding it into absence.
+        let present = match probe_catalog_table_present(&borrowed) {
+            Ok(p) => p,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
+        let reader = CatalogReader::new(&borrowed, present);
         let json = match reader.lookup(name) {
             Ok(Some(j)) => j,
             Ok(None) => {

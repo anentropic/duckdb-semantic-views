@@ -1387,6 +1387,14 @@ static void sv_run_varchar_bind_with_name(ClientContext &context,
                                           const char *fn_name,
                                           DispatcherFn &&dispatcher) {
     bd.expected_cols = expected_cols;
+    // FF-4: guard the positional view-name argument. Without this a NULL
+    // argument (e.g. describe_semantic_view(NULL)) reached GetValue<string>()
+    // and surfaced as the confusing "view 'NULL' does not exist"; match the
+    // semantic_view() binder's up-front BinderException instead.
+    if (input.inputs.empty() || input.inputs[0].IsNull()) {
+        throw BinderException(std::string(fn_name) +
+                              ": view name is required (positional arg 0)");
+    }
     std::string name = input.inputs[0].GetValue<std::string>();
     Connection probe(*context.db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
@@ -1413,6 +1421,15 @@ static void sv_run_varchar_bool_bind_with_two_names(
     const char *fn_name,
     DispatcherFn &&dispatcher) {
     bd.expected_varchar_cols = expected_varchar_cols;
+    // FF-4: guard both positional arguments (view_name, metric_name) before
+    // GetValue<string>() so a NULL argument raises a clear BinderException
+    // rather than resolving to a spurious "'NULL' does not exist".
+    if (input.inputs.size() < 2 || input.inputs[0].IsNull() ||
+        input.inputs[1].IsNull()) {
+        throw BinderException(
+            std::string(fn_name) +
+            ": view name and metric name are required (positional args 0, 1)");
+    }
     std::string name1 = input.inputs[0].GetValue<std::string>();
     std::string name2 = input.inputs[1].GetValue<std::string>();
     Connection probe(*context.db);

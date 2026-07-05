@@ -74,8 +74,12 @@ unsafe fn show_dims_for_metric(
 ) -> Result<Vec<u8>, String> {
     let view_name = read_str_arg(view_name_ptr, view_name_len, "view name")?;
     let metric_name = read_str_arg(metric_name_ptr, metric_name_len, "metric name")?;
+    // FF-4: normalize the view name so quoted-identifier inputs resolve the
+    // same way they do through `semantic_view()`.
+    let view_name = crate::ident::normalize_view_name(&view_name)
+        .map_err(|e| format!("Invalid view name '{view_name}': {e}"))?;
 
-    let present = probe_catalog_table_present(borrowed);
+    let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
     let json = match reader.lookup(&view_name)? {
         Some(j) => j,

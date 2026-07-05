@@ -104,8 +104,16 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
         // Probe whether semantic_layer._definitions exists on the caller's
         // connection. Cheap (single query); matches Phase 63's RO-load
         // short-circuit semantics so an attached read-only DB without a
-        // bootstrapped catalog returns 0 rows instead of an error.
-        let table_present = probe_catalog_table_present(&borrowed);
+        // bootstrapped catalog returns Ok(false) (0 rows) instead of an error.
+        // FF-9: a genuine probe-query failure now surfaces as an error rather
+        // than being silently folded into "no views".
+        let table_present = match probe_catalog_table_present(&borrowed) {
+            Ok(p) => p,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
 
         // CatalogReader::new only stores the raw pointer extracted via
         // borrowed.as_raw() — no transfer of ownership.
@@ -234,7 +242,15 @@ pub unsafe extern "C" fn sv_list_terse_semantic_views_bind_rust(
             return 1_u8;
         }
 
-        let table_present = probe_catalog_table_present(&borrowed);
+        // FF-9: a genuine probe-query failure now surfaces as an error rather
+        // than being silently folded into "no views".
+        let table_present = match probe_catalog_table_present(&borrowed) {
+            Ok(p) => p,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
         let reader = CatalogReader::new(&borrowed, table_present);
         let entries = match reader.list_all() {
             Ok(e) => e,

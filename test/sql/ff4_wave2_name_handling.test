@@ -1,0 +1,99 @@
+# FF-4 (code-review 2026-07-02): wave-2 read table functions
+# (DESCRIBE / SHOW COLUMNS / SHOW SEMANTIC {DIMENSIONS,...} IN /
+# ... FOR METRIC) now handle view-name identifiers exactly like
+# semantic_view():
+#   * unquoted names fold to lowercase, quoted names preserve case
+#     (folding happens once, at the TF dispatcher — see FF-4 in
+#     src/parse/mod.rs and the ddl/ dispatchers), and
+#   * a NULL positional argument raises a clear BinderException instead
+#     of the confusing "'NULL' does not exist".
+# Previously DESCRIBE / SHOW COLUMNS double-normalized (folding a quoted
+# mixed-case name to lowercase and failing the lookup), and the SHOW ... IN
+# forms skipped normalization entirely.
+
+require semantic_views
+
+statement ok
+CREATE TABLE ff4_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), region VARCHAR);
+
+statement ok
+INSERT INTO ff4_orders VALUES (1, 100.00, 'US'), (2, 50.00, 'EU');
+
+# Case-preserved (quoted) view name.
+statement ok
+CREATE SEMANTIC VIEW "MixedCaseView" AS
+  TABLES (o AS ff4_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+query I
+SELECT name FROM list_semantic_views();
+----
+MixedCaseView
+
+# ============================================================
+# Quoted mixed-case name resolves through every wave-2 read form
+# (regression: DESCRIBE / SHOW COLUMNS previously double-folded to
+# 'mixedcaseview' and failed; SHOW ... IN kept the literal quotes).
+# ============================================================
+
+statement ok
+DESCRIBE SEMANTIC VIEW "MixedCaseView";
+
+statement ok
+SHOW COLUMNS IN SEMANTIC VIEW "MixedCaseView";
+
+statement ok
+SHOW SEMANTIC DIMENSIONS IN "MixedCaseView";
+
+statement ok
+SHOW SEMANTIC METRICS IN "MixedCaseView";
+
+statement ok
+SHOW SEMANTIC DIMENSIONS IN "MixedCaseView" FOR METRIC total;
+
+# Direct table-function calls fold identically to semantic_view(): the
+# quoted-in-string form preserves case and resolves.
+query I
+SELECT count(*) > 0 FROM describe_semantic_view('"MixedCaseView"');
+----
+true
+
+query I
+SELECT count(*) > 0 FROM show_columns_in_semantic_view('"MixedCaseView"');
+----
+true
+
+# An unquoted reference folds to lowercase and does NOT find the
+# case-preserved view — consistent with semantic_view().
+statement error
+DESCRIBE SEMANTIC VIEW MixedCaseView;
+----
+does not exist
+
+statement error
+SELECT * FROM describe_semantic_view('MixedCaseView');
+----
+does not exist
+
+# ============================================================
+# NULL positional argument raises a BinderException up front
+# ============================================================
+
+statement error
+SELECT * FROM describe_semantic_view(NULL);
+----
+view name is required
+
+statement error
+SELECT * FROM show_columns_in_semantic_view(NULL);
+----
+view name is required
+
+statement error
+SELECT * FROM show_semantic_dimensions_for_metric(NULL, 'total');
+----
+view name and metric name are required
+
+statement ok
+DROP SEMANTIC VIEW "MixedCaseView";
