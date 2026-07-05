@@ -98,12 +98,17 @@ enum Trailing {
     Allow,
 }
 
-/// Extract just the view name from a name-only DDL statement (DROP, DESCRIBE,
-/// SHOW COLUMNS; ALTER uses [`Trailing::Allow`] since its sub-operation
-/// follows the name).
+/// Extract the RAW (un-normalized) view name from a name-only DDL statement.
+///
+/// The read-side DESCRIBE / SHOW COLUMNS rewrites embed this raw name into a
+/// table-function call and defer identifier folding to the TF dispatcher —
+/// exactly like `semantic_view()` (FF-4), so every read TF normalizes uniformly
+/// at the catalog-read boundary. DROP / ALTER, which emit native catalog SQL
+/// with the name baked in (no later normalize opportunity), use the normalizing
+/// [`extract_name_only`] wrapper instead.
 ///
 /// `prefix_len` is the byte length of the already-matched prefix.
-fn extract_name_only(
+fn extract_raw_name_only(
     trimmed: &str,
     prefix_len: usize,
     trailing: Trailing,
@@ -127,8 +132,21 @@ fn extract_name_only(
             return Err(format!("Unexpected tokens after view name: '{rest}'"));
         }
     }
-    let name = normalize_view_name(raw_name).map_err(|e| format!("Invalid view name: {e}"))?;
-    Ok(name)
+    Ok(raw_name.to_string())
+}
+
+/// Extract and normalize the view name from a name-only DDL statement (DROP;
+/// ALTER uses [`Trailing::Allow`] since its sub-operation follows the name).
+/// Folds unquoted names to lowercase and reduces a qualified name to its bare
+/// last part at parse time — appropriate for the native-SQL emitters that bake
+/// the name in. Read-side rewrites use [`extract_raw_name_only`] instead.
+fn extract_name_only(
+    trimmed: &str,
+    prefix_len: usize,
+    trailing: Trailing,
+) -> Result<String, String> {
+    let raw = extract_raw_name_only(trimmed, prefix_len, trailing)?;
+    normalize_view_name(&raw).map_err(|e| format!("Invalid view name: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -298,10 +316,16 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
                 if_exists: kind == DdlKind::DropIfExists,
             })
         }
-        // Read-side name-only forms (DESCRIBE, SHOW COLUMNS IN SEMANTIC VIEW):
-        // run the read-side table function as-is.
+        // Read-side name-only forms (DESCRIBE, SHOW COLUMNS IN SEMANTIC VIEW).
+        // FF-4: embed the RAW name and let the TF dispatcher fold it, matching
+        // the other read TFs (`semantic_view`, `show_semantic_* IN`) which all
+        // normalize once at the catalog-read boundary. Normalizing here as well
+        // would double-fold a quoted mixed-case name (`"MyView"` → `myview`).
+        // The single-quote escape keeps the literal well-formed; the dispatcher
+        // reads the view via a prepared statement, so the raw name never reaches
+        // SQL text on the read side.
         DdlKind::Describe | DdlKind::ShowColumns => {
-            let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
+            let name = extract_raw_name_only(trimmed, plen, Trailing::Reject)?;
             let safe_name = name.replace('\'', "''");
             Ok(RewriteAction::Passthrough(format!(
                 "SELECT * FROM {fn_name}('{safe_name}')"
@@ -1196,8 +1220,11 @@ mod tests {
             }
         );
 
+        // FF-4: DESCRIBE / SHOW COLUMNS now embed the RAW name and fold at the
+        // TF dispatcher (like `semantic_view`), so the rewrite carries 'SALES'
+        // verbatim; the dispatcher's normalize_view_name resolves it to 'sales'.
         let sql = passthrough_sql("DESCRIBE SEMANTIC VIEW SALES");
-        assert_eq!(sql, "SELECT * FROM describe_semantic_view('sales')");
+        assert_eq!(sql, "SELECT * FROM describe_semantic_view('SALES')");
 
         assert_eq!(
             extract_ddl_name("CREATE SEMANTIC VIEW Sales (body)").unwrap(),
@@ -3515,14 +3542,23 @@ $$"#;
 
         #[test]
         fn describe_with_quoted_fqn() {
+            // FF-4: the raw qualified name is embedded verbatim; the dispatcher's
+            // normalize_view_name reduces it to the bare 'v' at lookup time.
             let sql = passthrough_sql("DESCRIBE SEMANTIC VIEW \"memory\".\"main\".\"v\"");
-            assert_eq!(sql, "SELECT * FROM describe_semantic_view('v')");
+            assert_eq!(
+                sql,
+                "SELECT * FROM describe_semantic_view('\"memory\".\"main\".\"v\"')"
+            );
         }
 
         #[test]
         fn show_columns_with_quoted_fqn() {
+            // FF-4: raw qualified name embedded verbatim; dispatcher reduces to 'v'.
             let sql = passthrough_sql("SHOW COLUMNS IN SEMANTIC VIEW \"memory\".\"main\".\"v\"");
-            assert_eq!(sql, "SELECT * FROM show_columns_in_semantic_view('v')");
+            assert_eq!(
+                sql,
+                "SELECT * FROM show_columns_in_semantic_view('\"memory\".\"main\".\"v\"')"
+            );
         }
 
         #[test]

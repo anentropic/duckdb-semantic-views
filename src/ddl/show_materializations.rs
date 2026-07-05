@@ -42,12 +42,10 @@ impl ShowMatRow {
     }
 }
 
-/// Collect materialization rows for a single view. Unparseable JSON yields no
-/// rows (display-only surface).
-fn collect_mats(view_name: &str, json: &str) -> Vec<ShowMatRow> {
-    let Ok(def) = SemanticViewDefinition::from_json(view_name, json) else {
-        return Vec::new();
-    };
+/// Collect materialization rows for a single already-parsed view. Parsing
+/// (and the FF-9 decision of whether an unparseable definition is a hard error
+/// or a skipped row) happens at the call site.
+fn collect_mats(view_name: &str, def: &SemanticViewDefinition) -> Vec<ShowMatRow> {
     let db_name = def.database_name.clone().unwrap_or_default();
     let sch_name = def.schema_name.clone().unwrap_or_default();
     def.materializations
@@ -84,12 +82,17 @@ pub unsafe extern "C" fn sv_show_semantic_materializations_all_bind_rust(
         error_buf_len,
         "sv_show_semantic_materializations_all_bind_rust",
         |borrowed| {
-            let present = unsafe { probe_catalog_table_present(borrowed) };
+            let present = unsafe { probe_catalog_table_present(borrowed) }?;
             let reader = CatalogReader::new(borrowed, present);
             let entries = reader.list_all()?;
             let mut rows: Vec<Vec<String>> = Vec::new();
             for (name, json) in &entries {
-                for r in collect_mats(name, json) {
+                // FF-9: `_all` stays tolerant — skip a view whose stored JSON
+                // won't parse rather than failing the whole listing.
+                let Ok(def) = SemanticViewDefinition::from_json(name, json) else {
+                    continue;
+                };
+                for r in collect_mats(name, &def) {
                     rows.push(r.into_cells());
                 }
             }
@@ -122,13 +125,20 @@ pub unsafe extern "C" fn sv_show_semantic_materializations_bind_rust(
         "sv_show_semantic_materializations_bind_rust",
         |borrowed| {
             let view_name = unsafe { read_str_arg(name_ptr, name_len, "view name") }?;
-            let present = unsafe { probe_catalog_table_present(borrowed) };
+            // FF-4: normalize so quoted-identifier inputs resolve like
+            // `semantic_view()` does.
+            let view_name = crate::ident::normalize_view_name(&view_name)
+                .map_err(|e| format!("Invalid view name '{view_name}': {e}"))?;
+            let present = unsafe { probe_catalog_table_present(borrowed) }?;
             let reader = CatalogReader::new(borrowed, present);
             let json = match reader.lookup(&view_name)? {
                 Some(j) => j,
                 None => return Err(crate::catalog::view_not_found_msg(&view_name)),
             };
-            let mut internal = collect_mats(&view_name, &json);
+            // FF-9: named single-view SHOW propagates a parse error rather than
+            // silently returning zero rows for a corrupt definition.
+            let def = SemanticViewDefinition::from_json(&view_name, &json)?;
+            let mut internal = collect_mats(&view_name, &def);
             internal.sort_by(|a, b| a.name.cmp(&b.name));
             let rows: Vec<Vec<String>> = internal.into_iter().map(ShowMatRow::into_cells).collect();
             serialize_varchar_rows(&rows)

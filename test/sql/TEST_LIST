@@ -12,6 +12,7 @@ test/sql/error_caret_drop.test
 test/sql/error_caret_multiline.test
 test/sql/error_caret_unicode.test
 test/sql/extension_reload.test
+test/sql/ff4_wave2_name_handling.test
 test/sql/identity_fact_passthrough.test
 test/sql/lru_removed_isolation.test
 test/sql/pa8_case_normalization.test

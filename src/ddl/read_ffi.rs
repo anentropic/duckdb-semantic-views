@@ -41,7 +41,7 @@
 #![cfg(feature = "extension")]
 
 use libduckdb_sys as ffi;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 
 /// Borrowed `duckdb_connection` handle. The bridge contract: this handle is
 /// owned by a stack `Connection probe(*context.db)` constructed in a C++
@@ -117,10 +117,20 @@ impl BorrowedConnection {
 // unwrapping intent at each FFI boundary.
 
 /// Probe whether `semantic_layer._definitions` exists on the given borrowed
-/// connection. Returns `false` if the schema/table is missing OR if the
-/// probe query itself fails (defensive — never raises). Mirrors the Phase
-/// 63 read-only short-circuit logic at `src/lib.rs:393-403` and the inline
-/// probe in `src/ddl/list.rs`.
+/// connection.
+///
+/// Returns:
+/// * `Ok(true)` — the catalog table is present.
+/// * `Ok(false)` — the probe query succeeded but the table is absent (0 rows).
+///   This is the Phase 63 read-only short-circuit path: an attached read-only
+///   DB whose `_definitions` table was never bootstrapped returns 0 rows here,
+///   which callers treat as "no views", not an error. Mirrors the read-only
+///   short-circuit logic at `src/lib.rs` and the inline probe in
+///   `src/ddl/list.rs`.
+/// * `Err(msg)` — the probe query itself failed to execute (FF-9). Previously
+///   any such failure was silently folded into `false` ("no views"), masking
+///   catalog corruption or a broken connection as an empty result. Callers now
+///   surface it as an error distinct from genuine absence.
 ///
 /// # Safety
 ///
@@ -128,24 +138,28 @@ impl BorrowedConnection {
 /// and must outlive this call — the typical caller is a bind dispatcher
 /// running inside a C++ bind callback that owns a stack `Connection
 /// probe(*context.db)`.
-pub unsafe fn probe_catalog_table_present(borrowed: &BorrowedConnection) -> bool {
+pub unsafe fn probe_catalog_table_present(borrowed: &BorrowedConnection) -> Result<bool, String> {
     let conn = borrowed.as_raw();
-    let sql = match CString::new(
+    let sql = CString::new(
         "SELECT 1 FROM information_schema.tables \
          WHERE table_schema = 'semantic_layer' AND table_name = '_definitions' LIMIT 1",
-    ) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+    )
+    .map_err(|_| "catalog probe SQL contains an interior null byte".to_string())?;
     let mut result: ffi::duckdb_result = std::mem::zeroed();
     let rc = ffi::duckdb_query(conn, sql.as_ptr(), &mut result);
-    let present = if rc == ffi::DuckDBSuccess {
-        ffi::duckdb_row_count(&mut result) > 0
+    let out = if rc == ffi::DuckDBSuccess {
+        Ok(ffi::duckdb_row_count(&mut result) > 0)
     } else {
-        false
+        let err_ptr = ffi::duckdb_result_error(&mut result);
+        let msg = if err_ptr.is_null() {
+            "catalog presence probe failed".to_string()
+        } else {
+            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+        };
+        Err(msg)
     };
     ffi::duckdb_destroy_result(&mut result);
-    present
+    out
 }
 
 /// Write a NUL-terminated error message into the C-side `error_buf`,

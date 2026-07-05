@@ -43,14 +43,35 @@ pub unsafe extern "C" fn sv_show_columns_in_semantic_view_bind_rust(
             return 1_u8;
         }
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let view_name = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s.to_string(),
+        let raw_name = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s,
             Err(_) => {
                 write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
                 return 1_u8;
             }
         };
-        let reader = CatalogReader::new(&borrowed, probe_catalog_table_present(&borrowed));
+        // FF-4: normalize so quoted-identifier inputs resolve like `semantic_view()`.
+        let view_name = match crate::ident::normalize_view_name(raw_name) {
+            Ok(s) => s,
+            Err(e) => {
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &format!("Invalid view name '{raw_name}': {e}"),
+                );
+                return 1_u8;
+            }
+        };
+        // FF-9: surface a probe-query failure as an error distinct from "no
+        // views" instead of silently folding it into absence.
+        let present = match probe_catalog_table_present(&borrowed) {
+            Ok(p) => p,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
+        let reader = CatalogReader::new(&borrowed, present);
         let json = match reader.lookup(&view_name) {
             Ok(Some(j)) => j,
             Ok(None) => {

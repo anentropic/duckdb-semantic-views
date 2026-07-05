@@ -374,15 +374,17 @@ proptest! {
         let extracted = extract_ddl_name(&ddl).unwrap();
         prop_assert_eq!(extracted, Some(content.clone()));
 
-        // The rewrite embeds the bare content: DROP carries the view name
-        // structurally; DESCRIBE passes through read-side SQL with the name
-        // single-quote-escaped.
+        // DROP carries the normalized view name structurally (quoted content is
+        // preserved by normalize_view_name). FF-4: DESCRIBE / SHOW COLUMNS now
+        // embed the RAW quoted name verbatim (single-quote-escaped) and defer
+        // folding to the TF dispatcher, matching every other read TF — so the
+        // passthrough SQL carries the quoted form, not the bare content.
         let action = rewrite_result(&ddl).unwrap();
         match action {
             RewriteAction::Drop { name, .. } => prop_assert_eq!(name, content.clone()),
             RewriteAction::Passthrough(sql) => {
                 let expected =
-                    format!("SELECT * FROM {fn_name}('{}')", content.replace('\'', "''"));
+                    format!("SELECT * FROM {fn_name}('{}')", quoted.replace('\'', "''"));
                 prop_assert_eq!(sql, expected);
             }
             other => prop_assert!(false, "unexpected rewrite action: {:?}", other),

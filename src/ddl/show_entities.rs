@@ -63,13 +63,15 @@ impl EntityRow {
     }
 }
 
-/// Collect the entity rows of `kind` for a single stored view. Unparseable
-/// JSON yields no rows (the SHOW surface is display-only). `table_name` is
-/// resolved from each entity's `source_table` alias via the view's alias map.
-fn collect_entities(kind: EntityKind, view_name: &str, json: &str) -> Vec<EntityRow> {
-    let Ok(def) = SemanticViewDefinition::from_json(view_name, json) else {
-        return Vec::new();
-    };
+/// Collect the entity rows of `kind` for a single already-parsed view.
+/// `table_name` is resolved from each entity's `source_table` alias via the
+/// view's alias map. Parsing (and the FF-9 decision of whether an unparseable
+/// definition is a hard error or a skipped row) happens at the call site.
+fn collect_entities(
+    kind: EntityKind,
+    view_name: &str,
+    def: &SemanticViewDefinition,
+) -> Vec<EntityRow> {
     let db_name = def.database_name.clone().unwrap_or_default();
     let sch_name = def.schema_name.clone().unwrap_or_default();
     let alias_map = def.alias_to_table_map();
@@ -142,12 +144,18 @@ fn collect_entities(kind: EntityKind, view_name: &str, json: &str) -> Vec<Entity
 /// Cross-view `_all` body: collect `kind` rows over every stored view, sorted
 /// by `(semantic_view_name, name)`.
 fn show_entities_all(kind: EntityKind, borrowed: &BorrowedConnection) -> Result<Vec<u8>, String> {
-    let present = unsafe { probe_catalog_table_present(borrowed) };
+    let present = unsafe { probe_catalog_table_present(borrowed) }?;
     let reader = CatalogReader::new(borrowed, present);
     let entries = reader.list_all()?;
     let mut rows: Vec<Vec<String>> = Vec::new();
     for (name, json) in &entries {
-        for r in collect_entities(kind, name, json) {
+        // FF-9: the cross-view `_all` listing stays tolerant — a single view
+        // whose stored JSON won't parse is skipped rather than failing the
+        // whole listing. The named single-view path below is the strict one.
+        let Ok(def) = SemanticViewDefinition::from_json(name, json) else {
+            continue;
+        };
+        for r in collect_entities(kind, name, &def) {
             rows.push(r.into_cells());
         }
     }
@@ -162,13 +170,22 @@ fn show_entities_one(
     borrowed: &BorrowedConnection,
     view_name: &str,
 ) -> Result<Vec<u8>, String> {
-    let present = unsafe { probe_catalog_table_present(borrowed) };
+    // FF-4: normalize the requested name so quoted-identifier inputs resolve
+    // the same way they do through `semantic_view()` (unquoted folds to
+    // lowercase; quoted preserves case).
+    let view_name = crate::ident::normalize_view_name(view_name)
+        .map_err(|e| format!("Invalid view name '{view_name}': {e}"))?;
+    let present = unsafe { probe_catalog_table_present(borrowed) }?;
     let reader = CatalogReader::new(borrowed, present);
-    let json = match reader.lookup(view_name)? {
+    let json = match reader.lookup(&view_name)? {
         Some(j) => j,
-        None => return Err(crate::catalog::view_not_found_msg(view_name)),
+        None => return Err(crate::catalog::view_not_found_msg(&view_name)),
     };
-    let mut internal = collect_entities(kind, view_name, &json);
+    // FF-9: named single-view SHOW propagates a parse error — the user asked
+    // for this specific view, so a corrupt definition must surface loudly
+    // instead of silently returning zero rows.
+    let def = SemanticViewDefinition::from_json(&view_name, &json)?;
+    let mut internal = collect_entities(kind, &view_name, &def);
     internal.sort_by(|a, b| a.name.cmp(&b.name));
     let rows: Vec<Vec<String>> = internal.into_iter().map(EntityRow::into_cells).collect();
     serialize_varchar_rows(&rows)

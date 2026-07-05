@@ -78,7 +78,16 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
         };
         let bare_name = resolve_bare_name(raw_name);
 
-        let reader = CatalogReader::new(&borrowed, probe_catalog_table_present(&borrowed));
+        // FF-9: surface a probe-query failure as an error distinct from "no
+        // views" instead of silently folding it into absence.
+        let present = match probe_catalog_table_present(&borrowed) {
+            Ok(p) => p,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
+        let reader = CatalogReader::new(&borrowed, present);
         let json = match reader.lookup(&bare_name) {
             Ok(Some(j)) => j,
             Ok(None) => {
