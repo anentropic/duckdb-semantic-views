@@ -94,7 +94,7 @@ pub unsafe extern "C" fn sv_show_semantic_materializations_all_bind_rust(
                 }
             }
             rows.sort_by(|a, b| a[2].cmp(&b[2]).then_with(|| a[3].cmp(&b[3])));
-            Ok(serialize_varchar_rows(&rows))
+            serialize_varchar_rows(&rows)
         },
     )
 }
@@ -131,7 +131,7 @@ pub unsafe extern "C" fn sv_show_semantic_materializations_bind_rust(
             let mut internal = collect_mats(&view_name, &json);
             internal.sort_by(|a, b| a.name.cmp(&b.name));
             let rows: Vec<Vec<String>> = internal.into_iter().map(ShowMatRow::into_cells).collect();
-            Ok(serialize_varchar_rows(&rows))
+            serialize_varchar_rows(&rows)
         },
     )
 }

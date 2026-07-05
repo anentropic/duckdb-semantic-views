@@ -152,7 +152,7 @@ fn show_entities_all(kind: EntityKind, borrowed: &BorrowedConnection) -> Result<
         }
     }
     rows.sort_by(|a, b| a[2].cmp(&b[2]).then_with(|| a[4].cmp(&b[4])));
-    Ok(serialize_varchar_rows(&rows))
+    serialize_varchar_rows(&rows)
 }
 
 /// Single-view body: collect `kind` rows for one view, sorted by `name`.
@@ -171,7 +171,7 @@ fn show_entities_one(
     let mut internal = collect_entities(kind, view_name, &json);
     internal.sort_by(|a, b| a.name.cmp(&b.name));
     let rows: Vec<Vec<String>> = internal.into_iter().map(EntityRow::into_cells).collect();
-    Ok(serialize_varchar_rows(&rows))
+    serialize_varchar_rows(&rows)
 }
 
 // ---------------------------------------------------------------------------

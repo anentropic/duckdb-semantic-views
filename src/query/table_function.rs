@@ -4,7 +4,7 @@ use libduckdb_sys as ffi;
 
 use crate::catalog::CatalogReader;
 use crate::expand::wildcard::{expand_wildcards, WildcardItemType};
-use crate::expand::{expand, QueryRequest};
+use crate::expand::{expand, quote_ident, QueryRequest};
 use crate::model::SemanticViewDefinition;
 use crate::util::suggest_closest;
 
@@ -83,7 +83,12 @@ unsafe fn sv_parse_string_list(buf: *const u8, len: usize) -> Result<Vec<String>
         Ok(v)
     };
     let count = read_u32(slice, &mut off)? as usize;
-    let mut out = Vec::with_capacity(count);
+    // FF-6: cap the pre-allocation at the largest element count the buffer
+    // could actually hold (each element carries at least a 4-byte length
+    // prefix). A corrupt `count` near u32::MAX would otherwise request a
+    // ~100 GB allocation up front; the per-element bounds check below still
+    // rejects a genuinely truncated payload.
+    let mut out = Vec::with_capacity(count.min(len / 4));
     for i in 0..count {
         let n = read_u32(slice, &mut off)
             .map_err(|e| format!("reading length for element {i} of {count}: {e}"))?
@@ -348,23 +353,14 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
         let execution_sql = build_execution_sql(&expanded_sql, &column_names, &column_type_ids);
 
         // Serialise schema + execution_sql into a flat binary buffer.
-        let n_cols = column_names.len() as u32;
-        let cap = 4 // n_cols
-            + column_names.iter().map(|n| 4 + n.len()).sum::<usize>()
-            + column_type_ids.len() * 4
-            + 4 + execution_sql.len();
-        let mut buf: Vec<u8> = Vec::with_capacity(cap);
-        buf.extend_from_slice(&n_cols.to_le_bytes());
-        for (name, tid) in column_names.iter().zip(column_type_ids.iter()) {
-            let nl = name.len() as u32;
-            buf.extend_from_slice(&nl.to_le_bytes());
-            buf.extend_from_slice(name.as_bytes());
-            buf.extend_from_slice(&tid.to_le_bytes());
-        }
-        let sql_len = execution_sql.len() as u32;
-        buf.extend_from_slice(&sql_len.to_le_bytes());
-        buf.extend_from_slice(execution_sql.as_bytes());
-
+        let buf = match serialize_register_payload(&column_names, &column_type_ids, &execution_sql)
+        {
+            Ok(b) => b,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
         publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));
@@ -532,6 +528,49 @@ fn type_id_to_cast_sql(type_id: u32) -> Option<&'static str> {
     }
 }
 
+/// Serialize the inferred schema + execution SQL into the flat register wire
+/// format consumed by the C++ `semantic_view` bind:
+///
+/// ```text
+/// u32 n_cols
+/// for each col: u32 name_len | name bytes | u32 type_id
+/// u32 sql_len | sql bytes
+/// ```
+///
+/// FF-6: every length goes through a checked `u32::try_from` and the function
+/// returns an error rather than a bare `as u32` truncation, which would write a
+/// length prefix that disagrees with the bytes appended and desync the header
+/// from the payload on the C++ read side. Overflow is unreachable for real
+/// queries (a column name or the execution SQL would each need to exceed 4 GiB).
+fn serialize_register_payload(
+    column_names: &[String],
+    column_type_ids: &[u32],
+    execution_sql: &str,
+) -> Result<Vec<u8>, String> {
+    let wire_len = |n: usize, what: &str| -> Result<u32, String> {
+        u32::try_from(n)
+            .map_err(|_| format!("{what} ({n} bytes) exceeds the wire-format u32 limit"))
+    };
+    let n_cols = wire_len(column_names.len(), "column count")?;
+    let cap = 4
+        + column_names.iter().map(|n| 4 + n.len()).sum::<usize>()
+        + column_type_ids.len() * 4
+        + 4
+        + execution_sql.len();
+    let mut buf: Vec<u8> = Vec::with_capacity(cap);
+    buf.extend_from_slice(&n_cols.to_le_bytes());
+    for (name, tid) in column_names.iter().zip(column_type_ids.iter()) {
+        let nl = wire_len(name.len(), "column name")?;
+        buf.extend_from_slice(&nl.to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(&tid.to_le_bytes());
+    }
+    let sql_len = wire_len(execution_sql.len(), "execution SQL")?;
+    buf.extend_from_slice(&sql_len.to_le_bytes());
+    buf.extend_from_slice(execution_sql.as_bytes());
+    Ok(buf)
+}
+
 /// Build the SQL used at execution time, wrapping the expanded SQL with explicit
 /// type casts for EVERY output column.
 ///
@@ -557,9 +596,17 @@ fn build_execution_sql(
     let clauses: Vec<String> = column_names
         .iter()
         .zip(column_type_ids.iter())
-        .map(|(name, &tid)| match type_id_to_cast_sql(tid) {
-            Some(cast_type) => format!("\"{name}\"::{cast_type} AS \"{name}\""),
-            None => format!("\"{name}\""),
+        .map(|(name, &tid)| {
+            // FF-8: quote_ident escapes an embedded `"` in the inferred column
+            // name (`"` → `""`); a raw format!("\"{name}\"") would break the
+            // cast wrapper and mis-alias the column. Names come from
+            // duckdb_column_name on the LIMIT-0 probe, so a fact/dimension
+            // alias containing `"` reaches here verbatim.
+            let quoted = quote_ident(name);
+            match type_id_to_cast_sql(tid) {
+                Some(cast_type) => format!("{quoted}::{cast_type} AS {quoted}"),
+                None => quoted,
+            }
         })
         .collect();
 

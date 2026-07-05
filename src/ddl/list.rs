@@ -85,7 +85,10 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
-    use crate::ddl::read_ffi::{probe_catalog_table_present, write_err, BorrowedConnection};
+    use crate::ddl::read_ffi::{
+        probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
+        BorrowedConnection,
+    };
     use std::panic::AssertUnwindSafe;
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         // Wrap the raw FFI handle in a BorrowedConnection at the boundary
@@ -118,7 +121,7 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
         // Reconstruct the 6-column rows exactly like the Rust VTab did
         // (ListBindData::rows) — sort by name so output ordering is
         // byte-identical to the v0.9.0 behavior.
-        let mut rows: Vec<[String; 6]> = Vec::with_capacity(entries.len());
+        let mut rows: Vec<Vec<String>> = Vec::with_capacity(entries.len());
         for (name, json) in &entries {
             let def = SemanticViewDefinition::from_json(name, json).ok();
             let (created_on, database_name, schema_name, comment) = match &def {
@@ -130,7 +133,7 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
                 ),
                 None => (String::new(), String::new(), String::new(), String::new()),
             };
-            rows.push([
+            rows.push(vec![
                 created_on,
                 name.clone(),
                 "SEMANTIC_VIEW".to_string(),
@@ -141,39 +144,20 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
         }
         rows.sort_by(|a, b| a[1].cmp(&b[1]));
 
-        // Serialize to the flat binary buffer. Wire format:
-        //   u32 row_count (LE)
-        //   for each row:
-        //     for each of 6 cols:
-        //       u32 byte_len (LE) | bytes
-        let row_count = rows.len() as u32;
-        let mut buf: Vec<u8> = Vec::with_capacity(
-            4 + rows
-                .iter()
-                .map(|r| r.iter().map(|s| 4 + s.len()).sum::<usize>())
-                .sum::<usize>(),
-        );
-        buf.extend_from_slice(&row_count.to_le_bytes());
-        for row in &rows {
-            for col in row {
-                let len = col.len() as u32;
-                buf.extend_from_slice(&len.to_le_bytes());
-                buf.extend_from_slice(col.as_bytes());
+        // FF-6: the shared serializer returns an error (rather than clamping a
+        // length to u32::MAX and desyncing the header from the payload) if a
+        // cell or the row count overflows the wire format's u32 fields. The
+        // previous inline copy used bare `as u32` casts. `publish_owned_buffer`
+        // hands the heap-owned buffer to C++ under the both-or-drop contract;
+        // the caller releases it via sv_free_buffer with the exact (ptr, len).
+        let buf = match serialize_varchar_rows(&rows) {
+            Ok(b) => b,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
             }
-        }
-
-        // Hand the heap-owned buffer to the C++ side. Caller releases via
-        // sv_free_buffer with the exact (ptr, len) pair. Matches the
-        // convention established in src/parse.rs and src/ddl/alter_helpers_ffi.rs.
-        let boxed: Box<[u8]> = buf.into_boxed_slice();
-        let len = boxed.len();
-        let raw = Box::into_raw(boxed) as *mut u8;
-        if !out_ptr.is_null() {
-            *out_ptr = raw;
-        }
-        if !out_len.is_null() {
-            *out_len = len;
-        }
+        };
+        publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));
     match result {
@@ -281,7 +265,13 @@ pub unsafe extern "C" fn sv_list_terse_semantic_views_bind_rust(
         }
         rows.sort_by(|a, b| a[1].cmp(&b[1]));
 
-        let buf = serialize_varchar_rows(&rows);
+        let buf = match serialize_varchar_rows(&rows) {
+            Ok(b) => b,
+            Err(e) => {
+                write_err(error_buf, error_buf_len, &e);
+                return 1_u8;
+            }
+        };
         publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));
