@@ -168,6 +168,42 @@ The typical pattern for shipping a read-only database with pre-defined semantic 
    ).fetchall()
 
 
+.. _explanation-txn-ddl-attach:
+
+Attached Databases (Single-Catalog)
+====================================
+
+Semantic-view definitions live in one place: a ``semantic_layer._definitions`` table created in the database you loaded the extension into (the primary database). The extension is **single-catalog** -- it manages semantic views in that one database, not across ``ATTACH``-ed databases.
+
+Concretely, if you ``ATTACH`` another database and ``USE`` it, then run semantic-view DDL:
+
+.. code-block:: sql
+
+   ATTACH 'other.db' AS other;
+   USE other;
+   CREATE SEMANTIC VIEW v AS ...;   -- error, see below
+
+you get an actionable error rather than a confusing failure or a silently-lost view:
+
+.. code-block:: text
+
+   semantic_views: semantic-view DDL was issued against database 'other', but the
+   semantic view catalog lives in a different database. Semantic views are
+   single-catalog: manage them from the database the extension was loaded into,
+   without USE-ing into an attached database.
+
+Reads (``SHOW SEMANTIC VIEWS``, ``semantic_view(...)``, ``DESCRIBE``) always resolve against the primary catalog regardless of ``USE``, so the rule is simply: **run semantic-view DDL from the database you loaded the extension into.** You can still reference tables from attached databases inside a view body by qualifying them (``TABLES (o AS other.main.orders ...)``) -- only the ``_definitions`` catalog is single-database.
+
+You never have to think about this if you don't ``ATTACH`` a second database, or if you keep the session on the primary catalog.
+
+.. note::
+
+   Because the ``_definitions`` table is tied to the primary database, the one-time
+   v0.1.0 companion-file migration only ever imports the **primary** database's own
+   ``<db>.semantic_views`` companion file. An attached database's companion file is
+   never read or removed.
+
+
 .. _explanation-txn-ddl-peg:
 
 DuckDB's Experimental PEG Parser
@@ -204,11 +240,13 @@ The other items on this page only matter in specific situations:
 
 - Introspection inside an open transaction shows committed state -- commit before ``SHOW`` / ``DESCRIBE`` if you need to see your own pending changes.
 - Concurrent ``CREATE IF NOT EXISTS`` from two processes can produce a constraint error on one of them; catch it and treat as success.
+- Semantic views are single-catalog: run their DDL from the database you loaded the extension into, not from a ``USE``-d attached database.
 - Toggling ``disable_peg_parser`` requires re-setting one parser option afterwards.
 
 See also:
 
 - :ref:`explanation-txn-ddl-readonly` -- read-only database support and the bootstrap-then-reopen workflow.
+- :ref:`explanation-txn-ddl-attach` -- single-catalog behaviour with ``ATTACH`` / ``USE``.
 - :ref:`ref-create-semantic-view` -- syntax for all four ``CREATE`` body forms.
 - :ref:`ref-drop-semantic-view` -- ``DROP`` and ``DROP IF EXISTS``.
 - :ref:`ref-alter-semantic-view` -- ``ALTER`` variants.
