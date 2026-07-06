@@ -24,7 +24,12 @@
 #[cfg(feature = "extension")]
 use super::rewrite_to_native_sql;
 #[cfg(any(feature = "extension", test))]
-use super::{detect_ddl_kind, detect_near_miss, plan_rewrite};
+use super::{detect_ddl_kind, detect_near_miss};
+// `plan_rewrite` only backs the syntax-only `run_validation_for_parse_function`
+// used in non-extension unit tests; the extension build routes through
+// `rewrite_to_native_sql` instead, so importing it there is unused.
+#[cfg(all(not(feature = "extension"), test))]
+use super::plan_rewrite;
 #[cfg(any(feature = "extension", test))]
 use crate::errors::ParseError;
 
