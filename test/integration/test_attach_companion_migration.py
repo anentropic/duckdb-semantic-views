@@ -81,7 +81,8 @@ def test_attached_companion_untouched() -> None:
     c0 = duckdb.connect(attached)
     c0.execute("CREATE TABLE t (x INTEGER)")
     c0.close()
-    json.dump(_companion_payload(), open(companion, "w"))
+    with open(companion, "w") as f:
+        json.dump(_companion_payload(), f)
     assert os.path.exists(companion)
 
     conn = duckdb.connect(
@@ -118,7 +119,8 @@ def test_primary_companion_still_migrates() -> None:
     companion = primary + ".semantic_views"
     c0 = duckdb.connect(primary)
     c0.close()
-    json.dump(_companion_payload(), open(companion, "w"))
+    with open(companion, "w") as f:
+        json.dump(_companion_payload(), f)
 
     conn = duckdb.connect(
         primary,

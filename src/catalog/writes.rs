@@ -99,18 +99,29 @@ pub(crate) fn rename_collision_guard_select(new_name_escaped: &str) -> String {
 /// only in the database the extension was loaded into (the primary), and every
 /// read runs on a fresh per-call connection that resolves against that primary
 /// catalog. A write issued while the caller is `USE`-d into a different (e.g.
-/// attached) database would otherwise resolve `semantic_layer._definitions`
-/// against that other catalog — either failing with a cryptic
-/// `schema semantic_layer does not exist` (CREATE), or, if that catalog happens
-/// to hold its own table, writing a row the primary-pinned reads never see.
+/// attached) database resolves `semantic_layer._definitions` against that other
+/// catalog. In the common case that catalog has no `semantic_layer` schema, so
+/// the write would otherwise fail with a cryptic
+/// `schema semantic_layer does not exist` (CREATE) or a misleading
+/// "does not exist" (DROP/ALTER).
 ///
-/// This guard raises an actionable error when a semantic-view catalog exists in
-/// SOME OTHER database but NOT the current one — exactly the "USE-d into the
-/// wrong database" case. It is a no-op on the normal single-catalog path (the
-/// current database holds the catalog) and on a fresh / never-bootstrapped DB
-/// (no catalog in any database — the existing table/row guards handle that).
-/// It uses `duckdb_tables()`, which spans every attached catalog, rather than
+/// This guard turns that into an actionable single-catalog error. It fires when
+/// a semantic-view catalog exists in SOME OTHER database but NOT the current one
+/// — exactly the "USE-d into the wrong database, and this database has no
+/// catalog" case. It is a no-op on the normal single-catalog path (the current
+/// database holds the catalog) and on a fresh / never-bootstrapped DB (no
+/// catalog in any database — the existing table/row guards handle that). It uses
+/// `duckdb_tables()`, which spans every attached catalog, rather than
 /// `information_schema.tables`, which only sees the current one.
+///
+/// Residual (documented single-catalog limitation): if the attached database
+/// the caller is `USE`-d into ALSO has its own `semantic_layer._definitions`
+/// (e.g. it was itself bootstrapped as a primary at some point), the guard does
+/// NOT fire — the write lands in that catalog while the primary-pinned reads
+/// never see it. Detecting this requires knowing which catalog the read binds
+/// use, which is not exposed on the caller's connection; fully closing it is
+/// the reader-context-threading work tracked as AR-6. Managing two
+/// independent semantic-view catalogs from one session is unsupported.
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 pub(crate) fn managed_catalog_guard_select() -> String {
     format!(
