@@ -143,13 +143,13 @@ def main() -> None:
 
         # ------------------------------------------------------------------
         # 5. Two-connection drop. Connection B drops the view; A's
-        #    subsequent DROP errors clearly. With auto-commit (this demo)
-        #    A's catalog pre-check sees committed state and fires the
-        #    "does not exist" path. With a long-lived BEGIN open on A and
-        #    a concurrent commit on B between A's pre-check and A's DELETE,
-        #    the in-SQL race guard would fire instead and report
-        #    "was concurrently dropped" — see the dedicated regression in
-        #    test/integration/test_concurrent_ddl.py.
+        #    subsequent DROP errors clearly. Under auto-commit (this demo)
+        #    A's existence guard sees B's committed drop and fires the
+        #    "semantic view '...' does not exist" path. Note the guard and
+        #    the DELETE are separate statements: under auto-commit a drop
+        #    that lands in the window *between* them is NOT caught (A's DELETE
+        #    just removes 0 rows). Wrapping the DROP in BEGIN ... COMMIT makes
+        #    the check-and-delete atomic. See FF-1 / TECH-DEBT #27.
         # ------------------------------------------------------------------
         section("5. Cross-connection DROP: clear error on the second drop")
         con.execute(CREATE_VIEW.replace("sales", "shared_view"))

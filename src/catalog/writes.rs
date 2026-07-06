@@ -23,9 +23,41 @@ use super::{DEFINITIONS_SCHEMA, DEFINITIONS_TABLE, DEFINITIONS_TABLE_NAME};
 ///
 /// The emitted statement errors with `semantic view '<name>' does not
 /// exist` when the row is missing from the catalog table (`DEFINITIONS_TABLE`).
-/// Caller appends `;` and the actual DELETE/UPDATE; both run on the
-/// caller's connection in the same transaction so the guard's NOT EXISTS
-/// check is snapshot-consistent with the DML that follows.
+/// Caller appends `;` and the actual DELETE/UPDATE.
+///
+/// # Transactional scope of the guard (FF-1)
+///
+/// The guard and the DML are emitted as consecutive statements of one
+/// multi-statement rewrite that `DuckDB` re-parses and runs on the caller's
+/// connection. Their atomicity — and therefore whether the guard's check is
+/// snapshot-consistent with the DML — depends entirely on the caller's
+/// transaction state:
+///
+/// * **Inside an explicit transaction** (`BEGIN … COMMIT`, or an ADBC/PG
+///   connection with `autocommit = false`): every emitted statement shares
+///   the one open transaction and its MVCC snapshot, so the guard's decision
+///   is consistent with the DML that follows. This is the atomic path.
+/// * **Under autocommit** (the default): `DuckDB` commits after *each* statement
+///   of a multi-statement string, so the guard and the DML execute in
+///   **separate implicit transactions**. A different connection that commits
+///   in the window between them can invalidate the guard's decision:
+///   - concurrent DROP — both droppers' existence guards pass, both DELETEs
+///     run; the loser's DELETE matches 0 rows and reports success having
+///     deleted nothing (a silent no-op, not an error);
+///   - concurrent RENAME — the loser's collision guard passes, then the
+///     UPDATE hits `DuckDB`'s primary-key constraint and surfaces a raw
+///     `Constraint Error: Duplicate key` instead of the friendly
+///     `already exists` wording.
+///
+/// This guard window is accepted debt (TECH-DEBT #27), the DROP/ALTER sibling
+/// of the CREATE race in #23. It is **not** closed by wrapping the rewrite in
+/// an emitted `BEGIN … COMMIT`: `DuckDB` rejects a nested `BEGIN` (`cannot start
+/// a transaction within a transaction`), so that wrapper would fail outright
+/// whenever the caller is already in a transaction, and an emitted `COMMIT`
+/// would prematurely commit an `autocommit = false` caller's in-flight work —
+/// breaking the very transaction-participation contract the native-DML rewrite
+/// exists to provide. Callers needing atomic check-and-write should wrap their
+/// own DDL in `BEGIN … COMMIT` (the atomic path above).
 ///
 /// Phase 65 Plan 06: this guard subsumes both (a) the legacy "view never
 /// existed" catalog pre-check (retired with H1 `catalog_conn`) AND (b)
@@ -80,9 +112,13 @@ pub(crate) fn existence_guard_select(name_escaped: &str) -> String {
 
 /// Build the "target name must NOT already exist" guard for ALTER RENAME.
 /// Errors with `semantic view '<new_name>' already exists` if a row with
-/// the new name is found in `semantic_layer._definitions`. Runs on the
-/// caller's connection in the same transaction as the UPDATE so its
-/// EXISTS check is snapshot-consistent with the DML.
+/// the new name is found in `semantic_layer._definitions`. Runs as a
+/// statement of the rewrite preceding the UPDATE; its EXISTS check is
+/// snapshot-consistent with the UPDATE only within an explicit caller
+/// transaction — see the transactional-scope note on
+/// [`existence_guard_select`] (FF-1 / TECH-DEBT #27) for the autocommit
+/// guard window (a concurrent committer can take the target name between the
+/// guard and the UPDATE, surfacing a raw PK constraint error).
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 pub(crate) fn rename_collision_guard_select(new_name_escaped: &str) -> String {
     format!(

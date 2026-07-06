@@ -434,12 +434,15 @@ fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, P
     }
 
     // Plain DROP: pure-SQL existence guard + DELETE on the caller's
-    // connection. The guard runs in the same transaction as the DELETE so
-    // its NOT EXISTS check is snapshot-consistent. Phase 65 Plan 06: the
-    // legacy `catalog.exists()` Rust-side pre-check is gone — H1
-    // catalog_conn retired; the guard subsumes both the never-existed
-    // case and the concurrent-drop case under a single "does not exist"
-    // wording.
+    // connection. The guard's NOT EXISTS check is snapshot-consistent with
+    // the DELETE only within an explicit caller transaction; under autocommit
+    // the two statements auto-commit separately, so a concurrent DROP can
+    // leave the loser's DELETE matching 0 rows and reporting success having
+    // deleted nothing (FF-1 / TECH-DEBT #27 — see the transactional-scope note
+    // on `existence_guard_select`). Phase 65 Plan 06: the legacy
+    // `catalog.exists()` Rust-side pre-check is gone — H1 catalog_conn retired;
+    // the guard subsumes both the never-existed case and the (in-transaction)
+    // concurrent-drop case under a single "does not exist" wording.
     //
     // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard` so
     // neither the row-existence guard NOR the DELETE bind against a
@@ -466,10 +469,13 @@ fn rewrite_alter_rename(
         // IF EXISTS: pure UPDATE on the caller's connection. We still need
         // the rename-collision guard (target name must not be taken),
         // because PK violations from DuckDB's UPDATE produce a less
-        // actionable error message. The guard runs in the same transaction
-        // as the UPDATE so the EXISTS check is snapshot-consistent. The
-        // UPDATE itself silently affects 0 rows on a missing source row —
-        // matches the IF EXISTS contract.
+        // actionable error message. The guard's EXISTS check is
+        // snapshot-consistent with the UPDATE only within an explicit caller
+        // transaction; under autocommit a concurrent writer can take the
+        // target name in the window between the guard and the UPDATE, and the
+        // UPDATE then surfaces the raw PK error the guard meant to pre-empt
+        // (FF-1 / TECH-DEBT #27). The UPDATE itself silently affects 0 rows on
+        // a missing source row — matches the IF EXISTS contract.
         //
         // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard`
         // so neither the collision guard NOR the UPDATE bind against a
@@ -487,10 +493,13 @@ fn rewrite_alter_rename(
     }
 
     // Plain ALTER RENAME: pure-SQL existence guard (source must exist) +
-    // collision guard (target must not exist) + UPDATE. All three run on
-    // the caller's connection in the same transaction so the EXISTS
-    // checks are snapshot-consistent with the DML. Phase 65 Plan 06: the
-    // legacy `catalog.exists()` Rust-side pre-checks are gone.
+    // collision guard (target must not exist) + UPDATE. The EXISTS checks are
+    // snapshot-consistent with the DML only within an explicit caller
+    // transaction; under autocommit each statement auto-commits separately, so
+    // a concurrent committer in the guard window can make the source vanish or
+    // the target appear, surfacing a raw PK error or a silent no-op (FF-1 /
+    // TECH-DEBT #27). Phase 65 Plan 06: the legacy `catalog.exists()`
+    // Rust-side pre-checks are gone.
     //
     // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard` so
     // none of the row guards / UPDATE bind against a missing
@@ -579,11 +588,13 @@ fn rewrite_alter_comment(
     }
 
     // Plain ALTER: pure-SQL existence guard + UPDATE on the caller's
-    // connection. The guard's NOT EXISTS check is snapshot-consistent
-    // with the UPDATE since both run in the same transaction. Concurrent
-    // ALTER-against-the-same-row carries no lost-update risk because we
-    // apply the mutation via json_merge_patch ON THE CURRENT ROW — not a
-    // Rust-side snapshot.
+    // connection. The guard's NOT EXISTS check is snapshot-consistent with the
+    // UPDATE only within an explicit caller transaction; under autocommit the
+    // guard and UPDATE auto-commit separately, so a concurrent DROP in the
+    // guard window leaves the UPDATE affecting 0 rows (FF-1 / TECH-DEBT #27).
+    // Concurrent ALTER-against-the-same-row carries no lost-update risk
+    // regardless, because we apply the mutation via json_merge_patch ON THE
+    // CURRENT ROW — not a Rust-side snapshot.
     //
     // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard` so
     // neither the row guard NOR the UPDATE bind against a missing

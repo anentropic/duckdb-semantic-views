@@ -101,20 +101,37 @@ The first writer wins, the second writer sees a clear error rather than silent c
 
 .. _explanation-txn-ddl-drop-alter-race:
 
-DROP and ALTER Without IF EXISTS Detect Concurrent Drops
-=========================================================
+DROP and ALTER Without IF EXISTS: the Existence Check and Its Race Window
+=========================================================================
 
-If you run ``DROP SEMANTIC VIEW my_view`` (without ``IF EXISTS``) or any ``ALTER SEMANTIC VIEW my_view ...`` form (without ``IF EXISTS``), and another process drops the view at the same time, you'll see:
+A non-``IF EXISTS`` ``DROP SEMANTIC VIEW my_view`` (or any non-``IF EXISTS`` ``ALTER SEMANTIC VIEW my_view ...`` form) is rewritten into a small existence-check statement followed by the actual ``DELETE`` / ``UPDATE``. If the view is not there when the check runs, you get:
 
 .. code-block:: text
 
-   Invalid Input Error: semantic view 'my_view' was concurrently dropped
+   Invalid Input Error: semantic view 'my_view' does not exist
 
-instead of a silent success. This is intentional -- you asked for an operation on a specific view, the view was there when the extension checked, and then it wasn't. Surfacing the race is more useful than pretending the operation succeeded.
+rather than a silent success -- you asked for an operation on a specific view and it wasn't there. The ``IF EXISTS`` variants (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SEMANTIC VIEW IF EXISTS my_view ...``) keep their silent-no-op contract by design.
 
-The ``IF EXISTS`` variants (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SEMANTIC VIEW IF EXISTS my_view ...``) keep their silent-no-op contract by design: you opted in to "do nothing if the view isn't there", and that's what they do.
+In a single-process workload there is no race to worry about. The rest of this section only matters when multiple processes issue DDL against the same database file at the same time.
 
-In a single-process workload there's no race window to worry about. This only surfaces if multiple processes are issuing DDL against the same database file at the same time.
+The check and the write are separate statements, and **whether they are atomic depends on your transaction**:
+
+- **Under autocommit (the default), they are not atomic.** DuckDB commits after each statement, so the existence check and the ``DELETE`` / ``UPDATE`` run in two separate transactions. A concurrent drop is caught only if it has already committed by the time your check runs. If another process drops the view in the small window *between* your check and your write, the check passes and then:
+
+  - a plain ``DROP`` deletes 0 rows and reports success having removed nothing (a silent no-op);
+  - a plain ``ALTER RENAME`` whose target name was taken in that window surfaces a raw ``Constraint Error: Duplicate key`` from DuckDB rather than the friendly ``already exists`` message.
+
+- **Inside an explicit transaction, they are atomic.** Wrap the DDL in ``BEGIN ... COMMIT`` (or use a connection with ``autocommit = false``) and the check and the write share one snapshot. A conflicting concurrent commit then makes your ``COMMIT`` fail with a transaction-conflict error you can retry, instead of slipping through the window.
+
+So if you run parallel DDL and need the check to be reliable, wrap it in a transaction:
+
+.. code-block:: sql
+
+   BEGIN;
+   DROP SEMANTIC VIEW my_view;
+   COMMIT;
+
+This is the ``DROP`` / ``ALTER`` counterpart of the ``CREATE IF NOT EXISTS`` race above; both come down to the same rule -- concurrent DDL against one database file wants an explicit transaction. It is tracked as a known single-connection guard-window limitation.
 
 
 .. _explanation-txn-ddl-readonly:

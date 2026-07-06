@@ -684,9 +684,11 @@ mod tests {
 
     // ===================================================================
     // B1 / D6: race-guard SQL shape. Pinned so a future refactor cannot
-    // silently drop the snapshot-consistent existence check that protects
-    // non-IF-EXISTS DROP / ALTER from a concurrent commit landing between
-    // the catalog pre-check (separate connection) and the DML.
+    // silently drop the existence check that protects non-IF-EXISTS DROP /
+    // ALTER. The check is snapshot-consistent with the DML within an explicit
+    // caller transaction; under autocommit the guard and DML auto-commit
+    // separately, so a concurrent commit in that window is accepted debt
+    // (FF-1 / TECH-DEBT #27).
     // ===================================================================
 
     // ===================================================================
