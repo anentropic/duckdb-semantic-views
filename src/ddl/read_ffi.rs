@@ -10,25 +10,41 @@
 //! # Wire format (length-prefixed binary, little-endian)
 //!
 //! ```text
+//! u32 col_count                 ─┐ self-describing schema header (AR-3)
+//! col_count × u8 type_tag        │ 1 = VARCHAR, 2 = BOOLEAN
+//!                               ─┘
 //! u32 row_count
 //! for each row:
-//!   for each column:
-//!     u32 byte_len
-//!     byte_len bytes (UTF-8 payload — VARCHAR cells)
+//!   for each column (in type_tag order):
+//!     VARCHAR: u32 byte_len + byte_len bytes (UTF-8 payload)
+//!     BOOLEAN: u8 (1 = TRUE, 0 = FALSE)
 //! ```
 //!
-//! Column layout (count + order + types) is implicit — agreed out-of-band
-//! between the Rust dispatcher and the matching C++ bind. The C++ side
-//! parses with `sv_read_u32_le` + `sv_read_string` helpers (already in
-//! `cpp/src/shim.cpp` from the Wave 0 spike) and emits rows into the
-//! DataChunk.
+//! ## Self-describing schema header (AR-3)
 //!
-//! # Variant: VARCHAR with a trailing BOOLEAN column
+//! The payload opens with a schema header — the column count followed by one
+//! type tag per column. This makes the column layout *self-describing* rather
+//! than agreed out-of-band: the C++ bind reads the header and asserts it
+//! against the column set it declared (count, and per-column VARCHAR/BOOLEAN),
+//! turning a former convention-guarded coupling (the reintroduction of
+//! TECH-DEBT #12's two-place schema agreement) into a machine-checked one. A
+//! dispatcher that emits a different column shape than its C++ bind expects
+//! now fails loudly at the header with a clear message, instead of desyncing
+//! silently or misparsing cell bytes. The C++ side parses with `sv_read_u32_le`
+//! + `sv_read_string` (+ `sv_read_wire_schema` for the header) in
+//! `cpp/src/shim.cpp`, then emits rows into the DataChunk.
 //!
-//! `show_semantic_dimensions_for_metric` returns 3 VARCHAR + 1 BOOLEAN.
-//! The wire-format encodes the BOOLEAN as a single trailing `u8` per row
-//! (1 = TRUE, 0 = FALSE) after all the VARCHAR cells. C++ side parses with
-//! `sv_read_u8` after the string reads.
+//! The header is emitted for every non-empty result. An empty result set
+//! (`row_count == 0`) writes `col_count == 0` and no tags: there are no cells
+//! to misalign, so the C++ side skips the schema assertion in that case.
+//!
+//! ## Variant: VARCHAR with a trailing BOOLEAN column
+//!
+//! `show_semantic_dimensions_for_metric` returns 3 VARCHAR + 1 BOOLEAN. Its
+//! schema header carries tags `[VARCHAR, VARCHAR, VARCHAR, BOOLEAN]`; each
+//! row emits the VARCHAR cells first, then a single trailing `u8` for the
+//! BOOLEAN (1 = TRUE, 0 = FALSE). C++ side parses with `sv_read_u8` after the
+//! string reads.
 //!
 //! # Borrow contract (critical)
 //!
@@ -188,20 +204,53 @@ fn wire_len(n: usize, what: &str) -> Result<u32, String> {
     u32::try_from(n).map_err(|_| format!("{what} ({n} bytes) exceeds the wire-format u32 limit"))
 }
 
+/// Column type tag in the self-describing schema header (AR-3). Kept in sync
+/// with the `SV_WIRE_VARCHAR` / `SV_WIRE_BOOL` constants in `cpp/src/shim.cpp`
+/// — the C++ bind asserts the received tags against the column set it declared.
+const WIRE_TAG_VARCHAR: u8 = 1;
+/// See [`WIRE_TAG_VARCHAR`].
+const WIRE_TAG_BOOL: u8 = 2;
+
+/// Write the self-describing schema header (AR-3): `u32 col_count` followed by
+/// one `u8` type tag per column. Emitting the header for every non-empty
+/// payload lets the C++ bind assert the column layout it declared matches what
+/// the dispatcher actually produced, rather than trusting an out-of-band
+/// agreement.
+fn write_wire_schema(buf: &mut Vec<u8>, tags: &[u8]) -> Result<(), String> {
+    let col_count = wire_len(tags.len(), "column count")?;
+    buf.extend_from_slice(&col_count.to_le_bytes());
+    buf.extend_from_slice(tags);
+    Ok(())
+}
+
 /// Serialize a vector of VARCHAR rows into the wire format described above.
 ///
-/// `rows` is a `Vec<Vec<String>>` where every inner Vec has the same length
-/// (number of columns). The function does NOT validate that — callers are
-/// expected to construct rectangular row sets.
+/// `rows` is a `Vec<Vec<String>>` where every inner Vec must have the same
+/// length (number of columns). The column count for the self-describing header
+/// (AR-3) is taken from the first row; an empty row set emits a zero-column
+/// header (the C++ side skips its schema assertion then). A ragged row set is
+/// rejected: the header would otherwise advertise the first row's column count
+/// while the payload bytes carry a different one, desyncing the C++ parser.
 ///
-/// Returns `Err` if the row count or any cell length overflows the wire
-/// format's `u32` fields (see [`wire_len`]).
+/// Returns `Err` if the rows are non-rectangular, or if the row count or any
+/// cell length overflows the wire format's `u32` fields (see [`wire_len`]).
 pub fn serialize_varchar_rows(rows: &[Vec<String>]) -> Result<Vec<u8>, String> {
-    let cap = 4 + rows
-        .iter()
-        .map(|r| r.iter().map(|s| 4 + s.len()).sum::<usize>())
-        .sum::<usize>();
+    let n_cols = rows.first().map_or(0, Vec::len);
+    if let Some(bad) = rows.iter().position(|r| r.len() != n_cols) {
+        return Err(format!(
+            "non-rectangular row set: row {bad} has {} columns, expected {n_cols}",
+            rows[bad].len()
+        ));
+    }
+    let cap = 4
+        + n_cols
+        + 4
+        + rows
+            .iter()
+            .map(|r| r.iter().map(|s| 4 + s.len()).sum::<usize>())
+            .sum::<usize>();
     let mut buf = Vec::with_capacity(cap);
+    write_wire_schema(&mut buf, &vec![WIRE_TAG_VARCHAR; n_cols])?;
     let row_count = wire_len(rows.len(), "row count")?;
     buf.extend_from_slice(&row_count.to_le_bytes());
     for row in rows {
@@ -218,14 +267,39 @@ pub fn serialize_varchar_rows(rows: &[Vec<String>]) -> Result<Vec<u8>, String> {
 /// emitted first (same shape as `serialize_varchar_rows`) followed by a
 /// single trailing `u8` (1 = TRUE, 0 = FALSE).
 ///
-/// Returns `Err` on the same overflow conditions as
+/// The self-describing header (AR-3) carries the VARCHAR tags followed by a
+/// trailing BOOLEAN tag; the VARCHAR column count is taken from the first
+/// row's string vector. An empty row set emits a zero-column header. A ragged
+/// row set (rows whose VARCHAR-cell counts differ) is rejected for the same
+/// reason as [`serialize_varchar_rows`] — the header would disagree with the
+/// payload bytes.
+///
+/// Returns `Err` on non-rectangular rows or the same overflow conditions as
 /// [`serialize_varchar_rows`].
 pub fn serialize_varchar_bool_rows(rows: &[(Vec<String>, bool)]) -> Result<Vec<u8>, String> {
-    let cap = 4 + rows
-        .iter()
-        .map(|(strs, _)| strs.iter().map(|s| 4 + s.len()).sum::<usize>() + 1)
-        .sum::<usize>();
+    let n_varchar = rows.first().map_or(0, |(strs, _)| strs.len());
+    if let Some(bad) = rows.iter().position(|(strs, _)| strs.len() != n_varchar) {
+        return Err(format!(
+            "non-rectangular row set: row {bad} has {} VARCHAR columns, expected {n_varchar}",
+            rows[bad].0.len()
+        ));
+    }
+    let cap = 4
+        + (n_varchar + 1)
+        + 4
+        + rows
+            .iter()
+            .map(|(strs, _)| strs.iter().map(|s| 4 + s.len()).sum::<usize>() + 1)
+            .sum::<usize>();
     let mut buf = Vec::with_capacity(cap);
+    if rows.is_empty() {
+        // No rows → zero-column header (C++ skips the schema assertion).
+        write_wire_schema(&mut buf, &[])?;
+    } else {
+        let mut tags = vec![WIRE_TAG_VARCHAR; n_varchar];
+        tags.push(WIRE_TAG_BOOL);
+        write_wire_schema(&mut buf, &tags)?;
+    }
     let row_count = wire_len(rows.len(), "row count")?;
     buf.extend_from_slice(&row_count.to_le_bytes());
     for (strs, b) in rows {
@@ -349,15 +423,25 @@ mod tests {
 
     #[test]
     fn serialize_empty_row_set() {
+        // Empty result → zero-column schema header, then row_count = 0.
         let buf = serialize_varchar_rows(&[]).unwrap();
-        assert_eq!(buf, vec![0, 0, 0, 0]);
+        assert_eq!(
+            buf,
+            vec![
+                0, 0, 0, 0, // col_count = 0 (no tags follow)
+                0, 0, 0, 0, // row_count = 0
+            ]
+        );
     }
 
     #[test]
     fn serialize_single_row() {
         let rows = vec![vec!["a".to_string(), "bc".to_string()]];
         let buf = serialize_varchar_rows(&rows).unwrap();
+        #[rustfmt::skip]
         let expected: Vec<u8> = vec![
+            2, 0, 0, 0, // col_count = 2
+            WIRE_TAG_VARCHAR, WIRE_TAG_VARCHAR, // tags: [VARCHAR, VARCHAR]
             1, 0, 0, 0, // row_count = 1
             1, 0, 0, 0,    // len("a") = 1
             b'a', // "a"
@@ -374,11 +458,45 @@ mod tests {
             (vec!["y".to_string()], false),
         ];
         let buf = serialize_varchar_bool_rows(&rows).unwrap();
+        #[rustfmt::skip]
         let expected: Vec<u8> = vec![
+            2, 0, 0, 0, // col_count = 2 (1 VARCHAR + trailing BOOL)
+            WIRE_TAG_VARCHAR, WIRE_TAG_BOOL, // tags: [VARCHAR, BOOL]
             2, 0, 0, 0, // row_count = 2
             1, 0, 0, 0, b'x', 1, // ("x", true)
             1, 0, 0, 0, b'y', 0, // ("y", false)
         ];
         assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn serialize_bool_empty_row_set() {
+        // Empty bool-variant result → zero-column header, then row_count = 0.
+        let buf = serialize_varchar_bool_rows(&[]).unwrap();
+        assert_eq!(buf, vec![0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn serialize_varchar_rows_rejects_ragged() {
+        // Second row has a different column count than the first — the schema
+        // header (derived from row 0) would disagree with the payload bytes.
+        let rows = vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["c".to_string()],
+        ];
+        let err = serialize_varchar_rows(&rows).unwrap_err();
+        assert!(err.contains("non-rectangular"), "unexpected error: {err}");
+        assert!(err.contains("row 1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn serialize_varchar_bool_rows_rejects_ragged() {
+        let rows = vec![
+            (vec!["a".to_string(), "b".to_string()], true),
+            (vec!["c".to_string()], false),
+        ];
+        let err = serialize_varchar_bool_rows(&rows).unwrap_err();
+        assert!(err.contains("non-rectangular"), "unexpected error: {err}");
+        assert!(err.contains("row 1"), "unexpected error: {err}");
     }
 }
