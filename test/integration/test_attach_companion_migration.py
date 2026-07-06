@@ -28,6 +28,7 @@ Exit codes: 0 = all passed, 1 = at least one failed.
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import traceback
@@ -107,6 +108,7 @@ def test_attached_companion_untouched() -> None:
         )
     finally:
         conn.close()
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_primary_companion_still_migrates() -> None:
@@ -141,6 +143,7 @@ def test_primary_companion_still_migrates() -> None:
         assert names == ["legacy_view"], f"expected migrated legacy_view, got {names}"
     finally:
         conn.close()
+        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":
