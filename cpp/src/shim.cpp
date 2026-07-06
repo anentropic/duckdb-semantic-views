@@ -1000,6 +1000,52 @@ static std::string sv_read_string(const char *buf, size_t buf_len, size_t &offse
     return s;
 }
 
+// Self-describing wire-format schema tags (AR-3). Kept in sync with
+// `WIRE_TAG_VARCHAR` / `WIRE_TAG_BOOL` in `src/ddl/read_ffi.rs` — the Rust
+// serializers emit these, the parsers below assert them.
+static constexpr uint8_t SV_WIRE_VARCHAR = 1;
+static constexpr uint8_t SV_WIRE_BOOL = 2;
+
+// Read + validate the self-describing schema header (AR-3): `u32 col_count`
+// followed by one `u8` type tag per column. `expected_tags` is the column
+// layout the bind callback declared; a mismatch means the Rust dispatcher and
+// this C++ bind disagree on the result shape — fail loudly at the header
+// rather than misparse cell bytes downstream.
+//
+// An empty result set is serialized with `col_count == 0` and no tags (there
+// are no rows, hence no cells to misalign); the schema check is skipped in
+// that case and only the `row_count == 0` that follows is read by the caller.
+static void sv_read_wire_schema(const char *buf, size_t buf_len, size_t &offset,
+                                const std::vector<uint8_t> &expected_tags,
+                                const char *fn_name) {
+    uint32_t col_count = sv_read_u32_le(buf, buf_len, offset);
+    if (col_count == 0) {
+        return;  // empty result set — no schema to validate
+    }
+    if (col_count != expected_tags.size()) {
+        throw BinderException(
+            std::string(fn_name) + ": FFI wire-format column count mismatch (payload declares " +
+            std::to_string(col_count) + " columns, bind expects " +
+            std::to_string(expected_tags.size()) + ")");
+    }
+    if (offset + col_count > buf_len) {
+        throw BinderException(
+            std::string(fn_name) + ": FFI buffer truncated (expected " +
+            std::to_string(col_count) + " schema tags at offset " +
+            std::to_string(offset) + " of " + std::to_string(buf_len) + ")");
+    }
+    for (uint32_t c = 0; c < col_count; ++c) {
+        uint8_t tag = static_cast<uint8_t>(buf[offset + c]);
+        if (tag != expected_tags[c]) {
+            throw BinderException(
+                std::string(fn_name) + ": FFI wire-format column-type mismatch at column " +
+                std::to_string(c) + " (payload tag " + std::to_string(tag) +
+                ", bind expects " + std::to_string(expected_tags[c]) + ")");
+        }
+    }
+    offset += col_count;
+}
+
 static unique_ptr<FunctionData> sv_list_semantic_views_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
@@ -1069,8 +1115,13 @@ static unique_ptr<FunctionData> sv_list_semantic_views_bind(
         return std::move(bd);
     }
 
-    // Parse the flat binary buffer into ListSemanticViewsRow entries.
+    // Parse the flat binary buffer into ListSemanticViewsRow entries. The
+    // self-describing schema header (AR-3) is validated first: this TF
+    // declares 6 VARCHAR columns (see return_types above).
     size_t offset = 0;
+    sv_read_wire_schema(
+        payload.ptr, payload.len, offset,
+        std::vector<uint8_t>(6, SV_WIRE_VARCHAR), "list_semantic_views");
     uint32_t row_count = sv_read_u32_le(payload.ptr, payload.len, offset);
     bd->rows.reserve(row_count);
     for (uint32_t r = 0; r < row_count; ++r) {
@@ -1184,6 +1235,10 @@ static void sv_parse_varchar_payload(const char *buf, size_t buf_len,
         return;  // rc=0 with null buffer == zero rows
     }
     size_t offset = 0;
+    // Validate the self-describing schema header (AR-3): all VARCHAR columns.
+    sv_read_wire_schema(buf, buf_len, offset,
+                        std::vector<uint8_t>(bd.expected_cols, SV_WIRE_VARCHAR),
+                        fn_name);
     uint32_t row_count = sv_read_u32_le(buf, buf_len, offset);
     bd.rows.reserve(row_count);
     for (uint32_t r = 0; r < row_count; ++r) {
@@ -1256,6 +1311,11 @@ static void sv_parse_varchar_bool_payload(const char *buf, size_t buf_len,
         return;
     }
     size_t offset = 0;
+    // Validate the self-describing schema header (AR-3): N VARCHAR columns
+    // followed by a single trailing BOOLEAN column.
+    std::vector<uint8_t> expected_tags(bd.expected_varchar_cols, SV_WIRE_VARCHAR);
+    expected_tags.push_back(SV_WIRE_BOOL);
+    sv_read_wire_schema(buf, buf_len, offset, expected_tags, fn_name);
     uint32_t row_count = sv_read_u32_le(buf, buf_len, offset);
     bd.rows.reserve(row_count);
     for (uint32_t r = 0; r < row_count; ++r) {
