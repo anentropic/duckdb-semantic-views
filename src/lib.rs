@@ -439,13 +439,34 @@ mod extension {
         con: &Connection,
         db_handle: ffi::duckdb_database,
     ) -> Result<(), Box<dyn Error>> {
-        // Resolve the host database file path by querying PRAGMA database_list.
+        // Resolve the PRIMARY database's file path via PRAGMA database_list.
+        //
+        // FF-3: this previously took the FIRST non-empty file from
+        // `PRAGMA database_list`. With an in-memory primary and a file-backed
+        // ATTACHed database, that picked the ATTACHed file — and the v0.1.0
+        // companion-file migration in `init_catalog` then imported that attached
+        // DB's `<file>.semantic_views` companion into the (ephemeral in-memory)
+        // primary catalog and DELETED the source file: cross-catalog data loss.
+        //
+        // The companion migration is a legacy concept tied to the PRIMARY
+        // database's own file, so resolve the primary specifically: the
+        // `database_list` row whose name matches `current_database()`. `con` is a
+        // fresh load-time connection (`Connection::open_from_raw`), so its current
+        // catalog is the default/primary regardless of any `USE` on the user's
+        // connection. An in-memory primary has a NULL/empty file → `:memory:`,
+        // which makes `init_catalog` skip the companion migration entirely.
         let db_path: Arc<str> = {
+            let primary: String =
+                con.query_row("SELECT current_database()", [], |row| row.get(0))?;
             let mut stmt = con.prepare("PRAGMA database_list")?;
             let path = stmt
-                .query_map([], |row| row.get::<_, String>(2))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+                })?
                 .filter_map(Result::ok)
-                .find(|file| !file.is_empty())
+                .find(|(name, _)| name.eq_ignore_ascii_case(&primary))
+                .and_then(|(_, file)| file)
+                .filter(|f| !f.is_empty())
                 .unwrap_or_default();
             if path.is_empty() {
                 Arc::from(":memory:")

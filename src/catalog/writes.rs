@@ -93,6 +93,58 @@ pub(crate) fn rename_collision_guard_select(new_name_escaped: &str) -> String {
     )
 }
 
+/// Build the single-catalog guard prepended to every write DDL (FF-3).
+///
+/// Semantic views are single-catalog: `semantic_layer._definitions` is created
+/// only in the database the extension was loaded into (the primary), and every
+/// read runs on a fresh per-call connection that resolves against that primary
+/// catalog. A write issued while the caller is `USE`-d into a different (e.g.
+/// attached) database resolves `semantic_layer._definitions` against that other
+/// catalog. In the common case that catalog has no `semantic_layer` schema, so
+/// the write would otherwise fail with a cryptic
+/// `schema semantic_layer does not exist` (CREATE) or a misleading
+/// "does not exist" (DROP/ALTER).
+///
+/// This guard turns that into an actionable single-catalog error. It fires when
+/// a semantic-view catalog exists in SOME OTHER database but NOT the current one
+/// — exactly the "USE-d into the wrong database, and this database has no
+/// catalog" case. It is a no-op on the normal single-catalog path (the current
+/// database holds the catalog) and on a fresh / never-bootstrapped DB (no
+/// catalog in any database — the existing table/row guards handle that). It uses
+/// `duckdb_tables()`, which spans every attached catalog, rather than
+/// `information_schema.tables`, which only sees the current one.
+///
+/// Residual (documented single-catalog limitation — TECH-DEBT #26): if the
+/// attached database the caller is `USE`-d into ALSO has its own
+/// `semantic_layer._definitions` (e.g. it was itself bootstrapped as a primary
+/// at some point), the guard does NOT fire — the write lands in that catalog
+/// while the primary-pinned reads never see it. Detecting this requires knowing
+/// which catalog the read binds use, which is not exposed on the caller's
+/// connection; fully closing it is the reader-context-threading work tracked as
+/// AR-6 (see TECH-DEBT #26). Managing two independent semantic-view catalogs
+/// from one session is unsupported until then.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+pub(crate) fn managed_catalog_guard_select() -> String {
+    format!(
+        "SELECT CASE \
+              WHEN EXISTS (SELECT 1 FROM duckdb_tables() \
+                            WHERE schema_name = '{DEFINITIONS_SCHEMA}' \
+                              AND table_name = '{DEFINITIONS_TABLE_NAME}' \
+                              AND database_name <> current_database()) \
+               AND NOT EXISTS (SELECT 1 FROM duckdb_tables() \
+                            WHERE schema_name = '{DEFINITIONS_SCHEMA}' \
+                              AND table_name = '{DEFINITIONS_TABLE_NAME}' \
+                              AND database_name = current_database()) \
+                THEN error('semantic_views: semantic-view DDL was issued against database ''' \
+                           || current_database() || \
+                           ''', but the semantic view catalog lives in a different database. \
+                           Semantic views are single-catalog: manage them from the database the \
+                           extension was loaded into, without USE-ing into an attached database.') \
+              ELSE TRUE \
+            END"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +246,36 @@ mod tests {
         assert!(
             g.contains("error('semantic view ''taken'' already exists')"),
             "missing error() with 'already exists' wording: {g}"
+        );
+        assert!(g.trim_start().starts_with("SELECT "), "not a SELECT: {g}");
+        assert!(!g.contains(';'), "guard must not include ';' itself: {g}");
+    }
+
+    #[test]
+    fn managed_catalog_guard_detects_cross_catalog_via_duckdb_tables() {
+        // FF-3: the single-catalog guard must span catalogs (duckdb_tables, not
+        // information_schema), fire only when the catalog lives in ANOTHER
+        // database than the current one, and carry an actionable single-catalog
+        // message that names the current database.
+        let g = managed_catalog_guard_select();
+        assert!(
+            g.contains("FROM duckdb_tables()"),
+            "must use duckdb_tables() (spans catalogs), not information_schema: {g}"
+        );
+        assert!(
+            g.contains("database_name <> current_database()")
+                && g.contains("database_name = current_database()"),
+            "must compare the catalog's database against the current one: {g}"
+        );
+        // `duckdb_tables()` exposes `schema_name`, not `table_schema`.
+        assert!(
+            g.contains("schema_name = 'semantic_layer'")
+                && g.contains("table_name = '_definitions'"),
+            "must match the semantic_layer._definitions catalog table: {g}"
+        );
+        assert!(
+            g.contains("single-catalog") && g.contains("|| current_database() ||"),
+            "message must name the current database and state the single-catalog rule: {g}"
         );
         assert!(g.trim_start().starts_with("SELECT "), "not a SELECT: {g}");
         assert!(!g.contains(';'), "guard must not include ';' itself: {g}");

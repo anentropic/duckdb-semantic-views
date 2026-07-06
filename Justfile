@@ -172,6 +172,11 @@ test-load-idempotent: build
 test-yaml-file-create: build
     uv run test/integration/test_create_from_yaml_v010.py
 
+# FF-3: the v0.1.0 companion-file migration must never touch an ATTACHed DB
+# (in-memory primary + file-backed ATTACH used to migrate+delete its companion).
+test-attach-migration: build
+    uv run test/integration/test_attach_companion_migration.py
+
 # DROP/ALTER SEMANTIC VIEW on a fresh read-only DB that was never bootstrapped
 # must surface the canonical "semantic view 'X' does not exist" wording, not a
 # raw `_definitions` catalog leak (Phase 65.1 Plan 04, WR-03 D-18).
@@ -195,7 +200,7 @@ test-differential: build
 # exact set the `python-integration` CI job runs (IntegrationChecks.yml) —
 # keep the two in sync by editing THIS recipe, not the workflow.
 # (test-ducklake-ci is excluded: it has its own dedicated CI job.)
-test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-readonly-fresh-drop test-chunk-boundary test-differential
+test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + all Python integration suites
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.

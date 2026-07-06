@@ -85,12 +85,17 @@ pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, Parse
         return Ok(None);
     };
 
-    match action {
+    // Read-side DDL is passed through unchanged; write DDL gets the FF-3
+    // single-catalog guard prepended below.
+    let emitted: Option<String> = match action {
+        // Read-side DDL (DESCRIBE / SHOW / SHOW COLUMNS): DuckDB runs the
+        // read-side table function on the caller's connection unchanged.
+        RewriteAction::Passthrough(sql) => return Ok(Some(sql)),
         // CREATE from an in-memory definition — hand the definition straight to
         // the shared emission path. AR-2: no JSON serialize → re-parse →
         // deserialize round-trip; the `SemanticViewDefinition` flows structurally.
         RewriteAction::Create { name, def, mode } => {
-            emit_native_create_sql(&name, *def, mode.or_replace(), mode.if_not_exists())
+            emit_native_create_sql(&name, *def, mode.or_replace(), mode.if_not_exists())?
         }
         // CREATE FROM YAML FILE — emit the INSERT that selects from the
         // `__sv_compute_create_from_yaml` helper TF (which reads the file at
@@ -106,11 +111,11 @@ pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, Parse
             &comment,
             mode.or_replace(),
             mode.if_not_exists(),
-        ),
+        )?,
         // DROP / ALTER: pure-SQL race-guard + native DML on the caller's
         // connection. Names/comment are carried raw; escape at the boundary so
         // the emission helpers keep receiving already-escaped args.
-        RewriteAction::Drop { name, if_exists } => rewrite_drop(&escape_sql_arg(&name), if_exists),
+        RewriteAction::Drop { name, if_exists } => rewrite_drop(&escape_sql_arg(&name), if_exists)?,
         RewriteAction::AlterRename {
             name,
             new_name,
@@ -119,7 +124,7 @@ pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, Parse
             &escape_sql_arg(&name),
             &escape_sql_arg(&new_name),
             if_exists,
-        ),
+        )?,
         RewriteAction::AlterSetComment {
             name,
             comment,
@@ -128,14 +133,25 @@ pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, Parse
             &escape_sql_arg(&name),
             Some(&escape_sql_arg(&comment)),
             if_exists,
-        ),
+        )?,
         RewriteAction::AlterUnsetComment { name, if_exists } => {
-            rewrite_alter_comment(&escape_sql_arg(&name), None, if_exists)
+            rewrite_alter_comment(&escape_sql_arg(&name), None, if_exists)?
         }
-        // Read-side DDL (DESCRIBE / SHOW / SHOW COLUMNS): DuckDB runs the
-        // read-side table function on the caller's connection unchanged.
-        RewriteAction::Passthrough(sql) => Ok(Some(sql)),
-    }
+    };
+
+    // FF-3: prepend the single-catalog guard to every write DDL. Run as the
+    // FIRST statement so multi-statement execution short-circuits before the
+    // DML when the caller is USE-d into a database that isn't the one holding
+    // the semantic-view catalog (typically after `USE <attached_db>`). Without
+    // it, such a write either fails with a cryptic "schema semantic_layer does
+    // not exist" (CREATE) or writes a row the primary-pinned reads never see.
+    // The guard is a no-op on the normal single-catalog path.
+    Ok(emitted.map(|dml| {
+        format!(
+            "{}; {dml}",
+            crate::catalog::writes::managed_catalog_guard_select()
+        )
+    }))
 }
 
 /// Shared CREATE-emission helper for the in-memory-definition path
