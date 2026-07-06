@@ -972,10 +972,11 @@ struct ListSemanticViewsLocalState : public LocalTableFunctionState {
 // Helper: read a little-endian u32 from buf[offset..offset+4] and advance.
 // Throws BinderException on out-of-bounds — defensive against an FFI buffer
 // truncated by a panic or allocation failure on the Rust side.
-static uint32_t sv_read_u32_le(const char *buf, size_t buf_len, size_t &offset) {
+static uint32_t sv_read_u32_le(const char *buf, size_t buf_len, size_t &offset,
+                               const char *fn_name) {
     if (offset + 4 > buf_len) {
         throw BinderException(
-            "list_semantic_views: FFI buffer truncated (expected u32 at offset " +
+            std::string(fn_name) + ": FFI buffer truncated (expected u32 at offset " +
             std::to_string(offset) + " of " + std::to_string(buf_len) + ")");
     }
     auto p = reinterpret_cast<const unsigned char *>(buf + offset);
@@ -987,11 +988,12 @@ static uint32_t sv_read_u32_le(const char *buf, size_t buf_len, size_t &offset) 
     return v;
 }
 
-static std::string sv_read_string(const char *buf, size_t buf_len, size_t &offset) {
-    uint32_t len = sv_read_u32_le(buf, buf_len, offset);
+static std::string sv_read_string(const char *buf, size_t buf_len, size_t &offset,
+                                  const char *fn_name) {
+    uint32_t len = sv_read_u32_le(buf, buf_len, offset, fn_name);
     if (offset + len > buf_len) {
         throw BinderException(
-            "list_semantic_views: FFI buffer truncated (expected " +
+            std::string(fn_name) + ": FFI buffer truncated (expected " +
             std::to_string(len) + " string bytes at offset " +
             std::to_string(offset) + " of " + std::to_string(buf_len) + ")");
     }
@@ -1014,13 +1016,15 @@ static constexpr uint8_t SV_WIRE_BOOL = 2;
 //
 // An empty result set is serialized with `col_count == 0` and no tags (there
 // are no rows, hence no cells to misalign); the schema check is skipped in
-// that case and only the `row_count == 0` that follows is read by the caller.
-static void sv_read_wire_schema(const char *buf, size_t buf_len, size_t &offset,
-                                const std::vector<uint8_t> &expected_tags,
-                                const char *fn_name) {
-    uint32_t col_count = sv_read_u32_le(buf, buf_len, offset);
+// that case. Returns the `col_count` read from the header so the caller can
+// enforce the empty-encoding invariant (`col_count == 0` ⟺ `row_count == 0`)
+// against the `row_count` that follows.
+static uint32_t sv_read_wire_schema(const char *buf, size_t buf_len, size_t &offset,
+                                    const std::vector<uint8_t> &expected_tags,
+                                    const char *fn_name) {
+    uint32_t col_count = sv_read_u32_le(buf, buf_len, offset, fn_name);
     if (col_count == 0) {
-        return;  // empty result set — no schema to validate
+        return 0;  // empty result set — no schema to validate
     }
     if (col_count != expected_tags.size()) {
         throw BinderException(
@@ -1044,6 +1048,7 @@ static void sv_read_wire_schema(const char *buf, size_t buf_len, size_t &offset,
         }
     }
     offset += col_count;
+    return col_count;
 }
 
 static unique_ptr<FunctionData> sv_list_semantic_views_bind(
@@ -1119,19 +1124,26 @@ static unique_ptr<FunctionData> sv_list_semantic_views_bind(
     // self-describing schema header (AR-3) is validated first: this TF
     // declares 6 VARCHAR columns (see return_types above).
     size_t offset = 0;
-    sv_read_wire_schema(
+    const char *fn_name = "list_semantic_views";
+    uint32_t schema_cols = sv_read_wire_schema(
         payload.ptr, payload.len, offset,
-        std::vector<uint8_t>(6, SV_WIRE_VARCHAR), "list_semantic_views");
-    uint32_t row_count = sv_read_u32_le(payload.ptr, payload.len, offset);
+        std::vector<uint8_t>(6, SV_WIRE_VARCHAR), fn_name);
+    uint32_t row_count = sv_read_u32_le(payload.ptr, payload.len, offset, fn_name);
+    if (schema_cols == 0 && row_count != 0) {
+        throw BinderException(
+            std::string(fn_name) +
+            ": FFI wire-format empty-schema header (col_count == 0) with row_count == " +
+            std::to_string(row_count) + " > 0");
+    }
     bd->rows.reserve(row_count);
     for (uint32_t r = 0; r < row_count; ++r) {
         ListSemanticViewsRow row;
-        row.created_on    = sv_read_string(payload.ptr, payload.len, offset);
-        row.name          = sv_read_string(payload.ptr, payload.len, offset);
-        row.kind          = sv_read_string(payload.ptr, payload.len, offset);
-        row.database_name = sv_read_string(payload.ptr, payload.len, offset);
-        row.schema_name   = sv_read_string(payload.ptr, payload.len, offset);
-        row.comment       = sv_read_string(payload.ptr, payload.len, offset);
+        row.created_on    = sv_read_string(payload.ptr, payload.len, offset, fn_name);
+        row.name          = sv_read_string(payload.ptr, payload.len, offset, fn_name);
+        row.kind          = sv_read_string(payload.ptr, payload.len, offset, fn_name);
+        row.database_name = sv_read_string(payload.ptr, payload.len, offset, fn_name);
+        row.schema_name   = sv_read_string(payload.ptr, payload.len, offset, fn_name);
+        row.comment       = sv_read_string(payload.ptr, payload.len, offset, fn_name);
         bd->rows.push_back(std::move(row));
     }
 
@@ -1236,16 +1248,23 @@ static void sv_parse_varchar_payload(const char *buf, size_t buf_len,
     }
     size_t offset = 0;
     // Validate the self-describing schema header (AR-3): all VARCHAR columns.
-    sv_read_wire_schema(buf, buf_len, offset,
-                        std::vector<uint8_t>(bd.expected_cols, SV_WIRE_VARCHAR),
-                        fn_name);
-    uint32_t row_count = sv_read_u32_le(buf, buf_len, offset);
+    uint32_t schema_cols =
+        sv_read_wire_schema(buf, buf_len, offset,
+                            std::vector<uint8_t>(bd.expected_cols, SV_WIRE_VARCHAR),
+                            fn_name);
+    uint32_t row_count = sv_read_u32_le(buf, buf_len, offset, fn_name);
+    if (schema_cols == 0 && row_count != 0) {
+        throw BinderException(
+            std::string(fn_name) +
+            ": FFI wire-format empty-schema header (col_count == 0) with row_count == " +
+            std::to_string(row_count) + " > 0");
+    }
     bd.rows.reserve(row_count);
     for (uint32_t r = 0; r < row_count; ++r) {
         std::vector<std::string> row;
         row.reserve(bd.expected_cols);
         for (size_t c = 0; c < bd.expected_cols; ++c) {
-            row.push_back(sv_read_string(buf, buf_len, offset));
+            row.push_back(sv_read_string(buf, buf_len, offset, fn_name));
         }
         bd.rows.push_back(std::move(row));
     }
@@ -1315,14 +1334,20 @@ static void sv_parse_varchar_bool_payload(const char *buf, size_t buf_len,
     // followed by a single trailing BOOLEAN column.
     std::vector<uint8_t> expected_tags(bd.expected_varchar_cols, SV_WIRE_VARCHAR);
     expected_tags.push_back(SV_WIRE_BOOL);
-    sv_read_wire_schema(buf, buf_len, offset, expected_tags, fn_name);
-    uint32_t row_count = sv_read_u32_le(buf, buf_len, offset);
+    uint32_t schema_cols = sv_read_wire_schema(buf, buf_len, offset, expected_tags, fn_name);
+    uint32_t row_count = sv_read_u32_le(buf, buf_len, offset, fn_name);
+    if (schema_cols == 0 && row_count != 0) {
+        throw BinderException(
+            std::string(fn_name) +
+            ": FFI wire-format empty-schema header (col_count == 0) with row_count == " +
+            std::to_string(row_count) + " > 0");
+    }
     bd.rows.reserve(row_count);
     for (uint32_t r = 0; r < row_count; ++r) {
         std::vector<std::string> strs;
         strs.reserve(bd.expected_varchar_cols);
         for (size_t c = 0; c < bd.expected_varchar_cols; ++c) {
-            strs.push_back(sv_read_string(buf, buf_len, offset));
+            strs.push_back(sv_read_string(buf, buf_len, offset, fn_name));
         }
         if (offset + 1 > buf_len) {
             throw BinderException(
@@ -2550,15 +2575,15 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
 
     // Parse the schema + execution_sql wire format.
     size_t offset = 0;
-    uint32_t n_cols = sv_read_u32_le(payload.ptr, payload.len, offset);
+    uint32_t n_cols = sv_read_u32_le(payload.ptr, payload.len, offset, "semantic_view");
     bd->columns.reserve(n_cols);
     for (uint32_t i = 0; i < n_cols; ++i) {
         SemanticViewColumnInfo info;
-        info.name = sv_read_string(payload.ptr, payload.len, offset);
-        info.type_id = sv_read_u32_le(payload.ptr, payload.len, offset);
+        info.name = sv_read_string(payload.ptr, payload.len, offset, "semantic_view");
+        info.type_id = sv_read_u32_le(payload.ptr, payload.len, offset, "semantic_view");
         bd->columns.push_back(std::move(info));
     }
-    bd->execution_sql = sv_read_string(payload.ptr, payload.len, offset);
+    bd->execution_sql = sv_read_string(payload.ptr, payload.len, offset, "semantic_view");
     if (offset != payload.len) {
         throw BinderException(
             "semantic_view: FFI buffer has trailing bytes (consumed " +

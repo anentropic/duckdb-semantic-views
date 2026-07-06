@@ -225,16 +225,23 @@ fn write_wire_schema(buf: &mut Vec<u8>, tags: &[u8]) -> Result<(), String> {
 
 /// Serialize a vector of VARCHAR rows into the wire format described above.
 ///
-/// `rows` is a `Vec<Vec<String>>` where every inner Vec has the same length
-/// (number of columns). The function does NOT validate that — callers are
-/// expected to construct rectangular row sets. The column count for the
-/// self-describing header (AR-3) is taken from the first row; an empty row set
-/// emits a zero-column header (the C++ side skips its schema assertion then).
+/// `rows` is a `Vec<Vec<String>>` where every inner Vec must have the same
+/// length (number of columns). The column count for the self-describing header
+/// (AR-3) is taken from the first row; an empty row set emits a zero-column
+/// header (the C++ side skips its schema assertion then). A ragged row set is
+/// rejected: the header would otherwise advertise the first row's column count
+/// while the payload bytes carry a different one, desyncing the C++ parser.
 ///
-/// Returns `Err` if the row count or any cell length overflows the wire
-/// format's `u32` fields (see [`wire_len`]).
+/// Returns `Err` if the rows are non-rectangular, or if the row count or any
+/// cell length overflows the wire format's `u32` fields (see [`wire_len`]).
 pub fn serialize_varchar_rows(rows: &[Vec<String>]) -> Result<Vec<u8>, String> {
     let n_cols = rows.first().map_or(0, Vec::len);
+    if let Some(bad) = rows.iter().position(|r| r.len() != n_cols) {
+        return Err(format!(
+            "non-rectangular row set: row {bad} has {} columns, expected {n_cols}",
+            rows[bad].len()
+        ));
+    }
     let cap = 4
         + n_cols
         + 4
@@ -262,12 +269,21 @@ pub fn serialize_varchar_rows(rows: &[Vec<String>]) -> Result<Vec<u8>, String> {
 ///
 /// The self-describing header (AR-3) carries the VARCHAR tags followed by a
 /// trailing BOOLEAN tag; the VARCHAR column count is taken from the first
-/// row's string vector. An empty row set emits a zero-column header.
+/// row's string vector. An empty row set emits a zero-column header. A ragged
+/// row set (rows whose VARCHAR-cell counts differ) is rejected for the same
+/// reason as [`serialize_varchar_rows`] — the header would disagree with the
+/// payload bytes.
 ///
-/// Returns `Err` on the same overflow conditions as
+/// Returns `Err` on non-rectangular rows or the same overflow conditions as
 /// [`serialize_varchar_rows`].
 pub fn serialize_varchar_bool_rows(rows: &[(Vec<String>, bool)]) -> Result<Vec<u8>, String> {
     let n_varchar = rows.first().map_or(0, |(strs, _)| strs.len());
+    if let Some(bad) = rows.iter().position(|(strs, _)| strs.len() != n_varchar) {
+        return Err(format!(
+            "non-rectangular row set: row {bad} has {} VARCHAR columns, expected {n_varchar}",
+            rows[bad].0.len()
+        ));
+    }
     let cap = 4
         + (n_varchar + 1)
         + 4
@@ -458,5 +474,29 @@ mod tests {
         // Empty bool-variant result → zero-column header, then row_count = 0.
         let buf = serialize_varchar_bool_rows(&[]).unwrap();
         assert_eq!(buf, vec![0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn serialize_varchar_rows_rejects_ragged() {
+        // Second row has a different column count than the first — the schema
+        // header (derived from row 0) would disagree with the payload bytes.
+        let rows = vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["c".to_string()],
+        ];
+        let err = serialize_varchar_rows(&rows).unwrap_err();
+        assert!(err.contains("non-rectangular"), "unexpected error: {err}");
+        assert!(err.contains("row 1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn serialize_varchar_bool_rows_rejects_ragged() {
+        let rows = vec![
+            (vec!["a".to_string(), "b".to_string()], true),
+            (vec!["c".to_string()], false),
+        ];
+        let err = serialize_varchar_bool_rows(&rows).unwrap_err();
+        assert!(err.contains("non-rectangular"), "unexpected error: {err}");
+        assert!(err.contains("row 1"), "unexpected error: {err}");
     }
 }
