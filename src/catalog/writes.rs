@@ -114,14 +114,15 @@ pub(crate) fn rename_collision_guard_select(new_name_escaped: &str) -> String {
 /// `duckdb_tables()`, which spans every attached catalog, rather than
 /// `information_schema.tables`, which only sees the current one.
 ///
-/// Residual (documented single-catalog limitation): if the attached database
-/// the caller is `USE`-d into ALSO has its own `semantic_layer._definitions`
-/// (e.g. it was itself bootstrapped as a primary at some point), the guard does
-/// NOT fire — the write lands in that catalog while the primary-pinned reads
-/// never see it. Detecting this requires knowing which catalog the read binds
-/// use, which is not exposed on the caller's connection; fully closing it is
-/// the reader-context-threading work tracked as AR-6. Managing two
-/// independent semantic-view catalogs from one session is unsupported.
+/// Residual (documented single-catalog limitation — TECH-DEBT #26): if the
+/// attached database the caller is `USE`-d into ALSO has its own
+/// `semantic_layer._definitions` (e.g. it was itself bootstrapped as a primary
+/// at some point), the guard does NOT fire — the write lands in that catalog
+/// while the primary-pinned reads never see it. Detecting this requires knowing
+/// which catalog the read binds use, which is not exposed on the caller's
+/// connection; fully closing it is the reader-context-threading work tracked as
+/// AR-6 (see TECH-DEBT #26). Managing two independent semantic-view catalogs
+/// from one session is unsupported until then.
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 pub(crate) fn managed_catalog_guard_select() -> String {
     format!(
