@@ -200,7 +200,7 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
         let def = match SemanticViewDefinition::from_json(&view_name, &json_str) {
             Ok(d) => d,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.clone());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
@@ -208,21 +208,21 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
         let dimensions = match expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension) {
             Ok(v) => v,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.clone());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
         let metrics = match expand_wildcards(&metrics, &def, &WildcardItemType::Metric) {
             Ok(v) => v,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.clone());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
         let facts = match expand_wildcards(&facts, &def, &WildcardItemType::Fact) {
             Ok(v) => v,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.clone());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };

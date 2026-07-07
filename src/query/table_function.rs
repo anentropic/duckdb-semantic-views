@@ -195,7 +195,7 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
         let def = match SemanticViewDefinition::from_json(&view_name, &json_str) {
             Ok(d) => d,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.clone());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };

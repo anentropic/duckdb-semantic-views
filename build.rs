@@ -182,6 +182,12 @@ fn main() {
     if std::path::Path::new("cpp/include/duckdb.cpp").exists() {
         println!("cargo:rerun-if-changed=cpp/include/duckdb.cpp");
     }
+    // Toggling SV_SKIP_CPP_BUILD flips whether the C++ shim/amalgamation is
+    // compiled below, so it must invalidate the build-script cache. Without
+    // this, a `cargo build --features extension` right after a
+    // `SV_SKIP_CPP_BUILD=1 cargo clippy` could reuse the skipped output and
+    // link against a never-built shim.
+    println!("cargo:rerun-if-env-changed=SV_SKIP_CPP_BUILD");
 
     // Only configure C++ compilation and symbol visibility when building the loadable
     // extension binary. CARGO_FEATURE_EXTENSION is set by Cargo when `--features extension`

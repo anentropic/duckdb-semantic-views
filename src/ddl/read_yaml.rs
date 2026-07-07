@@ -110,7 +110,7 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
         let yaml = match render_yaml_export(&def) {
             Ok(s) => s,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.clone());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
