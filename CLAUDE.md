@@ -48,6 +48,36 @@ At the end of every milestone, before tagging:
 - `cargo test` — runs without the extension feature (in-memory DuckDB)
 - `just test-sql` — requires a fresh `just build` to pick up code changes
 
+### Offline amalgamation fallback (blocked GitHub — agent/sandbox sessions only)
+
+`just build` → `make ensure_amalgamation` downloads the DuckDB amalgamation
+(`cpp/include/duckdb.{hpp,cpp}`) from the DuckDB **GitHub release**. This is the
+normal, canonical path — use it whenever GitHub is reachable (i.e. always, on a
+normal local machine).
+
+Some sandboxed agent sessions run behind an egress proxy that blocks
+`github.com/duckdb/duckdb` (the release fetch returns HTTP 403), so `just build`
+can't get the amalgamation. In that case only, regenerate the identical files
+from GitHub-free hosts:
+
+```bash
+python3 scripts/fetch_amalgamation_offline.py
+```
+
+It pulls the DuckDB source from the PyPI sdist (`files.pythonhosted.org`) and
+DuckDB's own amalgamation generator from jsDelivr (`cdn.jsdelivr.net`), writes
+`cpp/include/duckdb.{hpp,cpp}` and caches them under `.amalgamation/<version>/`,
+so the subsequent `just build` finds the correct version present and skips its
+own (blocked) download. Output is byte-identical to the release amalgamation
+except `DUCKDB_SOURCE_ID` (a placeholder — the real SHA isn't reachable without
+GitHub): verified fine for building + `clippy --features extension`; loading the
+built extension (`just test-sql`) may hit a source-id check. Do **not** use this
+on a normal local machine — it's a fallback, not a replacement for `just build`.
+
+To lint the `extension`-gated FFI layer without any C++ build at all (no
+amalgamation needed), use `SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features
+--features extension -- -D warnings` (see MAINTAINER.md).
+
 ## Build/test command rules (non-negotiable)
 
 These two rules have previously caused multi-hour agent stalls. They apply to every
