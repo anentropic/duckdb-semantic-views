@@ -750,19 +750,29 @@ Window metric required dimension missing
 Concurrent DDL Errors
 =====================
 
-These errors occur during ``DROP`` or ``ALTER SEMANTIC VIEW`` when another writer modifies the catalog mid-statement.
+These errors relate to ``DROP`` or ``ALTER SEMANTIC VIEW`` when another writer modifies the catalog around the same time.
 
 
-Concurrently dropped (DROP / ALTER)
------------------------------------
+Existence guard on DROP / ALTER (and its autocommit window)
+-----------------------------------------------------------
+
+A non-``IF EXISTS`` ``DROP`` or ``ALTER`` runs a small existence check before its ``DELETE`` / ``UPDATE``. When the view is absent at check time you get:
 
 .. code-block:: text
 
-   semantic view '<name>' was concurrently dropped
+   semantic view '<name>' does not exist
 
-**Cause:** A non-``IF EXISTS`` ``DROP`` or ``ALTER`` confirmed the view existed at snapshot time, but another connection removed it before the change applied.
+and ``ALTER ... RENAME`` additionally raises, when the target name is taken:
 
-**Fix:** Decide on the contract you want. Use ``IF EXISTS`` if a missing target should silently no-op (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SEMANTIC VIEW IF EXISTS my_view ...``). Otherwise, retry the statement after handling the race in your application. See :ref:`explanation-transactional-ddl` for the snapshot-and-apply mechanism.
+.. code-block:: text
+
+   semantic view '<new_name>' already exists
+
+**Cause:** The view was not present (or the rename target was already present) when the guard evaluated -- either it never existed, or another connection had already committed the change by the time your statement ran.
+
+**A subtlety under autocommit:** the guard and the ``DELETE`` / ``UPDATE`` are separate statements. Under autocommit (the default) they commit independently, so a concurrent commit that lands in the window *between* them is **not** caught by the guard: a concurrent ``DROP`` leaves your ``DROP`` deleting 0 rows and reporting success, and a rename target taken in that window surfaces a raw ``Constraint Error: Duplicate key`` from DuckDB instead of the friendly ``already exists`` message.
+
+**Fix:** Decide on the contract you want. Use ``IF EXISTS`` if a missing target should silently no-op (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SEMANTIC VIEW IF EXISTS my_view ...``). If you need the check and the write to be atomic under concurrency, wrap the statement in an explicit transaction (``BEGIN; DROP SEMANTIC VIEW my_view; COMMIT;``): all statements then share one snapshot, and a conflicting concurrent commit makes your ``COMMIT`` fail with a retryable transaction-conflict error instead of slipping through the window. See :ref:`explanation-transactional-ddl` for the full mechanism.
 
 
 .. _ref-err-wildcard:

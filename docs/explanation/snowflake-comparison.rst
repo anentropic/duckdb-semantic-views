@@ -366,7 +366,7 @@ The DuckDB-specific behaviour worth noting before you build on it:
 
 - ``DESCRIBE SEMANTIC VIEW`` and the ``SHOW SEMANTIC ...`` family read **committed** catalog state. A ``CREATE`` issued earlier in the same uncommitted transaction is not yet visible to introspection in that transaction; commit first, then describe.
 - ``CREATE SEMANTIC VIEW IF NOT EXISTS`` cannot fully absorb a race between two separate processes both running it against the same database at the same moment -- one will succeed and the other will see a constraint error. Within a single process or transaction, ``IF NOT EXISTS`` is reliable.
-- The non-``IF EXISTS`` ``DROP`` and ``ALTER`` forms raise ``semantic view '<name>' was concurrently dropped`` if another writer removes the view between snapshot and apply, instead of silently no-opping.
+- The non-``IF EXISTS`` ``DROP`` and ``ALTER`` forms raise ``semantic view '<name>' does not exist`` when the view is absent at check time, instead of silently no-opping. The existence check and the write are atomic only inside an explicit transaction; under autocommit a drop committed by another writer in the window between them is not detected. Wrap the DDL in ``BEGIN ... COMMIT`` when you need the check to be reliable under concurrency.
 
 See :ref:`explanation-transactional-ddl` for the full mechanism and worked examples.
 

@@ -512,7 +512,10 @@ mod tests {
     // A CTE needs a SELECT"), so we emit two statements separated by `;`:
     // a guard SELECT that raises via error() if the row is missing, then
     // the DELETE/UPDATE itself. Both statements run on the caller's
-    // connection in the same transaction (snapshot consistent).
+    // connection; they share one snapshot only within an explicit caller
+    // transaction — under autocommit each auto-commits separately (FF-1 /
+    // TECH-DEBT #27). This single-connection smoke test exercises the SQL
+    // shape, not the concurrency window.
     #[cfg(not(feature = "extension"))]
     #[test]
     fn two_statement_guard_then_dml_smoke() {

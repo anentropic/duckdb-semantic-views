@@ -49,7 +49,7 @@ Statement Variants
 
 .. note::
 
-   ``ALTER`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the previous name and comment). The non-``IF EXISTS`` forms raise ``semantic view '<name>' was concurrently dropped`` if another process drops the view at the same time, instead of silently succeeding. ``IF EXISTS`` keeps its silent-no-op behaviour. See :ref:`explanation-transactional-ddl`.
+   ``ALTER`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the previous name and comment). The non-``IF EXISTS`` forms raise ``semantic view '<name>' does not exist`` when the view is absent at check time (and ``RENAME`` raises ``semantic view '<new_name>' already exists`` if the target name is taken); ``IF EXISTS`` keeps its silent-no-op behaviour. The existence/collision check and the update are atomic only inside an explicit transaction -- under autocommit a concurrent commit in the window between them is not detected (a concurrent drop leaves the update affecting 0 rows; a concurrently taken rename target surfaces a raw key-constraint error). See :ref:`explanation-transactional-ddl` for the guard window and how to close it.
 
 .. note::
 

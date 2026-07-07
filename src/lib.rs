@@ -498,7 +498,9 @@ mod extension {
         // parser_override path is now pure-SQL on the caller's connection
         // — existence checks use a `SELECT CASE WHEN NOT EXISTS THEN
         // error() ELSE TRUE END; <DML>` two-statement guard that runs
-        // snapshot-consistent with the DML. No long-lived extension-owned
+        // snapshot-consistent with the DML within an explicit caller
+        // transaction (under autocommit the two statements auto-commit
+        // separately — FF-1 / TECH-DEBT #27). No long-lived extension-owned
         // `duckdb_connection` is allocated in `init_extension` after this
         // plan; `tests/no_long_lived_conn.rs` is the structural guard
         // that fails CI if anyone re-introduces one.

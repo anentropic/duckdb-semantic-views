@@ -16,10 +16,15 @@ Without the parser_override path emitting an INSERT against `_definitions`
 out-of-band — concurrency semantics were undefined. v0.8.0 keeps the same
 serialization guarantee while collapsing onto a single execution path.
 
-This is also the test that would catch a regression of the B1 race guards:
-if a concurrent commit lands between a DROP/ALTER's catalog pre-check and
-its DML, the `SELECT CASE WHEN NOT EXISTS THEN error()` guard surfaces a
-"was concurrently dropped" error rather than silently no-op-ing.
+Scope note: these tests cover the CREATE / CREATE IF NOT EXISTS races only.
+The non-IF-EXISTS DROP/ALTER existence guard (`SELECT CASE WHEN NOT EXISTS
+THEN error('... does not exist')`) is snapshot-consistent with its DML only
+inside an explicit transaction; under autocommit the guard and the DML commit
+separately, so a drop landing in the window between them is not caught (the
+DROP silently affects 0 rows). That guard window is a documented limitation
+(FF-1 / TECH-DEBT #27), not something these tests pin — a deterministic
+regression for it is not feasible because the window is inherently timing
+dependent.
 
 Exit codes:
     0 = test passed

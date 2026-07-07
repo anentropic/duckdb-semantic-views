@@ -33,7 +33,7 @@ Statement Variants
 
 .. note::
 
-   ``DROP`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the view). ``DROP SEMANTIC VIEW`` (without ``IF EXISTS``) raises ``semantic view '<name>' was concurrently dropped`` if another process drops the view at the same time, instead of silently succeeding. ``IF EXISTS`` keeps its silent-no-op behaviour. See :ref:`explanation-transactional-ddl`.
+   ``DROP`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the view). ``DROP SEMANTIC VIEW`` (without ``IF EXISTS``) raises ``semantic view '<name>' does not exist`` when the view is absent at check time; ``IF EXISTS`` keeps its silent-no-op behaviour. The existence check and the delete are atomic only inside an explicit transaction -- under autocommit a drop that another process commits in the window between them is not detected. See :ref:`explanation-transactional-ddl` for the guard window and how to close it.
 
 .. note::
 
