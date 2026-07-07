@@ -142,8 +142,3 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
         }
     }
 }
-
-// Legacy `GetDdlScalar` (duckdb-rs `VScalar` impl) RETIRED — Phase 65
-// Plan 05 Batch 3. The C++ Catalog API path
-// (`sv_register_get_ddl` → `sv_get_ddl_exec_rust`) is the sole
-// registration target.

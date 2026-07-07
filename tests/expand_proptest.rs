@@ -236,6 +236,60 @@ fn joined_definition() -> SemanticViewDefinition {
 }
 
 // ---------------------------------------------------------------------------
+// Bind oracle: a real in-memory DuckDB with physical tables matching the two
+// fixtures, so expanded SQL can be bound (LIMIT 0) to prove it is not just
+// string-shaped but actually valid — the gap TC-4 calls out ("SQL never
+// executed"). One combined schema serves both fixtures: `orders` carries the
+// superset of referenced columns; `customers`/`products` back the joins.
+// ---------------------------------------------------------------------------
+
+fn oracle_db() -> duckdb::Connection {
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+    conn.execute_batch(
+        "CREATE TABLE orders (
+             region      VARCHAR,
+             status      VARCHAR,
+             amount      DOUBLE,
+             created_at  TIMESTAMP,
+             customer_id INTEGER,
+             product_id  INTEGER
+         );
+         CREATE TABLE customers (id INTEGER, name VARCHAR);
+         CREATE TABLE products  (id INTEGER, category VARCHAR);",
+    )
+    .expect("create oracle schema");
+    conn
+}
+
+/// Bind (but do not run) the expanded SQL against the oracle schema by
+/// preparing it under a `LIMIT 0`. `prepare` performs full name/type binding
+/// in DuckDB, so a forward-referencing join, a dropped table, or a malformed
+/// clause surfaces here as an `Err` rather than passing a string-shape check.
+fn assert_binds(conn: &duckdb::Connection, sql: &str) -> Result<(), String> {
+    let probe = format!("{sql}\nLIMIT 0");
+    conn.prepare(&probe)
+        .map(|_| ())
+        .map_err(|e| format!("expanded SQL failed to bind: {e}\n---\n{probe}"))
+}
+
+/// Extract the exact ordinal list from a `GROUP BY` clause. `expand` always
+/// emits `GROUP BY` as the final clause with only integer ordinals, so every
+/// comma-separated token must parse as a `usize` — a stray token means the
+/// generator drifted. Returns `None` when there is no `GROUP BY`.
+fn parse_group_by_ordinals(sql: &str) -> Option<Vec<usize>> {
+    let tail = sql.split("GROUP BY").nth(1)?;
+    Some(
+        tail.split(',')
+            .map(|t| {
+                t.trim()
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| panic!("non-ordinal token {t:?} in GROUP BY: {sql}"))
+            })
+            .collect(),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Strategy: generate arbitrary valid QueryRequest from a definition
 // ---------------------------------------------------------------------------
 
@@ -277,6 +331,12 @@ proptest! {
         let def = simple_definition();
         let sql = expand("test", &def, &req).unwrap();
 
+        // Bind oracle: the expanded SQL must be valid against a real schema.
+        let conn = oracle_db();
+        if let Err(e) = assert_binds(&conn, &sql) {
+            prop_assert!(false, "{e}");
+        }
+
         if req.dimensions.is_empty() {
             // Metrics-only: global aggregate, no GROUP BY.
             prop_assert!(
@@ -307,19 +367,23 @@ proptest! {
         } else {
             // Both dimensions and metrics: GROUP BY with ordinal positions for
             // each dimension, and all dimension expressions present in SELECT.
-            let group_by_section = sql.split("GROUP BY").nth(1)
-                .expect("GROUP BY section must exist when both dimensions and metrics present");
-
-            // The expand function uses ordinal positions (GROUP BY 1, 2, ...).
-            // Verify the correct number of ordinals are present.
+            //
+            // Parse the ordinal list EXACTLY (not `.contains("1")`, which the
+            // review flagged as matching any digit anywhere): the GROUP BY must
+            // be precisely `1, 2, ..., dim_count` — same count, same values, in
+            // order, with no extras.
             let dim_count = req.dimensions.len();
-            for i in 1..=dim_count {
-                let ordinal = format!("{i}");
-                prop_assert!(
-                    group_by_section.contains(&ordinal),
-                    "GROUP BY must contain ordinal '{i}' for dimension {i} of {dim_count}. GROUP BY section:\n{group_by_section}"
-                );
-            }
+            let ordinals = parse_group_by_ordinals(&sql)
+                .expect("GROUP BY must exist when both dimensions and metrics present");
+            let expected: Vec<usize> = (1..=dim_count).collect();
+            prop_assert_eq!(
+                &ordinals,
+                &expected,
+                "GROUP BY ordinals must be exactly {:?}, got {:?}. SQL:\n{}",
+                expected,
+                ordinals,
+                sql
+            );
 
             // Verify dimension expressions appear in the SELECT clause
             // (before the GROUP BY).
@@ -405,6 +469,14 @@ proptest! {
         let def = joined_definition();
         let sql = expand("test", &def, &req).unwrap();
 
+        // Bind oracle: exercises join emission against a real schema, so a
+        // forward-referencing ON clause or a dropped connecting join (SG-2/SG-10)
+        // would fail to bind here, not just fail a substring check.
+        let conn = oracle_db();
+        if let Err(e) = assert_binds(&conn, &sql) {
+            prop_assert!(false, "{e}");
+        }
+
         for join in &def.joins {
             let join_table_needed = req.dimensions.iter().any(|d| {
                 def.dimensions.iter()
@@ -429,34 +501,46 @@ proptest! {
         }
     }
 
-    /// Property 5: Global aggregate (empty dimensions) has no GROUP BY but includes metric expr.
+    /// Property 5: Global aggregate — any NON-EMPTY subset of metrics with no
+    /// dimensions produces no GROUP BY, includes every requested metric's expr,
+    /// and binds.
+    ///
+    /// Previously this property took `Just(<fixed request>)` — a unit test in
+    /// proptest costume (TC-4). It now samples a real, varying metrics-only
+    /// subset so the invariant is checked across every combination.
     #[test]
     fn global_aggregate_no_group_by(
-        _dummy in Just(QueryRequest {
-            dimensions: vec![],
-            metrics: vec![MetricName::new("total_revenue")],
-            facts: vec![],
-        })
+        metrics in proptest::sample::subsequence(
+            simple_definition().metrics.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+            1..=simple_definition().metrics.len(),
+        )
     ) {
         let def = simple_definition();
         let req = QueryRequest {
             dimensions: vec![],
-            metrics: vec![MetricName::new("total_revenue")],
+            metrics: metrics.iter().map(MetricName::new).collect(),
             facts: vec![],
         };
         let sql = expand("test", &def, &req).unwrap();
+
+        let conn = oracle_db();
+        if let Err(e) = assert_binds(&conn, &sql) {
+            prop_assert!(false, "{e}");
+        }
 
         prop_assert!(
             !sql.contains("GROUP BY"),
             "Global aggregate must not contain GROUP BY. SQL:\n{sql}"
         );
-        let met_def = def.metrics.iter()
-            .find(|m| m.name == "total_revenue")
-            .unwrap();
-        prop_assert!(
-            sql.contains(&met_def.expr),
-            "Global aggregate SQL must contain metric expr '{}'. SQL:\n{}",
-            met_def.expr, sql
-        );
+        for met_name in &metrics {
+            let met_def = def.metrics.iter()
+                .find(|m| &m.name == met_name)
+                .unwrap();
+            prop_assert!(
+                sql.contains(&met_def.expr),
+                "Global aggregate SQL must contain metric expr '{}'. SQL:\n{}",
+                met_def.expr, sql
+            );
+        }
     }
 }

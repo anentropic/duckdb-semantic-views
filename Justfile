@@ -75,6 +75,14 @@ _ensure-test-deps:
 test-sql: build _ensure-test-deps
     make test_debug
 
+# TC-10 expected-fail probe: check whether the per-file sqllogictest process
+# isolation workaround (see Makefile) is still needed. Runs the whole TEST_LIST
+# in ONE process; exits 0 while the DuckDB 1.5 multi-DB crash still reproduces
+# (workaround required) and exits 1 loudly if it ever stops crashing (time to
+# retire the workaround). Requires a debug build.
+probe-isolation-workaround: build
+    make probe_isolation_debug_internal
+
 # Download jaffle-shop data and create DuckLake/Iceberg catalog for integration tests.
 # Idempotent — safe to run multiple times. Data files are gitignored.
 # Uses uv to run the script with its declared dependencies (PEP 723).

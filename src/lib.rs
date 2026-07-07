@@ -7,7 +7,11 @@ pub mod graph;
 pub mod ident;
 pub mod model;
 pub mod parse;
-#[cfg(feature = "extension")]
+// The `query` module itself is always compiled; its FFI-heavy submodules
+// (`error`, `explain`, `table_function`) are `extension`-gated inside
+// `query/mod.rs`, while `query::wire` — the pure wire-format/SQL-shape
+// helpers — compiles under default features so it is covered by `cargo test`
+// / clippy / coverage (TC-8).
 pub mod query;
 pub mod render_ddl;
 pub mod render_yaml;
@@ -84,8 +88,18 @@ pub mod test_helpers {
 
     /// Read a typed value from a DuckDB result chunk column/row using binary reads.
     ///
-    /// This mirrors `read_typed_from_vector` in `query::table_function` but is
-    /// compiled with the default (bundled) feature for integration test use.
+    /// This is a **test-only** decoder. It does not mirror any single production
+    /// function — the extension's read side no longer materializes typed values
+    /// in Rust (that path was retired in Phase 65: production now hands zero-copy
+    /// vector references to DuckDB and streams results C++-side, with
+    /// `query::table_function::read_varchar_from_vector` the only remaining
+    /// per-value Rust reader, used for VARCHAR-only paths like EXPLAIN).
+    ///
+    /// What it *does* mirror is the binary layout contract the extension depends
+    /// on: it decodes `duckdb_data_chunk` vectors directly (validity mask +
+    /// per-type data buffers) exactly as the C++ streaming emitter expects them,
+    /// so `output_proptest`/`vector_reference_test` can assert type fidelity of
+    /// real DuckDB result chunks under the default (bundled) feature.
     ///
     /// # Safety
     ///
@@ -314,23 +328,12 @@ mod extension {
     use std::os::raw::c_char;
 
     use crate::catalog::init_catalog;
-    // Phase 65 Plan 05 (complete after Batch 3 cleanup): all 17 read-side
-    // registrations now go through the C++ Catalog API path:
-    //  - Wave 0: list_semantic_views (bridge spike)
-    //  - Wave 1: list_terse + 4 "_all" variants
-    //  - Wave 2: describe + show_columns + 4 single-view SHOW variants +
-    //            show_dimensions_for_metric
-    //  - Wave 3: get_ddl + read_yaml_from_semantic_view (scalars)
-    //  - Wave 5: explain_semantic_view
-    //  - Wave 6: semantic_view
-    // The legacy duckdb-rs `register_table_function_with_extra_info` /
-    // `register_scalar_function_with_state` registrations were deleted
-    // together with the H2 query_conn allocation in the Plan 05 Batch 3
-    // cleanup commit. Phase 65 Plan 06 retires H1 catalog_conn as well —
-    // `init_extension` no longer allocates any long-lived extension-owned
-    // `duckdb_connection`. `tests/no_long_lived_conn.rs` is the
-    // structural guard that fails CI if any future change re-introduces
-    // one inside `init_extension`.
+    // INVARIANT: every read-side function is registered through the C++ Catalog
+    // API path (no duckdb-rs `register_*_with_extra_info` / `_with_state`
+    // calls), and `init_extension` allocates no long-lived extension-owned
+    // `duckdb_connection` — reads run on per-call borrowed connections.
+    // `tests/no_long_lived_conn.rs` is the structural guard that fails CI if a
+    // future change re-introduces a long-lived connection here.
 
     // C++ shim registration wrappers (defined in cpp/src/shim.cpp). Every one
     // shares the same ABI — `(db_handle, error_buf, error_buf_len) -> bool` —

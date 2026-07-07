@@ -7,8 +7,13 @@
 //!    CREATE TABLE → INSERT → SELECT → `read_typed_value` → assert type and values match.
 //!
 //! These tests run under the default `bundled` feature (`cargo test`).
-//! The extension feature is NOT required — `test_helpers` provides the same binary-read
-//! functions compiled for the bundled environment.
+//! The extension feature is NOT required — `test_helpers::read_typed_value` is a
+//! test-only decoder that reads a `duckdb_data_chunk` using the same binary
+//! layout (validity mask + per-type data buffers) the extension's C++ streaming
+//! emitter relies on. It is not a copy of a production Rust function (the read
+//! side stopped materializing typed values in Rust in Phase 65); it exists to
+//! assert that real DuckDB result chunks decode to the expected types/values.
+//! This is the CV-1-style typed-output check that runs in CI via `cargo test`.
 
 use libduckdb_sys as ffi;
 use proptest::prelude::*;

@@ -97,7 +97,8 @@ patch-runner: check_configure
 # because the Python runner cannot reload an external extension after the
 # `restart` directive in a file-backed database (the extension's init_catalog
 # may deadlock during reload). Restart persistence is verified separately via
-# `cargo test` Rust integration tests.
+# `cargo test` (catalog::tests::tc6_restart_persistence_survives_reopen:
+# open -> persist -> close -> reopen -> init_catalog -> lookup).
 TEST_LIST_PATH := test/sql/TEST_LIST
 # --test-dir is passed alongside --file-list so the runner can resolve __TEST_DIR__
 # (used by tests that create file-backed databases). The file list controls which
@@ -115,6 +116,10 @@ TEST_RUNNER_FILE_LIST_RELEASE := $(TEST_RUNNER) --test-dir test/sql --file-list 
 # by running each test file in a separate process. Each test passes in isolation.
 # Uses mktemp instead of /dev/stdin because the Python sqllogictest runner
 # resolves /dev/stdin to /proc/self/fd/0, which doesn't exist on Windows.
+#
+# The `probe_isolation_debug_internal` target below (TC-10) is the expected-fail
+# probe that tells us when this workaround can be retired: it runs the whole
+# TEST_LIST in one process and fails loudly if that ever stops crashing.
 test_extension_debug_internal: patch-runner
 	@echo "Running DEBUG tests.."
 	@FAILED=0; \
@@ -148,3 +153,28 @@ test_extension_release_internal: patch-runner
 	rm -f "$$TMPLIST"; \
 	echo "$$TOTAL tests run, $$FAILED failed"; \
 	[ $$FAILED -eq 0 ]
+
+# TC-10 expected-fail probe. The per-file isolation loop above exists solely to
+# dodge a DuckDB 1.5.0 crash when one sqllogictest process creates/destroys
+# multiple databases sequentially. Nothing pins that motivating crash, so the
+# workaround would silently outlive its cause. This target runs the ENTIRE
+# TEST_LIST in a SINGLE process (the exact trigger) and INVERTS the result:
+#   - while the bug still reproduces, the single-process run crashes/fails and
+#     the probe exits 0 ("workaround still required" -- expected);
+#   - if the run ever SUCCEEDS, the probe exits 1 and tells the maintainer to
+#     retire the per-file loop and route test-sql back to the single-process
+#     TEST_RUNNER_FILE_LIST_DEBUG path.
+# Requires a debug build (`just build`). Run via `just probe-isolation-workaround`.
+probe_isolation_debug_internal: patch-runner
+	@echo "Probing whether the DuckDB 1.5 multi-file isolation workaround is still needed.."
+	@if $(TEST_RUNNER_FILE_LIST_DEBUG) >/dev/null 2>&1; then \
+		echo "UNEXPECTED PASS: running all TEST_LIST files in one sqllogictest process no"; \
+		echo "longer crashes -- the DuckDB 1.5 multi-DB lifecycle segfault appears fixed."; \
+		echo "Retire the per-file isolation loop in test_extension_debug_internal /"; \
+		echo "test_extension_release_internal and route test-sql back to the single-process"; \
+		echo "TEST_RUNNER_FILE_LIST_DEBUG path."; \
+		exit 1; \
+	else \
+		echo "OK: single-process run still fails; the per-file isolation workaround is still"; \
+		echo "required (expected)."; \
+	fi

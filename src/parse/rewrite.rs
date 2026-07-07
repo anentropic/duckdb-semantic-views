@@ -114,8 +114,6 @@ fn function_name(kind: DdlKind) -> &'static str {
     }
 }
 
-// rewrite_show_dims_for_metric removed in Phase 34.1.1 -- absorbed into parse_show_filter_clauses.
-
 // ---------------------------------------------------------------------------
 // SHOW SEMANTIC filter clause helpers (Phase 34.1.1)
 // ---------------------------------------------------------------------------

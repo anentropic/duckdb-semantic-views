@@ -188,16 +188,6 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
 // canonical version flows to all 17 read-side dispatchers.
 
 // ---------------------------------------------------------------------------
-// Legacy Rust VTab `ListSemanticViewsVTab` RETIRED — Phase 65 Plan 05 Batch 3
-// (cleanup commit). The C++ Catalog API path above is the sole registration
-// target; no duckdb-rs `register_table_function_with_extra_info` call is
-// reachable from `src/lib.rs::init_extension`. The legacy struct + impl block
-// + `ListBindData` + `ListInitData` were deleted together with the H2
-// query_conn allocation that fed `CatalogReader` to the bind callback's
-// `get_extra_info::<CatalogReader>()`.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // list_terse_semantic_views — Phase 65 Plan 05 Task 2 (Wave 1)
 // ---------------------------------------------------------------------------
 //
@@ -304,10 +294,3 @@ pub unsafe extern "C" fn sv_list_terse_semantic_views_bind_rust(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// SHOW TERSE SEMANTIC VIEWS — Legacy VTab RETIRED Phase 65 Plan 05 Batch 3.
-// ListTerseSemanticViewsVTab + ListTerseRow + ListTerseBindData +
-// ListTerseInitData were deleted together with the H2 query_conn allocation.
-// The C++ Catalog API path is the sole registration target.
-// ---------------------------------------------------------------------------

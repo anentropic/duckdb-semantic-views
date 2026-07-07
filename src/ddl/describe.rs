@@ -607,11 +607,6 @@ fn collect_materialization_rows(def: &SemanticViewDefinition, rows: &mut Vec<Des
     }
 }
 
-// Legacy `DescribeSemanticViewVTab` (duckdb-rs `VTab` impl block) RETIRED —
-// Phase 65 Plan 05 Batch 3. The C++ Catalog API path
-// (`sv_register_describe_semantic_view` → `sv_describe_semantic_view_bind_rust`
-// above) is the sole registration target.
-
 #[cfg(test)]
 mod tests {
     use super::*;
