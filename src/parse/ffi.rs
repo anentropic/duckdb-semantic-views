@@ -220,9 +220,10 @@ pub unsafe extern "C" fn sv_parser_override_rust(
 ///
 /// The extension build re-runs the full rewrite (`rewrite_to_native_sql`); unit
 /// tests (no `extension` feature) fall back to syntax-only validation via
-/// `plan_rewrite`. Either way the purpose is to recover the `ParseError` message
-/// + caret position for a *structurally invalid* DDL statement (e.g. a malformed
-/// CREATE body), reproducing exactly what `parser_override` saw. Catalog-level
+/// `plan_rewrite`. Either way the purpose is to recover the `ParseError`
+/// message and caret position for a *structurally invalid* DDL statement (e.g. a
+/// malformed CREATE body), reproducing exactly what `parser_override` saw.
+/// Catalog-level
 /// conditions — DROP-of-missing, rename-into-an-existing-name — are NOT
 /// rewrite-time errors: `rewrite_drop` / `rewrite_alter_*` emit execution-time
 /// SQL guards, so a well-formed-but-catalog-invalid statement rewrites

@@ -110,17 +110,13 @@ pub unsafe extern "C" fn sv_compute_create_from_yaml_rust(
         }
 
         let content_bytes = std::slice::from_raw_parts(content_ptr, content_len);
-        let content = if let Ok(s) = std::str::from_utf8(content_bytes) {
-            s
-        } else {
+        let Ok(content) = std::str::from_utf8(content_bytes) else {
             write_error_buf(error_buf, error_buf_len, "YAML content is not valid UTF-8");
             return 1_u8;
         };
 
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let name = if let Ok(s) = std::str::from_utf8(name_bytes) {
-            s
-        } else {
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
             write_error_buf(error_buf, error_buf_len, "view name is not valid UTF-8");
             return 1_u8;
         };

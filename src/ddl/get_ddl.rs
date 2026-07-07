@@ -61,15 +61,11 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
         }
         let type_bytes = std::slice::from_raw_parts(type_ptr, type_len);
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let obj_type = if let Ok(s) = std::str::from_utf8(type_bytes) {
-            s
-        } else {
+        let Ok(obj_type) = std::str::from_utf8(type_bytes) else {
             write_err(error_buf, error_buf_len, "object_type is not valid UTF-8");
             return 1_u8;
         };
-        let name = if let Ok(s) = std::str::from_utf8(name_bytes) {
-            s
-        } else {
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
             write_err(error_buf, error_buf_len, "name is not valid UTF-8");
             return 1_u8;
         };

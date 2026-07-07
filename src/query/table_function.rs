@@ -56,7 +56,11 @@ use super::wire::{build_execution_sql, parse_varchar_list, serialize_register_pa
 /// described above; `name_ptr` must point to `name_len` UTF-8 bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
+// Single linear FFI dispatcher: catch_unwind guard, arg decoding, catalog
+// lookup, expansion, schema inference, and wire serialization in one straight
+// path with no shared state — splitting it would scatter the panic boundary and
+// the borrow contract across helpers for no readability gain.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub unsafe extern "C" fn sv_semantic_view_bind_rust(
     conn: ffi::duckdb_connection,
     name_ptr: *const u8,
@@ -396,7 +400,8 @@ pub(crate) unsafe fn try_infer_schema(
 ) -> Result<(Vec<String>, Vec<ffi::duckdb_type>), String> {
     let mut result = execute_sql_raw(borrowed.as_raw(), sql)?;
 
-    let col_count = ffi::duckdb_column_count(&raw mut result) as usize;
+    // idx_t (u64) column count; `unwrap_or(0)` avoids a 32-bit truncation cast.
+    let col_count = usize::try_from(ffi::duckdb_column_count(&raw mut result)).unwrap_or(0);
     let mut names = Vec::with_capacity(col_count);
     let mut types = Vec::with_capacity(col_count);
 

@@ -410,6 +410,11 @@ pub(crate) fn escape_sql_arg(s: &str) -> String {
 }
 
 #[cfg(feature = "extension")]
+// Infallible today, but kept `Result`-returning for symmetry with the fallible
+// `rewrite_*` siblings (e.g. `rewrite_alter_comment`) dispatched through the
+// same `?`-chained match in `rewrite_to_native_sql`; diverging one signature
+// would fragment that dispatch.
+#[allow(clippy::unnecessary_wraps)]
 fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, ParseError> {
     if if_exists {
         // IF EXISTS: pure DELETE on the caller's connection — affects 0
@@ -460,6 +465,9 @@ fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, P
 }
 
 #[cfg(feature = "extension")]
+// Infallible today; kept `Result`-returning for symmetry with the fallible
+// `rewrite_*` siblings dispatched through the same match (see `rewrite_drop`).
+#[allow(clippy::unnecessary_wraps)]
 fn rewrite_alter_rename(
     old_escaped: &str,
     new_escaped: &str,

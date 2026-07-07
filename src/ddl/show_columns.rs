@@ -43,9 +43,7 @@ pub unsafe extern "C" fn sv_show_columns_in_semantic_view_bind_rust(
             return 1_u8;
         }
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let raw_name = if let Ok(s) = std::str::from_utf8(name_bytes) {
-            s
-        } else {
+        let Ok(raw_name) = std::str::from_utf8(name_bytes) else {
             write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
             return 1_u8;
         };

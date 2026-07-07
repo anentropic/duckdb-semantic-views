@@ -45,26 +45,27 @@ use crate::model::SemanticViewDefinition;
 /// The 6 columns match the v0.9.0 Rust `VTab` shape exactly:
 /// (`created_on`, name, kind, `database_name`, `schema_name`, comment).
 ///
-/// # Bridge lifecycle (critical)
+/// # Safety
 ///
-/// The `conn` parameter is a BORROWED handle — the underlying C++
-/// `Connection` is owned by a stack local in the C++ bind callback.
-/// This function MUST NOT:
-///   * call `duckdb_disconnect(conn)` (would `delete` a stack object — UB),
-///   * stash the handle in long-lived storage (would dangle after bind),
-///   * call functions that take ownership of the handle (none in the
-///     `CatalogReader` path — `CatalogReader::new` only stores the raw
-///     pointer, and the prepared-statement / query helpers in
-///     `src/catalog.rs` operate on the handle without consuming it).
+/// The `conn` parameter is a BORROWED handle (bridge lifecycle, critical) — the
+/// underlying C++ `Connection` is owned by a stack local in the C++ bind
+/// callback. This function MUST NOT:
+///
+/// * call `duckdb_disconnect(conn)` (would `delete` a stack object — UB),
+/// * stash the handle in long-lived storage (would dangle after bind),
+/// * call functions that take ownership of the handle (none in the
+///   `CatalogReader` path — `CatalogReader::new` only stores the raw pointer,
+///   and the prepared-statement / query helpers in `src/catalog.rs` operate on
+///   the handle without consuming it).
 ///
 /// # Return codes
 ///
 /// * `0` — success; `(out_ptr, out_len)` populated. Caller MUST release
-///         via `sv_free_buffer(ptr, len)`.
+///   via `sv_free_buffer(ptr, len)`.
 /// * `1` — catalog read error (e.g. the `semantic_layer._definitions`
-///         table is missing); `error_buf` populated.
+///   table is missing); `error_buf` populated.
 /// * `2` — internal error (panic across FFI, serialization failure);
-///         `error_buf` populated.
+///   `error_buf` populated.
 ///
 /// # Catalog-table-present probing
 ///

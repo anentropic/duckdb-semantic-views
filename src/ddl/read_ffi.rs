@@ -30,9 +30,9 @@
 //! TECH-DEBT #12's two-place schema agreement) into a machine-checked one. A
 //! dispatcher that emits a different column shape than its C++ bind expects
 //! now fails loudly at the header with a clear message, instead of desyncing
-//! silently or misparsing cell bytes. The C++ side parses with `sv_read_u32_le`
-//! + `sv_read_string` (+ `sv_read_wire_schema` for the header) in
-//! `cpp/src/shim.cpp`, then emits rows into the `DataChunk`.
+//! silently or misparsing cell bytes. The C++ side parses the payload with
+//! `sv_read_u32_le` / `sv_read_string` (plus `sv_read_wire_schema` for the
+//! header) in `cpp/src/shim.cpp`, then emits rows into the `DataChunk`.
 //!
 //! The header is emitted for every non-empty result. An empty result set
 //! (`row_count == 0`) writes `col_count == 0` and no tags: there are no cells

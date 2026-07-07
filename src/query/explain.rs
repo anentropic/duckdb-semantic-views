@@ -56,7 +56,10 @@ use super::wire::parse_varchar_list;
 /// documented above. `name_ptr` must point to `name_len` UTF-8 bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
+// Single linear FFI dispatcher (catch_unwind guard, arg decode, expand, EXPLAIN
+// capture, wire serialization); kept as one straight path so the panic boundary
+// and borrow contract stay in one place.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
     conn: libduckdb_sys::duckdb_connection,
     name_ptr: *const u8,

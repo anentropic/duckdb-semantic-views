@@ -437,7 +437,9 @@ mod reader {
         }
 
         let row_count = ffi::duckdb_row_count(result.raw_mut());
-        let mut out = Vec::with_capacity(row_count as usize);
+        // Capacity hint only; `unwrap_or(0)` keeps it correct (never truncating)
+        // on 32-bit targets where idx_t (u64) may exceed usize.
+        let mut out = Vec::with_capacity(usize::try_from(row_count).unwrap_or(0));
         for r in 0..row_count {
             let name = read_column_string(result.raw_mut(), 0, r).unwrap_or_default();
             let def = read_column_string(result.raw_mut(), 1, r).unwrap_or_default();
@@ -463,7 +465,9 @@ mod reader {
         }
 
         let row_count = ffi::duckdb_row_count(result.raw_mut());
-        let mut out = Vec::with_capacity(row_count as usize);
+        // Capacity hint only; `unwrap_or(0)` keeps it correct (never truncating)
+        // on 32-bit targets where idx_t (u64) may exceed usize.
+        let mut out = Vec::with_capacity(usize::try_from(row_count).unwrap_or(0));
         for r in 0..row_count {
             let name = read_column_string(result.raw_mut(), 0, r).unwrap_or_default();
             out.push(name);
