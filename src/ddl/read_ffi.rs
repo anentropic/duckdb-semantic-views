@@ -32,7 +32,7 @@
 //! now fails loudly at the header with a clear message, instead of desyncing
 //! silently or misparsing cell bytes. The C++ side parses with `sv_read_u32_le`
 //! + `sv_read_string` (+ `sv_read_wire_schema` for the header) in
-//! `cpp/src/shim.cpp`, then emits rows into the DataChunk.
+//! `cpp/src/shim.cpp`, then emits rows into the `DataChunk`.
 //!
 //! The header is emitted for every non-empty result. An empty result set
 //! (`row_count == 0`) writes `col_count == 0` and no tags: there are no cells
@@ -162,11 +162,11 @@ pub unsafe fn probe_catalog_table_present(borrowed: &BorrowedConnection) -> Resu
     )
     .map_err(|_| "catalog probe SQL contains an interior null byte".to_string())?;
     let mut result: ffi::duckdb_result = std::mem::zeroed();
-    let rc = ffi::duckdb_query(conn, sql.as_ptr(), &mut result);
+    let rc = ffi::duckdb_query(conn, sql.as_ptr(), &raw mut result);
     let out = if rc == ffi::DuckDBSuccess {
-        Ok(ffi::duckdb_row_count(&mut result) > 0)
+        Ok(ffi::duckdb_row_count(&raw mut result) > 0)
     } else {
-        let err_ptr = ffi::duckdb_result_error(&mut result);
+        let err_ptr = ffi::duckdb_result_error(&raw mut result);
         let msg = if err_ptr.is_null() {
             "catalog presence probe failed".to_string()
         } else {
@@ -174,7 +174,7 @@ pub unsafe fn probe_catalog_table_present(borrowed: &BorrowedConnection) -> Resu
         };
         Err(msg)
     };
-    ffi::duckdb_destroy_result(&mut result);
+    ffi::duckdb_destroy_result(&raw mut result);
     out
 }
 
@@ -384,16 +384,15 @@ where
             }
         }
     }));
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            write_err(
-                error_buf,
-                error_buf_len,
-                &format!("internal error: panic inside {panic_label}"),
-            );
-            2
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        write_err(
+            error_buf,
+            error_buf_len,
+            &format!("internal error: panic inside {panic_label}"),
+        );
+        2
     }
 }
 

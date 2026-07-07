@@ -91,12 +91,11 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
             return 1_u8;
         }
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let view_name_raw = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
-                return 1_u8;
-            }
+        let view_name_raw = if let Ok(s) = std::str::from_utf8(name_bytes) {
+            s.to_string()
+        } else {
+            write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
+            return 1_u8;
         };
         let view_name = match crate::ident::normalize_view_name(&view_name_raw) {
             Ok(s) => s,
@@ -192,7 +191,7 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
         let def = match SemanticViewDefinition::from_json(&view_name, &json_str) {
             Ok(d) => d,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.to_string());
+                write_err(error_buf, error_buf_len, &e.clone());
                 return 1_u8;
             }
         };
@@ -279,8 +278,7 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
             // expressions behind a VARCHAR placeholder at query time.
             match try_infer_schema(&borrowed, &limit0_sql) {
                 Ok((names, types)) => {
-                    let type_ids: Vec<u32> =
-                        types.iter().map(|t| normalize_type_id(*t as u32)).collect();
+                    let type_ids: Vec<u32> = types.iter().map(|t| normalize_type_id(*t)).collect();
                     (names, type_ids)
                 }
                 Err(msg) => {
@@ -312,17 +310,16 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
         publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            use crate::ddl::read_ffi::write_err;
-            write_err(
-                error_buf,
-                error_buf_len,
-                "internal error: panic inside sv_semantic_view_bind_rust",
-            );
-            2
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        use crate::ddl::read_ffi::write_err;
+        write_err(
+            error_buf,
+            error_buf_len,
+            "internal error: panic inside sv_semantic_view_bind_rust",
+        );
+        2
     }
 }
 
@@ -330,7 +327,7 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
 // FFI helpers
 // ---------------------------------------------------------------------------
 
-/// Execute a SQL string via the DuckDB C API and return the result.
+/// Execute a SQL string via the `DuckDB` C API and return the result.
 ///
 /// The caller is responsible for calling `duckdb_destroy_result` on the returned
 /// result when done.
@@ -344,15 +341,15 @@ pub(crate) unsafe fn execute_sql_raw(
 ) -> Result<ffi::duckdb_result, String> {
     let sql_cstr = CString::new(sql).map_err(|e| e.to_string())?;
     let mut result: ffi::duckdb_result = std::mem::zeroed();
-    let rc = ffi::duckdb_query(conn, sql_cstr.as_ptr(), &mut result);
+    let rc = ffi::duckdb_query(conn, sql_cstr.as_ptr(), &raw mut result);
     if rc != ffi::DuckDBSuccess {
-        let err_ptr = ffi::duckdb_result_error(&mut result);
+        let err_ptr = ffi::duckdb_result_error(&raw mut result);
         let err_msg = if err_ptr.is_null() {
             "unknown error".to_string()
         } else {
             CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
         };
-        ffi::duckdb_destroy_result(&mut result);
+        ffi::duckdb_destroy_result(&raw mut result);
         return Err(err_msg);
     }
     Ok(result)
@@ -360,7 +357,7 @@ pub(crate) unsafe fn execute_sql_raw(
 
 /// Normalize HUGEINT/UHUGEINT type IDs to BIGINT/UBIGINT.
 ///
-/// DuckDB's query planner infers `sum()` as HUGEINT at LIMIT-0 time, but the
+/// `DuckDB`'s query planner infers `sum()` as HUGEINT at LIMIT-0 time, but the
 /// runtime optimizer may substitute `sum_no_overflow` → BIGINT (8 bytes/value).
 /// Normalizing stored type IDs prevents stale HUGEINT values from propagating
 /// into output declarations.
@@ -399,12 +396,12 @@ pub(crate) unsafe fn try_infer_schema(
 ) -> Result<(Vec<String>, Vec<ffi::duckdb_type>), String> {
     let mut result = execute_sql_raw(borrowed.as_raw(), sql)?;
 
-    let col_count = ffi::duckdb_column_count(&mut result) as usize;
+    let col_count = ffi::duckdb_column_count(&raw mut result) as usize;
     let mut names = Vec::with_capacity(col_count);
     let mut types = Vec::with_capacity(col_count);
 
     for i in 0..col_count {
-        let name_ptr = ffi::duckdb_column_name(&mut result, i as ffi::idx_t);
+        let name_ptr = ffi::duckdb_column_name(&raw mut result, i as ffi::idx_t);
         let name = if name_ptr.is_null() {
             format!("column{i}")
         } else {
@@ -412,11 +409,11 @@ pub(crate) unsafe fn try_infer_schema(
         };
         names.push(name);
 
-        let ty = ffi::duckdb_column_type(&mut result, i as ffi::idx_t);
+        let ty = ffi::duckdb_column_type(&raw mut result, i as ffi::idx_t);
         types.push(ty);
     }
 
-    ffi::duckdb_destroy_result(&mut result);
+    ffi::duckdb_destroy_result(&raw mut result);
     Ok((names, types))
 }
 

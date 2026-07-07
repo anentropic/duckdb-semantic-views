@@ -1,6 +1,6 @@
-//! GET_DDL scalar function: wraps [`crate::render_ddl::render_create_ddl`] as a
+//! `GET_DDL` scalar function: wraps [`crate::render_ddl::render_create_ddl`] as a
 //! C++ Catalog API scalar so that `SELECT GET_DDL('SEMANTIC_VIEW', 'name')`
-//! works inside DuckDB.
+//! works inside `DuckDB`.
 //!
 //! The render logic itself lives in [`crate::render_ddl`] (always compiled,
 //! unit-tested under `cargo test`). This module adds the extension-only Rust
@@ -9,7 +9,7 @@
 //! # Phase 65 Plan 05 Task 4 (Wave 3) — Batch 3 final cleanup
 //!
 //! The legacy `GetDdlScalar` `VScalar` impl block was retired in the same
-//! commit that deleted the H2 query_conn allocation; all live invocations
+//! commit that deleted the H2 `query_conn` allocation; all live invocations
 //! of `SELECT GET_DDL(...)` now route through [`sv_get_ddl_exec_rust`] below.
 
 use crate::catalog::CatalogReader;
@@ -61,19 +61,17 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
         }
         let type_bytes = std::slice::from_raw_parts(type_ptr, type_len);
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let obj_type = match std::str::from_utf8(type_bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                write_err(error_buf, error_buf_len, "object_type is not valid UTF-8");
-                return 1_u8;
-            }
+        let obj_type = if let Ok(s) = std::str::from_utf8(type_bytes) {
+            s
+        } else {
+            write_err(error_buf, error_buf_len, "object_type is not valid UTF-8");
+            return 1_u8;
         };
-        let name = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                write_err(error_buf, error_buf_len, "name is not valid UTF-8");
-                return 1_u8;
-            }
+        let name = if let Ok(s) = std::str::from_utf8(name_bytes) {
+            s
+        } else {
+            write_err(error_buf, error_buf_len, "name is not valid UTF-8");
+            return 1_u8;
         };
 
         if !obj_type.eq_ignore_ascii_case("SEMANTIC_VIEW") {
@@ -129,16 +127,15 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
         publish_owned_buffer(ddl.into_bytes(), out_ptr, out_len);
         0_u8
     }));
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            use crate::ddl::read_ffi::write_err;
-            write_err(
-                error_buf,
-                error_buf_len,
-                "internal error: panic inside sv_get_ddl_exec_rust",
-            );
-            2
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        use crate::ddl::read_ffi::write_err;
+        write_err(
+            error_buf,
+            error_buf_len,
+            "internal error: panic inside sv_get_ddl_exec_rust",
+        );
+        2
     }
 }

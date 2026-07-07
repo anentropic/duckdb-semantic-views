@@ -245,6 +245,7 @@ mod reader {
         /// (the BORROW contract documented at module scope of
         /// `src/ddl/read_ffi.rs`). The `'a` lifetime parameter prevents safe
         /// code from moving the reader past that scope.
+        #[must_use]
         pub fn new(borrowed: &'a BorrowedConnection, catalog_table_present: bool) -> Self {
             Self {
                 conn: borrowed.as_raw(),
@@ -253,6 +254,7 @@ mod reader {
             }
         }
 
+        #[must_use]
         pub fn raw(&self) -> ffi::duckdb_connection {
             self.conn
         }
@@ -314,7 +316,7 @@ mod reader {
     impl PreparedStmt {
         unsafe fn prepare(conn: ffi::duckdb_connection, sql: &CStr) -> Result<Self, String> {
             let mut ptr: ffi::duckdb_prepared_statement = std::ptr::null_mut();
-            let rc = ffi::duckdb_prepare(conn, sql.as_ptr(), &mut ptr);
+            let rc = ffi::duckdb_prepare(conn, sql.as_ptr(), &raw mut ptr);
             if rc != ffi::DuckDBSuccess {
                 let err = ffi::duckdb_prepare_error(ptr);
                 let msg = if err.is_null() {
@@ -322,7 +324,7 @@ mod reader {
                 } else {
                     CStr::from_ptr(err).to_string_lossy().into_owned()
                 };
-                ffi::duckdb_destroy_prepare(&mut ptr);
+                ffi::duckdb_destroy_prepare(&raw mut ptr);
                 return Err(msg);
             }
             Ok(Self { ptr })
@@ -335,7 +337,7 @@ mod reader {
 
     impl Drop for PreparedStmt {
         fn drop(&mut self) {
-            unsafe { ffi::duckdb_destroy_prepare(&mut self.ptr) };
+            unsafe { ffi::duckdb_destroy_prepare(&raw mut self.ptr) };
         }
     }
 

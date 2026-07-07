@@ -162,7 +162,7 @@ pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, Parse
 /// 1. Run `enrich_definition_for_create` (validation + graph + serialize
 ///    to JSON; no catalog connection needed).
 /// 2. Emit `INSERT [OR REPLACE / OR IGNORE] INTO semantic_layer._definitions
-///    ... RETURNING name AS view_name` so DuckDB executes the write on the
+///    ... RETURNING name AS view_name` so `DuckDB` executes the write on the
 ///    caller's connection inside the caller's transaction. The plain CREATE
 ///    form (no OR REPLACE, no IF NOT EXISTS) wraps the INSERT in a
 ///    CASE+error subquery that emits "already exists" wording — replaces

@@ -10,7 +10,7 @@
 //! # Phase 65 Plan 05 Task 4 (Wave 3) — Batch 3 final cleanup
 //!
 //! The legacy `ReadYamlFromSemanticViewScalar` `VScalar` impl block was
-//! retired in the same commit that deleted the H2 query_conn allocation; all
+//! retired in the same commit that deleted the H2 `query_conn` allocation; all
 //! live invocations of `SELECT READ_YAML_FROM_SEMANTIC_VIEW(...)` now route
 //! through [`sv_read_yaml_from_semantic_view_exec_rust`] below.
 
@@ -69,12 +69,11 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
             return 1_u8;
         }
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let raw_name = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
-                return 1_u8;
-            }
+        let raw_name = if let Ok(s) = std::str::from_utf8(name_bytes) {
+            s
+        } else {
+            write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
+            return 1_u8;
         };
         let bare_name = resolve_bare_name(raw_name);
 
@@ -113,24 +112,23 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
         let yaml = match render_yaml_export(&def) {
             Ok(s) => s,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.to_string());
+                write_err(error_buf, error_buf_len, &e.clone());
                 return 1_u8;
             }
         };
         publish_owned_buffer(yaml.into_bytes(), out_ptr, out_len);
         0_u8
     }));
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            use crate::ddl::read_ffi::write_err;
-            write_err(
-                error_buf,
-                error_buf_len,
-                "internal error: panic inside sv_read_yaml_from_semantic_view_exec_rust",
-            );
-            2
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        use crate::ddl::read_ffi::write_err;
+        write_err(
+            error_buf,
+            error_buf_len,
+            "internal error: panic inside sv_read_yaml_from_semantic_view_exec_rust",
+        );
+        2
     }
 }
 

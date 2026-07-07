@@ -1,7 +1,7 @@
-//! CREATE-time enrichment shared by the parser_override CREATE path.
+//! CREATE-time enrichment shared by the `parser_override` CREATE path.
 //!
 //! Pre-v0.8.0 this module also hosted `DefineFromJsonVTab` — a table function
-//! that the legacy parse_function fallback rewrote DDL into. v0.8.0's full
+//! that the legacy `parse_function` fallback rewrote DDL into. v0.8.0's full
 //! unification deleted that path; `parser_override` now emits native INSERT
 //! against `semantic_layer._definitions` directly. Only the enrichment helper
 //! remains — called by `crate::parse::rewrite_create` and
@@ -42,10 +42,10 @@
 /// populated here — the rewritten INSERT in `emit_native_create_sql`
 /// wraps the serialized JSON in a `json_merge_patch(..., json_object(
 /// 'created_on', strftime(now(), '%Y-%m-%dT%H:%M:%SZ'), 'database_name',
-/// current_database(), 'schema_name', current_schema()))` so DuckDB
+/// current_database(), 'schema_name', current_schema()))` so `DuckDB`
 /// resolves the values on the caller's connection at INSERT-time. This
 /// makes CREATE SEMANTIC VIEW participate in the caller's transaction
-/// without parser_override needing a long-lived catalog connection
+/// without `parser_override` needing a long-lived catalog connection
 /// (D-21 + read-elimination architecture).
 ///
 /// Column type inference (`column_type_names`, `column_types_inferred`,
@@ -54,7 +54,7 @@
 /// in the persisted JSON.
 ///
 /// Called by both `parse::rewrite_create` (inline AS-body) and
-/// `parse::rewrite_yaml_file_create` (FROM YAML FILE) under parser_override.
+/// `parse::rewrite_yaml_file_create` (FROM YAML FILE) under `parser_override`.
 pub fn enrich_definition_for_create(
     _name: &str,
     mut def: crate::model::SemanticViewDefinition,

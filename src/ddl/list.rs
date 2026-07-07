@@ -36,14 +36,14 @@ use crate::model::SemanticViewDefinition;
 /// `CatalogReader`, performs the catalog read, and serializes the rows
 /// into a flat binary buffer with the wire format:
 ///
-///   u32 row_count (little-endian)
+///   u32 `row_count` (little-endian)
 ///   for each row:
 ///     for each of 6 columns:
-///       u32 byte_len (little-endian)
-///       byte_len bytes (UTF-8, NOT NUL-terminated)
+///       u32 `byte_len` (little-endian)
+///       `byte_len` bytes (UTF-8, NOT NUL-terminated)
 ///
-/// The 6 columns match the v0.9.0 Rust VTab shape exactly:
-/// (created_on, name, kind, database_name, schema_name, comment).
+/// The 6 columns match the v0.9.0 Rust `VTab` shape exactly:
+/// (`created_on`, name, kind, `database_name`, `schema_name`, comment).
 ///
 /// # Bridge lifecycle (critical)
 ///
@@ -53,7 +53,7 @@ use crate::model::SemanticViewDefinition;
 ///   * call `duckdb_disconnect(conn)` (would `delete` a stack object — UB),
 ///   * stash the handle in long-lived storage (would dangle after bind),
 ///   * call functions that take ownership of the handle (none in the
-///     CatalogReader path — `CatalogReader::new` only stores the raw
+///     `CatalogReader` path — `CatalogReader::new` only stores the raw
 ///     pointer, and the prepared-statement / query helpers in
 ///     `src/catalog.rs` operate on the handle without consuming it).
 ///
@@ -168,16 +168,15 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
         publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            write_err(
-                error_buf,
-                error_buf_len,
-                "internal error: panic inside sv_list_semantic_views_bind_rust",
-            );
-            2
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        write_err(
+            error_buf,
+            error_buf_len,
+            "internal error: panic inside sv_list_semantic_views_bind_rust",
+        );
+        2
     }
 }
 
@@ -201,11 +200,11 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
 /// function — 5-column subset of `list_semantic_views()` (no `comment`).
 ///
 /// Wire format (length-prefixed binary, LE):
-///   u32 row_count
+///   u32 `row_count`
 ///   for each row:
-///     for each of 5 cols: u32 byte_len | bytes (UTF-8)
+///     for each of 5 cols: u32 `byte_len` | bytes (UTF-8)
 ///
-/// Columns: (created_on, name, kind, database_name, schema_name).
+/// Columns: (`created_on`, name, kind, `database_name`, `schema_name`).
 ///
 /// # Safety
 ///
@@ -281,16 +280,15 @@ pub unsafe extern "C" fn sv_list_terse_semantic_views_bind_rust(
         publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            use crate::ddl::read_ffi::write_err;
-            write_err(
-                error_buf,
-                error_buf_len,
-                "internal error: panic inside sv_list_terse_semantic_views_bind_rust",
-            );
-            2
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        use crate::ddl::read_ffi::write_err;
+        write_err(
+            error_buf,
+            error_buf_len,
+            "internal error: panic inside sv_list_terse_semantic_views_bind_rust",
+        );
+        2
     }
 }
