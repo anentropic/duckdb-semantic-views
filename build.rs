@@ -190,6 +190,21 @@ fn main() {
         return;
     }
 
+    // SV_SKIP_CPP_BUILD lets `cargo clippy`/`cargo check --features extension`
+    // type-check the extension-gated Rust WITHOUT compiling the ~25 MB DuckDB
+    // amalgamation + C++ shim (a ~10-min cc build). Analysis-only cargo modes
+    // never link the final cdylib, so the missing DuckDB symbols and link
+    // directives don't matter — this is purely to make linting the FFI layer
+    // fast (locally and in CI) and does NOT produce a loadable extension.
+    // A real `cargo build --features extension` must leave this unset.
+    if std::env::var("SV_SKIP_CPP_BUILD").is_ok() {
+        println!(
+            "cargo:warning=SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile \
+             (analysis-only; the resulting artifact will NOT link/load as an extension)"
+        );
+        return;
+    }
+
     // Compile the DuckDB amalgamation source + C++ shim.
     // duckdb.cpp provides all DuckDB C++ symbol definitions (constructors, RTTI,
     // vtables) so the shim can use ParserExtension, TableFunction, etc. without
