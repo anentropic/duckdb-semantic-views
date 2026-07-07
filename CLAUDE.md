@@ -75,8 +75,11 @@ built extension (`just test-sql`) may hit a source-id check. Do **not** use this
 on a normal local machine — it's a fallback, not a replacement for `just build`.
 
 To lint the `extension`-gated FFI layer without any C++ build at all (no
-amalgamation needed), use `SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features
---features extension -- -D warnings` (see MAINTAINER.md).
+amalgamation needed), use (see MAINTAINER.md):
+
+```bash
+SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features --features extension -- -D warnings
+```
 
 ## Build/test command rules (non-negotiable)
 

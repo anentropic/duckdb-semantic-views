@@ -113,16 +113,29 @@ def extract_duckdb_source(sdist_path: str, dest: str) -> str:
         for m in tar.getmembers():
             # e.g. duckdb-1.5.4/external/duckdb/src/include/duckdb.hpp
             parts = m.name.split("/")
-            if len(parts) >= 3 and parts[1] == "external" and parts[2] == "duckdb":
-                if prefix is None:
-                    prefix = "/".join(parts[:3]) + "/"
-                # strip the "<pkg>/external/duckdb/" prefix
-                m.name = m.name[len(prefix):] or "."
-                if m.name != ".":
-                    members.append(m)
+            if not (len(parts) >= 3 and parts[1] == "external" and parts[2] == "duckdb"):
+                continue
+            if prefix is None:
+                prefix = "/".join(parts[:3]) + "/"
+            stripped = m.name[len(prefix):]  # strip "<pkg>/external/duckdb/"
+            if not stripped:
+                continue
+            # Path-traversal / link hardening (defense in depth; also covers
+            # Python < 3.12, where the `filter="data"` extraction guard below is
+            # unavailable): accept only regular files and directories whose names
+            # stay inside `dest`. A malicious sdist can't escape the temp dir.
+            if m.issym() or m.islnk() or m.isdev():
+                continue
+            norm = os.path.normpath(stripped)
+            if os.path.isabs(norm) or norm == ".." or norm.startswith(".." + os.sep):
+                raise SystemExit(f"refusing unsafe path in sdist: {m.name!r}")
+            m.name = stripped
+            members.append(m)
         if not members:
             raise SystemExit("sdist did not contain external/duckdb/ source tree")
-        # Python 3.12+ warns without a filter; 'data' is the safe extraction filter.
+        # Python 3.12+ warns without a filter; 'data' is the safe extraction
+        # filter. Older Python lacks it, but the per-member checks above already
+        # reject traversal/link entries.
         try:
             tar.extractall(dest, members=members, filter="data")
         except TypeError:
@@ -195,17 +208,27 @@ def main() -> int:
     pyver = version.lstrip("v")  # '1.5.4'
     tag = version if version.startswith("v") else f"v{version}"
 
-    if not args.force and installed_version() == version:
-        log(f"cpp/include/duckdb.hpp already at {version}; nothing to do (use --force to regenerate)")
+    # Require BOTH files present at the right version: a stray duckdb.hpp with a
+    # missing duckdb.cpp (partial checkout / cache cleanup) must still trigger a
+    # rebuild, not a false no-op.
+    if (
+        not args.force
+        and installed_version() == version
+        and os.path.exists(CPP_DST)
+    ):
+        log(f"cpp/include/duckdb.{{hpp,cpp}} already at {version}; nothing to do (use --force to regenerate)")
         return 0
 
-    # Fast path: restore from the version cache if a previous run populated it.
+    # Fast path: restore from the version cache only if BOTH files are cached;
+    # a partially-populated cache falls through to a full regeneration.
     cache = os.path.join(REPO_ROOT, ".amalgamation", version)
-    if not args.force and os.path.exists(os.path.join(cache, "duckdb.cpp")):
+    cache_hpp = os.path.join(cache, "duckdb.hpp")
+    cache_cpp = os.path.join(cache, "duckdb.cpp")
+    if not args.force and os.path.exists(cache_hpp) and os.path.exists(cache_cpp):
         log(f"restoring from cache {cache}")
         os.makedirs(INCLUDE_DIR, exist_ok=True)
-        shutil.copyfile(os.path.join(cache, "duckdb.hpp"), HPP_DST)
-        shutil.copyfile(os.path.join(cache, "duckdb.cpp"), CPP_DST)
+        shutil.copyfile(cache_hpp, HPP_DST)
+        shutil.copyfile(cache_cpp, CPP_DST)
         return 0
 
     log(f"reconstructing DuckDB {version} amalgamation from PyPI sdist + jsDelivr")
