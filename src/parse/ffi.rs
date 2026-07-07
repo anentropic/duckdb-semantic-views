@@ -92,10 +92,10 @@ unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len:
     crate::ffi_util::publish_owned_string(sql, sql_out_ptr, sql_out_len);
 }
 
-/// FFI entry point for parser_override. The sole DDL entry point for the
-/// extension as of v0.8.0 — the legacy parse_function/parse_stub path was
+/// FFI entry point for `parser_override`. The sole DDL entry point for the
+/// extension as of v0.8.0 — the legacy `parse_function/parse_stub` path was
 /// retired. Rewrites recognized semantic-view DDL into native SQL suitable
-/// for re-parsing through DuckDB's own parser and execution on the caller's
+/// for re-parsing through `DuckDB`'s own parser and execution on the caller's
 /// connection.
 ///
 /// Returns:
@@ -104,7 +104,7 @@ unsafe fn publish_owned_sql(sql: String, sql_out_ptr: *mut *mut u8, sql_out_len:
 ///       release via `sv_free_buffer`. The buffer is **not** NUL-terminated;
 ///       read exactly `*sql_out_len` bytes.
 ///   1 = validation error / near-miss suggestion: error message written to
-///       `error_out`. (Currently unused under FALLBACK_OVERRIDE; kept for
+///       `error_out`. (Currently unused under `FALLBACK_OVERRIDE`; kept for
 ///       Phase 62 Plan 03 once `parse_function` returns to caret rendering.)
 ///   2 = not ours: defer to default parser. Used both for genuinely
 ///       non-semantic SQL and for the early-return on null/empty input or
@@ -195,10 +195,10 @@ pub unsafe extern "C" fn sv_parser_override_rust(
 
 /// FFI entry point for `parse_function` — Phase 62's error-reporting layer.
 ///
-/// Called by DuckDB's `Parser::ParseQuery` after the default parser fails on
+/// Called by `DuckDB`'s `Parser::ParseQuery` after the default parser fails on
 /// an unrecognised prefix (e.g. `CREATE SEMANTIC VIEW …` or `CRETAE …`).
 /// Re-runs validation against the user's input and returns the validation
-/// error message + a byte-offset position so DuckDB's
+/// error message + a byte-offset position so `DuckDB`'s
 /// `ParserException::SyntaxError` can render `LINE 1: … ^` (caret) at the
 /// offending token.
 ///
@@ -220,9 +220,10 @@ pub unsafe extern "C" fn sv_parser_override_rust(
 ///
 /// The extension build re-runs the full rewrite (`rewrite_to_native_sql`); unit
 /// tests (no `extension` feature) fall back to syntax-only validation via
-/// `plan_rewrite`. Either way the purpose is to recover the `ParseError` message
-/// + caret position for a *structurally invalid* DDL statement (e.g. a malformed
-/// CREATE body), reproducing exactly what `parser_override` saw. Catalog-level
+/// `plan_rewrite`. Either way the purpose is to recover the `ParseError`
+/// message and caret position for a *structurally invalid* DDL statement (e.g. a
+/// malformed CREATE body), reproducing exactly what `parser_override` saw.
+/// Catalog-level
 /// conditions — DROP-of-missing, rename-into-an-existing-name — are NOT
 /// rewrite-time errors: `rewrite_drop` / `rewrite_alter_*` emit execution-time
 /// SQL guards, so a well-formed-but-catalog-invalid statement rewrites
@@ -333,15 +334,15 @@ pub unsafe extern "C" fn sv_parse_function_rust(
     result.unwrap_or(2) // on panic: not ours
 }
 
-/// Re-run validation for the parse_function path. Mirrors what
+/// Re-run validation for the `parse_function` path. Mirrors what
 /// `sv_parser_override_rust` did at parse time (`rewrite_to_native_sql`), so a
 /// structurally-invalid DDL statement surfaces the same `ParseError` wording +
-/// position that parser_override produced. Catalog-level errors (DROP-of-missing,
+/// position that `parser_override` produced. Catalog-level errors (DROP-of-missing,
 /// rename collision) are enforced by guards in the *emitted* SQL at execution
 /// time, so they are not reproduced here — such statements return `Ok(Some(_))`.
 ///
 /// Returning `Ok(Some(_))` means "validation succeeded" — at the
-/// parse_function call site this can only happen when parser_override
+/// `parse_function` call site this can only happen when `parser_override`
 /// itself didn't run, so the caller maps it to rc=3 (actionable hint).
 #[cfg(feature = "extension")]
 fn run_validation_for_parse_function(query: &str) -> Result<Option<String>, ParseError> {

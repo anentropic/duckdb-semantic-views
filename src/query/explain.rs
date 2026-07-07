@@ -56,7 +56,10 @@ use super::wire::parse_varchar_list;
 /// documented above. `name_ptr` must point to `name_len` UTF-8 bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
+// Single linear FFI dispatcher (catch_unwind guard, arg decode, expand, EXPLAIN
+// capture, wire serialization); kept as one straight path so the panic boundary
+// and borrow contract stay in one place.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
     conn: libduckdb_sys::duckdb_connection,
     name_ptr: *const u8,
@@ -94,12 +97,11 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
             return 1_u8;
         }
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let view_name_raw = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
-                return 1_u8;
-            }
+        let view_name_raw = if let Ok(s) = std::str::from_utf8(name_bytes) {
+            s.to_string()
+        } else {
+            write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
+            return 1_u8;
         };
         let view_name = match crate::ident::normalize_view_name(&view_name_raw) {
             Ok(s) => s,
@@ -198,7 +200,7 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
         let def = match SemanticViewDefinition::from_json(&view_name, &json_str) {
             Ok(d) => d,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.to_string());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
@@ -206,21 +208,21 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
         let dimensions = match expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension) {
             Ok(v) => v,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.to_string());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
         let metrics = match expand_wildcards(&metrics, &def, &WildcardItemType::Metric) {
             Ok(v) => v,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.to_string());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
         let facts = match expand_wildcards(&facts, &def, &WildcardItemType::Fact) {
             Ok(v) => v,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.to_string());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
@@ -300,17 +302,16 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
         publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            use crate::ddl::read_ffi::write_err;
-            write_err(
-                error_buf,
-                error_buf_len,
-                "internal error: panic inside sv_explain_semantic_view_bind_rust",
-            );
-            2
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        use crate::ddl::read_ffi::write_err;
+        write_err(
+            error_buf,
+            error_buf_len,
+            "internal error: panic inside sv_explain_semantic_view_bind_rust",
+        );
+        2
     }
 }
 

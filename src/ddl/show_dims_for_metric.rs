@@ -65,6 +65,10 @@ pub unsafe extern "C" fn sv_show_semantic_dimensions_for_metric_bind_rust(
 ///
 /// `view_name_ptr` / `metric_name_ptr` must each be null or point to the
 /// matching number of readable bytes.
+// Linear resolve-and-filter path (decode names, look up view, find metric,
+// walk reachable dimensions, serialize); kept together so each not-found case
+// returns its own tailored diagnostic.
+#[allow(clippy::too_many_lines)]
 unsafe fn show_dims_for_metric(
     borrowed: &BorrowedConnection,
     view_name_ptr: *const u8,
@@ -81,36 +85,30 @@ unsafe fn show_dims_for_metric(
 
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
-    let json = match reader.lookup(&view_name)? {
-        Some(j) => j,
-        None => {
-            let available = reader.list_names().unwrap_or_default();
-            let not_found = crate::catalog::view_not_found_msg(&view_name);
-            return Err(match suggest_closest(&view_name, &available) {
-                Some(suggestion) => format!("{not_found}. Did you mean '{suggestion}'?"),
-                None => not_found,
-            });
-        }
+    let Some(json) = reader.lookup(&view_name)? else {
+        let available = reader.list_names().unwrap_or_default();
+        let not_found = crate::catalog::view_not_found_msg(&view_name);
+        return Err(match suggest_closest(&view_name, &available) {
+            Some(suggestion) => format!("{not_found}. Did you mean '{suggestion}'?"),
+            None => not_found,
+        });
     };
     let def = SemanticViewDefinition::from_json(&view_name, &json)?;
 
     let metric_lower = metric_name.to_ascii_lowercase();
-    let met = match def
+    let Some(met) = def
         .metrics
         .iter()
         .find(|m| m.name.to_ascii_lowercase() == metric_lower)
-    {
-        Some(m) => m,
-        None => {
-            let available: Vec<String> = def.metrics.iter().map(|m| m.name.clone()).collect();
-            return Err(match suggest_closest(&metric_name, &available) {
-                Some(suggestion) => format!(
-                    "metric '{metric_name}' not found in semantic view '{view_name}'. \
-                     Did you mean '{suggestion}'?"
-                ),
-                None => format!("metric '{metric_name}' not found in semantic view '{view_name}'"),
-            });
-        }
+    else {
+        let available: Vec<String> = def.metrics.iter().map(|m| m.name.clone()).collect();
+        return Err(match suggest_closest(&metric_name, &available) {
+            Some(suggestion) => format!(
+                "metric '{metric_name}' not found in semantic view '{view_name}'. \
+                 Did you mean '{suggestion}'?"
+            ),
+            None => format!("metric '{metric_name}' not found in semantic view '{view_name}'"),
+        });
     };
 
     let required_dim_names: HashSet<String> = if let Some(ref ws) = met.window_spec {

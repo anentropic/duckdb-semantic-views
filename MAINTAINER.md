@@ -238,6 +238,16 @@ The `Coverage check (80% minimum)` job in `CodeQuality.yml` runs `cargo llvm-cov
 
 Net: treat the 80% figure as a floor on the bundled core's line coverage, not as end-to-end coverage of the shipped extension.
 
+### Linting the extension-gated FFI layer
+
+`cargo clippy` (and the `Clippy (pedantic lints, deny warnings)` CI step) compiles the **default** feature set, so it never lints the `#[cfg(feature = "extension")]` FFI modules. A second CI step, `Clippy (extension feature, deny warnings)`, closes that gap:
+
+```bash
+SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features --features extension -- -D warnings
+```
+
+`SV_SKIP_CPP_BUILD` makes `build.rs` skip the ~25 MB DuckDB amalgamation + C++ shim compile. Clippy only type-checks (it never links the final `cdylib`), so the C++ half is irrelevant and the check needs no amalgamation download — it runs in seconds. Use the same command locally before touching any FFI (`src/query/{table_function,explain}.rs`, `src/ddl/*_ffi.rs`, `src/parse/ffi.rs`) code. Do **not** set `SV_SKIP_CPP_BUILD` for a real `just build` — the extension won't link without the C++ shim.
+
 ### DuckLake/Iceberg Tests
 
 The DuckLake integration test requires one-time setup:

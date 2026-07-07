@@ -177,9 +177,8 @@ fn show_entities_one(
         .map_err(|e| format!("Invalid view name '{view_name}': {e}"))?;
     let present = unsafe { probe_catalog_table_present(borrowed) }?;
     let reader = CatalogReader::new(borrowed, present);
-    let json = match reader.lookup(&view_name)? {
-        Some(j) => j,
-        None => return Err(crate::catalog::view_not_found_msg(&view_name)),
+    let Some(json) = reader.lookup(&view_name)? else {
+        return Err(crate::catalog::view_not_found_msg(&view_name));
     };
     // FF-9: named single-view SHOW propagates a parse error — the user asked
     // for this specific view, so a corrupt definition must surface loudly

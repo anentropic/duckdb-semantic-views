@@ -2,19 +2,19 @@
 //!
 //! Phase 65 Plan 04 introduces the first such helper, `__sv_compute_create_from_yaml`,
 //! whose C++ bind callback (in `cpp/src/shim.cpp`) opens a per-call
-//! `Connection(*context.db)` to read the YAML file via DuckDB's `read_text(?)`
+//! `Connection(*context.db)` to read the YAML file via `DuckDB`'s `read_text(?)`
 //! function, then calls into Rust here to parse the YAML, run validation +
 //! cardinality inference, and serialize the resulting JSON. The bind returns
-//! the JSON in a single VARCHAR row; the outer parser_override INSERT (in
+//! the JSON in a single VARCHAR row; the outer `parser_override` INSERT (in
 //! `src/parse.rs::rewrite_yaml_file_create`) wraps that row with
 //! `json_merge_patch` + `json_object` to add the metadata fields
 //! (`created_on`, `database_name`, `schema_name`) on the caller's connection.
 //!
 //! Read-elimination architecture (Phase 65 D-11): the YAML read no longer
-//! goes through the OverrideContext's catalog connection. The per-call
+//! goes through the `OverrideContext`'s catalog connection. The per-call
 //! Connection opened inside the bind closes at end-of-bind scope, so no
 //! long-lived extension-owned `duckdb_connection` outlives the user's
-//! `close()`. This is the load-bearing primitive for retiring H1 catalog_conn
+//! `close()`. This is the load-bearing primitive for retiring H1 `catalog_conn`
 //! in Plan 06.
 //!
 //! FFI safety conventions (match `src/parse.rs::sv_parser_override_rust`):
@@ -44,7 +44,7 @@ use std::panic::AssertUnwindSafe;
 /// opened from `ClientContext::db`, so this function only sees the
 /// already-loaded bytes — no file I/O on the Rust side.
 ///
-/// Returns the metadata-less JSON definition. The outer parser_override
+/// Returns the metadata-less JSON definition. The outer `parser_override`
 /// INSERT wraps the JSON with `json_merge_patch(new_def, json_object(...))`
 /// to populate `created_on` / `database_name` / `schema_name` on the
 /// caller's connection (preserving D-21 transactional contract).
@@ -110,33 +110,26 @@ pub unsafe extern "C" fn sv_compute_create_from_yaml_rust(
         }
 
         let content_bytes = std::slice::from_raw_parts(content_ptr, content_len);
-        let content = match std::str::from_utf8(content_bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                write_error_buf(error_buf, error_buf_len, "YAML content is not valid UTF-8");
-                return 1_u8;
-            }
+        let Ok(content) = std::str::from_utf8(content_bytes) else {
+            write_error_buf(error_buf, error_buf_len, "YAML content is not valid UTF-8");
+            return 1_u8;
         };
 
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let name = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                write_error_buf(error_buf, error_buf_len, "view name is not valid UTF-8");
-                return 1_u8;
-            }
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
+            write_error_buf(error_buf, error_buf_len, "view name is not valid UTF-8");
+            return 1_u8;
         };
 
         let comment_opt: Option<String> = if comment_len == 0 || comment_ptr.is_null() {
             None
         } else {
             let comment_bytes = std::slice::from_raw_parts(comment_ptr, comment_len);
-            match std::str::from_utf8(comment_bytes) {
-                Ok(s) => Some(s.to_owned()),
-                Err(_) => {
-                    write_error_buf(error_buf, error_buf_len, "COMMENT value is not valid UTF-8");
-                    return 1_u8;
-                }
+            if let Ok(s) = std::str::from_utf8(comment_bytes) {
+                Some(s.to_owned())
+            } else {
+                write_error_buf(error_buf, error_buf_len, "COMMENT value is not valid UTF-8");
+                return 1_u8;
             }
         };
 
@@ -173,16 +166,15 @@ pub unsafe extern "C" fn sv_compute_create_from_yaml_rust(
             }
         }
     }));
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            write_error_buf(
-                error_buf,
-                error_buf_len,
-                "internal error: panic inside sv_compute_create_from_yaml_rust",
-            );
-            3
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        write_error_buf(
+            error_buf,
+            error_buf_len,
+            "internal error: panic inside sv_compute_create_from_yaml_rust",
+        );
+        3
     }
 }
 

@@ -15,7 +15,7 @@ pub enum QueryError {
     EmptyRequest { view_name: String },
     /// The expansion engine returned an error.
     ExpandFailed { source: ExpandError },
-    /// The expanded SQL failed to execute against DuckDB.
+    /// The expanded SQL failed to execute against `DuckDB`.
     SqlExecution {
         expanded_sql: String,
         duckdb_error: String,

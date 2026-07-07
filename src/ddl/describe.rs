@@ -15,6 +15,10 @@ use crate::model::{AccessModifier, SemanticViewDefinition};
 /// `conn` is a borrowed handle; `name_ptr` must point to `name_len` UTF-8 bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
+// Single linear FFI dispatcher (catch_unwind guard, arg decode, catalog lookup,
+// row collection, wire serialization) kept as one path so the panic boundary
+// and borrow contract stay in one place.
+#[allow(clippy::too_many_lines)]
 pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
     conn: libduckdb_sys::duckdb_connection,
     name_ptr: *const u8,
@@ -40,12 +44,9 @@ pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
             return 1_u8;
         }
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let raw_name = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
-                return 1_u8;
-            }
+        let Ok(raw_name) = std::str::from_utf8(name_bytes) else {
+            write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
+            return 1_u8;
         };
         // FF-4: normalize so quoted-identifier inputs resolve like `semantic_view()`.
         let name = match crate::ident::normalize_view_name(raw_name) {
@@ -87,7 +88,7 @@ pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
         let def = match SemanticViewDefinition::from_json(&name, &json) {
             Ok(d) => d,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.to_string());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
@@ -131,17 +132,16 @@ pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
         publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            use crate::ddl::read_ffi::write_err;
-            write_err(
-                error_buf,
-                error_buf_len,
-                "internal error: panic inside sv_describe_semantic_view_bind_rust",
-            );
-            2
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        use crate::ddl::read_ffi::write_err;
+        write_err(
+            error_buf,
+            error_buf_len,
+            "internal error: panic inside sv_describe_semantic_view_bind_rust",
+        );
+        2
     }
 }
 
@@ -415,10 +415,14 @@ fn collect_dimension_rows(
     }
 }
 
-/// Collect METRIC and DERIVED_METRIC property rows from the definition.
+/// Collect METRIC and `DERIVED_METRIC` property rows from the definition.
 ///
-/// Metrics with `source_table: Some(...)` emit as METRIC (TABLE, EXPRESSION, DATA_TYPE).
-/// Metrics with `source_table: None` emit as DERIVED_METRIC (EXPRESSION, DATA_TYPE only).
+/// Metrics with `source_table: Some(...)` emit as METRIC (TABLE, EXPRESSION, `DATA_TYPE`).
+/// Metrics with `source_table: None` emit as `DERIVED_METRIC` (EXPRESSION, `DATA_TYPE` only).
+// One row-builder per metric shape (regular, window, semi-additive, derived);
+// each branch emits a distinct fixed set of property rows, so the length is
+// inherent to the DESCRIBE row schema rather than tangled logic.
+#[allow(clippy::too_many_lines)]
 fn collect_metric_rows(
     def: &SemanticViewDefinition,
     base_table: &str,

@@ -43,12 +43,9 @@ pub unsafe extern "C" fn sv_show_columns_in_semantic_view_bind_rust(
             return 1_u8;
         }
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let raw_name = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
-                return 1_u8;
-            }
+        let Ok(raw_name) = std::str::from_utf8(name_bytes) else {
+            write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
+            return 1_u8;
         };
         // FF-4: normalize so quoted-identifier inputs resolve like `semantic_view()`.
         let view_name = match crate::ident::normalize_view_name(raw_name) {
@@ -90,7 +87,7 @@ pub unsafe extern "C" fn sv_show_columns_in_semantic_view_bind_rust(
         let def = match SemanticViewDefinition::from_json(&view_name, &json) {
             Ok(d) => d,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.to_string());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
@@ -118,17 +115,16 @@ pub unsafe extern "C" fn sv_show_columns_in_semantic_view_bind_rust(
         publish_owned_buffer(buf, out_ptr, out_len);
         0_u8
     }));
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            use crate::ddl::read_ffi::write_err;
-            write_err(
-                error_buf,
-                error_buf_len,
-                "internal error: panic inside sv_show_columns_in_semantic_view_bind_rust",
-            );
-            2
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        use crate::ddl::read_ffi::write_err;
+        write_err(
+            error_buf,
+            error_buf_len,
+            "internal error: panic inside sv_show_columns_in_semantic_view_bind_rust",
+        );
+        2
     }
 }
 
@@ -152,7 +148,7 @@ struct ShowColumnRow {
 
 /// Collect column rows from a semantic view definition.
 /// Includes all dimensions, public facts, and public metrics.
-/// Derived metrics (no source_table) get kind "DERIVED_METRIC".
+/// Derived metrics (no `source_table`) get kind "`DERIVED_METRIC`".
 fn collect_column_rows(def: &SemanticViewDefinition, view_name: &str) -> Vec<ShowColumnRow> {
     let database_name = def.database_name.clone().unwrap_or_default();
     let schema_name = def.schema_name.clone().unwrap_or_default();

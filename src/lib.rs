@@ -307,15 +307,15 @@ pub mod test_helpers {
 #[cfg(feature = "extension")]
 pub mod ddl;
 
-/// Extension entry point — called by DuckDB when the extension is loaded.
+/// Extension entry point — called by `DuckDB` when the extension is loaded.
 ///
-/// Uses C_STRUCT ABI (semantic_views_init_c_api) for the DuckDB handshake.
+/// Uses `C_STRUCT` ABI (`semantic_views_init_c_api`) for the `DuckDB` handshake.
 /// After Rust-side initialization (catalog, DDL functions, query functions),
-/// calls a C++ helper (sv_register_parser_hooks) to register parser extension
-/// hooks that require C++ types (ParserExtension, DBConfig).
+/// calls a C++ helper (`sv_register_parser_hooks`) to register parser extension
+/// hooks that require C++ types (`ParserExtension`, `DBConfig`).
 ///
-/// This is "Option A" from Phase 15: keep C_STRUCT entry, call C++ helper.
-/// Option B (CPP entry via DUCKDB_CPP_EXTENSION_ENTRY) was tried first but
+/// This is "Option A" from Phase 15: keep `C_STRUCT` entry, call C++ helper.
+/// Option B (CPP entry via `DUCKDB_CPP_EXTENSION_ENTRY`) was tried first but
 /// failed due to unresolved C++ symbols from -fvisibility=hidden in the host.
 #[cfg(feature = "extension")]
 mod extension {
@@ -491,8 +491,7 @@ mod extension {
             .query_row("SELECT current_setting('access_mode')", [], |row| {
                 row.get::<_, String>(0)
             })
-            .map(|s| s.eq_ignore_ascii_case("read_only"))
-            .unwrap_or(false);
+            .is_ok_and(|s| s.eq_ignore_ascii_case("read_only"));
 
         // Initialize the persistent catalog (schema + table + companion-file migration).
         init_catalog(con, &db_path, is_read_only)?;
@@ -551,7 +550,7 @@ mod extension {
     /// # Safety
     ///
     /// Called by the extern "C" entrypoint below. `info` and `access` must be
-    /// valid pointers provided by DuckDB.
+    /// valid pointers provided by `DuckDB`.
     unsafe fn semantic_views_init_c_api_internal(
         info: ffi::duckdb_extension_info,
         access: *const ffi::duckdb_extension_access,
@@ -575,12 +574,12 @@ mod extension {
         Ok(true)
     }
 
-    /// FFI entrypoint called by DuckDB when the extension is loaded (C_STRUCT ABI).
+    /// FFI entrypoint called by `DuckDB` when the extension is loaded (`C_STRUCT` ABI).
     ///
     /// # Safety
     ///
-    /// This is an extern "C" function called across the FFI boundary by DuckDB.
-    /// `info` and `access` are guaranteed valid by DuckDB for the call duration.
+    /// This is an extern "C" function called across the FFI boundary by `DuckDB`.
+    /// `info` and `access` are guaranteed valid by `DuckDB` for the call duration.
     #[no_mangle]
     pub unsafe extern "C" fn semantic_views_init_c_api(
         info: ffi::duckdb_extension_info,
