@@ -168,8 +168,8 @@ test_extension_release_internal: patch-runner
 probe_isolation_debug_internal: patch-runner
 	@echo "Probing whether the DuckDB 1.5 multi-file isolation workaround is still needed.."
 	@if $(TEST_RUNNER_FILE_LIST_DEBUG) >/dev/null 2>&1; then \
-		echo "UNEXPECTED PASS: running all TEST_LIST files in one sqllogictest process no"; \
-		echo "longer crashes -- the DuckDB 1.5 multi-DB lifecycle segfault appears fixed."; \
+		echo "UNEXPECTED PASS: running all TEST_LIST files in one sqllogictest process no longer crashes"; \
+		echo "-- the DuckDB 1.5 multi-DB lifecycle segfault appears fixed."; \
 		echo "Retire the per-file isolation loop in test_extension_debug_internal /"; \
 		echo "test_extension_release_internal and route test-sql back to the single-process"; \
 		echo "TEST_RUNNER_FILE_LIST_DEBUG path."; \

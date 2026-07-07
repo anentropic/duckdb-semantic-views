@@ -838,8 +838,18 @@ mod tests {
     #[cfg(not(feature = "extension"))]
     #[test]
     fn tc6_restart_persistence_survives_reopen() {
+        // Unique per-invocation filename (pid + nanos) so concurrent `cargo test`
+        // runs — in this binary or another process — cannot race on the same
+        // DB/WAL paths and flake via cross-deletion/reuse.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_tc6_restart_persistence.duckdb");
+        let db_path_buf = tmp.join(format!(
+            "test_tc6_restart_persistence_{}_{nanos}.duckdb",
+            std::process::id()
+        ));
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}.wal"));
