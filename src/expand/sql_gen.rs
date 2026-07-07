@@ -488,7 +488,7 @@ pub fn expand(
         sql.push_str(&quote_ident(&base_ref.alias));
     }
 
-    // Join resolution via PK/FK graph (legacy resolve_joins removed in Phase 27).
+    // Join resolution via PK/FK graph.
     // The resolver returns structured edges in emission order; role-playing
     // scoped joins (e.g. "a__dep_airport") follow the bare joins.
     let resolved_joins = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets, &[]);
@@ -916,8 +916,6 @@ GROUP BY
             assert!(msg.contains("duplicate metric 'total_revenue'"));
         }
 
-        // Legacy join tests removed in Phase 27
-
         #[test]
         fn test_join_excluded_when_not_needed() {
             let def = orders_view()
@@ -1166,8 +1164,6 @@ GROUP BY
                 comment: None,
             }
         }
-
-        // Legacy join_columns tests removed in Phase 27
 
         #[test]
         fn table_qualified_dimension_lookup_with_matching_source_table() {

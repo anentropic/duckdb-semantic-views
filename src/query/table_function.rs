@@ -4,11 +4,12 @@ use libduckdb_sys as ffi;
 
 use crate::catalog::CatalogReader;
 use crate::expand::wildcard::{expand_wildcards, WildcardItemType};
-use crate::expand::{expand, quote_ident, QueryRequest};
+use crate::expand::{expand, QueryRequest};
 use crate::model::SemanticViewDefinition;
 use crate::util::suggest_closest;
 
 use super::error::QueryError;
+use super::wire::{build_execution_sql, parse_varchar_list, serialize_register_payload};
 
 // ---------------------------------------------------------------------------
 // Phase 65 Plan 05 Task 6 (Wave 6) — sv_semantic_view_bind_rust
@@ -48,69 +49,6 @@ use super::error::QueryError;
 //   0 — success; (out_ptr, out_len) populated.
 //   1 — user-visible error; error_buf populated (raised as BinderException).
 //   2 — internal error (panic across FFI); error_buf populated.
-
-// Phase 65.1 WR-05: returns Result<_, String> so the dispatcher can
-// surface byte-offset / element-index detail in the user message,
-// matching the diagnostic shape of the C++ sv_parse_varchar_payload
-// helpers. Sibling of src/query/explain.rs::parse_string_list.
-unsafe fn sv_parse_string_list(buf: *const u8, len: usize) -> Result<Vec<String>, String> {
-    if buf.is_null() {
-        return if len == 0 {
-            Ok(Vec::new())
-        } else {
-            Err(format!("null buffer but len={len} (FFI shape drift)"))
-        };
-    }
-    if len < 4 {
-        return Err(format!(
-            "buffer too short for count prefix: len={len} (expected >= 4)"
-        ));
-    }
-    let slice = std::slice::from_raw_parts(buf, len);
-    let mut off = 0usize;
-    let read_u32 = |slice: &[u8], off: &mut usize| -> Result<u32, String> {
-        if *off + 4 > slice.len() {
-            return Err(format!(
-                "expected u32 at offset {} of {} (truncated)",
-                *off,
-                slice.len()
-            ));
-        }
-        let v = u32::from_le_bytes(slice[*off..*off + 4].try_into().map_err(
-            |e: std::array::TryFromSliceError| format!("u32 decode failed at offset {}: {e}", *off),
-        )?);
-        *off += 4;
-        Ok(v)
-    };
-    let count = read_u32(slice, &mut off)? as usize;
-    // FF-6: cap the pre-allocation at the largest element count the buffer
-    // could actually hold. The 4-byte count prefix has already been consumed,
-    // and each remaining element carries at least a 4-byte length prefix, so
-    // the ceiling is `(len - 4) / 4`. A corrupt `count` near u32::MAX would
-    // otherwise request a ~100 GB allocation up front; the per-element bounds
-    // check below still rejects a genuinely truncated payload.
-    let mut out = Vec::with_capacity(count.min(len.saturating_sub(4) / 4));
-    for i in 0..count {
-        let n = read_u32(slice, &mut off)
-            .map_err(|e| format!("reading length for element {i} of {count}: {e}"))?
-            as usize;
-        if off + n > slice.len() {
-            return Err(format!(
-                "element {i} of {count} declares length {n} but only {} bytes remain at offset {off}",
-                slice.len().saturating_sub(off)
-            ));
-        }
-        out.push(String::from_utf8_lossy(&slice[off..off + n]).into_owned());
-        off += n;
-    }
-    if off != len {
-        return Err(format!(
-            "trailing {} bytes after count {count} (consumed {off} of {len})",
-            len - off
-        ));
-    }
-    Ok(out)
-}
 
 /// # Safety
 ///
@@ -172,7 +110,7 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
             }
         };
 
-        let dimensions = match sv_parse_string_list(dims_ptr, dims_len) {
+        let dimensions = match parse_varchar_list(dims_ptr, dims_len) {
             Ok(v) => v,
             Err(detail) => {
                 write_err(
@@ -183,7 +121,7 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
                 return 1_u8;
             }
         };
-        let metrics = match sv_parse_string_list(metrics_ptr, metrics_len) {
+        let metrics = match parse_varchar_list(metrics_ptr, metrics_len) {
             Ok(v) => v,
             Err(detail) => {
                 write_err(
@@ -194,7 +132,7 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
                 return 1_u8;
             }
         };
-        let facts = match sv_parse_string_list(facts_ptr, facts_len) {
+        let facts = match parse_varchar_list(facts_ptr, facts_len) {
             Ok(v) => v,
             Err(detail) => {
                 write_err(
@@ -389,17 +327,6 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
 }
 
 // ---------------------------------------------------------------------------
-// Legacy `QueryState` + `SemanticViewBindData` + `StreamingState` +
-// `SemanticViewInitData` RETIRED — Phase 65 Plan 05 Batch 3. The C++
-// Catalog API path (`sv_register_semantic_view`) carries its own
-// BindData / GlobalState struct on the C++ side; the Rust dispatcher
-// `sv_semantic_view_bind_rust` only serialises the wire format and
-// returns. The `MaterializedQueryResult` lives in `SemanticViewGlobalState`
-// on the C++ side (see `cpp/src/shim.cpp`) and outlives the per-call
-// Connection that produced it.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // FFI helpers
 // ---------------------------------------------------------------------------
 
@@ -431,18 +358,6 @@ pub(crate) unsafe fn execute_sql_raw(
     Ok(result)
 }
 
-// `value_raw_ptr`, `extract_list_strings`, `LogicalTypeOwned`,
-// `type_from_duckdb_type_u32`, `declare_output_type` RETIRED — Phase 65
-// Plan 05 Batch 3. All five helpers belonged to the legacy
-// `SemanticViewVTab` Rust path. The C++ Catalog API path
-// (`sv_register_semantic_view`) flattens LIST(VARCHAR) named params
-// inside `cpp/src/shim.cpp::sv_serialise_string_list` and declares
-// output logical types via the C++ helper
-// `sv_logical_type_from_c_type_id` (see BATCH2-SUMMARY for the C-API ↔
-// C++ enum-value mismatch story). Their removal also retires the
-// duckdb-rs `Value`-pointer transmute that depended on
-// `repr(Rust)` layout assumptions of `duckdb::vtab::Value`.
-
 /// Normalize HUGEINT/UHUGEINT type IDs to BIGINT/UBIGINT.
 ///
 /// DuckDB's query planner infers `sum()` as HUGEINT at LIMIT-0 time, but the
@@ -460,193 +375,6 @@ pub(crate) fn normalize_type_id(t: u32) -> u32 {
         _ => t,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Execution SQL generation
-// ---------------------------------------------------------------------------
-
-/// Map a DuckDB type ID to its SQL cast name.
-///
-/// Returns `Some("TYPE")` for types that can be cast via SQL text, `None` for
-/// types whose precision/metadata cannot be expressed in a bare cast (DECIMAL,
-/// LIST) -- those are handled via logical type metadata at bind time.
-fn type_id_to_cast_sql(type_id: u32) -> Option<&'static str> {
-    const BOOLEAN: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN;
-    const TINYINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT;
-    const SMALLINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT;
-    const INTEGER: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER;
-    const BIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT;
-    const UTINYINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT;
-    const USMALLINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT;
-    const UINTEGER: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER;
-    const UBIGINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT;
-    const FLOAT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT;
-    const DOUBLE: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE;
-    const TIMESTAMP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP;
-    const DATE: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE;
-    const TIME: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIME;
-    const HUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT;
-    const UHUGEINT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT;
-    const VARCHAR: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR;
-    const TIMESTAMP_S: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S;
-    const TIMESTAMP_MS: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS;
-    const TIMESTAMP_NS: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS;
-    const TIMESTAMP_TZ: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ;
-
-    // Complex types that are declared as VARCHAR at bind time.
-    const STRUCT: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT;
-    const MAP: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP;
-    const INVALID: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_INVALID;
-
-    // Note: DECIMAL is intentionally NOT cast via SQL text here -- DECIMAL
-    // precision/scale is declared from the logical type handle at bind time,
-    // and a bare "DECIMAL" cast would lose width/scale. Instead, DECIMAL
-    // columns pass through without a text cast; the bind-time declaration
-    // already ensures the correct output type.
-    const DECIMAL: u32 = ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL;
-
-    match type_id {
-        BOOLEAN => Some("BOOLEAN"),
-        TINYINT => Some("TINYINT"),
-        SMALLINT => Some("SMALLINT"),
-        INTEGER => Some("INTEGER"),
-        BIGINT | HUGEINT => Some("BIGINT"),
-        UTINYINT => Some("UTINYINT"),
-        USMALLINT => Some("USMALLINT"),
-        UINTEGER => Some("UINTEGER"),
-        UBIGINT | UHUGEINT => Some("UBIGINT"),
-        FLOAT => Some("FLOAT"),
-        DOUBLE => Some("DOUBLE"),
-        DATE => Some("DATE"),
-        TIME => Some("TIME"),
-        TIMESTAMP => Some("TIMESTAMP"),
-        TIMESTAMP_S => Some("TIMESTAMP_S"),
-        TIMESTAMP_MS => Some("TIMESTAMP_MS"),
-        TIMESTAMP_NS => Some("TIMESTAMP_NS"),
-        TIMESTAMP_TZ => Some("TIMESTAMPTZ"),
-        VARCHAR => Some("VARCHAR"),
-        STRUCT | MAP | INVALID => Some("VARCHAR"),
-        // DECIMAL and LIST columns cannot be cast via bare SQL type name --
-        // DECIMAL requires precision/scale (bare "DECIMAL" defaults to (18,3)
-        // which changes the value), LIST requires child type. These types are
-        // handled via logical type metadata at bind time, so pass through
-        // unmodified in the execution SQL wrapper.
-        DECIMAL => None,
-        // Unknown types: pass through rather than risk a lossy VARCHAR cast.
-        // The runtime type check in func() will catch any real mismatch.
-        _ => None,
-    }
-}
-
-/// Serialize the inferred schema + execution SQL into the flat register wire
-/// format consumed by the C++ `semantic_view` bind:
-///
-/// ```text
-/// u32 n_cols
-/// for each col: u32 name_len | name bytes | u32 type_id
-/// u32 sql_len | sql bytes
-/// ```
-///
-/// FF-6: every length goes through a checked `u32::try_from` and the function
-/// returns an error rather than a bare `as u32` truncation, which would write a
-/// length prefix that disagrees with the bytes appended and desync the header
-/// from the payload on the C++ read side. Overflow is unreachable for real
-/// queries (a column name or the execution SQL would each need to exceed 4 GiB).
-fn serialize_register_payload(
-    column_names: &[String],
-    column_type_ids: &[u32],
-    execution_sql: &str,
-) -> Result<Vec<u8>, String> {
-    let wire_len = |n: usize, what: &str| -> Result<u32, String> {
-        u32::try_from(n)
-            .map_err(|_| format!("{what} ({n} bytes) exceeds the wire-format u32 limit"))
-    };
-    // Guard against slice desync: the header writes `n_cols` from
-    // `column_names.len()`, but the body serializes via `zip`, which would
-    // silently truncate to the shorter slice and emit a header that disagrees
-    // with the payload. Today both vectors come from the same
-    // `duckdb_column_count` loop, but reject mismatch explicitly so a future
-    // caller cannot desync the wire format.
-    if column_names.len() != column_type_ids.len() {
-        return Err(format!(
-            "column name count ({}) disagrees with type id count ({})",
-            column_names.len(),
-            column_type_ids.len()
-        ));
-    }
-    let n_cols = wire_len(column_names.len(), "column count")?;
-    let cap = 4
-        + column_names.iter().map(|n| 4 + n.len()).sum::<usize>()
-        + column_type_ids.len() * 4
-        + 4
-        + execution_sql.len();
-    let mut buf: Vec<u8> = Vec::with_capacity(cap);
-    buf.extend_from_slice(&n_cols.to_le_bytes());
-    for (name, tid) in column_names.iter().zip(column_type_ids.iter()) {
-        let nl = wire_len(name.len(), "column name")?;
-        buf.extend_from_slice(&nl.to_le_bytes());
-        buf.extend_from_slice(name.as_bytes());
-        buf.extend_from_slice(&tid.to_le_bytes());
-    }
-    let sql_len = wire_len(execution_sql.len(), "execution SQL")?;
-    buf.extend_from_slice(&sql_len.to_le_bytes());
-    buf.extend_from_slice(execution_sql.as_bytes());
-    Ok(buf)
-}
-
-/// Build the SQL used at execution time, wrapping the expanded SQL with explicit
-/// type casts for EVERY output column.
-///
-/// This ensures that runtime column types always match the bind-time schema
-/// declaration, preventing type mismatches in `duckdb_vector_reference_vector`.
-/// DuckDB optimizes away no-op casts (e.g., `col::BIGINT` when `col` is already
-/// BIGINT), so the wrapper has negligible performance overhead.
-///
-/// Key type mappings:
-/// - HUGEINT/UHUGEINT → BIGINT/UBIGINT (optimizer substitution)
-/// - STRUCT/MAP/INVALID → VARCHAR (complex types declared as VARCHAR at bind)
-/// - All scalar types → explicit cast matching bind declaration
-fn build_execution_sql(
-    expanded_sql: &str,
-    column_names: &[String],
-    column_type_ids: &[u32],
-) -> String {
-    // If there are no columns, return the original SQL (edge case).
-    if column_names.is_empty() {
-        return expanded_sql.to_string();
-    }
-
-    let clauses: Vec<String> = column_names
-        .iter()
-        .zip(column_type_ids.iter())
-        .map(|(name, &tid)| {
-            // FF-8: quote_ident escapes an embedded `"` in the inferred column
-            // name (`"` → `""`); a raw format!("\"{name}\"") would break the
-            // cast wrapper and mis-alias the column. Names come from
-            // duckdb_column_name on the LIMIT-0 probe, so a fact/dimension
-            // alias containing `"` reaches here verbatim.
-            let quoted = quote_ident(name);
-            match type_id_to_cast_sql(tid) {
-                Some(cast_type) => format!("{quoted}::{cast_type} AS {quoted}"),
-                None => quoted,
-            }
-        })
-        .collect();
-
-    format!(
-        "SELECT {} FROM ({expanded_sql}) __sv_inner",
-        clauses.join(", ")
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Legacy `SemanticViewVTab` (duckdb-rs `VTab` impl) RETIRED — Phase 65 Plan 05
-// Batch 3. The C++ Catalog API path (`sv_register_semantic_view` →
-// `sv_semantic_view_bind_rust` above) is the sole registration target.
-// The MaterializedQueryResult lives in `SemanticViewGlobalState` on the C++
-// side and outlives the per-call Connection that produced it (see
-// `cpp/src/shim.cpp` and 65-05-BATCH2-SUMMARY.md for the streaming model).
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Schema inference

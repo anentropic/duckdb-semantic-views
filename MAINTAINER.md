@@ -73,11 +73,12 @@ src/
 │   ├── alter.rs               #   ALTER SEMANTIC VIEW execution
 │   ├── show.rs                #   SHOW SEMANTIC VIEWS / DIMENSIONS / METRICS / FACTS
 │   └── describe.rs            #   DESCRIBE SEMANTIC VIEW
-└── query/                     # Query interface (only compiled for the extension build)
+└── query/                     # Query interface
     ├── mod.rs                 #   Module declarations
-    ├── table_function.rs      #   semantic_view() -- the main table function (FFI-heavy)
-    ├── explain.rs             #   explain_semantic_view() -- shows expanded SQL and EXPLAIN plan
-    └── error.rs               #   Query-specific error types
+    ├── table_function.rs      #   semantic_view() -- the main table function (FFI-heavy, extension-only)
+    ├── explain.rs             #   explain_semantic_view() -- expanded SQL + EXPLAIN plan (extension-only)
+    ├── wire.rs                #   Pure wire-format/SQL-shape helpers (always compiled + unit-tested)
+    └── error.rs               #   Query-specific error types (extension-only)
 
 fuzz/                          # Fuzz testing (independent Cargo crate)
 ├── Cargo.toml                 #   Depends on semantic_views with "arbitrary" feature
@@ -227,6 +228,15 @@ Fix: `rustup update stable`
 - SQL logic errors in the DDL and query functions
 
 **Always run `just test-sql` before submitting a PR.** A passing `cargo test` does not guarantee the extension loads correctly.
+
+### How to read the 80% coverage gate (CI-6)
+
+The `Coverage check (80% minimum)` job in `CodeQuality.yml` runs `cargo llvm-cov nextest` with the **default (bundled) feature set only**. Two consequences worth keeping in mind so the number isn't misread:
+
+- **The `extension`-gated FFI code is excluded from the denominator.** Modules compiled only under `--features extension` (the `#[no_mangle] extern "C"` bind callbacks in `src/query/{table_function,explain}.rs`, `src/ddl/*_ffi` entrypoints, etc.) are not built during the coverage run, so they neither raise nor lower the percentage. The line coverage figure describes the *pure Rust core*, not the FFI seam. Pure logic that the FFI callbacks delegate to lives in always-compiled modules (e.g. `src/query/wire.rs`) specifically so it *is* covered; behaviour that only exists across the FFI boundary is exercised by `just test-sql` and the Python integration suites instead.
+- **`nextest` does not run doc tests.** `cargo test` runs them; `cargo llvm-cov nextest` does not. Doc-test-only examples therefore contribute nothing to the coverage number even though they run (and can fail) under `just test-rust` / `cargo test`.
+
+Net: treat the 80% figure as a floor on the bundled core's line coverage, not as end-to-end coverage of the shipped extension.
 
 ### DuckLake/Iceberg Tests
 

@@ -85,7 +85,9 @@ pub(crate) fn try_route_materialization(
 ///
 /// This is used by `explain_semantic_view` to report the routing decision
 /// without duplicating the matching logic from `try_route_materialization`.
-#[allow(dead_code)] // Used only under `extension` feature (explain.rs)
+// Used only under the `extension` feature (explain.rs); scope the allow to the
+// default build so genuine dead code is still caught under `extension` (ST-8).
+#[cfg_attr(not(feature = "extension"), allow(dead_code))]
 pub(crate) fn find_routing_materialization_name<'a>(
     def: &'a SemanticViewDefinition,
     resolved_dims: &[&Dimension],

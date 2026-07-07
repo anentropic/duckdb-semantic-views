@@ -824,6 +824,87 @@ mod tests {
         let _ = std::fs::remove_file(format!("{db_path}.wal"));
     }
 
+    /// TC-6: restart persistence. Open a file-backed DB, persist a definition,
+    /// close the connection entirely, reopen from disk, run `init_catalog`
+    /// against the now-populated catalog, and confirm the definition survives.
+    ///
+    /// This is the open→persist→drop→reopen→lookup coverage the Makefile /
+    /// `_excluded` test headers claimed "verified via cargo test Rust
+    /// integration tests" — before this test, only ROLLBACK (persist_02) was
+    /// exercised, not durability across a fresh connection. The key invariant
+    /// is that `init_catalog` on an existing catalog is idempotent: it must
+    /// `CREATE ... IF NOT EXISTS` and leave stored rows intact, not re-create
+    /// or truncate the table.
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn tc6_restart_persistence_survives_reopen() {
+        // Unique per-invocation filename (pid + nanos) so concurrent `cargo test`
+        // runs — in this binary or another process — cannot race on the same
+        // DB/WAL paths and flake via cross-deletion/reuse.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir();
+        let db_path_buf = tmp.join(format!(
+            "test_tc6_restart_persistence_{}_{nanos}.duckdb",
+            std::process::id()
+        ));
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}.wal"));
+
+        let json = r#"{"schema_version":1,"base_table":"sales","dimensions":[],"metrics":[]}"#;
+
+        // --- Session 1: create the catalog and persist a definition. ---
+        {
+            let con = Connection::open(db_path).expect("open file-backed DB (session 1)");
+            init_catalog(&con, db_path, false).unwrap();
+            con.execute(
+                "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
+                duckdb::params!["sales", json],
+            )
+            .unwrap();
+            // Force the write to the file so a fresh open sees it.
+            con.execute_batch("CHECKPOINT;").unwrap();
+            drop(con);
+        }
+
+        // --- Session 2: reopen from disk; init_catalog must not clobber. ---
+        {
+            let con = Connection::open(db_path).expect("reopen file-backed DB (session 2)");
+            // Re-running init_catalog against a populated catalog is the exact
+            // path taken on every LOAD of an existing database; it must be a
+            // no-op for stored rows.
+            init_catalog(&con, db_path, false).unwrap();
+
+            let stored: String = con
+                .query_row(
+                    "SELECT definition FROM semantic_layer._definitions WHERE name = 'sales'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("definition must survive reopen + init_catalog");
+            assert_eq!(
+                stored, json,
+                "reopened definition must be byte-identical to what was persisted"
+            );
+
+            let count: i64 = con
+                .query_row(
+                    "SELECT count(*) FROM semantic_layer._definitions",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "init_catalog on reopen must not add or drop rows");
+            drop(con);
+        }
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}.wal"));
+    }
+
     // -----------------------------------------------------------------
     // Phase 63 (v0.9.0): read-only LOAD support — init_catalog
     // short-circuit + CatalogReader::{lookup,list_all,list_names}

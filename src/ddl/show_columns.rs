@@ -215,9 +215,3 @@ fn collect_column_rows(def: &SemanticViewDefinition, view_name: &str) -> Vec<Sho
     });
     rows
 }
-
-// Legacy `ShowColumnsInSemanticViewVTab` (duckdb-rs VTab impl) RETIRED —
-// Phase 65 Plan 05 Batch 3. The C++ Catalog API path
-// (`sv_register_show_columns_in_semantic_view` →
-// `sv_show_columns_in_semantic_view_bind_rust`) is the sole registration
-// target.

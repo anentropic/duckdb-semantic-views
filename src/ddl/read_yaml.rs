@@ -134,12 +134,6 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
     }
 }
 
-// Legacy `ReadYamlFromSemanticViewScalar` (duckdb-rs `VScalar` impl) RETIRED
-// — Phase 65 Plan 05 Batch 3. The C++ Catalog API path
-// (`sv_register_read_yaml_from_semantic_view` →
-// `sv_read_yaml_from_semantic_view_exec_rust`) is the sole registration
-// target.
-
 #[cfg(test)]
 mod tests {
     use super::*;

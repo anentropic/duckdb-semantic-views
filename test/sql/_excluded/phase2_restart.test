@@ -15,8 +15,11 @@
 # under its --test-dir, so the file is moved out rather than just omitted
 # from TEST_LIST.
 #
-# Restart persistence is verified separately via `cargo test` Rust integration
-# tests. When this issue is resolved, re-add this file to TEST_LIST.
+# Restart persistence is verified separately via `cargo test`
+# (catalog::tests::tc6_restart_persistence_survives_reopen covers PERSIST-01:
+# open -> persist -> close -> reopen -> init_catalog -> lookup;
+# persist_02_rollback_leaves_catalog_unchanged covers PERSIST-02).
+# When the runner issue above is resolved, re-add this file to TEST_LIST.
 #
 # Requirements covered:
 #   PERSIST-01: definitions persist via DuckDB table (no companion file)

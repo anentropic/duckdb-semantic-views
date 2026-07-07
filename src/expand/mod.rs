@@ -7,7 +7,10 @@ mod role_playing;
 mod semi_additive;
 mod sql_gen;
 mod types;
-#[allow(dead_code)]
+// Live under the `extension` feature (wildcard expansion in the query/explain
+// FFI paths); dead only in the default build, so scope the allow accordingly
+// (ST-8) rather than blanket-suppressing dead_code in the extension build too.
+#[cfg_attr(not(feature = "extension"), allow(dead_code))]
 pub(crate) mod wildcard;
 mod window;
 
