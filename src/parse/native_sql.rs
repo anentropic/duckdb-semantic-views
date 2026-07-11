@@ -7,13 +7,14 @@
 //! Read-side DDL (DESCRIBE / SHOW) is passed through unchanged by
 //! [`rewrite_to_native_sql`], the dispatch entry point.
 //!
-//! The SQL-string escape pair and the guard-SELECT builders are compiled
-//! unconditionally (no `extension` gate) so `cargo test` can exercise the
-//! escaping and guard wording without linking the loadable-extension stubs;
-//! the emission/rewrite functions are `extension`-gated. `rewrite_to_native_sql`
-//! is re-exported from the parent module for the FFI entry points; the
-//! escape/guard helpers are re-exported under `#[cfg(test)]` for the parent
-//! module's unit tests.
+//! SQL-string escaping is handled by the [`crate::sql_lit::SqlLit`] newtype
+//! (R-1): names are escaped exactly once at this dispatch boundary via
+//! `SqlLit::escape`, and the emission helpers take `&SqlLit` so a raw `&str`
+//! cannot be embedded by mistake. The emission/rewrite functions are
+//! `extension`-gated; `rewrite_to_native_sql` is re-exported from the parent
+//! module for the FFI entry points. The guard-SELECT builders in
+//! `crate::catalog::writes` are compiled unconditionally so their wording
+//! unit tests run under `cargo test`.
 
 #[cfg(feature = "extension")]
 use super::{plan_rewrite, RewriteAction};
@@ -27,6 +28,8 @@ use crate::catalog::DEFINITIONS_TABLE;
 use crate::errors::ParseError;
 #[cfg(feature = "extension")]
 use crate::ident::normalize_view_name;
+#[cfg(feature = "extension")]
+use crate::sql_lit::SqlLit;
 
 // ---------------------------------------------------------------------------
 // v0.8.x: native-SQL rewrite for parser_override (transactional DDL)
@@ -115,29 +118,28 @@ pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, Parse
             mode.if_not_exists(),
         )?,
         // DROP / ALTER: pure-SQL race-guard + native DML on the caller's
-        // connection. Names/comment are carried raw; escape at the boundary so
-        // the emission helpers keep receiving already-escaped args.
-        RewriteAction::Drop { name, if_exists } => rewrite_drop(&escape_sql_arg(&name), if_exists)?,
+        // connection. Names carried raw; `SqlLit::escape` at the boundary
+        // produces the escaped literal the emission helpers embed (R-1: the
+        // escaped-vs-raw distinction is type-enforced, not by convention).
+        // The comment is passed RAW — `rewrite_alter_comment` needs it
+        // un-escaped to build the JSON patch and escapes the patch itself.
+        RewriteAction::Drop { name, if_exists } => rewrite_drop(&SqlLit::escape(&name), if_exists)?,
         RewriteAction::AlterRename {
             name,
             new_name,
             if_exists,
         } => rewrite_alter_rename(
-            &escape_sql_arg(&name),
-            &escape_sql_arg(&new_name),
+            &SqlLit::escape(&name),
+            &SqlLit::escape(&new_name),
             if_exists,
         )?,
         RewriteAction::AlterSetComment {
             name,
             comment,
             if_exists,
-        } => rewrite_alter_comment(
-            &escape_sql_arg(&name),
-            Some(&escape_sql_arg(&comment)),
-            if_exists,
-        )?,
+        } => rewrite_alter_comment(&SqlLit::escape(&name), Some(&comment), if_exists)?,
         RewriteAction::AlterUnsetComment { name, if_exists } => {
-            rewrite_alter_comment(&escape_sql_arg(&name), None, if_exists)?
+            rewrite_alter_comment(&SqlLit::escape(&name), None, if_exists)?
         }
     };
 
@@ -190,7 +192,7 @@ fn emit_native_create_sql(
         message: format!("Invalid view name: {e}"),
         position: None,
     })?;
-    let name_escaped = escape_sql_arg(&name);
+    let name_escaped = SqlLit::escape(&name);
 
     // Phase 65 (D-16, metadata-via-SQL): enrichment no longer takes a
     // catalog connection. CREATE-time `now()` / `current_database()` /
@@ -206,7 +208,7 @@ fn emit_native_create_sql(
             message: e,
             position: None,
         })?;
-    let enriched_escaped = escape_sql_arg(&enriched_json);
+    let enriched_escaped = SqlLit::escape(&enriched_json);
 
     // Metadata-via-SQL sub-expression: produces a VARCHAR by patching
     // the enriched JSON (no created_on / database_name / schema_name
@@ -315,9 +317,9 @@ fn emit_native_create_from_yaml_file(
         message: format!("Invalid view name: {e}"),
         position: None,
     })?;
-    let name_escaped = escape_sql_arg(&name);
-    let path_escaped = escape_sql_arg(file_path);
-    let comment_escaped = escape_sql_arg(comment);
+    let name_escaped = SqlLit::escape(&name);
+    let path_escaped = SqlLit::escape(file_path);
+    let comment_escaped = SqlLit::escape(comment);
 
     // Helper-TF subquery + metadata-via-SQL wrapper. The helper TF returns
     // exactly one row whose `new_def` column contains the metadata-less
@@ -388,28 +390,12 @@ fn emit_native_create_from_yaml_file(
     Ok(Some(sql))
 }
 
-// SQL-string escape helpers (round-trip pair).
-//
-// `escape_sql_arg` doubles single quotes so the input can be embedded inside
-// a single-quoted SQL string literal: `O'Brien` → `O''Brien`. `unescape_sql_arg`
-// reverses the doubling for values that arrived already-escaped (e.g. the
-// SET COMMENT literal that `rewrite_alter_comment` re-parses as JSON).
-//
-// The pair is unconditionally compiled (no `#[cfg(feature = "extension")]`)
-// so unit tests under `cargo test` can exercise the escaping rules without
-// linking the loadable-extension stubs. They have no FFI dependencies.
-
-/// Undo the SQL `''`-escaping of an already-escaped single-quoted-literal value.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-pub(crate) fn unescape_sql_arg(s: &str) -> String {
-    s.replace("''", "'")
-}
-
-/// Re-escape a string for embedding in single-quoted SQL.
-#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-pub(crate) fn escape_sql_arg(s: &str) -> String {
-    s.replace('\'', "''")
-}
+// SQL-string escaping is handled by the `SqlLit` newtype (`crate::sql_lit`),
+// which makes the escaped-vs-raw distinction a compile-time contract instead
+// of a naming convention (R-1). The old free `escape_sql_arg` /
+// `unescape_sql_arg` pair was removed: names are escaped exactly once at the
+// `rewrite_to_native_sql` boundary via `SqlLit::escape`, and the comment now
+// flows RAW to `rewrite_alter_comment` (no escape→unescape round-trip).
 
 #[cfg(feature = "extension")]
 // Infallible today, but kept `Result`-returning for symmetry with the fallible
@@ -417,7 +403,7 @@ pub(crate) fn escape_sql_arg(s: &str) -> String {
 // same `?`-chained match in `rewrite_to_native_sql`; diverging one signature
 // would fragment that dispatch.
 #[allow(clippy::unnecessary_wraps)]
-fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, ParseError> {
+fn rewrite_drop(name_escaped: &SqlLit, if_exists: bool) -> Result<Option<String>, ParseError> {
     if if_exists {
         // IF EXISTS: pure DELETE on the caller's connection — affects 0
         // rows when the view is missing (silent no-op contract).
@@ -471,8 +457,8 @@ fn rewrite_drop(name_escaped: &str, if_exists: bool) -> Result<Option<String>, P
 // `rewrite_*` siblings dispatched through the same match (see `rewrite_drop`).
 #[allow(clippy::unnecessary_wraps)]
 fn rewrite_alter_rename(
-    old_escaped: &str,
-    new_escaped: &str,
+    old_escaped: &SqlLit,
+    new_escaped: &SqlLit,
     if_exists: bool,
 ) -> Result<Option<String>, ParseError> {
     if if_exists {
@@ -529,8 +515,8 @@ fn rewrite_alter_rename(
 
 #[cfg(feature = "extension")]
 fn rewrite_alter_comment(
-    name_escaped: &str,
-    new_comment_escaped: Option<&str>,
+    name_escaped: &SqlLit,
+    new_comment_raw: Option<&str>,
     if_exists: bool,
 ) -> Result<Option<String>, ParseError> {
     // Phase 65 Plan 06 — all pure-SQL on the caller's connection:
@@ -551,27 +537,28 @@ fn rewrite_alter_comment(
     //
     // For SET, we use serde_json::to_string on a one-key object so internal
     // `"` and `\` characters in the user's comment are JSON-escaped
-    // correctly; then escape_sql_arg doubles any embedded single quotes for
+    // correctly; then `SqlLit::escape` doubles any embedded single quotes for
     // the outer single-quoted SQL literal. Belt-and-braces escape: JSON
     // first (handles `"`/`\`/control chars), SQL second (handles `'`).
     let (patch_json_for_sql, status_label) =
-        match new_comment_escaped {
-            Some(escaped) => {
-                // The arg arrives SQL-escaped (single quotes doubled); undo
-                // that before handing to serde_json so the JSON value is the
-                // user's literal comment.
-                let comment = unescape_sql_arg(escaped);
+        match new_comment_raw {
+            Some(comment) => {
+                // The comment arrives RAW; serde_json handles `"`/`\`/control
+                // chars, then `SqlLit::escape` doubles any `'` for the outer
+                // single-quoted SQL literal (belt-and-braces: JSON then SQL).
                 let patch = serde_json::to_string(&serde_json::json!({"comment": comment}))
                     .map_err(|e| ParseError {
                         message: format!("failed to build comment patch: {e}"),
                         position: None,
                     })?;
-                (escape_sql_arg(&patch), "comment set")
+                (SqlLit::escape(&patch), "comment set")
             }
             None => {
-                // UNSET COMMENT: constant patch. The Wave 0 spike empirically
-                // confirms DuckDB v1.5.2 implements RFC-7396 null-as-delete.
-                (r#"{"comment":null}"#.to_string(), "comment unset")
+                // UNSET COMMENT: constant patch (no single quotes, so the
+                // escape is a no-op — wrapped in SqlLit for type parity with
+                // the SET arm). The Wave 0 spike empirically confirms DuckDB
+                // v1.5.2 implements RFC-7396 null-as-delete.
+                (SqlLit::escape(r#"{"comment":null}"#), "comment unset")
             }
         };
 

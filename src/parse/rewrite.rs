@@ -699,40 +699,8 @@ mod tests {
     // (FF-1 / TECH-DEBT #27).
     // ===================================================================
 
-    // ===================================================================
-    // C2: SQL escape helpers — round-trip pair, no extension feature.
-    // ===================================================================
-
-    #[test]
-    fn escape_sql_arg_doubles_single_quotes() {
-        assert_eq!(escape_sql_arg(""), "");
-        assert_eq!(escape_sql_arg("plain"), "plain");
-        assert_eq!(escape_sql_arg("O'Brien"), "O''Brien");
-        assert_eq!(escape_sql_arg("a'b'c"), "a''b''c");
-        assert_eq!(escape_sql_arg("''"), "''''");
-    }
-
-    #[test]
-    fn unescape_sql_arg_undoes_escape() {
-        assert_eq!(unescape_sql_arg(""), "");
-        assert_eq!(unescape_sql_arg("plain"), "plain");
-        assert_eq!(unescape_sql_arg("O''Brien"), "O'Brien");
-        assert_eq!(unescape_sql_arg("a''b''c"), "a'b'c");
-    }
-
-    #[test]
-    fn escape_unescape_round_trip() {
-        for s in [
-            "",
-            "plain",
-            "O'Brien",
-            "''already-doubled''",
-            "mix 'of' quotes",
-            "trailing'",
-        ] {
-            assert_eq!(unescape_sql_arg(&escape_sql_arg(s)), s);
-        }
-    }
+    // SQL-string escaping moved to the `SqlLit` newtype (R-1); its escape
+    // rules are unit-tested in `src/sql_lit.rs`.
 
     // ===================================================================
     // AR-7: the empty `OverrideContext` + `sv_make_override_context` /
