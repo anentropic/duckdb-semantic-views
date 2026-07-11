@@ -133,7 +133,16 @@ pub(super) fn expand_semi_additive(
 
     let mut cte_select_items: Vec<String> = Vec::new();
 
-    // Dimension columns in CTE
+    // Dimension columns in CTE. Keep each dimension's rendered expression:
+    // the RANK() window clauses below must repeat the EXPRESSION, never the
+    // select alias — inside the CTE's own SELECT, DuckDB resolves a
+    // window-clause identifier to a same-named physical FROM-clause column
+    // before the lateral select alias, so `PARTITION BY "region"` with
+    // `upper(o.region) AS region` silently partitioned on the raw column
+    // and produced wrong snapshot sums (E-1, code-review 2026-07-11). The
+    // standard path defends against the same shadowing with GROUP BY
+    // ordinals; this is the CTE-path equivalent.
+    let mut dim_cte_exprs: Vec<String> = Vec::with_capacity(resolved_dims.len());
     for (i, dim) in resolved_dims.iter().enumerate() {
         let mut base_expr = dim.expr.clone();
         if let Some(ref scoped) = dim_scoped_aliases[i] {
@@ -151,6 +160,7 @@ pub(super) fn expand_semi_additive(
             final_expr,
             quote_ident(&dim.name)
         ));
+        dim_cte_exprs.push(final_expr);
     }
 
     // Metric raw columns in CTE -- the validated inner expression of each
@@ -184,10 +194,12 @@ pub(super) fn expand_semi_additive(
             .map(|nd| nd.dimension.to_ascii_lowercase())
             .collect();
 
+        // Partition by the dimension EXPRESSIONS, not the CTE aliases (E-1).
         let partition_dims: Vec<String> = resolved_dims
             .iter()
-            .filter(|d| !na_dim_names.contains(&d.name.to_ascii_lowercase()))
-            .map(|d| quote_ident(&d.name))
+            .zip(&dim_cte_exprs)
+            .filter(|(d, _)| !na_dim_names.contains(&d.name.to_ascii_lowercase()))
+            .map(|(_, expr)| expr.clone())
             .collect();
 
         let partition_clause = if partition_dims.is_empty() {
@@ -196,10 +208,13 @@ pub(super) fn expand_semi_additive(
             format!("PARTITION BY {}", partition_dims.join(", "))
         };
 
-        // ORDER BY: the NA dims with their specified sort order.
-        // Use the dimension's raw expression when the NA dim is NOT in the
-        // queried dimensions (it won't have a CTE alias). That raw expression
-        // may reference a non-base table -- its join is guaranteed below (SG-9).
+        // ORDER BY: the NA dims with their specified sort order, always as
+        // EXPRESSIONS (E-1: a queried NA dim previously ordered by its CTE
+        // alias, which DuckDB binds to a same-named physical column first).
+        // A queried NA dim uses its rendered CTE expression; an unqueried NA
+        // dim uses its raw definition expression (it has no CTE column). That
+        // raw expression may reference a non-base table -- its join is
+        // guaranteed below (SG-9).
         let order_items: Vec<String> = group
             .na_dims
             .iter()
@@ -207,7 +222,7 @@ pub(super) fn expand_semi_additive(
                 // Try to find the dimension in resolved (queried) dims first
                 let dim_expr = resolved_dims
                     .iter()
-                    .find(|d| d.name.eq_ignore_ascii_case(&nd.dimension))
+                    .position(|d| d.name.eq_ignore_ascii_case(&nd.dimension))
                     .map_or_else(
                         || {
                             // NA dim not in queried dims -- find it in the view definition
@@ -217,7 +232,7 @@ pub(super) fn expand_semi_additive(
                                 .find(|d| d.name.eq_ignore_ascii_case(&nd.dimension))
                                 .map_or_else(|| quote_ident(&nd.dimension), |d| d.expr.clone())
                         },
-                        |d| quote_ident(&d.name),
+                        |idx| dim_cte_exprs[idx].clone(),
                     );
                 let dir = match nd.order {
                     SortOrder::Asc => "ASC",
@@ -566,9 +581,11 @@ mod tests {
             !sql.contains("ROW_NUMBER"),
             "ROW_NUMBER drops snapshot ties (SG-4): {sql}"
         );
+        // E-1: the window clause repeats the dimension EXPRESSION, never the
+        // CTE alias (an alias matching a physical column binds to the column).
         assert!(
-            sql.contains("PARTITION BY \"customer_id\""),
-            "Should partition by queried dim: {sql}"
+            sql.contains("PARTITION BY customer_id"),
+            "Should partition by queried dim expression: {sql}"
         );
         assert!(
             sql.contains("DESC NULLS FIRST"),
@@ -581,6 +598,83 @@ mod tests {
         assert!(
             sql.contains("\"__sv_semi_0\""),
             "Should have semi-additive CTE alias: {sql}"
+        );
+    }
+
+    /// E-1 regression (code-review 2026-07-11): a dimension whose expression
+    /// differs from its bare column must be repeated as an EXPRESSION in the
+    /// RANK() PARTITION BY. Referencing the CTE alias instead binds to the
+    /// same-named physical column (DuckDB resolves window-clause identifiers
+    /// to FROM-clause columns before lateral select aliases), silently
+    /// partitioning on the raw column: `upper(region) AS region` over rows
+    /// 'us'/'US' produced two partitions and summed both snapshot rows.
+    #[test]
+    fn test_semi_additive_expr_dim_repeats_expression_not_alias() {
+        let def = minimal_def(
+            "accounts",
+            "region",
+            "upper(region)",
+            "balance",
+            "SUM(balance)",
+        )
+        .with_dimension("report_date", "report_date", None)
+        .with_non_additive_by(
+            "balance",
+            &[("report_date", SortOrder::Desc, NullsOrder::First)],
+        );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("region")],
+            metrics: vec![MetricName::new("balance")],
+        };
+
+        let sql = expand("test_view", &def, &req).unwrap();
+        assert!(
+            sql.contains("PARTITION BY upper(region)"),
+            "PARTITION BY must repeat the dimension expression: {sql}"
+        );
+        assert!(
+            !sql.contains("PARTITION BY \"region\""),
+            "PARTITION BY must not reference the CTE alias: {sql}"
+        );
+    }
+
+    /// E-1 regression, ORDER BY arm: a QUERIED NA dim (mixed NA group where
+    /// another NA dim is absent from the query, keeping the metric active)
+    /// must also be ordered by its expression, not its CTE alias.
+    #[test]
+    fn test_semi_additive_queried_na_dim_orders_by_expression() {
+        let def = minimal_def(
+            "accounts",
+            "region",
+            "upper(region)",
+            "balance",
+            "SUM(balance)",
+        )
+        .with_dimension("report_date", "report_date", None)
+        .with_non_additive_by(
+            "balance",
+            &[
+                ("report_date", SortOrder::Desc, NullsOrder::First),
+                ("region", SortOrder::Asc, NullsOrder::Last),
+            ],
+        );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("region")],
+            metrics: vec![MetricName::new("balance")],
+        };
+
+        let sql = expand("test_view", &def, &req).unwrap();
+        assert!(
+            sql.contains("upper(region) ASC NULLS LAST"),
+            "queried NA dim must order by its expression, not its alias: {sql}"
+        );
+        assert!(
+            !sql.contains("\"region\" ASC"),
+            "queried NA dim must not order by the CTE alias: {sql}"
         );
     }
 
@@ -647,8 +741,8 @@ mod tests {
 
         let sql = expand("test_view", &def, &req).unwrap();
         assert!(
-            sql.contains("PARTITION BY \"customer_id\""),
-            "Should partition by queried dims: {sql}"
+            sql.contains("PARTITION BY customer_id"),
+            "Should partition by queried dim expression (E-1): {sql}"
         );
         // report_date is the NA dim, should appear in ORDER BY with its expression
         assert!(
@@ -1196,8 +1290,8 @@ mod tests {
         assert!(sql.contains("WITH __sv_snapshot"), "Should have CTE: {sql}");
         assert!(sql.contains("LEFT JOIN"), "CTE should include JOIN: {sql}");
         assert!(
-            sql.contains("PARTITION BY \"customer_name\""),
-            "Should partition by customer_name: {sql}"
+            sql.contains("PARTITION BY c.name"),
+            "Should partition by the customer_name expression (E-1): {sql}"
         );
     }
 

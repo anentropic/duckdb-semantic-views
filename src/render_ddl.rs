@@ -188,6 +188,44 @@ fn emit_dimensions(out: &mut String, def: &SemanticViewDefinition) {
     out.push_str(")\n");
 }
 
+/// Render a `WindowSpec` back to its DDL expression form.
+///
+/// Single source of truth shared by `GET_DDL` (`emit_metrics`) and DESCRIBE's
+/// `WINDOW_SPEC` property (C-5, code-review 2026-07-11: DESCRIBE carried an
+/// inline copy that had drifted — it dropped `frame_clause` entirely and
+/// emitted NULLS asymmetrically, contradicting `GET_DDL` for the same stored
+/// object).
+#[must_use]
+pub(crate) fn render_window_spec(ws: &crate::model::WindowSpec) -> String {
+    let mut s = String::new();
+    emit_window_expr(&mut s, ws);
+    s
+}
+
+/// Render `NON ADDITIVE BY` entries: `dim [DESC] NULLS FIRST|LAST, ...`.
+///
+/// NULLS is always explicit (avoids `DuckDB` version divergence). Shared by
+/// `GET_DDL` (`emit_metrics`) and DESCRIBE's `NON_ADDITIVE_BY` property (C-5).
+#[must_use]
+pub(crate) fn render_non_additive_entries(entries: &[crate::model::NonAdditiveDim]) -> String {
+    let mut out = String::new();
+    for (j, na) in entries.iter().enumerate() {
+        if j > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&na.dimension);
+        match na.order {
+            SortOrder::Asc => {} // default, omit
+            SortOrder::Desc => out.push_str(" DESC"),
+        }
+        match na.nulls {
+            NullsOrder::Last => out.push_str(" NULLS LAST"),
+            NullsOrder::First => out.push_str(" NULLS FIRST"),
+        }
+    }
+    out
+}
+
 /// Emit a window metric expression reconstructed from its parsed `WindowSpec`.
 ///
 /// Format: `FUNC(inner_metric[, extra_args]) OVER (PARTITION BY EXCLUDING d1, d2 [ORDER BY ...] [frame])`
@@ -265,27 +303,13 @@ fn emit_metrics(out: &mut String, def: &SemanticViewDefinition) {
         }
         if !metric.non_additive_by.is_empty() {
             out.push_str(" NON ADDITIVE BY (");
-            for (j, na) in metric.non_additive_by.iter().enumerate() {
-                if j > 0 {
-                    out.push_str(", ");
-                }
-                out.push_str(&na.dimension);
-                match na.order {
-                    SortOrder::Asc => {} // default, omit
-                    SortOrder::Desc => out.push_str(" DESC"),
-                }
-                // Always emit explicit NULLS to avoid DuckDB version divergence
-                match na.nulls {
-                    NullsOrder::Last => out.push_str(" NULLS LAST"),
-                    NullsOrder::First => out.push_str(" NULLS FIRST"),
-                }
-            }
+            out.push_str(&render_non_additive_entries(&metric.non_additive_by));
             out.push(')');
         }
         out.push_str(" AS ");
         if let Some(ref ws) = metric.window_spec {
             // Reconstruct the OVER clause from parsed WindowSpec for normalized formatting
-            emit_window_expr(out, ws);
+            out.push_str(&render_window_spec(ws));
         } else {
             out.push_str(&metric.expr);
         }

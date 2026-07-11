@@ -135,17 +135,41 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     let upper_after_name = after_name.to_ascii_uppercase();
     let pk_pos = find_primary_key(&upper_after_name);
 
-    let (pk_columns, after_pk_text) = if let Some((_pk_start, pk_end)) = pk_pos {
-        let after_pk = after_name[pk_end..].trim_start();
+    // P-1 (code-review 2026-07-11): reject text between the source-table
+    // name and PRIMARY KEY instead of silently discarding it. The keyword
+    // scan finds PRIMARY KEY anywhere in the post-name slice, so
+    // `o AS orders COMMENT = 'doc' PRIMARY KEY (id)` previously parsed
+    // "successfully" with the comment destroyed.
+    if let Some((pk_start, _)) = pk_pos {
+        let pre = &after_name[..pk_start];
+        if !pre.trim().is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "Unexpected text '{}' between source table name and PRIMARY KEY for alias '{alias}' in TABLES clause. Constraints must immediately follow the table name; COMMENT / WITH SYNONYMS come after constraints.",
+                    pre.trim()
+                ),
+                position: Some(after_name_offset + (pre.len() - pre.trim_start().len())),
+            });
+        }
+    }
+
+    // `after_pk_offset` tracks the absolute byte offset of `after_pk_text[0]`
+    // so the UNIQUE-loop guards below can point their carets at the actual
+    // offending token rather than the start of the entry (Copilot review,
+    // PR #71).
+    let (pk_columns, after_pk_text, after_pk_offset) = if let Some((_pk_start, pk_end)) = pk_pos {
+        let after_pk_raw = &after_name[pk_end..];
+        let after_pk = after_pk_raw.trim_start();
+        let after_pk_offset = after_name_offset + pk_end + (after_pk_raw.len() - after_pk.len());
         if !after_pk.starts_with('(') {
             return Err(ParseError {
                 message: "Expected '(' after PRIMARY KEY in TABLES clause.".to_string(),
-                position: Some(after_name_offset + pk_end),
+                position: Some(after_pk_offset),
             });
         }
         let pk_body = extract_paren_content(after_pk).ok_or_else(|| ParseError {
             message: "Unclosed '(' in PRIMARY KEY column list.".to_string(),
-            position: Some(after_name_offset + pk_end),
+            position: Some(after_pk_offset),
         })?;
         let pk_columns: Vec<String> = split_at_depth0_commas(pk_body)
             .into_iter()
@@ -157,33 +181,52 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
         // column name (PA-6).
         let close = 1 + pk_body.len();
         let remainder = &after_pk[close + 1..];
-        (pk_columns, remainder)
+        (pk_columns, remainder, after_pk_offset + close + 1)
     } else {
         // No PRIMARY KEY -- fact table. Hand the whole post-name slice to
         // the UNIQUE/annotation steps below. (Previously the bare no-PK /
         // no-UNIQUE case hard-set the remainder to "" — silently dropping
         // table-level COMMENT / WITH SYNONYMS annotations, PA-9.)
-        (vec![], after_name)
+        (vec![], after_name, after_name_offset)
     };
 
     // Step 4: parse zero or more UNIQUE constraints from after_pk_text
     let mut unique_constraints: Vec<Vec<String>> = Vec::new();
     let mut remaining = after_pk_text;
+    let mut remaining_offset = after_pk_offset;
     loop {
         let upper_remaining = remaining.to_ascii_uppercase();
-        if let Some((_u_start, u_end)) = find_unique(&upper_remaining) {
-            let after_unique_kw = remaining[u_end..].trim_start();
+        if let Some((u_start, u_end)) = find_unique(&upper_remaining) {
+            // P-1 companion: text before a UNIQUE constraint is an error,
+            // not silently discarded (the same anywhere-scan hole as the
+            // PRIMARY KEY slot above).
+            let pre = &remaining[..u_start];
+            if !pre.trim().is_empty() {
+                return Err(ParseError {
+                    message: format!(
+                        "Unexpected text '{}' before UNIQUE for alias '{alias}' in TABLES clause. Constraints must immediately follow the table name or the preceding constraint; COMMENT / WITH SYNONYMS come after constraints.",
+                        pre.trim()
+                    ),
+                    // Caret on the junk token, not the entry start (skip
+                    // leading whitespace within `pre`).
+                    position: Some(remaining_offset + (pre.len() - pre.trim_start().len())),
+                });
+            }
+            let after_unique_raw = &remaining[u_end..];
+            let after_unique_kw = after_unique_raw.trim_start();
+            let after_unique_offset =
+                remaining_offset + u_end + (after_unique_raw.len() - after_unique_kw.len());
             if !after_unique_kw.starts_with('(') {
                 return Err(ParseError {
                     message: format!(
                         "Expected '(' after UNIQUE keyword for table alias '{alias}'."
                     ),
-                    position: Some(entry_offset),
+                    position: Some(after_unique_offset),
                 });
             }
             let cols_str = extract_paren_content(after_unique_kw).ok_or_else(|| ParseError {
                 message: format!("Unclosed '(' in UNIQUE column list for table alias '{alias}'."),
-                position: Some(entry_offset),
+                position: Some(after_unique_offset),
             })?;
             let cols: Vec<String> = split_at_depth0_commas(cols_str)
                 .into_iter()
@@ -193,6 +236,7 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
             // Quote-aware close (see the PRIMARY KEY branch above).
             let close = 1 + cols_str.len();
             remaining = &after_unique_kw[close + 1..];
+            remaining_offset = after_unique_offset + close + 1;
         } else {
             break;
         }

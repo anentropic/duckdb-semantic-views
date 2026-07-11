@@ -33,6 +33,18 @@ Extensions so far:
     dimension is two joins away (orders -> products -> categories) with
     the p->cat relationship declared FIRST — pre-fix this emitted a
     forward-referencing join and dropped the o->p connecting join.
+  - E-1 + SG-4 (code-review 2026-07-11, T-1): semi-additive snapshot
+    section over a seeded snapshots table with (a) a dimension whose
+    expression differs from its bare column (`upper(s.region)` over
+    mixed-case region values — the E-1 alias-shadowing poison: pre-fix
+    the RANK() partitioned on the raw column) and (b) guaranteed ties at
+    the snapshot date within groups (the SG-4 RANK-vs-ROW_NUMBER
+    distinction only matters with ties). Reference SQL uses an
+    independent MAX-date semi-join formulation, not RANK.
+  - T-1 window-metric section: running totals compared against a
+    hand-written aggregate-then-window reference.
+  - T-1 wildcard section: `['*']` requests must equal the explicit
+    full-list requests (routing equivalence, incl. a window metric).
 
 Usage:
     uv run test/integration/test_differential.py
@@ -223,6 +235,248 @@ def rows_equal(got: list[tuple], want: list[tuple]) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# T-1 (code-review 2026-07-11): semi-additive / window / wildcard sections.
+# ---------------------------------------------------------------------------
+
+N_SNAPSHOTS = 800
+# Semantic dim name -> reference SQL expr (over `snapshots s LEFT JOIN
+# customers c`). `region_norm`'s expression differs from its bare column and
+# the seeded values collide case-insensitively — the E-1 poison: pre-fix, the
+# snapshot CTE's RANK() partitioned on the raw `s.region` column instead of
+# `upper(s.region)` (DuckDB binds a window-clause identifier to a same-named
+# FROM-clause column before the lateral select alias), silently splitting
+# 'us'/'US' into separate partitions and summing both snapshot dates.
+SEMI_DIMS = {
+    "region_norm": "upper(s.region)",
+    "tier": "c.tier",
+}
+
+
+def seed_snapshots(conn) -> None:
+    rng = random.Random(SEED + 1)
+    conn.execute(
+        "CREATE TABLE snapshots (id INTEGER PRIMARY KEY, customer_id INTEGER, "
+        "region VARCHAR, snap_date DATE, balance DECIMAL(10,2))"
+    )
+    # Mixed-case regions (upper() collapses them) and few distinct dates over
+    # many rows: every (group, max-date) slice has multiple tied rows, so the
+    # SG-4 RANK path is genuinely exercised (ROW_NUMBER would drop ties).
+    regions = ["us", "US", "Us", "eu", "EU", "apac"]
+    dates = ["2024-01-05", "2024-02-05", "2024-03-05", "2024-04-05"]
+    rows = []
+    for i in range(N_SNAPSHOTS):
+        cust = None if rng.random() < 0.10 else rng.randrange(N_CUSTOMERS)
+        bal = None if rng.random() < 0.08 else round(rng.uniform(-100, 1000), 2)
+        rows.append((i, cust, rng.choice(regions), rng.choice(dates), bal))
+    conn.executemany("INSERT INTO snapshots VALUES (?, ?, ?, ?, ?)", rows)
+
+
+def semi_reference_sql(dims: list[str]) -> str:
+    """Independent reference for a NON ADDITIVE BY (snap_date DESC) metric:
+    MAX-date semi-join per group (NOT the engine's RANK formulation, so the
+    two paths share no mechanism). NULL-safe group join via IS NOT DISTINCT
+    FROM (tier contains NULLs)."""
+    sel = ", ".join(f"{SEMI_DIMS[d]} AS g{i}" for i, d in enumerate(dims))
+    base = (
+        "SELECT " + (sel + ", " if sel else "")
+        + "s.snap_date AS sd, s.balance AS bal "
+        "FROM snapshots s LEFT JOIN customers c ON s.customer_id = c.id"
+    )
+    if not dims:
+        return f"WITH b AS ({base}) SELECT SUM(bal) FROM b WHERE sd = (SELECT MAX(sd) FROM b)"
+    gcols = ", ".join(f"g{i}" for i in range(len(dims)))
+    on = " AND ".join(
+        [f"b.g{i} IS NOT DISTINCT FROM m.g{i}" for i in range(len(dims))] + ["b.sd = m.md"]
+    )
+    outer = ", ".join(f"b.g{i}" for i in range(len(dims)))
+    return (
+        f"WITH b AS ({base}), "
+        f"m AS (SELECT {gcols}, MAX(sd) AS md FROM b GROUP BY {gcols}) "
+        f"SELECT {outer}, SUM(b.bal) FROM b JOIN m ON {on} GROUP BY {outer}"
+    )
+
+
+def _check(conn, label: str, sv_sql: str, ref_sql: str) -> int:
+    """Run both sides, compare multisets; returns 1 on failure, 0 on match."""
+    try:
+        got = normalize(conn.execute(sv_sql).fetchall())
+        want = normalize(conn.execute(ref_sql).fetchall())
+    except Exception as exc:  # noqa: BLE001 — report and continue
+        print(f"FAIL {label}: query error: {exc}")
+        return 1
+    if rows_equal(got, want):
+        print(f"  PASS: {label}")
+        return 0
+    print(f"FAIL {label}: result mismatch")
+    print(f"  semantic_view rows={len(got)}, reference rows={len(want)}")
+    for g, w in list(zip(got, want))[:3]:
+        if not (len(g) == len(w) and all(values_equal(a, b) for a, b in zip(g, w))):
+            print(f"  first differing row: got={g!r} want={w!r}")
+            break
+    return 1
+
+
+def run_semi_additive_section(conn) -> tuple[int, int]:
+    seed_snapshots(conn)
+    conn.execute(
+        "CREATE SEMANTIC VIEW diff_semi AS "
+        "TABLES (s AS snapshots PRIMARY KEY (id), c AS customers PRIMARY KEY (id)) "
+        "RELATIONSHIPS (snap_cust AS s(customer_id) REFERENCES c) "
+        "DIMENSIONS (s.region_norm AS upper(s.region), c.tier AS c.tier, "
+        "s.snap_date AS s.snap_date) "
+        "METRICS (s.latest_balance NON ADDITIVE BY (snap_date DESC) AS SUM(s.balance), "
+        "s.total_balance AS SUM(s.balance))"
+    )
+    total, failures = 0, 0
+
+    # Active semi-additive: NA dim absent from the query.
+    for dims in ([], ["region_norm"], ["tier"], ["region_norm", "tier"]):
+        total += 1
+        parts = []
+        if dims:
+            parts.append("dimensions := [" + ", ".join(f"'{d}'" for d in dims) + "]")
+        parts.append("metrics := ['latest_balance']")
+        sv = f"SELECT * FROM semantic_view('diff_semi', {', '.join(parts)})"
+        failures += _check(conn, f"semi-additive dims={dims}", sv, semi_reference_sql(dims))
+
+    # Co-query: semi-additive + regular metric in one request.
+    total += 1
+    co_ref = (
+        "WITH b AS (SELECT upper(s.region) AS g0, s.snap_date AS sd, s.balance AS bal "
+        "FROM snapshots s LEFT JOIN customers c ON s.customer_id = c.id), "
+        "m AS (SELECT g0, MAX(sd) AS md FROM b GROUP BY g0), "
+        "sm AS (SELECT b.g0, SUM(b.bal) AS latest FROM b JOIN m "
+        "ON b.g0 IS NOT DISTINCT FROM m.g0 AND b.sd = m.md GROUP BY b.g0), "
+        "tt AS (SELECT g0, SUM(bal) AS total FROM b GROUP BY g0) "
+        "SELECT sm.g0, sm.latest, tt.total FROM sm JOIN tt "
+        "ON sm.g0 IS NOT DISTINCT FROM tt.g0"
+    )
+    failures += _check(
+        conn,
+        "semi-additive co-query with regular metric",
+        "SELECT * FROM semantic_view('diff_semi', dimensions := ['region_norm'], "
+        "metrics := ['latest_balance', 'total_balance'])",
+        co_ref,
+    )
+
+    # Effectively regular: ALL NA dims queried -> plain aggregation.
+    total += 1
+    failures += _check(
+        conn,
+        "semi-additive effectively-regular (NA dim queried)",
+        "SELECT * FROM semantic_view('diff_semi', "
+        "dimensions := ['region_norm', 'snap_date'], metrics := ['latest_balance'])",
+        "SELECT upper(region), snap_date, SUM(balance) FROM snapshots GROUP BY 1, 2",
+    )
+    return total, failures
+
+
+def run_window_section(conn) -> tuple[int, int]:
+    conn.execute(
+        "CREATE SEMANTIC VIEW diff_win AS "
+        "TABLES (s AS snapshots PRIMARY KEY (id)) "
+        "DIMENSIONS (s.region_norm AS upper(s.region), s.snap_date AS s.snap_date) "
+        "METRICS (s.total_balance AS SUM(s.balance), "
+        "s.running_total AS SUM(total_balance) OVER "
+        "(PARTITION BY EXCLUDING snap_date ORDER BY snap_date ASC NULLS LAST))"
+    )
+    total, failures = 0, 0
+
+    # Window metric: aggregate per (region, date), then running SUM within
+    # region ordered by date. Reference is hand-written aggregate-then-window.
+    total += 1
+    failures += _check(
+        conn,
+        "window metric running total",
+        "SELECT * FROM semantic_view('diff_win', "
+        "dimensions := ['region_norm', 'snap_date'], metrics := ['running_total'])",
+        "WITH agg AS (SELECT upper(region) AS g, snap_date AS d, SUM(balance) AS t "
+        "FROM snapshots GROUP BY 1, 2) "
+        "SELECT g, d, SUM(t) OVER (PARTITION BY g ORDER BY d ASC NULLS LAST) FROM agg",
+    )
+
+    # Window + aggregate metrics in one request is an EXPLICIT engine
+    # rejection (mirrors the SG-5 decomposability contract) — pin the error.
+    total += 1
+    try:
+        conn.execute(
+            "SELECT * FROM semantic_view('diff_win', "
+            "dimensions := ['region_norm', 'snap_date'], "
+            "metrics := ['total_balance', 'running_total'])"
+        ).fetchall()
+        failures += 1
+        print("FAIL window+aggregate co-query: expected mix error, query succeeded")
+    except Exception as exc:  # noqa: BLE001
+        if "cannot mix window function metrics" in str(exc):
+            print("  PASS: window+aggregate co-query raises the mix error")
+        else:
+            failures += 1
+            print(f"FAIL window+aggregate co-query: wrong error: {exc}")
+    return total, failures
+
+
+def run_wildcard_section(conn) -> tuple[int, int]:
+    total, failures = 0, 0
+    # Wildcards are alias-qualified (`alias.*`; bare `*` is rejected,
+    # matching Snowflake). `o.*` on metrics also includes the unqualified
+    # derived metric `net_revenue` (SG-15: source_table == None items belong
+    # to the base alias). Wildcard requests must equal explicit full lists.
+    total += 1
+    failures += _check(
+        conn,
+        "alias wildcards == explicit lists (diff_sv)",
+        "SELECT * FROM semantic_view('diff_sv', "
+        "dimensions := ['o.*', 'c.*', 'p.*', 'cat.*'], metrics := ['o.*'])",
+        "SELECT * FROM semantic_view('diff_sv', "
+        "dimensions := [" + ", ".join(f"'{d}'" for d in DIMS) + "], "
+        "metrics := [" + ", ".join(f"'{m}'" for m in METRICS) + "])",
+    )
+    # Bare `*` is a pinned rejection.
+    total += 1
+    try:
+        conn.execute(
+            "SELECT * FROM semantic_view('diff_sv', dimensions := ['*'])"
+        ).fetchall()
+        failures += 1
+        print("FAIL bare-star wildcard: expected rejection, query succeeded")
+    except Exception as exc:  # noqa: BLE001
+        if "unqualified wildcard '*' is not supported" in str(exc):
+            print("  PASS: bare '*' wildcard rejected with actionable message")
+        else:
+            failures += 1
+            print(f"FAIL bare-star wildcard: wrong error: {exc}")
+    # Wildcard routing with a WINDOW metric in the view: `s.*` expands to
+    # {total_balance, running_total}, which is the window+aggregate mix —
+    # the expansion must surface the same mix error as the explicit list.
+    total += 1
+    try:
+        conn.execute(
+            "SELECT * FROM semantic_view('diff_win', "
+            "dimensions := ['region_norm', 'snap_date'], metrics := ['s.*'])"
+        ).fetchall()
+        failures += 1
+        print("FAIL wildcard-window mix: expected mix error, query succeeded")
+    except Exception as exc:  # noqa: BLE001
+        if "cannot mix window function metrics" in str(exc):
+            print("  PASS: s.* expanding to window+aggregate raises the mix error")
+        else:
+            failures += 1
+            print(f"FAIL wildcard-window mix: wrong error: {exc}")
+    # Wildcard equivalence including a window metric, mix-free: request the
+    # window metric explicitly alongside a dims wildcard.
+    total += 1
+    failures += _check(
+        conn,
+        "dims wildcard + explicit window metric (diff_win)",
+        "SELECT * FROM semantic_view('diff_win', "
+        "dimensions := ['s.*'], metrics := ['running_total'])",
+        "SELECT * FROM semantic_view('diff_win', "
+        "dimensions := ['region_norm', 'snap_date'], metrics := ['running_total'])",
+    )
+    return total, failures
+
+
 def run_harness() -> int:
     import duckdb
 
@@ -377,6 +631,16 @@ def run_harness() -> int:
     else:
         failures += 1
         print(f"FAIL SG-8: item_count-by-region mismatch got={got} want={want}")
+
+    t, f = run_semi_additive_section(conn)
+    total += t
+    failures += f
+    t, f = run_window_section(conn)
+    total += t
+    failures += f
+    t, f = run_wildcard_section(conn)
+    total += t
+    failures += f
 
     print()
     print(f"Ran {total} dims×metrics combinations over {N_ORDERS} orders "

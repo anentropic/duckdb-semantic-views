@@ -779,6 +779,47 @@ mod tests {
     }
 
     #[test]
+    fn inline_derived_metrics_mixed_case_references_are_inlined() {
+        // E-2 regression (code-review 2026-07-11): the CREATE-time validators
+        // resolve metric references case-insensitively, but the substitution
+        // scanner compared raw bytes — `profit AS REVENUE - Cost` passed
+        // validation, skipped inlining, and leaked raw identifiers into the
+        // generated SQL (erroring or silently "working" depending on which
+        // other metrics were co-queried).
+        let metrics = vec![
+            make_metric("revenue", "SUM(o.rev)", Some("o")),
+            make_metric("cost", "SUM(o.cost)", Some("o")),
+            make_metric("profit", "REVENUE - Cost", None),
+        ];
+        let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+            .unwrap()
+            .exprs;
+        assert_eq!(
+            resolved.get("profit").unwrap(),
+            "(SUM(o.rev)) - (SUM(o.cost))"
+        );
+    }
+
+    #[test]
+    fn inline_facts_mixed_case_references_are_inlined() {
+        // E-2, facts arm: fact references are validated case-insensitively
+        // (graph/facts.rs lowercases both sides), so inlining must match
+        // any-case references to an as-declared fact name.
+        let facts = vec![Fact {
+            name: "net_price".to_string(),
+            expr: "price * (1 - discount)".to_string(),
+            source_table: Some("o".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Public,
+        }];
+        let topo = toposort_facts(&facts).unwrap();
+        let result = inline_facts("SUM(Net_Price)", &facts, &topo);
+        assert_eq!(result, "SUM((price * (1 - discount)))");
+    }
+
+    #[test]
     fn inline_derived_metrics_depth_limit_exceeded() {
         // Create a chain of 65 derived metrics: m0 -> m1 -> ... -> m64
         // m0 is base, m1..m64 are derived (64 derived exceeds the limit since

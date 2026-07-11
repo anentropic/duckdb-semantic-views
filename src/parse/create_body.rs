@@ -153,21 +153,20 @@ pub(crate) fn validate_create_body(
     // --- End AS keyword body path ---
 
     // --- FROM YAML body path (Phase 52 + Phase 53) ---
-    let is_yaml_body = after_name_trimmed
-        .get(..9)
-        .is_some_and(|s| s.eq_ignore_ascii_case("FROM YAML"))
-        && (after_name_trimmed.len() == 9
-            || after_name_trimmed.as_bytes()[9].is_ascii_whitespace());
-    if is_yaml_body {
-        let yaml_text = after_name_trimmed[9..].trim_start();
+    // P-7 (code-review 2026-07-11): keyword matching via match_keyword_prefix
+    // — the previous 9-byte literal compare required exactly one ASCII space,
+    // so `FROM  YAML`, `FROM\tYAML`, and `FROM /* fmt */ YAML` (comments are
+    // blanked to a RUN of spaces before this runs) all fell through to the
+    // generic "Expected 'AS' or 'FROM YAML'" error. Same fixed class as
+    // PA-10 / TECH-DEBT #4; this site was missed.
+    if let Some(kw_len) =
+        super::match_keyword_prefix(after_name_trimmed.as_bytes(), &[b"from", b"yaml"])
+    {
+        let yaml_text = after_name_trimmed[kw_len..].trim_start();
 
         // Phase 53: FROM YAML FILE '/path' sub-branch
-        let is_file = yaml_text
-            .get(..4)
-            .is_some_and(|s| s.eq_ignore_ascii_case("FILE"))
-            && (yaml_text.len() == 4 || yaml_text.as_bytes()[4].is_ascii_whitespace());
-        if is_file {
-            let file_text = yaml_text[4..].trim_start();
+        if let Some(file_len) = super::match_keyword_prefix(yaml_text.as_bytes(), &[b"file"]) {
+            let file_text = yaml_text[file_len..].trim_start();
             return rewrite_ddl_yaml_file_body(kind, name, file_text, view_comment).map(Some);
         }
 

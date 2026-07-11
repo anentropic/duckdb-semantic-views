@@ -198,14 +198,15 @@ true
 
 # ========================================
 # Test 8: DESCRIBE surfaces WINDOW_SPEC
-# DESCRIBE omits default ASC and NULLS LAST
+# C-5 (code-review 2026-07-11): DESCRIBE renders via the same helper as
+# GET_DDL — default ASC omitted, NULLS always explicit, frame preserved.
 # ========================================
 
 query TTTTT
 SELECT * FROM describe_semantic_view('p48_sales_view') WHERE property = 'WINDOW_SPEC' ORDER BY object_name;
 ----
-METRIC	avg_qty	p48_sales	WINDOW_SPEC	AVG(total_qty) OVER (PARTITION BY EXCLUDING date ORDER BY date)
-METRIC	qty_lag	p48_sales	WINDOW_SPEC	LAG(total_qty, 1) OVER (PARTITION BY EXCLUDING date ORDER BY date)
+METRIC	avg_qty	p48_sales	WINDOW_SPEC	AVG(total_qty) OVER (PARTITION BY EXCLUDING date ORDER BY date NULLS LAST)
+METRIC	qty_lag	p48_sales	WINDOW_SPEC	LAG(total_qty, 1) OVER (PARTITION BY EXCLUDING date ORDER BY date NULLS LAST)
 
 # ========================================
 # Test 9: Window metric over a safe many-to-one join direction

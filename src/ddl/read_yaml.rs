@@ -100,10 +100,13 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
                 return 1_u8;
             }
         };
-        let def: SemanticViewDefinition = match serde_json::from_str(&json) {
+        // C-2 (code-review 2026-07-11): `from_json` for the canonical
+        // "invalid definition for semantic view '<name>'" context on corrupt
+        // rows, matching every TF dispatcher.
+        let def = match SemanticViewDefinition::from_json(&bare_name, &json) {
             Ok(d) => d,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.to_string());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };

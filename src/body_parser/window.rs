@@ -186,13 +186,37 @@ fn parse_over_content(
     let mut order_by: Vec<WindowOrderBy> = Vec::new();
     let order_pos = find_keyword_ci(remaining_upper, "ORDER");
     if let Some(opos) = order_pos {
-        let after_order = &remaining[opos..];
-        let after_order_upper = &remaining_upper[opos..];
-        // Skip "ORDER BY" (consume ORDER, then BY)
-        let by_pos = find_keyword_ci(&after_order_upper[5..], "BY");
-        if let Some(bp) = by_pos {
-            let after_order_by = &after_order[5 + bp + 2..].trim();
-            let after_order_by_upper = after_order_upper[5 + bp + 2..].trim();
+        // P-3 (code-review 2026-07-11): text before ORDER at this point is
+        // not valid OVER-clause content — it was previously skipped silently.
+        if !remaining[..opos].trim().is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "Unexpected text '{}' before ORDER BY in OVER clause.",
+                    remaining[..opos].trim()
+                ),
+                position: Some(base_offset),
+            });
+        }
+        let after_order = &remaining[opos + 5..];
+        let after_order_upper = &remaining_upper[opos + 5..];
+        // P-3: ORDER must be immediately followed by BY. Previously BY was
+        // searched for ANYWHERE after ORDER (junk between them was skipped),
+        // and when BY was absent the whole tail fell through silently and
+        // `ORDER d` was stored as the frame clause — accepted with no
+        // ordering applied.
+        let ws_len = after_order.len() - after_order.trim_start().len();
+        let at_by = &after_order_upper.as_bytes()[ws_len..];
+        let by_ok =
+            at_by.starts_with(b"BY") && (at_by.len() == 2 || !is_ident_continuation(at_by[2]));
+        if !by_ok {
+            return Err(ParseError {
+                message: "Expected BY immediately after ORDER in OVER clause.".to_string(),
+                position: Some(base_offset),
+            });
+        }
+        {
+            let after_order_by = after_order[ws_len + 2..].trim();
+            let after_order_by_upper = after_order_upper[ws_len + 2..].trim();
 
             // Find end of ORDER BY: frame clause or end of string
             let frame_start = find_frame_start(after_order_by_upper);
@@ -241,6 +265,19 @@ fn parse_over_content(
                 });
             }
 
+            // P-3: ORDER BY must yield at least one parsed entry. Without
+            // this, an unquoted reference named `range`/`rows`/`groups` was
+            // claimed by `find_frame_start`, leaving zero entries and a
+            // bogus frame clause with no diagnostics.
+            if order_by.is_empty() {
+                return Err(ParseError {
+                    message: format!(
+                        "Expected column reference after ORDER BY in OVER clause, found '{after_order_by}'. (Quote the reference if it is named like a frame keyword.)"
+                    ),
+                    position: Some(base_offset),
+                });
+            }
+
             // Frame clause is everything after ORDER BY entries
             remaining = match frame_start {
                 Some(fpos) => after_order_by[fpos..].trim(),
@@ -249,10 +286,25 @@ fn parse_over_content(
         }
     }
 
-    // Whatever is left is the frame clause
+    // Whatever is left is the frame clause. P-3: validate it actually IS one
+    // — previously any residue was stored verbatim as `frame_clause`.
     let frame_clause = if remaining.is_empty() {
         None
     } else {
+        let upper_rem = remaining.to_ascii_uppercase();
+        let is_frame = [&b"ROWS"[..], b"RANGE", b"GROUPS"].iter().any(|kw| {
+            upper_rem.as_bytes().starts_with(kw)
+                && (upper_rem.len() == kw.len()
+                    || !is_ident_continuation(upper_rem.as_bytes()[kw.len()]))
+        });
+        if !is_frame {
+            return Err(ParseError {
+                message: format!(
+                    "Expected frame clause starting with ROWS, RANGE, or GROUPS in OVER clause, found '{remaining}'."
+                ),
+                position: Some(base_offset),
+            });
+        }
         Some(remaining.to_string())
     };
 

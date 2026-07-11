@@ -205,24 +205,50 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
             }
         };
 
+        // R-3 (code-review 2026-07-11): wildcard failures render through
+        // QueryError::WildcardExpansion, matching semantic_view()'s wording.
         let dimensions = match expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension) {
             Ok(v) => v,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::WildcardExpansion {
+                        view_name: view_name.clone(),
+                        detail: e,
+                    }
+                    .to_string(),
+                );
                 return 1_u8;
             }
         };
         let metrics = match expand_wildcards(&metrics, &def, &WildcardItemType::Metric) {
             Ok(v) => v,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::WildcardExpansion {
+                        view_name: view_name.clone(),
+                        detail: e,
+                    }
+                    .to_string(),
+                );
                 return 1_u8;
             }
         };
         let facts = match expand_wildcards(&facts, &def, &WildcardItemType::Fact) {
             Ok(v) => v,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
+                write_err(
+                    error_buf,
+                    error_buf_len,
+                    &QueryError::WildcardExpansion {
+                        view_name: view_name.clone(),
+                        detail: e,
+                    }
+                    .to_string(),
+                );
                 return 1_u8;
             }
         };

@@ -206,10 +206,9 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
                 write_err(
                     error_buf,
                     error_buf_len,
-                    &QueryError::ExpandFailed {
-                        source: crate::expand::ExpandError::EmptyRequest {
-                            view_name: format!("{view_name}: {e}"),
-                        },
+                    &QueryError::WildcardExpansion {
+                        view_name: view_name.clone(),
+                        detail: e,
                     }
                     .to_string(),
                 );
@@ -222,10 +221,9 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
                 write_err(
                     error_buf,
                     error_buf_len,
-                    &QueryError::ExpandFailed {
-                        source: crate::expand::ExpandError::EmptyRequest {
-                            view_name: format!("{view_name}: {e}"),
-                        },
+                    &QueryError::WildcardExpansion {
+                        view_name: view_name.clone(),
+                        detail: e,
                     }
                     .to_string(),
                 );
@@ -238,10 +236,9 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
                 write_err(
                     error_buf,
                     error_buf_len,
-                    &QueryError::ExpandFailed {
-                        source: crate::expand::ExpandError::EmptyRequest {
-                            view_name: format!("{view_name}: {e}"),
-                        },
+                    &QueryError::WildcardExpansion {
+                        view_name: view_name.clone(),
+                        detail: e,
                     }
                     .to_string(),
                 );

@@ -13,6 +13,12 @@ pub enum QueryError {
     },
     /// The query specified neither dimensions nor metrics.
     EmptyRequest { view_name: String },
+    /// A wildcard (`*` / `prefix*`) in dimensions/metrics/facts failed to
+    /// expand (R-3, code-review 2026-07-11: these errors were previously
+    /// smuggled through `ExpandError::EmptyRequest`'s `view_name` field,
+    /// rendering the diagnostic inside quotes followed by irrelevant
+    /// "specify at least dimensions" advice).
+    WildcardExpansion { view_name: String, detail: String },
     /// The expansion engine returned an error.
     ExpandFailed { source: ExpandError },
     /// The expanded SQL failed to execute against `DuckDB`.
@@ -61,6 +67,9 @@ impl fmt::Display for QueryError {
                     " Run DESCRIBE SEMANTIC VIEW {view_name} to see available dimensions, metrics, and facts."
                 )
             }
+            Self::WildcardExpansion { view_name, detail } => {
+                write!(f, "semantic view '{view_name}': {detail}")
+            }
             Self::ExpandFailed { source } => {
                 write!(f, "{source}")
             }
@@ -104,5 +113,26 @@ impl std::error::Error for QueryError {
 impl From<ExpandError> for QueryError {
     fn from(source: ExpandError) -> Self {
         Self::ExpandFailed { source }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_expansion_display_renders_detail_directly() {
+        // R-3 regression (code-review 2026-07-11): wildcard failures were
+        // smuggled through ExpandError::EmptyRequest's view_name field,
+        // rendering as `semantic view 'orders: unknown alias ...': specify
+        // at least dimensions := [...]` — diagnostic buried, advice wrong.
+        let e = QueryError::WildcardExpansion {
+            view_name: "orders".to_string(),
+            detail: "unknown alias 'x' in wildcard 'x.*'".to_string(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "semantic view 'orders': unknown alias 'x' in wildcard 'x.*'"
+        );
     }
 }

@@ -1,0 +1,166 @@
+# Code-review 2026-07-11 correctness fixes — executed regression coverage.
+# E-1: semi-additive RANK() window must partition/order by the dimension
+#      EXPRESSION, not the CTE alias (alias binds to a same-named physical
+#      column, silently producing wrong snapshot sums).
+# E-2: derived-metric references resolve case-insensitively end-to-end.
+# P-1: TABLES entry rejects text between source-table name and constraints.
+# P-3: OVER clause rejects ORDER without BY.
+# C-2: GET_DDL normalizes the view name like every other read path.
+
+require semantic_views
+
+# ========================================
+# E-1 setup: dimension expression differs from its bare column, and the
+# raw column values collide case-insensitively ('us' vs 'US'). Includes a
+# tie at the snapshot date within one normalized region (SG-4 RANK path).
+# ========================================
+
+statement ok
+CREATE TABLE cr1_accounts (
+    id INTEGER PRIMARY KEY,
+    region VARCHAR,
+    snap_date DATE,
+    balance DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO cr1_accounts VALUES
+    (1, 'us', '2024-01-01', 1.00),
+    (2, 'US', '2024-01-02', 2.00),
+    (3, 'us', '2024-01-02', 5.00),
+    (4, 'eu', '2024-01-01', 10.00),
+    (5, 'EU', '2024-01-01', 20.00);
+
+statement ok
+CREATE SEMANTIC VIEW cr1_view AS
+TABLES (
+    a AS cr1_accounts PRIMARY KEY (id)
+)
+DIMENSIONS (
+    a.region AS upper(a.region),
+    a.snap_date AS a.snap_date
+)
+METRICS (
+    a.latest_balance NON ADDITIVE BY (snap_date DESC) AS SUM(a.balance)
+)
+
+# E-1: partitioning must be on upper(a.region), so 'us'/'US' form ONE
+# partition per normalized region. US snapshot = 2024-01-02 rows (2.00 +
+# 5.00, tied at the snapshot date — both contribute via RANK). EU snapshot
+# = 2024-01-01 rows (10.00 + 20.00, tied). The pre-fix alias binding
+# partitioned on raw region and returned US = 8.00 (1+2+5).
+query TR
+SELECT region, latest_balance FROM semantic_view('cr1_view',
+    dimensions := ['region'], metrics := ['latest_balance']) ORDER BY region;
+----
+EU	30
+US	7
+
+# The expanded SQL repeats the expression inside the window clause.
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('cr1_view',
+    dimensions := ['region'], metrics := ['latest_balance'])
+WHERE explain_output LIKE '%PARTITION BY upper(a.region)%';
+----
+true
+
+# ========================================
+# E-2: derived metric written with different casing than its base metrics
+# must inline and execute (validators were already case-insensitive).
+# ========================================
+
+statement ok
+CREATE TABLE cr2_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), cost DECIMAL(10,2));
+
+statement ok
+INSERT INTO cr2_orders VALUES (1, 10.00, 4.00), (2, 20.00, 6.00);
+
+statement ok
+CREATE SEMANTIC VIEW cr2_view AS
+TABLES (
+    o AS cr2_orders PRIMARY KEY (id)
+)
+DIMENSIONS (
+    o.order_id AS o.id
+)
+METRICS (
+    o.revenue AS SUM(o.amount),
+    o.cost AS SUM(o.cost),
+    profit AS REVENUE - Cost
+)
+
+# Pre-fix this errored with `Referenced column "REVENUE" not found` when
+# profit was queried alone (and silently "worked" only when co-queried
+# with revenue and cost — DuckDB's lateral alias resolution rescued it).
+query R
+SELECT profit FROM semantic_view('cr2_view', metrics := ['profit']);
+----
+20
+
+# ========================================
+# P-1: misplaced annotation / junk before constraints is a loud error.
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW cr3_view AS
+TABLES (o AS cr2_orders COMMENT = 'load-bearing doc' PRIMARY KEY (id))
+DIMENSIONS (o.order_id AS o.id)
+METRICS (o.revenue AS SUM(o.amount))
+----
+between source table name and PRIMARY KEY
+
+statement error
+CREATE SEMANTIC VIEW cr3_view AS
+TABLES (o AS cr2_orders PRIMARY KEY (id) junk UNIQUE (amount))
+DIMENSIONS (o.order_id AS o.id)
+METRICS (o.revenue AS SUM(o.amount))
+----
+before UNIQUE
+
+# ========================================
+# P-3: OVER clause — ORDER without BY, and junk content, are loud errors.
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW cr4_view AS
+TABLES (o AS cr2_orders PRIMARY KEY (id))
+DIMENSIONS (o.order_id AS o.id)
+METRICS (
+    o.revenue AS SUM(o.amount),
+    o.running AS AVG(revenue) OVER (PARTITION BY order_id ORDER amount)
+)
+----
+Expected BY immediately after ORDER
+
+statement error
+CREATE SEMANTIC VIEW cr4_view AS
+TABLES (o AS cr2_orders PRIMARY KEY (id))
+DIMENSIONS (o.order_id AS o.id)
+METRICS (
+    o.revenue AS SUM(o.amount),
+    o.running AS AVG(revenue) OVER (banana)
+)
+----
+Expected frame clause starting with ROWS, RANGE, or GROUPS
+
+# ========================================
+# C-2: GET_DDL folds unquoted case and strips qualification like every
+# other single-view read path.
+# ========================================
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'CR2_View') LIKE '%CREATE OR REPLACE SEMANTIC VIEW%';
+----
+true
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'main.cr2_view') LIKE '%CREATE OR REPLACE SEMANTIC VIEW%';
+----
+true
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW cr1_view
+
+statement ok
+DROP SEMANTIC VIEW cr2_view
