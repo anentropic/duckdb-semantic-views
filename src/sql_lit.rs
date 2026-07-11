@@ -5,11 +5,17 @@
 //! SQL by interpolating user-supplied names/comments into single-quoted
 //! literals. Escaping was carried by a naming convention (`name_escaped:
 //! &str`) with a free `escape_sql_arg` / `unescape_sql_arg` pair, so nothing
-//! at the type level stopped a call site from (a) forgetting to escape — an
-//! injection into emitted DDL — or (b) escaping an already-escaped value
-//! twice. This newtype makes both a compile error: a value can only reach an
-//! emission helper by going through [`SqlLit::escape`] exactly once, and a
-//! raw `&str` no longer type-checks where a `&SqlLit` is required.
+//! at the type level distinguished a raw value from an escaped one.
+//!
+//! This newtype makes the raw-vs-escaped distinction type-enforced and
+//! centralizes escaping at one boundary: the emission helpers take `&SqlLit`,
+//! so a raw `&str` no longer type-checks (the accidental "forgot to escape →
+//! injection" footgun is a compile error), and the only way to obtain a
+//! `SqlLit` is [`SqlLit::escape`], so escaping happens once, at the
+//! `rewrite_to_native_sql` boundary. It does NOT make double-escaping
+//! impossible — a caller could deliberately round-trip through `Display`
+//! (`SqlLit::escape(&lit.to_string())`) — but that is an intentional act, not
+//! an accidental one, and there is no such call site.
 
 // The only non-test constructor call sites are the `extension`-gated write
 // emitters (`crate::parse::native_sql`); under a default, non-test build the
@@ -25,10 +31,10 @@ pub(crate) struct SqlLit(String);
 
 impl SqlLit {
     /// Escape a raw value for embedding in a single-quoted SQL literal:
-    /// doubles every `'`. This is the single entry point, so a value that
-    /// exists as a `SqlLit` has been escaped exactly once. Interpolate the
-    /// result with `{sql_lit}` (the `Display` impl) to emit the escaped text
-    /// between the caller-supplied quotes.
+    /// doubles every `'`. The sole constructor, so a `SqlLit` obtained from a
+    /// raw value carries exactly one escaping pass. Interpolate the result
+    /// with `{sql_lit}` (the `Display` impl) to emit the escaped text between
+    /// the caller-supplied quotes.
     #[must_use]
     pub(crate) fn escape(raw: &str) -> Self {
         Self(raw.replace('\'', "''"))
