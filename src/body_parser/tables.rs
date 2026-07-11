@@ -135,6 +135,24 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     let upper_after_name = after_name.to_ascii_uppercase();
     let pk_pos = find_primary_key(&upper_after_name);
 
+    // P-1 (code-review 2026-07-11): reject text between the source-table
+    // name and PRIMARY KEY instead of silently discarding it. The keyword
+    // scan finds PRIMARY KEY anywhere in the post-name slice, so
+    // `o AS orders COMMENT = 'doc' PRIMARY KEY (id)` previously parsed
+    // "successfully" with the comment destroyed.
+    if let Some((pk_start, _)) = pk_pos {
+        let pre = &after_name[..pk_start];
+        if !pre.trim().is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "Unexpected text '{}' between source table name and PRIMARY KEY for alias '{alias}' in TABLES clause. Constraints must immediately follow the table name; COMMENT / WITH SYNONYMS come after constraints.",
+                    pre.trim()
+                ),
+                position: Some(after_name_offset + (pre.len() - pre.trim_start().len())),
+            });
+        }
+    }
+
     let (pk_columns, after_pk_text) = if let Some((_pk_start, pk_end)) = pk_pos {
         let after_pk = after_name[pk_end..].trim_start();
         if !after_pk.starts_with('(') {
@@ -171,7 +189,20 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     let mut remaining = after_pk_text;
     loop {
         let upper_remaining = remaining.to_ascii_uppercase();
-        if let Some((_u_start, u_end)) = find_unique(&upper_remaining) {
+        if let Some((u_start, u_end)) = find_unique(&upper_remaining) {
+            // P-1 companion: text before a UNIQUE constraint is an error,
+            // not silently discarded (the same anywhere-scan hole as the
+            // PRIMARY KEY slot above).
+            let pre = &remaining[..u_start];
+            if !pre.trim().is_empty() {
+                return Err(ParseError {
+                    message: format!(
+                        "Unexpected text '{}' before UNIQUE for alias '{alias}' in TABLES clause. Constraints must immediately follow the table name or the preceding constraint; COMMENT / WITH SYNONYMS come after constraints.",
+                        pre.trim()
+                    ),
+                    position: Some(entry_offset),
+                });
+            }
             let after_unique_kw = remaining[u_end..].trim_start();
             if !after_unique_kw.starts_with('(') {
                 return Err(ParseError {

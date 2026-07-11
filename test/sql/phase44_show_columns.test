@@ -104,4 +104,4 @@ total_revenue	Total revenue
 statement error
 SHOW COLUMNS IN SEMANTIC VIEW nonexistent_view
 ----
-not found
+semantic view 'nonexistent_view' does not exist

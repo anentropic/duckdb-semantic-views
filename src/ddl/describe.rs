@@ -498,84 +498,29 @@ fn collect_metric_rows(
             },
         });
         if !metric.non_additive_by.is_empty() {
-            let na_value = metric
-                .non_additive_by
-                .iter()
-                .map(|na| {
-                    let mut s = na.dimension.clone();
-                    match na.order {
-                        crate::model::SortOrder::Desc => s.push_str(" DESC"),
-                        crate::model::SortOrder::Asc => {}
-                    }
-                    match na.nulls {
-                        crate::model::NullsOrder::First => s.push_str(" NULLS FIRST"),
-                        crate::model::NullsOrder::Last => {}
-                    }
-                    s
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
+            // C-5 (code-review 2026-07-11): single-sourced with GET_DDL. The
+            // previous inline copy omitted NULLS LAST (asymmetric with the
+            // always-explicit NULLS that GET_DDL emits for the same object).
             rows.push(DescribeRow {
                 object_kind: object_kind.to_string(),
                 object_name: metric.name.clone(),
                 parent_entity: parent.clone(),
                 property: "NON_ADDITIVE_BY".to_string(),
-                property_value: na_value,
+                property_value: crate::render_ddl::render_non_additive_entries(
+                    &metric.non_additive_by,
+                ),
             });
         }
         if let Some(ref ws) = metric.window_spec {
-            let mut ws_value = format!("{}({})", ws.window_function, ws.inner_metric);
-            if !ws.extra_args.is_empty() {
-                // Rewrite to include extra args: e.g., LAG(metric, 30)
-                ws_value = format!(
-                    "{}({}, {})",
-                    ws.window_function,
-                    ws.inner_metric,
-                    ws.extra_args.join(", ")
-                );
-            }
-            ws_value.push_str(" OVER (");
-            let has_partition = if !ws.excluding_dims.is_empty() {
-                ws_value.push_str("PARTITION BY EXCLUDING ");
-                ws_value.push_str(&ws.excluding_dims.join(", "));
-                true
-            } else if !ws.partition_dims.is_empty() {
-                ws_value.push_str("PARTITION BY ");
-                ws_value.push_str(&ws.partition_dims.join(", "));
-                true
-            } else {
-                false
-            };
-            if !ws.order_by.is_empty() {
-                if has_partition {
-                    ws_value.push(' ');
-                }
-                ws_value.push_str("ORDER BY ");
-                let ob_strs: Vec<String> = ws
-                    .order_by
-                    .iter()
-                    .map(|ob| {
-                        let mut s = ob.expr.clone();
-                        match ob.order {
-                            crate::model::SortOrder::Desc => s.push_str(" DESC"),
-                            crate::model::SortOrder::Asc => {}
-                        }
-                        match ob.nulls {
-                            crate::model::NullsOrder::First => s.push_str(" NULLS FIRST"),
-                            crate::model::NullsOrder::Last => {}
-                        }
-                        s
-                    })
-                    .collect();
-                ws_value.push_str(&ob_strs.join(", "));
-            }
-            ws_value.push(')');
+            // C-5: single-sourced with GET_DDL. The previous inline copy
+            // dropped `frame_clause` entirely — DESCRIBE silently
+            // under-reported metrics carrying RANGE/ROWS frames.
             rows.push(DescribeRow {
                 object_kind: object_kind.to_string(),
                 object_name: metric.name.clone(),
                 parent_entity: parent,
                 property: "WINDOW_SPEC".to_string(),
-                property_value: ws_value,
+                property_value: crate::render_ddl::render_window_spec(ws),
             });
         }
     }
@@ -709,6 +654,83 @@ mod tests {
         assert!(
             total_rows.is_empty(),
             "Regular metric should not have WINDOW_SPEC row"
+        );
+    }
+
+    #[test]
+    fn window_spec_property_includes_frame_clause_and_explicit_nulls() {
+        // C-5 regression (code-review 2026-07-11): DESCRIBE's inline
+        // window-spec renderer had drifted from GET_DDL's — it dropped
+        // `frame_clause` entirely (a RANGE/ROWS frame silently vanished from
+        // DESCRIBE output) and emitted NULLS FIRST only. Both must now render
+        // through the shared `render_ddl` helpers, byte-identical to GET_DDL.
+        use crate::model::{
+            AccessModifier, Metric, NonAdditiveDim, NullsOrder, SortOrder, TableRef, WindowOrderBy,
+            WindowSpec,
+        };
+        let ws = WindowSpec {
+            window_function: "SUM".to_string(),
+            inner_metric: "total_qty".to_string(),
+            extra_args: vec![],
+            excluding_dims: vec![],
+            partition_dims: vec!["region".to_string()],
+            order_by: vec![WindowOrderBy {
+                expr: "d".to_string(),
+                order: SortOrder::Asc,
+                nulls: NullsOrder::Last,
+            }],
+            frame_clause: Some("RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW".into()),
+        };
+        let def = SemanticViewDefinition {
+            tables: vec![TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                pk_columns: vec!["id".to_string()],
+                ..Default::default()
+            }],
+            metrics: vec![Metric {
+                name: "windowed".to_string(),
+                expr: "SUM(total_qty) OVER (...)".to_string(),
+                source_table: Some("o".to_string()),
+                access: AccessModifier::Public,
+                window_spec: Some(ws.clone()),
+                non_additive_by: vec![NonAdditiveDim {
+                    dimension: "snap_date".to_string(),
+                    order: SortOrder::Desc,
+                    nulls: NullsOrder::Last,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let alias_map = def.alias_to_table_map();
+        let mut rows = Vec::new();
+        collect_metric_rows(&def, "orders", &alias_map, &mut rows);
+
+        let ws_row = rows
+            .iter()
+            .find(|r| r.property == "WINDOW_SPEC")
+            .expect("Should have WINDOW_SPEC row");
+        assert!(
+            ws_row
+                .property_value
+                .contains("RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW"),
+            "frame clause must survive into DESCRIBE output: {}",
+            ws_row.property_value
+        );
+        assert_eq!(
+            ws_row.property_value,
+            crate::render_ddl::render_window_spec(&ws),
+            "DESCRIBE and GET_DDL must render the identical window spec"
+        );
+
+        let na_row = rows
+            .iter()
+            .find(|r| r.property == "NON_ADDITIVE_BY")
+            .expect("Should have NON_ADDITIVE_BY row");
+        assert_eq!(
+            na_row.property_value, "snap_date DESC NULLS LAST",
+            "NULLS LAST must be explicit (previously omitted)"
         );
     }
 }

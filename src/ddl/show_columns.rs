@@ -72,10 +72,13 @@ pub unsafe extern "C" fn sv_show_columns_in_semantic_view_bind_rust(
         let json = match reader.lookup(&view_name) {
             Ok(Some(j)) => j,
             Ok(None) => {
+                // C-4 (code-review 2026-07-11): canonical wording via
+                // view_not_found_msg — SHOW COLUMNS was the one read path
+                // with divergent "not found" phrasing.
                 write_err(
                     error_buf,
                     error_buf_len,
-                    &format!("Semantic view '{view_name}' not found"),
+                    &crate::catalog::view_not_found_msg(&view_name),
                 );
                 return 1_u8;
             }

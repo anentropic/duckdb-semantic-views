@@ -34,7 +34,11 @@ pub fn suggest_closest(name: &str, available: &[String]) -> Option<String> {
 /// alphanumeric or underscore. This prevents `net_price` from matching inside
 /// `net_price_total` or `my_net_price`.
 ///
-/// The matching is case-sensitive (fact names are identifiers).
+/// Matching is ASCII-case-insensitive: unquoted SQL identifiers resolve
+/// case-insensitively, and the CREATE-time validators (`graph/facts.rs`,
+/// `graph/derived_metrics.rs`) already lowercase both sides — a
+/// case-sensitive substitution here let `profit AS REVENUE - Cost` pass
+/// validation but skip inlining (E-2, code-review 2026-07-11).
 #[must_use]
 pub fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() || needle.len() > haystack.len() {
@@ -49,7 +53,7 @@ pub fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) ->
     let mut i = 0;
 
     while i + n_len <= h_bytes.len() {
-        if &h_bytes[i..i + n_len] == n_bytes {
+        if h_bytes[i..i + n_len].eq_ignore_ascii_case(n_bytes) {
             let before_ok = i == 0 || is_word_boundary_char(h_bytes[i - 1]);
             let after_ok = i + n_len == h_bytes.len() || is_word_boundary_char(h_bytes[i + n_len]);
             if before_ok && after_ok {
@@ -107,6 +111,8 @@ pub fn replace_word_boundary_any(haystack: &str, needles: &[&str], replacement: 
 /// a column reference inside another metric's resolved expression (`revenue`
 /// inside `SUM(o.revenue)` — `.` is a word boundary) got double-substituted
 /// into invalid nested-aggregate SQL, dependent on hash-map iteration order.
+///
+/// Matching is ASCII-case-insensitive (see [`replace_word_boundary`] — E-2).
 #[must_use]
 pub fn replace_word_boundary_pairs(haystack: &str, pairs: &[(&str, &str)]) -> String {
     let h_bytes = haystack.as_bytes();
@@ -121,7 +127,7 @@ pub fn replace_word_boundary_pairs(haystack: &str, pairs: &[(&str, &str)]) -> St
             if n_len == 0 || i + n_len > h_bytes.len() {
                 continue;
             }
-            if &h_bytes[i..i + n_len] == n_bytes {
+            if h_bytes[i..i + n_len].eq_ignore_ascii_case(n_bytes) {
                 let before_ok = i == 0 || is_word_boundary_char(h_bytes[i - 1]);
                 let after_ok =
                     i + n_len == h_bytes.len() || is_word_boundary_char(h_bytes[i + n_len]);
@@ -497,6 +503,27 @@ mod tests {
     }
 
     #[test]
+    fn replace_word_boundary_case_insensitive_match() {
+        // E-2 (code-review 2026-07-11): validators are case-insensitive, so
+        // substitution must be too — `REVENUE` must match needle `revenue`.
+        let result = replace_word_boundary("REVENUE + tax", "revenue", "(SUM(o.amount))");
+        assert_eq!(result, "(SUM(o.amount)) + tax");
+        // Mixed case, and the boundary rules still hold.
+        assert_eq!(
+            replace_word_boundary("Net_Price_total", "net_price", "(x)"),
+            "Net_Price_total"
+        );
+    }
+
+    #[test]
+    fn replace_word_boundary_pairs_case_insensitive_match() {
+        // E-2 repro shape: `profit AS REVENUE - Cost` with lowercased needles.
+        let pairs = vec![("revenue", "(SUM(o.rev))"), ("cost", "(SUM(o.cost))")];
+        let result = replace_word_boundary_pairs("REVENUE - Cost", &pairs);
+        assert_eq!(result, "(SUM(o.rev)) - (SUM(o.cost))");
+    }
+
+    #[test]
     fn replace_word_boundary_pairs_distinct_replacements_single_pass() {
         let pairs = [
             ("revenue", "(SUM(o.revenue))"),
@@ -536,7 +563,9 @@ mod tests {
             replacement in "\\PC{0,12}",
         ) {
             let out = replace_word_boundary(&haystack, &needle, &replacement);
-            if !haystack.contains(&needle) {
+            // Matching is ASCII-case-insensitive (E-2), so the no-match
+            // invariant must fold case the same way.
+            if !haystack.to_ascii_lowercase().contains(&needle) {
                 prop_assert_eq!(out, haystack);
             }
         }

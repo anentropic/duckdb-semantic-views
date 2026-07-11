@@ -81,6 +81,14 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
             return 1_u8;
         }
 
+        // C-2 (code-review 2026-07-11): normalize the requested name like
+        // every other single-view read path (FF-4/PA-8 sweep) — fold
+        // unquoted case, strip qualification, unwrap quoting. Lenient
+        // contract mirrors read_yaml's `resolve_bare_name`: a name that does
+        // not parse as an identifier is looked up verbatim and fails with
+        // the canonical "does not exist" message.
+        let name = crate::ident::normalize_view_name(name).unwrap_or_else(|_| name.to_string());
+
         // FF-9: surface a probe-query failure as an error distinct from "no
         // views" instead of silently folding it into absence.
         let present = match probe_catalog_table_present(&borrowed) {
@@ -91,13 +99,13 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
             }
         };
         let reader = CatalogReader::new(&borrowed, present);
-        let json = match reader.lookup(name) {
+        let json = match reader.lookup(&name) {
             Ok(Some(j)) => j,
             Ok(None) => {
                 write_err(
                     error_buf,
                     error_buf_len,
-                    &crate::catalog::view_not_found_msg(name),
+                    &crate::catalog::view_not_found_msg(&name),
                 );
                 return 1_u8;
             }
@@ -106,14 +114,17 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
                 return 1_u8;
             }
         };
-        let def: SemanticViewDefinition = match serde_json::from_str(&json) {
+        // C-2: `from_json` for the canonical "invalid definition for
+        // semantic view '<name>'" context on corrupt rows (raw serde
+        // messages were the get_ddl/read_yaml exception).
+        let def = match SemanticViewDefinition::from_json(&name, &json) {
             Ok(d) => d,
             Err(e) => {
-                write_err(error_buf, error_buf_len, &e.to_string());
+                write_err(error_buf, error_buf_len, &e);
                 return 1_u8;
             }
         };
-        let ddl = match render_create_ddl(name, &def) {
+        let ddl = match render_create_ddl(&name, &def) {
             Ok(s) => s,
             Err(e) => {
                 write_err(error_buf, error_buf_len, &format!("GET_DDL error: {e}"));

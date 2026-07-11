@@ -641,6 +641,93 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // P-1 (code-review 2026-07-11): text between the source-table name and a
+    // PRIMARY KEY / UNIQUE constraint must be rejected, not silently
+    // discarded. The anywhere-scan for the constraint keywords previously
+    // dropped everything before the match — including a naturally-misplaced
+    // COMMENT annotation (silent data loss).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_table_entry_comment_before_pk_rejected() {
+        let err = parse_tables_clause(
+            "o AS orders COMMENT = 'load-bearing doc' PRIMARY KEY (id)",
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            err.message
+                .contains("between source table name and PRIMARY KEY"),
+            "got: {}",
+            err.message
+        );
+        assert!(err.position.is_some(), "error must carry a position");
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_junk_before_pk_rejected() {
+        let err = parse_tables_clause("o AS orders banana PRIMARY KEY (id)", 0).unwrap_err();
+        assert!(
+            err.message.contains("Unexpected text 'banana'"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_junk_between_pk_and_unique_rejected() {
+        let err =
+            parse_tables_clause("o AS orders PRIMARY KEY (id) junk UNIQUE (email)", 0).unwrap_err();
+        assert!(
+            err.message.contains("before UNIQUE"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_annotation_before_unique_rejected() {
+        let err = parse_tables_clause("o AS orders COMMENT = 'doc' UNIQUE (email)", 0).unwrap_err();
+        assert!(
+            err.message.contains("before UNIQUE"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_full_form_still_parses() {
+        // The complete legal ordering is unaffected by the P-1 guards.
+        let result = parse_tables_clause(
+            "o AS orders PRIMARY KEY (id) UNIQUE (email) COMMENT = 'doc' WITH SYNONYMS = ('ord')",
+            0,
+        )
+        .unwrap();
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+        assert_eq!(
+            result[0].unique_constraints,
+            vec![vec!["email".to_string()]]
+        );
+        assert_eq!(result[0].comment.as_deref(), Some("doc"));
+        assert_eq!(result[0].synonyms, vec!["ord".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_unique_inside_comment_string_ok() {
+        // The constraint scans are quote-aware: keyword text INSIDE the
+        // annotation string must not trip the P-1 guards.
+        let result = parse_tables_clause(
+            "o AS orders PRIMARY KEY (id) COMMENT = 'has UNIQUE and PRIMARY KEY inside'",
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            result[0].comment.as_deref(),
+            Some("has UNIQUE and PRIMARY KEY inside")
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Phase 68 A1 (D-03): bare reserved keywords (PRIMARY, UNIQUE, FOREIGN,
     // REFERENCES, NOT) appearing in the source-table-name slot must surface
     // the pre-Phase-67 literal error message. The keyword set is authoritative
@@ -1120,6 +1207,78 @@ mod tests {
         assert_eq!(ws.excluding_dims, vec!["region"]);
         assert_eq!(ws.order_by.len(), 1);
         assert_eq!(ws.order_by[0].expr, "d");
+    }
+
+    // -----------------------------------------------------------------------
+    // P-3 (code-review 2026-07-11): the OVER-clause parser must not silently
+    // degrade malformed content. `ORDER` without an adjacent `BY` previously
+    // became the frame clause; junk between ORDER and BY was skipped; any
+    // residue was stored verbatim as a frame clause.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_over_order_without_by_rejected() {
+        let err = parse_metrics_clause("s.r AS SUM(t) OVER (PARTITION BY region ORDER d)", 0)
+            .unwrap_err();
+        assert!(
+            err.message.contains("Expected BY immediately after ORDER"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_over_order_junk_before_by_rejected() {
+        let err = parse_metrics_clause(
+            "s.r AS SUM(t) OVER (PARTITION BY region ORDER banana BY d)",
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("Expected BY immediately after ORDER"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_over_junk_content_rejected_as_frame() {
+        let err = parse_metrics_clause("s.r AS SUM(t) OVER (banana)", 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("Expected frame clause starting with ROWS, RANGE, or GROUPS"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_over_order_by_frame_keyword_name_rejected() {
+        // An unquoted reference named like a frame keyword is claimed by
+        // find_frame_start, leaving zero ORDER BY entries — must error, not
+        // silently produce an orderless window with a bogus frame.
+        let err = parse_metrics_clause("s.r AS SUM(t) OVER (ORDER BY range)", 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("Expected column reference after ORDER BY"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_over_frame_only_still_parses() {
+        let result = parse_metrics_clause(
+            "s.r AS SUM(t) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+            0,
+        )
+        .unwrap();
+        let ws = result[0].8.as_ref().expect("window spec");
+        assert!(ws.order_by.is_empty());
+        assert_eq!(
+            ws.frame_clause.as_deref(),
+            Some("ROWS BETWEEN 1 PRECEDING AND CURRENT ROW")
+        );
     }
 
     #[test]

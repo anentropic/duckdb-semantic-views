@@ -2918,6 +2918,26 @@ $$"#;
     }
 
     #[test]
+    fn test_from_yaml_flexible_whitespace() {
+        // P-7 (code-review 2026-07-11): the FROM YAML detection was a 9-byte
+        // literal compare requiring exactly one space — `FROM  YAML`,
+        // `FROM\tYAML`, and `FROM /* fmt */ YAML` (comments blank to a run
+        // of spaces) all fell through to the generic error. Fixed PA-10
+        // class; this site was missed by the Phase 25.1 sweep.
+        let two_spaces = "CREATE SEMANTIC VIEW v FROM  YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        assert!(matches!(plan(two_spaces), RewriteAction::Create { .. }));
+
+        let tab = "CREATE SEMANTIC VIEW v FROM\tYAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        assert!(matches!(plan(tab), RewriteAction::Create { .. }));
+
+        let comment = "CREATE SEMANTIC VIEW v FROM /* fmt */ YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        assert!(matches!(plan(comment), RewriteAction::Create { .. }));
+
+        let newline = "CREATE SEMANTIC VIEW v FROM\nYAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        assert!(matches!(plan(newline), RewriteAction::Create { .. }));
+    }
+
+    #[test]
     fn test_error_message_mentions_from_yaml() {
         let query = "CREATE SEMANTIC VIEW v SOMETHING_ELSE";
         let err = plan_rewrite(query).unwrap_err();
