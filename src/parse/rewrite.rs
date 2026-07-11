@@ -91,26 +91,36 @@ fn extract_name_only(
 }
 
 // ---------------------------------------------------------------------------
-// Rewrite: DDL -> function call
+// Read-side DDL lowering (DESCRIBE / SHOW → SELECT * FROM <read TF>(...))
 // ---------------------------------------------------------------------------
 
-/// Map a `DdlKind` to its target function name.
-fn function_name(kind: DdlKind) -> &'static str {
+/// Map a read-side `DdlKind` to the read table function it lowers to.
+///
+/// Only the read-side kinds are lowered to a function-call `Passthrough`;
+/// CREATE routes through `plan_rewrite`, and DROP/ALTER become structured
+/// native-DML `RewriteAction`s (their v0.5-era `*_semantic_view` function
+/// names were retired in v0.8.0 and are no longer registered). `panic`ing on
+/// a write kind is unreachable: every caller is inside a read-side `match`
+/// arm of `plan_ddl`.
+fn read_function_name(kind: DdlKind) -> &'static str {
     match kind {
-        DdlKind::Create => "create_semantic_view",
-        DdlKind::CreateOrReplace => "create_or_replace_semantic_view",
-        DdlKind::CreateIfNotExists => "create_semantic_view_if_not_exists",
-        DdlKind::Drop => "drop_semantic_view",
-        DdlKind::DropIfExists => "drop_semantic_view_if_exists",
         DdlKind::Describe => "describe_semantic_view",
         DdlKind::Show => "list_semantic_views",
         DdlKind::ShowTerse => "list_terse_semantic_views",
         DdlKind::ShowColumns => "show_columns_in_semantic_view",
-        DdlKind::Alter | DdlKind::AlterIfExists => "alter_semantic_view",
         DdlKind::ShowDimensions => "show_semantic_dimensions",
         DdlKind::ShowMetrics => "show_semantic_metrics",
         DdlKind::ShowFacts => "show_semantic_facts",
         DdlKind::ShowMaterializations => "show_semantic_materializations",
+        DdlKind::Create
+        | DdlKind::CreateOrReplace
+        | DdlKind::CreateIfNotExists
+        | DdlKind::Drop
+        | DdlKind::DropIfExists
+        | DdlKind::Alter
+        | DdlKind::AlterIfExists => {
+            unreachable!("read_function_name called on a write-side DdlKind: {kind:?}")
+        }
     }
 }
 
@@ -240,8 +250,6 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
     let (kind, plen) = detect_ddl_prefix(trimmed)
         .ok_or_else(|| "Not a semantic view DDL statement".to_string())?;
 
-    let fn_name = function_name(kind);
-
     match kind {
         // CREATE forms no longer supported via plan_ddl -- use plan_rewrite
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
@@ -266,6 +274,7 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
         DdlKind::Describe | DdlKind::ShowColumns => {
             let name = extract_raw_name_only(trimmed, plen, Trailing::Reject)?;
             let safe_name = name.replace('\'', "''");
+            let fn_name = read_function_name(kind);
             Ok(RewriteAction::Passthrough(format!(
                 "SELECT * FROM {fn_name}('{safe_name}')"
             )))
@@ -294,6 +303,7 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
                         "SELECT * FROM show_semantic_dimensions_for_metric('{safe_name}', '{safe_metric}')"
                     )
                 } else {
+                    let fn_name = read_function_name(kind);
                     format!("SELECT * FROM {fn_name}('{safe_name}')")
                 }
             } else {

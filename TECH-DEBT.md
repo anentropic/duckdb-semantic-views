@@ -10,7 +10,7 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 
 - **Origin:** Phase 2, decision [02-04] sidecar-persistence
 - **Decision:** DuckDB holds execution locks during scalar `invoke()`, which prevents any SQL execution from within DDL functions (`define_semantic_view`, `drop_semantic_view`). Both `try_clone()` (same-instance locks) and `Connection::open(path)` (file-level lock) deadlock or block. The extension writes catalog changes to a `.semantic_views` sidecar file using plain file I/O with atomic rename (write-to-tmp-then-rename). On next extension load, `init_catalog` reads the sidecar and syncs definitions into the `semantic_layer._definitions` DuckDB table.
-- **Action:** Resolved in v0.2.0 with `pragma_query_t` using a separate `persist_conn` (write-first pattern). The sidecar file was eliminated. The C++ shim was subsequently removed in v0.4.0 (it was a no-op stub) -- all persistence is handled in pure Rust.
+- **Action:** Resolved. The sidecar file was eliminated in v0.2.0; the v0.2-era `persist_conn` (`pragma_query_t` write-first pattern) was itself superseded in v0.8.0 by the `parser_override` design, which rewrites catalog writes to native DML that runs on the caller's own connection (`persist_conn` no longer exists). A no-op C++ shim was removed in v0.4.0, and a **new** C++ shim was reintroduced in v0.5.0 for the parser-override hook + read-side Catalog-API table functions — persistence itself is pure-Rust native SQL, but "no C++ shim exists" is no longer true.
 
 ### 2. ✅ Catalog table naming: `semantic_layer._definitions`
 
@@ -27,8 +27,9 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 ### 4. ✅ Manual FFI entrypoint instead of macro
 
 - **Origin:** Phase 4, decision [04-01] manual-ffi-entrypoint
-- **Decision:** Replaced the `#[duckdb_entrypoint_c_api]` macro with a hand-written FFI entrypoint function. This was necessary to capture the raw `duckdb_database` handle, which enables creating an independent `duckdb_connection` via `duckdb_connect`. The independent connection is used by `semantic_query()` to execute expanded SQL without lock conflicts with the host connection.
-- **Action:** None needed unless the `duckdb-rs` macro adds database handle capture in a future release.
+- **Decision:** The extension uses a hand-written FFI entrypoint (`src/lib.rs`, mirroring what `#[duckdb_entrypoint_c_api]` generates) rather than the macro, so it can capture the raw `duckdb_database` handle. The handle is used to register the parser-override hook and the read-side/query table functions via the C++ Catalog API.
+- **Note (rationale updated):** The original entry justified the manual entrypoint by "creating an independent `duckdb_connection` for `semantic_query()`." That is no longer how queries run: since Phase 65 `semantic_view()` (and the read-side TFs) execute on a **fresh per-call `Connection(*context.db)` opened inside the C++ bind callback**, not a long-lived independent connection. The extension/runtime path opens no independent connection via `duckdb_connect` (the only `duckdb_connect` call in `src/` is in the `#[cfg(not(feature = "extension"))]` unit-test helper `test_helpers::RawDb`, which never runs in the loaded extension). The manual entrypoint is retained for the database-handle capture the registration path needs.
+- **Action:** None needed.
 
 ### 5. ❌ Native EXPLAIN deferred to v0.2.0
 
@@ -57,11 +58,11 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 - **Resolution:** v0.5.2 Phase 25 ("SQL Body Parser") implemented a full SQL keyword body parser (`src/body_parser.rs`) that accepts conventional SQL syntax: `TABLES (...) RELATIONSHIPS (...) DIMENSIONS (...) METRICS (...)`. The translation layer in `src/parse.rs` (`rewrite_ddl_keyword_body()`) converts the parsed SQL body into the underlying function-based execution model. No `:=` parameters or struct literals required — pure SQL DDL grammar.
 - **Action:** None needed.
 
-### 9. ✅ DDL connection isolation pattern
+### 9. ✅ DDL connection isolation pattern — SUPERSEDED (historical)
 
 - **Origin:** v0.5.0 Phase 17, DDL execution
-- **Decision:** The plan_function executes rewritten DDL SQL on a separate `duckdb_connection` created at extension init time and stored as a file-scope static in `shim.cpp`. This avoids deadlocking the main connection's ClientContext lock, which is held during the bind phase when plan_function is called.
-- **Action:** None needed. The pattern is safe as long as DDL is not executed concurrently (DuckDB is single-writer). If concurrent DDL becomes a requirement, a connection pool or mutex would be needed.
+- **Decision (historical):** The v0.5-era plan_function executed rewritten DDL SQL on a separate `duckdb_connection` created at extension init time and stored as a file-scope static (`sv_ddl_conn`) in `shim.cpp`, to avoid deadlocking the main connection's ClientContext lock held during the bind phase.
+- **Superseded:** This mechanism no longer exists — `sv_ddl_conn` has zero occurrences in the codebase. Since v0.8.0 (the `parser_override` unification), write-side DDL is rewritten to **native DML that runs on the caller's own connection**, so it participates in the caller's transaction (the ADBC `autocommit = false` fix). See the accurate entries #23 and #27 for the current DROP/ALTER/CREATE concurrency semantics, and `src/parse/native_sql.rs` for the rewrite. No separate DDL connection is used or needed.
 
 ### 10. ✅ Amalgamation compilation via cc crate
 
@@ -75,12 +76,11 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 - **Decision:** Evaluated switching from `C_STRUCT_UNSTABLE` to `CPP` ABI for community extension registry compatibility. Rejected: CPP entry point failed in Phase 15 because `ExtensionLoader` referenced non-inlined C++ symbols unavailable under Python DuckDB's `-fvisibility=hidden`. `C_STRUCT_UNSTABLE` pins the binary to an exact DuckDB version (same as CPP in practice). Compatible with the community extension registry (`rusty_quack` uses the same approach). The version-pinning cost is mitigated by the DuckDB Version Monitor CI workflow.
 - **Action:** No change. Re-evaluate if DuckDB stabilizes the C API or adds a new ABI type for mixed Rust+C++ extensions.
 
-### 12. ❓ DDL pipeline uses all-VARCHAR result forwarding
+### 12. ✅ DDL pipeline uses all-VARCHAR result forwarding — SUPERSEDED (historical)
 
 - **Origin:** v0.5.1 Phase 20, C++ result forwarding for DESCRIBE/SHOW
-- **Decision:** The DDL parser hook pipeline (`sv_ddl_bind`/`sv_ddl_execute` in `shim.cpp`) executes rewritten SQL on `sv_ddl_conn`, reads results via `duckdb_value_varchar` into `vector<vector<string>>`, and declares all output columns as VARCHAR. This works but loses native types — DESCRIBE and SHOW return VARCHAR columns even though the underlying functions have known, static schemas.
-- **Why not fix now:** The schema for each `DdlKind` variant is known at detection time (e.g., DESCRIBE always returns 6 specific columns, SHOW returns 2). We could declare native types per variant and skip VARCHAR serialization. However, this creates schema coupling — any change to what `describe_semantic_view()` or `list_semantic_views()` returns would need updating in two places (the VTab bind in Rust and the DDL schema declaration). DDL results are single-digit rows, so the performance difference is immeasurable.
-- **Action:** If the DDL result schemas stabilize and a cleaner type contract is desired, declare static types per `DdlKind` in Rust, pass them across the FFI boundary, and use native types in `sv_ddl_bind`. Zero-copy vector transfer (as in the query path) is not worth the complexity here — the C++ execute callback receives a C++ `DataChunk&` while `sv_ddl_conn` results come from the C API, making bridging awkward for negligible gain.
+- **Decision (historical):** The v0.5-era DDL parser hook pipeline (`sv_ddl_bind`/`sv_ddl_execute` executing on `sv_ddl_conn`) read results via `duckdb_value_varchar` into `vector<vector<string>>` and declared all output columns as VARCHAR.
+- **Superseded:** That pipeline no longer exists — `sv_ddl_bind`, `sv_ddl_execute`, and `sv_ddl_conn` have zero occurrences in `shim.cpp`. Since Phase 65 the read-side table functions (DESCRIBE / SHOW / GET_DDL / READ_YAML) are real C++ Catalog-API table functions whose Rust dispatchers assemble rows and serialize them over the AR-3 self-describing wire format (`src/ddl/read_ffi.rs`). DESCRIBE still declares a deliberate 5-column VARCHAR schema (`object_kind, object_name, parent_entity, property, property_value`) — that is the intended Snowflake-shaped property table, not the retired forwarding pipeline. No further action.
 
 ## Deferred Requirements
 
@@ -91,9 +91,9 @@ Requirements originally deferred from v0.1.0. Updated to reflect status as of v0
 | ✅ | QUERY-V2-01 | Native `CREATE SEMANTIC VIEW` DDL syntax | Resolved in v0.5.0 via statement rewrite (Phase 16-17). |
 | ✅ | QUERY-V2-02 | Time dimensions with granularity coarsening | Resolved in v0.4.0 — removed; users write `date_trunc()` directly in dimension `expr`. |
 | ❌ | QUERY-V2-03 | Native `EXPLAIN` interception for `semantic_query()` | Architecturally blocked: EXPLAIN hooks not exposed to loadable extensions. |
-| ❓ | DIST-V2-01 | Published to DuckDB community extension registry | Pending upstream PR to `duckdb/community-extensions`. |
-| ❓ | DIST-V2-02 | Real-world TPC-H demo with documented example queries | Pending — deferred to align with registry publishing. |
-| ✅ | — | Replace sidecar file persistence with `pragma_query_t` callbacks | Resolved in v0.2.0 with `persist_conn` write-first pattern. |
+| ✅ | DIST-V2-01 | Published to DuckDB community extension registry | Published: `INSTALL semantic_views FROM community; LOAD semantic_views;` (see CHANGELOG for the per-DuckDB-version rebuilds). |
+| ❓ | DIST-V2-02 | Real-world TPC-H demo with documented example queries | Pending — no TPC-H demo in `examples/` yet (registry publishing, its former blocker, has since landed). |
+| ✅ | — | Replace sidecar file persistence with SQL-based catalog writes | Resolved in v0.2.0 (sidecar eliminated); the write path was again reworked in v0.8.0 to native DML on the caller's connection. See Accepted Decision #1. |
 
 ## Known Architectural Limitations
 
@@ -106,9 +106,9 @@ Constraints inherent to the current approach that affect users or maintainers.
 - **Impact:** The unsafe surface area is significantly smaller than v0.2.0's binary-read dispatch — only `execute_sql_raw` (query execution) and `duckdb_vector_reference_vector` (shared vector ownership) remain in the hot path. Type mismatches are handled at SQL generation time via `build_execution_sql` casts, not at read/write time.
 - **Mitigation:** SQLLogicTest integration tests exercise these paths with real data. `tests/vector_reference_test.rs` validates the zero-copy mechanism directly (lifetime safety, multi-chunk, complex types). The 36 PBTs in `tests/output_proptest.rs` still validate end-to-end type correctness via `test_helpers`.
 
-### 2. ❓ DuckDB version pinning (`= 1.4.4`)
+### 2. ❓ DuckDB version pinning (exact)
 
-- **What:** The `duckdb` crate dependency is pinned to an exact version (`= 1.4.4`) in `Cargo.toml`.
+- **What:** The `duckdb` / `libduckdb-sys` crate dependencies are pinned to an exact version in `Cargo.toml` (currently `= 1.10504.0`, the duckdb-rs release tracking DuckDB **v1.5.4**; `.duckdb-version` holds the matching `v1.5.4`).
 - **Why:** DuckDB's ABI is not stable across minor versions. An extension built against one version may crash or fail to load with a different DuckDB runtime.
 - **Impact:** Every DuckDB release requires a version bump, rebuild, and re-test of the extension. The `DuckDBVersionMonitor.yml` CI workflow automates detection and opens a PR when a new DuckDB version is available.
 - **Mitigation:** The version monitor workflow (Phase 1, INFRA-03) detects new releases and opens a PR with `@copilot` mention for automated investigation. Manual version bumps follow the process documented in MAINTAINER.md.
@@ -132,13 +132,13 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 - **Origin:** Phase 4 audit item; decision [04-03] python-ducklake-test
 - **Reason:** The DuckDB SQLLogicTest runner cannot dynamically install extensions (DuckLake, httpfs). The integration test requires loading these extensions to create Iceberg-backed tables.
-- **Mitigation:** `test/integration/test_ducklake.py` covers the same semantic query functionality against DuckLake tables. It is run via `just test-iceberg` and exercises the full round-trip: define semantic view, query with dimensions and metrics, assert correct results.
+- **Mitigation:** `test/integration/test_ducklake.py` covers the same semantic query functionality against DuckLake tables. It is run via `just test-ducklake` (local) / `just test-ducklake-ci` (synthetic-data CI variant) and exercises the full round-trip: define semantic view, query with dimensions and metrics, assert correct results.
 
 ### 2. ❓ FFI execution layer not fuzz-testable standalone
 
 - **Origin:** Phase 5 audit item (TEST-05 partial scope)
 - **Reason:** The loadable-extension function-pointer stubs (`duckdb_query`, `duckdb_value_varchar`, etc.) are only available at runtime when DuckDB loads the extension. A standalone fuzz binary cannot initialize these stubs.
-- **Mitigation:** Three fuzz targets cover the non-FFI attack surface: `fuzz_json_parse` (definition JSON parsing), `fuzz_sql_expand` (expansion engine SQL generation), `fuzz_query_names` (dimension/metric name validation). SQLLogicTest provides integration coverage of the FFI layer. Post-v0.2.0, the FFI unsafe surface is much smaller — the zero-copy vector reference approach eliminated all per-type binary read/write code; only `execute_sql_raw` and `duckdb_vector_reference_vector` remain in the hot path. `tests/vector_reference_test.rs` validates zero-copy lifetime safety under `cargo test`.
+- **Mitigation:** Eight fuzz targets cover the non-FFI attack surface: `fuzz_json_parse`, `fuzz_yaml_parse`, `fuzz_ddl_parse`, `fuzz_keyword_body`, `fuzz_sql_expand`, `fuzz_query_names`, `fuzz_render_roundtrip`, and `fuzz_parser_override_ffi` (see `fuzz/fuzz_targets/`). SQLLogicTest provides integration coverage of the FFI layer. Post-v0.2.0, the FFI unsafe surface is much smaller — the zero-copy vector reference approach eliminated all per-type binary read/write code; only `execute_sql_raw` and `duckdb_vector_reference_vector` remain in the hot path. `tests/vector_reference_test.rs` validates zero-copy lifetime safety under `cargo test`.
 
 ### 3. ✅ Sandbox test portability (resolved in Phase 6)
 
@@ -150,10 +150,13 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 - **Origin:** Phase 25 proptest surfaced this
 - **Resolution:** Phase 25.1 replaced `starts_with_ci` literal prefix matching with
-  `match_keyword_prefix` token-based scanning. All 7 DDL prefix forms now tolerate
-  arbitrary ASCII whitespace (space, tab, newline, carriage return, vertical tab,
-  form feed) between keywords. The `prefix_len()` static function was replaced by
-  the dynamic byte count returned by `detect_ddl_prefix(query)`.
+  `match_keyword_prefix` token-based scanning. Every DDL prefix form (the
+  `DdlKind` set has since grown to ~15: CREATE / OR REPLACE / IF NOT EXISTS,
+  DROP / IF EXISTS, ALTER / IF EXISTS, DESCRIBE, SHOW SEMANTIC
+  VIEWS/TERSE/DIMENSIONS/METRICS/FACTS/MATERIALIZATIONS, SHOW COLUMNS) now
+  tolerates arbitrary ASCII whitespace (space, tab, newline, carriage return,
+  vertical tab, form feed) between keywords. The `prefix_len()` static function
+  was replaced by the dynamic byte count returned by `detect_ddl_prefix(query)`.
 - **Scope:** ASCII whitespace only (6 characters: 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20).
   Unicode whitespace is handled by DuckDB before the hook fires.
 
@@ -170,7 +173,7 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ### 20. ✅ Bounded LRU evictions are silent at the parser-override site
 
-**Resolved in Phase 62 (v0.8.0).** The bounded LRU is gone — each `SemanticViewsParserInfo` now owns an `OverrideContext` directly, lifetime-tied to `DBConfig`. Multi-DB processes can load the extension into arbitrarily many DuckDB instances without eviction. The `duckdb_connection` inside each `OverrideContext` is intentionally leaked at DB shutdown to avoid a use-after-free on `~DatabaseInstance` destruction order — bounded at one Connection (~few KB) per DB ever opened in the process. See `.planning/phases/62-caret-restoration-lru-removal/62-RESEARCH.md` §Q2 for the destruction-order trace and §6 row B15 for the multi-DB test coverage.
+**Resolved in Phase 62 (v0.8.0), simplified further in Phase 65 / AR-7.** The bounded LRU is gone: multi-DB processes can load the extension into arbitrarily many DuckDB instances without eviction. The Phase-62 design held a per-DB `OverrideContext` (with an intentionally-leaked `duckdb_connection`), but Phase 65 Plan 06's H1 emptied that struct and **AR-7 removed it entirely** — `SemanticViewsParserInfo` is now an empty marker struct (`cpp/src/shim.cpp`), the parser hook carries no per-DB Rust state, and the read side uses a fresh per-call `Connection(*context.db)` instead of any long-lived/leaked connection. So there is no longer any per-DB context to evict *or* leak.
 
 **Original limitation (preserved for archaeology):**
 
@@ -215,18 +218,18 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Decision:** `parse_single_table_entry` in `src/body_parser.rs` uses a whitespace-based tokenizer to peel off the alias, the `AS`, and the source-table name from each entry in the `TABLES (...)` clause. If a source-table name has whitespace INSIDE a quoted part (e.g. `TABLES (o AS "my db"."schema"."t" PRIMARY KEY (id))`), the tokenizer truncates mid-name and the parse fails. The Phase 64 quoted-identifier fix tightens identifier handling at every other capture site (CREATE / DROP / ALTER / DESCRIBE / SHOW COLUMNS view-name slot, the runtime `semantic_view()` positional arg, and the expansion-side `quote_table_ref`) but leaves this body-parser path on the legacy whitespace tokenizer.
 - **Why deferred:** The bug-report reproduction (`"memory"."main"."orders_sv"` as the VIEW name) doesn't exercise this path. Whitespace inside quoted source-table parts is vanishingly rare — physical-table names almost never contain spaces, and even when they do (`"sales 2024"`), the user had the option of writing them as `"sales_2024"` or aliasing them outside the semantic-views layer. Fixing this requires `src/body_parser.rs` to adopt the `src/ident.rs` `find_identifier_end` helper at multiple parse points, which is non-trivial body-parser surgery for a vanishingly rare case.
 - **Action if a user hits this:** Provide an alias in DuckDB itself (e.g. `CREATE VIEW orders_clean AS SELECT * FROM "my db"."schema"."t"`) and reference the alias in the semantic view's `TABLES` clause. If the case becomes common, port `find_identifier_end` into `src/body_parser.rs::parse_single_table_entry` and surrounding helpers.
-- **Resolution:** Resolved in Phase 67 Plan 02 (commits `256ae65` body-parser surgery + `5fb2ed4` sqllogictest fixture). `parse_single_table_entry` now consumes the source-table-name slot via dot-separated `find_identifier_end`-driven advancement BEFORE running the `PRIMARY KEY` / `UNIQUE` keyword scan over the post-name slice. The canonical pathological case (`TABLES (o AS "weird PRIMARY KEY name" PRIMARY KEY (id))`) now parses correctly. Regression coverage: 5 new Rust unit tests in `src/body_parser.rs::tests::test_parse_single_table_entry_*` + 4-scenario sqllogictest fixture at `test/sql/phase67_quoted_source_tables.test`. The `src/ident.rs` helper itself was not modified (D-09).
+- **Resolution:** Resolved in Phase 67 Plan 02 (commits `256ae65` body-parser surgery + `5fb2ed4` sqllogictest fixture). `parse_single_table_entry` (now in `src/body_parser/tables.rs`, after the AR-1 split of the former single-file `src/body_parser.rs` into a module directory) consumes the source-table-name slot via dot-separated `find_identifier_end`-driven advancement BEFORE running the `PRIMARY KEY` / `UNIQUE` keyword scan over the post-name slice. The canonical pathological case (`TABLES (o AS "weird PRIMARY KEY name" PRIMARY KEY (id))`) now parses correctly. Regression coverage: Rust unit tests in `src/body_parser/mod.rs::tests::test_parse_single_table_entry_*` + a sqllogictest fixture at `test/sql/phase67_quoted_source_tables.test`. The `src/ident.rs` helper itself was not modified (D-09).
 
 ---
 
 ## v0.10.0 additions
 
-### 25. ❓ Body parser's `NON ADDITIVE BY` and OVER `ORDER BY` clauses split on whitespace for the dimension/column reference
+### 25. ✅ Body parser's `NON ADDITIVE BY` and OVER `ORDER BY` clauses split on whitespace for the dimension/column reference — RESOLVED in Phase 68 B1
 
-- **Origin:** v0.10.0 Phase 67 Plan 02 audit-grep (D-10). Sibling pattern to TECH-DEBT #24 surfaced by the `grep -n "split_whitespace" src/body_parser.rs` audit after the `parse_single_table_entry` surgery.
-- **Decision:** `parse_non_additive_dims` (line ~1415) and the OVER `ORDER BY` parser inside `parse_window_spec` (line ~1731) both call `entry_text.split_whitespace()` to peel off the first token as the dimension/column reference and the subsequent tokens as ASC/DESC/NULLS FIRST|LAST modifiers. A quoted reference with internal whitespace (e.g. `NON ADDITIVE BY ("my dim" ASC)`) would split mid-name. This is the exact same identifier-vs-whitespace class as TECH-DEBT #24, just in a different DDL slot.
-- **Why deferred:** Two reasons. (a) The trailing-modifier parser (ASC/DESC/NULLS FIRST|LAST) keys off whitespace-split index positions in a tight loop — replacing the whitespace tokeniser with `find_identifier_end` requires rewriting the modifier loop to use a token-aware iterator that can advance one identifier + N keyword tokens with explicit position tracking. That's a structural rewrite, not the mechanical helper-reuse that TECH-DEBT #24 was. Phase 67 Plan 02 explicitly bounded scope to the `TABLES` clause site per CONTEXT.md `<risk_areas>` (B5 scope creep). (b) `NON ADDITIVE BY` and OVER `ORDER BY` references are semantic-layer dimension/column names that the user defined elsewhere — they are essentially never quoted-with-whitespace in practice. The same vanishingly-rare-case argument from TECH-DEBT #24 applies.
-- **Action if a user hits this:** Define the dimension with a bare name (`o.region`, `region_name`) and reference the bare name in `NON ADDITIVE BY` / `ORDER BY`. If quoted-with-whitespace dimension references become common, the fix is to introduce a small token-iterator helper alongside `find_identifier_end` and rewrite both modifier loops to consume `(identifier, [modifier]*)` rather than `Vec<&str>` from `split_whitespace`.
+- **Origin:** v0.10.0 Phase 67 Plan 02 audit-grep (D-10). Sibling pattern to TECH-DEBT #24.
+- **Decision (historical):** `parse_non_additive_dims` and the OVER `ORDER BY` parser both peeled the reference off the entry with `split_whitespace()`, so a quoted reference with internal whitespace (`NON ADDITIVE BY ("my dim" ASC)`) split mid-name.
+- **Resolution:** Phase 68 Plan 03 (B1) captures the reference slot via `find_identifier_end` + `is_quoting_balanced` in both sites (`src/body_parser/metrics.rs::parse_non_additive_dims` — its doc comment cites this entry — and the OVER `ORDER BY` parser in `src/body_parser/window.rs`). `split_whitespace` now runs only over the *trailing modifier* slice (ASC/DESC/NULLS FIRST|LAST), which contains no identifiers. Quoted-with-whitespace references parse correctly.
+- **Remaining sibling slots in the same whitespace-tokeniser class (still open, low-risk):** the `TABLES` alias slot (`tables.rs:42`, `split_first_token`), the `MATERIALIZATIONS` name (`materializations.rs:40`), the relationship target alias (`relationships.rs:119,134`), and the SHOW name slots `IN <view>` / `IN SCHEMA` / `FOR METRIC` (`show_clauses.rs:101,133,192`) still peel their identifier on the first whitespace, so a quoted-with-whitespace value there would split. Same vanishingly-rare-case argument as #24 applies; the fix, if ever needed, is to route each through `find_identifier_end`.
 
 ### 26. ❓ Single-catalog write guard does not cover an attached DB that has its own catalog table
 
@@ -247,5 +250,11 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ---
 
-**Last updated:** 2026-07-07 (v0.10.4)
+**Last updated:** 2026-07-11 (v0.10.4) — accuracy sweep against the 2026-07-11
+code review: retired the ghost-code descriptions in entries #1, #4, #9, #12, #20
+(sidecar `persist_conn`, the independent-query-connection rationale, `sv_ddl_conn`,
+the `sv_ddl_bind`/`sv_ddl_execute` VARCHAR-forwarding pipeline, and the
+`OverrideContext`, none of which exist in the code anymore); flipped #25 and
+DIST-V2-01 to ✅; and corrected the DuckDB pin (v1.5.4, not 1.4.4), the fuzz-target
+count (8), and the DuckLake test recipe names.
 **Most recent full audit:** v0.8.0 — `.planning/milestones/v0.8.0-MILESTONE-AUDIT.md` (entries #24–#25 added post-audit during v0.10.0)

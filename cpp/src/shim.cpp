@@ -101,9 +101,10 @@ extern "C" {
     void sv_free_buffer(char *ptr, size_t len);
 
     // Phase 65 Plan 04 (Task 2 Step C) — Rust FFI bridge for the
-    // `__sv_compute_create_from_yaml` helper TF. Reads file content from
-    // the bind callback (via Connection probe(*context.db) + read_text(?))
-    // and parses + enriches the YAML on the Rust side, returning the
+    // `__sv_compute_create_from_yaml` helper TF. The bind callback reads the
+    // file content directly through DuckDB's FileSystem API (Phase 65.1
+    // D-01..D-03 replaced the earlier read_text(?) SQL path) and this bridge
+    // parses + enriches the YAML on the Rust side, returning the
     // metadata-less JSON definition as a heap-owned (ptr, len) buffer.
     //
     // The outer parser_override INSERT wraps `new_def` with json_merge_patch
@@ -937,14 +938,16 @@ static void sv_create_from_yaml_function(
 // mechanism design and the LOC extrapolation for the remaining 16 read-side
 // migrations.
 //
-// Wire format from Rust dispatcher: a flat length-prefixed binary buffer:
+// Wire format from Rust dispatcher (AR-3 self-describing): a flat binary
+// buffer beginning with a schema header of column type tags, then:
 //   u32 row_count (little-endian)
 //   for each row:
 //     for each of 6 columns:
 //       u32 byte_len (little-endian)
 //       byte_len bytes (UTF-8, NOT NUL-terminated)
-// Buffer is heap-owned by Rust; C++ parses into BindData and immediately
-// releases via `sv_free_buffer`.
+// The parse below validates the schema header via `sv_read_wire_schema`
+// before reading rows. Buffer is heap-owned by Rust; C++ parses into
+// BindData and immediately releases via `sv_free_buffer`.
 
 struct ListSemanticViewsRow {
     std::string created_on;
@@ -2435,7 +2438,6 @@ struct SemanticViewBindData : public TableFunctionData {
 
 struct SemanticViewGlobalState : public GlobalTableFunctionState {
     std::unique_ptr<MaterializedQueryResult> result;
-    idx_t emitted_chunks = 0;
 };
 
 // Look up DECIMAL/LIST logical types via a LIMIT-0 probe. Returns a
@@ -2686,7 +2688,6 @@ static void sv_semantic_view_function(
         }
     }
     output.SetCardinality(chunk->size());
-    gs.emitted_chunks++;
 }
 
 // Register semantic_view via the C++ Catalog API — same pattern as

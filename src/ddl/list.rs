@@ -33,14 +33,11 @@ use crate::model::SemanticViewDefinition;
 /// Called from `cpp/src/shim.cpp::sv_list_semantic_views_bind`. The C++
 /// side passes a per-call `duckdb_connection` borrowed from a stack
 /// `Connection probe(*context.db)`. This function wraps the handle in a
-/// `CatalogReader`, performs the catalog read, and serializes the rows
-/// into a flat binary buffer with the wire format:
-///
-///   u32 `row_count` (little-endian)
-///   for each row:
-///     for each of 6 columns:
-///       u32 `byte_len` (little-endian)
-///       `byte_len` bytes (UTF-8, NOT NUL-terminated)
+/// `CatalogReader`, performs the catalog read, and serializes the rows via
+/// [`crate::ddl::read_ffi::serialize_varchar_rows`] — the shared, AR-3
+/// self-describing wire format (a schema header of column type tags followed
+/// by the length-prefixed cells). See that function for the authoritative
+/// byte layout; it is intentionally NOT duplicated here to avoid drift.
 ///
 /// The 6 columns match the v0.9.0 Rust `VTab` shape exactly:
 /// (`created_on`, name, kind, `database_name`, `schema_name`, comment).
@@ -63,9 +60,9 @@ use crate::model::SemanticViewDefinition;
 /// * `0` — success; `(out_ptr, out_len)` populated. Caller MUST release
 ///   via `sv_free_buffer(ptr, len)`.
 /// * `1` — catalog read error (e.g. the `semantic_layer._definitions`
-///   table is missing); `error_buf` populated.
-/// * `2` — internal error (panic across FFI, serialization failure);
-///   `error_buf` populated.
+///   table is missing) OR serialization failure; `error_buf` populated.
+/// * `2` — internal error (a panic caught at the FFI boundary by
+///   `catch_unwind`); `error_buf` populated.
 ///
 /// # Catalog-table-present probing
 ///
@@ -200,10 +197,8 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
 /// FFI dispatcher for the migrated `list_terse_semantic_views()` table
 /// function — 5-column subset of `list_semantic_views()` (no `comment`).
 ///
-/// Wire format (length-prefixed binary, LE):
-///   u32 `row_count`
-///   for each row:
-///     for each of 5 cols: u32 `byte_len` | bytes (UTF-8)
+/// Serializes via the shared [`crate::ddl::read_ffi::serialize_varchar_rows`]
+/// (AR-3 self-describing wire format — see that function for the byte layout).
 ///
 /// Columns: (`created_on`, name, kind, `database_name`, `schema_name`).
 ///
