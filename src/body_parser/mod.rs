@@ -676,12 +676,31 @@ mod tests {
 
     #[test]
     fn test_parse_single_table_entry_junk_between_pk_and_unique_rejected() {
-        let err =
-            parse_tables_clause("o AS orders PRIMARY KEY (id) junk UNIQUE (email)", 0).unwrap_err();
+        let entry = "o AS orders PRIMARY KEY (id) junk UNIQUE (email)";
+        let err = parse_tables_clause(entry, 0).unwrap_err();
         assert!(
             err.message.contains("before UNIQUE"),
             "got: {}",
             err.message
+        );
+        // Caret must land on the junk token, not the entry start (Copilot
+        // review, PR #71).
+        assert_eq!(
+            err.position,
+            Some(entry.find("junk").unwrap()),
+            "position should point at 'junk'"
+        );
+    }
+
+    #[test]
+    fn test_parse_single_table_entry_junk_before_pk_caret_position() {
+        // Sibling assertion for the PRIMARY KEY guard's caret.
+        let entry = "o AS orders banana PRIMARY KEY (id)";
+        let err = parse_tables_clause(entry, 0).unwrap_err();
+        assert_eq!(
+            err.position,
+            Some(entry.find("banana").unwrap()),
+            "position should point at 'banana'"
         );
     }
 
