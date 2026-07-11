@@ -52,6 +52,22 @@ jobs:
       - name: cargo-deny (licenses + advisories)
         uses: EmbarkStudios/cargo-deny-action@v2
 
+      # `cargo llvm-cov` builds an instrumented copy of the WHOLE crate —
+      # including the bundled DuckDB linked by the default-feature `duckdb`
+      # dependency — plus every integration test binary into
+      # target/llvm-cov-target/. That tree runs right at the edge of the
+      # runner's ~14 GB free disk and has failed with "No space left on
+      # device". Reclaim the large preinstalled toolchains this job never uses
+      # (~25 GB) so the instrumented build has headroom. Inline shell (not a
+      # third-party action) to keep the supply-chain surface unchanged.
+      - name: Free disk space for the instrumented coverage build
+        run: |
+          echo "Before:" && df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          echo "After:" && df -h /
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
