@@ -15,10 +15,6 @@ use crate::model::{AccessModifier, SemanticViewDefinition};
 /// `conn` is a borrowed handle; `name_ptr` must point to `name_len` UTF-8 bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
-// Single linear FFI dispatcher (catch_unwind guard, arg decode, catalog lookup,
-// row collection, wire serialization) kept as one path so the panic boundary
-// and borrow contract stay in one place.
-#[allow(clippy::too_many_lines)]
 pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
     conn: libduckdb_sys::duckdb_connection,
     name_ptr: *const u8,
@@ -28,121 +24,75 @@ pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
-    use crate::ddl::read_ffi::{
-        probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
-        BorrowedConnection,
-    };
-    use std::panic::AssertUnwindSafe;
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let borrowed = BorrowedConnection::new(conn);
-        if borrowed.is_null() {
-            write_err(error_buf, error_buf_len, "duckdb_connection is null");
-            return 1_u8;
-        }
-        if name_ptr.is_null() {
-            write_err(error_buf, error_buf_len, "view name pointer is null");
-            return 1_u8;
-        }
-        let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let Ok(raw_name) = std::str::from_utf8(name_bytes) else {
-            write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
-            return 1_u8;
-        };
-        // FF-4: normalize so quoted-identifier inputs resolve like `semantic_view()`.
-        let name = match crate::ident::normalize_view_name(raw_name) {
-            Ok(s) => s,
-            Err(e) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &format!("Invalid view name '{raw_name}': {e}"),
-                );
-                return 1_u8;
-            }
-        };
-        // FF-9: surface a probe-query failure as an error distinct from "no
-        // views" instead of silently folding it into absence.
-        let present = match probe_catalog_table_present(&borrowed) {
-            Ok(p) => p,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let reader = CatalogReader::new(&borrowed, present);
-        let json = match reader.lookup(&name) {
-            Ok(Some(j)) => j,
-            Ok(None) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &crate::catalog::view_not_found_msg(&name),
-                );
-                return 1_u8;
-            }
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let def = match SemanticViewDefinition::from_json(&name, &json) {
-            Ok(d) => d,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let alias_map = def.alias_to_table_map();
-        let base_table = def.base_table().to_string();
+    crate::ddl::read_ffi::run_dispatcher(
+        conn,
+        out_ptr,
+        out_len,
+        error_buf,
+        error_buf_len,
+        "sv_describe_semantic_view_bind_rust",
+        |borrowed| unsafe { describe_view_rows(borrowed, name_ptr, name_len) },
+    )
+}
 
-        let mut internal: Vec<DescribeRow> = Vec::new();
-        if let Some(ref comment) = def.comment {
-            internal.push(DescribeRow {
-                object_kind: String::new(),
-                object_name: String::new(),
-                parent_entity: String::new(),
-                property: "COMMENT".to_string(),
-                property_value: comment.clone(),
-            });
-        }
-        collect_table_rows(&def, &mut internal);
-        collect_relationship_rows(&def, &alias_map, &mut internal);
-        collect_fact_rows(&def, &base_table, &alias_map, &mut internal);
-        collect_dimension_rows(&def, &base_table, &alias_map, &mut internal);
-        collect_metric_rows(&def, &base_table, &alias_map, &mut internal);
-        collect_materialization_rows(&def, &mut internal);
+/// Body for [`sv_describe_semantic_view_bind_rust`]: resolve the view and
+/// serialize its DESCRIBE property rows over the shared varchar wire format.
+///
+/// # Safety
+///
+/// `name_ptr` must be null or point to `name_len` readable bytes.
+#[cfg(feature = "extension")]
+unsafe fn describe_view_rows(
+    borrowed: &crate::ddl::read_ffi::BorrowedConnection,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> Result<Vec<u8>, String> {
+    use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg, serialize_varchar_rows};
 
-        let mut rows: Vec<Vec<String>> = Vec::with_capacity(internal.len());
-        for r in internal {
-            rows.push(vec![
+    let raw_name = read_str_arg(name_ptr, name_len, "view name")?;
+    // FF-4: normalize so quoted-identifier inputs resolve like `semantic_view()`.
+    let name = crate::ident::normalize_view_name(&raw_name)
+        .map_err(|e| format!("Invalid view name '{raw_name}': {e}"))?;
+    // FF-9: a probe-query failure is distinct from "no views" (propagated).
+    let present = probe_catalog_table_present(borrowed)?;
+    let reader = CatalogReader::new(borrowed, present);
+    let json = reader
+        .lookup(&name)?
+        .ok_or_else(|| crate::catalog::view_not_found_msg(&name))?;
+    let def = SemanticViewDefinition::from_json(&name, &json)?;
+    let alias_map = def.alias_to_table_map();
+    let base_table = def.base_table().to_string();
+
+    let mut internal: Vec<DescribeRow> = Vec::new();
+    if let Some(ref comment) = def.comment {
+        internal.push(DescribeRow {
+            object_kind: String::new(),
+            object_name: String::new(),
+            parent_entity: String::new(),
+            property: "COMMENT".to_string(),
+            property_value: comment.clone(),
+        });
+    }
+    collect_table_rows(&def, &mut internal);
+    collect_relationship_rows(&def, &alias_map, &mut internal);
+    collect_fact_rows(&def, &base_table, &alias_map, &mut internal);
+    collect_dimension_rows(&def, &base_table, &alias_map, &mut internal);
+    collect_metric_rows(&def, &base_table, &alias_map, &mut internal);
+    collect_materialization_rows(&def, &mut internal);
+
+    let rows: Vec<Vec<String>> = internal
+        .into_iter()
+        .map(|r| {
+            vec![
                 r.object_kind,
                 r.object_name,
                 r.parent_entity,
                 r.property,
                 r.property_value,
-            ]);
-        }
-        let buf = match serialize_varchar_rows(&rows) {
-            Ok(b) => b,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        publish_owned_buffer(buf, out_ptr, out_len);
-        0_u8
-    }));
-    if let Ok(rc) = result {
-        rc
-    } else {
-        use crate::ddl::read_ffi::write_err;
-        write_err(
-            error_buf,
-            error_buf_len,
-            "internal error: panic inside sv_describe_semantic_view_bind_rust",
-        );
-        2
-    }
+            ]
+        })
+        .collect();
+    serialize_varchar_rows(&rows)
 }
 
 /// A single property row in the DESCRIBE output.

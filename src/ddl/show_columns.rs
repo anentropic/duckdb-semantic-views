@@ -27,77 +27,47 @@ pub unsafe extern "C" fn sv_show_columns_in_semantic_view_bind_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
-    use crate::ddl::read_ffi::{
-        probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
-        BorrowedConnection,
-    };
-    use std::panic::AssertUnwindSafe;
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let borrowed = BorrowedConnection::new(conn);
-        if borrowed.is_null() {
-            write_err(error_buf, error_buf_len, "duckdb_connection is null");
-            return 1_u8;
-        }
-        if name_ptr.is_null() {
-            write_err(error_buf, error_buf_len, "view name pointer is null");
-            return 1_u8;
-        }
-        let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let Ok(raw_name) = std::str::from_utf8(name_bytes) else {
-            write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
-            return 1_u8;
-        };
-        // FF-4: normalize so quoted-identifier inputs resolve like `semantic_view()`.
-        let view_name = match crate::ident::normalize_view_name(raw_name) {
-            Ok(s) => s,
-            Err(e) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &format!("Invalid view name '{raw_name}': {e}"),
-                );
-                return 1_u8;
-            }
-        };
-        // FF-9: surface a probe-query failure as an error distinct from "no
-        // views" instead of silently folding it into absence.
-        let present = match probe_catalog_table_present(&borrowed) {
-            Ok(p) => p,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let reader = CatalogReader::new(&borrowed, present);
-        let json = match reader.lookup(&view_name) {
-            Ok(Some(j)) => j,
-            Ok(None) => {
-                // C-4 (code-review 2026-07-11): canonical wording via
-                // view_not_found_msg — SHOW COLUMNS was the one read path
-                // with divergent "not found" phrasing.
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &crate::catalog::view_not_found_msg(&view_name),
-                );
-                return 1_u8;
-            }
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let def = match SemanticViewDefinition::from_json(&view_name, &json) {
-            Ok(d) => d,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let internal_rows = collect_column_rows(&def, &view_name);
-        let mut rows: Vec<Vec<String>> = Vec::with_capacity(internal_rows.len());
-        for r in internal_rows {
-            rows.push(vec![
+    crate::ddl::read_ffi::run_dispatcher(
+        conn,
+        out_ptr,
+        out_len,
+        error_buf,
+        error_buf_len,
+        "sv_show_columns_in_semantic_view_bind_rust",
+        |borrowed| unsafe { show_columns_rows(borrowed, name_ptr, name_len) },
+    )
+}
+
+/// Body for [`sv_show_columns_in_semantic_view_bind_rust`]: resolve the view
+/// and serialize its column rows over the shared varchar wire format.
+///
+/// # Safety
+///
+/// `name_ptr` must be null or point to `name_len` readable bytes.
+#[cfg(feature = "extension")]
+unsafe fn show_columns_rows(
+    borrowed: &crate::ddl::read_ffi::BorrowedConnection,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> Result<Vec<u8>, String> {
+    use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg, serialize_varchar_rows};
+
+    let raw_name = read_str_arg(name_ptr, name_len, "view name")?;
+    // FF-4: normalize so quoted-identifier inputs resolve like `semantic_view()`.
+    let view_name = crate::ident::normalize_view_name(&raw_name)
+        .map_err(|e| format!("Invalid view name '{raw_name}': {e}"))?;
+    // FF-9: a probe-query failure is distinct from "no views" (propagated).
+    let present = probe_catalog_table_present(borrowed)?;
+    let reader = CatalogReader::new(borrowed, present);
+    // C-4 (code-review 2026-07-11): canonical wording via view_not_found_msg.
+    let json = reader
+        .lookup(&view_name)?
+        .ok_or_else(|| crate::catalog::view_not_found_msg(&view_name))?;
+    let def = SemanticViewDefinition::from_json(&view_name, &json)?;
+    let rows: Vec<Vec<String>> = collect_column_rows(&def, &view_name)
+        .into_iter()
+        .map(|r| {
+            vec![
                 r.database_name,
                 r.schema_name,
                 r.semantic_view_name,
@@ -106,29 +76,10 @@ pub unsafe extern "C" fn sv_show_columns_in_semantic_view_bind_rust(
                 r.kind,
                 r.expression,
                 r.comment,
-            ]);
-        }
-        let buf = match serialize_varchar_rows(&rows) {
-            Ok(b) => b,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        publish_owned_buffer(buf, out_ptr, out_len);
-        0_u8
-    }));
-    if let Ok(rc) = result {
-        rc
-    } else {
-        use crate::ddl::read_ffi::write_err;
-        write_err(
-            error_buf,
-            error_buf_len,
-            "internal error: panic inside sv_show_columns_in_semantic_view_bind_rust",
-        );
-        2
-    }
+            ]
+        })
+        .collect();
+    serialize_varchar_rows(&rows)
 }
 
 /// A single row in the SHOW COLUMNS IN SEMANTIC VIEW output.

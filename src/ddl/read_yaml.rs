@@ -54,83 +54,44 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
-    use crate::ddl::read_ffi::{
-        probe_catalog_table_present, publish_owned_buffer, write_err, BorrowedConnection,
-    };
-    use std::panic::AssertUnwindSafe;
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let borrowed = BorrowedConnection::new(conn);
-        if borrowed.is_null() {
-            write_err(error_buf, error_buf_len, "duckdb_connection is null");
-            return 1_u8;
-        }
-        if name_ptr.is_null() {
-            write_err(error_buf, error_buf_len, "view name pointer is null");
-            return 1_u8;
-        }
-        let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let Ok(raw_name) = std::str::from_utf8(name_bytes) else {
-            write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
-            return 1_u8;
-        };
-        let bare_name = resolve_bare_name(raw_name);
+    crate::ddl::read_ffi::run_dispatcher(
+        conn,
+        out_ptr,
+        out_len,
+        error_buf,
+        error_buf_len,
+        "sv_read_yaml_from_semantic_view_exec_rust",
+        |borrowed| unsafe { read_yaml_export(borrowed, name_ptr, name_len) },
+    )
+}
 
-        // FF-9: surface a probe-query failure as an error distinct from "no
-        // views" instead of silently folding it into absence.
-        let present = match probe_catalog_table_present(&borrowed) {
-            Ok(p) => p,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let reader = CatalogReader::new(&borrowed, present);
-        let json = match reader.lookup(&bare_name) {
-            Ok(Some(j)) => j,
-            Ok(None) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &crate::catalog::view_not_found_msg(&bare_name),
-                );
-                return 1_u8;
-            }
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        // C-2 (code-review 2026-07-11): `from_json` for the canonical
-        // "invalid definition for semantic view '<name>'" context on corrupt
-        // rows, matching every TF dispatcher.
-        let def = match SemanticViewDefinition::from_json(&bare_name, &json) {
-            Ok(d) => d,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let yaml = match render_yaml_export(&def) {
-            Ok(s) => s,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        publish_owned_buffer(yaml.into_bytes(), out_ptr, out_len);
-        0_u8
-    }));
-    if let Ok(rc) = result {
-        rc
-    } else {
-        use crate::ddl::read_ffi::write_err;
-        write_err(
-            error_buf,
-            error_buf_len,
-            "internal error: panic inside sv_read_yaml_from_semantic_view_exec_rust",
-        );
-        2
-    }
+/// Body for [`sv_read_yaml_from_semantic_view_exec_rust`]: resolve the view
+/// and render its YAML export.
+///
+/// # Safety
+///
+/// `name_ptr` must be null or point to `name_len` readable bytes.
+#[cfg(feature = "extension")]
+unsafe fn read_yaml_export(
+    borrowed: &crate::ddl::read_ffi::BorrowedConnection,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> Result<Vec<u8>, String> {
+    use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg};
+
+    let raw_name = read_str_arg(name_ptr, name_len, "view name")?;
+    let bare_name = resolve_bare_name(&raw_name);
+
+    // FF-9: a probe-query failure is distinct from "no views" (propagated).
+    let present = probe_catalog_table_present(borrowed)?;
+    let reader = CatalogReader::new(borrowed, present);
+    let json = reader
+        .lookup(&bare_name)?
+        .ok_or_else(|| crate::catalog::view_not_found_msg(&bare_name))?;
+    // C-2 (code-review 2026-07-11): `from_json` for the canonical
+    // "invalid definition for semantic view '<name>'" context on corrupt rows.
+    let def = SemanticViewDefinition::from_json(&bare_name, &json)?;
+    render_yaml_export(&def).map(String::into_bytes)
 }
 
 #[cfg(test)]
