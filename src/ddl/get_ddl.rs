@@ -45,104 +45,59 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
-    use crate::ddl::read_ffi::{
-        probe_catalog_table_present, publish_owned_buffer, write_err, BorrowedConnection,
-    };
-    use std::panic::AssertUnwindSafe;
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let borrowed = BorrowedConnection::new(conn);
-        if borrowed.is_null() {
-            write_err(error_buf, error_buf_len, "duckdb_connection is null");
-            return 1_u8;
-        }
-        if type_ptr.is_null() || name_ptr.is_null() {
-            write_err(error_buf, error_buf_len, "argument pointer is null");
-            return 1_u8;
-        }
-        let type_bytes = std::slice::from_raw_parts(type_ptr, type_len);
-        let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let Ok(obj_type) = std::str::from_utf8(type_bytes) else {
-            write_err(error_buf, error_buf_len, "object_type is not valid UTF-8");
-            return 1_u8;
-        };
-        let Ok(name) = std::str::from_utf8(name_bytes) else {
-            write_err(error_buf, error_buf_len, "name is not valid UTF-8");
-            return 1_u8;
-        };
+    crate::ddl::read_ffi::run_dispatcher(
+        conn,
+        out_ptr,
+        out_len,
+        error_buf,
+        error_buf_len,
+        "sv_get_ddl_exec_rust",
+        |borrowed| unsafe { get_ddl(borrowed, type_ptr, type_len, name_ptr, name_len) },
+    )
+}
 
-        if !obj_type.eq_ignore_ascii_case("SEMANTIC_VIEW") {
-            write_err(
-                error_buf,
-                error_buf_len,
-                &format!(
-                    "GET_DDL: unsupported object type '{obj_type}'. Only 'SEMANTIC_VIEW' is supported."
-                ),
-            );
-            return 1_u8;
-        }
+/// Body for [`sv_get_ddl_exec_rust`]: validate the object type, resolve the
+/// view, and render its `CREATE OR REPLACE SEMANTIC VIEW` DDL.
+///
+/// # Safety
+///
+/// `type_ptr` / `name_ptr` must each be null or point to the matching number
+/// of readable bytes.
+#[cfg(feature = "extension")]
+unsafe fn get_ddl(
+    borrowed: &crate::ddl::read_ffi::BorrowedConnection,
+    type_ptr: *const u8,
+    type_len: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> Result<Vec<u8>, String> {
+    use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg};
 
-        // C-2 (code-review 2026-07-11): normalize the requested name like
-        // every other single-view read path (FF-4/PA-8 sweep) — fold
-        // unquoted case, strip qualification, unwrap quoting. Lenient
-        // contract mirrors read_yaml's `resolve_bare_name`: a name that does
-        // not parse as an identifier is looked up verbatim and fails with
-        // the canonical "does not exist" message.
-        let name = crate::ident::normalize_view_name(name).unwrap_or_else(|_| name.to_string());
+    let obj_type = read_str_arg(type_ptr, type_len, "object_type")?;
+    let raw_name = read_str_arg(name_ptr, name_len, "view name")?;
 
-        // FF-9: surface a probe-query failure as an error distinct from "no
-        // views" instead of silently folding it into absence.
-        let present = match probe_catalog_table_present(&borrowed) {
-            Ok(p) => p,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let reader = CatalogReader::new(&borrowed, present);
-        let json = match reader.lookup(&name) {
-            Ok(Some(j)) => j,
-            Ok(None) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &crate::catalog::view_not_found_msg(&name),
-                );
-                return 1_u8;
-            }
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        // C-2: `from_json` for the canonical "invalid definition for
-        // semantic view '<name>'" context on corrupt rows (raw serde
-        // messages were the get_ddl/read_yaml exception).
-        let def = match SemanticViewDefinition::from_json(&name, &json) {
-            Ok(d) => d,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let ddl = match render_create_ddl(&name, &def) {
-            Ok(s) => s,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &format!("GET_DDL error: {e}"));
-                return 1_u8;
-            }
-        };
-        publish_owned_buffer(ddl.into_bytes(), out_ptr, out_len);
-        0_u8
-    }));
-    if let Ok(rc) = result {
-        rc
-    } else {
-        use crate::ddl::read_ffi::write_err;
-        write_err(
-            error_buf,
-            error_buf_len,
-            "internal error: panic inside sv_get_ddl_exec_rust",
-        );
-        2
+    if !obj_type.eq_ignore_ascii_case("SEMANTIC_VIEW") {
+        return Err(format!(
+            "GET_DDL: unsupported object type '{obj_type}'. Only 'SEMANTIC_VIEW' is supported."
+        ));
     }
+
+    // C-2 (code-review 2026-07-11): normalize the requested name like every
+    // other single-view read path (FF-4/PA-8 sweep). Lenient contract mirrors
+    // read_yaml's `resolve_bare_name`: a name that does not parse as an
+    // identifier is looked up verbatim and fails with the canonical message.
+    let name = crate::ident::normalize_view_name(&raw_name).unwrap_or(raw_name);
+
+    // FF-9: a probe-query failure is distinct from "no views" (propagated).
+    let present = probe_catalog_table_present(borrowed)?;
+    let reader = CatalogReader::new(borrowed, present);
+    let json = reader
+        .lookup(&name)?
+        .ok_or_else(|| crate::catalog::view_not_found_msg(&name))?;
+    // C-2: `from_json` for the canonical "invalid definition for semantic
+    // view '<name>'" context on corrupt rows.
+    let def = SemanticViewDefinition::from_json(&name, &json)?;
+    render_create_ddl(&name, &def)
+        .map(String::into_bytes)
+        .map_err(|e| format!("GET_DDL error: {e}"))
 }

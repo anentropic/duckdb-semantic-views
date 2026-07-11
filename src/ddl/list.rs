@@ -83,99 +83,73 @@ pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
-    use crate::ddl::read_ffi::{
-        probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
-        BorrowedConnection,
-    };
-    use std::panic::AssertUnwindSafe;
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        // Wrap the raw FFI handle in a BorrowedConnection at the boundary
-        // (D-10 / WR-05). Everything below this point goes through &borrowed
-        // or borrowed.as_raw(); the raw `conn` parameter is shadowed and
-        // never used again.
-        let borrowed = BorrowedConnection::new(conn);
-        if borrowed.is_null() {
-            write_err(error_buf, error_buf_len, "duckdb_connection is null");
-            return 1_u8;
+    crate::ddl::read_ffi::run_dispatcher(
+        conn,
+        out_ptr,
+        out_len,
+        error_buf,
+        error_buf_len,
+        "sv_list_semantic_views_bind_rust",
+        |borrowed| unsafe {
+            list_view_rows(borrowed, /* include_comment = */ true)
+        },
+    )
+}
+
+/// Shared body for both `list_semantic_views()` (6 columns) and
+/// `list_terse_semantic_views()` (5 columns — no trailing `comment`): probe
+/// the catalog, read every definition, and serialize the rows over the shared
+/// varchar wire format, name-sorted for byte-stable output.
+///
+/// FF-9: a genuine probe-query failure surfaces as an error rather than being
+/// folded into "no views" (an attached read-only DB without a bootstrapped
+/// catalog still returns 0 rows via `probe_catalog_table_present == false`).
+///
+/// # Safety
+///
+/// `borrowed` must wrap a live `duckdb_connection` (guaranteed by
+/// `run_dispatcher`, which constructs and null-checks it before calling).
+#[cfg(feature = "extension")]
+unsafe fn list_view_rows(
+    borrowed: &crate::ddl::read_ffi::BorrowedConnection,
+    include_comment: bool,
+) -> Result<Vec<u8>, String> {
+    use crate::ddl::read_ffi::{probe_catalog_table_present, serialize_varchar_rows};
+
+    let table_present = probe_catalog_table_present(borrowed)?;
+    let reader = CatalogReader::new(borrowed, table_present);
+    let entries = reader.list_all()?;
+
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(entries.len());
+    for (name, json) in &entries {
+        let def = SemanticViewDefinition::from_json(name, json).ok();
+        let (created_on, database_name, schema_name, comment) = match &def {
+            Some(d) => (
+                d.created_on.clone().unwrap_or_default(),
+                d.database_name.clone().unwrap_or_default(),
+                d.schema_name.clone().unwrap_or_default(),
+                d.comment.clone().unwrap_or_default(),
+            ),
+            None => (String::new(), String::new(), String::new(), String::new()),
+        };
+        let mut row = vec![
+            created_on,
+            name.clone(),
+            "SEMANTIC_VIEW".to_string(),
+            database_name,
+            schema_name,
+        ];
+        if include_comment {
+            row.push(comment);
         }
-
-        // Probe whether semantic_layer._definitions exists on the caller's
-        // connection. Cheap (single query); matches Phase 63's RO-load
-        // short-circuit semantics so an attached read-only DB without a
-        // bootstrapped catalog returns Ok(false) (0 rows) instead of an error.
-        // FF-9: a genuine probe-query failure now surfaces as an error rather
-        // than being silently folded into "no views".
-        let table_present = match probe_catalog_table_present(&borrowed) {
-            Ok(p) => p,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-
-        // CatalogReader::new only stores the raw pointer extracted via
-        // borrowed.as_raw() — no transfer of ownership.
-        let reader = CatalogReader::new(&borrowed, table_present);
-        let entries = match reader.list_all() {
-            Ok(e) => e,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-
-        // Reconstruct the 6-column rows exactly like the Rust VTab did
-        // (ListBindData::rows) — sort by name so output ordering is
-        // byte-identical to the v0.9.0 behavior.
-        let mut rows: Vec<Vec<String>> = Vec::with_capacity(entries.len());
-        for (name, json) in &entries {
-            let def = SemanticViewDefinition::from_json(name, json).ok();
-            let (created_on, database_name, schema_name, comment) = match &def {
-                Some(d) => (
-                    d.created_on.clone().unwrap_or_default(),
-                    d.database_name.clone().unwrap_or_default(),
-                    d.schema_name.clone().unwrap_or_default(),
-                    d.comment.clone().unwrap_or_default(),
-                ),
-                None => (String::new(), String::new(), String::new(), String::new()),
-            };
-            rows.push(vec![
-                created_on,
-                name.clone(),
-                "SEMANTIC_VIEW".to_string(),
-                database_name,
-                schema_name,
-                comment,
-            ]);
-        }
-        rows.sort_by(|a, b| a[1].cmp(&b[1]));
-
-        // FF-6: the shared serializer returns an error (rather than clamping a
-        // length to u32::MAX and desyncing the header from the payload) if a
-        // cell or the row count overflows the wire format's u32 fields. The
-        // previous inline copy used bare `as u32` casts. `publish_owned_buffer`
-        // hands the heap-owned buffer to C++ under the both-or-drop contract;
-        // the caller releases it via sv_free_buffer with the exact (ptr, len).
-        let buf = match serialize_varchar_rows(&rows) {
-            Ok(b) => b,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        publish_owned_buffer(buf, out_ptr, out_len);
-        0_u8
-    }));
-    if let Ok(rc) = result {
-        rc
-    } else {
-        write_err(
-            error_buf,
-            error_buf_len,
-            "internal error: panic inside sv_list_semantic_views_bind_rust",
-        );
-        2
+        rows.push(row);
     }
+    rows.sort_by(|a, b| a[1].cmp(&b[1]));
+
+    // FF-6: the shared serializer errors (rather than clamping a length to
+    // u32::MAX and desyncing the header from the payload) if a cell or the
+    // row count overflows the wire format's u32 fields.
+    serialize_varchar_rows(&rows)
 }
 
 // Phase 65.1 Plan 03a (IN-06 / D-26): the module-local duplicates of
@@ -215,76 +189,15 @@ pub unsafe extern "C" fn sv_list_terse_semantic_views_bind_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
-    use crate::ddl::read_ffi::{
-        probe_catalog_table_present, publish_owned_buffer, serialize_varchar_rows, write_err,
-        BorrowedConnection,
-    };
-    use std::panic::AssertUnwindSafe;
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let borrowed = BorrowedConnection::new(conn);
-        if borrowed.is_null() {
-            write_err(error_buf, error_buf_len, "duckdb_connection is null");
-            return 1_u8;
-        }
-
-        // FF-9: a genuine probe-query failure now surfaces as an error rather
-        // than being silently folded into "no views".
-        let table_present = match probe_catalog_table_present(&borrowed) {
-            Ok(p) => p,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let reader = CatalogReader::new(&borrowed, table_present);
-        let entries = match reader.list_all() {
-            Ok(e) => e,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-
-        let mut rows: Vec<Vec<String>> = Vec::with_capacity(entries.len());
-        for (name, json) in &entries {
-            let def = SemanticViewDefinition::from_json(name, json).ok();
-            let (created_on, database_name, schema_name) = match &def {
-                Some(d) => (
-                    d.created_on.clone().unwrap_or_default(),
-                    d.database_name.clone().unwrap_or_default(),
-                    d.schema_name.clone().unwrap_or_default(),
-                ),
-                None => (String::new(), String::new(), String::new()),
-            };
-            rows.push(vec![
-                created_on,
-                name.clone(),
-                "SEMANTIC_VIEW".to_string(),
-                database_name,
-                schema_name,
-            ]);
-        }
-        rows.sort_by(|a, b| a[1].cmp(&b[1]));
-
-        let buf = match serialize_varchar_rows(&rows) {
-            Ok(b) => b,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        publish_owned_buffer(buf, out_ptr, out_len);
-        0_u8
-    }));
-    if let Ok(rc) = result {
-        rc
-    } else {
-        use crate::ddl::read_ffi::write_err;
-        write_err(
-            error_buf,
-            error_buf_len,
-            "internal error: panic inside sv_list_terse_semantic_views_bind_rust",
-        );
-        2
-    }
+    crate::ddl::read_ffi::run_dispatcher(
+        conn,
+        out_ptr,
+        out_len,
+        error_buf,
+        error_buf_len,
+        "sv_list_terse_semantic_views_bind_rust",
+        |borrowed| unsafe {
+            list_view_rows(borrowed, /* include_comment = */ false)
+        },
+    )
 }
