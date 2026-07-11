@@ -209,11 +209,13 @@ mod reader {
 
     /// Read-side handle for `semantic_layer._definitions`.
     ///
-    /// Wraps a raw `duckdb_connection` ("catalog connection") created at
-    /// extension load time. Reads see the connection's transactional view
-    /// of the table, which for the catalog connection is always committed
-    /// state. Writes performed by parser-override-emitted SQL run on the
-    /// *caller's* connection and become visible here on commit.
+    /// Wraps a per-call `BorrowedConnection` — the raw `duckdb_connection`
+    /// borrowed from the caller's stack `Connection probe(*context.db)` in
+    /// the C++ bind callback (the extension-load-time "catalog connection"
+    /// was retired in Phase 65). A fresh connection runs its own
+    /// transaction, so reads see **committed** state (TECH-DEBT #19). Writes
+    /// performed by parser-override-emitted SQL run on the *caller's*
+    /// connection and become visible here on commit.
     ///
     /// The `'a` lifetime ties the reader to the `&'a BorrowedConnection` it
     /// was constructed from (Phase 65.1 WR-05 follow-up to Copilot PR #35

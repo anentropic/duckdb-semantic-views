@@ -1,9 +1,10 @@
 //! Rust↔C++ FFI bridges for the `__sv_compute_*` helper table functions.
 //!
 //! Phase 65 Plan 04 introduces the first such helper, `__sv_compute_create_from_yaml`,
-//! whose C++ bind callback (in `cpp/src/shim.cpp`) opens a per-call
-//! `Connection(*context.db)` to read the YAML file via `DuckDB`'s `read_text(?)`
-//! function, then calls into Rust here to parse the YAML, run validation +
+//! whose C++ bind callback (in `cpp/src/shim.cpp`) reads the YAML file directly
+//! through `DuckDB`'s `FileSystem` API (Phase 65.1 D-01..D-03 replaced the
+//! earlier `read_text(?)` SQL path), then calls into Rust here to parse the
+//! YAML, run validation +
 //! cardinality inference, and serialize the resulting JSON. The bind returns
 //! the JSON in a single VARCHAR row; the outer `parser_override` INSERT (in
 //! `src/parse.rs::rewrite_yaml_file_create`) wraps that row with
@@ -11,11 +12,11 @@
 //! (`created_on`, `database_name`, `schema_name`) on the caller's connection.
 //!
 //! Read-elimination architecture (Phase 65 D-11): the YAML read no longer
-//! goes through the `OverrideContext`'s catalog connection. The per-call
-//! Connection opened inside the bind closes at end-of-bind scope, so no
-//! long-lived extension-owned `duckdb_connection` outlives the user's
-//! `close()`. This is the load-bearing primitive for retiring H1 `catalog_conn`
-//! in Plan 06.
+//! goes through any long-lived extension-owned connection (the `catalog_conn`
+//! static and the `OverrideContext` that once held it were both retired —
+//! see AR-7). The per-call Connection opened inside the bind closes at
+//! end-of-bind scope, so nothing outlives the user's `close()`. This is the
+//! load-bearing primitive that let H1 `catalog_conn` be retired in Plan 06.
 //!
 //! FFI safety conventions (match `src/parse.rs::sv_parser_override_rust`):
 //!   * Every entry point wraps its body in `std::panic::catch_unwind(
@@ -40,9 +41,9 @@ use std::panic::AssertUnwindSafe;
 ///
 /// Called from the C++ bind callback for `__sv_compute_create_from_yaml`
 /// (see `cpp/src/shim.cpp::sv_create_from_yaml_bind`). The C++ side has
-/// already read the YAML file via `read_text(?)` on a per-call Connection
-/// opened from `ClientContext::db`, so this function only sees the
-/// already-loaded bytes — no file I/O on the Rust side.
+/// already read the YAML file directly through `DuckDB`'s `FileSystem` API,
+/// so this function only sees the already-loaded bytes — no file I/O on the
+/// Rust side.
 ///
 /// Returns the metadata-less JSON definition. The outer `parser_override`
 /// INSERT wraps the JSON with `json_merge_patch(new_def, json_object(...))`
