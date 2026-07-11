@@ -506,6 +506,142 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // T-2 (code-review 2026-07-11): the duplicate-clause-keyword branch in
+    // clause_bounds.rs had zero test coverage. Pin the message and that the
+    // caret points at the SECOND occurrence.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_clause_bounds_rejects_duplicate_dimensions() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.a AS o.a) DIMENSIONS (o.b AS o.b)";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("Duplicate clause keyword 'DIMENSIONS'"),
+            "got: {}",
+            err.message
+        );
+        // Caret must point at the second DIMENSIONS keyword.
+        assert_eq!(err.position, Some(body.rfind("DIMENSIONS").unwrap()));
+    }
+
+    #[test]
+    fn find_clause_bounds_rejects_duplicate_tables() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) TABLES (c AS customers PRIMARY KEY (id)) DIMENSIONS (o.a AS o.a)";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("Duplicate clause keyword 'TABLES'"),
+            "got: {}",
+            err.message
+        );
+        assert_eq!(err.position, Some(body.rfind("TABLES").unwrap()));
+    }
+
+    // -----------------------------------------------------------------------
+    // T-3 (code-review 2026-07-11): pin the behaviour of empty clause bodies.
+    // TABLES () satisfies the presence check but yields zero tables — the
+    // "at least one of DIMENSIONS/METRICS" and downstream validation decide
+    // the outcome. These tests document what actually happens so a future
+    // refactor can't silently change it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_dimensions_and_metrics_both_present_is_ok() {
+        // Both clauses present but empty: the "at least one of D/M" rule is
+        // about clause PRESENCE, so this parses to an empty-dims/empty-mets
+        // body (a dimensionless, metricless view — degenerate but legal at
+        // the parse layer).
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS () METRICS ()";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.tables.len(), 1);
+        assert!(kb.dimensions.is_empty());
+        assert!(kb.metrics.is_empty());
+    }
+
+    #[test]
+    fn empty_tables_clause_parses_to_zero_tables() {
+        // TABLES () satisfies the presence check; downstream expansion is
+        // what rejects a zero-table view, not the clause scanner.
+        let body = "AS TABLES () DIMENSIONS (o.a AS o.a)";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert!(kb.tables.is_empty());
+        assert_eq!(kb.dimensions.len(), 1);
+    }
+
+    #[test]
+    fn empty_metrics_only_still_requires_tables_and_d_or_m_by_presence() {
+        // METRICS () alone (no DIMENSIONS) satisfies the presence rule.
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) METRICS ()";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert!(kb.metrics.is_empty());
+        // Neither DIMENSIONS nor METRICS present at all is the actual error.
+        let body_none = "AS TABLES (o AS orders PRIMARY KEY (id))";
+        let err = parse_keyword_body(body_none, 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("At least one of 'DIMENSIONS' or 'METRICS' is required"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn empty_materializations_clause_parses() {
+        let body =
+            "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.a AS o.a) MATERIALIZATIONS ()";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert!(kb.materializations.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // T-4 (code-review 2026-07-11): comments INSIDE the AS body work only by
+    // construction (whole-query blanking runs before the body parser). Pin
+    // that block comments between clauses and inside clause parens are inert,
+    // and that a typo after an in-body comment still carets correctly.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn block_comment_between_clauses_is_inert() {
+        // The parse layer sees comments already blanked to spaces (length
+        // preserving), so this must parse identically to the comment-free
+        // form. NOTE: parse_keyword_body itself does not blank — callers
+        // (plan_rewrite) do — so exercise the blank-then-parse pipeline.
+        let raw = "AS TABLES (o AS orders PRIMARY KEY (id)) /* between */ DIMENSIONS (o.a AS o.a)";
+        let blanked = crate::util::blank_sql_comments(raw);
+        let kb = parse_keyword_body(&blanked, 0).unwrap();
+        assert_eq!(kb.tables.len(), 1);
+        assert_eq!(kb.dimensions.len(), 1);
+    }
+
+    #[test]
+    fn block_comment_inside_clause_parens_is_inert() {
+        let raw =
+            "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.a AS o.a /* c, ) inside */)";
+        let blanked = crate::util::blank_sql_comments(raw);
+        let kb = parse_keyword_body(&blanked, 0).unwrap();
+        assert_eq!(kb.dimensions.len(), 1);
+        assert_eq!(kb.dimensions[0].name, "a");
+    }
+
+    #[test]
+    fn caret_after_in_body_comment_is_honest() {
+        // blank_sql_comments is length-preserving, so a typo AFTER an in-body
+        // comment must still caret at its true byte offset. Here `TABLSE`
+        // follows a block comment; its reported position must equal the raw
+        // byte index of `TABLSE`, not be shifted by the comment's length.
+        let raw =
+            "AS /* leading note */ TABLSE (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.a AS o.a)";
+        let blanked = crate::util::blank_sql_comments(raw);
+        let err = parse_keyword_body(&blanked, 0).unwrap_err();
+        assert!(err.message.contains("TABLSE") || err.message.contains("TABLES"));
+        assert_eq!(
+            err.position,
+            Some(raw.find("TABLSE").unwrap()),
+            "caret must point at the raw offset of TABLSE despite the preceding comment"
+        );
+    }
+
     #[test]
     fn find_clause_bounds_nested_pk_not_confused() {
         // PRIMARY KEY (...) creates nested depth — closing paren must not end TABLES clause early

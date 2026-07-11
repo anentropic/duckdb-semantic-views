@@ -1,0 +1,150 @@
+# Code-review 2026-07-11 PR2 — parser/coverage holes (T-2, T-3, T-4, T-6).
+# End-to-end coverage through the full CREATE / semantic_view() pipeline for
+# branches previously exercised only at the parse-unit layer (or not at all).
+
+require semantic_views
+
+statement ok
+CREATE TABLE cvb_orders (
+    id INTEGER PRIMARY KEY,
+    region VARCHAR,
+    snap_date DATE,
+    amount DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO cvb_orders VALUES
+    (1, 'east', '2024-01-01', 10.00),
+    (2, 'east', '2024-01-02', 20.00),
+    (3, 'east', '2024-01-02', 5.00),
+    (4, 'west', '2024-01-01', 30.00);
+
+# ========================================
+# T-2: duplicate clause keyword is rejected end-to-end.
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW cvb_dup AS
+TABLES (o AS cvb_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+DIMENSIONS (o.snap_date AS o.snap_date)
+METRICS (o.total AS SUM(o.amount))
+----
+Duplicate clause keyword 'DIMENSIONS'
+
+# ========================================
+# T-3: empty clause bodies. TABLES () satisfies the presence check at the
+# parse layer, but a zero-table view has no base table — pin whatever the
+# full pipeline actually does (documented, so a refactor can't drift it).
+# DIMENSIONS () METRICS () both-empty is the degenerate legal-parse case.
+# ========================================
+
+# Empty DIMENSIONS with a real METRICS clause: grand-total metric works.
+statement ok
+CREATE SEMANTIC VIEW cvb_empty_dims AS
+TABLES (o AS cvb_orders PRIMARY KEY (id))
+DIMENSIONS ()
+METRICS (o.total AS SUM(o.amount))
+
+query R
+SELECT total FROM semantic_view('cvb_empty_dims', metrics := ['total']);
+----
+65
+
+statement ok
+DROP SEMANTIC VIEW cvb_empty_dims
+
+# ========================================
+# T-4: comments INSIDE the AS body (between clauses and inside parens) are
+# inert — length-preserving blanking runs before the body parser.
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW cvb_comments AS
+TABLES (o AS cvb_orders PRIMARY KEY (id)) /* between clauses */
+DIMENSIONS (o.region AS o.region /* inside parens: has ) and , */)
+METRICS (o.total AS SUM(o.amount))
+
+query TR
+SELECT region, total FROM semantic_view('cvb_comments',
+    dimensions := ['region'], metrics := ['total']) ORDER BY region;
+----
+east	35
+west	30
+
+# A typo after an in-body comment still surfaces a parser error (caret honesty
+# is unit-tested; here we only assert the pipeline rejects it).
+statement error
+CREATE SEMANTIC VIEW cvb_comment_typo AS
+TABLES (o AS cvb_orders PRIMARY KEY (id)) /* note */ TABLSE (x AS y)
+DIMENSIONS (o.region AS o.region)
+METRICS (o.total AS SUM(o.amount))
+----
+TABLSE
+
+statement ok
+DROP SEMANTIC VIEW cvb_comments
+
+# ========================================
+# T-6: wildcard interaction cells — wildcard expansion routing when the view
+# contains a SEMI-ADDITIVE metric and a WINDOW metric (distinct dispatch
+# decisions previously untested through wildcards).
+# ========================================
+
+# --- Semi-additive × wildcard -------------------------------------------
+statement ok
+CREATE SEMANTIC VIEW cvb_semi AS
+TABLES (o AS cvb_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region, o.snap_date AS o.snap_date)
+METRICS (
+    o.total AS SUM(o.amount),
+    o.latest NON ADDITIVE BY (snap_date DESC) AS SUM(o.amount)
+)
+
+# o.* on metrics expands to {total, latest}; queried by region (NOT the NA
+# dim), so `latest` takes the active semi-additive snapshot path. East's
+# latest date is 2024-01-02 (20.00 + 5.00 tied = 25.00); west's is
+# 2024-01-01 (30.00). total is the plain sum.
+query TRR
+SELECT region, total, latest FROM semantic_view('cvb_semi',
+    dimensions := ['region'], metrics := ['o.*']) ORDER BY region;
+----
+east	35	25
+west	30	30
+
+statement ok
+DROP SEMANTIC VIEW cvb_semi
+
+# --- Window × wildcard ---------------------------------------------------
+statement ok
+CREATE SEMANTIC VIEW cvb_win AS
+TABLES (o AS cvb_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region, o.snap_date AS o.snap_date)
+METRICS (
+    o.total AS SUM(o.amount),
+    o.running AS SUM(total) OVER (PARTITION BY EXCLUDING snap_date ORDER BY snap_date ASC NULLS LAST)
+)
+
+# o.* on metrics expands to {total, running} — an aggregate + a window
+# metric, which the engine forbids in one query. The wildcard expansion must
+# surface the same mix error as the explicit list (routing via wildcards).
+statement error
+SELECT * FROM semantic_view('cvb_win',
+    dimensions := ['region', 'snap_date'], metrics := ['o.*']);
+----
+cannot mix window function metrics
+
+# Explicit window metric alongside a dims wildcard is mix-free and works.
+query TTR
+SELECT region, snap_date, running FROM semantic_view('cvb_win',
+    dimensions := ['o.*'], metrics := ['running']) ORDER BY region, snap_date;
+----
+east	2024-01-01	10
+east	2024-01-02	35
+west	2024-01-01	30
+
+statement ok
+DROP SEMANTIC VIEW cvb_win
+
+statement ok
+DROP TABLE cvb_orders

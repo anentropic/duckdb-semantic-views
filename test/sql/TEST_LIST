@@ -7,6 +7,7 @@ test/sql/65_read_bridge_spike.test
 test/sql/ar4_schema_version.test
 test/sql/count_star_left_join.test
 test/sql/cr20260711_correctness.test
+test/sql/cr20260711b_test_coverage.test
 test/sql/error_caret_alter.test
 test/sql/error_caret_create.test
 test/sql/error_caret_drop.test
