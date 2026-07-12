@@ -323,7 +323,42 @@ pub fn normalize_ident_part(raw: &str) -> String {
 /// case is unchanged; only a double-quoted reference gains case-sensitivity.
 #[must_use]
 pub fn ident_matches(stored: &str, requested: &str) -> bool {
+    // Fast path (the common case): when neither side is double-quoted, the
+    // match is a plain ASCII case-insensitive comparison — allocation-free and
+    // byte-for-byte the former `eq_ignore_ascii_case` behaviour, so hot
+    // name-resolution loops pay nothing for the contract. Only a quoted
+    // reference on either side needs the normalize-and-compare path.
+    if !stored.contains('"') && !requested.contains('"') {
+        return stored.eq_ignore_ascii_case(requested);
+    }
     normalize_ident_part(stored) == normalize_ident_part(requested)
+}
+
+/// Byte offset of the first `.` in `s` that lies OUTSIDE a double-quoted
+/// region, or `None`. Used to split a qualified reference `alias.name` at its
+/// qualifier dot without splitting inside a quoted part — `"a.b"` has no
+/// top-level dot, and `o."a.b"` splits only at the dot after `o`. Honours the
+/// `""` escape (a doubled quote stays inside the quoted region).
+#[must_use]
+pub fn first_unquoted_dot(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if in_quotes && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2; // "" escape — stay inside the quoted region
+                    continue;
+                }
+                in_quotes = !in_quotes;
+            }
+            b'.' if !in_quotes => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -780,6 +815,21 @@ mod tests {
             // Unquoted request still matches an unquoted stored name of any
             // case (the folded keys coincide).
             assert!(ident_matches("Region", "region"));
+        }
+
+        #[test]
+        fn first_unquoted_dot_ignores_dots_in_quotes() {
+            // Top-level dot after the alias.
+            assert_eq!(first_unquoted_dot("o.region"), Some(1));
+            // Dot only inside a quoted part → no top-level dot.
+            assert_eq!(first_unquoted_dot("\"a.b\""), None);
+            // Qualifier dot present, plus a dot inside the quoted name part:
+            // split at the qualifier dot (offset 1), not the inner one.
+            assert_eq!(first_unquoted_dot("o.\"a.b\""), Some(1));
+            // Bare name, no dot.
+            assert_eq!(first_unquoted_dot("region"), None);
+            // Doubled-quote escape keeps us inside the quoted region.
+            assert_eq!(first_unquoted_dot("\"a\"\"b.c\""), None);
         }
     }
 }

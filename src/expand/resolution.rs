@@ -160,7 +160,7 @@ pub(super) fn find_dimension<'a>(
     def: &'a SemanticViewDefinition,
     name: &str,
 ) -> Option<&'a crate::model::Dimension> {
-    if let Some(dot_pos) = name.find('.') {
+    if let Some(dot_pos) = crate::ident::first_unquoted_dot(name) {
         let alias = &name[..dot_pos];
         let bare = &name[dot_pos + 1..];
         def.dimensions.iter().find(|d| {
@@ -187,7 +187,7 @@ pub(super) fn find_metric<'a>(
     def: &'a SemanticViewDefinition,
     name: &str,
 ) -> Option<&'a crate::model::Metric> {
-    if let Some(dot_pos) = name.find('.') {
+    if let Some(dot_pos) = crate::ident::first_unquoted_dot(name) {
         let alias = &name[..dot_pos];
         let bare = &name[dot_pos + 1..];
         def.metrics.iter().find(|m| {
