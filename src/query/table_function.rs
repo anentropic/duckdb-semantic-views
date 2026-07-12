@@ -105,8 +105,11 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
 ///
 /// # Safety
 ///
-/// Each `*_ptr` is null or points to its paired `*_len` readable bytes; the
-/// borrowed connection must outlive the call (see the module borrow contract).
+/// Each `*_ptr` is either null or points to its paired `*_len` readable bytes.
+/// A null pointer is only meaningful with `*_len == 0` (an empty list / absent
+/// name); the decoders reject `(null, len > 0)` as FFI shape drift rather than
+/// dereferencing it. The borrowed connection must outlive the call (see the
+/// module borrow contract).
 #[cfg(feature = "extension")]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 unsafe fn semantic_view_bind_body(
