@@ -15,6 +15,7 @@ pub mod parse;
 pub mod query;
 pub mod render_ddl;
 pub mod render_yaml;
+pub(crate) mod sql_lit;
 pub mod util;
 
 /// Minimum `DuckDB` version this extension declares compatibility with, passed to

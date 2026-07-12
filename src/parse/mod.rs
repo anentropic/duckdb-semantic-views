@@ -39,8 +39,6 @@ pub(crate) use ffi::sv_parser_override_rust;
 mod native_sql;
 #[cfg(feature = "extension")]
 pub(crate) use native_sql::rewrite_to_native_sql;
-#[cfg(test)]
-pub(crate) use native_sql::{escape_sql_arg, unescape_sql_arg};
 
 mod show_clauses;
 pub(crate) use show_clauses::{build_filter_suffix, parse_show_filter_clauses};
