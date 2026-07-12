@@ -17,7 +17,8 @@ mod window;
 #[cfg(test)]
 mod test_helpers;
 
-// Public API (matches prior expand.rs surface exactly)
+// Public API (the pre-split expand.rs surface, plus the boxed fan-trap detail
+// structs re-exported for R-9).
 pub use resolution::{quote_ident, quote_ident_if_needed, quote_table_ref};
 pub use sql_gen::expand;
 pub use types::{

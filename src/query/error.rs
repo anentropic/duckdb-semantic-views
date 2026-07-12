@@ -138,10 +138,10 @@ mod tests {
 
     #[test]
     fn empty_request_message_matches_expand_error_verbatim() {
-        // R-16 (code-review 2026-07-11): `QueryError::EmptyRequest` and
-        // `ExpandError::EmptyRequest` now share `expand::write_empty_request`.
-        // Pin that they render byte-for-byte identically so the wording can't
-        // drift apart again (the original defect this refactor removed).
+        // R-16 (code-review 2026-07-11): `QueryError::EmptyRequest`'s Display
+        // delegates to `ExpandError::EmptyRequest`, so the two are guaranteed to
+        // render identically. Pin it so the wording can't drift apart again
+        // (the original defect this refactor removed).
         let query_side = QueryError::EmptyRequest {
             view_name: "orders".to_string(),
         };
