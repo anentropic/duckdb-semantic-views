@@ -3196,7 +3196,7 @@ GROUP BY
                     Metric {
                         name: "profit".to_string(),
                         expr: "total_revenue - secret_cost".to_string(),
-                        source_table: None, // derived metric,
+                        // no source_table: derived metric
                         ..Default::default()
                     },
                 ],
