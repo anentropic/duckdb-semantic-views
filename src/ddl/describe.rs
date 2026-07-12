@@ -115,9 +115,19 @@ struct DescribeRow {
 
 /// Format column names as a JSON array: `["col1","col2"]`.
 /// Matches Snowflake format: no spaces after commas.
+///
+/// Delegates to `serde_json` so a value containing `"`, `\`, or a control
+/// character is escaped into valid JSON instead of breaking out of the
+/// string literal (C-12, code-review 2026-07-11) — the previous
+/// `format!("\"{s}\"")` emitted `["a"b"]` for a synonym `a"b`, which the
+/// DESCRIBE output documents as a JSON array. `serde_json` writes no space
+/// after the comma and passes UTF-8 through unescaped, so all-ASCII inputs
+/// stay byte-identical to the prior hand-rolled format.
 pub(crate) fn format_json_array(items: &[String]) -> String {
-    let quoted: Vec<String> = items.iter().map(|s| format!("\"{s}\"")).collect();
-    format!("[{}]", quoted.join(","))
+    // Serializing a slice of `String` to JSON is infallible (no floats, no
+    // non-string map keys, in-memory writer), so `expect` documents an
+    // impossibility rather than swallowing a real error.
+    serde_json::to_string(items).expect("serializing a &[String] to JSON is infallible")
 }
 
 /// Collect TABLE property rows from the definition.
@@ -525,6 +535,37 @@ mod tests {
     fn format_json_array_empty() {
         let cols: Vec<String> = vec![];
         assert_eq!(format_json_array(&cols), "[]");
+    }
+
+    /// C-12 (code-review 2026-07-11): a value containing `"` or `\` must be
+    /// escaped so the DESCRIBE output stays valid JSON. The previous
+    /// `format!("\"{s}\"")` emitted `["a"b"]` — unparseable.
+    #[test]
+    fn format_json_array_escapes_quote_and_backslash() {
+        let items = vec![r#"a"b"#.to_string(), r"c\d".to_string()];
+        let json = format_json_array(&items);
+        assert_eq!(json, r#"["a\"b","c\\d"]"#);
+        // Round-trips through a real JSON parser back to the originals.
+        let parsed: Vec<String> = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed, items);
+    }
+
+    /// C-12: control characters (a synonym pasted with an embedded newline or
+    /// tab) are escaped rather than emitted raw into the JSON string.
+    #[test]
+    fn format_json_array_escapes_control_characters() {
+        let items = vec!["line1\nline2\t".to_string()];
+        let json = format_json_array(&items);
+        assert_eq!(json, r#"["line1\nline2\t"]"#);
+        let parsed: Vec<String> = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed, items);
+    }
+
+    /// C-12: non-ASCII passes through as raw UTF-8 (valid JSON), matching the
+    /// prior format so existing DESCRIBE fixtures stay byte-identical.
+    #[test]
+    fn format_json_array_preserves_utf8_unescaped() {
+        assert_eq!(format_json_array(&["café★".to_string()]), "[\"café★\"]");
     }
 
     #[test]

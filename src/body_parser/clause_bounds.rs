@@ -3,6 +3,15 @@
 use super::scan::QuoteState;
 use crate::errors::ParseError;
 
+/// Decode the character starting at byte offset `i` in `text` for an error
+/// message. `bytes[i] as char` truncated a multibyte codepoint to its lead
+/// byte, so `★` (0xE2 0x98 0x85) surfaced as the mojibake `'â'` (0xE2) —
+/// P-14, code-review 2026-07-11. Returns `None` at end-of-input or a
+/// non-char-boundary offset (both callers pass boundary offsets).
+fn char_at(text: &str, i: usize) -> Option<char> {
+    text.get(i..).and_then(|s| s.chars().next())
+}
+
 /// Known clause keywords for the AS-body scanner.
 const CLAUSE_KEYWORDS: &[&str] = &[
     "tables",
@@ -44,6 +53,7 @@ fn suggest_clause_keyword(word: &str) -> Option<&'static str> {
 }
 
 /// Internal result of scanning a single clause from the AS-body.
+#[derive(Debug)]
 pub(super) struct ClauseBound<'a> {
     pub(super) keyword: &'static str,
     pub(super) content: &'a str,      // text inside the matching parens
@@ -70,7 +80,7 @@ pub(super) fn find_clause_bounds<'a>(
 
     while i < bytes.len() {
         // Skip whitespace
-        while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
         if i >= bytes.len() {
@@ -78,19 +88,20 @@ pub(super) fn find_clause_bounds<'a>(
         }
 
         // Collect identifier word
-        if !(bytes[i] as char).is_ascii_alphabetic() {
-            // Unexpected character at top level
-            let ch = bytes[i] as char;
+        if !bytes[i].is_ascii_alphabetic() {
+            // Unexpected character at top level. Decode the real UTF-8 char
+            // (never the mojibake lead byte) for the message (P-14).
+            let ch = char_at(text, i).unwrap_or('\u{FFFD}');
             return Err(ParseError {
                 message: format!(
-                    "Unexpected character '{ch}' in AS body; expected a clause keyword (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS).",
+                    "Unexpected character '{ch}' in AS body; expected a clause keyword (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS).",
                 ),
                 position: Some(base_offset + i),
             });
         }
 
         let word_start = i;
-        while i < bytes.len() && (bytes[i] as char).is_ascii_alphabetic() {
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
             i += 1;
         }
         let word = &text[word_start..i];
@@ -107,7 +118,7 @@ pub(super) fn find_clause_bounds<'a>(
                 format!("Unknown clause keyword '{word}'; did you mean '{sug_upper}'?")
             } else {
                 format!(
-                    "Unknown clause keyword '{word}'; expected one of TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS.",
+                    "Unknown clause keyword '{word}'; expected one of TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS.",
                 )
             };
             return Err(ParseError {
@@ -126,18 +137,16 @@ pub(super) fn find_clause_bounds<'a>(
         }
 
         // Skip whitespace after keyword
-        while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
 
         // Expect '('
-        if i >= bytes.len() || bytes[i] as char != '(' {
+        if i >= bytes.len() || bytes[i] != b'(' {
             let kw_upper = keyword.to_ascii_uppercase();
-            let found = if i < bytes.len() {
-                bytes[i] as char
-            } else {
-                '\0'
-            };
+            // Decode the real UTF-8 char for the message; '\0' at EOF keeps
+            // the prior end-of-input sentinel (P-14).
+            let found = char_at(text, i).unwrap_or('\0');
             return Err(ParseError {
                 message: format!(
                     "Expected '(' after clause keyword '{kw_upper}', found '{found}'.",
@@ -238,4 +247,87 @@ pub(super) fn find_clause_bounds<'a>(
     }
 
     Ok(bounds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{char_at, find_clause_bounds};
+
+    /// P-14 (code-review 2026-07-11): a multibyte character at the top level
+    /// of the AS body must appear verbatim in the error, not truncated to its
+    /// UTF-8 lead byte. `bytes[i] as char` rendered `★` (0xE2 0x98 0x85) as
+    /// the mojibake `'â'` (U+00E2), the char for byte 0xE2 alone.
+    #[test]
+    fn unexpected_multibyte_char_reported_verbatim() {
+        let err = find_clause_bounds("★ DIMENSIONS (d AS x)", 0).unwrap_err();
+        assert!(
+            err.message.contains("'★'"),
+            "error must contain the real character, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains('\u{00E2}'),
+            "error must not contain the mojibake lead byte: {}",
+            err.message
+        );
+        // Position is the byte offset of the character (unchanged).
+        assert_eq!(err.position, Some(0));
+    }
+
+    /// P-14, the "expected '(' after keyword" arm: a multibyte character where
+    /// a '(' is expected must also render verbatim.
+    #[test]
+    fn expected_paren_multibyte_char_reported_verbatim() {
+        let err = find_clause_bounds("TABLES ★", 0).unwrap_err();
+        assert!(
+            err.message.contains("Expected '('") && err.message.contains("'★'"),
+            "error must name the real character, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains('\u{00E2}'),
+            "error must not contain the mojibake lead byte: {}",
+            err.message
+        );
+    }
+
+    /// `char_at` decodes the whole codepoint at a boundary offset and yields
+    /// `None` past end-of-input (the EOF sentinel path for the paren arm).
+    #[test]
+    fn char_at_decodes_codepoint_and_handles_eof() {
+        assert_eq!(char_at("★x", 0), Some('★'));
+        assert_eq!(char_at("a★", 1), Some('★'));
+        assert_eq!(char_at("abc", 3), None);
+    }
+
+    /// A plain ASCII unexpected character still renders correctly (no
+    /// regression for the common case).
+    #[test]
+    fn unexpected_ascii_char_reported() {
+        let err = find_clause_bounds("# DIMENSIONS (d AS x)", 0).unwrap_err();
+        assert!(err.message.contains("'#'"), "got: {}", err.message);
+    }
+
+    /// The clause-keyword lists in the "unexpected character" and "unknown
+    /// keyword" errors must name every keyword the scanner accepts —
+    /// MATERIALIZATIONS was previously omitted from both, while the ordering
+    /// error already listed it (Copilot review, #83).
+    #[test]
+    fn keyword_list_errors_include_materializations() {
+        // "unexpected character" arm (leading non-alphabetic byte).
+        let err = find_clause_bounds("# TABLES (o AS x)", 0).unwrap_err();
+        assert!(
+            err.message.contains("MATERIALIZATIONS"),
+            "unexpected-char message must list MATERIALIZATIONS: {}",
+            err.message
+        );
+        // "unknown clause keyword" arm. ZZZQQQ is >3 edits from every keyword
+        // so it takes the no-suggestion branch that lists the keywords.
+        let err = find_clause_bounds("ZZZQQQ (x)", 0).unwrap_err();
+        assert!(
+            err.message.contains("MATERIALIZATIONS"),
+            "unknown-keyword message must list MATERIALIZATIONS: {}",
+            err.message
+        );
+    }
 }
