@@ -104,7 +104,11 @@ fn extract_name_only(
     let raw = extract_raw_name_only(trimmed, prefix_len, trailing, base)?;
     normalize_view_name(&raw).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
-        position: Some(base + prefix_len),
+        // Point the caret at the name token itself, not the end of the prefix:
+        // with whitespace after the prefix the two differ. Matches the other
+        // helpers in this PR (extract_raw_name_only, rewrite_alter) which all
+        // resolve positions from the trimmed name slice.
+        position: Some(base + byte_offset_within(trimmed, trimmed[prefix_len..].trim())),
     })
 }
 
@@ -1786,6 +1790,13 @@ mod tests {
             "oops",
             "caret should sit on the trailing token"
         );
+
+        // Invalid view name → caret at the name token, not the end of the
+        // prefix. Extra whitespace after the prefix makes the two differ, so
+        // this pins that `extract_name_only` resolves from the trimmed slice.
+        let q = "DROP SEMANTIC VIEW   \"unterminated";
+        let pos = plan_rewrite(q).unwrap_err().position.expect("position set");
+        assert_eq!(&q[pos..=pos], "\"", "caret should sit on the name token");
     }
 
     #[test]
