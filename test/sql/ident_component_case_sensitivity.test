@@ -1,0 +1,60 @@
+# Snowflake identifier contract for dimension/metric/fact query references.
+#
+# Unquoted references match case-insensitively; a double-quoted reference
+# matches case-sensitively and only against a name declared with that exact
+# quoted spelling. End-to-end pin through the full CREATE -> semantic_view()
+# resolution pipeline (the resolution-layer unit tests live in
+# src/expand/resolution.rs; this pins the string-arg query surface).
+
+require semantic_views
+
+statement ok
+CREATE TABLE ics_orders (id BIGINT, region VARCHAR, status VARCHAR, amount DOUBLE);
+
+statement ok
+INSERT INTO ics_orders VALUES (1, 'US', 'open', 100.0), (2, 'EU', 'closed', 200.0);
+
+# Quoted mixed-case dimension "Region" (distinct from an unquoted `region`);
+# plain unquoted dimension `status`; metric `total`.
+statement ok
+CREATE SEMANTIC VIEW ics_v AS
+  TABLES (o AS ics_orders PRIMARY KEY (id))
+  DIMENSIONS (o."Region" AS o.region, o.status AS o.status)
+  METRICS (o.total AS SUM(o.amount))
+
+# --- quoted reference is case-sensitive ---
+
+# Exact-case quoted reference resolves.
+statement ok
+SELECT * FROM explain_semantic_view('ics_v', dimensions := ['"Region"'], metrics := ['total']);
+
+# Wrong-case quoted reference does NOT resolve (case-sensitive).
+statement error
+SELECT * FROM explain_semantic_view('ics_v', dimensions := ['"region"'], metrics := ['total']);
+----
+unknown dimension
+
+# An unquoted reference (fold key `region`) is a DIFFERENT object from the
+# quoted `"Region"` (key `Region`), so it does not resolve either.
+statement error
+SELECT * FROM explain_semantic_view('ics_v', dimensions := ['region'], metrics := ['total']);
+----
+unknown dimension
+
+# --- unquoted reference stays case-insensitive (regression) ---
+
+statement ok
+SELECT * FROM explain_semantic_view('ics_v', dimensions := ['status'], metrics := ['total']);
+
+statement ok
+SELECT * FROM explain_semantic_view('ics_v', dimensions := ['STATUS'], metrics := ['total']);
+
+statement ok
+SELECT * FROM explain_semantic_view('ics_v', dimensions := ['Status'], metrics := ['TOTAL']);
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW ics_v;
+
+statement ok
+DROP TABLE ics_orders;

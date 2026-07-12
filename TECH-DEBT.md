@@ -248,9 +248,22 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Mitigation for callers needing atomic check-and-write:** wrap the DDL in an explicit `BEGIN … COMMIT` (or use a connection with `autocommit = false`). All emitted statements then share one snapshot and the guard is consistent with the DML; a concurrent committer instead triggers a serialization/PK conflict at `COMMIT`, which the caller can retry — the same pattern as #23's `CREATE IF NOT EXISTS` mitigation.
 - **Action if DuckDB ever exposes the caller's transaction state (or a retry-on-conflict hook) from a `parser_override` callback:** conditionally wrap the rewrite in `BEGIN … COMMIT` only when the caller is under autocommit, and convert this entry to ✅ resolved.
 
+### 28. ❌ Component-name identifier contract applied only at the query-resolution boundary (deferred to review §6.2)
+
+- **Origin:** v0.11 identifier-contract work extending PA-8 (view-name case-sensitivity) to dimension/metric/fact names; code review on that PR (2026-07-12).
+- **Limitation:** The Snowflake identifier contract (unquoted → case-insensitive, `"quoted"` → case-sensitive) is applied via `ident::ident_matches` / `ident::normalize_ident_part` at the query-argument resolution boundary (`find_dimension` / `find_metric` / `Fact::find`), the CREATE-time uniqueness key (`graph/names.rs::validate_name_uniqueness`), and `alias.*` wildcard de-duplication (`expand/wildcard.rs`). It is **not** yet applied to the remaining name-comparison / keying sites, which still fold case-insensitively regardless of quoting:
+  - materialization routing (`expand/materialization.rs`, two duplicated matchers) and the `explain_semantic_view()` `-- Materialization:` header (`query/explain.rs`) — deliberately left *both* case-insensitive so the header cannot disagree with the routing it describes;
+  - `NON ADDITIVE BY` dimension references and window inner-metric references;
+  - derived-metric / fact expression inlining (identifier references scanned inside expression *text*);
+  - the table-alias slot, output-column aliasing for quoted names, and `CiName`'s own case-insensitive `Eq`.
+- **Why this is acceptable (interim):** the common case — unquoted names — is unchanged everywhere (`ident_matches` reduces to `eq_ignore_ascii_case` when neither side is quoted), so the split affects only quoted mixed-case component names, which are rare. The query boundary and CREATE-time uniqueness use the same key, so a quoted name cannot silently shadow (the SG-13 hazard that motivated aligning the uniqueness key).
+- **Action:** Unify these onto one quote-aware reference-scanning engine as part of §6.2 of `_notes/code-review-2026-07-11.md` (which also collapses the duplicated materialization matcher and the copies of the word-boundary reference scanner). The expression-text sites specifically need a quote-aware tokenizer, not a name comparison — that engine is the right home. Tracked here rather than only in the PR description so the follow-up is not lost (the "half-migrated abstraction" pattern §7 of that review warns about).
+
 ---
 
-**Last updated:** 2026-07-11 (v0.10.4) — accuracy sweep against the 2026-07-11
+**Last updated:** 2026-07-12 (v0.11 unreleased) — added entry #28 (component-name
+identifier contract deferred to review §6.2). Prior: 2026-07-11 (v0.10.4) accuracy
+sweep against the 2026-07-11
 code review: retired the ghost-code descriptions in entries #1, #4, #9, #12, #20
 (sidecar `persist_conn`, the independent-query-connection rationale, `sv_ddl_conn`,
 the `sv_ddl_bind`/`sv_ddl_execute` VARCHAR-forwarding pipeline, and the

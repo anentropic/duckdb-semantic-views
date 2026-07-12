@@ -173,7 +173,7 @@ Use standard SQL ``ORDER BY`` and ``LIMIT`` on the outer query:
 Name Resolution
 ===============
 
-Dimension, metric, and fact names are resolved case-insensitively. Names can optionally be table-qualified (e.g., ``'o.region'``), which matches against the ``source_table`` alias of the dimension, metric, or fact.
+Dimension, metric, and fact names are resolved under the Snowflake identifier contract: an **unquoted** reference (``'region'``, ``'REGION'``) matches case-insensitively, while a **double-quoted** reference (``'"Region"'``) matches case-sensitively and only against a name declared with that exact quoted spelling. Names can optionally be table-qualified (e.g., ``'o.region'``), which matches against the ``source_table`` alias of the dimension, metric, or fact.
 
 Wildcard patterns (``alias.*``) are expanded before name resolution. The expansion respects ``PRIVATE`` access modifiers -- private items are excluded.
 
