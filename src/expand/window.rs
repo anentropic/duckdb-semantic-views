@@ -31,11 +31,7 @@ use super::types::ExpandError;
 /// 2. **Outer SELECT**: Applies each window function over the CTE results with
 ///    computed PARTITION BY (all queried dims minus EXCLUDING dims) and ORDER BY.
 ///    No GROUP BY in the outer query -- window functions are row-level operations.
-#[allow(
-    clippy::too_many_lines,
-    clippy::result_large_err,
-    clippy::unnecessary_wraps
-)]
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
 pub(super) fn expand_window_metrics(
     view_name: &str,
     def: &SemanticViewDefinition,

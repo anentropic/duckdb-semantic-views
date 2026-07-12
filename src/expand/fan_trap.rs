@@ -4,7 +4,7 @@ use crate::model::{Cardinality, Metric, SemanticViewDefinition};
 
 use super::facts::collect_derived_metric_source_tables;
 use super::semi_additive::is_active_semi_additive;
-use super::types::ExpandError;
+use super::types::{ExpandError, FanTrapError, MetricFanTrapError};
 
 /// Cardinality map: `(from_lower, to_lower)` -> (worst-case cardinality,
 /// name of a relationship carrying that cardinality).
@@ -32,7 +32,7 @@ type CardMap = HashMap<(String, String), (Cardinality, String)>;
 /// For an edge `(from_alias, to_alias)` with cardinality:
 /// - `ManyToOne`: from->to is safe (many go to one), to->from is fan-out
 /// - `OneToOne`: both directions are safe
-#[allow(clippy::result_large_err, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 pub(super) fn check_fan_traps(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -116,15 +116,17 @@ pub(super) fn check_fan_traps(
                     .or_else(|| fanning_edge_on_path(&down_path, &card_map));
                 if let Some(rel_name) = fanning {
                     return Err(ExpandError::FanTrap {
-                        view_name: view_name.to_string(),
-                        metric_name: met.name.clone(),
-                        metric_table: met
-                            .source_table
-                            .clone()
-                            .unwrap_or_else(|| met_table.clone()),
-                        dimension_name: dim.name.clone(),
-                        dimension_table: dim_table_raw.clone(),
-                        relationship_name: rel_name,
+                        detail: Box::new(FanTrapError {
+                            view_name: view_name.to_string(),
+                            metric_name: met.name.clone(),
+                            metric_table: met
+                                .source_table
+                                .clone()
+                                .unwrap_or_else(|| met_table.clone()),
+                            dimension_name: dim.name.clone(),
+                            dimension_table: dim_table_raw.clone(),
+                            relationship_name: rel_name,
+                        }),
                     });
                 }
             }
@@ -176,12 +178,14 @@ pub(super) fn check_fan_traps(
                     };
                     if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
                         return Err(ExpandError::MetricFanTrap {
-                            view_name: view_name.to_string(),
-                            metric_name: met_a.name.clone(),
-                            metric_table: table_a.clone(),
-                            other_metric_name: met_b.name.clone(),
-                            other_metric_table: table_b.clone(),
-                            relationship_name: rel_name,
+                            detail: Box::new(MetricFanTrapError {
+                                view_name: view_name.to_string(),
+                                metric_name: met_a.name.clone(),
+                                metric_table: table_a.clone(),
+                                other_metric_name: met_b.name.clone(),
+                                other_metric_table: table_b.clone(),
+                                relationship_name: rel_name,
+                            }),
                         });
                     }
                 }
@@ -206,7 +210,6 @@ pub(super) fn check_fan_traps(
 /// fan-trap check passes vacuously. Reject such definitions up front so an
 /// un-upgradeable legacy row (which the `init_catalog` upgrade pass leaves at
 /// `schema_version` 0) fails loudly here instead of under-checking.
-#[allow(clippy::result_large_err)]
 fn build_relationship_graph(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -437,7 +440,6 @@ fn fanning_edge_on_path(path: &[String], card_map: &CardMap) -> Option<String> {
 ///
 /// Skips validation when there is only one unique table (trivially valid)
 /// or when there are no joins (single-table view).
-#[allow(clippy::result_large_err)]
 pub(super) fn validate_fact_table_path(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -608,8 +610,8 @@ mod tests {
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
         let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
         assert!(result.is_err(), "Should detect fan-out");
-        if let Err(ExpandError::FanTrap { metric_name, .. }) = &result {
-            assert_eq!(metric_name, "total");
+        if let Err(ExpandError::FanTrap { detail }) = &result {
+            assert_eq!(detail.metric_name, "total");
         } else {
             panic!("Expected FanTrap error, got: {result:?}");
         }
@@ -817,19 +819,12 @@ mod tests {
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
         let result = check_fan_traps("test", &def, &[], &resolved_mets);
         match result {
-            Err(ExpandError::MetricFanTrap {
-                metric_name,
-                metric_table,
-                other_metric_name,
-                other_metric_table,
-                relationship_name,
-                ..
-            }) => {
-                assert_eq!(metric_name, "order_total", "inflated metric");
-                assert_eq!(metric_table, "o");
-                assert_eq!(other_metric_name, "item_count");
-                assert_eq!(other_metric_table, "li");
-                assert_eq!(relationship_name, "items_to_orders");
+            Err(ExpandError::MetricFanTrap { detail }) => {
+                assert_eq!(detail.metric_name, "order_total", "inflated metric");
+                assert_eq!(detail.metric_table, "o");
+                assert_eq!(detail.other_metric_name, "item_count");
+                assert_eq!(detail.other_metric_table, "li");
+                assert_eq!(detail.relationship_name, "items_to_orders");
             }
             other => panic!("Expected MetricFanTrap, got: {other:?}"),
         }
@@ -852,13 +847,9 @@ mod tests {
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
         let result = check_fan_traps("test", &def, &[], &resolved_mets);
         match result {
-            Err(ExpandError::MetricFanTrap {
-                metric_name,
-                other_metric_name,
-                ..
-            }) => {
-                assert_eq!(metric_name, "item_total");
-                assert_eq!(other_metric_name, "payment_total");
+            Err(ExpandError::MetricFanTrap { detail }) => {
+                assert_eq!(detail.metric_name, "item_total");
+                assert_eq!(detail.other_metric_name, "payment_total");
             }
             other => panic!("Expected MetricFanTrap for chasm trap, got: {other:?}"),
         }
@@ -908,15 +899,13 @@ mod tests {
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
         let result = check_fan_traps("test", &def, &[], &resolved_mets);
         match result {
-            Err(ExpandError::MetricFanTrap {
-                metric_name,
-                metric_table,
-                other_metric_name,
-                ..
-            }) => {
-                assert_eq!(metric_name, "order_total");
-                assert_eq!(metric_table, "o", "base metric resolves to the root grain");
-                assert_eq!(other_metric_name, "item_count");
+            Err(ExpandError::MetricFanTrap { detail }) => {
+                assert_eq!(detail.metric_name, "order_total");
+                assert_eq!(
+                    detail.metric_table, "o",
+                    "base metric resolves to the root grain"
+                );
+                assert_eq!(detail.other_metric_name, "item_count");
             }
             other => panic!("Expected MetricFanTrap, got: {other:?}"),
         }
@@ -1005,11 +994,9 @@ mod tests {
             let resolved_mets: Vec<&_> = def.metrics.iter().collect();
             let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
             match result {
-                Err(ExpandError::FanTrap {
-                    relationship_name, ..
-                }) => {
+                Err(ExpandError::FanTrap { detail }) => {
                     assert_eq!(
-                        relationship_name, "rel_m2o",
+                        detail.relationship_name, "rel_m2o",
                         "error must name the fanning relationship (m2o_first={m2o_first})"
                     );
                 }

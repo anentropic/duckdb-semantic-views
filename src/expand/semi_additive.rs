@@ -65,7 +65,7 @@ pub(super) fn is_active_semi_additive(met: &Metric, queried_dim_names: &HashSet<
 ///
 /// Called from `expand()` when `has_active_semi_additive` is true.
 /// Receives already-resolved dims, metrics, expressions, and scoped aliases.
-#[allow(clippy::too_many_lines, clippy::result_large_err)]
+#[allow(clippy::too_many_lines)]
 pub(super) fn expand_semi_additive(
     view_name: &str,
     def: &SemanticViewDefinition,

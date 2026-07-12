@@ -65,7 +65,6 @@ pub(super) fn is_role_playing_target(def: &SemanticViewDefinition, target_alias:
 /// - `Ok(None)` if the dimension's table is not a role-playing table (single or no relationship)
 /// - `Ok(Some(scoped_alias))` if exactly one USING path disambiguates
 /// - `Err(ExpandError::AmbiguousPath)` if ambiguous with no single USING context
-#[allow(clippy::result_large_err)]
 pub(super) fn find_using_context(
     view_name: &str,
     def: &SemanticViewDefinition,

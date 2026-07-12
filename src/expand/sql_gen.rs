@@ -145,7 +145,6 @@ impl Resolvable for Metric {
 /// request string (SG-14): `region` and `o.region` resolve to the same
 /// dimension and are rejected as duplicates instead of emitting the same
 /// column twice.
-#[allow(clippy::result_large_err)]
 fn resolve_names<'a, T: Resolvable, N: AsRef<str>>(
     names: &[N],
     view_name: &str,
@@ -187,7 +186,7 @@ fn resolve_names<'a, T: Resolvable, N: AsRef<str>>(
 ///
 /// Dimensions, when present, add columns to SELECT but do NOT trigger GROUP BY
 /// (unlike metric queries where dims + metrics => GROUP BY).
-#[allow(clippy::too_many_lines, clippy::result_large_err)]
+#[allow(clippy::too_many_lines)]
 fn expand_facts(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -292,7 +291,7 @@ fn expand_facts(
 /// - Neither dimensions nor metrics are requested (`EmptyRequest`)
 /// - A requested dimension or metric name is not found (`UnknownDimension`, `UnknownMetric`)
 /// - A dimension or metric name is duplicated (`DuplicateDimension`, `DuplicateMetric`)
-#[allow(clippy::too_many_lines, clippy::result_large_err)]
+#[allow(clippy::too_many_lines)]
 pub fn expand(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -516,7 +515,9 @@ pub fn expand(
 
 #[cfg(test)]
 mod tests {
-    use crate::expand::{expand, DimensionName, ExpandError, MetricName, QueryRequest};
+    use crate::expand::{
+        expand, DimensionName, ExpandError, FanTrapError, MetricName, QueryRequest,
+    };
 
     mod expand_tests {
         use super::*;
@@ -2771,15 +2772,10 @@ GROUP BY
             let result = expand("sales", &def, &req);
             assert!(result.is_err(), "Fan trap must block the query");
             match result.unwrap_err() {
-                ExpandError::FanTrap {
-                    view_name,
-                    metric_name,
-                    dimension_name,
-                    ..
-                } => {
-                    assert_eq!(view_name, "sales");
-                    assert_eq!(metric_name, "order_count");
-                    assert_eq!(dimension_name, "status");
+                ExpandError::FanTrap { detail } => {
+                    assert_eq!(detail.view_name, "sales");
+                    assert_eq!(detail.metric_name, "order_count");
+                    assert_eq!(detail.dimension_name, "status");
                 }
                 other => panic!("Expected FanTrap, got: {other}"),
             }
@@ -2925,13 +2921,9 @@ GROUP BY
                 "Transitive chain fan trap must be detected"
             );
             match result.unwrap_err() {
-                ExpandError::FanTrap {
-                    metric_name,
-                    dimension_name,
-                    ..
-                } => {
-                    assert_eq!(metric_name, "customer_count");
-                    assert_eq!(dimension_name, "status");
+                ExpandError::FanTrap { detail } => {
+                    assert_eq!(detail.metric_name, "customer_count");
+                    assert_eq!(detail.dimension_name, "status");
                 }
                 other => panic!("Expected FanTrap, got: {other}"),
             }
@@ -2960,13 +2952,9 @@ GROUP BY
             let result = expand("sales", &def, &req);
             assert!(result.is_err(), "Derived metric fan trap must be detected");
             match result.unwrap_err() {
-                ExpandError::FanTrap {
-                    metric_name,
-                    dimension_name,
-                    ..
-                } => {
-                    assert_eq!(metric_name, "avg_order");
-                    assert_eq!(dimension_name, "status");
+                ExpandError::FanTrap { detail } => {
+                    assert_eq!(detail.metric_name, "avg_order");
+                    assert_eq!(detail.dimension_name, "status");
                 }
                 other => panic!("Expected FanTrap, got: {other}"),
             }
@@ -2975,12 +2963,14 @@ GROUP BY
         #[test]
         fn fan_trap_error_message_format() {
             let err = ExpandError::FanTrap {
-                view_name: "sales".to_string(),
-                metric_name: "order_count".to_string(),
-                metric_table: "o".to_string(),
-                dimension_name: "status".to_string(),
-                dimension_table: "li".to_string(),
-                relationship_name: "li_to_order".to_string(),
+                detail: Box::new(FanTrapError {
+                    view_name: "sales".to_string(),
+                    metric_name: "order_count".to_string(),
+                    metric_table: "o".to_string(),
+                    dimension_name: "status".to_string(),
+                    dimension_table: "li".to_string(),
+                    relationship_name: "li_to_order".to_string(),
+                }),
             };
             let msg = format!("{err}");
             assert!(msg.contains("sales"), "Must contain view name");

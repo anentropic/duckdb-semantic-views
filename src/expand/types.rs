@@ -195,6 +195,44 @@ mod tests {
         assert_eq!(&*met.clone(), "Total_Revenue");
         assert_eq!(met.as_ref() as &str, "Total_Revenue");
     }
+
+    #[test]
+    fn expand_error_stays_under_large_err_threshold() {
+        // R-9 (code-review 2026-07-11): the two fattest variants (FanTrap,
+        // MetricFanTrap) are boxed so `ExpandError` fits under clippy's
+        // `result_large_err` threshold (128 bytes) and the `Result<_,
+        // ExpandError>` allows could be dropped. Pin the size so a future fat
+        // variant can't silently reintroduce the bloat (box it instead).
+        assert!(
+            std::mem::size_of::<ExpandError>() <= 128,
+            "ExpandError is {} bytes (> 128); box the newly-added fat variant (see R-9)",
+            std::mem::size_of::<ExpandError>()
+        );
+    }
+}
+
+/// Detail payload for [`ExpandError::FanTrap`], boxed so the enum stays small
+/// (R-9, code-review 2026-07-11 — this variant was one of the two fattest).
+#[derive(Debug)]
+pub struct FanTrapError {
+    pub view_name: String,
+    pub metric_name: String,
+    pub metric_table: String,
+    pub dimension_name: String,
+    pub dimension_table: String,
+    pub relationship_name: String,
+}
+
+/// Detail payload for [`ExpandError::MetricFanTrap`], boxed so the enum stays
+/// small (R-9, code-review 2026-07-11 — the other fat variant).
+#[derive(Debug)]
+pub struct MetricFanTrapError {
+    pub view_name: String,
+    pub metric_name: String,
+    pub metric_table: String,
+    pub other_metric_name: String,
+    pub other_metric_table: String,
+    pub relationship_name: String,
 }
 
 /// Errors that can occur during semantic view expansion.
@@ -221,26 +259,12 @@ pub enum ExpandError {
     /// A metric name was requested more than once.
     DuplicateMetric { view_name: String, name: String },
     /// A metric aggregates across a one-to-many boundary, risking inflated results.
-    FanTrap {
-        view_name: String,
-        metric_name: String,
-        metric_table: String,
-        dimension_name: String,
-        dimension_table: String,
-        relationship_name: String,
-    },
+    FanTrap { detail: Box<FanTrapError> },
     /// Two queried metrics sit at different grains (source tables) and the
     /// join path between those tables crosses a fan-out edge: joining both
     /// source tables multiplies `metric_table`'s rows, silently inflating
     /// `metric_name` (fan trap / chasm trap between metric grains).
-    MetricFanTrap {
-        view_name: String,
-        metric_name: String,
-        metric_table: String,
-        other_metric_name: String,
-        other_metric_table: String,
-        relationship_name: String,
-    },
+    MetricFanTrap { detail: Box<MetricFanTrapError> },
     /// The stored definition's relationship graph could not be rebuilt at
     /// query time, so safety checks (fan-trap detection) cannot run.
     UncheckableDefinition { view_name: String, reason: String },
@@ -394,14 +418,15 @@ impl fmt::Display for ExpandError {
             Self::DuplicateMetric { view_name, name } => {
                 write!(f, "semantic view '{view_name}': duplicate metric '{name}'")
             }
-            Self::FanTrap {
-                view_name,
-                metric_name,
-                metric_table,
-                dimension_name,
-                dimension_table,
-                relationship_name,
-            } => {
+            Self::FanTrap { detail } => {
+                let FanTrapError {
+                    view_name,
+                    metric_name,
+                    metric_table,
+                    dimension_name,
+                    dimension_table,
+                    relationship_name,
+                } = &**detail;
                 write!(
                     f,
                     "semantic view '{view_name}': fan trap detected -- metric '{metric_name}' \
@@ -413,14 +438,15 @@ impl fmt::Display for ExpandError {
                      relationship."
                 )
             }
-            Self::MetricFanTrap {
-                view_name,
-                metric_name,
-                metric_table,
-                other_metric_name,
-                other_metric_table,
-                relationship_name,
-            } => {
+            Self::MetricFanTrap { detail } => {
+                let MetricFanTrapError {
+                    view_name,
+                    metric_name,
+                    metric_table,
+                    other_metric_name,
+                    other_metric_table,
+                    relationship_name,
+                } = &**detail;
                 write!(
                     f,
                     "semantic view '{view_name}': fan trap detected -- metric '{metric_name}' \
