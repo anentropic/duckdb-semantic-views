@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **View name case normalization**: unquoted view names now fold to lowercase in every DDL statement and in `semantic_view()` / `explain_semantic_view()` lookup arguments, so `CREATE SEMANTIC VIEW Sales` and `DROP SEMANTIC VIEW SALES` refer to the same view. Quoted names (`"Sales"`) preserve exact case, matching the Snowflake identifier contract with DuckDB's lowercase fold direction. Previously unquoted names were byte-exact case-sensitive. **Migration**: views created earlier with unquoted mixed-case names are stored under their original casing — reference them quoted (`"Sales"`), or drop and recreate them.
+- **Dimension / metric / fact references honour the identifier contract**: names referenced in a `semantic_view()` / `explain_semantic_view()` query now follow the same Snowflake rule as view names — an unquoted reference (`region`, `REGION`) matches case-insensitively, while a double-quoted reference (`"Region"`) matches case-sensitively (so `"Region"` and `"region"` are distinct). Previously every reference matched case-insensitively regardless of quoting. Unquoted references — the common case — are unchanged. (Case-sensitive matching of names embedded in stored expressions, such as derived-metric operands and `NON ADDITIVE BY` lists, is unified in later work.)
 
 ### Added
 

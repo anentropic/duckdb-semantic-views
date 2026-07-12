@@ -42,7 +42,9 @@ trait Resolvable: Sized {
 
 impl Resolvable for Fact {
     fn find<'a>(def: &'a SemanticViewDefinition, name: &str) -> Option<&'a Self> {
-        def.facts.iter().find(|f| f.name.eq_ignore_ascii_case(name))
+        def.facts
+            .iter()
+            .find(|f| crate::ident::ident_matches(&f.name, name))
     }
     fn is_private(&self) -> bool {
         self.access == AccessModifier::Private

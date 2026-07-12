@@ -272,6 +272,60 @@ pub fn find_identifier_end(input: &str, allow_paren: bool) -> usize {
     bytes.len()
 }
 
+/// Normalize a (possibly dot-qualified, possibly double-quoted) SQL identifier
+/// to its case-folding **match key** under the Snowflake identifier contract,
+/// using `DuckDB`'s lowercase fold direction (the same direction
+/// [`normalize_view_name`] uses for view names):
+///
+/// - an UNQUOTED part folds to ASCII lowercase, so `Region`, `region`, and
+///   `REGION` share the key `region` and match case-insensitively;
+/// - a `"quoted"` part keeps its exact case with the surrounding quotes
+///   stripped (and `""` unescaped), so `"Region"` has the key `Region` and
+///   only another `"Region"` matches it — case-sensitively.
+///
+/// This is the component-name analogue of the view-name contract (PA-8): it
+/// lets dimension / metric / fact references in a query honour Snowflake's
+/// rule that unquoted identifiers are case-insensitive while double-quoted
+/// identifiers are case-sensitive, WITHOUT changing how names are stored (the
+/// serde wire format is unaffected — normalization happens only at match time).
+///
+/// Total by construction: input that is not a well-formed identifier (an
+/// unterminated quote, an empty part) falls back to a lowercase fold of the
+/// trimmed raw text, so name matching never panics or errors.
+#[must_use]
+pub fn normalize_ident_part(raw: &str) -> String {
+    let trimmed = raw.trim();
+    match parse_qualified_identifier_with_quoting(trimmed) {
+        Ok(parts) => parts
+            .into_iter()
+            .map(|(part, quoted)| {
+                if quoted {
+                    part
+                } else {
+                    part.to_ascii_lowercase()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("."),
+        Err(_) => trimmed.to_ascii_lowercase(),
+    }
+}
+
+/// True when a stored identifier and a requested identifier denote the same
+/// object under the Snowflake identifier contract (see [`normalize_ident_part`]):
+/// unquoted references match case-insensitively, double-quoted references match
+/// case-sensitively.
+///
+/// This replaces a bare `eq_ignore_ascii_case` on component names, which
+/// treated every reference as case-insensitive regardless of quoting. For
+/// UNQUOTED names on both sides it is behaviourally identical to
+/// `eq_ignore_ascii_case` (both fold to lowercase and compare), so the common
+/// case is unchanged; only a double-quoted reference gains case-sensitivity.
+#[must_use]
+pub fn ident_matches(stored: &str, requested: &str) -> bool {
+    normalize_ident_part(stored) == normalize_ident_part(requested)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -667,6 +721,65 @@ mod tests {
                     Ok(folded),
                 );
             }
+        }
+    }
+
+    mod normalize_ident_part_tests {
+        use super::*;
+
+        #[test]
+        fn unquoted_folds_to_lowercase() {
+            assert_eq!(normalize_ident_part("Region"), "region");
+            assert_eq!(normalize_ident_part("REGION"), "region");
+            assert_eq!(normalize_ident_part("region"), "region");
+        }
+
+        #[test]
+        fn quoted_preserves_case_and_strips_quotes() {
+            assert_eq!(normalize_ident_part("\"Region\""), "Region");
+            assert_eq!(normalize_ident_part("\"REGION\""), "REGION");
+            // Doubled-quote escape is unescaped.
+            assert_eq!(normalize_ident_part("\"a\"\"b\""), "a\"b");
+        }
+
+        #[test]
+        fn qualified_normalizes_each_part() {
+            assert_eq!(normalize_ident_part("O.Region"), "o.region");
+            assert_eq!(normalize_ident_part("o.\"Region\""), "o.Region");
+        }
+
+        #[test]
+        fn whitespace_trimmed() {
+            assert_eq!(normalize_ident_part("  Region  "), "region");
+        }
+
+        #[test]
+        fn malformed_falls_back_to_lowercase_fold() {
+            // Unterminated quote — total, never panics.
+            assert_eq!(normalize_ident_part("\"oops"), "\"oops");
+        }
+
+        #[test]
+        fn ident_matches_unquoted_is_case_insensitive() {
+            // Identical to the former eq_ignore_ascii_case behaviour.
+            assert!(ident_matches("region", "REGION"));
+            assert!(ident_matches("Region", "region"));
+            assert!(ident_matches("region", "region"));
+            assert!(!ident_matches("region", "country"));
+        }
+
+        #[test]
+        fn ident_matches_quoted_is_case_sensitive() {
+            // A quoted request matches a quoted stored name only exactly.
+            assert!(ident_matches("\"Region\"", "\"Region\""));
+            assert!(!ident_matches("\"Region\"", "\"region\""));
+            // Quoted request vs unquoted-stored: distinct objects (the stored
+            // unquoted `Region` folds to `region`; the quoted request stays
+            // `Region`).
+            assert!(!ident_matches("Region", "\"Region\""));
+            // Unquoted request still matches an unquoted stored name of any
+            // case (the folded keys coincide).
+            assert!(ident_matches("Region", "region"));
         }
     }
 }
