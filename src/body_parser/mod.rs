@@ -29,28 +29,38 @@ pub(crate) use relationships::parse_relationships_clause;
 pub(crate) use scan::split_at_depth0_commas;
 pub(crate) use tables::parse_tables_clause;
 
-/// Parsed qualified entry tuple.
-pub(super) type QualifiedEntry = (
-    String,
-    String,
-    String,
-    Option<String>,
-    Vec<String>,
-    AccessModifier,
-);
+/// Parsed DIMENSIONS / FACTS entry (R-4: named fields, was a 6-tuple).
+///
+/// Shared shape for both clauses; DIMENSIONS ignores `access` (a leading
+/// PRIVATE/PUBLIC is rejected earlier for dimensions). Fields map onto
+/// [`Fact`] / [`Dimension`] in `parse_keyword_body`.
+#[derive(Debug)]
+pub(super) struct ParsedQualifiedEntry {
+    pub(super) source_alias: String,
+    pub(super) name: String,
+    pub(super) expr: String,
+    pub(super) comment: Option<String>,
+    pub(super) synonyms: Vec<String>,
+    pub(super) access: AccessModifier,
+}
 
-/// Parsed metric entry tuple.
-pub(super) type MetricEntry = (
-    Option<String>,      // source_alias
-    String,              // bare_name
-    String,              // expr
-    Vec<String>,         // using_relationships
-    Option<String>,      // comment
-    Vec<String>,         // synonyms
-    AccessModifier,      // access
-    Vec<NonAdditiveDim>, // non_additive_by
-    Option<WindowSpec>,  // window_spec
-);
+/// Parsed METRICS entry (R-4: named fields, was a 9-tuple with `// tuple
+/// index N` comments and a 9-way closure destructuring).
+///
+/// Fields map 1:1 onto [`Metric`]; `output_type` is assigned during
+/// expansion, not at parse time, so it has no field here.
+#[derive(Debug)]
+pub(super) struct ParsedMetric {
+    pub(super) source_alias: Option<String>,
+    pub(super) name: String,
+    pub(super) expr: String,
+    pub(super) using_relationships: Vec<String>,
+    pub(super) comment: Option<String>,
+    pub(super) synonyms: Vec<String>,
+    pub(super) access: AccessModifier,
+    pub(super) non_additive_by: Vec<NonAdditiveDim>,
+    pub(super) window_spec: Option<WindowSpec>,
+}
 
 /// Result of parsing the keyword body (everything after "AS").
 #[derive(Debug)]
@@ -91,9 +101,9 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
 
     let mut tables: Vec<TableRef> = Vec::new();
     let mut relationships: Vec<Join> = Vec::new();
-    let mut facts_raw: Vec<QualifiedEntry> = Vec::new();
-    let mut dimensions_raw: Vec<QualifiedEntry> = Vec::new();
-    let mut metrics_raw: Vec<MetricEntry> = Vec::new();
+    let mut facts_raw: Vec<ParsedQualifiedEntry> = Vec::new();
+    let mut dimensions_raw: Vec<ParsedQualifiedEntry> = Vec::new();
+    let mut metrics_raw: Vec<ParsedMetric> = Vec::new();
     let mut materializations: Vec<Materialization> = Vec::new();
 
     for bound in &bounds {
@@ -127,60 +137,48 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
         }
     }
 
-    // Map qualified entries to Fact / Dimension / Metric structs
+    // Map parsed clause entries onto the Fact / Dimension / Metric model types.
     let facts = facts_raw
         .into_iter()
-        .map(|(alias, bare_name, expr, comment, synonyms, access)| Fact {
-            name: bare_name,
-            expr,
-            source_table: Some(alias),
+        .map(|e| Fact {
+            name: e.name,
+            expr: e.expr,
+            source_table: Some(e.source_alias),
             output_type: None,
-            comment,
-            synonyms,
-            access,
+            comment: e.comment,
+            synonyms: e.synonyms,
+            access: e.access,
         })
         .collect();
 
     let dimensions: Vec<Dimension> = dimensions_raw
         .into_iter()
-        .map(
-            |(alias, bare_name, expr, comment, synonyms, _access)| Dimension {
-                name: bare_name,
-                expr,
-                source_table: Some(alias),
-                output_type: None,
-                comment,
-                synonyms,
-            },
-        )
+        // Dimensions carry no access modifier — `e.access` is intentionally
+        // dropped (a leading PRIVATE/PUBLIC is rejected earlier for DIMENSIONS).
+        .map(|e| Dimension {
+            name: e.name,
+            expr: e.expr,
+            source_table: Some(e.source_alias),
+            output_type: None,
+            comment: e.comment,
+            synonyms: e.synonyms,
+        })
         .collect();
 
     let metrics: Vec<Metric> = metrics_raw
         .into_iter()
-        .map(
-            |(
-                source_alias,
-                bare_name,
-                expr,
-                using_rels,
-                comment,
-                synonyms,
-                access,
-                non_additive_by,
-                window_spec,
-            )| Metric {
-                name: bare_name,
-                expr,
-                source_table: source_alias,
-                output_type: None,
-                using_relationships: using_rels,
-                comment,
-                synonyms,
-                access,
-                non_additive_by,
-                window_spec,
-            },
-        )
+        .map(|m| Metric {
+            name: m.name,
+            expr: m.expr,
+            source_table: m.source_alias,
+            output_type: None,
+            using_relationships: m.using_relationships,
+            comment: m.comment,
+            synonyms: m.synonyms,
+            access: m.access,
+            non_additive_by: m.non_additive_by,
+            window_spec: m.window_spec,
+        })
         .collect();
 
     // Phase 47: Validate NON ADDITIVE BY dimension references
@@ -1128,8 +1126,8 @@ mod tests {
         // Dimension bare name `"a.b"` — the inner dot is not a separator.
         let entries = parse_qualified_entries("o.\"a.b\" AS o.c", 0, false, "dimensions").unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, "o");
-        assert_eq!(entries[0].1, "\"a.b\"");
+        assert_eq!(entries[0].source_alias, "o");
+        assert_eq!(entries[0].name, "\"a.b\"");
     }
 
     #[test]
@@ -1139,8 +1137,8 @@ mod tests {
         // and the annotation scanner truncated the expression.
         let entries = parse_qualified_entries("o.x AS o.commenté", 0, false, "dimensions").unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].2, "o.commenté");
-        assert_eq!(entries[0].3, None);
+        assert_eq!(entries[0].expr, "o.commenté");
+        assert_eq!(entries[0].comment, None);
     }
 
     #[test]
@@ -1151,8 +1149,8 @@ mod tests {
         let entries =
             parse_qualified_entries("o.note AS o.\"comment\"", 0, false, "dimensions").unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].2, "o.\"comment\"");
-        assert_eq!(entries[0].3, None);
+        assert_eq!(entries[0].expr, "o.\"comment\"");
+        assert_eq!(entries[0].comment, None);
     }
 
     #[test]
@@ -1209,8 +1207,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        // MetricEntry tuple: non_additive_by is at index 7.
-        let na_vec = &result[0].7;
+        let na_vec = &result[0].non_additive_by;
         assert_eq!(na_vec.len(), 1);
         let na = &na_vec[0];
         assert_eq!(na.dimension, "\"my dim\"");
@@ -1229,7 +1226,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        let na_vec = &result[0].7;
+        let na_vec = &result[0].non_additive_by;
         assert_eq!(na_vec.len(), 2);
 
         let na0 = &na_vec[0];
@@ -1252,7 +1249,7 @@ mod tests {
         let r = parse_metrics_clause("a.bal NON ADDITIVE BY_x (d) AS SUM(a.bal)", 0);
         if let Ok(v) = r {
             assert!(
-                v[0].7.is_empty(),
+                v[0].non_additive_by.is_empty(),
                 "BY_x must not match the NON ADDITIVE BY keyword"
             );
         }
@@ -1262,7 +1259,7 @@ mod tests {
             0,
         );
         if let Ok(v) = r {
-            let ws = v[0].8.as_ref().expect("window spec");
+            let ws = v[0].window_spec.as_ref().expect("window spec");
             assert!(
                 ws.partition_dims.is_empty(),
                 "PARTITION BY_x must not match PARTITION BY: {:?}",
@@ -1275,7 +1272,7 @@ mod tests {
             0,
         );
         if let Ok(v) = r {
-            let ws = v[0].8.as_ref().expect("window spec");
+            let ws = v[0].window_spec.as_ref().expect("window spec");
             assert!(
                 ws.excluding_dims.is_empty(),
                 "EXCLUDING_x must not match EXCLUDING: {:?}",
@@ -1289,7 +1286,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let ws = v[0].8.as_ref().expect("window spec");
+        let ws = v[0].window_spec.as_ref().expect("window spec");
         assert_eq!(ws.excluding_dims, vec!["region"]);
     }
 
@@ -1343,7 +1340,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let ws = result[0].8.as_ref().expect("window spec");
+        let ws = result[0].window_spec.as_ref().expect("window spec");
         assert_eq!(ws.partition_dims, vec!["region"]);
         assert_eq!(ws.order_by.len(), 1, "ORDER BY must survive: {ws:?}");
         assert_eq!(ws.order_by[0].expr, "d");
@@ -1358,7 +1355,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let ws = result[0].8.as_ref().expect("window spec");
+        let ws = result[0].window_spec.as_ref().expect("window spec");
         assert_eq!(ws.excluding_dims, vec!["region"]);
         assert_eq!(ws.order_by.len(), 1);
         assert_eq!(ws.order_by[0].expr, "d");
@@ -1428,7 +1425,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let ws = result[0].8.as_ref().expect("window spec");
+        let ws = result[0].window_spec.as_ref().expect("window spec");
         assert!(ws.order_by.is_empty());
         assert_eq!(
             ws.frame_clause.as_deref(),
@@ -1448,7 +1445,7 @@ mod tests {
             let result = parse_metrics_clause(entry, 0)
                 .unwrap_or_else(|e| panic!("{entry} failed: {}", e.message));
             assert_eq!(result.len(), 1);
-            let na_vec = &result[0].7;
+            let na_vec = &result[0].non_additive_by;
             assert_eq!(na_vec.len(), 1, "for {entry}");
             assert_eq!(na_vec[0].dimension, "report_date");
         }
@@ -1477,8 +1474,8 @@ mod tests {
     // intact through `parse_over_content` / `parse_window_over_clause`.
     // `parse_window_spec` / `parse_over_content` is private — exercise via the
     // public `parse_metrics_clause` entry which routes a window-metric expression
-    // through `parse_window_over_clause`. The parsed `WindowSpec.order_by` is at
-    // tuple index 8 of `MetricEntry`.
+    // through `parse_window_over_clause`. The parsed `WindowSpec` lives in the
+    // `ParsedMetric.window_spec` field.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1490,8 +1487,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        // MetricEntry tuple: window_spec is at index 8.
-        let ws = result[0].8.as_ref().expect("window_spec must be Some");
+        let ws = result[0]
+            .window_spec
+            .as_ref()
+            .expect("window_spec must be Some");
         assert_eq!(ws.order_by.len(), 1);
         let ob = &ws.order_by[0];
         assert_eq!(ob.expr, "\"order date\"");
@@ -1509,7 +1508,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        let ws = result[0].8.as_ref().expect("window_spec must be Some");
+        let ws = result[0]
+            .window_spec
+            .as_ref()
+            .expect("window_spec must be Some");
         assert_eq!(ws.order_by.len(), 1);
         let ob = &ws.order_by[0];
         assert_eq!(ob.expr, "o.\"order date\"");
@@ -1542,7 +1544,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        let ws = result[0].8.as_ref().expect("window_spec must be Some");
+        let ws = result[0]
+            .window_spec
+            .as_ref()
+            .expect("window_spec must be Some");
         assert_eq!(ws.order_by.len(), 1);
         let ob = &ws.order_by[0];
         assert_eq!(ob.expr, "order_date");
@@ -1560,7 +1565,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        let na_vec = &result[0].7;
+        let na_vec = &result[0].non_additive_by;
         assert_eq!(na_vec.len(), 1);
         let na = &na_vec[0];
         assert_eq!(na.dimension, "report_date");
@@ -1784,9 +1789,9 @@ mod tests {
         let result =
             parse_qualified_entries("o.revenue AS SUM(amount)", 0, false, "dimensions").unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "o"); // source_alias
-        assert_eq!(result[0].1, "revenue"); // bare_name
-        assert_eq!(result[0].2, "SUM(amount)"); // expr
+        assert_eq!(result[0].source_alias, "o"); // source_alias
+        assert_eq!(result[0].name, "revenue"); // bare_name
+        assert_eq!(result[0].expr, "SUM(amount)"); // expr
     }
 
     #[test]
@@ -1798,7 +1803,7 @@ mod tests {
             "dimensions",
         )
         .unwrap();
-        assert_eq!(result[0].2, "SUM(l_extendedprice * (1 - l_discount))");
+        assert_eq!(result[0].expr, "SUM(l_extendedprice * (1 - l_discount))");
     }
 
     #[test]
@@ -1817,8 +1822,8 @@ mod tests {
         let result =
             parse_qualified_entries("o.a AS x, o.b AS y,", 0, false, "dimensions").unwrap();
         assert_eq!(result.len(), 2, "Expected 2 entries, got {:?}", result);
-        assert_eq!(result[0].1, "a");
-        assert_eq!(result[1].1, "b");
+        assert_eq!(result[0].name, "a");
+        assert_eq!(result[1].name, "b");
     }
 
     #[test]
@@ -1947,8 +1952,8 @@ mod tests {
         let body = "\n  o.revenue AS SUM(amount),\n  o.count AS COUNT(*)\n";
         let result = parse_qualified_entries(body, 0, false, "dimensions").unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].1, "revenue");
-        assert_eq!(result[1].1, "count");
+        assert_eq!(result[0].name, "revenue");
+        assert_eq!(result[1].name, "count");
     }
 
     // -----------------------------------------------------------------------
@@ -2006,8 +2011,8 @@ mod tests {
     fn parse_qualified_entries_lowercase_as() {
         let result =
             parse_qualified_entries("o.revenue as SUM(amount)", 0, false, "dimensions").unwrap();
-        assert_eq!(result[0].1, "revenue");
-        assert_eq!(result[0].2, "SUM(amount)");
+        assert_eq!(result[0].name, "revenue");
+        assert_eq!(result[0].expr, "SUM(amount)");
     }
 
     #[test]
@@ -2111,18 +2116,18 @@ mod tests {
     fn parse_metrics_clause_qualified_entry() {
         let result = parse_metrics_clause("li.revenue AS SUM(li.amount)", 0).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, Some("li".to_string())); // source alias
-        assert_eq!(result[0].1, "revenue"); // bare_name
-        assert_eq!(result[0].2, "SUM(li.amount)"); // expr
+        assert_eq!(result[0].source_alias, Some("li".to_string())); // source alias
+        assert_eq!(result[0].name, "revenue"); // bare_name
+        assert_eq!(result[0].expr, "SUM(li.amount)"); // expr
     }
 
     #[test]
     fn parse_metrics_clause_unqualified_entry() {
         let result = parse_metrics_clause("profit AS revenue - cost", 0).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, None); // no source alias (derived metric)
-        assert_eq!(result[0].1, "profit"); // bare_name
-        assert_eq!(result[0].2, "revenue - cost"); // expr
+        assert_eq!(result[0].source_alias, None); // no source alias (derived metric)
+        assert_eq!(result[0].name, "profit"); // bare_name
+        assert_eq!(result[0].expr, "revenue - cost"); // expr
     }
 
     #[test]
@@ -2134,17 +2139,17 @@ mod tests {
         .unwrap();
         assert_eq!(result.len(), 3);
         // First: qualified
-        assert_eq!(result[0].0, Some("li".to_string()));
-        assert_eq!(result[0].1, "revenue");
-        assert_eq!(result[0].2, "SUM(li.amount)");
+        assert_eq!(result[0].source_alias, Some("li".to_string()));
+        assert_eq!(result[0].name, "revenue");
+        assert_eq!(result[0].expr, "SUM(li.amount)");
         // Second: unqualified (derived)
-        assert_eq!(result[1].0, None);
-        assert_eq!(result[1].1, "profit");
-        assert_eq!(result[1].2, "revenue - cost");
+        assert_eq!(result[1].source_alias, None);
+        assert_eq!(result[1].name, "profit");
+        assert_eq!(result[1].expr, "revenue - cost");
         // Third: qualified
-        assert_eq!(result[2].0, Some("li".to_string()));
-        assert_eq!(result[2].1, "cost");
-        assert_eq!(result[2].2, "SUM(li.unit_cost)");
+        assert_eq!(result[2].source_alias, Some("li".to_string()));
+        assert_eq!(result[2].name, "cost");
+        assert_eq!(result[2].expr, "SUM(li.unit_cost)");
     }
 
     #[test]
@@ -2165,9 +2170,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].0, Some("li".to_string()));
-        assert_eq!(result[1].0, None);
-        assert_eq!(result[1].1, "profit");
+        assert_eq!(result[0].source_alias, Some("li".to_string()));
+        assert_eq!(result[1].source_alias, None);
+        assert_eq!(result[1].name, "profit");
     }
 
     #[test]
@@ -2227,20 +2232,20 @@ mod tests {
         let result =
             parse_metrics_clause("f.departure_count USING (dep_airport) AS COUNT(*)", 0).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, Some("f".to_string())); // source alias
-        assert_eq!(result[0].1, "departure_count"); // bare_name
-        assert_eq!(result[0].2, "COUNT(*)"); // expr
-        assert_eq!(result[0].3, vec!["dep_airport"]); // using_relationships
+        assert_eq!(result[0].source_alias, Some("f".to_string())); // source alias
+        assert_eq!(result[0].name, "departure_count"); // bare_name
+        assert_eq!(result[0].expr, "COUNT(*)"); // expr
+        assert_eq!(result[0].using_relationships, vec!["dep_airport"]); // using_relationships
     }
 
     #[test]
     fn parse_metrics_using_multiple_relationships() {
         let result = parse_metrics_clause("f.met USING (rel1, rel2) AS SUM(x)", 0).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, Some("f".to_string()));
-        assert_eq!(result[0].1, "met");
-        assert_eq!(result[0].2, "SUM(x)");
-        assert_eq!(result[0].3, vec!["rel1", "rel2"]);
+        assert_eq!(result[0].source_alias, Some("f".to_string()));
+        assert_eq!(result[0].name, "met");
+        assert_eq!(result[0].expr, "SUM(x)");
+        assert_eq!(result[0].using_relationships, vec!["rel1", "rel2"]);
     }
 
     #[test]
@@ -2264,21 +2269,24 @@ mod tests {
         // Metric without USING still parses correctly
         let result = parse_metrics_clause("o.revenue AS SUM(o.amount)", 0).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, Some("o".to_string()));
-        assert_eq!(result[0].1, "revenue");
-        assert_eq!(result[0].2, "SUM(o.amount)");
-        assert!(result[0].3.is_empty(), "No USING -> empty relationships");
+        assert_eq!(result[0].source_alias, Some("o".to_string()));
+        assert_eq!(result[0].name, "revenue");
+        assert_eq!(result[0].expr, "SUM(o.amount)");
+        assert!(
+            result[0].using_relationships.is_empty(),
+            "No USING -> empty relationships"
+        );
     }
 
     #[test]
     fn parse_metrics_using_case_insensitive() {
         let result =
             parse_metrics_clause("f.departure_count using (dep_airport) AS COUNT(*)", 0).unwrap();
-        assert_eq!(result[0].3, vec!["dep_airport"]);
+        assert_eq!(result[0].using_relationships, vec!["dep_airport"]);
 
         let result2 =
             parse_metrics_clause("f.departure_count UsInG (dep_airport) AS COUNT(*)", 0).unwrap();
-        assert_eq!(result2[0].3, vec!["dep_airport"]);
+        assert_eq!(result2[0].using_relationships, vec!["dep_airport"]);
     }
 
     #[test]
@@ -2447,14 +2455,13 @@ mod tests {
     fn parse_metrics_non_additive_by_single_dim_defaults() {
         let result = parse_metrics_clause("a.bal NON ADDITIVE BY (d1) AS SUM(x)", 0).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, Some("a".to_string())); // source alias
-        assert_eq!(result[0].1, "bal"); // bare name
-        assert_eq!(result[0].2, "SUM(x)"); // expr
-                                           // 8th element: non_additive_by
-        assert_eq!(result[0].7.len(), 1);
-        assert_eq!(result[0].7[0].dimension, "d1");
-        assert_eq!(result[0].7[0].order, SortOrder::Asc);
-        assert_eq!(result[0].7[0].nulls, NullsOrder::Last);
+        assert_eq!(result[0].source_alias, Some("a".to_string())); // source alias
+        assert_eq!(result[0].name, "bal"); // bare name
+        assert_eq!(result[0].expr, "SUM(x)"); // expr
+        assert_eq!(result[0].non_additive_by.len(), 1);
+        assert_eq!(result[0].non_additive_by[0].dimension, "d1");
+        assert_eq!(result[0].non_additive_by[0].order, SortOrder::Asc);
+        assert_eq!(result[0].non_additive_by[0].nulls, NullsOrder::Last);
     }
 
     #[test]
@@ -2465,11 +2472,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].7.len(), 1);
-        assert_eq!(result[0].7[0].dimension, "date_dim");
-        assert_eq!(result[0].7[0].order, SortOrder::Desc);
+        assert_eq!(result[0].non_additive_by.len(), 1);
+        assert_eq!(result[0].non_additive_by[0].dimension, "date_dim");
+        assert_eq!(result[0].non_additive_by[0].order, SortOrder::Desc);
         // DESC defaults to NULLS FIRST
-        assert_eq!(result[0].7[0].nulls, NullsOrder::First);
+        assert_eq!(result[0].non_additive_by[0].nulls, NullsOrder::First);
     }
 
     #[test]
@@ -2480,13 +2487,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].7.len(), 2);
-        assert_eq!(result[0].7[0].dimension, "d1");
-        assert_eq!(result[0].7[0].order, SortOrder::Desc);
-        assert_eq!(result[0].7[0].nulls, NullsOrder::First);
-        assert_eq!(result[0].7[1].dimension, "d2");
-        assert_eq!(result[0].7[1].order, SortOrder::Asc);
-        assert_eq!(result[0].7[1].nulls, NullsOrder::Last);
+        assert_eq!(result[0].non_additive_by.len(), 2);
+        assert_eq!(result[0].non_additive_by[0].dimension, "d1");
+        assert_eq!(result[0].non_additive_by[0].order, SortOrder::Desc);
+        assert_eq!(result[0].non_additive_by[0].nulls, NullsOrder::First);
+        assert_eq!(result[0].non_additive_by[1].dimension, "d2");
+        assert_eq!(result[0].non_additive_by[1].order, SortOrder::Asc);
+        assert_eq!(result[0].non_additive_by[1].nulls, NullsOrder::Last);
     }
 
     #[test]
@@ -2512,12 +2519,12 @@ mod tests {
             parse_metrics_clause("a.bal USING (rel1) NON ADDITIVE BY (d1 DESC) AS SUM(x)", 0)
                 .unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, Some("a".to_string()));
-        assert_eq!(result[0].1, "bal");
-        assert_eq!(result[0].3, vec!["rel1"]); // using_relationships
-        assert_eq!(result[0].7.len(), 1);
-        assert_eq!(result[0].7[0].dimension, "d1");
-        assert_eq!(result[0].7[0].order, SortOrder::Desc);
+        assert_eq!(result[0].source_alias, Some("a".to_string()));
+        assert_eq!(result[0].name, "bal");
+        assert_eq!(result[0].using_relationships, vec!["rel1"]); // using_relationships
+        assert_eq!(result[0].non_additive_by.len(), 1);
+        assert_eq!(result[0].non_additive_by[0].dimension, "d1");
+        assert_eq!(result[0].non_additive_by[0].order, SortOrder::Desc);
     }
 
     #[test]
@@ -2581,10 +2588,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, Some("o".to_string())); // source alias
-        assert_eq!(result[0].1, "avg_qty"); // bare name
-                                            // 9th element: window_spec
-        let ws = result[0].8.as_ref().expect("window_spec should be Some");
+        assert_eq!(result[0].source_alias, Some("o".to_string())); // source alias
+        assert_eq!(result[0].name, "avg_qty"); // bare name
+        let ws = result[0]
+            .window_spec
+            .as_ref()
+            .expect("window_spec should be Some");
         assert_eq!(ws.window_function, "AVG");
         assert_eq!(ws.inner_metric, "total_qty");
         assert!(ws.extra_args.is_empty());
@@ -2604,7 +2613,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        let ws = result[0].8.as_ref().expect("window_spec should be Some");
+        let ws = result[0]
+            .window_spec
+            .as_ref()
+            .expect("window_spec should be Some");
         assert_eq!(ws.window_function, "AVG");
         assert_eq!(ws.inner_metric, "total_qty");
         assert_eq!(ws.excluding_dims, vec!["d1"]);
@@ -2624,7 +2636,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
-        let ws = result[0].8.as_ref().expect("window_spec should be Some");
+        let ws = result[0]
+            .window_spec
+            .as_ref()
+            .expect("window_spec should be Some");
         assert_eq!(ws.window_function, "LAG");
         assert_eq!(ws.inner_metric, "total_qty");
         assert_eq!(ws.extra_args, vec!["30"]);
@@ -2668,7 +2683,7 @@ mod tests {
         let result = parse_metrics_clause("o.revenue AS SUM(o.amount)", 0).unwrap();
         assert_eq!(result.len(), 1);
         assert!(
-            result[0].8.is_none(),
+            result[0].window_spec.is_none(),
             "Regular metric should have no window_spec"
         );
     }
@@ -2680,7 +2695,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let ws = result[0].8.as_ref().unwrap();
+        let ws = result[0].window_spec.as_ref().unwrap();
         assert_eq!(ws.order_by[0].order, SortOrder::Desc);
         assert_eq!(ws.order_by[0].nulls, NullsOrder::Last);
     }
@@ -2795,7 +2810,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let ws = result[0].8.as_ref().unwrap();
+        let ws = result[0].window_spec.as_ref().unwrap();
         assert_eq!(ws.window_function, "AVG");
         assert_eq!(ws.inner_metric, "total_qty");
         assert!(ws.excluding_dims.is_empty());
@@ -2811,7 +2826,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let ws = result[0].8.as_ref().unwrap();
+        let ws = result[0].window_spec.as_ref().unwrap();
         assert!(ws.excluding_dims.is_empty());
         assert_eq!(ws.partition_dims, vec!["store", "region"]);
         assert_eq!(ws.order_by[0].order, SortOrder::Desc);
@@ -2823,7 +2838,7 @@ mod tests {
         let result =
             parse_metrics_clause("o.avg_qty AS AVG(total_qty) OVER (PARTITION BY store)", 0)
                 .unwrap();
-        let ws = result[0].8.as_ref().unwrap();
+        let ws = result[0].window_spec.as_ref().unwrap();
         assert!(ws.excluding_dims.is_empty());
         assert_eq!(ws.partition_dims, vec!["store"]);
         assert!(ws.order_by.is_empty());

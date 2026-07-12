@@ -6,7 +6,7 @@ use super::scan::{
     is_quoting_balanced, unterminated_quote_error,
 };
 use super::window::{parse_order_by_modifiers, parse_window_over_clause, OrderModifierContext};
-use super::{split_at_depth0_commas, MetricEntry};
+use super::{split_at_depth0_commas, ParsedMetric};
 use crate::errors::ParseError;
 use crate::ident::find_identifier_end;
 use crate::model::NonAdditiveDim;
@@ -17,15 +17,14 @@ use crate::model::NonAdditiveDim;
 /// Qualified entries may include: `alias.name USING (rel1, rel2) AS expr` (Phase 32).
 /// Unqualified entries have the form: `name AS expr` (derived metric).
 ///
-/// Returns `Vec<(Option<source_alias>, bare_name, expr, using_relationships, comment, synonyms, access)>` where:
-/// - Option is `Some(alias)` for qualified entries and `None` for unqualified (derived) entries
-/// - `using_relationships` is a `Vec<String>` of named relationships (empty if no USING clause)
-/// - Phase 43: comment, synonyms, and access modifier are parsed from trailing annotations and leading keyword
-#[allow(clippy::type_complexity)]
+/// Returns one [`ParsedMetric`] per entry, where `source_alias` is `Some(alias)`
+/// for qualified entries and `None` for unqualified (derived) entries;
+/// `using_relationships` is empty when there is no USING clause; and comment,
+/// synonyms, and access are parsed from trailing annotations / a leading keyword.
 pub(crate) fn parse_metrics_clause(
     body: &str,
     base_offset: usize,
-) -> Result<Vec<MetricEntry>, ParseError> {
+) -> Result<Vec<ParsedMetric>, ParseError> {
     if body.trim().is_empty() {
         return Ok(vec![]);
     }
@@ -136,7 +135,7 @@ fn parse_non_additive_dims(
 /// Phase 47: If a NON ADDITIVE BY clause is present, it must be on a qualified entry (has dot).
 /// Phase 48: If an OVER clause is present, it must be on a qualified entry (has dot).
 #[allow(clippy::too_many_lines)]
-fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<MetricEntry, ParseError> {
+fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedMetric, ParseError> {
     let entry = entry.trim();
 
     // Unterminated quoting swallows the rest of the entry under the
@@ -280,17 +279,17 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<MetricE
             });
         }
 
-        Ok((
-            Some(source_alias),
-            bare_name,
+        Ok(ParsedMetric {
+            source_alias: Some(source_alias),
+            name: bare_name,
             expr,
             using_relationships,
-            annotations.comment,
-            annotations.synonyms,
+            comment: annotations.comment,
+            synonyms: annotations.synonyms,
             access,
             non_additive_by,
             window_spec,
-        ))
+        })
     } else {
         // Unqualified: just name (derived metric)
         // USING is not allowed on derived metrics
@@ -324,16 +323,16 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<MetricE
             });
         }
         let bare_name = final_name_portion.to_string();
-        Ok((
-            None,
-            bare_name,
+        Ok(ParsedMetric {
+            source_alias: None,
+            name: bare_name,
             expr,
-            vec![],
-            annotations.comment,
-            annotations.synonyms,
+            using_relationships: vec![],
+            comment: annotations.comment,
+            synonyms: annotations.synonyms,
             access,
-            vec![],
-            None,
-        ))
+            non_additive_by: vec![],
+            window_spec: None,
+        })
     }
 }
