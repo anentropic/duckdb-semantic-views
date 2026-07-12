@@ -40,7 +40,7 @@ use crate::util::replace_word_boundary;
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
-use super::types::ExpandError;
+use super::types::{ExpandError, ResolvedDim};
 
 /// Returns true when `met` is an ACTIVE semi-additive metric for a query over
 /// `queried_dim_names` (lowercased): it has a NON ADDITIVE BY clause and at
@@ -69,17 +69,16 @@ pub(super) fn is_active_semi_additive(met: &Metric, queried_dim_names: &HashSet<
 pub(super) fn expand_semi_additive(
     view_name: &str,
     def: &SemanticViewDefinition,
-    resolved_dims: &[&crate::model::Dimension],
+    resolved_dims: &[ResolvedDim],
     resolved_mets: &[&Metric],
     resolved_exprs: &HashMap<String, String>,
-    dim_scoped_aliases: &[Option<String>],
 ) -> Result<String, ExpandError> {
     let mut sql = String::with_capacity(512);
 
     // Build set of queried dimension names for classification
     let queried_dim_names: HashSet<String> = resolved_dims
         .iter()
-        .map(|d| d.name.to_ascii_lowercase())
+        .map(|rd| rd.dim.name.to_ascii_lowercase())
         .collect();
 
     // Classify each metric as active semi-additive (shared routing predicate)
@@ -143,9 +142,10 @@ pub(super) fn expand_semi_additive(
     // standard path defends against the same shadowing with GROUP BY
     // ordinals; this is the CTE-path equivalent.
     let mut dim_cte_exprs: Vec<String> = Vec::with_capacity(resolved_dims.len());
-    for (i, dim) in resolved_dims.iter().enumerate() {
+    for rd in resolved_dims {
+        let dim = rd.dim;
         let mut base_expr = dim.expr.clone();
-        if let Some(ref scoped) = dim_scoped_aliases[i] {
+        if let Some(ref scoped) = rd.scoped_alias {
             if let Some(ref st) = dim.source_table {
                 base_expr = replace_word_boundary(&base_expr, st, scoped);
             }
@@ -198,7 +198,7 @@ pub(super) fn expand_semi_additive(
         let partition_dims: Vec<String> = resolved_dims
             .iter()
             .zip(&dim_cte_exprs)
-            .filter(|(d, _)| !na_dim_names.contains(&d.name.to_ascii_lowercase()))
+            .filter(|(rd, _)| !na_dim_names.contains(&rd.dim.name.to_ascii_lowercase()))
             .map(|(_, expr)| expr.clone())
             .collect();
 
@@ -222,7 +222,7 @@ pub(super) fn expand_semi_additive(
                 // Try to find the dimension in resolved (queried) dims first
                 let dim_expr = resolved_dims
                     .iter()
-                    .position(|d| d.name.eq_ignore_ascii_case(&nd.dimension))
+                    .position(|rd| rd.dim.name.eq_ignore_ascii_case(&nd.dimension))
                     .map_or_else(
                         || {
                             // NA dim not in queried dims -- find it in the view definition
@@ -275,7 +275,8 @@ pub(super) fn expand_semi_additive(
     // resolver's extra-alias parameter, which appends each with its path
     // intermediaries (aliases already joined for dims/metrics are skipped).
     let na_dim_sources = collect_na_dim_source_tables(def, &na_groups);
-    let resolved_joins = resolve_joins_pkfk(def, resolved_dims, resolved_mets, &na_dim_sources);
+    let dims: Vec<&crate::model::Dimension> = resolved_dims.iter().map(|rd| rd.dim).collect();
+    let resolved_joins = resolve_joins_pkfk(def, &dims, resolved_mets, &na_dim_sources);
     push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
 
     sql.push_str("\n)\n");
@@ -286,11 +287,11 @@ pub(super) fn expand_semi_additive(
     let mut outer_select_items: Vec<String> = Vec::new();
 
     // Dimension columns: reference CTE aliases
-    for dim in resolved_dims {
+    for rd in resolved_dims {
         outer_select_items.push(format!(
             "    {} AS {}",
-            quote_ident(&dim.name),
-            quote_ident(&dim.name)
+            quote_ident(&rd.dim.name),
+            quote_ident(&rd.dim.name)
         ));
     }
 

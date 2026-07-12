@@ -119,6 +119,23 @@ pub struct QueryRequest {
     pub facts: Vec<String>,
 }
 
+/// A resolved dimension paired with its role-playing scoped alias, if any.
+///
+/// R-8 (code-review 2026-07-11): replaces the former parallel slices
+/// `resolved_dims: &[&Dimension]` and `dim_scoped_aliases: &[Option<String>]`,
+/// which were threaded together through several expansion functions and indexed
+/// by position (`dim_scoped_aliases[i]`) — a silent-wrong-results footgun if the
+/// two ever fell out of sync. Zipping them into one value makes the pairing
+/// structural, so an index can't reach the wrong alias.
+pub(crate) struct ResolvedDim<'a> {
+    /// The resolved dimension definition (borrowed from the view definition).
+    pub dim: &'a crate::model::Dimension,
+    /// The role-playing scoped alias for this dimension's source table
+    /// (e.g. `Some("a__dep_airport")`), or `None` when the table is not
+    /// role-played for this query.
+    pub scoped_alias: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

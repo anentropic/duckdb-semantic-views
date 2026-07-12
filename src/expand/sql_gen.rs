@@ -8,7 +8,7 @@ use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident};
 use super::role_playing::find_using_context;
-use super::types::{ExpandError, QueryRequest};
+use super::types::{ExpandError, QueryRequest, ResolvedDim};
 
 /// An entity kind resolvable by name against a [`SemanticViewDefinition`]
 /// (dimensions, metrics, facts). Encapsulates lookup, the PRIVATE-access
@@ -374,12 +374,14 @@ pub fn expand(
     // Phase 31: Check for fan traps before generating SQL.
     check_fan_traps(view_name, def, &resolved_dims, &resolved_mets)?;
 
-    // Phase 32: Pre-compute dimension scoped aliases for role-playing tables.
-    // Maps dimension index -> scoped alias (e.g., "a__dep_airport").
-    let mut dim_scoped_aliases: Vec<Option<String>> = Vec::with_capacity(resolved_dims.len());
-    for dim in &resolved_dims {
-        let scoped = find_using_context(view_name, def, dim, &resolved_mets)?;
-        dim_scoped_aliases.push(scoped);
+    // Phase 32: pair each resolved dimension with its role-playing scoped alias
+    // (e.g. "a__dep_airport"). R-8 (code-review 2026-07-11): zipped into
+    // `ResolvedDim` so the alias travels with its dimension instead of a
+    // position-indexed side array (`dim_scoped_aliases[i]`).
+    let mut resolved: Vec<ResolvedDim> = Vec::with_capacity(resolved_dims.len());
+    for &dim in &resolved_dims {
+        let scoped_alias = find_using_context(view_name, def, dim, &resolved_mets)?;
+        resolved.push(ResolvedDim { dim, scoped_alias });
     }
 
     // Phase 47: Check if any resolved metric ACTUALLY needs semi-additive expansion.
@@ -399,10 +401,9 @@ pub fn expand(
         return super::semi_additive::expand_semi_additive(
             view_name,
             def,
-            &resolved_dims,
+            &resolved,
             &resolved_mets,
             &resolved_exprs,
-            &dim_scoped_aliases,
         );
     }
 
@@ -430,10 +431,9 @@ pub fn expand(
         return super::window::expand_window_metrics(
             view_name,
             def,
-            &resolved_dims,
+            &resolved,
             &resolved_mets,
             &resolved_exprs,
-            &dim_scoped_aliases,
         );
     }
 
@@ -449,10 +449,11 @@ pub fn expand(
     }
 
     let mut select_items: Vec<String> = Vec::new();
-    for (i, dim) in resolved_dims.iter().enumerate() {
+    for rd in &resolved {
+        let dim = rd.dim;
         let mut base_expr = dim.expr.clone();
         // Phase 32: If this dimension has a scoped alias, rewrite the expression.
-        if let Some(ref scoped) = dim_scoped_aliases[i] {
+        if let Some(ref scoped) = rd.scoped_alias {
             if let Some(ref st) = dim.source_table {
                 // Replace bare alias with scoped alias in expression
                 // e.g., "a.city" -> "a__dep_airport.city"
