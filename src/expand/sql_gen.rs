@@ -1,4 +1,4 @@
-use crate::model::{AccessModifier, SemanticViewDefinition};
+use crate::model::{AccessModifier, Dimension, Fact, Metric, SemanticViewDefinition};
 use crate::util::{replace_word_boundary, suggest_closest};
 
 use super::facts::{
@@ -10,50 +10,169 @@ use super::resolution::{find_dimension, find_metric, qualify_and_quote_table_ref
 use super::role_playing::find_using_context;
 use super::types::{ExpandError, QueryRequest};
 
-/// Resolve a list of names against a definition, checking for duplicates,
-/// unknown names, and optional access restrictions.
+/// An entity kind resolvable by name against a [`SemanticViewDefinition`]
+/// (dimensions, metrics, facts). Encapsulates lookup, the PRIVATE-access
+/// policy, and the three error variants so [`resolve_names`] takes the
+/// definition plus the requested names — not nine positional closures (R-5).
 ///
-/// Generic helper that deduplicates the resolution pattern used for
-/// dimensions, metrics, and facts.
+/// Modelling the error variants per kind is what makes a slot transposition
+/// unrepresentable: the old positional API let the dimension call sites pass
+/// `DuplicateDimension` in the private-error slot (harmless only because
+/// dimensions are never private), a mistake the compiler could not catch.
+trait Resolvable: Sized {
+    /// Find this entity by (possibly qualified) name in the definition.
+    fn find<'a>(def: &'a SemanticViewDefinition, name: &str) -> Option<&'a Self>;
+    /// Is this resolved entity PRIVATE — barred from direct querying?
+    fn is_private(&self) -> bool;
+    /// All declared names of this kind, for the not-found error + suggestion.
+    fn available(def: &SemanticViewDefinition) -> Vec<String>;
+    /// Error: the same entity was requested twice (keyed on resolved identity).
+    fn duplicate_err(view_name: String, name: String) -> ExpandError;
+    /// Error: no entity of this kind by that name.
+    fn unknown_err(
+        view_name: String,
+        name: String,
+        available: Vec<String>,
+        suggestion: Option<String>,
+    ) -> ExpandError;
+    /// Error: the entity is PRIVATE. Never called for kinds whose
+    /// [`is_private`](Self::is_private) is always `false`.
+    fn private_err(view_name: String, name: String) -> ExpandError;
+}
+
+impl Resolvable for Fact {
+    fn find<'a>(def: &'a SemanticViewDefinition, name: &str) -> Option<&'a Self> {
+        def.facts.iter().find(|f| f.name.eq_ignore_ascii_case(name))
+    }
+    fn is_private(&self) -> bool {
+        self.access == AccessModifier::Private
+    }
+    fn available(def: &SemanticViewDefinition) -> Vec<String> {
+        def.facts.iter().map(|f| f.name.clone()).collect()
+    }
+    fn duplicate_err(view_name: String, name: String) -> ExpandError {
+        ExpandError::DuplicateFact { view_name, name }
+    }
+    fn unknown_err(
+        view_name: String,
+        name: String,
+        available: Vec<String>,
+        suggestion: Option<String>,
+    ) -> ExpandError {
+        ExpandError::UnknownFact {
+            view_name,
+            name,
+            available,
+            suggestion,
+        }
+    }
+    fn private_err(view_name: String, name: String) -> ExpandError {
+        ExpandError::PrivateFact { view_name, name }
+    }
+}
+
+impl Resolvable for Dimension {
+    fn find<'a>(def: &'a SemanticViewDefinition, name: &str) -> Option<&'a Self> {
+        find_dimension(def, name)
+    }
+    fn is_private(&self) -> bool {
+        // Dimensions carry no access modifier — never private.
+        false
+    }
+    fn available(def: &SemanticViewDefinition) -> Vec<String> {
+        def.dimensions.iter().map(|d| d.name.clone()).collect()
+    }
+    fn duplicate_err(view_name: String, name: String) -> ExpandError {
+        ExpandError::DuplicateDimension { view_name, name }
+    }
+    fn unknown_err(
+        view_name: String,
+        name: String,
+        available: Vec<String>,
+        suggestion: Option<String>,
+    ) -> ExpandError {
+        ExpandError::UnknownDimension {
+            view_name,
+            name,
+            available,
+            suggestion,
+        }
+    }
+    fn private_err(_view_name: String, _name: String) -> ExpandError {
+        // `is_private` is always false for dimensions, so `resolve_names`
+        // never reaches this. There is no `PrivateDimension` variant; the old
+        // positional API filled this slot with `DuplicateDimension` (dead but
+        // misleading) — the trait removes the footgun entirely.
+        unreachable!("dimensions cannot be private")
+    }
+}
+
+impl Resolvable for Metric {
+    fn find<'a>(def: &'a SemanticViewDefinition, name: &str) -> Option<&'a Self> {
+        find_metric(def, name)
+    }
+    fn is_private(&self) -> bool {
+        self.access == AccessModifier::Private
+    }
+    fn available(def: &SemanticViewDefinition) -> Vec<String> {
+        def.metrics.iter().map(|m| m.name.clone()).collect()
+    }
+    fn duplicate_err(view_name: String, name: String) -> ExpandError {
+        ExpandError::DuplicateMetric { view_name, name }
+    }
+    fn unknown_err(
+        view_name: String,
+        name: String,
+        available: Vec<String>,
+        suggestion: Option<String>,
+    ) -> ExpandError {
+        ExpandError::UnknownMetric {
+            view_name,
+            name,
+            available,
+            suggestion,
+        }
+    }
+    fn private_err(view_name: String, name: String) -> ExpandError {
+        ExpandError::PrivateMetric { view_name, name }
+    }
+}
+
+/// Resolve a list of requested names to their [`Resolvable`] definitions,
+/// checking for unknown names, duplicates, and PRIVATE access.
 ///
 /// Duplicate detection keys on the RESOLVED item's identity, not the raw
 /// request string (SG-14): `region` and `o.region` resolve to the same
 /// dimension and are rejected as duplicates instead of emitting the same
 /// column twice.
-#[allow(clippy::too_many_arguments, clippy::result_large_err)]
-fn resolve_names<'a, T, N: AsRef<str>>(
+#[allow(clippy::result_large_err)]
+fn resolve_names<'a, T: Resolvable, N: AsRef<str>>(
     names: &[N],
     view_name: &str,
-    find_fn: impl Fn(&str) -> Option<&'a T>,
-    is_private: impl Fn(&T) -> bool,
-    available_fn: impl Fn() -> Vec<String>,
-    suggest_fn: impl Fn(&str) -> Option<String>,
-    make_dup_err: impl Fn(String, String) -> ExpandError,
-    make_not_found_err: impl Fn(String, String, Vec<String>, Option<String>) -> ExpandError,
-    make_private_err: impl Fn(String, String) -> ExpandError,
+    def: &'a SemanticViewDefinition,
 ) -> Result<Vec<&'a T>, ExpandError> {
     let mut resolved = Vec::with_capacity(names.len());
     let mut seen: std::collections::HashSet<*const T> = std::collections::HashSet::new();
     for name in names {
         let name_str = name.as_ref();
-        let item = find_fn(name_str).ok_or_else(|| {
-            let avail = available_fn();
-            let suggestion = suggest_fn(name_str);
-            make_not_found_err(
+        let item = T::find(def, name_str).ok_or_else(|| {
+            let available = T::available(def);
+            let suggestion = suggest_closest(name_str, &available);
+            T::unknown_err(
                 view_name.to_string(),
                 name_str.to_string(),
-                avail,
+                available,
                 suggestion,
             )
         })?;
         if !seen.insert(std::ptr::from_ref(item)) {
-            return Err(make_dup_err(view_name.to_string(), name_str.to_string()));
-        }
-        if is_private(item) {
-            return Err(make_private_err(
+            return Err(T::duplicate_err(
                 view_name.to_string(),
                 name_str.to_string(),
             ));
+        }
+        if item.is_private() {
+            return Err(T::private_err(view_name.to_string(), name_str.to_string()));
         }
         resolved.push(item);
     }
@@ -75,65 +194,10 @@ fn expand_facts(
     req: &QueryRequest,
 ) -> Result<String, ExpandError> {
     // 1. Validate + resolve requested facts.
-    let resolved_facts = resolve_names(
-        &req.facts,
-        view_name,
-        |name| def.facts.iter().find(|f| f.name.eq_ignore_ascii_case(name)),
-        |fact| fact.access == AccessModifier::Private,
-        || def.facts.iter().map(|f| f.name.clone()).collect(),
-        |name| {
-            suggest_closest(
-                name,
-                &def.facts.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
-            )
-        },
-        |vn, n| ExpandError::DuplicateFact {
-            view_name: vn,
-            name: n,
-        },
-        |vn, n, avail, sug| ExpandError::UnknownFact {
-            view_name: vn,
-            name: n,
-            available: avail,
-            suggestion: sug,
-        },
-        |vn, n| ExpandError::PrivateFact {
-            view_name: vn,
-            name: n,
-        },
-    )?;
+    let resolved_facts = resolve_names::<Fact, _>(&req.facts, view_name, def)?;
 
     // 2. Resolve requested dimensions (same logic as expand()).
-    let resolved_dims = resolve_names(
-        &req.dimensions,
-        view_name,
-        |name| find_dimension(def, name),
-        |_dim| false,
-        || def.dimensions.iter().map(|d| d.name.clone()).collect(),
-        |name| {
-            suggest_closest(
-                name,
-                &def.dimensions
-                    .iter()
-                    .map(|d| d.name.clone())
-                    .collect::<Vec<_>>(),
-            )
-        },
-        |vn, n| ExpandError::DuplicateDimension {
-            view_name: vn,
-            name: n,
-        },
-        |vn, n, avail, sug| ExpandError::UnknownDimension {
-            view_name: vn,
-            name: n,
-            available: avail,
-            suggestion: sug,
-        },
-        |vn, n| ExpandError::DuplicateDimension {
-            view_name: vn,
-            name: n,
-        },
-    )?;
+    let resolved_dims = resolve_names::<Dimension, _>(&req.dimensions, view_name, def)?;
 
     // 3. Validate table path constraint (FACT-04).
     let fact_tables: Vec<String> = resolved_facts
@@ -254,71 +318,13 @@ pub fn expand(
     }
 
     // 2. Resolve requested dimensions to their definitions.
-    let resolved_dims = resolve_names(
-        &req.dimensions,
-        view_name,
-        |name| find_dimension(def, name),
-        |_dim| false,
-        || def.dimensions.iter().map(|d| d.name.clone()).collect(),
-        |name| {
-            suggest_closest(
-                name,
-                &def.dimensions
-                    .iter()
-                    .map(|d| d.name.clone())
-                    .collect::<Vec<_>>(),
-            )
-        },
-        |vn, n| ExpandError::DuplicateDimension {
-            view_name: vn,
-            name: n,
-        },
-        |vn, n, avail, sug| ExpandError::UnknownDimension {
-            view_name: vn,
-            name: n,
-            available: avail,
-            suggestion: sug,
-        },
-        |vn, n| ExpandError::DuplicateDimension {
-            view_name: vn,
-            name: n,
-        },
-    )?;
+    let resolved_dims = resolve_names::<Dimension, _>(&req.dimensions, view_name, def)?;
 
     // 3. Resolve requested metrics to their definitions.
     // Phase 43: PRIVATE access check -- private metrics cannot be queried directly.
     // Derived metrics that reference private bases still work because
     // inline_derived_metrics resolves expressions, not access modifiers.
-    let resolved_mets = resolve_names(
-        &req.metrics,
-        view_name,
-        |name| find_metric(def, name),
-        |met| met.access == AccessModifier::Private,
-        || def.metrics.iter().map(|m| m.name.clone()).collect(),
-        |name| {
-            suggest_closest(
-                name,
-                &def.metrics
-                    .iter()
-                    .map(|m| m.name.clone())
-                    .collect::<Vec<_>>(),
-            )
-        },
-        |vn, n| ExpandError::DuplicateMetric {
-            view_name: vn,
-            name: n,
-        },
-        |vn, n, avail, sug| ExpandError::UnknownMetric {
-            view_name: vn,
-            name: n,
-            available: avail,
-            suggestion: sug,
-        },
-        |vn, n| ExpandError::PrivateMetric {
-            view_name: vn,
-            name: n,
-        },
-    )?;
+    let resolved_mets = resolve_names::<Metric, _>(&req.metrics, view_name, def)?;
 
     // Phase 55: Materialization routing.
     // Attempt to route to a pre-aggregated table if an exact match exists.
