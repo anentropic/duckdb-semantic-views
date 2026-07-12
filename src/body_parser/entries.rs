@@ -2,12 +2,12 @@
 
 use super::annotations::{parse_leading_access_modifier, parse_trailing_annotations};
 use super::scan::{find_keyword_ci, find_live_byte, unterminated_quote_error};
-use super::{split_at_depth0_commas, QualifiedEntry};
+use super::{split_at_depth0_commas, ParsedQualifiedEntry};
 use crate::errors::ParseError;
 use crate::model::AccessModifier;
 
 /// Parse the content inside DIMENSIONS or FACTS (...).
-/// Returns `Vec<(source_alias, bare_name, expr, comment, synonyms, access)>`.
+/// Returns one [`ParsedQualifiedEntry`] per entry.
 ///
 /// Each entry has the form: `[PRIVATE|PUBLIC] alias.name AS sql_expression [COMMENT = '...'] [WITH SYNONYMS = ('...')]`
 ///
@@ -18,7 +18,7 @@ pub(crate) fn parse_qualified_entries(
     base_offset: usize,
     allow_access_modifier: bool,
     clause_name: &str,
-) -> Result<Vec<QualifiedEntry>, ParseError> {
+) -> Result<Vec<ParsedQualifiedEntry>, ParseError> {
     if body.trim().is_empty() {
         return Ok(vec![]);
     }
@@ -42,7 +42,7 @@ fn parse_single_qualified_entry(
     entry_offset: usize,
     allow_access_modifier: bool,
     clause_name: &str,
-) -> Result<QualifiedEntry, ParseError> {
+) -> Result<ParsedQualifiedEntry, ParseError> {
     let entry = entry.trim();
 
     // Unterminated quoting swallows the rest of the entry under the
@@ -133,12 +133,12 @@ fn parse_single_qualified_entry(
     // Phase 43: Parse trailing annotations from expression
     let (expr, annotations) = parse_trailing_annotations(raw_expr)?;
 
-    Ok((
+    Ok(ParsedQualifiedEntry {
         source_alias,
-        bare_name,
+        name: bare_name,
         expr,
-        annotations.comment,
-        annotations.synonyms,
+        comment: annotations.comment,
+        synonyms: annotations.synonyms,
         access,
-    ))
+    })
 }
