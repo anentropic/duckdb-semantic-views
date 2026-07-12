@@ -52,7 +52,56 @@ SELECT * FROM explain_semantic_view('ics_v', dimensions := ['STATUS'], metrics :
 statement ok
 SELECT * FROM explain_semantic_view('ics_v', dimensions := ['Status'], metrics := ['TOTAL']);
 
+# --- explain header must agree with routing for a quoted reference ---
+# Regression for the #84 re-review: the `-- Materialization:` header resolves
+# requested names via its own lookup. When that lookup was quote-UNAWARE
+# (eq_ignore_ascii_case) while expand() used the quote-aware key, a quoted
+# reference routed to the materialization in the emitted SQL but the header
+# reported "none" — one explain output contradicting itself. The earlier
+# quoted-name test (ics_v) has no materialization, so it could not catch this.
+
+statement ok
+CREATE TABLE ics_mat_orders (id BIGINT, region VARCHAR, amount DOUBLE);
+
+statement ok
+CREATE TABLE ics_mat_agg (region VARCHAR, total DOUBLE);
+
+statement ok
+CREATE SEMANTIC VIEW ics_mat_v AS
+  TABLES (o AS ics_mat_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+  MATERIALIZATIONS (
+    reg_agg AS (
+      TABLE ics_mat_agg,
+      DIMENSIONS (region),
+      METRICS (total)
+    )
+  )
+
+# Quoted `"region"` folds to the same key as the unquoted stored `region`, so
+# expand() routes to the materialization AND the header must name it.
+query I
+SELECT explain_output FROM explain_semantic_view('ics_mat_v', dimensions := ['"region"'], metrics := ['total']) WHERE explain_output LIKE '-- Materialization:%'
+----
+-- Materialization: reg_agg
+
+# Unquoted reference routes identically (baseline).
+query I
+SELECT explain_output FROM explain_semantic_view('ics_mat_v', dimensions := ['region'], metrics := ['total']) WHERE explain_output LIKE '-- Materialization:%'
+----
+-- Materialization: reg_agg
+
 # Cleanup
+statement ok
+DROP SEMANTIC VIEW ics_mat_v;
+
+statement ok
+DROP TABLE ics_mat_agg;
+
+statement ok
+DROP TABLE ics_mat_orders;
+
 statement ok
 DROP SEMANTIC VIEW ics_v;
 
