@@ -9,7 +9,9 @@
 
 use crate::errors::ParseError;
 use crate::ident::{find_identifier_end, normalize_view_name};
-use crate::util::{extract_single_quoted_prefix, starts_with_keyword_ci, SingleQuoteError};
+use crate::util::{
+    byte_offset_within, extract_single_quoted_prefix, starts_with_keyword_ci, SingleQuoteError,
+};
 
 use super::{
     build_filter_suffix, detect_ddl_prefix, match_keyword_prefix, parse_show_filter_clauses,
@@ -48,15 +50,21 @@ enum Trailing {
 /// with the name baked in (no later normalize opportunity), use the normalizing
 /// [`extract_name_only`] wrapper instead.
 ///
-/// `prefix_len` is the byte length of the already-matched prefix.
+/// `prefix_len` is the byte length of the already-matched prefix; `base` is the
+/// absolute byte offset of `trimmed[0]` in the original query, so errors carry a
+/// caret position pointing at the offending token (R-2).
 fn extract_raw_name_only(
     trimmed: &str,
     prefix_len: usize,
     trailing: Trailing,
-) -> Result<String, String> {
+    base: usize,
+) -> Result<String, ParseError> {
     let after_prefix = trimmed[prefix_len..].trim();
     if after_prefix.is_empty() {
-        return Err("Missing view name".to_string());
+        return Err(ParseError {
+            message: "Missing view name".to_string(),
+            position: Some(base + prefix_len),
+        });
     }
     // Name is everything up to whitespace (or end), honouring `"..."` regions so
     // a quoted identifier with inner whitespace (`"my view"`) is captured intact.
@@ -65,12 +73,18 @@ fn extract_raw_name_only(
     let name_end = find_identifier_end(after_prefix, false);
     let raw_name = &after_prefix[..name_end];
     if raw_name.is_empty() {
-        return Err("Missing view name".to_string());
+        return Err(ParseError {
+            message: "Missing view name".to_string(),
+            position: Some(base + byte_offset_within(trimmed, after_prefix)),
+        });
     }
     if trailing == Trailing::Reject {
         let rest = after_prefix[name_end..].trim();
         if !rest.is_empty() {
-            return Err(format!("Unexpected tokens after view name: '{rest}'"));
+            return Err(ParseError {
+                message: format!("Unexpected tokens after view name: '{rest}'"),
+                position: Some(base + byte_offset_within(trimmed, rest)),
+            });
         }
     }
     Ok(raw_name.to_string())
@@ -85,9 +99,13 @@ fn extract_name_only(
     trimmed: &str,
     prefix_len: usize,
     trailing: Trailing,
-) -> Result<String, String> {
-    let raw = extract_raw_name_only(trimmed, prefix_len, trailing)?;
-    normalize_view_name(&raw).map_err(|e| format!("Invalid view name: {e}"))
+    base: usize,
+) -> Result<String, ParseError> {
+    let raw = extract_raw_name_only(trimmed, prefix_len, trailing, base)?;
+    normalize_view_name(&raw).map_err(|e| ParseError {
+        message: format!("Invalid view name: {e}"),
+        position: Some(base + prefix_len),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -151,17 +169,50 @@ pub(crate) fn extract_quoted_string(input: &str) -> Result<(String, usize), Stri
 /// [`RewriteAction`] (RENAME TO → `AlterRename`, SET COMMENT → `AlterSetComment`,
 /// UNSET COMMENT → `AlterUnsetComment`). Names/comment are carried raw; the
 /// emission stage escapes them.
-fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<RewriteAction, String> {
+///
+/// `base` is the absolute byte offset of `trimmed[0]` in the original query, so
+/// errors carry a caret position pointing at the offending token (R-2). This is
+/// the sole ALTER grammar (P-9): the former `validate_alter` pre-pass that
+/// `plan_rewrite` ran before this was a second, drift-prone copy of the same
+/// grammar; its two unique diagnostics (missing sub-operation, missing view
+/// name) are folded in below.
+#[allow(clippy::too_many_lines)]
+fn rewrite_alter(
+    trimmed: &str,
+    plen: usize,
+    kind: DdlKind,
+    base: usize,
+) -> Result<RewriteAction, ParseError> {
+    // Absolute offset of a subslice of `trimmed`, for caret positions.
+    let abs = |sub: &str| base + byte_offset_within(trimmed, sub);
     let after_prefix = trimmed[plen..].trim();
+    if after_prefix.is_empty() {
+        return Err(ParseError {
+            message: "Missing view name after ALTER SEMANTIC VIEW".to_string(),
+            position: Some(base + plen),
+        });
+    }
     // Quote-aware delimiter scan so `"my view"` is captured intact (allow_paren=false).
     let name_end = find_identifier_end(after_prefix, false);
-    if name_end == 0 || name_end == after_prefix.len() {
-        return Err("Missing view name after ALTER SEMANTIC VIEW".to_string());
+    if name_end == 0 {
+        return Err(ParseError {
+            message: "Missing view name after ALTER SEMANTIC VIEW".to_string(),
+            position: Some(abs(after_prefix)),
+        });
     }
     let raw_view_name = &after_prefix[..name_end];
-    let view_name =
-        normalize_view_name(raw_view_name).map_err(|e| format!("Invalid view name: {e}"))?;
+    let view_name = normalize_view_name(raw_view_name).map_err(|e| ParseError {
+        message: format!("Invalid view name: {e}"),
+        position: Some(abs(after_prefix)),
+    })?;
     let rest = after_prefix[name_end..].trim();
+    if rest.is_empty() {
+        // Name present, no sub-operation (was `validate_alter`'s diagnostic).
+        return Err(ParseError {
+            message: "Missing ALTER operation after view name. Supported: RENAME TO, SET COMMENT, UNSET COMMENT.".to_string(),
+            position: Some(abs(after_prefix) + after_prefix.len()),
+        });
+    }
     let if_exists = kind == DdlKind::AlterIfExists;
 
     // Sub-operation keyword matching rides match_keyword_prefix so any
@@ -171,7 +222,10 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<RewriteAct
     if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"rename", b"to"]) {
         let after_op = rest[consumed..].trim();
         if after_op.is_empty() {
-            return Err("Missing new name after RENAME TO".to_string());
+            return Err(ParseError {
+                message: "Missing new name after RENAME TO".to_string(),
+                position: Some(abs(rest) + rest.len()),
+            });
         }
         // Capture the (possibly quoted) new name, then reject trailing
         // garbage — `RENAME TO x oops` must not rename to `x oops` (PA-5).
@@ -179,12 +233,17 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<RewriteAct
         let new_name_raw = &after_op[..new_name_end];
         let trailing = after_op[new_name_end..].trim();
         if !trailing.is_empty() {
-            return Err(format!(
-                "Unexpected tokens after new view name in RENAME TO: '{trailing}'"
-            ));
+            return Err(ParseError {
+                message: format!(
+                    "Unexpected tokens after new view name in RENAME TO: '{trailing}'"
+                ),
+                position: Some(abs(trailing)),
+            });
         }
-        let new_name = normalize_view_name(new_name_raw)
-            .map_err(|e| format!("Invalid new view name in RENAME TO: {e}"))?;
+        let new_name = normalize_view_name(new_name_raw).map_err(|e| ParseError {
+            message: format!("Invalid new view name in RENAME TO: {e}"),
+            position: Some(abs(after_op)),
+        })?;
         Ok(RewriteAction::AlterRename {
             name: view_name,
             new_name,
@@ -193,20 +252,30 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<RewriteAct
     } else if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"set", b"comment"]) {
         let after_set_comment = rest[consumed..].trim_start();
         if !after_set_comment.starts_with('=') {
-            return Err("Expected '=' after SET COMMENT".to_string());
+            return Err(ParseError {
+                message: "Expected '=' after SET COMMENT".to_string(),
+                position: Some(abs(after_set_comment)),
+            });
         }
         let after_eq = after_set_comment[1..].trim_start();
         if !after_eq.starts_with('\'') {
-            return Err("Expected single-quoted string after SET COMMENT =".to_string());
+            return Err(ParseError {
+                message: "Expected single-quoted string after SET COMMENT =".to_string(),
+                position: Some(abs(after_eq)),
+            });
         }
         // Extract the quoted string handling '' escaping
         let (comment_value, consumed_lit) =
-            extract_quoted_string(after_eq).map_err(|e| format!("Invalid comment string: {e}"))?;
+            extract_quoted_string(after_eq).map_err(|e| ParseError {
+                message: format!("Invalid comment string: {e}"),
+                position: Some(abs(after_eq)),
+            })?;
         let trailing = after_eq[consumed_lit..].trim();
         if !trailing.is_empty() {
-            return Err(format!(
-                "Unexpected tokens after SET COMMENT string: '{trailing}'"
-            ));
+            return Err(ParseError {
+                message: format!("Unexpected tokens after SET COMMENT string: '{trailing}'"),
+                position: Some(abs(trailing)),
+            });
         }
         Ok(RewriteAction::AlterSetComment {
             name: view_name,
@@ -216,19 +285,22 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<RewriteAct
     } else if let Some(consumed) = match_keyword_prefix(rest.as_bytes(), &[b"unset", b"comment"]) {
         let trailing = rest[consumed..].trim();
         if !trailing.is_empty() {
-            return Err(format!(
-                "Unexpected tokens after UNSET COMMENT: '{trailing}'"
-            ));
+            return Err(ParseError {
+                message: format!("Unexpected tokens after UNSET COMMENT: '{trailing}'"),
+                position: Some(abs(trailing)),
+            });
         }
         Ok(RewriteAction::AlterUnsetComment {
             name: view_name,
             if_exists,
         })
     } else {
-        Err(
-            "Unsupported ALTER operation. Supported: RENAME TO, SET COMMENT, UNSET COMMENT."
-                .to_string(),
-        )
+        Err(ParseError {
+            message:
+                "Unsupported ALTER operation. Supported: RENAME TO, SET COMMENT, UNSET COMMENT."
+                    .to_string(),
+            position: Some(abs(rest)),
+        })
     }
 }
 
@@ -238,7 +310,7 @@ fn rewrite_alter(trimmed: &str, plen: usize, kind: DdlKind) -> Result<RewriteAct
 /// - Read-side DESCRIBE / SHOW / SHOW COLUMNS → `Passthrough` final SQL.
 ///
 /// CREATE forms must go through `plan_rewrite` -> `validate_create_body`.
-fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
+fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
     // PA-7: comment-blind rewriting (idempotent when the caller already
     // blanked; only allocates when comments are present).
     let blanked = crate::util::blank_sql_comments(query);
@@ -246,18 +318,28 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end();
     let trimmed = trimmed.trim_end_matches(';').trim();
+    // `trimmed` starts at absolute byte offset `lead` in the (length-preserving
+    // blanked) query; helpers add offsets to this for caret positions (R-2).
+    let trim_base = lead;
 
-    let (kind, plen) = detect_ddl_prefix(trimmed)
-        .ok_or_else(|| "Not a semantic view DDL statement".to_string())?;
+    let Some((kind, plen)) = detect_ddl_prefix(trimmed) else {
+        return Err(ParseError {
+            message: "Not a semantic view DDL statement".to_string(),
+            position: None,
+        });
+    };
 
     match kind {
-        // CREATE forms no longer supported via plan_ddl -- use plan_rewrite
+        // CREATE forms are handled by `plan_rewrite` -> `validate_create_body`
+        // and never routed here (this is the only caller path): the match is
+        // exhaustive, so the branch must exist, but it is unreachable in a
+        // well-formed call graph.
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
-            Err("CREATE forms must use plan_rewrite".to_string())
+            unreachable!("plan_ddl called with a CREATE DdlKind; CREATE routes via plan_rewrite")
         }
         // DROP: native DELETE (structured).
         DdlKind::Drop | DdlKind::DropIfExists => {
-            let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
+            let name = extract_name_only(trimmed, plen, Trailing::Reject, trim_base)?;
             Ok(RewriteAction::Drop {
                 name,
                 if_exists: kind == DdlKind::DropIfExists,
@@ -272,7 +354,7 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
         // reads the view via a prepared statement, so the raw name never reaches
         // SQL text on the read side.
         DdlKind::Describe | DdlKind::ShowColumns => {
-            let name = extract_raw_name_only(trimmed, plen, Trailing::Reject)?;
+            let name = extract_raw_name_only(trimmed, plen, Trailing::Reject, trim_base)?;
             let safe_name = name.replace('\'', "''");
             let fn_name = read_function_name(kind);
             Ok(RewriteAction::Passthrough(format!(
@@ -287,11 +369,15 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
         | DdlKind::ShowFacts
         | DdlKind::ShowMaterializations => {
             let after_prefix = trimmed[plen..].trim();
-            let clauses = parse_show_filter_clauses(after_prefix, kind)?;
+            let after_prefix_base = trim_base + byte_offset_within(trimmed, after_prefix);
+            let clauses = parse_show_filter_clauses(after_prefix, kind, after_prefix_base)?;
 
             // Validate FOR METRIC requires IN
             if clauses.for_metric.is_some() && clauses.in_view.is_none() {
-                return Err("FOR METRIC requires IN view_name".to_string());
+                return Err(ParseError {
+                    message: "FOR METRIC requires IN view_name".to_string(),
+                    position: Some(after_prefix_base),
+                });
             }
 
             // Build base SELECT
@@ -330,7 +416,7 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
             Ok(RewriteAction::Passthrough(format!("{base}{suffix}")))
         }
         // ALTER: sub-operation dispatch (RENAME TO, SET COMMENT, UNSET COMMENT)
-        DdlKind::Alter | DdlKind::AlterIfExists => rewrite_alter(trimmed, plen, kind),
+        DdlKind::Alter | DdlKind::AlterIfExists => rewrite_alter(trimmed, plen, kind, trim_base),
     }
 }
 
@@ -343,16 +429,21 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, String> {
 /// Returns `Ok(Some(name))` for DDL forms that have a view name (CREATE, DROP,
 /// DESCRIBE), and `Ok(None)` for SHOW (no name). Returns `Err` if the query
 /// is not a semantic view DDL statement or is malformed.
-pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
+pub fn extract_ddl_name(query: &str) -> Result<Option<String>, ParseError> {
     // PA-7: comment-blind name extraction.
     let blanked = crate::util::blank_sql_comments(query);
     let query = blanked.as_ref();
     let lead = skip_leading_whitespace_and_comments(query);
     let trimmed = query[lead..].trim_end();
     let trimmed = trimmed.trim_end_matches(';').trim();
+    let trim_base = lead;
 
-    let (kind, plen) = detect_ddl_prefix(trimmed)
-        .ok_or_else(|| "Not a semantic view DDL statement".to_string())?;
+    let Some((kind, plen)) = detect_ddl_prefix(trimmed) else {
+        return Err(ParseError {
+            message: "Not a semantic view DDL statement".to_string(),
+            position: None,
+        });
+    };
 
     match kind {
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
@@ -363,25 +454,33 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, String> {
             // bare last part.
             let after_prefix = trimmed[plen..].trim_start();
             if after_prefix.is_empty() {
-                return Err("Missing view name".to_string());
+                return Err(ParseError {
+                    message: "Missing view name".to_string(),
+                    position: Some(trim_base + plen),
+                });
             }
             let name_end = find_identifier_end(after_prefix, true);
             let raw_name = &after_prefix[..name_end];
             if raw_name.is_empty() {
-                return Err("Missing view name".to_string());
+                return Err(ParseError {
+                    message: "Missing view name".to_string(),
+                    position: Some(trim_base + byte_offset_within(trimmed, after_prefix)),
+                });
             }
-            let name =
-                normalize_view_name(raw_name).map_err(|e| format!("Invalid view name: {e}"))?;
+            let name = normalize_view_name(raw_name).map_err(|e| ParseError {
+                message: format!("Invalid view name: {e}"),
+                position: Some(trim_base + byte_offset_within(trimmed, after_prefix)),
+            })?;
             Ok(Some(name))
         }
         DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe | DdlKind::ShowColumns => {
-            let name = extract_name_only(trimmed, plen, Trailing::Reject)?;
+            let name = extract_name_only(trimmed, plen, Trailing::Reject, trim_base)?;
             Ok(Some(name))
         }
         // ALTER: the sub-operation (RENAME TO / SET COMMENT / ...) follows
         // the name, so trailing text is expected here.
         DdlKind::Alter | DdlKind::AlterIfExists => {
-            let name = extract_name_only(trimmed, plen, Trailing::Allow)?;
+            let name = extract_name_only(trimmed, plen, Trailing::Allow, trim_base)?;
             Ok(Some(name))
         }
         DdlKind::Show | DdlKind::ShowTerse => Ok(None),
@@ -529,135 +628,19 @@ pub fn plan_rewrite(query: &str) -> Result<Option<RewriteAction>, ParseError> {
         return Ok(None);
     };
 
+    // CREATE-with-body forms validate their clause bodies here; every other
+    // recognised form is delegated to `plan_ddl`, which now carries its own
+    // structured errors with caret positions resolved at the point each fault
+    // is detected (R-2). The old per-arm "missing view name" pre-checks and the
+    // five identical `.map_err(|e| ParseError { position: Some(trim_offset +
+    // plen), .. })` wrappers — which re-manufactured one coarse position for
+    // every inner fault — are gone: `plan_ddl` is the single grammar.
     match kind {
-        // CREATE-with-body forms: validate clauses before rewriting
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
             validate_create_body(query, trimmed_no_semi, trim_offset, plen, kind)
         }
-        // Name-only forms: validate name is present
-        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe => {
-            let after_prefix = trimmed_no_semi[plen..].trim();
-            if after_prefix.is_empty() {
-                return Err(ParseError {
-                    message: "Missing view name.".to_string(),
-                    position: Some(trim_offset + plen),
-                });
-            }
-            plan_ddl(query).map(Some).map_err(|e| ParseError {
-                message: e,
-                position: Some(trim_offset + plen),
-            })
-        }
-        // SHOW [TERSE] SEMANTIC VIEWS: optional filter/scope clauses
-        DdlKind::Show | DdlKind::ShowTerse => plan_ddl(query).map(Some).map_err(|e| ParseError {
-            message: e,
-            position: Some(trim_offset + plen),
-        }),
-        // SHOW COLUMNS IN SEMANTIC VIEW: name-only form
-        DdlKind::ShowColumns => {
-            let after_prefix = trimmed_no_semi[plen..].trim();
-            if after_prefix.is_empty() {
-                return Err(ParseError {
-                    message: "Missing view name.".to_string(),
-                    position: Some(trim_offset + plen),
-                });
-            }
-            plan_ddl(query).map(Some).map_err(|e| ParseError {
-                message: e,
-                position: Some(trim_offset + plen),
-            })
-        }
-        // SHOW SEMANTIC DIMENSIONS/METRICS/FACTS/MATERIALIZATIONS: optional IN view_name
-        DdlKind::ShowDimensions
-        | DdlKind::ShowMetrics
-        | DdlKind::ShowFacts
-        | DdlKind::ShowMaterializations => plan_ddl(query).map(Some).map_err(|e| ParseError {
-            message: e,
-            position: Some(trim_offset + plen),
-        }),
-        // ALTER forms: validate sub-operation (RENAME TO, SET COMMENT, UNSET COMMENT)
-        DdlKind::Alter | DdlKind::AlterIfExists => {
-            validate_alter(trimmed_no_semi, trim_offset, plen)?;
-            plan_ddl(query).map(Some).map_err(|e| ParseError {
-                message: e,
-                position: Some(trim_offset + plen),
-            })
-        }
+        _ => plan_ddl(query).map(Some),
     }
-}
-
-/// Validate an ALTER SEMANTIC VIEW statement's sub-operation before rewriting.
-///
-/// Checks that the view name and a valid sub-operation (RENAME TO, SET COMMENT,
-/// UNSET COMMENT) are present, returning a `ParseError` on validation failure.
-fn validate_alter(
-    trimmed_no_semi: &str,
-    trim_offset: usize,
-    plen: usize,
-) -> Result<(), ParseError> {
-    let after_prefix = trimmed_no_semi[plen..].trim();
-    if after_prefix.is_empty() {
-        return Err(ParseError {
-            message: "Missing view name after ALTER SEMANTIC VIEW.".to_string(),
-            position: Some(trim_offset + plen),
-        });
-    }
-    // Quote-aware name capture + word-boundary sub-op matching, sharing
-    // `find_identifier_end` and `match_keyword_prefix` with `rewrite_alter`
-    // so the validate and rewrite passes agree on the ALTER grammar. The
-    // previous hand-rolled `find(whitespace)` + single-space
-    // `starts_with("RENAME TO")` drifted from the (PA-10-fixed) rewriter:
-    // it split quoted names at their inner space (`"my view"`) and rejected
-    // flexible inter-keyword whitespace (`RENAME  TO`) that the rewriter
-    // accepts (PR #50 self-review).
-    let name_end = find_identifier_end(after_prefix, /* allow_paren = */ false);
-    let rest = after_prefix[name_end..].trim();
-    if rest.is_empty() {
-        return Err(ParseError {
-            message: "Missing ALTER operation after view name. Supported: RENAME TO, SET COMMENT, UNSET COMMENT.".to_string(),
-            position: Some(trim_offset + plen + after_prefix.len()),
-        });
-    }
-    let op_pos = Some(trim_offset + plen + name_end);
-    let rb = rest.as_bytes();
-
-    if let Some(consumed) = match_keyword_prefix(rb, &[b"rename", b"to"]) {
-        if rest[consumed..].trim().is_empty() {
-            return Err(ParseError {
-                message: "Missing new name after RENAME TO.".to_string(),
-                position: Some(trim_offset + plen + after_prefix.len()),
-            });
-        }
-    } else if let Some(consumed) = match_keyword_prefix(rb, &[b"set", b"comment"]) {
-        let after_set_comment = rest[consumed..].trim_start();
-        if !after_set_comment.starts_with('=') {
-            return Err(ParseError {
-                message: "Expected '=' after SET COMMENT.".to_string(),
-                position: op_pos,
-            });
-        }
-        let after_eq = after_set_comment[1..].trim_start();
-        if !after_eq.starts_with('\'') {
-            return Err(ParseError {
-                message: "Expected single-quoted string after SET COMMENT =.".to_string(),
-                position: op_pos,
-            });
-        }
-        let _ = extract_quoted_string(after_eq).map_err(|e| ParseError {
-            message: format!("Invalid comment string: {e}"),
-            position: op_pos,
-        })?;
-    } else if match_keyword_prefix(rb, &[b"unset", b"comment"]).is_some() {
-        // Valid -- no further arguments needed
-    } else {
-        return Err(ParseError {
-            message:
-                "Unsupported ALTER operation. Supported: RENAME TO, SET COMMENT, UNSET COMMENT."
-                    .to_string(),
-            position: op_pos,
-        });
-    }
-    Ok(())
 }
 
 // Cardinality inference (Phase 33) now lives in `crate::graph::cardinality`
@@ -1043,13 +1026,14 @@ mod tests {
     // ===================================================================
 
     #[test]
-    fn test_rewrite_create_rejected() {
-        let err = plan_ddl("CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])")
-            .unwrap_err();
-        assert!(
-            err.contains("plan_rewrite"),
-            "CREATE forms should be rejected by plan_ddl, got: {err}"
-        );
+    #[should_panic(expected = "CREATE routes via plan_rewrite")]
+    fn test_plan_ddl_create_is_unreachable() {
+        // CREATE never reaches `plan_ddl` in a well-formed call graph
+        // (`plan_rewrite` routes it to `validate_create_body`); the exhaustive
+        // match arm is `unreachable!`. Calling it directly with CREATE trips
+        // that invariant — the contract is expressed in the type/panic, not a
+        // user-facing error string (R-2).
+        let _ = plan_ddl("CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])");
     }
 
     #[test]
@@ -1166,7 +1150,7 @@ mod tests {
     #[test]
     fn test_rewrite_drop_missing_name() {
         let err = plan_ddl("DROP SEMANTIC VIEW").unwrap_err();
-        assert!(err.contains("Missing view name"), "got: {err}");
+        assert!(err.message.contains("Missing view name"), "got: {err}");
     }
 
     // ===================================================================
@@ -1397,10 +1381,10 @@ mod tests {
     fn test_for_metric_requires_boundaries() {
         // FOREIGN must not match the FOR clause keyword (PR #50 review).
         let err = plan_ddl("SHOW SEMANTIC VIEWS FOREIGN").unwrap_err();
-        assert!(err.contains("Unexpected tokens"), "got: {err}");
+        assert!(err.message.contains("Unexpected tokens"), "got: {err}");
         // METRICS must not match METRIC (the metric would have been 's').
         let err = plan_ddl("SHOW SEMANTIC DIMENSIONS IN v FOR METRICS revenue").unwrap_err();
-        assert!(err.contains("Expected FOR METRIC"), "got: {err}");
+        assert!(err.message.contains("Expected FOR METRIC"), "got: {err}");
         // The legal form still parses.
         let sql = passthrough_sql("SHOW SEMANTIC DIMENSIONS IN v FOR METRIC revenue");
         assert_eq!(
@@ -1441,7 +1425,7 @@ mod tests {
         ] {
             let err = plan_ddl(q).unwrap_err();
             assert!(
-                err.contains("Unexpected tokens after view name"),
+                err.message.contains("Unexpected tokens after view name"),
                 "expected trailing-garbage error for {q}, got: {err}"
             );
         }
@@ -1460,7 +1444,10 @@ mod tests {
     #[test]
     fn test_rewrite_not_semantic() {
         let err = plan_ddl("SELECT 1").unwrap_err();
-        assert!(err.contains("Not a semantic view DDL"), "got: {err}");
+        assert!(
+            err.message.contains("Not a semantic view DDL"),
+            "got: {err}"
+        );
     }
 
     // ===================================================================
@@ -1747,6 +1734,67 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.position.is_some());
+    }
+
+    // R-2: with errors carried from their origin (rather than one coarse
+    // `Some(trim_offset + plen)` manufactured for every inner fault), the caret
+    // now points at the offending token itself. Each case asserts the byte the
+    // position lands on so a future coarsening regresses loudly.
+    #[test]
+    fn parse_error_position_points_at_offending_token() {
+        // Trailing garbage after a DROP name → caret at the garbage, not the prefix.
+        let q = "DROP SEMANTIC VIEW foo bar";
+        let pos = plan_rewrite(q).unwrap_err().position.expect("position set");
+        assert_eq!(
+            &q[pos..pos + 3],
+            "bar",
+            "caret should sit on the trailing token"
+        );
+
+        // Unsupported ALTER sub-operation → caret at the bad keyword.
+        let q = "ALTER SEMANTIC VIEW v TRUNCATE";
+        let pos = plan_rewrite(q).unwrap_err().position.expect("position set");
+        assert_eq!(
+            &q[pos..pos + 8],
+            "TRUNCATE",
+            "caret should sit on the sub-op"
+        );
+
+        // Unexpected SHOW clause token → caret at the token.
+        let q = "SHOW SEMANTIC VIEWS FOREIGN";
+        let pos = plan_rewrite(q).unwrap_err().position.expect("position set");
+        assert_eq!(
+            &q[pos..pos + 7],
+            "FOREIGN",
+            "caret should sit on the clause token"
+        );
+
+        // Non-numeric LIMIT → caret at the offending value.
+        let q = "SHOW SEMANTIC VIEWS LIMIT abc";
+        let pos = plan_rewrite(q).unwrap_err().position.expect("position set");
+        assert_eq!(
+            &q[pos..pos + 3],
+            "abc",
+            "caret should sit on the LIMIT value"
+        );
+
+        // Trailing garbage after a RENAME target → caret at the garbage.
+        let q = "ALTER SEMANTIC VIEW v RENAME TO w oops";
+        let pos = plan_rewrite(q).unwrap_err().position.expect("position set");
+        assert_eq!(
+            &q[pos..pos + 4],
+            "oops",
+            "caret should sit on the trailing token"
+        );
+    }
+
+    #[test]
+    fn parse_error_position_survives_leading_comment() {
+        // The offending-token caret is an offset into the ORIGINAL query, so a
+        // length-preserving comment blank must not shift it.
+        let q = "/* hi */ SHOW SEMANTIC VIEWS FOREIGN";
+        let pos = plan_rewrite(q).unwrap_err().position.expect("position set");
+        assert_eq!(&q[pos..pos + 7], "FOREIGN");
     }
 
     // ===================================================================
@@ -2322,7 +2370,7 @@ mod tests {
             // ("byte index 4 is not a char boundary"), surfacing as
             // "internal error (panic)" at the FFI boundary.
             let err = plan_ddl("SHOW SEMANTIC VIEWS aΩΩ").unwrap_err();
-            assert!(err.contains("Unexpected tokens"), "got: {err}");
+            assert!(err.message.contains("Unexpected tokens"), "got: {err}");
 
             // Every clause scanner position: 2, 3, 4, 5, 6-byte prefixes.
             for q in [
@@ -2362,7 +2410,8 @@ mod tests {
             );
             let err = result.unwrap_err();
             assert!(
-                err.contains("SHOW SEMANTIC VIEWS requires IN SCHEMA"),
+                err.message
+                    .contains("SHOW SEMANTIC VIEWS requires IN SCHEMA"),
                 "got: {err}"
             );
         }
@@ -2432,7 +2481,10 @@ mod tests {
                 "FOR METRIC should be rejected for SHOW SEMANTIC VIEWS"
             );
             let err = result.unwrap_err();
-            assert!(err.contains("FOR METRIC is only valid"), "got: {err}");
+            assert!(
+                err.message.contains("FOR METRIC is only valid"),
+                "got: {err}"
+            );
         }
 
         #[test]
@@ -3481,7 +3533,7 @@ $$"#;
         fn drop_with_unterminated_quote_errors() {
             let err = plan_ddl("DROP SEMANTIC VIEW \"foo").unwrap_err();
             assert!(
-                err.contains("Invalid view name") && err.contains("unterminated"),
+                err.message.contains("Invalid view name") && err.message.contains("unterminated"),
                 "expected invalid-view-name/unterminated error, got: {err}"
             );
         }
