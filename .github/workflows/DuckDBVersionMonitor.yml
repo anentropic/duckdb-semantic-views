@@ -47,6 +47,12 @@ jobs:
         if: steps.latest.outputs.is_new == 'true'
         uses: dtolnay/rust-toolchain@stable
 
+      # Pre-install the pinned toolchain so the `make` build below doesn't hit
+      # cargo's flake-prone lazy rustup install. See the composite action.
+      - name: Install pinned Rust toolchain
+        if: steps.latest.outputs.is_new == 'true'
+        uses: ./.github/actions/setup-pinned-rust
+
       - name: Update version pins
         if: steps.latest.outputs.is_new == 'true'
         run: |
@@ -226,6 +232,12 @@ jobs:
       - name: Install Rust stable
         if: steps.lts.outputs.is_new == 'true'
         uses: dtolnay/rust-toolchain@stable
+
+      # Pre-install the pinned toolchain so the `make` build below doesn't hit
+      # cargo's flake-prone lazy rustup install. See the composite action.
+      - name: Install pinned Rust toolchain
+        if: steps.lts.outputs.is_new == 'true'
+        uses: ./.github/actions/setup-pinned-rust
 
       - name: Update LTS version pins
         if: steps.lts.outputs.is_new == 'true'

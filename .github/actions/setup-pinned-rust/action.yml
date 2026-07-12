@@ -1,0 +1,31 @@
+name: Setup pinned Rust toolchain
+description: >
+  Install the Rust toolchain pinned in rust-toolchain.toml BEFORE any cargo
+  command, so cargo's lazy rustup install never runs during the build. That
+  lazy path intermittently fails with "detected conflict: 'bin/cargo-clippy'"
+  when rustup rolls back a partially-installed toolchain and collides with the
+  runner image's preinstalled cargo-clippy proxy (the #72 / #76 DuckLake
+  flake). The channel is read from rust-toolchain.toml, so the pin stays
+  single-source (a Dependabot bump can't drift this action).
+
+runs:
+  using: composite
+  steps:
+    - name: Install pinned Rust toolchain
+      shell: bash
+      run: |
+        channel="$(grep -oP '^\s*channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
+        echo "Pinned toolchain from rust-toolchain.toml: $channel"
+        install() {
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy --no-self-update
+        }
+        # Fast path: a normal install is a quick no-op when the toolchain is
+        # already present and healthy — no forced re-download. Only on failure
+        # (the partial-install rollback conflict) do we wipe the partial copy
+        # and reinstall clean, which clears the precondition the flake needs.
+        if ! install; then
+          echo "::warning::Pinned toolchain install failed; clearing partial state and retrying"
+          rustup toolchain uninstall "$channel" >/dev/null 2>&1 || true
+          install
+        fi

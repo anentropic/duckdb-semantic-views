@@ -24,22 +24,11 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      # Pre-install the toolchain pinned in rust-toolchain.toml (single source
-      # of truth — read the channel from the file so a Dependabot bump can't
-      # drift) BEFORE `make` runs cargo. Letting cargo lazily trigger the
-      # rustup install of the pinned toolchain races on the runner image's
-      # preinstalled `~/.cargo/bin/cargo-clippy` proxy and intermittently dies
-      # with "detected conflict: 'bin/cargo-clippy'" while rustup rolls back a
-      # partial install (the #72 / #76 DuckLake flake). Uninstall-then-install
-      # clears any partial copy and completes here, so cargo's lazy path is a
-      # clean no-op.
-      - name: Pre-install pinned Rust toolchain (avoid lazy-install race)
-        run: |
-          channel="$(grep -oP '^\s*channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
-          echo "Pinned toolchain from rust-toolchain.toml: $channel"
-          rustup toolchain uninstall "$channel" >/dev/null 2>&1 || true
-          rustup toolchain install "$channel" --profile minimal \
-            --component rustfmt --component clippy --no-self-update
+      # Pre-install the toolchain pinned in rust-toolchain.toml before `make`
+      # runs cargo, so cargo's flake-prone lazy rustup install is a no-op. See
+      # the composite action for the full rationale.
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/setup-pinned-rust
 
       - name: Build extension
         run: make configure debug
@@ -63,22 +52,11 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      # Pre-install the toolchain pinned in rust-toolchain.toml (single source
-      # of truth — read the channel from the file so a Dependabot bump can't
-      # drift) BEFORE `make` runs cargo. Letting cargo lazily trigger the
-      # rustup install of the pinned toolchain races on the runner image's
-      # preinstalled `~/.cargo/bin/cargo-clippy` proxy and intermittently dies
-      # with "detected conflict: 'bin/cargo-clippy'" while rustup rolls back a
-      # partial install (the #72 / #76 DuckLake flake). Uninstall-then-install
-      # clears any partial copy and completes here, so cargo's lazy path is a
-      # clean no-op.
-      - name: Pre-install pinned Rust toolchain (avoid lazy-install race)
-        run: |
-          channel="$(grep -oP '^\s*channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
-          echo "Pinned toolchain from rust-toolchain.toml: $channel"
-          rustup toolchain uninstall "$channel" >/dev/null 2>&1 || true
-          rustup toolchain install "$channel" --profile minimal \
-            --component rustfmt --component clippy --no-self-update
+      # Pre-install the toolchain pinned in rust-toolchain.toml before `make`
+      # runs cargo, so cargo's flake-prone lazy rustup install is a no-op. See
+      # the composite action for the full rationale.
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/setup-pinned-rust
 
       - name: Build extension
         run: make configure debug
