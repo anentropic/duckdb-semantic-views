@@ -144,7 +144,10 @@ fn source_table_matches(
     }
 }
 
-/// Look up a dimension by name using case-insensitive matching.
+/// Look up a dimension by name under the Snowflake identifier contract
+/// ([`crate::ident::ident_matches`]): an unquoted reference matches
+/// case-insensitively, a `"quoted"` reference case-sensitively. For unquoted
+/// names this is identical to the former `eq_ignore_ascii_case`.
 ///
 /// Supports table-qualified names: if `name` contains a '.' (e.g., "o.region"),
 /// splits into (alias, `bare_name`) and matches only dimensions whose
@@ -157,21 +160,23 @@ pub(super) fn find_dimension<'a>(
     def: &'a SemanticViewDefinition,
     name: &str,
 ) -> Option<&'a crate::model::Dimension> {
-    if let Some(dot_pos) = name.find('.') {
+    if let Some(dot_pos) = crate::ident::first_unquoted_dot(name) {
         let alias = &name[..dot_pos];
         let bare = &name[dot_pos + 1..];
         def.dimensions.iter().find(|d| {
-            d.name.eq_ignore_ascii_case(bare)
+            crate::ident::ident_matches(&d.name, bare)
                 && source_table_matches(d.source_table.as_deref(), alias, def)
         })
     } else {
         def.dimensions
             .iter()
-            .find(|d| d.name.eq_ignore_ascii_case(name))
+            .find(|d| crate::ident::ident_matches(&d.name, name))
     }
 }
 
-/// Look up a metric by name using case-insensitive matching.
+/// Look up a metric by name under the Snowflake identifier contract
+/// ([`crate::ident::ident_matches`]): unquoted references match
+/// case-insensitively, `"quoted"` references case-sensitively.
 ///
 /// Supports table-qualified names: if `name` contains a '.' (e.g., "o.revenue"),
 /// splits into (alias, `bare_name`) and matches only metrics whose
@@ -182,17 +187,17 @@ pub(super) fn find_metric<'a>(
     def: &'a SemanticViewDefinition,
     name: &str,
 ) -> Option<&'a crate::model::Metric> {
-    if let Some(dot_pos) = name.find('.') {
+    if let Some(dot_pos) = crate::ident::first_unquoted_dot(name) {
         let alias = &name[..dot_pos];
         let bare = &name[dot_pos + 1..];
         def.metrics.iter().find(|m| {
-            m.name.eq_ignore_ascii_case(bare)
+            crate::ident::ident_matches(&m.name, bare)
                 && source_table_matches(m.source_table.as_deref(), alias, def)
         })
     } else {
         def.metrics
             .iter()
-            .find(|m| m.name.eq_ignore_ascii_case(name))
+            .find(|m| crate::ident::ident_matches(&m.name, name))
     }
 }
 
@@ -322,6 +327,64 @@ mod tests {
             assert!(find_dimension(&def, "STATUS").is_some());
             assert!(find_metric(&def, "revenue").is_some());
             assert!(find_dimension(&def, "nonexistent").is_none());
+        }
+
+        /// A quoted mixed-case stored dimension (`"Region"`) follows the
+        /// Snowflake identifier contract: it matches a `"Region"` reference
+        /// case-sensitively, but NOT `"region"`, nor an unquoted `region`
+        /// (whose fold key is `region`, a different object). An unquoted
+        /// reference of any case remains case-insensitive against an unquoted
+        /// stored name.
+        fn quoted_dim_def() -> SemanticViewDefinition {
+            let mut def = def_with_db_schema(None, None);
+            def.tables = vec![TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                ..Default::default()
+            }];
+            def.dimensions = vec![
+                // Stored as CREATE captured it — a quoted name retains its
+                // surrounding quotes in the stored string.
+                Dimension {
+                    name: "\"Region\"".to_string(),
+                    expr: "o.region".to_string(),
+                    source_table: Some("o".to_string()),
+                    ..Default::default()
+                },
+                Dimension {
+                    name: "status".to_string(),
+                    expr: "o.status".to_string(),
+                    source_table: Some("o".to_string()),
+                    ..Default::default()
+                },
+            ];
+            def
+        }
+
+        #[test]
+        fn quoted_stored_name_is_case_sensitive() {
+            let def = quoted_dim_def();
+            // Exact quoted reference matches.
+            assert!(find_dimension(&def, "\"Region\"").is_some());
+            // Different-case quoted reference does NOT match.
+            assert!(find_dimension(&def, "\"region\"").is_none());
+            assert!(find_dimension(&def, "\"REGION\"").is_none());
+            // An unquoted reference (fold key `region`) is a different object
+            // from the quoted `Region`.
+            assert!(find_dimension(&def, "region").is_none());
+            assert!(find_dimension(&def, "Region").is_none());
+        }
+
+        #[test]
+        fn quoted_lowercase_reference_matches_unquoted_stored() {
+            // Unquoted stored `status`: an unquoted ref of any case matches,
+            // and a quoted `"status"` (fold-equivalent) also matches, but a
+            // quoted mixed-case `"Status"` does not.
+            let def = quoted_dim_def();
+            assert!(find_dimension(&def, "status").is_some());
+            assert!(find_dimension(&def, "STATUS").is_some());
+            assert!(find_dimension(&def, "\"status\"").is_some());
+            assert!(find_dimension(&def, "\"Status\"").is_none());
         }
     }
 

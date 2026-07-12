@@ -74,7 +74,10 @@ pub fn expand_wildcards(
                 WildcardItemType::Dimension => {
                     for dim in &def.dimensions {
                         if on_table(dim.source_table.as_deref()) {
-                            let key = dim.name.to_ascii_lowercase();
+                            // Dedup on the identifier match key so quoted and
+                            // unquoted names collapse exactly as resolution
+                            // matches them (review on #84).
+                            let key = crate::ident::normalize_ident_part(&dim.name);
                             if seen.insert(key) {
                                 result.push(dim.name.clone());
                             }
@@ -86,7 +89,7 @@ pub fn expand_wildcards(
                         if on_table(met.source_table.as_deref())
                             && met.access != AccessModifier::Private
                         {
-                            let key = met.name.to_ascii_lowercase();
+                            let key = crate::ident::normalize_ident_part(&met.name);
                             if seen.insert(key) {
                                 result.push(met.name.clone());
                             }
@@ -98,7 +101,7 @@ pub fn expand_wildcards(
                         if on_table(fact.source_table.as_deref())
                             && fact.access != AccessModifier::Private
                         {
-                            let key = fact.name.to_ascii_lowercase();
+                            let key = crate::ident::normalize_ident_part(&fact.name);
                             if seen.insert(key) {
                                 result.push(fact.name.clone());
                             }
@@ -107,7 +110,7 @@ pub fn expand_wildcards(
                 }
             }
         } else {
-            let key = item.to_ascii_lowercase();
+            let key = crate::ident::normalize_ident_part(item);
             if seen.insert(key) {
                 result.push(item.clone());
             }

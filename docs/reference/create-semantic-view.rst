@@ -270,8 +270,8 @@ Declares named grouping expressions available for queries.
 
 **Validation rules:**
 
-- Dimension names must be unique within the view (case-insensitive). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
-- A dimension name cannot collide with any metric name (case-insensitive). See :ref:`ref-err-name-uniqueness`.
+- Dimension names must be unique within the view (case-insensitive for unquoted names; a double-quoted name such as ``"Region"`` is a distinct, case-sensitive name). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
+- A dimension name cannot collide with any metric name (case-insensitive for unquoted names; a double-quoted name such as ``"Region"`` is a distinct, case-sensitive name). See :ref:`ref-err-name-uniqueness`.
 
 **Type inference:**
 
@@ -389,8 +389,8 @@ See :ref:`howto-window-metrics` for details on both modes.
 
 **Validation rules:**
 
-- Metric names must be unique within the view (case-insensitive), across both base and derived metrics. See :ref:`ref-err-name-uniqueness`.
-- A metric name cannot collide with any dimension name (case-insensitive). See :ref:`ref-err-name-uniqueness`.
+- Metric names must be unique within the view (case-insensitive for unquoted names; a double-quoted name such as ``"Revenue"`` is a distinct, case-sensitive name), across both base and derived metrics. See :ref:`ref-err-name-uniqueness`.
+- A metric name cannot collide with any dimension name (case-insensitive for unquoted names; a double-quoted name such as ``"Region"`` is a distinct, case-sensitive name). See :ref:`ref-err-name-uniqueness`.
 - Derived metrics must not contain aggregate functions.
 - Circular derived metric references are rejected.
 - ``USING`` relationship names must match declared relationships.

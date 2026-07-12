@@ -188,6 +188,13 @@ unsafe fn explain_semantic_view_bind_body(
     })?;
 
     let mat_name = {
+        // NB: these lookups (and the materialization routing they feed) still
+        // fold case-insensitively regardless of quoting. That keeps this
+        // display header consistent with the actual routing in `expand()`
+        // (both use the same case-insensitive key), so a quoted reference
+        // cannot make the header and the emitted SQL disagree. Making
+        // materialization matching quote-aware is deferred to the §6.2
+        // reference-engine work, which collapses the duplicated matcher first.
         let dim_refs: Vec<&crate::model::Dimension> = dimensions
             .iter()
             .filter_map(|name| {
