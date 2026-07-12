@@ -15,7 +15,8 @@
 
 use super::extract_quoted_string;
 use super::DdlKind;
-use crate::util::{is_ident_byte, starts_with_keyword_ci};
+use crate::errors::ParseError;
+use crate::util::{byte_offset_within, is_ident_byte, starts_with_keyword_ci};
 
 /// Build optional WHERE and LIMIT suffix for a SHOW rewrite.
 ///
@@ -74,8 +75,13 @@ pub(crate) struct ShowClauses<'a> {
 /// Parse a keyword + identifier pair from text starting with IN.
 ///
 /// Checks for `IN SCHEMA <name>` or `IN DATABASE <name>`.
-/// Returns `(remaining_text, in_schema, in_database)`.
-fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), String> {
+/// Returns `(remaining_text, in_schema, in_database)`. `base` is the absolute
+/// byte offset of `rest[0]` in the original query, so errors carry a caret
+/// position pointing at the offending token (R-2).
+fn parse_in_scope(
+    rest: &str,
+    base: usize,
+) -> Result<(&str, Option<&str>, Option<&str>), ParseError> {
     let after_in = rest[2..].trim_start();
 
     // Try to match a keyword (SCHEMA or DATABASE) followed by an identifier.
@@ -88,14 +94,19 @@ fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), Stri
     {
         ("DATABASE", 8, "database")
     } else {
-        return Err(
-            "SHOW SEMANTIC VIEWS requires IN SCHEMA <name> or IN DATABASE <name>".to_string(),
-        );
+        return Err(ParseError {
+            message: "SHOW SEMANTIC VIEWS requires IN SCHEMA <name> or IN DATABASE <name>"
+                .to_string(),
+            position: Some(base + byte_offset_within(rest, after_in)),
+        });
     };
 
     let after_kw = after_in[kw_len..].trim_start();
     if after_kw.is_empty() {
-        return Err(format!("Missing {label} name after IN {keyword}"));
+        return Err(ParseError {
+            message: format!("Missing {label} name after IN {keyword}"),
+            position: Some(base + byte_offset_within(rest, after_kw)),
+        });
     }
     let name_end = after_kw
         .find(|c: char| c.is_whitespace())
@@ -112,22 +123,33 @@ fn parse_in_scope(rest: &str) -> Result<(&str, Option<&str>, Option<&str>), Stri
 
 /// Parse FOR METRIC clause (only valid for `ShowDimensions`).
 ///
-/// Returns `(remaining_text, metric_name)`.
-fn parse_for_metric<'a>(rest: &'a str, _entity: &str) -> Result<(&'a str, &'a str), String> {
+/// Returns `(remaining_text, metric_name)`. `base` is the absolute byte offset
+/// of `rest[0]` in the original query (R-2).
+fn parse_for_metric<'a>(
+    rest: &'a str,
+    _entity: &str,
+    base: usize,
+) -> Result<(&'a str, &'a str), ParseError> {
     let after_for = rest[3..].trim_start();
     // Word boundary after METRIC: `FOR METRICS x` must not parse as the
     // METRIC keyword followed by a metric named `s x` (PR #50 review).
     let metric_boundary_ok = starts_with_keyword_ci(after_for, "METRIC")
         && (after_for.len() == 6 || after_for.as_bytes()[6].is_ascii_whitespace());
     if !metric_boundary_ok {
-        return Err("Expected FOR METRIC after view name. \
-             Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] \
-             [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
-            .to_string());
+        return Err(ParseError {
+            message: "Expected FOR METRIC after view name. \
+                 Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] \
+                 [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
+                .to_string(),
+            position: Some(base + byte_offset_within(rest, after_for)),
+        });
     }
     let after_metric = after_for[6..].trim_start();
     if after_metric.is_empty() {
-        return Err("Missing metric name after FOR METRIC".to_string());
+        return Err(ParseError {
+            message: "Missing metric name after FOR METRIC".to_string(),
+            position: Some(base + byte_offset_within(rest, after_metric)),
+        });
     }
     let name_end = after_metric
         .find(|c: char| c.is_whitespace())
@@ -141,11 +163,19 @@ fn parse_for_metric<'a>(rest: &'a str, _entity: &str) -> Result<(&'a str, &'a st
 /// Parse optional SHOW SEMANTIC filter clauses from text after the prefix.
 ///
 /// Clause order (Snowflake): LIKE, IN, FOR METRIC, STARTS WITH, LIMIT.
+///
+/// `base` is the absolute byte offset of `after_prefix[0]` in the original
+/// query; every error carries a caret position pointing at its offending token
+/// (R-2). Errors resolve to absolute offsets via [`byte_offset_within`] against
+/// `after_prefix`, so the parser never threads manual byte counters.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_show_filter_clauses<'a>(
     after_prefix: &'a str,
     kind: DdlKind,
-) -> Result<ShowClauses<'a>, String> {
+    base: usize,
+) -> Result<ShowClauses<'a>, ParseError> {
+    // Absolute offset of a subslice of `after_prefix`, for caret positions.
+    let abs = |sub: &str| base + byte_offset_within(after_prefix, sub);
     let mut rest = after_prefix.trim();
     let mut like_pattern: Option<String> = None;
     let mut in_view: Option<&'a str> = None;
@@ -169,7 +199,11 @@ pub(crate) fn parse_show_filter_clauses<'a>(
         // Ensure it's followed by whitespace (not just a prefix match)
         if rest.len() == 4 || rest.as_bytes()[4].is_ascii_whitespace() {
             rest = rest[4..].trim_start();
-            let (pattern, consumed) = extract_quoted_string(rest)?;
+            let (pattern, consumed) =
+                extract_quoted_string(rest).map_err(|message| ParseError {
+                    message,
+                    position: Some(abs(rest)),
+                })?;
             like_pattern = Some(pattern);
             rest = rest[consumed..].trim_start();
         }
@@ -180,14 +214,17 @@ pub(crate) fn parse_show_filter_clauses<'a>(
         && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
     {
         if kind == DdlKind::Show || kind == DdlKind::ShowTerse {
-            let (remaining, schema, database) = parse_in_scope(rest)?;
+            let (remaining, schema, database) = parse_in_scope(rest, abs(rest))?;
             rest = remaining;
             in_schema = schema;
             in_database = database;
         } else {
             rest = rest[2..].trim_start();
             if rest.is_empty() {
-                return Err("Missing view name after IN".to_string());
+                return Err(ParseError {
+                    message: "Missing view name after IN".to_string(),
+                    position: Some(abs(rest)),
+                });
             }
             let name_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
             in_view = Some(&rest[..name_end]);
@@ -201,11 +238,14 @@ pub(crate) fn parse_show_filter_clauses<'a>(
         && (rest.len() == 3 || rest.as_bytes()[3].is_ascii_whitespace())
     {
         if kind != DdlKind::ShowDimensions {
-            return Err(format!(
-                "FOR METRIC is only valid for SHOW SEMANTIC DIMENSIONS, not SHOW SEMANTIC {entity}"
-            ));
+            return Err(ParseError {
+                message: format!(
+                    "FOR METRIC is only valid for SHOW SEMANTIC DIMENSIONS, not SHOW SEMANTIC {entity}"
+                ),
+                position: Some(abs(rest)),
+            });
         }
-        let (remaining, metric_name) = parse_for_metric(rest, entity)?;
+        let (remaining, metric_name) = parse_for_metric(rest, entity, abs(rest))?;
         rest = remaining;
         for_metric = Some(metric_name);
     }
@@ -222,13 +262,19 @@ pub(crate) fn parse_show_filter_clauses<'a>(
         let with_boundary_ok = starts_with_keyword_ci(rest, "WITH")
             && (rest.len() == 4 || !is_ident_byte(rest.as_bytes()[4]));
         if !with_boundary_ok {
-            return Err(format!(
-                "Expected STARTS WITH. \
-                 Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
-            ));
+            return Err(ParseError {
+                message: format!(
+                    "Expected STARTS WITH. \
+                     Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
+                ),
+                position: Some(abs(rest)),
+            });
         }
         rest = rest[4..].trim_start();
-        let (prefix, consumed) = extract_quoted_string(rest)?;
+        let (prefix, consumed) = extract_quoted_string(rest).map_err(|message| ParseError {
+            message,
+            position: Some(abs(rest)),
+        })?;
         starts_with = Some(prefix);
         rest = rest[consumed..].trim_start();
     }
@@ -241,9 +287,10 @@ pub(crate) fn parse_show_filter_clauses<'a>(
         rest = rest[5..].trim_start();
         let token_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let token = &rest[..token_end];
-        let n: u64 = token
-            .parse()
-            .map_err(|_| format!("LIMIT must be a positive integer, got: '{token}'"))?;
+        let n: u64 = token.parse().map_err(|_| ParseError {
+            message: format!("LIMIT must be a positive integer, got: '{token}'"),
+            position: Some(abs(rest)),
+        })?;
         limit = Some(n);
         rest = rest[token_end..].trim_start();
     }
@@ -261,7 +308,10 @@ pub(crate) fn parse_show_filter_clauses<'a>(
                  Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
             )
         };
-        return Err(usage);
+        return Err(ParseError {
+            message: usage,
+            position: Some(abs(rest)),
+        });
     }
 
     Ok(ShowClauses {

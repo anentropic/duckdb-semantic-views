@@ -169,6 +169,26 @@ pub fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
+/// Byte offset of the subslice `inner` within `outer`.
+///
+/// `inner` MUST be a subslice of `outer` (borrowed from the same allocation,
+/// as produced by `&outer[a..b]` / `.trim()` / `.split` etc.). Used to recover
+/// an absolute error position from a re-sliced token without threading manual
+/// byte counters through every clause scanner (R-2): the parser slices its way
+/// down to the offending token, and this maps that token back to an offset in
+/// the original query for the caret. `debug_assert`s the subslice relationship;
+/// a non-subslice argument is a caller bug, not a runtime condition.
+#[must_use]
+pub fn byte_offset_within(outer: &str, inner: &str) -> usize {
+    let outer_start = outer.as_ptr() as usize;
+    let inner_start = inner.as_ptr() as usize;
+    debug_assert!(
+        inner_start >= outer_start && inner_start + inner.len() <= outer_start + outer.len(),
+        "byte_offset_within: `inner` is not a subslice of `outer`"
+    );
+    inner_start - outer_start
+}
+
 /// Is `b` a word-boundary byte — i.e. NOT an [`is_ident_byte`]? The
 /// primitive used by [`replace_word_boundary`] and the `facts.rs` name /
 /// COUNT matchers so inlining shares the parser's notion of an identifier.
@@ -404,6 +424,29 @@ pub fn extract_single_quoted_prefix(input: &str) -> Result<(String, usize), Sing
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // -------------------------------------------------------------------
+    // byte_offset_within tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn byte_offset_within_returns_slice_offset() {
+        let outer = "DROP SEMANTIC VIEW foo bar";
+        let inner = &outer[19..22]; // "foo"
+        assert_eq!(byte_offset_within(outer, inner), 19);
+        assert_eq!(byte_offset_within(outer, outer), 0);
+        // A trailing-trimmed token still maps back to its original offset.
+        let tail = outer[18..].trim_start(); // "foo bar" at offset 19
+        assert_eq!(byte_offset_within(outer, tail), 19);
+    }
+
+    #[test]
+    fn byte_offset_within_handles_multibyte_token() {
+        // 'Ω' is 2 bytes; the trailing token starts at byte 20.
+        let outer = "SHOW SEMANTIC VIEWS Ωx";
+        let inner = &outer[20..]; // "Ωx"
+        assert_eq!(byte_offset_within(outer, inner), 20);
+    }
 
     // -------------------------------------------------------------------
     // replace_word_boundary tests
