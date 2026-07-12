@@ -94,7 +94,7 @@ pub(super) fn find_clause_bounds<'a>(
             let ch = char_at(text, i).unwrap_or('\u{FFFD}');
             return Err(ParseError {
                 message: format!(
-                    "Unexpected character '{ch}' in AS body; expected a clause keyword (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS).",
+                    "Unexpected character '{ch}' in AS body; expected a clause keyword (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS).",
                 ),
                 position: Some(base_offset + i),
             });
@@ -118,7 +118,7 @@ pub(super) fn find_clause_bounds<'a>(
                 format!("Unknown clause keyword '{word}'; did you mean '{sug_upper}'?")
             } else {
                 format!(
-                    "Unknown clause keyword '{word}'; expected one of TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS.",
+                    "Unknown clause keyword '{word}'; expected one of TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS.",
                 )
             };
             return Err(ParseError {
@@ -306,5 +306,28 @@ mod tests {
     fn unexpected_ascii_char_reported() {
         let err = find_clause_bounds("# DIMENSIONS (d AS x)", 0).unwrap_err();
         assert!(err.message.contains("'#'"), "got: {}", err.message);
+    }
+
+    /// The clause-keyword lists in the "unexpected character" and "unknown
+    /// keyword" errors must name every keyword the scanner accepts —
+    /// MATERIALIZATIONS was previously omitted from both, while the ordering
+    /// error already listed it (Copilot review, #83).
+    #[test]
+    fn keyword_list_errors_include_materializations() {
+        // "unexpected character" arm (leading non-alphabetic byte).
+        let err = find_clause_bounds("# TABLES (o AS x)", 0).unwrap_err();
+        assert!(
+            err.message.contains("MATERIALIZATIONS"),
+            "unexpected-char message must list MATERIALIZATIONS: {}",
+            err.message
+        );
+        // "unknown clause keyword" arm. ZZZQQQ is >3 edits from every keyword
+        // so it takes the no-suggestion branch that lists the keywords.
+        let err = find_clause_bounds("ZZZQQQ (x)", 0).unwrap_err();
+        assert!(
+            err.message.contains("MATERIALIZATIONS"),
+            "unknown-keyword message must list MATERIALIZATIONS: {}",
+            err.message
+        );
     }
 }
