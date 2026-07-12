@@ -24,6 +24,12 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      # Pre-install the toolchain pinned in rust-toolchain.toml before `make`
+      # runs cargo, so cargo's flake-prone lazy rustup install is a no-op. See
+      # the composite action for the full rationale.
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/setup-pinned-rust
+
       - name: Build extension
         run: make configure debug
 
@@ -45,6 +51,12 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      # Pre-install the toolchain pinned in rust-toolchain.toml before `make`
+      # runs cargo, so cargo's flake-prone lazy rustup install is a no-op. See
+      # the composite action for the full rationale.
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/setup-pinned-rust
 
       - name: Build extension
         run: make configure debug

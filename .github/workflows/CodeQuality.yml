@@ -26,6 +26,13 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Pre-install the toolchain pinned in rust-toolchain.toml before any
+      # cargo command (every fmt/clippy/llvm-cov step below runs under it), so
+      # cargo's flake-prone lazy rustup install is a no-op. See the composite
+      # action for the full rationale.
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/setup-pinned-rust
+
       # The sqllogictest runner executes ONLY files named in TEST_LIST; a
       # .test file missing from it is silently skipped. Mirrors `just check-test-list`.
       - name: Check test/sql/TEST_LIST is in sync with test/sql/*.test
