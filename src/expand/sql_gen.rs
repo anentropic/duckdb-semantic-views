@@ -1126,31 +1126,21 @@ GROUP BY
                         expr: "o.region".to_string(),
                         source_table: Some("o".to_string()),
 
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     crate::model::Dimension {
                         name: "tier".to_string(),
                         expr: "c.tier".to_string(),
                         source_table: Some("c".to_string()),
 
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 metrics: vec![crate::model::Metric {
                     name: "revenue".to_string(),
                     expr: "sum(o.amount)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 }],
 
                 joins: vec![crate::model::Join {
@@ -1270,10 +1260,8 @@ GROUP BY
             def.dimensions.push(Dimension {
                 name: "region_id".to_string(),
                 expr: "region_id".to_string(),
-                source_table: None,
                 output_type: Some("INTEGER".to_string()),
-                comment: None,
-                synonyms: vec![],
+                ..Default::default()
             });
             let req = QueryRequest {
                 facts: vec![],
@@ -1323,17 +1311,13 @@ GROUP BY
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![
@@ -1341,30 +1325,20 @@ GROUP BY
                         name: "region".to_string(),
                         expr: "o.region".to_string(),
                         source_table: Some("o".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     Dimension {
                         name: "customer_name".to_string(),
                         expr: "c.name".to_string(),
                         source_table: Some("c".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 metrics: vec![Metric {
                     name: "total_amount".to_string(),
                     expr: "sum(o.amount)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 }],
 
                 joins: vec![Join {
@@ -1391,25 +1365,19 @@ GROUP BY
                         alias: "li".to_string(),
                         table: "line_items".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![
@@ -1417,30 +1385,20 @@ GROUP BY
                         name: "product".to_string(),
                         expr: "li.product".to_string(),
                         source_table: Some("li".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     Dimension {
                         name: "customer_name".to_string(),
                         expr: "c.name".to_string(),
                         source_table: Some("c".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 metrics: vec![Metric {
                     name: "total_qty".to_string(),
                     expr: "sum(li.qty)".to_string(),
                     source_table: Some("li".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 }],
 
                 joins: vec![
@@ -1490,38 +1448,26 @@ GROUP BY
                         alias: "a".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "b".to_string(),
                         table: "details".to_string(),
                         pk_columns: vec!["pk1".to_string(), "pk2".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![Dimension {
                     name: "detail".to_string(),
                     expr: "b.detail".to_string(),
                     source_table: Some("b".to_string()),
-                    output_type: None,
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 metrics: vec![Metric {
                     name: "cnt".to_string(),
                     expr: "count(*)".to_string(),
                     source_table: Some("a".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 }],
 
                 joins: vec![Join {
@@ -1650,38 +1596,26 @@ GROUP BY
                         alias: "o".to_string(),
                         table: "p27_orders".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "p27_customers".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![Dimension {
                     name: "customer_name".to_string(),
                     expr: "c.name".to_string(),
                     source_table: Some("c".to_string()),
-                    output_type: None,
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 metrics: vec![Metric {
                     name: "total_amount".to_string(),
                     expr: "sum(o.amount)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 }],
 
                 joins: vec![Join {
@@ -1729,17 +1663,13 @@ GROUP BY
                         alias: "o".to_string(),
                         table: "p27_orders".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "p27_customers".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![
@@ -1747,30 +1677,20 @@ GROUP BY
                         name: "customer_name".to_string(),
                         expr: "c.name".to_string(),
                         source_table: Some("c".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     Dimension {
                         name: "order_region".to_string(),
                         expr: "o.region".to_string(),
                         source_table: Some("o".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 metrics: vec![Metric {
                     name: "total_amount".to_string(),
                     expr: "sum(o.amount)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 }],
 
                 joins: vec![Join {
@@ -2095,37 +2015,18 @@ GROUP BY
                     name: "revenue".to_string(),
                     expr: "SUM(amount)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "cost".to_string(),
                     expr: "SUM(unit_cost)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "profit".to_string(),
                     expr: "revenue - cost".to_string(),
-                    source_table: None,
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
             ];
             let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
@@ -2144,49 +2045,23 @@ GROUP BY
                     name: "revenue".to_string(),
                     expr: "SUM(amount)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "cost".to_string(),
                     expr: "SUM(unit_cost)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "profit".to_string(),
                     expr: "revenue - cost".to_string(),
-                    source_table: None,
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "margin".to_string(),
                     expr: "profit / revenue * 100".to_string(),
-                    source_table: None,
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
             ];
             let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
@@ -2209,25 +2084,12 @@ GROUP BY
                     name: "revenue".to_string(),
                     expr: "SUM(net_price)".to_string(),
                     source_table: Some("li".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "double_rev".to_string(),
                     expr: "revenue * 2".to_string(),
-                    source_table: None,
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
             ];
             let facts = vec![Fact {
@@ -2260,49 +2122,23 @@ GROUP BY
                     name: "a".to_string(),
                     expr: "SUM(x)".to_string(),
                     source_table: Some("t".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "b".to_string(),
                     expr: "SUM(y)".to_string(),
                     source_table: Some("t".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "profit".to_string(),
                     expr: "a - b".to_string(),
-                    source_table: None,
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "margin".to_string(),
                     expr: "profit / a".to_string(),
-                    source_table: None,
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
             ];
             let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
@@ -2321,37 +2157,18 @@ GROUP BY
                     name: "revenue".to_string(),
                     expr: "SUM(amount)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "revenue_total".to_string(),
                     expr: "SUM(total)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
                 Metric {
                     name: "derived".to_string(),
                     expr: "revenue + revenue_total".to_string(),
-                    source_table: None,
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 },
             ];
             let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
@@ -2395,63 +2212,38 @@ GROUP BY
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "li".to_string(),
                         table: "line_items".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
                     expr: "o.region".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 metrics: vec![
                     Metric {
                         name: "revenue".to_string(),
                         expr: "SUM(li.amount)".to_string(),
                         source_table: Some("li".to_string()),
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "cost".to_string(),
                         expr: "SUM(li.unit_cost)".to_string(),
                         source_table: Some("li".to_string()),
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "profit".to_string(),
                         expr: "revenue - cost".to_string(),
-                        source_table: None,
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                 ],
                 joins: vec![Join {
@@ -2488,63 +2280,38 @@ GROUP BY
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "li".to_string(),
                         table: "line_items".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
                     expr: "o.region".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 metrics: vec![
                     Metric {
                         name: "revenue".to_string(),
                         expr: "SUM(li.amount)".to_string(),
                         source_table: Some("li".to_string()),
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "order_count".to_string(),
                         expr: "COUNT(DISTINCT o.id)".to_string(),
                         source_table: Some("o".to_string()),
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "avg_order_value".to_string(),
                         expr: "revenue / order_count".to_string(),
-                        source_table: None,
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                 ],
                 joins: vec![Join {
@@ -2582,37 +2349,18 @@ GROUP BY
                         name: "revenue".to_string(),
                         expr: "SUM(net_price)".to_string(),
                         source_table: Some("li".to_string()),
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "cost".to_string(),
                         expr: "SUM(unit_cost)".to_string(),
                         source_table: Some("li".to_string()),
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "profit".to_string(),
                         expr: "revenue - cost".to_string(),
-                        source_table: None,
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                 ],
                 joins: vec![],
@@ -2660,25 +2408,19 @@ GROUP BY
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "li".to_string(),
                         table: "line_items".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![
@@ -2686,25 +2428,19 @@ GROUP BY
                         name: "region".to_string(),
                         expr: "o.region".to_string(),
                         source_table: Some("o".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     Dimension {
                         name: "status".to_string(),
                         expr: "li.status".to_string(),
                         source_table: Some("li".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     Dimension {
                         name: "segment".to_string(),
                         expr: "c.segment".to_string(),
                         source_table: Some("c".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 metrics: vec![
@@ -2712,25 +2448,13 @@ GROUP BY
                         name: "revenue".to_string(),
                         expr: "SUM(li.extended_price)".to_string(),
                         source_table: Some("li".to_string()),
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "order_count".to_string(),
                         expr: "COUNT(*)".to_string(),
                         source_table: Some("o".to_string()),
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                 ],
                 joins: vec![
@@ -2806,38 +2530,26 @@ GROUP BY
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "d".to_string(),
                         table: "details".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![Dimension {
                     name: "detail".to_string(),
                     expr: "d.detail".to_string(),
                     source_table: Some("d".to_string()),
-                    output_type: None,
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 metrics: vec![Metric {
                     name: "cnt".to_string(),
                     expr: "COUNT(*)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 }],
                 joins: vec![Join {
                     table: "d".to_string(),
@@ -2903,13 +2615,7 @@ GROUP BY
                 name: "customer_count".to_string(),
                 expr: "COUNT(DISTINCT c.id)".to_string(),
                 source_table: Some("c".to_string()),
-                output_type: None,
-                using_relationships: vec![],
-                comment: None,
-                synonyms: vec![],
-                access: AccessModifier::Public,
-                non_additive_by: vec![],
-                window_spec: None,
+                ..Default::default()
             });
             let req = QueryRequest {
                 facts: vec![],
@@ -2936,14 +2642,7 @@ GROUP BY
             def.metrics.push(Metric {
                 name: "avg_order".to_string(),
                 expr: "order_count / 1".to_string(),
-                source_table: None,
-                output_type: None,
-                using_relationships: vec![],
-                comment: None,
-                synonyms: vec![],
-                access: AccessModifier::Public,
-                non_additive_by: vec![],
-                window_spec: None,
+                ..Default::default()
             });
             let req = QueryRequest {
                 facts: vec![],
@@ -3006,17 +2705,13 @@ GROUP BY
                         alias: "f".to_string(),
                         table: "flights".to_string(),
                         pk_columns: vec!["flight_id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "a".to_string(),
                         table: "airports".to_string(),
                         pk_columns: vec!["airport_code".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![
@@ -3024,25 +2719,19 @@ GROUP BY
                         name: "city".to_string(),
                         expr: "a.city".to_string(),
                         source_table: Some("a".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     Dimension {
                         name: "country".to_string(),
                         expr: "a.country".to_string(),
                         source_table: Some("a".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     Dimension {
                         name: "carrier".to_string(),
                         expr: "f.carrier".to_string(),
                         source_table: Some("f".to_string()),
-                        output_type: None,
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 metrics: vec![
@@ -3050,37 +2739,20 @@ GROUP BY
                         name: "departure_count".to_string(),
                         expr: "COUNT(*)".to_string(),
                         source_table: Some("f".to_string()),
-                        output_type: None,
                         using_relationships: vec!["dep_airport".to_string()],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "arrival_count".to_string(),
                         expr: "COUNT(*)".to_string(),
                         source_table: Some("f".to_string()),
-                        output_type: None,
                         using_relationships: vec!["arr_airport".to_string()],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "total_flights".to_string(),
                         expr: "departure_count + arrival_count".to_string(),
-                        source_table: None,
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                 ],
                 joins: vec![
@@ -3262,38 +2934,26 @@ GROUP BY
                         alias: "f".to_string(),
                         table: "flights".to_string(),
                         pk_columns: vec!["flight_id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "a".to_string(),
                         table: "airports".to_string(),
                         pk_columns: vec!["airport_code".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![Dimension {
                     name: "carrier".to_string(),
                     expr: "f.carrier".to_string(),
                     source_table: Some("f".to_string()),
-                    output_type: None,
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 metrics: vec![Metric {
                     name: "airport_count".to_string(),
                     expr: "COUNT(*)".to_string(),
                     source_table: Some("a".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 }],
                 joins: vec![Join {
                     table: "a".to_string(),
@@ -3350,29 +3010,19 @@ GROUP BY
                     alias: "o".to_string(),
                     table: "orders".to_string(),
                     pk_columns: vec!["id".to_string()],
-                    unique_constraints: vec![],
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
                     expr: "o.region".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 metrics: vec![Metric {
                     name: "cnt".to_string(),
                     expr: "COUNT(*)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 }],
                 joins: vec![],
                 facts: vec![],
@@ -3402,38 +3052,26 @@ GROUP BY
                         alias: "o".to_string(),
                         table: "orders".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                     TableRef {
                         alias: "c".to_string(),
                         table: "customers".to_string(),
                         pk_columns: vec!["id".to_string()],
-                        unique_constraints: vec![],
-                        comment: None,
-                        synonyms: vec![],
+                        ..Default::default()
                     },
                 ],
                 dimensions: vec![Dimension {
                     name: "customer_name".to_string(),
                     expr: "c.name".to_string(),
                     source_table: Some("c".to_string()),
-                    output_type: None,
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 metrics: vec![Metric {
                     name: "revenue".to_string(),
                     expr: "SUM(o.amount)".to_string(),
                     source_table: Some("o".to_string()),
-                    output_type: None,
-                    using_relationships: vec![],
-                    comment: None,
-                    synonyms: vec![],
-                    access: AccessModifier::Public,
-                    non_additive_by: vec![],
-                    window_spec: None,
+                    ..Default::default()
                 }],
                 joins: vec![Join {
                     table: "c".to_string(),
@@ -3510,35 +3148,19 @@ GROUP BY
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
                     expr: "region".to_string(),
-                    source_table: None,
-                    output_type: None,
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 metrics: vec![
                     Metric {
                         name: "total_revenue".to_string(),
                         expr: "SUM(amount)".to_string(),
-                        source_table: None,
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "secret_cost".to_string(),
                         expr: "SUM(cost)".to_string(),
-                        source_table: None,
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
                         access: AccessModifier::Private,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                 ],
                 joins: vec![],
@@ -3557,47 +3179,25 @@ GROUP BY
                 dimensions: vec![Dimension {
                     name: "region".to_string(),
                     expr: "region".to_string(),
-                    source_table: None,
-                    output_type: None,
-                    comment: None,
-                    synonyms: vec![],
+                    ..Default::default()
                 }],
                 metrics: vec![
                     Metric {
                         name: "total_revenue".to_string(),
                         expr: "SUM(amount)".to_string(),
-                        source_table: None,
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "secret_cost".to_string(),
                         expr: "SUM(cost)".to_string(),
-                        source_table: None,
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
                         access: AccessModifier::Private,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        ..Default::default()
                     },
                     Metric {
                         name: "profit".to_string(),
                         expr: "total_revenue - secret_cost".to_string(),
-                        source_table: None, // derived metric
-                        output_type: None,
-                        using_relationships: vec![],
-                        comment: None,
-                        synonyms: vec![],
-                        access: AccessModifier::Public,
-                        non_additive_by: vec![],
-                        window_spec: None,
+                        // no source_table: derived metric
+                        ..Default::default()
                     },
                 ],
                 joins: vec![],
