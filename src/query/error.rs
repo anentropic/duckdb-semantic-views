@@ -57,16 +57,16 @@ impl fmt::Display for QueryError {
                     " Run FROM list_semantic_views() to see all registered views."
                 )
             }
-            Self::EmptyRequest { view_name } => {
-                write!(
-                    f,
-                    "semantic view '{view_name}': specify at least dimensions := [...], metrics := [...], or facts := [...]."
-                )?;
-                write!(
-                    f,
-                    " Run DESCRIBE SEMANTIC VIEW {view_name} to see available dimensions, metrics, and facts."
-                )
-            }
+            // R-16 (code-review 2026-07-11): delegate to `ExpandError::EmptyRequest`
+            // so the two render identically and can't drift apart. The clone is
+            // cheap — this is the error path.
+            Self::EmptyRequest { view_name } => write!(
+                f,
+                "{}",
+                ExpandError::EmptyRequest {
+                    view_name: view_name.clone(),
+                }
+            ),
             Self::WildcardExpansion { view_name, detail } => {
                 write!(f, "semantic view '{view_name}': {detail}")
             }
@@ -134,5 +134,25 @@ mod tests {
             e.to_string(),
             "semantic view 'orders': unknown alias 'x' in wildcard 'x.*'"
         );
+    }
+
+    #[test]
+    fn empty_request_message_matches_expand_error_verbatim() {
+        // R-16 (code-review 2026-07-11): `QueryError::EmptyRequest` and
+        // `ExpandError::EmptyRequest` now share `expand::write_empty_request`.
+        // Pin that they render byte-for-byte identically so the wording can't
+        // drift apart again (the original defect this refactor removed).
+        let query_side = QueryError::EmptyRequest {
+            view_name: "orders".to_string(),
+        };
+        let expand_side = ExpandError::EmptyRequest {
+            view_name: "orders".to_string(),
+        };
+        assert_eq!(query_side.to_string(), expand_side.to_string());
+        // And that the single source carries the current, fuller wording.
+        assert!(query_side.to_string().contains("facts := [...]"));
+        assert!(query_side
+            .to_string()
+            .contains("DESCRIBE SEMANTIC VIEW orders"));
     }
 }
