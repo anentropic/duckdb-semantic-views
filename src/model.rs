@@ -1,3 +1,24 @@
+//! Serialized model of a stored semantic-view definition.
+//!
+//! # Wire-format freeze (C-11, code-review 2026-07-11)
+//!
+//! These structs ARE the on-disk format: every definition is persisted as JSON
+//! in the catalog and re-emitted verbatim by YAML export, so the serde surface
+//! is a compatibility contract, not an implementation detail. Two conventions
+//! look inconsistent but are deliberate and frozen — do not "tidy" them, and
+//! match them when adding fields:
+//!
+//! - **`source_table` and `output_type` serialize explicit `null`s** (they carry
+//!   `#[serde(default)]` but *not* `skip_serializing_if`), whereas every sibling
+//!   optional/collection field is omitted when empty. These two predate the
+//!   `skip_serializing_if` convention; stored JSON in the wild already contains
+//!   their explicit `null`s, so adding the skip now would change bytes for
+//!   round-tripped definitions. New fields should use `skip_serializing_if`.
+//! - **Enum variants persist in their Rust casing** (e.g. `AccessModifier`,
+//!   `Cardinality`, `SortOrder`, `NullsOrder`) — no `#[serde(rename_all)]`. That
+//!   casing is now baked into stored JSON and the YAML export, so renaming a
+//!   variant or adding a rename attribute is a breaking format change.
+
 use serde::{Deserialize, Serialize};
 
 /// A table alias entry for the `tables` DDL parameter.

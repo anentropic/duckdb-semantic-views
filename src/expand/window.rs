@@ -15,7 +15,7 @@ use crate::util::replace_word_boundary;
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
-use super::types::ExpandError;
+use super::types::{ExpandError, ResolvedDim};
 
 /// Generate CTE-based expansion SQL for queries containing window function metrics.
 ///
@@ -31,23 +31,18 @@ use super::types::ExpandError;
 /// 2. **Outer SELECT**: Applies each window function over the CTE results with
 ///    computed PARTITION BY (all queried dims minus EXCLUDING dims) and ORDER BY.
 ///    No GROUP BY in the outer query -- window functions are row-level operations.
-#[allow(
-    clippy::too_many_lines,
-    clippy::result_large_err,
-    clippy::unnecessary_wraps
-)]
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
 pub(super) fn expand_window_metrics(
     view_name: &str,
     def: &SemanticViewDefinition,
-    resolved_dims: &[&crate::model::Dimension],
+    resolved_dims: &[ResolvedDim],
     resolved_mets: &[&Metric],
     resolved_exprs: &HashMap<String, String>,
-    dim_scoped_aliases: &[Option<String>],
 ) -> Result<String, ExpandError> {
     // 1. Validate required dimensions for each window metric.
     let queried_dim_names: HashSet<String> = resolved_dims
         .iter()
-        .map(|d| d.name.to_ascii_lowercase())
+        .map(|rd| rd.dim.name.to_ascii_lowercase())
         .collect();
 
     for met in resolved_mets {
@@ -122,9 +117,10 @@ pub(super) fn expand_window_metrics(
     let mut cte_select_items: Vec<String> = Vec::new();
 
     // Dimension columns in CTE
-    for (i, dim) in resolved_dims.iter().enumerate() {
+    for rd in resolved_dims {
+        let dim = rd.dim;
         let mut base_expr = dim.expr.clone();
-        if let Some(ref scoped) = dim_scoped_aliases[i] {
+        if let Some(ref scoped) = rd.scoped_alias {
             if let Some(ref st) = dim.source_table {
                 base_expr = replace_word_boundary(&base_expr, st, scoped);
             }
@@ -160,7 +156,8 @@ pub(super) fn expand_window_metrics(
     }
 
     // CTE JOINs
-    let resolved_joins = resolve_joins_pkfk(def, resolved_dims, resolved_mets, &[]);
+    let dims: Vec<&crate::model::Dimension> = resolved_dims.iter().map(|rd| rd.dim).collect();
+    let resolved_joins = resolve_joins_pkfk(def, &dims, resolved_mets, &[]);
     push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
 
     // CTE GROUP BY (all dimension columns)
@@ -180,11 +177,11 @@ pub(super) fn expand_window_metrics(
     let mut outer_select_items: Vec<String> = Vec::new();
 
     // Dimension columns: reference CTE aliases
-    for dim in resolved_dims {
+    for rd in resolved_dims {
         outer_select_items.push(format!(
             "    {} AS {}",
-            quote_ident(&dim.name),
-            quote_ident(&dim.name)
+            quote_ident(&rd.dim.name),
+            quote_ident(&rd.dim.name)
         ));
     }
 
@@ -212,8 +209,8 @@ pub(super) fn expand_window_metrics(
                 .collect();
             resolved_dims
                 .iter()
-                .filter(|d| !excluding_set.contains(&d.name.to_ascii_lowercase()))
-                .map(|d| quote_ident(&d.name))
+                .filter(|rd| !excluding_set.contains(&rd.dim.name.to_ascii_lowercase()))
+                .map(|rd| quote_ident(&rd.dim.name))
                 .collect()
         } else {
             // Explicit PARTITION BY: use listed dims directly

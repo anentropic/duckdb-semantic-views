@@ -17,10 +17,13 @@ mod window;
 #[cfg(test)]
 mod test_helpers;
 
-// Public API (matches prior expand.rs surface exactly)
+// Public API (the pre-split expand.rs surface, plus the boxed fan-trap detail
+// structs re-exported for R-9).
 pub use resolution::{quote_ident, quote_ident_if_needed, quote_table_ref};
 pub use sql_gen::expand;
-pub use types::{DimensionName, ExpandError, MetricName, QueryRequest};
+pub use types::{
+    DimensionName, ExpandError, FanTrapError, MetricFanTrapError, MetricName, QueryRequest,
+};
 
 // Crate-internal API (used by ddl/show_dims_for_metric.rs under extension feature)
 #[cfg(feature = "extension")]

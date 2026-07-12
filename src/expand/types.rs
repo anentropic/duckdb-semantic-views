@@ -1,136 +1,108 @@
 use std::fmt;
+use std::marker::PhantomData;
 
-/// A dimension name with case-insensitive equality and hashing.
+/// A query-request name (dimension or metric) with case-insensitive ASCII
+/// equality and hashing.
 ///
-/// Wraps a `String` and provides `PartialEq`/`Eq`/`Hash` based on ASCII-lowercased form.
-/// This centralizes the ad-hoc `eq_ignore_ascii_case` / `to_ascii_lowercase` calls
-/// throughout the resolution code.
-#[derive(Debug, Clone)]
-pub struct DimensionName(String);
+/// Semantic-view names are matched case-insensitively, so this newtype provides
+/// `PartialEq`/`Eq`/`Hash` on the ASCII-lowercased form, centralizing the ad-hoc
+/// `eq_ignore_ascii_case` / `to_ascii_lowercase` calls that used to live
+/// throughout the resolution code. The `K` kind marker (see [`DimensionName`]
+/// and [`MetricName`]) keeps the flavors distinct at the type level so a
+/// dimension name can't be passed where a metric name is expected — one impl,
+/// several types (R-7, code-review 2026-07-11, replacing the former per-flavor
+/// copy-paste twins).
+pub struct CiName<K> {
+    raw: String,
+    // `fn() -> K` keeps `CiName<K>: Send + Sync` regardless of `K` and marks the
+    // kind purely at compile time (the marker types are never constructed).
+    _kind: PhantomData<fn() -> K>,
+}
 
-impl DimensionName {
+impl<K> CiName<K> {
     pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
+        Self {
+            raw: s.into(),
+            _kind: PhantomData,
+        }
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.raw
     }
 }
 
-impl PartialEq for DimensionName {
+impl<K> Clone for CiName<K> {
+    fn clone(&self) -> Self {
+        Self::new(self.raw.clone())
+    }
+}
+
+impl<K> fmt::Debug for CiName<K> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CiName").field(&self.raw).finish()
+    }
+}
+
+impl<K> PartialEq for CiName<K> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.eq_ignore_ascii_case(&other.0)
+        self.raw.eq_ignore_ascii_case(&other.raw)
     }
 }
 
-impl Eq for DimensionName {}
+impl<K> Eq for CiName<K> {}
 
-impl std::hash::Hash for DimensionName {
+impl<K> std::hash::Hash for CiName<K> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        for byte in self.0.bytes() {
+        for byte in self.raw.bytes() {
             byte.to_ascii_lowercase().hash(state);
         }
     }
 }
 
-impl fmt::Display for DimensionName {
+impl<K> fmt::Display for CiName<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.raw)
     }
 }
 
-impl std::ops::Deref for DimensionName {
+impl<K> std::ops::Deref for CiName<K> {
     type Target = str;
     fn deref(&self) -> &str {
-        &self.0
+        &self.raw
     }
 }
 
-impl AsRef<str> for DimensionName {
+impl<K> AsRef<str> for CiName<K> {
     fn as_ref(&self) -> &str {
-        &self.0
+        &self.raw
     }
 }
 
-impl From<String> for DimensionName {
+impl<K> From<String> for CiName<K> {
     fn from(s: String) -> Self {
-        Self(s)
+        Self::new(s)
     }
 }
 
-impl From<&str> for DimensionName {
+impl<K> From<&str> for CiName<K> {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self::new(s)
     }
 }
 
-/// A metric name with case-insensitive equality and hashing.
-///
-/// Wraps a `String` and provides `PartialEq`/`Eq`/`Hash` based on ASCII-lowercased form.
-/// This centralizes the ad-hoc `eq_ignore_ascii_case` / `to_ascii_lowercase` calls
-/// throughout the resolution code.
-#[derive(Debug, Clone)]
-pub struct MetricName(String);
+/// Kind marker for [`DimensionName`]; never constructed.
+pub enum DimensionKind {}
 
-impl MetricName {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
-    }
+/// Kind marker for [`MetricName`]; never constructed.
+pub enum MetricKind {}
 
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+/// A dimension name with case-insensitive equality and hashing (see [`CiName`]).
+pub type DimensionName = CiName<DimensionKind>;
 
-impl PartialEq for MetricName {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.eq_ignore_ascii_case(&other.0)
-    }
-}
-
-impl Eq for MetricName {}
-
-impl std::hash::Hash for MetricName {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        for byte in self.0.bytes() {
-            byte.to_ascii_lowercase().hash(state);
-        }
-    }
-}
-
-impl fmt::Display for MetricName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::ops::Deref for MetricName {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for MetricName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<String> for MetricName {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for MetricName {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
-    }
-}
+/// A metric name with case-insensitive equality and hashing (see [`CiName`]).
+pub type MetricName = CiName<MetricKind>;
 
 /// A request to expand a semantic view into SQL.
 ///
@@ -145,6 +117,23 @@ pub struct QueryRequest {
     pub dimensions: Vec<DimensionName>,
     pub metrics: Vec<MetricName>,
     pub facts: Vec<String>,
+}
+
+/// A resolved dimension paired with its role-playing scoped alias, if any.
+///
+/// R-8 (code-review 2026-07-11): replaces the former parallel slices
+/// `resolved_dims: &[&Dimension]` and `dim_scoped_aliases: &[Option<String>]`,
+/// which were threaded together through several expansion functions and indexed
+/// by position (`dim_scoped_aliases[i]`) — a silent-wrong-results footgun if the
+/// two ever fell out of sync. Zipping them into one value makes the pairing
+/// structural, so an index can't reach the wrong alias.
+pub(crate) struct ResolvedDim<'a> {
+    /// The resolved dimension definition (borrowed from the view definition).
+    pub dim: &'a crate::model::Dimension,
+    /// The role-playing scoped alias for this dimension's source table
+    /// (e.g. `Some("a__dep_airport")`), or `None` when the table is not
+    /// role-played for this query.
+    pub scoped_alias: Option<String>,
 }
 
 #[cfg(test)]
@@ -203,6 +192,64 @@ mod tests {
         let name2: DimensionName = String::from("bar").into();
         assert_eq!(name2.as_str(), "bar");
     }
+
+    #[test]
+    fn ci_name_shared_impl_covers_both_kinds() {
+        // R-7 (code-review 2026-07-11): `DimensionName` and `MetricName` are now
+        // `CiName<K>` aliases sharing one impl. Exercise the surface (Clone,
+        // Deref, AsRef, case-insensitive Eq) through both kinds so the generic
+        // impl stays covered for each.
+        let dim = DimensionName::new("Region");
+        let dim_clone = dim.clone();
+        assert_eq!(dim, dim_clone);
+        assert_eq!(dim, DimensionName::new("REGION")); // case-insensitive Eq
+        assert_eq!(&*dim, "Region"); // Deref<Target = str>
+        let as_ref: &str = dim.as_ref(); // AsRef<str>
+        assert_eq!(as_ref, "Region");
+
+        let met = MetricName::new("Total_Revenue");
+        assert_eq!(met, MetricName::new("total_revenue"));
+        assert_eq!(&*met.clone(), "Total_Revenue");
+        assert_eq!(met.as_ref() as &str, "Total_Revenue");
+    }
+
+    #[test]
+    fn expand_error_stays_under_large_err_threshold() {
+        // R-9 (code-review 2026-07-11): the two fattest variants (FanTrap,
+        // MetricFanTrap) are boxed so `ExpandError` fits under clippy's
+        // `result_large_err` threshold (128 bytes) and the `Result<_,
+        // ExpandError>` allows could be dropped. Pin the size so a future fat
+        // variant can't silently reintroduce the bloat (box it instead).
+        assert!(
+            std::mem::size_of::<ExpandError>() <= 128,
+            "ExpandError is {} bytes (> 128); box the newly-added fat variant (see R-9)",
+            std::mem::size_of::<ExpandError>()
+        );
+    }
+}
+
+/// Detail payload for [`ExpandError::FanTrap`], boxed so the enum stays small
+/// (R-9, code-review 2026-07-11 — this variant was one of the two fattest).
+#[derive(Debug)]
+pub struct FanTrapError {
+    pub view_name: String,
+    pub metric_name: String,
+    pub metric_table: String,
+    pub dimension_name: String,
+    pub dimension_table: String,
+    pub relationship_name: String,
+}
+
+/// Detail payload for [`ExpandError::MetricFanTrap`], boxed so the enum stays
+/// small (R-9, code-review 2026-07-11 — the other fat variant).
+#[derive(Debug)]
+pub struct MetricFanTrapError {
+    pub view_name: String,
+    pub metric_name: String,
+    pub metric_table: String,
+    pub other_metric_name: String,
+    pub other_metric_table: String,
+    pub relationship_name: String,
 }
 
 /// Errors that can occur during semantic view expansion.
@@ -229,26 +276,12 @@ pub enum ExpandError {
     /// A metric name was requested more than once.
     DuplicateMetric { view_name: String, name: String },
     /// A metric aggregates across a one-to-many boundary, risking inflated results.
-    FanTrap {
-        view_name: String,
-        metric_name: String,
-        metric_table: String,
-        dimension_name: String,
-        dimension_table: String,
-        relationship_name: String,
-    },
+    FanTrap { detail: Box<FanTrapError> },
     /// Two queried metrics sit at different grains (source tables) and the
     /// join path between those tables crosses a fan-out edge: joining both
     /// source tables multiplies `metric_table`'s rows, silently inflating
     /// `metric_name` (fan trap / chasm trap between metric grains).
-    MetricFanTrap {
-        view_name: String,
-        metric_name: String,
-        metric_table: String,
-        other_metric_name: String,
-        other_metric_table: String,
-        relationship_name: String,
-    },
+    MetricFanTrap { detail: Box<MetricFanTrapError> },
     /// The stored definition's relationship graph could not be rebuilt at
     /// query time, so safety checks (fan-trap detection) cannot run.
     UncheckableDefinition { view_name: String, reason: String },
@@ -345,10 +378,20 @@ impl fmt::Display for ExpandError {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // R-16 (code-review 2026-07-11): this arm is the single source of the
+            // empty-request wording. `QueryError::EmptyRequest` renders by
+            // delegating to it, so the two can no longer drift apart (they had:
+            // this side lacked the `facts` option and the DESCRIBE hint). Both
+            // are reachable — the FFI binder short-circuits with the QueryError
+            // form; a direct `expand()` call hits this form.
             Self::EmptyRequest { view_name } => {
                 write!(
                     f,
-                    "semantic view '{view_name}': specify at least dimensions := [...] or metrics := [...]"
+                    "semantic view '{view_name}': specify at least dimensions := [...], metrics := [...], or facts := [...]."
+                )?;
+                write!(
+                    f,
+                    " Run DESCRIBE SEMANTIC VIEW {view_name} to see available dimensions, metrics, and facts."
                 )
             }
             Self::UnknownDimension {
@@ -392,14 +435,15 @@ impl fmt::Display for ExpandError {
             Self::DuplicateMetric { view_name, name } => {
                 write!(f, "semantic view '{view_name}': duplicate metric '{name}'")
             }
-            Self::FanTrap {
-                view_name,
-                metric_name,
-                metric_table,
-                dimension_name,
-                dimension_table,
-                relationship_name,
-            } => {
+            Self::FanTrap { detail } => {
+                let FanTrapError {
+                    view_name,
+                    metric_name,
+                    metric_table,
+                    dimension_name,
+                    dimension_table,
+                    relationship_name,
+                } = &**detail;
                 write!(
                     f,
                     "semantic view '{view_name}': fan trap detected -- metric '{metric_name}' \
@@ -411,14 +455,15 @@ impl fmt::Display for ExpandError {
                      relationship."
                 )
             }
-            Self::MetricFanTrap {
-                view_name,
-                metric_name,
-                metric_table,
-                other_metric_name,
-                other_metric_table,
-                relationship_name,
-            } => {
+            Self::MetricFanTrap { detail } => {
+                let MetricFanTrapError {
+                    view_name,
+                    metric_name,
+                    metric_table,
+                    other_metric_name,
+                    other_metric_table,
+                    relationship_name,
+                } = &**detail;
                 write!(
                     f,
                     "semantic view '{view_name}': fan trap detected -- metric '{metric_name}' \

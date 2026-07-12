@@ -16,7 +16,7 @@ fn escape_single_quote(s: &str) -> String {
 }
 
 /// Append ` COMMENT = '<escaped>'` to `out` if comment is present.
-fn emit_comment(out: &mut String, comment: Option<&String>) {
+fn emit_comment(out: &mut String, comment: Option<&str>) {
     if let Some(c) = comment {
         out.push_str(" COMMENT = '");
         out.push_str(&escape_single_quote(c));
@@ -58,7 +58,7 @@ fn emit_tables(out: &mut String, def: &SemanticViewDefinition) {
             out.push_str(&uc.join(", "));
             out.push(')');
         }
-        emit_comment(out, table.comment.as_ref());
+        emit_comment(out, table.comment.as_deref());
         emit_synonyms(out, &table.synonyms);
         if i + 1 < def.tables.len() {
             out.push(',');
@@ -156,7 +156,7 @@ fn emit_facts(out: &mut String, def: &SemanticViewDefinition) {
         out.push_str(&fact.name);
         out.push_str(" AS ");
         out.push_str(&fact.expr);
-        emit_comment(out, fact.comment.as_ref());
+        emit_comment(out, fact.comment.as_deref());
         emit_synonyms(out, &fact.synonyms);
         if i + 1 < def.facts.len() {
             out.push(',');
@@ -178,7 +178,7 @@ fn emit_dimensions(out: &mut String, def: &SemanticViewDefinition) {
         out.push_str(&dim.name);
         out.push_str(" AS ");
         out.push_str(&dim.expr);
-        emit_comment(out, dim.comment.as_ref());
+        emit_comment(out, dim.comment.as_deref());
         emit_synonyms(out, &dim.synonyms);
         if i + 1 < def.dimensions.len() {
             out.push(',');
@@ -313,7 +313,7 @@ fn emit_metrics(out: &mut String, def: &SemanticViewDefinition) {
         } else {
             out.push_str(&metric.expr);
         }
-        emit_comment(out, metric.comment.as_ref());
+        emit_comment(out, metric.comment.as_deref());
         emit_synonyms(out, &metric.synonyms);
         if i + 1 < def.metrics.len() {
             out.push(',');
@@ -383,7 +383,7 @@ pub fn render_create_ddl(name: &str, def: &SemanticViewDefinition) -> Result<Str
     out.push_str(&crate::expand::quote_ident_if_needed(name));
 
     // View-level comment
-    emit_comment(&mut out, def.comment.as_ref());
+    emit_comment(&mut out, def.comment.as_deref());
 
     // AS keyword
     out.push_str(" AS\n");
@@ -743,7 +743,7 @@ mod tests {
         assert!(out.is_empty());
 
         let hello = "hello".to_string();
-        emit_comment(&mut out, Some(&hello));
+        emit_comment(&mut out, Some(hello.as_str()));
         assert_eq!(out, " COMMENT = 'hello'");
     }
 

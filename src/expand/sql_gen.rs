@@ -8,7 +8,7 @@ use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident};
 use super::role_playing::find_using_context;
-use super::types::{ExpandError, QueryRequest};
+use super::types::{ExpandError, QueryRequest, ResolvedDim};
 
 /// An entity kind resolvable by name against a [`SemanticViewDefinition`]
 /// (dimensions, metrics, facts). Encapsulates lookup, the PRIVATE-access
@@ -145,7 +145,6 @@ impl Resolvable for Metric {
 /// request string (SG-14): `region` and `o.region` resolve to the same
 /// dimension and are rejected as duplicates instead of emitting the same
 /// column twice.
-#[allow(clippy::result_large_err)]
 fn resolve_names<'a, T: Resolvable, N: AsRef<str>>(
     names: &[N],
     view_name: &str,
@@ -187,7 +186,7 @@ fn resolve_names<'a, T: Resolvable, N: AsRef<str>>(
 ///
 /// Dimensions, when present, add columns to SELECT but do NOT trigger GROUP BY
 /// (unlike metric queries where dims + metrics => GROUP BY).
-#[allow(clippy::too_many_lines, clippy::result_large_err)]
+#[allow(clippy::too_many_lines)]
 fn expand_facts(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -292,7 +291,7 @@ fn expand_facts(
 /// - Neither dimensions nor metrics are requested (`EmptyRequest`)
 /// - A requested dimension or metric name is not found (`UnknownDimension`, `UnknownMetric`)
 /// - A dimension or metric name is duplicated (`DuplicateDimension`, `DuplicateMetric`)
-#[allow(clippy::too_many_lines, clippy::result_large_err)]
+#[allow(clippy::too_many_lines)]
 pub fn expand(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -375,12 +374,14 @@ pub fn expand(
     // Phase 31: Check for fan traps before generating SQL.
     check_fan_traps(view_name, def, &resolved_dims, &resolved_mets)?;
 
-    // Phase 32: Pre-compute dimension scoped aliases for role-playing tables.
-    // Maps dimension index -> scoped alias (e.g., "a__dep_airport").
-    let mut dim_scoped_aliases: Vec<Option<String>> = Vec::with_capacity(resolved_dims.len());
-    for dim in &resolved_dims {
-        let scoped = find_using_context(view_name, def, dim, &resolved_mets)?;
-        dim_scoped_aliases.push(scoped);
+    // Phase 32: pair each resolved dimension with its role-playing scoped alias
+    // (e.g. "a__dep_airport"). R-8 (code-review 2026-07-11): zipped into
+    // `ResolvedDim` so the alias travels with its dimension instead of a
+    // position-indexed side array (`dim_scoped_aliases[i]`).
+    let mut resolved: Vec<ResolvedDim> = Vec::with_capacity(resolved_dims.len());
+    for &dim in &resolved_dims {
+        let scoped_alias = find_using_context(view_name, def, dim, &resolved_mets)?;
+        resolved.push(ResolvedDim { dim, scoped_alias });
     }
 
     // Phase 47: Check if any resolved metric ACTUALLY needs semi-additive expansion.
@@ -400,10 +401,9 @@ pub fn expand(
         return super::semi_additive::expand_semi_additive(
             view_name,
             def,
-            &resolved_dims,
+            &resolved,
             &resolved_mets,
             &resolved_exprs,
-            &dim_scoped_aliases,
         );
     }
 
@@ -431,10 +431,9 @@ pub fn expand(
         return super::window::expand_window_metrics(
             view_name,
             def,
-            &resolved_dims,
+            &resolved,
             &resolved_mets,
             &resolved_exprs,
-            &dim_scoped_aliases,
         );
     }
 
@@ -450,10 +449,11 @@ pub fn expand(
     }
 
     let mut select_items: Vec<String> = Vec::new();
-    for (i, dim) in resolved_dims.iter().enumerate() {
+    for rd in &resolved {
+        let dim = rd.dim;
         let mut base_expr = dim.expr.clone();
         // Phase 32: If this dimension has a scoped alias, rewrite the expression.
-        if let Some(ref scoped) = dim_scoped_aliases[i] {
+        if let Some(ref scoped) = rd.scoped_alias {
             if let Some(ref st) = dim.source_table {
                 // Replace bare alias with scoped alias in expression
                 // e.g., "a.city" -> "a__dep_airport.city"
@@ -516,7 +516,9 @@ pub fn expand(
 
 #[cfg(test)]
 mod tests {
-    use crate::expand::{expand, DimensionName, ExpandError, MetricName, QueryRequest};
+    use crate::expand::{
+        expand, DimensionName, ExpandError, FanTrapError, MetricName, QueryRequest,
+    };
 
     mod expand_tests {
         use super::*;
@@ -2771,15 +2773,10 @@ GROUP BY
             let result = expand("sales", &def, &req);
             assert!(result.is_err(), "Fan trap must block the query");
             match result.unwrap_err() {
-                ExpandError::FanTrap {
-                    view_name,
-                    metric_name,
-                    dimension_name,
-                    ..
-                } => {
-                    assert_eq!(view_name, "sales");
-                    assert_eq!(metric_name, "order_count");
-                    assert_eq!(dimension_name, "status");
+                ExpandError::FanTrap { detail } => {
+                    assert_eq!(detail.view_name, "sales");
+                    assert_eq!(detail.metric_name, "order_count");
+                    assert_eq!(detail.dimension_name, "status");
                 }
                 other => panic!("Expected FanTrap, got: {other}"),
             }
@@ -2925,13 +2922,9 @@ GROUP BY
                 "Transitive chain fan trap must be detected"
             );
             match result.unwrap_err() {
-                ExpandError::FanTrap {
-                    metric_name,
-                    dimension_name,
-                    ..
-                } => {
-                    assert_eq!(metric_name, "customer_count");
-                    assert_eq!(dimension_name, "status");
+                ExpandError::FanTrap { detail } => {
+                    assert_eq!(detail.metric_name, "customer_count");
+                    assert_eq!(detail.dimension_name, "status");
                 }
                 other => panic!("Expected FanTrap, got: {other}"),
             }
@@ -2960,13 +2953,9 @@ GROUP BY
             let result = expand("sales", &def, &req);
             assert!(result.is_err(), "Derived metric fan trap must be detected");
             match result.unwrap_err() {
-                ExpandError::FanTrap {
-                    metric_name,
-                    dimension_name,
-                    ..
-                } => {
-                    assert_eq!(metric_name, "avg_order");
-                    assert_eq!(dimension_name, "status");
+                ExpandError::FanTrap { detail } => {
+                    assert_eq!(detail.metric_name, "avg_order");
+                    assert_eq!(detail.dimension_name, "status");
                 }
                 other => panic!("Expected FanTrap, got: {other}"),
             }
@@ -2975,12 +2964,14 @@ GROUP BY
         #[test]
         fn fan_trap_error_message_format() {
             let err = ExpandError::FanTrap {
-                view_name: "sales".to_string(),
-                metric_name: "order_count".to_string(),
-                metric_table: "o".to_string(),
-                dimension_name: "status".to_string(),
-                dimension_table: "li".to_string(),
-                relationship_name: "li_to_order".to_string(),
+                detail: Box::new(FanTrapError {
+                    view_name: "sales".to_string(),
+                    metric_name: "order_count".to_string(),
+                    metric_table: "o".to_string(),
+                    dimension_name: "status".to_string(),
+                    dimension_table: "li".to_string(),
+                    relationship_name: "li_to_order".to_string(),
+                }),
             };
             let msg = format!("{err}");
             assert!(msg.contains("sales"), "Must contain view name");
