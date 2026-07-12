@@ -556,15 +556,24 @@ mod extension {
         info: ffi::duckdb_extension_info,
         access: *const ffi::duckdb_extension_access,
     ) -> std::result::Result<bool, Box<dyn Error>> {
+        // R-13 (code-review 2026-07-11): a panic here degrades to the generic
+        // "panicked unexpectedly" load failure (the `Err(_panic)` arm of the
+        // extern "C" wrapper). Returning `Err` instead routes the real reason
+        // through `set_error` — for the API init that carries the DuckDB
+        // version-mismatch detail, which is exactly what a failed load needs.
         let have_api_struct =
-            ffi::duckdb_rs_extension_api_init(info, access, crate::MINIMUM_DUCKDB_VERSION).unwrap();
+            ffi::duckdb_rs_extension_api_init(info, access, crate::MINIMUM_DUCKDB_VERSION)
+                .map_err(|e| format!("DuckDB extension C API init failed: {e}"))?;
 
         if !have_api_struct {
             return Ok(false);
         }
 
         // Get the raw database handle BEFORE wrapping in Connection.
-        let db_handle: ffi::duckdb_database = *(*access).get_database.unwrap()(info);
+        let Some(get_database) = (*access).get_database else {
+            return Err("DuckDB extension access vtable is missing get_database".into());
+        };
+        let db_handle: ffi::duckdb_database = *get_database(info);
 
         // Create a Connection from the database handle (same as the macro does).
         let connection = Connection::open_from_raw(db_handle.cast())?;
