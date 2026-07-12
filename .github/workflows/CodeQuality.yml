@@ -26,6 +26,24 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Pre-install the toolchain pinned in rust-toolchain.toml (single source
+      # of truth — read the channel from the file so a Dependabot bump can't
+      # drift) BEFORE any cargo command. Every fmt/clippy/llvm-cov step below
+      # runs under the pinned toolchain via rust-toolchain.toml; letting cargo
+      # lazily trigger its rustup install races on the runner image's
+      # preinstalled `~/.cargo/bin/cargo-clippy` proxy and intermittently dies
+      # with "detected conflict: 'bin/cargo-clippy'" while rustup rolls back a
+      # partial install (the #72 / #76 DuckLake flake). Uninstall-then-install
+      # clears any partial copy and completes here, so cargo's lazy path is a
+      # clean no-op.
+      - name: Pre-install pinned Rust toolchain (avoid lazy-install race)
+        run: |
+          channel="$(grep -oP '^\s*channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
+          echo "Pinned toolchain from rust-toolchain.toml: $channel"
+          rustup toolchain uninstall "$channel" >/dev/null 2>&1 || true
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy --no-self-update
+
       # The sqllogictest runner executes ONLY files named in TEST_LIST; a
       # .test file missing from it is silently skipped. Mirrors `just check-test-list`.
       - name: Check test/sql/TEST_LIST is in sync with test/sql/*.test
