@@ -56,11 +56,7 @@ use super::wire::{build_execution_sql, parse_varchar_list, serialize_register_pa
 /// described above; `name_ptr` must point to `name_len` UTF-8 bytes.
 #[cfg(feature = "extension")]
 #[no_mangle]
-// Single linear FFI dispatcher: catch_unwind guard, arg decoding, catalog
-// lookup, expansion, schema inference, and wire serialization in one straight
-// path with no shared state — splitting it would scatter the panic boundary and
-// the borrow contract across helpers for no readability gain.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn sv_semantic_view_bind_rust(
     conn: ffi::duckdb_connection,
     name_ptr: *const u8,
@@ -76,252 +72,159 @@ pub unsafe extern "C" fn sv_semantic_view_bind_rust(
     error_buf: *mut u8,
     error_buf_len: usize,
 ) -> u8 {
-    use crate::ddl::read_ffi::{
-        probe_catalog_table_present, publish_owned_buffer, write_err, BorrowedConnection,
-    };
-    use std::panic::AssertUnwindSafe;
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        // Wrap-on-entry (Phase 65.1 D-10 / WR-05). The raw `conn` parameter
-        // is shadowed; everything downstream goes through `&borrowed` or
-        // `borrowed.as_raw()`. `ffi::duckdb_disconnect` does not type-check
-        // against `&mut BorrowedConnection`, enforcing the BORROW contract.
-        let borrowed = BorrowedConnection::new(conn);
-        if borrowed.is_null() {
-            write_err(error_buf, error_buf_len, "duckdb_connection is null");
-            return 1_u8;
-        }
-        if name_ptr.is_null() {
-            write_err(error_buf, error_buf_len, "view name pointer is null");
-            return 1_u8;
-        }
-        let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let view_name_raw = if let Ok(s) = std::str::from_utf8(name_bytes) {
-            s.to_string()
-        } else {
-            write_err(error_buf, error_buf_len, "view name is not valid UTF-8");
-            return 1_u8;
-        };
-        let view_name = match crate::ident::normalize_view_name(&view_name_raw) {
-            Ok(s) => s,
-            Err(e) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &format!("Invalid view name '{view_name_raw}': {e}"),
-                );
-                return 1_u8;
-            }
-        };
+    // R-6/C-3: the catch_unwind guard, borrowed-connection null check, buffer
+    // publish, error-string write, and panic arm now live in the shared
+    // `run_dispatcher` scaffold (ST-2); the body does only the interesting work
+    // and returns `Result<Vec<u8>, String>`.
+    crate::ddl::read_ffi::run_dispatcher(
+        conn,
+        out_ptr,
+        out_len,
+        error_buf,
+        error_buf_len,
+        "sv_semantic_view_bind_rust",
+        |borrowed| unsafe {
+            semantic_view_bind_body(
+                borrowed,
+                name_ptr,
+                name_len,
+                dims_ptr,
+                dims_len,
+                metrics_ptr,
+                metrics_len,
+                facts_ptr,
+                facts_len,
+            )
+        },
+    )
+}
 
-        let dimensions = match parse_varchar_list(dims_ptr, dims_len) {
-            Ok(v) => v,
-            Err(detail) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &format!("malformed `dimensions` payload: {detail}"),
-                );
-                return 1_u8;
-            }
-        };
-        let metrics = match parse_varchar_list(metrics_ptr, metrics_len) {
-            Ok(v) => v,
-            Err(detail) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &format!("malformed `metrics` payload: {detail}"),
-                );
-                return 1_u8;
-            }
-        };
-        let facts = match parse_varchar_list(facts_ptr, facts_len) {
-            Ok(v) => v,
-            Err(detail) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &format!("malformed `facts` payload: {detail}"),
-                );
-                return 1_u8;
-            }
-        };
+/// Body for [`sv_semantic_view_bind_rust`]: decode the request args, resolve
+/// the view, expand + type-infer, and serialize the register payload. Returns
+/// the wire buffer on success or the user-visible error message.
+///
+/// # Safety
+///
+/// Each `*_ptr` is either null or points to its paired `*_len` readable bytes.
+/// A null pointer is only meaningful with `*_len == 0` (an empty list / absent
+/// name); the decoders reject `(null, len > 0)` as FFI shape drift rather than
+/// dereferencing it. The borrowed connection must outlive the call (see the
+/// module borrow contract).
+#[cfg(feature = "extension")]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+unsafe fn semantic_view_bind_body(
+    borrowed: &crate::ddl::read_ffi::BorrowedConnection,
+    name_ptr: *const u8,
+    name_len: usize,
+    dims_ptr: *const u8,
+    dims_len: usize,
+    metrics_ptr: *const u8,
+    metrics_len: usize,
+    facts_ptr: *const u8,
+    facts_len: usize,
+) -> Result<Vec<u8>, String> {
+    use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg};
 
-        if dimensions.is_empty() && metrics.is_empty() && facts.is_empty() {
-            write_err(
-                error_buf,
-                error_buf_len,
-                &QueryError::EmptyRequest {
-                    view_name: view_name.clone(),
-                }
-                .to_string(),
-            );
-            return 1_u8;
-        }
+    let view_name_raw = read_str_arg(name_ptr, name_len, "view name")?;
+    let view_name = crate::ident::normalize_view_name(&view_name_raw)
+        .map_err(|e| format!("Invalid view name '{view_name_raw}': {e}"))?;
 
-        // FF-9: surface a probe-query failure as an error distinct from "no
-        // views" instead of silently folding it into absence.
-        let present = match probe_catalog_table_present(&borrowed) {
-            Ok(p) => p,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        let reader = CatalogReader::new(&borrowed, present);
-        let json_str = match reader.lookup(&view_name) {
-            Ok(Some(j)) => j,
-            Ok(None) => {
-                let available = reader.list_names().unwrap_or_default();
-                let suggestion = suggest_closest(&view_name, &available);
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &QueryError::ViewNotFound {
-                        name: view_name,
-                        suggestion,
-                        available,
-                    }
-                    .to_string(),
-                );
-                return 1_u8;
-            }
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
+    let dimensions = parse_varchar_list(dims_ptr, dims_len)
+        .map_err(|detail| format!("malformed `dimensions` payload: {detail}"))?;
+    let metrics = parse_varchar_list(metrics_ptr, metrics_len)
+        .map_err(|detail| format!("malformed `metrics` payload: {detail}"))?;
+    let facts = parse_varchar_list(facts_ptr, facts_len)
+        .map_err(|detail| format!("malformed `facts` payload: {detail}"))?;
 
-        let def = match SemanticViewDefinition::from_json(&view_name, &json_str) {
-            Ok(d) => d,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-
-        let dimensions = match expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension) {
-            Ok(v) => v,
-            Err(e) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &QueryError::WildcardExpansion {
-                        view_name: view_name.clone(),
-                        detail: e,
-                    }
-                    .to_string(),
-                );
-                return 1_u8;
-            }
-        };
-        let metrics = match expand_wildcards(&metrics, &def, &WildcardItemType::Metric) {
-            Ok(v) => v,
-            Err(e) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &QueryError::WildcardExpansion {
-                        view_name: view_name.clone(),
-                        detail: e,
-                    }
-                    .to_string(),
-                );
-                return 1_u8;
-            }
-        };
-        let facts = match expand_wildcards(&facts, &def, &WildcardItemType::Fact) {
-            Ok(v) => v,
-            Err(e) => {
-                write_err(
-                    error_buf,
-                    error_buf_len,
-                    &QueryError::WildcardExpansion {
-                        view_name: view_name.clone(),
-                        detail: e,
-                    }
-                    .to_string(),
-                );
-                return 1_u8;
-            }
-        };
-
-        let req = QueryRequest {
-            dimensions: dimensions
-                .iter()
-                .map(|s| crate::expand::DimensionName::new(s.clone()))
-                .collect(),
-            metrics: metrics
-                .iter()
-                .map(|s| crate::expand::MetricName::new(s.clone()))
-                .collect(),
-            facts: facts.clone(),
-        };
-        let expanded_sql = match expand(&view_name, &def, &req) {
-            Ok(s) => s,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &QueryError::from(e).to_string());
-                return 1_u8;
-            }
-        };
-
-        // Type inference: a LIMIT-0 probe on the per-call connection yields
-        // the output column names + types. The probe runs on `conn`, not a
-        // long-lived handle (H2). AR-4 (PR-2) removed the DDL-time
-        // persisted-types fast path (`column_type_names` / `column_types_inferred`
-        // were dead for post-v0.10 rows) — every row now infers at read time,
-        // matching Plan 03 D-16, so this is a single unconditional probe.
-        let (column_names, column_type_ids): (Vec<String>, Vec<u32>) = {
-            let limit0_sql = format!("{expanded_sql} LIMIT 0");
-            // Phase 65.1 Plan 11 / WR-08 / D-15: surface probe failures via
-            // the error_buf cascade. No silent vec![0u32; names.len()]
-            // fallback to DUCKDB_TYPE_INVALID — that masked broken FACTS
-            // expressions behind a VARCHAR placeholder at query time.
-            match try_infer_schema(&borrowed, &limit0_sql) {
-                Ok((names, types)) => {
-                    let type_ids: Vec<u32> = types.iter().map(|t| normalize_type_id(*t)).collect();
-                    (names, type_ids)
-                }
-                Err(msg) => {
-                    write_err(
-                        error_buf,
-                        error_buf_len,
-                        &format!(
-                            "semantic_view: type inference failed for query \
-                             `{limit0_sql}`: {msg}"
-                        ),
-                    );
-                    return 1_u8;
-                }
-            }
-        };
-
-        // Build execution SQL with casts where needed (HUGEINT→BIGINT etc).
-        let execution_sql = build_execution_sql(&expanded_sql, &column_names, &column_type_ids);
-
-        // Serialise schema + execution_sql into a flat binary buffer.
-        let buf = match serialize_register_payload(&column_names, &column_type_ids, &execution_sql)
-        {
-            Ok(b) => b,
-            Err(e) => {
-                write_err(error_buf, error_buf_len, &e);
-                return 1_u8;
-            }
-        };
-        publish_owned_buffer(buf, out_ptr, out_len);
-        0_u8
-    }));
-    if let Ok(rc) = result {
-        rc
-    } else {
-        use crate::ddl::read_ffi::write_err;
-        write_err(
-            error_buf,
-            error_buf_len,
-            "internal error: panic inside sv_semantic_view_bind_rust",
-        );
-        2
+    if dimensions.is_empty() && metrics.is_empty() && facts.is_empty() {
+        return Err(QueryError::EmptyRequest { view_name }.to_string());
     }
+
+    // FF-9: surface a probe-query failure as an error distinct from "no
+    // views" instead of silently folding it into absence.
+    let present = probe_catalog_table_present(borrowed)?;
+    let reader = CatalogReader::new(borrowed, present);
+    let json_str = match reader.lookup(&view_name) {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            let available = reader.list_names().unwrap_or_default();
+            let suggestion = suggest_closest(&view_name, &available);
+            return Err(QueryError::ViewNotFound {
+                name: view_name,
+                suggestion,
+                available,
+            }
+            .to_string());
+        }
+        Err(e) => return Err(e),
+    };
+
+    let def = SemanticViewDefinition::from_json(&view_name, &json_str)?;
+
+    let dimensions =
+        expand_wildcards(&dimensions, &def, &WildcardItemType::Dimension).map_err(|e| {
+            QueryError::WildcardExpansion {
+                view_name: view_name.clone(),
+                detail: e,
+            }
+            .to_string()
+        })?;
+    let metrics = expand_wildcards(&metrics, &def, &WildcardItemType::Metric).map_err(|e| {
+        QueryError::WildcardExpansion {
+            view_name: view_name.clone(),
+            detail: e,
+        }
+        .to_string()
+    })?;
+    let facts = expand_wildcards(&facts, &def, &WildcardItemType::Fact).map_err(|e| {
+        QueryError::WildcardExpansion {
+            view_name: view_name.clone(),
+            detail: e,
+        }
+        .to_string()
+    })?;
+
+    let req = QueryRequest {
+        dimensions: dimensions
+            .iter()
+            .map(|s| crate::expand::DimensionName::new(s.clone()))
+            .collect(),
+        metrics: metrics
+            .iter()
+            .map(|s| crate::expand::MetricName::new(s.clone()))
+            .collect(),
+        facts: facts.clone(),
+    };
+    let expanded_sql =
+        expand(&view_name, &def, &req).map_err(|e| QueryError::from(e).to_string())?;
+
+    // Type inference: a LIMIT-0 probe on the per-call connection yields
+    // the output column names + types. The probe runs on `conn`, not a
+    // long-lived handle (H2). AR-4 (PR-2) removed the DDL-time
+    // persisted-types fast path (`column_type_names` / `column_types_inferred`
+    // were dead for post-v0.10 rows) — every row now infers at read time,
+    // matching Plan 03 D-16, so this is a single unconditional probe.
+    let (column_names, column_type_ids): (Vec<String>, Vec<u32>) = {
+        let limit0_sql = format!("{expanded_sql} LIMIT 0");
+        // Phase 65.1 Plan 11 / WR-08 / D-15: surface probe failures via
+        // the error message. No silent vec![0u32; names.len()] fallback to
+        // DUCKDB_TYPE_INVALID — that masked broken FACTS expressions behind a
+        // VARCHAR placeholder at query time.
+        let (names, types) = try_infer_schema(borrowed, &limit0_sql).map_err(|msg| {
+            format!(
+                "semantic_view: type inference failed for query \
+                 `{limit0_sql}`: {msg}"
+            )
+        })?;
+        let type_ids: Vec<u32> = types.iter().map(|t| normalize_type_id(*t)).collect();
+        (names, type_ids)
+    };
+
+    // Build execution SQL with casts where needed (HUGEINT→BIGINT etc).
+    let execution_sql = build_execution_sql(&expanded_sql, &column_names, &column_type_ids);
+
+    // Serialise schema + execution_sql into a flat binary buffer.
+    serialize_register_payload(&column_names, &column_type_ids, &execution_sql)
 }
 
 // ---------------------------------------------------------------------------
