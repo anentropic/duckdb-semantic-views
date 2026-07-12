@@ -244,6 +244,13 @@ pub(super) fn is_quoting_balanced(s: &str) -> bool {
 /// Quote-aware: brackets inside `'...'` string literals and `"..."` quoted
 /// identifiers are inert (PA-6).
 pub(super) fn extract_paren_content(s: &str) -> Option<&str> {
+    extract_paren_prefix(s).map(|(inner, _)| inner)
+}
+
+/// Like [`extract_paren_content`], but also returns the number of bytes consumed
+/// through the matching closing `)` (so a caller can advance past the whole
+/// `(...)` group and inspect what follows). `s` must start with `(`.
+pub(super) fn extract_paren_prefix(s: &str) -> Option<(&str, usize)> {
     let bytes = s.as_bytes();
     if bytes.is_empty() || bytes[0] != b'(' {
         return None;
@@ -265,7 +272,7 @@ pub(super) fn extract_paren_content(s: &str) -> Option<&str> {
                 b')' => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(&s[start.unwrap()..i]);
+                        return Some((&s[start.unwrap()..i], i + 1));
                     }
                 }
                 _ => {}

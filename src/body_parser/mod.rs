@@ -1035,6 +1035,76 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // P-2 (code-review 2026-07-11): the annotation region must be tiled
+    // exactly — duplicate clauses, malformed clauses, and trailing junk are
+    // rejected instead of being silently dropped/accepted.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_annotation_both_orders_still_parse() {
+        // Regression: valid single-clause and both-order forms are unaffected.
+        let (_, a) = parse_trailing_annotations("x COMMENT = 'c' WITH SYNONYMS = ('s')").unwrap();
+        assert_eq!(a.comment.as_deref(), Some("c"));
+        assert_eq!(a.synonyms, vec!["s"]);
+        let (_, b) = parse_trailing_annotations("x WITH SYNONYMS = ('s') COMMENT = 'c'").unwrap();
+        assert_eq!(b.comment.as_deref(), Some("c"));
+        assert_eq!(b.synonyms, vec!["s"]);
+    }
+
+    #[test]
+    fn test_annotation_duplicate_comment_rejected() {
+        // Previously the second COMMENT was silently dropped.
+        let err = parse_trailing_annotations("x COMMENT = 'a' COMMENT = 'b'").unwrap_err();
+        assert!(
+            err.message.contains("Duplicate COMMENT"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_annotation_duplicate_synonyms_rejected() {
+        let err = parse_trailing_annotations("x WITH SYNONYMS = ('a') WITH SYNONYMS = ('b')")
+            .unwrap_err();
+        assert!(
+            err.message.contains("Duplicate WITH SYNONYMS"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_annotation_trailing_garbage_rejected() {
+        // Previously `banana` was silently accepted and discarded.
+        let err = parse_trailing_annotations("x COMMENT = 'a' banana").unwrap_err();
+        assert!(
+            err.message.contains("Unexpected text in annotations"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_annotation_keyword_word_boundary_preserved() {
+        // A column-ish token that merely starts with COMMENT must not be
+        // mistaken for the keyword — it stays part of the expression.
+        let (expr, ann) = parse_trailing_annotations("commentary_col").unwrap();
+        assert_eq!(expr, "commentary_col");
+        assert!(ann.comment.is_none() && ann.synonyms.is_empty());
+    }
+
+    #[test]
+    fn test_annotation_with_without_synonyms_rejected() {
+        // A second WITH clause that isn't WITH SYNONYMS is an error, not junk.
+        let err = parse_trailing_annotations("x COMMENT = 'a' WITH FOO").unwrap_err();
+        assert!(
+            err.message.contains("Expected SYNONYMS after WITH"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // PA-3 (code-review 2026-07-02): keyword scanners must not match inside
     // string literals. Pre-fix, a COMMENT payload mentioning PRIMARY KEY
     // fabricated pk_columns from comment text and discarded the comment.
