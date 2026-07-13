@@ -179,10 +179,16 @@ pub fn parse_qualified_identifier_with_quoting(input: &str) -> Result<Vec<(Strin
 /// diverged from `DuckDB` and from the rest of the project, so quoted names
 /// now fold too.)
 ///
-/// Migration note: definitions created before v0.11 with a mixed-case name —
-/// quoted or unquoted — are stored under their original casing; an unquoted
-/// *or* quoted reference now folds to lowercase before lookup, so reference
-/// them in lowercase, or drop and recreate them.
+/// Migration note: lookups fold the *requested* name to lowercase and match
+/// the stored `semantic_layer._definitions(name)` column exactly, so a view is
+/// only reachable if its **stored** name is already lowercase. Unquoted DDL
+/// always stored a lowercase name (both before and after this change), so those
+/// views are unaffected. Only a definition created before v0.11 via a *quoted*
+/// mixed-case identifier (e.g. `CREATE SEMANTIC VIEW "Sales"`) kept its original
+/// casing in the catalog; under the folding rule no spelling — `sales`,
+/// `Sales`, or `"Sales"` — matches the stored `Sales`, so it is no longer
+/// reachable. Drop and recreate it, or rename the catalog row to lowercase, to
+/// make it reachable again.
 ///
 /// # Examples
 ///

@@ -110,7 +110,7 @@ All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` 
 
    **View name case.** A ``<name>`` is folded to lowercase before it is stored, whether written quoted or not, and every later reference — ``DROP`` / ``DESCRIBE`` / ``ALTER`` / ``SHOW COLUMNS`` statements and the :ref:`semantic_view() <ref-semantic-view-function>` lookup argument — folds the same way, so ``CREATE SEMANTIC VIEW Sales``, ``DROP SEMANTIC VIEW SALES``, and ``DROP SEMANTIC VIEW "sales"`` all refer to the same view. This follows DuckDB's identifier semantics, where double-quoted identifiers are case-insensitive too; quoting a name only lets it contain whitespace or other special characters, it does not make it case-sensitive.
 
-   *Migration:* views created before v0.11 with a mixed-case name — quoted or unquoted — are stored under their original casing; reference them in lowercase, or drop and recreate them.
+   *Migration:* lookups fold the requested name to lowercase and match the stored catalog name exactly, so a view is only reachable if its **stored** name is lowercase. Unquoted ``CREATE`` always stored a lowercase name, so those views are unaffected. Only a view created before v0.11 via a *quoted* mixed-case identifier (e.g. ``CREATE SEMANTIC VIEW "Sales"``) kept its original casing in the catalog, and it is no longer reachable by any spelling — ``sales``, ``Sales``, and ``"Sales"`` all fold to ``sales``, which does not match the stored ``Sales``. Drop and recreate it, or rename its catalog row to lowercase, to make it reachable again.
 
 .. note::
 
