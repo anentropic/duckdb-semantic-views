@@ -56,8 +56,14 @@ jobs:
       - name: Clippy (extension feature, deny warnings)
         run: SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features --features extension -- -D warnings
 
+      # Pinned to a commit SHA (not the floating @v2) because the v2.1.0/v2.1.1
+      # releases (2026-07-13) bundle cargo-deny 0.20.2, whose CLI refactor drops
+      # the `--log-level` argument this action still passes — breaking the step
+      # with "unrecognized subcommand 'warn'". v2.0.20 bundles cargo-deny 0.19.8,
+      # the version CI ran green on through 2026-07-13. Bump deliberately once
+      # the action/cargo-deny arg mismatch is resolved upstream.
       - name: cargo-deny (licenses + advisories)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20 (cargo-deny 0.19.8)
 
       # `cargo llvm-cov` builds an instrumented copy of the WHOLE crate —
       # including the bundled DuckDB linked by the default-feature `duckdb`

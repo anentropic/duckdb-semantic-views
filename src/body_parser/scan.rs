@@ -107,7 +107,13 @@ pub(super) fn find_live_byte(s: &str, needle: u8) -> Option<usize> {
 
 /// Split `body` at depth-0 commas, respecting nested parens, single-quoted
 /// strings, and double-quoted identifiers.
-/// Returns `Vec<(start_offset_in_body, trimmed_slice)>`. Trailing empty entries discarded.
+///
+/// Returns `Vec<(offset_in_body, trimmed_slice)>` where the offset is that of
+/// the **trimmed** slice's first byte — not the position right after the comma.
+/// Leading whitespace between the comma and the entry is excluded, so an error
+/// caret computed as `base + offset` lands on the entry itself rather than
+/// drifting left into the gap (P-4, code-review 2026-07-11). Trailing empty
+/// entries are discarded.
 pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
     let mut entries = Vec::new();
     let mut depth: i32 = 0;
@@ -124,7 +130,7 @@ pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
                 b',' if depth == 0 => {
                     let entry = body[start..i].trim();
                     if !entry.is_empty() {
-                        entries.push((start, entry));
+                        entries.push((crate::util::byte_offset_within(body, entry), entry));
                     }
                     start = i + 1;
                 }
@@ -135,7 +141,7 @@ pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
     }
     let tail = body[start..].trim();
     if !tail.is_empty() {
-        entries.push((start, tail));
+        entries.push((crate::util::byte_offset_within(body, tail), tail));
     }
     entries
 }
