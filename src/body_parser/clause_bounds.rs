@@ -56,9 +56,12 @@ fn suggest_clause_keyword(word: &str) -> Option<&'static str> {
 #[derive(Debug)]
 pub(super) struct ClauseBound<'a> {
     pub(super) keyword: &'static str,
-    pub(super) content: &'a str,      // text inside the matching parens
-    pub(super) content_offset: usize, // byte offset of content[0] relative to the AS-body text
-    pub(super) keyword_offset: usize, // byte offset of the keyword relative to the AS-body text
+    pub(super) content: &'a str, // text inside the matching parens
+    // Offsets below include `base_offset`, so they are byte offsets in the
+    // original query string (what `ParseError.position` expects), not relative
+    // to the AS-body `text` this scanner receives.
+    pub(super) content_offset: usize, // byte offset of content[0] in the original query
+    pub(super) keyword_offset: usize, // byte offset of the keyword in the original query
 }
 
 /// Scan `text` (the text after "AS") at depth 0 to find clause headers of the form
