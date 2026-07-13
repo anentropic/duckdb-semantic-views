@@ -56,8 +56,12 @@ fn suggest_clause_keyword(word: &str) -> Option<&'static str> {
 #[derive(Debug)]
 pub(super) struct ClauseBound<'a> {
     pub(super) keyword: &'static str,
-    pub(super) content: &'a str,      // text inside the matching parens
-    pub(super) content_offset: usize, // byte offset of content[0] relative to the AS-body text
+    pub(super) content: &'a str, // text inside the matching parens
+    // Offsets below include `base_offset`, so they are byte offsets in the
+    // original query string (what `ParseError.position` expects), not relative
+    // to the AS-body `text` this scanner receives.
+    pub(super) content_offset: usize, // byte offset of content[0] in the original query
+    pub(super) keyword_offset: usize, // byte offset of the keyword in the original query
 }
 
 /// Scan `text` (the text after "AS") at depth 0 to find clause headers of the form
@@ -208,6 +212,7 @@ pub(super) fn find_clause_bounds<'a>(
             keyword,
             content,
             content_offset,
+            keyword_offset: base_offset + word_start,
         });
     }
 
@@ -224,7 +229,9 @@ pub(super) fn find_clause_bounds<'a>(
                 message: format!(
                     "Clause '{kw_upper}' appears out of order; clauses must appear as: TABLES, RELATIONSHIPS (optional), FACTS (optional), DIMENSIONS (optional), METRICS (optional), MATERIALIZATIONS (optional).",
                 ),
-                position: None,
+                // T-7 (code-review 2026-07-11): point the caret at the
+                // out-of-order clause keyword instead of dropping the position.
+                position: Some(bound.keyword_offset),
             });
         }
         last_order = Some(order);
@@ -329,5 +336,54 @@ mod tests {
             "unknown-keyword message must list MATERIALIZATIONS: {}",
             err.message
         );
+    }
+
+    /// T-7 (code-review 2026-07-11): every 2-clause inversion (a clause
+    /// written before one that must precede it) is rejected as out-of-order,
+    /// and the error caret points at the offending (out-of-order) clause
+    /// keyword rather than being dropped (`position: None` before the fix).
+    /// Exhaustive over all 15 ordered pairs of the 6 clause keywords; empty
+    /// `()` bodies isolate the ordering rule from per-clause content parsing.
+    #[test]
+    fn all_two_clause_order_inversions_rejected_with_caret() {
+        let order = [
+            "tables",
+            "relationships",
+            "facts",
+            "dimensions",
+            "metrics",
+            "materializations",
+        ];
+        for (i, &earlier) in order.iter().enumerate() {
+            for &later in &order[i + 1..] {
+                // Write `later` first, then `earlier` — an inversion.
+                let body = format!("{later} () {earlier} ()");
+                let err = find_clause_bounds(&body, 0).unwrap_err();
+                assert!(
+                    err.message.contains("out of order"),
+                    "`{body}` must be rejected as out of order, got: {}",
+                    err.message
+                );
+                // Caret points at the out-of-order (`earlier`) keyword, which
+                // begins right after "{later} () ".
+                let expected = later.len() + 4;
+                assert_eq!(
+                    err.position,
+                    Some(expected),
+                    "caret for `{body}` should point at the out-of-order '{earlier}' keyword"
+                );
+            }
+        }
+    }
+
+    /// T-7: the out-of-order caret is anchored in the original query via
+    /// `base_offset`, matching every other position this scanner reports.
+    #[test]
+    fn out_of_order_caret_honours_base_offset() {
+        let base = 100;
+        let err = find_clause_bounds("metrics () dimensions ()", base).unwrap_err();
+        assert!(err.message.contains("out of order"), "{}", err.message);
+        // "dimensions" starts at byte 11 within the body ("metrics () " == 11).
+        assert_eq!(err.position, Some(base + 11));
     }
 }
