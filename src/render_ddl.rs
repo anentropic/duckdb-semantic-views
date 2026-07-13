@@ -572,7 +572,9 @@ mod tests {
     #[test]
     fn test_view_name_quoted_when_needed() {
         let def = minimal_def();
-        // Mixed case (created quoted, stored case-preserved).
+        // A name with uppercase must be quoted to render round-trippably.
+        // (Stored view names fold to lowercase, but the renderer's quoting
+        // predicate is exercised in isolation here.)
         let ddl = render_create_ddl("Sales", &def).unwrap();
         assert!(ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW \"Sales\""));
         // Whitespace.

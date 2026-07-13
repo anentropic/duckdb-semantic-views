@@ -1,6 +1,6 @@
 //! Trailing COMMENT / WITH SYNONYMS annotations and leading access modifiers.
 
-use super::scan::{extract_paren_content, find_keyword_ci, is_ident_continuation, QuoteState};
+use super::scan::{extract_paren_prefix, is_ident_continuation, QuoteState};
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
 use crate::model::AccessModifier;
@@ -63,6 +63,11 @@ fn parse_synonym_list(content: &str) -> Result<Vec<String>, ParseError> {
 /// - Either order (COMMENT then SYNONYMS or vice versa)
 /// - No annotations at all (returns original expression with empty annotations)
 /// - COMMENT as an identifier inside expressions (only matches at depth-0 with word boundaries)
+///
+/// Once the annotation region begins, it must be tiled exactly by recognized
+/// clauses separated by whitespace: a duplicate `COMMENT` / `WITH SYNONYMS`, a
+/// malformed clause, or any leftover text is an error (P-2) — none of it is
+/// silently dropped.
 #[allow(clippy::too_many_lines)]
 pub(super) fn parse_trailing_annotations(
     text: &str,
@@ -124,55 +129,117 @@ pub(super) fn parse_trailing_annotations(
         return Ok((text.to_string(), ParsedAnnotations::default()));
     };
 
-    // Parse annotation_text for COMMENT = '...' and WITH SYNONYMS = ('...', '...')
+    // Parse the annotation region as a sequence of clauses that must TILE it:
+    // each is `COMMENT = '...'` or `WITH SYNONYMS = (...)`, separated only by
+    // whitespace. A duplicate clause, a malformed clause, or ANY leftover
+    // non-whitespace text is a hard error rather than being silently discarded
+    // (P-2, code-review 2026-07-11). Previously only the FIRST COMMENT / first
+    // WITH SYNONYMS was read: a second `COMMENT = '...'` was dropped and
+    // trailing junk (`COMMENT = 'a' banana`) was accepted.
     let mut comment: Option<String> = None;
-    let mut synonyms: Vec<String> = Vec::new();
-    let ann_upper = annotation_text.to_ascii_uppercase();
+    let mut synonyms: Option<Vec<String>> = None;
+    let mut rest = annotation_text;
 
-    // Extract COMMENT = '...'
-    if let Some(comment_pos) = find_keyword_ci(&ann_upper, "COMMENT") {
-        let after_comment = annotation_text[comment_pos + 7..].trim_start();
-        if !after_comment.starts_with('=') {
-            return Err(ParseError {
-                message: "Expected '=' after COMMENT keyword.".to_string(),
-                position: None,
-            });
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
         }
-        let after_eq = after_comment[1..].trim_start();
-        if !after_eq.starts_with('\'') {
-            return Err(ParseError {
-                message: "Expected single-quoted string after COMMENT =.".to_string(),
-                position: None,
-            });
-        }
-        comment = Some(extract_single_quoted_string(after_eq)?);
-    }
+        let rest_upper = rest.to_ascii_uppercase();
 
-    // Extract WITH SYNONYMS = ('...', '...')
-    if let Some(with_pos) = find_keyword_ci(&ann_upper, "WITH") {
-        let after_with = annotation_text[with_pos + 4..].trim_start();
-        let aw_upper = after_with.to_ascii_uppercase();
-        if aw_upper.starts_with("SYNONYMS") {
-            let after_syn = after_with[8..].trim_start();
-            if !after_syn.starts_with('=') {
+        if starts_with_keyword(&rest_upper, "COMMENT") {
+            if comment.is_some() {
+                return Err(ParseError {
+                    message: "Duplicate COMMENT annotation.".to_string(),
+                    position: None,
+                });
+            }
+            // `COMMENT` is 7 ASCII bytes, so slicing at 7 is on a char boundary.
+            let Some(after_eq) = rest[7..].trim_start().strip_prefix('=') else {
+                return Err(ParseError {
+                    message: "Expected '=' after COMMENT keyword.".to_string(),
+                    position: None,
+                });
+            };
+            let after_eq = after_eq.trim_start();
+            if !after_eq.starts_with('\'') {
+                return Err(ParseError {
+                    message: "Expected single-quoted string after COMMENT =.".to_string(),
+                    position: None,
+                });
+            }
+            let (content, consumed) =
+                crate::util::extract_single_quoted_prefix(after_eq).map_err(|e| ParseError {
+                    message: match e {
+                        crate::util::SingleQuoteError::NotQuoted => {
+                            "Expected single-quoted string after COMMENT =.".to_string()
+                        }
+                        crate::util::SingleQuoteError::Unterminated => {
+                            "Unclosed single-quoted string.".to_string()
+                        }
+                    },
+                    position: None,
+                })?;
+            comment = Some(content);
+            rest = &after_eq[consumed..];
+        } else if starts_with_keyword(&rest_upper, "WITH") {
+            if synonyms.is_some() {
+                return Err(ParseError {
+                    message: "Duplicate WITH SYNONYMS annotation.".to_string(),
+                    position: None,
+                });
+            }
+            // `WITH` is 4 ASCII bytes.
+            let after_with = rest[4..].trim_start();
+            if !starts_with_keyword(&after_with.to_ascii_uppercase(), "SYNONYMS") {
+                return Err(ParseError {
+                    message: "Expected SYNONYMS after WITH keyword.".to_string(),
+                    position: None,
+                });
+            }
+            // `SYNONYMS` is 8 ASCII bytes.
+            let Some(after_eq) = after_with[8..].trim_start().strip_prefix('=') else {
                 return Err(ParseError {
                     message: "Expected '=' after WITH SYNONYMS keyword.".to_string(),
                     position: None,
                 });
-            }
-            let after_eq = after_syn[1..].trim_start();
-            let content = extract_paren_content(after_eq).ok_or_else(|| ParseError {
+            };
+            let after_eq = after_eq.trim_start();
+            let (content, consumed) = extract_paren_prefix(after_eq).ok_or_else(|| ParseError {
                 message: "Expected parenthesized list after WITH SYNONYMS =.".to_string(),
                 position: None,
             })?;
-            synonyms = parse_synonym_list(content)?;
+            synonyms = Some(parse_synonym_list(content)?);
+            rest = &after_eq[consumed..];
+        } else {
+            return Err(ParseError {
+                message: format!(
+                    "Unexpected text in annotations: '{rest}'. Expected COMMENT = '...' or WITH SYNONYMS = (...)."
+                ),
+                position: None,
+            });
         }
     }
 
     Ok((
         expr_text.to_string(),
-        ParsedAnnotations { comment, synonyms },
+        ParsedAnnotations {
+            comment,
+            synonyms: synonyms.unwrap_or_default(),
+        },
     ))
+}
+
+/// True when `upper` (already ASCII-uppercased) begins with `keyword` (also
+/// uppercase) at a word boundary — i.e. the byte after the keyword, if any, is
+/// not an identifier-continuation byte. Prevents `COMMENTARY` from matching
+/// `COMMENT` / `WITHDRAW` from matching `WITH`.
+fn starts_with_keyword(upper: &str, keyword: &str) -> bool {
+    let ub = upper.as_bytes();
+    let kb = keyword.as_bytes();
+    ub.len() >= kb.len()
+        && &ub[..kb.len()] == kb
+        && (ub.len() == kb.len() || !is_ident_continuation(ub[kb.len()]))
 }
 
 /// Check for a leading PRIVATE or PUBLIC keyword on an entry.

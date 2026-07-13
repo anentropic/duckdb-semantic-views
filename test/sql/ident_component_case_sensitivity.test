@@ -1,10 +1,9 @@
-# Snowflake identifier contract for dimension/metric/fact query references.
-#
-# Unquoted references match case-insensitively; a double-quoted reference
-# matches case-sensitively and only against a name declared with that exact
-# quoted spelling. End-to-end pin through the full CREATE -> semantic_view()
-# resolution pipeline (the resolution-layer unit tests live in
-# src/expand/resolution.rs; this pins the string-arg query surface).
+# DuckDB identifier case handling for dimension/metric/fact query references:
+# matching is case-insensitive and quoting-blind — DuckDB treats double-quoted
+# identifiers as case-insensitive too, and this extension follows DuckDB. End-
+# to-end pin through the full CREATE -> semantic_view() resolution pipeline
+# (resolution-layer unit tests live in src/expand/resolution.rs; this pins the
+# string-arg query surface).
 
 require semantic_views
 
@@ -14,34 +13,35 @@ CREATE TABLE ics_orders (id BIGINT, region VARCHAR, status VARCHAR, amount DOUBL
 statement ok
 INSERT INTO ics_orders VALUES (1, 'US', 'open', 100.0), (2, 'EU', 'closed', 200.0);
 
-# Quoted mixed-case dimension "Region" (distinct from an unquoted `region`);
-# plain unquoted dimension `status`; metric `total`.
+# Dimension declared with a quoted mixed-case name "Region" (folds to key
+# `region`); plain unquoted dimension `status`; metric `total`.
 statement ok
 CREATE SEMANTIC VIEW ics_v AS
   TABLES (o AS ics_orders PRIMARY KEY (id))
   DIMENSIONS (o."Region" AS o.region, o.status AS o.status)
   METRICS (o.total AS SUM(o.amount))
 
-# --- quoted reference is case-sensitive ---
+# --- a quoted mixed-case name resolves for ANY casing, quoted or not ---
 
-# Exact-case quoted reference resolves.
 statement ok
 SELECT * FROM explain_semantic_view('ics_v', dimensions := ['"Region"'], metrics := ['total']);
 
-# Wrong-case quoted reference does NOT resolve (case-sensitive).
-statement error
+statement ok
 SELECT * FROM explain_semantic_view('ics_v', dimensions := ['"region"'], metrics := ['total']);
-----
-unknown dimension
 
-# An unquoted reference (fold key `region`) is a DIFFERENT object from the
-# quoted `"Region"` (key `Region`), so it does not resolve either.
-statement error
+statement ok
 SELECT * FROM explain_semantic_view('ics_v', dimensions := ['region'], metrics := ['total']);
+
+statement ok
+SELECT * FROM explain_semantic_view('ics_v', dimensions := ['REGION'], metrics := ['total']);
+
+# A genuinely unknown name still errors.
+statement error
+SELECT * FROM explain_semantic_view('ics_v', dimensions := ['country'], metrics := ['total']);
 ----
 unknown dimension
 
-# --- unquoted reference stays case-insensitive (regression) ---
+# --- unquoted reference is case-insensitive too ---
 
 statement ok
 SELECT * FROM explain_semantic_view('ics_v', dimensions := ['status'], metrics := ['total']);
@@ -52,7 +52,56 @@ SELECT * FROM explain_semantic_view('ics_v', dimensions := ['STATUS'], metrics :
 statement ok
 SELECT * FROM explain_semantic_view('ics_v', dimensions := ['Status'], metrics := ['TOTAL']);
 
+# --- explain header must agree with routing for a quoted reference ---
+# Regression for the #84 re-review: the `-- Materialization:` header resolves
+# requested names via its own lookup. When that lookup was quote-UNAWARE
+# (eq_ignore_ascii_case) while expand() used the quote-aware key, a quoted
+# reference routed to the materialization in the emitted SQL but the header
+# reported "none" — one explain output contradicting itself. The earlier
+# quoted-name test (ics_v) has no materialization, so it could not catch this.
+
+statement ok
+CREATE TABLE ics_mat_orders (id BIGINT, region VARCHAR, amount DOUBLE);
+
+statement ok
+CREATE TABLE ics_mat_agg (region VARCHAR, total DOUBLE);
+
+statement ok
+CREATE SEMANTIC VIEW ics_mat_v AS
+  TABLES (o AS ics_mat_orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+  MATERIALIZATIONS (
+    reg_agg AS (
+      TABLE ics_mat_agg,
+      DIMENSIONS (region),
+      METRICS (total)
+    )
+  )
+
+# Quoted `"region"` folds to the same key as the unquoted stored `region`, so
+# expand() routes to the materialization AND the header must name it.
+query I
+SELECT explain_output FROM explain_semantic_view('ics_mat_v', dimensions := ['"region"'], metrics := ['total']) WHERE explain_output LIKE '-- Materialization:%'
+----
+-- Materialization: reg_agg
+
+# Unquoted reference routes identically (baseline).
+query I
+SELECT explain_output FROM explain_semantic_view('ics_mat_v', dimensions := ['region'], metrics := ['total']) WHERE explain_output LIKE '-- Materialization:%'
+----
+-- Materialization: reg_agg
+
 # Cleanup
+statement ok
+DROP SEMANTIC VIEW ics_mat_v;
+
+statement ok
+DROP TABLE ics_mat_agg;
+
+statement ok
+DROP TABLE ics_mat_orders;
+
 statement ok
 DROP SEMANTIC VIEW ics_v;
 

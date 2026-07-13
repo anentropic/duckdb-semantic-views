@@ -163,21 +163,32 @@ pub fn parse_qualified_identifier_with_quoting(input: &str) -> Result<Vec<(Strin
 /// identifier. This is the lookup key stored in
 /// `semantic_layer._definitions(name)`.
 ///
-/// Case normalisation (PA-8, code-review 2026-07-02): an UNQUOTED name is
-/// folded to ASCII lowercase; a `"quoted"` name preserves its exact case.
-/// This is the Snowflake identifier contract (fold unquoted, preserve
-/// quoted) with `DuckDB`'s lowercase fold direction, and it applies uniformly
-/// because every view-name consumer — DDL capture sites, guard/DML
-/// emission, and the `semantic_view()` / `explain_semantic_view()` lookup
-/// arguments — resolves names through this function. Previously unquoted
-/// names were byte-exact case-sensitive (`CREATE ... Sales` then
-/// `DROP ... sales` → "does not exist"), diverging from both `DuckDB` and
-/// Snowflake.
+/// Case normalisation (PA-8, code-review 2026-07-02; case rule revised
+/// 2026-07-12): the name is stripped of any surrounding quotes and folded to
+/// ASCII lowercase, whether it was written quoted or not. This matches
+/// **`DuckDB`'s** identifier semantics — identifiers are case-insensitive
+/// *including* double-quoted ones (`"Foo"`, `foo`, and `"FOO"` all denote the
+/// same object) — which is the convention the rest of this extension follows
+/// (dimension/metric/fact and table-alias matching are all case-insensitive).
+/// It applies uniformly because every view-name consumer — DDL capture sites,
+/// guard/DML emission, and the `semantic_view()` / `explain_semantic_view()`
+/// lookup arguments — resolves names through this function.
 ///
-/// Migration note: definitions created before v0.11 with unquoted
-/// mixed-case names are stored under their original casing and must now be
-/// referenced quoted (`"Sales"`) — or dropped and recreated — because an
-/// unquoted reference folds to lowercase before lookup.
+/// (The earlier revision folded unquoted names but *preserved* quoted ones,
+/// i.e. Snowflake's rule where a quoted identifier is case-sensitive. That
+/// diverged from `DuckDB` and from the rest of the project, so quoted names
+/// now fold too.)
+///
+/// Migration note: lookups fold the *requested* name to lowercase and match
+/// the stored `semantic_layer._definitions(name)` column exactly, so a view is
+/// only reachable if its **stored** name is already lowercase. Unquoted DDL
+/// always stored a lowercase name (both before and after this change), so those
+/// views are unaffected. Only a definition created before v0.11 via a *quoted*
+/// mixed-case identifier (e.g. `CREATE SEMANTIC VIEW "Sales"`) kept its original
+/// casing in the catalog; under the folding rule no spelling — `sales`,
+/// `Sales`, or `"Sales"` — matches the stored `Sales`, so it is no longer
+/// reachable. Drop and recreate it, or rename the catalog row to lowercase, to
+/// make it reachable again.
 ///
 /// # Examples
 ///
@@ -185,7 +196,7 @@ pub fn parse_qualified_identifier_with_quoting(input: &str) -> Result<Vec<(Strin
 /// use semantic_views::ident::normalize_view_name;
 /// assert_eq!(normalize_view_name("orders_sv").unwrap(), "orders_sv");
 /// assert_eq!(normalize_view_name("Orders_SV").unwrap(), "orders_sv");
-/// assert_eq!(normalize_view_name("\"Orders_SV\"").unwrap(), "Orders_SV");
+/// assert_eq!(normalize_view_name("\"Orders_SV\"").unwrap(), "orders_sv");
 /// assert_eq!(
 ///     normalize_view_name("\"memory\".\"main\".\"orders_sv\"").unwrap(),
 ///     "orders_sv",
@@ -196,13 +207,7 @@ pub fn normalize_view_name(input: &str) -> Result<String, String> {
     parts
         .into_iter()
         .next_back()
-        .map(|(part, quoted)| {
-            if quoted {
-                part
-            } else {
-                part.to_ascii_lowercase()
-            }
-        })
+        .map(|(part, _quoted)| part.to_ascii_lowercase())
         .ok_or_else(|| "empty identifier".to_string())
 }
 
@@ -273,21 +278,19 @@ pub fn find_identifier_end(input: &str, allow_paren: bool) -> usize {
 }
 
 /// Normalize a (possibly dot-qualified, possibly double-quoted) SQL identifier
-/// to its case-folding **match key** under the Snowflake identifier contract,
-/// using `DuckDB`'s lowercase fold direction (the same direction
-/// [`normalize_view_name`] uses for view names):
+/// to its case-folding **match key**, following `DuckDB`'s identifier
+/// semantics (the same rule [`normalize_view_name`] uses for view names): each
+/// part has its surrounding quotes stripped (and `""` unescaped) and is folded
+/// to ASCII lowercase, whether it was quoted or not. So `Region`, `region`,
+/// `REGION`, `"Region"`, and `"region"` all share the key `region` and match
+/// case-insensitively — `DuckDB` treats even double-quoted identifiers as
+/// case-insensitive.
 ///
-/// - an UNQUOTED part folds to ASCII lowercase, so `Region`, `region`, and
-///   `REGION` share the key `region` and match case-insensitively;
-/// - a `"quoted"` part keeps its exact case with the surrounding quotes
-///   stripped (and `""` unescaped), so `"Region"` has the key `Region` and
-///   only another `"Region"` matches it — case-sensitively.
-///
-/// This is the component-name analogue of the view-name contract (PA-8): it
-/// lets dimension / metric / fact references in a query honour Snowflake's
-/// rule that unquoted identifiers are case-insensitive while double-quoted
-/// identifiers are case-sensitive, WITHOUT changing how names are stored (the
-/// serde wire format is unaffected — normalization happens only at match time).
+/// This is the component-name analogue of the view-name rule: dimension /
+/// metric / fact references in a query match case-insensitively regardless of
+/// quoting, WITHOUT changing how names are stored (the serde wire format is
+/// unaffected — normalization happens only at match time, so `DESCRIBE` /
+/// `GET_DDL` still show the name as originally written).
 ///
 /// Total by construction: input that is not a well-formed identifier (an
 /// unterminated quote, an empty part) falls back to a lowercase fold of the
@@ -298,13 +301,7 @@ pub fn normalize_ident_part(raw: &str) -> String {
     match parse_qualified_identifier_with_quoting(trimmed) {
         Ok(parts) => parts
             .into_iter()
-            .map(|(part, quoted)| {
-                if quoted {
-                    part
-                } else {
-                    part.to_ascii_lowercase()
-                }
-            })
+            .map(|(part, _quoted)| part.to_ascii_lowercase())
             .collect::<Vec<_>>()
             .join("."),
         Err(_) => trimmed.to_ascii_lowercase(),
@@ -312,22 +309,21 @@ pub fn normalize_ident_part(raw: &str) -> String {
 }
 
 /// True when a stored identifier and a requested identifier denote the same
-/// object under the Snowflake identifier contract (see [`normalize_ident_part`]):
-/// unquoted references match case-insensitively, double-quoted references match
-/// case-sensitively.
+/// object under `DuckDB`'s case-insensitive identifier rule (see
+/// [`normalize_ident_part`]): quoting does not affect matching, and case is
+/// ignored on both sides.
 ///
-/// This replaces a bare `eq_ignore_ascii_case` on component names, which
-/// treated every reference as case-insensitive regardless of quoting. For
-/// UNQUOTED names on both sides it is behaviourally identical to
-/// `eq_ignore_ascii_case` (both fold to lowercase and compare), so the common
-/// case is unchanged; only a double-quoted reference gains case-sensitivity.
+/// Replaces a bare `eq_ignore_ascii_case` on component names, which did not
+/// strip quotes, so a `"quoted"` stored name was only reachable by a reference
+/// carrying the identical quote characters. Now `"Region"` is matched by
+/// `region`, `REGION`, `"region"`, etc., exactly as `DuckDB` matches a
+/// double-quoted table name.
 #[must_use]
 pub fn ident_matches(stored: &str, requested: &str) -> bool {
     // Fast path (the common case): when neither side is double-quoted, the
     // match is a plain ASCII case-insensitive comparison — allocation-free and
-    // byte-for-byte the former `eq_ignore_ascii_case` behaviour, so hot
-    // name-resolution loops pay nothing for the contract. Only a quoted
-    // reference on either side needs the normalize-and-compare path.
+    // byte-for-byte the former `eq_ignore_ascii_case` behaviour. Only a quoted
+    // reference on either side needs the strip-quotes-and-fold path.
     if !stored.contains('"') && !requested.contains('"') {
         return stored.eq_ignore_ascii_case(requested);
     }
@@ -518,7 +514,8 @@ mod tests {
             assert_eq!(normalize_view_name("orders_sv").unwrap(), "orders_sv");
         }
 
-        // --- PA-8 (code-review 2026-07-02): fold unquoted, preserve quoted ---
+        // --- PA-8 (code-review 2026-07-02; revised 2026-07-12): fold to
+        // lowercase whether quoted or not (DuckDB case-insensitive) ---
 
         #[test]
         fn unquoted_mixed_case_folds_to_lowercase() {
@@ -528,13 +525,16 @@ mod tests {
         }
 
         #[test]
-        fn quoted_mixed_case_preserved() {
-            assert_eq!(normalize_view_name("\"Sales\"").unwrap(), "Sales");
-            assert_eq!(normalize_view_name("\"ORDERS SV\"").unwrap(), "ORDERS SV");
+        fn quoted_names_fold_like_unquoted() {
+            // DuckDB treats double-quoted identifiers as case-insensitive too,
+            // so a quoted name folds to lowercase exactly like an unquoted one
+            // (revised 2026-07-12, replacing the Snowflake preserve-quoted rule).
+            assert_eq!(normalize_view_name("\"Sales\"").unwrap(), "sales");
+            assert_eq!(normalize_view_name("\"ORDERS SV\"").unwrap(), "orders sv");
             assert_eq!(
                 normalize_view_name("main.\"Sales\"").unwrap(),
-                "Sales",
-                "quotedness is per-part: only the last part decides"
+                "sales",
+                "only the last part is the name; it folds whether quoted or not"
             );
         }
 
@@ -718,16 +718,17 @@ mod tests {
         }
 
         proptest! {
-            /// normalize_view_name(emit(v)) == Ok(v.last()). All parts are
-            /// emitted QUOTED via quote_ident, so PA-8 case folding never
-            /// applies — the exact content round-trips.
+            /// normalize_view_name(emit(v)) == Ok(v.last().to_lowercase()).
+            /// Quoted identifiers fold to lowercase like unquoted ones under
+            /// DuckDB's case-insensitive rule (revised 2026-07-12), so the last
+            /// part round-trips as its ASCII-lowercased form.
             #[test]
             fn normalize_returns_last_part(
                 parts in prop::collection::vec(arb_part(), 1..=4)
             ) {
                 let emitted = emit_via_quote_ident(&parts);
                 let normalised = normalize_view_name(&emitted);
-                let expected = parts.last().unwrap().clone();
+                let expected = parts.last().unwrap().to_ascii_lowercase();
                 prop_assert_eq!(
                     normalised,
                     Ok(expected),
@@ -770,17 +771,20 @@ mod tests {
         }
 
         #[test]
-        fn quoted_preserves_case_and_strips_quotes() {
-            assert_eq!(normalize_ident_part("\"Region\""), "Region");
-            assert_eq!(normalize_ident_part("\"REGION\""), "REGION");
-            // Doubled-quote escape is unescaped.
-            assert_eq!(normalize_ident_part("\"a\"\"b\""), "a\"b");
+        fn quoted_strips_quotes_and_folds() {
+            // DuckDB: quoted identifiers are case-insensitive too, so a quoted
+            // part strips its quotes AND folds to lowercase (revised
+            // 2026-07-12, replacing the Snowflake preserve-quoted rule).
+            assert_eq!(normalize_ident_part("\"Region\""), "region");
+            assert_eq!(normalize_ident_part("\"REGION\""), "region");
+            // Doubled-quote escape is unescaped, then folded.
+            assert_eq!(normalize_ident_part("\"a\"\"B\""), "a\"b");
         }
 
         #[test]
         fn qualified_normalizes_each_part() {
             assert_eq!(normalize_ident_part("O.Region"), "o.region");
-            assert_eq!(normalize_ident_part("o.\"Region\""), "o.Region");
+            assert_eq!(normalize_ident_part("o.\"Region\""), "o.region");
         }
 
         #[test]
@@ -804,17 +808,19 @@ mod tests {
         }
 
         #[test]
-        fn ident_matches_quoted_is_case_sensitive() {
-            // A quoted request matches a quoted stored name only exactly.
+        fn ident_matches_quoted_is_case_insensitive() {
+            // DuckDB: quoting does not affect matching, and case is ignored on
+            // both sides — a quoted name matches any-case quoted or unquoted
+            // reference (revised 2026-07-12).
             assert!(ident_matches("\"Region\"", "\"Region\""));
-            assert!(!ident_matches("\"Region\"", "\"region\""));
-            // Quoted request vs unquoted-stored: distinct objects (the stored
-            // unquoted `Region` folds to `region`; the quoted request stays
-            // `Region`).
-            assert!(!ident_matches("Region", "\"Region\""));
-            // Unquoted request still matches an unquoted stored name of any
-            // case (the folded keys coincide).
+            assert!(ident_matches("\"Region\"", "\"region\""));
+            assert!(ident_matches("\"Region\"", "\"REGION\""));
+            // Quoted vs unquoted, any case: all match (quotes stripped, folded).
+            assert!(ident_matches("Region", "\"Region\""));
+            assert!(ident_matches("\"Region\"", "region"));
             assert!(ident_matches("Region", "region"));
+            // Distinct names still don't match.
+            assert!(!ident_matches("\"Region\"", "\"Country\""));
         }
 
         #[test]

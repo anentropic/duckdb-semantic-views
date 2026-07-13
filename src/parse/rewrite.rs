@@ -1087,11 +1087,11 @@ mod tests {
     }
 
     // ===================================================================
-    // PA-8 (code-review 2026-07-02): unquoted view names fold to lowercase
-    // at every DDL capture site; quoted names preserve case. Previously
-    // unquoted names were byte-exact case-sensitive (CREATE ... Sales /
-    // DROP ... sales -> "does not exist"), diverging from both DuckDB and
-    // Snowflake.
+    // PA-8 (code-review 2026-07-02; case rule revised 2026-07-12): view names
+    // fold to lowercase at every DDL capture site, whether quoted or not —
+    // DuckDB treats even double-quoted identifiers as case-insensitive.
+    // Previously unquoted names were byte-exact case-sensitive
+    // (CREATE ... Sales / DROP ... sales -> "does not exist").
     // ===================================================================
 
     #[test]
@@ -1127,25 +1127,28 @@ mod tests {
     }
 
     #[test]
-    fn test_quoted_names_preserve_case_across_ddl_forms() {
+    fn test_quoted_names_also_fold_to_lowercase_across_ddl_forms() {
+        // DuckDB: quoted identifiers are case-insensitive too, so a quoted
+        // view name folds to lowercase exactly like an unquoted one (revised
+        // 2026-07-12, replacing the Snowflake preserve-quoted rule).
         assert_eq!(
             plan("DROP SEMANTIC VIEW \"Sales\""),
             RewriteAction::Drop {
-                name: "Sales".to_string(),
+                name: "sales".to_string(),
                 if_exists: false,
             }
         );
 
         assert_eq!(
             extract_ddl_name("CREATE SEMANTIC VIEW \"Sales\" (body)").unwrap(),
-            Some("Sales".to_string())
+            Some("sales".to_string())
         );
 
         assert_eq!(
             plan("ALTER SEMANTIC VIEW \"Sales\" RENAME TO \"NewSales\""),
             RewriteAction::AlterRename {
-                name: "Sales".to_string(),
-                new_name: "NewSales".to_string(),
+                name: "sales".to_string(),
+                new_name: "newsales".to_string(),
                 if_exists: false,
             }
         );

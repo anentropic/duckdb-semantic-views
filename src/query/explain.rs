@@ -188,19 +188,24 @@ unsafe fn explain_semantic_view_bind_body(
     })?;
 
     let mat_name = {
-        // NB: these lookups (and the materialization routing they feed) still
-        // fold case-insensitively regardless of quoting. That keeps this
-        // display header consistent with the actual routing in `expand()`
-        // (both use the same case-insensitive key), so a quoted reference
-        // cannot make the header and the emitted SQL disagree. Making
-        // materialization matching quote-aware is deferred to the §6.2
-        // reference-engine work, which collapses the duplicated matcher first.
+        // Resolve the requested names to their stored items with the SAME
+        // quote-aware key `expand()` uses (`ident::ident_matches`), so this
+        // display header agrees with the routing in the emitted SQL by
+        // construction. A bare `eq_ignore_ascii_case` here treated a quoted
+        // reference's quote characters as literal bytes, matching nothing, so
+        // a query like `dimensions := ['"region"']` (which `expand()`
+        // resolves and routes to a materialization) reported
+        // `-- Materialization: none` — the header contradicting the routed SQL
+        // two sections below (code-review re-review on #84). The
+        // table-qualified variant (`'o.region'`) is still dropped here — a
+        // pre-existing gap this header never handled — and is unified with the
+        // rest of the materialization matcher in the §6.2 reference engine.
         let dim_refs: Vec<&crate::model::Dimension> = dimensions
             .iter()
             .filter_map(|name| {
                 def.dimensions
                     .iter()
-                    .find(|d| d.name.eq_ignore_ascii_case(name))
+                    .find(|d| crate::ident::ident_matches(&d.name, name))
             })
             .collect();
         let met_refs: Vec<&crate::model::Metric> = metrics
@@ -208,7 +213,7 @@ unsafe fn explain_semantic_view_bind_body(
             .filter_map(|name| {
                 def.metrics
                     .iter()
-                    .find(|m| m.name.eq_ignore_ascii_case(name))
+                    .find(|m| crate::ident::ident_matches(&m.name, name))
             })
             .collect();
         find_routing_materialization_name(&def, &dim_refs, &met_refs).map(String::from)

@@ -171,8 +171,8 @@ fn show_entities_one(
     view_name: &str,
 ) -> Result<Vec<u8>, String> {
     // FF-4: normalize the requested name so quoted-identifier inputs resolve
-    // the same way they do through `semantic_view()` (unquoted folds to
-    // lowercase; quoted preserves case).
+    // the same way they do through `semantic_view()` (folds to lowercase
+    // whether quoted or not — DuckDB's case-insensitive identifier rule).
     let view_name = crate::ident::normalize_view_name(view_name)
         .map_err(|e| format!("Invalid view name '{view_name}': {e}"))?;
     let present = unsafe { probe_catalog_table_present(borrowed) }?;
