@@ -7,12 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
 use crate::model::SemanticViewDefinition;
-use crate::util::suggest_closest;
-
-/// Check if a byte is a word-boundary character (NOT alphanumeric or underscore).
-fn is_word_boundary_byte(b: u8) -> bool {
-    !b.is_ascii_alphanumeric() && b != b'_'
-}
+use crate::util::{is_word_boundary_char, suggest_closest};
 
 /// Find references to known fact names in an expression using word-boundary matching.
 ///
@@ -37,9 +32,9 @@ pub fn find_fact_references<'a>(expr: &str, fact_names: &[&'a str]) -> Vec<&'a s
         let mut i = 0;
         while i + fn_len <= lower_bytes.len() {
             if &lower_bytes[i..i + fn_len] == fn_bytes {
-                let before_ok = i == 0 || is_word_boundary_byte(bytes[i - 1]);
+                let before_ok = i == 0 || is_word_boundary_char(bytes[i - 1]);
                 let after_ok =
-                    i + fn_len == bytes.len() || is_word_boundary_byte(bytes[i + fn_len]);
+                    i + fn_len == bytes.len() || is_word_boundary_char(bytes[i + fn_len]);
                 if before_ok && after_ok {
                     found.push(fact_name);
                     break; // Each fact name only counted once
@@ -432,5 +427,19 @@ mod tests {
     fn find_fact_references_case_insensitive() {
         let refs = find_fact_references("SUM(Net_Price)", &["net_price"]);
         assert_eq!(refs, vec!["net_price"]);
+    }
+
+    #[test]
+    fn find_fact_references_no_match_inside_unicode_identifier() {
+        // E-5 (code-review 2026-07-11): non-ASCII bytes are identifier
+        // continuation per the crate's single boundary definition
+        // (`util::is_ident_byte`), so a fact name must NOT match where a
+        // unicode char abuts it — `id` inside `idΩ` / `Ωid` is one identifier,
+        // not a reference. The previous local boundary predicate treated
+        // >= 0x80 bytes as boundaries and matched here.
+        assert!(find_fact_references("idΩ", &["id"]).is_empty());
+        assert!(find_fact_references("Ωid", &["id"]).is_empty());
+        // A genuine ASCII boundary still matches.
+        assert_eq!(find_fact_references("Ω id", &["id"]), vec!["id"]);
     }
 }

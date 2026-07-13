@@ -820,6 +820,49 @@ mod tests {
     }
 
     #[test]
+    fn inline_facts_does_not_capture_qualified_column_on_other_table() {
+        // E-3 (code-review 2026-07-11): a bare fact reference is inlined, but
+        // the fact name appearing as the column part of a qualified reference
+        // on a *different* relation (`x.net_price`) must be left untouched —
+        // substituting there produced invalid SQL (`x.(price * ...)`).
+        let facts = vec![Fact {
+            name: "net_price".to_string(),
+            expr: "price * (1 - discount)".to_string(),
+            source_table: Some("o".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Public,
+        }];
+        let topo = toposort_facts(&facts).unwrap();
+        // Bare reference inlined; `x.net_price` (other table's column) intact.
+        assert_eq!(
+            inline_facts("SUM(net_price) + x.net_price", &facts, &topo),
+            "SUM((price * (1 - discount))) + x.net_price"
+        );
+        // The fact's own qualified form is still matched as a whole.
+        assert_eq!(
+            inline_facts("o.net_price + x.net_price", &facts, &topo),
+            "(price * (1 - discount)) + x.net_price"
+        );
+    }
+
+    #[test]
+    fn inline_derived_metrics_does_not_capture_qualified_column_on_other_table() {
+        // E-3, derived-metric arm: a bare metric reference is inlined, but the
+        // same name as a qualified column on another relation (`x.revenue`) is
+        // left alone.
+        let metrics = vec![
+            make_metric("revenue", "SUM(o.rev)", Some("o")),
+            make_metric("profit", "revenue - x.revenue", None),
+        ];
+        let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+            .unwrap()
+            .exprs;
+        assert_eq!(resolved.get("profit").unwrap(), "(SUM(o.rev)) - x.revenue");
+    }
+
+    #[test]
     fn inline_derived_metrics_depth_limit_exceeded() {
         // Create a chain of 65 derived metrics: m0 -> m1 -> ... -> m64
         // m0 is base, m1..m64 are derived (64 derived exceeds the limit since

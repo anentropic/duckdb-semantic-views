@@ -113,6 +113,13 @@ pub fn replace_word_boundary_any(haystack: &str, needles: &[&str], replacement: 
 /// into invalid nested-aggregate SQL, dependent on hash-map iteration order.
 ///
 /// Matching is ASCII-case-insensitive (see [`replace_word_boundary`] — E-2).
+/// A match immediately preceded by `.` is skipped: it is the column part of a
+/// qualified reference (`x.revenue`) on some *other* relation, not a standalone
+/// reference to the inlined name (E-3, code-review 2026-07-11). A name's own
+/// qualified form is passed as a separate `alias.name` needle (tried first) so
+/// it still matches as a whole. This differs from single-needle
+/// [`replace_word_boundary`], whose alias-rewriting callers intentionally match
+/// after a dot.
 #[must_use]
 pub fn replace_word_boundary_pairs(haystack: &str, pairs: &[(&str, &str)]) -> String {
     let h_bytes = haystack.as_bytes();
@@ -128,7 +135,15 @@ pub fn replace_word_boundary_pairs(haystack: &str, pairs: &[(&str, &str)]) -> St
                 continue;
             }
             if h_bytes[i..i + n_len].eq_ignore_ascii_case(n_bytes) {
-                let before_ok = i == 0 || is_word_boundary_char(h_bytes[i - 1]);
+                // A match immediately preceded by `.` is the column part of a
+                // qualified reference (`x.revenue`), not a standalone identifier
+                // reference to the name being inlined — do not substitute there
+                // (E-3, code-review 2026-07-11). The inliner supplies a fact's
+                // own qualified form (`alias.name`) as a *separate* needle tried
+                // first at the alias position, so that legitimate case is matched
+                // as a whole before the bare needle is ever tested here.
+                let before_ok =
+                    i == 0 || (is_word_boundary_char(h_bytes[i - 1]) && h_bytes[i - 1] != b'.');
                 let after_ok =
                     i + n_len == h_bytes.len() || is_word_boundary_char(h_bytes[i + n_len]);
                 if before_ok && after_ok {
@@ -557,6 +572,38 @@ mod tests {
         let pairs = [("a", "(X)"), ("b", "(a + 1)")];
         let result = replace_word_boundary_pairs("a + b", &pairs);
         assert_eq!(result, "(X) + (a + 1)");
+    }
+
+    #[test]
+    fn replace_word_boundary_pairs_skips_qualified_column_on_other_table() {
+        // E-2/E-3 (code-review 2026-07-11): a bare metric/fact needle must NOT
+        // substitute into the column part of a qualified reference on another
+        // relation — `x.revenue` is table `x`'s column `revenue`, not the
+        // metric `revenue`. Substituting there produced invalid SQL like
+        // `x.(SUM(o.amount))`.
+        let pairs = [("revenue", "(SUM(o.amount))")];
+        assert_eq!(
+            replace_word_boundary_pairs("x.revenue / 2", &pairs),
+            "x.revenue / 2"
+        );
+        // A genuine bare reference in the same expression is still inlined.
+        assert_eq!(
+            replace_word_boundary_pairs("revenue + x.revenue", &pairs),
+            "(SUM(o.amount)) + x.revenue"
+        );
+    }
+
+    #[test]
+    fn replace_word_boundary_any_qualified_form_matches_but_other_table_does_not() {
+        // The inliner supplies a fact's own qualified form (`o.net_price`) as a
+        // needle tried before the bare form. That whole-token qualified match
+        // still fires, while the bare needle must not leak into a *different*
+        // table's `x.net_price` (E-3).
+        let needles = ["o.net_price", "net_price"];
+        assert_eq!(
+            replace_word_boundary_any("o.net_price + x.net_price", &needles, "(P)"),
+            "(P) + x.net_price"
+        );
     }
 
     #[test]

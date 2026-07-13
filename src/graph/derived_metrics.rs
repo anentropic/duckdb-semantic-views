@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
 use crate::model::SemanticViewDefinition;
-use crate::util::suggest_closest;
+use crate::util::{is_ident_byte, is_word_boundary_char, suggest_closest};
 
 use super::facts::find_fact_references;
 
@@ -89,7 +89,7 @@ pub fn contains_aggregate_function(expr: &str) -> Option<&'static str> {
             // Check if we have a match at position i
             if i + fn_len <= lower_bytes.len() && &lower_bytes[i..i + fn_len] == fn_bytes {
                 // Check word boundary before
-                let before_ok = i == 0 || is_word_boundary_byte(bytes[i - 1]);
+                let before_ok = i == 0 || is_word_boundary_char(bytes[i - 1]);
                 // Check followed by '(' (with optional whitespace)
                 if before_ok {
                     let after_pos = i + fn_len;
@@ -321,7 +321,11 @@ fn extract_identifiers(expr: &str) -> Vec<String> {
         // We want bare identifiers only
         if ch.is_ascii_alphabetic() || ch == '_' {
             let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            // Continuation uses the crate's single identifier-byte definition
+            // (ASCII alnum / `_` / any byte >= 0x80), so a non-ASCII character
+            // mid-identifier (`revenueΩ`) is not split into a spurious bare
+            // token (E-5, code-review 2026-07-11).
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
                 i += 1;
             }
             let ident = &expr[start..i];
@@ -413,11 +417,6 @@ fn is_sql_keyword_or_builtin(token: &str) -> bool {
     SQL_KEYWORDS.contains(&token)
 }
 
-/// Check if a byte is a word-boundary character (NOT alphanumeric or underscore).
-fn is_word_boundary_byte(b: u8) -> bool {
-    !b.is_ascii_alphanumeric() && b != b'_'
-}
-
 #[cfg(test)]
 mod tests {
     use crate::graph::{contains_aggregate_function, validate_derived_metrics};
@@ -470,6 +469,16 @@ mod tests {
         // Inside single-quoted string literal -- best effort skip
         let result = contains_aggregate_function("'SUM of values'");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn contains_aggregate_none_after_unicode_prefix() {
+        // E-5 (code-review 2026-07-11): the aggregate-name scan shares the
+        // crate's single boundary definition, so `sum` abutting a non-ASCII
+        // byte is part of one identifier (a function named `Ωsum`), not the
+        // aggregate `sum`. The previous local boundary predicate treated
+        // >= 0x80 bytes as boundaries and falsely reported an aggregate here.
+        assert_eq!(contains_aggregate_function("Ωsum(x)"), None);
     }
 
     // -----------------------------------------------------------------------
