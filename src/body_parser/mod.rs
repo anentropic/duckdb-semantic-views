@@ -1963,6 +1963,45 @@ mod tests {
         assert_eq!(kb.metrics[0].expr, "SUM(amount)");
     }
 
+    /// T-8 (code-review 2026-07-11): a large *valid* body parses correctly and
+    /// without arbitrary entry limits. 500 METRICS entries exercise the
+    /// depth-0 comma splitter and per-entry scans at scale; the test also pins
+    /// linearity — an accidentally-quadratic clause scan would blow this up
+    /// into a visible timeout rather than passing in milliseconds.
+    #[test]
+    fn parse_keyword_body_large_metrics_clause() {
+        const N: usize = 500;
+        let mut entries = Vec::with_capacity(N);
+        for i in 0..N {
+            entries.push(format!("o.m{i} AS SUM(amount)"));
+        }
+        let body = format!(
+            "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS region) METRICS ({})",
+            entries.join(", ")
+        );
+        let kb = parse_keyword_body(&body, 0).unwrap();
+        assert_eq!(kb.metrics.len(), N);
+        // Spot-check the boundaries so a silent off-by-one in the splitter
+        // would surface.
+        assert_eq!(kb.metrics[0].name, "m0");
+        assert_eq!(kb.metrics[N - 1].name, format!("m{}", N - 1));
+        assert!(kb.metrics.iter().all(|m| m.expr == "SUM(amount)"));
+    }
+
+    /// T-8: a deeply-nested but balanced parenthesized metric expression parses
+    /// (the depth counter is a plain `i32`, so 64 levels is far within range)
+    /// and is stored verbatim as an uninterpreted expression.
+    #[test]
+    fn parse_keyword_body_deeply_nested_parens() {
+        const DEPTH: usize = 64;
+        let expr = format!("SUM({}amount{})", "(".repeat(DEPTH), ")".repeat(DEPTH));
+        let body = format!("AS TABLES (o AS orders PRIMARY KEY (id)) METRICS (o.deep AS {expr})");
+        let kb = parse_keyword_body(&body, 0).unwrap();
+        assert_eq!(kb.metrics.len(), 1);
+        assert_eq!(kb.metrics[0].name, "deep");
+        assert_eq!(kb.metrics[0].expr, expr);
+    }
+
     #[test]
     fn parse_keyword_body_with_relationships() {
         let body = "AS TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (id)) RELATIONSHIPS (o_to_c AS o(cust_id) REFERENCES c) DIMENSIONS (o.reg AS region) METRICS (o.rev AS SUM(amount))";
