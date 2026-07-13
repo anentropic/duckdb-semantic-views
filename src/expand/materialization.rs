@@ -6,14 +6,14 @@
 
 use std::collections::HashSet;
 
-use crate::model::{Dimension, Metric, SemanticViewDefinition};
+use crate::model::{Dimension, Materialization, Metric, SemanticViewDefinition};
 
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 
-/// Attempt to route a query to a materialization table.
-///
-/// Returns `Some(sql)` if an exact-match materialization is found,
-/// `None` if no match or if routing is excluded (semi-additive/window metrics).
+/// Find the materialization whose declared dimension and metric name sets
+/// EXACTLY match the requested ones (case-insensitive), honoring the routing
+/// exclusions. First match wins (definition order); `None` when nothing matches
+/// or routing is excluded.
 ///
 /// # Matching rules (v0.7.0 -- exact match only)
 ///
@@ -25,27 +25,30 @@ use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 ///
 /// Re-aggregation routing (materialization covers a SUPERSET of requested dims)
 /// is deferred to v2 (MAT-F01).
-pub(crate) fn try_route_materialization(
-    def: &SemanticViewDefinition,
+///
+/// Single source of the routing decision (E-6, code-review 2026-07-11), shared
+/// by [`try_route_materialization`] (which emits the materialized SELECT) and
+/// [`find_routing_materialization_name`] (which reports the chosen name for
+/// `explain`) so the two can never disagree about what would be routed.
+fn find_matching_materialization<'a>(
+    def: &'a SemanticViewDefinition,
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
-) -> Option<String> {
-    // Fast path: no materializations declared -> None (MAT-05)
+) -> Option<&'a Materialization> {
+    // Fast path: no materializations declared (MAT-05).
     if def.materializations.is_empty() {
         return None;
     }
-
-    // MAT-04: Exclude semi-additive metrics from routing
+    // MAT-04: semi-additive and window-function metrics are never routed.
     if resolved_mets.iter().any(|m| !m.non_additive_by.is_empty()) {
         return None;
     }
-
-    // MAT-04: Exclude window function metrics from routing
     if resolved_mets.iter().any(|m| m.is_window()) {
         return None;
     }
 
-    // Build requested dimension/metric name sets (lowercase for case-insensitive matching)
+    // Requested dimension/metric name sets (lowercase for case-insensitive
+    // matching).
     let req_dims: HashSet<String> = resolved_dims
         .iter()
         .map(|d| d.name.to_ascii_lowercase())
@@ -55,8 +58,8 @@ pub(crate) fn try_route_materialization(
         .map(|m| m.name.to_ascii_lowercase())
         .collect();
 
-    // Scan materializations in definition order (first match wins)
-    for mat in &def.materializations {
+    // Definition order -> first exact match wins.
+    def.materializations.iter().find(|mat| {
         let mat_dims: HashSet<String> = mat
             .dimensions
             .iter()
@@ -64,27 +67,29 @@ pub(crate) fn try_route_materialization(
             .collect();
         let mat_mets: HashSet<String> =
             mat.metrics.iter().map(|m| m.to_ascii_lowercase()).collect();
-
-        if mat_dims == req_dims && mat_mets == req_mets {
-            return Some(build_materialized_sql(
-                &mat.table,
-                def,
-                resolved_dims,
-                resolved_mets,
-            ));
-        }
-    }
-
-    None
+        mat_dims == req_dims && mat_mets == req_mets
+    })
 }
 
-/// Find the name of the materialization that would be selected for routing.
+/// Attempt to route a query to a materialization table.
 ///
-/// Returns `Some(&str)` with the materialization name if an exact match exists,
-/// `None` if no match or if routing would be excluded (semi-additive/window).
+/// Returns `Some(sql)` selecting from the pre-aggregated table when an
+/// exact-match materialization is found (rules: [`find_matching_materialization`]),
+/// else `None` and the caller expands raw sources.
+pub(crate) fn try_route_materialization(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&Dimension],
+    resolved_mets: &[&Metric],
+) -> Option<String> {
+    find_matching_materialization(def, resolved_dims, resolved_mets)
+        .map(|mat| build_materialized_sql(&mat.table, def, resolved_dims, resolved_mets))
+}
+
+/// Name of the materialization that would be selected for routing, or `None`.
 ///
-/// This is used by `explain_semantic_view` to report the routing decision
-/// without duplicating the matching logic from `try_route_materialization`.
+/// Used by `explain_semantic_view` to report the routing decision; delegates to
+/// the shared [`find_matching_materialization`] so it cannot drift from the
+/// routing [`try_route_materialization`] actually performs.
 // Used only under the `extension` feature (explain.rs); scope the allow to the
 // default build so genuine dead code is still caught under `extension` (ST-8).
 #[cfg_attr(not(feature = "extension"), allow(dead_code))]
@@ -93,38 +98,7 @@ pub(crate) fn find_routing_materialization_name<'a>(
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
 ) -> Option<&'a str> {
-    if def.materializations.is_empty() {
-        return None;
-    }
-    if resolved_mets.iter().any(|m| !m.non_additive_by.is_empty()) {
-        return None;
-    }
-    if resolved_mets.iter().any(|m| m.is_window()) {
-        return None;
-    }
-
-    let req_dims: HashSet<String> = resolved_dims
-        .iter()
-        .map(|d| d.name.to_ascii_lowercase())
-        .collect();
-    let req_mets: HashSet<String> = resolved_mets
-        .iter()
-        .map(|m| m.name.to_ascii_lowercase())
-        .collect();
-
-    for mat in &def.materializations {
-        let mat_dims: HashSet<String> = mat
-            .dimensions
-            .iter()
-            .map(|d| d.to_ascii_lowercase())
-            .collect();
-        let mat_mets: HashSet<String> =
-            mat.metrics.iter().map(|m| m.to_ascii_lowercase()).collect();
-        if mat_dims == req_dims && mat_mets == req_mets {
-            return Some(&mat.name);
-        }
-    }
-    None
+    find_matching_materialization(def, resolved_dims, resolved_mets).map(|mat| mat.name.as_str())
 }
 
 /// Generate a SELECT from the materialization table.
