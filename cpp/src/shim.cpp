@@ -931,11 +931,11 @@ static void sv_create_from_yaml_function(
 // ---------------------------------------------------------------------------
 // Foundation shared by every migrated read-side table function: the generic
 // VARCHAR / VARCHAR+BOOL scaffolds below, the `list_semantic_views` family,
-// and the `semantic_view` bind. Introduced with the Wave-0 `list_semantic_
-// views` spike (Task 1) — the first read-side TF moved off duckdb-rs
-// `register_table_function_with_extra_info` (which marshals `ClientContext &`
-// away — Plan 01 Spike A6) onto the C++ Catalog API path via
-// `sv_register_table_function` (Plan 04). See `65-05-SPIKE-SUMMARY.md` for
+// and the `semantic_view` bind. Introduced with the Wave-0
+// `list_semantic_views` spike (Task 1) — the first read-side TF moved off
+// duckdb-rs `register_table_function_with_extra_info` (which marshals
+// `ClientContext &` away — Plan 01 Spike A6) onto the C++ Catalog API path
+// via `sv_register_table_function` (Plan 04). See `65-05-SPIKE-SUMMARY.md` for
 // the bridge design; the per-call `Connection probe` borrow contract is
 // documented on the FFI dispatcher declarations above and applied by the
 // shared bind helpers (`sv_run_varchar_bind` et al.) below.
