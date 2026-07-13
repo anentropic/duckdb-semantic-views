@@ -96,30 +96,23 @@ impl RelationshipGraph {
     pub fn check_no_diamonds(&self, def: &SemanticViewDefinition) -> Result<(), String> {
         for (node, parents) in &self.reverse {
             if node != &self.root && parents.len() > 1 {
-                // E-4 (code-review 2026-07-11): parents from two or more
-                // DISTINCT source tables is a genuine multi-path diamond
-                // (`root->a->c` AND `root->b->c`). The join path to `node` is
-                // ambiguous and expansion silently resolves it to whichever
-                // edge is declared first (verified: it emits only the first
-                // path and drops the other). Reject regardless of relationship
-                // naming — the role-playing allowance below is only for a
-                // SINGLE source table declaring several named FKs to the
-                // target, matching `role_playing::is_role_playing_target`'s
-                // same-`from` rule. (Convergence onto the base table — the
-                // `li->o`, `p->o` fan-in — is not a diamond and is skipped
-                // above by `node != root`.)
+                // Parents from two or more DISTINCT source tables => a genuine
+                // multi-path diamond with an ambiguous join path. The
+                // role-playing allowance below is only for a single source
+                // declaring several named FKs (see the method doc).
                 let distinct_sources: HashSet<&String> = parents.iter().collect();
                 if distinct_sources.len() > 1 {
                     let mut srcs: Vec<&str> = distinct_sources.iter().map(|s| s.as_str()).collect();
                     srcs.sort_unstable();
                     return Err(format!(
-                        "diamond: '{}' is reachable from multiple tables ({}); the join \
-                         path is ambiguous",
+                        "diamond: '{}' is reachable from multiple tables ({}); the join path \
+                         is ambiguous. Declare the target under a second table alias so it is \
+                         joined once per path.",
                         node,
                         srcs.into_iter()
                             .map(|s| format!("'{s}'"))
                             .collect::<Vec<_>>()
-                            .join(" and ")
+                            .join(", ")
                     ));
                 }
 
