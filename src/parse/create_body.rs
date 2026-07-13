@@ -311,10 +311,27 @@ pub(crate) fn extract_dollar_quoted(input: &str) -> Result<(String, usize), Pars
             position: None,
         });
     }
-    let tag_end = input[1..].find('$').ok_or_else(|| ParseError {
-        message: "Unterminated dollar-quote opening delimiter".to_string(),
-        position: None,
-    })? + 2;
+    // Recognize the opener through the crate's single dollar-tag definition so
+    // this extractor and `blank_sql_comments` agree on what a valid tag is
+    // (P-6). A run that is not a valid opener — an unterminated `$no_close`, a
+    // digit-started `$1$`, or a tag with interior whitespace — is rejected here
+    // rather than silently treated as a delimiter over comment-blanked text.
+    let tag_end = crate::util::read_dollar_tag_len(input.as_bytes(), 0).ok_or_else(|| {
+        // Distinguish a genuinely unterminated opener (no second `$` at all)
+        // from a terminated-but-invalid tag (`$1$`, `$ta g$`): the latter has a
+        // closing `$` for the tag but a body that is not a legal tag.
+        let message = if input[1..].contains('$') {
+            "Invalid dollar-quote tag (a tag must be empty or begin with a letter or \
+             underscore followed by letters, digits, or underscores)"
+                .to_string()
+        } else {
+            "Unterminated dollar-quote opening delimiter".to_string()
+        };
+        ParseError {
+            message,
+            position: None,
+        }
+    })?;
     let delimiter = &input[..tag_end];
     let content_start = tag_end;
     let close_pos = input[content_start..]

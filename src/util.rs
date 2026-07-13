@@ -229,6 +229,44 @@ pub fn starts_with_keyword_ci(s: &str, kw: &str) -> bool {
     s.len() >= n && s.as_bytes()[..n].eq_ignore_ascii_case(kw.as_bytes())
 }
 
+/// Length in bytes of the dollar-quote opener `$tag$` at `bytes[start]`, or
+/// `None` if there is no valid opener there.
+///
+/// Returns `None` when `start` is out of bounds or `bytes[start]` is not `$`,
+/// so callers may probe any offset without a prior bounds/`$` check. When it
+/// returns `Some(len)`, `bytes[start]` was `$` and `&bytes[start..start + len]`
+/// is the opener (e.g. `$$`, `$yaml$`). The tag body is ASCII alphanumerics and
+/// `_` and may **not** start with a digit — `$1` is a positional parameter, not
+/// a dollar-quote tag — matching `PostgreSQL`/`DuckDB`. The empty tag `$$` is
+/// valid; the returned length includes both `$` delimiters.
+///
+/// **Single source of truth for dollar-quote tags** (P-6, code-review
+/// 2026-07-11), shared by [`blank_sql_comments`] and the CREATE-body
+/// `extract_dollar_quoted` extractor so the two can never disagree about what
+/// a valid tag is. Previously the extractor accepted any run between two `$`
+/// (including `$1$` and `$ta g$`) while comment-blanking recognized only the
+/// stricter form; a body opened with a tag the blanker rejected had its `--`
+/// runs blanked as SQL before the extractor stored the (now corrupted) text.
+#[must_use]
+pub fn read_dollar_tag_len(bytes: &[u8], start: usize) -> Option<usize> {
+    if start >= bytes.len() || bytes[start] != b'$' {
+        return None;
+    }
+    let mut j = start + 1;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        // A tag may not START with a digit ($1 is a parameter, not a tag).
+        if j == start + 1 && bytes[j].is_ascii_digit() {
+            return None;
+        }
+        j += 1;
+    }
+    if j < bytes.len() && bytes[j] == b'$' {
+        Some(j - start + 1)
+    } else {
+        None
+    }
+}
+
 /// Blank SQL comments out of `input`, byte-for-byte length-preserving.
 ///
 /// Every byte of a comment — `-- ...` to end of line (the newline itself is
@@ -267,27 +305,6 @@ pub fn blank_sql_comments(input: &str) -> std::borrow::Cow<'_, str> {
     let mut st = St::Code;
     let mut dollar_tag: Option<&[u8]> = None;
     let mut i = 0;
-
-    // Try to read a dollar-quote opener `$tag$` at `i`; returns the tag
-    // including both `$` delimiters.
-    let read_dollar_tag = |i: usize| -> Option<&[u8]> {
-        if bytes[i] != b'$' {
-            return None;
-        }
-        let mut j = i + 1;
-        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-            // A tag may not START with a digit ($1 is a parameter, not a tag).
-            if j == i + 1 && bytes[j].is_ascii_digit() {
-                return None;
-            }
-            j += 1;
-        }
-        if j < bytes.len() && bytes[j] == b'$' {
-            Some(&bytes[i..=j])
-        } else {
-            None
-        }
-    };
 
     while i < bytes.len() {
         if let Some(tag) = dollar_tag {
@@ -331,9 +348,9 @@ pub fn blank_sql_comments(input: &str) -> std::borrow::Cow<'_, str> {
                     i += 1;
                 }
                 b'$' => {
-                    if let Some(tag) = read_dollar_tag(i) {
-                        i += tag.len();
-                        dollar_tag = Some(tag);
+                    if let Some(len) = read_dollar_tag_len(bytes, i) {
+                        dollar_tag = Some(&bytes[i..i + len]);
+                        i += len;
                     } else {
                         i += 1;
                     }
@@ -761,6 +778,45 @@ mod tests {
         // here (PA-1); byte comparison just fails.
         assert!(!starts_with_keyword_ci("aΩΩ", "LIKE"));
         assert!(!starts_with_keyword_ci("Ωx", "IN"));
+    }
+
+    // -------------------------------------------------------------------
+    // read_dollar_tag_len tests (P-6)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn dollar_tag_valid_forms() {
+        // Empty tag `$$` (len 2) and a named tag `$yaml$` (len 6).
+        assert_eq!(read_dollar_tag_len(b"$$rest", 0), Some(2));
+        assert_eq!(read_dollar_tag_len(b"$yaml$rest", 0), Some(6));
+        assert_eq!(read_dollar_tag_len(b"$_t9$x", 0), Some(5));
+    }
+
+    #[test]
+    fn dollar_tag_rejects_invalid_openers() {
+        // P-6: these are the forms the extractor used to accept but the
+        // comment-blanker rejected. Both must now agree they are NOT openers.
+        assert_eq!(read_dollar_tag_len(b"$1$body$1$", 0), None); // digit-started tag
+        assert_eq!(read_dollar_tag_len(b"$ta g$", 0), None); // interior whitespace
+        assert_eq!(read_dollar_tag_len(b"$no_close", 0), None); // unterminated opener
+        assert_eq!(read_dollar_tag_len(b"nope", 0), None); // no leading `$`
+        assert_eq!(read_dollar_tag_len(b"", 0), None); // empty input
+    }
+
+    #[test]
+    fn blank_comments_and_dollar_tag_agree_on_validity() {
+        // A VALID tag makes the payload inert: `--` inside survives.
+        let valid = "FROM YAML $y$a: 1 -- keep$y$";
+        assert_eq!(blank_sql_comments(valid), valid);
+        // An INVALID tag (`$1$`) is not a dollar-quote, so the payload is
+        // scanned as SQL and its line comment IS blanked — matching the fact
+        // that `extract_dollar_quoted` now rejects `$1$` outright rather than
+        // storing this blanked text (P-6).
+        let out = blank_sql_comments("$1$a -- x$1$");
+        assert!(
+            !out.contains("-- x"),
+            "invalid tag payload must be treated as SQL: {out}"
+        );
     }
 
     // -------------------------------------------------------------------
