@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::model::{Fact, TableRef};
-use crate::util::{is_word_boundary_char, replace_word_boundary_any, replace_word_boundary_pairs};
+use crate::util::{
+    contains_word_boundary_ref, is_word_boundary_char, replace_word_boundary_any,
+    replace_word_boundary_pairs,
+};
 
 use super::resolution::quote_ident;
 
@@ -45,27 +48,10 @@ pub(super) fn collect_derived_metric_using(
                 }
             }
         } else {
-            // Derived metric: find referenced metric names and push to stack
-            let expr_lower = current_met.expr.to_ascii_lowercase();
+            // Derived metric: find referenced metric names and push to stack.
             for name in &all_names {
-                if *name == current_name {
-                    continue;
-                }
-                let expr_bytes = expr_lower.as_bytes();
-                let name_bytes = name.as_bytes();
-                let name_len = name_bytes.len();
-                let mut pos = 0;
-                while pos + name_len <= expr_bytes.len() {
-                    if &expr_bytes[pos..pos + name_len] == name_bytes {
-                        let before_ok = pos == 0 || is_word_boundary_char(expr_bytes[pos - 1]);
-                        let after_ok = pos + name_len == expr_bytes.len()
-                            || is_word_boundary_char(expr_bytes[pos + name_len]);
-                        if before_ok && after_ok {
-                            stack.push(name.clone());
-                            break;
-                        }
-                    }
-                    pos += 1;
+                if *name != current_name && contains_word_boundary_ref(&current_met.expr, name) {
+                    stack.push(name.clone());
                 }
             }
         }
@@ -99,28 +85,14 @@ pub(super) fn toposort_facts(facts: &[Fact]) -> Result<Vec<usize>, String> {
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n]; // dependents[dep] = facts that depend on dep
 
     for (i, fact) in facts.iter().enumerate() {
-        let expr_lower = fact.expr.to_ascii_lowercase();
         for (name, &dep_idx) in &name_to_idx {
             if dep_idx == i {
                 continue; // skip self
             }
-            // Check if this fact's expr references the other fact name using word boundary
-            let expr_bytes = expr_lower.as_bytes();
-            let name_bytes = name.as_bytes();
-            let name_len = name_bytes.len();
-            let mut pos = 0;
-            while pos + name_len <= expr_bytes.len() {
-                if &expr_bytes[pos..pos + name_len] == name_bytes {
-                    let before_ok = pos == 0 || is_word_boundary_char(expr_bytes[pos - 1]);
-                    let after_ok = pos + name_len == expr_bytes.len()
-                        || is_word_boundary_char(expr_bytes[pos + name_len]);
-                    if before_ok && after_ok {
-                        in_degree[i] += 1;
-                        dependents[dep_idx].push(i);
-                        break;
-                    }
-                }
-                pos += 1;
+            // Does this fact's expr reference the other fact name (whole word)?
+            if contains_word_boundary_ref(&fact.expr, name) {
+                in_degree[i] += 1;
+                dependents[dep_idx].push(i);
             }
         }
     }
@@ -328,28 +300,14 @@ fn toposort_derived(
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
 
     for (i, (_, met)) in derived.iter().enumerate() {
-        let expr_lower = met.expr.to_ascii_lowercase();
         for (name, &dep_idx) in &name_to_idx {
             if dep_idx == i {
                 continue; // skip self
             }
-            // Check word-boundary reference
-            let expr_bytes = expr_lower.as_bytes();
-            let name_bytes = name.as_bytes();
-            let name_len = name_bytes.len();
-            let mut pos = 0;
-            while pos + name_len <= expr_bytes.len() {
-                if &expr_bytes[pos..pos + name_len] == name_bytes {
-                    let before_ok = pos == 0 || is_word_boundary_char(expr_bytes[pos - 1]);
-                    let after_ok = pos + name_len == expr_bytes.len()
-                        || is_word_boundary_char(expr_bytes[pos + name_len]);
-                    if before_ok && after_ok {
-                        in_degree[i] += 1;
-                        dependents[dep_idx].push(i);
-                        break;
-                    }
-                }
-                pos += 1;
+            // Only derived-to-derived edges: does this expr reference `name`?
+            if contains_word_boundary_ref(&met.expr, name) {
+                in_degree[i] += 1;
+                dependents[dep_idx].push(i);
             }
         }
     }
@@ -521,29 +479,6 @@ pub(super) fn inline_derived_metrics(
     })
 }
 
-/// True when `expr_lower` references `name` at a word boundary.
-///
-/// Both arguments must already be lowercased. Shared byte-scan used by the
-/// transitive metric walks.
-fn references_name(expr_lower: &str, name: &str) -> bool {
-    let expr_bytes = expr_lower.as_bytes();
-    let name_bytes = name.as_bytes();
-    let name_len = name_bytes.len();
-    let mut pos = 0;
-    while pos + name_len <= expr_bytes.len() {
-        if &expr_bytes[pos..pos + name_len] == name_bytes {
-            let before_ok = pos == 0 || is_word_boundary_char(expr_bytes[pos - 1]);
-            let after_ok = pos + name_len == expr_bytes.len()
-                || is_word_boundary_char(expr_bytes[pos + name_len]);
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-        pos += 1;
-    }
-    false
-}
-
 /// Collect the lowercased names of `met` and every metric it transitively
 /// depends on: derived metrics contribute the metric names referenced in
 /// their expressions; window metrics contribute their inner metric.
@@ -577,10 +512,9 @@ pub(super) fn collect_transitive_metric_names(
             stack.push(ws.inner_metric.to_ascii_lowercase());
         }
         if current_met.source_table.is_none() {
-            // Derived metric: find referenced metric names and push to stack
-            let expr_lower = current_met.expr.to_ascii_lowercase();
+            // Derived metric: find referenced metric names and push to stack.
             for name in &all_names {
-                if *name != current_name && references_name(&expr_lower, name) {
+                if *name != current_name && contains_word_boundary_ref(&current_met.expr, name) {
                     stack.push(name.clone());
                 }
             }
@@ -624,28 +558,10 @@ pub(crate) fn collect_derived_metric_source_tables(
             // Base metric: add its source table
             sources.insert(st.to_ascii_lowercase());
         } else {
-            // Derived metric: find referenced metric names and push to stack
-            let expr_lower = current_met.expr.to_ascii_lowercase();
+            // Derived metric: find referenced metric names and push to stack.
             for name in &all_names {
-                if *name == current_name {
-                    continue;
-                }
-                // Word-boundary check
-                let expr_bytes = expr_lower.as_bytes();
-                let name_bytes = name.as_bytes();
-                let name_len = name_bytes.len();
-                let mut pos = 0;
-                while pos + name_len <= expr_bytes.len() {
-                    if &expr_bytes[pos..pos + name_len] == name_bytes {
-                        let before_ok = pos == 0 || is_word_boundary_char(expr_bytes[pos - 1]);
-                        let after_ok = pos + name_len == expr_bytes.len()
-                            || is_word_boundary_char(expr_bytes[pos + name_len]);
-                        if before_ok && after_ok {
-                            stack.push(name.clone());
-                            break;
-                        }
-                    }
-                    pos += 1;
+                if *name != current_name && contains_word_boundary_ref(&current_met.expr, name) {
+                    stack.push(name.clone());
                 }
             }
         }

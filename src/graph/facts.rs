@@ -7,44 +7,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
 use crate::model::SemanticViewDefinition;
-use crate::util::{is_word_boundary_char, suggest_closest};
+use crate::util::suggest_closest;
 
 /// Find references to known fact names in an expression using word-boundary matching.
 ///
 /// Returns a list of fact names found in `expr`. Only matches whole words:
 /// `net_price` matches in `SUM(net_price)` and `net_price + tax`
-/// but NOT in `net_price_total` or `my_net_price`.
+/// but NOT in `net_price_total` or `my_net_price`. Case-insensitive.
+///
+/// A thin domain-named view over the shared reference engine
+/// [`crate::util::find_word_boundary_refs`] (§6.2, code-review 2026-07-11) —
+/// this used to hand-roll its own dual-buffer byte scan.
 #[must_use]
 pub fn find_fact_references<'a>(expr: &str, fact_names: &[&'a str]) -> Vec<&'a str> {
-    let bytes = expr.as_bytes();
-    let expr_lower = expr.to_ascii_lowercase();
-    let lower_bytes = expr_lower.as_bytes();
-    let mut found = Vec::new();
-
-    for &fact_name in fact_names {
-        let fn_lower = fact_name.to_ascii_lowercase();
-        let fn_bytes = fn_lower.as_bytes();
-        let fn_len = fn_bytes.len();
-        if fn_len == 0 || fn_len > bytes.len() {
-            continue;
-        }
-
-        let mut i = 0;
-        while i + fn_len <= lower_bytes.len() {
-            if &lower_bytes[i..i + fn_len] == fn_bytes {
-                let before_ok = i == 0 || is_word_boundary_char(bytes[i - 1]);
-                let after_ok =
-                    i + fn_len == bytes.len() || is_word_boundary_char(bytes[i + fn_len]);
-                if before_ok && after_ok {
-                    found.push(fact_name);
-                    break; // Each fact name only counted once
-                }
-            }
-            i += 1;
-        }
-    }
-
-    found
+    crate::util::find_word_boundary_refs(expr, fact_names)
 }
 
 /// Validate facts in a semantic view definition.
