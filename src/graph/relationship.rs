@@ -83,15 +83,50 @@ impl RelationshipGraph {
     /// Check that the relationship graph is a tree (each non-root node has
     /// at most one parent), with an exception for role-playing dimensions.
     ///
-    /// Returns `Err` with diamond description if any node is reachable via
-    /// multiple paths, UNLESS all relationships pointing to that node are named
-    /// with distinct names (Phase 32: role-playing dimension support).
+    /// Returns `Err` with a diamond description if any non-root node is
+    /// reachable via multiple paths. The sole exception (Phase 32:
+    /// role-playing) is a node reached by multiple relationships **all from the
+    /// same source table**, each named with a distinct name (e.g.
+    /// `flights -> airports` via `dep_airport` and `arr_airport`). Multiple
+    /// paths from *different* source tables are always a genuine diamond and
+    /// are rejected regardless of naming (E-4), because expansion would
+    /// otherwise resolve the ambiguous path to whichever edge was declared
+    /// first. (Fan-in onto the base table is not a diamond — the root is
+    /// exempt.)
     pub fn check_no_diamonds(&self, def: &SemanticViewDefinition) -> Result<(), String> {
         for (node, parents) in &self.reverse {
             if node != &self.root && parents.len() > 1 {
-                // Check if ALL relationships to this node are named with distinct names.
-                // If so, this is a role-playing pattern (e.g., flights -> airports via
-                // dep_airport and arr_airport) and should be allowed.
+                // E-4 (code-review 2026-07-11): parents from two or more
+                // DISTINCT source tables is a genuine multi-path diamond
+                // (`root->a->c` AND `root->b->c`). The join path to `node` is
+                // ambiguous and expansion silently resolves it to whichever
+                // edge is declared first (verified: it emits only the first
+                // path and drops the other). Reject regardless of relationship
+                // naming — the role-playing allowance below is only for a
+                // SINGLE source table declaring several named FKs to the
+                // target, matching `role_playing::is_role_playing_target`'s
+                // same-`from` rule. (Convergence onto the base table — the
+                // `li->o`, `p->o` fan-in — is not a diamond and is skipped
+                // above by `node != root`.)
+                let distinct_sources: HashSet<&String> = parents.iter().collect();
+                if distinct_sources.len() > 1 {
+                    let mut srcs: Vec<&str> = distinct_sources.iter().map(|s| s.as_str()).collect();
+                    srcs.sort_unstable();
+                    return Err(format!(
+                        "diamond: '{}' is reachable from multiple tables ({}); the join \
+                         path is ambiguous",
+                        node,
+                        srcs.into_iter()
+                            .map(|s| format!("'{s}'"))
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    ));
+                }
+
+                // Single source, multiple edges: allowed only as role-playing —
+                // every relationship to this node must be named with a distinct
+                // name (e.g. flights -> airports via dep_airport and
+                // arr_airport).
                 let joins_to_node: Vec<&crate::model::Join> = def
                     .joins
                     .iter()
@@ -382,7 +417,7 @@ mod tests {
         );
         let err = validate_graph(&def).unwrap_err();
         assert!(
-            err.contains("diamond") && err.contains("two paths to"),
+            err.contains("diamond") && err.contains("reachable from multiple tables"),
             "expected diamond error, got: {err}"
         );
     }
@@ -660,6 +695,38 @@ mod tests {
         assert!(
             validate_graph(&def).is_ok(),
             "Two named relationships to same table should be accepted"
+        );
+    }
+
+    #[test]
+    fn named_cross_source_diamond_rejected() {
+        // E-4 (code-review 2026-07-11): a node reached from two DIFFERENT
+        // source tables via distinctly-named relationships is a genuine
+        // multi-path diamond, NOT role-playing. It was previously accepted
+        // (the relaxation only checked name uniqueness), and expansion then
+        // silently joined the node through whichever edge was declared first.
+        // It must be rejected: role-playing requires a single source table.
+        //   a (base) -> b, a -> c, b -> d (via_b), c -> d (via_c)  =>  d is a
+        //   diamond reachable from both b and c.
+        let def = make_def_with_named_joins(
+            vec![
+                ("a", "tbl_a", vec!["id"]),
+                ("b", "tbl_b", vec!["id"]),
+                ("c", "tbl_c", vec!["id"]),
+                ("d", "tbl_d", vec!["id"]),
+            ],
+            vec![
+                (Some("a_to_b"), "a", "b", vec!["b_id"]),
+                (Some("a_to_c"), "a", "c", vec!["c_id"]),
+                (Some("via_b"), "b", "d", vec!["d_id"]),
+                (Some("via_c"), "c", "d", vec!["d_id"]),
+            ],
+            vec![("cnt", Some("a"), vec![])],
+        );
+        let err = validate_graph(&def).unwrap_err();
+        assert!(
+            err.contains("diamond") && err.contains("reachable from multiple tables"),
+            "cross-source named diamond must be rejected: {err}"
         );
     }
 
