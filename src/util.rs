@@ -212,6 +212,62 @@ pub fn is_word_boundary_char(b: u8) -> bool {
     !is_ident_byte(b)
 }
 
+/// Does `haystack` reference `needle` at a word boundary?
+///
+/// `true` iff `needle` occurs in `haystack` delimited on both sides by
+/// [`is_word_boundary_char`], compared ASCII-case-insensitively — so `revenue`
+/// matches in `SUM(Revenue)` and `revenue + tax` but not in `revenue_total`,
+/// `my_revenue`, or `revenueΩ`.
+///
+/// This is the FIND counterpart of [`replace_word_boundary`] and the single
+/// primitive for the fact / derived-metric *dependency* scans (`expand::facts`,
+/// `graph::facts`), replacing the byte loops those sites hand-rolled. Like the
+/// replace primitives it is **not** quote-aware and does not treat `.`
+/// specially — it answers "does this bare identifier appear as a whole word",
+/// which is what dependency discovery over an expression needs. (The
+/// aggregate-function detector and identifier tokenizer in `graph` additionally
+/// need quote-skipping and lookahead, so they stay separate.)
+#[must_use]
+pub fn contains_word_boundary_ref(haystack: &str, needle: &str) -> bool {
+    let n_bytes = needle.as_bytes();
+    let n_len = n_bytes.len();
+    if n_len == 0 || n_len > haystack.len() {
+        return false;
+    }
+    let h_bytes = haystack.as_bytes();
+    // Byte-wise scan is safe: we only index byte windows and test boundary
+    // bytes (never slice `haystack` by `i`), and `eq_ignore_ascii_case` folds
+    // only ASCII letters, so a multi-byte needle byte is compared exactly.
+    let mut i = 0;
+    while i + n_len <= h_bytes.len() {
+        if h_bytes[i..i + n_len].eq_ignore_ascii_case(n_bytes) {
+            let before_ok = i == 0 || is_word_boundary_char(h_bytes[i - 1]);
+            let after_ok = i + n_len == h_bytes.len() || is_word_boundary_char(h_bytes[i + n_len]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Of `needles`, those referenced in `haystack` at a word boundary — the
+/// multi-needle FIND counterpart of [`replace_word_boundary_pairs`].
+///
+/// Each needle contributes at most one entry (even if it occurs several times),
+/// and results follow `needles` order. Matching rules are exactly
+/// [`contains_word_boundary_ref`]'s. This is the "which known names does this
+/// expression reference" primitive for metric/fact dependency discovery.
+#[must_use]
+pub fn find_word_boundary_refs<'a>(haystack: &str, needles: &[&'a str]) -> Vec<&'a str> {
+    needles
+        .iter()
+        .copied()
+        .filter(|needle| contains_word_boundary_ref(haystack, needle))
+        .collect()
+}
+
 /// Does `s` start with the ASCII keyword `kw`, case-insensitively?
 ///
 /// Compares raw *bytes*, so it is safe on any UTF-8 input: the old
@@ -562,6 +618,55 @@ mod tests {
             replace_word_boundary("Net_Price_total", "net_price", "(x)"),
             "Net_Price_total"
         );
+    }
+
+    #[test]
+    fn contains_word_boundary_ref_whole_word_only() {
+        // Matches as a whole word...
+        assert!(contains_word_boundary_ref("SUM(revenue)", "revenue"));
+        assert!(contains_word_boundary_ref("revenue + tax", "revenue"));
+        assert!(contains_word_boundary_ref("tax - revenue", "revenue"));
+        assert!(contains_word_boundary_ref("revenue", "revenue"));
+        // ...but not as a substring of a larger identifier.
+        assert!(!contains_word_boundary_ref("revenue_total", "revenue"));
+        assert!(!contains_word_boundary_ref("my_revenue", "revenue"));
+        // Non-ASCII abutting bytes are identifier continuation (E-5), not
+        // boundaries, so an ASCII needle must not match against them.
+        assert!(!contains_word_boundary_ref("revenueΩ", "revenue"));
+        assert!(!contains_word_boundary_ref("Ωrevenue", "revenue"));
+        // A genuine ASCII boundary (`.`) is still a boundary here — this
+        // primitive, unlike the inliner, does not special-case `.`.
+        assert!(contains_word_boundary_ref("x.revenue", "revenue"));
+    }
+
+    #[test]
+    fn contains_word_boundary_ref_case_insensitive() {
+        assert!(contains_word_boundary_ref("SUM(Revenue)", "revenue"));
+        assert!(contains_word_boundary_ref("sum(revenue)", "REVENUE"));
+    }
+
+    #[test]
+    fn contains_word_boundary_ref_edge_cases() {
+        assert!(!contains_word_boundary_ref("anything", "")); // empty needle
+        assert!(!contains_word_boundary_ref("ab", "abc")); // needle longer than haystack
+        assert!(!contains_word_boundary_ref("", "x"));
+    }
+
+    #[test]
+    fn find_word_boundary_refs_returns_referenced_subset_in_order() {
+        let needles = ["revenue", "cost", "tax", "profit"];
+        // `profit` and `tax` are not referenced; result keeps `needles` order.
+        assert_eq!(
+            find_word_boundary_refs("revenue - cost", &needles),
+            vec!["revenue", "cost"]
+        );
+        // Each needle contributes at most one entry even if it occurs twice.
+        assert_eq!(
+            find_word_boundary_refs("revenue + revenue", &["revenue"]),
+            vec!["revenue"]
+        );
+        // Nothing referenced.
+        assert!(find_word_boundary_refs("count(*)", &needles).is_empty());
     }
 
     #[test]
