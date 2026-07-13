@@ -1,11 +1,12 @@
-# PA-8 (code-review 2026-07-02): view-name case normalization.
+# PA-8 (code-review 2026-07-02); case rule revised 2026-07-12.
 #
-# Unquoted view names fold to ASCII lowercase at every DDL capture site and
-# at the semantic_view() lookup argument; "quoted" names preserve exact case.
-# This matches the Snowflake identifier contract (fold unquoted, preserve
-# quoted) with DuckDB's lowercase fold direction. Previously unquoted names
-# were byte-exact case-sensitive: CREATE ... Sales then DROP ... sales
-# failed with "does not exist".
+# View names fold to ASCII lowercase at every DDL capture site and at the
+# semantic_view() lookup argument, whether written quoted or not — DuckDB
+# treats even double-quoted identifiers as case-insensitive, and this
+# extension follows DuckDB's identifier semantics. Previously unquoted names
+# were byte-exact case-sensitive (CREATE ... Sales then DROP ... sales failed);
+# an intermediate revision preserved quoted names (Snowflake-style), since
+# reversed so quoting no longer affects matching.
 
 require semantic_views
 
@@ -56,7 +57,8 @@ SELECT count(*) FROM list_semantic_views();
 0
 
 # ============================================================
-# Quoted mixed-case name preserves exact case
+# Quoted mixed-case name ALSO folds to lowercase (DuckDB: quoted
+# identifiers are case-insensitive too)
 # ============================================================
 
 statement ok
@@ -65,19 +67,13 @@ CREATE SEMANTIC VIEW "SalesView" AS
   DIMENSIONS (o.region AS o.region)
   METRICS (o.total AS SUM(o.amount));
 
+# Stored under the folded name, exactly like the unquoted form.
 query I
 SELECT name FROM list_semantic_views();
 ----
-SalesView
+salesview
 
-# An unquoted reference folds to lowercase and does NOT find the
-# case-preserved quoted name.
-statement error
-DROP SEMANTIC VIEW SalesView;
-----
-does not exist
-
-# The quoted reference finds it.
+# Every casing reaches the same view, quoted or not.
 query II
 FROM semantic_view('"SalesView"', dimensions := ['region'], metrics := ['total'])
 ORDER BY 1;
@@ -85,5 +81,19 @@ ORDER BY 1;
 EU	50.00
 US	100.00
 
+query II
+FROM semantic_view('salesview', dimensions := ['region'], metrics := ['total'])
+ORDER BY 1;
+----
+EU	50.00
+US	100.00
+
+# An unquoted reference finds the (quoted-created) view — quoting is
+# irrelevant to matching.
 statement ok
-DROP SEMANTIC VIEW "SalesView";
+DROP SEMANTIC VIEW SalesView;
+
+query I
+SELECT count(*) FROM list_semantic_views();
+----
+0

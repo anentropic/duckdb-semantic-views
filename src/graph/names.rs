@@ -1,20 +1,22 @@
 //! Define-time name-uniqueness validation (SG-13).
 //!
 //! Dimensions, metrics, and facts are resolved from one request namespace at
-//! query time: `semantic_view(...)` looks names up under the Snowflake
-//! identifier contract and the first declaration wins, so any collision —
-//! within a kind or across kinds — silently shadows (duplicate metrics) or
-//! emits duplicate output columns (dimension/metric sharing a name). Reject
-//! collisions when the definition is created or altered.
+//! query time: `semantic_view(...)` looks names up case-insensitively
+//! (`DuckDB`'s identifier rule — quoting does not affect matching) and the first
+//! declaration wins, so any collision — within a kind or across kinds —
+//! silently shadows (duplicate metrics) or emits duplicate output columns
+//! (dimension/metric sharing a name). Reject collisions when the definition is
+//! created or altered.
 //!
 //! The uniqueness key MUST be the same key resolution uses
-//! ([`crate::ident::normalize_ident_part`]): an unquoted name folds to
-//! lowercase, a `"quoted"` name keeps its exact case. Keying on a plain
+//! ([`crate::ident::normalize_ident_part`]): quotes are stripped and the name
+//! folds to lowercase whether written quoted or not. Keying on a plain
 //! `to_ascii_lowercase` instead would diverge from resolution — a quoted
-//! `"region"` and an unquoted `REGION` would pass as distinct here yet both
-//! resolve to key `region`, silently shadowing (the SG-13 class this module
-//! prevents); conversely `"Region"` and `"REGION"` are genuinely distinct
-//! objects and must NOT be rejected as duplicates.
+//! `"region"` retains its quote characters and would pass as distinct from an
+//! unquoted `region` here yet both resolve to key `region`, silently shadowing
+//! (the SG-13 class this module prevents). Names differing only in case or
+//! quoting — `region`, `REGION`, `"Region"` — all share key `region` and
+//! collide.
 //!
 //! This is define-time-only validation: read paths (`SHOW`, `DESCRIBE`,
 //! expansion) intentionally keep first-match behavior so legacy catalog rows
@@ -25,9 +27,9 @@ use std::collections::HashMap;
 use crate::model::SemanticViewDefinition;
 
 /// Validate that dimension, metric, and fact names are unique across the
-/// shared namespace, under the same identifier contract resolution uses
-/// (unquoted case-insensitive, `"quoted"` case-sensitive — see the module
-/// docs and [`crate::ident::normalize_ident_part`]).
+/// shared namespace, under the same identifier rule resolution uses
+/// (case-insensitive, quoted or not — see the module docs and
+/// [`crate::ident::normalize_ident_part`]).
 ///
 /// Returns `Err` naming the colliding item and the kinds involved.
 pub fn validate_name_uniqueness(def: &SemanticViewDefinition) -> Result<(), String> {
@@ -43,8 +45,8 @@ pub fn validate_name_uniqueness(def: &SemanticViewDefinition) -> Result<(), Stri
         if let Some((first_kind, first_name)) = seen.get(key.as_str()) {
             return Err(format!(
                 "duplicate name '{name}': {kind} '{name}' collides with {first_kind} \
-                 '{first_name}' -- dimension, metric, and fact names share one namespace; \
-                 unquoted names are case-insensitive (quoted names case-sensitive)"
+                 '{first_name}' -- dimension, metric, and fact names share one namespace \
+                 and are case-insensitive (quoting does not make a name distinct)"
             ));
         }
         seen.insert(key, (kind, name));
@@ -162,28 +164,31 @@ mod tests {
         );
     }
 
-    /// Mirror case: two quoted names differing only in case are DISTINCT
-    /// objects under the identifier contract and must NOT be rejected as
-    /// duplicates (previously `to_ascii_lowercase` conflated them).
+    /// Two quoted names differing only in case collide under DuckDB's
+    /// case-insensitive rule (revised 2026-07-12): `"Region"` and `"REGION"`
+    /// both fold to key `region`, so they are duplicates. (Under the earlier
+    /// Snowflake-style rule they were distinct; DuckDB ignores case even for
+    /// quoted identifiers.)
     #[test]
-    fn quoted_names_differing_in_case_are_distinct() {
+    fn quoted_names_differing_in_case_collide() {
         let def = def_with(&["\"Region\"", "\"REGION\""], &[], &[]);
-        assert!(
-            validate_name_uniqueness(&def).is_ok(),
-            "quoted mixed-case names must be treated as distinct objects"
-        );
-    }
-
-    /// An unquoted name and a quoted name that preserves the SAME lowercase
-    /// spelling collide (unquoted `region` ≡ quoted `"region"` under the
-    /// lowercase fold, mirroring Snowflake's unquoted ≡ capitalized-quoted).
-    #[test]
-    fn unquoted_and_matching_lowercase_quoted_collide() {
-        let def = def_with(&["region", "\"region\""], &[], &[]);
         let err = validate_name_uniqueness(&def).unwrap_err();
         assert!(
             err.contains("duplicate name"),
-            "unquoted `region` and quoted `\"region\"` share key `region`: {err}"
+            "quoted mixed-case names share key `region`: {err}"
+        );
+    }
+
+    /// An unquoted name and a quoted name with the same spelling (any case)
+    /// collide — quoting is irrelevant to the key (`region` ≡ `"region"` ≡
+    /// `"Region"`, all key `region`).
+    #[test]
+    fn unquoted_and_quoted_same_name_collide() {
+        let def = def_with(&["region", "\"Region\""], &[], &[]);
+        let err = validate_name_uniqueness(&def).unwrap_err();
+        assert!(
+            err.contains("duplicate name"),
+            "unquoted `region` and quoted `\"Region\"` share key `region`: {err}"
         );
     }
 }

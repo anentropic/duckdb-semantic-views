@@ -360,28 +360,31 @@ fn arb_hostile_name_content() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-    /// Quoted hostile names round-trip through name extraction with exact
-    /// content (case preserved, no mojibake, no truncation at inner
-    /// whitespace/dots) for every name-only form.
+    /// Quoted hostile names round-trip through name extraction with their
+    /// content intact except for ASCII case, which folds to lowercase — DuckDB
+    /// treats quoted identifiers as case-insensitive too (revised 2026-07-12).
+    /// No mojibake, no truncation at inner whitespace/dots, for every
+    /// name-only form.
     #[test]
     fn extract_name_quoted_hostile_names(
         form_idx in 0..3usize,
         content in arb_hostile_name_content(),
     ) {
         let (prefix, _kind, fn_name) = NAME_ONLY_FORMS[form_idx];
+        let folded = content.to_ascii_lowercase();
         let quoted = format!("\"{}\"", content.replace('"', "\"\""));
         let ddl = format!("{prefix} {quoted}");
         let extracted = extract_ddl_name(&ddl).unwrap();
-        prop_assert_eq!(extracted, Some(content.clone()));
+        prop_assert_eq!(extracted, Some(folded.clone()));
 
-        // DROP carries the normalized view name structurally (quoted content is
-        // preserved by normalize_view_name). FF-4: DESCRIBE / SHOW COLUMNS now
-        // embed the RAW quoted name verbatim (single-quote-escaped) and defer
-        // folding to the TF dispatcher, matching every other read TF — so the
-        // passthrough SQL carries the quoted form, not the bare content.
+        // DROP carries the normalized view name structurally (quoted content
+        // folds to lowercase via normalize_view_name). FF-4: DESCRIBE / SHOW
+        // COLUMNS embed the RAW quoted name verbatim (single-quote-escaped) and
+        // defer folding to the TF dispatcher, matching every other read TF — so
+        // the passthrough SQL carries the quoted form, not the bare content.
         let action = rewrite_result(&ddl).unwrap();
         match action {
-            RewriteAction::Drop { name, .. } => prop_assert_eq!(name, content.clone()),
+            RewriteAction::Drop { name, .. } => prop_assert_eq!(name, folded.clone()),
             RewriteAction::Passthrough(sql) => {
                 let expected =
                     format!("SELECT * FROM {fn_name}('{}')", quoted.replace('\'', "''"));

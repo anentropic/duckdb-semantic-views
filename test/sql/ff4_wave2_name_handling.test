@@ -1,14 +1,14 @@
-# FF-4 (code-review 2026-07-02): wave-2 read table functions
-# (DESCRIBE / SHOW COLUMNS / SHOW SEMANTIC {DIMENSIONS,...} IN /
-# ... FOR METRIC) now handle view-name identifiers exactly like
+# FF-4 (code-review 2026-07-02; case rule revised 2026-07-12): wave-2 read
+# table functions (DESCRIBE / SHOW COLUMNS / SHOW SEMANTIC {DIMENSIONS,...} IN
+# / ... FOR METRIC) normalize view-name identifiers exactly like
 # semantic_view():
-#   * unquoted names fold to lowercase, quoted names preserve case
-#     (folding happens once, at the TF dispatcher — see FF-4 in
-#     src/parse/mod.rs and the ddl/ dispatchers), and
-#   * a NULL positional argument raises a clear BinderException instead
-#     of the confusing "'NULL' does not exist".
-# Previously DESCRIBE / SHOW COLUMNS double-normalized (folding a quoted
-# mixed-case name to lowercase and failing the lookup), and the SHOW ... IN
+#   * names fold to lowercase whether quoted or not — DuckDB treats
+#     double-quoted identifiers as case-insensitive too (folding happens once,
+#     at the TF dispatcher — see FF-4 in src/parse/mod.rs and the ddl/
+#     dispatchers), and
+#   * a NULL positional argument raises a clear BinderException instead of the
+#     confusing "'NULL' does not exist".
+# Previously DESCRIBE / SHOW COLUMNS double-normalized and the SHOW ... IN
 # forms skipped normalization entirely.
 
 require semantic_views
@@ -19,7 +19,7 @@ CREATE TABLE ff4_orders (id INTEGER PRIMARY KEY, amount DECIMAL(10,2), region VA
 statement ok
 INSERT INTO ff4_orders VALUES (1, 100.00, 'US'), (2, 50.00, 'EU');
 
-# Case-preserved (quoted) view name.
+# A quoted mixed-case view name folds to lowercase like any other.
 statement ok
 CREATE SEMANTIC VIEW "MixedCaseView" AS
   TABLES (o AS ff4_orders PRIMARY KEY (id))
@@ -29,7 +29,7 @@ CREATE SEMANTIC VIEW "MixedCaseView" AS
 query I
 SELECT name FROM list_semantic_views();
 ----
-MixedCaseView
+mixedcaseview
 
 # ============================================================
 # Quoted mixed-case name resolves through every wave-2 read form
@@ -53,7 +53,7 @@ statement ok
 SHOW SEMANTIC DIMENSIONS IN "MixedCaseView" FOR METRIC total;
 
 # Direct table-function calls fold identically to semantic_view(): the
-# quoted-in-string form preserves case and resolves.
+# quoted-in-string form folds to lowercase and resolves.
 query I
 SELECT count(*) > 0 FROM describe_semantic_view('"MixedCaseView"');
 ----
@@ -64,17 +64,15 @@ SELECT count(*) > 0 FROM show_columns_in_semantic_view('"MixedCaseView"');
 ----
 true
 
-# An unquoted reference folds to lowercase and does NOT find the
-# case-preserved view — consistent with semantic_view().
-statement error
+# An unquoted (any-case) reference resolves the SAME view — quoting is
+# irrelevant to matching in DuckDB, consistent with semantic_view().
+statement ok
 DESCRIBE SEMANTIC VIEW MixedCaseView;
-----
-does not exist
 
-statement error
-SELECT * FROM describe_semantic_view('MixedCaseView');
+query I
+SELECT count(*) > 0 FROM describe_semantic_view('MixedCaseView');
 ----
-does not exist
+true
 
 # ============================================================
 # NULL positional argument raises a BinderException up front

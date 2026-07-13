@@ -173,7 +173,7 @@ Use standard SQL ``ORDER BY`` and ``LIMIT`` on the outer query:
 Name Resolution
 ===============
 
-Dimension, metric, and fact names are resolved under the Snowflake identifier contract: an **unquoted** reference (``'region'``, ``'REGION'``) matches case-insensitively, while a **double-quoted** reference (``'"Region"'``) matches case-sensitively and only against a name declared with that exact quoted spelling. Names can optionally be table-qualified (e.g., ``'o.region'``), which matches against the ``source_table`` alias of the dimension, metric, or fact.
+Dimension, metric, and fact names are resolved case-insensitively, following DuckDB's identifier semantics: matching ignores case whether the reference is written unquoted (``'region'``, ``'REGION'``) or double-quoted (``'"Region"'``) — DuckDB treats double-quoted identifiers as case-insensitive too, so quoting a reference only lets it carry whitespace or special characters, it does not make it case-sensitive. Names can optionally be table-qualified (e.g., ``'o.region'``), which matches against the ``source_table`` alias of the dimension, metric, or fact.
 
 Wildcard patterns (``alias.*``) are expanded before name resolution. The expansion respects ``PRIVATE`` access modifiers -- private items are excluded.
 

@@ -108,9 +108,9 @@ All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` 
 
 .. note::
 
-   **View name case.** An unquoted ``<name>`` is folded to lowercase before it is stored, and every later reference — ``DROP`` / ``DESCRIBE`` / ``ALTER`` / ``SHOW COLUMNS`` statements and the :ref:`semantic_view() <ref-semantic-view-function>` lookup argument — folds unquoted names the same way, so ``CREATE SEMANTIC VIEW Sales`` and ``DROP SEMANTIC VIEW SALES`` refer to the same view. A ``"quoted"`` name preserves its exact case and must be referenced quoted. This is the Snowflake identifier contract (fold unquoted, preserve quoted) with DuckDB's lowercase fold direction.
+   **View name case.** A ``<name>`` is folded to lowercase before it is stored, whether written quoted or not, and every later reference — ``DROP`` / ``DESCRIBE`` / ``ALTER`` / ``SHOW COLUMNS`` statements and the :ref:`semantic_view() <ref-semantic-view-function>` lookup argument — folds the same way, so ``CREATE SEMANTIC VIEW Sales``, ``DROP SEMANTIC VIEW SALES``, and ``DROP SEMANTIC VIEW "sales"`` all refer to the same view. This follows DuckDB's identifier semantics, where double-quoted identifiers are case-insensitive too; quoting a name only lets it contain whitespace or other special characters, it does not make it case-sensitive.
 
-   *Migration:* views created before v0.11 with unquoted mixed-case names are stored under their original casing; reference them quoted (``"Sales"``) or drop and recreate them.
+   *Migration:* views created before v0.11 with a mixed-case name — quoted or unquoted — are stored under their original casing; reference them in lowercase, or drop and recreate them.
 
 .. note::
 
@@ -270,8 +270,8 @@ Declares named grouping expressions available for queries.
 
 **Validation rules:**
 
-- Dimension names must be unique within the view (case-insensitive for unquoted names; a double-quoted name such as ``"Region"`` is a distinct, case-sensitive name). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
-- A dimension name cannot collide with any metric name (case-insensitive for unquoted names; a double-quoted name such as ``"Region"`` is a distinct, case-sensitive name). See :ref:`ref-err-name-uniqueness`.
+- Dimension names must be unique within the view (case-insensitive, quoted or not — DuckDB treats double-quoted identifiers as case-insensitive too). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
+- A dimension name cannot collide with any metric name (case-insensitive, quoted or not — DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
 
 **Type inference:**
 
@@ -389,8 +389,8 @@ See :ref:`howto-window-metrics` for details on both modes.
 
 **Validation rules:**
 
-- Metric names must be unique within the view (case-insensitive for unquoted names; a double-quoted name such as ``"Revenue"`` is a distinct, case-sensitive name), across both base and derived metrics. See :ref:`ref-err-name-uniqueness`.
-- A metric name cannot collide with any dimension name (case-insensitive for unquoted names; a double-quoted name such as ``"Region"`` is a distinct, case-sensitive name). See :ref:`ref-err-name-uniqueness`.
+- Metric names must be unique within the view (case-insensitive, quoted or not — DuckDB treats double-quoted identifiers as case-insensitive too), across both base and derived metrics. See :ref:`ref-err-name-uniqueness`.
+- A metric name cannot collide with any dimension name (case-insensitive, quoted or not — DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
 - Derived metrics must not contain aggregate functions.
 - Circular derived metric references are rejected.
 - ``USING`` relationship names must match declared relationships.

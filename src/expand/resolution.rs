@@ -144,10 +144,10 @@ fn source_table_matches(
     }
 }
 
-/// Look up a dimension by name under the Snowflake identifier contract
-/// ([`crate::ident::ident_matches`]): an unquoted reference matches
-/// case-insensitively, a `"quoted"` reference case-sensitively. For unquoted
-/// names this is identical to the former `eq_ignore_ascii_case`.
+/// Look up a dimension by name under `DuckDB`'s case-insensitive identifier
+/// rule ([`crate::ident::ident_matches`]): matching ignores case and quoting
+/// alike. For unquoted names this is identical to the former
+/// `eq_ignore_ascii_case`.
 ///
 /// Supports table-qualified names: if `name` contains a '.' (e.g., "o.region"),
 /// splits into (alias, `bare_name`) and matches only dimensions whose
@@ -174,9 +174,8 @@ pub(super) fn find_dimension<'a>(
     }
 }
 
-/// Look up a metric by name under the Snowflake identifier contract
-/// ([`crate::ident::ident_matches`]): unquoted references match
-/// case-insensitively, `"quoted"` references case-sensitively.
+/// Look up a metric by name under `DuckDB`'s case-insensitive identifier rule
+/// ([`crate::ident::ident_matches`]): matching ignores case and quoting alike.
 ///
 /// Supports table-qualified names: if `name` contains a '.' (e.g., "o.revenue"),
 /// splits into (alias, `bare_name`) and matches only metrics whose
@@ -329,12 +328,10 @@ mod tests {
             assert!(find_dimension(&def, "nonexistent").is_none());
         }
 
-        /// A quoted mixed-case stored dimension (`"Region"`) follows the
-        /// Snowflake identifier contract: it matches a `"Region"` reference
-        /// case-sensitively, but NOT `"region"`, nor an unquoted `region`
-        /// (whose fold key is `region`, a different object). An unquoted
-        /// reference of any case remains case-insensitive against an unquoted
-        /// stored name.
+        /// A quoted mixed-case stored dimension (`"Region"`) matches
+        /// case-INsensitively under DuckDB's identifier rule (revised
+        /// 2026-07-12): quoting does not make it case-sensitive, so `"Region"`,
+        /// `"region"`, `region`, `REGION`, etc. all resolve to it.
         fn quoted_dim_def() -> SemanticViewDefinition {
             let mut def = def_with_db_schema(None, None);
             def.tables = vec![TableRef {
@@ -362,29 +359,29 @@ mod tests {
         }
 
         #[test]
-        fn quoted_stored_name_is_case_sensitive() {
+        fn quoted_stored_name_is_case_insensitive() {
             let def = quoted_dim_def();
-            // Exact quoted reference matches.
+            // A quoted mixed-case stored name resolves for a reference of any
+            // case, quoted or not (DuckDB case-insensitive; quotes stripped).
             assert!(find_dimension(&def, "\"Region\"").is_some());
-            // Different-case quoted reference does NOT match.
-            assert!(find_dimension(&def, "\"region\"").is_none());
-            assert!(find_dimension(&def, "\"REGION\"").is_none());
-            // An unquoted reference (fold key `region`) is a different object
-            // from the quoted `Region`.
-            assert!(find_dimension(&def, "region").is_none());
-            assert!(find_dimension(&def, "Region").is_none());
+            assert!(find_dimension(&def, "\"region\"").is_some());
+            assert!(find_dimension(&def, "\"REGION\"").is_some());
+            assert!(find_dimension(&def, "region").is_some());
+            assert!(find_dimension(&def, "Region").is_some());
+            // A genuinely different name still does not resolve.
+            assert!(find_dimension(&def, "country").is_none());
         }
 
         #[test]
-        fn quoted_lowercase_reference_matches_unquoted_stored() {
-            // Unquoted stored `status`: an unquoted ref of any case matches,
-            // and a quoted `"status"` (fold-equivalent) also matches, but a
-            // quoted mixed-case `"Status"` does not.
+        fn unquoted_stored_name_matches_any_case_quoted_or_not() {
+            // Unquoted stored `status`: matched by any-case unquoted and any
+            // any-case quoted reference alike (quoting is irrelevant to
+            // matching in DuckDB).
             let def = quoted_dim_def();
             assert!(find_dimension(&def, "status").is_some());
             assert!(find_dimension(&def, "STATUS").is_some());
             assert!(find_dimension(&def, "\"status\"").is_some());
-            assert!(find_dimension(&def, "\"Status\"").is_none());
+            assert!(find_dimension(&def, "\"Status\"").is_some());
         }
     }
 
