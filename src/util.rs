@@ -232,11 +232,13 @@ pub fn starts_with_keyword_ci(s: &str, kw: &str) -> bool {
 /// Length in bytes of the dollar-quote opener `$tag$` at `bytes[start]`, or
 /// `None` if there is no valid opener there.
 ///
-/// `bytes[start]` must be `$`. The tag body is ASCII alphanumerics and `_` and
-/// may **not** start with a digit — `$1` is a positional parameter, not a
-/// dollar-quote tag — matching `PostgreSQL`/`DuckDB`. The empty tag `$$` is
-/// valid. The returned length includes both `$` delimiters, so
-/// `&bytes[start..start + len]` is the opener (e.g. `$$`, `$yaml$`).
+/// Returns `None` when `start` is out of bounds or `bytes[start]` is not `$`,
+/// so callers may probe any offset without a prior bounds/`$` check. When it
+/// returns `Some(len)`, `bytes[start]` was `$` and `&bytes[start..start + len]`
+/// is the opener (e.g. `$$`, `$yaml$`). The tag body is ASCII alphanumerics and
+/// `_` and may **not** start with a digit — `$1` is a positional parameter, not
+/// a dollar-quote tag — matching `PostgreSQL`/`DuckDB`. The empty tag `$$` is
+/// valid; the returned length includes both `$` delimiters.
 ///
 /// **Single source of truth for dollar-quote tags** (P-6, code-review
 /// 2026-07-11), shared by [`blank_sql_comments`] and the CREATE-body
