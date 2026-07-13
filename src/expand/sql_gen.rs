@@ -8,6 +8,7 @@ use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident};
 use super::role_playing::find_using_context;
+use super::select_spec::SelectItem;
 use super::types::{ExpandError, QueryRequest, ResolvedDim};
 
 /// An entity kind resolvable by name against a [`SemanticViewDefinition`]
@@ -236,24 +237,23 @@ fn expand_facts(
 
     // Dimensions first
     for dim in &resolved_dims {
-        let base_expr = dim.expr.clone();
-        let final_expr = if let Some(ref type_str) = dim.output_type {
-            format!("CAST({base_expr} AS {type_str})")
-        } else {
-            base_expr
-        };
-        select_items.push(format!("    {} AS {}", final_expr, quote_ident(&dim.name)));
+        let item = SelectItem::new(
+            dim.expr.clone(),
+            dim.output_type.clone(),
+            quote_ident(&dim.name),
+        );
+        select_items.push(format!("    {}", item.render()));
     }
 
     // Then facts (inlined expressions, no aggregation)
     for fact in &resolved_facts {
         let resolved_expr = inline_facts(&fact.expr, &def.facts, &topo_order);
-        let final_expr = if let Some(ref type_str) = fact.output_type {
-            format!("CAST({resolved_expr} AS {type_str})")
-        } else {
-            resolved_expr
-        };
-        select_items.push(format!("    {} AS {}", final_expr, quote_ident(&fact.name)));
+        let item = SelectItem::new(
+            resolved_expr,
+            fact.output_type.clone(),
+            quote_ident(&fact.name),
+        );
+        select_items.push(format!("    {}", item.render()));
     }
     sql.push_str(&select_items.join(",\n"));
 
@@ -462,13 +462,8 @@ pub fn expand(
                 base_expr = replace_word_boundary(&base_expr, st, scoped);
             }
         }
-        // If output_type is set, wrap the expression in CAST(... AS <type>).
-        let final_expr = if let Some(ref type_str) = dim.output_type {
-            format!("CAST({base_expr} AS {type_str})")
-        } else {
-            base_expr
-        };
-        select_items.push(format!("    {} AS {}", final_expr, quote_ident(&dim.name)));
+        let item = SelectItem::new(base_expr, dim.output_type.clone(), quote_ident(&dim.name));
+        select_items.push(format!("    {}", item.render()));
     }
     for met in &resolved_mets {
         // Look up the pre-computed resolved expression (handles both base + derived metrics)
@@ -476,13 +471,12 @@ pub fn expand(
             .get(&met.name.to_ascii_lowercase())
             .cloned()
             .unwrap_or_else(|| met.expr.clone());
-        // If output_type is set, wrap the aggregate in CAST(... AS <type>).
-        let final_expr = if let Some(ref type_str) = met.output_type {
-            format!("CAST({resolved_expr} AS {type_str})")
-        } else {
-            resolved_expr
-        };
-        select_items.push(format!("    {} AS {}", final_expr, quote_ident(&met.name)));
+        let item = SelectItem::new(
+            resolved_expr,
+            met.output_type.clone(),
+            quote_ident(&met.name),
+        );
+        select_items.push(format!("    {}", item.render()));
     }
     sql.push_str(&select_items.join(",\n"));
 

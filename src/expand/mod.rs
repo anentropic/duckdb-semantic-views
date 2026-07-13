@@ -4,6 +4,7 @@ mod join_resolver;
 mod materialization;
 mod resolution;
 mod role_playing;
+mod select_spec;
 mod semi_additive;
 mod sql_gen;
 mod types;
