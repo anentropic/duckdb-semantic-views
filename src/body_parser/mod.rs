@@ -452,6 +452,20 @@ mod tests {
         assert_eq!(result.len(), 0, "Empty body must produce 0 entries");
     }
 
+    #[test]
+    fn split_offset_points_at_trimmed_entry() {
+        // P-4 (code-review 2026-07-11): the returned offset is the trimmed
+        // entry's first byte, not the position right after the comma, so an
+        // error caret computed from it lands on the entry rather than drifting
+        // left into the inter-entry whitespace.
+        let result = split_at_depth0_commas("a,   b_bad");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], (0, "a"));
+        assert_eq!(result[1], (5, "b_bad"));
+        // Leading whitespace on the first entry is skipped too.
+        assert_eq!(split_at_depth0_commas("   x, y")[0], (3, "x"));
+    }
+
     // -----------------------------------------------------------------------
     // find_clause_bounds tests (via parse_keyword_body integration)
     // -----------------------------------------------------------------------
@@ -1358,6 +1372,28 @@ mod tests {
         .unwrap();
         let ws = v[0].window_spec.as_ref().expect("window spec");
         assert_eq!(ws.excluding_dims, vec!["region"]);
+    }
+
+    #[test]
+    fn metric_non_additive_missing_paren_caret_accounts_for_access_modifier() {
+        // P-4 (code-review 2026-07-11): the "Expected '(' after NON ADDITIVE
+        // BY" caret is recovered from the failing token's slice, so it points
+        // at that token even when a leading PRIVATE modifier shifts the
+        // name portion off the entry origin (the old `entry_offset + na_end`
+        // arithmetic drifted left by the modifier's length).
+        let entry = "PRIVATE revenue NON ADDITIVE BY date AS SUM(x)";
+        let err = parse_metrics_clause(entry, 0).unwrap_err();
+        assert!(
+            err.message.contains("Expected '(' after NON ADDITIVE BY"),
+            "got: {}",
+            err.message
+        );
+        let expected = entry.find("date").unwrap();
+        assert_eq!(
+            err.position,
+            Some(expected),
+            "caret should point at the token where '(' is expected"
+        );
     }
 
     #[test]

@@ -200,17 +200,24 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
     let mut non_additive_by: Vec<NonAdditiveDim> = Vec::new();
     let before_na = if let Some((na_start, na_end)) = na_pos {
         let after_na = before_as[na_end..].trim();
+        // Recover carets from the re-sliced tokens themselves rather than
+        // `entry_offset + na_end`: `na_end` is an offset within `before_as`,
+        // which does not start at the entry origin when a leading access
+        // modifier is present, so the manual sum drifted (P-4). `after_na` is
+        // the token where `(` is expected; `paren_content` is the inner list.
+        let after_na_pos = entry_offset + crate::util::byte_offset_within(entry, after_na);
         if !after_na.starts_with('(') {
             return Err(ParseError {
                 message: format!("Expected '(' after NON ADDITIVE BY in metric entry '{entry}'."),
-                position: Some(entry_offset + na_end),
+                position: Some(after_na_pos),
             });
         }
         let paren_content = extract_paren_content(after_na).ok_or_else(|| ParseError {
             message: format!("Unclosed '(' after NON ADDITIVE BY in metric entry '{entry}'."),
-            position: Some(entry_offset + na_end),
+            position: Some(after_na_pos),
         })?;
-        non_additive_by = parse_non_additive_dims(paren_content, entry_offset + na_end + 1)?;
+        let paren_pos = entry_offset + crate::util::byte_offset_within(entry, paren_content);
+        non_additive_by = parse_non_additive_dims(paren_content, paren_pos)?;
         before_as[..na_start].trim()
     } else {
         before_as
@@ -235,17 +242,21 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
 
     // The name portion is before USING (or all of before_na if no USING)
     let final_name_portion = if let Some(upos) = using_pos {
-        // Extract the parenthesized relationship list after USING
+        // Extract the parenthesized relationship list after USING. Caret is
+        // recovered from `after_using` (the token where `(` is expected) rather
+        // than `entry_offset + upos + 5`, which ignored where `before_na` starts
+        // within the entry (P-4).
         let after_using = before_na[upos + 5..].trim();
+        let after_using_pos = entry_offset + crate::util::byte_offset_within(entry, after_using);
         if !after_using.starts_with('(') {
             return Err(ParseError {
                 message: format!("Expected '(' after USING in metric entry '{entry}'."),
-                position: Some(entry_offset + upos + 5),
+                position: Some(after_using_pos),
             });
         }
         let paren_content = extract_paren_content(after_using).ok_or_else(|| ParseError {
             message: format!("Unclosed '(' after USING in metric entry '{entry}'."),
-            position: Some(entry_offset + upos + 5),
+            position: Some(after_using_pos),
         })?;
         using_relationships = split_at_depth0_commas(paren_content)
             .into_iter()
