@@ -2042,11 +2042,14 @@ static void sv_emit_scalar_row(Vector &result, idx_t row_idx,
         throw InvalidInputException(std::string(fn_name) + ": " + error_buf);
     }
     // payload.ptr is non-null on rc==0 (publish_owned_buffer guarantees this
-    // when out_ptr is non-null); len may be 0 for an empty string.
-    string_t out_value = StringVector::AddString(
-        result,
-        payload.ptr == nullptr ? "" : payload.ptr,
-        payload.len);
+    // when out_ptr is non-null); len may be 0 for an empty string. The null
+    // branch is purely defensive, but AddString(data, len) copies `len` bytes,
+    // so the fallback length MUST be 0 too — otherwise a (nullptr, len>0)
+    // payload would read `len` bytes past the 1-byte "" literal (C-9,
+    // code-review 2026-07-11).
+    const char *out_data = payload.ptr == nullptr ? "" : payload.ptr;
+    idx_t out_len = payload.ptr == nullptr ? 0 : payload.len;
+    string_t out_value = StringVector::AddString(result, out_data, out_len);
     FlatVector::GetData<string_t>(result)[row_idx] = out_value;
 }
 

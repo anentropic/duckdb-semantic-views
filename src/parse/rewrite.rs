@@ -2797,6 +2797,16 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_dollar_quoted_rejects_invalid_tag() {
+        // P-6: `$1$` is not a valid dollar-quote tag ($1 is a parameter), and
+        // `blank_sql_comments` treats it as SQL. The extractor must agree and
+        // reject it rather than accept a delimiter the blanker already corrupted
+        // the payload for. A tag with interior whitespace is likewise rejected.
+        assert!(extract_dollar_quoted("$1$body$1$").is_err());
+        assert!(extract_dollar_quoted("$ta g$body$ta g$").is_err());
+    }
+
+    #[test]
     fn test_extract_dollar_quoted_inner_dollar() {
         // First closing $$ wins — content is "has inner "
         let (content, consumed) = extract_dollar_quoted("$$has inner $$ text$$").unwrap();
