@@ -70,9 +70,22 @@ DuckDB's own amalgamation generator from jsDelivr (`cdn.jsdelivr.net`), writes
 so the subsequent `just build` finds the correct version present and skips its
 own (blocked) download. Output is byte-identical to the release amalgamation
 except `DUCKDB_SOURCE_ID` (a placeholder — the real SHA isn't reachable without
-GitHub): verified fine for building + `clippy --features extension`; loading the
-built extension (`just test-sql`) may hit a source-id check. Do **not** use this
-on a normal local machine — it's a fallback, not a replacement for `just build`.
+GitHub).
+
+**The placeholder source-id does NOT block loading the extension.** The debug
+extension this produces uses the `C_STRUCT_UNSTABLE` ABI, which does not enforce
+a source-id match, so it **loads and runs** — `just test-sql` / `just test-all`
+(and `make test_debug`) pass end-to-end against it (empirically verified). So in
+a blocked-GitHub session, after `python3 scripts/fetch_amalgamation_offline.py`,
+run the **full** local gate — `just build` + `just test-sql` — as usual. Do
+**not** assume the offline extension "can't load" and skip local sqllogictest in
+favour of CI: it does load, and CLAUDE.md's quality gate expects sqllogictest to
+run. (`just build` needs the `extension-ci-tools` git submodule checked out —
+`git submodule update --init` — and `make configure` for the venv/platform
+metadata, both of which `just setup` handles.)
+
+Do **not** use the offline fetcher on a normal local machine — it's a fallback,
+not a replacement for `just build`.
 
 To lint the `extension`-gated FFI layer without any C++ build at all (no
 amalgamation needed), use (see MAINTAINER.md):
