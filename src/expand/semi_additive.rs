@@ -39,8 +39,8 @@ use crate::model::{Metric, NonAdditiveDim, NullsOrder, SemanticViewDefinition, S
 use crate::util::replace_word_boundary;
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
-use super::resolution::{qualify_and_quote_table_ref, quote_ident};
-use super::select_spec::SelectItem;
+use super::resolution::quote_ident;
+use super::select_spec::{push_from_base, push_group_by_ordinals, SelectItem};
 use super::types::{ExpandError, ResolvedDim};
 
 /// Returns true when `met` is an ACTIVE semi-additive metric for a query over
@@ -257,12 +257,7 @@ pub(super) fn expand_semi_additive(
     sql.push_str(&cte_select_items.join(",\n"));
 
     // CTE FROM clause (same logic as expand())
-    sql.push_str("\n    FROM ");
-    sql.push_str(&qualify_and_quote_table_ref(def.base_table(), def));
-    if let Some(base_ref) = def.tables.first() {
-        sql.push_str(" AS ");
-        sql.push_str(&quote_ident(&base_ref.alias));
-    }
+    push_from_base(&mut sql, def, "\n    ");
 
     // CTE JOINs. SG-9: the snapshot ORDER BY references each active NA dim's
     // raw expression even when that dim is not queried, so the NA dims'
@@ -312,11 +307,7 @@ pub(super) fn expand_semi_additive(
 
     // GROUP BY (when dims are present)
     if !resolved_dims.is_empty() {
-        sql.push_str("\nGROUP BY\n");
-        let group_items: Vec<String> = (1..=resolved_dims.len())
-            .map(|i| format!("    {i}"))
-            .collect();
-        sql.push_str(&group_items.join(",\n"));
+        push_group_by_ordinals(&mut sql, resolved_dims.len(), "\n", "    ");
     }
 
     Ok(sql)

@@ -6,9 +6,9 @@ use super::facts::{
 };
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
-use super::resolution::{find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident};
+use super::resolution::{find_dimension, find_metric, quote_ident};
 use super::role_playing::find_using_context;
-use super::select_spec::SelectItem;
+use super::select_spec::{push_from_base, push_group_by_ordinals, SelectItem};
 use super::types::{ExpandError, QueryRequest, ResolvedDim};
 
 /// An entity kind resolvable by name against a [`SemanticViewDefinition`]
@@ -258,12 +258,7 @@ fn expand_facts(
     sql.push_str(&select_items.join(",\n"));
 
     // 6. FROM clause — same pattern as expand().
-    sql.push_str("\nFROM ");
-    sql.push_str(&qualify_and_quote_table_ref(def.base_table(), def));
-    if let Some(base_ref) = def.tables.first() {
-        sql.push_str(" AS ");
-        sql.push_str(&quote_ident(&base_ref.alias));
-    }
+    push_from_base(&mut sql, def, "\n");
 
     // 7. JOIN clauses — resolve required joins for dim + fact source tables.
     // Fact queries have no metrics; fact source tables are resolved through
@@ -480,15 +475,8 @@ pub fn expand(
     }
     sql.push_str(&select_items.join(",\n"));
 
-    // 6. FROM clause with base table.
-    sql.push_str("\nFROM ");
-    sql.push_str(&qualify_and_quote_table_ref(def.base_table(), def));
-
-    // If tables aliases are declared, emit AS "alias" after the base table.
-    if let Some(base_ref) = def.tables.first() {
-        sql.push_str(" AS ");
-        sql.push_str(&quote_ident(&base_ref.alias));
-    }
+    // 6. FROM clause with base table (+ AS "alias" when declared).
+    push_from_base(&mut sql, def, "\n");
 
     // Join resolution via PK/FK graph.
     // The resolver returns structured edges in emission order; role-playing
@@ -497,14 +485,10 @@ pub fn expand(
     push_join_clauses(&mut sql, &resolved_joins, def, "\nLEFT JOIN ");
 
     // 7. GROUP BY (only when both dimensions and metrics are present).
-    //    Use ordinal positions (GROUP BY 1, 2, ...) instead of expressions to avoid
-    //    ambiguity when an expression matches its alias (e.g., `status AS "status"`).
+    //    Ordinal positions avoid ambiguity when an expression matches its alias
+    //    (e.g. `status AS "status"`) — see push_group_by_ordinals (E-1).
     if !resolved_dims.is_empty() && !resolved_mets.is_empty() {
-        sql.push_str("\nGROUP BY\n");
-        let group_items: Vec<String> = (1..=resolved_dims.len())
-            .map(|i| format!("    {i}"))
-            .collect();
-        sql.push_str(&group_items.join(",\n"));
+        push_group_by_ordinals(&mut sql, resolved_dims.len(), "\n", "    ");
     }
 
     Ok(sql)
