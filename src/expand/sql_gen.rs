@@ -5,10 +5,10 @@ use super::facts::{
     collect_transitive_metric_names, inline_derived_metrics, inline_facts, toposort_facts,
 };
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
-use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
+use super::join_resolver::resolve_joins_pkfk;
 use super::resolution::{find_dimension, find_metric, quote_ident};
 use super::role_playing::find_using_context;
-use super::select_spec::{push_from_base, push_group_by_ordinals, SelectItem};
+use super::select_spec::{FromSource, GroupBy, SelectItem, SelectSpec};
 use super::types::{ExpandError, QueryRequest, ResolvedDim};
 
 /// An entity kind resolvable by name against a [`SemanticViewDefinition`]
@@ -229,38 +229,29 @@ fn expand_facts(
         cycle_description: e,
     })?;
 
-    // 5. Build SELECT clause (no DISTINCT, no aggregation).
-    let mut sql = String::with_capacity(256);
-    sql.push_str("SELECT\n");
-
-    let mut select_items: Vec<String> = Vec::new();
+    // 5. Build the SELECT list (no DISTINCT, no aggregation).
+    let mut items: Vec<SelectItem> = Vec::new();
 
     // Dimensions first
     for dim in &resolved_dims {
-        let item = SelectItem::new(
+        items.push(SelectItem::new(
             dim.expr.clone(),
             dim.output_type.clone(),
             quote_ident(&dim.name),
-        );
-        select_items.push(format!("    {}", item.render()));
+        ));
     }
 
     // Then facts (inlined expressions, no aggregation)
     for fact in &resolved_facts {
         let resolved_expr = inline_facts(&fact.expr, &def.facts, &topo_order);
-        let item = SelectItem::new(
+        items.push(SelectItem::new(
             resolved_expr,
             fact.output_type.clone(),
             quote_ident(&fact.name),
-        );
-        select_items.push(format!("    {}", item.render()));
+        ));
     }
-    sql.push_str(&select_items.join(",\n"));
 
-    // 6. FROM clause — same pattern as expand().
-    push_from_base(&mut sql, def, "\n");
-
-    // 7. JOIN clauses — resolve required joins for dim + fact source tables.
+    // 6. JOIN clauses — resolve required joins for dim + fact source tables.
     // Fact queries have no metrics; fact source tables are resolved through
     // the same path walk as dimensions (SG-10) and their joins are appended
     // after the dimension-driven joins.
@@ -268,12 +259,17 @@ fn expand_facts(
         .iter()
         .filter_map(|f| f.source_table.clone())
         .collect();
-    let resolved_joins = resolve_joins_pkfk(def, &resolved_dims, &[], &fact_sources);
-    push_join_clauses(&mut sql, &resolved_joins, def, "\nLEFT JOIN ");
+    let joins = resolve_joins_pkfk(def, &resolved_dims, &[], &fact_sources);
 
-    // NO GROUP BY — fact queries are unaggregated
-
-    Ok(sql)
+    // 7. A fact query is an unaggregated top-level SELECT over the base table
+    //    (+ joins): no DISTINCT, no GROUP BY.
+    Ok(SelectSpec {
+        distinct: false,
+        items,
+        from: FromSource::BaseTable { def, joins },
+        group_by: GroupBy::None,
+    }
+    .render())
 }
 
 /// Expand a semantic view definition into a SQL query string.
@@ -434,18 +430,13 @@ pub fn expand(
         );
     }
 
-    // 5. Build the SELECT clause.
+    // 5. Build the top-level SELECT.
     //    Dimensions-only (no metrics): SELECT DISTINCT, no GROUP BY.
     //    Metrics-only (no dimensions): SELECT (global aggregate), no GROUP BY.
-    //    Both: SELECT with GROUP BY.
-    let mut sql = String::with_capacity(256);
-    if !resolved_dims.is_empty() && resolved_mets.is_empty() {
-        sql.push_str("SELECT DISTINCT\n");
-    } else {
-        sql.push_str("SELECT\n");
-    }
+    //    Both: SELECT with an ordinal GROUP BY over the dimensions.
+    let distinct = !resolved_dims.is_empty() && resolved_mets.is_empty();
 
-    let mut select_items: Vec<String> = Vec::new();
+    let mut items: Vec<SelectItem> = Vec::new();
     for rd in &resolved {
         let dim = rd.dim;
         let mut base_expr = dim.expr.clone();
@@ -457,8 +448,11 @@ pub fn expand(
                 base_expr = replace_word_boundary(&base_expr, st, scoped);
             }
         }
-        let item = SelectItem::new(base_expr, dim.output_type.clone(), quote_ident(&dim.name));
-        select_items.push(format!("    {}", item.render()));
+        items.push(SelectItem::new(
+            base_expr,
+            dim.output_type.clone(),
+            quote_ident(&dim.name),
+        ));
     }
     for met in &resolved_mets {
         // Look up the pre-computed resolved expression (handles both base + derived metrics)
@@ -466,32 +460,34 @@ pub fn expand(
             .get(&met.name.to_ascii_lowercase())
             .cloned()
             .unwrap_or_else(|| met.expr.clone());
-        let item = SelectItem::new(
+        items.push(SelectItem::new(
             resolved_expr,
             met.output_type.clone(),
             quote_ident(&met.name),
-        );
-        select_items.push(format!("    {}", item.render()));
+        ));
     }
-    sql.push_str(&select_items.join(",\n"));
 
-    // 6. FROM clause with base table (+ AS "alias" when declared).
-    push_from_base(&mut sql, def, "\n");
-
-    // Join resolution via PK/FK graph.
-    // The resolver returns structured edges in emission order; role-playing
-    // scoped joins (e.g. "a__dep_airport") follow the bare joins.
-    let resolved_joins = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets, &[]);
-    push_join_clauses(&mut sql, &resolved_joins, def, "\nLEFT JOIN ");
+    // 6. Join resolution via PK/FK graph.
+    //    The resolver returns structured edges in emission order; role-playing
+    //    scoped joins (e.g. "a__dep_airport") follow the bare joins.
+    let joins = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets, &[]);
 
     // 7. GROUP BY (only when both dimensions and metrics are present).
     //    Ordinal positions avoid ambiguity when an expression matches its alias
     //    (e.g. `status AS "status"`) — see push_group_by_ordinals (E-1).
-    if !resolved_dims.is_empty() && !resolved_mets.is_empty() {
-        push_group_by_ordinals(&mut sql, resolved_dims.len(), "\n", "    ");
-    }
+    let group_by = if !resolved_dims.is_empty() && !resolved_mets.is_empty() {
+        GroupBy::Ordinals(resolved_dims.len())
+    } else {
+        GroupBy::None
+    };
 
-    Ok(sql)
+    Ok(SelectSpec {
+        distinct,
+        items,
+        from: FromSource::BaseTable { def, joins },
+        group_by,
+    }
+    .render())
 }
 
 #[cfg(test)]
