@@ -1106,7 +1106,7 @@ GROUP BY
 
     mod phase11_1_expand_tests {
         use super::*;
-        use crate::model::{AccessModifier, TableRef};
+        use crate::model::TableRef;
 
         fn def_with_join_columns() -> crate::model::SemanticViewDefinition {
             crate::model::SemanticViewDefinition {
@@ -1301,9 +1301,7 @@ GROUP BY
 
     mod phase26_pkfk_expand_tests {
         use super::*;
-        use crate::model::{
-            AccessModifier, Dimension, Join, Metric, SemanticViewDefinition, TableRef,
-        };
+        use crate::model::{Dimension, Join, Metric, SemanticViewDefinition, TableRef};
 
         /// Helper: build a 2-table PK/FK definition (orders -> customers).
         fn pkfk_two_table_def() -> SemanticViewDefinition {
@@ -1587,9 +1585,7 @@ GROUP BY
 
     mod phase27_qualified_refs_tests {
         use super::*;
-        use crate::model::{
-            AccessModifier, Dimension, Join, Metric, SemanticViewDefinition, TableRef,
-        };
+        use crate::model::{Dimension, Join, Metric, SemanticViewDefinition, TableRef};
 
         fn qualified_ref_def() -> SemanticViewDefinition {
             SemanticViewDefinition {
@@ -2400,7 +2396,7 @@ GROUP BY
         use super::*;
         use crate::expand::test_helpers::minimal_def;
         use crate::model::{
-            AccessModifier, Cardinality, Dimension, Join, Metric, SemanticViewDefinition, TableRef,
+            Cardinality, Dimension, Join, Metric, SemanticViewDefinition, TableRef,
         };
 
         fn fan_trap_three_table_def() -> SemanticViewDefinition {
@@ -2697,7 +2693,7 @@ GROUP BY
         use super::*;
         use crate::expand::test_helpers::TestFixtureExt;
         use crate::model::{
-            AccessModifier, Cardinality, Dimension, Join, Metric, SemanticViewDefinition, TableRef,
+            Cardinality, Dimension, Join, Metric, SemanticViewDefinition, TableRef,
         };
 
         fn flights_airports_def() -> SemanticViewDefinition {
