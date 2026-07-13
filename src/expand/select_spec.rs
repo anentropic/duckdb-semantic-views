@@ -34,6 +34,24 @@ impl SelectItem {
         Self { expr, cast, alias }
     }
 
+    /// Write `CAST(expr AS <cast>)` (or bare `expr`) into `out`. The single
+    /// source of the CAST-wrap rendering, shared by [`Self::rendered_expr`] and
+    /// [`Self::render`] so they cannot diverge (the E-1 invariant lives here);
+    /// writing into the caller's buffer keeps `render` to one allocation and
+    /// avoids cloning `expr` in the common no-cast case.
+    fn write_expr(&self, out: &mut String) {
+        match &self.cast {
+            Some(ty) => {
+                out.push_str("CAST(");
+                out.push_str(&self.expr);
+                out.push_str(" AS ");
+                out.push_str(ty);
+                out.push(')');
+            }
+            None => out.push_str(&self.expr),
+        }
+    }
+
     /// The rendered expression with the optional CAST wrap applied, WITHOUT the
     /// trailing `AS alias`: `CAST(expr AS <cast>)` when a cast is set, else
     /// `expr`. Use where the same expression must be repeated elsewhere in the
@@ -41,17 +59,20 @@ impl SelectItem {
     /// CTE column by its expression rather than the shadowing select alias
     /// (E-1, code-review 2026-07-11).
     pub(super) fn rendered_expr(&self) -> String {
-        match &self.cast {
-            Some(ty) => format!("CAST({} AS {})", self.expr, ty),
-            None => self.expr.clone(),
-        }
+        let mut out = String::with_capacity(self.expr.len() + 16);
+        self.write_expr(&mut out);
+        out
     }
 
     /// Render as `<rendered_expr> AS alias` — i.e. `CAST(expr AS <cast>) AS
     /// alias` when a cast is set, else `expr AS alias`. No leading indent — the
     /// caller prepends clause indentation.
     pub(super) fn render(&self) -> String {
-        format!("{} AS {}", self.rendered_expr(), self.alias)
+        let mut out = String::with_capacity(self.expr.len() + self.alias.len() + 24);
+        self.write_expr(&mut out);
+        out.push_str(" AS ");
+        out.push_str(&self.alias);
+        out
     }
 }
 
