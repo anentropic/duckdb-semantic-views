@@ -1,0 +1,73 @@
+# E-4 (code-review 2026-07-11): a table reachable from two DIFFERENT source
+# tables is a genuine multi-path join diamond, not role-playing. Before the
+# fix the definition was accepted (as long as the relationships were named)
+# and a query silently joined the shared table through whichever relationship
+# was declared first. CREATE must reject it at define time.
+#
+# End-to-end coverage: exercises the full extension-load -> DDL -> graph
+# validation pipeline that the Rust unit tests in graph/relationship.rs miss.
+
+require semantic_views
+
+statement ok
+CREATE TABLE e4_o (id INTEGER, a_id INTEGER, b_id INTEGER, val DOUBLE);
+
+statement ok
+CREATE TABLE e4_a (id INTEGER, d_id INTEGER);
+
+statement ok
+CREATE TABLE e4_b (id INTEGER, d_id INTEGER);
+
+statement ok
+CREATE TABLE e4_d (id INTEGER, name VARCHAR);
+
+# `d` is reachable via o->a->d AND o->b->d: two distinct source tables (a, b)
+# converge on it. Rejected regardless of relationship naming.
+statement error
+CREATE SEMANTIC VIEW e4_diamond AS
+  TABLES (
+    o AS e4_o,
+    a AS e4_a PRIMARY KEY (id),
+    b AS e4_b PRIMARY KEY (id),
+    d AS e4_d PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_a AS o(a_id) REFERENCES a,
+    o_to_b AS o(b_id) REFERENCES b,
+    a_to_d AS a(d_id) REFERENCES d,
+    b_to_d AS b(d_id) REFERENCES d
+  )
+  DIMENSIONS (
+    d.name AS d.name
+  )
+  METRICS (
+    o.total AS SUM(o.val)
+  );
+----
+reachable from multiple tables
+
+# Role-playing (a SINGLE source table with two distinctly-named FKs to one
+# target) is NOT a diamond and remains accepted — the no-regression guard.
+
+statement ok
+CREATE TABLE e4_flights (id INTEGER, dep_id INTEGER, arr_id INTEGER, miles DOUBLE);
+
+statement ok
+CREATE TABLE e4_airports (id INTEGER, name VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW e4_roleplay AS
+  TABLES (
+    f AS e4_flights,
+    ap AS e4_airports PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    dep AS f(dep_id) REFERENCES ap,
+    arr AS f(arr_id) REFERENCES ap
+  )
+  DIMENSIONS (
+    ap.name AS ap.name
+  )
+  METRICS (
+    f.total AS SUM(f.miles)
+  );
