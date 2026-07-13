@@ -34,14 +34,24 @@ impl SelectItem {
         Self { expr, cast, alias }
     }
 
-    /// Render as `CAST(expr AS <cast>) AS alias` (when a cast is set) or
-    /// `expr AS alias`. No leading indent — the caller prepends clause
-    /// indentation.
-    pub(super) fn render(&self) -> String {
+    /// The rendered expression with the optional CAST wrap applied, WITHOUT the
+    /// trailing `AS alias`: `CAST(expr AS <cast>)` when a cast is set, else
+    /// `expr`. Use where the same expression must be repeated elsewhere in the
+    /// query — e.g. a window `PARTITION BY` / `ORDER BY` that must reference a
+    /// CTE column by its expression rather than the shadowing select alias
+    /// (E-1, code-review 2026-07-11).
+    pub(super) fn rendered_expr(&self) -> String {
         match &self.cast {
-            Some(ty) => format!("CAST({} AS {}) AS {}", self.expr, ty, self.alias),
-            None => format!("{} AS {}", self.expr, self.alias),
+            Some(ty) => format!("CAST({} AS {})", self.expr, ty),
+            None => self.expr.clone(),
         }
+    }
+
+    /// Render as `<rendered_expr> AS alias` — i.e. `CAST(expr AS <cast>) AS
+    /// alias` when a cast is set, else `expr AS alias`. No leading indent — the
+    /// caller prepends clause indentation.
+    pub(super) fn render(&self) -> String {
+        format!("{} AS {}", self.rendered_expr(), self.alias)
     }
 }
 
@@ -66,6 +76,22 @@ mod tests {
             item.render(),
             "CAST(SUM(o.amount) AS DECIMAL(18,2)) AS \"revenue\""
         );
+    }
+
+    #[test]
+    fn rendered_expr_omits_alias() {
+        // No cast: the bare expression.
+        let plain = SelectItem::new("upper(o.region)".to_string(), None, "\"r\"".to_string());
+        assert_eq!(plain.rendered_expr(), "upper(o.region)");
+        // With cast: the CAST wrap, still no `AS alias`. This is what the E-1
+        // window PARTITION/ORDER clauses repeat instead of the select alias.
+        let cast = SelectItem::new(
+            "o.d".to_string(),
+            Some("DATE".to_string()),
+            "\"d\"".to_string(),
+        );
+        assert_eq!(cast.rendered_expr(), "CAST(o.d AS DATE)");
+        assert_eq!(cast.render(), "CAST(o.d AS DATE) AS \"d\"");
     }
 
     /// Byte-identical to the pre-refactor idiom: the caller's

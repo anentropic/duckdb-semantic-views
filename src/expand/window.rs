@@ -15,6 +15,7 @@ use crate::util::replace_word_boundary;
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
+use super::select_spec::SelectItem;
 use super::types::{ExpandError, ResolvedDim};
 
 /// Generate CTE-based expansion SQL for queries containing window function metrics.
@@ -125,16 +126,8 @@ pub(super) fn expand_window_metrics(
                 base_expr = replace_word_boundary(&base_expr, st, scoped);
             }
         }
-        let final_expr = if let Some(ref type_str) = dim.output_type {
-            format!("CAST({base_expr} AS {type_str})")
-        } else {
-            base_expr
-        };
-        cte_select_items.push(format!(
-            "        {} AS {}",
-            final_expr,
-            quote_ident(&dim.name)
-        ));
+        let item = SelectItem::new(base_expr, dim.output_type.clone(), quote_ident(&dim.name));
+        cte_select_items.push(format!("        {}", item.render()));
     }
 
     // Inner metric aggregated columns in CTE
@@ -176,13 +169,11 @@ pub(super) fn expand_window_metrics(
 
     let mut outer_select_items: Vec<String> = Vec::new();
 
-    // Dimension columns: reference CTE aliases
+    // Dimension columns: reference CTE aliases (outer query over the CTE, so
+    // referencing the alias is safe here).
     for rd in resolved_dims {
-        outer_select_items.push(format!(
-            "    {} AS {}",
-            quote_ident(&rd.dim.name),
-            quote_ident(&rd.dim.name)
-        ));
+        let item = SelectItem::new(quote_ident(&rd.dim.name), None, quote_ident(&rd.dim.name));
+        outer_select_items.push(format!("    {}", item.render()));
     }
 
     // Window metric columns
@@ -247,13 +238,8 @@ pub(super) fn expand_window_metrics(
         let over_clause = over_parts.join(" ");
         let window_expr = format!("{func_call} OVER ({over_clause})");
 
-        let final_expr = if let Some(ref type_str) = met.output_type {
-            format!("CAST({window_expr} AS {type_str})")
-        } else {
-            window_expr
-        };
-
-        outer_select_items.push(format!("    {} AS {}", final_expr, quote_ident(&met.name)));
+        let item = SelectItem::new(window_expr, met.output_type.clone(), quote_ident(&met.name));
+        outer_select_items.push(format!("    {}", item.render()));
     }
 
     sql.push_str(&outer_select_items.join(",\n"));

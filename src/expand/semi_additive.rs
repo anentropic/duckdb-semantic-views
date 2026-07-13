@@ -40,6 +40,7 @@ use crate::util::replace_word_boundary;
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
+use super::select_spec::SelectItem;
 use super::types::{ExpandError, ResolvedDim};
 
 /// Returns true when `met` is an ACTIVE semi-additive metric for a query over
@@ -150,17 +151,11 @@ pub(super) fn expand_semi_additive(
                 base_expr = replace_word_boundary(&base_expr, st, scoped);
             }
         }
-        let final_expr = if let Some(ref type_str) = dim.output_type {
-            format!("CAST({base_expr} AS {type_str})")
-        } else {
-            base_expr
-        };
-        cte_select_items.push(format!(
-            "        {} AS {}",
-            final_expr,
-            quote_ident(&dim.name)
-        ));
-        dim_cte_exprs.push(final_expr);
+        let item = SelectItem::new(base_expr, dim.output_type.clone(), quote_ident(&dim.name));
+        cte_select_items.push(format!("        {}", item.render()));
+        // The window PARTITION/ORDER clauses must repeat this EXPRESSION, never
+        // the select alias (E-1) — see the comment above.
+        dim_cte_exprs.push(item.rendered_expr());
     }
 
     // Metric raw columns in CTE -- the validated inner expression of each
@@ -286,41 +281,28 @@ pub(super) fn expand_semi_additive(
 
     let mut outer_select_items: Vec<String> = Vec::new();
 
-    // Dimension columns: reference CTE aliases
+    // Dimension columns: reference CTE aliases (outer query over the CTE, so
+    // referencing the alias is safe — no physical column shadows it here).
     for rd in resolved_dims {
-        outer_select_items.push(format!(
-            "    {} AS {}",
-            quote_ident(&rd.dim.name),
-            quote_ident(&rd.dim.name)
-        ));
+        let item = SelectItem::new(quote_ident(&rd.dim.name), None, quote_ident(&rd.dim.name));
+        outer_select_items.push(format!("    {}", item.render()));
     }
 
     // Metric columns
     for (met_idx, met) in resolved_mets.iter().enumerate() {
         let agg_func = &decomposed[met_idx].0;
 
-        if is_active_semi(met) {
-            // Active semi-additive: aggregate only rows at the snapshot rank.
-            // All rows tied at rank 1 contribute (RANK semantics, SG-4).
+        // Active semi-additive aggregates only rows at the snapshot rank (all
+        // rows tied at rank 1 contribute — RANK semantics, SG-4); regular
+        // metrics aggregate over all rows.
+        let inner = if is_active_semi(met) {
             let rn_col = get_rn_column_for_metric(met_idx, &na_groups);
-            let final_expr =
-                format!("{agg_func}(CASE WHEN \"{rn_col}\" = 1 THEN \"__sv_semi_{met_idx}\" END)");
-            let cast_expr = if let Some(ref type_str) = met.output_type {
-                format!("CAST({final_expr} AS {type_str})")
-            } else {
-                final_expr
-            };
-            outer_select_items.push(format!("    {} AS {}", cast_expr, quote_ident(&met.name)));
+            format!("{agg_func}(CASE WHEN \"{rn_col}\" = 1 THEN \"__sv_semi_{met_idx}\" END)")
         } else {
-            // Regular or effectively-regular: aggregate normally over all rows
-            let final_expr = format!("{agg_func}(\"__sv_reg_{met_idx}\")");
-            let cast_expr = if let Some(ref type_str) = met.output_type {
-                format!("CAST({final_expr} AS {type_str})")
-            } else {
-                final_expr
-            };
-            outer_select_items.push(format!("    {} AS {}", cast_expr, quote_ident(&met.name)));
-        }
+            format!("{agg_func}(\"__sv_reg_{met_idx}\")")
+        };
+        let item = SelectItem::new(inner, met.output_type.clone(), quote_ident(&met.name));
+        outer_select_items.push(format!("    {}", item.render()));
     }
 
     sql.push_str(&outer_select_items.join(",\n"));
