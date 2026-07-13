@@ -12,6 +12,14 @@
 //! pass the already-resolved expression (scoped-alias rewrite / fact inlining
 //! done) and the already-quoted output alias; the item owns only the optional
 //! `output_type` CAST wrap and the trailing `AS alias`.
+//!
+//! Also here: the shared [`push_from_base`] (base-table FROM clause) and
+//! [`push_group_by_ordinals`] (ordinal GROUP BY) emit helpers, each previously
+//! copied across the base / CTE strategies.
+
+use crate::model::SemanticViewDefinition;
+
+use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 
 /// One `SELECT`-list item: an expression, an optional `output_type` CAST wrap,
 /// and an output alias.
@@ -76,9 +84,50 @@ impl SelectItem {
     }
 }
 
+/// Append the base-table FROM clause: `<lead>FROM <qualified-table> [AS
+/// <alias>]`.
+///
+/// `lead` is the whitespace before `FROM` — `"\n"` at the top level, `"\n    "`
+/// inside a CTE. The base table is qualified + quoted via
+/// [`qualify_and_quote_table_ref`]; the first declared table's alias is
+/// appended as `AS <quote_ident>` when present. Shared by the base, facts,
+/// semi-additive, and window emitters (§6.2). The materialization renderer
+/// intentionally does not use this — it selects from the pre-aggregated table
+/// with no alias.
+pub(super) fn push_from_base(sql: &mut String, def: &SemanticViewDefinition, lead: &str) {
+    sql.push_str(lead);
+    sql.push_str("FROM ");
+    sql.push_str(&qualify_and_quote_table_ref(def.base_table(), def));
+    if let Some(base_ref) = def.tables.first() {
+        sql.push_str(" AS ");
+        sql.push_str(&quote_ident(&base_ref.alias));
+    }
+}
+
+/// Append an ordinal `GROUP BY` for `n` grouping columns: `<lead>GROUP BY\n`
+/// then `<item_indent>1,\n<item_indent>2,…`. No-op when `n == 0`.
+///
+/// Ordinal grouping (never expressions) is what defends the base + CTE
+/// aggregation paths from the E-1 alias-shadowing pitfall — `GROUP BY 1` can't
+/// be captured by a same-named physical column the way `GROUP BY "region"`
+/// could. Callers own the decision of WHETHER to group (the emptiness guard
+/// differs by strategy: the base path needs both dimensions and metrics, the
+/// CTE paths need only dimensions). `lead` is the whitespace before `GROUP BY`
+/// (`"\n"` flat, `"\n    "` in a CTE); `item_indent` the per-ordinal indent
+/// (`"    "` flat, `"        "` in a CTE).
+pub(super) fn push_group_by_ordinals(sql: &mut String, n: usize, lead: &str, item_indent: &str) {
+    if n == 0 {
+        return;
+    }
+    sql.push_str(lead);
+    sql.push_str("GROUP BY\n");
+    let items: Vec<String> = (1..=n).map(|i| format!("{item_indent}{i}")).collect();
+    sql.push_str(&items.join(",\n"));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SelectItem;
+    use super::{push_group_by_ordinals, SelectItem};
 
     #[test]
     fn renders_without_cast() {
@@ -132,4 +181,27 @@ mod tests {
         let item_cast = SelectItem::new("expr".to_string(), Some("INT".to_string()), alias.clone());
         assert_eq!(format!("    {}", item_cast.render()), legacy_cast);
     }
+
+    #[test]
+    fn group_by_ordinals_flat_and_cte_indents() {
+        // Flat (top-level) layout: "\nGROUP BY\n" + 4-space ordinals.
+        let mut flat = String::new();
+        push_group_by_ordinals(&mut flat, 3, "\n", "    ");
+        assert_eq!(flat, "\nGROUP BY\n    1,\n    2,\n    3");
+        // CTE layout: "\n    GROUP BY\n" + 8-space ordinals.
+        let mut cte = String::new();
+        push_group_by_ordinals(&mut cte, 2, "\n    ", "        ");
+        assert_eq!(cte, "\n    GROUP BY\n        1,\n        2");
+    }
+
+    #[test]
+    fn group_by_ordinals_zero_is_noop() {
+        let mut s = String::from("prefix");
+        push_group_by_ordinals(&mut s, 0, "\n", "    ");
+        assert_eq!(s, "prefix");
+    }
+
+    // push_from_base is covered end-to-end (byte-identical) by the exact-string
+    // emission tests in sql_gen / semi_additive / window; a direct unit test
+    // would need a full SemanticViewDefinition fixture for little added signal.
 }
