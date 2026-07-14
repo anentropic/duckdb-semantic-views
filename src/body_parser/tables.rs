@@ -51,7 +51,6 @@ fn missing_name_msg(alias: &str) -> String {
 /// - `alias AS physical_table PRIMARY KEY (cols) [UNIQUE (cols)]*`
 /// - `alias AS physical_table [UNIQUE (cols)]*`   (no PRIMARY KEY -- fact tables)
 /// - `alias AS physical_table`                    (bare -- no PK, no UNIQUE)
-#[allow(clippy::too_many_lines)]
 fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef, ParseError> {
     let entry = entry.trim();
     let mut cur = Cursor::new(entry, entry_offset);
@@ -79,54 +78,8 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
         }
     }
 
-    // Step 3: the source-table name — a maximal run of tokens with no
-    // whitespace gap, stopping before `(` / `;`. This reproduces
-    // `find_identifier_end`: a dotted / quoted FQN like `"my db"."sch"."t"` is
-    // contiguous and captured whole, while a following ` PRIMARY KEY` is
-    // separated by whitespace and left for the constraint parser.
-    let Some(first) = cur.peek() else {
-        return Err(cur.err(cur.byte_pos(), missing_name_msg(alias)));
-    };
-    if matches!(first.kind, TokenKind::Symbol(_)) {
-        // A leading `(` / `.` / etc. where the name should be.
-        return Err(cur.err(first.start, missing_name_msg(alias)));
-    }
-    let name_start = first.start;
-    let mut name_end = first.end;
-    let mut unterminated_ident = matches!(first.kind, TokenKind::Unterminated { ident: true });
-    cur.bump();
-    while let Some(t) = cur.peek() {
-        // A whitespace gap or a `(` / `;` symbol ends the name.
-        if t.start != name_end || matches!(t.kind, TokenKind::Symbol(b'(' | b';')) {
-            break;
-        }
-        if matches!(t.kind, TokenKind::Unterminated { ident: true }) {
-            unterminated_ident = true;
-        }
-        name_end = t.end;
-        cur.bump();
-    }
-    let table_name = &entry[name_start..name_end];
-
-    // Bare reserved keywords in the name slot surface the missing-name error
-    // (Phase 68 A1 / D-03) — `o AS PRIMARY KEY (id)` has no real table name.
-    if matches!(
-        table_name.to_ascii_uppercase().as_str(),
-        "PRIMARY" | "UNIQUE" | "FOREIGN" | "REFERENCES" | "NOT"
-    ) {
-        return Err(cur.err(name_start, missing_name_msg(alias)));
-    }
-    // An unterminated `"..."` in the name slot (Phase 68 A4). A doubled-quote
-    // `""` is an escape and stays balanced, so only a genuinely open quote trips
-    // this — the lexer already encoded that distinction in the token kind.
-    if unterminated_ident {
-        return Err(cur.err(
-            name_start,
-            format!(
-                "Unterminated quoted identifier in source-table name for alias '{alias}' in TABLES clause.",
-            ),
-        ));
-    }
+    // Step 3: the source-table name (see `take_source_table_name`).
+    let (table_name, name_end) = take_source_table_name(&mut cur, entry, alias)?;
 
     // Step 4: optional PRIMARY KEY. Its keyword pair may appear anywhere in the
     // remaining tokens; any token before it is text that does not belong
@@ -198,6 +151,66 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
         comment: annotations.comment,
         synonyms: annotations.synonyms,
     })
+}
+
+/// Capture the source-table name after `AS` — a maximal run of tokens with no
+/// whitespace gap, stopping before a `(` / `;` symbol. This reproduces
+/// `find_identifier_end`: a dotted / quoted FQN like `"my db"."sch"."t"` is
+/// contiguous and captured whole, while a following ` PRIMARY KEY` is separated
+/// by whitespace and left for the constraint parser. Returns the verbatim name
+/// slice and its end offset (in `entry`) for the caller's "between" check.
+fn take_source_table_name<'a>(
+    cur: &mut Cursor<'a>,
+    entry: &'a str,
+    alias: &str,
+) -> Result<(&'a str, usize), ParseError> {
+    let Some(first) = cur.peek() else {
+        return Err(cur.err(cur.byte_pos(), missing_name_msg(alias)));
+    };
+    if matches!(first.kind, TokenKind::Symbol(_)) {
+        // A leading `(` / `.` / `=` / etc. where the name should be. `find_identifier_end`
+        // returned 0 only for `(` / `;` / whitespace, but a leading `.foo` / `=x`
+        // is a non-name that is better rejected here than accepted as a bogus
+        // table name (pinned by `test_leading_symbol_in_name_slot_is_missing_name`).
+        return Err(cur.err(first.start, missing_name_msg(alias)));
+    }
+    let name_start = first.start;
+    let mut name_end = first.end;
+    let mut unterminated_ident = matches!(first.kind, TokenKind::Unterminated { ident: true });
+    cur.bump();
+    while let Some(t) = cur.peek() {
+        // A whitespace gap or a `(` / `;` symbol ends the name.
+        if t.start != name_end || matches!(t.kind, TokenKind::Symbol(b'(' | b';')) {
+            break;
+        }
+        if matches!(t.kind, TokenKind::Unterminated { ident: true }) {
+            unterminated_ident = true;
+        }
+        name_end = t.end;
+        cur.bump();
+    }
+    let table_name = &entry[name_start..name_end];
+
+    // Bare reserved keywords in the name slot surface the missing-name error
+    // (Phase 68 A1 / D-03) — `o AS PRIMARY KEY (id)` has no real table name.
+    if matches!(
+        table_name.to_ascii_uppercase().as_str(),
+        "PRIMARY" | "UNIQUE" | "FOREIGN" | "REFERENCES" | "NOT"
+    ) {
+        return Err(cur.err(name_start, missing_name_msg(alias)));
+    }
+    // An unterminated `"..."` in the name slot (Phase 68 A4). A doubled-quote
+    // `""` is an escape and stays balanced, so only a genuinely open quote trips
+    // this — the lexer already encoded that distinction in the token kind.
+    if unterminated_ident {
+        return Err(cur.err(
+            name_start,
+            format!(
+                "Unterminated quoted identifier in source-table name for alias '{alias}' in TABLES clause.",
+            ),
+        ));
+    }
+    Ok((table_name, name_end))
 }
 
 /// Consume the `(col, col, ...)` list that must follow a `PRIMARY KEY` /

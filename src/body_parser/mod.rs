@@ -1019,6 +1019,25 @@ mod tests {
     }
 
     #[test]
+    fn test_leading_symbol_in_name_slot_is_missing_name() {
+        // §6.1 (PR #100 review): when the name slot begins with a non-`(`/`;`
+        // symbol (`.foo`, `=x`, `-1`), the token cursor surfaces the missing-name
+        // error at parse time. The pre-migration `find_identifier_end` folded a
+        // leading `.`/`=`/`-` INTO the table name (a latent bug — no SQL
+        // identifier starts with one), so this is a deliberate, stricter
+        // behaviour on input the old code left undefined-by-test. Pinned here so
+        // it stays intentional rather than drifting.
+        for entry in ["o AS .foo", "o AS =x", "o AS -1"] {
+            let err = parse_tables_clause(entry, 0).unwrap_err();
+            assert!(
+                err.message.contains("Missing physical table name"),
+                "{entry}: got {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
     fn test_bare_paren_immediately_after_name_terminates_name() {
         // §6.1 (PR #100 review): the name-capture loop stops at a contiguous
         // `(`, mirroring `find_identifier_end(.., allow_paren = true)`. The stop

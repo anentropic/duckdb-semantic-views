@@ -309,4 +309,31 @@ mod tests {
             assert_well_formed(s);
         }
     }
+
+    // The tiling invariant is the whole point of the lexer — it must hold for
+    // ARBITRARY input, not just the curated cases above (PR #100 review). These
+    // proptests make the "no byte-slice ever cuts a codepoint" / "no
+    // non-whitespace byte is dropped" guarantees generative rather than sampled.
+    mod proptests {
+        use super::assert_well_formed;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// A dense hostile alphabet: `"`/`'` (forming `""`/`''` escapes and
+            /// unterminated regions), `(` `)` `;` `.` `=` `-`, unicode, and
+            /// whitespace — the bytes whose handling the lexer is responsible for.
+            #[test]
+            fn tiling_holds_over_hostile_alphabet(s in r#"[-a-zé_ "'(),.;=]{0,48}"#) {
+                assert_well_formed(&s);
+            }
+
+            /// Fully arbitrary Unicode (control bytes, astral-plane codepoints)
+            /// the curated alphabet can't reach — the generative form of the
+            /// char-boundary guarantee.
+            #[test]
+            fn tiling_holds_over_arbitrary_unicode(s in r"[\s\S]{0,32}") {
+                assert_well_formed(&s);
+            }
+        }
+    }
 }
