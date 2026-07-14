@@ -16,8 +16,8 @@ use crate::ddl::read_ffi::{
     probe_catalog_table_present, read_str_arg, run_dispatcher, serialize_varchar_bool_rows,
     BorrowedConnection,
 };
-use crate::expand::{ancestors_to_root, collect_derived_metric_source_tables};
-use crate::graph::RelationshipGraph;
+use crate::expand::collect_derived_metric_source_tables;
+use crate::graph::{JoinTree, RelationshipGraph};
 use crate::model::{Cardinality, Dimension, SemanticViewDefinition};
 use crate::util::suggest_closest;
 
@@ -159,12 +159,8 @@ unsafe fn show_dims_for_metric(
     } else {
         let graph =
             RelationshipGraph::from_definition(&def).map_err(|e| format!("graph error: {e}"))?;
-        let mut parent_map: HashMap<String, String> = HashMap::new();
-        for (child, parents) in &graph.reverse {
-            if let Some(parent) = parents.first() {
-                parent_map.insert(child.clone(), parent.clone());
-            }
-        }
+        // The directed parent tree — same derivation the fan-trap check uses (E-7).
+        let tree = JoinTree::from_graph(&graph);
         let card_map: HashMap<(String, String), Cardinality> = def
             .joins
             .iter()
@@ -181,7 +177,7 @@ unsafe fn show_dims_for_metric(
             .collect();
         def.dimensions
             .iter()
-            .filter(|d| is_dimension_reachable_for_metric(d, &met_tables, &parent_map, &card_map))
+            .filter(|d| is_dimension_reachable_for_metric(d, &met_tables, &tree, &card_map))
             .map(|d| {
                 let table_name = d
                     .source_table
@@ -215,7 +211,7 @@ unsafe fn show_dims_for_metric(
 fn is_dimension_reachable_for_metric(
     dim: &Dimension,
     met_tables: &[String],
-    parent_map: &HashMap<String, String>,
+    tree: &JoinTree,
     card_map: &HashMap<(String, String), Cardinality>,
 ) -> bool {
     // Base table dimension (no source_table): always reachable
@@ -229,8 +225,8 @@ fn is_dimension_reachable_for_metric(
             return true; // Same table, no fan-out possible
         }
 
-        let met_ancestors = ancestors_to_root(met_table, parent_map);
-        let dim_ancestors = ancestors_to_root(&dim_table, parent_map);
+        let met_ancestors = tree.ancestors_to_root(met_table);
+        let dim_ancestors = tree.ancestors_to_root(&dim_table);
 
         // Find the lowest common ancestor (LCA)
         let dim_ancestor_set: HashSet<&String> = dim_ancestors.iter().collect();
@@ -249,7 +245,7 @@ fn is_dimension_reachable_for_metric(
         // Walking current -> parent at each step.
         let mut current = met_table.clone();
         while current != lca {
-            let Some(parent) = parent_map.get(&current) else {
+            let Some(parent) = tree.parent_of(&current) else {
                 break;
             };
 
