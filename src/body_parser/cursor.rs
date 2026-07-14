@@ -142,6 +142,32 @@ impl<'a> Cursor<'a> {
             .map(|w| w[0])
     }
 
+    /// The first bare keyword `kw` token at/after the cursor that sits at
+    /// paren-depth 0 (not inside any `(...)` group). Used for `OVER`, which must
+    /// be outside the window-function call's own parentheses.
+    pub(super) fn find_kw_depth0(&self, kw: &str) -> Option<Token> {
+        let mut depth = 0i32;
+        for &t in &self.toks[self.idx..] {
+            match t.kind {
+                TokenKind::Symbol(b'(') => depth += 1,
+                TokenKind::Symbol(b')') => depth -= 1,
+                _ if depth == 0 && self.is_kw(t, kw) => return Some(t),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The first token at/after the cursor that is a bare keyword equal to ANY
+    /// of `kws`. Used to locate the earliest of several possible boundary
+    /// keywords (e.g. `ORDER` / `ROWS` / `RANGE` / `GROUPS`).
+    pub(super) fn find_any_kw(&self, kws: &[&str]) -> Option<Token> {
+        self.toks[self.idx..]
+            .iter()
+            .copied()
+            .find(|&t| kws.iter().any(|kw| self.is_kw(t, kw)))
+    }
+
     /// The first run of consecutive bare keyword tokens matching `kws` in order
     /// (only whitespace between them, since that is all that separates adjacent
     /// tokens). Returns `(first_token, last_token)`. Used for multi-word
