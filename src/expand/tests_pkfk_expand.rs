@@ -281,7 +281,7 @@ fn test_pkfk_topological_order() {
         .find("LEFT JOIN \"customers\"")
         .expect("customers join missing");
     assert!(
-                o_pos < c_pos,
-                "orders (closer to root) must appear before customers (further from root) in topo order: {sql}"
-            );
+        o_pos < c_pos,
+        "orders (closer to root) must appear before customers (further from root) in topo order: {sql}"
+    );
 }
