@@ -160,6 +160,28 @@ impl<'a> Cursor<'a> {
         None
     }
 
+    /// Every bare keyword token at/after the cursor that equals ANY of `kws`
+    /// AND sits at bracket-depth 0, in source order. The depth-0 tiling variant
+    /// of [`Cursor::find_any_kw`]: it locates a fixed set of sub-clause
+    /// keywords (`TABLE` / `DIMENSIONS` / `METRICS`) that partition a body, so a
+    /// keyword-like name nested inside one of their `(...)` lists is inert.
+    /// Replaces the ad-hoc quote+depth `find_sub_keyword_positions` scan
+    /// (code-review 2026-07-11). All three bracket kinds count as nesting,
+    /// matching [`Cursor::find_kw_depth0`].
+    pub(super) fn find_all_kw_depth0(&self, kws: &[&str]) -> Vec<Token> {
+        let mut depth = 0i32;
+        let mut out = Vec::new();
+        for &t in &self.toks[self.idx..] {
+            match t.kind {
+                TokenKind::Symbol(b'(' | b'[' | b'{') => depth += 1,
+                TokenKind::Symbol(b')' | b']' | b'}') => depth -= 1,
+                _ if depth == 0 && kws.iter().any(|kw| self.is_kw(t, kw)) => out.push(t),
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// The first token at/after the cursor that is a bare keyword equal to ANY
     /// of `kws`. Used to locate the earliest of several possible boundary
     /// keywords (e.g. `ORDER` / `ROWS` / `RANGE` / `GROUPS`).
@@ -280,6 +302,21 @@ mod tests {
         assert!(Cursor::new("\"NON\" ADDITIVE BY", 0)
             .find_kw_seq(&["NON", "ADDITIVE", "BY"])
             .is_none());
+    }
+
+    #[test]
+    fn find_all_kw_depth0_tiles_and_ignores_nested_and_quoted() {
+        // TABLE / DIMENSIONS / METRICS at depth 0 are found in order; a
+        // keyword-like *name* nested inside a (...) list (`METRICS` as a dim
+        // name at depth 1) or hidden inside a quoted ident is inert.
+        let c = Cursor::new(
+            "TABLE t, DIMENSIONS (metrics, \"TABLE\"), METRICS (total)",
+            0,
+        );
+        let kws = c.find_all_kw_depth0(&["TABLE", "DIMENSIONS", "METRICS"]);
+        let texts: Vec<&str> = kws.iter().map(|&t| c.text(t)).collect();
+        // The depth-0 `metrics` name and the quoted `"TABLE"` do not appear.
+        assert_eq!(texts, vec!["TABLE", "DIMENSIONS", "METRICS"]);
     }
 
     #[test]
