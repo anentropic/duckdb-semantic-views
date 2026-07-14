@@ -88,15 +88,15 @@ impl JoinTree {
     }
 
     /// Build the path from `ancestor` down to `target`: `[ancestor, …,
-    /// target]`. Derived from `target`'s ancestor chain (so `ancestor` must be
-    /// an ancestor of `target`); falls back to `[ancestor, target]` when it is
-    /// not on the chain.
+    /// target]`. Walks `target` UP to `ancestor` (a prefix of `target`'s full
+    /// ancestor chain — it stops at `ancestor` rather than continuing to the
+    /// root) and reverses, so callers that already hold `target`'s ancestor
+    /// chain don't pay for a second full walk to the root. Falls back to
+    /// `[ancestor, target]` when `ancestor` is not on `target`'s parent chain.
     pub(crate) fn path_from_ancestor_to_node(&self, ancestor: &str, target: &str) -> Vec<String> {
-        let target_ancestors = self.ancestors_to_root(target);
-        if let Some(pos) = target_ancestors.iter().position(|a| a == ancestor) {
-            let mut path: Vec<String> = target_ancestors[..=pos].to_vec();
-            path.reverse();
-            path
+        let up = self.path_to_ancestor(target, ancestor);
+        if up.last().is_some_and(|last| last == ancestor) {
+            up.into_iter().rev().collect()
         } else {
             vec![ancestor.to_string(), target.to_string()]
         }
