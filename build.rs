@@ -472,21 +472,35 @@ fn patch_duckdb_cpp_for_windows() -> String {
     let patch3_before = "#ifdef _SECURE_SCL\n// Make a checked iterator to avoid MSVC warnings.\ntemplate <typename T> using checked_ptr = stdext::checked_array_iterator<T*>;";
     let patch3_after = "#if 0 // semantic-views patch: stdext::checked_array_iterator removed from modern MSVC STL — force fmt's portable raw-pointer path\n// Make a checked iterator to avoid MSVC warnings.\ntemplate <typename T> using checked_ptr = stdext::checked_array_iterator<T*>;";
 
-    // AR-9: like patch 2, a patch-3 miss is a HARD error. Without it, MSVC
-    // takes fmt's `stdext::checked_array_iterator` branch — removed from modern
-    // MSVC STL — and fails with `error C2653: 'stdext' is not a namespace`.
-    // Fail loudly at the patch site rather than deep in the fmt headers.
+    // AR-9: a patch-3 miss is a HARD error ONLY when the dangerous reference is
+    // still present but has drifted out of `patch3_before`'s exact shape — that
+    // is the case #60 cared about (a silently-unapplied patch shipping a broken
+    // MSVC build). But DuckDB's bundled fmt no longer emits the
+    // `stdext::checked_array_iterator` block at all (it is absent as of the
+    // v1.5.4 amalgamation — `grep` finds zero occurrences of `stdext`), so the
+    // original unconditional hard-fail was a false positive that has kept every
+    // Windows build red since the marker disappeared. Distinguish the two:
+    //   - `patch3_before` present            -> apply the guard flip;
+    //   - `stdext::checked_array_iterator` present but not in that shape
+    //                                        -> the patch drifted: fail loudly;
+    //   - neither present                    -> nothing to neutralize, MSVC
+    //                                           already compiles fmt's portable
+    //                                           `checked_ptr = T*` path: skip.
     let content = if content.contains(patch3_before) {
         content.replace(patch3_before, patch3_after)
-    } else {
+    } else if content.contains("stdext::checked_array_iterator") {
         panic!(
-            "duckdb.cpp Win32 patch 3 FAILED: expected _SECURE_SCL marker not found. The \
-             bundled DuckDB/fmt amalgamation changed shape (most likely a version bump), so \
-             this Windows-only fmt patch no longer applies. Left unpatched, MSVC selects \
-             fmt's removed `stdext::checked_array_iterator` and fails with `error C2653: \
-             'stdext' is not a class or namespace name`. Update `patch3_before` in \
+            "duckdb.cpp Win32 patch 3 FAILED: `stdext::checked_array_iterator` is present but \
+             not in the exact form `patch3_before` matches, so the guard flip was silently \
+             dropped. Left unpatched, MSVC selects fmt's removed \
+             `stdext::checked_array_iterator` and fails with `error C2653: 'stdext' is not a \
+             class or namespace name`. Update `patch3_before` in \
              build.rs::patch_duckdb_cpp_for_windows to match the new amalgamation."
         );
+    } else {
+        // fmt's MSVC checked-iterator block was removed upstream; there is no
+        // `stdext` reference for MSVC to reject. Nothing to patch.
+        content
     };
 
     std::fs::write(&patched, content).expect("failed to write duckdb_patched.cpp to OUT_DIR");
