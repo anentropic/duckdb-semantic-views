@@ -18,6 +18,41 @@ mod window;
 #[cfg(test)]
 mod test_helpers;
 
+// Behaviour-named expansion test modules, extracted from sql_gen.rs's monolithic
+// phase-named `mod tests` (§6.2 move 6, code-review 2026-07-11).
+#[cfg(test)]
+mod tests_cast;
+#[cfg(test)]
+mod tests_count_star_rewrite;
+#[cfg(test)]
+mod tests_derived_metric;
+#[cfg(test)]
+mod tests_expand;
+#[cfg(test)]
+mod tests_expand_basic;
+#[cfg(test)]
+mod tests_fact_inlining;
+#[cfg(test)]
+mod tests_fact_query;
+#[cfg(test)]
+mod tests_facts_awareness;
+#[cfg(test)]
+mod tests_facts_path_role_playing;
+#[cfg(test)]
+mod tests_fan_trap;
+#[cfg(test)]
+mod tests_join_emission_regression;
+#[cfg(test)]
+mod tests_pkfk_expand;
+#[cfg(test)]
+mod tests_private_access;
+#[cfg(test)]
+mod tests_qualified_name_resolution;
+#[cfg(test)]
+mod tests_qualified_refs;
+#[cfg(test)]
+mod tests_role_playing;
+
 // Public API (the pre-split expand.rs surface, plus the boxed fan-trap detail
 // structs re-exported for R-9).
 pub use resolution::{quote_ident, quote_ident_if_needed, quote_table_ref};
