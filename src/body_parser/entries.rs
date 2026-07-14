@@ -96,10 +96,13 @@ fn parse_single_qualified_entry(
         }
     }
 
-    // The cursor spans the post-access-modifier text. Its base is `entry_offset`
-    // (not the access-modifier offset within `entry`) so error carets reproduce
-    // the pre-migration formula exactly.
-    let mut cur = Cursor::new(entry_after_access, entry_offset);
+    // The cursor spans the post-access-modifier text. Its base includes the
+    // byte offset of `entry_after_access` within `entry` so error carets land at
+    // true positions — the pre-migration `entry_offset + dot_pos` formula was
+    // relative to `entry_after_access` and so drifted left into a stripped
+    // `PRIVATE `/`PUBLIC ` prefix on FACTS entries (PR #102 review).
+    let access_offset = crate::util::byte_offset_within(entry, entry_after_access);
+    let mut cur = Cursor::new(entry_after_access, entry_offset + access_offset);
 
     // Split `alias.name` at the first `.` SYMBOL token — quote-aware (PA-6): a
     // dot inside a quoted name (`"a.b"`) is part of that one token, not a

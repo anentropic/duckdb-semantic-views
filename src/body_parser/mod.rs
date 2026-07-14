@@ -1268,6 +1268,20 @@ mod tests {
     }
 
     #[test]
+    fn test_private_fact_structural_error_caret_after_modifier() {
+        // §6.1 (phase 3, PR #102 review): the cursor base accounts for the
+        // stripped PRIVATE/PUBLIC modifier, so a structural-error caret lands in
+        // the alias.name region, not inside "PRIVATE ". `PRIVATE o.x` has no AS.
+        let entry = "PRIVATE o.x";
+        let err = parse_qualified_entries(entry, 0, true, "facts").unwrap_err();
+        let pos = err.position.expect("caret");
+        assert!(
+            pos >= entry.find("o.x").unwrap(),
+            "caret {pos} drifted into the access modifier of {entry:?}"
+        );
+    }
+
+    #[test]
     fn test_quoted_dot_in_alias_not_a_qualifier() {
         // §6.1 (phase 3): the qualifier `.` is the first `.` SYMBOL token, so a
         // dot inside a QUOTED alias is inert — the split happens at the dot
