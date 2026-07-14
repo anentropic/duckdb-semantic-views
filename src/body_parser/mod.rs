@@ -1891,6 +1891,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_materializations_unterminated_name_rejected_cleanly() {
+        // PR #105 review: an unterminated quoted-identifier name lexes as one
+        // token spanning the whole entry; reject it up front (like every sibling
+        // clause) instead of embedding the entry in an "Expected 'AS'" error.
+        let err = parse_materializations_clause("\"unclosed AS (TABLE t, DIMENSIONS (r))", 0)
+            .unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "got: {}",
+            err.message
+        );
+        // An unterminated string literal in the name slot is distinguished.
+        let err =
+            parse_materializations_clause("'unclosed AS (TABLE t, DIMENSIONS (r))", 0).unwrap_err();
+        assert!(
+            err.message.contains("Unterminated string literal"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn parse_relationships_error_missing_name() {
         // Entry starts with "AS" — no preceding relationship name
         let result = parse_relationships_clause("AS o(customer_id) REFERENCES c", 0);

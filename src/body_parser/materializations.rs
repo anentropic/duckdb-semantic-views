@@ -13,6 +13,7 @@
 //! [`split_at_depth0_commas`] unchanged.
 
 use super::cursor::Cursor;
+use super::lexer::TokenKind;
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
 use crate::model::Materialization;
@@ -62,6 +63,24 @@ fn parse_single_materialization_entry(
         });
     }
     let name_tok = cur.bump().expect("peek_is_value guaranteed a token");
+
+    // An unterminated `"..."` / `'...'` lexes as a single token spanning the
+    // rest of the entry, so without this guard it would be swallowed as the
+    // `name` and surface a misleading "Expected 'AS' after name '<whole entry>'"
+    // error. Reject it up front — matching how every sibling clause (TABLES via
+    // the token kind, entries/metrics via `unterminated_quote_error`) handles an
+    // orphan quote (PR #105 review).
+    if let TokenKind::Unterminated { ident } = name_tok.kind {
+        let noun = if ident {
+            "Unterminated quoted identifier"
+        } else {
+            "Unterminated string literal"
+        };
+        return Err(cur.err(
+            name_tok.start,
+            format!("{noun} in materialization entry '{entry}'."),
+        ));
+    }
     let name = cur.text(name_tok);
 
     // Expect `AS` immediately after the name (only whitespace between the two
