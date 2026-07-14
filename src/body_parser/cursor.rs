@@ -315,7 +315,7 @@ mod tests {
         );
         let kws = c.find_all_kw_depth0(&["TABLE", "DIMENSIONS", "METRICS"]);
         let texts: Vec<&str> = kws.iter().map(|&t| c.text(t)).collect();
-        // The depth-0 `metrics` name and the quoted `"TABLE"` do not appear.
+        // The nested (depth-1) `metrics` name and the quoted `"TABLE"` do not appear.
         assert_eq!(texts, vec!["TABLE", "DIMENSIONS", "METRICS"]);
     }
 

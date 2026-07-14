@@ -43,9 +43,12 @@ fn parse_single_materialization_entry(
     let entry = entry.trim();
     let mut cur = Cursor::new(entry, entry_offset);
 
-    // The name is the first token, which must be an identifier (bare or
-    // quoted) — not punctuation. A quoted name keeps its quotes and may contain
-    // whitespace (`"my mat"`), since it is one token now rather than a
+    // The name is the first token, which must be a value token — a bare or
+    // quoted identifier, or a string literal (`peek_is_value`) — rather than
+    // punctuation. This mirrors the retired first-whitespace scan, which also
+    // took a leading `'string'` verbatim as the name; only a leading symbol is
+    // rejected here as "missing name". A quoted name keeps its quotes and may
+    // contain whitespace (`"my mat"`), since it is one token now rather than a
     // first-whitespace split.
     if !cur.peek_is_value() {
         let message = if cur.peek().is_none() {
