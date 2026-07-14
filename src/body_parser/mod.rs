@@ -1019,6 +1019,29 @@ mod tests {
     }
 
     #[test]
+    fn test_bare_paren_immediately_after_name_terminates_name() {
+        // §6.1 (PR #100 review): the name-capture loop stops at a contiguous
+        // `(`, mirroring `find_identifier_end(.., allow_paren = true)`. The stop
+        // is expressed as the or-pattern `Symbol(b'(' | b';')` — this test would
+        // fail (name greedily swallowing `(foo)`, parsing to Ok) if that arm
+        // ever stopped matching `(`. Expected: name is `v`, and the trailing
+        // `(foo)` is reported as unexpected text, not folded into the name.
+        let err = parse_tables_clause("o AS v(foo)", 0).unwrap_err();
+        assert!(
+            err.message.contains("after table declaration"),
+            "got: {}",
+            err.message
+        );
+        // A contiguous `;` likewise ends the name (the other or-pattern arm).
+        let err2 = parse_tables_clause("o AS v;junk", 0).unwrap_err();
+        assert!(
+            err2.message.contains("after table declaration"),
+            "got: {}",
+            err2.message
+        );
+    }
+
+    #[test]
     fn test_non_ascii_name_then_primary_key_no_panic() {
         // A non-ASCII quoted source-table name followed by PRIMARY KEY must
         // tokenize without a mid-codepoint panic and still resolve the

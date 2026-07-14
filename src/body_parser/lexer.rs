@@ -163,7 +163,10 @@ mod tests {
     }
 
     /// Every token span lands on a char boundary and the spans tile the
-    /// non-whitespace bytes left to right without overlap.
+    /// non-whitespace bytes left to right without overlap — i.e. the only bytes
+    /// NOT covered by a token are whitespace. Asserting the gaps are whitespace
+    /// (not just that tokens don't overlap) is what makes this catch a `lex()`
+    /// regression that silently drops a non-whitespace byte.
     fn assert_well_formed(src: &str) {
         let toks = lex(src);
         let mut prev_end = 0;
@@ -175,9 +178,19 @@ mod tests {
             assert!(src.is_char_boundary(t.end), "end not on boundary: {src:?}");
             assert!(t.start >= prev_end, "overlap in {src:?}");
             assert!(t.end > t.start, "empty token in {src:?}");
+            assert!(
+                src[prev_end..t.start]
+                    .bytes()
+                    .all(|b| b.is_ascii_whitespace()),
+                "non-whitespace bytes dropped in gap {prev_end}..{} of {src:?}",
+                t.start
+            );
             prev_end = t.end;
         }
-        assert!(prev_end <= src.len());
+        assert!(
+            src[prev_end..].bytes().all(|b| b.is_ascii_whitespace()),
+            "non-whitespace trailing bytes dropped after {prev_end} in {src:?}"
+        );
     }
 
     #[test]
