@@ -192,8 +192,15 @@ fn parse_over_content(content: &str, base_offset: usize) -> Result<OverContent, 
             cur.advance_past_byte(ex_end);
         }
         let dims_start = cur.byte_pos();
-        // Dims run up to ORDER or a frame keyword (whichever is first), else end.
-        let boundary = cur.find_any_kw(&["ORDER", "ROWS", "RANGE", "GROUPS"]);
+        // Dims run up to ORDER BY, else a frame keyword, else end. ORDER is
+        // PREFERRED over frame keywords (matching the old
+        // `find_keyword_ci("ORDER").or_else(find_frame_start)`), so a dim named
+        // like a frame keyword (`groups`/`rows`/`range`) followed by ORDER BY
+        // stays a dim rather than being taken as the frame boundary (PR #104
+        // review).
+        let boundary = cur
+            .find_kw("ORDER")
+            .or_else(|| cur.find_any_kw(&FRAME_KEYWORDS));
         let dims_end = boundary.map_or(content.len(), |t| t.start);
         let dims = split_dim_list(content[dims_start..dims_end].trim());
         if excluding {

@@ -1547,6 +1547,34 @@ mod tests {
         assert_eq!(ws.order_by[0].expr, "d");
     }
 
+    #[test]
+    fn test_over_partition_dim_named_like_frame_keyword() {
+        // §6.1 (phase 5, PR #104 review): a PARTITION/EXCLUDING dim named like a
+        // frame keyword (`groups`/`rows`/`range`) followed by ORDER BY stays a
+        // dim — the dims boundary prefers ORDER over frame keywords, matching
+        // the pre-migration `find_keyword_ci("ORDER").or_else(find_frame_start)`.
+        // (Neither the old nor the new suite covered this boundary before.)
+        let result = parse_metrics_clause(
+            "s.r AS SUM(qty) OVER (PARTITION BY EXCLUDING region, groups ORDER BY d)",
+            0,
+        )
+        .unwrap();
+        let ws = result[0].window_spec.as_ref().expect("window spec");
+        assert_eq!(ws.excluding_dims, vec!["region", "groups"]);
+        assert_eq!(ws.order_by.len(), 1);
+        assert_eq!(ws.order_by[0].expr, "d");
+        // Plain PARTITION BY with a frame-keyword-named dim + ORDER BY.
+        let result = parse_metrics_clause(
+            "s.r AS SUM(qty) OVER (PARTITION BY region, rows ORDER BY d)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            result[0].window_spec.as_ref().unwrap().partition_dims,
+            vec!["region", "rows"]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // P-3 (code-review 2026-07-11): the OVER-clause parser must not silently
     // degrade malformed content. `ORDER` without an adjacent `BY` previously
