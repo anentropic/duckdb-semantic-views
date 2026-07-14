@@ -87,23 +87,11 @@ pub(super) fn unterminated_quote_error(s: &str) -> Option<&'static str> {
     }
 }
 
-/// Find the first *live-code* occurrence of ASCII byte `needle` in `s` —
-/// i.e. outside single-quoted strings and double-quoted identifiers. The
-/// quote-aware replacement for `str::find` at the alias/name dot-splits
-/// (PA-6: `"a.b"` must not split at its inner dot).
-pub(super) fn find_live_byte(s: &str, needle: u8) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut st = QuoteState::default();
-    let mut i = 0;
-    while i < bytes.len() {
-        let (next, live) = st.step(bytes, i);
-        if live && bytes[i] == needle {
-            return Some(i);
-        }
-        i = next;
-    }
-    None
-}
+// `find_live_byte` (the quote-aware "first byte outside quotes" scan for
+// alias/name dot-splits) was retired in the §6.1 migration: the qualifier `.`
+// is now the first `.` SYMBOL token, which is inherently quote-aware since a
+// dot inside a string/quoted-ident is part of that one token (code-review
+// 2026-07-11).
 
 /// Split `body` at depth-0 commas, respecting nested parens, single-quoted
 /// strings, and double-quoted identifiers.

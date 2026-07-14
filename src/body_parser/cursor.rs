@@ -142,6 +142,24 @@ impl<'a> Cursor<'a> {
             .map(|w| w[0])
     }
 
+    /// The first run of consecutive bare keyword tokens matching `kws` in order
+    /// (only whitespace between them, since that is all that separates adjacent
+    /// tokens). Returns `(first_token, last_token)`. Used for multi-word
+    /// keywords like `NON ADDITIVE BY` — quote-aware by construction.
+    pub(super) fn find_kw_seq(&self, kws: &[&str]) -> Option<(Token, Token)> {
+        let toks = &self.toks[self.idx..];
+        if kws.is_empty() || toks.len() < kws.len() {
+            return None;
+        }
+        (0..=toks.len() - kws.len())
+            .find(|&w| {
+                kws.iter()
+                    .enumerate()
+                    .all(|(k, kw)| self.is_kw(toks[w + k], kw))
+            })
+            .map(|w| (toks[w], toks[w + kws.len() - 1]))
+    }
+
     /// If the next token is `(`, consume the whole balanced `(...)` group and
     /// return its inner source slice (between the parens). Advances past the
     /// matching `)`. Returns `None` when the next token is not `(` *or* the

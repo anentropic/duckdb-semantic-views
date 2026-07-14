@@ -1,15 +1,24 @@
 //! METRICS clause parsing, including USING and NON ADDITIVE BY.
+//!
+//! §6.1 (phase 4, code-review 2026-07-11): the structural scan — `AS`, `USING`,
+//! `NON ADDITIVE BY`, and the `alias.name` dot split — is parsed on the shared
+//! [`Cursor`]/lexer. Keyword and delimiter detection is now quote-aware by
+//! construction (a `USING`/`.`/`(` inside a `"quoted"`/`'string'` token is
+//! inert), replacing the `find_keyword_ci` / `find_live_byte` /
+//! `extract_paren_content` scans. The OVER/window sub-parser
+//! ([`parse_window_over_clause`], migrated separately) and the NON ADDITIVE BY
+//! dimension list ([`parse_non_additive_dims`]) are delegated unchanged, as is
+//! the trailing COMMENT / WITH SYNONYMS region.
 
 use super::annotations::{parse_leading_access_modifier, parse_trailing_annotations};
-use super::scan::{
-    extract_paren_content, find_keyword_ci, find_live_byte, is_ident_continuation,
-    is_quoting_balanced, unterminated_quote_error,
-};
+use super::cursor::Cursor;
+use super::scan::{is_quoting_balanced, unterminated_quote_error};
 use super::window::{parse_order_by_modifiers, parse_window_over_clause, OrderModifierContext};
 use super::{split_at_depth0_commas, ParsedMetric};
 use crate::errors::ParseError;
 use crate::ident::find_identifier_end;
 use crate::model::NonAdditiveDim;
+use crate::util::byte_offset_within;
 
 /// Parse the content inside METRICS (...) supporting both qualified and unqualified entries.
 ///
@@ -39,35 +48,6 @@ pub(crate) fn parse_metrics_clause(
     }
 
     Ok(result)
-}
-
-/// Find the keyword sequence "NON ADDITIVE BY" with word boundaries.
-/// Returns `(start, end)` byte offsets — `start` at 'N' of NON, `end` one
-/// past 'Y' of BY. Returning the real end kills the hardcoded
-/// `start + 16` slice (PA-10, code-review 2026-07-02): it assumed exactly
-/// one space between the keywords, rejecting `NON  ADDITIVE BY` and the
-/// no-space `BY(d)` form.
-fn find_non_additive_by_keyword(upper_text: &str) -> Option<(usize, usize)> {
-    let mut search_from = 0;
-    while let Some(pos) = find_keyword_ci(&upper_text[search_from..], "NON") {
-        let abs_pos = search_from + pos;
-        let after_non = upper_text[abs_pos + 3..].trim_start();
-        if let Some(rest) = after_non.strip_prefix("ADDITIVE") {
-            let after_additive = rest.trim_start();
-            if let Some(after_by) = after_additive.strip_prefix("BY") {
-                // Verify BY has a word boundary: `_` and non-ASCII bytes
-                // continue an identifier (BY_foo is not the keyword BY).
-                if after_by.is_empty() || !is_ident_continuation(after_by.as_bytes()[0]) {
-                    // `after_by` is a suffix slice of `upper_text`, so the
-                    // offset one past "BY" falls out of the lengths.
-                    let end = upper_text.len() - after_by.len();
-                    return Some((abs_pos, end));
-                }
-            }
-        }
-        search_from = abs_pos + 3;
-    }
-    None
 }
 
 /// Parse the dimension entries inside a NON ADDITIVE BY (...) clause.
@@ -147,45 +127,43 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
         });
     }
 
-    // Phase 43: Check for leading PRIVATE/PUBLIC keyword
+    // Phase 43: Check for leading PRIVATE/PUBLIC keyword. The cursor base
+    // includes the modifier's byte offset so token-position carets are accurate.
     let (access, entry_after_access) = parse_leading_access_modifier(entry);
+    let cur = Cursor::new(
+        entry_after_access,
+        entry_offset + byte_offset_within(entry, entry_after_access),
+    );
 
-    // Check if entry contains a dot BEFORE the AS keyword -- if so, it's qualified.
-    // Find "AS" keyword first (case-insensitive, word boundary).
-    let upper = entry_after_access.to_ascii_uppercase();
-    let as_pos = find_keyword_ci(&upper, "AS").ok_or_else(|| ParseError {
-        message: format!(
-            "Expected 'AS' keyword in metric entry '{entry}'. Form: 'alias.name AS expr' or 'name AS expr'.",
-        ),
-        position: Some(entry_offset),
-    })?;
-
-    let before_as = entry_after_access[..as_pos].trim();
-    let raw_expr = entry_after_access[as_pos + 2..].trim();
+    // Split the entry at the first `AS` keyword token.
+    let Some(as_tok) = cur.find_kw("AS") else {
+        return Err(ParseError {
+            message: format!(
+                "Expected 'AS' keyword in metric entry '{entry}'. Form: 'alias.name AS expr' or 'name AS expr'.",
+            ),
+            position: Some(entry_offset),
+        });
+    };
+    let before_as = entry_after_access[..as_tok.start].trim();
+    let raw_expr = entry_after_access[as_tok.end..].trim();
 
     if raw_expr.is_empty() {
-        return Err(ParseError {
-            message: format!("Missing expression after 'AS' in metric entry '{entry}'."),
-            position: Some(entry_offset + as_pos + 2),
-        });
+        return Err(cur.err(
+            as_tok.end,
+            format!("Missing expression after 'AS' in metric entry '{entry}'."),
+        ));
     }
 
     // Phase 43: Parse trailing annotations from expression
     let (expr, annotations) = parse_trailing_annotations(raw_expr)?;
 
     // Phase 48: Detect and parse OVER clause from the expression text.
-    // The OVER clause is part of the expression for window metrics, e.g.:
     //   AVG(total_qty) OVER (PARTITION BY EXCLUDING d1, d2 ORDER BY d1)
     // Base the reported positions at the expression's own offset within the
-    // entry (leading access modifier + AS + whitespace), not the entry start
-    // — otherwise OVER-clause error carets point at the metric name
-    // (PR #50 review).
-    let after_as_slice = &entry_after_access[as_pos + 2..];
-    let expr_offset = (entry.len() - entry_after_access.len())
-        + as_pos
-        + 2
-        + (after_as_slice.len() - after_as_slice.trim_start().len());
-    let (expr, window_spec) = parse_window_over_clause(&expr, entry_offset + expr_offset)?;
+    // entry so OVER-clause error carets point at the expression, not the
+    // metric name (PR #50 review).
+    let expr_abs = entry_offset + byte_offset_within(entry, raw_expr);
+    let (expr, window_spec) = parse_window_over_clause(&expr, expr_abs)?;
 
     if before_as.is_empty() {
         return Err(ParseError {
@@ -194,33 +172,42 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
         });
     }
 
-    // Phase 47: Check for NON ADDITIVE BY in before_as first (it appears after USING if both present)
-    let upper_before = before_as.to_ascii_uppercase();
-    let na_pos = find_non_additive_by_keyword(&upper_before);
+    // Parse `before_as` = `name [USING (...)] [NON ADDITIVE BY (...)]` on a
+    // cursor scoped to that slice (its base is its offset within the entry, so
+    // token carets stay accurate under a leading access modifier).
+    let before_base = entry_offset + byte_offset_within(entry, before_as);
+
+    // Phase 47: NON ADDITIVE BY appears after USING when both are present, so
+    // peel it off the tail first.
     let mut non_additive_by: Vec<NonAdditiveDim> = Vec::new();
-    let before_na = if let Some((na_start, na_end)) = na_pos {
-        let after_na = before_as[na_end..].trim();
-        // Recover carets from the re-sliced tokens themselves rather than
-        // `entry_offset + na_end`: `na_end` is an offset within `before_as`,
-        // which does not start at the entry origin when a leading access
-        // modifier is present, so the manual sum drifted (P-4). `after_na` is
-        // the token where `(` is expected; `paren_content` is the inner list.
-        let after_na_pos = entry_offset + crate::util::byte_offset_within(entry, after_na);
-        if !after_na.starts_with('(') {
-            return Err(ParseError {
-                message: format!("Expected '(' after NON ADDITIVE BY in metric entry '{entry}'."),
-                position: Some(after_na_pos),
-            });
+    let before_na = {
+        let mut nab_cur = Cursor::new(before_as, before_base);
+        if let Some((na_first, na_last)) = nab_cur.find_kw_seq(&["NON", "ADDITIVE", "BY"]) {
+            nab_cur.advance_past_byte(na_last.end);
+            // The token where `(` is expected; caret recovered from it (P-4).
+            let after_na_abs = nab_cur.abs(nab_cur.byte_pos());
+            if !nab_cur.peek_is_symbol(b'(') {
+                return Err(ParseError {
+                    message: format!(
+                        "Expected '(' after NON ADDITIVE BY in metric entry '{entry}'."
+                    ),
+                    position: Some(after_na_abs),
+                });
+            }
+            let Some(inner) = nab_cur.take_parens() else {
+                return Err(ParseError {
+                    message: format!(
+                        "Unclosed '(' after NON ADDITIVE BY in metric entry '{entry}'."
+                    ),
+                    position: Some(after_na_abs),
+                });
+            };
+            non_additive_by =
+                parse_non_additive_dims(inner, entry_offset + byte_offset_within(entry, inner))?;
+            before_as[..na_first.start].trim()
+        } else {
+            before_as
         }
-        let paren_content = extract_paren_content(after_na).ok_or_else(|| ParseError {
-            message: format!("Unclosed '(' after NON ADDITIVE BY in metric entry '{entry}'."),
-            position: Some(after_na_pos),
-        })?;
-        let paren_pos = entry_offset + crate::util::byte_offset_within(entry, paren_content);
-        non_additive_by = parse_non_additive_dims(paren_content, paren_pos)?;
-        before_as[..na_start].trim()
-    } else {
-        before_as
     };
 
     // Phase 48: OVER clause combined with NON ADDITIVE BY produces error (mutually exclusive)
@@ -235,45 +222,45 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
         });
     }
 
-    // Check for USING keyword in the portion before NON ADDITIVE BY (or full before_as)
-    let upper_before_na = before_na.to_ascii_uppercase();
-    let using_pos = find_keyword_ci(&upper_before_na, "USING");
+    // USING (...) sits between the name and NON ADDITIVE BY. Scope a cursor to
+    // `before_na`.
     let mut using_relationships: Vec<String> = Vec::new();
-
-    // The name portion is before USING (or all of before_na if no USING)
-    let final_name_portion = if let Some(upos) = using_pos {
-        // Extract the parenthesized relationship list after USING. Caret is
-        // recovered from `after_using` (the token where `(` is expected) rather
-        // than `entry_offset + upos + 5`, which ignored where `before_na` starts
-        // within the entry (P-4).
-        let after_using = before_na[upos + 5..].trim();
-        let after_using_pos = entry_offset + crate::util::byte_offset_within(entry, after_using);
-        if !after_using.starts_with('(') {
-            return Err(ParseError {
-                message: format!("Expected '(' after USING in metric entry '{entry}'."),
-                position: Some(after_using_pos),
-            });
+    let final_name_portion = {
+        let na_base = entry_offset + byte_offset_within(entry, before_na);
+        let mut using_cur = Cursor::new(before_na, na_base);
+        if let Some(using_tok) = using_cur.find_kw("USING") {
+            using_cur.advance_past_byte(using_tok.end);
+            let after_using_abs = using_cur.abs(using_cur.byte_pos());
+            if !using_cur.peek_is_symbol(b'(') {
+                return Err(ParseError {
+                    message: format!("Expected '(' after USING in metric entry '{entry}'."),
+                    position: Some(after_using_abs),
+                });
+            }
+            let Some(inner) = using_cur.take_parens() else {
+                return Err(ParseError {
+                    message: format!("Unclosed '(' after USING in metric entry '{entry}'."),
+                    position: Some(after_using_abs),
+                });
+            };
+            using_relationships = split_at_depth0_commas(inner)
+                .into_iter()
+                .map(|(_, rel)| rel.to_string())
+                .collect();
+            before_na[..using_tok.start].trim()
+        } else {
+            before_na
         }
-        let paren_content = extract_paren_content(after_using).ok_or_else(|| ParseError {
-            message: format!("Unclosed '(' after USING in metric entry '{entry}'."),
-            position: Some(after_using_pos),
-        })?;
-        using_relationships = split_at_depth0_commas(paren_content)
-            .into_iter()
-            .map(|(_, entry)| entry.to_string())
-            .collect();
-        before_na[..upos].trim()
-    } else {
-        before_na
     };
 
-    // Check for dot to distinguish qualified vs unqualified. Quote-aware
-    // (PA-6): a dot inside a quoted name (`"a.b"`) is not a qualifier
-    // separator.
-    if let Some(dot_pos) = find_live_byte(final_name_portion, b'.') {
+    // Distinguish qualified (`alias.name`) from unqualified (derived) at the
+    // first `.` SYMBOL token — quote-aware (a dot inside `"a.b"` is inert).
+    let name_base = entry_offset + byte_offset_within(entry, final_name_portion);
+    let name_cur = Cursor::new(final_name_portion, name_base);
+    if let Some(dot_tok) = name_cur.find_symbol(b'.') {
         // Qualified: alias.name
-        let source_alias = final_name_portion[..dot_pos].trim().to_string();
-        let bare_name = final_name_portion[dot_pos + 1..].trim().to_string();
+        let source_alias = final_name_portion[..dot_tok.start].trim().to_string();
+        let bare_name = final_name_portion[dot_tok.end..].trim().to_string();
 
         if source_alias.is_empty() {
             return Err(ParseError {
@@ -282,12 +269,10 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
             });
         }
         if bare_name.is_empty() {
-            return Err(ParseError {
-                message: format!(
-                    "Missing bare name between '.' and 'AS' in metric entry '{entry}'."
-                ),
-                position: Some(entry_offset + dot_pos + 1),
-            });
+            return Err(name_cur.err(
+                dot_tok.end,
+                format!("Missing bare name between '.' and 'AS' in metric entry '{entry}'."),
+            ));
         }
 
         Ok(ParsedMetric {
