@@ -142,6 +142,24 @@ impl<'a> Cursor<'a> {
             .map(|w| w[0])
     }
 
+    /// The first run of consecutive bare keyword tokens matching `kws` in order
+    /// (only whitespace between them, since that is all that separates adjacent
+    /// tokens). Returns `(first_token, last_token)`. Used for multi-word
+    /// keywords like `NON ADDITIVE BY` — quote-aware by construction.
+    pub(super) fn find_kw_seq(&self, kws: &[&str]) -> Option<(Token, Token)> {
+        let toks = &self.toks[self.idx..];
+        if kws.is_empty() || toks.len() < kws.len() {
+            return None;
+        }
+        (0..=toks.len() - kws.len())
+            .find(|&w| {
+                kws.iter()
+                    .enumerate()
+                    .all(|(k, kw)| self.is_kw(toks[w + k], kw))
+            })
+            .map(|w| (toks[w], toks[w + kws.len() - 1]))
+    }
+
     /// If the next token is `(`, consume the whole balanced `(...)` group and
     /// return its inner source slice (between the parens). Advances past the
     /// matching `)`. Returns `None` when the next token is not `(` *or* the
@@ -209,6 +227,31 @@ mod tests {
         // `PRIMARY , KEY` — a comma between → not a pair.
         let c2 = Cursor::new("PRIMARY , KEY", 0);
         assert!(c2.find_kw_pair("PRIMARY", "KEY").is_none());
+    }
+
+    #[test]
+    fn find_kw_seq_matches_consecutive_words() {
+        // Successful 3-word match returns the first and last keyword tokens.
+        let c = Cursor::new("revenue NON ADDITIVE BY date", 0);
+        let (first, last) = c.find_kw_seq(&["NON", "ADDITIVE", "BY"]).unwrap();
+        assert_eq!(c.text(first), "NON");
+        assert_eq!(c.text(last), "BY");
+        // Case-insensitive.
+        assert!(Cursor::new("non additive by", 0)
+            .find_kw_seq(&["NON", "ADDITIVE", "BY"])
+            .is_some());
+        // Interrupted by an intervening token → no match.
+        assert!(Cursor::new("NON ADDITIVE junk BY", 0)
+            .find_kw_seq(&["NON", "ADDITIVE", "BY"])
+            .is_none());
+        // Too short → no match.
+        assert!(Cursor::new("NON ADDITIVE", 0)
+            .find_kw_seq(&["NON", "ADDITIVE", "BY"])
+            .is_none());
+        // Quote-aware: a quoted "NON" is not a keyword token.
+        assert!(Cursor::new("\"NON\" ADDITIVE BY", 0)
+            .find_kw_seq(&["NON", "ADDITIVE", "BY"])
+            .is_none());
     }
 
     #[test]
