@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::graph::JoinTree;
 use crate::model::{Cardinality, Metric, SemanticViewDefinition};
 
 use super::facts::collect_derived_metric_source_tables;
@@ -46,14 +47,10 @@ pub(super) fn check_fan_traps(
     let graph = build_relationship_graph(view_name, def)?;
     let card_map = build_card_map(def);
 
-    // Build parent map for tree path finding.
-    // In a validated tree, each non-root node has exactly one parent via the reverse map.
-    let mut parent_map: HashMap<String, String> = HashMap::new();
-    for (child, parents) in &graph.reverse {
-        if let Some(parent) = parents.first() {
-            parent_map.insert(child.clone(), parent.clone());
-        }
-    }
+    // The directed parent tree for path finding — derived once and shared with
+    // the fact-path validator + the SHOW-dims filter (E-7). In a validated tree
+    // each non-root node has exactly one parent via the reverse map.
+    let tree = JoinTree::from_graph(&graph);
 
     let queried_dim_names: HashSet<String> = resolved_dims
         .iter()
@@ -94,8 +91,8 @@ pub(super) fn check_fan_traps(
 
                 // Find path from met_table to dim_table through the tree.
                 // Walk both up to root to get ancestor chains, then derive path.
-                let met_ancestors = ancestors_to_root(met_table, &parent_map);
-                let dim_ancestors = ancestors_to_root(&dim_table, &parent_map);
+                let met_ancestors = tree.ancestors_to_root(met_table);
+                let dim_ancestors = tree.ancestors_to_root(&dim_table);
 
                 // Find the lowest common ancestor (LCA)
                 let dim_ancestor_set: HashSet<&String> = dim_ancestors.iter().collect();
@@ -110,8 +107,8 @@ pub(super) fn check_fan_traps(
 
                 // Build path: met_table -> ... -> LCA -> ... -> dim_table,
                 // then scan the up-leg and down-leg for a fanning edge.
-                let up_path = path_to_ancestor(met_table, &lca, &parent_map);
-                let down_path = path_from_ancestor_to_node(&lca, &dim_table, &dim_ancestors);
+                let up_path = tree.path_to_ancestor(met_table, &lca);
+                let down_path = tree.path_from_ancestor_to_node(&lca, &dim_table);
                 let fanning = fanning_edge_on_path(&up_path, &card_map)
                     .or_else(|| fanning_edge_on_path(&down_path, &card_map));
                 if let Some(rel_name) = fanning {
@@ -146,7 +143,7 @@ pub(super) fn check_fan_traps(
         .map(|m| {
             let tables = metric_grain_tables(m, def);
             if tables.is_empty() {
-                vec![graph.root.clone()]
+                vec![tree.root().to_string()]
             } else {
                 tables
             }
@@ -372,38 +369,6 @@ fn find_path(
     None
 }
 
-/// Walk from `node` to the root through the parent map, returning the chain
-/// including `node` itself. The last element is the root.
-pub(crate) fn ancestors_to_root(node: &str, parent_map: &HashMap<String, String>) -> Vec<String> {
-    let mut chain = vec![node.to_string()];
-    let mut current = node.to_string();
-    while let Some(parent) = parent_map.get(&current) {
-        chain.push(parent.clone());
-        current = parent.clone();
-    }
-    chain
-}
-
-/// Build the chain `[start, parent, ..., ancestor]` by walking the parent
-/// map. Stops early (returning a partial chain) if the parent chain breaks
-/// before reaching `ancestor`.
-fn path_to_ancestor(
-    start: &str,
-    ancestor: &str,
-    parent_map: &HashMap<String, String>,
-) -> Vec<String> {
-    let mut path = vec![start.to_string()];
-    let mut current = start.to_string();
-    while current != ancestor {
-        let Some(parent) = parent_map.get(&current) else {
-            break;
-        };
-        path.push(parent.clone());
-        current = parent.clone();
-    }
-    path
-}
-
 /// Scan consecutive pairs along `path` for an edge traversed in the fan-out
 /// direction, returning the fanning relationship's name.
 ///
@@ -467,21 +432,16 @@ pub(super) fn validate_fact_table_path(
     // SG-7: an unbuildable graph is an error, not a skipped check.
     let graph = build_relationship_graph(view_name, def)?;
 
-    // Build parent map from reverse adjacency
-    let mut parent_map: HashMap<String, String> = HashMap::new();
-    for (child, parents) in &graph.reverse {
-        if let Some(parent) = parents.first() {
-            parent_map.insert(child.clone(), parent.clone());
-        }
-    }
+    // The directed parent tree (shared derivation with check_fan_traps, E-7).
+    let tree = JoinTree::from_graph(&graph);
 
     // For each pair, verify one is an ancestor of the other
     for i in 0..all_tables.len() {
         for j in (i + 1)..all_tables.len() {
             let a = &all_tables[i];
             let b = &all_tables[j];
-            let a_ancestors = ancestors_to_root(a, &parent_map);
-            let b_ancestors = ancestors_to_root(b, &parent_map);
+            let a_ancestors = tree.ancestors_to_root(a);
+            let b_ancestors = tree.ancestors_to_root(b);
             let a_is_ancestor_of_b = b_ancestors.iter().any(|x| x == a);
             let b_is_ancestor_of_a = a_ancestors.iter().any(|x| x == b);
             if !a_is_ancestor_of_b && !b_is_ancestor_of_a {
@@ -497,53 +457,14 @@ pub(super) fn validate_fact_table_path(
     Ok(())
 }
 
-/// Build the path from an ancestor down to a target node, given the target's ancestor chain.
-/// Returns a vec starting at `ancestor` and ending at `target`.
-fn path_from_ancestor_to_node(
-    ancestor: &str,
-    target: &str,
-    target_ancestors: &[String],
-) -> Vec<String> {
-    // target_ancestors is [target, parent, grandparent, ..., root]
-    // Find ancestor in this chain and take the sub-chain, reversed.
-    if let Some(pos) = target_ancestors.iter().position(|a| a == ancestor) {
-        let mut path: Vec<String> = target_ancestors[..=pos].to_vec();
-        path.reverse();
-        path
-    } else {
-        vec![ancestor.to_string(), target.to_string()]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::expand::test_helpers::{minimal_def, orders_view, TestFixtureExt};
     use crate::model::{Cardinality, NullsOrder, SortOrder, WindowSpec};
 
-    #[test]
-    fn test_ancestors_to_root_at_root() {
-        let parent_map: HashMap<String, String> = HashMap::new();
-        let result = ancestors_to_root("root", &parent_map);
-        assert_eq!(result, vec!["root"]);
-    }
-
-    #[test]
-    fn test_ancestors_to_root_single_parent() {
-        let mut parent_map: HashMap<String, String> = HashMap::new();
-        parent_map.insert("child".to_string(), "root".to_string());
-        let result = ancestors_to_root("child", &parent_map);
-        assert_eq!(result, vec!["child", "root"]);
-    }
-
-    #[test]
-    fn test_ancestors_to_root_multi_level() {
-        let mut parent_map: HashMap<String, String> = HashMap::new();
-        parent_map.insert("leaf".to_string(), "mid".to_string());
-        parent_map.insert("mid".to_string(), "root".to_string());
-        let result = ancestors_to_root("leaf", &parent_map);
-        assert_eq!(result, vec!["leaf", "mid", "root"]);
-    }
+    // The directed ancestor-walk helpers now live on `crate::graph::JoinTree`,
+    // where their unit tests moved too (§6.2 move 5, E-7).
 
     #[test]
     fn test_check_fan_traps_no_joins_ok() {
