@@ -1,7 +1,16 @@
 //! DIMENSIONS / FACTS qualified-entry parsing.
+//!
+//! §6.1 (phase 3, code-review 2026-07-11): the structural `alias.name AS`
+//! prefix is parsed on the shared [`Cursor`]/lexer — the qualifier `.` is the
+//! first `.` SYMBOL token (quote-aware: a dot inside a quoted `"a.b"` is inert,
+//! PA-6) and `AS` is the first keyword token after it. The leading access
+//! modifier, the unterminated-quote guard, and the trailing COMMENT / WITH
+//! SYNONYMS region continue to use their shared helpers (the annotation tail is
+//! handed the post-`AS` source verbatim, as TABLES does).
 
 use super::annotations::{parse_leading_access_modifier, parse_trailing_annotations};
-use super::scan::{find_keyword_ci, find_live_byte, unterminated_quote_error};
+use super::cursor::Cursor;
+use super::scan::unterminated_quote_error;
 use super::{split_at_depth0_commas, ParsedQualifiedEntry};
 use crate::errors::ParseError;
 use crate::model::AccessModifier;
@@ -87,47 +96,58 @@ fn parse_single_qualified_entry(
         }
     }
 
-    // Find first live '.' to split alias.bare_name — quote-aware (PA-6):
-    // a dot inside a quoted name (`"a.b"`) is not a qualifier separator.
-    let dot_pos = find_live_byte(entry_after_access, b'.').ok_or_else(|| ParseError {
-        message: format!(
-            "Expected 'alias.name' qualified identifier, got '{entry}'. Each dimension/metric entry must have the form 'alias.name AS expr'.",
-        ),
-        position: Some(entry_offset),
-    })?;
+    // The cursor spans the post-access-modifier text. Its base is `entry_offset`
+    // (not the access-modifier offset within `entry`) so error carets reproduce
+    // the pre-migration formula exactly.
+    let mut cur = Cursor::new(entry_after_access, entry_offset);
 
-    let source_alias = entry_after_access[..dot_pos].trim().to_string();
+    // Split `alias.name` at the first `.` SYMBOL token — quote-aware (PA-6): a
+    // dot inside a quoted name (`"a.b"`) is part of that one token, not a
+    // qualifier separator. `name` keeps the source-slice form because it may
+    // itself contain dots (`o.x.y` → alias `o`, name `x.y`).
+    let Some(dot_tok) = cur.find_symbol(b'.') else {
+        return Err(cur.err(
+            0,
+            format!(
+                "Expected 'alias.name' qualified identifier, got '{entry}'. Each dimension/metric entry must have the form 'alias.name AS expr'.",
+            ),
+        ));
+    };
+    let source_alias = entry_after_access[..dot_tok.start].trim().to_string();
     if source_alias.is_empty() {
-        return Err(ParseError {
-            message: format!("Source alias before '.' is empty in entry '{entry}'."),
-            position: Some(entry_offset),
-        });
+        return Err(cur.err(
+            0,
+            format!("Source alias before '.' is empty in entry '{entry}'."),
+        ));
     }
+    cur.advance_past_byte(dot_tok.end);
 
-    // Everything from dot+1 forward; find "AS" (case-insensitive, word boundary)
-    let after_dot = &entry_after_access[dot_pos + 1..];
-    let upper_after = after_dot.to_ascii_uppercase();
-    let as_pos = find_keyword_ci(&upper_after, "AS").ok_or_else(|| ParseError {
-        message: format!(
-            "Expected 'AS' keyword in dimension/metric entry '{entry}'. Form: 'alias.name AS expr'.",
-        ),
-        position: Some(entry_offset + dot_pos + 1),
-    })?;
-
-    let bare_name = after_dot[..as_pos].trim().to_string();
+    // `AS` is the first keyword token after the qualifier dot; `name` is the
+    // text between them.
+    let Some(as_tok) = cur.find_kw("AS") else {
+        return Err(cur.err(
+            dot_tok.end,
+            format!(
+                "Expected 'AS' keyword in dimension/metric entry '{entry}'. Form: 'alias.name AS expr'.",
+            ),
+        ));
+    };
+    let bare_name = entry_after_access[dot_tok.end..as_tok.start]
+        .trim()
+        .to_string();
     if bare_name.is_empty() {
-        return Err(ParseError {
-            message: format!("Missing bare name between '.' and 'AS' in entry '{entry}'."),
-            position: Some(entry_offset + dot_pos + 1),
-        });
+        return Err(cur.err(
+            dot_tok.end,
+            format!("Missing bare name between '.' and 'AS' in entry '{entry}'."),
+        ));
     }
 
-    let raw_expr = after_dot[as_pos + 2..].trim();
+    let raw_expr = entry_after_access[as_tok.end..].trim();
     if raw_expr.is_empty() {
-        return Err(ParseError {
-            message: format!("Missing expression after 'AS' in entry '{entry}'."),
-            position: Some(entry_offset + dot_pos + 1 + as_pos + 2),
-        });
+        return Err(cur.err(
+            as_tok.end,
+            format!("Missing expression after 'AS' in entry '{entry}'."),
+        ));
     }
 
     // Phase 43: Parse trailing annotations from expression

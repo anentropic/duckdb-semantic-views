@@ -1268,6 +1268,18 @@ mod tests {
     }
 
     #[test]
+    fn test_quoted_dot_in_alias_not_a_qualifier() {
+        // §6.1 (phase 3): the qualifier `.` is the first `.` SYMBOL token, so a
+        // dot inside a QUOTED alias is inert — the split happens at the dot
+        // AFTER the closing quote. (Quote-aware already, now token-structural.)
+        let entries = parse_qualified_entries("\"a.b\".name AS 1", 0, false, "dimensions").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_alias, "\"a.b\"");
+        assert_eq!(entries[0].name, "name");
+        assert_eq!(entries[0].expr, "1");
+    }
+
+    #[test]
     fn test_keyword_not_matched_before_non_ascii_continuation() {
         // PR #50 review: keyword boundary checks treated non-ASCII bytes as
         // boundaries, so COMMENT matched inside the identifier `commenté`

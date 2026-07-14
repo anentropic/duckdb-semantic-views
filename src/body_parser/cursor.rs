@@ -98,6 +98,17 @@ impl<'a> Cursor<'a> {
             .find(|&t| self.is_kw(t, kw))
     }
 
+    /// The first `Symbol(b)` token at/after the cursor, without consuming.
+    /// Quote-aware by construction — a `b` inside a string/quoted-ident is part
+    /// of that one token, never a `Symbol`. Used to locate a structural
+    /// delimiter (e.g. the qualifier `.`) that a name run splits on.
+    pub(super) fn find_symbol(&self, b: u8) -> Option<Token> {
+        self.toks[self.idx..]
+            .iter()
+            .copied()
+            .find(|t| t.kind == TokenKind::Symbol(b))
+    }
+
     /// Is the next token `Symbol(b)`?
     pub(super) fn peek_is_symbol(&self, b: u8) -> bool {
         matches!(self.peek(), Some(t) if t.kind == TokenKind::Symbol(b))
