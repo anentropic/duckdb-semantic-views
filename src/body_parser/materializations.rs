@@ -1,6 +1,19 @@
 //! MATERIALIZATIONS clause parsing.
+//!
+//! §6.1 (phase 6, code-review 2026-07-11): the entry structure — the `name`,
+//! the `AS`, the parenthesized sub-body, and the depth-0 TABLE / DIMENSIONS /
+//! METRICS keyword scan — is parsed on the shared [`Cursor`]/lexer. Keyword,
+//! `AS`-boundary, and paren detection are now quote- and depth-aware by
+//! construction: a `TABLE`/`METRICS`/`(`/`)` inside a `"quoted"` / `'string'`
+//! token is inert, a keyword-like name nested inside a DIMENSIONS/METRICS list
+//! (depth > 0) does not split the sub-body, and `ASx` is a single ident token
+//! (never the `AS` keyword). This replaces the `split_first_token` /
+//! `extract_paren_content` / local `find_sub_keyword_positions` byte scans. The
+//! comma-split into entries and into per-list names is delegated to the shared
+//! [`split_at_depth0_commas`] unchanged.
 
-use super::scan::{extract_paren_content, is_ident_continuation, split_first_token, QuoteState};
+use super::cursor::Cursor;
+use super::lexer::TokenKind;
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
 use crate::model::Materialization;
@@ -29,90 +42,113 @@ fn parse_single_materialization_entry(
     entry_offset: usize,
 ) -> Result<Materialization, ParseError> {
     let entry = entry.trim();
-    if entry.is_empty() {
+    let mut cur = Cursor::new(entry, entry_offset);
+
+    // The name is the first token, which must be a value token — a bare or
+    // quoted identifier, or a string literal (`peek_is_value`) — rather than
+    // punctuation. This mirrors the retired first-whitespace scan, which also
+    // took a leading `'string'` verbatim as the name; only a leading symbol is
+    // rejected here as "missing name". A quoted name keeps its quotes and may
+    // contain whitespace (`"my mat"`), since it is one token now rather than a
+    // first-whitespace split.
+    if !cur.peek_is_value() {
+        let message = if cur.peek().is_none() {
+            "Empty entry in MATERIALIZATIONS clause.".to_string()
+        } else {
+            "Expected materialization name in MATERIALIZATIONS entry.".to_string()
+        };
         return Err(ParseError {
-            message: "Empty entry in MATERIALIZATIONS clause.".to_string(),
+            message,
             position: Some(entry_offset),
         });
     }
+    let name_tok = cur.bump().expect("peek_is_value guaranteed a token");
 
-    // Extract name before "AS"
-    let (name, rest) = split_first_token(entry);
-    if name.is_empty() {
-        return Err(ParseError {
-            message: "Expected materialization name in MATERIALIZATIONS entry.".to_string(),
-            position: Some(entry_offset),
-        });
+    // An unterminated `"..."` / `'...'` lexes as a single token spanning the
+    // rest of the entry, so without this guard it would be swallowed as the
+    // `name` and surface a misleading "Expected 'AS' after name '<whole entry>'"
+    // error. Reject it up front — matching how every sibling clause (TABLES via
+    // the token kind, entries/metrics via `unterminated_quote_error`) handles an
+    // orphan quote (PR #105 review).
+    if let TokenKind::Unterminated { ident } = name_tok.kind {
+        let noun = if ident {
+            "Unterminated quoted identifier"
+        } else {
+            "Unterminated string literal"
+        };
+        return Err(cur.err(
+            name_tok.start,
+            format!("{noun} in materialization entry '{entry}'."),
+        ));
     }
-    let rest = rest.trim();
+    let name = cur.text(name_tok);
 
-    // Expect "AS", with a trailing word boundary — `AS(...)` is legal
-    // (punctuation boundary) but `ASx` is not (PR #50 review).
-    let as_ok = rest.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("AS"))
-        && (rest.len() == 2 || !is_ident_continuation(rest.as_bytes()[2]));
+    // Expect `AS` immediately after the name (only whitespace between the two
+    // tokens). `AS(...)` is legal — `(` is a separate token — while `ASx` is a
+    // single `ASx` ident token that is not the `AS` keyword (PR #50 review).
+    let as_ok = cur.peek().is_some_and(|t| cur.is_kw(t, "AS"));
     if !as_ok {
-        return Err(ParseError {
-            message: format!(
+        return Err(cur.err(
+            name_tok.end,
+            format!(
                 "Expected 'AS' after materialization name '{name}' in MATERIALIZATIONS clause."
             ),
-            position: Some(entry_offset + name.len()),
-        });
+        ));
     }
-    let after_as = rest[2..].trim();
+    cur.bump(); // consume AS
 
-    // Expect parenthesized sub-body: (TABLE ..., DIMENSIONS (...), METRICS (...))
-    if !after_as.starts_with('(') {
+    // Expect the parenthesized sub-body: (TABLE ..., DIMENSIONS (...), METRICS (...)).
+    if !cur.peek_is_symbol(b'(') {
         return Err(ParseError {
             message: format!("Expected '(' after 'AS' for materialization '{name}'."),
             position: None,
         });
     }
-    // Find matching closing paren — via the shared quote-aware extractor, so
-    // a ')' inside a quoted identifier or string cannot close the sub-body
-    // early (PA-6).
-    let sub_body = extract_paren_content(after_as).ok_or_else(|| ParseError {
-        message: format!("Unclosed '(' for materialization '{name}'."),
-        position: None,
-    })?;
+    // A `)` inside a quoted identifier or string is part of that one token, so
+    // it cannot close the sub-body early (PA-6).
+    let Some(sub_body) = cur.take_parens() else {
+        return Err(ParseError {
+            message: format!("Unclosed '(' for materialization '{name}'."),
+            position: None,
+        });
+    };
 
-    // Parse sub-body keywords: TABLE, DIMENSIONS, METRICS
+    // Locate the TABLE / DIMENSIONS / METRICS sub-keywords at depth 0 (outside
+    // any nested `(...)` list) and outside quotes, in order. Each keyword's
+    // content runs from just past it to the start of the next keyword (or the
+    // end of the sub-body) — the same tiling the retired
+    // `find_sub_keyword_positions` produced, now quote-aware by construction.
+    let sub = Cursor::new(sub_body, 0);
+    let kw_toks = sub.find_all_kw_depth0(&["TABLE", "DIMENSIONS", "METRICS"]);
+
     let mut table_name: Option<String> = None;
     let mut dim_names: Vec<String> = Vec::new();
     let mut met_names: Vec<String> = Vec::new();
 
-    // Scan for keyword positions (case-insensitive)
-    let sub_upper = sub_body.to_ascii_uppercase();
-    let kw_positions = find_sub_keyword_positions(&sub_upper);
-
-    for (i, &(kw, start)) in kw_positions.iter().enumerate() {
-        let end = if i + 1 < kw_positions.len() {
-            kw_positions[i + 1].1
+    for (i, &kw_tok) in kw_toks.iter().enumerate() {
+        let end = if i + 1 < kw_toks.len() {
+            kw_toks[i + 1].start
         } else {
             sub_body.len()
         };
-        let content = sub_body[start + kw.len()..end].trim();
-        // Strip trailing comma
+        let content = sub_body[kw_tok.end..end].trim();
+        // Strip a single trailing comma (the separator to the next sub-clause).
         let content = content.strip_suffix(',').unwrap_or(content).trim();
 
-        match kw {
-            "TABLE" => {
-                if content.is_empty() {
-                    return Err(ParseError {
-                        message: format!(
-                            "Materialization '{name}': TABLE sub-clause has no table name."
-                        ),
-                        position: None,
-                    });
-                }
-                table_name = Some(content.to_string());
+        if sub.is_kw(kw_tok, "TABLE") {
+            if content.is_empty() {
+                return Err(ParseError {
+                    message: format!(
+                        "Materialization '{name}': TABLE sub-clause has no table name."
+                    ),
+                    position: None,
+                });
             }
-            "DIMENSIONS" => {
-                dim_names = extract_paren_list(content)?;
-            }
-            "METRICS" => {
-                met_names = extract_paren_list(content)?;
-            }
-            _ => {}
+            table_name = Some(content.to_string());
+        } else if sub.is_kw(kw_tok, "DIMENSIONS") {
+            dim_names = extract_paren_list(content)?;
+        } else if sub.is_kw(kw_tok, "METRICS") {
+            met_names = extract_paren_list(content)?;
         }
     }
 
@@ -138,59 +174,20 @@ fn parse_single_materialization_entry(
     })
 }
 
-/// Find positions of TABLE, DIMENSIONS, METRICS keywords in the uppercased
-/// sub-body. Returns (keyword, `byte_offset`) pairs sorted by position.
-///
-/// Matches only at depth 0 and outside quoted regions (PA-6): a
-/// dimension/metric name inside a nested `(...)` list, or keyword text
-/// inside `'...'` / `"..."`, must not split the sub-body. The uppercased
-/// copy has identical byte offsets to the raw text (ASCII-only fold), so
-/// quote tracking over it is sound.
-fn find_sub_keyword_positions(upper: &str) -> Vec<(&'static str, usize)> {
-    let keywords: &[&str] = &["TABLE", "DIMENSIONS", "METRICS"];
-    let bytes = upper.as_bytes();
-    let mut positions = Vec::new();
-    let mut st = QuoteState::default();
-    let mut depth: i32 = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let (next, live) = st.step(bytes, i);
-        if live {
-            match bytes[i] {
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0 {
-                for &kw in keywords {
-                    let kb = kw.as_bytes();
-                    if i + kb.len() <= bytes.len() && &bytes[i..i + kb.len()] == kb {
-                        let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
-                        let after_pos = i + kb.len();
-                        let after_ok =
-                            after_pos >= bytes.len() || !is_ident_continuation(bytes[after_pos]);
-                        if before_ok && after_ok {
-                            positions.push((kw, i));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        i = next;
-    }
-    positions
-}
-
 /// Extract a parenthesized comma-separated name list: `(name1, name2, ...)`.
-/// Strips whitespace from each name.
+/// Strips whitespace from each name. A bare, unparenthesized `content` is
+/// treated as a single-element list (unchanged tolerance from the pre-cursor
+/// scanner).
 fn extract_paren_list(content: &str) -> Result<Vec<String>, ParseError> {
     let content = content.trim();
     if content.is_empty() {
         return Ok(Vec::new());
     }
     let inner = if content.starts_with('(') {
-        extract_paren_content(content).ok_or_else(|| ParseError {
+        // Quote-aware balanced `(...)`: a `)` inside a string / quoted ident
+        // cannot close the list early (PA-6).
+        let mut c = Cursor::new(content, 0);
+        c.take_parens().ok_or_else(|| ParseError {
             message: "Unclosed parenthesis in MATERIALIZATIONS sub-clause.".to_string(),
             position: None,
         })?

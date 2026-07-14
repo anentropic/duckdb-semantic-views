@@ -134,15 +134,11 @@ pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
     entries
 }
 
-/// Split `s` at the first ASCII whitespace, returning `(first_token, rest)`.
-/// If no whitespace found, returns `(s, "")`.
-pub(super) fn split_first_token(s: &str) -> (&str, &str) {
-    if let Some(pos) = s.find(|c: char| c.is_ascii_whitespace()) {
-        (&s[..pos], &s[pos..])
-    } else {
-        (s, "")
-    }
-}
+// `split_first_token` (first-whitespace split for the MATERIALIZATIONS name)
+// was retired in the §6.1 MATERIALIZATIONS migration: the name is now the first
+// TOKEN via `super::cursor::Cursor`, so a quoted name containing whitespace
+// (`"my mat"`) stays one identifier instead of splitting mid-quote
+// (code-review 2026-07-11).
 
 /// Phase 68 B1 (D-08): split a qualified identifier at the FIRST dot that
 /// falls OUTSIDE a double-quoted region. Returns
@@ -233,17 +229,17 @@ pub(super) fn is_quoting_balanced(s: &str) -> bool {
     !in_quote
 }
 
-/// Extract content inside the outermost `(...)` of `s` (which must start with `(`).
-/// Returns the content between the first `(` and its matching `)`, or `None` if unbalanced.
-/// Quote-aware: brackets inside `'...'` string literals and `"..."` quoted
-/// identifiers are inert (PA-6).
-pub(super) fn extract_paren_content(s: &str) -> Option<&str> {
-    extract_paren_prefix(s).map(|(inner, _)| inner)
-}
+// `extract_paren_content` (content between the first `(` and its matching `)`)
+// was retired in the §6.1 MATERIALIZATIONS migration: the sub-body and each
+// DIMENSIONS/METRICS list are now consumed with `super::cursor::Cursor`'s
+// quote-aware `take_parens` (code-review 2026-07-11). `extract_paren_prefix`
+// stays — the trailing-annotation parser still needs the consumed-byte count.
 
-/// Like [`extract_paren_content`], but also returns the number of bytes consumed
-/// through the matching closing `)` (so a caller can advance past the whole
-/// `(...)` group and inspect what follows). `s` must start with `(`.
+/// Returns the content inside the outermost `(...)` of `s` (which must start
+/// with `(`) plus the number of bytes consumed through the matching closing `)`
+/// (so a caller can advance past the whole `(...)` group and inspect what
+/// follows). Quote-aware: brackets inside `'...'` string literals and `"..."`
+/// quoted identifiers are inert (PA-6). Returns `None` if unbalanced.
 pub(super) fn extract_paren_prefix(s: &str) -> Option<(&str, usize)> {
     let bytes = s.as_bytes();
     if bytes.is_empty() || bytes[0] != b'(' {

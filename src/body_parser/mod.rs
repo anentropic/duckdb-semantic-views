@@ -1848,6 +1848,71 @@ mod tests {
     }
 
     #[test]
+    fn parse_materializations_unquoted_keyword_name_nested_not_a_subkeyword() {
+        // §6.1 phase 6: a *bare* dimension named like a sub-keyword (`metrics`)
+        // sits at bracket-depth 1 inside DIMENSIONS (...), so the depth-0
+        // TABLE/DIMENSIONS/METRICS scan must not treat it as the METRICS
+        // sub-clause and split the sub-body there.
+        let result =
+            parse_materializations_clause("m1 AS (TABLE t, DIMENSIONS (metrics, region))", 0)
+                .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].table, "t");
+        assert_eq!(result[0].dimensions, vec!["metrics", "region"]);
+        assert!(
+            result[0].metrics.is_empty(),
+            "the nested `metrics` name must not become a METRICS sub-clause"
+        );
+    }
+
+    #[test]
+    fn parse_materializations_quoted_name_with_space() {
+        // §6.1 phase 6: the name is the first TOKEN, so a double-quoted name
+        // containing whitespace stays whole (`"my mat"`) instead of splitting
+        // at the interior space the way the old first-whitespace scan did.
+        let result =
+            parse_materializations_clause("\"my mat\" AS (TABLE t, DIMENSIONS (region))", 0)
+                .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "\"my mat\"");
+        assert_eq!(result[0].table, "t");
+        assert_eq!(result[0].dimensions, vec!["region"]);
+    }
+
+    #[test]
+    fn parse_materializations_leading_symbol_is_missing_name() {
+        // §6.1 phase 6: an entry whose first token is punctuation has no name.
+        let err = parse_materializations_clause("(TABLE t, DIMENSIONS (region))", 0).unwrap_err();
+        assert!(
+            err.message.contains("Expected materialization name"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_materializations_unterminated_name_rejected_cleanly() {
+        // PR #105 review: an unterminated quoted-identifier name lexes as one
+        // token spanning the whole entry; reject it up front (like every sibling
+        // clause) instead of embedding the entry in an "Expected 'AS'" error.
+        let err = parse_materializations_clause("\"unclosed AS (TABLE t, DIMENSIONS (r))", 0)
+            .unwrap_err();
+        assert!(
+            err.message.contains("Unterminated quoted identifier"),
+            "got: {}",
+            err.message
+        );
+        // An unterminated string literal in the name slot is distinguished.
+        let err =
+            parse_materializations_clause("'unclosed AS (TABLE t, DIMENSIONS (r))", 0).unwrap_err();
+        assert!(
+            err.message.contains("Unterminated string literal"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn parse_relationships_error_missing_name() {
         // Entry starts with "AS" — no preceding relationship name
         let result = parse_relationships_clause("AS o(customer_id) REFERENCES c", 0);
