@@ -1,0 +1,216 @@
+//! A forward token cursor over a lexed clause (§6.1 incremental lexer + cursor
+//! migration, code-review 2026-07-11).
+//!
+//! The cursor is the layer the recursive-descent clause parsers talk to. It
+//! owns the token vector produced by [`super::lexer::lex`] and exposes exactly
+//! the primitives a clause parser needs: look at the next token, consume it,
+//! recognize a bare keyword, scan ahead for a keyword, consume a balanced
+//! `(...)` group, and build a [`ParseError`] whose caret is a real token
+//! offset (no manual `+2` / `- len` byte arithmetic — the source of the P-4
+//! caret-drift class).
+//!
+//! `base` is the absolute byte offset of `src[0]` within the original query,
+//! so [`Cursor::err`] and [`Cursor::abs`] map a source-relative offset back to
+//! a caret position in the user's SQL.
+
+use super::lexer::{lex, Token, TokenKind};
+use crate::errors::ParseError;
+
+pub(super) struct Cursor<'a> {
+    src: &'a str,
+    base: usize,
+    toks: Vec<Token>,
+    idx: usize,
+}
+
+impl<'a> Cursor<'a> {
+    /// Lex `src` and position the cursor at the first token. `base` is the
+    /// absolute offset of `src[0]` in the original query (for carets).
+    pub(super) fn new(src: &'a str, base: usize) -> Self {
+        Cursor {
+            src,
+            base,
+            toks: lex(src),
+            idx: 0,
+        }
+    }
+
+    /// The next unconsumed token, if any.
+    pub(super) fn peek(&self) -> Option<Token> {
+        self.toks.get(self.idx).copied()
+    }
+
+    /// Consume and return the next token, if any.
+    pub(super) fn bump(&mut self) -> Option<Token> {
+        let t = self.toks.get(self.idx).copied();
+        if t.is_some() {
+            self.idx += 1;
+        }
+        t
+    }
+
+    /// The source text of `t`.
+    pub(super) fn text(&self, t: Token) -> &'a str {
+        &self.src[t.start..t.end]
+    }
+
+    /// Byte offset (in `src`) of the next unconsumed token, or `src.len()` when
+    /// the cursor is exhausted. This is where "the rest of the input" begins.
+    pub(super) fn byte_pos(&self) -> usize {
+        self.toks.get(self.idx).map_or(self.src.len(), |t| t.start)
+    }
+
+    /// The remaining source from [`Cursor::byte_pos`] to end — handed verbatim
+    /// to a sub-parser (e.g. the shared trailing-annotation parser) so
+    /// uninterpreted tails stay re-sliced source, never re-tokenized twice.
+    pub(super) fn rest(&self) -> &'a str {
+        &self.src[self.byte_pos()..]
+    }
+
+    /// Absolute caret position for a source-relative byte offset.
+    pub(super) fn abs(&self, off: usize) -> usize {
+        self.base + off
+    }
+
+    /// Build a [`ParseError`] anchored at a source-relative offset.
+    pub(super) fn err(&self, off: usize, message: String) -> ParseError {
+        ParseError {
+            message,
+            position: Some(self.abs(off)),
+        }
+    }
+
+    /// Is `t` a *bare* identifier equal to `kw` (ASCII case-insensitive)? A
+    /// double-quoted `"..."` never matches — quoting means the text is data,
+    /// not a keyword.
+    pub(super) fn is_kw(&self, t: Token, kw: &str) -> bool {
+        matches!(t.kind, TokenKind::Ident { quoted: false })
+            && self.text(t).eq_ignore_ascii_case(kw)
+    }
+
+    /// The first token at/after the cursor that is a bare keyword `kw`,
+    /// without consuming anything. Quote-aware by construction (a quoted
+    /// `"UNIQUE"` is not a keyword token).
+    pub(super) fn find_kw(&self, kw: &str) -> Option<Token> {
+        self.toks[self.idx..]
+            .iter()
+            .copied()
+            .find(|&t| self.is_kw(t, kw))
+    }
+
+    /// The first token at/after the cursor that is a bare keyword `kw1`
+    /// *immediately followed* by a bare keyword `kw2` (only whitespace between
+    /// them, since whitespace is the only thing that separates two adjacent
+    /// tokens). Reproduces the two-word keyword match (`PRIMARY KEY`) without a
+    /// substring scan.
+    pub(super) fn find_kw_pair(&self, kw1: &str, kw2: &str) -> Option<Token> {
+        let rest = &self.toks[self.idx..];
+        rest.windows(2)
+            .find(|w| self.is_kw(w[0], kw1) && self.is_kw(w[1], kw2))
+            .map(|w| w[0])
+    }
+
+    /// If the next token is `(`, consume the whole balanced `(...)` group and
+    /// return its inner source slice (between the parens). Advances past the
+    /// matching `)`. Returns `None` when the next token is not `(` *or* the
+    /// group never closes — the caller distinguishes the two with a prior
+    /// [`Cursor::peek`] and reports "Expected '('" vs "Unclosed '('".
+    ///
+    /// Quote-awareness is free: a `)` inside a string or quoted identifier is
+    /// part of that single token, never a `Symbol(b')')`, so it cannot close
+    /// the group.
+    pub(super) fn take_parens(&mut self) -> Option<&'a str> {
+        let open = self.peek()?;
+        if open.kind != TokenKind::Symbol(b'(') {
+            return None;
+        }
+        self.bump();
+        let inner_start = open.end;
+        let mut depth = 1i32;
+        while let Some(t) = self.peek() {
+            match t.kind {
+                TokenKind::Symbol(b'(') => depth += 1,
+                TokenKind::Symbol(b')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let inner = &self.src[inner_start..t.start];
+                        self.bump();
+                        return Some(inner);
+                    }
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peek_bump_and_kw() {
+        let mut c = Cursor::new("o AS orders", 100);
+        let a = c.peek().unwrap();
+        assert_eq!(c.text(a), "o");
+        assert!(c.is_kw(c.peek().unwrap(), "o"));
+        c.bump();
+        assert!(c.is_kw(c.peek().unwrap(), "as")); // case-insensitive
+        c.bump();
+        assert_eq!(c.text(c.peek().unwrap()), "orders");
+    }
+
+    #[test]
+    fn abs_carets_are_base_relative() {
+        let c = Cursor::new("xy", 100);
+        assert_eq!(c.abs(0), 100);
+        assert_eq!(c.err(1, "boom".to_string()).position, Some(101));
+    }
+
+    #[test]
+    fn find_kw_pair_only_matches_adjacent_words() {
+        let c = Cursor::new("orders PRIMARY KEY (id)", 0);
+        let t = c.find_kw_pair("PRIMARY", "KEY").unwrap();
+        assert_eq!(c.text(t), "PRIMARY");
+        // `PRIMARY , KEY` — a comma between → not a pair.
+        let c2 = Cursor::new("PRIMARY , KEY", 0);
+        assert!(c2.find_kw_pair("PRIMARY", "KEY").is_none());
+    }
+
+    #[test]
+    fn find_kw_skips_quoted_and_strings() {
+        // A quoted "UNIQUE" and a string 'UNIQUE' are not keyword tokens.
+        let c = Cursor::new("\"UNIQUE\" 'UNIQUE'", 0);
+        assert!(c.find_kw("UNIQUE").is_none());
+    }
+
+    #[test]
+    fn take_parens_is_quote_and_nest_aware() {
+        let mut c = Cursor::new("(a, (b), \"x)y\")", 0);
+        assert_eq!(c.take_parens(), Some("a, (b), \"x)y\""));
+        assert!(c.peek().is_none());
+    }
+
+    #[test]
+    fn take_parens_unclosed_is_none() {
+        let mut c = Cursor::new("(a, b", 0);
+        assert_eq!(c.take_parens(), None);
+    }
+
+    #[test]
+    fn take_parens_not_a_paren_is_none() {
+        let mut c = Cursor::new("id", 0);
+        assert_eq!(c.take_parens(), None);
+        // Cursor did not advance.
+        assert_eq!(c.text(c.peek().unwrap()), "id");
+    }
+
+    #[test]
+    fn rest_returns_remaining_source() {
+        let mut c = Cursor::new("a b   c", 0);
+        c.bump();
+        assert_eq!(c.rest(), "b   c");
+    }
+}

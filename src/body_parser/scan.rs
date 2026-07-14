@@ -367,77 +367,9 @@ pub(super) fn find_depth0_keyword(
     None
 }
 
-/// Find the byte position of a keyword (already uppercased) in `upper_text`.
-/// Find "PRIMARY KEY" with any amount of whitespace between the two words.
-/// Returns `(start, end)` byte offsets into `upper_text`, where `upper_text` is already uppercased.
-/// `start` points at 'P', `end` points past 'Y' (exclusive).
-pub(super) fn find_primary_key(upper_text: &str) -> Option<(usize, usize)> {
-    let bytes = upper_text.as_bytes();
-    let mut st = QuoteState::default();
-    let mut i = 0;
-    while i < bytes.len() {
-        let (next, live) = st.step(bytes, i);
-        if !live || i + 7 > bytes.len() {
-            i = next;
-            continue;
-        }
-        // Look for "PRIMARY". Compare BYTES, not string slices: `i` advances
-        // one byte at a time, so `&upper_text[i..]` panics mid-codepoint on
-        // non-ASCII input (PA-1). A multi-byte char can never byte-match an
-        // ASCII keyword, so byte comparison is also correct. Quote-aware
-        // (PA-3): `COMMENT = 'the PRIMARY KEY (id) lives here'` must not
-        // fabricate a primary key from string-literal text.
-        if &bytes[i..i + 7] == b"PRIMARY" {
-            // Phase 68 A7: align word-boundary checks with `find_unique` —
-            // `_` is a valid identifier continuation byte, so exclude it from
-            // the "non-identifier" boundary set in all three checks below.
-            let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
-            let after_primary = i + 7;
-            if before_ok
-                && (after_primary == bytes.len() || !is_ident_continuation(bytes[after_primary]))
-            {
-                // Skip whitespace between PRIMARY and KEY
-                let mut j = after_primary;
-                while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
-                    j += 1;
-                }
-                // Match "KEY"
-                if j + 3 <= bytes.len() && &bytes[j..j + 3] == b"KEY" {
-                    let after_key = j + 3;
-                    let after_ok =
-                        after_key == bytes.len() || !is_ident_continuation(bytes[after_key]);
-                    if after_ok {
-                        return Some((i, after_key));
-                    }
-                }
-            }
-        }
-        i = next;
-    }
-    None
-}
-
-/// Find "UNIQUE" keyword with word-boundary matching in `upper_text`.
-/// Returns `(start, end)` byte offsets where start points at 'U' and end is past 'E'.
-///
-/// Quote-aware (PA-3): a `UNIQUE` inside a `'...'` string literal (e.g. a
-/// COMMENT payload) or a `"..."` quoted identifier does not match.
-pub(super) fn find_unique(upper_text: &str) -> Option<(usize, usize)> {
-    let bytes = upper_text.as_bytes();
-    let kw = b"UNIQUE";
-    let kw_len = kw.len(); // 6
-    let mut st = QuoteState::default();
-    let mut i = 0;
-    while i < bytes.len() {
-        let (next, live) = st.step(bytes, i);
-        if live && i + kw_len <= bytes.len() && &bytes[i..i + kw_len] == kw {
-            let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
-            let after_ok = i + kw_len == bytes.len() || !is_ident_continuation(bytes[i + kw_len]);
-            if before_ok && after_ok {
-                return Some((i, i + kw_len));
-            }
-        }
-        i = next;
-    }
-    None
-}
+// `find_primary_key` / `find_unique` (the case-insensitive, quote-aware
+// "find this constraint keyword anywhere in the post-name slice and slice from
+// it" scanners) were retired in the §6.1 TABLES migration: the TABLES clause
+// now consumes tokens in order via `super::cursor::Cursor`, so a constraint
+// keyword is recognized as a bare-identifier token — inherently quote-aware and
+// UTF-8-safe — rather than by a substring scan (code-review 2026-07-11).

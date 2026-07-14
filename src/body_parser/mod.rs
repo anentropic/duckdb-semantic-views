@@ -5,7 +5,9 @@
 
 mod annotations;
 mod clause_bounds;
+mod cursor;
 mod entries;
+mod lexer;
 mod materializations;
 mod metrics;
 mod relationships;
@@ -399,7 +401,7 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
 #[cfg(test)]
 mod tests {
     use super::annotations::parse_trailing_annotations;
-    use super::scan::{find_keyword_ci, find_primary_key};
+    use super::scan::find_keyword_ci;
     use super::*;
     use crate::model::{Cardinality, NullsOrder, SortOrder};
 
@@ -982,18 +984,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 68 A7: `find_primary_key`'s three word-boundary checks align with
-    // `find_unique`'s `_`-exclusion pattern. Identifiers like `my_PRIMARY`
-    // (prefix) or `PRIMARY KEY_extra` (suffix) must NOT match.
+    // Phase 68 A7, re-pinned at the clause level after the §6.1 TABLES
+    // migration (code-review 2026-07-11): a constraint keyword is now a token,
+    // so word-boundary correctness is structural. A source-table name whose
+    // bytes merely CONTAIN `PRIMARY` (`my_primary`, underscore-joined) is a
+    // single identifier token and must not be read as a PRIMARY KEY constraint.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_find_primary_key_word_boundary_underscore() {
-        // Underscore-prefixed: `_PRIMARY` should not match because `_` is now
-        // excluded from the before-boundary set.
-        assert!(find_primary_key(&"my_PRIMARY KEY".to_ascii_uppercase()).is_none());
-        // Underscore-suffixed on KEY: `KEY_extra` should not match.
-        assert!(find_primary_key(&"PRIMARY KEY_extra".to_ascii_uppercase()).is_none());
+    fn test_underscore_joined_primary_in_name_is_not_a_constraint() {
+        // `my_primary` is one identifier token — no PRIMARY KEY here, so the
+        // table is a bare (no-PK) table, not a table named `my` with a PK.
+        let result = parse_tables_clause("o AS my_primary", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].table, "my_primary");
+        assert!(result[0].pk_columns.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1014,11 +1019,59 @@ mod tests {
     }
 
     #[test]
-    fn test_find_primary_key_non_ascii_no_panic() {
-        assert!(find_primary_key("ΩΩ NO PK HERE Ω").is_none());
-        let upper = "\"CAFÉ\" PRIMARY KEY (ID)".to_string();
-        let (start, end) = find_primary_key(&upper).expect("PRIMARY KEY found");
-        assert_eq!(&upper[start..end], "PRIMARY KEY");
+    fn test_leading_symbol_in_name_slot_is_missing_name() {
+        // §6.1 (PR #100 review): when the name slot begins with a non-`(`/`;`
+        // symbol (`.foo`, `=x`, `-1`), the token cursor surfaces the missing-name
+        // error at parse time. The pre-migration `find_identifier_end` folded a
+        // leading `.`/`=`/`-` INTO the table name (a latent bug — no SQL
+        // identifier starts with one), so this is a deliberate, stricter
+        // behaviour on input the old code left undefined-by-test. Pinned here so
+        // it stays intentional rather than drifting.
+        for entry in ["o AS .foo", "o AS =x", "o AS -1"] {
+            let err = parse_tables_clause(entry, 0).unwrap_err();
+            assert!(
+                err.message.contains("Missing physical table name"),
+                "{entry}: got {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn test_bare_paren_immediately_after_name_terminates_name() {
+        // §6.1 (PR #100 review): the name-capture loop stops at a contiguous
+        // `(`, mirroring `find_identifier_end(.., allow_paren = true)`. The stop
+        // is expressed as the or-pattern `Symbol(b'(' | b';')` — this test would
+        // fail (name greedily swallowing `(foo)`, parsing to Ok) if that arm
+        // ever stopped matching `(`. Expected: name is `v`, and the trailing
+        // `(foo)` is reported as unexpected text, not folded into the name.
+        let err = parse_tables_clause("o AS v(foo)", 0).unwrap_err();
+        assert!(
+            err.message.contains("after table declaration"),
+            "got: {}",
+            err.message
+        );
+        // A contiguous `;` likewise ends the name (the other or-pattern arm).
+        let err2 = parse_tables_clause("o AS v;junk", 0).unwrap_err();
+        assert!(
+            err2.message.contains("after table declaration"),
+            "got: {}",
+            err2.message
+        );
+    }
+
+    #[test]
+    fn test_non_ascii_name_then_primary_key_no_panic() {
+        // A non-ASCII quoted source-table name followed by PRIMARY KEY must
+        // tokenize without a mid-codepoint panic and still resolve the
+        // constraint (was `find_primary_key`'s PA-1 byte-scan guarantee).
+        let result = parse_tables_clause("o AS \"CAFÉ\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].table, "\"CAFÉ\"");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+        // Pure non-ASCII with no constraint keyword: bare table, no panic.
+        let bare = parse_tables_clause("o AS \"ΩΩ Ω\"", 0).unwrap();
+        assert!(bare[0].pk_columns.is_empty());
     }
 
     #[test]
