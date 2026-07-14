@@ -1912,6 +1912,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_relationships_multi_token_from_alias_rejected() {
+        // §6.1 (phase 2, PR #101 review): from_alias is a single value token
+        // (like a TABLES alias), immediately followed by `(`. A multi-token run
+        // (`a b(...)`, `a.b(...)`) is rejected at parse time rather than
+        // captured as a bogus alias that only fails later at resolution.
+        for entry in ["rel AS a b(fk) REFERENCES c", "rel AS a.b(fk) REFERENCES c"] {
+            let err = parse_relationships_clause(entry, 0).unwrap_err();
+            assert!(
+                err.message.contains("Expected '(' after from_alias"),
+                "{entry}: got {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
     fn parse_relationships_junk_before_references_rejected() {
         // §6.1 (phase 2): text between the FK list and REFERENCES is rejected,
         // not silently skipped. The old code scanned for REFERENCES anywhere

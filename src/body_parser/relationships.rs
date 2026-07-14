@@ -68,24 +68,7 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
     let after_as = entry[as_tok.end..].trim_start();
     cur.advance_past_byte(as_tok.end);
 
-    // `from_alias(` — the from-alias is everything up to the first `(` SYMBOL
-    // token (so a `(` inside a quoted alias is inert — the P-11 fix).
-    let Some(paren_tok) = cur.find_symbol(b'(') else {
-        return Err(cur.err(
-            0,
-            format!(
-                "Expected '(' after from_alias in relationship '{rel_name}'. Got: '{after_as}'",
-            ),
-        ));
-    };
-    let from_alias = entry[cur.byte_pos()..paren_tok.start].trim();
-    if from_alias.is_empty() {
-        return Err(cur.err(
-            0,
-            format!("Expected from_alias before '(' in relationship '{rel_name}'."),
-        ));
-    }
-    cur.advance_past_byte(paren_tok.start); // now positioned at `(`
+    let from_alias = take_from_alias(&mut cur, rel_name, after_as)?;
     let fk_columns = take_columns(
         &mut cur,
         entry_offset,
@@ -150,6 +133,39 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
         name: Some(rel_name.to_string()),
         cardinality: Cardinality::default(), // will be set by inference
     })
+}
+
+/// Capture the from-alias: a SINGLE value token (a table alias is one
+/// identifier, matching TABLES) that must be immediately followed by `(`.
+/// Quote-awareness is structural — a `(` inside a quoted alias is part of that
+/// one token (the P-11 fix) — and a multi-token run like `a b(...)` / `a.b(...)`
+/// is rejected rather than captured as a bogus alias that only fails later at
+/// resolution (PR #101 review). Leaves the cursor positioned at the `(`.
+/// `after_as` is echoed in the "Expected '('" error to show the offending tail.
+fn take_from_alias<'a>(
+    cur: &mut Cursor<'a>,
+    rel_name: &str,
+    after_as: &str,
+) -> Result<&'a str, ParseError> {
+    let expected_paren =
+        || format!("Expected '(' after from_alias in relationship '{rel_name}'. Got: '{after_as}'");
+    if cur.peek_is_symbol(b'(') {
+        return Err(cur.err(
+            0,
+            format!("Expected from_alias before '(' in relationship '{rel_name}'."),
+        ));
+    }
+    let from_alias = match cur.peek() {
+        Some(t) if cur.peek_is_value() => {
+            cur.bump();
+            cur.text(t)
+        }
+        _ => return Err(cur.err(0, expected_paren())),
+    };
+    if !cur.peek_is_symbol(b'(') {
+        return Err(cur.err(0, expected_paren()));
+    }
+    Ok(from_alias)
 }
 
 /// Consume a `(col, col, ...)` list at the cursor's current position (which
