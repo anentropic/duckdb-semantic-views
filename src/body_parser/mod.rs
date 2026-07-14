@@ -401,7 +401,6 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
 #[cfg(test)]
 mod tests {
     use super::annotations::parse_trailing_annotations;
-    use super::scan::find_keyword_ci;
     use super::*;
     use crate::model::{Cardinality, NullsOrder, SortOrder};
 
@@ -1009,13 +1008,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_find_keyword_ci_non_ascii_no_panic() {
-        // `é` uppercases to `É` (both 2 bytes); scanning must not panic and
-        // must still find the keyword after the multi-byte run.
-        let upper = "ÉÉÉ AS x".to_string();
-        assert_eq!(find_keyword_ci(&upper, "AS"), Some(7));
-        // No match at all — pure multi-byte text.
-        assert_eq!(find_keyword_ci("東京東京", "AS"), None);
+    fn test_keyword_scan_over_non_ascii_no_panic() {
+        // PA-1/PA-2: keyword scanning over non-ASCII input must not panic and
+        // must still find a keyword after a multi-byte run. This is now
+        // structural — the lexer consumes each multi-byte codepoint whole and
+        // the cursor matches keywords by token — so it is exercised via the
+        // cursor (replacing the retired `find_keyword_ci` scan test).
+        use super::cursor::Cursor;
+        assert!(Cursor::new("ÉÉÉ AS x", 0).find_kw("AS").is_some());
+        assert!(Cursor::new("東京東京", 0).find_kw("AS").is_none());
     }
 
     #[test]
@@ -1544,6 +1545,34 @@ mod tests {
         assert_eq!(ws.excluding_dims, vec!["region"]);
         assert_eq!(ws.order_by.len(), 1);
         assert_eq!(ws.order_by[0].expr, "d");
+    }
+
+    #[test]
+    fn test_over_partition_dim_named_like_frame_keyword() {
+        // §6.1 (phase 5, PR #104 review): a PARTITION/EXCLUDING dim named like a
+        // frame keyword (`groups`/`rows`/`range`) followed by ORDER BY stays a
+        // dim — the dims boundary prefers ORDER over frame keywords, matching
+        // the pre-migration `find_keyword_ci("ORDER").or_else(find_frame_start)`.
+        // (Neither the old nor the new suite covered this boundary before.)
+        let result = parse_metrics_clause(
+            "s.r AS SUM(qty) OVER (PARTITION BY EXCLUDING region, groups ORDER BY d)",
+            0,
+        )
+        .unwrap();
+        let ws = result[0].window_spec.as_ref().expect("window spec");
+        assert_eq!(ws.excluding_dims, vec!["region", "groups"]);
+        assert_eq!(ws.order_by.len(), 1);
+        assert_eq!(ws.order_by[0].expr, "d");
+        // Plain PARTITION BY with a frame-keyword-named dim + ORDER BY.
+        let result = parse_metrics_clause(
+            "s.r AS SUM(qty) OVER (PARTITION BY region, rows ORDER BY d)",
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            result[0].window_spec.as_ref().unwrap().partition_dims,
+            vec!["region", "rows"]
+        );
     }
 
     // -----------------------------------------------------------------------

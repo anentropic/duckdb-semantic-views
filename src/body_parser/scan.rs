@@ -277,83 +277,12 @@ pub(super) fn extract_paren_prefix(s: &str) -> Option<(&str, usize)> {
     None
 }
 
-/// Requires the keyword to be preceded by whitespace (or be at start) and
-/// followed by whitespace or end-of-string. Returns byte offset into `upper_text`.
-///
-/// Quote-aware (PA-3/PA-6): keyword text inside `'...'` string literals or
-/// `"..."` quoted identifiers does not match.
-pub(super) fn find_keyword_ci(upper_text: &str, keyword: &str) -> Option<usize> {
-    let kw_len = keyword.len();
-    let text_len = upper_text.len();
-    if text_len < kw_len {
-        return None;
-    }
-    let kw_bytes = keyword.as_bytes();
-    let text_bytes = upper_text.as_bytes();
-    let mut st = QuoteState::default();
-    let mut i = 0;
-    while i < text_len {
-        let (next, live) = st.step(text_bytes, i);
-        // Byte comparison — `i` advances one byte at a time, so a string
-        // slice here panics mid-codepoint on non-ASCII input (PA-1).
-        if live && i + kw_len <= text_len && &text_bytes[i..i + kw_len] == kw_bytes {
-            // Check boundary: preceded by non-identifier char (or start), followed by non-identifier char (or end).
-            // Underscore is a valid identifier character, so it must NOT count as a word boundary.
-            let before_ok = i == 0 || !is_ident_continuation(text_bytes[i - 1]);
-            let after_ok = i + kw_len == text_len || !is_ident_continuation(text_bytes[i + kw_len]);
-            if before_ok && after_ok {
-                return Some(i);
-            }
-        }
-        i = next;
-    }
-    None
-}
-
-/// Find a keyword at depth-0 in a string (not inside parens or string literals).
-/// Returns byte offset of the keyword start.
-pub(super) fn find_depth0_keyword(
-    upper_text: &str,
-    raw_text: &str,
-    keyword: &str,
-) -> Option<usize> {
-    let bytes = upper_text.as_bytes();
-    let kw_len = keyword.len();
-    if bytes.len() < kw_len {
-        return None;
-    }
-    let raw_bytes = raw_text.as_bytes();
-    let mut depth: i32 = 0;
-    let mut st = QuoteState::default();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Quote state tracks the RAW text (quotes live at identical offsets
-        // in the uppercased copy, but scan the original for clarity).
-        let (next, live) = st.step(raw_bytes, i);
-        if live {
-            match raw_bytes[i] {
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0
-                && i + kw_len <= bytes.len()
-                // Byte comparison — `i` advances one byte at a time, so a string
-                // slice here panics mid-codepoint on non-ASCII input (PA-1).
-                && &bytes[i..i + kw_len] == keyword.as_bytes()
-            {
-                let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
-                let after_ok =
-                    i + kw_len == bytes.len() || !is_ident_continuation(bytes[i + kw_len]);
-                if before_ok && after_ok {
-                    return Some(i);
-                }
-            }
-        }
-        i = next;
-    }
-    None
-}
+// `find_keyword_ci` (case-insensitive, quote-aware, word-boundaried keyword
+// search) and `find_depth0_keyword` (its paren-depth-0 variant, used for OVER)
+// were retired in the §6.1 migration: clause parsers now recognize keywords as
+// bare-identifier TOKENS via `super::cursor::Cursor` (`find_kw` / `find_kw_seq`
+// / `find_kw_depth0`), which are inherently quote-aware and UTF-8-safe
+// (code-review 2026-07-11).
 
 // `find_primary_key` / `find_unique` (the case-insensitive, quote-aware
 // "find this constraint keyword anywhere in the post-name slice and slice from
