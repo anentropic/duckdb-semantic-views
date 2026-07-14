@@ -230,6 +230,31 @@ mod tests {
     }
 
     #[test]
+    fn find_kw_seq_matches_consecutive_words() {
+        // Successful 3-word match returns the first and last keyword tokens.
+        let c = Cursor::new("revenue NON ADDITIVE BY date", 0);
+        let (first, last) = c.find_kw_seq(&["NON", "ADDITIVE", "BY"]).unwrap();
+        assert_eq!(c.text(first), "NON");
+        assert_eq!(c.text(last), "BY");
+        // Case-insensitive.
+        assert!(Cursor::new("non additive by", 0)
+            .find_kw_seq(&["NON", "ADDITIVE", "BY"])
+            .is_some());
+        // Interrupted by an intervening token → no match.
+        assert!(Cursor::new("NON ADDITIVE junk BY", 0)
+            .find_kw_seq(&["NON", "ADDITIVE", "BY"])
+            .is_none());
+        // Too short → no match.
+        assert!(Cursor::new("NON ADDITIVE", 0)
+            .find_kw_seq(&["NON", "ADDITIVE", "BY"])
+            .is_none());
+        // Quote-aware: a quoted "NON" is not a keyword token.
+        assert!(Cursor::new("\"NON\" ADDITIVE BY", 0)
+            .find_kw_seq(&["NON", "ADDITIVE", "BY"])
+            .is_none());
+    }
+
+    #[test]
     fn find_kw_skips_quoted_and_strings() {
         // A quoted "UNIQUE" and a string 'UNIQUE' are not keyword tokens.
         let c = Cursor::new("\"UNIQUE\" 'UNIQUE'", 0);
