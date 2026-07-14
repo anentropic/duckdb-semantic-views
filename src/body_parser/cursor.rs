@@ -143,14 +143,16 @@ impl<'a> Cursor<'a> {
     }
 
     /// The first bare keyword `kw` token at/after the cursor that sits at
-    /// paren-depth 0 (not inside any `(...)` group). Used for `OVER`, which must
-    /// be outside the window-function call's own parentheses.
+    /// bracket-depth 0 (not inside any `(...)`, `[...]`, or `{...}` group). Used
+    /// for `OVER`, which must be outside the window-function call's own
+    /// parentheses. All three bracket kinds count as nesting, matching
+    /// [`super::split_at_depth0_commas`] and the retired `find_depth0_keyword`.
     pub(super) fn find_kw_depth0(&self, kw: &str) -> Option<Token> {
         let mut depth = 0i32;
         for &t in &self.toks[self.idx..] {
             match t.kind {
-                TokenKind::Symbol(b'(') => depth += 1,
-                TokenKind::Symbol(b')') => depth -= 1,
+                TokenKind::Symbol(b'(' | b'[' | b'{') => depth += 1,
+                TokenKind::Symbol(b')' | b']' | b'}') => depth -= 1,
                 _ if depth == 0 && self.is_kw(t, kw) => return Some(t),
                 _ => {}
             }

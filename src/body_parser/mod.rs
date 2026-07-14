@@ -401,7 +401,6 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
 #[cfg(test)]
 mod tests {
     use super::annotations::parse_trailing_annotations;
-    use super::scan::find_keyword_ci;
     use super::*;
     use crate::model::{Cardinality, NullsOrder, SortOrder};
 
@@ -1009,13 +1008,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_find_keyword_ci_non_ascii_no_panic() {
-        // `é` uppercases to `É` (both 2 bytes); scanning must not panic and
-        // must still find the keyword after the multi-byte run.
-        let upper = "ÉÉÉ AS x".to_string();
-        assert_eq!(find_keyword_ci(&upper, "AS"), Some(7));
-        // No match at all — pure multi-byte text.
-        assert_eq!(find_keyword_ci("東京東京", "AS"), None);
+    fn test_keyword_scan_over_non_ascii_no_panic() {
+        // PA-1/PA-2: keyword scanning over non-ASCII input must not panic and
+        // must still find a keyword after a multi-byte run. This is now
+        // structural — the lexer consumes each multi-byte codepoint whole and
+        // the cursor matches keywords by token — so it is exercised via the
+        // cursor (replacing the retired `find_keyword_ci` scan test).
+        use super::cursor::Cursor;
+        assert!(Cursor::new("ÉÉÉ AS x", 0).find_kw("AS").is_some());
+        assert!(Cursor::new("東京東京", 0).find_kw("AS").is_none());
     }
 
     #[test]
