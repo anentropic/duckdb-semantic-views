@@ -1,6 +1,15 @@
 //! RELATIONSHIPS clause parsing.
+//!
+//! §6.1 (phase 2, code-review 2026-07-11): migrated onto the shared
+//! [`Cursor`]/lexer. The grammar is
+//! `rel_name AS from_alias(fk_cols) REFERENCES to_alias[(ref_cols)]`; parsing
+//! it through tokens fixes the non-quote-aware `after_as.find('(')` (P-11 — a
+//! quoted `from_alias` containing `(` mis-split) and closes the silent-discard
+//! gap between the FK list and `REFERENCES` (text there was dropped, the P-1
+//! class): `REFERENCES` must now be the token immediately following the FK
+//! `(...)`. Every error still anchors at `entry_offset`, as before.
 
-use super::scan::{extract_paren_content, find_keyword_ci, find_live_byte, split_first_token};
+use super::cursor::Cursor;
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
 use crate::model::{Cardinality, Join};
@@ -34,136 +43,86 @@ pub(crate) fn parse_relationships_clause(
 /// Phase 33: Cardinality keywords (MANY TO ONE, etc.) are no longer accepted.
 /// Cardinality is inferred from PK/UNIQUE constraints at parse time.
 /// Optional `REFERENCES target(col1, col2)` syntax stores explicit `ref_columns`.
-#[allow(clippy::too_many_lines)]
 fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<Join, ParseError> {
     let entry = entry.trim();
+    let mut cur = Cursor::new(entry, entry_offset);
 
-    // Find "AS" keyword (case-insensitive) -- relationship name is before it
-    let upper = entry.to_ascii_uppercase();
-    let as_pos = find_keyword_ci(&upper, "AS").ok_or_else(|| ParseError {
-        message: format!(
-            "Missing relationship name: expected 'rel_name AS from_alias(fk_cols) REFERENCES to_alias', got '{entry}'.",
-        ),
-        position: Some(entry_offset),
-    })?;
-
-    let rel_name = entry[..as_pos].trim();
+    // `rel_name AS ...` — the relationship name is everything before the first
+    // `AS` keyword token (quote-aware: an `AS` inside a quoted name is not a
+    // keyword). No `AS` at all ⇒ the whole entry is malformed.
+    let Some(as_tok) = cur.find_kw("AS") else {
+        return Err(cur.err(
+            0,
+            format!(
+                "Missing relationship name: expected 'rel_name AS from_alias(fk_cols) REFERENCES to_alias', got '{entry}'.",
+            ),
+        ));
+    };
+    let rel_name = entry[..as_tok.start].trim();
     if rel_name.is_empty() {
-        return Err(ParseError {
-            message: "Relationship name is required; found 'AS' without a preceding name."
-                .to_string(),
-            position: Some(entry_offset),
-        });
+        return Err(cur.err(
+            0,
+            "Relationship name is required; found 'AS' without a preceding name.".to_string(),
+        ));
     }
+    let after_as = entry[as_tok.end..].trim_start();
+    cur.advance_past_byte(as_tok.end);
 
-    let after_as = entry[as_pos + 2..].trim_start();
-    let after_as_offset = entry_offset + entry.len() - entry[as_pos + 2..].len();
-    let _ = after_as_offset;
+    let from_alias = take_from_alias(&mut cur, rel_name, after_as)?;
+    let fk_columns = take_columns(
+        &mut cur,
+        entry_offset,
+        format!("Unclosed '(' in FK column list for relationship '{rel_name}'."),
+    )?;
 
-    // Next: from_alias, then '(' for fk cols, then REFERENCES, then to_alias
-    // Find the '(' for fk cols
-    let paren_pos = after_as.find('(').ok_or_else(|| ParseError {
-        message: format!(
-            "Expected '(' after from_alias in relationship '{rel_name}'. Got: '{after_as}'",
-        ),
-        position: Some(entry_offset),
-    })?;
-
-    let from_alias = after_as[..paren_pos].trim();
-    if from_alias.is_empty() {
-        return Err(ParseError {
-            message: format!("Expected from_alias before '(' in relationship '{rel_name}'."),
-            position: Some(entry_offset),
-        });
-    }
-
-    // Extract fk_columns from parenthesized list
-    let paren_content =
-        extract_paren_content(&after_as[paren_pos..]).ok_or_else(|| ParseError {
-            message: format!("Unclosed '(' in FK column list for relationship '{rel_name}'."),
-            position: Some(entry_offset),
-        })?;
-
-    let fk_columns: Vec<String> = split_at_depth0_commas(paren_content)
-        .into_iter()
-        .map(|(_, entry)| entry.to_string())
-        .collect();
-
-    // Find REFERENCES after the closing paren. extract_paren_content is
-    // quote-aware and requires its input to start with '(', so the matching
-    // close is exactly one byte past the content — a naive find(')') would
-    // stop at a ')' inside a quoted FK column name (PA-6).
-    let close_paren_pos = paren_pos + paren_content.len() + 2;
-
-    let after_paren = after_as[close_paren_pos..].trim_start();
-    let upper_after = after_paren.to_ascii_uppercase();
-    let refs_pos = find_keyword_ci(&upper_after, "REFERENCES").ok_or_else(|| ParseError {
-        message: format!("Expected 'REFERENCES' after FK columns in relationship '{rel_name}'."),
-        position: Some(entry_offset),
-    })?;
-
-    let remaining_after_refs = after_paren[refs_pos + "REFERENCES".len()..].trim();
-
-    // Get target alias: may be followed by '(' for explicit ref columns
-    let (to_alias, after_to) = if remaining_after_refs.is_empty() {
-        return Err(ParseError {
-            message: format!(
-                "Expected target alias after REFERENCES in relationship '{rel_name}'.",
-            ),
-            position: Some(entry_offset),
-        });
-    } else if let Some(paren_idx) = find_live_byte(remaining_after_refs, b'(') {
-        let before_paren = remaining_after_refs[..paren_idx].trim_end();
-        if before_paren.contains(char::is_whitespace) {
-            // "target (col)" -- split at first whitespace
-            let (alias, rest) = split_first_token(remaining_after_refs);
-            (alias, rest.trim_start())
-        } else if before_paren.is_empty() {
-            return Err(ParseError {
-                message: format!(
-                    "Expected target alias after REFERENCES in relationship '{rel_name}'.",
-                ),
-                position: Some(entry_offset),
-            });
-        } else {
-            // "target(col)" -- alias is before '('
-            (before_paren, &remaining_after_refs[paren_idx..])
+    // `REFERENCES` must immediately follow the FK list (any token in between is
+    // rejected rather than silently skipped past — the old anywhere-scan).
+    match cur.peek() {
+        Some(t) if cur.is_kw(t, "REFERENCES") => {
+            cur.bump();
         }
+        _ => {
+            return Err(cur.err(
+                0,
+                format!("Expected 'REFERENCES' after FK columns in relationship '{rel_name}'."),
+            ));
+        }
+    }
+
+    // `to_alias[(ref_cols)]` — a single alias token, then an optional explicit
+    // reference-column list.
+    let to_alias = match cur.peek() {
+        Some(t) if cur.peek_is_value() => {
+            cur.bump();
+            cur.text(t)
+        }
+        _ => {
+            return Err(cur.err(
+                0,
+                format!("Expected target alias after REFERENCES in relationship '{rel_name}'."),
+            ));
+        }
+    };
+    let ref_columns = if cur.peek_is_symbol(b'(') {
+        take_columns(
+            &mut cur,
+            entry_offset,
+            format!("Unclosed '(' in REFERENCES column list for relationship '{rel_name}'."),
+        )?
     } else {
-        // No paren at all -- target alias is first token
-        let (alias, rest) = split_first_token(remaining_after_refs);
-        (alias, rest.trim_start())
+        vec![]
     };
 
-    // Parse optional ref_columns from REFERENCES target(col1, col2)
-    let (ref_columns, after_ref_cols) = if after_to.starts_with('(') {
-        let cols_str = extract_paren_content(after_to).ok_or_else(|| ParseError {
-            message: format!(
-                "Unclosed '(' in REFERENCES column list for relationship '{rel_name}'.",
-            ),
-            position: Some(entry_offset),
-        })?;
-        let cols: Vec<String> = split_at_depth0_commas(cols_str)
-            .into_iter()
-            .map(|(_, entry)| entry.to_string())
-            .collect();
-        // Quote-aware close (see the FK-list scan above): after_to starts
-        // with '(', so the matching ')' is one byte past the content.
-        let close = 1 + cols_str.len();
-        (cols, after_to[close + 1..].trim())
-    } else {
-        (vec![], after_to)
-    };
-
-    // Reject any remaining tokens (old cardinality keywords or garbage)
-    if !after_ref_cols.is_empty() {
-        return Err(ParseError {
-            message: format!(
-                "Unexpected tokens after REFERENCES target in relationship '{rel_name}': '{after_ref_cols}'. \
+    // Anything left is trailing garbage (retired cardinality keywords, etc.).
+    let leftover = cur.rest().trim();
+    if !leftover.is_empty() {
+        return Err(cur.err(
+            0,
+            format!(
+                "Unexpected tokens after REFERENCES target in relationship '{rel_name}': '{leftover}'. \
                  Cardinality is now inferred from PK/UNIQUE constraints; explicit keywords are no longer supported.",
             ),
-            position: Some(entry_offset),
-        });
+        ));
     }
 
     Ok(Join {
@@ -174,4 +133,57 @@ fn parse_single_relationship_entry(entry: &str, entry_offset: usize) -> Result<J
         name: Some(rel_name.to_string()),
         cardinality: Cardinality::default(), // will be set by inference
     })
+}
+
+/// Capture the from-alias: a SINGLE value token (a table alias is one
+/// identifier, matching TABLES) that must be immediately followed by `(`.
+/// Quote-awareness is structural — a `(` inside a quoted alias is part of that
+/// one token (the P-11 fix) — and a multi-token run like `a b(...)` / `a.b(...)`
+/// is rejected rather than captured as a bogus alias that only fails later at
+/// resolution (PR #101 review). Leaves the cursor positioned at the `(`.
+/// `after_as` is echoed in the "Expected '('" error to show the offending tail.
+fn take_from_alias<'a>(
+    cur: &mut Cursor<'a>,
+    rel_name: &str,
+    after_as: &str,
+) -> Result<&'a str, ParseError> {
+    let expected_paren =
+        || format!("Expected '(' after from_alias in relationship '{rel_name}'. Got: '{after_as}'");
+    if cur.peek_is_symbol(b'(') {
+        return Err(cur.err(
+            0,
+            format!("Expected from_alias before '(' in relationship '{rel_name}'."),
+        ));
+    }
+    let from_alias = match cur.peek() {
+        Some(t) if cur.peek_is_value() => {
+            cur.bump();
+            cur.text(t)
+        }
+        _ => return Err(cur.err(0, expected_paren())),
+    };
+    if !cur.peek_is_symbol(b'(') {
+        return Err(cur.err(0, expected_paren()));
+    }
+    Ok(from_alias)
+}
+
+/// Consume a `(col, col, ...)` list at the cursor's current position (which
+/// must be `(`). `unclosed_msg` fires when the group never closes; all
+/// relationship errors anchor at `entry_offset`.
+fn take_columns(
+    cur: &mut Cursor,
+    entry_offset: usize,
+    unclosed_msg: String,
+) -> Result<Vec<String>, ParseError> {
+    let Some(inner) = cur.take_parens() else {
+        return Err(ParseError {
+            message: unclosed_msg,
+            position: Some(entry_offset),
+        });
+    };
+    Ok(split_at_depth0_commas(inner)
+        .into_iter()
+        .map(|(_, col)| col.to_string())
+        .collect())
 }

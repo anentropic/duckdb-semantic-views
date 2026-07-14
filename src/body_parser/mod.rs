@@ -1899,6 +1899,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_relationships_quoted_paren_in_from_alias() {
+        // §6.1 (phase 2, PR follow-up to P-11): the from-alias run stops at the
+        // first `(` SYMBOL token, so a `(` inside a QUOTED from_alias is inert.
+        // The pre-migration `after_as.find('(')` was not quote-aware and split
+        // inside the quote, mis-parsing the entry.
+        let result = parse_relationships_clause("rel AS \"a(b\"(fk) REFERENCES c", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].from_alias, "\"a(b\"");
+        assert_eq!(result[0].fk_columns, vec!["fk"]);
+        assert_eq!(result[0].table, "c");
+    }
+
+    #[test]
+    fn parse_relationships_multi_token_from_alias_rejected() {
+        // §6.1 (phase 2, PR #101 review): from_alias is a single value token
+        // (like a TABLES alias), immediately followed by `(`. A multi-token run
+        // (`a b(...)`, `a.b(...)`) is rejected at parse time rather than
+        // captured as a bogus alias that only fails later at resolution.
+        for entry in ["rel AS a b(fk) REFERENCES c", "rel AS a.b(fk) REFERENCES c"] {
+            let err = parse_relationships_clause(entry, 0).unwrap_err();
+            assert!(
+                err.message.contains("Expected '(' after from_alias"),
+                "{entry}: got {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn parse_relationships_junk_before_references_rejected() {
+        // §6.1 (phase 2): text between the FK list and REFERENCES is rejected,
+        // not silently skipped. The old code scanned for REFERENCES anywhere
+        // after the FK `)` and dropped whatever preceded it (the P-1 class);
+        // token-sequential parsing requires REFERENCES to follow immediately.
+        let err = parse_relationships_clause("rel AS o(fk) junk REFERENCES c", 0).unwrap_err();
+        assert!(
+            err.message.contains("Expected 'REFERENCES'"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn unique_constraint_parsing() {
         let result = parse_tables_clause("o AS orders PRIMARY KEY (id) UNIQUE (email)", 0).unwrap();
         assert_eq!(result[0].unique_constraints.len(), 1);

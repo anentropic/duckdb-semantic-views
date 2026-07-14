@@ -98,6 +98,27 @@ impl<'a> Cursor<'a> {
             .find(|&t| self.is_kw(t, kw))
     }
 
+    /// Is the next token `Symbol(b)`?
+    pub(super) fn peek_is_symbol(&self, b: u8) -> bool {
+        matches!(self.peek(), Some(t) if t.kind == TokenKind::Symbol(b))
+    }
+
+    /// Is the next token a non-symbol value token (bare/quoted identifier,
+    /// string, or an unterminated region) — i.e. a name/value rather than
+    /// punctuation? Used where a clause expects an identifier next.
+    pub(super) fn peek_is_value(&self) -> bool {
+        matches!(self.peek(), Some(t) if !matches!(t.kind, TokenKind::Symbol(_)))
+    }
+
+    /// Advance the cursor past every token that starts before `byte` (an offset
+    /// in src). Used to resync the token index after a name run captured by
+    /// source-slice (e.g. "everything up to the `AS` / `(`").
+    pub(super) fn advance_past_byte(&mut self, byte: usize) {
+        while self.toks.get(self.idx).is_some_and(|t| t.start < byte) {
+            self.idx += 1;
+        }
+    }
+
     /// The first token at/after the cursor that is a bare keyword `kw1`
     /// *immediately followed* by a bare keyword `kw2` (only whitespace between
     /// them, since whitespace is the only thing that separates two adjacent
