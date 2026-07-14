@@ -40,7 +40,7 @@ use crate::util::replace_word_boundary;
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::quote_ident;
-use super::select_spec::{push_from_base, push_group_by_ordinals, SelectItem};
+use super::select_spec::{push_from_base, FromSource, GroupBy, SelectItem, SelectSpec};
 use super::types::{ExpandError, ResolvedDim};
 
 /// Returns true when `met` is an ACTIVE semi-additive metric for a query over
@@ -271,16 +271,17 @@ pub(super) fn expand_semi_additive(
 
     sql.push_str("\n)\n");
 
-    // === Outer SELECT ===
-    sql.push_str("SELECT\n");
-
-    let mut outer_select_items: Vec<String> = Vec::new();
+    // === Outer SELECT over the snapshot CTE ===
+    let mut outer_items: Vec<SelectItem> = Vec::new();
 
     // Dimension columns: reference CTE aliases (outer query over the CTE, so
     // referencing the alias is safe — no physical column shadows it here).
     for rd in resolved_dims {
-        let item = SelectItem::new(quote_ident(&rd.dim.name), None, quote_ident(&rd.dim.name));
-        outer_select_items.push(format!("    {}", item.render()));
+        outer_items.push(SelectItem::new(
+            quote_ident(&rd.dim.name),
+            None,
+            quote_ident(&rd.dim.name),
+        ));
     }
 
     // Metric columns
@@ -296,19 +297,30 @@ pub(super) fn expand_semi_additive(
         } else {
             format!("{agg_func}(\"__sv_reg_{met_idx}\")")
         };
-        let item = SelectItem::new(inner, met.output_type.clone(), quote_ident(&met.name));
-        outer_select_items.push(format!("    {}", item.render()));
+        outer_items.push(SelectItem::new(
+            inner,
+            met.output_type.clone(),
+            quote_ident(&met.name),
+        ));
     }
 
-    sql.push_str(&outer_select_items.join(",\n"));
+    // Dimensions present ⇒ ordinal GROUP BY over them; a metrics-only snapshot
+    // query is a global aggregate with no GROUP BY.
+    let group_by = if resolved_dims.is_empty() {
+        GroupBy::None
+    } else {
+        GroupBy::Ordinals(resolved_dims.len())
+    };
 
-    // FROM the CTE
-    sql.push_str("\nFROM __sv_snapshot");
-
-    // GROUP BY (when dims are present)
-    if !resolved_dims.is_empty() {
-        push_group_by_ordinals(&mut sql, resolved_dims.len(), "\n", "    ");
-    }
+    sql.push_str(
+        &SelectSpec {
+            distinct: false,
+            items: outer_items,
+            from: FromSource::Named("__sv_snapshot".to_string()),
+            group_by,
+        }
+        .render(),
+    );
 
     Ok(sql)
 }

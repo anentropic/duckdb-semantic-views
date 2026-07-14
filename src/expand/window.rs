@@ -15,7 +15,9 @@ use crate::util::replace_word_boundary;
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::quote_ident;
-use super::select_spec::{push_from_base, push_group_by_ordinals, SelectItem};
+use super::select_spec::{
+    push_from_base, push_group_by_ordinals, FromSource, GroupBy, SelectItem, SelectSpec,
+};
 use super::types::{ExpandError, ResolvedDim};
 
 /// Generate CTE-based expansion SQL for queries containing window function metrics.
@@ -155,16 +157,17 @@ pub(super) fn expand_window_metrics(
 
     sql.push_str("\n)\n");
 
-    // 4. Build outer SELECT
-    sql.push_str("SELECT\n");
-
-    let mut outer_select_items: Vec<String> = Vec::new();
+    // 4. Build the outer SELECT over the aggregation CTE.
+    let mut outer_items: Vec<SelectItem> = Vec::new();
 
     // Dimension columns: reference CTE aliases (outer query over the CTE, so
     // referencing the alias is safe here).
     for rd in resolved_dims {
-        let item = SelectItem::new(quote_ident(&rd.dim.name), None, quote_ident(&rd.dim.name));
-        outer_select_items.push(format!("    {}", item.render()));
+        outer_items.push(SelectItem::new(
+            quote_ident(&rd.dim.name),
+            None,
+            quote_ident(&rd.dim.name),
+        ));
     }
 
     // Window metric columns
@@ -229,16 +232,23 @@ pub(super) fn expand_window_metrics(
         let over_clause = over_parts.join(" ");
         let window_expr = format!("{func_call} OVER ({over_clause})");
 
-        let item = SelectItem::new(window_expr, met.output_type.clone(), quote_ident(&met.name));
-        outer_select_items.push(format!("    {}", item.render()));
+        outer_items.push(SelectItem::new(
+            window_expr,
+            met.output_type.clone(),
+            quote_ident(&met.name),
+        ));
     }
 
-    sql.push_str(&outer_select_items.join(",\n"));
-
-    // FROM the CTE
-    sql.push_str("\nFROM __sv_agg");
-
-    // No GROUP BY in the outer query -- window functions are row-level
+    // Window functions are row-level ⇒ no GROUP BY in the outer query.
+    sql.push_str(
+        &SelectSpec {
+            distinct: false,
+            items: outer_items,
+            from: FromSource::Named("__sv_agg".to_string()),
+            group_by: GroupBy::None,
+        }
+        .render(),
+    );
 
     Ok(sql)
 }

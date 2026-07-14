@@ -19,6 +19,7 @@
 
 use crate::model::SemanticViewDefinition;
 
+use super::join_resolver::{push_join_clauses, ResolvedJoin};
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 
 /// One `SELECT`-list item: an expression, an optional `output_type` CAST wrap,
@@ -125,9 +126,104 @@ pub(super) fn push_group_by_ordinals(sql: &mut String, n: usize, lead: &str, ite
     sql.push_str(&items.join(",\n"));
 }
 
+/// The `GROUP BY` of a top-level [`SelectSpec`].
+pub(super) enum GroupBy {
+    /// No `GROUP BY` — a dimensions-only `DISTINCT` query, a global aggregate
+    /// (metrics, no dimensions), an unaggregated fact query, or a window outer
+    /// query (window functions are row-level).
+    None,
+    /// Ordinal `GROUP BY` over the first `n` select items. The emitters always
+    /// place the grouping dimensions first, so `1..=n` names exactly them.
+    /// Ordinals — never expressions — are the E-1 alias-shadowing defense; see
+    /// [`push_group_by_ordinals`].
+    Ordinals(usize),
+}
+
+/// The `FROM` source of a top-level [`SelectSpec`].
+pub(super) enum FromSource<'a> {
+    /// The declared base table plus the resolver-selected `LEFT JOIN`s:
+    /// `FROM <qualified-base> [AS <alias>]` followed by each join. Carries
+    /// `def` for table qualification (both the base ref via [`push_from_base`]
+    /// and each join's physical table via [`push_join_clauses`]).
+    BaseTable {
+        def: &'a SemanticViewDefinition,
+        joins: Vec<ResolvedJoin<'a>>,
+    },
+    /// A bare, already-safe relation name — a CTE alias such as `__sv_snapshot`
+    /// / `__sv_agg`: emitted as `FROM <name>`, with no qualification, no `AS`
+    /// alias, and (structurally) no joins.
+    Named(String),
+}
+
+/// A whole top-level `SELECT` statement: `SELECT[ DISTINCT]` + select list +
+/// `FROM` (+ `LEFT JOIN`s) + optional ordinal `GROUP BY`.
+///
+/// The culmination of §6.2 move 3 (code-review 2026-07-11): the four
+/// hand-rolled top-level emitters — base ([`super::sql_gen::expand`]), facts
+/// (`sql_gen`'s `expand_facts`), and the OUTER query of the two CTE strategies
+/// ([`super::semi_additive`], [`super::window`]) — construct a `SelectSpec` and
+/// call [`Self::render`] instead of assembling the string by hand, so the
+/// statement skeleton (and the E-1 ordinal-`GROUP BY` defense) lives in one
+/// place.
+///
+/// The CTE strategies' INNER `SELECT` is deliberately NOT modelled here: its
+/// select list interleaves bespoke `RANK() OVER (...)` / decomposed-aggregate
+/// columns at a deeper indent, so it keeps hand-emitting while still sharing the
+/// lower-level [`SelectItem`], [`push_from_base`], [`push_join_clauses`], and
+/// [`push_group_by_ordinals`] pieces (the goal is the shared alias-shadowing
+/// defense + one render path for the common shape, not forcing every byte
+/// through it).
+pub(super) struct SelectSpec<'a> {
+    /// Emit `SELECT DISTINCT` rather than `SELECT` (dimensions-only base query).
+    pub(super) distinct: bool,
+    /// The select-list items in emission order. When [`Self::group_by`] is
+    /// [`GroupBy::Ordinals`], the grouping dimensions are the leading items.
+    pub(super) items: Vec<SelectItem>,
+    /// The `FROM` source (+ joins, for the base-table case).
+    pub(super) from: FromSource<'a>,
+    /// The `GROUP BY`, if any.
+    pub(super) group_by: GroupBy,
+}
+
+impl SelectSpec<'_> {
+    /// Render the whole statement — no leading indentation and no trailing
+    /// newline. Top-level callers place these at column 0; the CTE strategies
+    /// append the outer statement directly after the `)\n` closing the CTE.
+    pub(super) fn render(&self) -> String {
+        let mut sql = String::with_capacity(256);
+        sql.push_str(if self.distinct {
+            "SELECT DISTINCT\n"
+        } else {
+            "SELECT\n"
+        });
+        let rendered: Vec<String> = self
+            .items
+            .iter()
+            .map(|item| format!("    {}", item.render()))
+            .collect();
+        sql.push_str(&rendered.join(",\n"));
+        match &self.from {
+            FromSource::BaseTable { def, joins } => {
+                push_from_base(&mut sql, def, "\n");
+                push_join_clauses(&mut sql, joins, def, "\nLEFT JOIN ");
+            }
+            FromSource::Named(name) => {
+                sql.push_str("\nFROM ");
+                sql.push_str(name);
+            }
+        }
+        match self.group_by {
+            GroupBy::None => {}
+            GroupBy::Ordinals(n) => push_group_by_ordinals(&mut sql, n, "\n", "    "),
+        }
+        sql
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{push_group_by_ordinals, SelectItem};
+    use super::{push_group_by_ordinals, FromSource, GroupBy, SelectItem, SelectSpec};
+    use crate::expand::test_helpers::minimal_def;
 
     #[test]
     fn renders_without_cast() {
@@ -204,4 +300,95 @@ mod tests {
     // push_from_base is covered end-to-end (byte-identical) by the exact-string
     // emission tests in sql_gen / semi_additive / window; a direct unit test
     // would need a full SemanticViewDefinition fixture for little added signal.
+
+    #[test]
+    fn render_base_table_with_group_by() {
+        // The base metrics-and-dimensions shape: SELECT + items + FROM base +
+        // ordinal GROUP BY. `minimal_def("orders", …)` has no db/schema, so the
+        // base table qualifies to `"orders" AS "orders"`.
+        let def = minimal_def("orders", "region", "region", "cnt", "count(*)");
+        let spec = SelectSpec {
+            distinct: false,
+            items: vec![
+                SelectItem::new("region".to_string(), None, "\"region\"".to_string()),
+                SelectItem::new("count(*)".to_string(), None, "\"cnt\"".to_string()),
+            ],
+            from: FromSource::BaseTable {
+                def: &def,
+                joins: Vec::new(),
+            },
+            group_by: GroupBy::Ordinals(1),
+        };
+        assert_eq!(
+            spec.render(),
+            "SELECT\n    region AS \"region\",\n    count(*) AS \"cnt\"\n\
+             FROM \"orders\" AS \"orders\"\nGROUP BY\n    1"
+        );
+    }
+
+    #[test]
+    fn render_base_table_distinct_no_group_by() {
+        // Dimensions-only base query: SELECT DISTINCT, no GROUP BY.
+        let def = minimal_def("orders", "region", "region", "cnt", "count(*)");
+        let spec = SelectSpec {
+            distinct: true,
+            items: vec![SelectItem::new(
+                "region".to_string(),
+                None,
+                "\"region\"".to_string(),
+            )],
+            from: FromSource::BaseTable {
+                def: &def,
+                joins: Vec::new(),
+            },
+            group_by: GroupBy::None,
+        };
+        assert_eq!(
+            spec.render(),
+            "SELECT DISTINCT\n    region AS \"region\"\nFROM \"orders\" AS \"orders\""
+        );
+    }
+
+    #[test]
+    fn render_named_source_with_group_by() {
+        // The semi-additive OUTER shape: SELECT over a bare CTE name (no
+        // qualification, no alias, no joins) with an ordinal GROUP BY.
+        let spec = SelectSpec {
+            distinct: false,
+            items: vec![
+                SelectItem::new("\"region\"".to_string(), None, "\"region\"".to_string()),
+                SelectItem::new(
+                    "SUM(\"__sv_reg_0\")".to_string(),
+                    None,
+                    "\"total\"".to_string(),
+                ),
+            ],
+            from: FromSource::Named("__sv_snapshot".to_string()),
+            group_by: GroupBy::Ordinals(1),
+        };
+        assert_eq!(
+            spec.render(),
+            "SELECT\n    \"region\" AS \"region\",\n    SUM(\"__sv_reg_0\") AS \"total\"\n\
+             FROM __sv_snapshot\nGROUP BY\n    1"
+        );
+    }
+
+    #[test]
+    fn render_named_source_no_group_by() {
+        // The window OUTER shape: SELECT over a bare CTE name, no GROUP BY.
+        let spec = SelectSpec {
+            distinct: false,
+            items: vec![SelectItem::new(
+                "AVG(\"q\") OVER ()".to_string(),
+                None,
+                "\"m\"".to_string(),
+            )],
+            from: FromSource::Named("__sv_agg".to_string()),
+            group_by: GroupBy::None,
+        };
+        assert_eq!(
+            spec.render(),
+            "SELECT\n    AVG(\"q\") OVER () AS \"m\"\nFROM __sv_agg"
+        );
+    }
 }
