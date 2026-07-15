@@ -3,7 +3,7 @@
 //! Extracted from `parse` (AR-1). Everything here answers "is this one of our
 //! statements, and if so which kind?" without rewriting anything: keyword
 //! prefix matching ([`match_keyword_prefix`]), comment/whitespace skipping
-//! ([`skip_leading_whitespace_and_comments`]), the longest-first prefix table
+//! ([`skip_leading_whitespace`]), the longest-first prefix table
 //! ([`detect_ddl_prefix`]), the public detection entry points
 //! ([`detect_ddl_kind`], [`detect_semantic_view_ddl`]), and fuzzy near-miss
 //! suggestion ([`detect_near_miss`]).
@@ -68,54 +68,25 @@ pub(crate) fn match_keyword_prefix(input: &[u8], keywords: &[&[u8]]) -> Option<u
     Some(pos)
 }
 
-/// Return the byte offset of the first character that is neither ASCII whitespace
-/// nor part of a SQL comment. Recognises:
-///   - `-- ... \n` line comments (terminated by newline or end-of-input)
-///   - `/* ... */` block comments (NOT nested -- matches PostgreSQL/DuckDB behaviour)
+/// Return the byte offset of the first non-whitespace character in `input`.
 ///
-/// Designed for prefix-matching: never errors. An unterminated `/* ...` consumes to
-/// end of input (so the keyword match below it will simply fail and fall through
-/// to `PARSE_NOT_OURS`, matching today's behaviour for malformed queries).
+/// Every caller runs [`crate::util::blank_sql_comments`] first, which replaces
+/// each comment byte with a space (byte-length-preserving), so by the time input
+/// reaches here `-- ...` and `/* ... */` comments are already whitespace. This
+/// therefore only needs to skip leading ASCII whitespace — it formerly
+/// re-implemented comment scanning inline, but that branch was dead (comments
+/// were already blanked) *and* wrong: it treated `/* */` as non-nesting, the
+/// opposite of the nesting semantics `blank_sql_comments` (and PostgreSQL/DuckDB)
+/// actually apply (P-5, code-review 2026-07-11).
 ///
-/// Returns the byte offset where real SQL begins, in the *original* slice. Callers
-/// substitute this for the `query.len() - query.trim_start().len()` whitespace
-/// offset so that v0.5.1 error-caret positions continue to reference the original
-/// query string after a leading comment is consumed.
-///
-/// Quick task 260430-vdz: fixes parser hook compatibility with dbt-duckdb (and
-/// any other tool that prepends a query annotation comment).
-pub(crate) fn skip_leading_whitespace_and_comments(input: &str) -> usize {
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    loop {
-        // ASCII whitespace
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        // Line comment: -- ... \n
-        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue; // re-enter loop to consume more whitespace/comments
-        }
-        // Block comment: /* ... */ (non-nesting, Postgres semantics)
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            if i + 1 < bytes.len() {
-                i += 2; // consume "*/"
-            } else {
-                i = bytes.len(); // unterminated -- consume to end
-            }
-            continue;
-        }
-        break;
-    }
-    i
+/// The returned offset is into the *original* (blanked, length-preserving)
+/// slice, so v0.5.1 error-caret positions continue to reference the original
+/// query string after leading whitespace/comments are consumed. This is what
+/// keeps parser-hook compatibility with dbt-duckdb (and any other tool that
+/// prepends a query annotation comment): the comment is blanked upstream, then
+/// skipped here as whitespace.
+pub(crate) fn skip_leading_whitespace(input: &str) -> usize {
+    input.bytes().take_while(u8::is_ascii_whitespace).count()
 }
 
 /// Detect the DDL kind and consumed prefix byte count from a query string.
@@ -213,7 +184,7 @@ pub fn detect_ddl_kind(query: &str) -> Option<DdlKind> {
     // prefix keywords (`CREATE /* x */ SEMANTIC VIEW`).
     let blanked = crate::util::blank_sql_comments(query);
     let query = blanked.as_ref();
-    let lead = skip_leading_whitespace_and_comments(query);
+    let lead = skip_leading_whitespace(query);
     let trimmed = query[lead..].trim_end().trim_end_matches(';').trim();
     detect_ddl_prefix(trimmed).map(|(kind, _)| kind)
 }
@@ -262,7 +233,7 @@ pub fn detect_near_miss(query: &str) -> Option<ParseError> {
     // PA-7: comment-blind near-miss detection.
     let blanked = crate::util::blank_sql_comments(query);
     let query = blanked.as_ref();
-    let lead = skip_leading_whitespace_and_comments(query);
+    let lead = skip_leading_whitespace(query);
     let trimmed = query[lead..].trim_end();
     let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
     let lower = trimmed_no_semi.to_ascii_lowercase();

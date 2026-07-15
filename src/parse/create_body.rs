@@ -48,37 +48,26 @@ pub(crate) fn extract_view_comment(text: &str) -> Result<(Option<String>, &str),
                 position: None,
             });
         }
-        // Extract the quoted string handling '' escaping.
-        //
-        // Phase 65.1 WR-04: walk as `char` stream (UTF-8 scalar values)
-        // rather than raw bytes — the previous `bytes[i] as char` cast
-        // silently mangled non-ASCII characters in the comment body.
-        // We skip the opening quote (one ASCII byte) and iterate from
-        // byte offset 1 via `char_indices()` against `&after_eq[1..]`,
-        // adjusting reported offsets back to `after_eq` space.
-        let mut chars = after_eq[1..].char_indices();
-        let mut value = String::new();
-        while let Some((rel_i, ch)) = chars.next() {
-            if ch == '\'' {
-                let mut peek = chars.clone();
-                if matches!(peek.next(), Some((_, '\''))) {
-                    value.push('\'');
-                    chars = peek;
-                    continue;
+        // Extract the '...'-quoted comment (with '' escaping) via the shared
+        // single-quote extractor. This used to re-inline the exact `char`-stream
+        // loop `util::extract_single_quoted_prefix` already provides — the ST-4
+        // consolidation whose doc says "do not re-inline this logic" (P-8,
+        // code-review 2026-07-11). `after_eq` is known to start with `'` (checked
+        // above), so `NotQuoted` is unreachable; the only real failure is an
+        // unterminated literal. `consumed` counts both delimiter quotes, so the
+        // remaining slice starts right after the closing quote.
+        let (value, consumed) = extract_single_quoted_prefix(after_eq).map_err(|e| ParseError {
+            message: match e {
+                SingleQuoteError::Unterminated => {
+                    "Unclosed single-quoted string in view-level COMMENT.".to_string()
                 }
-                // Closing quote found. `rel_i` is offset into `after_eq[1..]`;
-                // absolute offset of the closing quote in `after_eq` is
-                // `rel_i + 1`; the slice after the closing quote starts at
-                // `rel_i + 2` (closing quote is one ASCII byte).
-                let remaining = &after_eq[rel_i + 2..];
-                return Ok((Some(value), remaining));
-            }
-            value.push(ch);
-        }
-        Err(ParseError {
-            message: "Unclosed single-quoted string in view-level COMMENT.".to_string(),
+                SingleQuoteError::NotQuoted => {
+                    "Expected single-quoted string after COMMENT =.".to_string()
+                }
+            },
             position: None,
-        })
+        })?;
+        Ok((Some(value), &after_eq[consumed..]))
     } else {
         Ok((None, text))
     }
@@ -86,7 +75,6 @@ pub(crate) fn extract_view_comment(text: &str) -> Result<(Option<String>, &str),
 
 /// Validate a CREATE-with-body DDL statement and rewrite it if valid.
 pub(crate) fn validate_create_body(
-    _query: &str,
     trimmed_no_semi: &str,
     trim_offset: usize,
     plen: usize,
