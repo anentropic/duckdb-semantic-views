@@ -346,6 +346,10 @@ pub fn read_dollar_tag_len(bytes: &[u8], start: usize) -> Option<usize> {
 /// every downstream scanner comment-immune, stops trailing comments being
 /// absorbed into stored expressions (`ALTER ... RENAME TO x -- oops` renamed
 /// to `x -- oops`), and fixes non-nesting block-comment handling (PA-10).
+///
+/// This pre-pass is the settled design, not a stopgap: §6.1 phase 8
+/// (2026-07-15) evaluated folding it into the body-parser lexer and declined
+/// — see the decision record in `crate::body_parser::lexer`'s module docs.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn blank_sql_comments(input: &str) -> std::borrow::Cow<'_, str> {
