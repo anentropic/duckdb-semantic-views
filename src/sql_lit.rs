@@ -7,14 +7,15 @@
 //! &str`) with a free `escape_sql_arg` / `unescape_sql_arg` pair, so nothing
 //! at the type level distinguished a raw value from an escaped one.
 //!
-//! This newtype makes the raw-vs-escaped distinction type-enforced and
-//! centralizes escaping at one boundary: the emission helpers take `&SqlLit`,
-//! so a raw `&str` no longer type-checks (the accidental "forgot to escape →
-//! injection" footgun is a compile error), and the only way to obtain a
-//! `SqlLit` is [`SqlLit::escape`], so escaping happens once, at each
-//! SQL-emission boundary: `rewrite_to_native_sql` for the write-DDL path, and
-//! the SHOW/DESCRIBE read-rewrite in `parse::rewrite` / `build_filter_suffix`
-//! for the read path. It does NOT make double-escaping
+//! This newtype makes the raw-vs-escaped distinction type-enforced and routes
+//! all escaping through a single constructor: the emission helpers take
+//! `&SqlLit`, so a raw `&str` no longer type-checks (the accidental "forgot to
+//! escape → injection" footgun is a compile error), and the only way to obtain
+//! a `SqlLit` is [`SqlLit::escape`] — so the `'` → `''` doubling logic lives in
+//! exactly one place, applied once at each SQL-emission boundary that uses it:
+//! `rewrite_to_native_sql` for the write-DDL path, and the SHOW/DESCRIBE
+//! read-rewrite in `parse::rewrite` / `build_filter_suffix` for the read path.
+//! It does NOT make double-escaping
 //! impossible — a caller could deliberately round-trip through `Display`
 //! (`SqlLit::escape(&lit.to_string())`) — but that is an intentional act, not
 //! an accidental one, and there is no such call site.
