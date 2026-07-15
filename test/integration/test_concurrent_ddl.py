@@ -111,18 +111,6 @@ def worker(thread_conn, sql: str, result: WorkerResult, staged: threading.Barrie
         result.ok = True
     except Exception as exc:  # noqa: BLE001 - we want every error type
         result.error = exc
-        # If we failed before reaching the barrier — e.g. the PK conflict
-        # surfaced at INSERT-time rather than the expected COMMIT-time (a shape
-        # the write-race suite documents) — abort the barrier so a peer that
-        # already staged unblocks immediately instead of waiting out the full
-        # timeout. abort() on an already-released barrier is a harmless no-op,
-        # so the normal one-loser-at-COMMIT path is unaffected. Then roll back
-        # so no aborted/open transaction lingers on this connection.
-        staged.abort()
-        try:
-            thread_conn.execute("ROLLBACK")
-        except Exception:  # noqa: BLE001 - txn already aborted / none active
-            pass
 
 
 def test_concurrent_create_serializes() -> bool:
