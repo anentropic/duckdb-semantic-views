@@ -10,6 +10,15 @@
 //! the hand-rolled `QuoteState` depth loop. Keyword validation (known / unknown
 //! with a "did you mean?" suggestion, duplicate, ordering, required) is
 //! unchanged.
+//!
+//! One deliberate divergence from the old prefix scan: because the keyword is a
+//! whole lexer token, an ALPHA-led word with a trailing non-alphabetic byte
+//! (`TABLES2`, `TABLES_`, `TABLES★`) is now the single token `TABLES2` and so is
+//! rejected as `Unknown clause keyword 'TABLES2'`. The old byte scan collected
+//! only the `[A-Za-z]+` run, matched `TABLES`, then failed at the trailing char
+//! with `Expected '(' ... found '2'`. Both reject; the message differs. (A word
+//! whose *first* byte is non-alphabetic is still the "unexpected character"
+//! case above — only the trailing-byte shape changed.)
 
 use super::cursor::Cursor;
 use super::lexer::TokenKind;
