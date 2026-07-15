@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use crate::model::SemanticViewDefinition;
 
 use super::facts::collect_derived_metric_using;
+use super::join_resolver::scoped_join_alias;
 use super::types::ExpandError;
 
 /// Determine which relationships point to a given table alias in the definition.
@@ -119,7 +120,7 @@ pub(super) fn find_using_context(
 
     if using_rels_for_table.len() == 1 {
         // Exactly one USING path disambiguates -> return scoped alias
-        let scoped = format!("{dim_table_lower}__{}", using_rels_for_table[0]);
+        let scoped = scoped_join_alias(&dim_table_lower, &using_rels_for_table[0]);
         Ok(Some(scoped))
     } else if using_rels_for_table.is_empty() && !is_role_playing_target(def, &dim_table_lower) {
         // Multiple inbound relationships but each from a DIFFERENT source

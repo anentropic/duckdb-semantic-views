@@ -31,7 +31,7 @@ fn test_facts_path_role_playing_dimension_raises_ambiguous_path() {
     // arbitrary edge.
     let def = role_playing_facts_def(true);
     let req = QueryRequest {
-        facts: vec!["order_note".to_string()],
+        facts: vec![FactName::new("order_note")],
         dimensions: vec![DimensionName::new("city")],
         metrics: vec![],
     };
@@ -59,7 +59,7 @@ fn test_facts_path_role_playing_dimension_raises_ambiguous_path() {
 fn test_facts_path_single_relationship_dimension_ok() {
     let def = role_playing_facts_def(false);
     let req = QueryRequest {
-        facts: vec!["order_note".to_string()],
+        facts: vec![FactName::new("order_note")],
         dimensions: vec![DimensionName::new("city")],
         metrics: vec![],
     };
@@ -90,7 +90,7 @@ fn test_facts_path_convergent_parent_dimension_not_ambiguous() {
         .with_pkfk_join("li_to_o", "li", "orders", &["order_id"], &["id"])
         .with_pkfk_join("pay_to_o", "pay", "orders", &["order_id"], &["id"]);
     let req = QueryRequest {
-        facts: vec!["net_price".to_string()],
+        facts: vec![FactName::new("net_price")],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![],
     };

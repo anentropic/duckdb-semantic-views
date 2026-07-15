@@ -24,7 +24,7 @@ fn multi_table_def() -> SemanticViewDefinition {
 fn test_fact_query_basic() {
     let def = multi_table_def();
     let req = QueryRequest {
-        facts: vec!["net_price".to_string()],
+        facts: vec![FactName::new("net_price")],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![],
     };
@@ -46,7 +46,7 @@ fn test_fact_query_basic() {
 fn test_fact_query_no_dimensions() {
     let def = multi_table_def();
     let req = QueryRequest {
-        facts: vec!["net_price".to_string()],
+        facts: vec![FactName::new("net_price")],
         dimensions: vec![],
         metrics: vec![],
     };
@@ -75,7 +75,7 @@ fn test_fact_query_inline_facts() {
         .with_fact("line_total", "net_price * li.quantity", "li")
         .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"]);
     let req = QueryRequest {
-        facts: vec!["line_total".to_string()],
+        facts: vec![FactName::new("line_total")],
         dimensions: vec![],
         metrics: vec![],
     };
@@ -91,7 +91,7 @@ fn test_fact_query_inline_facts() {
 fn test_fact_query_unknown_fact() {
     let def = multi_table_def();
     let req = QueryRequest {
-        facts: vec!["nonexistent".to_string()],
+        facts: vec![FactName::new("nonexistent")],
         dimensions: vec![],
         metrics: vec![],
     };
@@ -108,7 +108,7 @@ fn test_fact_query_unknown_fact() {
 fn test_fact_query_duplicate_fact() {
     let def = multi_table_def();
     let req = QueryRequest {
-        facts: vec!["net_price".to_string(), "net_price".to_string()],
+        facts: vec![FactName::new("net_price"), FactName::new("net_price")],
         dimensions: vec![],
         metrics: vec![],
     };
@@ -125,7 +125,7 @@ fn test_fact_query_duplicate_fact() {
 fn test_fact_query_private_fact() {
     let def = multi_table_def().with_private_fact("raw_price", "li.price", "li");
     let req = QueryRequest {
-        facts: vec!["raw_price".to_string()],
+        facts: vec![FactName::new("raw_price")],
         dimensions: vec![],
         metrics: vec![],
     };
@@ -151,7 +151,7 @@ fn test_fact_path_violation() {
         .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"])
         .with_pkfk_join("p_to_o", "p", "o", &["order_id"], &["id"]);
     let req = QueryRequest {
-        facts: vec!["net_price".to_string()],
+        facts: vec![FactName::new("net_price")],
         dimensions: vec![DimensionName::new("pay_status")],
         metrics: vec![],
     };
@@ -177,7 +177,7 @@ fn test_fact_path_valid_linear() {
         .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"])
         .with_pkfk_join("d_to_li", "d", "li", &["line_id"], &["id"]);
     let req = QueryRequest {
-        facts: vec!["detail_val".to_string()],
+        facts: vec![FactName::new("detail_val")],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![],
     };
@@ -190,7 +190,7 @@ fn test_fact_query_with_output_type() {
     let mut def = multi_table_def();
     def.facts[0].output_type = Some("DECIMAL(10,2)".to_string());
     let req = QueryRequest {
-        facts: vec!["net_price".to_string()],
+        facts: vec![FactName::new("net_price")],
         dimensions: vec![],
         metrics: vec![],
     };

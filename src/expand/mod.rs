@@ -58,7 +58,8 @@ mod tests_role_playing;
 pub use resolution::{quote_ident, quote_ident_if_needed, quote_table_ref};
 pub use sql_gen::expand;
 pub use types::{
-    DimensionName, ExpandError, FanTrapError, MetricFanTrapError, MetricName, QueryRequest,
+    DimensionName, ExpandError, FactName, FanTrapError, MetricFanTrapError, MetricName,
+    QueryRequest,
 };
 
 // Crate-internal API (used by ddl/show_dims_for_metric.rs under extension feature)

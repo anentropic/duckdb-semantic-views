@@ -24,9 +24,7 @@ pub(crate) use create_body::{
 
 mod detect;
 pub use detect::{detect_ddl_kind, detect_near_miss, detect_semantic_view_ddl};
-pub(crate) use detect::{
-    detect_ddl_prefix, match_keyword_prefix, skip_leading_whitespace_and_comments,
-};
+pub(crate) use detect::{detect_ddl_prefix, match_keyword_prefix, skip_leading_whitespace};
 
 mod ffi;
 #[cfg(feature = "extension")]

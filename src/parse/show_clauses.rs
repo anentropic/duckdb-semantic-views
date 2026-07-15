@@ -125,11 +125,7 @@ fn parse_in_scope(
 ///
 /// Returns `(remaining_text, metric_name)`. `base` is the absolute byte offset
 /// of `rest[0]` in the original query (R-2).
-fn parse_for_metric<'a>(
-    rest: &'a str,
-    _entity: &str,
-    base: usize,
-) -> Result<(&'a str, &'a str), ParseError> {
+fn parse_for_metric(rest: &str, base: usize) -> Result<(&str, &str), ParseError> {
     let after_for = rest[3..].trim_start();
     // Word boundary after METRIC: `FOR METRICS x` must not parse as the
     // METRIC keyword followed by a metric named `s x` (PR #50 review).
@@ -245,7 +241,7 @@ pub(crate) fn parse_show_filter_clauses<'a>(
                 position: Some(abs(rest)),
             });
         }
-        let (remaining, metric_name) = parse_for_metric(rest, entity, abs(rest))?;
+        let (remaining, metric_name) = parse_for_metric(rest, abs(rest))?;
         rest = remaining;
         for_metric = Some(metric_name);
     }

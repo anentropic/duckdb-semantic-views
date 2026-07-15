@@ -15,7 +15,7 @@ use crate::util::{
 
 use super::{
     build_filter_suffix, detect_ddl_prefix, match_keyword_prefix, parse_show_filter_clauses,
-    skip_leading_whitespace_and_comments, validate_create_body, DdlKind,
+    skip_leading_whitespace, validate_create_body, DdlKind,
 };
 
 // Used by the `write_error_to_buffer_*` unit tests (which reference it as
@@ -319,7 +319,7 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
     // blanked; only allocates when comments are present).
     let blanked = crate::util::blank_sql_comments(query);
     let query = blanked.as_ref();
-    let lead = skip_leading_whitespace_and_comments(query);
+    let lead = skip_leading_whitespace(query);
     let trimmed = query[lead..].trim_end();
     let trimmed = trimmed.trim_end_matches(';').trim();
     // `trimmed` starts at absolute byte offset `lead` in the (length-preserving
@@ -437,7 +437,7 @@ pub fn extract_ddl_name(query: &str) -> Result<Option<String>, ParseError> {
     // PA-7: comment-blind name extraction.
     let blanked = crate::util::blank_sql_comments(query);
     let query = blanked.as_ref();
-    let lead = skip_leading_whitespace_and_comments(query);
+    let lead = skip_leading_whitespace(query);
     let trimmed = query[lead..].trim_end();
     let trimmed = trimmed.trim_end_matches(';').trim();
     let trim_base = lead;
@@ -623,7 +623,7 @@ pub fn plan_rewrite(query: &str) -> Result<Option<RewriteAction>, ParseError> {
     // expression or rename target.
     let blanked = crate::util::blank_sql_comments(query);
     let query = blanked.as_ref();
-    let lead = skip_leading_whitespace_and_comments(query);
+    let lead = skip_leading_whitespace(query);
     let trimmed = query[lead..].trim_end();
     let trimmed_no_semi = trimmed.trim_end_matches(';').trim();
     let trim_offset = lead;
@@ -641,7 +641,7 @@ pub fn plan_rewrite(query: &str) -> Result<Option<RewriteAction>, ParseError> {
     // every inner fault — are gone: `plan_ddl` is the single grammar.
     match kind {
         DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
-            validate_create_body(query, trimmed_no_semi, trim_offset, plen, kind)
+            validate_create_body(trimmed_no_semi, trim_offset, plen, kind)
         }
         _ => plan_ddl(query).map(Some),
     }
@@ -3268,65 +3268,41 @@ $$"#;
     }
 
     // ===================================================================
-    // Quick task 260430-vdz: leading-comment skipping
+    // `skip_leading_whitespace` — leading-whitespace offset.
     //
-    // Failing-test-first: these reference `skip_leading_whitespace_and_comments`
-    // and rely on the helper being applied at five trimming sites. They will
-    // not compile/pass until the fix lands in the next commit.
+    // Comment handling is upstream in `blank_sql_comments` (P-5, code-review
+    // 2026-07-11): callers blank first, so by the time input reaches this
+    // helper comments are already spaces. The former inline comment-scanning
+    // branches were dead and are gone; end-to-end leading-comment skipping is
+    // covered by `detect_create_with_leading_block_comment` and the
+    // `detect_semantic_view_ddl` comment cases below (which go through the
+    // blank-then-skip pipeline).
     // ===================================================================
 
     #[test]
     fn skip_lws_empty() {
-        assert_eq!(skip_leading_whitespace_and_comments(""), 0);
+        assert_eq!(skip_leading_whitespace(""), 0);
     }
 
     #[test]
     fn skip_lws_only_whitespace() {
-        assert_eq!(skip_leading_whitespace_and_comments("   \n\t"), 5);
-    }
-
-    #[test]
-    fn skip_lws_line_comment() {
-        let q = "-- hi\nCREATE";
-        assert_eq!(&q[skip_leading_whitespace_and_comments(q)..], "CREATE");
-    }
-
-    #[test]
-    fn skip_lws_block_comment() {
-        let q = "/* hi */ CREATE";
-        assert_eq!(&q[skip_leading_whitespace_and_comments(q)..], "CREATE");
-    }
-
-    #[test]
-    fn skip_lws_multiple_comments_and_ws() {
-        let q = "-- a\n  /* b */\n\t-- c\n/*d*/CREATE";
-        assert_eq!(&q[skip_leading_whitespace_and_comments(q)..], "CREATE");
-    }
-
-    #[test]
-    fn skip_lws_block_does_not_nest() {
-        // Outer ends at first */, leaving "trailing */ CREATE"
-        let q = "/* outer /* inner */ trailing */ CREATE";
-        let rest = &q[skip_leading_whitespace_and_comments(q)..];
-        assert!(rest.starts_with("trailing"), "got: {rest:?}");
-    }
-
-    #[test]
-    fn skip_lws_unterminated_block_consumes_to_eof() {
-        let q = "/* never ends";
-        assert_eq!(skip_leading_whitespace_and_comments(q), q.len());
+        assert_eq!(skip_leading_whitespace("   \n\t"), 5);
     }
 
     #[test]
     fn skip_lws_no_leading_match() {
-        // No comments and no whitespace -> offset 0
-        assert_eq!(skip_leading_whitespace_and_comments("CREATE"), 0);
+        // No leading whitespace -> offset 0.
+        assert_eq!(skip_leading_whitespace("CREATE"), 0);
     }
 
     #[test]
-    fn skip_lws_dash_dash_at_eof() {
-        let q = "-- no newline at end";
-        assert_eq!(skip_leading_whitespace_and_comments(q), q.len());
+    fn skip_lws_blanked_comment_is_whitespace() {
+        // Mirrors production: a leading comment is blanked to spaces upstream,
+        // then this helper skips it as whitespace. (A raw `-- hi\n` would NOT
+        // be skipped — comment handling deliberately no longer lives here.)
+        let raw = "-- hi\nCREATE";
+        let blanked = crate::util::blank_sql_comments(raw);
+        assert_eq!(&blanked[skip_leading_whitespace(&blanked)..], "CREATE");
     }
 
     #[test]
