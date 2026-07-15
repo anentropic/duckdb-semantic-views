@@ -193,7 +193,10 @@ unsafe fn semantic_view_bind_body(
             .iter()
             .map(|s| crate::expand::MetricName::new(s.clone()))
             .collect(),
-        facts: facts.clone(),
+        facts: facts
+            .iter()
+            .map(|s| crate::expand::FactName::new(s.clone()))
+            .collect(),
     };
     let expanded_sql =
         expand(&view_name, &def, &req).map_err(|e| QueryError::from(e).to_string())?;

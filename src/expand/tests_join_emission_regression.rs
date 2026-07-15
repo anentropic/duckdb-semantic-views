@@ -136,7 +136,7 @@ GROUP BY
 #[test]
 fn sg10_fact_source_chain_includes_intermediate_join() {
     let req = QueryRequest {
-        facts: vec!["detail_amount".to_string()],
+        facts: vec![FactName::new("detail_amount")],
         dimensions: vec![],
         metrics: vec![],
     };

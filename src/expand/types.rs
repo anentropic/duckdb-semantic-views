@@ -98,11 +98,17 @@ pub enum DimensionKind {}
 /// Kind marker for [`MetricName`]; never constructed.
 pub enum MetricKind {}
 
+/// Kind marker for [`FactName`]; never constructed.
+pub enum FactKind {}
+
 /// A dimension name with case-insensitive equality and hashing (see [`CiName`]).
 pub type DimensionName = CiName<DimensionKind>;
 
 /// A metric name with case-insensitive equality and hashing (see [`CiName`]).
 pub type MetricName = CiName<MetricKind>;
+
+/// A fact name with case-insensitive equality and hashing (see [`CiName`]).
+pub type FactName = CiName<FactKind>;
 
 /// A request to expand a semantic view into SQL.
 ///
@@ -116,7 +122,7 @@ pub type MetricName = CiName<MetricKind>;
 pub struct QueryRequest {
     pub dimensions: Vec<DimensionName>,
     pub metrics: Vec<MetricName>,
-    pub facts: Vec<String>,
+    pub facts: Vec<FactName>,
 }
 
 /// A resolved dimension paired with its role-playing scoped alias, if any.
@@ -211,6 +217,14 @@ mod tests {
         assert_eq!(met, MetricName::new("total_revenue"));
         assert_eq!(&*met.clone(), "Total_Revenue");
         assert_eq!(met.as_ref() as &str, "Total_Revenue");
+
+        // Facts share the same case-insensitive impl (R-7 follow-up: the third
+        // `CiName<K>` type the original change omitted, replacing the former
+        // stringly `facts: Vec<String>`).
+        let fact = FactName::new("Line_Total");
+        assert_eq!(fact, FactName::new("line_total"));
+        assert_eq!(&*fact.clone(), "Line_Total");
+        assert_eq!(fact.as_ref() as &str, "Line_Total");
     }
 
     #[test]
