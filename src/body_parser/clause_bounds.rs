@@ -1,6 +1,27 @@
 //! AS-body clause scanning: split the body into `KEYWORD (...)` clause bounds.
+//!
+//! §6.1 (phase 7, code-review 2026-07-11): the clause-header scan runs on the
+//! shared [`Cursor`]/lexer. A clause keyword is a bare-identifier token whose
+//! first byte is ASCII-alphabetic (so a quoted `"tables"`, a symbol, or a
+//! digit/underscore/non-ASCII lead is still the "unexpected character" at top
+//! level, exactly as the old byte scan reported), and the `(...)` body is
+//! consumed with the quote-aware [`Cursor::take_parens`] — a `)` inside a
+//! `'string'` / `"ident"` token cannot close the clause early (PA-6), replacing
+//! the hand-rolled `QuoteState` depth loop. Keyword validation (known / unknown
+//! with a "did you mean?" suggestion, duplicate, ordering, required) is
+//! unchanged.
+//!
+//! One deliberate divergence from the old prefix scan: because the keyword is a
+//! whole lexer token, an ALPHA-led word with a trailing non-alphabetic byte
+//! (`TABLES2`, `TABLES_`, `TABLES★`) is now the single token `TABLES2` and so is
+//! rejected as `Unknown clause keyword 'TABLES2'`. The old byte scan collected
+//! only the `[A-Za-z]+` run, matched `TABLES`, then failed at the trailing char
+//! with `Expected '(' ... found '2'`. Both reject; the message differs. (A word
+//! whose *first* byte is non-alphabetic is still the "unexpected character"
+//! case above — only the trailing-byte shape changed.)
 
-use super::scan::QuoteState;
+use super::cursor::Cursor;
+use super::lexer::TokenKind;
 use crate::errors::ParseError;
 
 /// Decode the character starting at byte offset `i` in `text` for an error
@@ -77,38 +98,29 @@ pub(super) fn find_clause_bounds<'a>(
     text: &'a str,
     base_offset: usize,
 ) -> Result<Vec<ClauseBound<'a>>, ParseError> {
-    let bytes = text.as_bytes();
-    let mut i = 0;
+    let mut cur = Cursor::new(text, base_offset);
     let mut bounds: Vec<ClauseBound<'a>> = Vec::new();
     let mut seen: Vec<&'static str> = Vec::new();
 
-    while i < bytes.len() {
-        // Skip whitespace
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-
-        // Collect identifier word
-        if !bytes[i].is_ascii_alphabetic() {
-            // Unexpected character at top level. Decode the real UTF-8 char
-            // (never the mojibake lead byte) for the message (P-14).
-            let ch = char_at(text, i).unwrap_or('\u{FFFD}');
-            return Err(ParseError {
-                message: format!(
-                    "Unexpected character '{ch}' in AS body; expected a clause keyword (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS).",
+    while let Some(kw_tok) = cur.peek() {
+        let word = cur.text(kw_tok);
+        // A clause keyword is a bare-identifier token whose first byte is
+        // ASCII-alphabetic. Anything else at the top level — a symbol, a quoted
+        // `"..."`/`'...'` token, or a bare token led by a digit / `_` / a
+        // non-ASCII byte (e.g. `★`, tokenized whole so its char renders
+        // verbatim, no mojibake — P-14) — is an unexpected character.
+        let first = word.chars().next().expect("lexer tokens are never empty");
+        let is_keyword_word = matches!(kw_tok.kind, TokenKind::Ident { quoted: false })
+            && first.is_ascii_alphabetic();
+        if !is_keyword_word {
+            return Err(cur.err(
+                kw_tok.start,
+                format!(
+                    "Unexpected character '{first}' in AS body; expected a clause keyword (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS).",
                 ),
-                position: Some(base_offset + i),
-            });
+            ));
         }
 
-        let word_start = i;
-        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
-            i += 1;
-        }
-        let word = &text[word_start..i];
         let lower = word.to_ascii_lowercase();
 
         // Find matching static keyword
@@ -125,94 +137,58 @@ pub(super) fn find_clause_bounds<'a>(
                     "Unknown clause keyword '{word}'; expected one of TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS.",
                 )
             };
-            return Err(ParseError {
-                message: msg,
-                position: Some(base_offset + word_start),
-            });
+            return Err(cur.err(kw_tok.start, msg));
         };
 
         // Duplicate check
         if seen.contains(&keyword) {
             let kw_upper = keyword.to_ascii_uppercase();
-            return Err(ParseError {
-                message: format!("Duplicate clause keyword '{kw_upper}'."),
-                position: Some(base_offset + word_start),
-            });
+            return Err(cur.err(
+                kw_tok.start,
+                format!("Duplicate clause keyword '{kw_upper}'."),
+            ));
         }
 
-        // Skip whitespace after keyword
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        cur.bump(); // consume the keyword token
 
-        // Expect '('
-        if i >= bytes.len() || bytes[i] != b'(' {
+        // Expect '(' as the next token.
+        if !cur.peek_is_symbol(b'(') {
             let kw_upper = keyword.to_ascii_uppercase();
             // Decode the real UTF-8 char for the message; '\0' at EOF keeps
             // the prior end-of-input sentinel (P-14).
-            let found = char_at(text, i).unwrap_or('\0');
-            return Err(ParseError {
-                message: format!(
-                    "Expected '(' after clause keyword '{kw_upper}', found '{found}'.",
-                ),
-                position: Some(base_offset + i),
-            });
+            let found = char_at(text, cur.byte_pos()).unwrap_or('\0');
+            return Err(cur.err(
+                cur.byte_pos(),
+                format!("Expected '(' after clause keyword '{kw_upper}', found '{found}'."),
+            ));
         }
-        let open_paren_pos = i;
-        i += 1; // skip '('
+        // The `(` token — kept for the content offset and the unclosed-paren
+        // error caret before `take_parens` consumes it.
+        let open_tok = cur.peek().expect("peek_is_symbol guaranteed a '(' token");
 
-        // Find matching ')' with depth tracking, skipping quoted regions so
-        // a bracket inside `'...'` or `"..."` (e.g. `o AS "tbl)x"`) cannot
-        // close the clause early (PA-6).
-        let content_start = i;
-        let mut depth: i32 = 1;
-        let mut st = QuoteState::default();
-        while i < bytes.len() {
-            let (next, live) = st.step(bytes, i);
-            if live {
-                match bytes[i] {
-                    b'(' | b'[' | b'{' => depth += 1,
-                    b')' | b']' | b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            i = next;
-        }
-
-        if depth != 0 {
+        // Consume the balanced `(...)`. `take_parens` is quote-aware: a `)`
+        // inside a `'...'`/`"..."` token cannot close the clause early (PA-6).
+        let Some(content) = cur.take_parens() else {
             let kw_upper = keyword.to_ascii_uppercase();
             // Distinguish "a quote never closed, swallowing the rest of the
             // body" from a genuinely missing ')' — the quote-aware scan
             // otherwise reports the misleading unclosed-paren error for
             // unterminated quotes.
-            let message = if st.in_ident {
-                format!("Unterminated quoted identifier in clause '{kw_upper}'.")
-            } else if st.in_string {
-                format!("Unterminated string literal in clause '{kw_upper}'.")
-            } else {
-                format!("Unclosed '(' for clause '{kw_upper}'.")
+            let message = match cur.unterminated_tail() {
+                Some(true) => format!("Unterminated quoted identifier in clause '{kw_upper}'."),
+                Some(false) => format!("Unterminated string literal in clause '{kw_upper}'."),
+                None => format!("Unclosed '(' for clause '{kw_upper}'."),
             };
-            return Err(ParseError {
-                message,
-                position: Some(base_offset + open_paren_pos),
-            });
-        }
-
-        let content = &text[content_start..i];
-        let content_offset = base_offset + content_start;
-        i += 1; // skip closing ')'
+            return Err(cur.err(open_tok.start, message));
+        };
+        let content_offset = cur.abs(open_tok.end);
 
         seen.push(keyword);
         bounds.push(ClauseBound {
             keyword,
             content,
             content_offset,
-            keyword_offset: base_offset + word_start,
+            keyword_offset: cur.abs(kw_tok.start),
         });
     }
 

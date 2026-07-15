@@ -210,6 +210,21 @@ impl<'a> Cursor<'a> {
             .map(|w| (toks[w], toks[w + kws.len() - 1]))
     }
 
+    /// If the token stream ends in an unterminated `"`/`'` region, return
+    /// `Some(true)` for a quoted identifier (`"..."`) or `Some(false)` for a
+    /// string literal (`'...'`). The lexer emits at most one
+    /// [`TokenKind::Unterminated`] token and it always spans to end-of-input, so
+    /// it is necessarily the last token. Used to turn a failed [`Cursor::take_parens`]
+    /// into a precise "unterminated quote" error rather than a misleading
+    /// "unclosed paren" (the distinction the old quote-state scan made via its
+    /// `in_ident` / `in_string` flags).
+    pub(super) fn unterminated_tail(&self) -> Option<bool> {
+        match self.toks.last()?.kind {
+            TokenKind::Unterminated { ident } => Some(ident),
+            _ => None,
+        }
+    }
+
     /// If the next token is `(`, consume the whole balanced `(...)` group and
     /// return its inner source slice (between the parens). Advances past the
     /// matching `)`. Returns `None` when the next token is not `(` *or* the
@@ -337,6 +352,17 @@ mod tests {
     fn take_parens_unclosed_is_none() {
         let mut c = Cursor::new("(a, b", 0);
         assert_eq!(c.take_parens(), None);
+    }
+
+    #[test]
+    fn unterminated_tail_reports_open_quote_kind() {
+        // A `(...` that never closes because a quote swallowed the rest.
+        assert_eq!(Cursor::new("(a, \"b c", 0).unterminated_tail(), Some(true));
+        assert_eq!(Cursor::new("(a, 'b c", 0).unterminated_tail(), Some(false));
+        // A plain unclosed paren (no open quote) is not an unterminated tail.
+        assert_eq!(Cursor::new("(a, b", 0).unterminated_tail(), None);
+        // A fully-terminated stream has no unterminated tail.
+        assert_eq!(Cursor::new("(a, \"b\")", 0).unterminated_tail(), None);
     }
 
     #[test]
