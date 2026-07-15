@@ -135,8 +135,10 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
         entry_offset + byte_offset_within(entry, entry_after_access),
     );
 
-    // Split the entry at the first `AS` keyword token.
-    let Some(as_tok) = cur.find_kw("AS") else {
+    // Split the entry at the first `AS` keyword token AT DEPTH 0 — an `AS`
+    // nested inside a preceding `USING (a AS b)` list is inert, so the split
+    // lands on the structural `AS` before the expression (#103 review).
+    let Some(as_tok) = cur.find_kw_depth0("AS") else {
         return Err(ParseError {
             message: format!(
                 "Expected 'AS' keyword in metric entry '{entry}'. Form: 'alias.name AS expr' or 'name AS expr'.",
@@ -182,7 +184,7 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
     let mut non_additive_by: Vec<NonAdditiveDim> = Vec::new();
     let before_na = {
         let mut nab_cur = Cursor::new(before_as, before_base);
-        if let Some((na_first, na_last)) = nab_cur.find_kw_seq(&["NON", "ADDITIVE", "BY"]) {
+        if let Some((na_first, na_last)) = nab_cur.find_kw_seq_depth0(&["NON", "ADDITIVE", "BY"]) {
             nab_cur.advance_past_byte(na_last.end);
             // The token where `(` is expected; caret recovered from it (P-4).
             let after_na_abs = nab_cur.abs(nab_cur.byte_pos());
@@ -228,7 +230,7 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
     let final_name_portion = {
         let na_base = entry_offset + byte_offset_within(entry, before_na);
         let mut using_cur = Cursor::new(before_na, na_base);
-        if let Some(using_tok) = using_cur.find_kw("USING") {
+        if let Some(using_tok) = using_cur.find_kw_depth0("USING") {
             using_cur.advance_past_byte(using_tok.end);
             let after_using_abs = using_cur.abs(using_cur.byte_pos());
             if !using_cur.peek_is_symbol(b'(') {
