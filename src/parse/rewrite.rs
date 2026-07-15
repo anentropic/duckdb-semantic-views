@@ -9,6 +9,7 @@
 
 use crate::errors::ParseError;
 use crate::ident::{find_identifier_end, normalize_view_name};
+use crate::sql_lit::SqlLit;
 use crate::util::{
     byte_offset_within, extract_single_quoted_prefix, starts_with_keyword_ci, SingleQuoteError,
 };
@@ -359,7 +360,7 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
         // SQL text on the read side.
         DdlKind::Describe | DdlKind::ShowColumns => {
             let name = extract_raw_name_only(trimmed, plen, Trailing::Reject, trim_base)?;
-            let safe_name = name.replace('\'', "''");
+            let safe_name = SqlLit::escape(&name);
             let fn_name = read_function_name(kind);
             Ok(RewriteAction::Passthrough(format!(
                 "SELECT * FROM {fn_name}('{safe_name}')"
@@ -386,9 +387,9 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
 
             // Build base SELECT
             let base = if let Some(view_name) = clauses.in_view {
-                let safe_name = view_name.replace('\'', "''");
+                let safe_name = SqlLit::escape(view_name);
                 if let Some(metric_name) = clauses.for_metric {
-                    let safe_metric = metric_name.replace('\'', "''");
+                    let safe_metric = SqlLit::escape(metric_name);
                     format!(
                         "SELECT * FROM show_semantic_dimensions_for_metric('{safe_name}', '{safe_metric}')"
                     )

@@ -16,6 +16,7 @@
 use super::extract_quoted_string;
 use super::DdlKind;
 use crate::errors::ParseError;
+use crate::sql_lit::SqlLit;
 use crate::util::{byte_offset_within, is_ident_byte, starts_with_keyword_ci};
 
 /// Build optional WHERE and LIMIT suffix for a SHOW rewrite.
@@ -34,19 +35,19 @@ pub(crate) fn build_filter_suffix(
 ) -> String {
     let mut parts = Vec::new();
     if let Some(pattern) = like_pattern {
-        let escaped = pattern.replace('\'', "''");
+        let escaped = SqlLit::escape(pattern);
         parts.push(format!("name ILIKE '{escaped}'"));
     }
     if let Some(prefix) = starts_with {
-        let escaped = prefix.replace('\'', "''");
+        let escaped = SqlLit::escape(prefix);
         parts.push(format!("name LIKE '{escaped}%'"));
     }
     if let Some(schema) = in_schema {
-        let escaped = schema.replace('\'', "''");
+        let escaped = SqlLit::escape(schema);
         parts.push(format!("schema_name = '{escaped}'"));
     }
     if let Some(db) = in_database {
-        let escaped = db.replace('\'', "''");
+        let escaped = SqlLit::escape(db);
         parts.push(format!("database_name = '{escaped}'"));
     }
     let mut suffix = String::new();
@@ -319,4 +320,39 @@ pub(crate) fn parse_show_filter_clauses<'a>(
         starts_with,
         limit,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_filter_suffix;
+
+    // R-1 (code-review 2026-07-11): every user-supplied filter value is
+    // embedded in a single-quoted SQL literal via `SqlLit`, so `'` doubles to
+    // `''` and no lone quote can break out of the literal. These assertions
+    // pin the escaped output the manual `.replace('\'', "''")` used to produce,
+    // now routed through the single escaping boundary.
+    #[test]
+    fn filter_suffix_escapes_single_quotes() {
+        assert_eq!(
+            build_filter_suffix(Some("O'Brien"), None, None, None, None),
+            " WHERE name ILIKE 'O''Brien'"
+        );
+        assert_eq!(
+            build_filter_suffix(None, Some("O'Br"), None, None, None),
+            " WHERE name LIKE 'O''Br%'"
+        );
+        assert_eq!(
+            build_filter_suffix(None, None, None, Some("sch'ema"), Some("d'b")),
+            " WHERE schema_name = 'sch''ema' AND database_name = 'd''b'"
+        );
+    }
+
+    #[test]
+    fn filter_suffix_plain_values_and_limit_unchanged() {
+        assert_eq!(
+            build_filter_suffix(Some("cust%"), None, Some(10), None, None),
+            " WHERE name ILIKE 'cust%' LIMIT 10"
+        );
+        assert_eq!(build_filter_suffix(None, None, None, None, None), "");
+    }
 }
