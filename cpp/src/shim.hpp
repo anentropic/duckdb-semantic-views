@@ -265,13 +265,11 @@ bool sv_register_read_yaml_from_semantic_view(duckdb_database db_handle,
 // metrics := LIST(VARCHAR), facts := LIST(VARCHAR))` table function via
 // the C++ Catalog API. The bind opens a per-call
 // `Connection(*context.db)` and bridges to `sv_explain_semantic_view_bind_rust`.
-// Built without going through `sv_register_table_function` because the
-// generic shim does not (yet) accept named-parameter declarations; see
-// `cpp/src/shim.cpp::sv_register_explain_semantic_view_impl`.
-//
-// Phase 65.1 Plan 02a: hand-built impl writes failures directly into the
-// supplied `error_buf` via snprintf (same convention as the generic
-// `sv_register_table_function`), preserving the D-09 ABI-stable channel.
+// Registers through the shared spec-based core (C-7,
+// `cpp/src/shim.cpp::sv_register_table_function_core`) with the named
+// LIST(VARCHAR) parameters (`dimensions`/`metrics`/`facts`, from the single
+// `sv_semantic_named_params`) and an init_local state constructor. Failures
+// surface via the forwarded `error_buf` (D-08/D-09), never stderr.
 bool sv_register_explain_semantic_view(duckdb_database db_handle,
                                        char *error_buf, size_t error_buf_len);
 
@@ -286,9 +284,11 @@ bool sv_register_explain_semantic_view(duckdb_database db_handle,
 // H2 query_conn are NOT consumed by this path — Plan 06 retires H1,
 // Batch 3 of Plan 05 retires H2.
 //
-// Phase 65.1 Plan 02a: hand-built impl writes failures directly into the
-// supplied `error_buf` via snprintf (same convention as the generic
-// `sv_register_table_function`), preserving the D-09 ABI-stable channel.
+// Registers through the shared spec-based core (C-7,
+// `cpp/src/shim.cpp::sv_register_table_function_core`) with the shared named
+// LIST(VARCHAR) parameters and an init_global state constructor; the core's
+// generalized D-05 check accepts init_global as the required per-execution
+// state constructor. Failures surface via `error_buf` (D-08/D-09), never stderr.
 bool sv_register_semantic_view(duckdb_database db_handle,
                                char *error_buf, size_t error_buf_len);
 

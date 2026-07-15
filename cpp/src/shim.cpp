@@ -534,6 +534,142 @@ static ParserExtensionPlanResult sv_plan_unreachable(
 }
 
 // ---------------------------------------------------------------------------
+// Table-function registration: shared spec-based core (C-7, code-review
+// 2026-07-11)
+// ---------------------------------------------------------------------------
+// Every table function this extension installs goes through the C++ Catalog
+// API with identical boilerplate: unwrap the `DatabaseWrapper`, build a
+// `TableFunction`, set `ALTER_ON_CONFLICT`, and register it on the
+// system-catalog transaction — all inside a try/catch that funnels failures
+// into `error_buf` (D-08/D-09, never stderr). That boilerplate used to live in
+// three places: the generic `sv_register_table_function` wrapper plus two
+// hand-rolled impls for the named-parameter TFs (`explain_semantic_view`,
+// `semantic_view`) that the generic wrapper could not express. `SvTableFunctionSpec`
+// + `sv_register_table_function_core` own it once; the wrapper and the two named
+// registrations are now thin spec builders that differ only in data.
+struct SvTableFunctionSpec {
+    const char *name = nullptr;
+    const LogicalType *arg_types = nullptr;
+    size_t arg_count = 0;
+    // Named parameters, applied in order (empty for positional-only TFs).
+    std::vector<std::pair<std::string, LogicalType>> named_params;
+    table_function_bind_t bind_cb = nullptr;
+    table_function_t exec_cb = nullptr;
+    // D-05 (generalized): exactly one per-execution state constructor. A TF
+    // uses init_local (single-shot / streaming via local state) XOR init_global
+    // (semantic_view's per-execution global). The core enforces the XOR.
+    table_function_init_local_t init_local_cb = nullptr;
+    table_function_init_global_t init_global_cb = nullptr;
+};
+
+// The named LIST(VARCHAR) parameters shared by explain_semantic_view and
+// semantic_view. Defined once (C-7) so the two TFs cannot drift from each
+// other: this triple must stay byte-for-byte identical to the legacy Rust VTab
+// signature (`dimensions`, `metrics`, `facts`) so existing call sites keep
+// parsing.
+static std::vector<std::pair<std::string, LogicalType>> sv_semantic_named_params() {
+    auto list_varchar = LogicalType::LIST(LogicalType::VARCHAR);
+    return {
+        {"dimensions", list_varchar},
+        {"metrics", list_varchar},
+        {"facts", list_varchar},
+    };
+}
+
+// Shared registration core. `caller` names the outer entry point so
+// diagnostics keep naming the specific function (e.g. "sv_register_semantic_view
+// failed: ..."). Every failure path writes a NUL-terminated diagnostic into
+// `error_buf` (never stderr — D-09) and returns false.
+static bool sv_register_table_function_core(
+    duckdb_database db_handle,
+    const SvTableFunctionSpec &spec,
+    const char *caller,
+    char *error_buf, size_t error_buf_len) {
+    auto write_err = [error_buf, error_buf_len](const std::string &msg) {
+        if (error_buf == nullptr || error_buf_len == 0) {
+            return;
+        }
+        snprintf(error_buf, error_buf_len, "%s", msg.c_str());
+    };
+    // Diagnostics name both the registration entry point (`caller`) and the
+    // specific table function (`spec.name`), reproducing the pre-C-7
+    // `sv_register_table_function('<tf_name>') ...` format so no failure path
+    // — including the wrapper's — loses the TF name.
+    const std::string who =
+        std::string(caller != nullptr ? caller : "sv_register_table_function_core") +
+        "('" + (spec.name != nullptr ? spec.name : "(null)") + "')";
+    try {
+        if (db_handle == nullptr || spec.name == nullptr ||
+            spec.bind_cb == nullptr || spec.exec_cb == nullptr) {
+            write_err(who + ": null required argument");
+            return false;
+        }
+        // D-05 generalized (CR-02): every TF must have exactly one
+        // per-execution state constructor so the single-shot/streaming exec
+        // cannot double-emit or loop. init_local XOR init_global — both-null
+        // reopens that hazard; both-set mixes the two state models.
+        const bool has_local = spec.init_local_cb != nullptr;
+        const bool has_global = spec.init_global_cb != nullptr;
+        if (has_local == has_global) {
+            write_err(who +
+                ": exactly one of init_local / init_global must be non-null "
+                "(D-05)");
+            return false;
+        }
+        // Symmetric null guard for arg_types when arg_count > 0 (WR-01): a
+        // buggy (nullptr, > 0) caller would otherwise segfault in the copy loop.
+        if (spec.arg_count > 0 && spec.arg_types == nullptr) {
+            write_err(who + ": arg_count > 0 but arg_types is null");
+            return false;
+        }
+        auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
+            db_handle->internal_ptr);
+        if (wrapper == nullptr) {
+            write_err(who + ": null DatabaseWrapper");
+            return false;
+        }
+        auto &db = *wrapper->database->instance;
+
+        vector<LogicalType> args;
+        args.reserve(spec.arg_count);
+        for (size_t i = 0; i < spec.arg_count; ++i) {
+            args.push_back(spec.arg_types[i]);
+        }
+
+        // Six-arg TableFunction ctor: (name, args, function, bind,
+        // init_global, init_local). Exactly one init callback is non-null
+        // (enforced above); the other is nullptr.
+        TableFunction tf(
+            std::string(spec.name),
+            std::move(args),
+            spec.exec_cb,
+            spec.bind_cb,
+            spec.init_global_cb,
+            spec.init_local_cb);
+
+        for (const auto &np : spec.named_params) {
+            tf.named_parameters[np.first] = np.second;
+        }
+
+        CreateTableFunctionInfo info(tf);
+        // ALTER_ON_CONFLICT: extension reload replaces the registration cleanly
+        // instead of throwing on duplicate name.
+        info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+
+        auto &system_catalog = Catalog::GetSystemCatalog(db);
+        auto txn = CatalogTransaction::GetSystemTransaction(db);
+        system_catalog.CreateTableFunction(txn, info);
+        return true;
+    } catch (const std::exception &e) {
+        write_err(who + " failed: " + e.what());
+        return false;
+    } catch (...) {
+        write_err(who + " failed: unknown C++ exception");
+        return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // sv_register_table_function — Phase 65 Plan 04 (A2 resolution)
 // ---------------------------------------------------------------------------
 // Reusable C-callable wrapper around the C++ Catalog API table-function
@@ -566,91 +702,32 @@ extern "C" {
         table_function_t exec_cb,
         table_function_init_local_t init_cb,
         char *error_buf, size_t error_buf_len) {
-        // D-05 enforced shape: every required callback (including
-        // init_cb — tightened from "may be null" pre-Phase-65.1) is
-        // checked at the top before any allocation. Guard the snprintf
-        // calls against a null/zero-cap buffer.
-        auto write_err = [error_buf, error_buf_len](const char *fmt,
-                                                    const char *arg1) {
-            if (error_buf == nullptr || error_buf_len == 0) {
-                return;
-            }
-            snprintf(error_buf, error_buf_len, fmt, arg1 ? arg1 : "(null)");
-        };
-        try {
-            if (db_handle == nullptr || name == nullptr ||
-                bind_cb == nullptr || exec_cb == nullptr ||
-                init_cb == nullptr) {
-                write_err(
-                    "sv_register_table_function('%s'): null required "
-                    "argument (init_cb is mandatory)",
-                    name);
-                return false;
-            }
-            // Phase 65.1 WR-01: symmetric null guard for arg_types when the
-            // caller declares a non-zero arg_count. The header at
-            // cpp/src/shim.hpp documents arg_types "may be null when
-            // arg_count == 0"; without this check a buggy caller passing
-            // (nullptr, > 0) would segfault inside the loop below — far
-            // from the bug site. Matches the D-05/D-08/D-09 hardening
-            // pattern already applied to the other input arguments.
-            if (arg_count > 0 && arg_types == nullptr) {
-                write_err(
-                    "sv_register_table_function('%s'): arg_count > 0 but "
-                    "arg_types is null",
-                    name);
-                return false;
-            }
-            auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
-                db_handle->internal_ptr);
-            if (wrapper == nullptr) {
-                write_err(
-                    "sv_register_table_function('%s'): null DatabaseWrapper",
-                    name);
-                return false;
-            }
-            auto &db = *wrapper->database->instance;
-
-            vector<LogicalType> args;
-            args.reserve(arg_count);
-            for (size_t i = 0; i < arg_count; ++i) {
-                args.push_back(arg_types[i]);
-            }
-
-            // Six-arg TableFunction ctor: (name, args, function, bind,
-            // init_global, init_local). init_global is nullptr; init_cb
-            // (init_local) is now mandatory per D-05 — refused above.
-            TableFunction tf(
-                std::string(name),
-                std::move(args),
-                exec_cb,
-                bind_cb,
-                /*init_global*/ nullptr,
-                init_cb);
-
-            CreateTableFunctionInfo info(tf);
-            // ALTER_ON_CONFLICT: extension reload (LOAD semantic_views after
-            // a previous LOAD in the same process) replaces the registration
-            // cleanly instead of throwing on duplicate name.
-            info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-
-            auto &system_catalog = Catalog::GetSystemCatalog(db);
-            auto txn = CatalogTransaction::GetSystemTransaction(db);
-            system_catalog.CreateTableFunction(txn, info);
-            return true;
-        } catch (const std::exception &e) {
+        // Thin compatibility wrapper (C-7): preserves this entry point's
+        // narrow, documented contract (shim.hpp) — its call sites are all
+        // single-shot local-state TFs, so init_cb (init_local) is MANDATORY
+        // here and the exact legacy diagnostic is kept. Construction, the
+        // generalized D-05 XOR check, named-parameter population, and the
+        // catalog transaction all live in the shared core above.
+        if (init_cb == nullptr) {
             if (error_buf != nullptr && error_buf_len > 0) {
                 snprintf(error_buf, error_buf_len,
-                    "sv_register_table_function('%s') failed: %s",
-                    name ? name : "(null)", e.what());
+                    "sv_register_table_function('%s'): null required "
+                    "argument (init_cb is mandatory)",
+                    name ? name : "(null)");
             }
             return false;
-        } catch (...) {
-            write_err(
-                "sv_register_table_function('%s') failed: unknown C++ exception",
-                name);
-            return false;
         }
+        SvTableFunctionSpec spec;
+        spec.name = name;
+        spec.arg_types = arg_types;
+        spec.arg_count = arg_count;
+        spec.bind_cb = bind_cb;
+        spec.exec_cb = exec_cb;
+        spec.init_local_cb = init_cb;
+        spec.init_global_cb = nullptr;
+        return sv_register_table_function_core(
+            db_handle, spec, "sv_register_table_function", error_buf,
+            error_buf_len);
     }
 }
 
@@ -2142,73 +2219,31 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
     return std::move(bd);
 }
 
-// sv_register_table_function does not declare named parameters; for
-// explain_semantic_view (and Wave 6's semantic_view) we need them so
-// DuckDB's binder type-checks `dimensions := [...]` etc. against
-// LIST(VARCHAR). Build the TableFunction by hand and register it via the
-// same Catalog::CreateTableFunction path.
-//
-// Borrow contract identical to sv_register_table_function: callbacks
-// receive `ClientContext &` and the bind opens per-call Connections —
-// no long-lived extension-owned `duckdb_connection`.
-// Phase 65.1 Plan 02a (WR-02 D-08/D-09) — hand-built impl writes
-// failures directly into the supplied `error_buf` via snprintf instead
-// of stderr, mirroring `sv_register_table_function`. The buffer
-// argument is forwarded by `sv_register_explain_semantic_view` below;
-// init_extension (Plan 02b) supplies it.
+// explain_semantic_view takes named LIST(VARCHAR) parameters (`dimensions`,
+// `metrics`, `facts`) so DuckDB's binder type-checks `dimensions := [...]`.
+// It builds a spec carrying those named params (from the single shared
+// `sv_semantic_named_params`) plus an init_local state constructor, and
+// registers via `sv_register_table_function_core` (C-7) — the hand-rolled
+// TableFunction construction it used to duplicate now lives once, in the core.
+// Borrow contract is unchanged: the bind receives `ClientContext &` and opens
+// per-call Connections; no long-lived extension-owned connection. Failures
+// surface through the forwarded `error_buf` (D-08/D-09).
 static bool sv_register_explain_semantic_view_impl(duckdb_database db_handle,
                                                    char *error_buf,
                                                    size_t error_buf_len) {
-    auto write_err = [error_buf, error_buf_len](const char *msg) {
-        if (error_buf == nullptr || error_buf_len == 0) {
-            return;
-        }
-        snprintf(error_buf, error_buf_len, "%s", msg);
-    };
-    try {
-        auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
-            db_handle->internal_ptr);
-        if (wrapper == nullptr) {
-            write_err(
-                "sv_register_explain_semantic_view: null DatabaseWrapper");
-            return false;
-        }
-        auto &db = *wrapper->database->instance;
-
-        vector<LogicalType> args = {LogicalType::VARCHAR};
-        TableFunction tf(
-            std::string("explain_semantic_view"),
-            std::move(args),
-            sv_emit_varchar_rows,
-            sv_explain_semantic_view_bind,
-            /*init_global*/ nullptr,
-            sv_varchar_init_local);
-
-        // Named LIST(VARCHAR) parameters — match the legacy Rust VTab
-        // signature (`dimensions`, `metrics`, `facts`) byte-for-byte so
-        // existing call sites continue to parse without surprises.
-        tf.named_parameters["dimensions"] = LogicalType::LIST(LogicalType::VARCHAR);
-        tf.named_parameters["metrics"]    = LogicalType::LIST(LogicalType::VARCHAR);
-        tf.named_parameters["facts"]      = LogicalType::LIST(LogicalType::VARCHAR);
-
-        CreateTableFunctionInfo info(tf);
-        info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-
-        auto &system_catalog = Catalog::GetSystemCatalog(db);
-        auto txn = CatalogTransaction::GetSystemTransaction(db);
-        system_catalog.CreateTableFunction(txn, info);
-        return true;
-    } catch (const std::exception &e) {
-        if (error_buf != nullptr && error_buf_len > 0) {
-            snprintf(error_buf, error_buf_len,
-                "sv_register_explain_semantic_view failed: %s", e.what());
-        }
-        return false;
-    } catch (...) {
-        write_err(
-            "sv_register_explain_semantic_view failed: unknown C++ exception");
-        return false;
-    }
+    const LogicalType arg_types[] = {LogicalType::VARCHAR};
+    SvTableFunctionSpec spec;
+    spec.name = "explain_semantic_view";
+    spec.arg_types = arg_types;
+    spec.arg_count = 1;
+    spec.named_params = sv_semantic_named_params();
+    spec.bind_cb = sv_explain_semantic_view_bind;
+    spec.exec_cb = sv_emit_varchar_rows;
+    spec.init_local_cb = sv_varchar_init_local;
+    spec.init_global_cb = nullptr;
+    return sv_register_table_function_core(
+        db_handle, spec, "sv_register_explain_semantic_view", error_buf,
+        error_buf_len);
 }
 
 extern "C" {
@@ -2573,65 +2608,29 @@ static void sv_semantic_view_function(
     output.SetCardinality(chunk->size());
 }
 
-// Register semantic_view via the C++ Catalog API — same pattern as
-// sv_register_explain_semantic_view_impl. Constructs TableFunction by hand
-// (rather than going through sv_register_table_function) so the
-// `named_parameters` map can be populated for `dimensions` / `metrics` /
-// `facts`. Also passes `init_global` because semantic_view's exec needs
-// per-execution global state (the materialised query result).
-// Phase 65.1 Plan 02a (WR-02 D-08/D-09) — see
-// `sv_register_explain_semantic_view_impl` for the rationale. Same
-// snprintf-into-error_buf convention; no stderr writes.
+// semantic_view takes the same named LIST(VARCHAR) parameters as
+// explain_semantic_view, but uses an init_global state constructor (its exec
+// streams the materialised query result across invocations) rather than
+// init_local. It builds a spec from the single shared `sv_semantic_named_params`
+// and registers via `sv_register_table_function_core` (C-7); the shared triple
+// makes it impossible for this TF and explain_semantic_view to drift. Same
+// per-call borrow contract and error_buf convention (D-08/D-09); no stderr.
 static bool sv_register_semantic_view_impl(duckdb_database db_handle,
                                            char *error_buf,
                                            size_t error_buf_len) {
-    auto write_err = [error_buf, error_buf_len](const char *msg) {
-        if (error_buf == nullptr || error_buf_len == 0) {
-            return;
-        }
-        snprintf(error_buf, error_buf_len, "%s", msg);
-    };
-    try {
-        auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
-            db_handle->internal_ptr);
-        if (wrapper == nullptr) {
-            write_err(
-                "sv_register_semantic_view: null DatabaseWrapper");
-            return false;
-        }
-        auto &db = *wrapper->database->instance;
-
-        vector<LogicalType> args = {LogicalType::VARCHAR};
-        TableFunction tf(
-            std::string("semantic_view"),
-            std::move(args),
-            sv_semantic_view_function,
-            sv_semantic_view_bind,
-            sv_semantic_view_init_global,
-            /*init_local*/ nullptr);
-
-        tf.named_parameters["dimensions"] = LogicalType::LIST(LogicalType::VARCHAR);
-        tf.named_parameters["metrics"]    = LogicalType::LIST(LogicalType::VARCHAR);
-        tf.named_parameters["facts"]      = LogicalType::LIST(LogicalType::VARCHAR);
-
-        CreateTableFunctionInfo info(tf);
-        info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-
-        auto &system_catalog = Catalog::GetSystemCatalog(db);
-        auto txn = CatalogTransaction::GetSystemTransaction(db);
-        system_catalog.CreateTableFunction(txn, info);
-        return true;
-    } catch (const std::exception &e) {
-        if (error_buf != nullptr && error_buf_len > 0) {
-            snprintf(error_buf, error_buf_len,
-                "sv_register_semantic_view failed: %s", e.what());
-        }
-        return false;
-    } catch (...) {
-        write_err(
-            "sv_register_semantic_view failed: unknown C++ exception");
-        return false;
-    }
+    const LogicalType arg_types[] = {LogicalType::VARCHAR};
+    SvTableFunctionSpec spec;
+    spec.name = "semantic_view";
+    spec.arg_types = arg_types;
+    spec.arg_count = 1;
+    spec.named_params = sv_semantic_named_params();
+    spec.bind_cb = sv_semantic_view_bind;
+    spec.exec_cb = sv_semantic_view_function;
+    spec.init_local_cb = nullptr;
+    spec.init_global_cb = sv_semantic_view_init_global;
+    return sv_register_table_function_core(
+        db_handle, spec, "sv_register_semantic_view", error_buf,
+        error_buf_len);
 }
 
 extern "C" {

@@ -1,0 +1,60 @@
+# C-7 (code-review 2026-07-11): semantic_view and explain_semantic_view now
+# register through the shared spec-based core (sv_register_table_function_core)
+# from a single named-parameter definition (sv_semantic_named_params). Before
+# C-7 each TF hand-built its own TableFunction, so nothing forced their named
+# parameters to agree. This fixture pins that BOTH table functions accept the
+# identical dimensions / metrics / facts set and BOTH reject anything else — so
+# the two registrations cannot drift and the core's named-parameter population
+# stays wired up. Integer amounts keep the rendered output format stable.
+
+require semantic_views
+
+statement ok
+CREATE TABLE c7_orders (id INTEGER PRIMARY KEY, amount INTEGER, region VARCHAR, note VARCHAR);
+
+statement ok
+INSERT INTO c7_orders VALUES (1, 100, 'US', 'a'), (2, 200, 'EU', 'b'), (3, 50, 'US', 'c');
+
+statement ok
+CREATE SEMANTIC VIEW c7_sv
+AS
+  TABLES (o AS c7_orders PRIMARY KEY (id))
+  FACTS (o.amount AS o.amount)
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount))
+
+# semantic_view accepts the dimensions := / metrics := named parameters.
+query TI
+SELECT * FROM semantic_view('c7_sv', dimensions := ['region'], metrics := ['total']) ORDER BY 1
+----
+EU	200
+US	150
+
+# semantic_view accepts the facts := named parameter (mutually exclusive with
+# metrics), exercising the third member of the shared triple.
+query I
+SELECT * FROM semantic_view('c7_sv', facts := ['amount']) ORDER BY 1
+----
+50
+100
+200
+
+# explain_semantic_view accepts the identical named-parameter triple. Binding
+# is the C-7 contract here; the exact rendered SQL is asserted elsewhere.
+statement ok
+SELECT * FROM explain_semantic_view('c7_sv', dimensions := ['region'], metrics := ['total'])
+
+statement ok
+SELECT * FROM explain_semantic_view('c7_sv', facts := ['amount'])
+
+# Both table functions reject a named parameter outside the shared triple, so a
+# future edit that lets one TF's parameter set drift is caught here.
+statement error
+SELECT * FROM semantic_view('c7_sv', bogus := ['x'])
+----
+Invalid named parameter
+
+statement error
+SELECT * FROM explain_semantic_view('c7_sv', bogus := ['x'])
+----
+Invalid named parameter
