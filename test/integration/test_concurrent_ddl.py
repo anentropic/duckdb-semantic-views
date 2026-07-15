@@ -81,18 +81,33 @@ class WorkerResult:
         self.error: Exception | None = None
 
 
-def worker(thread_conn, sql: str, result: WorkerResult, gate: threading.Event) -> None:
-    # Both threads block at the gate before issuing their statement so they
-    # race the PK constraint check. The thread-local DuckDB connection
-    # (obtained via .cursor()) shares the underlying database instance
-    # with the master and the other worker, so both inserts hit the same
-    # `semantic_layer._definitions` table simultaneously. The PK constraint
-    # serializes them: one wins, the other gets a constraint-violation
-    # error (plain CREATE) or silently no-ops (CREATE IF NOT EXISTS via
-    # INSERT OR IGNORE).
-    gate.wait()
+def worker(thread_conn, sql: str, result: WorkerResult, staged: threading.Barrier) -> None:
+    # Force the two transactions to OVERLAP deterministically rather than
+    # leaving it to thread-scheduling luck.
+    #
+    # Each worker opens an explicit transaction, issues its CREATE (which
+    # parser_override rewrites to an INSERT [OR IGNORE] against
+    # `semantic_layer._definitions`), and only THEN waits on the shared
+    # barrier. Both transactions take their MVCC snapshot at BEGIN — before
+    # either has committed — so both see the target name absent and both stage
+    # the INSERT. The barrier holds every worker at the post-INSERT point until
+    # all have staged, so no COMMIT can land before the other's snapshot is
+    # fixed: the first COMMIT wins and the second necessarily hits DuckDB's
+    # primary-key write-write conflict. That makes "exactly one success, one
+    # failure" deterministic.
+    #
+    # The previous autocommit form (no BEGIN, a plain Event gate) could let the
+    # threads serialize cleanly — one CREATE fully committing before the other
+    # took its snapshot. Plain CREATE still errored then (its committed-state
+    # guard saw the row), but CREATE IF NOT EXISTS silently no-opped
+    # (INSERT OR IGNORE saw the row) → two successes, and the test flaked.
     try:
+        thread_conn.execute("BEGIN TRANSACTION")
         thread_conn.execute(sql)
+        # INSERT is now staged in this transaction's snapshot; release only
+        # once the other worker has staged its INSERT too, so the commits race.
+        staged.wait(timeout=20)
+        thread_conn.execute("COMMIT")
         result.ok = True
     except Exception as exc:  # noqa: BLE001 - we want every error type
         result.error = exc
@@ -111,13 +126,12 @@ def test_concurrent_create_serializes() -> bool:
         c1 = master.cursor()
         c2 = master.cursor()
 
-        gate = threading.Event()
+        staged = threading.Barrier(2)
         r1, r2 = WorkerResult(1), WorkerResult(2)
-        t1 = threading.Thread(target=worker, args=(c1, CREATE_SQL, r1, gate))
-        t2 = threading.Thread(target=worker, args=(c2, CREATE_SQL, r2, gate))
+        t1 = threading.Thread(target=worker, args=(c1, CREATE_SQL, r1, staged))
+        t2 = threading.Thread(target=worker, args=(c2, CREATE_SQL, r2, staged))
         t1.start()
         t2.start()
-        gate.set()
         t1.join(timeout=30)
         t2.join(timeout=30)
         if t1.is_alive() or t2.is_alive():
@@ -183,17 +197,12 @@ def test_concurrent_create_if_not_exists_serializes() -> bool:
         c1 = master.cursor()
         c2 = master.cursor()
 
-        gate = threading.Event()
+        staged = threading.Barrier(2)
         r1, r2 = WorkerResult(1), WorkerResult(2)
-        t1 = threading.Thread(
-            target=worker, args=(c1, CREATE_IF_NOT_EXISTS_SQL, r1, gate)
-        )
-        t2 = threading.Thread(
-            target=worker, args=(c2, CREATE_IF_NOT_EXISTS_SQL, r2, gate)
-        )
+        t1 = threading.Thread(target=worker, args=(c1, CREATE_IF_NOT_EXISTS_SQL, r1, staged))
+        t2 = threading.Thread(target=worker, args=(c2, CREATE_IF_NOT_EXISTS_SQL, r2, staged))
         t1.start()
         t2.start()
-        gate.set()
         t1.join(timeout=30)
         t2.join(timeout=30)
         if t1.is_alive() or t2.is_alive():
