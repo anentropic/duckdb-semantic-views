@@ -11,17 +11,13 @@
 //! centralizes escaping at one boundary: the emission helpers take `&SqlLit`,
 //! so a raw `&str` no longer type-checks (the accidental "forgot to escape →
 //! injection" footgun is a compile error), and the only way to obtain a
-//! `SqlLit` is [`SqlLit::escape`], so escaping happens once, at the
-//! `rewrite_to_native_sql` boundary. It does NOT make double-escaping
+//! `SqlLit` is [`SqlLit::escape`], so escaping happens once, at each
+//! SQL-emission boundary: `rewrite_to_native_sql` for the write-DDL path, and
+//! the SHOW/DESCRIBE read-rewrite in `parse::rewrite` / `build_filter_suffix`
+//! for the read path. It does NOT make double-escaping
 //! impossible — a caller could deliberately round-trip through `Display`
 //! (`SqlLit::escape(&lit.to_string())`) — but that is an intentional act, not
 //! an accidental one, and there is no such call site.
-
-// The only non-test constructor call sites are the `extension`-gated write
-// emitters (`crate::parse::native_sql`); under a default, non-test build the
-// type is unused (the guard builders that consume it are themselves
-// `allow(dead_code)` there). Mirror the escaping helpers this replaced.
-#![cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 
 /// A string with single quotes already SQL-doubled (`'` → `''`), ready to be
 /// embedded **between** the quotes of a single-quoted SQL string literal
