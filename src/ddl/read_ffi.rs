@@ -56,6 +56,7 @@
 
 #![cfg(feature = "extension")]
 
+use crate::ffi_util::wire_len;
 use libduckdb_sys as ffi;
 use std::ffi::{CStr, CString};
 
@@ -191,17 +192,6 @@ pub unsafe fn probe_catalog_table_present(borrowed: &BorrowedConnection) -> Resu
 /// `buf_len` bytes.
 pub unsafe fn write_err(buf: *mut u8, buf_len: usize, msg: &str) {
     crate::ffi_util::write_error_to_buffer(buf, buf_len, msg);
-}
-
-/// Encode a length as a little-endian `u32`, erroring rather than clamping
-/// when it exceeds `u32::MAX` (FF-6). A silent `unwrap_or(u32::MAX)` would
-/// write a length prefix that disagrees with the bytes actually appended,
-/// desyncing the header from the payload for every subsequent field on the
-/// C++ read side. The overflow is unreachable for real catalog metadata (a
-/// single row/cell would need >4 GiB), so the error is a hard corruption
-/// signal, not a routine path.
-fn wire_len(n: usize, what: &str) -> Result<u32, String> {
-    u32::try_from(n).map_err(|_| format!("{what} ({n} bytes) exceeds the wire-format u32 limit"))
 }
 
 /// Column type tag in the self-describing schema header (AR-3). Kept in sync
