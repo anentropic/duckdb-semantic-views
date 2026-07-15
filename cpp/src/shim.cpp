@@ -591,8 +591,13 @@ static bool sv_register_table_function_core(
         }
         snprintf(error_buf, error_buf_len, "%s", msg.c_str());
     };
+    // Diagnostics name both the registration entry point (`caller`) and the
+    // specific table function (`spec.name`), reproducing the pre-C-7
+    // `sv_register_table_function('<tf_name>') ...` format so no failure path
+    // — including the wrapper's — loses the TF name.
     const std::string who =
-        (caller != nullptr) ? caller : "sv_register_table_function_core";
+        std::string(caller != nullptr ? caller : "sv_register_table_function_core") +
+        "('" + (spec.name != nullptr ? spec.name : "(null)") + "')";
     try {
         if (db_handle == nullptr || spec.name == nullptr ||
             spec.bind_cb == nullptr || spec.exec_cb == nullptr) {
