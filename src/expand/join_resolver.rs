@@ -6,6 +6,17 @@ use crate::model::{Join, SemanticViewDefinition, TableRef};
 use super::facts::{collect_derived_metric_source_tables, collect_derived_metric_using};
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 
+/// Build a role-playing scoped alias in the documented `{table}__{rel}` format.
+///
+/// Both parts must already be lowercased by the caller (aliases and relationship
+/// names are matched case-insensitively via lowercasing at the call sites). This
+/// is the single source of the format so the two producers — this module's
+/// USING-relationship join synthesis and `role_playing::scoped_alias_for` — can
+/// never drift (E-10, code-review 2026-07-11).
+pub(super) fn scoped_join_alias(table_lower: &str, rel_lower: &str) -> String {
+    format!("{table_lower}__{rel_lower}")
+}
+
 /// Synthesize an ON clause from PK/FK column declarations (Phase 26).
 ///
 /// Zips `join.fk_columns` with the referenced table's `pk_columns` to produce
@@ -227,7 +238,7 @@ pub(super) fn resolve_joins_pkfk<'a>(
                 .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
         }) {
             let to_alias = join.table.to_ascii_lowercase();
-            let scoped = format!("{to_alias}__{using_rel_lower}");
+            let scoped = scoped_join_alias(&to_alias, &using_rel_lower);
             if !scoped_joins.iter().any(|(s, _)| *s == scoped) {
                 scoped_joins.push((scoped, join));
             }
