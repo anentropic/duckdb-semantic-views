@@ -15,6 +15,7 @@
 //! (`parse_string_list`) — the "fix landed in one copy" hazard §5.1 calls out.
 
 use crate::expand::quote_ident;
+use crate::ffi_util::wire_len;
 use libduckdb_sys as ffi;
 
 /// Decode a length-prefixed LIST(VARCHAR) argument buffer into a `Vec<String>`.
@@ -238,10 +239,6 @@ pub fn serialize_register_payload(
     column_type_ids: &[u32],
     execution_sql: &str,
 ) -> Result<Vec<u8>, String> {
-    let wire_len = |n: usize, what: &str| -> Result<u32, String> {
-        u32::try_from(n)
-            .map_err(|_| format!("{what} ({n} bytes) exceeds the wire-format u32 limit"))
-    };
     // Guard against slice desync: the header writes `n_cols` from
     // `column_names.len()`, but the body serializes via `zip`, which would
     // silently truncate to the shorter slice and emit a header that disagrees

@@ -23,6 +23,22 @@
 //! leaked on null out-pointers. Consolidated per ST-4 (code-review
 //! 2026-07-02); do not re-inline these at call sites.
 
+/// Encode a byte length as a little-endian wire `u32`, erroring rather than
+/// clamping when it exceeds `u32::MAX` (FF-6). A silent `as u32` truncation
+/// would write a length prefix that disagrees with the bytes actually
+/// appended, desyncing every subsequent field on the C++ read side. Overflow
+/// is unreachable for real payloads (a single row/cell, or the execution SQL,
+/// would each need to exceed 4 GiB), so the error is a hard corruption signal,
+/// not a routine path.
+///
+/// This is the single source shared by the read-path (`ddl::read_ffi`) and
+/// query-path (`query::wire`) serializers — C-6 (code-review 2026-07-11)
+/// collapsed the two divergent copies (a module fn and an inline closure) onto
+/// it.
+pub(crate) fn wire_len(n: usize, what: &str) -> Result<u32, String> {
+    u32::try_from(n).map_err(|_| format!("{what} ({n} bytes) exceeds the wire-format u32 limit"))
+}
+
 /// Write a NUL-terminated error message into a fixed-size C buffer.
 ///
 /// Truncates to at most `buf_len - 1` payload bytes, walking back to a UTF-8
