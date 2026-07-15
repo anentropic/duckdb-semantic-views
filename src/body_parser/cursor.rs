@@ -210,6 +210,37 @@ impl<'a> Cursor<'a> {
             .map(|w| (toks[w], toks[w + kws.len() - 1]))
     }
 
+    /// Like [`Cursor::find_kw_seq`], but only matches a run that starts at
+    /// bracket-depth 0 (not inside any `(...)`/`[...]`/`{...}` group). The
+    /// consecutive keyword tokens have no bracket tokens between them, so if the
+    /// first is at depth 0 the whole run is. Used for `NON ADDITIVE BY`, which
+    /// must be the metric entry's own tail keyword — not a like-named run nested
+    /// inside a preceding `USING (...)` list.
+    pub(super) fn find_kw_seq_depth0(&self, kws: &[&str]) -> Option<(Token, Token)> {
+        let toks = &self.toks[self.idx..];
+        let n = kws.len();
+        if n == 0 || toks.len() < n {
+            return None;
+        }
+        let mut depth = 0i32;
+        for w in 0..=toks.len() - n {
+            if depth == 0
+                && kws
+                    .iter()
+                    .enumerate()
+                    .all(|(k, kw)| self.is_kw(toks[w + k], kw))
+            {
+                return Some((toks[w], toks[w + n - 1]));
+            }
+            match toks[w].kind {
+                TokenKind::Symbol(b'(' | b'[' | b'{') => depth += 1,
+                TokenKind::Symbol(b')' | b']' | b'}') => depth -= 1,
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// If the token stream ends in an unterminated `"`/`'` region, return
     /// `Some(true)` for a quoted identifier (`"..."`) or `Some(false)` for a
     /// string literal (`'...'`). The lexer emits at most one
@@ -332,6 +363,24 @@ mod tests {
         let texts: Vec<&str> = kws.iter().map(|&t| c.text(t)).collect();
         // The nested (depth-1) `metrics` name and the quoted `"TABLE"` do not appear.
         assert_eq!(texts, vec!["TABLE", "DIMENSIONS", "METRICS"]);
+    }
+
+    #[test]
+    fn find_kw_seq_depth0_ignores_nested_run() {
+        // A `NON ADDITIVE BY` run nested inside a preceding `(...)` is inert;
+        // the depth-0 run at the tail is the match.
+        let c = Cursor::new("m USING (NON ADDITIVE BY) NON ADDITIVE BY (d)", 0);
+        let (first, last) = c.find_kw_seq_depth0(&["NON", "ADDITIVE", "BY"]).unwrap();
+        // The match is the depth-0 run, which starts after the `)` at byte 26.
+        assert_eq!(first.start, 26);
+        assert_eq!(c.text(first), "NON");
+        assert_eq!(c.text(last), "BY");
+        // With ONLY a nested run, there is no depth-0 match.
+        let c2 = Cursor::new("m USING (NON ADDITIVE BY)", 0);
+        assert!(c2.find_kw_seq_depth0(&["NON", "ADDITIVE", "BY"]).is_none());
+        // A plain depth-0 run still matches (parity with find_kw_seq).
+        let c3 = Cursor::new("revenue NON ADDITIVE BY date", 0);
+        assert!(c3.find_kw_seq_depth0(&["NON", "ADDITIVE", "BY"]).is_some());
     }
 
     #[test]

@@ -1380,6 +1380,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_metrics_using_nested_as_splits_at_structural_as() {
+        // #103 review follow-up: an `AS` token nested inside the `USING (...)`
+        // list must not be mistaken for the structural `AS`. The split now
+        // lands on the depth-0 `AS`, so the expression is the whole `SUM(v)`,
+        // not `b) AS SUM(v)`, and the USING list is `a AS b` verbatim.
+        let result = parse_metrics_clause("s.m USING (a AS b) AS SUM(v)", 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].source_alias.as_deref(), Some("s"));
+        assert_eq!(result[0].name, "m");
+        assert_eq!(result[0].expr, "SUM(v)");
+        assert_eq!(result[0].using_relationships, vec!["a AS b"]);
+    }
+
+    #[test]
     fn test_parse_non_additive_dims_dotted_path() {
         // Dotted-path dim_name (D-08 contract extension): `o."my dim"` must be
         // captured as a single identifier including the dot. Two-entry clause
