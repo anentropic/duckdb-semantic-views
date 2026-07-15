@@ -11,17 +11,29 @@
 //! tokens in order, so "text between the name and the constraint" becomes a
 //! visible unexpected token rather than a region silently skipped over.
 //!
-//! ## Scope (grows per phase)
+//! ## Scope
 //!
 //! The token kinds are exactly what the migrated clauses need today:
 //! double-quoted / bare identifiers, single-quoted string literals, and
-//! single-byte symbols. Comment handling still lives upstream in
-//! [`crate::util::blank_sql_comments`] (length-preserving, so byte offsets and
-//! carets stay valid); folding it into the lexer is a later phase, once every
-//! clause parser reads its input through this tokenizer. Numeric and
-//! dollar-quoted literals get their own kinds when a consumer first needs them
-//! distinguished (numbers currently tokenize as bare identifiers, which is
-//! harmless for the identifier-only clauses migrated so far).
+//! single-byte symbols. Comment handling deliberately stays upstream in
+//! [`crate::util::blank_sql_comments`] — §6.1 phase 8 (2026-07-15) evaluated
+//! folding it into this lexer and declined. Blanking is a whole-query,
+//! length-preserving pre-pass shared by statement detection
+//! (`parse::detect`) and the CREATE front door (`parse::rewrite`), neither of
+//! which tokenizes through this lexer, so a fold would not remove the
+//! pre-pass; and this lexer only ever receives already-blanked text, so
+//! comment handling here would be dead code on its own path. Length
+//! preservation is also load-bearing: stored expressions are re-sliced from
+//! raw source and error carets are computed on the blanked text, so offsets
+//! must map 1:1 onto the original bytes (pinned by
+//! `caret_after_in_body_comment_is_honest`) — a lexer that merely skipped
+//! comment tokens would let raw slices re-absorb comment bytes. Revisit only
+//! as part of a universal-front-door refactor in which detect/rewrite also
+//! tokenize through this lexer and every raw-slice consumer reads via a
+//! comment-aware token layer. Numeric and dollar-quoted literals get their
+//! own kinds when a consumer first needs them distinguished (numbers
+//! currently tokenize as bare identifiers, which is harmless for the
+//! identifier-only clauses migrated so far).
 //!
 //! ## UTF-8 safety
 //!
