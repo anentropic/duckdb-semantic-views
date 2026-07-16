@@ -19,27 +19,35 @@ pub(super) struct ParsedAnnotations {
 /// ignored (COMMENT extraction hands this function the whole annotation
 /// tail, e.g. `'x' WITH SYNONYMS = (...)`).
 ///
+/// `base_offset` is the absolute byte offset of `s[0]` in the original query,
+/// so the error carets point at the offending quote (F-15, code-review
+/// 2026-07-16).
+///
 /// Thin adapter over the shared UTF-8-correct extractor: this used to be
 /// the byte-wise copy that the WR-04 fix missed, Latin-1-izing every
 /// non-ASCII codepoint in COMMENT/SYNONYMS payloads (PA-2, code-review
 /// 2026-07-02).
-fn extract_single_quoted_string(s: &str) -> Result<String, ParseError> {
+fn extract_single_quoted_string(s: &str, base_offset: usize) -> Result<String, ParseError> {
     match crate::util::extract_single_quoted_prefix(s) {
         Ok((content, _consumed)) => Ok(content),
         Err(crate::util::SingleQuoteError::NotQuoted) => Err(ParseError {
             message: "Expected single-quoted string.".to_string(),
-            position: None,
+            position: Some(base_offset),
         }),
         Err(crate::util::SingleQuoteError::Unterminated) => Err(ParseError {
             message: "Unclosed single-quoted string.".to_string(),
-            position: None,
+            position: Some(base_offset),
         }),
     }
 }
 
 /// Parse comma-separated single-quoted strings from inside parentheses.
-/// Input: "'syn1', 'syn2'" (already extracted from parens)
-fn parse_synonym_list(content: &str) -> Result<Vec<String>, ParseError> {
+/// Input: "'syn1', 'syn2'" (already extracted from parens).
+///
+/// `base_offset` is the absolute byte offset of `content[0]` in the original
+/// query; each synonym's caret is recovered from its position within `content`
+/// (F-15, code-review 2026-07-16).
+fn parse_synonym_list(content: &str, base_offset: usize) -> Result<Vec<String>, ParseError> {
     let entries = split_at_depth0_commas(content)?;
     let mut result = Vec::new();
     for (_, entry) in entries {
@@ -47,7 +55,8 @@ fn parse_synonym_list(content: &str) -> Result<Vec<String>, ParseError> {
         if trimmed.is_empty() {
             continue;
         }
-        result.push(extract_single_quoted_string(trimmed)?);
+        let entry_offset = base_offset + crate::util::byte_offset_within(content, trimmed);
+        result.push(extract_single_quoted_string(trimmed, entry_offset)?);
     }
     Ok(result)
 }
@@ -68,11 +77,21 @@ fn parse_synonym_list(content: &str) -> Result<Vec<String>, ParseError> {
 /// clauses separated by whitespace: a duplicate `COMMENT` / `WITH SYNONYMS`, a
 /// malformed clause, or any leftover text is an error (P-2) — none of it is
 /// silently dropped.
+///
+/// `base_offset` is the absolute byte offset of `text[0]` in the original
+/// query; every error caret in this subtree is recovered from the offending
+/// token's position within `text` (F-15, code-review 2026-07-16).
 #[allow(clippy::too_many_lines)]
 pub(super) fn parse_trailing_annotations(
     text: &str,
+    base_offset: usize,
 ) -> Result<(String, ParsedAnnotations), ParseError> {
+    // Re-anchor past any leading whitespace `trim` will drop, so `base_offset`
+    // remains the absolute offset of `text[0]` after trimming.
+    let base_offset = base_offset + (text.len() - text.trim_start().len());
     let text = text.trim();
+    // Absolute caret for any subslice of `text` (F-15).
+    let pos_of = |sub: &str| base_offset + crate::util::byte_offset_within(text, sub);
     let upper = text.to_ascii_uppercase();
 
     // Find the FIRST occurrence of COMMENT or WITH SYNONYMS at depth-0 with word boundaries.
@@ -151,21 +170,22 @@ pub(super) fn parse_trailing_annotations(
             if comment.is_some() {
                 return Err(ParseError {
                     message: "Duplicate COMMENT annotation.".to_string(),
-                    position: None,
+                    position: Some(pos_of(rest)),
                 });
             }
             // `COMMENT` is 7 ASCII bytes, so slicing at 7 is on a char boundary.
-            let Some(after_eq) = rest[7..].trim_start().strip_prefix('=') else {
+            let after_kw = rest[7..].trim_start();
+            let Some(after_eq) = after_kw.strip_prefix('=') else {
                 return Err(ParseError {
                     message: "Expected '=' after COMMENT keyword.".to_string(),
-                    position: None,
+                    position: Some(pos_of(after_kw)),
                 });
             };
             let after_eq = after_eq.trim_start();
             if !after_eq.starts_with('\'') {
                 return Err(ParseError {
                     message: "Expected single-quoted string after COMMENT =.".to_string(),
-                    position: None,
+                    position: Some(pos_of(after_eq)),
                 });
             }
             let (content, consumed) =
@@ -178,7 +198,7 @@ pub(super) fn parse_trailing_annotations(
                             "Unclosed single-quoted string.".to_string()
                         }
                     },
-                    position: None,
+                    position: Some(pos_of(after_eq)),
                 })?;
             comment = Some(content);
             rest = &after_eq[consumed..];
@@ -186,7 +206,7 @@ pub(super) fn parse_trailing_annotations(
             if synonyms.is_some() {
                 return Err(ParseError {
                     message: "Duplicate WITH SYNONYMS annotation.".to_string(),
-                    position: None,
+                    position: Some(pos_of(rest)),
                 });
             }
             // `WITH` is 4 ASCII bytes.
@@ -194,7 +214,7 @@ pub(super) fn parse_trailing_annotations(
             if !starts_with_keyword(&after_with.to_ascii_uppercase(), "SYNONYMS") {
                 return Err(ParseError {
                     message: "Expected SYNONYMS after WITH keyword.".to_string(),
-                    position: None,
+                    position: Some(pos_of(after_with)),
                 });
             }
             // `SYNONYMS` is 8 ASCII bytes. Snowflake makes the `=` optional, so
@@ -207,16 +227,16 @@ pub(super) fn parse_trailing_annotations(
                 .trim_start();
             let (content, consumed) = extract_paren_prefix(after_eq).ok_or_else(|| ParseError {
                 message: "Expected parenthesized list after WITH SYNONYMS.".to_string(),
-                position: None,
+                position: Some(pos_of(after_eq)),
             })?;
-            synonyms = Some(parse_synonym_list(content)?);
+            synonyms = Some(parse_synonym_list(content, pos_of(content))?);
             rest = &after_eq[consumed..];
         } else {
             return Err(ParseError {
                 message: format!(
                     "Unexpected text in annotations: '{rest}'. Expected COMMENT = '...' or WITH SYNONYMS = (...)."
                 ),
-                position: None,
+                position: Some(pos_of(rest)),
             });
         }
     }

@@ -229,7 +229,8 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Origin:** v0.10.0 Phase 67 Plan 02 audit-grep (D-10). Sibling pattern to TECH-DEBT #24.
 - **Decision (historical):** `parse_non_additive_dims` and the OVER `ORDER BY` parser both peeled the reference off the entry with `split_whitespace()`, so a quoted reference with internal whitespace (`NON ADDITIVE BY ("my dim" ASC)`) split mid-name.
 - **Resolution:** Phase 68 Plan 03 (B1) captures the reference slot via `find_identifier_end` + `is_quoting_balanced` in both sites (`src/body_parser/metrics.rs::parse_non_additive_dims` — its doc comment cites this entry — and the OVER `ORDER BY` parser in `src/body_parser/window.rs`). `split_whitespace` now runs only over the *trailing modifier* slice (ASC/DESC/NULLS FIRST|LAST), which contains no identifiers. Quoted-with-whitespace references parse correctly.
-- **Remaining sibling slots in the same whitespace-tokeniser class (still open, low-risk):** the `TABLES` alias slot (`tables.rs:42`, `split_first_token`), the `MATERIALIZATIONS` name (`materializations.rs:40`), the relationship target alias (`relationships.rs:119,134`), and the SHOW name slots `IN <view>` / `IN SCHEMA` / `FOR METRIC` (`show_clauses.rs:101,133,192`) still peel their identifier on the first whitespace, so a quoted-with-whitespace value there would split. Same vanishingly-rare-case argument as #24 applies; the fix, if ever needed, is to route each through `find_identifier_end`.
+- **Remaining sibling slots in the same whitespace-tokeniser class (still open, low-risk):** the SHOW name slots `IN SCHEMA` / `IN DATABASE`, `IN <view>`, and `FOR METRIC` (`show_clauses.rs:113`, `:152`, and the `IN <view>` slot) still peel their identifier on the first whitespace (`str::find(char::is_whitespace)`), so a quoted-with-whitespace value there would split. Same vanishingly-rare-case argument as #24 applies; the fix, if ever needed, is to route each through `find_identifier_end`.
+  - **Updated 2026-07-16 (code-review sweep):** the body-parser siblings this entry previously listed — the `TABLES` alias slot, the `MATERIALIZATIONS` name, and the relationship target alias — were **all migrated to the shared `Cursor`/lexer** by the §6.1 lexer/cursor migration (`tables.rs`, `materializations.rs`, `relationships.rs` now lex their name slots), so a quoted-with-whitespace value parses correctly there. Only the SHOW name slots (which live in `parse/show_clauses.rs`, outside the body-parser cursor) remain on the whitespace tokeniser.
 
 ### 26. ❓ Single-catalog write guard does not cover an attached DB that has its own catalog table
 
@@ -252,16 +253,42 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 - **Origin:** v0.11 identifier-contract work for dimension/metric/fact names; code review on that PR (2026-07-12). The original entry flagged a case-sensitivity *split* (a Snowflake-style quoted-case-sensitive query boundary vs case-insensitive internals); that split was **resolved** by adopting DuckDB's uniform case-insensitive rule everywhere (quoted identifiers are case-insensitive too). What remains is narrower and is purely about quote *stripping*.
 - **Limitation:** matching is now case-insensitive uniformly, but only the query-facing sites *strip* surrounding quotes before matching — `ident::ident_matches` / `ident::normalize_ident_part` at the resolution boundary (`find_dimension` / `find_metric` / `Fact::find`), the CREATE-time uniqueness key (`graph/names.rs::validate_name_uniqueness`), `alias.*` wildcard de-duplication (`expand/wildcard.rs`), and the `explain_semantic_view()` materialization-header lookup (`query/explain.rs`). The remaining name-comparison / keying sites fold case (correct) but do **not** strip quotes, so a *quoted* name written in one of these internal positions is compared with its quote characters intact and fails to match its unquoted declaration:
-  - the materialization set-matcher (`expand/materialization.rs::find_routing_materialization_name`, plus a second duplicated copy) over a `MATERIALIZATIONS` clause's *declared* names;
+  - the materialization set-matcher (`expand/materialization.rs::find_routing_materialization_name`) over a `MATERIALIZATIONS` clause's *declared* names;
   - `NON ADDITIVE BY` dimension references and window inner-metric references;
   - derived-metric / fact expression inlining (identifier references scanned inside expression *text*);
   - the table-alias slot in the qualified-reference path, output-column aliasing for quoted names, and `CiName`'s `Eq`.
 - **Why this is acceptable (interim):** the common case — unquoted names — is entirely unaffected (`ident_matches` reduces to `eq_ignore_ascii_case` when neither side is quoted, and the internal sites already did that). The gap only bites when a name is written *quoted* in one of these internal positions (a `NON ADDITIVE BY` list, a derived-metric expression, a `MATERIALIZATIONS` declaration) — rare, and quoting there buys nothing since matching is case-insensitive regardless.
-- **Action:** Route all of these through one quote-aware reference-scanning engine as part of §6.2 of `_notes/code-review-2026-07-11.md` (which also collapses the duplicated materialization matcher and the copies of the word-boundary reference scanner). The expression-text sites specifically need a quote-aware tokenizer, not a name comparison — that engine is the right home. Tracked here so the follow-up is not lost (the "half-migrated abstraction" pattern §7 of that review warns about).
+- **Action:** Route all of these through one quote-aware reference-scanning engine as part of §6.2 of `_notes/code-review-2026-07-11.md` (which also collapses the remaining copies of the word-boundary reference scanner). The expression-text sites specifically need a quote-aware tokenizer, not a name comparison — that engine is the right home. Tracked here so the follow-up is not lost (the "half-migrated abstraction" pattern §7 of that review warns about).
+  - **Updated 2026-07-16 (code-review sweep):** the "second duplicated copy" of the materialization set-matcher this entry used to cite was **collapsed by E-6** — `explain` now reuses the single `find_routing_materialization_name` (`query/explain.rs:219`), so there is one matcher, not two. The quote-stripping gap itself is unchanged.
+
+### 29. ✅ `fk_columns.is_empty()` legacy-relationship guards are load-bearing — do NOT remove (E-8)
+
+- **Origin:** code-review 2026-07-16 §6 listed "the 13 unchanged `fk_columns.is_empty()` legacy guards (E-8, untouched)" as removable sediment, on the premise they are "mostly unreachable since SG-7 hard-errors on incomplete relationships." A dedicated reachability analysis (2026-07-16) **refuted that premise**; recording the result here so the guards are not mistaken for dead code and stripped.
+- **Finding:** SG-7's hard-error (`model.rs::has_incomplete_relationships` → `fan_trap.rs` `UncheckableDefinition`) is **not** a universal read gate. It fires only through `build_relationship_graph`, which three supported paths reach *without* triggering:
+  1. **single-table fact queries** — `validate_fact_table_path` early-returns for ≤1 table, so an empty-FK join flows into role-playing / `resolve_joins_pkfk`;
+  2. **`SHOW SEMANTIC DIMENSIONS FOR METRIC`** — calls `from_definition` directly, no SG-7 gate;
+  3. **`CREATE`/`ALTER … FROM YAML`** — an incomplete relationship can be deserialized (`#[serde(default)]` on `fk_columns`) from user YAML or a hand-written catalog row.
+  An empty-`fk_columns` join means exactly one thing (a legacy/pre-Phase-24 encoding — `Cardinality` has only `ManyToOne`/`OneToOne`, both PK/FK), so these are legacy-skip guards, not join-category selectors, but they are genuinely reachable on the paths above. The load-bearing sites: `graph/relationship.rs:57,126,193,304`, `graph/cardinality.rs:29`, `expand/role_playing.rs:21,43`, `ddl/show_dims_for_metric.rs:167`, `ddl/define.rs:85`, plus the SG-7 detector itself (`model.rs:488`).
+- **Also:** three items originally counted under E-8 (`cardinality.rs:47,74`, `join_resolver.rs:45`) are `ref_columns` resolution / count-match logic, not fk-empty guards. Three (`fan_trap.rs:242,311`, `join_resolver.rs:144`) are dead *only* behind an upstream SG-7 gate and are kept as defense-in-depth — the fact path already demonstrated once that such a gate can be bypassed.
+- **Decision:** Keep all guards. E-8 is **not** a safe deletion.
+
+### 30. ❓ Dotted-qualified `NON ADDITIVE BY` reference is untested in semi-additive snapshot expansion (F-18)
+
+- **Origin:** code-review 2026-07-16 F-18, extended during the hygiene sweep. `body_parser` Phase 47 validation accepts an NA dim written either bare (`date_dim`) or dotted (`alias.date_dim`), but stores the reference verbatim.
+- **Limitation:** `expand/semi_additive.rs` resolves the NA dim for the snapshot `ORDER BY` by **bare-name** comparison only (`rd.dim.name` / `d.name` vs `nd.dimension`). A dotted reference therefore misses both lookups and falls to the `quote_ident(&nd.dimension)` arm, emitting the quoted qualifier as an `ORDER BY` term. This fails cleanly at bind time (a quoted non-column) rather than corrupting results, and is never the aliased-column shape E-1 fixed — but the dotted × semi-additive cell has no test.
+- **Why acceptable (interim):** bare NA-dim references (the overwhelmingly common form, and the only form any example/test uses) resolve correctly; quoting/qualifying an NA dim buys nothing since matching is case-insensitive and the dim is already unambiguous by name.
+- **Action:** when the quote-aware reference engine (#28) lands, resolve NA-dim references through it (bare **and** dotted, honouring quotes) in both the queried (`resolved_dims`) and unqueried (`def.dimensions`) branches, and add a semi-additive × dotted-NA-dim sqllogictest. Related SPECULATIVE cell: semi-additive × role-playing (review T-15).
 
 ---
 
-**Last updated:** 2026-07-12 (v0.11 unreleased) — added entry #28 (component-name
+**Last updated:** 2026-07-16 (v0.11 unreleased) — accuracy sweep against the
+2026-07-16 code review: refreshed entry #25 (the `TABLES` / `MATERIALIZATIONS` /
+relationship-target slots it listed were migrated to the shared cursor by §6.1;
+only the SHOW name slots remain) and entry #28 (the duplicated materialization
+matcher was collapsed by E-6); added entry #29 (the `fk_columns.is_empty()`
+guards are reachable and load-bearing — E-8 is not a safe deletion) and entry #30
+(dotted `NON ADDITIVE BY` reference untested in semi-additive expansion, F-18).
+Prior: 2026-07-12 (v0.11 unreleased) — added entry #28 (component-name
 identifier contract deferred to review §6.2). Prior: 2026-07-11 (v0.10.4) accuracy
 sweep against the 2026-07-11
 code review: retired the ghost-code descriptions in entries #1, #4, #9, #12, #20

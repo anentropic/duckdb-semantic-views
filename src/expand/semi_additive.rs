@@ -225,7 +225,25 @@ pub(super) fn expand_semi_additive(
                     .map_or_else(
                         || {
                             // NA dim not in queried dims -- find it in the view definition
-                            // and use its raw expression
+                            // and use its raw expression.
+                            //
+                            // F-18 (code-review 2026-07-16): the final
+                            // `quote_ident(&nd.dimension)` arm is a defensive
+                            // fallback, not a live path for the validated
+                            // bare-name form. Phase 47 (`body_parser::mod`)
+                            // hard-errors at CREATE time on any NA dim that
+                            // doesn't name a declared dimension, so a bare-name
+                            // `nd.dimension` always matches a `def.dimensions`
+                            // entry here. The one residual shape that reaches
+                            // the fallback is a *dotted* qualifier
+                            // (`alias.dim`): Phase 47 accepts it via its
+                            // dotted-path branch, but this bare-name `.find`
+                            // does not resolve it, so it emits the quoted
+                            // qualifier and fails cleanly at bind time rather
+                            // than corrupting results. That dotted × semi-
+                            // additive cell is untested (TECH-DEBT); emitting a
+                            // quoted non-column is the safe failure, never the
+                            // aliased-column shape E-1 fixed.
                             def.dimensions
                                 .iter()
                                 .find(|d| d.name.eq_ignore_ascii_case(&nd.dimension))

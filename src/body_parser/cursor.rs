@@ -72,6 +72,15 @@ impl<'a> Cursor<'a> {
         self.base + off
     }
 
+    /// Absolute caret position of `sub`, which MUST be a subslice of this
+    /// cursor's `src` (as produced by slicing / `.trim()` of `src`). Lets a
+    /// caller hand a re-sliced tail to a sub-parser together with the absolute
+    /// offset of its first byte, so the sub-parser can anchor its own carets
+    /// (F-15, code-review 2026-07-16).
+    pub(super) fn abs_of(&self, sub: &str) -> usize {
+        self.base + crate::util::byte_offset_within(self.src, sub)
+    }
+
     /// Build a [`ParseError`] anchored at a source-relative offset.
     pub(super) fn err(&self, off: usize, message: String) -> ParseError {
         ParseError {

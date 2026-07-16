@@ -195,7 +195,8 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     // Step 6: trailing COMMENT / WITH SYNONYMS annotations. The shared parser
     // tiles the region exactly; any non-annotation text left in front of it is
     // reported here rather than silently dropped (PA-9 companion).
-    let (leftover, annotations) = parse_trailing_annotations(cur.rest())?;
+    let rest = cur.rest();
+    let (leftover, annotations) = parse_trailing_annotations(rest, cur.abs_of(rest))?;
     if !leftover.trim().is_empty() {
         return Err(ParseError {
             message: format!(
