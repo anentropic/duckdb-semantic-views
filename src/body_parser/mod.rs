@@ -85,11 +85,19 @@ pub struct KeywordBody {
 /// `base_offset` is the byte offset of `text[0]` in the original query string.
 #[allow(clippy::too_many_lines)]
 pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody, ParseError> {
-    // Strip leading "AS" (case-insensitive)
+    // Strip leading "AS" (case-insensitive). F-16 (code-review 2026-07-16):
+    // require a word boundary after "AS" so `ASTABLES(...)` is not silently
+    // read as `AS TABLES(...)`. The front door (`create_body.rs`) already
+    // whitespace-delimits this, but `parse_keyword_body` is `pub` and
+    // fuzz-facing, so it must self-guard against a following identifier byte.
     let trimmed = text.trim();
     let after_as = if trimmed
         .get(..2)
         .is_some_and(|s| s.eq_ignore_ascii_case("AS"))
+        && trimmed
+            .as_bytes()
+            .get(2)
+            .is_none_or(|&b| !crate::util::is_ident_byte(b))
     {
         trimmed[2..].trim_start()
     } else {
@@ -428,7 +436,7 @@ fn split_trailing_view_comment(
         return Ok((after_as, None));
     };
     let trailing = &after_as[comment_tok.start..];
-    let (leftover, ann) = annotations::parse_trailing_annotations(trailing)?;
+    let (leftover, ann) = annotations::parse_trailing_annotations(trailing, cur.abs_of(trailing))?;
     // `trailing` begins at the COMMENT keyword, so the "expression" prefix the
     // annotation parser peels off must be empty.
     if !leftover.trim().is_empty() {
@@ -564,6 +572,36 @@ mod tests {
         assert_eq!(kb.tables.len(), 1);
         assert_eq!(kb.dimensions.len(), 1);
         assert_eq!(kb.metrics.len(), 1);
+    }
+
+    #[test]
+    fn f16_leading_as_requires_word_boundary() {
+        // F-16 (code-review 2026-07-16): the leading-"AS" strip must not fire
+        // when "AS" is only a prefix of a longer identifier run. `ASTABLES(...)`
+        // must NOT be read as `AS TABLES(...)`.
+        let glued = "ASTABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.x AS x)";
+        let err = parse_keyword_body(glued, 0).unwrap_err();
+        assert!(
+            err.message.contains("Expected 'AS'"),
+            "glued ASTABLES should be rejected as a missing 'AS', got: {}",
+            err.message
+        );
+        // A genuine word boundary (space, or end-of-input right after AS) still
+        // strips as before.
+        assert!(parse_keyword_body(
+            "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.x AS x) METRICS (o.y AS SUM(y))",
+            0,
+        )
+        .is_ok());
+        // Lower-case and a non-identifier byte (`(`) immediately after AS are
+        // both boundaries, so the strip fires (then fails later for other
+        // reasons — the point is it is NOT rejected as "Expected 'AS'").
+        let paren_after = parse_keyword_body("AS(", 0).unwrap_err();
+        assert!(
+            !paren_after.message.contains("Expected 'AS'"),
+            "`(` after AS is a word boundary; got: {}",
+            paren_after.message
+        );
     }
 
     #[test]
@@ -1164,7 +1202,7 @@ mod tests {
     fn test_comment_annotation_non_ascii_payload_survives() {
         // PA-2: the pre-fix extractor stored 'café et plus' as mojibake.
         let (expr, ann) =
-            parse_trailing_annotations("SUM(o.amount) COMMENT = 'café et plus'").unwrap();
+            parse_trailing_annotations("SUM(o.amount) COMMENT = 'café et plus'", 0).unwrap();
         assert_eq!(expr, "SUM(o.amount)");
         assert_eq!(ann.comment.as_deref(), Some("café et plus"));
     }
@@ -1172,7 +1210,7 @@ mod tests {
     #[test]
     fn test_synonyms_annotation_non_ascii_payload_survives() {
         let (expr, ann) =
-            parse_trailing_annotations("o.city WITH SYNONYMS = ('ciudad', 'stadt', '都市')")
+            parse_trailing_annotations("o.city WITH SYNONYMS = ('ciudad', 'stadt', '都市')", 0)
                 .unwrap();
         assert_eq!(expr, "o.city");
         assert_eq!(ann.synonyms, vec!["ciudad", "stadt", "都市"]);
@@ -1182,7 +1220,8 @@ mod tests {
     fn test_annotation_scan_non_ascii_expression_no_panic() {
         // Multi-byte chars ahead of the annotation keywords exercise the
         // depth-0 scanner's byte loop.
-        let (expr, ann) = parse_trailing_annotations("concat(city, ' – ') COMMENT = 'ok'").unwrap();
+        let (expr, ann) =
+            parse_trailing_annotations("concat(city, ' – ') COMMENT = 'ok'", 0).unwrap();
         assert_eq!(expr, "concat(city, ' – ')");
         assert_eq!(ann.comment.as_deref(), Some("ok"));
     }
@@ -1196,10 +1235,12 @@ mod tests {
     #[test]
     fn test_annotation_both_orders_still_parse() {
         // Regression: valid single-clause and both-order forms are unaffected.
-        let (_, a) = parse_trailing_annotations("x COMMENT = 'c' WITH SYNONYMS = ('s')").unwrap();
+        let (_, a) =
+            parse_trailing_annotations("x COMMENT = 'c' WITH SYNONYMS = ('s')", 0).unwrap();
         assert_eq!(a.comment.as_deref(), Some("c"));
         assert_eq!(a.synonyms, vec!["s"]);
-        let (_, b) = parse_trailing_annotations("x WITH SYNONYMS = ('s') COMMENT = 'c'").unwrap();
+        let (_, b) =
+            parse_trailing_annotations("x WITH SYNONYMS = ('s') COMMENT = 'c'", 0).unwrap();
         assert_eq!(b.comment.as_deref(), Some("c"));
         assert_eq!(b.synonyms, vec!["s"]);
     }
@@ -1207,7 +1248,7 @@ mod tests {
     #[test]
     fn test_annotation_duplicate_comment_rejected() {
         // Previously the second COMMENT was silently dropped.
-        let err = parse_trailing_annotations("x COMMENT = 'a' COMMENT = 'b'").unwrap_err();
+        let err = parse_trailing_annotations("x COMMENT = 'a' COMMENT = 'b'", 0).unwrap_err();
         assert!(
             err.message.contains("Duplicate COMMENT"),
             "got: {}",
@@ -1217,7 +1258,7 @@ mod tests {
 
     #[test]
     fn test_annotation_duplicate_synonyms_rejected() {
-        let err = parse_trailing_annotations("x WITH SYNONYMS = ('a') WITH SYNONYMS = ('b')")
+        let err = parse_trailing_annotations("x WITH SYNONYMS = ('a') WITH SYNONYMS = ('b')", 0)
             .unwrap_err();
         assert!(
             err.message.contains("Duplicate WITH SYNONYMS"),
@@ -1229,7 +1270,7 @@ mod tests {
     #[test]
     fn test_annotation_trailing_garbage_rejected() {
         // Previously `banana` was silently accepted and discarded.
-        let err = parse_trailing_annotations("x COMMENT = 'a' banana").unwrap_err();
+        let err = parse_trailing_annotations("x COMMENT = 'a' banana", 0).unwrap_err();
         assert!(
             err.message.contains("Unexpected text in annotations"),
             "got: {}",
@@ -1241,7 +1282,7 @@ mod tests {
     fn test_annotation_keyword_word_boundary_preserved() {
         // A column-ish token that merely starts with COMMENT must not be
         // mistaken for the keyword — it stays part of the expression.
-        let (expr, ann) = parse_trailing_annotations("commentary_col").unwrap();
+        let (expr, ann) = parse_trailing_annotations("commentary_col", 0).unwrap();
         assert_eq!(expr, "commentary_col");
         assert!(ann.comment.is_none() && ann.synonyms.is_empty());
     }
@@ -1249,9 +1290,43 @@ mod tests {
     #[test]
     fn test_annotation_with_without_synonyms_rejected() {
         // A second WITH clause that isn't WITH SYNONYMS is an error, not junk.
-        let err = parse_trailing_annotations("x COMMENT = 'a' WITH FOO").unwrap_err();
+        let err = parse_trailing_annotations("x COMMENT = 'a' WITH FOO", 0).unwrap_err();
         assert!(
             err.message.contains("Expected SYNONYMS after WITH"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn f15_annotation_errors_carry_carets() {
+        // F-15 (code-review 2026-07-16): annotation-path errors used to carry
+        // `position: None`. They now anchor at the offending token, offset by
+        // the caller-supplied `base_offset`.
+        let text = "x COMMENT = 'a' banana";
+        let base = 100;
+        let err = parse_trailing_annotations(text, base).unwrap_err();
+        // Caret points at `banana` (the unexpected trailing text).
+        let banana_at = base + text.find("banana").unwrap();
+        assert_eq!(
+            err.position,
+            Some(banana_at),
+            "caret should point at the trailing junk: {}",
+            err.message
+        );
+
+        // Duplicate COMMENT anchors at the second COMMENT keyword.
+        let dup = "x COMMENT = 'a' COMMENT = 'b'";
+        let err = parse_trailing_annotations(dup, 0).unwrap_err();
+        let second_comment = dup.rfind("COMMENT").unwrap();
+        assert_eq!(err.position, Some(second_comment), "got: {}", err.message);
+
+        // A malformed synonym (missing quotes) anchors inside the paren list.
+        let bad_syn = "x WITH SYNONYMS = (foo)";
+        let err = parse_trailing_annotations(bad_syn, 0).unwrap_err();
+        assert_eq!(
+            err.position,
+            Some(bad_syn.find("foo").unwrap()),
             "got: {}",
             err.message
         );
@@ -3872,7 +3947,7 @@ mod tests {
     fn f12_with_synonyms_without_equals_accepted() {
         // Snowflake accepts `WITH SYNONYMS (...)` without the `=`.
         let (expr, ann) =
-            parse_trailing_annotations("SUM(o.amount) WITH SYNONYMS ('territory', 'area')")
+            parse_trailing_annotations("SUM(o.amount) WITH SYNONYMS ('territory', 'area')", 0)
                 .unwrap();
         assert_eq!(expr, "SUM(o.amount)");
         assert_eq!(ann.synonyms, vec!["territory", "area"]);
@@ -3881,7 +3956,7 @@ mod tests {
     #[test]
     fn f12_with_synonyms_with_equals_still_accepted() {
         let (_expr, ann) =
-            parse_trailing_annotations("SUM(o.amount) WITH SYNONYMS = ('territory')").unwrap();
+            parse_trailing_annotations("SUM(o.amount) WITH SYNONYMS = ('territory')", 0).unwrap();
         assert_eq!(ann.synonyms, vec!["territory"]);
     }
 

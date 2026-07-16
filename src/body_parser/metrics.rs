@@ -157,7 +157,7 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
     }
 
     // Phase 43: Parse trailing annotations from expression
-    let (expr, annotations) = parse_trailing_annotations(raw_expr)?;
+    let (expr, annotations) = parse_trailing_annotations(raw_expr, cur.abs_of(raw_expr))?;
 
     // Phase 48: Detect and parse OVER clause from the expression text.
     //   AVG(total_qty) OVER (PARTITION BY EXCLUDING d1, d2 ORDER BY d1)

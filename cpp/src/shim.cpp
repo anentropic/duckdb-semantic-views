@@ -2355,6 +2355,15 @@ struct SemanticViewBindData : public TableFunctionData {
 };
 
 struct SemanticViewGlobalState : public GlobalTableFunctionState {
+    // `result` is drained by a single, unsynchronized cursor: the exec
+    // function (`sv_semantic_view_function`) calls `result->Fetch()` with no
+    // lock. That is safe ONLY because this state does not override
+    // `MaxThreads()`, so it inherits the base `GlobalTableFunctionState`
+    // default of 1 — DuckDB scans the semantic_view() table function
+    // single-threaded and never calls the exec function concurrently on the
+    // same global state. If a future change overrides `MaxThreads()` to allow
+    // parallel scans, the `Fetch()` cursor must be guarded (mutex, or a
+    // per-thread local state) or it will data-race.
     std::unique_ptr<MaterializedQueryResult> result;
 };
 

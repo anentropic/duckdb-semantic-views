@@ -11,8 +11,15 @@
 use crate::model::{AccessModifier, NullsOrder, SemanticViewDefinition, SortOrder};
 
 /// SQL single-quote escaping: `'` -> `''`.
+///
+/// Delegates to [`crate::sql_lit::SqlLit`], the single source of the quote-
+/// doubling rule, so this logic lives in exactly one place and cannot drift
+/// (code-review 2026-07-16 hygiene: this was the one `''`-escape copy outside
+/// `SqlLit`). `render_ddl` keeps a thin named wrapper because its output is
+/// `GET_DDL` *display* text rather than executable catalog SQL — a different
+/// consumer, but an identical escaping rule.
 fn escape_single_quote(s: &str) -> String {
-    s.replace('\'', "''")
+    crate::sql_lit::SqlLit::escape(s).to_string()
 }
 
 /// Append ` COMMENT = '<escaped>'` to `out` if comment is present.

@@ -160,7 +160,7 @@ fn parse_single_qualified_entry(
     }
 
     // Phase 43: Parse trailing annotations from expression
-    let (expr, annotations) = parse_trailing_annotations(raw_expr)?;
+    let (expr, annotations) = parse_trailing_annotations(raw_expr, cur.abs_of(raw_expr))?;
 
     Ok(ParsedQualifiedEntry {
         source_alias,
