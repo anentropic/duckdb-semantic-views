@@ -65,7 +65,7 @@ pub fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) ->
         // Advance by a full UTF-8 char so `i` stays on a char boundary
         // (byte-wise advance both duplicated multi-byte chars in the output
         // and panicked slicing `haystack[i..]` mid-codepoint — MS-3,
-        // code-review 2026-07-02; mirrors `replace_word_boundary_any`).
+        // code-review 2026-07-02).
         let ch = haystack[i..].chars().next().unwrap();
         result.push(ch);
         i += ch.len_utf8();
@@ -74,94 +74,6 @@ pub fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) ->
     if i < haystack.len() {
         result.push_str(&haystack[i..]);
     }
-    result
-}
-
-/// Replace word-boundary occurrences of *any* needle in `needles` with `replacement`,
-/// in a single left-to-right pass.
-///
-/// At each position the needles are tried in the given order — put the more specific
-/// (e.g. qualified `alias.name`) needle first so it wins over a shorter one (`name`).
-/// On a match the replacement is emitted and scanning resumes *after* the matched
-/// needle: the inserted replacement text is never re-scanned.
-///
-/// This matters when the replacement itself contains one of the needles. For an
-/// identity fact (`name` whose expression is the qualified column `alias.name`), two
-/// sequential [`replace_word_boundary`] calls — qualified then unqualified — would
-/// double-substitute (`alias.name` -> `(alias.name)` -> `(alias.(alias.name))`).
-/// A single combined pass avoids that.
-#[must_use]
-pub fn replace_word_boundary_any(haystack: &str, needles: &[&str], replacement: &str) -> String {
-    let pairs: Vec<(&str, &str)> = needles.iter().map(|&n| (n, replacement)).collect();
-    replace_word_boundary_pairs(haystack, &pairs)
-}
-
-/// Replace word-boundary occurrences of each needle with its *own* replacement,
-/// in a single left-to-right pass.
-///
-/// Same scanning semantics as [`replace_word_boundary_any`] — at each position
-/// the pairs are tried in the given order, and on a match scanning resumes
-/// *after* the matched needle so inserted replacement text is never re-scanned.
-/// Callers that need deterministic output for overlapping needles should order
-/// the pairs deterministically (e.g. longest needle first, then lexicographic).
-///
-/// This is the safe substitution primitive for derived-metric inlining (SG-3,
-/// code-review 2026-07-02): sequential per-name [`replace_word_boundary`]
-/// calls re-scan earlier substitutions, so a metric name that also appears as
-/// a column reference inside another metric's resolved expression (`revenue`
-/// inside `SUM(o.revenue)` — `.` is a word boundary) got double-substituted
-/// into invalid nested-aggregate SQL, dependent on hash-map iteration order.
-///
-/// Matching is ASCII-case-insensitive (see [`replace_word_boundary`] — E-2).
-/// A match immediately preceded by `.` is skipped: it is the column part of a
-/// qualified reference (`x.revenue`) on some *other* relation, not a standalone
-/// reference to the inlined name (E-3, code-review 2026-07-11). A name's own
-/// qualified form is passed as a separate `alias.name` needle (tried first) so
-/// it still matches as a whole. This differs from single-needle
-/// [`replace_word_boundary`], whose alias-rewriting callers intentionally match
-/// after a dot.
-#[must_use]
-pub fn replace_word_boundary_pairs(haystack: &str, pairs: &[(&str, &str)]) -> String {
-    let h_bytes = haystack.as_bytes();
-    let mut result = String::with_capacity(haystack.len());
-    let mut i = 0;
-
-    while i < h_bytes.len() {
-        let mut matched = false;
-        for &(needle, replacement) in pairs {
-            let n_bytes = needle.as_bytes();
-            let n_len = n_bytes.len();
-            if n_len == 0 || i + n_len > h_bytes.len() {
-                continue;
-            }
-            if h_bytes[i..i + n_len].eq_ignore_ascii_case(n_bytes) {
-                // A match immediately preceded by `.` is the column part of a
-                // qualified reference (`x.revenue`), not a standalone identifier
-                // reference to the name being inlined — do not substitute there
-                // (E-3, code-review 2026-07-11). The inliner supplies a fact's
-                // own qualified form (`alias.name`) as a *separate* needle tried
-                // first at the alias position, so that legitimate case is matched
-                // as a whole before the bare needle is ever tested here.
-                let before_ok =
-                    i == 0 || (is_word_boundary_char(h_bytes[i - 1]) && h_bytes[i - 1] != b'.');
-                let after_ok =
-                    i + n_len == h_bytes.len() || is_word_boundary_char(h_bytes[i + n_len]);
-                if before_ok && after_ok {
-                    result.push_str(replacement);
-                    i += n_len;
-                    matched = true;
-                    break;
-                }
-            }
-        }
-        if !matched {
-            // Advance by a full UTF-8 char so `i` stays on a char boundary.
-            let ch = haystack[i..].chars().next().unwrap();
-            result.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-
     result
 }
 
@@ -210,62 +122,6 @@ pub fn byte_offset_within(outer: &str, inner: &str) -> usize {
 #[must_use]
 pub fn is_word_boundary_char(b: u8) -> bool {
     !is_ident_byte(b)
-}
-
-/// Does `haystack` reference `needle` at a word boundary?
-///
-/// `true` iff `needle` occurs in `haystack` delimited on both sides by
-/// [`is_word_boundary_char`], compared ASCII-case-insensitively — so `revenue`
-/// matches in `SUM(Revenue)` and `revenue + tax` but not in `revenue_total`,
-/// `my_revenue`, or `revenueΩ`.
-///
-/// This is the FIND counterpart of [`replace_word_boundary`] and the single
-/// primitive for the fact / derived-metric *dependency* scans (`expand::facts`,
-/// `graph::facts`), replacing the byte loops those sites hand-rolled. Like the
-/// replace primitives it is **not** quote-aware and does not treat `.`
-/// specially — it answers "does this bare identifier appear as a whole word",
-/// which is what dependency discovery over an expression needs. (The
-/// aggregate-function detector and identifier tokenizer in `graph` additionally
-/// need quote-skipping and lookahead, so they stay separate.)
-#[must_use]
-pub fn contains_word_boundary_ref(haystack: &str, needle: &str) -> bool {
-    let n_bytes = needle.as_bytes();
-    let n_len = n_bytes.len();
-    if n_len == 0 || n_len > haystack.len() {
-        return false;
-    }
-    let h_bytes = haystack.as_bytes();
-    // Byte-wise scan is safe: we only index byte windows and test boundary
-    // bytes (never slice `haystack` by `i`), and `eq_ignore_ascii_case` folds
-    // only ASCII letters, so a multi-byte needle byte is compared exactly.
-    let mut i = 0;
-    while i + n_len <= h_bytes.len() {
-        if h_bytes[i..i + n_len].eq_ignore_ascii_case(n_bytes) {
-            let before_ok = i == 0 || is_word_boundary_char(h_bytes[i - 1]);
-            let after_ok = i + n_len == h_bytes.len() || is_word_boundary_char(h_bytes[i + n_len]);
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Of `needles`, those referenced in `haystack` at a word boundary — the
-/// multi-needle FIND counterpart of [`replace_word_boundary_pairs`].
-///
-/// Each needle contributes at most one entry (even if it occurs several times),
-/// and results follow `needles` order. Matching rules are exactly
-/// [`contains_word_boundary_ref`]'s. This is the "which known names does this
-/// expression reference" primitive for metric/fact dependency discovery.
-#[must_use]
-pub fn find_word_boundary_refs<'a>(haystack: &str, needles: &[&'a str]) -> Vec<&'a str> {
-    needles
-        .iter()
-        .copied()
-        .filter(|needle| contains_word_boundary_ref(haystack, needle))
-        .collect()
 }
 
 /// Does `s` start with the ASCII keyword `kw`, case-insensitively?
@@ -624,124 +480,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn contains_word_boundary_ref_whole_word_only() {
-        // Matches as a whole word...
-        assert!(contains_word_boundary_ref("SUM(revenue)", "revenue"));
-        assert!(contains_word_boundary_ref("revenue + tax", "revenue"));
-        assert!(contains_word_boundary_ref("tax - revenue", "revenue"));
-        assert!(contains_word_boundary_ref("revenue", "revenue"));
-        // ...but not as a substring of a larger identifier.
-        assert!(!contains_word_boundary_ref("revenue_total", "revenue"));
-        assert!(!contains_word_boundary_ref("my_revenue", "revenue"));
-        // Non-ASCII abutting bytes are identifier continuation (E-5), not
-        // boundaries, so an ASCII needle must not match against them.
-        assert!(!contains_word_boundary_ref("revenueΩ", "revenue"));
-        assert!(!contains_word_boundary_ref("Ωrevenue", "revenue"));
-        // A genuine ASCII boundary (`.`) is still a boundary here — this
-        // primitive, unlike the inliner, does not special-case `.`.
-        assert!(contains_word_boundary_ref("x.revenue", "revenue"));
-    }
-
-    #[test]
-    fn contains_word_boundary_ref_case_insensitive() {
-        assert!(contains_word_boundary_ref("SUM(Revenue)", "revenue"));
-        assert!(contains_word_boundary_ref("sum(revenue)", "REVENUE"));
-    }
-
-    #[test]
-    fn contains_word_boundary_ref_edge_cases() {
-        assert!(!contains_word_boundary_ref("anything", "")); // empty needle
-        assert!(!contains_word_boundary_ref("ab", "abc")); // needle longer than haystack
-        assert!(!contains_word_boundary_ref("", "x"));
-    }
-
-    #[test]
-    fn find_word_boundary_refs_returns_referenced_subset_in_order() {
-        let needles = ["revenue", "cost", "tax", "profit"];
-        // `profit` and `tax` are not referenced; result keeps `needles` order.
-        assert_eq!(
-            find_word_boundary_refs("revenue - cost", &needles),
-            vec!["revenue", "cost"]
-        );
-        // Each needle contributes at most one entry even if it occurs twice.
-        assert_eq!(
-            find_word_boundary_refs("revenue + revenue", &["revenue"]),
-            vec!["revenue"]
-        );
-        // Nothing referenced.
-        assert!(find_word_boundary_refs("count(*)", &needles).is_empty());
-    }
-
-    #[test]
-    fn replace_word_boundary_pairs_case_insensitive_match() {
-        // E-2 repro shape: `profit AS REVENUE - Cost` with lowercased needles.
-        let pairs = vec![("revenue", "(SUM(o.rev))"), ("cost", "(SUM(o.cost))")];
-        let result = replace_word_boundary_pairs("REVENUE - Cost", &pairs);
-        assert_eq!(result, "(SUM(o.rev)) - (SUM(o.cost))");
-    }
-
-    #[test]
-    fn replace_word_boundary_pairs_distinct_replacements_single_pass() {
-        let pairs = [
-            ("revenue", "(SUM(o.revenue))"),
-            ("tax", "(SUM(o.revenue * 0.1))"),
-        ];
-        let result = replace_word_boundary_pairs("revenue - tax", &pairs);
-        assert_eq!(result, "(SUM(o.revenue)) - (SUM(o.revenue * 0.1))");
-    }
-
-    #[test]
-    fn replace_word_boundary_pairs_inserted_text_not_rescanned() {
-        // "b"'s replacement contains needle "a" at a word boundary; a second
-        // scan over inserted text would corrupt it.
-        let pairs = [("a", "(X)"), ("b", "(a + 1)")];
-        let result = replace_word_boundary_pairs("a + b", &pairs);
-        assert_eq!(result, "(X) + (a + 1)");
-    }
-
-    #[test]
-    fn replace_word_boundary_pairs_skips_qualified_column_on_other_table() {
-        // E-2/E-3 (code-review 2026-07-11): a bare metric/fact needle must NOT
-        // substitute into the column part of a qualified reference on another
-        // relation — `x.revenue` is table `x`'s column `revenue`, not the
-        // metric `revenue`. Substituting there produced invalid SQL like
-        // `x.(SUM(o.amount))`.
-        let pairs = [("revenue", "(SUM(o.amount))")];
-        assert_eq!(
-            replace_word_boundary_pairs("x.revenue / 2", &pairs),
-            "x.revenue / 2"
-        );
-        // A genuine bare reference in the same expression is still inlined.
-        assert_eq!(
-            replace_word_boundary_pairs("revenue + x.revenue", &pairs),
-            "(SUM(o.amount)) + x.revenue"
-        );
-    }
-
-    #[test]
-    fn replace_word_boundary_any_qualified_form_matches_but_other_table_does_not() {
-        // The inliner supplies a fact's own qualified form (`o.net_price`) as a
-        // needle tried before the bare form. That whole-token qualified match
-        // still fires, while the bare needle must not leak into a *different*
-        // table's `x.net_price` (E-3).
-        let needles = ["o.net_price", "net_price"];
-        assert_eq!(
-            replace_word_boundary_any("o.net_price + x.net_price", &needles, "(P)"),
-            "(P) + x.net_price"
-        );
-    }
-
-    #[test]
-    fn replace_word_boundary_any_still_shares_semantics_with_pairs() {
-        // _any delegates to _pairs; identical inputs must stay identical.
-        let via_any = replace_word_boundary_any("x + y", &["x", "y"], "(z)");
-        let pairs = [("x", "(z)"), ("y", "(z)")];
-        let via_pairs = replace_word_boundary_pairs("x + y", &pairs);
-        assert_eq!(via_any, via_pairs);
-        assert_eq!(via_any, "(z) + (z)");
-    }
-
     proptest! {
         // Any (haystack, needle, replacement) triple must not panic, and a
         // haystack containing no ASCII needle occurrence must round-trip
@@ -795,55 +533,6 @@ mod tests {
     fn replace_word_boundary_empty_needle() {
         let result = replace_word_boundary("abc", "", "x");
         assert_eq!(result, "abc");
-    }
-
-    // -------------------------------------------------------------------
-    // replace_word_boundary_any tests
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn replace_any_qualified_wins_over_unqualified() {
-        // Qualified needle is tried first; the unqualified `unit_price` inside the
-        // emitted replacement must NOT be re-scanned (no double substitution).
-        let result = replace_word_boundary_any(
-            "s.unit_price",
-            &["s.unit_price", "unit_price"],
-            "(s.unit_price)",
-        );
-        assert_eq!(result, "(s.unit_price)");
-    }
-
-    #[test]
-    fn replace_any_unqualified_fallback() {
-        // When only the unqualified form appears, it still matches.
-        let result =
-            replace_word_boundary_any("SUM(unit_price)", &["s.unit_price", "unit_price"], "(x)");
-        assert_eq!(result, "SUM((x))");
-    }
-
-    #[test]
-    fn replace_any_inside_qualified_metric() {
-        // Metric referencing an identity fact by its qualified column.
-        let result = replace_word_boundary_any(
-            "SUM(s.unit_price)",
-            &["s.unit_price", "unit_price"],
-            "(s.unit_price)",
-        );
-        assert_eq!(result, "SUM((s.unit_price))");
-    }
-
-    #[test]
-    fn replace_any_no_substring_match() {
-        let result =
-            replace_word_boundary_any("unit_price_total", &["s.unit_price", "unit_price"], "(x)");
-        assert_eq!(result, "unit_price_total");
-    }
-
-    #[test]
-    fn replace_any_utf8_passthrough() {
-        // Non-ASCII, non-matching content must not panic and must round-trip.
-        let result = replace_word_boundary_any("héllo + unit_price", &["unit_price"], "(x)");
-        assert_eq!(result, "héllo + (x)");
     }
 
     // -------------------------------------------------------------------
