@@ -154,17 +154,34 @@ pub(super) fn inline_facts(expr: &str, facts: &[Fact], topo_order: &[usize]) -> 
         let resolved_expr = if resolved.is_empty() {
             fact.expr.clone()
         } else {
-            let map = fact_replacement_map(fact.source_table.as_deref(), &resolved);
+            let map = fact_replacement_map(facts, &resolved);
             inline_references(&fact.expr, &map)
         };
         resolved.insert(fact.name.clone(), format!("({resolved_expr})"));
     }
 
-    // Apply all resolved facts to the input expression in one pass, keyed by
-    // each fact's bare and (source-qualified) forms.
-    let mut map: HashMap<String, &str> = HashMap::new();
-    for &idx in topo_order {
-        let fact = &facts[idx];
+    // Apply all resolved facts to the input expression in one pass.
+    let map = fact_replacement_map(facts, &resolved);
+    inline_references(expr, &map)
+}
+
+/// Build the `{normalized key -> replacement}` map for inlining resolved facts.
+///
+/// Each resolved fact is keyed by its **own** bare name and — when it has one —
+/// its own `source_table.name` qualified form. Keying by the fact's own source
+/// table (not the host expression's) keeps this consistent with dependency
+/// detection (`toposort_facts` / `build_fact_dag`), which recognise a reference
+/// to fact `f` written as `f.source_table.f.name`; a fact referenced across
+/// tables in its own-qualified form is then actually inlined, not just
+/// detected. Only facts present in `resolved` contribute, so during
+/// topological resolution the map naturally holds just the already-resolved
+/// (earlier) facts.
+fn fact_replacement_map<'a>(
+    facts: &[Fact],
+    resolved: &'a HashMap<String, String>,
+) -> HashMap<String, &'a str> {
+    let mut map: HashMap<String, &str> = HashMap::with_capacity(resolved.len() * 2);
+    for fact in facts {
         if let Some(replacement) = resolved.get(&fact.name) {
             insert_fact_keys(
                 &mut map,
@@ -173,21 +190,6 @@ pub(super) fn inline_facts(expr: &str, facts: &[Fact], topo_order: &[usize]) -> 
                 replacement,
             );
         }
-    }
-    inline_references(expr, &map)
-}
-
-/// Build the `{normalized key -> replacement}` map for inlining every entry of
-/// `resolved` (name -> resolved SQL) into an expression that lives on
-/// `source_table`. Each resolved name contributes its bare key and, when the
-/// host expression has a source table, its `source_table.name` qualified key.
-fn fact_replacement_map<'a>(
-    source_table: Option<&str>,
-    resolved: &'a HashMap<String, String>,
-) -> HashMap<String, &'a str> {
-    let mut map: HashMap<String, &str> = HashMap::with_capacity(resolved.len() * 2);
-    for (name, replacement) in resolved {
-        insert_fact_keys(&mut map, source_table, name, replacement);
     }
     map
 }
@@ -783,6 +785,40 @@ mod tests {
         assert_eq!(
             inline_facts("o.net_price + x.net_price", &facts, &topo),
             "(price * (1 - discount)) + x.net_price"
+        );
+    }
+
+    #[test]
+    fn inline_facts_cross_table_own_qualified_reference_is_inlined() {
+        // A fact on one table referenced by a fact on ANOTHER table via the
+        // referenced fact's OWN source-qualified form (`b_tbl.leaf`) must be
+        // inlined — the replacement map keys each fact by its own source table,
+        // not the host expression's, so detection (toposort) and inlining agree.
+        let facts = vec![
+            Fact {
+                name: "leaf".to_string(),
+                expr: "b_tbl.col".to_string(),
+                source_table: Some("b_tbl".to_string()),
+                output_type: None,
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+            },
+            Fact {
+                name: "top".to_string(),
+                // references `leaf` qualified by leaf's own table `b_tbl`
+                expr: "b_tbl.leaf + 1".to_string(),
+                source_table: Some("a_tbl".to_string()),
+                output_type: None,
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+            },
+        ];
+        let topo = toposort_facts(&facts).unwrap();
+        assert_eq!(
+            inline_facts("SUM(top)", &facts, &topo),
+            "SUM(((b_tbl.col) + 1))"
         );
     }
 

@@ -8,7 +8,7 @@
 //! metric expression like `profit AS revenue - cost` is produced by replacing
 //! the identifiers `revenue` / `cost` with their resolved SQL. Before this
 //! module that replacement was a family of hand-rolled word-boundary scanners
-//! ([`crate::util::replace_word_boundary_pairs`] and friends) that were **not**
+//! (`util::replace_word_boundary_pairs` and friends — since removed) that were **not**
 //! quote-aware and disagreed with the validators on two things:
 //!
 //! - **E-2** — validation resolved references case-insensitively but the
@@ -85,6 +85,12 @@ impl IdentRef<'_> {
 /// non-ASCII byte, so Unicode identifiers scan intact) or a `"…"` quoted part
 /// (with `""` escape). The returned spans are non-overlapping and tile the
 /// non-literal identifier text.
+///
+/// A chain immediately followed by `(` (skipping whitespace) is a **function
+/// call**, not a name reference (`SUM(x)`, `date_trunc (...)`), and is not
+/// emitted — so a fact/metric named like a function (`sum`) is never confused
+/// with the call, in either FIND or INLINE. This mirrors the derived-metric
+/// validator's `extract_identifiers`.
 pub(crate) fn scan_references(expr: &str) -> Vec<IdentRef<'_>> {
     let bytes = expr.as_bytes();
     let len = bytes.len();
@@ -101,28 +107,31 @@ pub(crate) fn scan_references(expr: &str) -> Vec<IdentRef<'_>> {
                     i += 1;
                 }
             }
-            b'"' => {
+            _ if b == b'"' || crate::util::is_ident_byte(b) => {
                 let end = scan_chain(bytes, i);
-                refs.push(IdentRef {
-                    start: i,
-                    end,
-                    raw: &expr[i..end],
-                });
-                i = end;
-            }
-            _ if crate::util::is_ident_byte(b) => {
-                let end = scan_chain(bytes, i);
-                refs.push(IdentRef {
-                    start: i,
-                    end,
-                    raw: &expr[i..end],
-                });
+                if !followed_by_open_paren(bytes, end) {
+                    refs.push(IdentRef {
+                        start: i,
+                        end,
+                        raw: &expr[i..end],
+                    });
+                }
                 i = end;
             }
             _ => i += 1,
         }
     }
     refs
+}
+
+/// Is the next non-whitespace byte at or after `pos` an opening `(`? Used to
+/// classify an identifier chain as a function call rather than a name reference.
+fn followed_by_open_paren(bytes: &[u8], pos: usize) -> bool {
+    let mut j = pos;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    j < bytes.len() && bytes[j] == b'('
 }
 
 /// Byte offset just past the closing `'` of a single-quoted string starting at
@@ -263,8 +272,8 @@ pub(crate) fn references_ref(expr: &str, name: &str, source_table: Option<&str>)
 ///
 /// Because the expression is tokenized once and replacements are spliced by
 /// byte span, inserted text is never rescanned — the double-substitution hazard
-/// that forced [`crate::util::replace_word_boundary_pairs`]'s single-pass design
-/// (SG-3) cannot occur here, and there is no needle-ordering concern: each chain
+/// that forced the former `util::replace_word_boundary_pairs`'s single-pass
+/// design (SG-3) cannot occur here, and there is no needle-ordering concern: each chain
 /// resolves to exactly one key (`o.net_price` and `net_price` are distinct
 /// keys). Literal text and unmatched references are copied verbatim, so a
 /// metric name inside `'…'` or a foreign `x.net_price` is left intact.
@@ -301,8 +310,25 @@ mod tests {
     #[test]
     fn scans_bare_and_qualified_chains() {
         assert_eq!(keys("revenue - cost"), vec!["revenue", "cost"]);
-        assert_eq!(keys("SUM(o.amount)"), vec!["sum", "o.amount"]);
+        // `SUM` is a function call, not a name reference — only its argument is.
+        assert_eq!(keys("SUM(o.amount)"), vec!["o.amount"]);
         assert_eq!(keys("a.b.c"), vec!["a.b.c"]);
+    }
+
+    #[test]
+    fn function_call_heads_are_not_references() {
+        // A chain immediately before `(` (any whitespace) is a call, not a ref,
+        // so a fact/metric named like a function is never confused with it.
+        assert_eq!(keys("sum(x)"), vec!["x"]);
+        // The numeric literal `0` scans as a harmless chain (it can never be a
+        // declared name, so it never matches); the function head is excluded.
+        assert_eq!(keys("COALESCE ( revenue , 0 )"), vec!["revenue", "0"]);
+        assert_eq!(keys("schema.date_trunc('day', o.ts)"), vec!["o.ts"]);
+        // FIND/INLINE both ignore the function name even if a name collides.
+        assert!(!references_ref("SUM(x)", "sum", None));
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("sum".to_string(), "(BAD)");
+        assert_eq!(inline_references("SUM(net_price)", &m), "SUM(net_price)");
     }
 
     #[test]
@@ -310,7 +336,7 @@ mod tests {
         // A quoted part normalizes exactly like an unquoted one (DuckDB rule).
         assert_eq!(keys("\"Revenue\""), vec!["revenue"]);
         assert_eq!(keys("a.\"C d\""), vec!["a.c d"]);
-        assert_eq!(keys("SUM(\"Rev\")"), vec!["sum", "rev"]);
+        assert_eq!(keys("SUM(\"Rev\")"), vec!["rev"]);
         // "" escape inside a quoted part stays one part.
         assert_eq!(keys("\"with\"\"q\""), vec!["with\"q"]);
     }
