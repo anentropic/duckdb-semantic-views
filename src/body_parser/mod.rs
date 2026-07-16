@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn split_simple_three_entries() {
-        let result = split_at_depth0_commas("a, b, c");
+        let result = split_at_depth0_commas("a, b, c").unwrap();
         assert_eq!(result.len(), 3, "Expected 3 entries, got {:?}", result);
         assert_eq!(result[0].1, "a");
         assert_eq!(result[1].1, "b");
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn split_nested_parens_not_split() {
         // The comma inside SUM(a, b) is at depth 1 — must not split
-        let result = split_at_depth0_commas("SUM(a, b), COUNT(*)");
+        let result = split_at_depth0_commas("SUM(a, b), COUNT(*)").unwrap();
         assert_eq!(result.len(), 2, "Expected 2 entries, got {:?}", result);
         assert_eq!(result[0].1, "SUM(a, b)");
         assert_eq!(result[1].1, "COUNT(*)");
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn split_string_literal_comma_not_split() {
         // Comma inside single-quoted string must not split
-        let result = split_at_depth0_commas("a, 'x, y', b");
+        let result = split_at_depth0_commas("a, 'x, y', b").unwrap();
         assert_eq!(result.len(), 3, "Expected 3 entries, got {:?}", result);
         assert_eq!(result[0].1, "a");
         assert_eq!(result[1].1, "'x, y'");
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn split_trailing_comma_discarded() {
-        let result = split_at_depth0_commas("a,");
+        let result = split_at_depth0_commas("a,").unwrap();
         assert_eq!(
             result.len(),
             1,
@@ -502,8 +502,23 @@ mod tests {
 
     #[test]
     fn split_empty_body() {
-        let result = split_at_depth0_commas("");
+        let result = split_at_depth0_commas("").unwrap();
         assert_eq!(result.len(), 0, "Empty body must produce 0 entries");
+    }
+
+    #[test]
+    fn split_leading_and_interior_empty_entries_rejected() {
+        // T-13 (code-review 2026-07-16): a stray leading (`,a`) or interior
+        // (`a,,b`) comma is rejected rather than silently dropped. A single
+        // trailing comma stays tolerated (covered above).
+        assert!(split_at_depth0_commas(",a").is_err());
+        assert!(split_at_depth0_commas("a,,b").is_err());
+        assert!(split_at_depth0_commas("a, , b").is_err());
+        assert!(split_at_depth0_commas(",").is_err());
+        // A comma inside parens / quotes is still not a top-level split, so an
+        // empty-looking interior there does not trip the check.
+        assert!(split_at_depth0_commas("SUM(a,,b)").is_ok());
+        assert!(split_at_depth0_commas("'a,,b'").is_ok());
     }
 
     #[test]
@@ -512,12 +527,27 @@ mod tests {
         // entry's first byte, not the position right after the comma, so an
         // error caret computed from it lands on the entry rather than drifting
         // left into the inter-entry whitespace.
-        let result = split_at_depth0_commas("a,   b_bad");
+        let result = split_at_depth0_commas("a,   b_bad").unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (0, "a"));
         assert_eq!(result[1], (5, "b_bad"));
         // Leading whitespace on the first entry is skipped too.
-        assert_eq!(split_at_depth0_commas("   x, y")[0], (3, "x"));
+        assert_eq!(split_at_depth0_commas("   x, y").unwrap()[0], (3, "x"));
+    }
+
+    #[test]
+    fn t13_stray_comma_in_clause_rejected_end_to_end() {
+        // The stray-comma rejection surfaces through the full body parser, not
+        // just the splitter unit.
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    DIMENSIONS (o.a AS o.a,, o.b AS o.b) \
+                    METRICS (o.rev AS SUM(o.amount))";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("stray or leading"),
+            "got: {}",
+            err.message
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1295,7 +1325,7 @@ mod tests {
 
     #[test]
     fn test_split_commas_ignores_comma_inside_quoted_ident() {
-        let entries = split_at_depth0_commas("o.x AS o.\"a,b\", o.y AS o.c");
+        let entries = split_at_depth0_commas("o.x AS o.\"a,b\", o.y AS o.c").unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].1, "o.x AS o.\"a,b\"");
         assert_eq!(entries[1].1, "o.y AS o.c");

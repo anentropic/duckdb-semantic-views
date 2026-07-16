@@ -40,7 +40,7 @@ fn extract_single_quoted_string(s: &str) -> Result<String, ParseError> {
 /// Parse comma-separated single-quoted strings from inside parentheses.
 /// Input: "'syn1', 'syn2'" (already extracted from parens)
 fn parse_synonym_list(content: &str) -> Result<Vec<String>, ParseError> {
-    let entries = split_at_depth0_commas(content);
+    let entries = split_at_depth0_commas(content)?;
     let mut result = Vec::new();
     for (_, entry) in entries {
         let trimmed = entry.trim();

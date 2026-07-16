@@ -26,7 +26,7 @@ pub(crate) fn parse_relationships_clause(
         return Ok(vec![]);
     }
 
-    let entries = split_at_depth0_commas(body);
+    let entries = split_at_depth0_commas(body)?;
     let mut result = Vec::new();
 
     for (entry_start, entry) in entries {
@@ -191,7 +191,7 @@ fn take_columns(
             position: Some(entry_offset),
         });
     };
-    Ok(split_at_depth0_commas(inner)
+    Ok(split_at_depth0_commas(inner)?
         .into_iter()
         .map(|(_, col)| col.to_string())
         .collect())

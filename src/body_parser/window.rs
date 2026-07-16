@@ -70,7 +70,7 @@ pub(super) fn parse_window_over_clause(
     };
 
     // Split function arguments: first is inner_metric, rest are extra_args
-    let func_args: Vec<&str> = split_at_depth0_commas(func_args_content)
+    let func_args: Vec<&str> = split_at_depth0_commas(func_args_content)?
         .into_iter()
         .map(|(_, s)| s.trim())
         .filter(|s| !s.is_empty())
@@ -110,13 +110,14 @@ pub(super) fn parse_window_over_clause(
 type OverContent = (Vec<String>, Vec<String>, Vec<WindowOrderBy>, Option<String>);
 
 /// Split a comma-separated dimension list (already sliced from the source),
-/// trimming and dropping empties.
-fn split_dim_list(text: &str) -> Vec<String> {
-    split_at_depth0_commas(text)
+/// trimming and dropping empties. A stray/leading comma is rejected by
+/// [`split_at_depth0_commas`] (T-13).
+fn split_dim_list(text: &str) -> Result<Vec<String>, ParseError> {
+    Ok(split_at_depth0_commas(text)?
         .into_iter()
         .map(|(_, s)| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .collect()
+        .collect())
 }
 
 /// Parse the comma-separated `dim [ASC|DESC] [NULLS FIRST|LAST]` entries of an
@@ -129,7 +130,7 @@ fn parse_order_by_entries(
     base_offset: usize,
 ) -> Result<Vec<WindowOrderBy>, ParseError> {
     let mut order_by = Vec::new();
-    for (start, entry_text) in split_at_depth0_commas(order_text) {
+    for (start, entry_text) in split_at_depth0_commas(order_text)? {
         let entry_text = entry_text.trim();
         if entry_text.is_empty() {
             continue;
@@ -216,7 +217,7 @@ fn parse_over_content(content: &str, base_offset: usize) -> Result<OverContent, 
             .find_kw("ORDER")
             .or_else(|| cur.find_any_kw(&FRAME_KEYWORDS));
         let dims_end = boundary.map_or(content.len(), |t| t.start);
-        let dims = split_dim_list(content[dims_start..dims_end].trim());
+        let dims = split_dim_list(content[dims_start..dims_end].trim())?;
         if excluding {
             excluding_dims = dims;
         } else {

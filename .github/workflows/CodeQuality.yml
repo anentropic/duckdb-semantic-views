@@ -56,6 +56,20 @@ jobs:
       - name: Clippy (extension feature, deny warnings)
         run: SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features --features extension -- -D warnings
 
+      # T-12 (code-review 2026-07-16): doctests run in no other job — the
+      # coverage step below uses cargo-nextest, which skips them entirely. Run
+      # the default-feature doctests so their examples cannot silently rot, and
+      # the `extension`-gated FFI doctests separately: the load-bearing one is a
+      # `compile_fail` ABI-safety guard in src/ddl/read_ffi.rs that only
+      # type-checks (SV_SKIP_CPP_BUILD skips the C++ build; a compile_fail
+      # doctest never links). It is scoped to `read_ffi` because the other
+      # doctests assume the default `duckdb` feature and won't compile here.
+      - name: Doctests (default features)
+        run: cargo test --doc
+
+      - name: FFI doctests (extension feature, compile_fail ABI guard)
+        run: SV_SKIP_CPP_BUILD=1 cargo test --doc --no-default-features --features extension read_ffi
+
       # Pinned to a commit SHA (not the floating @v2) because the v2.1.0/v2.1.1
       # releases (2026-07-13) bundle cargo-deny 0.20.2, whose CLI refactor drops
       # the `--log-level` argument this action still passes — breaking the step

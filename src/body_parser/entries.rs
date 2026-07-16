@@ -32,7 +32,7 @@ pub(crate) fn parse_qualified_entries(
         return Ok(vec![]);
     }
 
-    let entries = split_at_depth0_commas(body);
+    let entries = split_at_depth0_commas(body)?;
     let mut result = Vec::new();
 
     for (entry_start, entry) in entries {

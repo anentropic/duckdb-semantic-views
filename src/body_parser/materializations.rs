@@ -26,7 +26,7 @@ pub(crate) fn parse_materializations_clause(
     body: &str,
     base_offset: usize,
 ) -> Result<Vec<Materialization>, ParseError> {
-    let entries = split_at_depth0_commas(body);
+    let entries = split_at_depth0_commas(body)?;
     let mut result = Vec::new();
     for (entry_start, entry) in entries {
         let entry_offset = base_offset + entry_start;
@@ -255,7 +255,7 @@ fn extract_paren_list(content: &str) -> Result<Vec<String>, ParseError> {
     } else {
         content
     };
-    Ok(split_at_depth0_commas(inner)
+    Ok(split_at_depth0_commas(inner)?
         .into_iter()
         .map(|(_, entry)| entry.to_string())
         .collect())

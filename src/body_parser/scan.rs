@@ -1,5 +1,7 @@
 //! Low-level byte/keyword scanning helpers shared by the clause parsers.
 
+use crate::errors::ParseError;
+
 /// Byte-scan state for SQL text: tracks single-quoted string literals and
 /// double-quoted identifiers, honouring the SQL escape doubling (`''` inside
 /// a string, `""` inside a quoted identifier).
@@ -100,9 +102,15 @@ pub(super) fn unterminated_quote_error(s: &str) -> Option<&'static str> {
 /// the **trimmed** slice's first byte — not the position right after the comma.
 /// Leading whitespace between the comma and the entry is excluded, so an error
 /// caret computed as `base + offset` lands on the entry itself rather than
-/// drifting left into the gap (P-4, code-review 2026-07-11). Trailing empty
-/// entries are discarded.
-pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
+/// drifting left into the gap (P-4, code-review 2026-07-11).
+///
+/// A single **trailing** comma is tolerated (`a, b,` → `[a, b]`). A **leading**
+/// or **interior** empty entry — a stray comma with no content before it
+/// (`,a`, `a,,b`) — is rejected rather than silently dropped (T-13, code-review
+/// 2026-07-16; the P-2 no-silent-discard rule). The error carries no caret: the
+/// helper is base-offset-agnostic (offsets it returns are body-relative), and
+/// its callers surface the message with their own clause context.
+pub(crate) fn split_at_depth0_commas(body: &str) -> Result<Vec<(usize, &str)>, ParseError> {
     let mut entries = Vec::new();
     let mut depth: i32 = 0;
     let mut st = QuoteState::default();
@@ -117,9 +125,20 @@ pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
                 b')' | b']' | b'}' => depth -= 1,
                 b',' if depth == 0 => {
                     let entry = body[start..i].trim();
-                    if !entry.is_empty() {
-                        entries.push((crate::util::byte_offset_within(body, entry), entry));
+                    if entry.is_empty() {
+                        // A leading (`,a`) or interior (`a,,b`) empty entry is a
+                        // stray comma. A trailing comma leaves its empty segment
+                        // in the tail below (not between two commas), so `a,`
+                        // stays allowed.
+                        return Err(ParseError {
+                            message:
+                                "Empty entry: a stray or leading ',' with no content before it. \
+                                 Remove the extra comma."
+                                    .to_string(),
+                            position: None,
+                        });
                     }
+                    entries.push((crate::util::byte_offset_within(body, entry), entry));
                     start = i + 1;
                 }
                 _ => {}
@@ -131,7 +150,7 @@ pub(crate) fn split_at_depth0_commas(body: &str) -> Vec<(usize, &str)> {
     if !tail.is_empty() {
         entries.push((crate::util::byte_offset_within(body, tail), tail));
     }
-    entries
+    Ok(entries)
 }
 
 // `split_first_token` (first-whitespace split for the MATERIALIZATIONS name)
