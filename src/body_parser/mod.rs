@@ -1490,6 +1490,45 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // F-3 (code-review 2026-07-16): text between a metric's USING (...) /
+    // NON ADDITIVE BY (...) clause and AS was matched-then-sliced-backwards
+    // and silently discarded.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_metric_junk_after_non_additive_by_rejected() {
+        let err = parse_metrics_clause("o.m NON ADDITIVE BY (d) junk AS SUM(o.v)", 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("Unexpected text 'junk' after NON ADDITIVE BY (...)"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_metric_junk_after_using_rejected() {
+        let err = parse_metrics_clause("o.m USING (r) junk AS SUM(o.v)", 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("Unexpected text 'junk' after USING (...)"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_metric_using_then_non_additive_by_still_parses() {
+        // Guard: the legitimate `USING (...) NON ADDITIVE BY (...)` order is
+        // still accepted (residue checks must not reject the real grammar).
+        let result =
+            parse_metrics_clause("o.m USING (r) NON ADDITIVE BY (d) AS SUM(o.v)", 0).unwrap();
+        assert_eq!(result[0].using_relationships, vec!["r"]);
+        assert_eq!(result[0].non_additive_by.len(), 1);
+        assert_eq!(result[0].name, "m");
+    }
+
     #[test]
     fn test_as_keyword_requires_boundary_in_tables_and_materializations() {
         // PR #50 review: `AS` was matched as a raw 2-byte prefix, so
@@ -1644,6 +1683,47 @@ mod tests {
             "got: {}",
             err.message
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // F-2 (code-review 2026-07-16): content before PARTITION BY in an OVER
+    // clause was matched-anywhere and silently discarded. A misplaced
+    // `ORDER BY` before PARTITION BY previously produced an unordered
+    // aggregate with no diagnostic.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_over_order_by_before_partition_by_rejected() {
+        let err = parse_metrics_clause("s.r AS SUM(t) OVER (ORDER BY d PARTITION BY region)", 0)
+            .unwrap_err();
+        assert!(
+            err.message
+                .contains("Unexpected text 'ORDER BY d' before PARTITION BY"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_over_junk_before_partition_by_rejected() {
+        let err =
+            parse_metrics_clause("s.r AS SUM(t) OVER (banana PARTITION BY region)", 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("Unexpected text 'banana' before PARTITION BY"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_over_well_formed_partition_order_still_parses() {
+        // Guard against over-eager rejection: the canonical order is accepted.
+        let result =
+            parse_metrics_clause("s.r AS SUM(t) OVER (PARTITION BY region ORDER BY d)", 0).unwrap();
+        let ws = result[0].window_spec.as_ref().unwrap();
+        assert_eq!(ws.partition_dims, vec!["region"]);
+        assert_eq!(ws.order_by.len(), 1);
     }
 
     #[test]
@@ -3334,6 +3414,59 @@ mod tests {
             err.message
                 .contains("must specify at least one of DIMENSIONS or METRICS"),
             "Expected error about empty dims/metrics: {}",
+            err.message
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F-4 (code-review 2026-07-16): the MATERIALIZATIONS sub-body tolerated
+    // junk before the first sub-keyword, duplicate sub-clauses (last-wins),
+    // and trailing junk after a `(...)` list — all silently.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_materializations_junk_before_first_subclause_rejected() {
+        let err =
+            parse_materializations_clause("mm AS (junk TABLE t, DIMENSIONS (d))", 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("unexpected text 'junk' before the first sub-clause"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_materializations_duplicate_table_rejected() {
+        let err = parse_materializations_clause("mm AS (TABLE t, TABLE u, DIMENSIONS (d))", 0)
+            .unwrap_err();
+        assert!(
+            err.message.contains("duplicate TABLE sub-clause"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_materializations_duplicate_dimensions_rejected() {
+        let err =
+            parse_materializations_clause("mm AS (TABLE t, DIMENSIONS (a), DIMENSIONS (b))", 0)
+                .unwrap_err();
+        assert!(
+            err.message.contains("duplicate DIMENSIONS sub-clause"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_materializations_junk_after_list_rejected() {
+        let err =
+            parse_materializations_clause("mm AS (TABLE t, DIMENSIONS (d) junk)", 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("Unexpected text 'junk' after a MATERIALIZATIONS sub-clause list"),
+            "got: {}",
             err.message
         );
     }

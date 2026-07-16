@@ -41,7 +41,7 @@ DIMENSIONS (
     a.snap_date AS a.snap_date
 )
 METRICS (
-    a.latest_balance NON ADDITIVE BY (snap_date DESC) AS SUM(a.balance)
+    a.latest_balance NON ADDITIVE BY (snap_date) AS SUM(a.balance)
 )
 
 # E-1: partitioning must be on upper(a.region), so 'us'/'US' form ONE

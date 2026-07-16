@@ -98,7 +98,7 @@ TABLES (o AS cvb_orders PRIMARY KEY (id))
 DIMENSIONS (o.region AS o.region, o.snap_date AS o.snap_date)
 METRICS (
     o.total AS SUM(o.amount),
-    o.latest NON ADDITIVE BY (snap_date DESC) AS SUM(o.amount)
+    o.latest NON ADDITIVE BY (snap_date) AS SUM(o.amount)
 )
 
 # o.* on metrics expands to {total, latest}; queried by region (NOT the NA

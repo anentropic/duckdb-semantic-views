@@ -113,17 +113,51 @@ fn parse_single_materialization_entry(
         });
     };
 
-    // Locate the TABLE / DIMENSIONS / METRICS sub-keywords at depth 0 (outside
-    // any nested `(...)` list) and outside quotes, in order. Each keyword's
-    // content runs from just past it to the start of the next keyword (or the
-    // end of the sub-body) — the same tiling the retired
-    // `find_sub_keyword_positions` produced, now quote-aware by construction.
+    let (table, dim_names, met_names) = parse_materialization_sub_body(name, sub_body)?;
+
+    Ok(Materialization {
+        name: name.to_string(),
+        table,
+        dimensions: dim_names,
+        metrics: met_names,
+    })
+}
+
+/// Parse the `(TABLE ..., DIMENSIONS (...), METRICS (...))` sub-body of one
+/// materialization entry into `(table, dimensions, metrics)`.
+///
+/// Locates the TABLE / DIMENSIONS / METRICS sub-keywords at depth 0 (outside
+/// any nested `(...)` list) and outside quotes, in order. Each keyword's
+/// content runs from just past it to the start of the next keyword (or the end
+/// of the sub-body) — the same tiling the retired `find_sub_keyword_positions`
+/// produced, now quote-aware by construction.
+fn parse_materialization_sub_body(
+    name: &str,
+    sub_body: &str,
+) -> Result<(String, Vec<String>, Vec<String>), ParseError> {
     let sub = Cursor::new(sub_body, 0);
     let kw_toks = sub.find_all_kw_depth0(&["TABLE", "DIMENSIONS", "METRICS"]);
+
+    // F-4 (code-review 2026-07-16): reject text before the first sub-keyword.
+    // The keyword tiling only examines content *after* each keyword, so a
+    // leading `(junk TABLE t, ...)` previously discarded `junk` silently.
+    if let Some(first) = kw_toks.first() {
+        let before = sub_body[..first.start].trim();
+        if !before.is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "Materialization '{name}': unexpected text '{before}' before the first sub-clause."
+                ),
+                position: None,
+            });
+        }
+    }
 
     let mut table_name: Option<String> = None;
     let mut dim_names: Vec<String> = Vec::new();
     let mut met_names: Vec<String> = Vec::new();
+    // F-4: a repeated sub-keyword previously overwrote silently (last wins).
+    let (mut dim_seen, mut met_seen) = (false, false);
 
     for (i, &kw_tok) in kw_toks.iter().enumerate() {
         let end = if i + 1 < kw_toks.len() {
@@ -136,6 +170,9 @@ fn parse_single_materialization_entry(
         let content = content.strip_suffix(',').unwrap_or(content).trim();
 
         if sub.is_kw(kw_tok, "TABLE") {
+            if table_name.is_some() {
+                return Err(duplicate_sub_clause(name, "TABLE"));
+            }
             if content.is_empty() {
                 return Err(ParseError {
                     message: format!(
@@ -146,8 +183,16 @@ fn parse_single_materialization_entry(
             }
             table_name = Some(content.to_string());
         } else if sub.is_kw(kw_tok, "DIMENSIONS") {
+            if dim_seen {
+                return Err(duplicate_sub_clause(name, "DIMENSIONS"));
+            }
+            dim_seen = true;
             dim_names = extract_paren_list(content)?;
         } else if sub.is_kw(kw_tok, "METRICS") {
+            if met_seen {
+                return Err(duplicate_sub_clause(name, "METRICS"));
+            }
+            met_seen = true;
             met_names = extract_paren_list(content)?;
         }
     }
@@ -166,12 +211,16 @@ fn parse_single_materialization_entry(
         });
     }
 
-    Ok(Materialization {
-        name: name.to_string(),
-        table,
-        dimensions: dim_names,
-        metrics: met_names,
-    })
+    Ok((table, dim_names, met_names))
+}
+
+/// Build the "duplicate sub-clause" error for a repeated TABLE / DIMENSIONS /
+/// METRICS keyword within one materialization entry (F-4).
+fn duplicate_sub_clause(name: &str, kw: &str) -> ParseError {
+    ParseError {
+        message: format!("Materialization '{name}': duplicate {kw} sub-clause."),
+        position: None,
+    }
 }
 
 /// Extract a parenthesized comma-separated name list: `(name1, name2, ...)`.
@@ -187,10 +236,22 @@ fn extract_paren_list(content: &str) -> Result<Vec<String>, ParseError> {
         // Quote-aware balanced `(...)`: a `)` inside a string / quoted ident
         // cannot close the list early (PA-6).
         let mut c = Cursor::new(content, 0);
-        c.take_parens().ok_or_else(|| ParseError {
+        let inner = c.take_parens().ok_or_else(|| ParseError {
             message: "Unclosed parenthesis in MATERIALIZATIONS sub-clause.".to_string(),
             position: None,
-        })?
+        })?;
+        // F-4 (code-review 2026-07-16): reject trailing text after the `(...)`
+        // list (`DIMENSIONS (d) junk`) instead of silently dropping it.
+        if let Some(tok) = c.peek() {
+            let residue = content[tok.start..].trim();
+            return Err(ParseError {
+                message: format!(
+                    "Unexpected text '{residue}' after a MATERIALIZATIONS sub-clause list."
+                ),
+                position: None,
+            });
+        }
+        inner
     } else {
         content
     };
