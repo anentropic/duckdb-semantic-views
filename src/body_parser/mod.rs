@@ -3729,6 +3729,22 @@ mod tests {
         assert_eq!(result[0].table, "\"my orders\"");
     }
 
+    #[test]
+    fn f7_alias_less_qualified_name_uses_last_component() {
+        // A qualified alias-less table name defaults the alias to its LAST
+        // identifier component (not the whole dotted name), so the `alias.name`
+        // reference splitter can still use it. The physical table keeps the
+        // full qualified form. (Copilot review, F-7 follow-up.)
+        let result = parse_tables_clause("schema.orders PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result[0].alias, "orders");
+        assert_eq!(result[0].table, "schema.orders");
+
+        // Quoted last part is preserved.
+        let result = parse_tables_clause("schema.\"my orders\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result[0].alias, "\"my orders\"");
+        assert_eq!(result[0].table, "schema.\"my orders\"");
+    }
+
     // --- F-9: a name slot must be a single identifier, not a token run ---
 
     #[test]

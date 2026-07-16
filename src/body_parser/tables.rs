@@ -50,19 +50,25 @@ fn missing_name_msg(alias: &str) -> String {
     }
 }
 
-/// Parse a single TABLES clause entry.
+/// Resolve the `[alias AS] table_name` prefix of a TABLES entry (Snowflake's
+/// grammar makes the alias optional — F-7). Advances `cur` past the source-table
+/// name so the caller can parse the trailing constraints, and returns
+/// `(alias, table_name, name_end)` where `name_end` is the byte offset in `entry`
+/// just past the name.
 ///
-/// Supports:
-/// - `alias AS physical_table PRIMARY KEY (cols) [UNIQUE (cols)]*`
-/// - `alias AS physical_table [UNIQUE (cols)]*`   (no PRIMARY KEY -- fact tables)
-/// - `alias AS physical_table`                    (bare -- no PK, no UNIQUE)
-fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef, ParseError> {
-    let entry = entry.trim();
-    let mut cur = Cursor::new(entry, entry_offset);
-
-    // Step 1: the first token — either an alias (when `AS` follows) or the
-    // start of a bare source-table name. A leading symbol (`(`, `.`, ...) where
-    // a name should be is rejected up front.
+/// When the alias is omitted, it defaults to the LAST identifier component of the
+/// table name — not the whole (possibly qualified) name: a dotted alias like
+/// `schema.orders` would be mis-split by the `alias.name` reference parser (which
+/// splits at the first dot, so `schema.orders.region` would resolve alias
+/// `schema`). Taking the last component yields the usable `orders` and matches
+/// Snowflake's implicit-alias behaviour; quoted parts are preserved.
+fn resolve_table_alias_and_name<'a>(
+    cur: &mut Cursor<'a>,
+    entry: &'a str,
+    entry_offset: usize,
+) -> Result<(&'a str, &'a str, usize), ParseError> {
+    // The first token is either an alias (when `AS` follows) or the start of a
+    // bare source-table name. A leading symbol (`(`, `.`, ...) is rejected.
     let Some(first_tok) = cur.peek() else {
         return Err(cur.err(
             0,
@@ -76,34 +82,47 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
         ));
     }
 
-    // Step 2: decide `alias AS table` vs a bare `table`. Snowflake's grammar is
-    // `[ <table_alias> AS ] <table_name>` — the alias is optional (F-7,
-    // code-review 2026-07-16). The alias, when present, is the first identifier
-    // token immediately followed by `AS`. Tokenization gives the word boundary
-    // for free: `ASorders` is one bare token (not `AS`), and `AS"my table"`
-    // splits into `AS` + the quoted name.
+    // Decide `alias AS table` vs a bare `table`. The alias, when present, is the
+    // first identifier token immediately followed by `AS`. Tokenization gives the
+    // word boundary for free: `ASorders` is one bare token (not `AS`), and
+    // `AS"my table"` splits into `AS` + the quoted name.
     cur.bump(); // consume the first token
     let has_alias = matches!(cur.peek(), Some(t) if cur.is_kw(t, "AS"));
 
-    let (alias, table_name, name_end) = if has_alias {
-        let alias = cur.text(first_tok).to_string();
-        // Consume `AS`, then read the source-table name after it (Step 3).
-        cur.bump();
-        let (table_name, name_end) = take_source_table_name(&mut cur, entry, &alias)?;
-        (alias, table_name.to_string(), name_end)
+    if has_alias {
+        let alias = cur.text(first_tok);
+        cur.bump(); // AS
+        let (table_name, name_end) = take_source_table_name(cur, entry, alias)?;
+        Ok((alias, table_name, name_end))
     } else {
-        // Alias-less: the first token begins the source-table name. Re-scan the
-        // name from the start of the entry so a dotted / quoted FQN
-        // (`schema.orders`, `"my table"`) is captured whole, and default the
-        // alias to the table name (Snowflake's implicit-alias behaviour).
+        // Alias-less: re-scan the name from the start of the entry so a dotted /
+        // quoted FQN (`schema.orders`, `"my table"`) is captured whole, then
+        // default the alias to the name's last identifier component.
         let mut name_cur = Cursor::new(entry, entry_offset);
         let (table_name, name_end) = take_source_table_name(&mut name_cur, entry, "")?;
-        // Resync the primary cursor past the whole name for constraint parsing.
-        cur.advance_past_byte(name_end);
-        (table_name.to_string(), table_name.to_string(), name_end)
-    };
-    let alias = alias.as_str();
-    let table_name = table_name.as_str();
+        cur.advance_past_byte(name_end); // resync for constraint parsing
+        let mut alias = table_name;
+        while let Some((_, after)) = super::scan::split_qualified_identifier(alias) {
+            alias = after;
+        }
+        Ok((alias, table_name, name_end))
+    }
+}
+
+/// Parse a single TABLES clause entry.
+///
+/// Supports:
+/// - `alias AS physical_table PRIMARY KEY (cols) [UNIQUE (cols)]*`
+/// - `alias AS physical_table [UNIQUE (cols)]*`   (no PRIMARY KEY -- fact tables)
+/// - `alias AS physical_table`                    (bare -- no PK, no UNIQUE)
+fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef, ParseError> {
+    let entry = entry.trim();
+    let mut cur = Cursor::new(entry, entry_offset);
+
+    // Steps 1-3: resolve the `[alias AS] table_name` prefix, advancing `cur`
+    // past the source-table name so the constraint scan below continues after it.
+    let (alias, table_name, name_end) =
+        resolve_table_alias_and_name(&mut cur, entry, entry_offset)?;
 
     // F-11 (code-review 2026-07-16): the alias and the source-table name must
     // each be a well-formed identifier — an empty quoted `""` in either slot
@@ -111,13 +130,16 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     // already rejects a multi-token name run, so F-9 does not recur here.)
     if let Some(reason) = super::scan::identifier_slot_error(alias) {
         return Err(cur.err(
-            first_tok.start,
+            0,
             format!("Invalid table alias in TABLES entry '{entry}': {reason}."),
         ));
     }
     if let Some(reason) = super::scan::identifier_slot_error(table_name) {
+        // Caret at the table-name token (its start = name_end - len), not the
+        // entry start, so `alias AS <bad table>` points at the offending name
+        // rather than the alias (Copilot review).
         return Err(cur.err(
-            first_tok.start,
+            name_end - table_name.len(),
             format!("Invalid source-table name in TABLES entry '{entry}': {reason}."),
         ));
     }

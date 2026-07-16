@@ -206,7 +206,7 @@ pub(super) fn parse_trailing_annotations(
                 .unwrap_or(after_synonyms)
                 .trim_start();
             let (content, consumed) = extract_paren_prefix(after_eq).ok_or_else(|| ParseError {
-                message: "Expected parenthesized list after WITH SYNONYMS =.".to_string(),
+                message: "Expected parenthesized list after WITH SYNONYMS.".to_string(),
                 position: None,
             })?;
             synonyms = Some(parse_synonym_list(content)?);
