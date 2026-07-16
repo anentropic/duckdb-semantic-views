@@ -20,9 +20,10 @@
 //! - `RANK() OVER (PARTITION BY non-NA-dims ORDER BY NA-dims) AS __sv_rn`
 //!   (the `__sv_rn` column name predates the RANK switch and is pinned by
 //!   sqllogictests -- keep it). The window's ORDER BY reverses each NA dim's
-//!   declared direction so `RANK() = 1` lands on the LAST row of the declared
-//!   sort — the default (ASC) therefore selects the latest snapshot and DESC
-//!   the earliest, matching Snowflake (F-1, code-review 2026-07-16).
+//!   declared direction so `RANK() = 1` lands on the LAST ordering value of the
+//!   declared sort (ties included — see the RANK note above) — the default (ASC)
+//!   therefore selects the latest snapshot and DESC the earliest, matching
+//!   Snowflake (F-1, code-review 2026-07-16).
 //! - Outer SELECT: regular/effectively-regular metrics use plain aggregation,
 //!   active semi-additive metrics use `SUM(CASE WHEN __sv_rn = 1 THEN raw_val END)`
 //!
@@ -234,12 +235,14 @@ pub(super) fn expand_semi_additive(
                     );
                 // Snowflake semi-additive semantics (F-1, code-review
                 // 2026-07-16): the rows are sorted by the NA dims and the values
-                // from the LAST row of that sort are aggregated — so the default
-                // (ASC) selects the LATEST snapshot and DESC selects the
+                // from the LAST ordering value of that sort are aggregated (with
+                // RANK(), every row tied at that value is included) — so the
+                // default (ASC) selects the LATEST snapshot and DESC selects the
                 // earliest. We pick the snapshot with `RANK() = 1`, which is the
-                // FIRST row of this window's ORDER BY, so we emit the REVERSE of
-                // the declared direction: the first row of the reversed sort is
-                // the last row of the declared sort. NULLS ordering is kept as
+                // FIRST ordering value of this window's ORDER BY, so we emit the
+                // REVERSE of the declared direction: the first value of the
+                // reversed sort is the last value of the declared sort. NULLS
+                // ordering is kept as
                 // declared (not reversed) so that under the default (NULLS LAST)
                 // a NULL key never outranks a real snapshot — matching the
                 // "latest non-NULL wins" intent; declare NULLS FIRST to let a

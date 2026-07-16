@@ -68,7 +68,7 @@ This declares that ``total_balance`` is non-additive by ``report_date``. When a 
 Sort Order and NULLS Placement
 ==============================
 
-Each dimension in ``NON ADDITIVE BY`` accepts an optional sort order and NULLS placement. The rows are sorted by the non-additive dimensions and the **last** row of that sort is aggregated, so:
+Each dimension in ``NON ADDITIVE BY`` accepts an optional sort order and NULLS placement. The rows are sorted by the non-additive dimensions and the rows sharing the **last ordering value** of that sort are aggregated (because the engine uses ``RANK()``, ties at that value all win), so:
 
 - ``ASC`` (default) -- selects the **latest** snapshot row (matches Snowflake)
 - ``DESC`` -- selects the **earliest** snapshot row
