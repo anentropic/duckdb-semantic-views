@@ -4,6 +4,7 @@
 //! derived metrics must not have USING, each relationship must exist, and
 //! each relationship must originate from the metric's source table.
 
+use crate::errors::ParseError;
 use crate::model::SemanticViewDefinition;
 
 /// Validate that all `using_relationships` references on metrics are valid.
@@ -14,7 +15,7 @@ use crate::model::SemanticViewDefinition;
 /// 3. Each referenced relationship must originate from the metric's `source_table`.
 ///
 /// Returns `Ok(())` if all references are valid, `Err` with descriptive message otherwise.
-pub fn validate_using_relationships(def: &SemanticViewDefinition) -> Result<(), String> {
+pub fn validate_using_relationships(def: &SemanticViewDefinition) -> Result<(), ParseError> {
     // Collect all named relationships for lookup
     let named_rels: Vec<(&crate::model::Join, String)> = def
         .joins
@@ -31,10 +32,10 @@ pub fn validate_using_relationships(def: &SemanticViewDefinition) -> Result<(), 
 
         // Check 1: derived metrics must not have USING
         if metric.source_table.is_none() {
-            return Err(format!(
+            return Err(ParseError::positionless(format!(
                 "USING clause not allowed on derived metric '{}'",
                 metric.name
-            ));
+            )));
         }
 
         let metric_source = metric.source_table.as_ref().unwrap().to_ascii_lowercase();
@@ -47,23 +48,23 @@ pub fn validate_using_relationships(def: &SemanticViewDefinition) -> Result<(), 
 
             match found {
                 None => {
-                    return Err(format!(
+                    return Err(ParseError::positionless(format!(
                         "unknown relationship '{rel_name}' in USING clause of metric '{}'. \
                          Available: [{}]",
                         metric.name,
                         available_names.join(", ")
-                    ));
+                    )));
                 }
                 Some((join, _)) => {
                     // Check 3: relationship must originate from metric's source_table
                     let from_lower = join.from_alias.to_ascii_lowercase();
                     if from_lower != metric_source {
-                        return Err(format!(
+                        return Err(ParseError::positionless(format!(
                             "relationship '{rel_name}' does not originate from table '{}' \
                              (metric '{}')",
                             metric.source_table.as_ref().unwrap(),
                             metric.name
-                        ));
+                        )));
                     }
                 }
             }
@@ -104,7 +105,7 @@ mod tests {
             vec![(Some("dep_airport"), "f", "a", vec!["dep_id"])],
             vec![("departure_count", Some("f"), vec!["nonexistent"])],
         );
-        let err = validate_using_relationships(&def).unwrap_err();
+        let err = validate_using_relationships(&def).unwrap_err().message;
         assert!(
             err.contains("unknown relationship") && err.contains("nonexistent"),
             "Expected unknown relationship error, got: {err}"
@@ -131,7 +132,7 @@ mod tests {
             // Metric is on "p" but references "dep_airport" which originates from "f"
             vec![("pax_count", Some("p"), vec!["dep_airport"])],
         );
-        let err = validate_using_relationships(&def).unwrap_err();
+        let err = validate_using_relationships(&def).unwrap_err().message;
         assert!(
             err.contains("does not originate"),
             "Expected wrong source table error, got: {err}"
@@ -146,7 +147,7 @@ mod tests {
             vec![(Some("dep_airport"), "f", "a", vec!["dep_id"])],
             vec![("derived_met", None, vec!["dep_airport"])],
         );
-        let err = validate_using_relationships(&def).unwrap_err();
+        let err = validate_using_relationships(&def).unwrap_err().message;
         assert!(
             err.contains("derived metric") && err.contains("USING"),
             "Expected USING on derived metric error, got: {err}"

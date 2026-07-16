@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
+use crate::errors::ParseError;
 use crate::model::SemanticViewDefinition;
 use crate::util::suggest_closest;
 
@@ -39,13 +40,13 @@ pub fn find_fact_references<'a>(expr: &str, names: &[&'a str]) -> Vec<&'a str> {
 ///
 /// Returns `Ok(())` if valid, `Err` with descriptive message otherwise.
 #[allow(clippy::too_many_lines)]
-pub fn validate_facts(def: &SemanticViewDefinition) -> Result<(), String> {
+pub fn validate_facts(def: &SemanticViewDefinition) -> Result<(), ParseError> {
     if def.facts.is_empty() {
         return Ok(());
     }
 
     // 1. Check source_table references
-    check_fact_source_tables(def)?;
+    check_fact_source_tables(def).map_err(ParseError::positionless)?;
 
     // Collect fact names
     let fact_names: Vec<&str> = def.facts.iter().map(|f| f.name.as_str()).collect();
@@ -54,10 +55,10 @@ pub fn validate_facts(def: &SemanticViewDefinition) -> Result<(), String> {
     let (edges, in_degree) = build_fact_dag(def, &fact_names);
 
     // 3. Check that all referenced facts exist
-    check_fact_references_exist(&edges, &fact_names)?;
+    check_fact_references_exist(&edges, &fact_names).map_err(ParseError::positionless)?;
 
     // 4. Cycle detection via Kahn's algorithm
-    check_fact_cycles(&edges, in_degree, &fact_names)
+    check_fact_cycles(&edges, in_degree, &fact_names).map_err(ParseError::positionless)
 }
 
 /// Check that each fact's `source_table` is a declared table alias.
@@ -246,7 +247,7 @@ mod tests {
             vec![("o", "orders")],
             vec![("net_price", "x.price", "x")], // 'x' is not a declared table
         );
-        let err = validate_facts(&def).unwrap_err();
+        let err = validate_facts(&def).unwrap_err().message;
         assert!(
             err.contains("unknown source table"),
             "Expected unknown source table error, got: {err}"
@@ -259,7 +260,7 @@ mod tests {
             vec![("orders", "orders")],
             vec![("net_price", "x.price", "ordres")], // typo: 'ordres' vs 'orders'
         );
-        let err = validate_facts(&def).unwrap_err();
+        let err = validate_facts(&def).unwrap_err().message;
         assert!(
             err.contains("unknown source table"),
             "Expected unknown source table error, got: {err}"
@@ -305,7 +306,7 @@ mod tests {
             vec![("o", "orders")],
             vec![("fact_a", "fact_b + 1", "o"), ("fact_b", "fact_a + 1", "o")],
         );
-        let err = validate_facts(&def).unwrap_err();
+        let err = validate_facts(&def).unwrap_err().message;
         assert!(
             err.contains("cycle detected in facts"),
             "Expected cycle error, got: {err}"
@@ -323,7 +324,7 @@ mod tests {
                 ("fact_c", "fact_a + 1", "o"),
             ],
         );
-        let err = validate_facts(&def).unwrap_err();
+        let err = validate_facts(&def).unwrap_err().message;
         assert!(
             err.contains("cycle detected in facts"),
             "Expected cycle error, got: {err}"

@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
+use crate::errors::ParseError;
 use crate::model::SemanticViewDefinition;
 use crate::util::suggest_closest;
 
@@ -90,7 +91,7 @@ pub fn contains_aggregate_function(expr: &str) -> Option<&'static str> {
 ///
 /// Returns `Ok(())` if valid, `Err` with descriptive message otherwise.
 #[allow(clippy::too_many_lines)]
-pub fn validate_derived_metrics(def: &SemanticViewDefinition) -> Result<(), String> {
+pub fn validate_derived_metrics(def: &SemanticViewDefinition) -> Result<(), ParseError> {
     let derived: Vec<&crate::model::Metric> = def
         .metrics
         .iter()
@@ -102,10 +103,10 @@ pub fn validate_derived_metrics(def: &SemanticViewDefinition) -> Result<(), Stri
     }
 
     // 1. Check metric name uniqueness (case-insensitive)
-    check_metric_name_uniqueness(def)?;
+    check_metric_name_uniqueness(def).map_err(ParseError::positionless)?;
 
     // 2. Check for aggregate functions in derived metrics
-    check_no_aggregates_in_derived(&derived)?;
+    check_no_aggregates_in_derived(&derived).map_err(ParseError::positionless)?;
 
     // 3. Check for unknown metric references in derived expressions
     let all_metric_names: Vec<&str> = def.metrics.iter().map(|m| m.name.as_str()).collect();
@@ -114,11 +115,12 @@ pub fn validate_derived_metrics(def: &SemanticViewDefinition) -> Result<(), Stri
         .copied()
         .map(ToString::to_string)
         .collect();
-    check_derived_metric_references(&derived, &all_metric_names, &all_metric_names_display)?;
+    check_derived_metric_references(&derived, &all_metric_names, &all_metric_names_display)
+        .map_err(ParseError::positionless)?;
 
     // 4. Check for cycles in derived metric dependency graph
     let derived_name_strs: Vec<&str> = derived.iter().map(|m| m.name.as_str()).collect();
-    check_derived_metric_cycles(&derived, &derived_name_strs)
+    check_derived_metric_cycles(&derived, &derived_name_strs).map_err(ParseError::positionless)
 }
 
 /// Check that no two metrics (base or derived) share the same name (case-insensitive).
@@ -437,7 +439,7 @@ mod tests {
     fn validate_derived_metrics_cycle_detected() {
         // a -> b -> a (cycle)
         let def = make_def_with_derived_metrics(vec![], vec![("a", "b + 1"), ("b", "a + 1")]);
-        let err = validate_derived_metrics(&def).unwrap_err();
+        let err = validate_derived_metrics(&def).unwrap_err().message;
         assert!(
             err.contains("cycle detected in derived metrics"),
             "Expected cycle error, got: {err}"
@@ -451,7 +453,7 @@ mod tests {
             vec![("revenue", "SUM(o.amount)", "o")],
             vec![("profit", "revenue - nonexistent")],
         );
-        let err = validate_derived_metrics(&def).unwrap_err();
+        let err = validate_derived_metrics(&def).unwrap_err().message;
         assert!(
             err.contains("unknown metric") && err.contains("nonexistent"),
             "Expected unknown metric error, got: {err}"
@@ -465,7 +467,7 @@ mod tests {
             vec![("revenue", "SUM(o.amount)", "o")],
             vec![("bad", "SUM(revenue)")],
         );
-        let err = validate_derived_metrics(&def).unwrap_err();
+        let err = validate_derived_metrics(&def).unwrap_err().message;
         assert!(
             err.contains("aggregate function") && err.contains("bad"),
             "Expected aggregate error, got: {err}"
@@ -524,7 +526,7 @@ mod tests {
             vec![("revenue", "SUM(o.amount)", "o")],
             vec![("profit", "revnue - cost")],
         );
-        let err = validate_derived_metrics(&def).unwrap_err();
+        let err = validate_derived_metrics(&def).unwrap_err().message;
         assert!(
             err.contains("did you mean"),
             "Expected 'did you mean?' suggestion, got: {err}"
@@ -567,7 +569,7 @@ mod tests {
             vec![("revenue", "SUM(o.amount)", "o")],
             vec![("bad", "\"No Such Metric\" + 1")],
         );
-        let err = validate_derived_metrics(&def).unwrap_err();
+        let err = validate_derived_metrics(&def).unwrap_err().message;
         assert!(
             err.contains("unknown metric") && err.contains("\"No Such Metric\""),
             "Expected raw quoted name in error, got: {err}"
@@ -596,7 +598,7 @@ mod tests {
             vec![("revenue", "SUM(o.amount)", "o")],
             vec![("revenue", "cost + 1")],
         );
-        let err = validate_derived_metrics(&def).unwrap_err();
+        let err = validate_derived_metrics(&def).unwrap_err().message;
         assert!(
             err.contains("duplicate metric name"),
             "Expected duplicate name error, got: {err}"
