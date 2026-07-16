@@ -57,10 +57,10 @@ Add ``NON ADDITIVE BY (<dimension>)`` to a metric to declare which dimensions it
    )
    METRICS (
        a.total_balance AS SUM(a.balance)
-           NON ADDITIVE BY (report_date DESC NULLS FIRST)
+           NON ADDITIVE BY (report_date)
    );
 
-This declares that ``total_balance`` is non-additive by ``report_date``. When a query requests ``total_balance`` grouped by ``customer_id`` (without ``report_date``), the extension selects the latest snapshot row per customer before summing.
+This declares that ``total_balance`` is non-additive by ``report_date``. When a query requests ``total_balance`` grouped by ``customer_id`` (without ``report_date``), the extension selects the latest snapshot row per customer before summing. The default direction (ascending) selects the **latest** snapshot, matching Snowflake -- no ``DESC`` is needed.
 
 
 .. _howto-semi-additive-sort:
@@ -68,20 +68,28 @@ This declares that ``total_balance`` is non-additive by ``report_date``. When a 
 Sort Order and NULLS Placement
 ==============================
 
-Each dimension in ``NON ADDITIVE BY`` accepts an optional sort order and NULLS placement:
+Each dimension in ``NON ADDITIVE BY`` accepts an optional sort order and NULLS placement. The rows are sorted by the non-additive dimensions and the **last** row of that sort is aggregated, so:
 
-- ``ASC`` (default) -- selects the earliest snapshot row
-- ``DESC`` -- selects the latest snapshot row
-- ``NULLS FIRST`` -- NULL dimension values are treated as highest priority
-- ``NULLS LAST`` (default) -- NULL dimension values are treated as lowest priority
+- ``ASC`` (default) -- selects the **latest** snapshot row (matches Snowflake)
+- ``DESC`` -- selects the **earliest** snapshot row
+- ``NULLS FIRST`` -- a NULL dimension value wins (outranks every real snapshot)
+- ``NULLS LAST`` (default) -- a NULL dimension value never wins; the latest (or earliest) real snapshot is chosen
 
 .. code-block:: sql
 
-   -- Latest balance (most recent report_date wins)
-   a.total_balance AS SUM(a.balance) NON ADDITIVE BY (report_date DESC NULLS FIRST)
+   -- Latest balance (most recent report_date wins) -- the default
+   a.total_balance AS SUM(a.balance) NON ADDITIVE BY (report_date)
 
    -- Earliest balance (oldest report_date wins)
-   a.opening_balance AS SUM(a.balance) NON ADDITIVE BY (report_date ASC NULLS LAST)
+   a.opening_balance AS SUM(a.balance) NON ADDITIVE BY (report_date DESC)
+
+.. versionchanged:: 0.10.5
+
+   The polarity of ``NON ADDITIVE BY`` was corrected to match Snowflake: the
+   default (ascending) direction now selects the **latest** snapshot and
+   ``DESC`` selects the **earliest**. Before this change the mapping was
+   inverted. Views that previously wrote ``DESC`` to get the latest snapshot
+   should drop the ``DESC`` (or the whole modifier).
 
 
 .. _howto-semi-additive-multiple:
@@ -94,7 +102,7 @@ A metric can be non-additive by more than one dimension. Each gets its own sort 
 .. code-block:: sql
 
    a.snapshot_balance AS SUM(a.balance)
-       NON ADDITIVE BY (report_date DESC NULLS FIRST, fiscal_period DESC NULLS FIRST)
+       NON ADDITIVE BY (report_date, fiscal_period)
 
 
 .. _howto-semi-additive-behavior:
@@ -156,7 +164,7 @@ The ``sql`` column shows the generated query:
            "accounts"."balance",
            RANK() OVER (
                PARTITION BY "accounts"."customer_id"
-               ORDER BY "accounts"."report_date" DESC NULLS FIRST
+               ORDER BY "accounts"."report_date" DESC NULLS LAST
            ) AS __sv_rn
        FROM "accounts"
    )
@@ -166,7 +174,7 @@ The ``sql`` column shows the generated query:
    FROM __sv_snapshot
    GROUP BY "customer_id"
 
-The CTE assigns a rank per ``customer_id`` ordered by ``report_date DESC``, so rank 1 is the latest snapshot -- including every row tied at that latest value. The outer query then aggregates only those latest rows via ``CASE WHEN __sv_rn = 1``.
+The CTE assigns a rank per ``customer_id``. Because ``RANK() = 1`` is the *first* row of the window's ``ORDER BY``, the extension emits the **reverse** of the declared direction: the declared default (ascending) becomes ``ORDER BY report_date DESC`` here, so rank 1 is the latest snapshot -- including every row tied at that latest value. The outer query then aggregates only those latest rows via ``CASE WHEN __sv_rn = 1``.
 
 
 .. _howto-semi-additive-restrictions:

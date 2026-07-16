@@ -338,10 +338,13 @@ Both systems support semi-additive metrics (``NON ADDITIVE BY``) and window func
        o.avg_qty AS AVG(total_qty) OVER (PARTITION BY EXCLUDING region ORDER BY month)
    )
 
+Like Snowflake, the default (ascending) direction selects the **latest** snapshot and ``DESC`` selects the earliest (see :ref:`howto-semi-additive`).
+
 The behavioral differences are:
 
 - ``NON ADDITIVE BY`` dimensions must be declared in the view's ``DIMENSIONS`` clause. Snowflake validates against its own catalog.
 - Window metrics and ``NON ADDITIVE BY`` cannot be combined on the same metric (mutually exclusive).
+- NULL keys in a non-additive dimension: under the default ``NULLS LAST`` a NULL key never wins, so the latest (or earliest) *real* snapshot is selected; declare ``NULLS FIRST`` to let a NULL key win.
 - Window metrics cannot be mixed with aggregate metrics in the same query.
 
 

@@ -19,7 +19,10 @@
 //! - Single CTE (`__sv_snapshot`) containing all raw columns needed
 //! - `RANK() OVER (PARTITION BY non-NA-dims ORDER BY NA-dims) AS __sv_rn`
 //!   (the `__sv_rn` column name predates the RANK switch and is pinned by
-//!   sqllogictests -- keep it)
+//!   sqllogictests -- keep it). The window's ORDER BY reverses each NA dim's
+//!   declared direction so `RANK() = 1` lands on the LAST row of the declared
+//!   sort — the default (ASC) therefore selects the latest snapshot and DESC
+//!   the earliest, matching Snowflake (F-1, code-review 2026-07-16).
 //! - Outer SELECT: regular/effectively-regular metrics use plain aggregation,
 //!   active semi-additive metrics use `SUM(CASE WHEN __sv_rn = 1 THEN raw_val END)`
 //!
@@ -229,9 +232,21 @@ pub(super) fn expand_semi_additive(
                         },
                         |idx| dim_cte_exprs[idx].clone(),
                     );
+                // Snowflake semi-additive semantics (F-1, code-review
+                // 2026-07-16): the rows are sorted by the NA dims and the values
+                // from the LAST row of that sort are aggregated — so the default
+                // (ASC) selects the LATEST snapshot and DESC selects the
+                // earliest. We pick the snapshot with `RANK() = 1`, which is the
+                // FIRST row of this window's ORDER BY, so we emit the REVERSE of
+                // the declared direction: the first row of the reversed sort is
+                // the last row of the declared sort. NULLS ordering is kept as
+                // declared (not reversed) so that under the default (NULLS LAST)
+                // a NULL key never outranks a real snapshot — matching the
+                // "latest non-NULL wins" intent; declare NULLS FIRST to let a
+                // NULL key win.
                 let dir = match nd.order {
-                    SortOrder::Asc => "ASC",
-                    SortOrder::Desc => "DESC",
+                    SortOrder::Asc => "DESC",
+                    SortOrder::Desc => "ASC",
                 };
                 let nulls = match nd.nulls {
                     NullsOrder::First => "NULLS FIRST",
@@ -573,9 +588,11 @@ mod tests {
             sql.contains("PARTITION BY customer_id"),
             "Should partition by queried dim expression: {sql}"
         );
+        // F-1: the RANK ORDER BY reverses the declared direction (keeps NULLS),
+        // so a `DESC NULLS FIRST` declaration emits `ASC NULLS FIRST`.
         assert!(
-            sql.contains("DESC NULLS FIRST"),
-            "Should have DESC NULLS FIRST: {sql}"
+            sql.contains("ASC NULLS FIRST"),
+            "Declared DESC must emit reversed ASC in the RANK ORDER BY: {sql}"
         );
         assert!(
             sql.contains("CASE WHEN \"__sv_rn\" = 1"),
@@ -654,8 +671,11 @@ mod tests {
         };
 
         let sql = expand("test_view", &def, &req).unwrap();
+        // F-1: `region ASC NULLS LAST` declared → `DESC NULLS LAST` emitted
+        // (direction reversed, NULLS kept); the point of this test is that the
+        // EXPRESSION (not the CTE alias) is what gets ordered.
         assert!(
-            sql.contains("upper(region) ASC NULLS LAST"),
+            sql.contains("upper(region) DESC NULLS LAST"),
             "queried NA dim must order by its expression, not its alias: {sql}"
         );
         assert!(
@@ -730,10 +750,12 @@ mod tests {
             sql.contains("PARTITION BY customer_id"),
             "Should partition by queried dim expression (E-1): {sql}"
         );
-        // report_date is the NA dim, should appear in ORDER BY with its expression
+        // report_date is the NA dim, should appear in ORDER BY with its
+        // expression. F-1: declared `DESC NULLS FIRST` emits reversed
+        // `ASC NULLS FIRST`.
         assert!(
-            sql.contains("ORDER BY report_date DESC NULLS FIRST"),
-            "Should order by NA dim expression: {sql}"
+            sql.contains("ORDER BY report_date ASC NULLS FIRST"),
+            "Should order by NA dim expression (direction reversed per F-1): {sql}"
         );
     }
 
@@ -1161,8 +1183,9 @@ mod tests {
             sql.contains("LEFT JOIN \"dates\" AS \"d\" ON \"a\".\"date_id\" = \"d\".\"id\""),
             "Snapshot CTE must join the NA dim's source table: {sql}"
         );
+        // F-1: declared `DESC NULLS FIRST` emits reversed `ASC NULLS FIRST`.
         assert!(
-            sql.contains("ORDER BY d.report_date DESC NULLS FIRST"),
+            sql.contains("ORDER BY d.report_date ASC NULLS FIRST"),
             "Snapshot ORDER BY must reference the joined alias: {sql}"
         );
     }
@@ -1281,9 +1304,11 @@ mod tests {
         );
     }
 
-    /// DESC NULLS FIRST in non_additive_by -> ORDER BY has "DESC NULLS FIRST".
+    /// F-1: a declared `DESC NULLS FIRST` NA dim emits the reversed
+    /// `ASC NULLS FIRST` in the RANK ORDER BY (so `RANK() = 1` lands on the last
+    /// row of the declared DESC sort = the earliest snapshot).
     #[test]
-    fn test_desc_nulls_first_order() {
+    fn test_desc_nulls_first_emits_reversed_asc() {
         let def = minimal_def(
             "accounts",
             "customer_id",
@@ -1305,14 +1330,20 @@ mod tests {
 
         let sql = expand("test_view", &def, &req).unwrap();
         assert!(
-            sql.contains("DESC NULLS FIRST"),
-            "Should have DESC NULLS FIRST in ORDER BY: {sql}"
+            sql.contains("ASC NULLS FIRST"),
+            "Declared DESC must emit reversed ASC in the RANK ORDER BY: {sql}"
+        );
+        assert!(
+            !sql.contains("DESC NULLS FIRST"),
+            "Declared direction must not leak un-reversed into the RANK ORDER BY: {sql}"
         );
     }
 
-    /// ASC NULLS LAST in non_additive_by -> ORDER BY has "ASC NULLS LAST".
+    /// F-1: a declared `ASC NULLS LAST` NA dim (the default direction) emits the
+    /// reversed `DESC NULLS LAST` in the RANK ORDER BY (so `RANK() = 1` lands on
+    /// the last row of the declared ASC sort = the latest snapshot).
     #[test]
-    fn test_asc_nulls_last_order() {
+    fn test_asc_nulls_last_emits_reversed_desc() {
         let def = minimal_def(
             "accounts",
             "customer_id",
@@ -1334,8 +1365,8 @@ mod tests {
 
         let sql = expand("test_view", &def, &req).unwrap();
         assert!(
-            sql.contains("ASC NULLS LAST"),
-            "Should have ASC NULLS LAST in ORDER BY: {sql}"
+            sql.contains("DESC NULLS LAST"),
+            "Declared ASC must emit reversed DESC in the RANK ORDER BY: {sql}"
         );
     }
 
@@ -1368,6 +1399,8 @@ mod tests {
             rows.collect::<Result<Vec<_>, _>>().expect("rows")
         }
 
+        // Default direction (ASC) selects the LATEST snapshot per F-1 (Snowflake
+        // semantics), so these "latest wins" data tests declare ASC.
         fn snapshot_def(nulls: NullsOrder) -> crate::model::SemanticViewDefinition {
             minimal_def(
                 "accounts",
@@ -1377,7 +1410,7 @@ mod tests {
                 "SUM(balance)",
             )
             .with_dimension("report_date", "report_date", None)
-            .with_non_additive_by("balance", &[("report_date", SortOrder::Desc, nulls)])
+            .with_non_additive_by("balance", &[("report_date", SortOrder::Asc, nulls)])
         }
 
         fn snapshot_req() -> QueryRequest {
@@ -1416,8 +1449,10 @@ mod tests {
             );
         }
 
-        /// TC-7 data-level: with DESC NULLS FIRST (the parser default for
-        /// DESC), bob's NULL-dated row outranks the dated row -> 40.0.
+        /// TC-7 data-level: with NULLS FIRST, bob's NULL-dated row outranks the
+        /// dated row -> 40.0 (F-1: the RANK ORDER BY keeps the declared NULLS
+        /// ordering, so NULLS FIRST lets the NULL key win regardless of the
+        /// direction reversal).
         #[test]
         fn test_nulls_first_null_row_wins() {
             let sql = expand(
@@ -1431,6 +1466,41 @@ mod tests {
             assert!(
                 (rows[1].1 - 40.0).abs() < 1e-9,
                 "NULLS FIRST: the NULL-dated row must win for bob, got: {rows:?}"
+            );
+        }
+
+        /// F-1 data-level: the polarity is inverted from the default. Declaring
+        /// `DESC` selects the EARLIEST snapshot (mirror of the ASC/latest
+        /// default), verified end-to-end on the same fixture as the latest-wins
+        /// test above. alice earliest = 2024-01-01 (999.0); bob earliest
+        /// non-NULL (NULLS LAST) = 2024-01-01 (300.0).
+        #[test]
+        fn test_desc_selects_earliest_snapshot() {
+            let def = minimal_def(
+                "accounts",
+                "customer_id",
+                "customer_id",
+                "balance",
+                "SUM(balance)",
+            )
+            .with_dimension("report_date", "report_date", None)
+            .with_non_additive_by(
+                "balance",
+                &[("report_date", SortOrder::Desc, NullsOrder::Last)],
+            );
+
+            let sql = expand("test_view", &def, &snapshot_req()).expect("expand");
+            let rows = run_by_first_col(&sql);
+            assert_eq!(rows.len(), 2, "two customers: {rows:?}");
+            assert_eq!(rows[0].0, "alice");
+            assert!(
+                (rows[0].1 - 999.0).abs() < 1e-9,
+                "DESC selects the earliest snapshot for alice (2024-01-01=999), got: {rows:?}"
+            );
+            assert_eq!(rows[1].0, "bob");
+            assert!(
+                (rows[1].1 - 300.0).abs() < 1e-9,
+                "DESC + NULLS LAST: earliest non-NULL date wins for bob (300), got: {rows:?}"
             );
         }
 
@@ -1456,7 +1526,7 @@ mod tests {
                 .with_dimension("report_date", "d.report_date", Some("d"))
                 .with_non_additive_by(
                     "balance",
-                    &[("report_date", SortOrder::Desc, NullsOrder::First)],
+                    &[("report_date", SortOrder::Asc, NullsOrder::First)],
                 )
                 .with_pkfk_join("acct_date", "a", "d", &["date_id"], &["id"]);
 

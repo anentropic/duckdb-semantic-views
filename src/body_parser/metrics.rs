@@ -206,6 +206,19 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
             };
             non_additive_by =
                 parse_non_additive_dims(inner, entry_offset + byte_offset_within(entry, inner))?;
+            // F-3 (code-review 2026-07-16): NON ADDITIVE BY is the final clause
+            // before AS, so nothing may follow its `(...)`. Previously the
+            // cursor stopped at the closing paren and any trailing text
+            // (`... NON ADDITIVE BY (d) junk AS ...`) was silently discarded.
+            if let Some(tok) = nab_cur.peek() {
+                let residue = before_as[tok.start..].trim();
+                return Err(ParseError {
+                    message: format!(
+                        "Unexpected text '{residue}' after NON ADDITIVE BY (...) in metric entry '{entry}'."
+                    ),
+                    position: Some(nab_cur.abs(tok.start)),
+                });
+            }
             before_as[..na_first.start].trim()
         } else {
             before_as
@@ -249,6 +262,19 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
                 .into_iter()
                 .map(|(_, rel)| rel.to_string())
                 .collect();
+            // F-3 (code-review 2026-07-16): the only clause that may follow
+            // USING (...) is NON ADDITIVE BY, which was already peeled off into
+            // `before_na` above — so nothing may remain here. Previously
+            // `... USING (r) junk AS ...` silently discarded the junk.
+            if let Some(tok) = using_cur.peek() {
+                let residue = before_na[tok.start..].trim();
+                return Err(ParseError {
+                    message: format!(
+                        "Unexpected text '{residue}' after USING (...) in metric entry '{entry}'."
+                    ),
+                    position: Some(using_cur.abs(tok.start)),
+                });
+            }
             before_na[..using_tok.start].trim()
         } else {
             before_na

@@ -215,7 +215,7 @@ DIMENSIONS (
     a.report_date AS a.report_date
 )
 METRICS (
-    a.latest_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+    a.latest_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
 );
 
 statement ok
@@ -264,7 +264,7 @@ DIMENSIONS (
     a.report_date AS a.report_date
 )
 METRICS (
-    a.latest_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+    a.latest_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
 );
 
 query I

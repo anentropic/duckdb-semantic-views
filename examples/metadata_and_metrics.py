@@ -84,7 +84,7 @@ AS
     b.total_deposits AS SUM(b.deposits)
       COMMENT = 'Sum of all deposits',
     b.latest_balance AS SUM(b.balance)
-      NON ADDITIVE BY (b.balance_date DESC NULLS LAST)
+      NON ADDITIVE BY (b.balance_date)
       COMMENT = 'Most recent balance (snapshot metric)',
     b.daily_deposit_share AS SUM(b.deposits)
       OVER (PARTITION BY EXCLUDING (a.region))
@@ -194,7 +194,8 @@ except Exception as e:
 
 print("\n=== Section 7: Semi-additive metrics ===")
 
-# latest_balance is NON ADDITIVE BY (balance_date DESC)
+# latest_balance is NON ADDITIVE BY (balance_date)
+# The default (ascending) direction selects the most recent snapshot (F-1).
 # When grouped by region, it takes the most recent balance per account,
 # then sums across accounts within each region
 print("\nLatest balance by region (snapshot metric):")

@@ -25,8 +25,9 @@ CREATE SEMANTIC VIEW p68_b1_v1 AS
   DIMENSIONS (o."order date" AS o."order date")
   METRICS (o.qty_sum NON ADDITIVE BY ("order date" DESC) AS SUM(o.qty))
 
-# Query returns rows (snapshot per "order date" — but the only-NAB-dim case
-# without grouping returns the latest snapshot row).
+# Query returns rows (snapshot per "order date" — the only-NAB-dim case
+# without grouping returns a single snapshot row; DESC selects the earliest
+# per F-1, but this test only pins that rows come back, not which snapshot).
 query I
 SELECT count(*) > 0 FROM semantic_view('p68_b1_v1', metrics := ['qty_sum']);
 ----

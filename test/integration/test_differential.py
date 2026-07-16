@@ -273,10 +273,11 @@ def seed_snapshots(conn) -> None:
 
 
 def semi_reference_sql(dims: list[str]) -> str:
-    """Independent reference for a NON ADDITIVE BY (snap_date DESC) metric:
-    MAX-date semi-join per group (NOT the engine's RANK formulation, so the
-    two paths share no mechanism). NULL-safe group join via IS NOT DISTINCT
-    FROM (tier contains NULLs)."""
+    """Independent reference for a NON ADDITIVE BY (snap_date) metric: the
+    default direction selects the LATEST snapshot (F-1, Snowflake semantics),
+    so the reference is a MAX-date semi-join per group (NOT the engine's RANK
+    formulation, so the two paths share no mechanism). NULL-safe group join via
+    IS NOT DISTINCT FROM (tier contains NULLs)."""
     sel = ", ".join(f"{SEMI_DIMS[d]} AS g{i}" for i, d in enumerate(dims))
     base = (
         "SELECT " + (sel + ", " if sel else "")
@@ -325,7 +326,7 @@ def run_semi_additive_section(conn) -> tuple[int, int]:
         "RELATIONSHIPS (snap_cust AS s(customer_id) REFERENCES c) "
         "DIMENSIONS (s.region_norm AS upper(s.region), c.tier AS c.tier, "
         "s.snap_date AS s.snap_date) "
-        "METRICS (s.latest_balance NON ADDITIVE BY (snap_date DESC) AS SUM(s.balance), "
+        "METRICS (s.latest_balance NON ADDITIVE BY (snap_date) AS SUM(s.balance), "
         "s.total_balance AS SUM(s.balance))"
     )
     total, failures = 0, 0

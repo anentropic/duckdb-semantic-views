@@ -172,7 +172,7 @@ DIMENSIONS (
     o.order_date AS o.order_date
 )
 METRICS (
-    o.latest_amount NON ADDITIVE BY (order_date DESC) AS SUM(o.amount)
+    o.latest_amount NON ADDITIVE BY (order_date) AS SUM(o.amount)
 )
 MATERIALIZATIONS (
     semi_agg AS (

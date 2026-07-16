@@ -48,12 +48,14 @@ DIMENSIONS (
     a.report_date AS a.report_date
 )
 METRICS (
-    a.total_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+    a.total_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
 )
 
 # ========================================
 # Test 2: Query semi-additive metric (NA dim NOT in query)
-# Latest balance per customer (snapshot at most recent date)
+# Latest balance per customer (snapshot at most recent date).
+# The default direction (ASC) selects the LATEST snapshot, matching Snowflake
+# (F-1): no DESC needed for "latest".
 # Alice: latest is 2024-01-03 -> 200.00
 # Bob: latest is 2024-01-02 -> 250.00
 # ========================================
@@ -140,7 +142,7 @@ DIMENSIONS (
 )
 METRICS (
     a.row_count AS COUNT(*),
-    a.total_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+    a.total_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
 )
 
 statement error
@@ -175,7 +177,7 @@ DIMENSIONS (
 )
 METRICS (
     a.row_count AS COUNT(a.id),
-    a.total_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+    a.total_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
 )
 
 query TIR
@@ -200,14 +202,13 @@ true
 query TTTTT
 SELECT * FROM describe_semantic_view('p47_account_view') WHERE property = 'NON_ADDITIVE_BY';
 ----
-METRIC	total_balance	p47_accounts	NON_ADDITIVE_BY	report_date DESC NULLS FIRST
+METRIC	total_balance	p47_accounts	NON_ADDITIVE_BY	report_date NULLS LAST
 
 # ========================================
 # Test 8: Global aggregate (no dims)
 # Uses single-entity data to ensure deterministic result.
-# With no partition and ORDER BY report_date DESC,
-# rn=1 is the row with 2024-01-03 (balance=200.00).
-# SUM of that single snapshot row = 200.00.
+# Default (ASC) selects the latest snapshot (F-1): rn=1 is the row with
+# 2024-01-03 (balance=200.00). SUM of that single snapshot row = 200.00.
 # ========================================
 
 statement ok
@@ -228,7 +229,7 @@ CREATE SEMANTIC VIEW p47_global_view AS
 TABLES (a AS p47_single_acct PRIMARY KEY (id))
 DIMENSIONS (a.report_date AS a.report_date)
 METRICS (
-    a.latest_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+    a.latest_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
 )
 
 query R
@@ -270,7 +271,7 @@ DIMENSIONS (
     a.report_date AS a.report_date
 )
 METRICS (
-    a.total_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+    a.total_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
 )
 
 query TR
@@ -288,12 +289,13 @@ SELECT * FROM semantic_view('p47_tie_view', metrics := ['total_balance']);
 
 # ========================================
 # Test 10 (TC-7b): NULLs in the NA ordering column
-# `report_date DESC` defaults to NULLS FIRST (matches DuckDB/Snowflake DESC
-# defaults), so a NULL-dated row outranks every dated row. An explicit
-# NULLS LAST makes the latest non-NULL date win instead.
+# The RANK ORDER BY keeps the declared NULLS ordering (only the direction is
+# reversed for the latest/earliest selection, F-1), so NULLS FIRST lets a
+# NULL-dated row outrank every dated row, while NULLS LAST makes the latest
+# non-NULL date win instead.
 # Alice rows: (NULL, 40.00), (2024-01-02, 150.00), (2024-01-01, 100.00)
-#   DESC [NULLS FIRST]: rank 1 = the NULL row       -> 40.00
-#   DESC NULLS LAST:    rank 1 = 2024-01-02          -> 150.00
+#   NULLS FIRST: rank 1 = the NULL row       -> 40.00
+#   NULLS LAST:  rank 1 = latest 2024-01-02  -> 150.00
 # Bob rows: (2024-01-01, 300.00) only -> 300.00 under both orderings
 # ========================================
 
@@ -320,7 +322,7 @@ DIMENSIONS (
     a.report_date AS a.report_date
 )
 METRICS (
-    a.latest_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+    a.latest_balance NON ADDITIVE BY (report_date NULLS FIRST) AS SUM(a.balance)
 )
 
 query TR
@@ -337,7 +339,7 @@ DIMENSIONS (
     a.report_date AS a.report_date
 )
 METRICS (
-    a.latest_balance NON ADDITIVE BY (report_date DESC NULLS LAST) AS SUM(a.balance)
+    a.latest_balance NON ADDITIVE BY (report_date NULLS LAST) AS SUM(a.balance)
 )
 
 query TR
@@ -345,6 +347,29 @@ SELECT * FROM semantic_view('p47_nulls_last_view', dimensions := ['customer_name
 ----
 Alice	150.00
 Bob	300.00
+
+# ========================================
+# Test 11 (F-1): explicit DESC now selects the EARLIEST snapshot — the mirror
+# of the ASC/latest default. This is the behavioural change: before F-1, DESC
+# meant "latest". Global aggregate (no dims): the earliest date overall is
+# 2024-01-01, held by Alice (100.00) and Bob (300.00) -> 400.00.
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW p47_earliest_view AS
+TABLES (a AS p47_accounts PRIMARY KEY (id))
+DIMENSIONS (a.report_date AS a.report_date)
+METRICS (
+    a.earliest_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+)
+
+query R
+SELECT * FROM semantic_view('p47_earliest_view', metrics := ['earliest_balance']);
+----
+400.00
+
+statement ok
+DROP SEMANTIC VIEW IF EXISTS p47_earliest_view;
 
 # ========================================
 # Cleanup

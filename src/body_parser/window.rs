@@ -183,7 +183,21 @@ fn parse_over_content(content: &str, base_offset: usize) -> Result<OverContent, 
     // (0 when there is no PARTITION BY).
     let mut tail_start = 0usize;
 
-    if let Some((_partition, by_tok)) = cur.find_kw_seq(&["PARTITION", "BY"]) {
+    if let Some((partition_tok, by_tok)) = cur.find_kw_seq(&["PARTITION", "BY"]) {
+        // F-2 (code-review 2026-07-16): `find_kw_seq` matches PARTITION BY
+        // anywhere in the OVER body, so any tokens before it — including a
+        // misplaced `ORDER BY` — were silently discarded (the window metric
+        // then computed an unordered aggregate). PARTITION BY is the first
+        // clause of a window spec, so nothing may precede it.
+        let before_partition = content[..partition_tok.start].trim();
+        if !before_partition.is_empty() {
+            return Err(ParseError {
+                message: format!(
+                    "Unexpected text '{before_partition}' before PARTITION BY in OVER clause."
+                ),
+                position: Some(base_offset),
+            });
+        }
         cur.advance_past_byte(by_tok.end);
         // Optional EXCLUDING.
         let excluding = cur.peek().is_some_and(|t| cur.is_kw(t, "EXCLUDING"));
