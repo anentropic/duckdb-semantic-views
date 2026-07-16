@@ -1,4 +1,5 @@
-//! Shared string utilities for fuzzy matching and word-boundary replacement.
+//! Shared string utilities for fuzzy matching and identifier-boundary
+//! classification.
 //!
 //! Extracted from `expand.rs` to break the expand <-> graph circular dependency.
 //! Both `expand` and `graph` modules import from here.
@@ -27,63 +28,14 @@ pub fn suggest_closest(name: &str, available: &[String]) -> Option<String> {
     best.map(|(_, s)| s.to_string())
 }
 
-/// Replace all word-boundary occurrences of `needle` in `haystack` with `replacement`.
-///
-/// A word boundary is defined as: the character before the match (if any) is NOT
-/// alphanumeric or underscore, AND the character after the match (if any) is NOT
-/// alphanumeric or underscore. This prevents `net_price` from matching inside
-/// `net_price_total` or `my_net_price`.
-///
-/// Matching is ASCII-case-insensitive: unquoted SQL identifiers resolve
-/// case-insensitively, and the CREATE-time validators (`graph/facts.rs`,
-/// `graph/derived_metrics.rs`) already lowercase both sides — a
-/// case-sensitive substitution here let `profit AS REVENUE - Cost` pass
-/// validation but skip inlining (E-2, code-review 2026-07-11).
-#[must_use]
-pub fn replace_word_boundary(haystack: &str, needle: &str, replacement: &str) -> String {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return haystack.to_string();
-    }
-
-    let h_bytes = haystack.as_bytes();
-    let n_bytes = needle.as_bytes();
-    let n_len = n_bytes.len();
-
-    let mut result = String::with_capacity(haystack.len());
-    let mut i = 0;
-
-    while i + n_len <= h_bytes.len() {
-        if h_bytes[i..i + n_len].eq_ignore_ascii_case(n_bytes) {
-            let before_ok = i == 0 || is_word_boundary_char(h_bytes[i - 1]);
-            let after_ok = i + n_len == h_bytes.len() || is_word_boundary_char(h_bytes[i + n_len]);
-            if before_ok && after_ok {
-                result.push_str(replacement);
-                i += n_len;
-                continue;
-            }
-        }
-        // Advance by a full UTF-8 char so `i` stays on a char boundary
-        // (byte-wise advance both duplicated multi-byte chars in the output
-        // and panicked slicing `haystack[i..]` mid-codepoint — MS-3,
-        // code-review 2026-07-02).
-        let ch = haystack[i..].chars().next().unwrap();
-        result.push(ch);
-        i += ch.len_utf8();
-    }
-    // Append remaining bytes that are shorter than needle
-    if i < haystack.len() {
-        result.push_str(&haystack[i..]);
-    }
-    result
-}
-
 /// Is `b` an identifier-continuation byte?
 ///
 /// **This is the single source of truth for "what byte continues a SQL
 /// identifier"** across the whole crate — the DDL keyword scanners
 /// (`body_parser::scan::is_ident_continuation` delegates here), the
-/// prefix matcher (`parse::match_keyword_prefix`), and fact/derived-metric
-/// inlining ([`is_word_boundary_char`], its inverse) all resolve through it.
+/// prefix matcher (`parse::match_keyword_prefix`), and the reference
+/// tokenizer that drives fact/derived-metric inlining (`expr_tokens`) all
+/// resolve through it.
 /// Keeping one definition is what prevents the recurring boundary-drift
 /// bug class (PR #50 review): a keyword must not match immediately before
 /// an identifier byte, or `AS`/`BY`/`id` matches inside `ASx`/`BYé`/`idΩ`.
@@ -117,8 +69,8 @@ pub fn byte_offset_within(outer: &str, inner: &str) -> usize {
 }
 
 /// Is `b` a word-boundary byte — i.e. NOT an [`is_ident_byte`]? The
-/// primitive used by [`replace_word_boundary`] and the `facts.rs` name /
-/// COUNT matchers so inlining shares the parser's notion of an identifier.
+/// primitive used by the `expand::facts` COUNT / name matchers so they share
+/// the parser's notion of an identifier boundary.
 #[must_use]
 pub fn is_word_boundary_char(b: u8) -> bool {
     !is_ident_byte(b)
@@ -394,145 +346,6 @@ mod tests {
         let outer = "SHOW SEMANTIC VIEWS Ωx";
         let inner = &outer[20..]; // "Ωx"
         assert_eq!(byte_offset_within(outer, inner), 20);
-    }
-
-    // -------------------------------------------------------------------
-    // replace_word_boundary tests
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn replace_word_boundary_no_match() {
-        let result = replace_word_boundary("SUM(total)", "net_price", "(x)");
-        assert_eq!(result, "SUM(total)");
-    }
-
-    #[test]
-    fn replace_word_boundary_exact_match_in_function() {
-        let result =
-            replace_word_boundary("SUM(net_price)", "net_price", "(price * (1 - discount))");
-        assert_eq!(result, "SUM((price * (1 - discount)))");
-    }
-
-    #[test]
-    fn replace_word_boundary_no_substring_match_suffix() {
-        // "net_price" should NOT match in "net_price_total"
-        let result = replace_word_boundary("SUM(net_price_total)", "net_price", "(x)");
-        assert_eq!(result, "SUM(net_price_total)");
-    }
-
-    #[test]
-    fn replace_word_boundary_no_substring_match_prefix() {
-        // "net_price" should NOT match in "total_net_price_x"
-        let result = replace_word_boundary("total_net_price_x + 1", "net_price", "(x)");
-        assert_eq!(result, "total_net_price_x + 1");
-    }
-
-    #[test]
-    fn replace_word_boundary_match_with_addition() {
-        let result = replace_word_boundary("net_price + tax", "net_price", "(a + b)");
-        assert_eq!(result, "(a + b) + tax");
-    }
-
-    #[test]
-    fn replace_word_boundary_non_ascii_haystack_no_panic_no_duplication() {
-        // MS-3 regression: byte-wise advance through a multi-byte char
-        // panicked on the next `haystack[i..]` slice ("byte index N is not
-        // a char boundary") and duplicated the char where it didn't panic.
-        // Reachable at query time via fact/derived-metric inlining over any
-        // expression containing non-ASCII (string literals, identifiers).
-        let result = replace_word_boundary("héllo + net_price", "net_price", "(x)");
-        assert_eq!(result, "héllo + (x)");
-
-        let result = replace_word_boundary("concat(city, ' – ') || net_price", "net_price", "(x)");
-        assert_eq!(result, "concat(city, ' – ') || (x)");
-
-        // Non-ASCII with no match at all must round-trip unchanged.
-        let result = replace_word_boundary("'São Paulo' || 'café'", "net_price", "(x)");
-        assert_eq!(result, "'São Paulo' || 'café'");
-    }
-
-    #[test]
-    fn replace_word_boundary_does_not_match_inside_unicode_identifier() {
-        // PR #50 review: non-ASCII bytes are identifier continuation, so the
-        // ASCII needle must NOT match where a unicode char abuts it
-        // (`id` inside `idΩ` / `Ωid`) — these are single identifiers.
-        assert_eq!(replace_word_boundary("idΩ", "id", "(x)"), "idΩ");
-        assert_eq!(replace_word_boundary("Ωid", "id", "(x)"), "Ωid");
-        assert_eq!(
-            replace_word_boundary("caféid + 1", "id", "(x)"),
-            "caféid + 1"
-        );
-        // A genuine boundary (ASCII punctuation / whitespace) still matches.
-        assert_eq!(replace_word_boundary("café.id", "id", "(x)"), "café.(x)");
-        assert_eq!(replace_word_boundary("Ω id", "id", "(x)"), "Ω (x)");
-    }
-
-    #[test]
-    fn replace_word_boundary_case_insensitive_match() {
-        // E-2 (code-review 2026-07-11): validators are case-insensitive, so
-        // substitution must be too — `REVENUE` must match needle `revenue`.
-        let result = replace_word_boundary("REVENUE + tax", "revenue", "(SUM(o.amount))");
-        assert_eq!(result, "(SUM(o.amount)) + tax");
-        // Mixed case, and the boundary rules still hold.
-        assert_eq!(
-            replace_word_boundary("Net_Price_total", "net_price", "(x)"),
-            "Net_Price_total"
-        );
-    }
-
-    proptest! {
-        // Any (haystack, needle, replacement) triple must not panic, and a
-        // haystack containing no ASCII needle occurrence must round-trip
-        // byte-identical (guards the char-boundary advance).
-        #[test]
-        fn replace_word_boundary_never_panics_on_unicode(
-            haystack in "\\PC{0,40}",
-            needle in "[a-z_]{1,8}",
-            replacement in "\\PC{0,12}",
-        ) {
-            let out = replace_word_boundary(&haystack, &needle, &replacement);
-            // Matching is ASCII-case-insensitive (E-2), so the no-match
-            // invariant must fold case the same way.
-            if !haystack.to_ascii_lowercase().contains(&needle) {
-                prop_assert_eq!(out, haystack);
-            }
-        }
-    }
-
-    #[test]
-    fn replace_word_boundary_match_in_parens() {
-        let result = replace_word_boundary("(net_price)", "net_price", "(a)");
-        assert_eq!(result, "((a))");
-    }
-
-    #[test]
-    fn replace_word_boundary_entire_string() {
-        let result = replace_word_boundary("net_price", "net_price", "(a + b)");
-        assert_eq!(result, "(a + b)");
-    }
-
-    #[test]
-    fn replace_word_boundary_at_start() {
-        let result = replace_word_boundary("net_price * 2", "net_price", "(x)");
-        assert_eq!(result, "(x) * 2");
-    }
-
-    #[test]
-    fn replace_word_boundary_at_end() {
-        let result = replace_word_boundary("2 * net_price", "net_price", "(x)");
-        assert_eq!(result, "2 * (x)");
-    }
-
-    #[test]
-    fn replace_word_boundary_multiple_occurrences() {
-        let result = replace_word_boundary("net_price + net_price", "net_price", "(x)");
-        assert_eq!(result, "(x) + (x)");
-    }
-
-    #[test]
-    fn replace_word_boundary_empty_needle() {
-        let result = replace_word_boundary("abc", "", "x");
-        assert_eq!(result, "abc");
     }
 
     // -------------------------------------------------------------------

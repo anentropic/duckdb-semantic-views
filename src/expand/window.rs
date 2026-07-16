@@ -11,7 +11,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::model::{Metric, NullsOrder, SemanticViewDefinition, SortOrder};
-use crate::util::replace_word_boundary;
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::quote_ident;
@@ -125,7 +124,7 @@ pub(super) fn expand_window_metrics(
         let mut base_expr = dim.expr.clone();
         if let Some(ref scoped) = rd.scoped_alias {
             if let Some(ref st) = dim.source_table {
-                base_expr = replace_word_boundary(&base_expr, st, scoped);
+                base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);
             }
         }
         let item = SelectItem::new(base_expr, dim.output_type.clone(), quote_ident(&dim.name));

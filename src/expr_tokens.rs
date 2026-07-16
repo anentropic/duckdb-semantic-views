@@ -47,8 +47,11 @@
 //!
 //! The **alias-qualifier** rewriters (`expand::window` / `expand::sql_gen` /
 //! `expand::semi_additive`, which rewrite the `a` in `a.city` to a scoped
-//! alias `a__dep`) are a *different* operation — they intentionally match the
-//! part *before* a dot — and stay on [`crate::util::replace_word_boundary`].
+//! alias `a__dep`) are a *different* operation — they rewrite the *head* part
+//! of a chain rather than replacing the whole reference — but they go through
+//! this same engine via [`rewrite_qualifier`], so they inherit its
+//! literal-/function-/foreign-tail safety instead of the old quote-blind
+//! `util::replace_word_boundary` (now retired).
 
 use std::collections::HashMap;
 
@@ -73,6 +76,15 @@ impl IdentRef<'_> {
     pub(crate) fn key(&self) -> String {
         crate::ident::normalize_ident_part(self.raw)
     }
+
+    /// True when this chain is a single, *unqualified* part (`revenue`,
+    /// `"Rev"`), false for a dotted chain (`a.b`, `o.amount`). Used by the
+    /// derived-metric validator, which treats only bare identifiers as metric
+    /// references — a qualified chain in a derived expression is a raw column,
+    /// not a metric name.
+    pub(crate) fn is_bare(&self) -> bool {
+        first_part_len(self.raw) == self.raw.len()
+    }
 }
 
 /// Scan `expr` and return every identifier reference chain in it, in source
@@ -89,12 +101,31 @@ impl IdentRef<'_> {
 /// A chain immediately followed by `(` (skipping whitespace) is a **function
 /// call**, not a name reference (`SUM(x)`, `date_trunc (...)`), and is not
 /// emitted — so a fact/metric named like a function (`sum`) is never confused
-/// with the call, in either FIND or INLINE. This mirrors the derived-metric
-/// validator's `extract_identifiers`.
+/// with the call, in either FIND or INLINE. The complementary chains (the call
+/// heads themselves) are available via [`scan_function_heads`].
 pub(crate) fn scan_references(expr: &str) -> Vec<IdentRef<'_>> {
+    scan_chains(expr, ChainKind::Reference)
+}
+
+/// Which class of identifier chain a scan collects: [`scan_references`] keeps
+/// the chains that are *not* function-call heads; [`scan_function_heads`] keeps
+/// the ones that *are*. Every chain is exactly one of the two.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChainKind {
+    /// A name reference — a chain not immediately followed by `(`.
+    Reference,
+    /// A function-call head — a chain immediately followed by `(`.
+    FunctionHead,
+}
+
+/// Walk `expr` and collect the identifier chains of the requested [`ChainKind`],
+/// in source order, skipping single-quoted (`''`-escaped) and `$tag$…$tag$`
+/// literal content. The one place that knows the tokenizer's lexical structure;
+/// both public scanners are thin polarity choices over it.
+fn scan_chains(expr: &str, kind: ChainKind) -> Vec<IdentRef<'_>> {
     let bytes = expr.as_bytes();
     let len = bytes.len();
-    let mut refs = Vec::new();
+    let mut out = Vec::new();
     let mut i = 0;
     while i < len {
         let b = bytes[i];
@@ -109,8 +140,14 @@ pub(crate) fn scan_references(expr: &str) -> Vec<IdentRef<'_>> {
             }
             _ if b == b'"' || crate::util::is_ident_byte(b) => {
                 let end = scan_chain(bytes, i);
-                if !followed_by_open_paren(bytes, end) {
-                    refs.push(IdentRef {
+                let is_head = followed_by_open_paren(bytes, end);
+                let want = if is_head {
+                    ChainKind::FunctionHead
+                } else {
+                    ChainKind::Reference
+                };
+                if want == kind {
+                    out.push(IdentRef {
                         start: i,
                         end,
                         raw: &expr[i..end],
@@ -121,7 +158,24 @@ pub(crate) fn scan_references(expr: &str) -> Vec<IdentRef<'_>> {
             _ => i += 1,
         }
     }
-    refs
+    out
+}
+
+/// Scan `expr` and return every identifier chain that is a **function-call
+/// head** — a chain immediately followed by `(` (skipping whitespace) — in
+/// source order, skipping single-quoted and `$tag$…$tag$` literal content
+/// exactly as [`scan_references`] does.
+///
+/// This is the exact complement of [`scan_references`]: every identifier chain
+/// in an expression is classified as *either* a name reference (returned there)
+/// *or* a call head (returned here), never both and never neither. It is the
+/// engine primitive behind aggregate-function detection — matching the last
+/// part of each head against a known-aggregate set — so that detection shares
+/// the tokenizer's literal handling (a `sum(` inside `'…'` is not a call) and
+/// its single identifier-byte rule (E-5: `Ωsum(` is one chain `Ωsum`, not the
+/// aggregate `sum`).
+pub(crate) fn scan_function_heads(expr: &str) -> Vec<IdentRef<'_>> {
+    scan_chains(expr, ChainKind::FunctionHead)
 }
 
 /// Is the next non-whitespace byte at or after `pos` an opening `(`? Used to
@@ -222,6 +276,24 @@ fn skip_quoted_part(bytes: &[u8], i: usize) -> usize {
     len
 }
 
+/// Byte length of the **first part** of a reference chain (`a` in `a.city`, the
+/// whole `"C d"` in `"C d".x`, or the entire chain when it is bare). `chain` is
+/// assumed well-formed as produced by [`scan_chain`] — it starts with a `"` or
+/// an identifier byte. Used to isolate the leading qualifier for
+/// [`rewrite_qualifier`] and to decide [`IdentRef::is_bare`].
+fn first_part_len(chain: &str) -> usize {
+    let bytes = chain.as_bytes();
+    if bytes.first() == Some(&b'"') {
+        skip_quoted_part(bytes, 0)
+    } else {
+        let mut i = 0;
+        while i < bytes.len() && crate::util::is_ident_byte(bytes[i]) {
+            i += 1;
+        }
+        i
+    }
+}
+
 /// The set of normalized keys of every reference chain in `expr` (bare and
 /// qualified), skipping string / dollar-quoted literal content. The FIND
 /// building block: a name is referenced iff one of its acceptable keys is in
@@ -291,6 +363,37 @@ pub(crate) fn inline_references(expr: &str, replacements: &HashMap<String, &str>
         if let Some(repl) = replacements.get(&r.key()) {
             out.push_str(&expr[copied..r.start]);
             out.push_str(repl);
+            copied = r.end;
+        }
+    }
+    out.push_str(&expr[copied..]);
+    out
+}
+
+/// Rewrite the leading **qualifier** (first part) of every reference chain in
+/// `expr` whose first part matches `alias`, replacing just that part with
+/// `replacement` and leaving the rest of the chain intact (`a.city` →
+/// `<replacement>.city`; a bare `a` → `<replacement>`).
+///
+/// This is the role-playing alias rewrite (`expand::window` / `sql_gen` /
+/// `semi_additive` rewrite a dimension's `source_table` alias to a scoped
+/// alias). It matches the first part through [`crate::ident::normalize_ident_part`],
+/// so a quoted or mixed-case qualifier (`"A".city`) is rewritten too, and —
+/// unlike the retired quote-blind `util::replace_word_boundary` — it operates
+/// only on genuine reference chains: text inside a `'…'` / `$tag$…$` literal is
+/// never touched, a function-call head (`date(x)` when `alias == "date"`) is
+/// left alone, and a *foreign* qualified tail (`x.a` when `alias == "a"`) does
+/// not match because only the chain's own first part is compared.
+pub(crate) fn rewrite_qualifier(expr: &str, alias: &str, replacement: &str) -> String {
+    let want = crate::ident::normalize_ident_part(alias);
+    let mut out = String::with_capacity(expr.len());
+    let mut copied = 0;
+    for r in scan_references(expr) {
+        let head_len = first_part_len(r.raw);
+        if crate::ident::normalize_ident_part(&r.raw[..head_len]) == want {
+            out.push_str(&expr[copied..r.start]);
+            out.push_str(replacement);
+            out.push_str(&r.raw[head_len..]);
             copied = r.end;
         }
     }
@@ -460,6 +563,90 @@ mod tests {
         );
     }
 
+    // ----- is_bare / scan_function_heads / rewrite_qualifier -----
+
+    #[test]
+    fn is_bare_distinguishes_qualified_chains() {
+        let bare: Vec<bool> = scan_references("revenue + o.amount + \"Rev\" + a.\"C d\"")
+            .iter()
+            .map(IdentRef::is_bare)
+            .collect();
+        // revenue (bare), o.amount (qualified), "Rev" (bare), a."C d" (qualified)
+        assert_eq!(bare, vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn function_heads_are_the_complement_of_references() {
+        let expr = "SUM(o.amount) + main.avg(x) - revenue";
+        let heads: Vec<String> = scan_function_heads(expr)
+            .iter()
+            .map(IdentRef::key)
+            .collect();
+        assert_eq!(heads, vec!["sum", "main.avg"]);
+        // The same chains never appear as references…
+        let refs: Vec<String> = keys(expr);
+        assert_eq!(refs, vec!["o.amount", "x", "revenue"]);
+        // …and reference vs head spans are disjoint.
+        let head_spans: Vec<(usize, usize)> = scan_function_heads(expr)
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+        for r in scan_references(expr) {
+            assert!(!head_spans.contains(&(r.start, r.end)));
+        }
+    }
+
+    #[test]
+    fn function_heads_skip_literal_content() {
+        // A `sum(` inside a string / dollar literal is not a call head.
+        assert!(scan_function_heads("'sum(x)'").is_empty());
+        assert!(scan_function_heads("$$avg(y)$$").is_empty());
+    }
+
+    #[test]
+    fn rewrite_qualifier_rewrites_only_the_head_part() {
+        // Bare-alias qualifier before a dot is rewritten; the column part stays.
+        assert_eq!(rewrite_qualifier("a.city", "a", "a__dep"), "a__dep.city");
+        // Every own-qualified chain in the expr is rewritten.
+        assert_eq!(
+            rewrite_qualifier("a.city || ' from ' || a.country", "a", "a__dep"),
+            "a__dep.city || ' from ' || a__dep.country"
+        );
+        // A bare occurrence of the alias is rewritten wholesale.
+        assert_eq!(rewrite_qualifier("a", "a", "a__dep"), "a__dep");
+    }
+
+    #[test]
+    fn rewrite_qualifier_is_case_and_quote_insensitive() {
+        assert_eq!(rewrite_qualifier("A.city", "a", "a__dep"), "a__dep.city");
+        assert_eq!(
+            rewrite_qualifier("\"A\".city", "a", "a__dep"),
+            "a__dep.city"
+        );
+    }
+
+    #[test]
+    fn rewrite_qualifier_leaves_literals_functions_and_foreign_tails_intact() {
+        // The alias `a` inside a string literal must NOT be rewritten (the E-3
+        // hazard that quote-blind replace_word_boundary had).
+        assert_eq!(
+            rewrite_qualifier("a.city || ' a '", "a", "a__dep"),
+            "a__dep.city || ' a '"
+        );
+        // A function head named like the alias is not a qualifier.
+        assert_eq!(
+            rewrite_qualifier("a(o.x) + a.city", "a", "a__dep"),
+            "a(o.x) + a__dep.city"
+        );
+        // A FOREIGN qualified tail `x.a` is not the alias `a` as a qualifier.
+        assert_eq!(
+            rewrite_qualifier("x.a + a.city", "a", "a__dep"),
+            "x.a + a__dep.city"
+        );
+        // No match → unchanged.
+        assert_eq!(rewrite_qualifier("b.city", "a", "a__dep"), "b.city");
+    }
+
     // ----- generative proptests -----
 
     /// A quoted-identifier part whose inner content is arbitrary (including
@@ -562,6 +749,69 @@ mod tests {
             let mut m: HashMap<String, &str> = HashMap::new();
             m.insert(tail.clone(), "<R>");
             prop_assert_eq!(inline_references(&expr, &m), expr);
+        }
+
+        /// References and function-call heads partition all identifier chains:
+        /// their spans are disjoint, and no span appears in both scans.
+        #[test]
+        fn references_and_heads_are_disjoint(expr in arb_expr()) {
+            let refs: std::collections::HashSet<(usize, usize)> =
+                scan_references(&expr).iter().map(|r| (r.start, r.end)).collect();
+            let heads: std::collections::HashSet<(usize, usize)> =
+                scan_function_heads(&expr).iter().map(|r| (r.start, r.end)).collect();
+            prop_assert!(refs.is_disjoint(&heads), "overlap in {expr:?}");
+        }
+
+        /// `scan_function_heads` is total and yields spans that tile a subset of
+        /// the input on char boundaries (same invariant as `scan_references`).
+        #[test]
+        fn function_heads_are_ordered_and_in_bounds(expr in arb_expr()) {
+            let mut last_end = 0;
+            for r in scan_function_heads(&expr) {
+                prop_assert!(r.start >= last_end);
+                prop_assert!(r.end <= expr.len());
+                prop_assert!(expr.is_char_boundary(r.start));
+                prop_assert!(expr.is_char_boundary(r.end));
+                prop_assert_eq!(&expr[r.start..r.end], r.raw);
+                last_end = r.end;
+            }
+        }
+
+        /// Rewriting a qualifier that matches no chain head leaves the
+        /// expression untouched, and rewriting is always total (never panics).
+        #[test]
+        fn rewrite_qualifier_is_total_and_identity_on_no_match(
+            expr in arb_expr(),
+            alias in "[a-z]{1,5}",
+        ) {
+            let out = rewrite_qualifier(&expr, &alias, "<Q>");
+            // If no chain's first part equals `alias`, the output is unchanged.
+            let matches = scan_references(&expr)
+                .iter()
+                .any(|r| crate::ident::normalize_ident_part(&r.raw[..first_part_len(r.raw)])
+                    == crate::ident::normalize_ident_part(&alias));
+            if !matches {
+                prop_assert_eq!(out, expr);
+            }
+        }
+
+        /// For a contiguous `head.tail`, rewriting the qualifier `head` rewrites
+        /// exactly the head part and preserves the tail (E-3: the foreign tail
+        /// `tail` is never itself treated as the qualifier).
+        #[test]
+        fn rewrite_qualifier_rewrites_head_preserves_tail(
+            head in "[a-z]{1,4}",
+            tail in "[a-z]{1,5}",
+        ) {
+            let expr = format!("{head}.{tail}");
+            prop_assert_eq!(
+                rewrite_qualifier(&expr, &head, "<Q>"),
+                format!("<Q>.{tail}")
+            );
+            // Rewriting by the tail name changes nothing (it is not a qualifier)
+            // — as long as the tail differs from the head part.
+            prop_assume!(head != tail);
+            prop_assert_eq!(rewrite_qualifier(&expr, &tail, "<Q>"), expr);
         }
     }
 }

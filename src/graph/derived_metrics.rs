@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
 use crate::model::SemanticViewDefinition;
-use crate::util::{is_ident_byte, is_word_boundary_char, suggest_closest};
+use crate::util::suggest_closest;
 
 use super::facts::find_fact_references;
 
@@ -55,58 +55,26 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
 
 /// Check if an expression contains an aggregate function call.
 ///
-/// Scans for known aggregate function names at word boundaries followed by `(`.
-/// Case-insensitive matching. Skips matches inside single-quoted string literals.
+/// Uses the shared reference tokenizer ([`crate::expr_tokens::scan_function_heads`])
+/// to find every function-call head, then matches the head's *last* identifier
+/// part (the called name — bare `sum(` or schema-qualified `main.sum(`) against
+/// the known-aggregate set. Because it rides the tokenizer, it inherits correct
+/// literal handling — a `sum(` inside a `'…'` / `$tag$…$` string is not a call —
+/// and the single identifier-byte rule (E-5: `Ωsum(` is the one identifier
+/// `Ωsum`, not the aggregate `sum`).
 ///
-/// Returns the first aggregate function name found (lowercase), or `None`.
+/// Returns the first aggregate function found in source order (lowercase), or
+/// `None`.
 #[must_use]
 pub fn contains_aggregate_function(expr: &str) -> Option<&'static str> {
-    let bytes = expr.as_bytes();
-    let expr_lower = expr.to_ascii_lowercase();
-    let lower_bytes = expr_lower.as_bytes();
-
-    for &func_name in AGGREGATE_FUNCTIONS {
-        let fn_bytes = func_name.as_bytes();
-        let fn_len = fn_bytes.len();
-        if fn_len > lower_bytes.len() {
-            continue;
-        }
-
-        let mut i = 0;
-        let mut in_string = false;
-        while i < lower_bytes.len() {
-            // Track string literal state
-            if bytes[i] == b'\'' {
-                in_string = !in_string;
-                i += 1;
-                continue;
-            }
-            if in_string {
-                i += 1;
-                continue;
-            }
-
-            // Check if we have a match at position i
-            if i + fn_len <= lower_bytes.len() && &lower_bytes[i..i + fn_len] == fn_bytes {
-                // Check word boundary before
-                let before_ok = i == 0 || is_word_boundary_char(bytes[i - 1]);
-                // Check followed by '(' (with optional whitespace)
-                if before_ok {
-                    let after_pos = i + fn_len;
-                    let mut j = after_pos;
-                    // Skip whitespace
-                    while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
-                        j += 1;
-                    }
-                    if j < bytes.len() && bytes[j] == b'(' {
-                        return Some(func_name);
-                    }
-                }
-            }
-            i += 1;
+    for head in crate::expr_tokens::scan_function_heads(expr) {
+        let key = head.key();
+        // The called name is the last dotted part (`main.sum` → `sum`).
+        let name = key.rsplit('.').next().unwrap_or(&key);
+        if let Some(&func) = AGGREGATE_FUNCTIONS.iter().find(|&&f| f == name) {
+            return Some(func);
         }
     }
-
     None
 }
 
@@ -178,31 +146,40 @@ fn check_no_aggregates_in_derived(derived: &[&crate::model::Metric]) -> Result<(
 }
 
 /// Check that all identifiers in derived metric expressions are known metric names.
+///
+/// Scans each derived expression with the shared reference tokenizer and treats
+/// only **bare** reference chains as candidate metric names (a qualified chain
+/// like `o.amount` is a raw column, not a metric). Matching goes through
+/// [`crate::ident::normalize_ident_part`] on both sides, so a quoted or
+/// mixed-case reference (`"Total Revenue"`, `REVENUE`) resolves exactly as the
+/// expansion-time inliner does — closing the validator/inliner disagreement
+/// that the former quote-blind byte scan had for quoted identifiers containing
+/// spaces or dots (E-2 / E-3).
 fn check_derived_metric_references(
     derived: &[&crate::model::Metric],
     all_metric_names: &[&str],
     all_metric_names_display: &[String],
 ) -> Result<(), String> {
+    let known: HashSet<String> = all_metric_names
+        .iter()
+        .map(|n| crate::ident::normalize_ident_part(n))
+        .collect();
     for met in derived {
-        let potential_refs = extract_identifiers(&met.expr);
-        for ident in &potential_refs {
-            let ident_lower = ident.to_ascii_lowercase();
-            if all_metric_names
-                .iter()
-                .any(|n| n.to_ascii_lowercase() == ident_lower)
+        for r in crate::expr_tokens::scan_references(&met.expr) {
+            if !r.is_bare() {
+                continue; // qualified chain: a raw column, not a metric reference
+            }
+            let key = r.key();
+            if known.contains(&key)
+                || is_sql_keyword_or_builtin(&key)
+                || key.chars().next().is_none_or(|c| c.is_ascii_digit())
             {
                 continue;
             }
-            if is_sql_keyword_or_builtin(&ident_lower) {
-                continue;
-            }
-            if ident.chars().next().is_none_or(|c| c.is_ascii_digit()) {
-                continue;
-            }
-            let suggestion = suggest_closest(&ident_lower, all_metric_names_display);
+            let suggestion = suggest_closest(&key, all_metric_names_display);
             let mut msg = format!(
                 "unknown metric '{}' referenced in derived metric '{}'",
-                ident, met.name
+                r.raw, met.name
             );
             if let Some(s) = suggestion {
                 let _ = write!(msg, "; did you mean '{s}'?");
@@ -295,65 +272,6 @@ fn check_derived_metric_cycles(
     }
 
     Ok(())
-}
-
-/// Extract identifiers from an expression (word-boundary tokens).
-/// Skips content inside single-quoted strings and dot-qualified identifiers.
-fn extract_identifiers(expr: &str) -> Vec<String> {
-    let bytes = expr.as_bytes();
-    let mut result = Vec::new();
-    let mut in_string = false;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        if ch == '\'' {
-            in_string = !in_string;
-            i += 1;
-            continue;
-        }
-        if in_string {
-            i += 1;
-            continue;
-        }
-
-        // Skip dot-qualified identifiers (e.g., "o.amount" -- the "o" and "amount" parts)
-        // We want bare identifiers only
-        if ch.is_ascii_alphabetic() || ch == '_' {
-            let start = i;
-            // Continuation uses the crate's single identifier-byte definition
-            // (ASCII alnum / `_` / any byte >= 0x80), so a non-ASCII character
-            // mid-identifier (`revenueΩ`) is not split into a spurious bare
-            // token (E-5, code-review 2026-07-11).
-            while i < bytes.len() && is_ident_byte(bytes[i]) {
-                i += 1;
-            }
-            let ident = &expr[start..i];
-
-            // Check if preceded by a dot (table-qualified) -- skip
-            if start > 0 && bytes[start - 1] == b'.' {
-                continue;
-            }
-            // Check if followed by a dot -- skip (it's a table alias prefix)
-            if i < bytes.len() && bytes[i] == b'.' {
-                continue;
-            }
-            // Check if followed by '(' -- it's a function call, skip
-            let mut j = i;
-            while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j] == b'(' {
-                continue;
-            }
-
-            result.push(ident.to_string());
-        } else {
-            i += 1;
-        }
-    }
-
-    result
 }
 
 /// Check if a token is a SQL keyword or common builtin (not a metric reference).
@@ -469,6 +387,24 @@ mod tests {
         // Inside single-quoted string literal -- best effort skip
         let result = contains_aggregate_function("'SUM of values'");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn contains_aggregate_none_inside_escaped_string_literal() {
+        // The tokenizer honours the `''` escape, so a `sum(` buried in a
+        // single-quoted literal (even one containing an escaped quote) is not a
+        // call — the former naive `'`-toggle scan could mis-detect it.
+        assert_eq!(contains_aggregate_function("'it''s a sum(x)'"), None);
+        // Dollar-quoted literal likewise.
+        assert_eq!(contains_aggregate_function("$$ sum(x) $$"), None);
+    }
+
+    #[test]
+    fn contains_aggregate_schema_qualified() {
+        // A schema-qualified aggregate call matches on its last part.
+        assert_eq!(contains_aggregate_function("main.sum(x)"), Some("sum"));
+        // A non-aggregate qualified call does not.
+        assert_eq!(contains_aggregate_function("main.scale(x)"), None);
     }
 
     #[test]
@@ -590,6 +526,54 @@ mod tests {
         assert!(
             validate_derived_metrics(&def).is_ok(),
             "No derived metrics should return Ok"
+        );
+    }
+
+    #[test]
+    fn validate_derived_metrics_quoted_spaced_reference_resolves() {
+        // A base metric whose name contains a space is referenced by a quoted
+        // identifier in a derived expression. The tokenizer treats `"Total
+        // Revenue"` as ONE reference (key `total revenue`) matching the base
+        // metric — the former quote-blind scan split it into `Total` + `Revenue`
+        // and falsely rejected this valid DDL (E-2 / E-3).
+        let def = make_def_with_derived_metrics(
+            vec![("total revenue", "SUM(o.amount)", "o")],
+            vec![("double", "\"Total Revenue\" * 2")],
+        );
+        assert!(
+            validate_derived_metrics(&def).is_ok(),
+            "quoted spaced metric reference should resolve: {:?}",
+            validate_derived_metrics(&def)
+        );
+    }
+
+    #[test]
+    fn validate_derived_metrics_quoted_unknown_reference_reports_raw() {
+        // An unknown quoted reference is reported with the raw text the user
+        // wrote (quotes and all), not a mangled split.
+        let def = make_def_with_derived_metrics(
+            vec![("revenue", "SUM(o.amount)", "o")],
+            vec![("bad", "\"No Such Metric\" + 1")],
+        );
+        let err = validate_derived_metrics(&def).unwrap_err();
+        assert!(
+            err.contains("unknown metric") && err.contains("\"No Such Metric\""),
+            "Expected raw quoted name in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_derived_metrics_qualified_column_reference_is_not_a_metric() {
+        // A qualified chain (`o.amount`) in a derived expression is a raw column,
+        // not a metric reference — it must not be flagged as an unknown metric.
+        let def = make_def_with_derived_metrics(
+            vec![("revenue", "SUM(o.amount)", "o")],
+            vec![("scaled", "revenue + o.amount")],
+        );
+        assert!(
+            validate_derived_metrics(&def).is_ok(),
+            "qualified column in derived expr should be ignored: {:?}",
+            validate_derived_metrics(&def)
         );
     }
 

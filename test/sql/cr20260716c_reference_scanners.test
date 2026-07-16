@@ -1,0 +1,103 @@
+# Code-review 2026-07-16: quote-aware reference tokenizer, slice 2.
+#
+# The remaining expression-text scanners now ride the shared `expr_tokens`
+# engine (retiring the quote-blind `util::replace_word_boundary` and the
+# derived-metric validator's hand-rolled byte scan):
+#
+#   * Cat 1 — the role-playing alias-qualifier rewrite. A dimension expression
+#     that embeds a string literal containing the source-table alias as a word
+#     is no longer corrupted when the dimension is scoped to a role alias.
+#   * Cat 2 — the derived-metric CREATE-time reference validator. A quoted
+#     metric name that contains a space is matched as ONE reference, exactly as
+#     the inliner sees it, instead of being split and falsely rejected.
+
+require semantic_views
+
+# ============================================================
+# Cat 1: role-playing rewrite must not touch string-literal content
+# ============================================================
+
+statement ok
+CREATE TABLE rs_airports (airport_code VARCHAR, city VARCHAR);
+
+statement ok
+INSERT INTO rs_airports VALUES ('SFO', 'San Francisco'), ('JFK', 'New York');
+
+statement ok
+CREATE TABLE rs_flights (flight_id INTEGER, departure_code VARCHAR, arrival_code VARCHAR);
+
+statement ok
+INSERT INTO rs_flights VALUES (1, 'SFO', 'JFK'), (2, 'JFK', 'SFO');
+
+# `a.city_tag` embeds the source-table alias `a` as a bare word inside a string
+# literal (`' seen at a '`). When co-queried with `departure_count` (which USES
+# dep_airport), the dimension's `a.` qualifier is rewritten to the scoped alias
+# `a__dep_airport`. The rewrite must touch ONLY the qualifier, never the `a`
+# inside the literal — the retired quote-blind rewriter corrupted the literal.
+statement ok
+CREATE SEMANTIC VIEW rs_flights_view AS
+  TABLES (
+    f AS rs_flights PRIMARY KEY (flight_id),
+    a AS rs_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+  )
+  DIMENSIONS (
+    a.city_tag AS a.city || ' seen at a '
+  )
+  METRICS (
+    f.departure_count USING (dep_airport) AS COUNT(*)
+  );
+
+# The literal ` seen at a ` survives verbatim (not ` seen at a__dep_airport `).
+query TI rowsort
+SELECT * FROM semantic_view('rs_flights_view', dimensions := ['city_tag'], metrics := ['departure_count']);
+----
+New York seen at a 	1
+San Francisco seen at a 	1
+
+statement ok
+DROP SEMANTIC VIEW rs_flights_view;
+
+statement ok
+DROP TABLE rs_flights;
+
+statement ok
+DROP TABLE rs_airports;
+
+# ============================================================
+# Cat 2: derived metric may reference a quoted, spaced metric name
+# ============================================================
+
+statement ok
+CREATE TABLE rs_orders (id INTEGER, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO rs_orders VALUES (1, 100.00), (2, 250.00);
+
+# The base metric is named with a space via a quoted identifier; the derived
+# metric references it double-quoted. The validator resolves `"Total Revenue"`
+# as one reference (key `total revenue`) matching the base metric — the former
+# quote-blind scan split it into `Total` + `Revenue` and rejected this at CREATE.
+statement ok
+CREATE SEMANTIC VIEW rs_sales AS
+  TABLES (
+    o AS rs_orders PRIMARY KEY (id)
+  )
+  METRICS (
+    o."Total Revenue" AS SUM(o.amount),
+    doubled AS "Total Revenue" * 2
+  );
+
+query RR
+SELECT * FROM semantic_view('rs_sales', metrics := ['Total Revenue', 'doubled']);
+----
+350.00	700.00
+
+statement ok
+DROP SEMANTIC VIEW rs_sales;
+
+statement ok
+DROP TABLE rs_orders;
