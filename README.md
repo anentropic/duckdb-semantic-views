@@ -186,16 +186,16 @@ METRICS (
 
 ## Cardinality and fan trap detection
 
-Annotate relationship cardinality to catch queries that would inflate aggregates. If a query must traverse a one-to-many join to reach a dimension, the extension raises an error instead of returning incorrect results.
+Relationship cardinality is **inferred** from the PRIMARY KEY / UNIQUE constraints on the referenced table — you do not annotate it. A join to a table on its declared key is many-to-one (or one-to-one); a join that could inflate aggregates is detected as a fan trap, and the extension raises an error instead of returning incorrect results.
 
 ```sql
 RELATIONSHIPS (
-    li_to_order AS li(order_id) REFERENCES o MANY TO ONE,
-    order_to_customer AS o(customer_id) REFERENCES c MANY TO ONE
+    li_to_order AS li(order_id) REFERENCES o,
+    order_to_customer AS o(customer_id) REFERENCES c
 )
 ```
 
-Supported annotations: `ONE TO ONE`, `ONE TO MANY`, `MANY TO ONE` (default if omitted).
+The `o` and `c` tables declare their keys in `TABLES (... PRIMARY KEY (...))`, so each relationship's cardinality follows from the target key. (Explicit `ONE TO ONE` / `ONE TO MANY` / `MANY TO ONE` annotations were removed in v0.6.0 and are now rejected.)
 
 ## Role-playing dimensions (USING RELATIONSHIPS)
 
@@ -226,7 +226,7 @@ Without `USING`, queries that involve an ambiguous join path will error.
 ## DDL reference
 
 ```sql
--- Full clause order (FACTS optional; DIMENSIONS, METRICS required)
+-- Full clause order (RELATIONSHIPS/FACTS optional; at least one of DIMENSIONS or METRICS required)
 CREATE SEMANTIC VIEW name AS
   TABLES (...)
   RELATIONSHIPS (...)

@@ -53,9 +53,7 @@ Syntax
            AS <aggregate_expression>
            [ COMMENT = '<text>' ]
            [ WITH SYNONYMS = ( '<synonym>' [, '<synonym>' ...] ) ]
-       [, [ PRIVATE ] <metric_name>
-           [ NON ADDITIVE BY ( ... ) ]
-           AS <expression> ... ]
+       [, [ PRIVATE ] <metric_name> AS <derived_expression> ... ]
        [, [ PRIVATE ] <alias>.<metric_name> AS
            <window_func>( <inner_metric> [, <extra_arg> ...] )
                OVER ( [ PARTITION BY EXCLUDING <dim_name> [, <dim_name> ...] ]
@@ -310,6 +308,8 @@ Declares named aggregation expressions, derived metrics, semi-additive metrics, 
        profit     AS revenue - cost,
        margin     AS profit / revenue * 100
    )
+
+A derived metric is an unqualified name (no table alias) whose expression combines other metrics. ``USING``, ``NON ADDITIVE BY``, and ``OVER`` apply only to qualified (``alias.name``) metrics and are rejected on derived metrics.
 
 **USING clause** (for role-playing dimensions):
 

@@ -204,6 +204,42 @@ pub(super) fn is_ident_continuation(b: u8) -> bool {
     crate::util::is_ident_byte(b)
 }
 
+/// Validate a captured identifier slot — a table alias, a source-table name, or
+/// a dimension / metric / relationship name. A valid slot is a single,
+/// well-formed (optionally dot-qualified, optionally `"quoted"`) SQL
+/// identifier.
+///
+/// Returns `Some(reason)` when the slot is malformed, for the caller to splice
+/// into a clause-specific error. Two porting-friction classes are caught
+/// (code-review 2026-07-16):
+///   * **F-9** — a whitespace-separated multi-token run (`o.d junk AS x` named
+///     the dimension `"d junk"`): an unquoted space / `;` ends the identifier,
+///     so anything after it is a stray token, not part of the name.
+///   * **F-11** — an empty quoted identifier (`""`) and the other malformed
+///     identifier shapes the shared grammar rejects (unterminated quote,
+///     `foo"bar"` bare-abutting-quoted). `DuckDB` itself rejects a zero-length
+///     quoted identifier, and view-name slots already do (`ident.rs`); body
+///     slots now match.
+///
+/// A quoted identifier that itself contains whitespace (`"a b"`) is a single
+/// token and is accepted. An empty (all-whitespace) slot returns `None` — the
+/// call site reports emptiness with a "missing name/alias" message of its own.
+pub(super) fn identifier_slot_error(slot: &str) -> Option<String> {
+    let s = slot.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // F-9: the identifier ends at the first unquoted whitespace / `;`. If that
+    // is not end-of-slot, a second token follows — the slot is not one name.
+    if crate::ident::find_identifier_end(s, /* allow_paren = */ false) != s.len() {
+        return Some(format!("'{s}' is not a single identifier"));
+    }
+    // F-11 + malformed shapes: the shared identifier grammar rejects `""` and
+    // friends. (Unterminated quotes are already caught upstream per entry, but
+    // re-checking here is harmless and keeps this helper total.)
+    crate::ident::parse_qualified_identifier(s).err()
+}
+
 /// Phase 68 A4: returns `true` if `s` has balanced double-quote runs, treating
 /// a doubled-quote `""` inside a quoted region as an escape (does NOT close).
 /// Mirrors the escape rule used by `src/ident.rs::find_identifier_end` so the

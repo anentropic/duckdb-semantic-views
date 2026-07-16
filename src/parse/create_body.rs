@@ -190,6 +190,23 @@ fn rewrite_ddl_keyword_body(
     // 1. Call parse_keyword_body (body_text starts at "AS"; pass body_offset)
     let mut keyword_body = parse_keyword_body(body_text, body_offset)?;
 
+    // F-6 (code-review 2026-07-16): the view-level COMMENT may be written either
+    // between the name and `AS` (`view_comment`, extracted earlier) or after the
+    // last clause in Snowflake's position (`keyword_body.view_comment`). Accept
+    // whichever is present; specifying both is contradictory and rejected.
+    let comment = match (view_comment, keyword_body.view_comment.take()) {
+        (Some(_), Some(_)) => {
+            return Err(ParseError {
+                message: "View-level COMMENT specified twice (once before AS and once after the \
+                          last clause). Use only one position."
+                    .to_string(),
+                position: None,
+            });
+        }
+        (Some(c), None) | (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+
     // Phase 33: Infer cardinality and resolve ref_columns.
     crate::graph::infer_cardinality(&keyword_body.tables, &mut keyword_body.relationships)?;
 
@@ -204,7 +221,7 @@ fn rewrite_ddl_keyword_body(
         created_on: None,
         database_name: None,
         schema_name: None,
-        comment: view_comment,
+        comment,
     };
 
     // 3. Carry the definition structurally — `rewrite_to_native_sql` hands it

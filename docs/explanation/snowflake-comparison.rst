@@ -113,7 +113,8 @@ The DDL syntax is intentionally close to Snowflake's. The clause order (``TABLES
 
       .. code-block:: sql
 
-         CREATE SEMANTIC VIEW analytics AS
+         -- Snowflake has no AS keyword before the body clauses.
+         CREATE SEMANTIC VIEW analytics
          TABLES (
              o AS orders,
              c AS customers
@@ -263,10 +264,14 @@ In Snowflake, you can write standard SQL against a semantic view and the system 
        metrics := ['revenue']
    );
 
-   -- Snowflake: equivalent SEMANTIC_VIEW clause
-   SELECT * FROM SEMANTIC_VIEW('analytics',
-       DIMENSIONS 'region'
-       METRICS 'revenue'
+   -- Snowflake: equivalent SEMANTIC_VIEW clause. The view name and the
+   -- dimension / metric references are bare identifiers (not string literals),
+   -- and there is no comma between the view name and the DIMENSIONS / METRICS
+   -- keywords.
+   SELECT * FROM SEMANTIC_VIEW(
+       analytics
+       DIMENSIONS orders.region
+       METRICS orders.revenue
    );
 
    -- Snowflake: direct SQL with AGG view-defined aggregate function
@@ -389,10 +394,14 @@ The following Snowflake ``CREATE SEMANTIC VIEW`` features are not yet implemente
      - Status
    * - Direct SQL query interface
      - Not planned; :ref:`semantic_view() <ref-semantic-view-function>` table function is the query interface
+   * - Pre-aggregation ``WHERE`` (a predicate filtering dimensions / facts *before* metrics are computed)
+     - Not yet supported. The only filter today is the outer SQL ``WHERE`` on the ``semantic_view()`` result, which applies *after* aggregation -- equivalent only when filtering on a queried dimension. A filter on a member that is not in the output (e.g. "revenue for orders shipped after X") cannot yet be expressed.
    * - Column-level security
      - Out of scope; DuckDB handles access control
    * - ``ASOF`` / temporal relationships
      - Not planned; standard equi-joins cover most use cases
+   * - ``CREATE OR ALTER``, tags / ``LABELS``, ``MAX_STALENESS``, and the ``AI_*`` / ``COPILOT`` clauses
+     - Not planned; these are Snowflake-catalog or Cortex-specific and have no DuckDB equivalent
 
 
 .. _explanation-sf-yaml:

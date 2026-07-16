@@ -302,6 +302,21 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
                 format!("Missing bare name between '.' and 'AS' in metric entry '{entry}'."),
             ));
         }
+        // F-9 / F-11 (code-review 2026-07-16): alias and name must each be a
+        // single well-formed identifier — `o.d junk AS ...` previously stored
+        // the two-word name `"d junk"`, and an empty quoted `""` slid through.
+        if let Some(reason) = super::scan::identifier_slot_error(&source_alias) {
+            return Err(ParseError {
+                message: format!("Invalid source alias in metric entry '{entry}': {reason}."),
+                position: Some(entry_offset),
+            });
+        }
+        if let Some(reason) = super::scan::identifier_slot_error(&bare_name) {
+            return Err(name_cur.err(
+                dot_tok.end,
+                format!("Invalid name in metric entry '{entry}': {reason}."),
+            ));
+        }
 
         Ok(ParsedMetric {
             source_alias: Some(source_alias),
@@ -343,6 +358,14 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
                     "OVER clause not allowed on derived metric '{final_name_portion}'. \
                      Only qualified metrics (alias.name) can use OVER.",
                 ),
+                position: Some(entry_offset),
+            });
+        }
+        // F-9 / F-11: a derived metric name must be a single well-formed
+        // identifier too (`total junk AS ...` is not a legal name).
+        if let Some(reason) = super::scan::identifier_slot_error(final_name_portion) {
+            return Err(ParseError {
+                message: format!("Invalid derived metric name in entry '{entry}': {reason}."),
                 position: Some(entry_offset),
             });
         }

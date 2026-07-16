@@ -42,7 +42,71 @@ pub(crate) fn parse_tables_clause(
 /// (no name token, a bare reserved keyword in the name slot, ...) so the exact
 /// message stays single-sourced.
 fn missing_name_msg(alias: &str) -> String {
-    format!("Missing physical table name after AS for alias '{alias}' in TABLES clause.")
+    if alias.is_empty() {
+        // Alias-less entry (F-7): there is no alias to name in the message.
+        "Missing physical table name in TABLES clause.".to_string()
+    } else {
+        format!("Missing physical table name after AS for alias '{alias}' in TABLES clause.")
+    }
+}
+
+/// Resolve the `[alias AS] table_name` prefix of a TABLES entry (Snowflake's
+/// grammar makes the alias optional — F-7). Advances `cur` past the source-table
+/// name so the caller can parse the trailing constraints, and returns
+/// `(alias, table_name, name_end)` where `name_end` is the byte offset in `entry`
+/// just past the name.
+///
+/// When the alias is omitted, it defaults to the LAST identifier component of the
+/// table name — not the whole (possibly qualified) name: a dotted alias like
+/// `schema.orders` would be mis-split by the `alias.name` reference parser (which
+/// splits at the first dot, so `schema.orders.region` would resolve alias
+/// `schema`). Taking the last component yields the usable `orders` and matches
+/// Snowflake's implicit-alias behaviour; quoted parts are preserved.
+fn resolve_table_alias_and_name<'a>(
+    cur: &mut Cursor<'a>,
+    entry: &'a str,
+    entry_offset: usize,
+) -> Result<(&'a str, &'a str, usize), ParseError> {
+    // The first token is either an alias (when `AS` follows) or the start of a
+    // bare source-table name. A leading symbol (`(`, `.`, ...) is rejected.
+    let Some(first_tok) = cur.peek() else {
+        return Err(cur.err(
+            0,
+            "Expected table alias or name in TABLES entry.".to_string(),
+        ));
+    };
+    if matches!(first_tok.kind, TokenKind::Symbol(_)) {
+        return Err(cur.err(
+            first_tok.start,
+            "Expected table alias or name in TABLES entry.".to_string(),
+        ));
+    }
+
+    // Decide `alias AS table` vs a bare `table`. The alias, when present, is the
+    // first identifier token immediately followed by `AS`. Tokenization gives the
+    // word boundary for free: `ASorders` is one bare token (not `AS`), and
+    // `AS"my table"` splits into `AS` + the quoted name.
+    cur.bump(); // consume the first token
+    let has_alias = matches!(cur.peek(), Some(t) if cur.is_kw(t, "AS"));
+
+    if has_alias {
+        let alias = cur.text(first_tok);
+        cur.bump(); // AS
+        let (table_name, name_end) = take_source_table_name(cur, entry, alias)?;
+        Ok((alias, table_name, name_end))
+    } else {
+        // Alias-less: re-scan the name from the start of the entry so a dotted /
+        // quoted FQN (`schema.orders`, `"my table"`) is captured whole, then
+        // default the alias to the name's last identifier component.
+        let mut name_cur = Cursor::new(entry, entry_offset);
+        let (table_name, name_end) = take_source_table_name(&mut name_cur, entry, "")?;
+        cur.advance_past_byte(name_end); // resync for constraint parsing
+        let mut alias = table_name;
+        while let Some((_, after)) = super::scan::split_qualified_identifier(alias) {
+            alias = after;
+        }
+        Ok((alias, table_name, name_end))
+    }
 }
 
 /// Parse a single TABLES clause entry.
@@ -55,31 +119,30 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     let entry = entry.trim();
     let mut cur = Cursor::new(entry, entry_offset);
 
-    // Step 1: alias — the first token.
-    let Some(alias_tok) = cur.bump() else {
-        return Err(cur.err(0, "Expected table alias in TABLES entry.".to_string()));
-    };
-    let alias = cur.text(alias_tok);
+    // Steps 1-3: resolve the `[alias AS] table_name` prefix, advancing `cur`
+    // past the source-table name so the constraint scan below continues after it.
+    let (alias, table_name, name_end) =
+        resolve_table_alias_and_name(&mut cur, entry, entry_offset)?;
 
-    // Step 2: the `AS` keyword. Tokenization gives the word boundary for free —
-    // `ASorders` is a single bare token that is not `AS`, and `AS"my table"`
-    // splits into `AS` + the quoted name — so no manual boundary check is
-    // needed (the PR #50 review's `is_ident_continuation` guard).
-    match cur.peek() {
-        Some(t) if cur.is_kw(t, "AS") => {
-            cur.bump();
-        }
-        _ => {
-            let off = cur.byte_pos();
-            return Err(cur.err(
-                off,
-                format!("Expected 'AS' after table alias '{alias}' in TABLES clause."),
-            ));
-        }
+    // F-11 (code-review 2026-07-16): the alias and the source-table name must
+    // each be a well-formed identifier — an empty quoted `""` in either slot
+    // (`TABLES ("" AS orders ...)`) previously parsed. (`take_source_table_name`
+    // already rejects a multi-token name run, so F-9 does not recur here.)
+    if let Some(reason) = super::scan::identifier_slot_error(alias) {
+        return Err(cur.err(
+            0,
+            format!("Invalid table alias in TABLES entry '{entry}': {reason}."),
+        ));
     }
-
-    // Step 3: the source-table name (see `take_source_table_name`).
-    let (table_name, name_end) = take_source_table_name(&mut cur, entry, alias)?;
+    if let Some(reason) = super::scan::identifier_slot_error(table_name) {
+        // Caret at the table-name token (its start = name_end - len), not the
+        // entry start, so `alias AS <bad table>` points at the offending name
+        // rather than the alias (Copilot review).
+        return Err(cur.err(
+            name_end - table_name.len(),
+            format!("Invalid source-table name in TABLES entry '{entry}': {reason}."),
+        ));
+    }
 
     // Step 4: optional PRIMARY KEY. Its keyword pair may appear anywhere in the
     // remaining tokens; any token before it is text that does not belong
