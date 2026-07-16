@@ -10,9 +10,7 @@
 use crate::errors::ParseError;
 use crate::ident::{find_identifier_end, normalize_view_name};
 use crate::sql_lit::SqlLit;
-use crate::util::{
-    byte_offset_within, extract_single_quoted_prefix, starts_with_keyword_ci, SingleQuoteError,
-};
+use crate::util::{byte_offset_within, extract_single_quoted_prefix, SingleQuoteError};
 
 use super::{
     build_filter_suffix, detect_ddl_prefix, match_keyword_prefix, parse_show_filter_clauses,
@@ -29,19 +27,6 @@ use crate::ffi_util::write_error_to_buffer;
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
-/// How [`extract_name_only`] treats text after the view name.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Trailing {
-    /// The statement ends at the view name — any trailing text is an error
-    /// (PA-5, code-review 2026-07-02: `DROP SEMANTIC VIEW a b c` used to
-    /// execute and silently discard `b c`; `DESCRIBE ... a CASCADE` silently
-    /// ignored the `CASCADE`).
-    Reject,
-    /// Trailing text is the caller's problem (ALTER: the sub-operation
-    /// follows the name).
-    Allow,
-}
-
 /// Extract the RAW (un-normalized) view name from a name-only DDL statement.
 ///
 /// The read-side DESCRIBE / SHOW COLUMNS rewrites embed this raw name into a
@@ -51,13 +36,18 @@ enum Trailing {
 /// with the name baked in (no later normalize opportunity), use the normalizing
 /// [`extract_name_only`] wrapper instead.
 ///
+/// The statement ends at the view name: any trailing text is an error (PA-5,
+/// code-review 2026-07-02: `DROP SEMANTIC VIEW a b c` used to execute and
+/// silently discard `b c`; `DESCRIBE ... a CASCADE` silently ignored the
+/// `CASCADE`). ALTER's sub-operation follows the name, so `rewrite_alter`
+/// parses the name on its own cursor rather than through this helper.
+///
 /// `prefix_len` is the byte length of the already-matched prefix; `base` is the
 /// absolute byte offset of `trimmed[0]` in the original query, so errors carry a
 /// caret position pointing at the offending token (R-2).
 fn extract_raw_name_only(
     trimmed: &str,
     prefix_len: usize,
-    trailing: Trailing,
     base: usize,
 ) -> Result<String, ParseError> {
     let after_prefix = trimmed[prefix_len..].trim();
@@ -79,30 +69,22 @@ fn extract_raw_name_only(
             position: Some(base + byte_offset_within(trimmed, after_prefix)),
         });
     }
-    if trailing == Trailing::Reject {
-        let rest = after_prefix[name_end..].trim();
-        if !rest.is_empty() {
-            return Err(ParseError {
-                message: format!("Unexpected tokens after view name: '{rest}'"),
-                position: Some(base + byte_offset_within(trimmed, rest)),
-            });
-        }
+    let rest = after_prefix[name_end..].trim();
+    if !rest.is_empty() {
+        return Err(ParseError {
+            message: format!("Unexpected tokens after view name: '{rest}'"),
+            position: Some(base + byte_offset_within(trimmed, rest)),
+        });
     }
     Ok(raw_name.to_string())
 }
 
-/// Extract and normalize the view name from a name-only DDL statement (DROP;
-/// ALTER uses [`Trailing::Allow`] since its sub-operation follows the name).
+/// Extract and normalize the view name from a name-only DDL statement (DROP).
 /// Folds unquoted names to lowercase and reduces a qualified name to its bare
 /// last part at parse time — appropriate for the native-SQL emitters that bake
 /// the name in. Read-side rewrites use [`extract_raw_name_only`] instead.
-fn extract_name_only(
-    trimmed: &str,
-    prefix_len: usize,
-    trailing: Trailing,
-    base: usize,
-) -> Result<String, ParseError> {
-    let raw = extract_raw_name_only(trimmed, prefix_len, trailing, base)?;
+fn extract_name_only(trimmed: &str, prefix_len: usize, base: usize) -> Result<String, ParseError> {
+    let raw = extract_raw_name_only(trimmed, prefix_len, base)?;
     normalize_view_name(&raw).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         // Point the caret at the name token itself, not the end of the prefix:
@@ -344,7 +326,7 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
         }
         // DROP: native DELETE (structured).
         DdlKind::Drop | DdlKind::DropIfExists => {
-            let name = extract_name_only(trimmed, plen, Trailing::Reject, trim_base)?;
+            let name = extract_name_only(trimmed, plen, trim_base)?;
             Ok(RewriteAction::Drop {
                 name,
                 if_exists: kind == DdlKind::DropIfExists,
@@ -359,7 +341,7 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
         // reads the view via a prepared statement, so the raw name never reaches
         // SQL text on the read side.
         DdlKind::Describe | DdlKind::ShowColumns => {
-            let name = extract_raw_name_only(trimmed, plen, Trailing::Reject, trim_base)?;
+            let name = extract_raw_name_only(trimmed, plen, trim_base)?;
             let safe_name = SqlLit::escape(&name);
             let fn_name = read_function_name(kind);
             Ok(RewriteAction::Passthrough(format!(
@@ -422,110 +404,6 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
         }
         // ALTER: sub-operation dispatch (RENAME TO, SET COMMENT, UNSET COMMENT)
         DdlKind::Alter | DdlKind::AlterIfExists => rewrite_alter(trimmed, plen, kind, trim_base),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Name extraction
-// ---------------------------------------------------------------------------
-
-/// Extract the view name from a semantic view DDL statement.
-///
-/// Returns `Ok(Some(name))` for DDL forms that have a view name (CREATE, DROP,
-/// DESCRIBE), and `Ok(None)` for SHOW (no name). Returns `Err` if the query
-/// is not a semantic view DDL statement or is malformed.
-pub fn extract_ddl_name(query: &str) -> Result<Option<String>, ParseError> {
-    // PA-7: comment-blind name extraction.
-    let blanked = crate::util::blank_sql_comments(query);
-    let query = blanked.as_ref();
-    let lead = skip_leading_whitespace(query);
-    let trimmed = query[lead..].trim_end();
-    let trimmed = trimmed.trim_end_matches(';').trim();
-    let trim_base = lead;
-
-    let Some((kind, plen)) = detect_ddl_prefix(trimmed) else {
-        return Err(ParseError {
-            message: "Not a semantic view DDL statement".to_string(),
-            position: None,
-        });
-    };
-
-    match kind {
-        DdlKind::Create | DdlKind::CreateOrReplace | DdlKind::CreateIfNotExists => {
-            // Extract name directly: after prefix, trim whitespace, take up to
-            // whitespace or '(' (same logic as validate_create_body). Honour
-            // `"..."` regions so quoted/FQN forms (`"db"."sch"."v"`,
-            // `"my view"`) are captured intact and then normalised to the
-            // bare last part.
-            let after_prefix = trimmed[plen..].trim_start();
-            if after_prefix.is_empty() {
-                return Err(ParseError {
-                    message: "Missing view name".to_string(),
-                    position: Some(trim_base + plen),
-                });
-            }
-            let name_end = find_identifier_end(after_prefix, true);
-            let raw_name = &after_prefix[..name_end];
-            if raw_name.is_empty() {
-                return Err(ParseError {
-                    message: "Missing view name".to_string(),
-                    position: Some(trim_base + byte_offset_within(trimmed, after_prefix)),
-                });
-            }
-            let name = normalize_view_name(raw_name).map_err(|e| ParseError {
-                message: format!("Invalid view name: {e}"),
-                position: Some(trim_base + byte_offset_within(trimmed, after_prefix)),
-            })?;
-            Ok(Some(name))
-        }
-        DdlKind::Drop | DdlKind::DropIfExists | DdlKind::Describe | DdlKind::ShowColumns => {
-            let name = extract_name_only(trimmed, plen, Trailing::Reject, trim_base)?;
-            Ok(Some(name))
-        }
-        // ALTER: the sub-operation (RENAME TO / SET COMMENT / ...) follows
-        // the name, so trailing text is expected here.
-        DdlKind::Alter | DdlKind::AlterIfExists => {
-            let name = extract_name_only(trimmed, plen, Trailing::Allow, trim_base)?;
-            Ok(Some(name))
-        }
-        DdlKind::Show | DdlKind::ShowTerse => Ok(None),
-        DdlKind::ShowDimensions
-        | DdlKind::ShowMetrics
-        | DdlKind::ShowFacts
-        | DdlKind::ShowMaterializations => {
-            let after_prefix = trimmed[plen..].trim();
-            if after_prefix.is_empty() {
-                return Ok(None); // Cross-view form, no specific name
-            }
-            let mut rest = after_prefix;
-            // Skip LIKE clause if present (LIKE appears before IN)
-            if starts_with_keyword_ci(rest, "LIKE")
-                && (rest.len() == 4 || rest.as_bytes()[4].is_ascii_whitespace())
-            {
-                rest = rest[4..].trim_start();
-                // Skip the quoted string
-                if let Ok((_pattern, consumed)) = extract_quoted_string(rest) {
-                    rest = rest[consumed..].trim_start();
-                } else {
-                    return Ok(None);
-                }
-            }
-            // Check for IN keyword
-            if starts_with_keyword_ci(rest, "IN")
-                && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
-            {
-                let after_in = rest[2..].trim();
-                if after_in.is_empty() {
-                    return Ok(None);
-                }
-                let name_end = after_in
-                    .find(|c: char| c.is_whitespace())
-                    .unwrap_or(after_in.len());
-                Ok(Some(after_in[..name_end].to_string()))
-            } else {
-                Ok(None)
-            }
-        }
     }
 }
 
@@ -1111,10 +989,14 @@ mod tests {
         let sql = passthrough_sql("DESCRIBE SEMANTIC VIEW SALES");
         assert_eq!(sql, "SELECT * FROM describe_semantic_view('SALES')");
 
-        assert_eq!(
-            extract_ddl_name("CREATE SEMANTIC VIEW Sales (body)").unwrap(),
-            Some("sales".to_string())
-        );
+        // CREATE folds the (bare, normalized) name carried in RewriteAction.
+        let RewriteAction::Create { name, .. } = plan(
+            "CREATE SEMANTIC VIEW Sales AS TABLES (o AS orders PRIMARY KEY (id)) \
+             DIMENSIONS (o.region AS o.region) METRICS (o.total AS SUM(o.amount))",
+        ) else {
+            panic!("expected RewriteAction::Create");
+        };
+        assert_eq!(name, "sales");
 
         // ALTER folds both the target and the RENAME TO name.
         assert_eq!(
@@ -1140,10 +1022,14 @@ mod tests {
             }
         );
 
-        assert_eq!(
-            extract_ddl_name("CREATE SEMANTIC VIEW \"Sales\" (body)").unwrap(),
-            Some("sales".to_string())
-        );
+        // A quoted CREATE name folds to lowercase exactly like an unquoted one.
+        let RewriteAction::Create { name, .. } = plan(
+            "CREATE SEMANTIC VIEW \"Sales\" AS TABLES (o AS orders PRIMARY KEY (id)) \
+             DIMENSIONS (o.region AS o.region) METRICS (o.total AS SUM(o.amount))",
+        ) else {
+            panic!("expected RewriteAction::Create");
+        };
+        assert_eq!(name, "sales");
 
         assert_eq!(
             plan("ALTER SEMANTIC VIEW \"Sales\" RENAME TO \"NewSales\""),
@@ -1440,70 +1326,11 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_ddl_name_rejects_trailing_garbage_but_allows_alter_ops() {
-        assert!(extract_ddl_name("DROP SEMANTIC VIEW a b c").is_err());
-        // ALTER legitimately has text after the name.
-        assert_eq!(
-            extract_ddl_name("ALTER SEMANTIC VIEW a RENAME TO b").unwrap(),
-            Some("a".to_string())
-        );
-    }
-
-    #[test]
     fn test_rewrite_not_semantic() {
         let err = plan_ddl("SELECT 1").unwrap_err();
         assert!(
             err.message.contains("Not a semantic view DDL"),
             "got: {err}"
-        );
-    }
-
-    // ===================================================================
-    // extract_ddl_name tests
-    // ===================================================================
-
-    #[test]
-    fn test_extract_name_drop() {
-        assert_eq!(
-            extract_ddl_name("DROP SEMANTIC VIEW x").unwrap(),
-            Some("x".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_name_drop_if_exists() {
-        assert_eq!(
-            extract_ddl_name("DROP SEMANTIC VIEW IF EXISTS x").unwrap(),
-            Some("x".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_name_describe() {
-        assert_eq!(
-            extract_ddl_name("DESCRIBE SEMANTIC VIEW x").unwrap(),
-            Some("x".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_name_show() {
-        assert_eq!(extract_ddl_name("SHOW SEMANTIC VIEWS").unwrap(), None);
-    }
-
-    #[test]
-    fn test_extract_name_create() {
-        assert_eq!(
-            extract_ddl_name("CREATE SEMANTIC VIEW x (body)").unwrap(),
-            Some("x".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_name_create_or_replace() {
-        assert_eq!(
-            extract_ddl_name("CREATE OR REPLACE SEMANTIC VIEW x (body)").unwrap(),
-            Some("x".to_string())
         );
     }
 
@@ -2323,20 +2150,6 @@ mod tests {
             assert!(result.is_err(), "FOR METRIC on SHOW METRICS should error");
         }
 
-        // --- extract_ddl_name with LIKE ---
-
-        #[test]
-        fn test_extract_ddl_name_like_before_in() {
-            let result = extract_ddl_name("SHOW SEMANTIC DIMENSIONS LIKE '%x%' IN v").unwrap();
-            assert_eq!(result, Some("v".to_string()));
-        }
-
-        #[test]
-        fn test_extract_ddl_name_like_cross_view() {
-            let result = extract_ddl_name("SHOW SEMANTIC DIMENSIONS LIKE '%x%'").unwrap();
-            assert_eq!(result, None);
-        }
-
         // --- Case insensitivity ---
 
         #[test]
@@ -2398,13 +2211,6 @@ mod tests {
                 let result = plan_ddl(q);
                 assert!(result.is_err(), "expected clean error for {q}");
             }
-        }
-
-        #[test]
-        fn test_extract_ddl_name_non_ascii_no_panic() {
-            // Same PA-1 pattern in extract_ddl_name's LIKE/IN skipper.
-            let result = extract_ddl_name("SHOW SEMANTIC DIMENSIONS aΩΩ");
-            assert!(matches!(result, Ok(None)), "got: {result:?}");
         }
 
         #[test]
@@ -2551,18 +2357,6 @@ mod tests {
         assert!(result.is_some());
         let err = result.unwrap();
         assert!(err.message.contains("Did you mean"), "got: {}", err.message);
-    }
-
-    #[test]
-    fn extract_ddl_name_show_materializations_in() {
-        let result = extract_ddl_name("SHOW SEMANTIC MATERIALIZATIONS IN my_view").unwrap();
-        assert_eq!(result, Some("my_view".to_string()));
-    }
-
-    #[test]
-    fn extract_ddl_name_show_materializations_all() {
-        let result = extract_ddl_name("SHOW SEMANTIC MATERIALIZATIONS").unwrap();
-        assert_eq!(result, None);
     }
 
     // -----------------------------------------------------------------------
@@ -3369,14 +3163,6 @@ $$"#;
     }
 
     #[test]
-    fn extract_ddl_name_with_leading_comment() {
-        assert_eq!(
-            extract_ddl_name("/* annotation */ DROP SEMANTIC VIEW my_view").unwrap(),
-            Some("my_view".to_string())
-        );
-    }
-
-    #[test]
     fn error_position_accounts_for_leading_comment() {
         // Missing view name -- error position should point at the offset AFTER
         // both the comment AND the prefix, in the ORIGINAL query string.
@@ -3441,9 +3227,8 @@ $$"#;
     // Wires `crate::ident::{normalize_view_name, find_identifier_end}` into
     // the five DDL capture sites in this file. Each capture site is
     // exercised here via its public-facing entry point (plan_ddl for
-    // DROP/DESCRIBE/SHOW COLUMNS, plan_rewrite for CREATE/ALTER,
-    // extract_ddl_name directly) with quoted and FQN forms — the bare
-    // unquoted last part is what reaches the catalog.
+    // DROP/DESCRIBE/SHOW COLUMNS, plan_rewrite for CREATE/ALTER) with quoted
+    // and FQN forms — the bare unquoted last part is what reaches the catalog.
     // ===================================================================
 
     mod phase64_quoted_ident_tests {
@@ -3553,24 +3338,28 @@ $$"#;
         //
         // We use the minimal AS-keyword body that produces a parsable
         // semantic view definition: `TABLES (...)`, `DIMENSIONS (...)`,
-        // `METRICS (...)`. The captured name's emission inside the
-        // rewritten SQL would show up either via the CREATE function call
-        // (legacy) or — for the post-Phase-62 native path — via the
-        // INSERT, but that path is feature-gated on `extension`.
-        //
-        // What we CAN assert without the extension feature: the result is
-        // Ok(Some(_)) AND extract_ddl_name on the same query returns the
-        // bare name. The combination proves capture-site normalisation.
+        // `METRICS (...)`. `plan(...)` returns `RewriteAction::Create { name,
+        // .. }` carrying the bare, normalized view name — asserting it proves
+        // the CREATE capture-site normalisation without needing the
+        // extension-gated INSERT emission.
 
         const MINIMAL_BODY: &str = "AS TABLES (o AS orders PRIMARY KEY (id)) \
                                     DIMENSIONS (o.region AS o.region) \
                                     METRICS (o.total AS SUM(o.amount))";
 
+        /// Plan a CREATE query and return the bare, normalized name it
+        /// captured in `RewriteAction::Create`.
+        fn create_name(query: &str) -> String {
+            match plan(query) {
+                RewriteAction::Create { name, .. } => name,
+                other => panic!("expected RewriteAction::Create, got {other:?}"),
+            }
+        }
+
         #[test]
         fn create_with_quoted_fqn_extracts_bare_name() {
             let q = format!("CREATE SEMANTIC VIEW \"db\".\"sch\".\"orders_sv\" {MINIMAL_BODY}");
-            let name = extract_ddl_name(&q).unwrap();
-            assert_eq!(name, Some("orders_sv".to_string()));
+            assert_eq!(create_name(&q), "orders_sv");
         }
 
         #[test]
@@ -3578,8 +3367,7 @@ $$"#;
             let q = format!(
                 "CREATE OR REPLACE SEMANTIC VIEW \"db\".\"sch\".\"orders_sv\" {MINIMAL_BODY}"
             );
-            let name = extract_ddl_name(&q).unwrap();
-            assert_eq!(name, Some("orders_sv".to_string()));
+            assert_eq!(create_name(&q), "orders_sv");
         }
 
         #[test]
@@ -3587,22 +3375,19 @@ $$"#;
             let q = format!(
                 "CREATE SEMANTIC VIEW IF NOT EXISTS \"db\".\"sch\".\"orders_sv\" {MINIMAL_BODY}"
             );
-            let name = extract_ddl_name(&q).unwrap();
-            assert_eq!(name, Some("orders_sv".to_string()));
+            assert_eq!(create_name(&q), "orders_sv");
         }
 
         #[test]
         fn create_with_partial_quoting_extracts_bare_name() {
             let q = format!("CREATE SEMANTIC VIEW main.\"orders_sv\" {MINIMAL_BODY}");
-            let name = extract_ddl_name(&q).unwrap();
-            assert_eq!(name, Some("orders_sv".to_string()));
+            assert_eq!(create_name(&q), "orders_sv");
         }
 
         #[test]
         fn create_with_quoted_whitespace_name_extracts_intact() {
             let q = format!("CREATE SEMANTIC VIEW \"my view\" {MINIMAL_BODY}");
-            let name = extract_ddl_name(&q).unwrap();
-            assert_eq!(name, Some("my view".to_string()));
+            assert_eq!(create_name(&q), "my view");
         }
 
         #[test]
@@ -3691,18 +3476,18 @@ $$"#;
             );
         }
 
-        // ----- extract_ddl_name CREATE branch quoted forms (Site C explicit) -----
+        // ----- CREATE-branch name capture, quoted/mixed FQN forms (Site C explicit) -----
 
         #[test]
-        fn extract_ddl_name_quoted_fqn_create() {
+        fn create_quoted_fqn_captures_bare_name() {
             let q = format!("CREATE SEMANTIC VIEW \"a\".\"b\".\"c\" {MINIMAL_BODY}");
-            assert_eq!(extract_ddl_name(&q).unwrap(), Some("c".to_string()));
+            assert_eq!(create_name(&q), "c");
         }
 
         #[test]
-        fn extract_ddl_name_mixed_quoting_create() {
+        fn create_mixed_quoting_captures_bare_name() {
             let q = format!("CREATE SEMANTIC VIEW a.\"b\".c {MINIMAL_BODY}");
-            assert_eq!(extract_ddl_name(&q).unwrap(), Some("c".to_string()));
+            assert_eq!(create_name(&q), "c");
         }
     }
 }

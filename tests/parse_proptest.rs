@@ -296,37 +296,37 @@ proptest! {
         }
     }
 
-    /// extract_ddl_name returns the correct name for CREATE forms.
+    /// plan_rewrite lowers name-only forms (DROP / DROP IF EXISTS / DESCRIBE)
+    /// to a structured action or passthrough carrying the view name. (CREATE
+    /// forms are covered by `rewrite_create_forms` above.)
     #[test]
-    fn extract_name_create_forms(
+    fn rewrite_name_only_forms_carry_name(
         form_idx in 0..3usize,
         name in arb_view_name(),
     ) {
-        let (prefix, _kind, _fn_name) = CREATE_FORMS[form_idx];
-        let ddl = format!("{prefix}{}", build_as_body_suffix(&name));
-        let extracted = extract_ddl_name(&ddl).unwrap();
-        prop_assert_eq!(extracted, Some(name));
-    }
-
-    /// extract_ddl_name returns the correct name for name-only forms (DROP, DESCRIBE).
-    #[test]
-    fn extract_name_name_only_forms(
-        form_idx in 0..3usize,
-        name in arb_view_name(),
-    ) {
-        let (prefix, _kind, _fn_name) = NAME_ONLY_FORMS[form_idx];
+        let (prefix, _kind, fn_name) = NAME_ONLY_FORMS[form_idx];
         let ddl = format!("{prefix} {name}");
-        let extracted = extract_ddl_name(&ddl).unwrap();
-        prop_assert_eq!(extracted, Some(name));
+        // arb_view_name() is already lowercase, so the DROP fold and the raw
+        // DESCRIBE passthrough both carry `name` verbatim.
+        match rewrite_result(&ddl).unwrap() {
+            RewriteAction::Drop { name: n, .. } => prop_assert_eq!(n, name),
+            RewriteAction::Passthrough(sql) =>
+                prop_assert_eq!(sql, format!("SELECT * FROM {fn_name}('{name}')")),
+            other => prop_assert!(false, "unexpected rewrite action: {:?}", other),
+        }
     }
 
-    /// extract_ddl_name returns None for SHOW form.
+    /// A bare SHOW SEMANTIC VIEWS has no target name: plan_rewrite lowers it to
+    /// the all-views list function with no name argument.
     #[test]
-    fn extract_name_show_returns_none(
+    fn rewrite_show_views_has_no_target_name(
         prefix in arb_case_variant("show semantic views"),
     ) {
-        let extracted = extract_ddl_name(&prefix).unwrap();
-        prop_assert_eq!(extracted, None);
+        match rewrite_result(&prefix).unwrap() {
+            RewriteAction::Passthrough(sql) =>
+                prop_assert_eq!(sql, "SELECT * FROM list_semantic_views()"),
+            other => prop_assert!(false, "unexpected rewrite action: {:?}", other),
+        }
     }
 }
 
@@ -360,13 +360,13 @@ fn arb_hostile_name_content() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-    /// Quoted hostile names round-trip through name extraction with their
-    /// content intact except for ASCII case, which folds to lowercase — DuckDB
-    /// treats quoted identifiers as case-insensitive too (revised 2026-07-12).
-    /// No mojibake, no truncation at inner whitespace/dots, for every
-    /// name-only form.
+    /// Quoted hostile names round-trip through the rewrite with their content
+    /// intact except for ASCII case, which folds to lowercase — DuckDB treats
+    /// quoted identifiers as case-insensitive too (revised 2026-07-12). No
+    /// mojibake, no truncation at inner whitespace/dots, for every name-only
+    /// form.
     #[test]
-    fn extract_name_quoted_hostile_names(
+    fn rewrite_quoted_hostile_names(
         form_idx in 0..3usize,
         content in arb_hostile_name_content(),
     ) {
@@ -374,8 +374,6 @@ proptest! {
         let folded = content.to_ascii_lowercase();
         let quoted = format!("\"{}\"", content.replace('"', "\"\""));
         let ddl = format!("{prefix} {quoted}");
-        let extracted = extract_ddl_name(&ddl).unwrap();
-        prop_assert_eq!(extracted, Some(folded.clone()));
 
         // DROP carries the normalized view name structurally (quoted content
         // folds to lowercase via normalize_view_name). FF-4: DESCRIBE / SHOW
@@ -394,16 +392,22 @@ proptest! {
         }
     }
 
-    /// Unquoted mixed-case names fold to lowercase (PA-8) at extraction.
+    /// Unquoted mixed-case names: DROP folds to lowercase structurally (PA-8);
+    /// DESCRIBE embeds the RAW name in its passthrough (FF-4 — folding is
+    /// deferred to the TF dispatcher), so the rewrite carries the original case.
     #[test]
-    fn extract_name_unquoted_folds(
+    fn rewrite_unquoted_name_case(
         form_idx in 0..3usize,
         name in "[A-Za-z_][A-Za-z0-9_]{0,20}",
     ) {
-        let (prefix, _kind, _fn_name) = NAME_ONLY_FORMS[form_idx];
+        let (prefix, _kind, fn_name) = NAME_ONLY_FORMS[form_idx];
         let ddl = format!("{prefix} {name}");
-        let extracted = extract_ddl_name(&ddl).unwrap();
-        prop_assert_eq!(extracted, Some(name.to_ascii_lowercase()));
+        match rewrite_result(&ddl).unwrap() {
+            RewriteAction::Drop { name: n, .. } => prop_assert_eq!(n, name.to_ascii_lowercase()),
+            RewriteAction::Passthrough(sql) =>
+                prop_assert_eq!(sql, format!("SELECT * FROM {fn_name}('{name}')")),
+            other => prop_assert!(false, "unexpected rewrite action: {:?}", other),
+        }
     }
 }
 

@@ -2,7 +2,7 @@
 //
 // This module provides two layers:
 // 1. Pure detection/rewrite functions (`detect_semantic_view_ddl`,
-//    `extract_ddl_name`, `plan_rewrite`) testable under `cargo test`
+//    `plan_rewrite`) testable under `cargo test`
 //    without the extension feature.
 // 2. FFI entry points (`sv_parser_override_rust`, `sv_free_buffer`)
 //    feature-gated on `extension`, with `catch_unwind` for panic safety.
@@ -43,7 +43,7 @@ pub(crate) use show_clauses::{build_filter_suffix, parse_show_filter_clauses};
 
 mod rewrite;
 pub(crate) use rewrite::extract_quoted_string;
-pub use rewrite::{extract_ddl_name, plan_rewrite, CreateMode, RewriteAction};
+pub use rewrite::{plan_rewrite, CreateMode, RewriteAction};
 
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.
 pub const PARSE_NOT_OURS: u8 = 0;
