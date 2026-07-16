@@ -73,7 +73,9 @@ Each dimension in ``NON ADDITIVE BY`` accepts an optional sort order and NULLS p
 - ``ASC`` (default) -- selects the **latest** snapshot row (matches Snowflake)
 - ``DESC`` -- selects the **earliest** snapshot row
 - ``NULLS FIRST`` -- a NULL dimension value wins (outranks every real snapshot)
-- ``NULLS LAST`` (default) -- a NULL dimension value never wins; the latest (or earliest) real snapshot is chosen
+- ``NULLS LAST`` -- a NULL dimension value never wins; the latest (or earliest) real snapshot is chosen
+
+The default NULLS placement follows the sort direction, matching DuckDB and Snowflake: ``ASC`` defaults to ``NULLS LAST`` and ``DESC`` defaults to ``NULLS FIRST``. So a bare ``NON ADDITIVE BY (report_date)`` (latest, ``NULLS LAST``) never lets a NULL date win, whereas ``NON ADDITIVE BY (report_date DESC)`` (earliest, ``NULLS FIRST``) *does* — add an explicit ``NULLS LAST`` if you want to exclude NULL keys regardless of direction.
 
 .. code-block:: sql
 

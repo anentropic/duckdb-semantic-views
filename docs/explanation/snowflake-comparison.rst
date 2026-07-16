@@ -344,7 +344,7 @@ The behavioral differences are:
 
 - ``NON ADDITIVE BY`` dimensions must be declared in the view's ``DIMENSIONS`` clause. Snowflake validates against its own catalog.
 - Window metrics and ``NON ADDITIVE BY`` cannot be combined on the same metric (mutually exclusive).
-- NULL keys in a non-additive dimension: under the default ``NULLS LAST`` a NULL key never wins, so the latest (or earliest) *real* snapshot is selected; declare ``NULLS FIRST`` to let a NULL key win.
+- NULL keys in a non-additive dimension: the default NULLS placement follows the direction (``ASC`` → ``NULLS LAST``, ``DESC`` → ``NULLS FIRST``), matching DuckDB/Snowflake. Under ``NULLS LAST`` a NULL key never wins (the latest/earliest *real* snapshot is selected); under ``NULLS FIRST`` a NULL key wins. Add an explicit ``NULLS LAST`` to exclude NULL keys regardless of direction.
 - Window metrics cannot be mixed with aggregate metrics in the same query.
 
 

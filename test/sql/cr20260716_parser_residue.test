@@ -1,0 +1,82 @@
+# Code-review 2026-07-16 F-2/F-3/F-4: the body parser must reject residue that
+# was previously matched-then-sliced-backwards and silently discarded. These
+# pin the fixes end-to-end through the full CREATE SEMANTIC VIEW pipeline (the
+# parse errors surface as DuckDB Parser Errors), complementing the unit tests
+# in src/body_parser/.
+
+require semantic_views
+
+statement ok
+CREATE TABLE r16_orders (id INTEGER PRIMARY KEY, region VARCHAR, d DATE, qty INTEGER);
+
+# ========================================
+# F-2: an OVER clause must reject tokens before PARTITION BY. A misplaced
+# ORDER BY was previously discarded, yielding an unordered window aggregate.
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW r16_f2 AS
+TABLES (o AS r16_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region, o.d AS o.d)
+METRICS (
+    o.total AS SUM(o.qty),
+    o.w AS SUM(total) OVER (ORDER BY d PARTITION BY region)
+)
+----
+Unexpected text 'ORDER BY d' before PARTITION BY
+
+# ========================================
+# F-3: junk after NON ADDITIVE BY (...) / USING (...) in a metric entry is
+# rejected instead of silently dropped.
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW r16_f3a AS
+TABLES (o AS r16_orders PRIMARY KEY (id))
+DIMENSIONS (o.d AS o.d)
+METRICS (o.m NON ADDITIVE BY (d) junk AS SUM(o.qty))
+----
+Unexpected text 'junk' after NON ADDITIVE BY (...)
+
+statement error
+CREATE SEMANTIC VIEW r16_f3b AS
+TABLES (o AS r16_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.m USING (rel) junk AS SUM(o.qty))
+----
+Unexpected text 'junk' after USING (...)
+
+# ========================================
+# F-4: MATERIALIZATIONS rejects junk before the first sub-keyword, duplicate
+# sub-clauses (was silent last-wins), and trailing junk after a (...) list.
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW r16_f4a AS
+TABLES (o AS r16_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.total AS SUM(o.qty))
+MATERIALIZATIONS (mm AS (junk TABLE t, DIMENSIONS (region)))
+----
+before the first sub-clause
+
+statement error
+CREATE SEMANTIC VIEW r16_f4b AS
+TABLES (o AS r16_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.total AS SUM(o.qty))
+MATERIALIZATIONS (mm AS (TABLE t, TABLE u, DIMENSIONS (region)))
+----
+duplicate TABLE sub-clause
+
+statement error
+CREATE SEMANTIC VIEW r16_f4c AS
+TABLES (o AS r16_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.total AS SUM(o.qty))
+MATERIALIZATIONS (mm AS (TABLE t, DIMENSIONS (region) junk))
+----
+after a MATERIALIZATIONS sub-clause list
+
+statement ok
+DROP TABLE r16_orders;

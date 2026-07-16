@@ -9,6 +9,7 @@ test/sql/count_star_left_join.test
 test/sql/cr20260711_c7_named_param_registration.test
 test/sql/cr20260711_correctness.test
 test/sql/cr20260711b_test_coverage.test
+test/sql/cr20260716_parser_residue.test
 test/sql/e4_cross_source_diamond.test
 test/sql/error_caret_alter.test
 test/sql/error_caret_create.test
