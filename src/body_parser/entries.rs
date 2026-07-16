@@ -63,7 +63,14 @@ fn parse_single_qualified_entry(
         });
     }
 
-    // Phase 43: Check for leading PRIVATE/PUBLIC keyword
+    // Phase 43: Check for leading PRIVATE/PUBLIC keyword.
+    //
+    // F-12 (code-review 2026-07-16): an explicit `PUBLIC` on a dimension is
+    // Snowflake-valid and accepted here — it is the default, so it is a no-op
+    // and the modifier is simply stripped (dimensions carry no access field).
+    // `PRIVATE` on a dimension is still rejected: this extension does not
+    // implement private dimensions, and silently downgrading one to public
+    // would hide data-exposure intent, so it errors rather than being ignored.
     let (access, entry_after_access) = parse_leading_access_modifier(entry);
     if access == AccessModifier::Private && !allow_access_modifier {
         return Err(ParseError {
@@ -73,28 +80,6 @@ fn parse_single_qualified_entry(
             position: Some(entry_offset),
         });
     }
-    // Also reject explicit PUBLIC on dimensions (for consistency)
-    if !allow_access_modifier
-        && entry_after_access.len() != entry.trim().len()
-        && access == AccessModifier::Public
-    {
-        // Check if it was an explicit PUBLIC keyword (entry was modified)
-        let entry_trimmed = entry.trim();
-        let entry_upper = entry_trimmed.to_ascii_uppercase();
-        if entry_upper.starts_with("PUBLIC") {
-            let after = &entry_trimmed["PUBLIC".len()..];
-            if after.starts_with(|c: char| c.is_ascii_whitespace())
-                && !after.trim_start().starts_with('.')
-            {
-                return Err(ParseError {
-                    message: format!(
-                        "PUBLIC is not supported on {clause_name}. Only facts and metrics can have access modifiers."
-                    ),
-                    position: Some(entry_offset),
-                });
-            }
-        }
-    }
 
     // The cursor spans the post-access-modifier text. Its base includes the
     // byte offset of `entry_after_access` within `entry` so error carets land at
@@ -102,13 +87,28 @@ fn parse_single_qualified_entry(
     // relative to `entry_after_access` and so drifted left into a stripped
     // `PRIVATE `/`PUBLIC ` prefix on FACTS entries (PR #102 review).
     let access_offset = crate::util::byte_offset_within(entry, entry_after_access);
-    let mut cur = Cursor::new(entry_after_access, entry_offset + access_offset);
+    let cur = Cursor::new(entry_after_access, entry_offset + access_offset);
 
-    // Split `alias.name` at the first `.` SYMBOL token — quote-aware (PA-6): a
-    // dot inside a quoted name (`"a.b"`) is part of that one token, not a
-    // qualifier separator. `name` keeps the source-slice form because it may
-    // itself contain dots (`o.x.y` → alias `o`, name `x.y`).
-    let Some(dot_tok) = cur.find_symbol(b'.') else {
+    // Find the entry's structural `AS` first. The qualifier `.` must precede
+    // it; searching for `.` across the whole entry (F-14, code-review
+    // 2026-07-16) would find a dot inside the *expression*
+    // (`region AS upper(o.region)`) and misreport the missing qualifier as a
+    // missing `AS`. The `AS` separating name from expression is the first `AS`
+    // keyword token (the name slot contains no `AS`).
+    let Some(as_tok) = cur.find_kw("AS") else {
+        return Err(cur.err(
+            0,
+            format!(
+                "Expected 'AS' keyword in dimension/metric entry '{entry}'. Form: 'alias.name AS expr'.",
+            ),
+        ));
+    };
+
+    // Split `alias.name` at the first `.` SYMBOL token *before* `AS` —
+    // quote-aware (PA-6): a dot inside a quoted name (`"a.b"`) is part of that
+    // one token, not a qualifier separator. `name` keeps the source-slice form
+    // because it may itself contain dots (`o.x.y` → alias `o`, name `x.y`).
+    let Some(dot_tok) = cur.find_symbol(b'.').filter(|d| d.start < as_tok.start) else {
         return Err(cur.err(
             0,
             format!(
@@ -123,18 +123,7 @@ fn parse_single_qualified_entry(
             format!("Source alias before '.' is empty in entry '{entry}'."),
         ));
     }
-    cur.advance_past_byte(dot_tok.end);
 
-    // `AS` is the first keyword token after the qualifier dot; `name` is the
-    // text between them.
-    let Some(as_tok) = cur.find_kw("AS") else {
-        return Err(cur.err(
-            dot_tok.end,
-            format!(
-                "Expected 'AS' keyword in dimension/metric entry '{entry}'. Form: 'alias.name AS expr'.",
-            ),
-        ));
-    };
     let bare_name = entry_after_access[dot_tok.end..as_tok.start]
         .trim()
         .to_string();
@@ -142,6 +131,23 @@ fn parse_single_qualified_entry(
         return Err(cur.err(
             dot_tok.end,
             format!("Missing bare name between '.' and 'AS' in entry '{entry}'."),
+        ));
+    }
+
+    // F-9 / F-11: the alias and name slots must each be a single well-formed
+    // identifier — `o.d junk AS x` previously stored the two-word name
+    // `"d junk"`, and an empty quoted `""` slid through. Report with the caret
+    // at the offending slot.
+    if let Some(reason) = super::scan::identifier_slot_error(&source_alias) {
+        return Err(cur.err(
+            0,
+            format!("Invalid source alias in {clause_name} entry '{entry}': {reason}."),
+        ));
+    }
+    if let Some(reason) = super::scan::identifier_slot_error(&bare_name) {
+        return Err(cur.err(
+            dot_tok.end,
+            format!("Invalid name in {clause_name} entry '{entry}': {reason}."),
         ));
     }
 

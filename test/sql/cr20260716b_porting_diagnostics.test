@@ -1,0 +1,131 @@
+# Code-review 2026-07-16 porting/diagnostics batch: F-6 (trailing view-level
+# COMMENT position), F-7 (optional table alias), F-9 (multi-token name slots
+# rejected), F-10 (DESC alias for DESCRIBE), F-11 (empty quoted identifier
+# rejected), F-12 (PUBLIC on dimensions + optional `=` in WITH SYNONYMS), F-14
+# (unqualified entry name gives a qualifier error, not "Expected AS"). These
+# pin the fixes end-to-end through the full CREATE / DESCRIBE pipeline.
+
+require semantic_views
+
+statement ok
+CREATE TABLE t16_orders (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO t16_orders VALUES (1, 'US', 10), (2, 'US', 5), (3, 'EU', 7);
+
+# ========================================
+# F-7: the table alias is optional (Snowflake `[alias AS] table`). Here the
+# alias defaults to the table name `t16_orders`.
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW t16_f7 AS
+TABLES (t16_orders PRIMARY KEY (id))
+DIMENSIONS (t16_orders.region AS t16_orders.region)
+METRICS (t16_orders.total AS SUM(t16_orders.qty))
+
+query TI rowsort
+SELECT region, total FROM semantic_view('t16_f7',
+    dimensions := ['region'], metrics := ['total'])
+----
+EU	7
+US	15
+
+# ========================================
+# F-10: DESC is accepted as an abbreviation of DESCRIBE.
+# ========================================
+
+statement ok
+DESC SEMANTIC VIEW t16_f7;
+
+statement ok
+DESCRIBE SEMANTIC VIEW t16_f7;
+
+# ========================================
+# F-6: a trailing view-level COMMENT after the last clause (Snowflake position).
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW t16_f6 AS
+TABLES (o AS t16_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.total AS SUM(o.qty))
+COMMENT = 'Trailing view comment'
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 't16_f6') LIKE '%Trailing view comment%'
+----
+true
+
+# A view-level COMMENT in BOTH positions is contradictory and rejected.
+statement error
+CREATE SEMANTIC VIEW t16_f6_dup COMMENT = 'leading' AS
+TABLES (o AS t16_orders PRIMARY KEY (id))
+METRICS (o.total AS SUM(o.qty))
+COMMENT = 'trailing'
+----
+specified twice
+
+# ========================================
+# F-12: PUBLIC accepted on dimensions (no-op); WITH SYNONYMS `=` optional.
+# ========================================
+
+statement ok
+CREATE SEMANTIC VIEW t16_f12 AS
+TABLES (o AS t16_orders PRIMARY KEY (id))
+DIMENSIONS (PUBLIC o.region AS o.region WITH SYNONYMS ('territory'))
+METRICS (o.total AS SUM(o.qty))
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 't16_f12') LIKE '%territory%'
+----
+true
+
+# PRIVATE on a dimension is still rejected.
+statement error
+CREATE SEMANTIC VIEW t16_f12_bad AS
+TABLES (o AS t16_orders PRIMARY KEY (id))
+DIMENSIONS (PRIVATE o.region AS o.region)
+METRICS (o.total AS SUM(o.qty))
+----
+PRIVATE is not supported
+
+# ========================================
+# F-9: a multi-token name slot is rejected instead of stored as a bogus name.
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW t16_f9 AS
+TABLES (o AS t16_orders PRIMARY KEY (id))
+DIMENSIONS (o.region junk AS o.region)
+METRICS (o.total AS SUM(o.qty))
+----
+is not a single identifier
+
+# ========================================
+# F-11: an empty quoted identifier `""` in a name slot is rejected.
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW t16_f11 AS
+TABLES ("" AS t16_orders PRIMARY KEY (id))
+DIMENSIONS (t16_orders.region AS t16_orders.region)
+METRICS (t16_orders.total AS SUM(t16_orders.qty))
+----
+empty quoted identifier
+
+# ========================================
+# F-14: an unqualified entry name (dot only inside the expression) reports the
+# missing qualifier, not a misleading "Expected AS".
+# ========================================
+
+statement error
+CREATE SEMANTIC VIEW t16_f14 AS
+TABLES (o AS t16_orders PRIMARY KEY (id))
+DIMENSIONS (region AS upper(o.region))
+METRICS (o.total AS SUM(o.qty))
+----
+qualified identifier
+
+statement ok
+DROP TABLE t16_orders CASCADE;

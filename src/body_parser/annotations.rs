@@ -197,14 +197,14 @@ pub(super) fn parse_trailing_annotations(
                     position: None,
                 });
             }
-            // `SYNONYMS` is 8 ASCII bytes.
-            let Some(after_eq) = after_with[8..].trim_start().strip_prefix('=') else {
-                return Err(ParseError {
-                    message: "Expected '=' after WITH SYNONYMS keyword.".to_string(),
-                    position: None,
-                });
-            };
-            let after_eq = after_eq.trim_start();
+            // `SYNONYMS` is 8 ASCII bytes. Snowflake makes the `=` optional, so
+            // both `WITH SYNONYMS = (...)` and `WITH SYNONYMS (...)` are
+            // accepted (F-12, code-review 2026-07-16).
+            let after_synonyms = after_with[8..].trim_start();
+            let after_eq = after_synonyms
+                .strip_prefix('=')
+                .unwrap_or(after_synonyms)
+                .trim_start();
             let (content, consumed) = extract_paren_prefix(after_eq).ok_or_else(|| ParseError {
                 message: "Expected parenthesized list after WITH SYNONYMS =.".to_string(),
                 position: None,

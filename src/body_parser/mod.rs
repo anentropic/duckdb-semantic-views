@@ -73,6 +73,10 @@ pub struct KeywordBody {
     pub dimensions: Vec<Dimension>,
     pub metrics: Vec<Metric>,
     pub materializations: Vec<Materialization>,
+    /// A trailing view-level `COMMENT = '...'` after the last clause
+    /// (Snowflake's comment position, F-6). `None` when absent; the caller
+    /// merges it with any comment written between the name and `AS`.
+    pub view_comment: Option<String>,
 }
 
 /// Parse the keyword body after "AS" into structured clause data.
@@ -98,6 +102,11 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
     // Offset of after_as within the original query
     let as_offset = base_offset + (text.len() - text.trim_start().len()) + 2;
     let after_as_offset = as_offset + (text.trim_start()[2..].len() - after_as.len());
+
+    // F-6 (code-review 2026-07-16): peel an optional trailing view-level
+    // `COMMENT = '...'` (Snowflake places it after the last clause) before the
+    // clause scan, so the COMMENT keyword is not read as an unknown clause.
+    let (after_as, view_comment) = split_trailing_view_comment(after_as, after_as_offset)?;
 
     let bounds = find_clause_bounds(after_as, after_as_offset)?;
 
@@ -395,7 +404,51 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
         dimensions,
         metrics,
         materializations,
+        view_comment,
     })
+}
+
+/// Peel an optional trailing view-level `COMMENT = '...'` off the clause region.
+///
+/// Snowflake places the view-level comment AFTER the last clause
+/// (`... METRICS (...) COMMENT = '...'`), whereas this parser historically only
+/// accepted it between the name and `AS`. Without peeling it here the trailing
+/// `COMMENT` keyword is read as an unknown clause (F-6, code-review 2026-07-16).
+///
+/// The comment is the region from the first depth-0 `COMMENT` keyword to the end
+/// of `after_as` — a `COMMENT` inside a clause's `(...)` sits at depth > 0 and is
+/// inert. Returns the clause region with the comment sliced off, plus the parsed
+/// comment. `WITH SYNONYMS` is not a view-level annotation and is rejected.
+fn split_trailing_view_comment(
+    after_as: &str,
+    base_offset: usize,
+) -> Result<(&str, Option<String>), ParseError> {
+    let cur = cursor::Cursor::new(after_as, base_offset);
+    let Some(comment_tok) = cur.find_kw_depth0("COMMENT") else {
+        return Ok((after_as, None));
+    };
+    let trailing = &after_as[comment_tok.start..];
+    let (leftover, ann) = annotations::parse_trailing_annotations(trailing)?;
+    // `trailing` begins at the COMMENT keyword, so the "expression" prefix the
+    // annotation parser peels off must be empty.
+    if !leftover.trim().is_empty() {
+        return Err(ParseError {
+            message: format!(
+                "Unexpected text '{}' before the trailing view-level COMMENT.",
+                leftover.trim()
+            ),
+            position: Some(base_offset + comment_tok.start),
+        });
+    }
+    if !ann.synonyms.is_empty() {
+        return Err(ParseError {
+            message: "WITH SYNONYMS is not valid at the view level; it applies to tables, \
+                      dimensions, facts, and metrics."
+                .to_string(),
+            position: Some(base_offset + comment_tok.start),
+        });
+    }
+    Ok((&after_as[..comment_tok.start], ann.comment))
 }
 
 #[cfg(test)]
@@ -694,13 +747,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_tables_error_missing_as() {
-        let result = parse_tables_clause("o orders PRIMARY KEY (id)", 0);
-        assert!(result.is_err(), "Expected error for missing AS");
-        let err = result.unwrap_err();
+    fn parse_tables_two_words_before_constraint_rejected() {
+        // F-7 (code-review 2026-07-16): the table alias is optional, so `o` is
+        // read as the table name; the stray second word `orders` before
+        // PRIMARY KEY is then unexpected text (a likely `o AS orders` typo with
+        // a missing `AS`), reported rather than silently taken.
+        let err = parse_tables_clause("o orders PRIMARY KEY (id)", 0).unwrap_err();
         assert!(
-            err.message.contains("AS"),
-            "Error should mention AS: {}",
+            err.message.contains("Unexpected text 'orders'"),
+            "got: {}",
             err.message
         );
     }
@@ -1533,9 +1588,13 @@ mod tests {
     fn test_as_keyword_requires_boundary_in_tables_and_materializations() {
         // PR #50 review: `AS` was matched as a raw 2-byte prefix, so
         // `ASorders` / `ASx` were treated as the AS keyword ending early.
+        // `ASorders` is a single bare token, never the AS keyword. With the
+        // alias now optional (F-7, code-review 2026-07-16), `o` is read as the
+        // table name and `ASorders` is unexpected text before PRIMARY KEY —
+        // still rejected, just no longer phrased as "Expected 'AS'".
         let err = parse_tables_clause("o ASorders PRIMARY KEY (id)", 0).unwrap_err();
         assert!(
-            err.message.contains("Expected 'AS'"),
+            err.message.contains("Unexpected text 'ASorders'"),
             "got: {}",
             err.message
         );
@@ -3628,5 +3687,229 @@ mod tests {
                      )";
         let result = parse_materializations_clause(body, 0).unwrap();
         assert_eq!(result[0].table, "catalog.schema.daily_revenue_agg");
+    }
+
+    // -----------------------------------------------------------------------
+    // Porting / diagnostics batch (code-review 2026-07-16): F-7 optional table
+    // alias, F-9 multi-token name rejection, F-11 empty-quoted rejection, F-12
+    // PUBLIC-on-dims + optional `=` in WITH SYNONYMS, F-14 bounded dot search.
+    // -----------------------------------------------------------------------
+
+    // --- F-7: the table alias is optional (Snowflake: `[alias AS] table`) ---
+
+    #[test]
+    fn f7_tables_bare_name_defaults_alias() {
+        let result = parse_tables_clause("orders PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result[0].alias, "orders");
+        assert_eq!(result[0].table, "orders");
+        assert_eq!(result[0].pk_columns, vec!["id"]);
+    }
+
+    #[test]
+    fn f7_tables_bare_name_no_constraint() {
+        let result = parse_tables_clause("orders", 0).unwrap();
+        assert_eq!(result[0].alias, "orders");
+        assert_eq!(result[0].table, "orders");
+        assert!(result[0].pk_columns.is_empty());
+    }
+
+    #[test]
+    fn f7_tables_explicit_alias_still_parses() {
+        // The `alias AS table` form is unchanged.
+        let result = parse_tables_clause("o AS orders PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result[0].alias, "o");
+        assert_eq!(result[0].table, "orders");
+    }
+
+    #[test]
+    fn f7_tables_quoted_bare_name() {
+        // A quoted alias-less name is captured whole and defaults the alias.
+        let result = parse_tables_clause("\"my orders\" PRIMARY KEY (id)", 0).unwrap();
+        assert_eq!(result[0].alias, "\"my orders\"");
+        assert_eq!(result[0].table, "\"my orders\"");
+    }
+
+    // --- F-9: a name slot must be a single identifier, not a token run ---
+
+    #[test]
+    fn f9_dimension_multi_token_name_rejected() {
+        let err = parse_qualified_entries("o.d junk AS o.x", 0, false, "dimensions").unwrap_err();
+        assert!(
+            err.message.contains("not a single identifier"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn f9_metric_multi_token_name_rejected() {
+        let err = parse_metrics_clause("o.d junk AS SUM(o.v)", 0).unwrap_err();
+        assert!(
+            err.message.contains("not a single identifier"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn f9_derived_metric_multi_token_name_rejected() {
+        let err = parse_metrics_clause("total junk AS revenue + 1", 0).unwrap_err();
+        assert!(
+            err.message.contains("not a single identifier"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn f9_relationship_multi_token_name_rejected() {
+        let err = parse_relationships_clause("foo bar AS f(id) REFERENCES a", 0).unwrap_err();
+        assert!(
+            err.message.contains("not a single identifier"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn f9_quoted_name_with_space_still_valid() {
+        // A quoted identifier that contains whitespace is a single token.
+        let result =
+            parse_qualified_entries("o.\"order date\" AS o.d", 0, false, "dimensions").unwrap();
+        assert_eq!(result[0].name, "\"order date\"");
+    }
+
+    // --- F-11: an empty quoted identifier `""` in a name/alias slot ---
+
+    #[test]
+    fn f11_empty_quoted_table_alias_rejected() {
+        let err = parse_tables_clause("\"\" AS orders PRIMARY KEY (id)", 0).unwrap_err();
+        assert!(
+            err.message.contains("empty quoted identifier"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn f11_empty_quoted_dimension_alias_rejected() {
+        let err = parse_qualified_entries("\"\".name AS x", 0, false, "dimensions").unwrap_err();
+        assert!(
+            err.message.contains("empty quoted identifier"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    // --- F-12: PUBLIC accepted on dimensions; WITH SYNONYMS `=` optional ---
+
+    #[test]
+    fn f12_public_on_dimension_accepted() {
+        let result =
+            parse_qualified_entries("PUBLIC o.region AS o.region", 0, false, "dimensions").unwrap();
+        assert_eq!(result[0].name, "region");
+        assert_eq!(result[0].source_alias, "o");
+    }
+
+    #[test]
+    fn f12_private_on_dimension_still_rejected() {
+        let err = parse_qualified_entries("PRIVATE o.region AS o.region", 0, false, "dimensions")
+            .unwrap_err();
+        assert!(
+            err.message.contains("PRIVATE is not supported"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn f12_with_synonyms_without_equals_accepted() {
+        // Snowflake accepts `WITH SYNONYMS (...)` without the `=`.
+        let (expr, ann) =
+            parse_trailing_annotations("SUM(o.amount) WITH SYNONYMS ('territory', 'area')")
+                .unwrap();
+        assert_eq!(expr, "SUM(o.amount)");
+        assert_eq!(ann.synonyms, vec!["territory", "area"]);
+    }
+
+    #[test]
+    fn f12_with_synonyms_with_equals_still_accepted() {
+        let (_expr, ann) =
+            parse_trailing_annotations("SUM(o.amount) WITH SYNONYMS = ('territory')").unwrap();
+        assert_eq!(ann.synonyms, vec!["territory"]);
+    }
+
+    // --- F-14: the qualifier dot search stops before the entry `AS` ---
+
+    #[test]
+    fn f14_unqualified_name_reports_qualifier_not_missing_as() {
+        // `region AS upper(o.region)` has an unqualified entry name; the dot in
+        // the expression must not be mistaken for the qualifier, which
+        // previously produced a misleading "Expected 'AS'" error.
+        let err = parse_qualified_entries("region AS upper(o.region)", 0, false, "dimensions")
+            .unwrap_err();
+        assert!(
+            err.message.contains("qualified identifier"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn f14_qualified_entry_with_dotted_expression_still_parses() {
+        // Guard: a normal qualified entry whose expression also contains a dot
+        // still parses — the qualifier is the dot before AS, not the one in the
+        // expression.
+        let result =
+            parse_qualified_entries("o.region AS upper(o.region)", 0, false, "dimensions").unwrap();
+        assert_eq!(result[0].source_alias, "o");
+        assert_eq!(result[0].name, "region");
+        assert_eq!(result[0].expr, "upper(o.region)");
+    }
+
+    // --- F-6: a trailing view-level COMMENT after the last clause ---
+
+    #[test]
+    fn f6_trailing_view_comment_extracted() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    DIMENSIONS (o.region AS o.region) \
+                    METRICS (o.rev AS SUM(o.amount)) COMMENT = 'My view'";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert_eq!(kb.view_comment.as_deref(), Some("My view"));
+        assert_eq!(kb.dimensions.len(), 1);
+        assert_eq!(kb.metrics.len(), 1);
+    }
+
+    #[test]
+    fn f6_no_trailing_comment_is_none() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (o.rev AS SUM(o.amount))";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert!(kb.view_comment.is_none());
+    }
+
+    #[test]
+    fn f6_entry_level_comment_not_mistaken_for_view_comment() {
+        // A COMMENT inside a clause (on a metric) sits at depth > 0 and must NOT
+        // be picked up as the view-level trailing comment.
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (o.rev AS SUM(o.amount) COMMENT = 'metric note')";
+        let kb = parse_keyword_body(body, 0).unwrap();
+        assert!(kb.view_comment.is_none());
+        assert_eq!(kb.metrics[0].comment.as_deref(), Some("metric note"));
+    }
+
+    #[test]
+    fn f6_view_level_synonyms_rejected() {
+        // WITH SYNONYMS is not a view-level annotation.
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (o.rev AS SUM(o.amount)) COMMENT = 'x' WITH SYNONYMS = ('v')";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("WITH SYNONYMS is not valid at the view level"),
+            "got: {}",
+            err.message
+        );
     }
 }

@@ -137,6 +137,15 @@ pub(crate) fn detect_ddl_prefix(trimmed: &str) -> Option<(DdlKind, usize)> {
     if let Some(n) = match_keyword_prefix(b, &[b"describe", b"semantic", b"view"]) {
         return Some((DdlKind::Describe, n));
     }
+    // DESC SEMANTIC VIEW (3 keywords) — Snowflake documents `{DESCRIBE | DESC}`
+    // and DuckDB itself accepts the `DESC` abbreviation, so both conventions
+    // support it (F-10, code-review 2026-07-16). The mandatory whitespace
+    // between prefix keywords keeps this from shadowing `DESCRIBE`: matching
+    // `desc` against `DESCRIBE...` leaves `RIBE...` where whitespace is
+    // required before `semantic`, so that path falls through to the match above.
+    if let Some(n) = match_keyword_prefix(b, &[b"desc", b"semantic", b"view"]) {
+        return Some((DdlKind::Describe, n));
+    }
     // SHOW COLUMNS IN SEMANTIC VIEW (5 keywords) -- before all SHOW SEMANTIC matches
     if let Some(n) = match_keyword_prefix(b, &[b"show", b"columns", b"in", b"semantic", b"view"]) {
         return Some((DdlKind::ShowColumns, n));
@@ -271,4 +280,40 @@ pub fn detect_near_miss(query: &str) -> Option<ParseError> {
             position: Some(trim_offset),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // F-10 (code-review 2026-07-16): `DESC` is a Snowflake- and DuckDB-accepted
+    // abbreviation of `DESCRIBE`, so `DESC SEMANTIC VIEW` maps to the same kind.
+    #[test]
+    fn desc_abbreviation_maps_to_describe() {
+        assert_eq!(
+            detect_ddl_kind("DESC SEMANTIC VIEW my_view"),
+            Some(DdlKind::Describe)
+        );
+        // Case-insensitive and whitespace-tolerant, like every other prefix.
+        assert_eq!(
+            detect_ddl_kind("desc   semantic   view v"),
+            Some(DdlKind::Describe)
+        );
+    }
+
+    #[test]
+    fn describe_full_spelling_still_maps_to_describe() {
+        // The `DESC` arm must not shadow the full `DESCRIBE` spelling: matching
+        // `desc` against `DESCRIBE` leaves `RIBE` where whitespace is required.
+        assert_eq!(
+            detect_ddl_kind("DESCRIBE SEMANTIC VIEW my_view"),
+            Some(DdlKind::Describe)
+        );
+    }
+
+    #[test]
+    fn desc_requires_word_boundary() {
+        // `DESCXYZ SEMANTIC VIEW` is neither DESC nor DESCRIBE.
+        assert_eq!(detect_ddl_kind("DESCXYZ SEMANTIC VIEW v"), None);
+    }
 }

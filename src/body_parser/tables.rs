@@ -42,7 +42,12 @@ pub(crate) fn parse_tables_clause(
 /// (no name token, a bare reserved keyword in the name slot, ...) so the exact
 /// message stays single-sourced.
 fn missing_name_msg(alias: &str) -> String {
-    format!("Missing physical table name after AS for alias '{alias}' in TABLES clause.")
+    if alias.is_empty() {
+        // Alias-less entry (F-7): there is no alias to name in the message.
+        "Missing physical table name in TABLES clause.".to_string()
+    } else {
+        format!("Missing physical table name after AS for alias '{alias}' in TABLES clause.")
+    }
 }
 
 /// Parse a single TABLES clause entry.
@@ -55,31 +60,67 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
     let entry = entry.trim();
     let mut cur = Cursor::new(entry, entry_offset);
 
-    // Step 1: alias — the first token.
-    let Some(alias_tok) = cur.bump() else {
-        return Err(cur.err(0, "Expected table alias in TABLES entry.".to_string()));
+    // Step 1: the first token — either an alias (when `AS` follows) or the
+    // start of a bare source-table name. A leading symbol (`(`, `.`, ...) where
+    // a name should be is rejected up front.
+    let Some(first_tok) = cur.peek() else {
+        return Err(cur.err(
+            0,
+            "Expected table alias or name in TABLES entry.".to_string(),
+        ));
     };
-    let alias = cur.text(alias_tok);
-
-    // Step 2: the `AS` keyword. Tokenization gives the word boundary for free —
-    // `ASorders` is a single bare token that is not `AS`, and `AS"my table"`
-    // splits into `AS` + the quoted name — so no manual boundary check is
-    // needed (the PR #50 review's `is_ident_continuation` guard).
-    match cur.peek() {
-        Some(t) if cur.is_kw(t, "AS") => {
-            cur.bump();
-        }
-        _ => {
-            let off = cur.byte_pos();
-            return Err(cur.err(
-                off,
-                format!("Expected 'AS' after table alias '{alias}' in TABLES clause."),
-            ));
-        }
+    if matches!(first_tok.kind, TokenKind::Symbol(_)) {
+        return Err(cur.err(
+            first_tok.start,
+            "Expected table alias or name in TABLES entry.".to_string(),
+        ));
     }
 
-    // Step 3: the source-table name (see `take_source_table_name`).
-    let (table_name, name_end) = take_source_table_name(&mut cur, entry, alias)?;
+    // Step 2: decide `alias AS table` vs a bare `table`. Snowflake's grammar is
+    // `[ <table_alias> AS ] <table_name>` — the alias is optional (F-7,
+    // code-review 2026-07-16). The alias, when present, is the first identifier
+    // token immediately followed by `AS`. Tokenization gives the word boundary
+    // for free: `ASorders` is one bare token (not `AS`), and `AS"my table"`
+    // splits into `AS` + the quoted name.
+    cur.bump(); // consume the first token
+    let has_alias = matches!(cur.peek(), Some(t) if cur.is_kw(t, "AS"));
+
+    let (alias, table_name, name_end) = if has_alias {
+        let alias = cur.text(first_tok).to_string();
+        // Consume `AS`, then read the source-table name after it (Step 3).
+        cur.bump();
+        let (table_name, name_end) = take_source_table_name(&mut cur, entry, &alias)?;
+        (alias, table_name.to_string(), name_end)
+    } else {
+        // Alias-less: the first token begins the source-table name. Re-scan the
+        // name from the start of the entry so a dotted / quoted FQN
+        // (`schema.orders`, `"my table"`) is captured whole, and default the
+        // alias to the table name (Snowflake's implicit-alias behaviour).
+        let mut name_cur = Cursor::new(entry, entry_offset);
+        let (table_name, name_end) = take_source_table_name(&mut name_cur, entry, "")?;
+        // Resync the primary cursor past the whole name for constraint parsing.
+        cur.advance_past_byte(name_end);
+        (table_name.to_string(), table_name.to_string(), name_end)
+    };
+    let alias = alias.as_str();
+    let table_name = table_name.as_str();
+
+    // F-11 (code-review 2026-07-16): the alias and the source-table name must
+    // each be a well-formed identifier — an empty quoted `""` in either slot
+    // (`TABLES ("" AS orders ...)`) previously parsed. (`take_source_table_name`
+    // already rejects a multi-token name run, so F-9 does not recur here.)
+    if let Some(reason) = super::scan::identifier_slot_error(alias) {
+        return Err(cur.err(
+            first_tok.start,
+            format!("Invalid table alias in TABLES entry '{entry}': {reason}."),
+        ));
+    }
+    if let Some(reason) = super::scan::identifier_slot_error(table_name) {
+        return Err(cur.err(
+            first_tok.start,
+            format!("Invalid source-table name in TABLES entry '{entry}': {reason}."),
+        ));
+    }
 
     // Step 4: optional PRIMARY KEY. Its keyword pair may appear anywhere in the
     // remaining tokens; any token before it is text that does not belong
