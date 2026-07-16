@@ -1,0 +1,64 @@
+# Code-review 2026-07-16: quote-aware reference tokenizer (E-2 / E-3 / #28).
+#
+# End-to-end coverage that derived-metric references are resolved through the
+# shared quote-/case-insensitive tokenizer: a mixed-case reference (E-2) and a
+# double-quoted reference (TECH-DEBT #28) both inline to the same SQL as the
+# plain lowercase reference. Before the tokenizer, a quoted reference like
+# `"Revenue"` was substituted *inside* the quotes, producing a bogus quoted
+# identifier and a bind error.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cri_line_items (id INTEGER, region VARCHAR, price DECIMAL(10,2), cost_amt DECIMAL(10,2));
+
+statement ok
+INSERT INTO cri_line_items VALUES
+    (1, 'East', 100.00, 50.00),
+    (2, 'East', 200.00, 80.00),
+    (3, 'West', 150.00, 60.00);
+
+# `profit` references the base metrics in MIXED CASE (E-2); `margin` references
+# them DOUBLE-QUOTED (#28). DuckDB treats quoted identifiers as case-insensitive,
+# so both must resolve to the same expression as a plain `revenue - cost`.
+statement ok
+CREATE SEMANTIC VIEW cri_sales AS
+  TABLES (
+    li AS cri_line_items PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    li.region AS li.region
+  )
+  METRICS (
+    li.revenue AS SUM(li.price),
+    li.cost AS SUM(li.cost_amt),
+    profit AS REVENUE - Cost,
+    margin AS "Revenue" - "Cost"
+  );
+
+# East: 300 - 130 = 170 ; West: 150 - 60 = 90
+query TR rowsort
+SELECT * FROM semantic_view('cri_sales', dimensions := ['region'], metrics := ['profit']);
+----
+East	170.00
+West	90.00
+
+# The quoted-reference derived metric yields the identical result.
+query TR rowsort
+SELECT * FROM semantic_view('cri_sales', dimensions := ['region'], metrics := ['margin']);
+----
+East	170.00
+West	90.00
+
+# Base metrics and both derived metrics together stay consistent.
+query TRRRR rowsort
+SELECT * FROM semantic_view('cri_sales', dimensions := ['region'], metrics := ['revenue', 'cost', 'profit', 'margin']);
+----
+East	300.00	130.00	170.00	170.00
+West	150.00	60.00	90.00	90.00
+
+statement ok
+DROP SEMANTIC VIEW cri_sales;
+
+statement ok
+DROP TABLE cri_line_items;

@@ -1,10 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::expr_tokens::{inline_references, references_ref};
+use crate::ident::normalize_ident_part;
 use crate::model::{Fact, TableRef};
-use crate::util::{
-    contains_word_boundary_ref, is_word_boundary_char, replace_word_boundary_any,
-    replace_word_boundary_pairs,
-};
+use crate::util::is_word_boundary_char;
 
 use super::resolution::quote_ident;
 
@@ -49,8 +48,10 @@ pub(super) fn collect_derived_metric_using(
             }
         } else {
             // Derived metric: find referenced metric names and push to stack.
+            // A base metric may be referenced bare or by its own source table.
             for name in &all_names {
-                if *name != current_name && contains_word_boundary_ref(&current_met.expr, name) {
+                let src = name_map.get(name).and_then(|m| m.source_table.as_deref());
+                if *name != current_name && references_ref(&current_met.expr, name, src) {
                     stack.push(name.clone());
                 }
             }
@@ -89,8 +90,10 @@ pub(super) fn toposort_facts(facts: &[Fact]) -> Result<Vec<usize>, String> {
             if dep_idx == i {
                 continue; // skip self
             }
-            // Does this fact's expr reference the other fact name (whole word)?
-            if contains_word_boundary_ref(&fact.expr, name) {
+            // Does this fact's expr reference the other fact — bare, or
+            // qualified by that fact's own source table (`o.b`)? A foreign
+            // qualifier is a column on another relation, not a fact ref (E-3).
+            if references_ref(&fact.expr, name, facts[dep_idx].source_table.as_deref()) {
                 in_degree[i] += 1;
                 dependents[dep_idx].push(i);
             }
@@ -137,55 +140,72 @@ pub(super) fn inline_facts(expr: &str, facts: &[Fact], topo_order: &[usize]) -> 
         return expr.to_string();
     }
 
-    // Build resolved expressions in topological order
+    // Build resolved expressions in topological order.
     let mut resolved: HashMap<String, String> = HashMap::new();
 
     for &idx in topo_order {
         let fact = &facts[idx];
-        let mut resolved_expr = fact.expr.clone();
-
-        // Inline any already-resolved facts into this fact's expression.
-        // Qualified (`alias.name`) and unqualified (`name`) forms are replaced in a
-        // single pass so a replacement containing the unqualified name is not
-        // re-scanned (see `replace_word_boundary_any`).
-        for (name, replacement) in &resolved {
-            let qualified = fact.source_table.as_ref().map(|st| format!("{st}.{name}"));
-            let mut needles: Vec<&str> = Vec::with_capacity(2);
-            if let Some(ref q) = qualified {
-                needles.push(q);
-            }
-            needles.push(name);
-            resolved_expr = replace_word_boundary_any(&resolved_expr, &needles, replacement);
-        }
-
-        // Store as parenthesized
-        let parenthesized = format!("({resolved_expr})");
-        resolved.insert(fact.name.clone(), parenthesized);
+        // Inline any already-resolved facts into this fact's expression, keyed
+        // by their normalized (quote-/case-insensitive) form. A fact's own
+        // qualified form `alias.name` and its bare `name` are distinct keys, so
+        // an identity fact's `alias.name` is matched as a whole while a foreign
+        // `x.name` is left intact (E-3) — the shared tokenizer handles both by
+        // chain key, and never rescans inserted text.
+        let resolved_expr = if resolved.is_empty() {
+            fact.expr.clone()
+        } else {
+            let map = fact_replacement_map(facts, &resolved);
+            inline_references(&fact.expr, &map)
+        };
+        resolved.insert(fact.name.clone(), format!("({resolved_expr})"));
     }
 
-    // Apply all resolved facts to the input expression
-    let mut result = expr.to_string();
-    // Process in topo order to ensure consistent replacement
-    for &idx in topo_order {
-        let fact = &facts[idx];
+    // Apply all resolved facts to the input expression in one pass.
+    let map = fact_replacement_map(facts, &resolved);
+    inline_references(expr, &map)
+}
+
+/// Build the `{normalized key -> replacement}` map for inlining resolved facts.
+///
+/// Each resolved fact is keyed by its **own** bare name and — when it has one —
+/// its own `source_table.name` qualified form. Keying by the fact's own source
+/// table (not the host expression's) keeps this consistent with dependency
+/// detection (`toposort_facts` / `build_fact_dag`), which recognise a reference
+/// to fact `f` written as `f.source_table.f.name`; a fact referenced across
+/// tables in its own-qualified form is then actually inlined, not just
+/// detected. Only facts present in `resolved` contribute, so during
+/// topological resolution the map naturally holds just the already-resolved
+/// (earlier) facts.
+fn fact_replacement_map<'a>(
+    facts: &[Fact],
+    resolved: &'a HashMap<String, String>,
+) -> HashMap<String, &'a str> {
+    let mut map: HashMap<String, &str> = HashMap::with_capacity(resolved.len() * 2);
+    for fact in facts {
         if let Some(replacement) = resolved.get(&fact.name) {
-            // Replace qualified (`alias.name`) and unqualified (`name`) forms in a
-            // single pass. Sequential calls would double-substitute an identity
-            // fact whose replacement contains its own unqualified name.
-            let qualified = fact
-                .source_table
-                .as_ref()
-                .map(|st| format!("{st}.{}", fact.name));
-            let mut needles: Vec<&str> = Vec::with_capacity(2);
-            if let Some(ref q) = qualified {
-                needles.push(q);
-            }
-            needles.push(&fact.name);
-            result = replace_word_boundary_any(&result, &needles, replacement);
+            insert_fact_keys(
+                &mut map,
+                fact.source_table.as_deref(),
+                &fact.name,
+                replacement,
+            );
         }
     }
+    map
+}
 
-    result
+/// Insert the bare and (optionally) `source_table.name` normalized keys for one
+/// fact `name` into `map`, both pointing at `replacement`.
+fn insert_fact_keys<'a>(
+    map: &mut HashMap<String, &'a str>,
+    source_table: Option<&str>,
+    name: &str,
+    replacement: &'a str,
+) {
+    if let Some(st) = source_table {
+        map.insert(normalize_ident_part(&format!("{st}.{name}")), replacement);
+    }
+    map.insert(normalize_ident_part(name), replacement);
 }
 
 /// Replace every `COUNT(*)` call in `expr` with `COUNT(<replacement_arg>)`.
@@ -305,7 +325,8 @@ fn toposort_derived(
                 continue; // skip self
             }
             // Only derived-to-derived edges: does this expr reference `name`?
-            if contains_word_boundary_ref(&met.expr, name) {
+            // Derived metrics have no source table, so a bare reference only.
+            if references_ref(&met.expr, name, None) {
                 in_degree[i] += 1;
                 dependents[dep_idx].push(i);
             }
@@ -452,23 +473,23 @@ pub(super) fn inline_derived_metrics(
             inline_facts(&met.expr, facts, fact_topo_order)
         };
         // Replace every known metric name with its resolved expression
-        // (parenthesized) in ONE combined left-to-right pass. Sequential
-        // per-name replace_word_boundary calls iterated the HashMap in
-        // nondeterministic order and re-scanned earlier substitutions: a
-        // metric named like a column used in another metric's expression
-        // (`revenue` vs `SUM(o.revenue)` — `.` is a word boundary) was
-        // double-substituted into invalid nested-aggregate SQL on a
-        // hash-seed-dependent fraction of runs (SG-3, code-review
-        // 2026-07-02). Pair order is deterministic (longest needle first,
-        // then lexicographic), mirroring `inline_facts`.
+        // (parenthesized) in ONE pass over the original text via the shared
+        // reference tokenizer. Each bare metric reference resolves to exactly
+        // one key, so — unlike the former word-boundary substitution — there is
+        // no needle-ordering concern and no rescanning of inserted text (the
+        // SG-3 double-substitution hazard): a metric named like a column used
+        // qualified in another metric's expression (`revenue` vs `x.revenue`)
+        // or appearing inside a string literal is left untouched (E-3).
         let expr = {
-            let mut entries: Vec<(&str, String)> = resolved
+            let parenthesized: HashMap<String, String> = resolved
                 .iter()
-                .map(|(name, replacement)| (name.as_str(), format!("({replacement})")))
+                .map(|(name, replacement)| (normalize_ident_part(name), format!("({replacement})")))
                 .collect();
-            entries.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-            let pairs: Vec<(&str, &str)> = entries.iter().map(|(n, r)| (*n, r.as_str())).collect();
-            replace_word_boundary_pairs(&raw_expr, &pairs)
+            let map: HashMap<String, &str> = parenthesized
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str()))
+                .collect();
+            inline_references(&raw_expr, &map)
         };
         resolved.insert(met.name.to_ascii_lowercase(), expr);
     }
@@ -513,8 +534,10 @@ pub(super) fn collect_transitive_metric_names(
         }
         if current_met.source_table.is_none() {
             // Derived metric: find referenced metric names and push to stack.
+            // A base metric may be referenced bare or by its own source table.
             for name in &all_names {
-                if *name != current_name && contains_word_boundary_ref(&current_met.expr, name) {
+                let src = name_map.get(name).and_then(|m| m.source_table.as_deref());
+                if *name != current_name && references_ref(&current_met.expr, name, src) {
                     stack.push(name.clone());
                 }
             }
@@ -559,8 +582,10 @@ pub(crate) fn collect_derived_metric_source_tables(
             sources.insert(st.to_ascii_lowercase());
         } else {
             // Derived metric: find referenced metric names and push to stack.
+            // A base metric may be referenced bare or by its own source table.
             for name in &all_names {
-                if *name != current_name && contains_word_boundary_ref(&current_met.expr, name) {
+                let src = name_map.get(name).and_then(|m| m.source_table.as_deref());
+                if *name != current_name && references_ref(&current_met.expr, name, src) {
                     stack.push(name.clone());
                 }
             }
@@ -764,6 +789,40 @@ mod tests {
     }
 
     #[test]
+    fn inline_facts_cross_table_own_qualified_reference_is_inlined() {
+        // A fact on one table referenced by a fact on ANOTHER table via the
+        // referenced fact's OWN source-qualified form (`b_tbl.leaf`) must be
+        // inlined — the replacement map keys each fact by its own source table,
+        // not the host expression's, so detection (toposort) and inlining agree.
+        let facts = vec![
+            Fact {
+                name: "leaf".to_string(),
+                expr: "b_tbl.col".to_string(),
+                source_table: Some("b_tbl".to_string()),
+                output_type: None,
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+            },
+            Fact {
+                name: "top".to_string(),
+                // references `leaf` qualified by leaf's own table `b_tbl`
+                expr: "b_tbl.leaf + 1".to_string(),
+                source_table: Some("a_tbl".to_string()),
+                output_type: None,
+                comment: None,
+                synonyms: vec![],
+                access: AccessModifier::Public,
+            },
+        ];
+        let topo = toposort_facts(&facts).unwrap();
+        assert_eq!(
+            inline_facts("SUM(top)", &facts, &topo),
+            "SUM(((b_tbl.col) + 1))"
+        );
+    }
+
+    #[test]
     fn inline_derived_metrics_does_not_capture_qualified_column_on_other_table() {
         // E-3, derived-metric arm: a bare metric reference is inlined, but the
         // same name as a qualified column on another relation (`x.revenue`) is
@@ -776,6 +835,81 @@ mod tests {
             .unwrap()
             .exprs;
         assert_eq!(resolved.get("profit").unwrap(), "(SUM(o.rev)) - x.revenue");
+    }
+
+    #[test]
+    fn inline_facts_leaves_string_literals_intact() {
+        // E-3 string arm (code-review 2026-07-16): a fact name appearing inside
+        // a single-quoted string literal must never be substituted into — only
+        // the bare identifier reference is inlined.
+        let facts = vec![Fact {
+            name: "net_price".to_string(),
+            expr: "price * (1 - discount)".to_string(),
+            source_table: Some("o".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Public,
+        }];
+        let topo = toposort_facts(&facts).unwrap();
+        assert_eq!(
+            inline_facts("COALESCE(net_price, 'net_price missing')", &facts, &topo),
+            "COALESCE((price * (1 - discount)), 'net_price missing')"
+        );
+    }
+
+    #[test]
+    fn inline_derived_metrics_leaves_string_literals_intact() {
+        let metrics = vec![
+            make_metric("revenue", "SUM(o.rev)", Some("o")),
+            make_metric("label", "revenue || ' revenue total'", None),
+        ];
+        let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+            .unwrap()
+            .exprs;
+        assert_eq!(
+            resolved.get("label").unwrap(),
+            "(SUM(o.rev)) || ' revenue total'"
+        );
+    }
+
+    #[test]
+    fn inline_facts_quoted_reference_is_inlined() {
+        // TECH-DEBT #28 (code-review 2026-07-16): a reference written `"Net_Price"`
+        // matches the declaration `net_price` — DuckDB treats quoted identifiers
+        // as case-insensitive, and the shared tokenizer normalizes both sides.
+        let facts = vec![Fact {
+            name: "net_price".to_string(),
+            expr: "price * (1 - discount)".to_string(),
+            source_table: Some("o".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            access: AccessModifier::Public,
+        }];
+        let topo = toposort_facts(&facts).unwrap();
+        assert_eq!(
+            inline_facts("SUM(\"Net_Price\")", &facts, &topo),
+            "SUM((price * (1 - discount)))"
+        );
+    }
+
+    #[test]
+    fn inline_derived_metrics_quoted_and_mixed_case_references_are_inlined() {
+        // E-2 + #28: a mixed-case and a quoted derived-metric reference both
+        // resolve against the lowercase declaration.
+        let metrics = vec![
+            make_metric("revenue", "SUM(o.rev)", Some("o")),
+            make_metric("cost", "SUM(o.cost)", Some("o")),
+            make_metric("profit", "REVENUE - \"Cost\"", None),
+        ];
+        let resolved = inline_derived_metrics(&metrics, &[], &[], &[])
+            .unwrap()
+            .exprs;
+        assert_eq!(
+            resolved.get("profit").unwrap(),
+            "(SUM(o.rev)) - (SUM(o.cost))"
+        );
     }
 
     #[test]

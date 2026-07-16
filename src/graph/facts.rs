@@ -9,18 +9,25 @@ use std::fmt::Write as _;
 use crate::model::SemanticViewDefinition;
 use crate::util::suggest_closest;
 
-/// Find references to known fact names in an expression using word-boundary matching.
+/// Find references to known (bare) names in an expression.
 ///
-/// Returns a list of fact names found in `expr`. Only matches whole words:
-/// `net_price` matches in `SUM(net_price)` and `net_price + tax`
-/// but NOT in `net_price_total` or `my_net_price`. Case-insensitive.
+/// Returns the names referenced as a whole *bare* identifier in `expr`:
+/// `net_price` matches in `SUM(net_price)` and `net_price + tax` but NOT in
+/// `net_price_total`, `my_net_price`, a qualified reference `x.net_price`, or
+/// inside a `'...'` string literal. Quote- and case-insensitive (`"Net_Price"`
+/// matches `net_price`).
 ///
-/// A thin domain-named view over the shared reference engine
-/// [`crate::util::find_word_boundary_refs`] (§6.2, code-review 2026-07-11) —
-/// this used to hand-roll its own dual-buffer byte scan.
+/// This is the bare-name FIND used where references carry no source-table
+/// qualifier (derived-metric cycle detection). Fact dependency discovery, where
+/// a fact may be referenced by its own `source_table.name`, uses
+/// [`crate::expr_tokens::referenced_names_qualified`] directly.
+///
+/// A thin view over the shared reference tokenizer (kills the E-2/E-3 class,
+/// code-review 2026-07-16).
 #[must_use]
-pub fn find_fact_references<'a>(expr: &str, fact_names: &[&'a str]) -> Vec<&'a str> {
-    crate::util::find_word_boundary_refs(expr, fact_names)
+pub fn find_fact_references<'a>(expr: &str, names: &[&'a str]) -> Vec<&'a str> {
+    let candidates: Vec<(&str, Option<&str>)> = names.iter().map(|&n| (n, None)).collect();
+    crate::expr_tokens::referenced_names_qualified(expr, &candidates)
 }
 
 /// Validate facts in a semantic view definition.
@@ -93,8 +100,18 @@ fn build_fact_dag<'a>(def: &'a SemanticViewDefinition, fact_names: &[&'a str]) -
         in_degree.entry(name).or_insert(0);
     }
 
+    // A fact may reference another fact bare (`net_price`) or qualified by that
+    // fact's own source table (`o.net_price`); a *foreign* qualifier
+    // (`x.net_price`) is a column on another relation, not a fact reference
+    // (E-3). Match both legitimate forms via the qualified FIND.
+    let candidates: Vec<(&str, Option<&str>)> = def
+        .facts
+        .iter()
+        .map(|f| (f.name.as_str(), f.source_table.as_deref()))
+        .collect();
+
     for fact in &def.facts {
-        let refs = find_fact_references(&fact.expr, fact_names);
+        let refs = crate::expr_tokens::referenced_names_qualified(&fact.expr, &candidates);
         for &referenced in &refs {
             if referenced == fact.name.as_str() {
                 // A fact's own name appearing in its own expression is a reference
