@@ -85,6 +85,25 @@ impl IdentRef<'_> {
     pub(crate) fn is_bare(&self) -> bool {
         first_part_len(self.raw) == self.raw.len()
     }
+
+    /// The normalized (quote-stripped, lowercased) key of the chain's **last**
+    /// part — the called name for a function head: `main.sum` → `sum`, but
+    /// `"main.sum"` → `main.sum` because the dot lives *inside* a quoted part
+    /// and so does not separate qualifiers. Splitting the joined [`key`] on `.`
+    /// cannot make this distinction (a quoted dot and a qualifier dot look
+    /// identical there), so this parses quote-aware via
+    /// [`crate::ident::parse_qualified_identifier_with_quoting`].
+    ///
+    /// [`key`]: IdentRef::key
+    pub(crate) fn last_part_key(&self) -> String {
+        match crate::ident::parse_qualified_identifier_with_quoting(self.raw.trim()) {
+            Ok(parts) => parts
+                .last()
+                .map(|(p, _)| p.to_ascii_lowercase())
+                .unwrap_or_default(),
+            Err(_) => crate::ident::normalize_ident_part(self.raw),
+        }
+    }
 }
 
 /// Scan `expr` and return every identifier reference chain in it, in source

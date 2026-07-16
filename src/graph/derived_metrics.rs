@@ -58,7 +58,11 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
 /// Uses the shared reference tokenizer ([`crate::expr_tokens::scan_function_heads`])
 /// to find every function-call head, then matches the head's *last* identifier
 /// part (the called name — bare `sum(` or schema-qualified `main.sum(`) against
-/// the known-aggregate set. Because it rides the tokenizer, it inherits correct
+/// the known-aggregate set. The last part is taken quote-aware
+/// ([`IdentRef::last_part_key`](crate::expr_tokens::IdentRef::last_part_key)),
+/// so a function whose name is a *quoted* identifier containing a dot
+/// (`"main.sum"(x)`) is one part `main.sum` and is not mistaken for the
+/// aggregate `sum`. Because it rides the tokenizer, it also inherits correct
 /// literal handling — a `sum(` inside a `'…'` / `$tag$…$` string is not a call —
 /// and the single identifier-byte rule (E-5: `Ωsum(` is the one identifier
 /// `Ωsum`, not the aggregate `sum`).
@@ -68,10 +72,8 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
 #[must_use]
 pub fn contains_aggregate_function(expr: &str) -> Option<&'static str> {
     for head in crate::expr_tokens::scan_function_heads(expr) {
-        let key = head.key();
-        // The called name is the last dotted part (`main.sum` → `sum`).
-        let name = key.rsplit('.').next().unwrap_or(&key);
-        if let Some(&func) = AGGREGATE_FUNCTIONS.iter().find(|&&f| f == name) {
+        let name = head.last_part_key();
+        if let Some(&func) = AGGREGATE_FUNCTIONS.iter().find(|&&f| f == name.as_str()) {
             return Some(func);
         }
     }
@@ -405,6 +407,16 @@ mod tests {
         assert_eq!(contains_aggregate_function("main.sum(x)"), Some("sum"));
         // A non-aggregate qualified call does not.
         assert_eq!(contains_aggregate_function("main.scale(x)"), None);
+    }
+
+    #[test]
+    fn contains_aggregate_quoted_dotted_function_name_is_not_split() {
+        // A function whose name is a QUOTED identifier containing a dot is a
+        // single part (`main.sum`), not the schema-qualified aggregate `sum` —
+        // the called name is split quote-aware, so this is not a false positive.
+        assert_eq!(contains_aggregate_function("\"main.sum\"(x)"), None);
+        // A quoted bare aggregate name still matches (quotes don't hide it).
+        assert_eq!(contains_aggregate_function("\"sum\"(x)"), Some("sum"));
     }
 
     #[test]
