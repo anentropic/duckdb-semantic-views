@@ -38,7 +38,7 @@ pub(crate) fn parse_metrics_clause(
         return Ok(vec![]);
     }
 
-    let entries = split_at_depth0_commas(body);
+    let entries = split_at_depth0_commas(body)?;
     let mut result = Vec::new();
 
     for (entry_start, entry) in entries {
@@ -62,7 +62,7 @@ fn parse_non_additive_dims(
     content: &str,
     base_offset: usize,
 ) -> Result<Vec<NonAdditiveDim>, ParseError> {
-    let entries = split_at_depth0_commas(content);
+    let entries = split_at_depth0_commas(content)?;
     let mut result = Vec::new();
     for (start, entry_text) in entries {
         let entry_text = entry_text.trim();
@@ -258,7 +258,7 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
                     position: Some(after_using_abs),
                 });
             };
-            using_relationships = split_at_depth0_commas(inner)
+            using_relationships = split_at_depth0_commas(inner)?
                 .into_iter()
                 .map(|(_, rel)| rel.to_string())
                 .collect();

@@ -478,6 +478,92 @@ def run_wildcard_section(conn) -> tuple[int, int]:
     return total, failures
 
 
+# ---------------------------------------------------------------------------
+# T-11 (code-review 2026-07-16): role-playing USING section. A single dimension
+# table (airports) is reached from one fact table (flights) via TWO distinct
+# relationships (departure / arrival). Each USING-scoped metric must join
+# through its OWN edge — the alias-binding-under-joins family that produced E-1.
+# The reference is an independent single-edge JOIN (no shared mechanism with the
+# engine's relationship resolver).
+# ---------------------------------------------------------------------------
+
+N_FLIGHTS = 600
+N_AIRPORTS = 12
+
+
+def seed_role_playing(conn) -> None:
+    rng = random.Random(SEED + 2)
+    conn.execute("CREATE TABLE rp_airports (id INTEGER PRIMARY KEY, city VARCHAR)")
+    # Cities collide (several airports per city) so GROUP BY city is non-trivial
+    # and the departure vs arrival paths yield genuinely different totals.
+    cities = [
+        "NYC", "NYC", "LON", "LON", "TYO", "SFO",
+        "SFO", "PAR", "BER", "SYD", "SYD", "DXB",
+    ]
+    conn.executemany(
+        "INSERT INTO rp_airports VALUES (?, ?)",
+        [(i, cities[i]) for i in range(N_AIRPORTS)],
+    )
+    conn.execute(
+        "CREATE TABLE rp_flights (id INTEGER PRIMARY KEY, dep_id INTEGER, arr_id INTEGER)"
+    )
+    # FKs are always valid (non-NULL, in range), so the engine's INNER/LEFT
+    # choice does not change results — the reference joins are unambiguous.
+    rows = [
+        (i, rng.randrange(N_AIRPORTS), rng.randrange(N_AIRPORTS))
+        for i in range(N_FLIGHTS)
+    ]
+    conn.executemany("INSERT INTO rp_flights VALUES (?, ?, ?)", rows)
+
+
+def run_role_playing_section(conn) -> tuple[int, int]:
+    seed_role_playing(conn)
+    conn.execute(
+        "CREATE SEMANTIC VIEW diff_role AS "
+        "TABLES (f AS rp_flights PRIMARY KEY (id), a AS rp_airports PRIMARY KEY (id)) "
+        "RELATIONSHIPS (dep AS f(dep_id) REFERENCES a, arr AS f(arr_id) REFERENCES a) "
+        "DIMENSIONS (a.city AS a.city) "
+        "METRICS (f.dep_count USING (dep) AS COUNT(f.id), "
+        "f.arr_count USING (arr) AS COUNT(f.id))"
+    )
+    total, failures = 0, 0
+
+    # dep_count by city -> flights grouped by their DEPARTURE airport's city.
+    total += 1
+    failures += _check(
+        conn,
+        "role-playing dep_count by city (departure edge)",
+        "SELECT * FROM semantic_view('diff_role', dimensions := ['city'], "
+        "metrics := ['dep_count'])",
+        "SELECT a.city, COUNT(f.id) FROM rp_flights f "
+        "JOIN rp_airports a ON f.dep_id = a.id GROUP BY a.city",
+    )
+
+    # arr_count by city -> flights grouped by their ARRIVAL airport's city. The
+    # SAME dimension resolves through a DIFFERENT edge, so the totals differ.
+    total += 1
+    failures += _check(
+        conn,
+        "role-playing arr_count by city (arrival edge)",
+        "SELECT * FROM semantic_view('diff_role', dimensions := ['city'], "
+        "metrics := ['arr_count'])",
+        "SELECT a.city, COUNT(f.id) FROM rp_flights f "
+        "JOIN rp_airports a ON f.arr_id = a.id GROUP BY a.city",
+    )
+
+    # Metric-only (no dimension): the USING edge still scopes the metric; with
+    # all FKs valid the count equals the flight total on either edge.
+    total += 1
+    failures += _check(
+        conn,
+        "role-playing dep_count total (no dim)",
+        "SELECT * FROM semantic_view('diff_role', metrics := ['dep_count'])",
+        "SELECT COUNT(f.id) FROM rp_flights f JOIN rp_airports a ON f.dep_id = a.id",
+    )
+
+    return total, failures
+
+
 def run_harness() -> int:
     import duckdb
 
@@ -640,6 +726,9 @@ def run_harness() -> int:
     total += t
     failures += f
     t, f = run_wildcard_section(conn)
+    total += t
+    failures += f
+    t, f = run_role_playing_section(conn)
     total += t
     failures += f
 

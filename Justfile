@@ -32,9 +32,17 @@ build-release:
 test:
     make test_debug
 
-# Run Rust unit tests only (does NOT test LOAD — use 'just test' for that)
+# Run Rust unit tests only (does NOT test LOAD — use 'just test' for that).
+# nextest cannot run doctests, so they run separately (T-12): the default set,
+# plus the `extension`-gated FFI doctests (the load-bearing `compile_fail`
+# ABI-safety guard in src/ddl/read_ffi.rs). The FFI run type-checks only —
+# SV_SKIP_CPP_BUILD skips the C++ amalgamation, and a `compile_fail` doctest
+# never links — and is scoped to `read_ffi` because other doctests assume the
+# default `duckdb` feature.
 test-rust:
     cargo nextest run
+    cargo test --doc
+    SV_SKIP_CPP_BUILD=1 cargo test --doc --no-default-features --features extension read_ffi
 
 # Run all lints
 lint:
