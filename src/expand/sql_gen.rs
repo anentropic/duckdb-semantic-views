@@ -1,5 +1,5 @@
 use crate::model::{AccessModifier, Dimension, Fact, Metric, SemanticViewDefinition};
-use crate::util::{replace_word_boundary, suggest_closest};
+use crate::util::suggest_closest;
 
 use super::facts::{
     collect_transitive_metric_names, inline_derived_metrics, inline_facts, toposort_facts,
@@ -443,9 +443,9 @@ pub fn expand(
         // Phase 32: If this dimension has a scoped alias, rewrite the expression.
         if let Some(ref scoped) = rd.scoped_alias {
             if let Some(ref st) = dim.source_table {
-                // Replace bare alias with scoped alias in expression
+                // Rewrite the source-table qualifier to the scoped alias
                 // e.g., "a.city" -> "a__dep_airport.city"
-                base_expr = replace_word_boundary(&base_expr, st, scoped);
+                base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);
             }
         }
         items.push(SelectItem::new(

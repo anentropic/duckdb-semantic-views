@@ -12,6 +12,7 @@ test/sql/cr20260711b_test_coverage.test
 test/sql/cr20260716_parser_residue.test
 test/sql/cr20260716_reference_inlining.test
 test/sql/cr20260716b_porting_diagnostics.test
+test/sql/cr20260716c_reference_scanners.test
 test/sql/e4_cross_source_diamond.test
 test/sql/error_caret_alter.test
 test/sql/error_caret_create.test
