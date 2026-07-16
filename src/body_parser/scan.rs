@@ -107,9 +107,10 @@ pub(super) fn unterminated_quote_error(s: &str) -> Option<&'static str> {
 /// A single **trailing** comma is tolerated (`a, b,` → `[a, b]`). A **leading**
 /// or **interior** empty entry — a stray comma with no content before it
 /// (`,a`, `a,,b`) — is rejected rather than silently dropped (T-13, code-review
-/// 2026-07-16; the P-2 no-silent-discard rule). The error carries no caret: the
-/// helper is base-offset-agnostic (offsets it returns are body-relative), and
-/// its callers surface the message with their own clause context.
+/// 2026-07-16; the P-2 no-silent-discard rule). The returned error has
+/// `position: None` — the helper is base-offset-agnostic (the offsets it returns
+/// are body-relative), so there is no absolute caret to attach — and callers
+/// propagate its message as-is via `?`.
 pub(crate) fn split_at_depth0_commas(body: &str) -> Result<Vec<(usize, &str)>, ParseError> {
     let mut entries = Vec::new();
     let mut depth: i32 = 0;
@@ -131,10 +132,8 @@ pub(crate) fn split_at_depth0_commas(body: &str) -> Result<Vec<(usize, &str)>, P
                         // in the tail below (not between two commas), so `a,`
                         // stays allowed.
                         return Err(ParseError {
-                            message:
-                                "Empty entry: a stray or leading ',' with no content before it. \
-                                 Remove the extra comma."
-                                    .to_string(),
+                            message: "Empty entry: a stray or leading ',' with no content before it. Remove the extra comma."
+                                .to_string(),
                             position: None,
                         });
                     }
