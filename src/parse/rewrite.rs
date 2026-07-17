@@ -1802,7 +1802,8 @@ mod tests {
                 ..Default::default()
             };
             let err = crate::ddl::define::enrich_definition_for_create("v_bad", def)
-                .expect_err("D-06 hard error must fire for FK→no-PK");
+                .expect_err("D-06 hard error must fire for FK→no-PK")
+                .message;
             assert!(
                 err.contains("has no PRIMARY KEY declared but is referenced by FK in"),
                 "D-06 substring missing in error: {err}"
@@ -1840,7 +1841,8 @@ mod tests {
                 ..Default::default()
             };
             let err = crate::ddl::define::enrich_definition_for_create("v_dup", def)
-                .expect_err("cross-kind name collision must be rejected at define time");
+                .expect_err("cross-kind name collision must be rejected at define time")
+                .message;
             assert!(
                 err.contains("duplicate name 'REGION'")
                     && err.contains("metric 'REGION' collides with dimension 'region'"),

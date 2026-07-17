@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 
+use crate::errors::ParseError;
 use crate::model::SemanticViewDefinition;
 
 /// Validate that dimension, metric, and fact names are unique across the
@@ -32,7 +33,7 @@ use crate::model::SemanticViewDefinition;
 /// [`crate::ident::normalize_ident_part`]).
 ///
 /// Returns `Err` naming the colliding item and the kinds involved.
-pub fn validate_name_uniqueness(def: &SemanticViewDefinition) -> Result<(), String> {
+pub fn validate_name_uniqueness(def: &SemanticViewDefinition) -> Result<(), ParseError> {
     let mut seen: HashMap<String, (&str, &str)> = HashMap::new();
     let items = def
         .dimensions
@@ -43,11 +44,11 @@ pub fn validate_name_uniqueness(def: &SemanticViewDefinition) -> Result<(), Stri
     for (kind, name) in items {
         let key = crate::ident::normalize_ident_part(name);
         if let Some((first_kind, first_name)) = seen.get(key.as_str()) {
-            return Err(format!(
+            return Err(ParseError::positionless(format!(
                 "duplicate name '{name}': {kind} '{name}' collides with {first_kind} \
                  '{first_name}' -- dimension, metric, and fact names share one namespace \
                  and are case-insensitive (quoting does not make a name distinct)"
-            ));
+            )));
         }
         seen.insert(key, (kind, name));
     }
@@ -100,7 +101,7 @@ mod tests {
     #[test]
     fn duplicate_metric_names_rejected_case_insensitively() {
         let def = def_with(&[], &["Revenue", "revenue"], &[]);
-        let err = validate_name_uniqueness(&def).unwrap_err();
+        let err = validate_name_uniqueness(&def).unwrap_err().message;
         assert!(
             err.contains("duplicate name 'revenue'")
                 && err.contains("metric 'revenue' collides with metric 'Revenue'"),
@@ -111,7 +112,7 @@ mod tests {
     #[test]
     fn dimension_metric_collision_rejected() {
         let def = def_with(&["region"], &["REGION"], &[]);
-        let err = validate_name_uniqueness(&def).unwrap_err();
+        let err = validate_name_uniqueness(&def).unwrap_err().message;
         assert!(
             err.contains("metric 'REGION' collides with dimension 'region'"),
             "unexpected error: {err}"
@@ -121,7 +122,7 @@ mod tests {
     #[test]
     fn fact_dimension_collision_rejected() {
         let def = def_with(&["amount"], &[], &["amount"]);
-        let err = validate_name_uniqueness(&def).unwrap_err();
+        let err = validate_name_uniqueness(&def).unwrap_err().message;
         assert!(
             err.contains("fact 'amount' collides with dimension 'amount'"),
             "unexpected error: {err}"
@@ -131,7 +132,7 @@ mod tests {
     #[test]
     fn duplicate_dimension_names_rejected() {
         let def = def_with(&["region", "Region"], &[], &[]);
-        let err = validate_name_uniqueness(&def).unwrap_err();
+        let err = validate_name_uniqueness(&def).unwrap_err().message;
         assert!(
             err.contains("dimension 'Region' collides with dimension 'region'"),
             "unexpected error: {err}"
@@ -141,7 +142,7 @@ mod tests {
     #[test]
     fn metric_fact_collision_rejected() {
         let def = def_with(&[], &["net_price"], &["Net_Price"]);
-        let err = validate_name_uniqueness(&def).unwrap_err();
+        let err = validate_name_uniqueness(&def).unwrap_err().message;
         assert!(
             err.contains("fact 'Net_Price' collides with metric 'net_price'"),
             "unexpected error: {err}"
@@ -157,7 +158,7 @@ mod tests {
     #[test]
     fn quoted_and_unquoted_folding_to_same_key_collide() {
         let def = def_with(&["\"region\"", "REGION"], &[], &[]);
-        let err = validate_name_uniqueness(&def).unwrap_err();
+        let err = validate_name_uniqueness(&def).unwrap_err().message;
         assert!(
             err.contains("duplicate name 'REGION'") && err.contains("dimension '\"region\"'"),
             "unexpected error: {err}"
@@ -172,7 +173,7 @@ mod tests {
     #[test]
     fn quoted_names_differing_in_case_collide() {
         let def = def_with(&["\"Region\"", "\"REGION\""], &[], &[]);
-        let err = validate_name_uniqueness(&def).unwrap_err();
+        let err = validate_name_uniqueness(&def).unwrap_err().message;
         assert!(
             err.contains("duplicate name"),
             "quoted mixed-case names share key `region`: {err}"
@@ -185,7 +186,7 @@ mod tests {
     #[test]
     fn unquoted_and_quoted_same_name_collide() {
         let def = def_with(&["region", "\"Region\""], &[], &[]);
-        let err = validate_name_uniqueness(&def).unwrap_err();
+        let err = validate_name_uniqueness(&def).unwrap_err().message;
         assert!(
             err.contains("duplicate name"),
             "unquoted `region` and quoted `\"Region\"` share key `region`: {err}"

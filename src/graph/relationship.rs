@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
+use crate::errors::ParseError;
 use crate::model::SemanticViewDefinition;
 use crate::util::suggest_closest;
 
@@ -299,7 +300,7 @@ fn check_source_tables_reachable(
 /// **Legacy skip:** If no joins have non-empty `fk_columns`, or if `tables`
 /// is empty, returns `Ok` with a default empty graph. This preserves backward
 /// compatibility with Phase 10/11 definitions.
-pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph, String> {
+pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph, ParseError> {
     // Legacy skip: no Phase 24 joins -> skip graph validation entirely.
     let has_pkfk_joins = def.joins.iter().any(|j| !j.fk_columns.is_empty());
     if !has_pkfk_joins || def.tables.is_empty() {
@@ -311,22 +312,24 @@ pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph,
         });
     }
 
-    let graph = RelationshipGraph::from_definition(def)?;
+    let graph = RelationshipGraph::from_definition(def).map_err(ParseError::positionless)?;
 
     // 1. Cycle detection (Kahn's algorithm).
-    let _topo_order = graph.toposort()?;
+    let _topo_order = graph.toposort().map_err(ParseError::positionless)?;
 
     // 2. Diamond detection (multiple parents, relaxed for named role-playing).
-    graph.check_no_diamonds(def)?;
+    graph
+        .check_no_diamonds(def)
+        .map_err(ParseError::positionless)?;
 
     // 3. Orphan table detection.
-    graph.check_no_orphans()?;
+    graph.check_no_orphans().map_err(ParseError::positionless)?;
 
     // 4. FK reference validation (Phase 33: replaces FK/PK count check).
-    validate_fk_references(def)?;
+    validate_fk_references(def).map_err(ParseError::positionless)?;
 
     // 5. Source table reachability.
-    check_source_tables_reachable(def, &graph)?;
+    check_source_tables_reachable(def, &graph).map_err(ParseError::positionless)?;
 
     Ok(graph)
 }
@@ -350,7 +353,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let err = validate_graph(&def).unwrap_err();
+        let err = validate_graph(&def).unwrap_err().message;
         assert!(
             err.contains("cannot reference itself"),
             "expected self-reference error, got: {err}"
@@ -378,7 +381,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let err = validate_graph(&def).unwrap_err();
+        let err = validate_graph(&def).unwrap_err().message;
         assert!(
             err.contains("cycle detected in relationships"),
             "expected cycle error, got: {err}"
@@ -408,7 +411,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let err = validate_graph(&def).unwrap_err();
+        let err = validate_graph(&def).unwrap_err().message;
         assert!(
             err.contains("diamond") && err.contains("reachable from multiple tables"),
             "expected diamond error, got: {err}"
@@ -432,7 +435,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let err = validate_graph(&def).unwrap_err();
+        let err = validate_graph(&def).unwrap_err().message;
         assert!(err.contains("orphan"), "expected orphan error, got: {err}");
     }
 
@@ -471,7 +474,7 @@ mod tests {
             vec![("name", Some("x"))], // 'x' is not in tables
             vec![],
         );
-        let err = validate_graph(&def).unwrap_err();
+        let err = validate_graph(&def).unwrap_err().message;
         assert!(
             err.contains("unknown source table"),
             "expected unreachable source table error, got: {err}"
@@ -486,7 +489,7 @@ mod tests {
             vec![],
             vec![("revenue", Some("missing"))],
         );
-        let err = validate_graph(&def).unwrap_err();
+        let err = validate_graph(&def).unwrap_err().message;
         assert!(
             err.contains("unknown source table"),
             "expected unreachable source table error, got: {err}"
@@ -612,7 +615,7 @@ mod tests {
             vec![("name", Some("custmers"))], // typo -> should suggest "c" or similar
             vec![],
         );
-        let err = validate_graph(&def).unwrap_err();
+        let err = validate_graph(&def).unwrap_err().message;
         assert!(
             err.contains("unknown source table"),
             "expected unknown source table error, got: {err}"
@@ -716,7 +719,7 @@ mod tests {
             ],
             vec![("cnt", Some("a"), vec![])],
         );
-        let err = validate_graph(&def).unwrap_err();
+        let err = validate_graph(&def).unwrap_err().message;
         assert!(
             err.contains("diamond") && err.contains("reachable from multiple tables"),
             "cross-source named diamond must be rejected: {err}"
@@ -734,7 +737,7 @@ mod tests {
             ],
             vec![("flight_count", Some("f"), vec![])],
         );
-        let err = validate_graph(&def).unwrap_err();
+        let err = validate_graph(&def).unwrap_err().message;
         assert!(
             err.contains("diamond"),
             "Unnamed diamonds should be rejected: {err}"
@@ -752,7 +755,7 @@ mod tests {
             ],
             vec![("flight_count", Some("f"), vec![])],
         );
-        let err = validate_graph(&def).unwrap_err();
+        let err = validate_graph(&def).unwrap_err().message;
         assert!(
             err.contains("diamond"),
             "Mixed named/unnamed diamonds should be rejected: {err}"

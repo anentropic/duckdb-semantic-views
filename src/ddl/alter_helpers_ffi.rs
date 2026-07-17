@@ -162,7 +162,7 @@ pub unsafe extern "C" fn sv_compute_create_from_yaml_rust(
                 0_u8
             }
             Err(e) => {
-                write_error_buf(error_buf, error_buf_len, &e);
+                write_error_buf(error_buf, error_buf_len, &e.message);
                 2_u8
             }
         }

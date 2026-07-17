@@ -58,12 +58,12 @@
 pub fn enrich_definition_for_create(
     _name: &str,
     mut def: crate::model::SemanticViewDefinition,
-) -> Result<String, String> {
+) -> Result<String, crate::errors::ParseError> {
     // 1. Re-run cardinality inference. Phase 65: no longer preceded by
     //    `resolve_pk_from_catalog` (D-05). Tables without explicit PRIMARY
     //    KEY in the TABLES clause that are FK-referenced by another table
     //    surface as the D-06 hard error in step 2.
-    crate::graph::infer_cardinality(&def.tables, &mut def.joins).map_err(|e| e.message)?;
+    crate::graph::infer_cardinality(&def.tables, &mut def.joins)?;
 
     // 2. Catch joins that reference a target without a PRIMARY KEY (or
     //    UNIQUE constraint) declared in the TABLES clause.
@@ -111,7 +111,7 @@ pub fn enrich_definition_for_create(
         // declared in the TABLES clause. This is unambiguously the D-06
         // case regardless of whether ref_columns is empty (implicit
         // REFERENCES) or set (explicit REFERENCES with cols).
-        return Err(format!(
+        return Err(crate::errors::ParseError::positionless(format!(
             "Table '{target}' has no PRIMARY KEY declared but is \
              referenced by FK in '{fk_source}'. Add PRIMARY KEY \
              (cols) or UNIQUE (cols) to the TABLES clause for \
@@ -119,7 +119,7 @@ pub fn enrich_definition_for_create(
              removed -- see CHANGELOG.)",
             target = t.alias,
             fk_source = fk_source,
-        ));
+        )));
     }
 
     // 3. Graph validations. Name uniqueness runs first (SG-13): dimensions,
@@ -136,5 +136,5 @@ pub fn enrich_definition_for_create(
     // 4. Serialize. Metadata (created_on, database_name, schema_name) is
     //    populated by SQL inside the rewritten INSERT — not here. Column
     //    type inference is deferred to read-side bind (Plan 05).
-    serde_json::to_string(&def).map_err(|e| e.to_string())
+    serde_json::to_string(&def).map_err(|e| crate::errors::ParseError::positionless(e.to_string()))
 }

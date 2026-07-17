@@ -15,6 +15,33 @@ pub struct ParseError {
     pub position: Option<usize>,
 }
 
+impl ParseError {
+    /// A validation error carrying **no** caret position.
+    ///
+    /// Used by the graph / semantic-validation layer (`graph::*`,
+    /// [`crate::ddl::define::enrich_definition_for_create`]). Those validators
+    /// receive a fully-built
+    /// [`SemanticViewDefinition`](crate::model::SemanticViewDefinition) whose
+    /// members hold owned names / expressions, not byte spans into the original
+    /// DDL — and the original query text is no longer in scope by then — so a
+    /// caret offset is genuinely not recoverable there. Many of these failures
+    /// are also global/topological (a dependency cycle, an ambiguous join
+    /// diamond) with no single offending token to point at.
+    ///
+    /// Emitting a typed `ParseError` (rather than a bare `String`) keeps one
+    /// error type across the parse, graph, and query layers; `position` is
+    /// honestly `None`, exactly as at the parse layer's own semantic-failure
+    /// sites. See TECH-DEBT #31 for the boundary rationale and what threading
+    /// real positions here would require.
+    #[must_use]
+    pub fn positionless(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            position: None,
+        }
+    }
+}
+
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The `position` is caret-rendering metadata for DuckDB, not part of
@@ -40,6 +67,18 @@ mod tests {
         assert_eq!(err.to_string(), "unexpected token 'FOO'");
         // `Display` must agree with the `.message` field callers still read.
         assert_eq!(err.to_string(), err.message);
+    }
+
+    #[test]
+    fn positionless_has_no_caret_and_displays_message() {
+        let err = ParseError::positionless("duplicate metric name 'revenue'");
+        assert_eq!(err.position, None);
+        assert_eq!(err.to_string(), "duplicate metric name 'revenue'");
+        // Accepts both &str and String.
+        assert_eq!(
+            ParseError::positionless(format!("cycle in {}", "facts")).message,
+            "cycle in facts"
+        );
     }
 
     #[test]

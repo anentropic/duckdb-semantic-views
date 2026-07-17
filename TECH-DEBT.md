@@ -286,9 +286,19 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Why acceptable (interim):** bare NA-dim references (the overwhelmingly common form, and the only form any example/test uses) resolve correctly; quoting/qualifying an NA dim buys nothing since matching is case-insensitive and the dim is already unambiguous by name.
 - **Action:** when the quote-aware reference engine (#28) lands, resolve NA-dim references through it (bare **and** dotted, honouring quotes) in both the queried (`resolved_dims`) and unqueried (`def.dimensions`) branches, and add a semi-additive × dotted-NA-dim sqllogictest. Related SPECULATIVE cell: semi-additive × role-playing (review T-15).
 
+### 31. ✅ Graph/validation errors are typed (`ParseError`) but deliberately positionless
+
+- **Origin:** code-review 2026-07-16 §6 item 1 / §7.5: "the typed-error rollout stops at the graph/validation layer (~15 `Result<_, String>` signatures with no positions)… Extend the treatment or write the paragraph declaring the boundary deliberate — currently it reads as an unfinished rollout."
+- **Resolution (2026-07-16):** the CREATE-time funnel and the graph module's public validators now speak the shared typed error `crate::errors::ParseError` instead of bare `String`: `validate_name_uniqueness`, `validate_facts`, `validate_derived_metrics`, `validate_graph`, `validate_using_relationships`, and `enrich_definition_for_create` (`ddl/define.rs`) all return `Result<_, ParseError>`; the two CREATE call sites (`parse/native_sql.rs`, `ddl/alter_helpers_ffi.rs`) consume it directly. Errors are constructed via `ParseError::positionless(..)`, a named constructor that makes the absence of a caret explicit. The private per-check helpers (`check_*`) and the externally-shared sub-validators (`RelationshipGraph::from_definition` / `check_no_diamonds` / `check_no_orphans` / `validate_fk_references` / `toposort`, also called by `SHOW … FOR METRIC`) keep their `String` signatures and are wrapped at the public boundary — so nothing `String`-typed propagates upward past the graph module, and no unrelated caller is disturbed.
+- **Why `position` is `None` (the deliberate boundary):** these validators receive a fully-built `SemanticViewDefinition` whose members (`Metric`/`Dimension`/`Fact`/`Join`) hold **owned** names and expressions, not byte spans into the original DDL, and the original query text is out of scope by the time they run — so `util::byte_offset_within` (which needs the offending token to be a *subslice of the original query*) cannot be applied here. Additionally, several of these failures are **global/topological** (a derived-metric or fact dependency cycle, an ambiguous join *diamond*, an empty `TABLES` clause) with no single offending token to point a caret at. This mirrors the already-accepted positionless-typed `expand::ExpandError` (fan-trap) and the pervasive `position: None` idiom at the parse layer's own semantic-failure sites.
+- **What real carets here would require (not done — out of proportion):** threading the original DDL body **and** a per-item byte-span table down into `SemanticViewDefinition`'s members (or passing them as a side channel into `enrich_definition_for_create`), then, for the *token-shaped* subset — duplicate name, unknown metric/fact reference, unknown source table, unknown/misrouted USING relationship, self-reference, FK/PK mismatch — recovering the offset with `byte_offset_within`. The global/topological subset stays positionless regardless. A future PR can add spans if define-time carets for these become worth the model change.
+
 ---
 
-**Last updated:** 2026-07-16 (v0.11 unreleased) — entry #28: Slice 2 landed —
+**Last updated:** 2026-07-16 (v0.11 unreleased) — added entry #31
+(graph/validation errors are now typed `ParseError`, deliberately positionless
+— the review §6.1 / §7.5 error-architecture item). Prior same-day: entry #28:
+Slice 2 landed —
 every expression-text scanner (alias-qualifier rewriters, derived-metric
 reference validator, aggregate detection) now rides `expr_tokens`;
 `util::replace_word_boundary` and `derived_metrics::extract_identifiers` are

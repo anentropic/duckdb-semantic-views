@@ -203,11 +203,7 @@ fn emit_native_create_sql(
     // column type inference (`column_type_names`, fact `output_type`)
     // is deferred to read-side bind under Plan 05's C++ Catalog API
     // migration (D-17).
-    let enriched_json =
-        crate::ddl::define::enrich_definition_for_create(&name, def).map_err(|e| ParseError {
-            message: e,
-            position: None,
-        })?;
+    let enriched_json = crate::ddl::define::enrich_definition_for_create(&name, def)?;
     let enriched_escaped = SqlLit::escape(&enriched_json);
 
     // Metadata-via-SQL sub-expression: produces a VARCHAR by patching
