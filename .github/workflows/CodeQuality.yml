@@ -86,7 +86,7 @@ jobs:
       # the version CI ran green on through 2026-07-13. Bump deliberately once
       # the action/cargo-deny arg mismatch is resolved upstream.
       - name: cargo-deny (licenses + advisories)
-        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20 (cargo-deny 0.19.8)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.0.20 (cargo-deny 0.19.8)
 
       # `cargo llvm-cov` builds an instrumented copy of the WHOLE crate —
       # including the bundled DuckDB linked by the default-feature `duckdb`
