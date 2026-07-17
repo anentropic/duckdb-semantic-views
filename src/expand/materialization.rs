@@ -47,15 +47,17 @@ fn find_matching_materialization<'a>(
         return None;
     }
 
-    // Requested dimension/metric name sets (lowercase for case-insensitive
-    // matching).
+    // Requested dimension/metric name sets, keyed by the canonical identifier
+    // key (quote-stripped + case-folded, `ident::normalize_ident_part`) so a
+    // declared name written quoted (`"Region"`) in a MATERIALIZATIONS clause
+    // still matches the stored `region` dimension — TECH-DEBT #28 Slice 3.
     let req_dims: HashSet<String> = resolved_dims
         .iter()
-        .map(|d| d.name.to_ascii_lowercase())
+        .map(|d| crate::ident::normalize_ident_part(&d.name))
         .collect();
     let req_mets: HashSet<String> = resolved_mets
         .iter()
-        .map(|m| m.name.to_ascii_lowercase())
+        .map(|m| crate::ident::normalize_ident_part(&m.name))
         .collect();
 
     // Definition order -> first exact match wins.
@@ -63,10 +65,13 @@ fn find_matching_materialization<'a>(
         let mat_dims: HashSet<String> = mat
             .dimensions
             .iter()
-            .map(|d| d.to_ascii_lowercase())
+            .map(|d| crate::ident::normalize_ident_part(d))
             .collect();
-        let mat_mets: HashSet<String> =
-            mat.metrics.iter().map(|m| m.to_ascii_lowercase()).collect();
+        let mat_mets: HashSet<String> = mat
+            .metrics
+            .iter()
+            .map(|m| crate::ident::normalize_ident_part(m))
+            .collect();
         mat_dims == req_dims && mat_mets == req_mets
     })
 }
@@ -240,6 +245,26 @@ mod tests {
         let mets = resolve_mets(&def, &["total_revenue", "order_count"]);
         let sql = try_route_materialization(&def, &dims, &mets);
         assert!(sql.is_some(), "case-insensitive matching should work");
+    }
+
+    #[test]
+    fn quote_insensitive_matching() {
+        // A MATERIALIZATIONS clause that declares its names double-quoted (and
+        // mixed-case) still routes to the stored unquoted dimensions/metrics —
+        // matching goes through the canonical identifier key (TECH-DEBT #28
+        // Slice 3), not a quote-blind `to_ascii_lowercase`.
+        let def = orders_view().with_materialization(
+            "region_agg",
+            "agg_table",
+            &["\"Region\""],
+            &["\"Total_Revenue\"", "\"order_count\""],
+        );
+        let dims = resolve_dims(&def, &["region"]);
+        let mets = resolve_mets(&def, &["total_revenue", "order_count"]);
+        assert!(
+            try_route_materialization(&def, &dims, &mets).is_some(),
+            "quoted declared materialization names should match unquoted stored names"
+        );
     }
 
     #[test]

@@ -1,17 +1,22 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-/// A query-request name (dimension or metric) with case-insensitive ASCII
-/// equality and hashing.
+/// A query-request name (dimension or metric) with case- **and quote**-
+/// insensitive equality and hashing.
 ///
-/// Semantic-view names are matched case-insensitively, so this newtype provides
-/// `PartialEq`/`Eq`/`Hash` on the ASCII-lowercased form, centralizing the ad-hoc
-/// `eq_ignore_ascii_case` / `to_ascii_lowercase` calls that used to live
-/// throughout the resolution code. The `K` kind marker (see [`DimensionName`]
-/// and [`MetricName`]) keeps the flavors distinct at the type level so a
-/// dimension name can't be passed where a metric name is expected — one impl,
-/// several types (R-7, code-review 2026-07-11, replacing the former per-flavor
-/// copy-paste twins).
+/// Semantic-view names are matched under `DuckDB`'s identifier rule — case is
+/// ignored, and a double-quoted name matches its unquoted spelling (`"Region"`,
+/// `REGION`, `region` are the same name) — so this newtype provides
+/// `PartialEq`/`Eq`/`Hash` on the canonical key from
+/// [`crate::ident::normalize_ident_part`], the same rule
+/// [`crate::ident::ident_matches`] and the resolution layer use. This
+/// centralizes the ad-hoc `eq_ignore_ascii_case` / `to_ascii_lowercase` calls
+/// that used to live throughout the resolution code (and closes the residual
+/// gap where those folded case but did not strip quotes — TECH-DEBT #28
+/// Slice 3). The `K` kind marker (see [`DimensionName`] and [`MetricName`])
+/// keeps the flavors distinct at the type level so a dimension name can't be
+/// passed where a metric name is expected — one impl, several types (R-7,
+/// code-review 2026-07-11, replacing the former per-flavor copy-paste twins).
 pub struct CiName<K> {
     raw: String,
     // `fn() -> K` keeps `CiName<K>: Send + Sync` regardless of `K` and marks the
@@ -31,6 +36,14 @@ impl<K> CiName<K> {
     pub fn as_str(&self) -> &str {
         &self.raw
     }
+
+    /// The canonical match key: quote-stripped and ASCII-case-folded via
+    /// [`crate::ident::normalize_ident_part`]. Used by `Hash` for the (rare)
+    /// quoted path; `Eq` uses the equivalent [`crate::ident::ident_matches`],
+    /// which is allocation-free when neither side is quoted.
+    fn key(&self) -> String {
+        crate::ident::normalize_ident_part(&self.raw)
+    }
 }
 
 impl<K> Clone for CiName<K> {
@@ -47,7 +60,10 @@ impl<K> fmt::Debug for CiName<K> {
 
 impl<K> PartialEq for CiName<K> {
     fn eq(&self, other: &Self) -> bool {
-        self.raw.eq_ignore_ascii_case(&other.raw)
+        // Allocation-free when neither side is quoted (plain
+        // `eq_ignore_ascii_case`); only a quoted side takes the
+        // strip-and-normalize path — see `ident::ident_matches`.
+        crate::ident::ident_matches(&self.raw, &other.raw)
     }
 }
 
@@ -55,8 +71,21 @@ impl<K> Eq for CiName<K> {}
 
 impl<K> std::hash::Hash for CiName<K> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        for byte in self.raw.bytes() {
-            byte.to_ascii_lowercase().hash(state);
+        // Must agree with `PartialEq` — equal names (any case/quoting) hash
+        // identically — while staying allocation-free on the common unquoted
+        // path. Hash the canonical key's bytes one at a time: for an unquoted
+        // name that is exactly its ASCII-lowercased bytes (no allocation, and
+        // byte-identical to the pre-quote-aware impl); a quoted name is
+        // normalized (quotes stripped) first, so `"Region"` hashes like
+        // `region` — consistent with the quote-insensitive `Eq`.
+        if self.raw.as_bytes().contains(&b'"') {
+            for b in self.key().bytes() {
+                b.hash(state);
+            }
+        } else {
+            for b in self.raw.bytes() {
+                b.to_ascii_lowercase().hash(state);
+            }
         }
     }
 }
@@ -101,13 +130,13 @@ pub enum MetricKind {}
 /// Kind marker for [`FactName`]; never constructed.
 pub enum FactKind {}
 
-/// A dimension name with case-insensitive equality and hashing (see [`CiName`]).
+/// A dimension name with case- and quote-insensitive equality and hashing (see [`CiName`]).
 pub type DimensionName = CiName<DimensionKind>;
 
-/// A metric name with case-insensitive equality and hashing (see [`CiName`]).
+/// A metric name with case- and quote-insensitive equality and hashing (see [`CiName`]).
 pub type MetricName = CiName<MetricKind>;
 
-/// A fact name with case-insensitive equality and hashing (see [`CiName`]).
+/// A fact name with case- and quote-insensitive equality and hashing (see [`CiName`]).
 pub type FactName = CiName<FactKind>;
 
 /// A request to expand a semantic view into SQL.
@@ -161,6 +190,29 @@ mod tests {
         assert!(set.contains(&DimensionName::new("foo")));
         assert!(set.contains(&DimensionName::new("FOO")));
         assert!(!set.contains(&DimensionName::new("bar")));
+    }
+
+    #[test]
+    fn dimension_name_quote_insensitive_eq_and_hash() {
+        use std::collections::HashSet;
+        // A double-quoted name matches its unquoted spelling (quotes stripped +
+        // case folded), consistent with `ident::ident_matches` — TECH-DEBT #28.
+        assert_eq!(
+            DimensionName::new("\"Region\""),
+            DimensionName::new("region")
+        );
+        assert_eq!(
+            DimensionName::new("\"REGION\""),
+            DimensionName::new("Region")
+        );
+        let mut set = HashSet::new();
+        set.insert(DimensionName::new("region"));
+        assert!(set.contains(&DimensionName::new("\"Region\"")));
+        // A quoted name that carries a space still matches its unquoted key.
+        assert_eq!(
+            MetricName::new("\"Total Revenue\""),
+            MetricName::new("total revenue")
+        );
     }
 
     #[test]

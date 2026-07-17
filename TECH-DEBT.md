@@ -266,7 +266,15 @@ Areas where test coverage is reduced compared to ideal, with justification.
     - the **derived-metric validator** (`graph::derived_metrics::check_derived_metric_references`) scans with `expr_tokens::scan_references` + `IdentRef::is_bare`, matching quoted / spaced metric names identically to the inliner (the `(`-lookahead that used to force a separate scanner is now built into the tokenizer);
     - **aggregate detection** (`contains_aggregate_function`) uses the new `expr_tokens::scan_function_heads` (the exact complement of `scan_references`), inheriting correct literal handling.
     `util::replace_word_boundary` and `derived_metrics::extract_identifiers` are **removed**; `util::is_word_boundary_char` survives only for the `expand::facts` COUNT/name matchers.
-  - **Slice 3 (remaining, deferred):** the sites that compare stored **name fields** rather than scanning expression text — a `CiName`/name-matching concern, not an `expr_tokens` one. These fold case but do not strip quotes: the materialization set-matcher (`expand/materialization.rs`) over a `MATERIALIZATIONS` clause's declared names; `NON ADDITIVE BY` dimension references and window inner-metric references (incl. the dotted NA-dim resolution, #30); and `CiName`'s `Eq`/`Hash`. Route these through a quote-aware `CiName` (via `ident::normalize_ident_part`) so a quoted name in one of these internal positions matches its unquoted declaration.
+  - **Slice 3 (name-field matchers) — mostly landed:** the sites that compare stored **name fields** rather than scanning expression text — a `CiName`/name-matching concern, not an `expr_tokens` one — folded case but did not strip quotes. Now routed through the canonical key (`ident::normalize_ident_part` / `ident_matches`):
+    - **`CiName`'s `Eq`/`Hash`** (`expand/types.rs`) key on `normalize_ident_part`, so `"Region"` == `region` (was ASCII-fold only). (In practice these are unused in production — resolution goes through `AsRef<str>` + `ident_matches`, dedup keys on pointer identity — so this is primitive-hygiene, not a behaviour fix.)
+    - **Materialization set-matcher** (`expand/materialization.rs::find_matching_materialization`): requested and declared dim/metric name sets are keyed by `normalize_ident_part`, so a quoted name in a `MATERIALIZATIONS` clause routes to its unquoted declaration (was a silently-missed routing / full-expansion fallback).
+    - **Window inner-metric** (`expand/window.rs`): the inner-metric CTE key, the def-lookup, and the emitted alias all use the canonical key, so a quoted inner-metric reference aliases and references consistently (a quoted inner metric previously produced a mismatched alias vs. reference).
+  - **Slice 3 remaining — dimension-side name matching (#30):** the sites that match a *dimension reference* (as opposed to a dimension's own declared name) still fold case but not quotes, and are not dotted-aware:
+    - `expand/semi_additive.rs` matches an NA dim against dimension names bare-only (`eq_ignore_ascii_case`) across several interlocking sites (classification, grouping, partition/order emission, source-table join). A **dotted** NA reference (`o."order date"`) misses those and falls to the `quote_ident(&nd.dimension)` arm → clean bind-time failure.
+    - `expand/window.rs` matches a window metric's `PARTITION BY` / `EXCLUDING` / `ORDER BY` dimension references against the queried-dim set with `to_ascii_lowercase` (the inner-*metric* keying there is already quote-aware; the dimension side is not — see the in-code note).
+
+    Fixing both means routing every reference-vs-dimension comparison through the bare-AND-dotted resolver (`resolution::find_dimension`) consistently; deferred to its own PR because the semi-additive path is E-1-sensitive (see #30).
 
 ### 29. ✅ `fk_columns.is_empty()` legacy-relationship guards are load-bearing — do NOT remove (E-8)
 
@@ -295,7 +303,11 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ---
 
-**Last updated:** 2026-07-16 (v0.11 unreleased) — added entry #31
+**Last updated:** 2026-07-17 (v0.11 unreleased) — entry #28: Slice 3 name-field
+matchers landed — `CiName` `Eq`/`Hash`, the materialization set-matcher, and
+window inner-metric matching now key on `ident::normalize_ident_part` (quote +
+case). Only the `NON ADDITIVE BY` dotted-qualified resolution (#30) remains,
+deferred to its own PR (E-1-sensitive). Prior: 2026-07-16 — added entry #31
 (graph/validation errors are now typed `ParseError`, deliberately positionless
 — the review §6.1 / §7.5 error-architecture item). Prior same-day: entry #28:
 Slice 2 landed —

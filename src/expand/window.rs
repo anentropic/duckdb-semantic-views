@@ -42,6 +42,17 @@ pub(super) fn expand_window_metrics(
     resolved_exprs: &HashMap<String, String>,
 ) -> Result<String, ExpandError> {
     // 1. Validate required dimensions for each window metric.
+    //
+    // NOTE (TECH-DEBT #28 Slice 3): the inner-*metric* keying below is
+    // quote-aware, but this dimension-side matching — `queried_dim_names` and
+    // the EXCLUDING / PARTITION BY / ORDER BY checks against it — still folds
+    // case only (`to_ascii_lowercase`), not quotes. A window whose partition/
+    // excluded/order dim is written quoted (`"Region"`) would not strip the
+    // quotes here. That is the same dimension-side gap left open in
+    // `semi_additive.rs` (the `NON ADDITIVE BY` matching, #30): both are
+    // deferred to the dimension-side pass that routes every NA-/window-vs-
+    // dimension comparison through the bare-AND-dotted resolver. So `window.rs`
+    // is quote-aware for inner metrics but not yet for its dimension references.
     let queried_dim_names: HashSet<String> = resolved_dims
         .iter()
         .map(|rd| rd.dim.name.to_ascii_lowercase())
@@ -93,7 +104,10 @@ pub(super) fn expand_window_metrics(
         let Some(ref ws) = met.window_spec else {
             continue;
         };
-        let key = ws.inner_metric.to_ascii_lowercase();
+        // Canonical identifier key (quote-stripped + case-folded) so a quoted
+        // inner-metric reference (`"Total_Qty"`) keys, and later aliases,
+        // identically to its stored `total_qty` — TECH-DEBT #28 Slice 3.
+        let key = crate::ident::normalize_ident_part(&ws.inner_metric);
         if inner_metric_set.insert(key.clone()) {
             inner_metric_order.push(key);
         }
@@ -106,7 +120,7 @@ pub(super) fn expand_window_metrics(
             // Fall back to finding the metric definition directly
             def.metrics
                 .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(inner_name))
+                .find(|m| crate::ident::ident_matches(&m.name, inner_name))
                 .map_or_else(|| inner_name.clone(), |m| m.expr.clone())
         });
         inner_metric_exprs.insert(inner_name.clone(), expr);
@@ -176,7 +190,11 @@ pub(super) fn expand_window_metrics(
         };
 
         // Build the function call: window_function(inner_metric_alias, extra_args...)
-        let inner_alias = quote_ident(&ws.inner_metric.to_ascii_lowercase());
+        // The canonical key (computed once here) is the same one the CTE column
+        // above was aliased with, so a quoted inner-metric reference aliases and
+        // references identically.
+        let inner_key = crate::ident::normalize_ident_part(&ws.inner_metric);
+        let inner_alias = quote_ident(&inner_key);
         let mut func_args = vec![inner_alias];
         for arg in &ws.extra_args {
             func_args.push(arg.clone());
@@ -311,6 +329,58 @@ mod tests {
         assert!(
             sql.contains("FROM __sv_agg"),
             "Outer should reference CTE: {sql}"
+        );
+    }
+
+    /// A window metric whose inner-metric reference is written QUOTED and
+    /// mixed-case (`"Total_Qty"`) against an unquoted base metric `total_qty`.
+    /// The CTE aggregate column and the outer window reference must both resolve
+    /// to the canonical key `"total_qty"` so the alias and the reference agree
+    /// (TECH-DEBT #28 Slice 3). Before quote-aware keying the inner name kept
+    /// its quote characters, so the def lookup missed the base metric and the
+    /// emitted alias/reference were a doubly-quoted, non-existent column.
+    #[test]
+    fn test_window_quoted_inner_metric() {
+        let def = minimal_def("sales", "store", "store", "total_qty", "SUM(s.quantity)")
+            .with_dimension("date", "date", None)
+            .with_window_spec(
+                "total_qty",
+                WindowSpec {
+                    window_function: "AVG".to_string(),
+                    inner_metric: "\"Total_Qty\"".to_string(),
+                    extra_args: vec![],
+                    excluding_dims: vec!["date".to_string()],
+                    partition_dims: vec![],
+                    order_by: vec![WindowOrderBy {
+                        expr: "date".to_string(),
+                        order: SortOrder::Asc,
+                        nulls: NullsOrder::Last,
+                    }],
+                    frame_clause: None,
+                },
+            );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("store"), DimensionName::new("date")],
+            metrics: vec![MetricName::new("total_qty")],
+        };
+
+        let sql = expand("test_view", &def, &req).unwrap();
+        // CTE aggregates the base metric under the canonical key alias.
+        assert!(
+            sql.contains("SUM(s.quantity) AS \"total_qty\""),
+            "CTE should alias the base metric to the canonical key: {sql}"
+        );
+        // Outer window references that exact alias — quotes stripped, folded.
+        assert!(
+            sql.contains("AVG(\"total_qty\")"),
+            "window should reference the canonical inner alias: {sql}"
+        );
+        // No doubly-quoted residue from keeping the reference's quote chars.
+        assert!(
+            !sql.contains("\"\"total_qty\"\""),
+            "inner-metric quotes must be stripped, not doubled: {sql}"
         );
     }
 
