@@ -43,6 +43,13 @@ test-rust:
     cargo nextest run
     cargo test --doc
     SV_SKIP_CPP_BUILD=1 cargo test --doc --no-default-features --features extension read_ffi
+    # `cargo nextest run` above uses default features, so #[cfg(feature =
+    # "extension")] UNIT tests are otherwise never compiled or run — two such
+    # tests silently rotted (a stale assertion + a signature-change compile
+    # break) before this step was added. --lib scopes to the library's own
+    # tests (the integration crates assume the default `duckdb` feature);
+    # SV_SKIP_CPP_BUILD skips the C++ build, the pure-Rust tests still run.
+    SV_SKIP_CPP_BUILD=1 cargo test --lib --no-default-features --features extension
 
 # Run all lints
 lint:
