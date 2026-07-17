@@ -63,6 +63,45 @@ pub(super) fn na_dim_match_key(def: &SemanticViewDefinition, na_dimension: &str)
     super::resolution::dim_ref_key(def, na_dimension)
 }
 
+/// Resolve the role-playing scoped alias for a semi-additive NON ADDITIVE BY
+/// dimension, in the context of one owning metric's `USING` clause — the same
+/// resolution the queried-dimension path performs via
+/// [`super::role_playing::find_using_context`] (`sql_gen.rs`). Returns:
+///
+/// - `Ok(None)` — the NA dim resolves to a dimension whose source table is not
+///   a role-playing target (reached by at most one relationship), or it has no
+///   source table / does not resolve: the snapshot orders by the raw declared
+///   expression, unchanged.
+/// - `Ok(Some(alias))` — the NA dim's table is role-playing and the metric's
+///   `USING` disambiguates to exactly one relationship: the snapshot must order
+///   by `alias.col` (e.g. `a__dep_airport`), the *same* scoped instance the
+///   metric joins. Ordering by the bare table instead would rank by whichever
+///   role the join resolver picked first (the first-declared relationship),
+///   ignoring `USING` — a silent wrong-role snapshot (F-18 / code-review
+///   2026-07-16 T-15).
+/// - `Err(AmbiguousPath)` — role-playing target with no single `USING` context:
+///   the snapshot end is genuinely ambiguous. Fail loud, matching the
+///   queried-dim path's identical rejection (`phase32_role_playing.test`).
+///
+/// A single-metric context (`from_ref`) is passed deliberately: each metric's
+/// own `USING` drives the role of its NA dims, so two metrics that share an NA
+/// dim set but differ in `USING` resolve to different aliases and are split
+/// into separate `RANK()` groups (folded into the group key by
+/// [`collect_na_groups`]).
+fn na_dim_scoped_alias(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    met: &Metric,
+    na_dimension: &str,
+) -> Result<Option<String>, ExpandError> {
+    let Some(dim) = super::resolution::find_dimension(def, na_dimension) else {
+        // Unresolvable references are handled by the fail-clean `quote_ident`
+        // arm at the ORDER BY site; no role to resolve here.
+        return Ok(None);
+    };
+    super::role_playing::find_using_context(view_name, def, dim, std::slice::from_ref(&met))
+}
+
 /// Returns true when `met` is an ACTIVE semi-additive metric for a query over
 /// `queried_dim_keys` (each the canonical [`crate::ident::normalize_ident_part`]
 /// key of a queried dimension's stored name): it has a NON ADDITIVE BY clause
@@ -117,7 +156,7 @@ pub(super) fn expand_semi_additive(
         |met: &Metric| -> bool { is_active_semi_additive(def, met, &queried_dim_keys) };
 
     // 1. Identify distinct NON ADDITIVE BY dimension sets for ACTIVE metrics only.
-    let na_groups = collect_na_groups(def, resolved_mets, &queried_dim_keys);
+    let na_groups = collect_na_groups(view_name, def, resolved_mets, &queried_dim_keys)?;
 
     // 2. SG-5: validate every metric expression BEFORE emitting any SQL. The
     //    snapshot CTE decomposes each metric into an inner-expression capture
@@ -248,7 +287,8 @@ pub(super) fn expand_semi_additive(
         let order_items: Vec<String> = group
             .na_dims
             .iter()
-            .map(|nd| {
+            .zip(&group.na_dim_scoped)
+            .map(|(nd, scoped)| {
                 // #30: resolve the NA dim reference (bare OR dotted, quoted or
                 // not) to its declared dimension via the shared resolver, so a
                 // dotted `o."order date"` orders by the same expression a bare
@@ -274,7 +314,29 @@ pub(super) fn expand_semi_additive(
                             .iter()
                             .zip(&dim_cte_exprs)
                             .find(|(rd, _)| crate::ident::normalize_ident_part(&rd.dim.name) == key)
-                            .map_or_else(|| d.expr.clone(), |(_, expr)| expr.clone())
+                            .map_or_else(
+                                || {
+                                    // UNQUERIED NA dim. Rewrite its declared
+                                    // expression to the role-playing scoped alias
+                                    // when its metric's USING disambiguates
+                                    // (T-15 / F-18) — the SAME instance the metric
+                                    // joins (e.g. `a.city` -> `a__dep_airport.city`).
+                                    // Without this the snapshot ordered by the bare
+                                    // table, whose join edge the resolver picks
+                                    // first (the first-declared relationship),
+                                    // ignoring USING — a silent wrong-role snapshot.
+                                    // Non-role-playing dims resolve to `None` and
+                                    // keep the raw expression (unchanged path).
+                                    let mut e = d.expr.clone();
+                                    if let (Some(sc), Some(st)) =
+                                        (scoped.as_ref(), d.source_table.as_ref())
+                                    {
+                                        e = crate::expr_tokens::rewrite_qualifier(&e, st, sc);
+                                    }
+                                    e
+                                },
+                                |(_, expr)| expr.clone(),
+                            )
                     },
                 );
                 // Snowflake semi-additive semantics (F-1, code-review
@@ -394,6 +456,13 @@ pub(super) fn expand_semi_additive(
 struct NaGroup {
     /// The actual `NonAdditiveDim` entries for this group.
     na_dims: Vec<NonAdditiveDim>,
+    /// Role-playing scoped alias for each NA dim, parallel to `na_dims`,
+    /// resolved from the group's metrics' `USING` context (`None` when the NA
+    /// dim's table is not a role-playing target). Homogeneous across the
+    /// group's metrics by construction — it is folded into the group key, so
+    /// two metrics whose NA dims resolve to different roles land in different
+    /// groups (separate `RANK()` columns).
+    na_dim_scoped: Vec<Option<String>>,
     /// Indices into `resolved_mets` that belong to this group.
     metric_indices: Vec<usize>,
 }
@@ -401,52 +470,71 @@ struct NaGroup {
 /// Group metrics by their NON ADDITIVE BY dimension sets.
 /// Only includes ACTIVE semi-additive metrics (those with at least one NA dim
 /// not in the queried dimensions).
+///
+/// Returns `Err` if an NA dim on a role-playing table cannot be disambiguated
+/// by its metric's `USING` context (propagated from [`na_dim_scoped_alias`]).
 fn collect_na_groups(
+    view_name: &str,
     def: &SemanticViewDefinition,
     resolved_mets: &[&Metric],
     queried_dim_keys: &HashSet<String>,
-) -> Vec<NaGroup> {
-    let mut groups: Vec<(Vec<String>, Vec<NonAdditiveDim>, Vec<usize>)> = Vec::new();
+) -> Result<Vec<NaGroup>, ExpandError> {
+    // Parallel `keys`/`groups`: a metric joins an existing group when its full
+    // key (dims + polarity + role) matches, else it starts a new one. Keeping
+    // the key beside the group (rather than inside `NaGroup`) avoids threading a
+    // grouping-only field through the struct used downstream.
+    let mut keys: Vec<Vec<String>> = Vec::new();
+    let mut groups: Vec<NaGroup> = Vec::new();
     for (idx, met) in resolved_mets.iter().enumerate() {
         // Skip regular and effectively-regular metrics (shared routing predicate)
         if !is_active_semi_additive(def, met, queried_dim_keys) {
             continue;
         }
-        // Key the group on the resolved dimension keys AND each NA dim's sort
-        // polarity (#30 for the resolver; polarity added so metrics that share
-        // NA dimension names but differ in ASC/DESC or NULLS placement do NOT
-        // collapse onto one RANK() column — the group's ORDER BY is taken from
-        // the FIRST metric registered, so merging different polarities would
-        // silently snapshot the other metric at the wrong end). Two metrics
-        // share a rank column only when their NA dims resolve to the same
-        // dimensions in the same order with identical polarity. `order`/`nulls`
-        // are `Copy` enums with a stable `Debug`; the NUL delimiter can never
-        // occur inside a normalized identifier key.
+        // Key the group on the resolved dimension keys, each NA dim's sort
+        // polarity, AND each NA dim's role-playing scoped alias (#30 for the
+        // resolver; polarity added so metrics that share NA dimension names but
+        // differ in ASC/DESC or NULLS placement do NOT collapse onto one RANK()
+        // column — the group's ORDER BY is taken from the FIRST metric
+        // registered, so merging different polarities would silently snapshot
+        // the other metric at the wrong end; the scoped alias added so metrics
+        // that share NA dims but resolve them to different role-playing
+        // instances via different USING clauses likewise stay on separate RANK()
+        // columns). Two metrics share a rank column only when their NA dims
+        // resolve to the same dimensions in the same order with identical
+        // polarity and identical role. `order`/`nulls` are `Copy` enums with a
+        // stable `Debug`; the NUL delimiter can never occur inside a normalized
+        // identifier key or a scoped alias.
+        let scoped: Vec<Option<String>> = met
+            .non_additive_by
+            .iter()
+            .map(|nd| na_dim_scoped_alias(view_name, def, met, &nd.dimension))
+            .collect::<Result<_, _>>()?;
         let key: Vec<String> = met
             .non_additive_by
             .iter()
-            .map(|nd| {
+            .zip(&scoped)
+            .map(|(nd, sc)| {
                 format!(
-                    "{}\u{0}{:?}\u{0}{:?}",
+                    "{}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
                     na_dim_match_key(def, &nd.dimension),
                     nd.order,
-                    nd.nulls
+                    nd.nulls,
+                    sc
                 )
             })
             .collect();
-        if let Some(group) = groups.iter_mut().find(|(k, _, _)| *k == key) {
-            group.2.push(idx);
+        if let Some(pos) = keys.iter().position(|k| *k == key) {
+            groups[pos].metric_indices.push(idx);
         } else {
-            groups.push((key, met.non_additive_by.clone(), vec![idx]));
+            keys.push(key);
+            groups.push(NaGroup {
+                na_dims: met.non_additive_by.clone(),
+                na_dim_scoped: scoped,
+                metric_indices: vec![idx],
+            });
         }
     }
-    groups
-        .into_iter()
-        .map(|(_, na_dims, metric_indices)| NaGroup {
-            na_dims,
-            metric_indices,
-        })
-        .collect()
+    Ok(groups)
 }
 
 /// Collect the (lowercased) source-table aliases of every active NA dim,
@@ -457,13 +545,25 @@ fn collect_na_groups(
 /// path intermediaries); otherwise its raw expression in the snapshot ORDER
 /// BY would reference an unjoined table and fail at bind time. Base-table
 /// dims (`source_table == None`) and unresolvable names contribute nothing.
+///
+/// A NA dim that resolved to a role-playing scoped alias (`na_dim_scoped` is
+/// `Some`) contributes nothing either: its ORDER BY references the *scoped*
+/// instance (`a__dep_airport`), which the owning metric's `USING` clause
+/// already joins. Adding the bare table alias here would emit a redundant
+/// second join to the same table on whichever edge the resolver picks first —
+/// exactly the wrong-role instance the T-15 fix routes the ORDER BY away from.
 fn collect_na_dim_source_tables(
     def: &SemanticViewDefinition,
     na_groups: &[NaGroup],
 ) -> Vec<String> {
     let mut sources: Vec<String> = Vec::new();
     for group in na_groups {
-        for nd in &group.na_dims {
+        for (nd, scoped) in group.na_dims.iter().zip(&group.na_dim_scoped) {
+            // Role-playing NA dim: the scoped join is emitted by the metric's
+            // USING (see the doc comment); don't add a bare-table duplicate.
+            if scoped.is_some() {
+                continue;
+            }
             // #30: resolve bare OR dotted/quoted NA references through the
             // shared resolver so a dotted NA dim on a non-base table still
             // contributes its source table to the snapshot join.
@@ -1575,6 +1675,158 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // T-15 / F-18 (code-review 2026-07-16): semi-additive × role-playing.
+    // An UNQUERIED NON ADDITIVE BY dim on a role-playing table must snapshot
+    // by the SAME role the metric's USING clause pins, not by whichever join
+    // edge the resolver picks first.
+    // -----------------------------------------------------------------------
+
+    /// Role-playing airports reached by `dep_airport(departure_code)` and
+    /// `arr_airport(arrival_code)`; a semi-additive metric on flights that
+    /// pins one role via `USING`, with the airport `city` dimension as its
+    /// (unqueried) NON ADDITIVE BY snapshot key. Query by the base `carrier`
+    /// only, so `city` is unqueried and the snapshot's RANK ORDER BY resolves
+    /// through the role-playing path.
+    fn role_playing_semi_def(using: &str) -> crate::model::SemanticViewDefinition {
+        let mut def = minimal_def("f", "carrier", "f.carrier", "latest_bal", "SUM(f.amount)");
+        def.tables[0].pk_columns = vec!["flight_id".to_string()];
+        def.metrics[0].source_table = Some("f".to_string());
+        def.with_table("a", "airports", &["airport_code"])
+            .with_dimension("city", "a.city", Some("a"))
+            .with_pkfk_join(
+                "dep_airport",
+                "f",
+                "a",
+                &["departure_code"],
+                &["airport_code"],
+            )
+            .with_pkfk_join(
+                "arr_airport",
+                "f",
+                "a",
+                &["arrival_code"],
+                &["airport_code"],
+            )
+            .with_using_relationship("latest_bal", &[using])
+            .with_non_additive_by("latest_bal", &[("city", SortOrder::Asc, NullsOrder::Last)])
+    }
+
+    fn carrier_only_req() -> QueryRequest {
+        QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("carrier")],
+            metrics: vec![MetricName::new("latest_bal")],
+        }
+    }
+
+    /// The snapshot ORDER BY must reference the metric's SCOPED airport
+    /// instance (`a__arr_airport.city`), and no redundant bare `a` join to
+    /// airports may be emitted. Before the fix the ORDER BY ordered by the bare
+    /// `a.city` and a second `airports AS a` join was added on the
+    /// first-declared edge (`departure_code`) — the wrong role.
+    #[test]
+    fn test_role_playing_na_dim_orders_by_scoped_alias() {
+        let sql = expand(
+            "rp_view",
+            &role_playing_semi_def("arr_airport"),
+            &carrier_only_req(),
+        )
+        .expect("expand");
+        // The metric's scoped instance carries the snapshot ordering.
+        assert!(
+            sql.contains("ORDER BY a__arr_airport.city"),
+            "snapshot must order by the USING-scoped alias, not the bare table: {sql}"
+        );
+        // The bare-table order (the wrong-role snapshot) must be gone.
+        assert!(
+            !sql.contains("ORDER BY a.city"),
+            "must NOT order by the bare table alias (wrong-role snapshot): {sql}"
+        );
+        // No redundant second join to airports on the bare alias.
+        assert!(
+            !sql.contains("AS \"a\" ON"),
+            "must NOT emit a redundant bare `a` join (the USING scoped join covers it): {sql}"
+        );
+        assert!(
+            sql.contains("AS \"a__arr_airport\" ON \"f\".\"arrival_code\""),
+            "the scoped airport join (arrival edge) must be present: {sql}"
+        );
+    }
+
+    /// The opposite role selects the departure edge — proving the ORDER BY
+    /// tracks the metric's USING, not a fixed first-declared relationship.
+    #[test]
+    fn test_role_playing_na_dim_tracks_using_dep() {
+        let sql = expand(
+            "rp_view",
+            &role_playing_semi_def("dep_airport"),
+            &carrier_only_req(),
+        )
+        .expect("expand");
+        assert!(
+            sql.contains("ORDER BY a__dep_airport.city"),
+            "USING(dep_airport) must order by the departure-scoped alias: {sql}"
+        );
+    }
+
+    /// A role-playing NA dim with NO USING context on its metric is genuinely
+    /// ambiguous (which airport instance?). It must fail loud with the same
+    /// `AmbiguousPath` error the queried-dim role-playing path raises — not
+    /// silently snapshot by the first-declared edge (the pre-fix behaviour).
+    #[test]
+    fn test_role_playing_na_dim_without_using_is_ambiguous() {
+        let mut def = role_playing_semi_def("dep_airport");
+        // Drop the USING that disambiguated the role.
+        def.metrics
+            .iter_mut()
+            .find(|m| m.name == "latest_bal")
+            .unwrap()
+            .using_relationships
+            .clear();
+        match expand("rp_view", &def, &carrier_only_req()) {
+            Err(ExpandError::AmbiguousPath { dimension_name, .. }) => {
+                assert_eq!(dimension_name, "city")
+            }
+            other => panic!("expected AmbiguousPath for the role-playing NA dim, got: {other:?}"),
+        }
+    }
+
+    /// Two active semi-additive metrics sharing the same NA dim (`city`) but
+    /// pinning DIFFERENT roles via USING must land on SEPARATE RANK() columns —
+    /// `collect_na_groups` folds the resolved scoped alias into the group key.
+    /// Collapsing them would order both snapshots by one role, silently giving
+    /// the other metric the wrong-role snapshot.
+    #[test]
+    fn test_role_playing_different_using_separate_rank_columns() {
+        let mut def = role_playing_semi_def("arr_airport");
+        def = def
+            .with_metric("latest_bal_dep", "SUM(f.amount)", Some("f"))
+            .with_using_relationship("latest_bal_dep", &["dep_airport"])
+            .with_non_additive_by(
+                "latest_bal_dep",
+                &[("city", SortOrder::Asc, NullsOrder::Last)],
+            );
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("carrier")],
+            metrics: vec![
+                MetricName::new("latest_bal"),
+                MetricName::new("latest_bal_dep"),
+            ],
+        };
+        let sql = expand("rp_view", &def, &req).expect("expand");
+        assert!(
+            sql.contains("__sv_rn_1") && sql.contains("__sv_rn_2"),
+            "different-role NA metrics must get separate RANK columns: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY a__arr_airport.city")
+                && sql.contains("ORDER BY a__dep_airport.city"),
+            "each RANK must order by its own role's scoped alias: {sql}"
+        );
+    }
+
     /// Data-level tests: execute the generated snapshot SQL against an
     /// in-memory `DuckDB`. The `extension` feature swaps the bundled API for
     /// loadable-extension stubs, so these are gated like catalog.rs's tests.
@@ -1815,6 +2067,58 @@ mod tests {
             assert!((rows[0].1 - 150.0).abs() < 1e-9, "rows: {rows:?}");
             assert_eq!(rows[1].0, 20);
             assert!((rows[1].1 - 300.0).abs() < 1e-9, "rows: {rows:?}");
+        }
+
+        /// T-15 / F-18 data-level: semi-additive × role-playing, end-to-end.
+        /// A metric pins the ARRIVAL role via `USING (arr_airport)` and
+        /// snapshots on the airport `city` (unqueried). The data is engineered
+        /// so the arrival-city snapshot and the departure-city snapshot pick
+        /// DIFFERENT flights:
+        ///   f1: dep San Francisco / arr Boston    / 100
+        ///   f2: dep London        / arr New York  / 200
+        /// Default (ASC) selects the alphabetically-LAST city (F-1 latest).
+        ///   arrival cities {Boston, New York} -> New York -> f2 -> 200 (correct)
+        ///   departure cities {San Francisco, London} -> San Francisco -> f1 -> 100
+        /// Before the fix the snapshot ordered by the bare `a.city`, whose join
+        /// edge is the first-declared relationship (dep_airport), so it returned
+        /// 100 — the wrong role — silently. It must return 200.
+        #[test]
+        fn test_role_playing_na_dim_snapshot_uses_correct_role() {
+            let sql = expand(
+                "rp_view",
+                &role_playing_semi_def("arr_airport"),
+                &carrier_only_req(),
+            )
+            .expect("expand");
+
+            let con = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+            con.execute_batch(
+                "CREATE TABLE airports (airport_code VARCHAR, city VARCHAR);
+                 INSERT INTO airports VALUES
+                     ('SFO','San Francisco'),('LHR','London'),
+                     ('BOS','Boston'),('JFK','New York');
+                 CREATE TABLE f (flight_id INTEGER, departure_code VARCHAR,
+                                 arrival_code VARCHAR, carrier VARCHAR, amount DOUBLE);
+                 INSERT INTO f VALUES
+                     (1, 'SFO', 'BOS', 'AA', 100.0),
+                     (2, 'LHR', 'JFK', 'AA', 200.0);",
+            )
+            .expect("setup");
+            let wrapped = format!("SELECT * FROM ({sql}) ORDER BY 1");
+            let mut stmt = con.prepare(&wrapped).expect("prepare generated SQL");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows");
+            assert_eq!(rows.len(), 1, "one carrier: {rows:?}");
+            assert_eq!(rows[0].0, "AA");
+            assert!(
+                (rows[0].1 - 200.0).abs() < 1e-9,
+                "arrival-role snapshot must win (New York -> 200), not departure (100): {rows:?}"
+            );
         }
 
         /// Regression (Copilot review on #129): two active semi-additive metrics

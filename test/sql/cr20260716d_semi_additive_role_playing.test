@@ -1,0 +1,161 @@
+# Code-review 2026-07-16 F-18 / T-15: semi-additive × role-playing.
+#
+# A semi-additive metric written `m USING (<rel>) NON ADDITIVE BY (<dim>)`,
+# where <dim> lives on a ROLE-PLAYING table (reached by 2+ distinctly-named
+# relationships from one source) and is not itself queried, must snapshot by
+# the role the metric's USING clause names — NOT by an arbitrary (first-
+# declared) join edge. Before the fix the snapshot ordered by the bare table
+# instance, whose edge is the first-declared relationship, so an arrival-scoped
+# metric was silently ranked by the departure airport's city.
+
+require semantic_views
+
+# ============================================================
+# Setup: flights with a role-playing join to airports on two edges
+# (departure_code / arrival_code). Data is engineered so the arrival-city
+# snapshot and the departure-city snapshot pick DIFFERENT flights:
+#   f1: dep San Francisco / arr Boston   / 100
+#   f2: dep London        / arr New York / 200
+# Default (ASC) NON ADDITIVE BY selects the alphabetically-LAST city (F-1
+# "latest"): arrival {Boston, New York} -> New York -> f2 -> 200;
+# departure {San Francisco, London} -> San Francisco -> f1 -> 100.
+# ============================================================
+
+statement ok
+CREATE TABLE crd_airports (airport_code VARCHAR, city VARCHAR);
+
+statement ok
+INSERT INTO crd_airports VALUES
+  ('SFO', 'San Francisco'),
+  ('LHR', 'London'),
+  ('BOS', 'Boston'),
+  ('JFK', 'New York');
+
+statement ok
+CREATE TABLE crd_flights (flight_id INTEGER, departure_code VARCHAR, arrival_code VARCHAR, carrier VARCHAR, amount DOUBLE);
+
+statement ok
+INSERT INTO crd_flights VALUES
+  (1, 'SFO', 'BOS', 'AA', 100.0),
+  (2, 'LHR', 'JFK', 'AA', 200.0);
+
+# ============================================================
+# Scenario 1 — USING (arr_airport): the snapshot ranks by the ARRIVAL city.
+# Correct answer 200 (New York wins). Before the fix this returned 100 (the
+# departure-edge snapshot) silently.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW crd_arr AS
+  TABLES (
+    f AS crd_flights PRIMARY KEY (flight_id),
+    a AS crd_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+  )
+  DIMENSIONS (
+    f.carrier AS f.carrier,
+    a.city AS a.city
+  )
+  METRICS (
+    f.latest_bal USING (arr_airport) NON ADDITIVE BY (city) AS SUM(f.amount)
+  )
+
+query TI
+SELECT carrier, CAST(latest_bal AS BIGINT)
+FROM semantic_view('crd_arr', dimensions := ['carrier'], metrics := ['latest_bal']);
+----
+AA	200
+
+# The snapshot OVER clause orders by the metric's SCOPED airport instance.
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('crd_arr', dimensions := ['carrier'], metrics := ['latest_bal']) WHERE explain_output LIKE '%ORDER BY a__arr_airport.city%';
+----
+true
+
+# It must NOT order by the bare table alias (the wrong-role snapshot).
+query I
+SELECT count(*) FROM explain_semantic_view('crd_arr', dimensions := ['carrier'], metrics := ['latest_bal']) WHERE explain_output LIKE '%ORDER BY a.city%';
+----
+0
+
+# ============================================================
+# Scenario 2 — USING (dep_airport): the SAME query shape now ranks by the
+# DEPARTURE city, proving the snapshot tracks USING rather than a fixed edge.
+# Correct answer 100 (San Francisco wins).
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW crd_dep AS
+  TABLES (
+    f AS crd_flights PRIMARY KEY (flight_id),
+    a AS crd_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+  )
+  DIMENSIONS (
+    f.carrier AS f.carrier,
+    a.city AS a.city
+  )
+  METRICS (
+    f.latest_bal USING (dep_airport) NON ADDITIVE BY (city) AS SUM(f.amount)
+  )
+
+query TI
+SELECT carrier, CAST(latest_bal AS BIGINT)
+FROM semantic_view('crd_dep', dimensions := ['carrier'], metrics := ['latest_bal']);
+----
+AA	100
+
+# ============================================================
+# Scenario 3 — no USING: the role is genuinely ambiguous (which airport
+# instance?). It must fail loud at query time, the same as a directly-queried
+# role-playing dimension, instead of silently snapshotting by the first edge.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW crd_amb AS
+  TABLES (
+    f AS crd_flights PRIMARY KEY (flight_id),
+    a AS crd_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+  )
+  DIMENSIONS (
+    f.carrier AS f.carrier,
+    a.city AS a.city
+  )
+  METRICS (
+    f.latest_bal NON ADDITIVE BY (city) AS SUM(f.amount)
+  )
+
+statement error
+SELECT carrier, latest_bal
+FROM semantic_view('crd_amb', dimensions := ['carrier'], metrics := ['latest_bal']);
+----
+ambiguous
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW crd_arr;
+
+statement ok
+DROP SEMANTIC VIEW crd_dep;
+
+statement ok
+DROP SEMANTIC VIEW crd_amb;
+
+statement ok
+DROP TABLE crd_flights;
+
+statement ok
+DROP TABLE crd_airports;
