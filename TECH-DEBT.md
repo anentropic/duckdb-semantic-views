@@ -295,10 +295,10 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ---
 
-**Last updated:** 2026-07-16 (v0.11 unreleased) — added entry #31 (graph/
-validation errors are now typed `ParseError`, deliberately positionless — the
-review §6.1 / §7.5 error-architecture item). Prior same-day: entry #28: Slice 2
-landed —
+**Last updated:** 2026-07-16 (v0.11 unreleased) — added entry #31
+(graph/validation errors are now typed `ParseError`, deliberately positionless
+— the review §6.1 / §7.5 error-architecture item). Prior same-day: entry #28:
+Slice 2 landed —
 every expression-text scanner (alias-qualifier rewriters, derived-metric
 reference validator, aggregate detection) now rides `expr_tokens`;
 `util::replace_word_boundary` and `derived_metrics::extract_identifiers` are
