@@ -126,10 +126,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bare_name_folds_unquoted() {
-        // PA-8 consistency: unquoted references fold to lowercase like
-        // every other lookup path.
+    fn resolve_bare_name_folds_to_lowercase() {
+        // View-name lookup folds to lowercase the same way `normalize_view_name`
+        // and every other lookup path does — for quoted names too. Under
+        // DuckDB's identifier rule (and this project's documented view-name
+        // normalization) quoting only lets a name carry special characters; it
+        // does NOT preserve case. Stored view names are lowercase, so a request
+        // written `"MyView"` must resolve to `myview` to find the view.
         assert_eq!(resolve_bare_name("MyView"), "myview");
-        assert_eq!(resolve_bare_name("\"MyView\""), "MyView");
+        assert_eq!(resolve_bare_name("\"MyView\""), "myview");
     }
 }
