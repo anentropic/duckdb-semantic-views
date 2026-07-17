@@ -174,6 +174,48 @@ pub(super) fn find_dimension<'a>(
     }
 }
 
+/// Canonical match key for a dimension *reference* — bare (`report_date`),
+/// dotted (`o.report_date`), or with quoted parts (`o."order date"`).
+///
+/// Resolves the reference to its declared dimension via [`find_dimension`] and
+/// returns that dimension's [`crate::ident::normalize_ident_part`] key, so a
+/// reference matches the queried-dimension set regardless of how it is spelled.
+///
+/// When the reference resolves to no declared dimension it falls back to a
+/// **sentinel-prefixed** normalized key ([`UNRESOLVED_DIM_KEY_PREFIX`]). The
+/// prefix guarantees an unresolved reference can never equal a resolved
+/// dimension's key — a resolved key is a plain normalized identifier and can
+/// never begin with the `\0`-delimited sentinel. Without it, an unresolved
+/// dotted reference (`s.date`) would collide with a dimension whose stored name
+/// is a *quoted* dotted identifier (`"s.date"` also normalizes to `s.date`),
+/// making a required-dimension check pass when it should fail (the later SQL
+/// emission would then bind-fail instead of erroring cleanly). Unknown
+/// references are already hard-errored at CREATE, so this is defence-in-depth
+/// for a now-shared helper, keeping it correct independent of caller
+/// validation. The sentinel key is still deterministic per reference, so the
+/// same unresolved reference keys consistently across all call sites.
+///
+/// Shared by the `NON ADDITIVE BY` (semi-additive) and window dimension-side
+/// matchers so a quoted/dotted reference classifies identically to its bare
+/// spelling (TECH-DEBT #28/#30).
+pub(super) fn dim_ref_key(def: &SemanticViewDefinition, reference: &str) -> String {
+    find_dimension(def, reference).map_or_else(
+        || {
+            format!(
+                "{UNRESOLVED_DIM_KEY_PREFIX}{}",
+                crate::ident::normalize_ident_part(reference)
+            )
+        },
+        |d| crate::ident::normalize_ident_part(&d.name),
+    )
+}
+
+/// Sentinel prefix for [`dim_ref_key`]'s unresolved-reference fallback. Uses NUL
+/// delimiters, which a normalized identifier key produced from a declared
+/// dimension name never begins with, so an unresolved reference's key can never
+/// collide with a real dimension's key.
+const UNRESOLVED_DIM_KEY_PREFIX: &str = "\u{0}unresolved\u{0}";
+
 /// Look up a metric by name under `DuckDB`'s case-insensitive identifier rule
 /// ([`crate::ident::ident_matches`]): matching ignores case and quoting alike.
 ///
@@ -203,7 +245,8 @@ pub(super) fn find_metric<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident, quote_table_ref,
+        dim_ref_key, find_dimension, find_metric, qualify_and_quote_table_ref, quote_ident,
+        quote_table_ref,
     };
     use crate::model::SemanticViewDefinition;
 
@@ -382,6 +425,58 @@ mod tests {
             assert!(find_dimension(&def, "STATUS").is_some());
             assert!(find_dimension(&def, "\"status\"").is_some());
             assert!(find_dimension(&def, "\"Status\"").is_some());
+        }
+
+        /// `dim_ref_key`: a resolved reference keys on its declared dimension's
+        /// normalized name.
+        #[test]
+        fn dim_ref_key_resolves_to_declared_dimension_key() {
+            let def = lookup_def();
+            // Bare, dotted (matching table), and quoted spellings all key the
+            // same as the stored `region` dimension.
+            assert_eq!(dim_ref_key(&def, "region"), "region");
+            assert_eq!(dim_ref_key(&def, "c.region"), "region");
+            assert_eq!(dim_ref_key(&def, "\"Region\""), "region");
+        }
+
+        /// `dim_ref_key`: an UNRESOLVED reference's fallback key carries the
+        /// sentinel prefix, so it can never collide with a real dimension key —
+        /// even one whose stored name is a *quoted dotted* identifier that
+        /// normalizes to the same text (`"s.date"` → `s.date`, the same
+        /// normalization an unresolved qualified `s.date` would produce). Copilot
+        /// review on #130.
+        #[test]
+        fn dim_ref_key_unresolved_never_collides_with_quoted_dotted_dim_name() {
+            let mut def = def_with_db_schema(None, None);
+            def.tables = vec![TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                ..Default::default()
+            }];
+            // Stored dimension name is a QUOTED DOTTED identifier: `"s.date"`.
+            // Its canonical key is the plain `s.date`.
+            def.dimensions = vec![Dimension {
+                name: "\"s.date\"".to_string(),
+                expr: "o.sale_date".to_string(),
+                source_table: Some("o".to_string()),
+                ..Default::default()
+            }];
+
+            // The declared dimension resolves to the plain key.
+            assert_eq!(dim_ref_key(&def, "\"s.date\""), "s.date");
+
+            // A qualified reference `s.date` (alias `s`, name `date`) matches no
+            // declared dimension, so it must NOT key as `s.date` (which would
+            // let a required-dimension check treat it as the `"s.date"` dim).
+            let unresolved = dim_ref_key(&def, "s.date");
+            assert_ne!(
+                unresolved, "s.date",
+                "unresolved reference must not collide with the quoted-dotted dim key"
+            );
+            assert!(
+                unresolved.starts_with('\u{0}'),
+                "unresolved key must carry the sentinel prefix: {unresolved:?}"
+            );
         }
     }
 

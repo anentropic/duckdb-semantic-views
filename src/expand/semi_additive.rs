@@ -48,28 +48,19 @@ use super::types::{ExpandError, ResolvedDim};
 
 /// Resolve a NON ADDITIVE BY dim reference — bare (`report_date`), dotted
 /// (`o.report_date`), or either with quoted parts (`o."order date"`) — to the
-/// canonical match key of its declared dimension's stored name, using the
-/// shared bare-AND-dotted resolver [`super::resolution::find_dimension`].
+/// canonical match key of its declared dimension's stored name.
 ///
-/// Routing every NA-vs-dimension comparison in this module through this one
-/// key is what makes a dotted NA reference classify, partition, order, and
-/// join identically to the equivalent bare dimension (#30). A bare
-/// `to_ascii_lowercase` could never match a dotted reference against the
-/// stored bare dimension name, so a dotted NA dim was previously always
-/// classified active and its raw text emitted as a quoted non-column.
-///
-/// When the reference resolves to no declared dimension it falls back to the
-/// normalized raw text: unknown bare NA dims are hard-errored at CREATE
-/// (Phase 47), so only a residual malformed/dotted shape reaches here, and the
-/// normalized-raw key never collides with a real dimension key — keeping such
-/// a reference "not in query" (active) and, downstream, emitted as a quoted
-/// non-column that fails cleanly at bind time (F-18) rather than corrupting
-/// results.
+/// Thin alias over the shared [`super::resolution::dim_ref_key`] (which the
+/// window dimension-side matcher uses too). Routing every NA-vs-dimension
+/// comparison in this module through this one key is what makes a dotted NA
+/// reference classify, partition, order, and join identically to the
+/// equivalent bare dimension (#30) — a bare `to_ascii_lowercase` could never
+/// match a dotted reference against the stored bare dimension name, so a
+/// dotted NA dim was previously always classified active and its raw text
+/// emitted as a quoted non-column. Unresolvable references fall back to the
+/// normalized raw text (fail-clean); see `dim_ref_key`.
 pub(super) fn na_dim_match_key(def: &SemanticViewDefinition, na_dimension: &str) -> String {
-    super::resolution::find_dimension(def, na_dimension).map_or_else(
-        || crate::ident::normalize_ident_part(na_dimension),
-        |d| crate::ident::normalize_ident_part(&d.name),
-    )
+    super::resolution::dim_ref_key(def, na_dimension)
 }
 
 /// Returns true when `met` is an ACTIVE semi-additive metric for a query over
