@@ -38,8 +38,9 @@ impl<K> CiName<K> {
     }
 
     /// The canonical match key: quote-stripped and ASCII-case-folded via
-    /// [`crate::ident::normalize_ident_part`]. Backs both `Eq` and `Hash` so
-    /// they stay mutually consistent and agree with `ident::ident_matches`.
+    /// [`crate::ident::normalize_ident_part`]. Used by `Hash` for the (rare)
+    /// quoted path; `Eq` uses the equivalent [`crate::ident::ident_matches`],
+    /// which is allocation-free when neither side is quoted.
     fn key(&self) -> String {
         crate::ident::normalize_ident_part(&self.raw)
     }
@@ -59,7 +60,10 @@ impl<K> fmt::Debug for CiName<K> {
 
 impl<K> PartialEq for CiName<K> {
     fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key()
+        // Allocation-free when neither side is quoted (plain
+        // `eq_ignore_ascii_case`); only a quoted side takes the
+        // strip-and-normalize path — see `ident::ident_matches`.
+        crate::ident::ident_matches(&self.raw, &other.raw)
     }
 }
 
@@ -67,9 +71,22 @@ impl<K> Eq for CiName<K> {}
 
 impl<K> std::hash::Hash for CiName<K> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Hash the canonical key so it stays consistent with the `Eq` above:
-        // equal names (any case/quoting) hash identically.
-        self.key().hash(state);
+        // Must agree with `PartialEq` — equal names (any case/quoting) hash
+        // identically — while staying allocation-free on the common unquoted
+        // path. Hash the canonical key's bytes one at a time: for an unquoted
+        // name that is exactly its ASCII-lowercased bytes (no allocation, and
+        // byte-identical to the pre-quote-aware impl); a quoted name is
+        // normalized (quotes stripped) first, so `"Region"` hashes like
+        // `region` — consistent with the quote-insensitive `Eq`.
+        if self.raw.as_bytes().contains(&b'"') {
+            for b in self.key().bytes() {
+                b.hash(state);
+            }
+        } else {
+            for b in self.raw.bytes() {
+                b.to_ascii_lowercase().hash(state);
+            }
+        }
     }
 }
 
