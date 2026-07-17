@@ -421,13 +421,27 @@ fn collect_na_groups(
         if !is_active_semi_additive(def, met, queried_dim_keys) {
             continue;
         }
-        // Key the group on the resolved dimension keys (#30) so two metrics
-        // whose NA sets name the same dims via different spellings (bare vs
-        // dotted, quoted vs not) share one snapshot rank column.
+        // Key the group on the resolved dimension keys AND each NA dim's sort
+        // polarity (#30 for the resolver; polarity added so metrics that share
+        // NA dimension names but differ in ASC/DESC or NULLS placement do NOT
+        // collapse onto one RANK() column — the group's ORDER BY is taken from
+        // the FIRST metric registered, so merging different polarities would
+        // silently snapshot the other metric at the wrong end). Two metrics
+        // share a rank column only when their NA dims resolve to the same
+        // dimensions in the same order with identical polarity. `order`/`nulls`
+        // are `Copy` enums with a stable `Debug`; the NUL delimiter can never
+        // occur inside a normalized identifier key.
         let key: Vec<String> = met
             .non_additive_by
             .iter()
-            .map(|nd| na_dim_match_key(def, &nd.dimension))
+            .map(|nd| {
+                format!(
+                    "{}\u{0}{:?}\u{0}{:?}",
+                    na_dim_match_key(def, &nd.dimension),
+                    nd.order,
+                    nd.nulls
+                )
+            })
             .collect();
         if let Some(group) = groups.iter_mut().find(|(k, _, _)| *k == key) {
             group.2.push(idx);
@@ -1810,6 +1824,90 @@ mod tests {
             assert!((rows[0].1 - 150.0).abs() < 1e-9, "rows: {rows:?}");
             assert_eq!(rows[1].0, 20);
             assert!((rows[1].1 - 300.0).abs() < 1e-9, "rows: {rows:?}");
+        }
+
+        /// Regression (Copilot review on #129): two active semi-additive metrics
+        /// that share the SAME NA dimension but have OPPOSITE polarity
+        /// (`ASC` = latest vs `DESC` = earliest) must snapshot at different ends.
+        /// `collect_na_groups` keys the group on dimension name AND polarity, so
+        /// they get SEPARATE RANK() columns; keying on the dimension alone would
+        /// collapse them onto one column built from the first metric's polarity,
+        /// silently giving the other metric the wrong-end snapshot.
+        ///
+        /// alice: latest (ASC) = 2024-01-02 tie (100+150=250); earliest (DESC)
+        /// = 2024-01-01 (999). The two answers differ, so a collapse to one
+        /// column would make `earliest_bal` wrongly read 250.
+        #[test]
+        fn test_same_na_dim_opposite_polarity_separate_rank_columns() {
+            let def = minimal_def(
+                "accounts",
+                "customer_id",
+                "customer_id",
+                "latest_bal",
+                "SUM(balance)",
+            )
+            .with_dimension("report_date", "report_date", None)
+            .with_metric("earliest_bal", "SUM(balance)", None)
+            .with_non_additive_by(
+                "latest_bal",
+                &[("report_date", SortOrder::Asc, NullsOrder::Last)],
+            )
+            .with_non_additive_by(
+                "earliest_bal",
+                &[("report_date", SortOrder::Desc, NullsOrder::Last)],
+            );
+
+            let req = QueryRequest {
+                facts: vec![],
+                dimensions: vec![DimensionName::new("customer_id")],
+                metrics: vec![
+                    MetricName::new("latest_bal"),
+                    MetricName::new("earliest_bal"),
+                ],
+            };
+
+            let sql = expand("test_view", &def, &req).expect("expand");
+            // Two distinct snapshot rank columns must be emitted.
+            assert!(
+                sql.contains("__sv_rn_1") && sql.contains("__sv_rn_2"),
+                "opposite-polarity NA metrics must get separate RANK columns: {sql}"
+            );
+
+            let con = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+            con.execute_batch(
+                "CREATE TABLE accounts (customer_id VARCHAR, report_date DATE, balance DOUBLE);
+                 INSERT INTO accounts VALUES
+                     ('alice', DATE '2024-01-01', 999.0),
+                     ('alice', DATE '2024-01-02', 100.0),
+                     ('alice', DATE '2024-01-02', 150.0);",
+            )
+            .expect("setup");
+            let wrapped = format!("SELECT * FROM ({sql}) ORDER BY 1");
+            let mut stmt = con.prepare(&wrapped).expect("prepare generated SQL");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                })
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows");
+            assert_eq!(rows.len(), 1, "rows: {rows:?}");
+            assert_eq!(rows[0].0, "alice");
+            // latest_bal (ASC → latest): 2024-01-02 tie = 250.0
+            assert!(
+                (rows[0].1 - 250.0).abs() < 1e-9,
+                "latest_bal must snapshot the latest date (250): {rows:?}"
+            );
+            // earliest_bal (DESC → earliest): 2024-01-01 = 999.0. A collapse to
+            // one RANK column would make this read 250.0 instead.
+            assert!(
+                (rows[0].2 - 999.0).abs() < 1e-9,
+                "earliest_bal must snapshot the earliest date (999), not share latest_bal's column: {rows:?}"
+            );
         }
     }
 }
