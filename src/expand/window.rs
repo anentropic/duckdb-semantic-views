@@ -93,7 +93,10 @@ pub(super) fn expand_window_metrics(
         let Some(ref ws) = met.window_spec else {
             continue;
         };
-        let key = ws.inner_metric.to_ascii_lowercase();
+        // Canonical identifier key (quote-stripped + case-folded) so a quoted
+        // inner-metric reference (`"Total_Qty"`) keys, and later aliases,
+        // identically to its stored `total_qty` — TECH-DEBT #28 Slice 3.
+        let key = crate::ident::normalize_ident_part(&ws.inner_metric);
         if inner_metric_set.insert(key.clone()) {
             inner_metric_order.push(key);
         }
@@ -106,7 +109,7 @@ pub(super) fn expand_window_metrics(
             // Fall back to finding the metric definition directly
             def.metrics
                 .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(inner_name))
+                .find(|m| crate::ident::ident_matches(&m.name, inner_name))
                 .map_or_else(|| inner_name.clone(), |m| m.expr.clone())
         });
         inner_metric_exprs.insert(inner_name.clone(), expr);
@@ -176,7 +179,9 @@ pub(super) fn expand_window_metrics(
         };
 
         // Build the function call: window_function(inner_metric_alias, extra_args...)
-        let inner_alias = quote_ident(&ws.inner_metric.to_ascii_lowercase());
+        // Use the same canonical key as the CTE column above (`inner_name`), so
+        // a quoted inner-metric reference aliases and references identically.
+        let inner_alias = quote_ident(&crate::ident::normalize_ident_part(&ws.inner_metric));
         let mut func_args = vec![inner_alias];
         for arg in &ws.extra_args {
             func_args.push(arg.clone());
