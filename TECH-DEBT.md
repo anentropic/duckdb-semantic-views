@@ -270,11 +270,8 @@ Areas where test coverage is reduced compared to ideal, with justification.
     - **`CiName`'s `Eq`/`Hash`** (`expand/types.rs`) key on `normalize_ident_part`, so `"Region"` == `region` (was ASCII-fold only). (In practice these are unused in production — resolution goes through `AsRef<str>` + `ident_matches`, dedup keys on pointer identity — so this is primitive-hygiene, not a behaviour fix.)
     - **Materialization set-matcher** (`expand/materialization.rs::find_matching_materialization`): requested and declared dim/metric name sets are keyed by `normalize_ident_part`, so a quoted name in a `MATERIALIZATIONS` clause routes to its unquoted declaration (was a silently-missed routing / full-expansion fallback).
     - **Window inner-metric** (`expand/window.rs`): the inner-metric CTE key, the def-lookup, and the emitted alias all use the canonical key, so a quoted inner-metric reference aliases and references consistently (a quoted inner metric previously produced a mismatched alias vs. reference).
-  - **Slice 3 remaining — dimension-side name matching (#30):** the sites that match a *dimension reference* (as opposed to a dimension's own declared name) still fold case but not quotes, and are not dotted-aware:
-    - `expand/semi_additive.rs` matches an NA dim against dimension names bare-only (`eq_ignore_ascii_case`) across several interlocking sites (classification, grouping, partition/order emission, source-table join). A **dotted** NA reference (`o."order date"`) misses those and falls to the `quote_ident(&nd.dimension)` arm → clean bind-time failure.
-    - `expand/window.rs` matches a window metric's `PARTITION BY` / `EXCLUDING` / `ORDER BY` dimension references against the queried-dim set with `to_ascii_lowercase` (the inner-*metric* keying there is already quote-aware; the dimension side is not — see the in-code note).
-
-    Fixing both means routing every reference-vs-dimension comparison through the bare-AND-dotted resolver (`resolution::find_dimension`) consistently; deferred to its own PR because the semi-additive path is E-1-sensitive (see #30).
+  - **Slice 3 — dimension-side, semi-additive (#30) landed 2026-07-17:** `expand/semi_additive.rs` now routes **every** NA-dim-vs-dimension comparison through the bare-AND-dotted resolver `resolution::find_dimension` via one shared `na_dim_match_key` helper — classification (`is_active_semi_additive`, now taking `def`), grouping (`collect_na_groups`), partition/order emission, and source-table join (`collect_na_dim_source_tables`) — plus the queried-dim sets at all three predicate call sites (`sql_gen`, `fan_trap` ×2) key on `normalize_ident_part`. A **dotted** NA reference (`o."order date"`) now classifies, partitions, orders, and joins identically to the bare form and expands to a bindable snapshot query end-to-end (was a `quote_ident(&nd.dimension)` bind-time failure). Verified E-1-safe: partition/order still emit the resolved dimension *expression*, never a CTE alias.
+  - **Slice 3 remaining — dimension-side, window (#30):** `expand/window.rs` still matches a window metric's `PARTITION BY` / `EXCLUDING` / `ORDER BY` dimension references against the queried-dim set with `to_ascii_lowercase` (the inner-*metric* keying there is already quote-aware; the dimension side is not — see the in-code note). Routing these through `find_dimension` too is the last Slice-3 site; deferred to its own PR (lower risk than the semi-additive path, but its own change surface).
 
 ### 29. ✅ `fk_columns.is_empty()` legacy-relationship guards are load-bearing — do NOT remove (E-8)
 
@@ -287,12 +284,13 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Also:** three items originally counted under E-8 (`cardinality.rs:47,74`, `join_resolver.rs:45`) are `ref_columns` resolution / count-match logic, not fk-empty guards. Three (`fan_trap.rs:242,311`, `join_resolver.rs:144`) are dead *only* behind an upstream SG-7 gate and are kept as defense-in-depth — the fact path already demonstrated once that such a gate can be bypassed.
 - **Decision:** Keep all guards. E-8 is **not** a safe deletion.
 
-### 30. ❓ Dotted-qualified `NON ADDITIVE BY` reference is untested in semi-additive snapshot expansion (F-18)
+### 30. ✅ Dotted-qualified `NON ADDITIVE BY` reference now resolves in semi-additive snapshot expansion (F-18) — RESOLVED 2026-07-17
 
 - **Origin:** code-review 2026-07-16 F-18, extended during the hygiene sweep. `body_parser` Phase 47 validation accepts an NA dim written either bare (`date_dim`) or dotted (`alias.date_dim`), but stores the reference verbatim.
-- **Limitation:** `expand/semi_additive.rs` resolves the NA dim for the snapshot `ORDER BY` by **bare-name** comparison only (`rd.dim.name` / `d.name` vs `nd.dimension`). A dotted reference therefore misses both lookups and falls to the `quote_ident(&nd.dimension)` arm, emitting the quoted qualifier as an `ORDER BY` term. This fails cleanly at bind time (a quoted non-column) rather than corrupting results, and is never the aliased-column shape E-1 fixed — but the dotted × semi-additive cell has no test.
-- **Why acceptable (interim):** bare NA-dim references (the overwhelmingly common form, and the only form any example/test uses) resolve correctly; quoting/qualifying an NA dim buys nothing since matching is case-insensitive and the dim is already unambiguous by name.
-- **Action:** when the quote-aware reference engine (#28) lands, resolve NA-dim references through it (bare **and** dotted, honouring quotes) in both the queried (`resolved_dims`) and unqueried (`def.dimensions`) branches, and add a semi-additive × dotted-NA-dim sqllogictest. Related SPECULATIVE cell: semi-additive × role-playing (review T-15).
+- **Was:** `expand/semi_additive.rs` resolved the NA dim for the snapshot `ORDER BY` by **bare-name** comparison only (`rd.dim.name` / `d.name` vs `nd.dimension`). A dotted reference therefore missed both lookups and fell to the `quote_ident(&nd.dimension)` arm, emitting the quoted qualifier as an `ORDER BY` term — a clean bind-time failure (a quoted non-column), never the aliased-column shape E-1 fixed, but the dotted × semi-additive cell had no test.
+- **Resolution (2026-07-17):** every NA-dim-vs-dimension comparison in `semi_additive.rs` is routed through the shared bare-AND-dotted resolver `resolution::find_dimension` via a single `na_dim_match_key(def, &nd.dimension)` helper that returns the resolved dimension's canonical `normalize_ident_part` key (falling back to the normalized raw text only for the unresolvable/fail-clean residual). The interlocking sites all use it: classification (`is_active_semi_additive`, resignatured to take `def`), grouping (`collect_na_groups`), the partition-exclusion filter, the `ORDER BY` expression resolution (queried → CTE expression per E-1, unqueried → the declared dim's own expression), and the snapshot-join source-table collection (`collect_na_dim_source_tables`). The three predicate call sites (`sql_gen`, `fan_trap` ×2) key their queried-dim sets on `normalize_ident_part`. A dotted `o."order date"` now classifies, partitions, orders, and joins identically to the bare form and expands to a bindable snapshot query.
+- **Tests:** four Rust unit tests in `semi_additive.rs` (dotted-not-queried orders-by-resolved-expression, dotted-queried effectively-regular, the shared predicate resolving a dotted reference, and a data-level dotted-NA-join execution) plus `phase68_quoted_idents_non_additive.test` Scenario 2/2b upgraded from DDL-only to full end-to-end query + plan-shape assertions.
+- **Still deferred (own PR):** the symmetric window-metric dimension-side matching (`expand/window.rs` `PARTITION BY` / `EXCLUDING` / `ORDER BY` dimension references) — see the Slice-3 window bullet under #28.
 
 ### 31. ✅ Graph/validation errors are typed (`ParseError`) but deliberately positionless
 
@@ -303,11 +301,16 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ---
 
-**Last updated:** 2026-07-17 (v0.11 unreleased) — entry #28: Slice 3 name-field
+**Last updated:** 2026-07-17 (v0.11 unreleased) — entry #30 RESOLVED: dotted
+`NON ADDITIVE BY` resolution landed — `semi_additive.rs` routes every
+NA-dim-vs-dimension comparison through `resolution::find_dimension` (one shared
+`na_dim_match_key`), so a dotted `o."order date"` classifies, partitions,
+orders, and joins like the bare form and expands end-to-end; only the symmetric
+window-metric dimension-side matching remains as the last Slice-3 site (entry
+#28 window bullet). Prior same-day: entry #28: Slice 3 name-field
 matchers landed — `CiName` `Eq`/`Hash`, the materialization set-matcher, and
 window inner-metric matching now key on `ident::normalize_ident_part` (quote +
-case). Only the `NON ADDITIVE BY` dotted-qualified resolution (#30) remains,
-deferred to its own PR (E-1-sensitive). Prior: 2026-07-16 — added entry #31
+case). Prior: 2026-07-16 — added entry #31
 (graph/validation errors are now typed `ParseError`, deliberately positionless
 — the review §6.1 / §7.5 error-architecture item). Prior same-day: entry #28:
 Slice 2 landed —

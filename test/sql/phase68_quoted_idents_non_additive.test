@@ -41,18 +41,14 @@ SELECT GET_DDL('SEMANTIC_VIEW', 'p68_b1_v1') LIKE '%NON ADDITIVE BY ("order date
 true
 
 # ========================================
-# Scenario 2 — dotted path in NAB dim, DDL-level (D-08 contract extension)
+# Scenario 2 — dotted path in NAB dim, end-to-end (D-08 + #30)
 #
-# `o."order date"` must be parsed AND name-resolved to the dimension whose
-# (source_alias, name) is (`o`, `"order date"`). End-to-end semi-additive query
-# expansion for dotted-NA-dim is NOT validated here — semi_additive expansion
-# emits the raw NA dim text into the RANK() OVER ORDER BY of the
-# snapshot CTE, which produces `"o.""order date"""` (single-quoted-identifier
-# shape) instead of `"o"."order date"`. The expand-side dotted-path emission
-# fix is out of scope for Plan 03 (D-10 renegotiation: pure-DDL validation
-# closes the contract test surface without expanding into expand/semi_additive.rs).
-# Coverage at the parser + name-resolution layer is the planner's narrowed
-# scope (per B1 Step C note).
+# `o."order date"` is parsed, name-resolved to the dimension whose
+# (source_alias, name) is (`o`, `"order date"`), AND — since #30 — expanded
+# end-to-end: the snapshot CTE's RANK() OVER ORDER BY now routes the dotted NA
+# reference through the shared resolver and emits the resolved dimension
+# EXPRESSION (`o."order date"`), not the raw dotted text as a quoted non-column
+# (`"o.""order date"""`) that used to fail at bind time.
 # ========================================
 
 statement ok
@@ -73,6 +69,47 @@ query T
 SELECT property_value FROM describe_semantic_view('p68_b1_v2') WHERE property = 'NON_ADDITIVE_BY';
 ----
 o."order date" DESC NULLS FIRST
+
+# #30 end-to-end: the dotted-NA metrics-only query expands to a bindable
+# snapshot and returns the correct value. Metrics-only ⇒ global snapshot; DESC
+# selects the EARLIEST "order date" (2026-01-01, qty 10) per F-1.
+query I
+SELECT qty_sum FROM semantic_view('p68_b1_v2', metrics := ['qty_sum']);
+----
+10
+
+# #30: the expanded snapshot CTE orders by the resolved dimension EXPRESSION
+# (o."order date"), never the raw dotted text as a quoted non-column.
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p68_b1_v2', metrics := ['qty_sum']) WHERE explain_output LIKE '%ORDER BY o."order date"%';
+----
+true
+
+query I
+SELECT count(*) FROM explain_semantic_view('p68_b1_v2', metrics := ['qty_sum']) WHERE explain_output LIKE '%"o.""order date"""%';
+----
+0
+
+# ========================================
+# Scenario 2b — dotted NAB dim that IS queried is effectively regular (#30)
+#
+# When the dotted NA dim is included in the query, Snowflake semantics make the
+# metric effectively additive: standard aggregation, no snapshot CTE.
+# ========================================
+
+# One row per "order date" (standard GROUP BY), each with its own qty — proves
+# the metric aggregated additively rather than collapsing to a single snapshot.
+query I rowsort
+SELECT qty_sum FROM semantic_view('p68_b1_v2', dimensions := ['order date'], metrics := ['qty_sum']);
+----
+10
+20
+
+# Effectively-regular ⇒ no RANK snapshot CTE in the expanded plan.
+query I
+SELECT count(*) FROM explain_semantic_view('p68_b1_v2', dimensions := ['order date'], metrics := ['qty_sum']) WHERE explain_output LIKE '%RANK() OVER%';
+----
+0
 
 # ========================================
 # Scenario 3 — unterminated quoted identifier surfaces a structured error
