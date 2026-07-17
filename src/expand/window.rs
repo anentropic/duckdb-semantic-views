@@ -19,6 +19,23 @@ use super::select_spec::{
 };
 use super::types::{ExpandError, ResolvedDim};
 
+/// Resolve a window dimension reference (bare, dotted, or quoted) to the
+/// `__sv_agg` CTE-alias column it must emit in the OVER clause — i.e.
+/// `quote_ident` of the *declared* dimension's stored name, the exact alias the
+/// CTE SELECT assigned it. Falls back to quoting the raw reference when it
+/// resolves to no declared dimension (fail-clean).
+///
+/// The outer query runs over the CTE, so referencing the alias is safe (no
+/// physical column shadows it, unlike the semi-additive CTE's own SELECT which
+/// must repeat expressions — E-1). Emitting the resolved alias keeps the OVER
+/// clause bound to the CTE column even when the reference is written quoted
+/// (`"order date"`) or dotted (`o."order date"`) — spellings that previously
+/// emitted a doubled-quote or dotted non-column (TECH-DEBT #28/#30).
+fn window_dim_column(def: &SemanticViewDefinition, reference: &str) -> String {
+    super::resolution::find_dimension(def, reference)
+        .map_or_else(|| quote_ident(reference), |d| quote_ident(&d.name))
+}
+
 /// Generate CTE-based expansion SQL for queries containing window function metrics.
 ///
 /// Called from `expand()` when all resolved metrics are window metrics.
@@ -43,19 +60,21 @@ pub(super) fn expand_window_metrics(
 ) -> Result<String, ExpandError> {
     // 1. Validate required dimensions for each window metric.
     //
-    // NOTE (TECH-DEBT #28 Slice 3): the inner-*metric* keying below is
-    // quote-aware, but this dimension-side matching — `queried_dim_names` and
-    // the EXCLUDING / PARTITION BY / ORDER BY checks against it — still folds
-    // case only (`to_ascii_lowercase`), not quotes. A window whose partition/
-    // excluded/order dim is written quoted (`"Region"`) would not strip the
-    // quotes here. That is the same dimension-side gap left open in
-    // `semi_additive.rs` (the `NON ADDITIVE BY` matching, #30): both are
-    // deferred to the dimension-side pass that routes every NA-/window-vs-
-    // dimension comparison through the bare-AND-dotted resolver. So `window.rs`
-    // is quote-aware for inner metrics but not yet for its dimension references.
-    let queried_dim_names: HashSet<String> = resolved_dims
+    // Both the inner-*metric* keying (below) and this dimension-side matching
+    // are quote- and dotted-aware: every EXCLUDING / PARTITION BY / ORDER BY
+    // dimension reference is resolved through the shared bare-AND-dotted
+    // resolver (`resolution::dim_ref_key`), the same key the queried dims use,
+    // so a reference written quoted (`"Region"`) or dotted (`o."order date"`)
+    // classifies identically to its bare spelling. This closes the window half
+    // of the dimension-side pass whose semi-additive half landed as #30
+    // (TECH-DEBT #28/#30). A dotted ORDER BY reference is accepted at CREATE
+    // (Phase 48 / D-08) but previously failed this bare-only check at query
+    // time; a quoted reference previously emitted a doubled-quote non-column in
+    // the OVER clause (uncaught because the pre-#30 tests never executed the
+    // window query, only inspected DDL / EXPLAIN text).
+    let queried_dim_keys: HashSet<String> = resolved_dims
         .iter()
-        .map(|rd| rd.dim.name.to_ascii_lowercase())
+        .map(|rd| crate::ident::normalize_ident_part(&rd.dim.name))
         .collect();
 
     for met in resolved_mets {
@@ -64,7 +83,7 @@ pub(super) fn expand_window_metrics(
         };
         // Check EXCLUDING dims are all in the query
         for excl_dim in &ws.excluding_dims {
-            if !queried_dim_names.contains(&excl_dim.to_ascii_lowercase()) {
+            if !queried_dim_keys.contains(&super::resolution::dim_ref_key(def, excl_dim)) {
                 return Err(ExpandError::WindowMetricRequiredDimension {
                     view_name: view_name.to_string(),
                     metric_name: met.name.clone(),
@@ -75,7 +94,7 @@ pub(super) fn expand_window_metrics(
         }
         // Check explicit PARTITION BY dims are all in the query
         for part_dim in &ws.partition_dims {
-            if !queried_dim_names.contains(&part_dim.to_ascii_lowercase()) {
+            if !queried_dim_keys.contains(&super::resolution::dim_ref_key(def, part_dim)) {
                 return Err(ExpandError::WindowMetricRequiredDimension {
                     view_name: view_name.to_string(),
                     metric_name: met.name.clone(),
@@ -86,7 +105,7 @@ pub(super) fn expand_window_metrics(
         }
         // Check ORDER BY dims are all in the query
         for ob in &ws.order_by {
-            if !queried_dim_names.contains(&ob.expr.to_ascii_lowercase()) {
+            if !queried_dim_keys.contains(&super::resolution::dim_ref_key(def, &ob.expr)) {
                 return Err(ExpandError::WindowMetricRequiredDimension {
                     view_name: view_name.to_string(),
                     metric_name: met.name.clone(),
@@ -203,20 +222,29 @@ pub(super) fn expand_window_metrics(
 
         // Compute PARTITION BY columns
         let partition_cols: Vec<String> = if ws.partition_dims.is_empty() {
-            // PARTITION BY EXCLUDING: all queried dims minus excluding_dims
+            // PARTITION BY EXCLUDING: all queried dims minus excluding_dims.
+            // Key the excluded set through the shared resolver so a quoted/dotted
+            // EXCLUDING reference still matches its declared dimension.
             let excluding_set: HashSet<String> = ws
                 .excluding_dims
                 .iter()
-                .map(|d| d.to_ascii_lowercase())
+                .map(|d| super::resolution::dim_ref_key(def, d))
                 .collect();
             resolved_dims
                 .iter()
-                .filter(|rd| !excluding_set.contains(&rd.dim.name.to_ascii_lowercase()))
+                .filter(|rd| {
+                    !excluding_set.contains(&crate::ident::normalize_ident_part(&rd.dim.name))
+                })
                 .map(|rd| quote_ident(&rd.dim.name))
                 .collect()
         } else {
-            // Explicit PARTITION BY: use listed dims directly
-            ws.partition_dims.iter().map(|d| quote_ident(d)).collect()
+            // Explicit PARTITION BY: emit each listed dim's resolved CTE alias so
+            // a quoted/dotted reference binds to the CTE column, not a
+            // doubled-quote/dotted non-column.
+            ws.partition_dims
+                .iter()
+                .map(|d| window_dim_column(def, d))
+                .collect()
         };
 
         // Build OVER clause
@@ -237,7 +265,7 @@ pub(super) fn expand_window_metrics(
                         NullsOrder::First => "NULLS FIRST",
                         NullsOrder::Last => "NULLS LAST",
                     };
-                    format!("{} {} {}", quote_ident(&ob.expr), dir, nulls)
+                    format!("{} {} {}", window_dim_column(def, &ob.expr), dir, nulls)
                 })
                 .collect();
             over_parts.push(format!("ORDER BY {}", order_items.join(", ")));
@@ -786,6 +814,104 @@ mod tests {
         assert!(
             msg.contains("requires dimension 'store'"),
             "Should mention missing partition dim: {msg}"
+        );
+    }
+
+    /// TECH-DEBT #28/#30 (window half): a DOTTED OVER ORDER BY reference
+    /// (`s.date`) — accepted at CREATE via D-08 — must resolve to its declared
+    /// dimension and emit that dimension's CTE alias (`"date"`), not error the
+    /// required-dimension check and not emit the raw dotted text as a
+    /// non-column (`"s.date"`). Before the window dimension-side pass, the
+    /// bare-only `to_ascii_lowercase` check failed to match the dotted
+    /// reference against the queried dim and returned a required-dimension
+    /// error even though `date` was queried.
+    #[test]
+    fn test_window_dotted_order_by_resolves_to_cte_alias() {
+        let def = minimal_def("sales", "store", "store", "total_qty", "SUM(s.quantity)")
+            .with_dimension("date", "s.sale_date", Some("s"))
+            .with_window_spec(
+                "total_qty",
+                WindowSpec {
+                    window_function: "AVG".to_string(),
+                    inner_metric: "total_qty".to_string(),
+                    extra_args: vec![],
+                    excluding_dims: vec![],
+                    partition_dims: vec!["store".to_string()],
+                    // DOTTED reference — the crux.
+                    order_by: vec![WindowOrderBy {
+                        expr: "s.date".to_string(),
+                        order: SortOrder::Asc,
+                        nulls: NullsOrder::Last,
+                    }],
+                    frame_clause: None,
+                },
+            );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("store"), DimensionName::new("date")],
+            metrics: vec![MetricName::new("total_qty")],
+        };
+
+        // Must not error the required-dimension check (dotted `s.date` resolves).
+        let sql = expand("test_view", &def, &req).expect("dotted ORDER BY must resolve");
+        assert!(
+            sql.contains("ORDER BY \"date\""),
+            "dotted ORDER BY must emit the resolved CTE alias: {sql}"
+        );
+        assert!(
+            !sql.contains("\"s.date\""),
+            "dotted ORDER BY text must not leak as a quoted non-column: {sql}"
+        );
+    }
+
+    /// TECH-DEBT #28/#30 (window half): a DOTTED-AND-QUOTED OVER ORDER BY
+    /// reference (`s."order date"`) to a quoted-stored dimension must emit the
+    /// dimension's CTE alias consistently, never the raw dotted text as a
+    /// doubled-quote non-column (`"s.""order date"""`). The CTE aliases the
+    /// dimension column as `quote_ident("\"order date\"")`; the OVER ORDER BY
+    /// must reference the identical token so it binds.
+    #[test]
+    fn test_window_dotted_quoted_order_by_matches_cte_alias() {
+        let def = minimal_def("sales", "store", "store", "total_qty", "SUM(s.quantity)")
+            .with_dimension("\"order date\"", "s.\"order date\"", Some("s"))
+            .with_window_spec(
+                "total_qty",
+                WindowSpec {
+                    window_function: "AVG".to_string(),
+                    inner_metric: "total_qty".to_string(),
+                    extra_args: vec![],
+                    excluding_dims: vec![],
+                    partition_dims: vec!["store".to_string()],
+                    order_by: vec![WindowOrderBy {
+                        expr: "s.\"order date\"".to_string(),
+                        order: SortOrder::Asc,
+                        nulls: NullsOrder::Last,
+                    }],
+                    frame_clause: None,
+                },
+            );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![
+                DimensionName::new("store"),
+                DimensionName::new("order date"),
+            ],
+            metrics: vec![MetricName::new("total_qty")],
+        };
+
+        let sql = expand("test_view", &def, &req).expect("dotted-quoted ORDER BY must resolve");
+        // The CTE aliases the dim column as quote_ident("\"order date\"") =
+        // """order date""" — the ORDER BY must reference that same token.
+        assert!(
+            sql.contains("ORDER BY \"\"\"order date\"\"\""),
+            "ORDER BY must reference the dimension's CTE alias: {sql}"
+        );
+        // The raw dotted reference must NOT be emitted as a non-column.
+        assert!(
+            !sql.contains("\"s.\"\"order date\"\"\""),
+            "dotted-quoted ORDER BY text must not leak as a non-column: {sql}"
         );
     }
 }

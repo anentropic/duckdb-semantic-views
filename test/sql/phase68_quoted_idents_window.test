@@ -48,16 +48,14 @@ SELECT count(*) > 0 FROM explain_semantic_view('p68_b2_v1', dimensions := ['regi
 true
 
 # ========================================
-# Scenario 2 — dotted path in OVER ORDER BY, DDL-level (D-08 extension)
+# Scenario 2 — dotted path in OVER ORDER BY, end-to-end (D-08 + window #28/#30)
 #
-# `o."order date"` must be captured as a single identifier including the dot
-# through the parser. Like B1 Scenario 2, end-to-end query expansion for
-# dotted-window-ORDER-BY is NOT validated here — the window expand path emits
-# the raw ORDER BY entry text into the OVER clause; the rendered SQL needs
-# `"o"."order date"` shape rather than the parser's stored `o."order date"`
-# pre-quote-normalisation. The expand-side dotted-path emission fix is out of
-# scope for Plan 03 (D-10 renegotiation). Coverage at the parser + DDL
-# round-trip layer is the planner's narrowed scope.
+# `o."order date"` is captured as a single identifier including the dot AND —
+# since the window dimension-side pass — expanded end-to-end: the OVER ORDER BY
+# routes the dotted reference through the shared resolver and emits the resolved
+# dimension's CTE alias (`"order date"`), not the raw dotted text as a
+# non-column (`"o.""order date"""`) that used to fail the required-dimension
+# check at query time.
 # ========================================
 
 statement ok
@@ -74,6 +72,34 @@ query I
 SELECT GET_DDL('SEMANTIC_VIEW', 'p68_b2_v2') LIKE '%ORDER BY o."order date" NULLS LAST%';
 ----
 true
+
+# End-to-end: the dotted-window-ORDER-BY query BINDS and executes (before the
+# fix this errored the required-dimension check — the dotted reference never
+# matched the queried dim). PARTITION BY EXCLUDING region ⇒ partition by
+# "order date"; within each date the RANGE-peer running total sums that date's
+# regions. Values CAST to BIGINT for deterministic formatting.
+query TI rowsort
+SELECT region, CAST(running_total AS BIGINT)
+FROM semantic_view('p68_b2_v2', dimensions := ['region', '"order date"'], metrics := ['running_total']);
+----
+EU	300
+US	150
+US	300
+
+# The OVER clause references the resolved dimension by its aggregation-CTE
+# alias. The stored dimension name is quoted (`"order date"`), so its alias is
+# the escaped form `"""order date"""` — the same token the CTE assigned, which
+# is why the query above binds.
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('p68_b2_v2', dimensions := ['region', '"order date"'], metrics := ['running_total']) WHERE explain_output LIKE '%"""order date"""%';
+----
+true
+
+# It must NOT emit the raw dotted reference as a non-column (the pre-fix bug).
+query I
+SELECT count(*) FROM explain_semantic_view('p68_b2_v2', dimensions := ['region', '"order date"'], metrics := ['running_total']) WHERE explain_output LIKE '%"o.""order date"""%';
+----
+0
 
 # ========================================
 # Scenario 3 — unterminated quoted identifier surfaces a structured error

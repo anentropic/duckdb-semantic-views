@@ -174,6 +174,27 @@ pub(super) fn find_dimension<'a>(
     }
 }
 
+/// Canonical match key for a dimension *reference* — bare (`report_date`),
+/// dotted (`o.report_date`), or with quoted parts (`o."order date"`).
+///
+/// Resolves the reference to its declared dimension via [`find_dimension`] and
+/// returns that dimension's [`crate::ident::normalize_ident_part`] key, so a
+/// reference matches the queried-dimension set regardless of how it is spelled.
+/// When the reference resolves to no declared dimension it falls back to the
+/// normalized raw text — the fail-clean path: unknown bare references are
+/// hard-errored at CREATE, so only a residual malformed/dotted shape reaches
+/// here, and the normalized-raw key never collides with a real dimension key.
+///
+/// Shared by the `NON ADDITIVE BY` (semi-additive) and window dimension-side
+/// matchers so a quoted/dotted reference classifies identically to its bare
+/// spelling (TECH-DEBT #28/#30).
+pub(super) fn dim_ref_key(def: &SemanticViewDefinition, reference: &str) -> String {
+    find_dimension(def, reference).map_or_else(
+        || crate::ident::normalize_ident_part(reference),
+        |d| crate::ident::normalize_ident_part(&d.name),
+    )
+}
+
 /// Look up a metric by name under `DuckDB`'s case-insensitive identifier rule
 /// ([`crate::ident::ident_matches`]): matching ignores case and quoting alike.
 ///
