@@ -46,23 +46,57 @@ use super::resolution::quote_ident;
 use super::select_spec::{push_from_base, FromSource, GroupBy, SelectItem, SelectSpec};
 use super::types::{ExpandError, ResolvedDim};
 
+/// Resolve a NON ADDITIVE BY dim reference — bare (`report_date`), dotted
+/// (`o.report_date`), or either with quoted parts (`o."order date"`) — to the
+/// canonical match key of its declared dimension's stored name, using the
+/// shared bare-AND-dotted resolver [`super::resolution::find_dimension`].
+///
+/// Routing every NA-vs-dimension comparison in this module through this one
+/// key is what makes a dotted NA reference classify, partition, order, and
+/// join identically to the equivalent bare dimension (#30). A bare
+/// `to_ascii_lowercase` could never match a dotted reference against the
+/// stored bare dimension name, so a dotted NA dim was previously always
+/// classified active and its raw text emitted as a quoted non-column.
+///
+/// When the reference resolves to no declared dimension it falls back to the
+/// normalized raw text: unknown bare NA dims are hard-errored at CREATE
+/// (Phase 47), so only a residual malformed/dotted shape reaches here, and the
+/// normalized-raw key never collides with a real dimension key — keeping such
+/// a reference "not in query" (active) and, downstream, emitted as a quoted
+/// non-column that fails cleanly at bind time (F-18) rather than corrupting
+/// results.
+pub(super) fn na_dim_match_key(def: &SemanticViewDefinition, na_dimension: &str) -> String {
+    super::resolution::find_dimension(def, na_dimension).map_or_else(
+        || crate::ident::normalize_ident_part(na_dimension),
+        |d| crate::ident::normalize_ident_part(&d.name),
+    )
+}
+
 /// Returns true when `met` is an ACTIVE semi-additive metric for a query over
-/// `queried_dim_names` (lowercased): it has a NON ADDITIVE BY clause and at
-/// least one of its NA dims is NOT in the queried dimension set, so it takes
-/// the `RANK`-CTE snapshot path. When ALL NA dims are queried, the
+/// `queried_dim_keys` (each the canonical [`crate::ident::normalize_ident_part`]
+/// key of a queried dimension's stored name): it has a NON ADDITIVE BY clause
+/// and at least one of its NA dims is NOT in the queried dimension set, so it
+/// takes the `RANK`-CTE snapshot path. When ALL NA dims are queried, the
 /// metric is "effectively regular" (Snowflake semantics) and takes the
 /// standard aggregation path.
+///
+/// Each NA dim is resolved to its dimension key via [`na_dim_match_key`] so a
+/// dotted/quoted NA reference matches the queried dimension it names (#30).
 ///
 /// This is THE routing predicate — shared by `expand()` (CTE dispatch),
 /// `expand_semi_additive` (per-metric classification), and the fan-trap check
 /// (which must skip exactly the metrics that take the CTE path, SG-6) so the
 /// three cannot drift.
-pub(super) fn is_active_semi_additive(met: &Metric, queried_dim_names: &HashSet<String>) -> bool {
+pub(super) fn is_active_semi_additive(
+    def: &SemanticViewDefinition,
+    met: &Metric,
+    queried_dim_keys: &HashSet<String>,
+) -> bool {
     !met.non_additive_by.is_empty()
         && met
             .non_additive_by
             .iter()
-            .any(|na| !queried_dim_names.contains(&na.dimension.to_ascii_lowercase()))
+            .any(|na| !queried_dim_keys.contains(&na_dim_match_key(def, &na.dimension)))
 }
 
 /// Generate CTE-based expansion SQL for queries containing semi-additive metrics.
@@ -79,18 +113,20 @@ pub(super) fn expand_semi_additive(
 ) -> Result<String, ExpandError> {
     let mut sql = String::with_capacity(512);
 
-    // Build set of queried dimension names for classification
-    let queried_dim_names: HashSet<String> = resolved_dims
+    // Build set of queried dimension keys for classification. Canonical keys
+    // (quote-stripped + folded) so a quoted stored dim name matches, and so a
+    // dotted/quoted NA reference resolves against it (#30).
+    let queried_dim_keys: HashSet<String> = resolved_dims
         .iter()
-        .map(|rd| rd.dim.name.to_ascii_lowercase())
+        .map(|rd| crate::ident::normalize_ident_part(&rd.dim.name))
         .collect();
 
     // Classify each metric as active semi-additive (shared routing predicate)
     let is_active_semi =
-        |met: &Metric| -> bool { is_active_semi_additive(met, &queried_dim_names) };
+        |met: &Metric| -> bool { is_active_semi_additive(def, met, &queried_dim_keys) };
 
     // 1. Identify distinct NON ADDITIVE BY dimension sets for ACTIVE metrics only.
-    let na_groups = collect_na_groups(resolved_mets, &queried_dim_names);
+    let na_groups = collect_na_groups(def, resolved_mets, &queried_dim_keys);
 
     // 2. SG-5: validate every metric expression BEFORE emitting any SQL. The
     //    snapshot CTE decomposes each metric into an inner-expression capture
@@ -185,18 +221,23 @@ pub(super) fn expand_semi_additive(
         };
 
         // PARTITION BY: all queried dims (NA dims not in query are not in
-        // resolved_dims, so this naturally partitions by all queried dims)
-        let na_dim_names: Vec<String> = group
+        // resolved_dims, so this naturally partitions by all queried dims).
+        // Key each NA dim through the shared resolver so a QUERIED NA dim
+        // named with a dotted/quoted reference is still excluded from the
+        // partition (#30) — a bare lowercase compare missed it.
+        let na_dim_keys: Vec<String> = group
             .na_dims
             .iter()
-            .map(|nd| nd.dimension.to_ascii_lowercase())
+            .map(|nd| na_dim_match_key(def, &nd.dimension))
             .collect();
 
         // Partition by the dimension EXPRESSIONS, not the CTE aliases (E-1).
         let partition_dims: Vec<String> = resolved_dims
             .iter()
             .zip(&dim_cte_exprs)
-            .filter(|(rd, _)| !na_dim_names.contains(&rd.dim.name.to_ascii_lowercase()))
+            .filter(|(rd, _)| {
+                !na_dim_keys.contains(&crate::ident::normalize_ident_part(&rd.dim.name))
+            })
             .map(|(_, expr)| expr.clone())
             .collect();
 
@@ -217,39 +258,34 @@ pub(super) fn expand_semi_additive(
             .na_dims
             .iter()
             .map(|nd| {
-                // Try to find the dimension in resolved (queried) dims first
-                let dim_expr = resolved_dims
-                    .iter()
-                    .position(|rd| rd.dim.name.eq_ignore_ascii_case(&nd.dimension))
-                    .map_or_else(
-                        || {
-                            // NA dim not in queried dims -- find it in the view definition
-                            // and use its raw expression.
-                            //
-                            // F-18 (code-review 2026-07-16): the final
-                            // `quote_ident(&nd.dimension)` arm is a defensive
-                            // fallback, not a live path for the validated
-                            // bare-name form. Phase 47 (`body_parser::mod`)
-                            // hard-errors at CREATE time on any NA dim that
-                            // doesn't name a declared dimension, so a bare-name
-                            // `nd.dimension` always matches a `def.dimensions`
-                            // entry here. The one residual shape that reaches
-                            // the fallback is a *dotted* qualifier
-                            // (`alias.dim`): Phase 47 accepts it via its
-                            // dotted-path branch, but this bare-name `.find`
-                            // does not resolve it, so it emits the quoted
-                            // qualifier and fails cleanly at bind time rather
-                            // than corrupting results. That dotted × semi-
-                            // additive cell is untested (TECH-DEBT); emitting a
-                            // quoted non-column is the safe failure, never the
-                            // aliased-column shape E-1 fixed.
-                            def.dimensions
-                                .iter()
-                                .find(|d| d.name.eq_ignore_ascii_case(&nd.dimension))
-                                .map_or_else(|| quote_ident(&nd.dimension), |d| d.expr.clone())
-                        },
-                        |idx| dim_cte_exprs[idx].clone(),
-                    );
+                // #30: resolve the NA dim reference (bare OR dotted, quoted or
+                // not) to its declared dimension via the shared resolver, so a
+                // dotted `o."order date"` orders by the same expression a bare
+                // `order_date` would — not the raw dotted text emitted as a
+                // quoted non-column.
+                let dim_expr = super::resolution::find_dimension(def, &nd.dimension).map_or_else(
+                    // Unresolvable: Phase 47 (`body_parser::mod`) hard-errors at
+                    // CREATE on any NA dim that names no declared dimension, so
+                    // only a malformed/unknown residual reaches this arm.
+                    // Emit a quoted non-column that fails cleanly at bind time
+                    // (F-18), never the aliased-column shape E-1 fixed.
+                    || quote_ident(&nd.dimension),
+                    |d| {
+                        // A QUERIED NA dim repeats its CTE expression (E-1: the
+                        // rendered expression, never the alias). An UNQUERIED NA
+                        // dim uses its raw definition expression — it has no CTE
+                        // column, and its source table is guaranteed joined
+                        // below (SG-9). Match the resolved declared dimension
+                        // against the queried set by canonical key so a
+                        // dotted/quoted NA reference finds its queried dim.
+                        let key = crate::ident::normalize_ident_part(&d.name);
+                        resolved_dims
+                            .iter()
+                            .zip(&dim_cte_exprs)
+                            .find(|(rd, _)| crate::ident::normalize_ident_part(&rd.dim.name) == key)
+                            .map_or_else(|| d.expr.clone(), |(_, expr)| expr.clone())
+                    },
+                );
                 // Snowflake semi-additive semantics (F-1, code-review
                 // 2026-07-16): the rows are sorted by the NA dims and the values
                 // from the LAST ordering value of that sort are aggregated (with
@@ -375,19 +411,23 @@ struct NaGroup {
 /// Only includes ACTIVE semi-additive metrics (those with at least one NA dim
 /// not in the queried dimensions).
 fn collect_na_groups(
+    def: &SemanticViewDefinition,
     resolved_mets: &[&Metric],
-    queried_dim_names: &HashSet<String>,
+    queried_dim_keys: &HashSet<String>,
 ) -> Vec<NaGroup> {
     let mut groups: Vec<(Vec<String>, Vec<NonAdditiveDim>, Vec<usize>)> = Vec::new();
     for (idx, met) in resolved_mets.iter().enumerate() {
         // Skip regular and effectively-regular metrics (shared routing predicate)
-        if !is_active_semi_additive(met, queried_dim_names) {
+        if !is_active_semi_additive(def, met, queried_dim_keys) {
             continue;
         }
+        // Key the group on the resolved dimension keys (#30) so two metrics
+        // whose NA sets name the same dims via different spellings (bare vs
+        // dotted, quoted vs not) share one snapshot rank column.
         let key: Vec<String> = met
             .non_additive_by
             .iter()
-            .map(|nd| nd.dimension.to_ascii_lowercase())
+            .map(|nd| na_dim_match_key(def, &nd.dimension))
             .collect();
         if let Some(group) = groups.iter_mut().find(|(k, _, _)| *k == key) {
             group.2.push(idx);
@@ -419,11 +459,10 @@ fn collect_na_dim_source_tables(
     let mut sources: Vec<String> = Vec::new();
     for group in na_groups {
         for nd in &group.na_dims {
-            let Some(dim) = def
-                .dimensions
-                .iter()
-                .find(|d| d.name.eq_ignore_ascii_case(&nd.dimension))
-            else {
+            // #30: resolve bare OR dotted/quoted NA references through the
+            // shared resolver so a dotted NA dim on a non-base table still
+            // contributes its source table to the snapshot join.
+            let Some(dim) = super::resolution::find_dimension(def, &nd.dimension) else {
                 continue;
             };
             if let Some(ref st) = dim.source_table {
@@ -1210,6 +1249,147 @@ mod tests {
         );
     }
 
+    /// #30: a DOTTED NON ADDITIVE BY reference (`d.report_date`) to a
+    /// non-queried NA dim must resolve to that declared dimension and order by
+    /// its EXPRESSION (`d.report_date`), never the raw dotted text emitted as a
+    /// quoted non-column (`"d.report_date"`). Before #30 the bare-name `.find`
+    /// missed the dotted reference and emitted the quoted qualifier, which
+    /// failed at bind time.
+    #[test]
+    fn test_dotted_na_dim_orders_by_resolved_expression() {
+        let mut def = minimal_def(
+            "accounts",
+            "customer_id",
+            "a.customer_id",
+            "balance",
+            "SUM(a.balance)",
+        );
+        def.tables[0].alias = "a".to_string();
+        def.tables[0].pk_columns = vec!["id".to_string()];
+        def.metrics[0].source_table = Some("a".to_string());
+        let def = def
+            .with_table("d", "dates", &["id"])
+            .with_dimension("report_date", "d.report_date", Some("d"))
+            // DOTTED reference — the crux of #30.
+            .with_non_additive_by(
+                "balance",
+                &[("d.report_date", SortOrder::Desc, NullsOrder::First)],
+            )
+            .with_pkfk_join("acct_date", "a", "d", &["date_id"], &["id"]);
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("customer_id")],
+            metrics: vec![MetricName::new("balance")],
+        };
+
+        let sql = expand("test_view", &def, &req).unwrap();
+        assert!(sql.contains("WITH __sv_snapshot"), "Should have CTE: {sql}");
+        // F-1: declared `DESC NULLS FIRST` emits reversed `ASC NULLS FIRST`,
+        // ordering by the resolved dimension EXPRESSION.
+        assert!(
+            sql.contains("ORDER BY d.report_date ASC NULLS FIRST"),
+            "dotted NA dim must order by its resolved expression: {sql}"
+        );
+        // The raw dotted text must NOT be emitted as a quoted non-column.
+        assert!(
+            !sql.contains("\"d.report_date\""),
+            "dotted NA text must not leak as a quoted non-column: {sql}"
+        );
+        // SG-9: the NA dim's source table is still joined.
+        assert!(
+            sql.contains("LEFT JOIN \"dates\" AS \"d\""),
+            "dotted NA dim source table must be joined: {sql}"
+        );
+    }
+
+    /// #30: a DOTTED NON ADDITIVE BY reference whose dim IS queried classifies
+    /// as effectively-regular (Snowflake semantics) — no snapshot CTE. Before
+    /// #30 the dotted reference never matched the queried bare dim name, so the
+    /// metric was wrongly kept active and took the CTE path.
+    #[test]
+    fn test_dotted_na_dim_queried_is_effectively_regular() {
+        let mut def = minimal_def(
+            "accounts",
+            "customer_id",
+            "a.customer_id",
+            "balance",
+            "SUM(a.balance)",
+        );
+        def.tables[0].alias = "a".to_string();
+        def.metrics[0].source_table = Some("a".to_string());
+        let def = def
+            .with_dimension("report_date", "a.report_date", Some("a"))
+            .with_non_additive_by(
+                "balance",
+                &[("a.report_date", SortOrder::Desc, NullsOrder::First)],
+            );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![
+                DimensionName::new("customer_id"),
+                // The dotted NA dim IS queried (by its bare name).
+                DimensionName::new("report_date"),
+            ],
+            metrics: vec![MetricName::new("balance")],
+        };
+
+        let sql = expand("test_view", &def, &req).unwrap();
+        assert!(
+            !sql.contains("WITH __sv_snapshot"),
+            "queried dotted NA dim must be effectively regular (no CTE): {sql}"
+        );
+        assert!(!sql.contains("RANK"), "Should NOT have RANK: {sql}");
+        assert!(
+            sql.contains("GROUP BY"),
+            "Should take the standard aggregation path: {sql}"
+        );
+    }
+
+    /// #30 unit-level: the shared routing predicate resolves a dotted/quoted NA
+    /// reference against the queried dimension keys.
+    #[test]
+    fn test_is_active_semi_additive_resolves_dotted_reference() {
+        use super::is_active_semi_additive;
+        use std::collections::HashSet;
+
+        let mut def = minimal_def(
+            "accounts",
+            "customer_id",
+            "a.customer_id",
+            "balance",
+            "SUM(a.balance)",
+        );
+        def.tables[0].alias = "a".to_string();
+        def.metrics[0].source_table = Some("a".to_string());
+        let def = def
+            .with_dimension("report_date", "a.report_date", Some("a"))
+            .with_non_additive_by(
+                "balance",
+                &[("a.report_date", SortOrder::Desc, NullsOrder::First)],
+            );
+        let met = &def.metrics[0];
+
+        // report_date queried (by bare name) → dotted NA resolves to it → NOT active.
+        let queried: HashSet<String> = ["customer_id", "report_date"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert!(
+            !is_active_semi_additive(&def, met, &queried),
+            "dotted NA dim present in query must classify effectively-regular"
+        );
+
+        // report_date absent → active.
+        let queried_without: HashSet<String> =
+            ["customer_id"].iter().map(|s| (*s).to_string()).collect();
+        assert!(
+            is_active_semi_additive(&def, met, &queried_without),
+            "dotted NA dim absent from query must classify active"
+        );
+    }
+
     /// Metrics-only (no dims) semi-additive -> global aggregate with CTE.
     #[test]
     fn test_metrics_only_global_aggregate() {
@@ -1547,6 +1727,61 @@ mod tests {
                 .with_non_additive_by(
                     "balance",
                     &[("report_date", SortOrder::Asc, NullsOrder::First)],
+                )
+                .with_pkfk_join("acct_date", "a", "d", &["date_id"], &["id"]);
+
+            let sql = expand("test_view", &def, &snapshot_req()).expect("expand");
+
+            let con = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+            con.execute_batch(
+                "CREATE TABLE dates (id INTEGER, report_date DATE);
+                 INSERT INTO dates VALUES (1, DATE '2024-01-01'), (2, DATE '2024-01-02');
+                 CREATE TABLE accounts (id INTEGER, customer_id INTEGER, date_id INTEGER, balance DOUBLE);
+                 INSERT INTO accounts VALUES
+                     (1, 10, 1, 100.0),
+                     (2, 10, 2, 150.0),
+                     (3, 20, 1, 300.0);",
+            )
+            .expect("setup");
+            let wrapped = format!("SELECT * FROM ({sql}) ORDER BY 1");
+            let mut stmt = con.prepare(&wrapped).expect("prepare generated SQL");
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, f64>(1)?)))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows");
+            assert_eq!(rows.len(), 2, "rows: {rows:?}");
+            assert_eq!(rows[0].0, 10);
+            assert!((rows[0].1 - 150.0).abs() < 1e-9, "rows: {rows:?}");
+            assert_eq!(rows[1].0, 20);
+            assert!((rows[1].1 - 300.0).abs() < 1e-9, "rows: {rows:?}");
+        }
+
+        /// #30 data-level: the same NA-dim-on-a-joined-table scenario as
+        /// `test_na_dim_join_executes`, but the NON ADDITIVE BY reference is
+        /// DOTTED (`d.report_date`). It must resolve to the same dimension and
+        /// produce identical results — proving the dotted path expands to a
+        /// bindable, correct snapshot query end-to-end (not the quoted
+        /// non-column that failed at bind time before #30).
+        #[test]
+        fn test_dotted_na_dim_join_executes() {
+            let mut def = minimal_def(
+                "accounts",
+                "customer_id",
+                "a.customer_id",
+                "balance",
+                "SUM(a.balance)",
+            );
+            def.tables[0].alias = "a".to_string();
+            def.tables[0].pk_columns = vec!["id".to_string()];
+            def.metrics[0].source_table = Some("a".to_string());
+            let def = def
+                .with_table("d", "dates", &["id"])
+                .with_dimension("report_date", "d.report_date", Some("d"))
+                // DOTTED NA reference — the crux of #30.
+                .with_non_additive_by(
+                    "balance",
+                    &[("d.report_date", SortOrder::Asc, NullsOrder::First)],
                 )
                 .with_pkfk_join("acct_date", "a", "d", &["date_id"], &["id"]);
 

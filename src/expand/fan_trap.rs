@@ -52,9 +52,11 @@ pub(super) fn check_fan_traps(
     // each non-root node has exactly one parent via the reverse map.
     let tree = JoinTree::from_graph(&graph);
 
-    let queried_dim_names: HashSet<String> = resolved_dims
+    // Canonical keys (quote-stripped + folded) so a dotted/quoted NA reference
+    // resolves against the queried dims (#30, shared with the CTE dispatch).
+    let queried_dim_keys: HashSet<String> = resolved_dims
         .iter()
-        .map(|d| d.name.to_ascii_lowercase())
+        .map(|d| crate::ident::normalize_ident_part(&d.name))
         .collect();
 
     // For each metric + dimension pair, check for fan-out on the join path.
@@ -72,7 +74,7 @@ pub(super) fn check_fan_traps(
         // Window metrics are NOT skipped: their inner aggregate is computed
         // over the already-fanned join, so fan-out inflates it before the
         // window function runs.
-        if is_active_semi_additive(met, &queried_dim_names) {
+        if is_active_semi_additive(def, met, &queried_dim_keys) {
             continue;
         }
 
@@ -155,7 +157,7 @@ pub(super) fn check_fan_traps(
         // skipped when it takes the CTE snapshot path. A CTE-handled metric
         // still participates as the OTHER side (its source table is still
         // joined, fanning co-queried metrics).
-        if is_active_semi_additive(met_a, &queried_dim_names) {
+        if is_active_semi_additive(def, met_a, &queried_dim_keys) {
             continue;
         }
         for (j, met_b) in resolved_mets.iter().enumerate() {

@@ -382,13 +382,15 @@ pub fn expand(
     // NA dims is NOT in the queried dimension set. When ALL NA dims are in the
     // query, the metric acts as regular (Snowflake semantics). The predicate
     // is shared with expand_semi_additive and the fan-trap check (SG-6).
-    let queried_dim_names: std::collections::HashSet<String> = resolved_dims
+    // Canonical keys (quote-stripped + folded) so a dotted/quoted NA reference
+    // resolves against the queried dims (#30, shared with the CTE path).
+    let queried_dim_keys: std::collections::HashSet<String> = resolved_dims
         .iter()
-        .map(|d| d.name.to_ascii_lowercase())
+        .map(|d| crate::ident::normalize_ident_part(&d.name))
         .collect();
     let has_active_semi_additive = resolved_mets
         .iter()
-        .any(|m| super::semi_additive::is_active_semi_additive(m, &queried_dim_names));
+        .any(|m| super::semi_additive::is_active_semi_additive(def, m, &queried_dim_keys));
 
     if has_active_semi_additive {
         return super::semi_additive::expand_semi_additive(
