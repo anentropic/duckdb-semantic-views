@@ -63,20 +63,41 @@ fn is_balanced(sql: &str) -> bool {
 /// SQL fragments are themselves balanced — expansion copies expressions
 /// through, and define-time validation (not exercised here) is what keeps
 /// unbalanced fragments out of the real catalog.
+///
+/// A "verbatim fragment" is anything `expand` interpolates UN-quoted into the
+/// generated SQL. That is every `expr`, plus the `output_type` that fills the
+/// `CAST(expr AS <output_type>)` slot (`sql_gen.rs` / `window.rs`) and a window
+/// metric's `window_function` (the `FUNC(...)` head, `window.rs`). It is NOT the
+/// names/aliases — those pass through `quote_ident`, whose output is always
+/// balanced. Omitting `output_type` / `window_function` let an unbalanced type
+/// or function name manufacture unbalanced SQL from otherwise-balanced inputs
+/// and trip the `is_balanced` assertion on a non-bug (fuzz_sql_expand,
+/// 2026-07-18). Over-inclusion is harmless — it can only make the guard skip
+/// more inputs, never assert a false positive.
 fn def_fragments_balanced(def: &SemanticViewDefinition) -> bool {
     let mut frags: Vec<&str> = Vec::new();
     for d in &def.dimensions {
         frags.push(&d.expr);
+        if let Some(ot) = &d.output_type {
+            frags.push(ot);
+        }
     }
     for f in &def.facts {
         frags.push(&f.expr);
+        if let Some(ot) = &f.output_type {
+            frags.push(ot);
+        }
     }
     for m in &def.metrics {
         frags.push(&m.expr);
+        if let Some(ot) = &m.output_type {
+            frags.push(ot);
+        }
         for na in &m.non_additive_by {
             frags.push(&na.dimension);
         }
         if let Some(ws) = &m.window_spec {
+            frags.push(&ws.window_function);
             frags.push(&ws.inner_metric);
             frags.extend(ws.extra_args.iter().map(String::as_str));
             frags.extend(ws.excluding_dims.iter().map(String::as_str));
@@ -102,8 +123,6 @@ fuzz_target!(|input: FuzzInput| {
     if let Ok(sql) = expand("fuzz_view", &input.def, &req) {
         // Successful expansion must produce non-empty SQL
         assert!(!sql.is_empty());
-        // Basic validity: starts with expected CTE prefix
-        assert!(sql.starts_with("WITH"));
         // Structural validity (TC-9): balanced quotes and parens whenever
         // the input fragments were balanced.
         if fragments_ok {

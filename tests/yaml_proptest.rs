@@ -23,7 +23,24 @@ fn arb_name() -> impl Strategy<Value = String> {
             "primary key".to_string(),
             "wéird name".to_string(),
         ]).boxed(),
+        // YAML-hostile scalars: bare forms a naive serializer would emit
+        // unquoted and re-read as null / bool / number / mapping / comment
+        // rather than as the original string. A correct serializer must quote
+        // them so they round-trip as plain string scalars; if any of these
+        // breaks the round-trip it is a real serializer bug, not a test bug.
+        2 => prop::sample::select(vec![
+            "null", "~", "no", "on", "yes", "true", "false", "123", "1.5",
+            "-0", "a: b", "x #y", " padded ", "line\nbreak",
+        ]).prop_map(str::to_string).boxed(),
+        1 => Just("has \"embedded\" quote".to_string()).boxed(),
     ]
+}
+
+/// Free-text payload for COMMENT / SYNONYMS fields. Reuses `arb_name`'s
+/// alphabet (including the YAML-hostile scalars) so those optional fields
+/// actually exercise the round-trip instead of being hardcoded empty.
+fn arb_payload() -> impl Strategy<Value = String> {
+    arb_name()
 }
 
 /// Generate an arbitrary SQL-like expression.
@@ -58,28 +75,38 @@ fn arb_table_ref() -> impl Strategy<Value = TableRef> {
         arb_name(),
         arb_name(),
         proptest::collection::vec(arb_name(), 0..=2),
+        proptest::collection::vec(proptest::collection::vec(arb_name(), 1..=2), 0..=2),
+        proptest::option::of(arb_payload()),
+        proptest::collection::vec(arb_payload(), 0..=2),
     )
-        .prop_map(|(alias, table, pk_columns)| TableRef {
-            alias,
-            table,
-            pk_columns,
-            unique_constraints: vec![],
-            comment: None,
-            synonyms: vec![],
-        })
+        .prop_map(
+            |(alias, table, pk_columns, unique_constraints, comment, synonyms)| TableRef {
+                alias,
+                table,
+                pk_columns,
+                unique_constraints,
+                comment,
+                synonyms,
+            },
+        )
 }
 
 fn arb_dimension() -> impl Strategy<Value = Dimension> {
-    (arb_name(), arb_expr(), proptest::option::of(arb_name())).prop_map(
-        |(name, expr, source_table)| Dimension {
+    (
+        arb_name(),
+        arb_expr(),
+        proptest::option::of(arb_name()),
+        proptest::option::of(arb_payload()),
+        proptest::collection::vec(arb_payload(), 0..=2),
+    )
+        .prop_map(|(name, expr, source_table, comment, synonyms)| Dimension {
             name,
             expr,
             source_table,
             output_type: None,
-            comment: None,
-            synonyms: vec![],
-        },
-    )
+            comment,
+            synonyms,
+        })
 }
 
 fn arb_non_additive_dim() -> impl Strategy<Value = NonAdditiveDim> {
@@ -103,16 +130,27 @@ fn arb_window_spec() -> impl Strategy<Value = WindowSpec> {
         arb_name(),
         proptest::collection::vec(arb_name(), 0..=1),
         proptest::collection::vec(arb_window_order_by(), 0..=2),
+        proptest::collection::vec(arb_name(), 0..=2),
+        proptest::collection::vec(arb_name(), 0..=2),
+        proptest::option::of(arb_payload()),
     )
         .prop_map(
-            |(window_function, inner_metric, excluding_dims, order_by)| WindowSpec {
+            |(
                 window_function,
                 inner_metric,
-                extra_args: vec![],
                 excluding_dims,
-                partition_dims: vec![],
                 order_by,
-                frame_clause: None,
+                extra_args,
+                partition_dims,
+                frame_clause,
+            )| WindowSpec {
+                window_function,
+                inner_metric,
+                extra_args,
+                excluding_dims,
+                partition_dims,
+                order_by,
+                frame_clause,
             },
         )
 }
@@ -125,19 +163,32 @@ fn arb_metric() -> impl Strategy<Value = Metric> {
         arb_access(),
         proptest::collection::vec(arb_non_additive_dim(), 0..=1),
         proptest::option::of(arb_window_spec()),
+        proptest::option::of(arb_payload()),
+        proptest::collection::vec(arb_payload(), 0..=2),
     )
         .prop_map(
-            |(name, expr, source_table, access, non_additive_by, window_spec)| Metric {
+            |(
                 name,
                 expr,
                 source_table,
-                output_type: None,
-                using_relationships: vec![],
-                comment: None,
-                synonyms: vec![],
                 access,
                 non_additive_by,
                 window_spec,
+                comment,
+                synonyms,
+            )| {
+                Metric {
+                    name,
+                    expr,
+                    source_table,
+                    output_type: None,
+                    using_relationships: vec![],
+                    comment,
+                    synonyms,
+                    access,
+                    non_additive_by,
+                    window_spec,
+                }
             },
         )
 }
@@ -148,16 +199,20 @@ fn arb_fact() -> impl Strategy<Value = Fact> {
         arb_expr(),
         proptest::option::of(arb_name()),
         arb_access(),
+        proptest::option::of(arb_payload()),
+        proptest::collection::vec(arb_payload(), 0..=2),
     )
-        .prop_map(|(name, expr, source_table, access)| Fact {
-            name,
-            expr,
-            source_table,
-            output_type: None,
-            comment: None,
-            synonyms: vec![],
-            access,
-        })
+        .prop_map(
+            |(name, expr, source_table, access, comment, synonyms)| Fact {
+                name,
+                expr,
+                source_table,
+                output_type: None,
+                comment,
+                synonyms,
+                access,
+            },
+        )
 }
 
 fn arb_join() -> impl Strategy<Value = Join> {
@@ -166,15 +221,19 @@ fn arb_join() -> impl Strategy<Value = Join> {
         arb_name(),
         proptest::collection::vec(arb_name(), 0..=2),
         arb_cardinality(),
+        proptest::collection::vec(arb_name(), 0..=2),
+        proptest::option::of(arb_name()),
     )
-        .prop_map(|(table, from_alias, fk_columns, cardinality)| Join {
-            table,
-            from_alias,
-            fk_columns,
-            ref_columns: vec![],
-            name: None,
-            cardinality,
-        })
+        .prop_map(
+            |(table, from_alias, fk_columns, cardinality, ref_columns, name)| Join {
+                table,
+                from_alias,
+                fk_columns,
+                ref_columns,
+                name,
+                cardinality,
+            },
+        )
 }
 
 fn arb_materialization() -> impl Strategy<Value = Materialization> {

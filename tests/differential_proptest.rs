@@ -26,10 +26,15 @@ use semantic_views::expand::{expand, DimensionName, MetricName, QueryRequest};
 use semantic_views::model::{AccessModifier, Dimension, Metric, SemanticViewDefinition, TableRef};
 
 /// An aggregate over a generated column (or `COUNT(*)`), rendered to SQL.
+///
+/// `CountCol` (`count(v{j})`) counts only non-NULL rows, so with NULL-bearing
+/// value columns it diverges from `Count` (`count(*)`) — the two are now
+/// differentially distinguished (previously only `count(*)` existed).
 #[derive(Debug, Clone)]
 enum Agg {
     Sum(usize),
     Count,
+    CountCol(usize),
     Min(usize),
     Max(usize),
 }
@@ -39,6 +44,7 @@ impl Agg {
         match self {
             Agg::Sum(j) => format!("sum(v{j})"),
             Agg::Count => "count(*)".to_string(),
+            Agg::CountCol(j) => format!("count(v{j})"),
             Agg::Min(j) => format!("min(v{j})"),
             Agg::Max(j) => format!("max(v{j})"),
         }
@@ -47,13 +53,14 @@ impl Agg {
 
 /// A generated schema shape plus its data. Columns are `d0..d{n_dims-1}`
 /// (group-by dimensions) followed by `v0..v{n_vals-1}` (metric inputs), all
-/// `INTEGER`. `rows` holds `n_dims + n_vals` values per row.
+/// `INTEGER`. `rows` holds `n_dims + n_vals` cells per row; `None` is a SQL
+/// `NULL` (exercises NULL group keys and NULL aggregate inputs).
 #[derive(Debug, Clone)]
 struct Schema {
     n_dims: usize,
     n_vals: usize,
     metric_aggs: Vec<Agg>,
-    rows: Vec<Vec<i64>>,
+    rows: Vec<Vec<Option<i64>>>,
 }
 
 /// A full test case: a schema plus the non-empty subset of dims and metrics to
@@ -70,20 +77,38 @@ fn arb_schema() -> impl Strategy<Value = Schema> {
         let agg = prop_oneof![
             (0..n_vals).prop_map(Agg::Sum),
             Just(Agg::Count),
+            (0..n_vals).prop_map(Agg::CountCol),
             (0..n_vals).prop_map(Agg::Min),
             (0..n_vals).prop_map(Agg::Max),
         ];
         let metrics = prop::collection::vec(agg, 1..=3);
-        let ncols = n_dims + n_vals;
-        // Dimension columns are squashed into a small domain (0..3) so rows
-        // collide into real groups; value columns range wider (0..10).
-        let row = prop::collection::vec(0i64..10, ncols).prop_map(move |mut r| {
-            for cell in r.iter_mut().take(n_dims) {
-                *cell %= 3;
-            }
-            r
-        });
-        let rows = prop::collection::vec(row, 1..=25);
+        // Dimension cells: a small domain (0..3) so rows collide into real
+        // groups, plus `None` (NULL) so NULL group keys are exercised.
+        let dim_cell = prop_oneof![
+            1 => Just(None),
+            5 => (0i64..3).prop_map(Some),
+        ];
+        // Value cells: `None` (NULL, so SUM-over-all-NULL and COUNT(col) vs
+        // COUNT(*) diverge), a small signed domain (exact sums / collisions),
+        // and a large signed magnitude — both spanning negatives. The domain
+        // stays within INT32 so it fits the `INTEGER` columns; SUM widens to
+        // HUGEINT in DuckDB so no aggregate overflow arises.
+        let val_cell = prop_oneof![
+            1 => Just(None),
+            2 => (-5i64..=5).prop_map(Some),
+            2 => (-1_000_000_000i64..=1_000_000_000).prop_map(Some),
+        ];
+        let row = (
+            prop::collection::vec(dim_cell, n_dims),
+            prop::collection::vec(val_cell, n_vals),
+        )
+            .prop_map(|(mut cells, vals)| {
+                cells.extend(vals);
+                cells
+            });
+        // 0 rows is allowed — the empty-table path (global aggregate over no
+        // rows, empty DISTINCT) was never differentially checked before.
+        let rows = prop::collection::vec(row, 0..=25);
         (Just(n_dims), Just(n_vals), metrics, rows).prop_map(
             |(n_dims, n_vals, metric_aggs, rows)| Schema {
                 n_dims,
@@ -99,13 +124,22 @@ fn arb_case() -> impl Strategy<Value = Case> {
     arb_schema().prop_flat_map(|schema| {
         let nd = schema.n_dims;
         let nm = schema.metric_aggs.len();
-        let dim_sel = prop::sample::subsequence((0..nd).collect::<Vec<_>>(), 1..=nd);
-        let met_sel = prop::sample::subsequence((0..nm).collect::<Vec<_>>(), 1..=nm);
-        (Just(schema), dim_sel, met_sel).prop_map(|(schema, sel_dims, sel_metrics)| Case {
-            schema,
-            sel_dims,
-            sel_metrics,
-        })
+        // Either selection may be empty (dims-only → SELECT DISTINCT,
+        // metrics-only → global aggregate), but not both — a fully-empty
+        // request is invalid, so the at-least-one invariant is preserved by
+        // the filter below.
+        let dim_sel = prop::sample::subsequence((0..nd).collect::<Vec<_>>(), 0..=nd);
+        let met_sel = prop::sample::subsequence((0..nm).collect::<Vec<_>>(), 0..=nm);
+        (Just(schema), dim_sel, met_sel)
+            .prop_filter(
+                "at least one of dimensions/metrics must be selected",
+                |(_, sel_dims, sel_metrics)| !sel_dims.is_empty() || !sel_metrics.is_empty(),
+            )
+            .prop_map(|(schema, sel_dims, sel_metrics)| Case {
+                schema,
+                sel_dims,
+                sel_metrics,
+            })
     })
 }
 
@@ -173,7 +207,10 @@ fn make_db(s: &Schema) -> duckdb::Connection {
         .map(|r| {
             format!(
                 "({})",
-                r.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+                r.iter()
+                    .map(|c| c.map_or_else(|| "NULL".to_string(), |v| v.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(",")
             )
         })
         .collect();
@@ -225,11 +262,20 @@ proptest! {
             .cloned()
             .collect::<Vec<_>>()
             .join(", ");
-        let group_by = (1..=case.sel_dims.len())
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let oracle = format!("SELECT {select_items} FROM t GROUP BY {group_by}");
+        // Metrics-only requests are a single global-aggregate row (no GROUP
+        // BY). Otherwise GROUP BY the selected dimensions by ordinal — they are
+        // projected first, so positions 1..=sel_dims.len(). Dims-only is a
+        // GROUP BY over all selected dims, multiset-equal to the expansion's
+        // SELECT DISTINCT.
+        let oracle = if case.sel_dims.is_empty() {
+            format!("SELECT {select_items} FROM t")
+        } else {
+            let group_by = (1..=case.sel_dims.len())
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("SELECT {select_items} FROM t GROUP BY {group_by}")
+        };
 
         // Canonical projection (columns sorted by output name) so a column
         // ORDER difference between the two formulations is not a false diff.

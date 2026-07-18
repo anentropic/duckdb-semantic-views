@@ -258,6 +258,148 @@ pub(super) fn identifier_slot_error(slot: &str) -> Option<String> {
     crate::ident::parse_qualified_identifier(s).err()
 }
 
+// ---------------------------------------------------------------------------
+// Render-side round-trip guards (RT-4, fuzz_render_roundtrip 2026-07-18)
+//
+// `render_ddl` must satisfy the fixpoint `render(parse(render(def))) ==
+// render(def)`. A stored column / alias / table string that does NOT re-parse
+// back to itself verbatim breaks that invariant when emitted raw (a depth-0
+// comma splits one column into two, a blank alias re-parses as garbage, etc.).
+// The renderer consults these predicates and wraps any non-round-tripping
+// string with `quote_ident`; because they must agree exactly with how the
+// clause parsers tokenize, they live here beside `QuoteState` / the lexer /
+// `identifier_slot_error` and reuse the same primitives. Each predicate is
+// conservative: canonical values (bare words, well-formed `"quoted"` idents,
+// dotted table names) return `true` and are emitted UNCHANGED; anything whose
+// verbatim round-trip is not guaranteed returns `false` and is quoted.
+// ---------------------------------------------------------------------------
+
+/// True when `s`, emitted verbatim as ONE element of a `(a, b, ...)` column
+/// list (PRIMARY KEY / UNIQUE / FK / REFERENCES), re-parses back to exactly
+/// `s` via `take_parens` + [`split_at_depth0_commas`].
+///
+/// Requirements, matching those two consumers: non-empty; no leading/trailing
+/// whitespace (which the parser trims away); no depth-0 comma (which would
+/// split it into multiple columns); and balanced quotes and brackets that
+/// never dip negative (so it neither leaks an open quote/paren into the list
+/// nor closes the enclosing `(...)` early). Both the `(`/`)`-only balance
+/// `take_parens` tracks and the `()[]{}` balance `split_at_depth0_commas`
+/// tracks are enforced. Idempotent on already-`quote_ident`ed input: a
+/// well-formed `"..."` token has no depth-0 comma and balanced quotes, so it
+/// returns `true` and is left as-is (never re-quoted).
+pub(crate) fn column_roundtrips_verbatim(s: &str) -> bool {
+    if s.is_empty() || s.trim() != s {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let mut st = QuoteState::default();
+    let mut paren_depth: i32 = 0; // '(' / ')' only — matches take_parens
+    let mut bracket_depth: i32 = 0; // ()[]{} — matches split_at_depth0_commas
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, live) = st.step(bytes, i);
+        if live {
+            match bytes[i] {
+                b'(' => {
+                    paren_depth += 1;
+                    bracket_depth += 1;
+                }
+                b')' => {
+                    paren_depth -= 1;
+                    bracket_depth -= 1;
+                    if paren_depth < 0 || bracket_depth < 0 {
+                        return false;
+                    }
+                }
+                b'[' | b'{' => bracket_depth += 1,
+                b']' | b'}' => {
+                    bracket_depth -= 1;
+                    if bracket_depth < 0 {
+                        return false;
+                    }
+                }
+                b',' if bracket_depth == 0 => return false,
+                _ => {}
+            }
+        }
+        i = next;
+    }
+    paren_depth == 0 && bracket_depth == 0 && !st.in_string && !st.in_ident
+}
+
+/// True when `s`, emitted verbatim in a single-identifier slot (a table alias,
+/// a relationship `from_alias`, or a `REFERENCES` target alias), re-parses
+/// back to exactly `s`.
+///
+/// Those slots are read as ONE value token by the cursor, so `s` must lex to
+/// exactly one terminated identifier token (bare or `"quoted"`) spanning the
+/// whole string, and pass [`identifier_slot_error`] (rejecting the empty
+/// quoted `""`). A multi-token run (`a b`, `a.b`, `a(b`) or an empty string
+/// therefore returns `false` and is quoted. Idempotent: a well-formed
+/// `"..."` token lexes as one quoted identifier and passes the slot check.
+pub(crate) fn identifier_slot_roundtrips_verbatim(s: &str) -> bool {
+    use super::lexer::{lex, TokenKind};
+    let toks = lex(s);
+    let [tok] = toks.as_slice() else {
+        return false;
+    };
+    matches!(tok.kind, TokenKind::Ident { .. })
+        && tok.start == 0
+        && tok.end == s.len()
+        && identifier_slot_error(s).is_none()
+}
+
+/// True when `s`, emitted verbatim as a source-table name (the `AS <table>`
+/// slot of a TABLES entry), re-parses back to exactly `s` via
+/// `take_source_table_name`.
+///
+/// Unlike an alias slot, a source-table name is a maximal CONTIGUOUS run of
+/// tokens, so a dot-qualified name (`schema.orders`, `"db"."t"`) is captured
+/// whole and round-trips verbatim — this predicate must leave such canonical
+/// names UNCHANGED (never always-quote). It returns `true` iff `s` lexes into
+/// a gap-free run of identifier tokens joined only by `.` symbols, covering
+/// the whole string, is not a bare reserved keyword the name slot rejects, and
+/// is a well-formed dotted identifier. Any interior whitespace, `(`/`)`/`,`/`;`
+/// symbol, string literal, unterminated quote, or empty input returns `false`
+/// and is quoted (collapsing to a single quoted part — acceptable, since such
+/// values are non-canonical). Idempotent on a `quote_ident`ed value: `"..."`
+/// is one quoted token covering the whole string.
+pub(crate) fn source_table_roundtrips_verbatim(s: &str) -> bool {
+    use super::lexer::{lex, TokenKind};
+    let toks = lex(s);
+    let Some(first) = toks.first() else {
+        return false; // empty
+    };
+    // No surrounding whitespace (lexer skips it, so a covered run starts at 0
+    // and ends at len only when there is none).
+    if first.start != 0 || toks.last().is_none_or(|t| t.end != s.len()) {
+        return false;
+    }
+    let mut prev_end: Option<usize> = None;
+    for t in &toks {
+        if let Some(pe) = prev_end {
+            if pe != t.start {
+                return false; // interior whitespace gap ends the name early
+            }
+        }
+        match t.kind {
+            // An identifier part, or the `.` that separates a dotted FQN.
+            TokenKind::Ident { .. } | TokenKind::Symbol(b'.') => {}
+            _ => return false, // (, ), comma, ;, string literal, unterminated, ...
+        }
+        prev_end = Some(t.end);
+    }
+    // A bare reserved keyword in the name slot is rejected by the parser.
+    if matches!(
+        s.to_ascii_uppercase().as_str(),
+        "PRIMARY" | "UNIQUE" | "FOREIGN" | "REFERENCES" | "NOT"
+    ) {
+        return false;
+    }
+    // Well-formed dotted identifier (rejects `""`, `a..b`, `foo"bar"`, ...).
+    crate::ident::parse_qualified_identifier(s).is_ok()
+}
+
 /// Phase 68 A4: returns `true` if `s` has balanced double-quote runs, treating
 /// a doubled-quote `""` inside a quoted region as an escape (does NOT close).
 /// Mirrors the escape rule used by `src/ident.rs::find_identifier_end` so the

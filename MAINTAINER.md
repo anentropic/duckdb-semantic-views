@@ -509,7 +509,7 @@ cargo +nightly fuzz list          # see available targets
 | `fuzz_yaml_parse` | Feeds arbitrary bytes to the YAML import path | Panics / serde surprises in YAML deserialization |
 | `fuzz_ddl_parse` | Arbitrary bytes → `plan_rewrite` (the full CREATE/DDL front door) | Panics or hangs in DDL parsing on malformed statements |
 | `fuzz_keyword_body` | Arbitrary bytes → `parse_keyword_body` (bypasses prefix detection) | Panics in the clause-body parser; asserts anything parsed also renders |
-| `fuzz_render_roundtrip` | Generated definitions → render → parse → render | Break in the fixpoint `render(parse(render(def))) == render(def)` |
+| `fuzz_render_roundtrip` | Generated definitions → normalize once via `parse(render(def))` → assert `render` is idempotent on the parser-produced def | Grammar drift between `render_ddl` and the body parser (dropped field, reordered clause, mis-quoted identifier). Uses the converge-once invariant, not the strong `render(parse(render(def))) == render(def)` fixpoint — that is unsatisfiable on arbitrary defs (a free-form `expr`'s surrounding whitespace is trimmed by the parser and cannot be quote-protected) |
 | `fuzz_sql_expand` | Arbitrary `SemanticViewDefinition` + name arrays → `expand()` | Panics/assertion failures in SQL generation; quote/paren imbalance in the emitted SQL |
 | `fuzz_query_names` | Fuzzes dimension/metric name strings against a fixed known-good definition | SQL injection via user-supplied column names, quoting bugs, name resolution panics |
 | `fuzz_parser_override_ffi` | Drives the `parser_override` FFI entry path with fuzzed input | Panics crossing the FFI boundary; unexpected rc / error propagation |

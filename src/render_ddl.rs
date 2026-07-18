@@ -47,22 +47,75 @@ fn emit_synonyms(out: &mut String, synonyms: &[String]) {
     }
 }
 
+/// Emit a stored single-identifier slot (table alias, relationship
+/// `from_alias`, `REFERENCES` target alias) so it round-trips through the body
+/// parser. Canonical values — bare words and well-formed `"quoted"`
+/// identifiers — are emitted UNCHANGED; anything that would not re-parse to
+/// itself as one identifier token (empty, embedded whitespace/comma/paren,
+/// unbalanced quotes) is wrapped via [`crate::expand::quote_ident`], which
+/// escapes internal `"` and produces a token that DOES round-trip. Idempotent:
+/// an already-quoted value is recognised as round-tripping and left as-is.
+fn emit_alias(s: &str) -> String {
+    if crate::body_parser::identifier_slot_roundtrips_verbatim(s) {
+        s.to_string()
+    } else {
+        crate::expand::quote_ident(s)
+    }
+}
+
+/// Emit a stored column identifier (a PRIMARY KEY / UNIQUE / FK / REFERENCES
+/// column-list entry) so it round-trips. Emitted UNCHANGED when it re-parses
+/// verbatim as a single column (no depth-0 comma, balanced quotes/brackets, no
+/// surrounding whitespace); otherwise wrapped via
+/// [`crate::expand::quote_ident`]. Idempotent (see [`emit_alias`]).
+fn emit_column(s: &str) -> String {
+    if crate::body_parser::column_roundtrips_verbatim(s) {
+        s.to_string()
+    } else {
+        crate::expand::quote_ident(s)
+    }
+}
+
+/// Emit a comma-separated column list, each entry passed through
+/// [`emit_column`] so a stored value containing a comma cannot silently split
+/// into two columns on re-parse.
+fn emit_column_list(cols: &[String]) -> String {
+    cols.iter()
+        .map(|c| emit_column(c))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Emit a stored source-table name (the `AS <table>` slot of a TABLES entry)
+/// so it round-trips. Dot-aware: canonical bare and dotted names
+/// (`orders`, `schema.orders`, `"db"."t"`) are emitted UNCHANGED; only names
+/// that would not re-parse verbatim (empty, embedded whitespace/comma/paren,
+/// unbalanced quotes, a bare reserved keyword) are wrapped via
+/// [`crate::expand::quote_ident`]. Idempotent (see [`emit_alias`]).
+fn emit_table(s: &str) -> String {
+    if crate::body_parser::source_table_roundtrips_verbatim(s) {
+        s.to_string()
+    } else {
+        crate::expand::quote_ident(s)
+    }
+}
+
 /// Emit TABLES clause entries.
 fn emit_tables(out: &mut String, def: &SemanticViewDefinition) {
     out.push_str("TABLES (\n");
     for (i, table) in def.tables.iter().enumerate() {
         out.push_str("    ");
-        out.push_str(&table.alias);
+        out.push_str(&emit_alias(&table.alias));
         out.push_str(" AS ");
-        out.push_str(&table.table);
+        out.push_str(&emit_table(&table.table));
         if !table.pk_columns.is_empty() {
             out.push_str(" PRIMARY KEY (");
-            out.push_str(&table.pk_columns.join(", "));
+            out.push_str(&emit_column_list(&table.pk_columns));
             out.push(')');
         }
         for uc in &table.unique_constraints {
             out.push_str(" UNIQUE (");
-            out.push_str(&uc.join(", "));
+            out.push_str(&emit_column_list(uc));
             out.push(')');
         }
         emit_comment(out, table.comment.as_deref());
@@ -84,11 +137,11 @@ fn emit_relationships(out: &mut String, def: &SemanticViewDefinition) {
             out.push_str(rel_name);
         }
         out.push_str(" AS ");
-        out.push_str(&join.from_alias);
+        out.push_str(&emit_alias(&join.from_alias));
         out.push('(');
-        out.push_str(&join.fk_columns.join(", "));
+        out.push_str(&emit_column_list(&join.fk_columns));
         out.push_str(") REFERENCES ");
-        out.push_str(&join.table);
+        out.push_str(&emit_alias(&join.table));
         // RT-1 (code-review 2026-07-02): a relationship declared against a
         // UNIQUE key (or any explicit column list differing from the
         // target's PRIMARY KEY) must render its `(ref_columns)` — omitting
@@ -97,7 +150,7 @@ fn emit_relationships(out: &mut String, def: &SemanticViewDefinition) {
         // list is redundant and is omitted for the historical compact form.
         if !join.ref_columns.is_empty() && !ref_columns_match_target_pk(def, join) {
             out.push('(');
-            out.push_str(&join.ref_columns.join(", "));
+            out.push_str(&emit_column_list(&join.ref_columns));
             out.push(')');
         }
         if i + 1 < def.joins.len() {
@@ -1181,6 +1234,177 @@ mod tests {
             metrics_pos < mats_pos,
             "MATERIALIZATIONS should come after METRICS"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // RT-4 (fuzz_render_roundtrip, 2026-07-18): render must be IDEMPOTENT on a
+    // parser-produced definition (the converge-once invariant the fuzz target
+    // asserts):
+    //   d1 = parse(render(def));  render(parse(render(d1))) == render(d1)
+    // The strong fixpoint render(parse(render(def))) == render(def) on an
+    // ARBITRARY def is unsatisfiable — a free-form `expr` with surrounding
+    // whitespace is trimmed by the parser and cannot be quote-protected. So we
+    // normalize once into the parser's image, then assert re-rendering that def
+    // is a fixpoint. The strict parse(render(def)) == def equality for CANONICAL
+    // defs lives in tests/roundtrip_proptest.rs.
+    // -------------------------------------------------------------------
+
+    /// Mirror of `fuzz_render_roundtrip::body_of`: return the ` AS\n...`
+    /// body suffix of a rendered DDL, locating the header's (possibly
+    /// quoted) name and optional COMMENT the same quote-aware way the fuzz
+    /// target and the body parser do.
+    fn body_of(ddl: &str) -> Option<&str> {
+        let rest = ddl.strip_prefix("CREATE OR REPLACE SEMANTIC VIEW ")?;
+        let name_end = crate::ident::find_identifier_end(rest, true);
+        let mut after = &rest[name_end..];
+        let trimmed = after.trim_start();
+        if trimmed.len() >= 7 && trimmed.as_bytes()[..7].eq_ignore_ascii_case(b"COMMENT") {
+            let after_kw = trimmed[7..].trim_start();
+            let after_eq = after_kw.strip_prefix('=')?.trim_start();
+            let (_, consumed) = crate::util::extract_single_quoted_prefix(after_eq).ok()?;
+            after = &after_eq[consumed..];
+        }
+        let trimmed = after.trim_start();
+        if trimmed.len() >= 2 && trimmed.as_bytes()[..2].eq_ignore_ascii_case(b"AS") {
+            Some(trimmed)
+        } else {
+            None
+        }
+    }
+
+    /// The `fuzz_render_roundtrip` converge-once invariant as a deterministic
+    /// assertion, mirroring that target exactly: normalize the (possibly
+    /// arbitrary) `def` once via `parse(render(def))` to land on a
+    /// parser-produced def, then assert `render` is IDEMPOTENT on it. A re-parse
+    /// failure at either stage is tolerated (the strict equality for canonical
+    /// defs lives in `roundtrip_proptest`); a SUCCESSFUL re-parse whose
+    /// re-render differs is the drift this catches.
+    fn assert_render_fixpoint(def: &SemanticViewDefinition) {
+        use crate::body_parser::{parse_keyword_body, KeywordBody};
+        fn kb_to_def(kb: KeywordBody) -> SemanticViewDefinition {
+            SemanticViewDefinition {
+                tables: kb.tables,
+                joins: kb.relationships,
+                facts: kb.facts,
+                dimensions: kb.dimensions,
+                metrics: kb.metrics,
+                materializations: kb.materializations,
+                ..Default::default()
+            }
+        }
+        // Normalize once into the parser's image.
+        let rendered0 = render_create_ddl("fuzz_view", def).expect("def renders");
+        let Some(body0) = body_of(&rendered0) else {
+            panic!("rendered DDL lost its AS body:\n{rendered0}");
+        };
+        let Ok(kb1) = parse_keyword_body(body0, 0) else {
+            return; // arbitrary content the parser can't accept — not reachable
+        };
+        let d1 = kb_to_def(kb1);
+        // Assert render is idempotent on the parser-produced def.
+        let rendered1 =
+            render_create_ddl("fuzz_view", &d1).expect("parser-produced def must render");
+        let Some(body1) = body_of(&rendered1) else {
+            panic!("rendered DDL lost its AS body:\n{rendered1}");
+        };
+        let Ok(kb2) = parse_keyword_body(body1, 0) else {
+            return; // freshly-rendered canonical DDL no longer re-parses — tolerated
+        };
+        let d2 = kb_to_def(kb2);
+        let rendered2 =
+            render_create_ddl("fuzz_view", &d2).expect("re-parsed definition must render");
+        let body2 = body_of(&rendered2).expect("re-rendered DDL kept its AS body");
+        assert_eq!(
+            body1, body2,
+            "render not idempotent on a parser-produced def\nfirst:\n{rendered1}\nsecond:\n{rendered2}"
+        );
+    }
+
+    #[test]
+    fn test_render_fixpoint_unique_constraint_column_with_comma() {
+        // A fully VALID view (a table with a dimension + metric) whose only
+        // UNIQUE constraint column is the bare string `a,b`. Emitted verbatim it
+        // would be `UNIQUE (a,b)`, which re-parses by splitting at the comma into
+        // TWO columns; the quote-protection emits `UNIQUE ("a,b")` instead, so
+        // the parser-produced def keeps one column `"a,b"` and re-render is
+        // idempotent. Exercises the converge-once assert branch (both parses
+        // succeed), not the re-parse-fails escape.
+        let mut def = minimal_def();
+        def.tables[0].unique_constraints = vec![vec!["a,b".to_string()]];
+        assert_render_fixpoint(&def);
+    }
+
+    #[test]
+    fn test_render_fixpoint_fuzz_seed_empty_alias_and_table() {
+        // The first fuzz_render_roundtrip counterexample: empty alias / table,
+        // a UNIQUE constraint whose first column carries a depth-0 comma and
+        // whose second column is empty, plus assorted empty / edge synonyms and
+        // a metric. The empty alias/table are quoted to `""`, which the parser
+        // rejects, so the first-stage parse(render(def)) fails and converge-once
+        // returns before asserting (the re-parse-fails escape).
+        let def = SemanticViewDefinition {
+            tables: vec![TableRef {
+                alias: String::new(),
+                table: String::new(),
+                pk_columns: vec![],
+                unique_constraints: vec![vec![
+                    "nticer ,roundtrip seed: tab".to_string(),
+                    String::new(),
+                ]],
+                comment: Some(String::new()),
+                synonyms: vec![
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                    "n)\n r".into(),
+                    "".into(),
+                    "".into(),
+                    "".into(),
+                    "egion,".into(),
+                ],
+                ..Default::default()
+            }],
+            dimensions: vec![],
+            metrics: vec![Metric {
+                name: "b".into(),
+                expr: "les ,".into(),
+                source_table: Some("\0\0\0".into()),
+                access: AccessModifier::Public,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_render_fixpoint(&def);
+    }
+
+    #[test]
+    fn test_render_fixpoint_fuzz_seed_nul_alias_empty_pk() {
+        // Second fuzz_render_roundtrip counterexample (2026-07-18): a NUL byte
+        // inside the table alias, an EMPTY PRIMARY KEY column, and a metric
+        // whose expr is a single space with a trailing COMMENT. `output_type`
+        // (also NUL-bearing) is not rendered, so it is irrelevant. The metric
+        // expr `" "` is emitted verbatim on the first render but TRIMMED to ""
+        // by the parser on re-parse — a free-form expr cannot be quote-protected,
+        // so the strong fixpoint is unsatisfiable. `render` must still be
+        // idempotent on the parser-produced definition (converge-once).
+        let def = SemanticViewDefinition {
+            tables: vec![TableRef {
+                alias: "emasemant\0".to_string(),
+                table: "e".to_string(),
+                pk_columns: vec![String::new()],
+                ..Default::default()
+            }],
+            metrics: vec![Metric {
+                name: "m".to_string(),
+                expr: " ".to_string(),
+                output_type: Some("gint\0".to_string()),
+                comment: Some("im regp seeum".to_string()),
+                access: AccessModifier::Public,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_render_fixpoint(&def);
     }
 
     #[test]
