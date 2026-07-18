@@ -1,0 +1,42 @@
+name: Docs Check
+
+# Lightweight documentation build check (Sphinx with -W, warnings as errors).
+#
+# This is deliberately NOT gated by `paths-ignore`, so it runs on
+# documentation/text-only changes: it is the "text lint" that keeps running
+# when the heavier build/test/fuzz workflows are skipped for markdown-only
+# changes (see the paths-ignore blocks in BuildAll / BuildQuick / CodeQuality /
+# IntegrationChecks). The docs site includes CHANGELOG.md and README content via
+# MyST, so a markdown edit really can break the build.
+#
+# Pushes to `main` build AND deploy the docs via Docs.yml (the same `-W` build),
+# so `main` is excluded here to avoid a duplicate build.
+on:
+  push:
+    tags-ignore:
+      - '**'
+    branches-ignore:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs-check:
+    name: Docs build check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Build docs (warnings as errors)
+        run: uv run --project docs sphinx-build -b html -W docs docs/_build/html
