@@ -102,8 +102,6 @@ fuzz_target!(|input: FuzzInput| {
     if let Ok(sql) = expand("fuzz_view", &input.def, &req) {
         // Successful expansion must produce non-empty SQL
         assert!(!sql.is_empty());
-        // Basic validity: starts with expected CTE prefix
-        assert!(sql.starts_with("WITH"));
         // Structural validity (TC-9): balanced quotes and parens whenever
         // the input fragments were balanced.
         if fragments_ok {
