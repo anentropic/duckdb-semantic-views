@@ -514,11 +514,13 @@ cargo +nightly fuzz list          # see available targets
 | `fuzz_query_names` | Fuzzes dimension/metric name strings against a fixed known-good definition | SQL injection via user-supplied column names, quoting bugs, name resolution panics |
 | `fuzz_parser_override_ffi` | Drives the `parser_override` FFI entry path with fuzzed input | Panics crossing the FFI boundary; unexpected rc / error propagation |
 
-> **Note:** most targets accumulate a coverage corpus under `fuzz/corpus/<target>/` (gitignored) seeded from `fuzz/seeds/<target>/`. The corpus/seed directory wiring is tracked as a known CI gap (see the code review notes / TECH-DEBT); `just fuzz` creates the directories locally as needed.
+> **Note:** most targets accumulate a coverage corpus under `fuzz/corpus/<target>/` (gitignored) seeded from `fuzz/seeds/<target>/` (committed). Both directories are passed to libFuzzer — `cargo fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- …` in `Fuzz.yml` and the `just fuzz` / `just fuzz-all` recipes — so committed seed files ARE used as starting inputs. `Fuzz.yml` creates the (gitignored) dirs before running; the older "corpus/seed wiring is a CI gap" note is resolved (CI-1, #135).
+
+> **Fuzz oracle design (TECH-DEBT #33):** the two struct-domain targets (`fuzz_render_roundtrip`, `fuzz_sql_expand`) and `fuzz_query_names` use hand-rolled *structural* oracles (converge-once render idempotence; balanced quotes/parens) rather than executing SQL, so they stay fast and DuckDB-free. Their preconditions must cover every fragment interpolated verbatim into the output — the recurring bug class was an *incomplete* precondition, not a wrong approach. The heavier "does DuckDB accept/return the right rows for the expanded SQL" oracle lives in the proptests (`tests/differential_proptest.rs`, which executes against in-memory DuckDB); the exact `parse(render(def)) == def` round-trip lives in `tests/roundtrip_proptest.rs`. A full trust-boundary redesign was considered and declined — see TECH-DEBT #33.
 
 ### Corpus Management
 
-The fuzzer saves coverage-increasing inputs to `fuzz/corpus/<target>/`. This corpus is committed to the repo so everyone (and CI) starts from the same base.
+The fuzzer saves coverage-increasing inputs to `fuzz/corpus/<target>/`, which is **gitignored** (`.gitignore`: "grows locally, bootstraps from fuzz/seeds/ on fresh clone") — it is regenerated locally and in CI, not committed. The shared base everyone (and CI) starts from is the committed `fuzz/seeds/<target>/`. To add a durable repro or a known-tricky input the whole team should start from, commit it under `fuzz/seeds/<target>/`, **not** the corpus.
 
 ```bash
 just fuzz-cmin                          # minimize corpus for default target (removes redundant inputs)
