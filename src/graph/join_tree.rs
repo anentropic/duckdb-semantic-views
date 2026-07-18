@@ -16,7 +16,7 @@
 //! different edges, and merging them would change which path the fan-trap check
 //! inspects.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::relationship::RelationshipGraph;
 
@@ -60,11 +60,23 @@ impl JoinTree {
     }
 
     /// Walk from `node` to the root, returning the chain including `node`
-    /// itself (`[node, parent, …, root]`; the last element is the root).
+    /// itself (`[node, parent, …, root]`). In a well-formed acyclic tree the
+    /// last element is the root; on a malformed CYCLIC parent map the walk stops
+    /// at the first revisited node, so the chain may end before the root (#141).
     pub(crate) fn ancestors_to_root(&self, node: &str) -> Vec<String> {
         let mut chain = vec![node.to_string()];
         let mut current = node.to_string();
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(current.clone());
         while let Some(parent) = self.parent.get(&current) {
+            // A validated relationship tree has an acyclic parent map, but a
+            // MALFORMED cyclic definition (a -> b -> a) yields a cyclic map here
+            // — stop at the first repeat so the walk is total instead of looping
+            // forever (issue #141: this was an unbounded `Vec` push → OOM in
+            // `check_fan_traps`).
+            if !seen.insert(parent.clone()) {
+                break;
+            }
             chain.push(parent.clone());
             current = parent.clone();
         }
@@ -73,14 +85,22 @@ impl JoinTree {
 
     /// Build the chain `[start, parent, …, ancestor]` by walking toward the
     /// root. Stops early (returning a partial chain) if the parent chain breaks
-    /// before reaching `ancestor`.
+    /// before reaching `ancestor`, or — on a malformed cyclic parent map — if a
+    /// node is revisited before `ancestor` is reached (#141).
     pub(crate) fn path_to_ancestor(&self, start: &str, ancestor: &str) -> Vec<String> {
         let mut path = vec![start.to_string()];
         let mut current = start.to_string();
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(current.clone());
         while current != ancestor {
             let Some(parent) = self.parent.get(&current) else {
                 break;
             };
+            // Cyclic parent map guard (see `ancestors_to_root` / issue #141):
+            // if `ancestor` is not on the chain, a cyclic map would loop forever.
+            if !seen.insert(parent.clone()) {
+                break;
+            }
             path.push(parent.clone());
             current = parent.clone();
         }
@@ -152,6 +172,42 @@ mod tests {
         assert_eq!(
             tree.path_to_ancestor("leaf", "root"),
             vec!["leaf", "mid", "root"]
+        );
+    }
+
+    #[test]
+    fn walks_terminate_on_cyclic_parent_map() {
+        // #141: a cyclic relationship graph (a -> b -> a) yields a cyclic
+        // child->parent map. The parent-chain walks must TERMINATE — before the
+        // fix they looped forever, pushing to the chain Vec until OOM (a hang in
+        // check_fan_traps). A malformed cyclic map is not a validated tree, so we
+        // only require the walks to stop with no node repeated, not a specific
+        // ordering.
+        let mut parent = HashMap::new();
+        parent.insert("a".to_string(), "b".to_string());
+        parent.insert("b".to_string(), "a".to_string());
+        let tree = JoinTree::from_parts("a", parent);
+
+        let chain = tree.ancestors_to_root("b");
+        assert!(
+            chain.len() <= 2,
+            "ancestors_to_root did not stop at the cycle: {chain:?}"
+        );
+        let mut deduped = chain.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            chain.len(),
+            "cycle revisited a node: {chain:?}"
+        );
+
+        // `ancestor` deliberately absent from the chain, so a naive walk never
+        // reaches it and loops the cycle forever.
+        let path = tree.path_to_ancestor("b", "not-on-chain");
+        assert!(
+            path.len() <= 2,
+            "path_to_ancestor did not stop at the cycle: {path:?}"
         );
     }
 
