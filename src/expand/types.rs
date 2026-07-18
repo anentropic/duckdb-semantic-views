@@ -348,6 +348,19 @@ pub enum ExpandError {
     /// source tables multiplies `metric_table`'s rows, silently inflating
     /// `metric_name` (fan trap / chasm trap between metric grains).
     MetricFanTrap { detail: Box<MetricFanTrapError> },
+    /// A metric aggregates a table that fans out relative to the query's base
+    /// (root) table. The generated SQL is always anchored `FROM <root>`, so if
+    /// the metric's source table is a parent/ancestor of the root across a
+    /// many-to-one edge, the metric's rows are duplicated once per root row and
+    /// the aggregate is silently inflated — even when the metric is queried
+    /// alone with no other metric or dimension to trigger the pairwise checks
+    /// (EXP-1, code-review 2026-07-18).
+    RootGrainFanTrap {
+        view_name: String,
+        metric_name: String,
+        metric_table: String,
+        relationship_name: String,
+    },
     /// The stored definition's relationship graph could not be rebuilt at
     /// query time, so safety checks (fan-trap detection) cannot run.
     UncheckableDefinition { view_name: String, reason: String },
@@ -538,6 +551,23 @@ impl fmt::Display for ExpandError {
                      tables via relationship '{relationship_name}' (many-to-one cardinality) \
                      duplicates rows of '{metric_table}' and would inflate '{metric_name}'. \
                      Query the metrics separately, or restructure the relationship."
+                )
+            }
+            Self::RootGrainFanTrap {
+                view_name,
+                metric_name,
+                metric_table,
+                relationship_name,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': fan trap detected -- metric '{metric_name}' \
+                     (table '{metric_table}') aggregates a table that fans out relative to the \
+                     query's base table via relationship '{relationship_name}' (many-to-one \
+                     cardinality): the query is anchored FROM the base table, so '{metric_table}' \
+                     rows are duplicated once per base-table row and '{metric_name}' would be \
+                     inflated. Query this metric at the base table's grain, or restructure the \
+                     relationship."
                 )
             }
             Self::UncheckableDefinition { view_name, reason } => {

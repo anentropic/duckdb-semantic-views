@@ -8,7 +8,7 @@ use super::*;
 use crate::expand::facts::{inline_derived_metrics, toposort_facts};
 use crate::expand::test_helpers::{minimal_def, TestFixtureExt};
 use crate::model::{
-    AccessModifier, Dimension, Fact, Join, Metric, SemanticViewDefinition, TableRef,
+    AccessModifier, Cardinality, Dimension, Fact, Join, Metric, SemanticViewDefinition, TableRef,
 };
 
 #[test]
@@ -320,10 +320,17 @@ fn resolve_joins_includes_transitive_deps_from_derived() {
                 ..Default::default()
             },
         ],
+        // OneToOne (declared): `avg_order_value` fuses base metrics on two
+        // tables (`revenue` on li, `order_count` on o). Across a ManyToOne edge
+        // that is now a fan trap (EXP-2, exercised by the fan_trap tests); this
+        // test's purpose is the ORTHOGONAL mechanic that a derived metric pulls
+        // its transitive dependency's join (`li`) into resolution, so the edge
+        // is declared OneToOne to keep the query legal and reach that assertion.
         joins: vec![Join {
             table: "o".to_string(),
             from_alias: "li".to_string(),
             fk_columns: vec!["order_id".to_string()],
+            cardinality: Cardinality::OneToOne,
             ..Default::default()
         }],
         facts: vec![],
