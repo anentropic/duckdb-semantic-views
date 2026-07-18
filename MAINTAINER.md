@@ -55,54 +55,71 @@ After `just build`, the extension binary is at `build/debug/semantic_views.duckd
 
 ```
 src/
-├── lib.rs                     # Extension entrypoint -- registers functions and parser hook with DuckDB
-├── model.rs                   # Data types: SemanticViewDefinition, Dimension, Metric, Fact, etc.
-│                              #   Handles validation and semantic model representation
-├── catalog.rs                 # In-memory catalog (HashMap) + pragma_query_t persistence
-│                              #   Manages the semantic_layer._definitions table
-├── expand.rs                  # SQL generation engine -- turns definitions + query requests into SQL
-│                              #   Pure Rust, no DuckDB dependency at runtime
-├── body_parser.rs             # DDL body parser -- state machine for TABLES/RELATIONSHIPS/FACTS/
-│                              #   HIERARCHIES/DIMENSIONS/METRICS clauses
-├── ddl_kind.rs                # DdlKind enum -- all DDL statement variants (CREATE, DROP, ALTER, etc.)
-├── parser_trampoline.rs       # Rust FFI trampoline for parser hook -- detects and parses DDL statements
-├── ddl/                       # DDL execution (only compiled for the extension build)
-│   ├── mod.rs                 #   Module declarations
-│   ├── create.rs              #   CREATE SEMANTIC VIEW execution
-│   ├── drop.rs                #   DROP SEMANTIC VIEW execution
-│   ├── alter.rs               #   ALTER SEMANTIC VIEW execution
-│   ├── show.rs                #   SHOW SEMANTIC VIEWS / DIMENSIONS / METRICS / FACTS
-│   └── describe.rs            #   DESCRIBE SEMANTIC VIEW
+├── lib.rs                     # Extension entrypoint — registers table functions + the parser_override hook
+├── model.rs                   # Core data types: SemanticViewDefinition, Dimension, Metric, Fact, Relationship…
+├── errors.rs                  # Typed error surface (ParseError + optional caret) for the CREATE/parse boundary
+├── ident.rs                   # Identifier grammar: quoting, case-folding, qualified-name splitting
+├── expr_tokens.rs             # Quote/literal-aware tokenizer for stored SQL expressions (reference find/inline)
+├── sql_lit.rs                 # SqlLit newtype — makes "forgot to escape a string literal" a compile error
+├── util.rs                    # Shared lexical helpers (is_ident_byte, blank_sql_comments, dollar-tag grammar)
+├── ffi_util.rs                # FFI seam helpers: buffer handoff, UTF-8-safe error truncation
+├── render_ddl.rs              # SemanticViewDefinition → CREATE SEMANTIC VIEW text (GET_DDL)
+├── render_yaml.rs             # SemanticViewDefinition → YAML
+│
+├── body_parser/               # Tokenizer + clause-body parser for the CREATE body (pure, always compiled)
+│   ├── lexer.rs cursor.rs scan.rs clause_bounds.rs   #   token layer, cursor, clause bounds
+│   ├── tables.rs relationships.rs metrics.rs entries.rs
+│   ├── annotations.rs window.rs materializations.rs
+│   └── mod.rs
+├── parse/                     # Statement-level DDL orchestration + parser_override FFI (write side)
+│   ├── ffi.rs                 #   FFI entry points: sv_parser_override_rust / sv_parse_function_rust
+│   ├── detect.rs              #   DDL-prefix detection
+│   ├── rewrite.rs             #   rewrite_to_native_sql: recognised DDL → native SQL (or error)
+│   ├── create_body.rs         #   CREATE front door (validate_and_rewrite)
+│   ├── native_sql.rs          #   INSERT/UPDATE/DELETE emission on _definitions
+│   ├── show_clauses.rs        #   SHOW … clause parsing
+│   └── mod.rs
+├── graph/                     # Relationship graph: cardinality, join tree, toposort, derived-metric DAG
+│   ├── relationship.rs cardinality.rs join_tree.rs toposort.rs
+│   ├── derived_metrics.rs facts.rs using.rs names.rs
+│   └── mod.rs
+├── expand/                    # Query expansion: definition + QueryRequest → SQL (pure, always compiled)
+│   ├── mod.rs resolution.rs join_resolver.rs sql_gen.rs select_spec.rs types.rs
+│   ├── facts.rs fan_trap.rs semi_additive.rs window.rs wildcard.rs role_playing.rs materialization.rs
+│   └── tests_*.rs             #   behaviour-named extracted test modules
+├── catalog/                   # Reads/writes of semantic_layer._definitions
+│   ├── mod.rs                 #   CatalogReader (fresh-per-call connection) + RAII PreparedStmt/QueryResult guards
+│   └── writes.rs              #   write-side race guards
+├── ddl/                       # DDL execution + read-side table functions (only compiled under --features extension)
+│   ├── define.rs              #   CREATE-time enrichment (PK lookup, type inference)
+│   ├── describe.rs get_ddl.rs list.rs
+│   ├── show_columns.rs show_entities.rs show_dims_for_metric.rs show_materializations.rs
+│   ├── read_ffi.rs read_yaml.rs alter_helpers_ffi.rs   #   FFI seam types (BorrowedConnection, dispatchers)
+│   └── mod.rs
 └── query/                     # Query interface
-    ├── mod.rs                 #   Module declarations
-    ├── table_function.rs      #   semantic_view() -- the main table function (FFI-heavy, extension-only)
-    ├── explain.rs             #   explain_semantic_view() -- expanded SQL + EXPLAIN plan (extension-only)
+    ├── table_function.rs      #   semantic_view() — main table function (FFI-heavy, extension-only)
+    ├── explain.rs             #   explain_semantic_view() — expanded SQL + EXPLAIN plan (extension-only)
     ├── wire.rs                #   Pure wire-format/SQL-shape helpers (always compiled + unit-tested)
-    └── error.rs               #   Query-specific error types (extension-only)
+    ├── error.rs               #   Query-specific error types (extension-only)
+    └── mod.rs
 
-fuzz/                          # Fuzz testing (independent Cargo crate)
-├── Cargo.toml                 #   Depends on semantic_views with "arbitrary" feature
-├── fuzz_targets/
-│   ├── fuzz_json_parse.rs     #   Target 1: arbitrary bytes -> JSON parser
-│   ├── fuzz_sql_expand.rs     #   Target 2: arbitrary definitions + names -> expand()
-│   └── fuzz_query_names.rs    #   Target 3: fuzzed name arrays against fixed definition
-└── corpus/                    #   Seed inputs and fuzzer-discovered inputs (committed to repo)
-    └── fuzz_json_parse/       #   Seed JSON files for the JSON parsing target
+fuzz/                          # Fuzz testing (independent Cargo crate; depends on semantic_views + "arbitrary")
+├── fuzz_targets/              #   Eight targets — see the Fuzzing section for what each covers
+│   ├── fuzz_json_parse.rs fuzz_yaml_parse.rs fuzz_ddl_parse.rs fuzz_keyword_body.rs
+│   └── fuzz_sql_expand.rs fuzz_query_names.rs fuzz_render_roundtrip.rs fuzz_parser_override_ffi.rs
+├── seeds/                     #   Committed seed inputs (per target)
+└── corpus/                    #   Fuzzer-discovered inputs (gitignored)
 
 test/
-├── sql/                       # SQL logic tests (run by DuckDB's test runner)
-│   ├── semantic_views.test    #   Core semantic_views extension test
-│   ├── phase2_ddl.test        #   DDL round-trip tests
-│   └── phase4_query.test      #   Query interface tests
-└── integration/               # Python integration tests
-    └── test_ducklake.py       #   DuckLake/Iceberg integration test
+├── sql/                       # sqllogictest files (run via test/sql/TEST_LIST — drift is a CI error)
+│   └── *.test                 #   e.g. phase4_query.test, phase29_facts.test, phase47_semi_additive.test
+└── integration/               # Python integration suites (test_ducklake_ci.py, test_differential.py, …)
 
-.github/workflows/             # CI pipelines
-├── BuildQuick.yml             #   Fast PR checks (Linux x86_64 only)
-├── BuildAll.yml               #   Full 5-platform build on main
-├── CodeQuality.yml            #   Formatting, linting, coverage
-├── DuckDBVersionMonitor.yml   #   Weekly check for new DuckDB releases
-└── Fuzz.yml                   #   Fuzzing on push to main, with crash reporting
+.github/workflows/             # CI pipelines — see the CI Workflows section for triggers
+├── BuildQuick.yml BuildAll.yml            #   extension build + sqllogictest (branch / main)
+├── CodeQuality.yml IntegrationChecks.yml  #   lint+coverage / DuckLake+Python integration
+├── DocsCheck.yml Docs.yml                 #   docs build check (branches) / build+deploy (main)
+└── Fuzz.yml DuckDBVersionMonitor.yml PublishExtension.yml
 ```
 
 ### Data Flow
@@ -112,17 +129,17 @@ Every recognised DDL form is rewritten by `parser_override` into native SQL that
 ```
 DDL (CREATE / DROP / ALTER / DESCRIBE / SHOW / GET_DDL / READ_YAML / FROM YAML FILE)
    └── C++ parser_override hook (cpp/src/shim.cpp::sv_parser_override)
-   └── Rust FFI trampoline (src/parse.rs::sv_parser_override_rust)
-   └── rewrite_to_native_sql
+   └── Rust FFI trampoline (src/parse/ffi.rs::sv_parser_override_rust)
+   └── rewrite_to_native_sql (src/parse/rewrite.rs)
          ├── validate_and_rewrite (canonical body parser → table-function-call SQL or sentinel)
          ├── rewrite_create / rewrite_yaml_file_create  (writes: INSERT/UPDATE/DELETE on _definitions)
-         ├── rewrite_drop_or_alter                       (writes: with race-guard SELECT prefix)
+         ├── drop / alter rewrite                        (writes: with race-guard SELECT prefix)
          └── (read-side pass-through: SELECT * FROM <read_side_fn>(...))
    └── publish_owned_sql → C++ Parser::ParseQuery (DEFAULT_OVERRIDE so the hook does not recurse)
    └── DuckDB executes the resulting SQLStatement(s) on the caller's connection.
 
 semantic_view('shop', dimensions := [...], metrics := [...])
-   └── Standard table function. Bind reads the definition via catalog.rs::CatalogReader,
+   └── Standard table function. Bind reads the definition via catalog::CatalogReader,
        expand/ generates SQL, DuckDB executes it.
 ```
 
@@ -140,7 +157,7 @@ GROUP BY
 
 #### Two FALLBACK_OVERRIDE quirks worth knowing
 
-1. **DuckDB silently drops `DISPLAY_EXTENSION_ERROR` from `parser_override` in FALLBACK mode** (`ParseInternal` in the v1.5.2 amalgamation). The success path is unaffected — `parser_override` rewrites recognised DDL into native SQL on the caller's connection. For *validation* errors (e.g. `semantic view 'X' does not exist`, unknown clause), `parser_override` instead returns `DISPLAY_ORIGINAL_ERROR`; the default parser then fails on the unrecognised DDL prefix; DuckDB calls our registered `parse_function`, which re-runs validation and returns `DISPLAY_EXTENSION_ERROR` with `error_location` set to the offending byte offset. `ParserException::SyntaxError` formats the caret automatically. See `sv_parse_function_rust` in `src/parse.rs`. (TECH-DEBT 22 was resolved by this mechanism in Phase 62; the older `sql_throwing` / synthesised-`SELECT error('...')` workaround was deleted.)
+1. **DuckDB silently drops `DISPLAY_EXTENSION_ERROR` from `parser_override` in FALLBACK mode** (`ParseInternal` in the v1.5.2 amalgamation). The success path is unaffected — `parser_override` rewrites recognised DDL into native SQL on the caller's connection. For *validation* errors (e.g. `semantic view 'X' does not exist`, unknown clause), `parser_override` instead returns `DISPLAY_ORIGINAL_ERROR`; the default parser then fails on the unrecognised DDL prefix; DuckDB calls our registered `parse_function`, which re-runs validation and returns `DISPLAY_EXTENSION_ERROR` with `error_location` set to the offending byte offset. `ParserException::SyntaxError` formats the caret automatically. See `sv_parse_function_rust` in `src/parse/ffi.rs`. (TECH-DEBT 22 was resolved by this mechanism in Phase 62; the older `sql_throwing` / synthesised-`SELECT error('...')` workaround was deleted.)
 2. **`CALL disable_peg_parser()` resets `allow_parser_override_extension` to `default`,** which silently bypasses our hook. After toggling PEG you must re-issue `SET allow_parser_override_extension='FALLBACK'`. The extension installs `FALLBACK` on load, so a process that never enables PEG is unaffected. See TECH-DEBT.md item 21.
 
 ### Feature Flag Split
@@ -165,7 +182,7 @@ Definitions live in `semantic_layer._definitions` (a regular DuckDB table that p
 
 The split exists because read-side table function bind hooks do not (currently) expose the executing connection through libduckdb-sys, so DESCRIBE / SHOW use `catalog_conn` even when called from inside an open transaction. Documented limitation; see TECH-DEBT item 19.
 
-The in-memory `CatalogState` HashMap mirror was removed in v0.8.0 (Phase 58); Phase 61 added internal `PreparedStmt` / `QueryResult` RAII guards in `catalog::reader` so error paths no longer juggle manual `duckdb_destroy_*` calls.
+The in-memory `CatalogState` HashMap mirror was removed in v0.8.0 (Phase 58); Phase 61 added internal `PreparedStmt` / `QueryResult` RAII guards in `catalog` (`src/catalog/mod.rs`) so error paths no longer juggle manual `duckdb_destroy_*` calls.
 
 ## Building
 
@@ -213,14 +230,16 @@ Fix: `rustup update stable`
 |---------|---------------|--------------|
 | `just test-rust` | Unit tests (model, catalog, expand) | Runs `cargo nextest run` with bundled DuckDB -- fast, no extension loading |
 | `just test-sql` | SQL logic tests (DDL + query round-trips) | Builds the extension, loads it in DuckDB, runs `test/sql/*.test` files |
-| `just test-iceberg` | DuckLake/Iceberg integration | Builds extension, runs Python test against DuckLake-managed Iceberg tables |
-| `just test-all` | All three above | Runs unit, SQL logic, and DuckLake tests sequentially |
+| `just test-ducklake-ci` | DuckLake integration (synthetic data) | Builds extension, runs the Python DuckLake CI test — the leg included in `test-all` |
+| `just test-ducklake` | DuckLake integration (real jaffle-shop data) | Builds extension, runs the Python test against DuckLake tables; requires `just setup-ducklake` first |
+| `just test-integration` | Python integration suites | Runs the full `test/integration/*.py` suite list (caret, ADBC, multi-db, concurrency, differential, …) |
+| `just test-all` | Rust + SQL logic + DuckLake CI + integration | Runs `test-rust`, `test-sql`, `test-ducklake-ci`, and `test-integration` sequentially |
 | `just coverage` | Coverage report | Runs unit tests with `cargo-llvm-cov`, fails if below 80% line coverage |
 | `just lint` | Code quality | `cargo fmt --check` + `cargo clippy` + `cargo deny check` |
 
 ### The Critical Difference: `cargo test` vs `just test-sql`
 
-`cargo test` (or `just test-rust`) runs unit tests with a **bundled** DuckDB compiled into the test binary. It exercises `model.rs`, `catalog.rs`, and `expand.rs` -- the pure Rust logic.
+`cargo test` (or `just test-rust`) runs unit tests with a **bundled** DuckDB compiled into the test binary. It exercises `model.rs`, `catalog/`, and `expand/` -- the pure Rust logic.
 
 `just test-sql` builds the **actual extension binary** and loads it into a real DuckDB process via `LOAD`. This catches:
 - ABI mismatches between the Rust code and the DuckDB version
@@ -254,7 +273,7 @@ The DuckLake integration test requires one-time setup:
 
 ```bash
 just setup-ducklake   # downloads jaffle-shop data, creates DuckLake catalog (idempotent)
-just test-iceberg     # runs the integration test
+just test-ducklake    # runs the integration test against the real jaffle-shop data
 ```
 
 This test verifies that `semantic_view()` works against DuckLake-managed Iceberg tables with real data (the jaffle-shop dataset).
@@ -454,7 +473,8 @@ just test-all
 
 ### CI Coverage
 
-Both branches run the full Build.yml pipeline on push. The DuckDB Version Monitor
+Both branches run the full build pipeline on push (`BuildAll` on `main`, `BuildQuick` on
+other branches), plus `CodeQuality` and `IntegrationChecks`. The DuckDB Version Monitor
 checks for new releases of both the latest and LTS version lines (weekly, Monday 09:00 UTC).
 
 ## Fuzzing
@@ -476,18 +496,25 @@ The nightly toolchain is only used for fuzzing. All other development uses stabl
 just fuzz                         # run default target (fuzz_json_parse) for 5 minutes
 just fuzz fuzz_sql_expand         # run a specific target for 5 minutes
 just fuzz fuzz_sql_expand 10      # run a specific target for 10 seconds
-just fuzz-all                     # run all three targets sequentially (15 min total)
-just fuzz-all 60                  # run all three targets for 60 seconds each
+just fuzz-all                     # run all eight targets sequentially (5 min each, 40 min total)
+just fuzz-all 60                  # run all eight targets for 60 seconds each
 cargo +nightly fuzz list          # see available targets
 ```
 
-### The Three Fuzz Targets
+### The Eight Fuzz Targets
 
 | Target | What It Fuzzes | What It Catches |
 |--------|---------------|-----------------|
 | `fuzz_json_parse` | Feeds arbitrary bytes to `SemanticViewDefinition::from_json()` | Panics in JSON parsing, unexpected serde behavior on malformed input |
-| `fuzz_sql_expand` | Generates arbitrary `SemanticViewDefinition` structs + name arrays, feeds to `expand()` | Panics in SQL generation, assertion failures, malformed SQL from edge-case definitions |
+| `fuzz_yaml_parse` | Feeds arbitrary bytes to the YAML import path | Panics / serde surprises in YAML deserialization |
+| `fuzz_ddl_parse` | Arbitrary bytes → `plan_rewrite` (the full CREATE/DDL front door) | Panics or hangs in DDL parsing on malformed statements |
+| `fuzz_keyword_body` | Arbitrary bytes → `parse_keyword_body` (bypasses prefix detection) | Panics in the clause-body parser; asserts anything parsed also renders |
+| `fuzz_render_roundtrip` | Generated definitions → render → parse → render | Break in the fixpoint `render(parse(render(def))) == render(def)` |
+| `fuzz_sql_expand` | Arbitrary `SemanticViewDefinition` + name arrays → `expand()` | Panics/assertion failures in SQL generation; quote/paren imbalance in the emitted SQL |
 | `fuzz_query_names` | Fuzzes dimension/metric name strings against a fixed known-good definition | SQL injection via user-supplied column names, quoting bugs, name resolution panics |
+| `fuzz_parser_override_ffi` | Drives the `parser_override` FFI entry path with fuzzed input | Panics crossing the FFI boundary; unexpected rc / error propagation |
+
+> **Note:** most targets accumulate a coverage corpus under `fuzz/corpus/<target>/` (gitignored) seeded from `fuzz/seeds/<target>/`. The corpus/seed directory wiring is tracked as a known CI gap (see the code review notes / TECH-DEBT); `just fuzz` creates the directories locally as needed.
 
 ### Corpus Management
 
@@ -516,7 +543,7 @@ The `fuzz/artifacts/` directory is gitignored -- crash artifacts are debugging d
 
 ### CI Fuzzing
 
-The `Fuzz.yml` workflow runs all three targets on push to `main` (10 minutes each). Crash detection works by checking for artifact files (not the fuzzer exit code), so build failures or timeouts do not trigger false positives.
+The `Fuzz.yml` workflow runs all eight targets (10 minutes each) on any push that touches `src/**`, `fuzz/**`, or the Cargo manifests (a path-filtered trigger, so documentation-only pushes skip it). Crash detection works by checking for artifact files (not the fuzzer exit code), so build failures or timeouts do not trigger false positives.
 
 On a real crash:
 
@@ -617,7 +644,7 @@ Since v0.5.2, DDL is handled via parser hooks -- the C++ shim detects `CREATE/DR
 
 **1. Add the DDL kind:**
 
-In `src/ddl_kind.rs`, extend the `DdlKind` enum:
+In the `parse` module (the `DdlKind` enum lives in `src/parse/`), extend it:
 
 ```rust
 pub enum DdlKind {
@@ -629,9 +656,9 @@ pub enum DdlKind {
 }
 ```
 
-**2. Update the parser trampoline:**
+**2. Update the parse layer:**
 
-In `src/parser_trampoline.rs`, add detection for the `ALTER SEMANTIC VIEW` prefix and parse the `RENAME TO` clause.
+Add prefix detection in `src/parse/detect.rs` and the rewrite-to-native-SQL handling in `src/parse/rewrite.rs` for the `ALTER SEMANTIC VIEW … RENAME TO` form.
 
 **3. Add a SQL logic test:**
 
@@ -660,11 +687,11 @@ DROP SEMANTIC VIEW renamed
 
 ### Adding a New Metric Type
 
-Suppose you want to add a `window` metric type that generates a window function instead of an aggregate.
+Suppose you want to add a `window` metric type that generates a window function instead of an aggregate. (Window metrics already exist — see `WindowSpec` in `src/model.rs` and `src/expand/window.rs`; this walks the general shape of such a change.)
 
 **1. Update the body parser:**
 
-In `src/body_parser.rs`, extend the METRICS clause parsing to accept a `WINDOW` keyword modifier:
+In `src/body_parser/metrics.rs`, extend the METRICS clause parsing to accept the window modifier:
 
 ```sql
 METRICS (
@@ -673,9 +700,9 @@ METRICS (
 )
 ```
 
-**2. Update `src/expand.rs`:**
+**2. Update the expansion layer (`src/expand/`):**
 
-In the `expand()` function, modify the SELECT item generation to handle window metrics differently:
+In the SELECT-item generation (`src/expand/sql_gen.rs`), handle window metrics differently:
 
 ```rust
 for met in &resolved_mets {
@@ -733,7 +760,7 @@ pip install duckdb==1.4.4
 
 ### `cargo test` passes but `just test-sql` fails
 
-**Why:** `cargo test` uses the `bundled` feature, which compiles DuckDB from source into the test binary. This bypasses the extension loading mechanism entirely. The `ddl/` and `query/` modules are not even compiled during `cargo test`. So a passing `cargo test` only validates the pure Rust logic in `model.rs`, `catalog.rs`, and `expand.rs`.
+**Why:** `cargo test` uses the `bundled` feature, which compiles DuckDB from source into the test binary. This bypasses the extension loading mechanism entirely. The `ddl/` and `query/` modules are not even compiled during `cargo test`. So a passing `cargo test` only validates the pure Rust logic in `model.rs`, `catalog/`, and `expand/`.
 
 `just test-sql` builds the actual extension (with `--features extension`) and loads it in a real DuckDB process. This catches FFI registration bugs, ABI mismatches, and SQL-level errors.
 
@@ -789,10 +816,18 @@ Do **not** set a directory-level nightly override (`rustup override set nightly`
 
 | Workflow | Trigger | What It Does |
 |----------|---------|--------------|
-| **BuildQuick** | Push to non-main branches | Fast feedback: builds and tests on Linux x86_64 only. Uses the DuckDB extension CI tools reusable workflow. |
-| **BuildAll** | Push to `main` | Full build across 5 platforms: Linux x86_64, Linux arm64, macOS x86_64, macOS arm64, Windows x86_64. Excluded: WASM, musl, mingw variants. |
-| **CodeQuality** | Push to `main`/`release/*` and PRs | Runs `cargo fmt --check`, `cargo clippy`, `cargo-deny` (license/advisory audit), and coverage check (80% minimum line coverage via `cargo-llvm-cov`). |
-| **DuckDBVersionMonitor** | Weekly (Monday 09:00 UTC) | Queries the DuckDB GitHub API for the latest release. If newer than the current pin, updates all four version locations, builds, and tests. Opens a version-bump PR on success or a breakage PR (tagging `@copilot`) on failure. |
-| **Fuzz** | Push to `main` | Runs all three fuzz targets for 10 minutes each. Detects crashes by checking for artifact files (not exit codes). Uploads crash artifacts, opens a GitHub issue, and fails the job on any crash. |
+| **BuildQuick** | Push to non-`main` branches (skips doc-only changes) | Fast feedback: extension build + full sqllogictest suite on Linux x86_64 only, via the DuckDB extension-ci-tools reusable workflow. |
+| **BuildAll** | Push to `main` (skips doc-only changes) | Full build across 5 platforms: Linux x86_64/arm64, macOS x86_64/arm64, Windows x86_64. Runs sqllogictest on each built platform except `linux_arm64`. Excludes WASM, musl, mingw variants. |
+| **CodeQuality** | Push to any branch (skips doc-only changes) | `TEST_LIST` sync check; `cargo fmt --check`; clippy (default **and** `--features extension`); doctests (default + the FFI `compile_fail` ABI guard); extension-feature unit tests; `cargo-deny` (license/advisory audit); 80%-line coverage floor via `cargo-llvm-cov`. |
+| **IntegrationChecks** | Push to any branch (skips doc-only changes) | DuckLake CI integration test **and** the full Python integration suite (`just test-integration`), each building the debug extension. |
+| **DocsCheck** | Push to non-`main` branches | Sphinx docs build with `-W` (warnings as errors). Deliberately **not** path-filtered, so documentation/text-only changes are still validated when the heavier workflows skip. |
+| **Docs** | Push to `main` | Same `-W` Sphinx build, then deploys the site to GitHub Pages. |
+| **Fuzz** | Push touching `src/**`, `fuzz/**`, or the Cargo manifests | Runs all eight fuzz targets for 10 minutes each. Detects crashes via artifact files (not exit codes), uploads them, opens a `bug`/`fuzzing` issue, and fails the job on any crash. |
+| **DuckDBVersionMonitor** | Weekly (Monday 09:00 UTC) + manual | Queries the DuckDB GitHub API for the latest / LTS release. If newer than the pin, updates all derived version locations, builds, and tests, then opens a version-bump PR on success or a breakage PR (tagging `@copilot`) on failure. |
+| **PublishExtension** | Manual (`workflow_dispatch`) only | Release automation for the Community Extension registry. |
 
-All workflows can be triggered manually via `workflow_dispatch` for debugging.
+Most workflows also accept a manual `workflow_dispatch` trigger for debugging.
+
+**Documentation-only skip.** `BuildAll`, `BuildQuick`, `CodeQuality`, and `IntegrationChecks` carry a shared `paths-ignore` (`**/*.md`, `_notes/**`, `docs/**`, `LICENSE`), so a commit that touches only documentation/text does not run the extension build, sqllogictest, Rust lint/coverage, or the integration suites. `Fuzz` achieves the same via its `paths` allowlist. `DocsCheck` is intentionally exempt so prose changes still get the `-W` docs build. A commit that also changes any non-doc file runs everything as normal. When editing these triggers, keep the four `paths-ignore` lists in sync.
+
+> **Gotcha:** `push` path filters are evaluated against the commits a push *introduces* (the `before..after` range), not the net branch/PR diff. A branch **restarted (force-pushed) on top of already-merged history** can therefore still trigger the heavy workflows, because the push range then includes the earlier non-doc commits (e.g. a squash-merge that touched `.github/workflows/`). A normal fast-forward doc-only push skips them as expected.
