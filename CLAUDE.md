@@ -151,3 +151,10 @@ If a command not on the list needs the bypass, halt and ask first.
 - New sqllogictest files must be added to `test/sql/TEST_LIST` or the runner will skip them.
 - For `statement error` assertions in sqllogictest, use the block form (`---- separator` +
   substring), not inline regex — the runner does not support inline form.
+- **Keep MAINTAINER.md in sync.** It documents the `src/` tree layout, the CI workflows and
+  their triggers, the Justfile test/fuzz recipes, the fuzz-target list, and the DuckDB
+  version-pin locations. Whenever you change any of those — add/rename/move/delete a module,
+  add or re-trigger a workflow, rename a `just` recipe, add or remove a fuzz target, bump the
+  version-pin plumbing — update the corresponding MAINTAINER.md section in the *same* change.
+  A structural change that leaves MAINTAINER.md describing the old layout is incomplete. The
+  same applies to any other doc that tracks these specifics (e.g. TECH-DEBT.md for debt items).
