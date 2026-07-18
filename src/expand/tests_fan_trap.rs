@@ -296,3 +296,66 @@ fn fan_trap_error_message_format() {
         "Must describe the cardinality direction"
     );
 }
+
+#[test]
+fn cyclic_relationships_do_not_hang_expand() {
+    // #141 (fuzz_sql_expand OOM): relationships forming a cycle (a -> b via r1,
+    // b -> a via r2) are parser-reachable and previously drove
+    // `check_fan_traps`' JoinTree parent-walk into an infinite loop, allocating
+    // until OOM. `expand` must now TERMINATE — this test hangs (→ CI timeout) if
+    // the JoinTree cycle guard regresses. The exact Ok/Err outcome for a
+    // malformed cyclic definition is unspecified; only termination is asserted.
+    let def = SemanticViewDefinition {
+        tables: vec![
+            TableRef {
+                alias: "a".to_string(),
+                table: "ta".to_string(),
+                pk_columns: vec!["id".to_string()],
+                ..Default::default()
+            },
+            TableRef {
+                alias: "b".to_string(),
+                table: "tb".to_string(),
+                pk_columns: vec!["id".to_string()],
+                ..Default::default()
+            },
+        ],
+        dimensions: vec![Dimension {
+            name: "d".to_string(),
+            expr: "a.c".to_string(),
+            source_table: Some("a".to_string()),
+            ..Default::default()
+        }],
+        metrics: vec![Metric {
+            name: "m".to_string(),
+            expr: "sum(b.v)".to_string(),
+            source_table: Some("b".to_string()),
+            ..Default::default()
+        }],
+        joins: vec![
+            Join {
+                from_alias: "a".to_string(),
+                table: "b".to_string(),
+                fk_columns: vec!["bid".to_string()],
+                ref_columns: vec!["id".to_string()],
+                name: Some("r1".to_string()),
+                cardinality: Cardinality::ManyToOne,
+            },
+            Join {
+                from_alias: "b".to_string(),
+                table: "a".to_string(),
+                fk_columns: vec!["aid".to_string()],
+                ref_columns: vec!["id".to_string()],
+                name: Some("r2".to_string()),
+                cardinality: Cardinality::ManyToOne,
+            },
+        ],
+        ..Default::default()
+    };
+    let req = QueryRequest {
+        dimensions: vec!["d".into()],
+        metrics: vec!["m".into()],
+        facts: vec![],
+    };
+    let _ = expand("v", &def, &req);
+}
