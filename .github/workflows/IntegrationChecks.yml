@@ -6,6 +6,16 @@ on:
       - '**'
     branches:
       - '**'
+    # Skip the DuckLake + Python integration builds for documentation/text-only
+    # changes (they build the debug extension and run the Python suites, which
+    # docs changes cannot affect). The docs build check runs separately in
+    # DocsCheck.yml so text/markdown changes are still validated. Keep this list
+    # in sync with BuildAll / BuildQuick / CodeQuality.
+    paths-ignore:
+      - '**/*.md'
+      - '_notes/**'
+      - 'docs/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 concurrency:
@@ -73,20 +83,3 @@ jobs:
       # and CI cannot drift.
       - name: Run Python integration suites
         run: just test-integration
-
-  docs-check:
-    name: Docs build check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-
-      - name: Build docs (warnings as errors)
-        run: uv run --project docs sphinx-build -b html -W docs docs/_build/html

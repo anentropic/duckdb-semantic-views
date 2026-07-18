@@ -3,6 +3,15 @@ name: "Build Extension: All Platforms"
 on:
   push:
     branches: ["main"]
+    # Skip the full-matrix build for documentation/text-only changes (the docs
+    # site itself is validated by Docs.yml / DocsCheck.yml). A commit that also
+    # touches any non-doc file still triggers a build. Keep this list in sync
+    # with BuildQuick / CodeQuality / IntegrationChecks.
+    paths-ignore:
+      - '**/*.md'
+      - '_notes/**'
+      - 'docs/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 concurrency:

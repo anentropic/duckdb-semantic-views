@@ -6,6 +6,15 @@ on:
       - '**'
     branches:
       - '**'
+    # Skip Rust lint/format/coverage for documentation/text-only changes; none
+    # of these steps touch the docs. A commit that also changes any non-doc
+    # file still runs. Keep this list in sync with BuildAll / BuildQuick /
+    # IntegrationChecks.
+    paths-ignore:
+      - '**/*.md'
+      - '_notes/**'
+      - 'docs/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 concurrency:

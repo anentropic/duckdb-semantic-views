@@ -8,6 +8,15 @@ on:
     # only negative patterns ("!main") matches nothing, which silently
     # disabled this workflow (it had zero runs before 2026-07-02).
     branches-ignore: ["main"]
+    # Skip the build + sqllogictest suite for documentation/text-only changes
+    # (validated by DocsCheck.yml instead). A commit that also touches any
+    # non-doc file still triggers a build. Keep this list in sync with
+    # BuildAll / CodeQuality / IntegrationChecks.
+    paths-ignore:
+      - '**/*.md'
+      - '_notes/**'
+      - 'docs/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 concurrency:

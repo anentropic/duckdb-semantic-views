@@ -29,6 +29,27 @@ just ci
 
 This adds linting (clippy pedantic + fmt + cargo-deny) and fuzz target compilation checks on top of `test-all`. The Rust toolchain version is pinned in `rust-toolchain.toml` and bumped automatically via Dependabot.
 
+## Bug Fixing & Refactoring Discipline
+
+**Fix bugs test-first.** Before changing any production code to fix a bug, first
+write a test that reproduces the issue and **fails** against the current code
+(run it, confirm the red). Only then write the fix, and confirm the same test
+goes green. This proves the bug was real, that the fix actually addresses it, and
+leaves a permanent regression guard behind. Prefer the layer that most directly
+exercises the defect — a `#[cfg(test)]`/`tests_*.rs` unit test for logic, a
+sqllogictest for anything on the extension-load → DDL → query path (added to
+`test/sql/TEST_LIST`). A "fix" landed without a failing-first test is incomplete.
+
+**Refactor coverage-forward.** A refactor must never silently reduce test
+coverage. Be alert for changes that quietly remove coverage — deleting or
+weakening an assertion, gating a test behind a feature/flag that CI doesn't
+exercise, dropping a `.test` file from `TEST_LIST`, narrowing a proptest
+generator so edge cases no longer occur, or asserting equality on a field the
+generator never populates (a vacuous check). When you move or rewrite code,
+carry its tests with it and strive to strengthen them; if a change genuinely
+must drop a test, say so explicitly and explain why rather than letting it vanish
+in a diff.
+
 ## Milestone Completion
 
 At the end of every milestone, before tagging:
