@@ -40,7 +40,30 @@ jobs:
         run: cargo fuzz build ${{ matrix.target }}
 
       - name: Run fuzzer
-        run: cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- -max_total_time=${{ env.FUZZ_TIME }} || true
+        run: |
+          # libFuzzer refuses to start if the corpus/seeds directories are
+          # absent (they are gitignored), exiting instantly — so create them
+          # first. Without this, 7 of 8 targets fuzzed nothing yet went green.
+          mkdir -p fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
+          set +e
+          cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- -max_total_time=${{ env.FUZZ_TIME }}
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          # A non-zero exit WITH a crash artifact is a real finding — the
+          # "Check for crash artifacts" step (and its uploader/issue/fail
+          # steps) owns that path, so let this step succeed and hand off.
+          if find fuzz/artifacts/${{ matrix.target }} -type f \( -name 'crash-*' -o -name 'oom-*' -o -name 'timeout-*' -o -name 'slow-unit-*' \) 2>/dev/null | grep -q .; then
+            echo "Fuzzer exited $rc with crash artifacts present — handled by crash-detection steps."
+            exit 0
+          fi
+          # Non-zero with NO artifacts means the fuzzer failed to start (bad
+          # corpus dir, build/link error, OOM before writing). Fail loudly
+          # instead of masking it with a trailing || true.
+          echo "::error::cargo fuzz run ${{ matrix.target }} failed to start (exit $rc) with no crash artifacts"
+          exit $rc
 
       - name: Check for crash artifacts
         id: check

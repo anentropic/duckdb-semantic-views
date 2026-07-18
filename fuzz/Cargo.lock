@@ -1695,6 +1695,8 @@ dependencies = [
  "arbitrary",
  "libfuzzer-sys",
  "semantic_views",
+ "serde_json",
+ "yaml_serde",
 ]
 
 [[package]]

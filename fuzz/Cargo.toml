@@ -11,6 +11,10 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 semantic_views = { path = "..", features = ["arbitrary"] }
+# Symmetric (de)serializers for the JSON / YAML parse-target round-trip oracles.
+# Kept at the same versions the parent crate pins so resolution is a no-op.
+serde_json = "1"
+yaml_serde = "0.10"
 
 # Prevent this from being absorbed into the parent workspace
 [workspace]

@@ -20,7 +20,7 @@
 
 use proptest::prelude::*;
 use semantic_views::model::{
-    AccessModifier, Dimension, Fact, Join, Metric, NonAdditiveDim, NullsOrder,
+    AccessModifier, Dimension, Fact, Join, Materialization, Metric, NonAdditiveDim, NullsOrder,
     SemanticViewDefinition, SortOrder, TableRef,
 };
 
@@ -116,6 +116,12 @@ type JoinSpec = (bool, Vec<String>, Option<Vec<String>>);
 type EntrySpec = (usize, String, String, bool, Option<String>, Vec<String>);
 /// Raw material for one metric: entry + (wants USING, wants NAB(order,nulls)).
 type MetricSpec = (EntrySpec, bool, Option<(SortOrder, NullsOrder)>);
+/// Raw material for one materialization: (name base, dimension include-mask,
+/// public-metric include-mask). The masks are zipped against the already-built
+/// dimension / public-metric name lists inside `prop_map`, so every reference
+/// resolves to a declared name by construction (mirroring how USING / NON
+/// ADDITIVE BY resolve against the built `joins` / `dimensions`).
+type MaterializationSpec = (String, Vec<bool>, Vec<bool>);
 
 /// All cross-references (USING → declared relationship, NON ADDITIVE BY →
 /// declared dimension) are resolved during assembly, so every generated
@@ -153,6 +159,13 @@ pub fn arb_canonical_def() -> impl Strategy<Value = SemanticViewDefinition> {
             prop::sample::select(vec![NullsOrder::First, NullsOrder::Last]),
         )),
     );
+    // Masks are sized to cover the maximum 2 dims / 2 metrics a def can hold, so
+    // a materialization can reference any subset of them.
+    let materialization_spec = (
+        arb_stored_ident(),
+        prop::collection::vec(any::<bool>(), 0..=2),
+        prop::collection::vec(any::<bool>(), 0..=2),
+    );
 
     (
         prop::collection::vec(table_spec, 1..=3),
@@ -160,9 +173,10 @@ pub fn arb_canonical_def() -> impl Strategy<Value = SemanticViewDefinition> {
         prop::collection::vec(entry_spec(3), 0..=2), // dims
         prop::collection::vec(entry_spec(3), 0..=2), // facts
         prop::collection::vec(metric_spec, 0..=2),
+        prop::collection::vec(materialization_spec, 0..=2),
     )
         .prop_map(
-            |(table_specs, join_specs, dim_specs, fact_specs, metric_specs)| {
+            |(table_specs, join_specs, dim_specs, fact_specs, metric_specs, mat_specs)| {
                 let tables: Vec<TableRef> = table_specs
                     .into_iter()
                     .enumerate()
@@ -312,12 +326,72 @@ pub fn arb_canonical_def() -> impl Strategy<Value = SemanticViewDefinition> {
                     })
                     .collect();
 
+                // MATERIALIZATIONS reference already-declared dimensions and
+                // metrics BY NAME. The body parser stores each name / table /
+                // ref verbatim (quote-aware split) and the renderer emits them
+                // verbatim, so referencing the exact declared `.name` strings
+                // round-trips. Metric refs are restricted to PUBLIC metrics —
+                // referencing a private metric may fail define-time validation
+                // on the CREATE front door. The parser also requires each entry
+                // to carry at least one of DIMENSIONS / METRICS, so an
+                // all-empty selection is forced to keep one valid reference.
+                let dim_names: Vec<String> = dimensions.iter().map(|d| d.name.clone()).collect();
+                let public_metric_names: Vec<String> = metrics
+                    .iter()
+                    .filter(|m| m.access == AccessModifier::Public)
+                    .map(|m| m.name.clone())
+                    .collect();
+                let materializations: Vec<Materialization> = if dim_names.is_empty()
+                    && public_metric_names.is_empty()
+                {
+                    // Nothing valid to reference ⇒ no materializations.
+                    Vec::new()
+                } else {
+                    mat_specs
+                        .into_iter()
+                        .enumerate()
+                        .map(
+                            |(i, (name_base, dim_mask, met_mask)): (usize, MaterializationSpec)| {
+                                let mut sel_dims: Vec<String> = dim_names
+                                    .iter()
+                                    .zip(dim_mask)
+                                    .filter(|(_, keep)| *keep)
+                                    .map(|(n, _)| n.clone())
+                                    .collect();
+                                let mut sel_mets: Vec<String> = public_metric_names
+                                    .iter()
+                                    .zip(met_mask)
+                                    .filter(|(_, keep)| *keep)
+                                    .map(|(n, _)| n.clone())
+                                    .collect();
+                                if sel_dims.is_empty() && sel_mets.is_empty() {
+                                    // Guarantee ≥1 reference (parser invariant).
+                                    if let Some(first) = dim_names.first() {
+                                        sel_dims.push(first.clone());
+                                    } else {
+                                        sel_mets.push(public_metric_names[0].clone());
+                                    }
+                                }
+                                Materialization {
+                                    // Distinct so entry names never collide.
+                                    name: distinct_name(&name_base, i),
+                                    // Bare, safe physical table name.
+                                    table: format!("mat_tbl_{i}"),
+                                    dimensions: sel_dims,
+                                    metrics: sel_mets,
+                                }
+                            },
+                        )
+                        .collect()
+                };
+
                 SemanticViewDefinition {
                     tables,
                     joins,
                     dimensions,
                     facts,
                     metrics,
+                    materializations,
                     ..Default::default()
                 }
             },

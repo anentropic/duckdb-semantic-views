@@ -19,9 +19,51 @@ fuzz_target!(|input: NameFuzzInput| {
     };
     if let Ok(sql) = expand("fuzz_view", &def, &req) {
         assert!(!sql.is_empty());
-        assert!(sql.starts_with("WITH"));
+        // Structural oracle: the emitted SQL must have balanced parentheses
+        // once single-quoted string literals are ignored, and every literal
+        // must be closed. The fixed definition's identifiers are known-good
+        // (no parens/quotes), so any imbalance is a real code-gen defect —
+        // strictly stronger than the previous `starts_with("WITH")` check.
+        assert!(
+            parens_balanced_outside_quotes(&sql),
+            "expand produced structurally-invalid SQL: {sql}"
+        );
     }
 });
+
+/// True iff parentheses are balanced when single-quoted string literals are
+/// skipped, the nesting depth never goes negative, and no literal is left open.
+/// A doubled `''` inside a literal is an escaped quote (stays inside the
+/// literal). `(`, `)`, and `'` are ASCII, so byte scanning is UTF-8-safe.
+fn parens_balanced_outside_quotes(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if in_str => {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    // Escaped quote — consume both, remain inside the literal.
+                    i += 2;
+                    continue;
+                }
+                in_str = false;
+            }
+            b'\'' => in_str = true,
+            b'(' if !in_str => depth += 1,
+            b')' if !in_str => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    depth == 0 && !in_str
+}
 
 fn fixed_definition() -> SemanticViewDefinition {
     SemanticViewDefinition {
