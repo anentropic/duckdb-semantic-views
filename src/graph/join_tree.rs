@@ -60,7 +60,9 @@ impl JoinTree {
     }
 
     /// Walk from `node` to the root, returning the chain including `node`
-    /// itself (`[node, parent, …, root]`; the last element is the root).
+    /// itself (`[node, parent, …, root]`). In a well-formed acyclic tree the
+    /// last element is the root; on a malformed CYCLIC parent map the walk stops
+    /// at the first revisited node, so the chain may end before the root (#141).
     pub(crate) fn ancestors_to_root(&self, node: &str) -> Vec<String> {
         let mut chain = vec![node.to_string()];
         let mut current = node.to_string();
@@ -83,7 +85,8 @@ impl JoinTree {
 
     /// Build the chain `[start, parent, …, ancestor]` by walking toward the
     /// root. Stops early (returning a partial chain) if the parent chain breaks
-    /// before reaching `ancestor`.
+    /// before reaching `ancestor`, or — on a malformed cyclic parent map — if a
+    /// node is revisited before `ancestor` is reached (#141).
     pub(crate) fn path_to_ancestor(&self, start: &str, ancestor: &str) -> Vec<String> {
         let mut path = vec![start.to_string()];
         let mut current = start.to_string();
