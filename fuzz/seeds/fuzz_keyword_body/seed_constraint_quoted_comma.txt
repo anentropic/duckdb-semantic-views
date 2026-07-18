@@ -1,0 +1,1 @@
+AS TABLES (o AS orders PRIMARY KEY ("id,x") UNIQUE ("a,b", "c)d")) DIMENSIONS (o.region AS o.region) METRICS (o.total AS SUM(o.amount))

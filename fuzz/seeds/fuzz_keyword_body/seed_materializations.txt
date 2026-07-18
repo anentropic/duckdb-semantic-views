@@ -1,0 +1,1 @@
+AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.total AS SUM(o.amount)) MATERIALIZATIONS (daily AS (TABLE daily_agg, DIMENSIONS (region), METRICS (total)), monthly AS (TABLE monthly_agg, METRICS (total)))
