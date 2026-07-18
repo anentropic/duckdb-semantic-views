@@ -50,6 +50,7 @@ pub(super) fn check_fan_traps(
     // the fact-path validator + the SHOW-dims filter (E-7). In a validated tree
     // each non-root node has exactly one parent via the reverse map.
     let tree = JoinTree::from_graph(&graph);
+    let root = tree.root().to_string();
 
     // For each metric + dimension pair, check for fan-out on the join path.
     //
@@ -64,7 +65,15 @@ pub(super) fn check_fan_traps(
     // (their inner aggregate is computed over the fanned join before the window
     // function runs); semi-additive metrics are now treated the same way.
     for met in resolved_mets {
-        let met_tables = metric_grain_tables(met, def);
+        // EXP-8: a base metric with no source table and no base-metric
+        // references has an empty grain set but sits at the root grain — the
+        // same substitution the EXP-1 root-grain and metric x metric loops make.
+        // Without it the inner loop below never runs, and a root-grain base
+        // metric paired with a fanning child dimension slips through the check.
+        let mut met_tables = metric_grain_tables(met, def);
+        if met_tables.is_empty() {
+            met_tables.push(root.clone());
+        }
 
         for dim in resolved_dims {
             let Some(ref dim_table_raw) = dim.source_table else {
@@ -128,12 +137,11 @@ pub(super) fn check_fan_traps(
     // reject a fan-out edge. A metric at or below the root grain (the root
     // itself, or a child on the FK/"many" side) traverses only safe forward
     // edges, so this never fires for it (nor for OneToOne edges).
-    let root = tree.root().to_string();
     for met in resolved_mets {
         let mut met_tables = metric_grain_tables(met, def);
-        // EXP-8: an empty grain set (legacy single-table `count(*)` with no
-        // source table and no base-metric refs) sits at the root grain, the
-        // same substitution the metric × metric loop makes below.
+        // EXP-8: an empty grain set (a base metric with no source table and no
+        // base-metric refs) sits at the root grain, the same substitution the
+        // metric x dimension and metric x metric loops make.
         if met_tables.is_empty() {
             met_tables.push(root.clone());
         }
@@ -1040,6 +1048,35 @@ mod tests {
                 result.is_ok(),
                 "Metric '{name}' at/below root grain must be allowed, got: {result:?}"
             );
+        }
+    }
+
+    /// EXP-8 (code-review 2026-07-18): a base-table metric with `source_table ==
+    /// None` and no base-metric references has an EMPTY grain set. The met x dim
+    /// loop must map that to the root grain (as the met x met loop already
+    /// does), or a root-grain base metric queried with a fanning child
+    /// dimension slips through the fence and silently inflates.
+    #[test]
+    fn test_check_fan_traps_empty_grain_base_metric_fanning_dim_errors() {
+        let def = minimal_def("o", "d", "d", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("li", "line_items", &["id"])
+            .with_dimension("item_name", "li.name", Some("li"))
+            // Base metric, source_table = None -> root grain, empty grain set.
+            .with_metric("total", "SUM(o.amount)", None)
+            .with_pkfk_join("li_o", "li", "o", &["order_id"], &["id"]);
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets) {
+            Err(ExpandError::FanTrap { detail }) => {
+                assert_eq!(detail.metric_name, "total");
+                assert_eq!(detail.dimension_name, "item_name");
+            }
+            other => panic!(
+                "Expected FanTrap for an empty-grain base metric with a fanning dim (EXP-8), \
+                 got: {other:?}"
+            ),
         }
     }
 
