@@ -520,7 +520,7 @@ cargo +nightly fuzz list          # see available targets
 
 ### Corpus Management
 
-The fuzzer saves coverage-increasing inputs to `fuzz/corpus/<target>/`. This corpus is committed to the repo so everyone (and CI) starts from the same base.
+The fuzzer saves coverage-increasing inputs to `fuzz/corpus/<target>/`, which is **gitignored** (`.gitignore`: "grows locally, bootstraps from fuzz/seeds/ on fresh clone") — it is regenerated locally and in CI, not committed. The shared base everyone (and CI) starts from is the committed `fuzz/seeds/<target>/`. To add a durable repro or a known-tricky input the whole team should start from, commit it under `fuzz/seeds/<target>/`, **not** the corpus.
 
 ```bash
 just fuzz-cmin                          # minimize corpus for default target (removes redundant inputs)
