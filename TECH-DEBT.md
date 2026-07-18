@@ -306,9 +306,26 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Resolution (2026-07-17):** `expand/semi_additive.rs` routes every NON ADDITIVE BY dimension through the **same** `find_using_context` the queried-dim path uses, via a new `na_dim_scoped_alias(view_name, def, met, na_dim)` helper (single-metric `USING` context per NA dim). The three outcomes mirror the queried-dim path exactly: not role-playing → `None` → raw expression (unchanged, backward-compatible); role-playing + one `USING` → `Some(scoped)` → the snapshot `ORDER BY` is rewritten to the scoped alias (`a__arr_airport.city`) and the redundant bare join is suppressed (`collect_na_dim_source_tables` skips it — the metric's `USING` already joins the scoped instance); role-playing + no/ambiguous `USING` → `Err(AmbiguousPath)` (fail loud, was silent-wrong). The resolved scoped alias is folded into the `collect_na_groups` group key, so two metrics that share an NA dim but pin different roles land on separate `RANK()` columns (the same defence the #129 polarity fix added for order/nulls).
 - **Tests:** four `semi_additive.rs` unit tests (scoped-alias ORDER BY under `arr`/`dep`; the no-`USING` ambiguity error; different-`USING` metrics get separate RANK columns) plus a data-level `execution` test whose fixture makes the arrival-role and departure-role snapshots pick different rows (arrival → 200, departure → 100) so a role regression flips the number, and an end-to-end sqllogictest fixture through `CREATE SEMANTIC VIEW` + `semantic_view()`. This closes the last SPECULATIVE cell from the 2026-07-16 review.
 
+### 33. ❌ Struct-domain fuzz targets test unreachable inputs — oracle patched (converge-once + fragment precondition); full redesign deferred
+
+- **Origin:** 2026-07-18. Once CI-1 made the fuzz targets actually run, `fuzz_render_roundtrip` and `fuzz_sql_expand` both flagged non-bugs. Both are symptoms of one design flaw: the targets `#[derive(Arbitrary)]` a whole `SemanticViewDefinition`, but `render`/`expand` are only ever called on **parser-produced** structs. The manufactured input domain is far larger than the reachable one, so each oracle has to re-derive "is this input well-formed?" — and that re-derivation is where the false positives live.
+  - `fuzz_render_roundtrip`: the strong fixpoint `render(parse(render(def))) == render(def)` is **unsatisfiable** on arbitrary defs — a free-form `expr` with surrounding whitespace is trimmed by the parser (`" "` → `""`) and cannot be quote-protected. (The e35cf15 identifier quote-protection only ever mattered for such unreachable inputs; it is a no-op for parser-produced defs and is kept as defensive hardening.)
+  - `fuzz_sql_expand`: `def_fragments_balanced()` (a precondition guarding the `is_balanced` assertion) omitted the `output_type` and window `window_function` fragments, which `expand` interpolates raw into `CAST(expr AS <type>)` / `FUNC(...)`; an unbalanced type/function name then manufactured unbalanced SQL from "balanced" inputs.
+- **Applied now (A):** `fuzz_render_roundtrip` switched to the **converge-once** invariant — normalize once via `parse(render(def))` to land on a parser-produced def, then assert `render` is idempotent on it (mirrored by the `assert_render_fixpoint` unit helper + three regression tests in `render_ddl.rs`). `fuzz_sql_expand`'s precondition extended to include `output_type` (dim/metric/fact) and `window_function`. Coverage is preserved: the strict `parse(render(def)) == def` equality for canonical defs lives in `tests/roundtrip_proptest.rs`.
+- **Deferred (B):** a from-scratch redesign that removes the domain mismatch instead of patching each instance —
+  - fuzz at the **trust boundary** (raw text / bytes) and derive every downstream struct by running the real parser, so preconditions and "tolerate re-parse failure" escapes vanish (a parsed def's fragments are balanced by construction);
+  - prefer **differential oracles** (does DuckDB parse the expanded SQL? does re-parse reproduce the struct?) over hand-rolled structural checks like `is_balanced`, which re-implement the lexer and can drift into their own bug source;
+  - split harnesses by fit — **libFuzzer** for coverage-guided byte mutation on the text→parser targets, **proptest** (shrinking, in-tree `cargo test`) for the struct-property round-trip/idempotence/differential checks, removing today's overlap;
+  - ship a **curated seed corpus** of real DDL (valid + known-tricky: quoted idents with commas, dotted FQNs, window frames) so mutation starts from reachable inputs.
+  - `Arbitrary`-on-the-struct stays correct only for the serde boundary (`fuzz_json_parse` / `fuzz_yaml_parse`), which has no sub-grammar. Tracked as its own follow-up PR.
+
 ---
 
-**Last updated:** 2026-07-17 (v0.11 unreleased) — semi-additive × role-playing
+**Last updated:** 2026-07-18 (v0.11 unreleased) — added entry #33: the
+struct-domain fuzz targets (`fuzz_render_roundtrip`, `fuzz_sql_expand`) test
+inputs the parser can't produce; oracles patched now (converge-once idempotence +
+`output_type`/`window_function` in the balance precondition), full trust-boundary
+redesign deferred to its own PR. Prior: 2026-07-17 — semi-additive × role-playing
 landed (entry #32, F-18 / T-15): an unqueried `NON ADDITIVE BY` dimension on a
 role-playing target now resolves through `role_playing::find_using_context` like
 a queried dimension, so the snapshot ranks by the role the metric's `USING`

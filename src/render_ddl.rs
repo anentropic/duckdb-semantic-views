@@ -1237,14 +1237,16 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // RT-4 (fuzz_render_roundtrip, 2026-07-18): non-canonical stored
-    // column / alias / table strings must not break the render fixpoint
-    //   render(parse(render(def))) == render(def)
-    // A stored value that does not round-trip verbatim — a depth-0 comma
-    // inside a column, an empty / whitespace alias or table, unbalanced
-    // quotes — must be quoted at emission so the freshly-rendered DDL either
-    // re-parses to the identical DDL (fixpoint holds) or fails to re-parse
-    // (the fuzz target skips it). A DIFFERENT successful re-render is the bug.
+    // RT-4 (fuzz_render_roundtrip, 2026-07-18): render must be IDEMPOTENT on a
+    // parser-produced definition (the converge-once invariant the fuzz target
+    // asserts):
+    //   d1 = parse(render(def));  render(parse(render(d1))) == render(d1)
+    // The strong fixpoint render(parse(render(def))) == render(def) on an
+    // ARBITRARY def is unsatisfiable — a free-form `expr` with surrounding
+    // whitespace is trimmed by the parser and cannot be quote-protected. So we
+    // normalize once into the parser's image, then assert re-rendering that def
+    // is a fixpoint. The strict parse(render(def)) == def equality for CANONICAL
+    // defs lives in tests/roundtrip_proptest.rs.
     // -------------------------------------------------------------------
 
     /// Mirror of `fuzz_render_roundtrip::body_of`: return the ` AS\n...`
@@ -1270,46 +1272,63 @@ mod tests {
         }
     }
 
-    /// The `fuzz_render_roundtrip` invariant as a deterministic assertion:
-    /// `render(def)` must either fail to re-parse OR its re-render must be
-    /// byte-identical to the first render (the fixpoint). A re-parse that
-    /// SUCCEEDS but re-renders to a DIFFERENT string is the failure the fuzz
-    /// target catches.
+    /// The `fuzz_render_roundtrip` converge-once invariant as a deterministic
+    /// assertion, mirroring that target exactly: normalize the (possibly
+    /// arbitrary) `def` once via `parse(render(def))` to land on a
+    /// parser-produced def, then assert `render` is IDEMPOTENT on it. A re-parse
+    /// failure at either stage is tolerated (the strict equality for canonical
+    /// defs lives in `roundtrip_proptest`); a SUCCESSFUL re-parse whose
+    /// re-render differs is the drift this catches.
     fn assert_render_fixpoint(def: &SemanticViewDefinition) {
-        use crate::body_parser::parse_keyword_body;
-        let rendered = render_create_ddl("fuzz_view", def).expect("def renders");
-        let Some(body) = body_of(&rendered) else {
-            panic!("rendered DDL lost its AS body:\n{rendered}");
+        use crate::body_parser::{parse_keyword_body, KeywordBody};
+        fn kb_to_def(kb: KeywordBody) -> SemanticViewDefinition {
+            SemanticViewDefinition {
+                tables: kb.tables,
+                joins: kb.relationships,
+                facts: kb.facts,
+                dimensions: kb.dimensions,
+                metrics: kb.metrics,
+                materializations: kb.materializations,
+                ..Default::default()
+            }
+        }
+        // Normalize once into the parser's image.
+        let rendered0 = render_create_ddl("fuzz_view", def).expect("def renders");
+        let Some(body0) = body_of(&rendered0) else {
+            panic!("rendered DDL lost its AS body:\n{rendered0}");
         };
-        let Ok(reparsed) = parse_keyword_body(body, 0) else {
-            return; // freshly-rendered DDL no longer re-parses — acceptable
+        let Ok(kb1) = parse_keyword_body(body0, 0) else {
+            return; // arbitrary content the parser can't accept — not reachable
         };
-        let reparsed_def = SemanticViewDefinition {
-            tables: reparsed.tables,
-            joins: reparsed.relationships,
-            facts: reparsed.facts,
-            dimensions: reparsed.dimensions,
-            metrics: reparsed.metrics,
-            materializations: reparsed.materializations,
-            ..Default::default()
+        let d1 = kb_to_def(kb1);
+        // Assert render is idempotent on the parser-produced def.
+        let rendered1 =
+            render_create_ddl("fuzz_view", &d1).expect("parser-produced def must render");
+        let Some(body1) = body_of(&rendered1) else {
+            panic!("rendered DDL lost its AS body:\n{rendered1}");
         };
-        let rerendered = render_create_ddl("fuzz_view", &reparsed_def)
-            .expect("re-parsed definition must render");
-        let body2 = body_of(&rerendered).expect("re-rendered DDL kept its AS body");
+        let Ok(kb2) = parse_keyword_body(body1, 0) else {
+            return; // freshly-rendered canonical DDL no longer re-parses — tolerated
+        };
+        let d2 = kb_to_def(kb2);
+        let rendered2 =
+            render_create_ddl("fuzz_view", &d2).expect("re-parsed definition must render");
+        let body2 = body_of(&rendered2).expect("re-rendered DDL kept its AS body");
         assert_eq!(
-            body, body2,
-            "render(parse(render(def))) != render(def)\nfirst:\n{rendered}\nsecond:\n{rerendered}"
+            body1, body2,
+            "render not idempotent on a parser-produced def\nfirst:\n{rendered1}\nsecond:\n{rendered2}"
         );
     }
 
     #[test]
     fn test_render_fixpoint_unique_constraint_column_with_comma() {
-        // A fully VALID view (a table with a dimension + metric, so the
-        // re-parse SUCCEEDS) whose only UNIQUE constraint column is the bare
-        // string `a,b`. Rendered verbatim it becomes `UNIQUE (a,b)`, which
-        // re-parses by splitting at the comma into TWO columns and re-renders
-        // as `UNIQUE (a, b)` — a DIFFERENT successful re-render. This exercises
-        // the fixpoint-holds branch, not the re-parse-fails escape.
+        // A fully VALID view (a table with a dimension + metric) whose only
+        // UNIQUE constraint column is the bare string `a,b`. Emitted verbatim it
+        // would be `UNIQUE (a,b)`, which re-parses by splitting at the comma into
+        // TWO columns; the quote-protection emits `UNIQUE ("a,b")` instead, so
+        // the parser-produced def keeps one column `"a,b"` and re-render is
+        // idempotent. Exercises the converge-once assert branch (both parses
+        // succeed), not the re-parse-fails escape.
         let mut def = minimal_def();
         def.tables[0].unique_constraints = vec![vec!["a,b".to_string()]];
         assert_render_fixpoint(&def);
@@ -1317,13 +1336,12 @@ mod tests {
 
     #[test]
     fn test_render_fixpoint_fuzz_seed_empty_alias_and_table() {
-        // The exact fuzz_render_roundtrip counterexample: empty alias / table,
+        // The first fuzz_render_roundtrip counterexample: empty alias / table,
         // a UNIQUE constraint whose first column carries a depth-0 comma and
-        // whose second column is empty, plus assorted empty / edge synonyms
-        // and a metric. Rendered verbatim the blank alias/table re-parse as
-        // garbage (`AS AS AS ...`), a different successful re-render. Post-fix
-        // the empty alias/table are quoted to `""`, which the parser rejects,
-        // so render(def) re-parses to Err and the fixpoint holds vacuously.
+        // whose second column is empty, plus assorted empty / edge synonyms and
+        // a metric. The empty alias/table are quoted to `""`, which the parser
+        // rejects, so the first-stage parse(render(def)) fails and converge-once
+        // returns before asserting (the re-parse-fails escape).
         let def = SemanticViewDefinition {
             tables: vec![TableRef {
                 alias: String::new(),
@@ -1351,6 +1369,36 @@ mod tests {
                 name: "b".into(),
                 expr: "les ,".into(),
                 source_table: Some("\0\0\0".into()),
+                access: AccessModifier::Public,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_render_fixpoint(&def);
+    }
+
+    #[test]
+    fn test_render_fixpoint_fuzz_seed_nul_alias_empty_pk() {
+        // Second fuzz_render_roundtrip counterexample (2026-07-18): a NUL byte
+        // inside the table alias, an EMPTY PRIMARY KEY column, and a metric
+        // whose expr is a single space with a trailing COMMENT. `output_type`
+        // (also NUL-bearing) is not rendered, so it is irrelevant. The metric
+        // expr `" "` is emitted verbatim on the first render but TRIMMED to ""
+        // by the parser on re-parse — a free-form expr cannot be quote-protected,
+        // so the strong fixpoint is unsatisfiable. `render` must still be
+        // idempotent on the parser-produced definition (converge-once).
+        let def = SemanticViewDefinition {
+            tables: vec![TableRef {
+                alias: "emasemant\0".to_string(),
+                table: "e".to_string(),
+                pk_columns: vec![String::new()],
+                ..Default::default()
+            }],
+            metrics: vec![Metric {
+                name: "m".to_string(),
+                expr: " ".to_string(),
+                output_type: Some("gint\0".to_string()),
+                comment: Some("im regp seeum".to_string()),
                 access: AccessModifier::Public,
                 ..Default::default()
             }],
