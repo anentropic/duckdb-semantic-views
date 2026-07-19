@@ -216,6 +216,52 @@ fn test_window_inner_aggregate_gets_rewrite() {
 }
 
 #[test]
+fn test_window_inner_aggregate_quoted_name_gets_rewrite() {
+    // EXP-6 (code-review 2026-07-18): a base metric declared with a QUOTED
+    // name must still resolve through the shared resolved-expressions map in
+    // the window CTE. `inline_derived_metrics` keys that map on the stored
+    // (quote-retaining) name, while the window path looks it up via
+    // `normalize_ident_part` (quote-stripped). Before the keying was unified,
+    // the lookup missed and fell back to the metric's RAW expression — losing
+    // the SG-8 COUNT(*)->COUNT(pk) rewrite, so the CTE counted NULL-extended
+    // LEFT-JOIN rows (one per childless order): a silent overcount.
+    let def = orders_view()
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("li", "line_items", &["id"])
+        .with_dimension("product", "li.product", Some("li"))
+        // Stored with literal quote characters and mixed case — the shape a
+        // `METRICS ("Item_Count" AS COUNT(*))` declaration produces.
+        .with_metric("\"Item_Count\"", "COUNT(*)", Some("li"))
+        .with_metric("rolling_items", "AVG(\"Item_Count\")", None)
+        .with_window_spec(
+            "rolling_items",
+            WindowSpec {
+                window_function: "AVG".to_string(),
+                inner_metric: "\"Item_Count\"".to_string(),
+                ..Default::default()
+            },
+        )
+        .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+    let req = QueryRequest {
+        facts: vec![],
+        dimensions: vec![DimensionName::new("product")],
+        metrics: vec![MetricName::new("rolling_items")],
+    };
+    let sql = expand("orders", &def, &req).unwrap();
+    assert!(
+        sql.contains("COUNT(\"li\".\"id\") AS \"item_count\""),
+        "window CTE inner aggregate on a QUOTED-name base metric must still use \
+         the rewritten count: {sql}"
+    );
+    assert!(
+        !sql.contains("COUNT(*)"),
+        "raw COUNT(*) must not leak into the CTE — the SG-8 rewrite was lost to a \
+         quote-keyed lookup miss: {sql}"
+    );
+}
+
+#[test]
 fn test_semi_additive_co_query_uses_rewritten_count() {
     // Semi-additive path: a same-grain COUNT(*) co-metric on the
     // child table decomposes into a CTE capture of the child PK and

@@ -171,7 +171,7 @@ pub(super) fn expand_semi_additive(
     let mut decomposed: Vec<(String, String)> = Vec::with_capacity(resolved_mets.len());
     for met in resolved_mets {
         let resolved_expr = resolved_exprs
-            .get(&met.name.to_ascii_lowercase())
+            .get(&crate::ident::normalize_ident_part(&met.name))
             .cloned()
             .unwrap_or_else(|| met.expr.clone());
         match parse_snapshot_aggregate(&resolved_expr) {

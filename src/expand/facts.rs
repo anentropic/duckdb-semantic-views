@@ -280,17 +280,25 @@ pub(super) fn rewrite_count_star(expr: &str, replacement_arg: &str) -> Option<St
 
 /// Resolved metric expressions plus SG-8 rewrite failures.
 ///
-/// Produced by [`inline_derived_metrics`]. `count_star_no_pk` is keyed by
-/// lowercased metric name and holds the lowercased source-table alias of each
-/// base metric whose `COUNT(*)` could NOT be rewritten (non-base source table
-/// with no PRIMARY KEY declared). Erroring is the caller's job so that only
-/// queries which actually use such a metric fail — unrelated metrics on the
-/// same view keep working.
+/// Produced by [`inline_derived_metrics`]. Both maps are keyed by the metric's
+/// canonical identifier key ([`crate::ident::normalize_ident_part`] — quotes
+/// stripped and case-folded), the same key every consumer resolves through
+/// (the window path's inner-metric lookup, the semi-additive path, and the
+/// top-level SELECT). Keying on the raw lowercased name instead left a quoted
+/// stored name (`"Item_Count"`) unreachable from a quote-stripped lookup, so a
+/// window metric over it silently lost fact inlining and the SG-8
+/// `COUNT(*)`->`COUNT(pk)` rewrite (EXP-6, code-review 2026-07-18).
+///
+/// `count_star_no_pk` holds the lowercased source-table alias of each base
+/// metric whose `COUNT(*)` could NOT be rewritten (non-base source table with
+/// no PRIMARY KEY declared). Erroring is the caller's job so that only queries
+/// which actually use such a metric fail — unrelated metrics on the same view
+/// keep working.
 #[derive(Debug)]
 pub(super) struct ResolvedMetricExprs {
-    /// Lowercased metric name -> fully-resolved expression.
+    /// Canonical metric key -> fully-resolved expression.
     pub exprs: HashMap<String, String>,
-    /// Lowercased metric name -> lowercased source-table alias for metrics
+    /// Canonical metric key -> lowercased source-table alias for metrics
     /// with an unrewritable `COUNT(*)` (SG-8).
     pub count_star_no_pk: HashMap<String, String>,
 }
@@ -309,11 +317,12 @@ fn toposort_derived(
         return Ok(Vec::new());
     }
 
-    // Build name -> index-in-derived-slice map (lowercased)
+    // Build name -> index-in-derived-slice map (canonical identifier keys, so a
+    // quoted stored name resolves consistently with the rest of the pipeline).
     let name_to_idx: HashMap<String, usize> = derived
         .iter()
         .enumerate()
-        .map(|(i, (_, m))| (m.name.to_ascii_lowercase(), i))
+        .map(|(i, (_, m))| (normalize_ident_part(&m.name), i))
         .collect();
 
     let mut in_degree = vec![0usize; n];
@@ -431,11 +440,11 @@ pub(super) fn inline_derived_metrics(
                     }
                 } else if rewrite_count_star(&expr, "*").is_some() {
                     // No PK declared (or unknown alias): rewrite impossible.
-                    count_star_no_pk.insert(met.name.to_ascii_lowercase(), st_lower);
+                    count_star_no_pk.insert(normalize_ident_part(&met.name), st_lower);
                 }
             }
         }
-        resolved.insert(met.name.to_ascii_lowercase(), expr);
+        resolved.insert(normalize_ident_part(&met.name), expr);
     }
 
     // Step 2: Collect derived metrics (no source_table)
@@ -491,7 +500,7 @@ pub(super) fn inline_derived_metrics(
                 .collect();
             inline_references(&raw_expr, &map)
         };
-        resolved.insert(met.name.to_ascii_lowercase(), expr);
+        resolved.insert(normalize_ident_part(&met.name), expr);
     }
 
     Ok(ResolvedMetricExprs {
@@ -510,16 +519,19 @@ pub(super) fn collect_transitive_metric_names(
     met: &crate::model::Metric,
     all_metrics: &[crate::model::Metric],
 ) -> HashSet<String> {
+    // Canonical identifier keys (quote-stripped + folded) throughout, so the
+    // returned set is directly comparable to `count_star_no_pk`'s keys and a
+    // quoted stored name matches its (quote-stripped) references — EXP-6.
     let mut visited: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = vec![met.name.to_ascii_lowercase()];
+    let mut stack: Vec<String> = vec![normalize_ident_part(&met.name)];
 
     let name_map: HashMap<String, &crate::model::Metric> = all_metrics
         .iter()
-        .map(|m| (m.name.to_ascii_lowercase(), m))
+        .map(|m| (normalize_ident_part(&m.name), m))
         .collect();
     let all_names: Vec<String> = all_metrics
         .iter()
-        .map(|m| m.name.to_ascii_lowercase())
+        .map(|m| normalize_ident_part(&m.name))
         .collect();
 
     while let Some(current_name) = stack.pop() {
@@ -530,7 +542,7 @@ pub(super) fn collect_transitive_metric_names(
             continue;
         };
         if let Some(ref ws) = current_met.window_spec {
-            stack.push(ws.inner_metric.to_ascii_lowercase());
+            stack.push(normalize_ident_part(&ws.inner_metric));
         }
         if current_met.source_table.is_none() {
             // Derived metric: find referenced metric names and push to stack.

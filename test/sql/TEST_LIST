@@ -15,6 +15,7 @@ test/sql/cr20260716b_porting_diagnostics.test
 test/sql/cr20260716c_reference_scanners.test
 test/sql/cr20260716d_semi_additive_role_playing.test
 test/sql/cr20260718_dollar_quoted_expr.test
+test/sql/cr20260718_quoted_metric_window.test
 test/sql/e4_cross_source_diamond.test
 test/sql/error_caret_alter.test
 test/sql/error_caret_create.test
