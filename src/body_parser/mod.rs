@@ -585,6 +585,22 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_dollar_in_clause_reports_precise_error() {
+        // PARSE-1 diagnostic (Copilot review of #144): an unterminated
+        // dollar-quoted literal in a clause reports "Unterminated dollar-quoted
+        // string", not a misleading "Unclosed '('" — the literal swallowed the
+        // clause's closing paren, so the lexer, not the paren matcher, has the
+        // precise cause. Matches the entry-level `unterminated_quote_error`.
+        let body = "AS TABLES (o AS orders) DIMENSIONS (o.a AS $$unterminated)";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("Unterminated dollar-quoted string"),
+            "expected a precise dollar-quote error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn split_trailing_comma_discarded() {
         let result = split_at_depth0_commas("a,").unwrap();
         assert_eq!(

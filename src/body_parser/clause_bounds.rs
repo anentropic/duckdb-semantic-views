@@ -20,7 +20,7 @@
 //! whose *first* byte is non-alphabetic is still the "unexpected character"
 //! case above — only the trailing-byte shape changed.)
 
-use super::cursor::Cursor;
+use super::cursor::{Cursor, UnterminatedRegion};
 use super::lexer::TokenKind;
 use crate::errors::ParseError;
 
@@ -175,8 +175,15 @@ pub(super) fn find_clause_bounds<'a>(
             // otherwise reports the misleading unclosed-paren error for
             // unterminated quotes.
             let message = match cur.unterminated_tail() {
-                Some(true) => format!("Unterminated quoted identifier in clause '{kw_upper}'."),
-                Some(false) => format!("Unterminated string literal in clause '{kw_upper}'."),
+                Some(UnterminatedRegion::Ident) => {
+                    format!("Unterminated quoted identifier in clause '{kw_upper}'.")
+                }
+                Some(UnterminatedRegion::String) => {
+                    format!("Unterminated string literal in clause '{kw_upper}'.")
+                }
+                Some(UnterminatedRegion::Dollar) => {
+                    format!("Unterminated dollar-quoted string in clause '{kw_upper}'.")
+                }
                 None => format!("Unclosed '(' for clause '{kw_upper}'."),
             };
             return Err(cur.err(open_tok.start, message));
