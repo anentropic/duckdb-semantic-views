@@ -136,11 +136,19 @@ pub(super) fn expand_window_metrics(
     let mut inner_metric_exprs: HashMap<String, String> = HashMap::new();
     for inner_name in &inner_metric_order {
         let expr = resolved_exprs.get(inner_name).cloned().unwrap_or_else(|| {
-            // Fall back to finding the metric definition directly
+            // Fall back to finding the metric definition directly, then — when
+            // the reference resolves to no declared metric — to the reference
+            // itself as a column, `quote_ident`'d (fail-clean, matching
+            // `window_dim_column`). `inner_name` is a canonical identifier key,
+            // so emitting it BARE leaked a literal `"` for a quoted-with-embedded
+            // -quote reference (`"a""b"` → normalized `a"b`), producing
+            // structurally invalid SQL — the alias side and the outer OVER
+            // reference already quote it, so the expression side must too
+            // (fuzz_sql_expand crash, issue #145).
             def.metrics
                 .iter()
                 .find(|m| crate::ident::ident_matches(&m.name, inner_name))
-                .map_or_else(|| inner_name.clone(), |m| m.expr.clone())
+                .map_or_else(|| quote_ident(inner_name), |m| m.expr.clone())
         });
         inner_metric_exprs.insert(inner_name.clone(), expr);
     }
@@ -303,6 +311,93 @@ mod tests {
     use crate::expand::test_helpers::{minimal_def, orders_view, TestFixtureExt};
     use crate::expand::{expand, DimensionName, ExpandError, MetricName, QueryRequest};
     use crate::model::{NullsOrder, SortOrder, WindowOrderBy, WindowSpec};
+
+    /// Mirror of the `fuzz_sql_expand` quote/paren-balance oracle
+    /// (`fuzz/fuzz_targets/fuzz_sql_expand.rs`): walk the text honoring `''`
+    /// string and `""` identifier escapes. Balanced input fragments must yield
+    /// balanced output — an odd bare `"` in the generated SQL is the exact
+    /// structural corruption the fuzzer trips on.
+    fn quotes_balanced(sql: &str) -> bool {
+        let bytes = sql.as_bytes();
+        let mut in_string = false;
+        let mut in_ident = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if b == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_string = false;
+                }
+            } else if in_ident {
+                if b == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    in_ident = false;
+                }
+            } else if b == b'\'' {
+                in_string = true;
+            } else if b == b'"' {
+                in_ident = true;
+            }
+            i += 1;
+        }
+        !in_string && !in_ident
+    }
+
+    /// Regression for the `fuzz_sql_expand` crash (issue #145): a window
+    /// metric whose `inner_metric` is a quoted identifier carrying an embedded
+    /// quote (`"a""b"`, logical name `a"b`) that resolves to no declared
+    /// metric. The CTE builder fell back to emitting the normalized name as a
+    /// BARE expression (`a"b AS "a""b"`), leaking a lone `"` and producing
+    /// structurally invalid SQL — the balance oracle panicked. The alias side
+    /// and the outer OVER reference already went through `quote_ident`, so the
+    /// expression side must too (fail-clean, matching `window_dim_column`).
+    #[test]
+    fn window_unresolved_quoted_inner_metric_emits_balanced_sql() {
+        let def = minimal_def("sales", "store", "store", "total_qty", "SUM(s.quantity)")
+            .with_window_spec(
+                "total_qty",
+                WindowSpec {
+                    window_function: "AVG".to_string(),
+                    // Quoted identifier with an embedded quote, naming no metric.
+                    inner_metric: "\"a\"\"b\"".to_string(),
+                    extra_args: vec![],
+                    excluding_dims: vec![],
+                    partition_dims: vec![],
+                    order_by: vec![],
+                    frame_clause: None,
+                },
+            );
+
+        let req = QueryRequest {
+            facts: vec![],
+            dimensions: vec![DimensionName::new("store")],
+            metrics: vec![MetricName::new("total_qty")],
+        };
+
+        let sql = expand("test_view", &def, &req)
+            .expect("window metric with an unresolved inner metric should still expand");
+        assert!(
+            quotes_balanced(&sql),
+            "generated SQL must have balanced quotes (no bare stored-name quote leak): {sql}"
+        );
+        // The inner reference must be quoted on BOTH sides of the CTE alias,
+        // never emitted bare.
+        assert!(
+            !sql.contains("a\"b AS"),
+            "inner-metric reference must not be emitted as a bare identifier: {sql}"
+        );
+        assert!(
+            sql.contains("\"a\"\"b\" AS \"a\"\"b\""),
+            "inner-metric reference must be quote_ident'd on both sides: {sql}"
+        );
+    }
 
     /// Single window metric with 3 dims -- CTE with GROUP BY all dims,
     /// outer SELECT with window function and PARTITION BY (all minus excluded).
