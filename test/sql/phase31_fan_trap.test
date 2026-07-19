@@ -223,15 +223,15 @@ SELECT * FROM semantic_view('p31_derived', dimensions := ['status'], metrics := 
 ----
 fan trap detected
 
-# But querying with o.region is safe (no fan-out traversal needed)
-# East: revenue=300, order_count=2, avg=150.0
-# West: revenue=150, order_count=1, avg=150.0
-
-query TR rowsort
+# Even with a safe DIMENSION (o.region needs no fan-out traversal), avg_revenue
+# is itself unsafe: it is a single derived metric whose grain spans {li, o}
+# across the li->o fan edge, so order_count is computed over the fanned
+# orders x line_items join (inflated denominator). It must be rejected
+# regardless of the dimension (EXP-2, code-review 2026-07-18).
+statement error
 SELECT * FROM semantic_view('p31_derived', dimensions := ['region'], metrics := ['avg_revenue']);
 ----
-East	150.0
-West	150.0
+fan trap detected
 
 # ============================================================
 # Cleanup

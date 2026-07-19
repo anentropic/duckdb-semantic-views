@@ -4,7 +4,6 @@ use crate::graph::JoinTree;
 use crate::model::{Cardinality, Metric, SemanticViewDefinition};
 
 use super::facts::collect_derived_metric_source_tables;
-use super::semi_additive::is_active_semi_additive;
 use super::types::{ExpandError, FanTrapError, MetricFanTrapError};
 
 /// Cardinality map: `(from_lower, to_lower)` -> (worst-case cardinality,
@@ -51,34 +50,30 @@ pub(super) fn check_fan_traps(
     // the fact-path validator + the SHOW-dims filter (E-7). In a validated tree
     // each non-root node has exactly one parent via the reverse map.
     let tree = JoinTree::from_graph(&graph);
-
-    // Canonical keys (quote-stripped + folded) so a dotted/quoted NA reference
-    // resolves against the queried dims (#30, shared with the CTE dispatch).
-    let queried_dim_keys: HashSet<String> = resolved_dims
-        .iter()
-        .map(|d| crate::ident::normalize_ident_part(&d.name))
-        .collect();
+    let root = tree.root().to_string();
 
     // For each metric + dimension pair, check for fan-out on the join path.
+    //
+    // EXP-3 (code-review 2026-07-18): EVERY metric gets this check, INCLUDING
+    // active semi-additive metrics that take the ROW_NUMBER-CTE snapshot path.
+    // The prior SG-6 behaviour skipped them on the (self-described "unproven")
+    // assumption that the CTE neutralizes fan-out by selecting one row per
+    // partition. It does not: the snapshot runs over the already-fanned join,
+    // and RANK ties across the fanned duplicates of one source row are
+    // indistinguishable from ties across distinct fact rows, so the CTE cannot
+    // dedupe them (silent double-count). Window metrics were never skipped
+    // (their inner aggregate is computed over the fanned join before the window
+    // function runs); semi-additive metrics are now treated the same way.
     for met in resolved_mets {
-        // SG-6 (code review 2026-07-02): skip ONLY metrics that actually take
-        // the ROW_NUMBER-CTE snapshot path for THIS request (active
-        // semi-additive: at least one NA dim absent from the queried dims —
-        // the same predicate `expand()` routes on, shared via
-        // `is_active_semi_additive` so the two cannot drift). The CTE path is
-        // assumed to neutralize fan-out by selecting one row per partition;
-        // that assumption is itself unproven (ROW_NUMBER ties, co-queried
-        // regular metrics — SG-4/SG-5 rework will revisit it).
-        // Effectively-regular semi-additive metrics (all NA dims queried)
-        // take the standard aggregation path and get the standard check.
-        // Window metrics are NOT skipped: their inner aggregate is computed
-        // over the already-fanned join, so fan-out inflates it before the
-        // window function runs.
-        if is_active_semi_additive(def, met, &queried_dim_keys) {
-            continue;
+        // EXP-8: a base metric with no source table and no base-metric
+        // references has an empty grain set but sits at the root grain — the
+        // same substitution the EXP-1 root-grain and metric x metric loops make.
+        // Without it the inner loop below never runs, and a root-grain base
+        // metric paired with a fanning child dimension slips through the check.
+        let mut met_tables = metric_grain_tables(met, def);
+        if met_tables.is_empty() {
+            met_tables.push(root.clone());
         }
-
-        let met_tables = metric_grain_tables(met, def);
 
         for dim in resolved_dims {
             let Some(ref dim_table_raw) = dim.source_table else {
@@ -132,6 +127,56 @@ pub(super) fn check_fan_traps(
         }
     }
 
+    // EXP-1 (code-review 2026-07-18): the root table is an IMPLICIT fan-trap
+    // participant. Generated SQL is always anchored `FROM <root>` with LEFT
+    // JOINs outward, so a metric whose grain table is a PARENT/ancestor of the
+    // root across a fan-out edge is duplicated once per root row and silently
+    // inflated — even when queried alone (no dimension, no second metric to
+    // trigger the pairwise loops above). Treat the root as an implicit
+    // dimension: for every metric grain table, walk the path to the root and
+    // reject a fan-out edge. A metric at or below the root grain (the root
+    // itself, or a child on the FK/"many" side) traverses only safe forward
+    // edges, so this never fires for it (nor for OneToOne edges).
+    for met in resolved_mets {
+        let mut met_tables = metric_grain_tables(met, def);
+        // EXP-8: an empty grain set (a base metric with no source table and no
+        // base-metric refs) sits at the root grain, the same substitution the
+        // metric x dimension and metric x metric loops make.
+        if met_tables.is_empty() {
+            met_tables.push(root.clone());
+        }
+        for met_table in &met_tables {
+            if *met_table == root {
+                continue; // At the root grain: nothing fans it.
+            }
+            let met_ancestors = tree.ancestors_to_root(met_table);
+            let root_ancestors = tree.ancestors_to_root(&root);
+            let root_ancestor_set: HashSet<&String> = root_ancestors.iter().collect();
+            let Some(lca) = met_ancestors
+                .iter()
+                .find(|a| root_ancestor_set.contains(a))
+                .cloned()
+            else {
+                continue; // No common ancestor (shouldn't happen in a tree).
+            };
+            let up_path = tree.path_to_ancestor(met_table, &lca);
+            let down_path = tree.path_from_ancestor_to_node(&lca, &root);
+            let fanning = fanning_edge_on_path(&up_path, &card_map)
+                .or_else(|| fanning_edge_on_path(&down_path, &card_map));
+            if let Some(rel_name) = fanning {
+                return Err(ExpandError::RootGrainFanTrap {
+                    view_name: view_name.to_string(),
+                    metric_name: met.name.clone(),
+                    metric_table: met
+                        .source_table
+                        .clone()
+                        .unwrap_or_else(|| met_table.clone()),
+                    relationship_name: rel_name,
+                });
+            }
+        }
+    }
+
     // SG-1 (code review 2026-07-02): metric × metric grain check.
     // For each ordered pair (A, B) of queried metrics, treat B's source table
     // the way a dimension table is treated above: if the join path from A's
@@ -152,14 +197,45 @@ pub(super) fn check_fan_traps(
         })
         .collect();
 
-    for (i, met_a) in resolved_mets.iter().enumerate() {
-        // Same SG-6 skip as above: only the potentially-inflated side is
-        // skipped when it takes the CTE snapshot path. A CTE-handled metric
-        // still participates as the OTHER side (its source table is still
-        // joined, fanning co-queried metrics).
-        if is_active_semi_additive(def, met_a, &queried_dim_keys) {
-            continue;
+    // EXP-2 (code-review 2026-07-18): a SINGLE metric whose OWN grain set spans
+    // more than one table — a derived metric over base metrics on different
+    // tables, or a window metric whose inner aggregate's grain differs — is
+    // never checked against itself by the ordered metric × metric loop below,
+    // which skips `i == j`. Folding two grains into one metric erases the
+    // protection: aggregating it inflates the parent-side component over the
+    // fanned join exactly as two separate metrics would. Check every pair WITHIN
+    // each metric's own grain set (both traversal directions, since a fan is
+    // only visible walking the parent → child leg), erroring with that metric.
+    for (i, met) in resolved_mets.iter().enumerate() {
+        for table_a in &grains[i] {
+            for table_b in &grains[i] {
+                if table_a == table_b {
+                    continue;
+                }
+                let Some(path) = find_path(table_a, table_b, &adjacency) else {
+                    continue;
+                };
+                if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
+                    return Err(ExpandError::MetricFanTrap {
+                        detail: Box::new(MetricFanTrapError {
+                            view_name: view_name.to_string(),
+                            metric_name: met.name.clone(),
+                            metric_table: table_a.clone(),
+                            other_metric_name: met.name.clone(),
+                            other_metric_table: table_b.clone(),
+                            relationship_name: rel_name,
+                        }),
+                    });
+                }
+            }
         }
+    }
+
+    for (i, met_a) in resolved_mets.iter().enumerate() {
+        // EXP-3 (code-review 2026-07-18): active semi-additive metrics are no
+        // longer skipped here either — a CTE-handled metric is still inflated as
+        // the potentially-multiplied side when a co-queried metric's table fans
+        // it, the same reason the metric × dimension loop above now checks them.
         for (j, met_b) in resolved_mets.iter().enumerate() {
             if i == j {
                 continue;
@@ -608,13 +684,18 @@ mod tests {
         );
     }
 
-    /// SG-6: a semi-additive metric with at least one NA dim NOT in the
-    /// queried dims takes the ROW_NUMBER-CTE snapshot path, which is assumed
-    /// to neutralize fan-out (one row per partition survives) — pinned here.
-    /// NOTE: that assumption is itself unproven (`ROW_NUMBER` ties, co-queried
-    /// regular metrics); the SG-4/SG-5 semi-additive rework will revisit it.
+    /// EXP-3 (code-review 2026-07-18): an ACTIVE semi-additive metric queried
+    /// with a dimension on a fanning child table must be REJECTED, not silently
+    /// double-counted. The snapshot ROW_NUMBER CTE runs over the already-fanned
+    /// `orders x line_items` join, and RANK ties across the fanned duplicates of
+    /// one source row are indistinguishable from ties across distinct fact rows,
+    /// so the CTE structurally cannot dedupe them. The prior behaviour SKIPPED
+    /// the fan-trap check for active semi-additive metrics on the (unproven)
+    /// assumption that the CTE neutralizes fan-out; this test previously asserted
+    /// `is_ok()`. The metric now gets the standard met x dim check like any
+    /// other, so the fanning dimension errors.
     #[test]
-    fn test_check_fan_traps_semi_additive_cte_path_skipped() {
+    fn test_check_fan_traps_semi_additive_active_fanning_dim_errors() {
         let def = minimal_def("orders", "item_name", "name", "total", "sum(amount)")
             .with_table("orders", "orders", &["id"])
             .with_table("line_items", "line_items", &["id"])
@@ -636,7 +717,8 @@ mod tests {
         def.dimensions.retain(|d| d.source_table.is_some());
         def.metrics.retain(|m| m.source_table.is_some());
         // Query only item_name: report_date (the NA dim) is NOT queried, so
-        // the metric is ACTIVE semi-additive and takes the CTE path.
+        // the metric is ACTIVE semi-additive and takes the CTE path — and the
+        // item_name dimension is on the fanning line_items child.
         let resolved_dims: Vec<&_> = def
             .dimensions
             .iter()
@@ -644,9 +726,58 @@ mod tests {
             .collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
         let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        match result {
+            Err(ExpandError::FanTrap { detail }) => {
+                assert_eq!(detail.metric_name, "total_sourced");
+                assert_eq!(detail.dimension_name, "item_name");
+            }
+            other => panic!(
+                "Active semi-additive metric with a fanning dimension must error (EXP-3), \
+                 got: {other:?}"
+            ),
+        }
+    }
+
+    /// EXP-3 guard against over-rejection: an ACTIVE semi-additive metric on the
+    /// base table, queried with a dimension in the SAFE (root-ward, many-to-one)
+    /// direction, must still be ALLOWED. Removing the blanket skip must not turn
+    /// legitimate snapshot queries into errors — only genuinely fanning ones.
+    #[test]
+    fn test_check_fan_traps_semi_additive_active_safe_dim_ok() {
+        // root = orders; orders --(customer_id)--> customers is ManyToOne, so a
+        // dim on customers is reached in the safe direction (no fan-out of the
+        // orders-grain metric).
+        let def = minimal_def("orders", "cust_name", "name", "total", "sum(amount)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("customers", "customers", &["id"])
+            .with_dimension("cust_name", "c.name", Some("customers"))
+            .with_dimension("report_date", "report_date", Some("orders"))
+            .with_metric("total_sourced", "sum(amount)", Some("orders"))
+            .with_non_additive_by(
+                "total_sourced",
+                &[("report_date", SortOrder::Desc, NullsOrder::First)],
+            )
+            .with_pkfk_join(
+                "orders_customers",
+                "orders",
+                "customers",
+                &["customer_id"],
+                &["id"],
+            );
+        // Query only cust_name: report_date (the NA dim) is NOT queried, so the
+        // metric is ACTIVE semi-additive; cust_name is on the parent side.
+        let resolved_dims: Vec<&_> = def
+            .dimensions
+            .iter()
+            .filter(|d| d.name == "cust_name")
+            .collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
         assert!(
             result.is_ok(),
-            "Active (CTE-path) semi-additive metrics skip the fan trap check, got: {result:?}"
+            "Active semi-additive metric with a safe-direction dimension must be allowed, \
+             got: {result:?}"
         );
     }
 
@@ -832,6 +963,170 @@ mod tests {
             }
             other => panic!("Expected MetricFanTrap, got: {other:?}"),
         }
+    }
+
+    /// EXP-1 (code-review 2026-07-18): a metric on a PARENT/ancestor of the
+    /// root table is aggregated at the root grain (the query is anchored
+    /// `FROM <root>`), so its rows are duplicated once per root row and the
+    /// aggregate is silently inflated. Here `orders` (root) references
+    /// `customers`, and the metric is on `customers`; the dimension is on the
+    /// same parent table, so the met x dim loop skips it (same table) — nothing
+    /// else fires. It must now error `RootGrainFanTrap`.
+    #[test]
+    fn test_check_fan_traps_parent_metric_root_grain_errors() {
+        let def = minimal_def("o", "d", "d", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("c", "customers", &["id"])
+            .with_dimension("segment", "c.segment", Some("c"))
+            .with_metric("total_balance", "SUM(c.balance)", Some("c"))
+            .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"]);
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets) {
+            Err(ExpandError::RootGrainFanTrap {
+                view_name,
+                metric_name,
+                metric_table,
+                relationship_name,
+            }) => {
+                assert_eq!(view_name, "test");
+                assert_eq!(metric_name, "total_balance");
+                assert_eq!(metric_table, "c");
+                assert_eq!(relationship_name, "o_to_c");
+            }
+            other => panic!("Expected RootGrainFanTrap, got: {other:?}"),
+        }
+    }
+
+    /// EXP-1: the same parent-table metric queried ALONE (no dimensions at all)
+    /// still errors — the pairwise met x dim / met x met checks have nothing to
+    /// pair, so only the root-grain check catches it.
+    #[test]
+    fn test_check_fan_traps_parent_metric_alone_errors() {
+        let def = minimal_def("o", "d", "d", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("c", "customers", &["id"])
+            .with_metric("total_balance", "SUM(c.balance)", Some("c"))
+            .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"]);
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        assert!(
+            matches!(
+                check_fan_traps("test", &def, &[], &resolved_mets),
+                Err(ExpandError::RootGrainFanTrap { .. })
+            ),
+            "A parent-table metric queried alone must error (EXP-1)"
+        );
+    }
+
+    /// EXP-1: a metric on the ROOT table (or a child/FK-side descendant) is at
+    /// or below the root grain and is NOT inflated by the root-anchored FROM —
+    /// it must stay allowed. Guards the root-grain check against over-rejection.
+    #[test]
+    fn test_check_fan_traps_root_and_child_metrics_allowed() {
+        // root = orders; line_items --(order_id)--> orders (ManyToOne child).
+        let def = minimal_def("orders", "d", "d", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("line_items", "line_items", &["id"])
+            .with_metric("order_total", "SUM(orders.amount)", Some("orders")) // root grain
+            .with_metric("item_total", "SUM(line_items.amount)", Some("line_items")) // child grain
+            .with_pkfk_join(
+                "items_to_orders",
+                "line_items",
+                "orders",
+                &["order_id"],
+                &["id"],
+            );
+        // Query each metric alone: neither is fanned by the root-anchored FROM
+        // (a child metric's rows appear once; the root metric is the anchor).
+        for name in ["order_total", "item_total"] {
+            let mets: Vec<&_> = def.metrics.iter().filter(|m| m.name == name).collect();
+            let result = check_fan_traps("test", &def, &[], &mets);
+            assert!(
+                result.is_ok(),
+                "Metric '{name}' at/below root grain must be allowed, got: {result:?}"
+            );
+        }
+    }
+
+    /// EXP-8 (code-review 2026-07-18): a base-table metric with `source_table ==
+    /// None` and no base-metric references has an EMPTY grain set. The met x dim
+    /// loop must map that to the root grain (as the met x met loop already
+    /// does), or a root-grain base metric queried with a fanning child
+    /// dimension slips through the fence and silently inflates.
+    #[test]
+    fn test_check_fan_traps_empty_grain_base_metric_fanning_dim_errors() {
+        let def = minimal_def("o", "d", "d", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("li", "line_items", &["id"])
+            .with_dimension("item_name", "li.name", Some("li"))
+            // Base metric, source_table = None -> root grain, empty grain set.
+            .with_metric("total", "SUM(o.amount)", None)
+            .with_pkfk_join("li_o", "li", "o", &["order_id"], &["id"]);
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets) {
+            Err(ExpandError::FanTrap { detail }) => {
+                assert_eq!(detail.metric_name, "total");
+                assert_eq!(detail.dimension_name, "item_name");
+            }
+            other => panic!(
+                "Expected FanTrap for an empty-grain base metric with a fanning dim (EXP-8), \
+                 got: {other:?}"
+            ),
+        }
+    }
+
+    /// EXP-2 (code-review 2026-07-18): a SINGLE derived metric whose transitive
+    /// grain spans two tables across a fan-out edge bypasses the ordered
+    /// met x met pair loop (which skips `i == j`). Here `ratio = order_total /
+    /// item_count` mixes a root-grain metric (`order_total` on `orders`) with a
+    /// child-grain metric (`item_count` on `line_items`); querying `ratio` alone
+    /// inflates the numerator over the fanned join. It must error `MetricFanTrap`
+    /// naming the derived metric.
+    #[test]
+    fn test_check_fan_traps_single_derived_multi_grain_errors() {
+        let def = minimal_def("o", "d", "d", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("li", "line_items", &["id"])
+            .with_metric("order_total", "SUM(o.amount)", Some("o"))
+            .with_metric("item_count", "COUNT(*)", Some("li"))
+            .with_metric("ratio", "order_total / item_count", None) // derived, grain {o, li}
+            .with_pkfk_join("li_o", "li", "o", &["order_id"], &["id"]);
+        let ratio: Vec<&_> = def.metrics.iter().filter(|m| m.name == "ratio").collect();
+        match check_fan_traps("test", &def, &[], &ratio) {
+            Err(ExpandError::MetricFanTrap { detail }) => {
+                assert_eq!(detail.metric_name, "ratio");
+                assert_eq!(detail.relationship_name, "li_o");
+            }
+            other => panic!(
+                "Expected MetricFanTrap for single multi-grain derived metric, got: {other:?}"
+            ),
+        }
+    }
+
+    /// EXP-2 guard: a single derived metric whose grain is a single table (its
+    /// two base metrics live on the SAME table) is not multi-grain and must stay
+    /// allowed.
+    #[test]
+    fn test_check_fan_traps_single_derived_single_grain_allowed() {
+        let def = minimal_def("o", "d", "d", "m", "count(*)")
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("li", "line_items", &["id"])
+            .with_metric("gross", "SUM(o.amount)", Some("o"))
+            .with_metric("net", "SUM(o.amount) - SUM(o.discount)", Some("o"))
+            .with_metric("ratio", "gross / net", None) // derived, grain {o}
+            .with_pkfk_join("li_o", "li", "o", &["order_id"], &["id"]);
+        let ratio: Vec<&_> = def.metrics.iter().filter(|m| m.name == "ratio").collect();
+        assert!(
+            check_fan_traps("test", &def, &[], &ratio).is_ok(),
+            "A single-grain derived metric must be allowed"
+        );
     }
 
     /// SG-7: a definition whose relationship graph cannot be rebuilt (here: a
