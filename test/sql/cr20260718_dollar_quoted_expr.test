@@ -1,0 +1,54 @@
+# PARSE-1 (code-review 2026-07-18): dollar-quoted strings ($$...$$ / $tag$...$tag$)
+# in a dimension/metric expression are opaque to the body parser's structural
+# scanners. A comma, a `)`, or a clause keyword inside one must be inert instead
+# of splitting an entry, closing the clause early, or being read as a keyword.
+
+require semantic_views
+
+statement ok
+CREATE TABLE dq_sales (id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO dq_sales VALUES (1, 10), (2, 20), (3, 30);
+
+# A dollar-quoted dimension expression is a string literal that contains a comma
+# AND parentheses. Before the fix the inner comma split this into two garbage
+# dimensions (and the `)` risked closing DIMENSIONS (...) early).
+statement ok
+CREATE SEMANTIC VIEW dq_view AS
+  TABLES (s AS dq_sales)
+  DIMENSIONS (s.label AS $$a, b (c)$$)
+  METRICS (s.total AS SUM(amount));
+
+# The dimension is a single constant literal, so every row shares one group and
+# the metric sums all rows. The label value is the literal text between the tags.
+query TI rowsort
+SELECT * FROM semantic_view('dq_view', dimensions := ['label'], metrics := ['total']);
+----
+a, b (c)	60
+
+# Tagged form, with a structural keyword (AS) and a different inner tag inside
+# the literal — all inert.
+statement ok
+CREATE SEMANTIC VIEW dq_view2 AS
+  TABLES (s AS dq_sales)
+  DIMENSIONS (s.note AS $tag$x AS y, $z$ inner$tag$)
+  METRICS (s.total AS SUM(amount));
+
+query TI rowsort
+SELECT * FROM semantic_view('dq_view2', dimensions := ['note'], metrics := ['total']);
+----
+x AS y, $z$ inner	60
+
+# GET_DDL emits the dollar-quoted expression verbatim (the renderer stores and
+# re-emits the raw expression, which the parser now re-scans as one literal).
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'dq_view') LIKE '%$$a, b (c)$$%';
+----
+true
+
+statement ok
+DROP SEMANTIC VIEW dq_view;
+
+statement ok
+DROP SEMANTIC VIEW dq_view2;

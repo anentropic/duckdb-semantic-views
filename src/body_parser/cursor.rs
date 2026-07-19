@@ -16,6 +16,19 @@
 use super::lexer::{lex, Token, TokenKind};
 use crate::errors::ParseError;
 
+/// The kind of unterminated quoted region a token stream ends in, returned by
+/// [`Cursor::unterminated_tail`] so a failed `take_parens` reports a precise
+/// "unterminated ..." message instead of a misleading "unclosed paren".
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum UnterminatedRegion {
+    /// An unterminated double-quoted identifier `"...`.
+    Ident,
+    /// An unterminated single-quoted string literal `'...`.
+    String,
+    /// An unterminated dollar-quoted string `$tag$...` (PARSE-1).
+    Dollar,
+}
+
 pub(super) struct Cursor<'a> {
     src: &'a str,
     base: usize,
@@ -250,17 +263,18 @@ impl<'a> Cursor<'a> {
         None
     }
 
-    /// If the token stream ends in an unterminated `"`/`'` region, return
-    /// `Some(true)` for a quoted identifier (`"..."`) or `Some(false)` for a
-    /// string literal (`'...'`). The lexer emits at most one
-    /// [`TokenKind::Unterminated`] token and it always spans to end-of-input, so
-    /// it is necessarily the last token. Used to turn a failed [`Cursor::take_parens`]
-    /// into a precise "unterminated quote" error rather than a misleading
-    /// "unclosed paren" (the distinction the old quote-state scan made via its
-    /// `in_ident` / `in_string` flags).
-    pub(super) fn unterminated_tail(&self) -> Option<bool> {
+    /// If the token stream ends in an unterminated quoted region, classify it.
+    /// A `TokenKind::Unterminated` token (`"..."` / `'...'`) and a dollar-quoted
+    /// literal whose close tag never appeared (`TokenKind::DollarString {
+    /// terminated: false }`, PARSE-1) each span to end-of-input, so the open
+    /// region is necessarily the last token. Used to turn a failed
+    /// [`Cursor::take_parens`] into a precise "unterminated ..." error rather
+    /// than a misleading "unclosed paren".
+    pub(super) fn unterminated_tail(&self) -> Option<UnterminatedRegion> {
         match self.toks.last()?.kind {
-            TokenKind::Unterminated { ident } => Some(ident),
+            TokenKind::Unterminated { ident: true } => Some(UnterminatedRegion::Ident),
+            TokenKind::Unterminated { ident: false } => Some(UnterminatedRegion::String),
+            TokenKind::DollarString { terminated: false } => Some(UnterminatedRegion::Dollar),
             _ => None,
         }
     }
@@ -414,9 +428,20 @@ mod tests {
 
     #[test]
     fn unterminated_tail_reports_open_quote_kind() {
-        // A `(...` that never closes because a quote swallowed the rest.
-        assert_eq!(Cursor::new("(a, \"b c", 0).unterminated_tail(), Some(true));
-        assert_eq!(Cursor::new("(a, 'b c", 0).unterminated_tail(), Some(false));
+        // A `(...` that never closes because a quote / dollar-quote swallowed
+        // the rest.
+        assert_eq!(
+            Cursor::new("(a, \"b c", 0).unterminated_tail(),
+            Some(UnterminatedRegion::Ident)
+        );
+        assert_eq!(
+            Cursor::new("(a, 'b c", 0).unterminated_tail(),
+            Some(UnterminatedRegion::String)
+        );
+        assert_eq!(
+            Cursor::new("(a, $$b c", 0).unterminated_tail(),
+            Some(UnterminatedRegion::Dollar)
+        );
         // A plain unclosed paren (no open quote) is not an unterminated tail.
         assert_eq!(Cursor::new("(a, b", 0).unterminated_tail(), None);
         // A fully-terminated stream has no unterminated tail.
