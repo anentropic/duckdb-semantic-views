@@ -7,7 +7,7 @@ use super::facts::{
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::resolve_joins_pkfk;
 use super::resolution::{find_dimension, find_metric, quote_ident};
-use super::role_playing::find_using_context;
+use super::role_playing::{check_fact_role_playing_path, find_using_context};
 use super::select_spec::{FromSource, GroupBy, SelectItem, SelectSpec};
 use super::types::{ExpandError, QueryRequest, ResolvedDim};
 
@@ -221,6 +221,14 @@ fn expand_facts(
     // the dimension to an arbitrary relationship edge.
     for dim in &resolved_dims {
         let _ = find_using_context(view_name, def, dim, &[])?;
+    }
+
+    // 3c. EXP-5: a fact sourced on (or reached only through) a role-playing
+    // table has no USING context to pick a role — reject rather than silently
+    // binding to the first-declared relationship, mirroring the dimension
+    // check above.
+    for fact in &resolved_facts {
+        check_fact_role_playing_path(view_name, def, fact)?;
     }
 
     // 4. Resolve fact expressions via DAG inlining (fact-to-fact dependencies).

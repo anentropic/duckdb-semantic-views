@@ -1,0 +1,109 @@
+# Code review 2026-07-18 — EXP-4 / EXP-5: role-playing ambiguity beyond one hop.
+#
+# `airports` (a) is a role-playing table: flights reach it via BOTH dep_airport
+# and arr_airport. A dimension directly on `a` already errors unless a metric's
+# USING picks the role. Two shapes slipped past that and silently bound to the
+# first-declared (departure) relationship:
+#   EXP-4 — a dimension on a DESCENDANT of `a` (regions `r`, reached only
+#           through `a`), and
+#   EXP-5 — a FACT sourced on `a` or on a descendant of it (facts carry no
+#           USING context at all).
+# Both must now error at query time, like a directly-queried role-playing dim.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr718rp_regions (region_id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO cr718rp_regions VALUES (1, 'West'), (2, 'Northeast'), (3, 'Europe');
+
+statement ok
+CREATE TABLE cr718rp_airports (airport_code VARCHAR, city VARCHAR, region_id INTEGER);
+
+statement ok
+INSERT INTO cr718rp_airports VALUES
+  ('SFO', 'San Francisco', 1),
+  ('LHR', 'London', 3),
+  ('BOS', 'Boston', 2),
+  ('JFK', 'New York', 2);
+
+statement ok
+CREATE TABLE cr718rp_flights (flight_id INTEGER, departure_code VARCHAR, arrival_code VARCHAR, carrier VARCHAR);
+
+statement ok
+INSERT INTO cr718rp_flights VALUES
+  (1, 'SFO', 'BOS', 'AA'),
+  (2, 'LHR', 'JFK', 'AA');
+
+# `a` is role-playing (dep/arr); `r` (regions) is a DESCENDANT of `a`.
+statement ok
+CREATE SEMANTIC VIEW cr718rp AS
+  TABLES (
+    f AS cr718rp_flights PRIMARY KEY (flight_id),
+    a AS cr718rp_airports PRIMARY KEY (airport_code),
+    r AS cr718rp_regions PRIMARY KEY (region_id)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a,
+    airport_region AS a(region_id) REFERENCES r
+  )
+  FACTS (
+    a.airport_city AS a.city,
+    r.fact_region AS r.name
+  )
+  DIMENSIONS (
+    f.carrier AS f.carrier,
+    a.city AS a.city,
+    r.region_name AS r.name
+  )
+  METRICS (
+    f.departure_count USING (dep_airport) AS COUNT(*),
+    f.arrival_count USING (arr_airport) AS COUNT(*)
+  )
+
+# EXP-4: `region_name` is on `r`, a descendant of the role-playing `a`. Which
+# airport role does the region hang off? Ambiguous -> reject (before the fix it
+# silently used the departure instance).
+statement error
+SELECT region_name, arrival_count
+FROM semantic_view('cr718rp', dimensions := ['region_name'], metrics := ['arrival_count']);
+----
+ambiguous
+
+# Control: a dimension DIRECTLY on the role-playing table still resolves via the
+# co-queried metric's USING (the one-hop case is unaffected). departure_count
+# USING (dep_airport) scopes `a` to the departure airport, so `city` is the
+# departure city.
+query TI rowsort
+SELECT city, departure_count
+FROM semantic_view('cr718rp', dimensions := ['city'], metrics := ['departure_count']);
+----
+London	1
+San Francisco	1
+
+# EXP-5: a fact sourced on the role-playing table `a` has no USING context to
+# pick a role -> reject (before the fix it silently read the departure airport).
+statement error
+SELECT airport_city FROM semantic_view('cr718rp', facts := ['airport_city']);
+----
+ambiguous
+
+# EXP-5: a fact on a DESCENDANT of the role-playing table is equally ambiguous.
+statement error
+SELECT fact_region FROM semantic_view('cr718rp', facts := ['fact_region']);
+----
+ambiguous
+
+statement ok
+DROP SEMANTIC VIEW cr718rp;
+
+statement ok
+DROP TABLE cr718rp_flights;
+
+statement ok
+DROP TABLE cr718rp_airports;
+
+statement ok
+DROP TABLE cr718rp_regions;

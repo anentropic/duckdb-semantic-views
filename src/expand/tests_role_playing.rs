@@ -94,6 +94,93 @@ fn flights_airports_def() -> SemanticViewDefinition {
     }
 }
 
+/// `flights_airports_def` extended with a `regions` table that `airports`
+/// references — a DESCENDANT of the role-playing target `a` (EXP-4).
+fn flights_airports_regions_def() -> SemanticViewDefinition {
+    let mut def = flights_airports_def();
+    def.tables.push(TableRef {
+        alias: "r".to_string(),
+        table: "regions".to_string(),
+        pk_columns: vec!["region_id".to_string()],
+        ..Default::default()
+    });
+    def.dimensions.push(Dimension {
+        name: "region_name".to_string(),
+        expr: "r.region_name".to_string(),
+        source_table: Some("r".to_string()),
+        ..Default::default()
+    });
+    def.joins.push(Join {
+        table: "r".to_string(),
+        from_alias: "a".to_string(),
+        fk_columns: vec!["region_id".to_string()],
+        ref_columns: vec!["region_id".to_string()],
+        name: Some("airport_region".to_string()),
+        cardinality: Cardinality::ManyToOne,
+        ..Default::default()
+    });
+    def
+}
+
+#[test]
+fn descendant_of_role_playing_table_errors_ambiguous() {
+    // EXP-4 (code-review 2026-07-18): `region_name` is on `r`, a descendant of
+    // the role-playing table `a` (flights reach `a` via BOTH dep_airport and
+    // arr_airport). `r` therefore hangs off whichever airport instance the
+    // join resolver picks first (departure), regardless of the queried metric's
+    // USING -- a silent, declaration-order-dependent wrong grouping. Reaching a
+    // table only through a role-playing table is ambiguous and must error, just
+    // as a dimension directly on `a` does.
+    let def = flights_airports_regions_def();
+    let req = QueryRequest {
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region_name")],
+        metrics: vec![MetricName::new("arrival_count")],
+    };
+    let err = expand("test_flights", &def, &req).unwrap_err();
+    match err {
+        ExpandError::AmbiguousDescendantPath {
+            view_name,
+            dimension_name,
+            dimension_table,
+            role_playing_table,
+            available_relationships,
+        } => {
+            assert_eq!(view_name, "test_flights");
+            assert_eq!(dimension_name, "region_name");
+            assert_eq!(dimension_table, "r");
+            assert_eq!(role_playing_table, "a");
+            assert!(
+                available_relationships.contains(&"dep_airport".to_string())
+                    && available_relationships.contains(&"arr_airport".to_string()),
+                "both airport relationships must be listed: {available_relationships:?}"
+            );
+        }
+        other => panic!("Expected AmbiguousDescendantPath, got: {other}"),
+    }
+}
+
+#[test]
+fn descendant_through_single_relationship_still_resolves() {
+    // Guard against over-rejection: when the intermediate table is reached by a
+    // SINGLE relationship (not role-playing), a dimension on its descendant is
+    // unambiguous and must still expand. Here only `dep_airport` connects
+    // flights to airports, so `region_name` on `r` has one join path.
+    let mut def = flights_airports_regions_def();
+    // Drop the second (arr) relationship so `a` is no longer role-playing.
+    def.joins
+        .retain(|j| j.name.as_deref() != Some("arr_airport"));
+    def.metrics
+        .retain(|m| m.name != "arrival_count" && m.name != "total_flights");
+    let req = QueryRequest {
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region_name")],
+        metrics: vec![MetricName::new("departure_count")],
+    };
+    let sql = expand("test_flights", &def, &req).expect("single-path descendant must resolve");
+    assert!(sql.contains("region_name"), "SQL: {sql}");
+}
+
 #[test]
 fn using_metric_generates_scoped_join_alias() {
     let def = flights_airports_def();

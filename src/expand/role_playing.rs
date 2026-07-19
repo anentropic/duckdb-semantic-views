@@ -56,6 +56,65 @@ pub(super) fn is_role_playing_target(def: &SemanticViewDefinition, target_alias:
     false
 }
 
+/// The role-playing target on the join path from `table` up to the root
+/// (inclusive of `table` itself), if any — the lowercased alias of a table that
+/// `table` *is*, or is reachable only *through*. Such a table has an ambiguous
+/// join path: which of the role-playing target's several relationship instances
+/// does it hang off? Used to reject dimensions on descendants of a role-playing
+/// table (EXP-4) and facts on/through one (EXP-5), one hop past the direct
+/// `AmbiguousPath` case.
+///
+/// The relationship graph is a tree apart from the sanctioned role-playing
+/// multi-edge (cross-source diamonds are rejected at define time), so each
+/// non-root, non-role-playing node has exactly one inbound edge — the first
+/// reverse entry is its parent toward the root.
+pub(super) fn role_playing_on_path(def: &SemanticViewDefinition, table: &str) -> Option<String> {
+    let table_lower = table.to_ascii_lowercase();
+    if is_role_playing_target(def, &table_lower) {
+        return Some(table_lower);
+    }
+    let graph = crate::graph::RelationshipGraph::from_definition(def).ok()?;
+    let mut current = table_lower;
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(current.clone());
+    while current != graph.root {
+        let parent = graph.reverse.get(&current)?.first()?.to_ascii_lowercase();
+        if !visited.insert(parent.clone()) {
+            return None; // defensive cycle guard (graph is acyclic at define time)
+        }
+        if is_role_playing_target(def, &parent) {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Reject a fact whose source table is (or is reached only through) a
+/// role-playing table (EXP-5). Facts carry no `USING` context, so the role is
+/// unresolvable; erroring beats silently binding to the first-declared
+/// relationship.
+pub(super) fn check_fact_role_playing_path(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    fact: &crate::model::Fact,
+) -> Result<(), ExpandError> {
+    let Some(ref fact_table) = fact.source_table else {
+        return Ok(());
+    };
+    if let Some(rp) = role_playing_on_path(def, fact_table) {
+        let available_relationships = relationships_to_table(def, &rp);
+        return Err(ExpandError::AmbiguousFactPath {
+            view_name: view_name.to_string(),
+            fact_name: fact.name.clone(),
+            fact_table: fact_table.to_ascii_lowercase(),
+            role_playing_table: rp,
+            available_relationships,
+        });
+    }
+    Ok(())
+}
+
 /// Determine the scoped alias for a dimension from a role-playing table.
 ///
 /// Checks whether the dimension's `source_table` is reached by multiple relationships.
@@ -80,6 +139,23 @@ pub(super) fn find_using_context(
     // Find all relationships pointing to this table
     let rels = relationships_to_table(def, &dim_table_lower);
     if rels.len() <= 1 {
+        // EXP-4: the dimension's own table has a single inbound relationship,
+        // but if it is reachable only THROUGH a role-playing table, its join
+        // path is ambiguous — and, unlike a dimension directly on the
+        // role-playing table, a descendant cannot be scoped by a co-queried
+        // metric's USING. Reject it instead of silently binding to the
+        // first-declared relationship (a declaration-order-dependent wrong
+        // grouping).
+        if let Some(rp) = role_playing_on_path(def, &dim_table_lower) {
+            let available_relationships = relationships_to_table(def, &rp);
+            return Err(ExpandError::AmbiguousDescendantPath {
+                view_name: view_name.to_string(),
+                dimension_name: dim.name.clone(),
+                dimension_table: dim_table_lower,
+                role_playing_table: rp,
+                available_relationships,
+            });
+        }
         return Ok(None); // Single or no relationship -> unambiguous, use bare alias
     }
 
