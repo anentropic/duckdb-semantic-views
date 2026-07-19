@@ -373,6 +373,30 @@ pub enum ExpandError {
         dimension_table: String,
         available_relationships: Vec<String>,
     },
+    /// A dimension whose table is reached *only through* a role-playing table
+    /// (a descendant of it) — the role cannot be inferred and, unlike a
+    /// dimension directly on the role-playing table, cannot be scoped by a
+    /// co-queried metric's USING (EXP-4, code-review 2026-07-18). Reached one
+    /// hop past the `AmbiguousPath` case, this previously bound silently to the
+    /// first-declared relationship.
+    AmbiguousDescendantPath {
+        view_name: String,
+        dimension_name: String,
+        dimension_table: String,
+        role_playing_table: String,
+        available_relationships: Vec<String>,
+    },
+    /// A fact whose source table is (or is reached only through) a role-playing
+    /// table. Facts carry no USING context, so the role is unresolvable
+    /// (EXP-5, code-review 2026-07-18); previously bound silently to the
+    /// first-declared relationship.
+    AmbiguousFactPath {
+        view_name: String,
+        fact_name: String,
+        fact_table: String,
+        role_playing_table: String,
+        available_relationships: Vec<String>,
+    },
     /// A requested metric is marked PRIVATE and cannot be queried directly.
     PrivateMetric { view_name: String, name: String },
     /// A requested fact is marked PRIVATE and cannot be queried directly.
@@ -591,6 +615,41 @@ impl fmt::Display for ExpandError {
                      table '{dimension_table}' is reached via multiple relationships: [{}]. \
                      Specify a metric with USING to disambiguate, or use a dimension from a \
                      non-ambiguous table.",
+                    available_relationships.join(", ")
+                )
+            }
+            Self::AmbiguousDescendantPath {
+                view_name,
+                dimension_name,
+                dimension_table,
+                role_playing_table,
+                available_relationships,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': dimension '{dimension_name}' is ambiguous -- \
+                     its table '{dimension_table}' is reachable only through the role-playing \
+                     table '{role_playing_table}', which is joined via multiple relationships: \
+                     [{}]. The role cannot be inferred for a descendant table; query a dimension \
+                     directly on '{role_playing_table}' with a metric USING one of those \
+                     relationships, or give the target table a distinct alias per role.",
+                    available_relationships.join(", ")
+                )
+            }
+            Self::AmbiguousFactPath {
+                view_name,
+                fact_name,
+                fact_table,
+                role_playing_table,
+                available_relationships,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': fact '{fact_name}' is ambiguous -- reaching its \
+                     table '{fact_table}' requires the role-playing table '{role_playing_table}', \
+                     joined via multiple relationships: [{}], and fact queries carry no USING \
+                     context to pick a role. Restructure the relationship or query via a \
+                     non-role-playing table.",
                     available_relationships.join(", ")
                 )
             }

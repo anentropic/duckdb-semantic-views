@@ -56,6 +56,83 @@ fn test_facts_path_role_playing_dimension_raises_ambiguous_path() {
 }
 
 #[test]
+fn fact_on_role_playing_table_errors_ambiguous() {
+    // EXP-5 (code-review 2026-07-18): `airport_city` is a FACT sourced on the
+    // role-playing table `a` (orders reach it via dep_airport AND arr_airport).
+    // Facts carry no USING context, so which airport instance the fact reads is
+    // unresolvable -- previously it silently bound to the first-declared
+    // (departure) relationship. It must error instead.
+    let def = orders_view()
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("a", "airports", &["code"])
+        .with_fact("airport_city", "a.city", "a")
+        .with_pkfk_join("dep_airport", "orders", "a", &["dep_code"], &["code"])
+        .with_pkfk_join("arr_airport", "orders", "a", &["arr_code"], &["code"]);
+    let req = QueryRequest {
+        facts: vec![FactName::new("airport_city")],
+        dimensions: vec![],
+        metrics: vec![],
+    };
+    let err = expand("orders", &def, &req).unwrap_err();
+    match err {
+        ExpandError::AmbiguousFactPath {
+            view_name,
+            fact_name,
+            fact_table,
+            role_playing_table,
+            available_relationships,
+        } => {
+            assert_eq!(view_name, "orders");
+            assert_eq!(fact_name, "airport_city");
+            assert_eq!(fact_table, "a");
+            assert_eq!(role_playing_table, "a");
+            assert!(
+                available_relationships.contains(&"dep_airport".to_string())
+                    && available_relationships.contains(&"arr_airport".to_string()),
+                "both relationships must be listed: {available_relationships:?}"
+            );
+        }
+        other => panic!("Expected AmbiguousFactPath, got: {other}"),
+    }
+}
+
+#[test]
+fn fact_on_descendant_of_role_playing_table_errors_ambiguous() {
+    // EXP-5 also covers a fact on a DESCENDANT of a role-playing table: `r`
+    // (regions) is reached only through the role-playing `a`, so a fact on it
+    // is just as unresolvable.
+    let def = orders_view()
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("a", "airports", &["code"])
+        .with_table("r", "regions", &["region_id"])
+        .with_fact("region_name", "r.name", "r")
+        .with_pkfk_join("dep_airport", "orders", "a", &["dep_code"], &["code"])
+        .with_pkfk_join("arr_airport", "orders", "a", &["arr_code"], &["code"])
+        .with_pkfk_join("airport_region", "a", "r", &["region_id"], &["region_id"]);
+    let req = QueryRequest {
+        facts: vec![FactName::new("region_name")],
+        dimensions: vec![],
+        metrics: vec![],
+    };
+    let err = expand("orders", &def, &req).unwrap_err();
+    match err {
+        ExpandError::AmbiguousFactPath {
+            fact_name,
+            fact_table,
+            role_playing_table,
+            ..
+        } => {
+            assert_eq!(fact_name, "region_name");
+            assert_eq!(fact_table, "r");
+            assert_eq!(role_playing_table, "a");
+        }
+        other => panic!("Expected AmbiguousFactPath, got: {other}"),
+    }
+}
+
+#[test]
 fn test_facts_path_single_relationship_dimension_ok() {
     let def = role_playing_facts_def(false);
     let req = QueryRequest {
