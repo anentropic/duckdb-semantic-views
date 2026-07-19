@@ -1,0 +1,94 @@
+# Code review 2026-07-18 — EXP-6: a window metric over a base metric declared
+# with a QUOTED name must still resolve that metric's fully-processed
+# expression (fact inlining + the SG-8 COUNT(*)->COUNT(pk) rewrite), not fall
+# back to its raw text.
+#
+# The resolved-metric-expression map was keyed by the stored name with its
+# quotes retained, while the window path looked it up by the quote-stripped,
+# case-folded key — so a quoted-name base metric missed the lookup and its
+# COUNT(*) counted NULL-extended LEFT JOIN rows (one per childless parent),
+# a silent overcount. `orders` row 3 (EU) has no line items, so the difference
+# is observable: the fixed count is 0, the buggy raw COUNT(*) would be 1.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr718_orders (id BIGINT, region VARCHAR, channel VARCHAR);
+
+statement ok
+CREATE TABLE cr718_items (id BIGINT, order_id BIGINT);
+
+statement ok
+INSERT INTO cr718_orders VALUES (1, 'US', 'web'), (2, 'US', 'store'), (3, 'EU', 'web');
+
+# order 3 (EU/web) has NO line items -> a NULL-extended LEFT JOIN row.
+statement ok
+INSERT INTO cr718_items VALUES (10, 1), (11, 1), (12, 2);
+
+statement ok
+CREATE SEMANTIC VIEW cr718_v AS
+  TABLES (
+    o AS cr718_orders PRIMARY KEY (id),
+    li AS cr718_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_o AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.region AS o.region,
+    o.channel AS o.channel
+  )
+  METRICS (
+    li."Item Count" AS COUNT(*),
+    li.rolling AS SUM("Item Count") OVER (PARTITION BY EXCLUDING channel ORDER BY region ASC NULLS LAST)
+  )
+
+# The quoted metric name round-trips through GET_DDL verbatim.
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'cr718_v') LIKE '%"Item Count" AS COUNT(*)%';
+----
+true
+
+# Plain aggregate query on the quoted-name child metric: COUNT(*) on the
+# non-base table is rewritten to COUNT(li.id), so the childless EU order counts
+# 0, not 1. `SELECT *` avoids naming the metric's output column, which retains
+# the stored name's quote characters (a separate, unrelated quoting quirk).
+query TI rowsort
+SELECT * FROM semantic_view('cr718_v', dimensions := ['region'], metrics := ['"Item Count"']);
+----
+EU	0
+US	3
+
+# EXP-6 guard — the window CTE's inner aggregate must use the REWRITTEN count.
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('cr718_v', dimensions := ['region', 'channel'], metrics := ['rolling']) WHERE explain_output LIKE '%COUNT("li"."id")%';
+----
+true
+
+# ...and the raw COUNT(*) must NOT leak into the generated SQL (the pre-fix bug:
+# a quote-keyed lookup miss fell back to the metric's raw COUNT(*)).
+query I
+SELECT count(*) FROM explain_semantic_view('cr718_v', dimensions := ['region', 'channel'], metrics := ['rolling']) WHERE explain_output LIKE '%COUNT(*)%';
+----
+0
+
+# End-to-end numeric guard — the window sum over the quoted-name base metric.
+# Partition = queried dims minus EXCLUDING channel = {region}; within a region
+# all rows are ORDER BY peers, so each sees the region's full sum. EU has only
+# the childless order, so its rolling sum is 0 (a raw COUNT(*) would make it 1).
+query TTI rowsort
+SELECT region, channel, CAST(rolling AS BIGINT)
+FROM semantic_view('cr718_v', dimensions := ['region', 'channel'], metrics := ['rolling']);
+----
+EU	web	0
+US	store	3
+US	web	3
+
+statement ok
+DROP SEMANTIC VIEW cr718_v;
+
+statement ok
+DROP TABLE cr718_items;
+
+statement ok
+DROP TABLE cr718_orders;

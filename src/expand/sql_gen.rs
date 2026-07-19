@@ -351,7 +351,7 @@ pub fn expand(
                     let metric_name = def
                         .metrics
                         .iter()
-                        .find(|m| m.name.eq_ignore_ascii_case(&name))
+                        .find(|m| crate::ident::ident_matches(&m.name, &name))
                         .map_or(name.clone(), |m| m.name.clone());
                     return Err(ExpandError::CountStarRequiresPrimaryKey {
                         view_name: view_name.to_string(),
@@ -457,9 +457,11 @@ pub fn expand(
         ));
     }
     for met in &resolved_mets {
-        // Look up the pre-computed resolved expression (handles both base + derived metrics)
+        // Look up the pre-computed resolved expression (handles both base +
+        // derived metrics) by the metric's canonical key, matching how
+        // `inline_derived_metrics` keys the map (EXP-6).
         let resolved_expr = resolved_exprs
-            .get(&met.name.to_ascii_lowercase())
+            .get(&crate::ident::normalize_ident_part(&met.name))
             .cloned()
             .unwrap_or_else(|| met.expr.clone());
         items.push(SelectItem::new(
