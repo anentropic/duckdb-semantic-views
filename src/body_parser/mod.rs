@@ -501,6 +501,90 @@ mod tests {
     }
 
     #[test]
+    fn split_dollar_quoted_comma_not_split() {
+        // PARSE-1 (code-review 2026-07-18): a comma inside a $$...$$
+        // dollar-quoted string is inert, exactly like one inside '...'. The
+        // dollar-quoted body is one opaque region between the two identical tags.
+        let result = split_at_depth0_commas("a, $$x, y$$, b").unwrap();
+        assert_eq!(result.len(), 3, "Expected 3 entries, got {result:?}");
+        assert_eq!(result[0].1, "a");
+        assert_eq!(result[1].1, "$$x, y$$");
+        assert_eq!(result[2].1, "b");
+    }
+
+    #[test]
+    fn split_tagged_dollar_quoted_comma_not_split() {
+        // Tagged form $t$...$t$; only the MATCHING tag closes, so a different
+        // inner tag ($z$) and its comma stay inside the region.
+        let result = split_at_depth0_commas("a, $t$x, $z$ y$t$, b").unwrap();
+        assert_eq!(result.len(), 3, "Expected 3 entries, got {result:?}");
+        assert_eq!(result[1].1, "$t$x, $z$ y$t$");
+    }
+
+    #[test]
+    fn split_dollar_paren_does_not_change_depth() {
+        // A `(` / `)` inside $$...$$ must not shift the depth counter, or a real
+        // depth-0 comma after the literal would be mis-counted.
+        let result = split_at_depth0_commas("$$a)b(c$$, d").unwrap();
+        assert_eq!(result.len(), 2, "Expected 2 entries, got {result:?}");
+        assert_eq!(result[0].1, "$$a)b(c$$");
+        assert_eq!(result[1].1, "d");
+    }
+
+    #[test]
+    fn split_lone_dollar_is_live_not_a_tag() {
+        // `$1` is a positional parameter, not a dollar-quote opener, and a lone
+        // `$` never opens a region — the comma still splits normally.
+        let result = split_at_depth0_commas("$1, a").unwrap();
+        assert_eq!(result.len(), 2, "Expected 2 entries, got {result:?}");
+        assert_eq!(result[0].1, "$1");
+        assert_eq!(result[1].1, "a");
+    }
+
+    #[test]
+    fn dollar_quoted_dimension_expr_is_one_entry() {
+        // PARSE-1 end-to-end: DIMENSIONS (o.a AS $$p,q.r AS s$$) must parse as
+        // ONE dimension whose expr is the whole dollar-quoted literal — the
+        // inner comma and `AS` are inert. Previously the inner comma split it
+        // into two garbage dimensions (`o.a AS $$p` and `q.r AS s$$`).
+        let body = "AS TABLES (o AS orders) DIMENSIONS (o.a AS $$p,q.r AS s$$)";
+        let parsed = parse_keyword_body(body, 0).expect("should parse");
+        assert_eq!(
+            parsed.dimensions.len(),
+            1,
+            "dollar-quoted expr must be one dimension, got: {:?}",
+            parsed.dimensions
+        );
+        assert_eq!(parsed.dimensions[0].name, "a");
+        assert_eq!(parsed.dimensions[0].expr, "$$p,q.r AS s$$");
+    }
+
+    #[test]
+    fn dollar_quoted_metric_keyword_is_inert() {
+        // PARSE-1: a structural keyword (USING / NON ADDITIVE BY) inside a
+        // metric expression's $$...$$ must be inert — the entry has no real
+        // USING clause, so it parses as a plain derived metric.
+        let body = "AS TABLES (o AS orders) METRICS (m AS $$a USING b$$)";
+        let parsed = parse_keyword_body(body, 0).expect("should parse");
+        assert_eq!(parsed.metrics.len(), 1, "got: {:?}", parsed.metrics);
+        assert_eq!(parsed.metrics[0].name, "m");
+        assert_eq!(parsed.metrics[0].expr, "$$a USING b$$");
+        assert!(
+            parsed.metrics[0].using_relationships.is_empty(),
+            "USING inside a dollar string must not be parsed as a USING clause"
+        );
+    }
+
+    #[test]
+    fn dollar_quoted_dimension_close_paren_is_inert() {
+        // PARSE-1: a `)` inside $$...$$ must not close the DIMENSIONS (...) early.
+        let body = "AS TABLES (o AS orders) DIMENSIONS (o.a AS $$x)y$$)";
+        let parsed = parse_keyword_body(body, 0).expect("should parse");
+        assert_eq!(parsed.dimensions.len(), 1, "got: {:?}", parsed.dimensions);
+        assert_eq!(parsed.dimensions[0].expr, "$$x)y$$");
+    }
+
+    #[test]
     fn split_trailing_comma_discarded() {
         let result = split_at_depth0_commas("a,").unwrap();
         assert_eq!(

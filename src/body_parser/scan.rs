@@ -15,19 +15,46 @@ use crate::errors::ParseError;
 ///
 /// Multi-byte UTF-8 is safe by construction: only ASCII bytes are compared,
 /// and continuation bytes (>= 0x80) never equal an ASCII quote.
+///
+/// Dollar-quoted strings (`$tag$ ... $tag$`, PARSE-1 / code-review 2026-07-18)
+/// are tracked too: a `,` / `)` / keyword inside one is inert, matching the
+/// comment-blanker and the CREATE-body extractor which already share the tag
+/// grammar via [`crate::util::read_dollar_tag_len`]. Without this a comma inside
+/// a dimension/metric expression's `$$...$$` split one entry into two garbage
+/// entries (the P-1/P-2 silent-mis-parse class).
 #[derive(Default, Clone, Copy)]
 pub(super) struct QuoteState {
     pub(super) in_string: bool,
     pub(super) in_ident: bool,
+    /// When inside a `$tag$ ... $tag$` region, the byte span `[start, end)` of
+    /// the OPENING tag within the buffer being scanned; `None` otherwise. Stored
+    /// as offsets (not the tag bytes) so `QuoteState` stays `Copy`; the offsets
+    /// index the same `bytes` slice passed to every `step` call, which every
+    /// scan-in-a-loop caller preserves.
+    dollar_open: Option<(usize, usize)>,
 }
 
 impl QuoteState {
+    /// True while inside an unterminated (still-open) dollar-quoted region.
+    pub(super) fn in_dollar(&self) -> bool {
+        self.dollar_open.is_some()
+    }
+
     /// Consume the byte at `i`, updating quote state. Returns
     /// `(next_index, is_live_code)` where `is_live_code` is true only when
     /// byte `i` is outside every quoted region and is not itself a quote
-    /// delimiter. Escape pairs are consumed whole (`next_index == i + 2`).
+    /// delimiter. Escape pairs / whole dollar tags are consumed at once.
     pub(super) fn step(&mut self, bytes: &[u8], i: usize) -> (usize, bool) {
         let b = bytes[i];
+        if let Some((ts, te)) = self.dollar_open {
+            // Inside `$tag$...$tag$`: only the IDENTICAL closing tag ends the
+            // region — a different inner tag ($z$) or a lone `$` does not.
+            if b == b'$' && bytes[i..].starts_with(&bytes[ts..te]) {
+                self.dollar_open = None;
+                return (i + (te - ts), false); // consume the whole closing tag
+            }
+            return (i + 1, false);
+        }
         if self.in_string {
             if b == b'\'' {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
@@ -53,6 +80,17 @@ impl QuoteState {
                 b'"' => {
                     self.in_ident = true;
                     (i + 1, false)
+                }
+                b'$' => {
+                    // A valid `$tag$` opener starts a dollar-quoted region; a
+                    // lone `$` or a `$1` positional parameter (rejected by
+                    // read_dollar_tag_len) is ordinary live code.
+                    if let Some(len) = crate::util::read_dollar_tag_len(bytes, i) {
+                        self.dollar_open = Some((i, i + len));
+                        (i + len, false) // consume the whole opening tag
+                    } else {
+                        (i + 1, true)
+                    }
                 }
                 _ => (i + 1, true),
             }
@@ -84,6 +122,8 @@ pub(super) fn unterminated_quote_error(s: &str) -> Option<&'static str> {
         Some("Unterminated quoted identifier")
     } else if st.in_string {
         Some("Unterminated string literal")
+    } else if st.in_dollar() {
+        Some("Unterminated dollar-quoted string")
     } else {
         None
     }
@@ -324,7 +364,7 @@ pub(crate) fn column_roundtrips_verbatim(s: &str) -> bool {
         }
         i = next;
     }
-    paren_depth == 0 && bracket_depth == 0 && !st.in_string && !st.in_ident
+    paren_depth == 0 && bracket_depth == 0 && !st.in_string && !st.in_ident && !st.in_dollar()
 }
 
 /// True when `s`, emitted verbatim in a single-identifier slot (a table alias,

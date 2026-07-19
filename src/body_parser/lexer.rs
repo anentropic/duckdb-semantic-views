@@ -30,10 +30,11 @@
 //! comment tokens would let raw slices re-absorb comment bytes. Revisit only
 //! as part of a universal-front-door refactor in which detect/rewrite also
 //! tokenize through this lexer and every raw-slice consumer reads via a
-//! comment-aware token layer. Numeric and dollar-quoted literals get their
-//! own kinds when a consumer first needs them distinguished (numbers
-//! currently tokenize as bare identifiers, which is harmless for the
-//! identifier-only clauses migrated so far).
+//! comment-aware token layer. Numeric literals still tokenize as bare
+//! identifiers (harmless for the identifier-only clauses migrated so far);
+//! dollar-quoted literals get their own [`TokenKind::DollarString`] (PARSE-1,
+//! code-review 2026-07-18) so a delimiter or keyword inside `$tag$ ... $tag$`
+//! is inert to the structural scan, exactly like the contents of a `'string'`.
 //!
 //! ## UTF-8 safety
 //!
@@ -55,6 +56,14 @@ pub(super) enum TokenKind {
     Ident { quoted: bool },
     /// A single-quoted string literal `'...'`, `''` treated as an escape.
     String,
+    /// A dollar-quoted string `$tag$ ... $tag$` (PARSE-1, code-review
+    /// 2026-07-18). `terminated` is false when the opening `$tag$` had no
+    /// matching close tag before end-of-input (the parser errors on it). The
+    /// whole literal is ONE opaque token so a `)` / `,` / keyword inside it is
+    /// never a matchable `Symbol` / `Ident` — the same guarantee `'...'` and
+    /// `"..."` already give. The tag grammar is shared with `QuoteState` and the
+    /// comment-blanker via [`crate::util::read_dollar_tag_len`].
+    DollarString { terminated: bool },
     /// A single punctuation byte outside any quoted region.
     Symbol(u8),
     /// An unterminated `"..."` (`ident = true`) or `'...'` (`ident = false`)
@@ -142,6 +151,14 @@ pub(super) fn lex(src: &str) -> Vec<Token> {
                     end: i,
                 });
             }
+            b'$' if crate::util::read_dollar_tag_len(bytes, i).is_some() => {
+                // `$tag$ ... $tag$` — one opaque token (a lone `$` / `$1`
+                // positional parameter is not a tag opener and falls through to
+                // the Symbol arm below).
+                let tok = lex_dollar_string(bytes, i);
+                i = tok.end;
+                toks.push(tok);
+            }
             _ if is_ident_byte(b) => {
                 let start = i;
                 while i < bytes.len() && is_ident_byte(bytes[i]) {
@@ -164,6 +181,32 @@ pub(super) fn lex(src: &str) -> Vec<Token> {
         }
     }
     toks
+}
+
+/// Lex one `$tag$ ... $tag$` dollar-quoted string starting at `start`, which
+/// MUST be a valid tag opener (`read_dollar_tag_len(bytes, start).is_some()`).
+/// Scans to the matching close tag, or to end-of-input if it never appears
+/// (`terminated == false`, which the parser turns into an error). Only the
+/// IDENTICAL tag closes the region — a different inner tag (`$z$`) does not.
+fn lex_dollar_string(bytes: &[u8], start: usize) -> Token {
+    let open_len =
+        crate::util::read_dollar_tag_len(bytes, start).expect("caller guards a valid tag opener");
+    let tag = &bytes[start..start + open_len];
+    let mut j = start + open_len;
+    let mut terminated = false;
+    while j < bytes.len() {
+        if bytes[j] == b'$' && bytes[j..].starts_with(tag) {
+            j += open_len;
+            terminated = true;
+            break;
+        }
+        j += 1;
+    }
+    Token {
+        kind: TokenKind::DollarString { terminated },
+        start,
+        end: j,
+    }
 }
 
 #[cfg(test)]
@@ -268,6 +311,50 @@ mod tests {
     }
 
     #[test]
+    fn dollar_string_is_one_opaque_token() {
+        // A `)` / `,` / keyword inside $$...$$ is not a matchable token.
+        let toks = lex("$$a) b, AS c$$");
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].kind, TokenKind::DollarString { terminated: true });
+        assert_eq!(
+            &"$$a) b, AS c$$"[toks[0].start..toks[0].end],
+            "$$a) b, AS c$$"
+        );
+    }
+
+    #[test]
+    fn tagged_dollar_string_closes_on_matching_tag_only() {
+        // $t$ ... $t$ ; the inner $z$ does not close the region.
+        let src = "$t$x $z$ y$t$";
+        let toks = lex(src);
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].kind, TokenKind::DollarString { terminated: true });
+        assert_eq!(toks[0].end, src.len());
+    }
+
+    #[test]
+    fn unterminated_dollar_string_spans_to_eof() {
+        let src = "$$unclosed ) , AS";
+        let toks = lex(src);
+        assert_eq!(toks.len(), 1);
+        assert_eq!(toks[0].kind, TokenKind::DollarString { terminated: false });
+        assert_eq!(toks[0].end, src.len());
+    }
+
+    #[test]
+    fn lone_dollar_and_positional_param_are_symbols() {
+        // `$1` is a positional parameter, not a dollar-quote tag.
+        let toks = lex("$1");
+        assert_eq!(toks[0].kind, TokenKind::Symbol(b'$'));
+        assert_eq!(toks[1].kind, TokenKind::Ident { quoted: false });
+        // A lone trailing `$` (no closable tag) is just a symbol.
+        assert_eq!(
+            lex("$").first().map(|t| t.kind),
+            Some(TokenKind::Symbol(b'$'))
+        );
+    }
+
+    #[test]
     fn unterminated_quote_and_string() {
         assert_eq!(
             lex("\"unclosed").first().map(|t| t.kind),
@@ -317,6 +404,10 @@ mod tests {
             "café AS \"東京 table\"",
             "'unterminated and PRIMARY KEY (id)",
             "\"unterminated ident",
+            "o.a AS $$p, q.r AS s$$",
+            "$t$x $z$ y$t$",
+            "$$unterminated ) , AS",
+            "$1 + $$tag$$",
         ] {
             assert_well_formed(s);
         }
@@ -335,7 +426,7 @@ mod tests {
             /// unterminated regions), `(` `)` `;` `.` `=` `-`, unicode, and
             /// whitespace — the bytes whose handling the lexer is responsible for.
             #[test]
-            fn tiling_holds_over_hostile_alphabet(s in r#"[-a-zé_ "'(),.;=]{0,48}"#) {
+            fn tiling_holds_over_hostile_alphabet(s in r#"[-a-zé_ "'(),.;=$]{0,48}"#) {
                 assert_well_formed(&s);
             }
 
