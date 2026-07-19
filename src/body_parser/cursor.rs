@@ -19,6 +19,7 @@ use crate::errors::ParseError;
 /// The kind of unterminated quoted region a token stream ends in, returned by
 /// [`Cursor::unterminated_tail`] so a failed `take_parens` reports a precise
 /// "unterminated ..." message instead of a misleading "unclosed paren".
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum UnterminatedRegion {
     /// An unterminated double-quoted identifier `"...`.
     Ident,
@@ -427,9 +428,20 @@ mod tests {
 
     #[test]
     fn unterminated_tail_reports_open_quote_kind() {
-        // A `(...` that never closes because a quote swallowed the rest.
-        assert_eq!(Cursor::new("(a, \"b c", 0).unterminated_tail(), Some(true));
-        assert_eq!(Cursor::new("(a, 'b c", 0).unterminated_tail(), Some(false));
+        // A `(...` that never closes because a quote / dollar-quote swallowed
+        // the rest.
+        assert_eq!(
+            Cursor::new("(a, \"b c", 0).unterminated_tail(),
+            Some(UnterminatedRegion::Ident)
+        );
+        assert_eq!(
+            Cursor::new("(a, 'b c", 0).unterminated_tail(),
+            Some(UnterminatedRegion::String)
+        );
+        assert_eq!(
+            Cursor::new("(a, $$b c", 0).unterminated_tail(),
+            Some(UnterminatedRegion::Dollar)
+        );
         // A plain unclosed paren (no open quote) is not an unterminated tail.
         assert_eq!(Cursor::new("(a, b", 0).unterminated_tail(), None);
         // A fully-terminated stream has no unterminated tail.
