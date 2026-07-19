@@ -87,13 +87,16 @@ US	150
 US	300
 
 # The OVER clause references the resolved dimension by its aggregation-CTE
-# alias. The stored dimension name is quoted (`"order date"`), so its alias is
-# the escaped form `"""order date"""` — the same token the CTE assigned, which
-# is why the query above binds.
+# alias. The stored dimension name is quoted (`"order date"`); its logical value
+# is stripped and quoted exactly once (EXP-7), so the CTE alias — and the OVER
+# reference to it — is the single-quoted `"order date"` (asserted present
+# above), NOT the triple-quoted `"""order date"""` that re-quoting the stored
+# name used to produce. The query above binds precisely because both sides use
+# that one token.
 query I
-SELECT count(*) > 0 FROM explain_semantic_view('p68_b2_v2', dimensions := ['region', '"order date"'], metrics := ['running_total']) WHERE explain_output LIKE '%"""order date"""%';
+SELECT count(*) FROM explain_semantic_view('p68_b2_v2', dimensions := ['region', '"order date"'], metrics := ['running_total']) WHERE explain_output LIKE '%"""order date"""%';
 ----
-true
+0
 
 # It must NOT emit the raw dotted reference as a non-column (the pre-fix bug).
 query I

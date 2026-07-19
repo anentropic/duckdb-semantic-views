@@ -130,3 +130,61 @@ fn table_qualified_metric_lookup_with_matching_source_table() {
         "Must include metric expr: {sql}"
     );
 }
+
+/// EXP-7 (code-review 2026-07-18): a dimension or metric declared with a
+/// *quoted* name (`"order date"`) is stored WITH its quotes, so passing the
+/// stored name straight through `quote_ident` at the emission sites re-quoted
+/// it into a triple-quoted alias (`AS """order date"""`) — the output column
+/// was then literally named with quote characters. The stored name must be
+/// stripped to its logical value before quoting, yielding exactly one pair of
+/// quotes (`AS "order date"`, output column `order date`).
+#[test]
+fn quoted_stored_names_emit_single_quoted_output_aliases() {
+    use crate::model::{Dimension, Metric, SemanticViewDefinition, TableRef};
+    let def = SemanticViewDefinition {
+        tables: vec![TableRef {
+            alias: "o".to_string(),
+            table: "orders".to_string(),
+            ..Default::default()
+        }],
+        dimensions: vec![Dimension {
+            // Stored with its quotes, exactly as the body parser captures it.
+            name: "\"order date\"".to_string(),
+            expr: "o.order_date".to_string(),
+            source_table: Some("o".to_string()),
+            ..Default::default()
+        }],
+        metrics: vec![Metric {
+            name: "\"total sales\"".to_string(),
+            expr: "SUM(o.amount)".to_string(),
+            source_table: Some("o".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let req = QueryRequest {
+        facts: vec![],
+        dimensions: vec![DimensionName::new("order date")],
+        metrics: vec![MetricName::new("total sales")],
+    };
+    let sql = expand("sales_view", &def, &req).expect("quoted-name query should expand");
+    // One canonical pair of quotes per alias — the output columns are named
+    // `order date` / `total sales`, not `"order date"` / `"total sales"`.
+    assert!(
+        sql.contains("AS \"order date\""),
+        "dimension alias must be single-quoted: {sql}"
+    );
+    assert!(
+        sql.contains("AS \"total sales\""),
+        "metric alias must be single-quoted: {sql}"
+    );
+    // No triple-quote leak from re-quoting the already-quoted stored name.
+    assert!(
+        !sql.contains("\"\"\"order date\"\"\""),
+        "dimension alias must not be triple-quoted: {sql}"
+    );
+    assert!(
+        !sql.contains("\"\"\"total sales\"\"\""),
+        "metric alias must not be triple-quoted: {sql}"
+    );
+}

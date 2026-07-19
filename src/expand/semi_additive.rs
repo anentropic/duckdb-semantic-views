@@ -42,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 use crate::model::{Metric, NonAdditiveDim, NullsOrder, SemanticViewDefinition, SortOrder};
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
-use super::resolution::quote_ident;
+use super::resolution::{quote_ident, quote_stored_ident};
 use super::select_spec::{push_from_base, FromSource, GroupBy, SelectItem, SelectSpec};
 use super::types::{ExpandError, ResolvedDim};
 
@@ -220,7 +220,11 @@ pub(super) fn expand_semi_additive(
                 base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);
             }
         }
-        let item = SelectItem::new(base_expr, dim.output_type.clone(), quote_ident(&dim.name));
+        let item = SelectItem::new(
+            base_expr,
+            dim.output_type.clone(),
+            quote_stored_ident(&dim.name),
+        );
         cte_select_items.push(format!("        {}", item.render()));
         // The window PARTITION/ORDER clauses must repeat this EXPRESSION, never
         // the select alias (E-1) — see the comment above.
@@ -402,9 +406,9 @@ pub(super) fn expand_semi_additive(
     // referencing the alias is safe — no physical column shadows it here).
     for rd in resolved_dims {
         outer_items.push(SelectItem::new(
-            quote_ident(&rd.dim.name),
+            quote_stored_ident(&rd.dim.name),
             None,
-            quote_ident(&rd.dim.name),
+            quote_stored_ident(&rd.dim.name),
         ));
     }
 
@@ -424,7 +428,7 @@ pub(super) fn expand_semi_additive(
         outer_items.push(SelectItem::new(
             inner,
             met.output_type.clone(),
-            quote_ident(&met.name),
+            quote_stored_ident(&met.name),
         ));
     }
 

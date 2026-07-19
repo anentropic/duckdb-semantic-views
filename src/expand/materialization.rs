@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use crate::model::{Dimension, Materialization, Metric, SemanticViewDefinition};
 
-use super::resolution::{qualify_and_quote_table_ref, quote_ident};
+use super::resolution::{qualify_and_quote_table_ref, quote_stored_ident};
 
 /// Find the materialization whose declared dimension and metric name sets
 /// EXACTLY match the requested ones (case-insensitive), honoring the routing
@@ -120,7 +120,7 @@ fn build_materialized_sql(
     let mut items: Vec<String> = Vec::with_capacity(dims.len() + mets.len());
 
     for dim in dims {
-        let col = quote_ident(&dim.name);
+        let col = quote_stored_ident(&dim.name);
         if let Some(ref type_str) = dim.output_type {
             items.push(format!("    CAST({col} AS {type_str}) AS {col}"));
         } else {
@@ -129,7 +129,7 @@ fn build_materialized_sql(
     }
 
     for met in mets {
-        let col = quote_ident(&met.name);
+        let col = quote_stored_ident(&met.name);
         if let Some(ref type_str) = met.output_type {
             items.push(format!("    CAST({col} AS {type_str}) AS {col}"));
         } else {

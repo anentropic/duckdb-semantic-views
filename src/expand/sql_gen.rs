@@ -6,7 +6,7 @@ use super::facts::{
 };
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::resolve_joins_pkfk;
-use super::resolution::{find_dimension, find_metric, quote_ident};
+use super::resolution::{find_dimension, find_metric, quote_stored_ident};
 use super::role_playing::{check_fact_role_playing_path, find_using_context};
 use super::select_spec::{FromSource, GroupBy, SelectItem, SelectSpec};
 use super::types::{ExpandError, QueryRequest, ResolvedDim};
@@ -245,7 +245,7 @@ fn expand_facts(
         items.push(SelectItem::new(
             dim.expr.clone(),
             dim.output_type.clone(),
-            quote_ident(&dim.name),
+            quote_stored_ident(&dim.name),
         ));
     }
 
@@ -255,7 +255,7 @@ fn expand_facts(
         items.push(SelectItem::new(
             resolved_expr,
             fact.output_type.clone(),
-            quote_ident(&fact.name),
+            quote_stored_ident(&fact.name),
         ));
     }
 
@@ -461,7 +461,7 @@ pub fn expand(
         items.push(SelectItem::new(
             base_expr,
             dim.output_type.clone(),
-            quote_ident(&dim.name),
+            quote_stored_ident(&dim.name),
         ));
     }
     for met in &resolved_mets {
@@ -475,7 +475,7 @@ pub fn expand(
         items.push(SelectItem::new(
             resolved_expr,
             met.output_type.clone(),
-            quote_ident(&met.name),
+            quote_stored_ident(&met.name),
         ));
     }
 

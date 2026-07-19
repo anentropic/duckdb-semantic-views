@@ -44,6 +44,43 @@ pub fn quote_ident_if_needed(ident: &str) -> String {
     }
 }
 
+/// Emit a *stored* identifier name (a dimension / metric / fact name, which
+/// retains whatever quoting the user wrote) as ONE canonical double-quoted SQL
+/// identifier — for an output-column alias or a materialization column
+/// reference.
+///
+/// Stored names keep their quotes (`"order date"` is stored verbatim, quotes
+/// included), so feeding one straight to [`quote_ident`] double-quotes it —
+/// `quote_ident("\"order date\"")` is `"""order date"""`, an output column
+/// literally named with quote characters and a materialization reference to a
+/// physically-impossible column (EXP-7, code-review 2026-07-18). Strip to the
+/// logical value first — CASE-PRESERVED, since quoted identifiers are
+/// case-sensitive (unlike [`crate::ident::normalize_ident_part`], which folds
+/// case for *matching*) — then quote exactly once.
+///
+/// A bare stored name (`region`) or an already-canonical key round-trips
+/// unchanged, so non-quoted names emit identically to a plain [`quote_ident`].
+/// A name that fails to parse as an identifier falls back to quoting the raw
+/// string (fail-clean).
+///
+/// ```
+/// use semantic_views::expand::quote_stored_ident;
+/// assert_eq!(quote_stored_ident("region"), "\"region\"");
+/// assert_eq!(quote_stored_ident("\"order date\""), "\"order date\"");
+/// assert_eq!(quote_stored_ident("\"Order Date\""), "\"Order Date\"");
+/// ```
+#[must_use]
+pub fn quote_stored_ident(stored_name: &str) -> String {
+    match crate::ident::parse_qualified_identifier(stored_name) {
+        Ok(parts) => parts
+            .iter()
+            .map(|p| quote_ident(p))
+            .collect::<Vec<_>>()
+            .join("."),
+        Err(_) => quote_ident(stored_name),
+    }
+}
+
 /// Quote a potentially dot-qualified table reference, normalising already-quoted input.
 ///
 /// Delegates to [`crate::ident::parse_qualified_identifier`] so we operate on the
