@@ -17,7 +17,9 @@ Syntax
 
 .. code-block:: sqlgrammar
 
-   DESCRIBE SEMANTIC VIEW <name>;
+   { DESCRIBE | DESC } SEMANTIC VIEW <name>;
+
+``DESC`` is accepted as an abbreviation of ``DESCRIBE``, matching Snowflake.
 
 
 .. _ref-describe-params:
@@ -210,10 +212,13 @@ Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then `
         - JSON array of synonym strings. Only emitted when synonyms are set.
       * - ``ACCESS_MODIFIER``
         - ``PUBLIC`` or ``PRIVATE``. Always emitted.
-      * - ``NON_ADDITIVE_BY``
-        - Only emitted for semi-additive derived metrics.
-      * - ``WINDOW_SPEC``
-        - Only emitted for window-function derived metrics.
+
+.. note::
+
+   Derived metrics never carry ``NON_ADDITIVE_BY`` or ``WINDOW_SPEC``
+   properties: the parser rejects ``NON ADDITIVE BY`` and ``OVER`` on a derived
+   metric, so a semi-additive or window derived metric cannot be defined. Those
+   properties appear only under ``METRIC`` (base metrics scoped to a table).
 
 **MATERIALIZATION**
    .. versionadded:: 0.7.0

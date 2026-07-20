@@ -38,7 +38,7 @@ Parameters
      - Description
    * - ``<view_name>``
      - VARCHAR (positional)
-     - The name of the semantic view to explain.
+     - The name of the semantic view to explain. Matched case-insensitively (folded to lowercase per DuckDB identifier semantics), quoted or not.
    * - ``dimensions``
      - LIST (named)
      - Optional list of dimension names. Supports ``alias.*`` wildcard patterns.

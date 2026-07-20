@@ -46,7 +46,17 @@ Parameters
 ==========
 
 ``<name>``
-   The name of the semantic view to drop. Case-sensitive.
+   The name of the semantic view to drop. The name is folded to lowercase and
+   matched case-insensitively, quoted or not -- ``DROP SEMANTIC VIEW SALES``,
+   ``DROP SEMANTIC VIEW sales``, and ``DROP SEMANTIC VIEW "sales"`` all refer to
+   the same view, following DuckDB's identifier semantics.
+
+.. note::
+
+   A view created before v0.11.0 via a *quoted* mixed-case identifier
+   (e.g. ``CREATE SEMANTIC VIEW "Sales"``) kept its original casing and is no
+   longer reachable by any spelling. Drop and recreate it, or rename its stored
+   catalog row to lowercase.
 
 
 .. _ref-drop-examples:

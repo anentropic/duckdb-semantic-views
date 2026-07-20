@@ -62,10 +62,10 @@ Parameters
 ==========
 
 ``<name>``
-   The name of the semantic view to modify.
+   The name of the semantic view to modify. Matched case-insensitively (folded to lowercase per DuckDB identifier semantics), quoted or not.
 
 ``<new_name>``
-   The new name for the semantic view (RENAME TO only). Must not match the name of an existing semantic view.
+   The new name for the semantic view (RENAME TO only). Folded to lowercase before it is stored, quoted or not. Must not match the name of an existing semantic view.
 
 ``<text>``
    The comment text (SET COMMENT only). Must be enclosed in single quotes. Use ``''`` to escape single quotes within the text.

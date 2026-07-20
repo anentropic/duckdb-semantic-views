@@ -62,7 +62,7 @@ Concept Mapping
      - ``COMMENT``, ``WITH SYNONYMS`` (see :ref:`howto-metadata-annotations`)
    * - Access modifiers
      - ``PRIVATE`` / ``PUBLIC``
-     - ``PRIVATE`` / ``PUBLIC`` on metrics and facts
+     - ``PRIVATE`` / ``PUBLIC`` on metrics and facts; ``PUBLIC`` also accepted (as a no-op) on dimensions, ``PRIVATE`` rejected on dimensions
    * - Materializations / pre-aggregation
      - Not part of Snowflake's ``CREATE SEMANTIC VIEW`` DDL
      - ``MATERIALIZATIONS`` clause for routing to pre-aggregated tables (see :ref:`howto-materializations`)
@@ -73,8 +73,8 @@ Concept Mapping
      - ``alias.*`` in query parameters
      - ``alias.*`` in ``dimensions``, ``metrics``, ``facts`` parameters (see :ref:`howto-wildcard-selection`)
    * - View inspection
-     - ``DESCRIBE SEMANTIC VIEW``
-     - ``DESCRIBE SEMANTIC VIEW``
+     - ``DESCRIBE`` / ``DESC SEMANTIC VIEW``
+     - ``DESCRIBE SEMANTIC VIEW`` (``DESC`` abbreviation also accepted)
    * - List views
      - ``SHOW SEMANTIC VIEWS``
      - ``SHOW SEMANTIC VIEWS``
@@ -104,6 +104,20 @@ Syntax Alignment
 ================
 
 The DDL syntax is intentionally close to Snowflake's. The clause order (``TABLES``, ``RELATIONSHIPS``, ``FACTS``, ``DIMENSIONS``, ``METRICS``) matches Snowflake, and the entry syntax within each clause follows the same pattern.
+
+.. note::
+
+   **Syntax conveniences for porting.**
+
+   .. versionadded:: 0.11.0
+
+   Several Snowflake spellings are accepted to reduce friction when porting DDL: the
+   table alias in ``TABLES`` is optional (``TABLES (orders PRIMARY KEY (id))``, matching
+   Snowflake's ``[alias AS] table``); a view-level ``COMMENT = '...'`` may appear in the
+   trailing position after the last clause; ``PUBLIC`` is accepted on dimensions;
+   ``WITH SYNONYMS (...)`` is accepted without the ``=``; and ``DESC SEMANTIC VIEW`` is
+   accepted as an abbreviation of ``DESCRIBE SEMANTIC VIEW``. See
+   :ref:`ref-create-semantic-view`.
 
 .. tab-set::
    :sync-group: platform
@@ -162,74 +176,38 @@ Primary Key Declarations
 
 .. note::
 
-   ``PRIMARY KEY`` declarations in the ``TABLES`` clause are optional at the syntax level.
-   Whether you need them in practice depends on your data source.
+   ``PRIMARY KEY`` declarations in the ``TABLES`` clause are optional at the syntax
+   level, but any table used as the target of a ``RELATIONSHIPS`` entry needs a key
+   the join can resolve against — either a ``PRIMARY KEY`` / ``UNIQUE`` declaration on
+   that table, or an explicit ``REFERENCES target(columns)`` list on the foreign side.
 
-Snowflake resolves PK/FK metadata directly from its catalog, so its SQL DDL does not require
-explicit ``PRIMARY KEY`` declarations. DuckDB also has catalog-level PK/FK metadata -- but only
-for native DuckDB tables that were created with ``PRIMARY KEY`` constraints.
+Snowflake resolves PK/FK metadata directly from its catalog, so its SQL DDL does not
+require explicit ``PRIMARY KEY`` declarations. DuckDB Semantic Views takes the opposite
+stance: a ``PRIMARY KEY`` in a semantic view is a **logical assertion you make**, not a
+physical constraint imported from the catalog.
 
-For external data sources -- Parquet files, CSV, Iceberg REST catalog tables, or any table not
-physically defined in DuckDB -- the DuckDB catalog has no PK/FK information to consult. When
-you create a semantic view, the extension queries DuckDB's internal ``duckdb_constraints()``
-table for each declared table. If a native DuckDB table has a ``PRIMARY KEY`` constraint, the
-extension finds it automatically and you can omit ``PRIMARY KEY`` from the ``TABLES`` clause.
-If the constraint is not there -- as is the case for Iceberg and other external sources --
-you must declare it explicitly.
+.. versionchanged:: 0.10.0
+
+   Automatic PK inference from DuckDB's ``duckdb_constraints()`` catalog was **removed**
+   (breaking). Earlier releases imported a native table's physical ``PRIMARY KEY`` at
+   ``CREATE`` time when the ``TABLES`` entry declared none; this fallback is gone. You
+   must now declare the key explicitly, whether the table is a native DuckDB table or an
+   external source. Migration: add a ``PRIMARY KEY (...)`` (or ``UNIQUE (...)``) clause to
+   any ``TABLES`` entry that previously relied on the auto-fallback, or use
+   ``REFERENCES target(columns)`` on the referencing side.
 
 .. tip::
 
-   Most data engineers using DuckDB with Iceberg tables via the ``iceberg`` extension will
-   need to include ``PRIMARY KEY`` declarations in their semantic view DDL. Iceberg's own
-   metadata supports primary key fields, but DuckDB does not surface those constraints
-   through ``duckdb_constraints()``. Declare them in the ``TABLES`` clause to unlock
-   join inference and relationship validation.
-
-The three cases are:
-
-.. list-table::
-   :header-rows: 1
-   :widths: 40 30 30
-
-   * - Data source
-     - Catalog PK available?
-     - ``PRIMARY KEY`` in DDL required?
-   * - Native DuckDB table with ``PRIMARY KEY`` constraint
-     - Yes (main schema only)
-     - No (resolved automatically)
-   * - Native DuckDB table without ``PRIMARY KEY`` constraint
-     - No
-     - Yes
-   * - External source (Parquet, CSV, Iceberg, Postgres, etc.)
-     - No
-     - Yes
-
-.. note::
-
-   Automatic PK resolution applies only to tables in the ``main`` schema of the current
-   DuckDB database. Tables in other schemas or attached databases are not resolved
-   automatically -- declare ``PRIMARY KEY`` explicitly for those tables.
+   This uniform rule is convenient for data engineers using DuckDB with Iceberg,
+   Parquet, CSV, or Postgres sources: those catalogs never surfaced PK/FK metadata
+   through ``duckdb_constraints()`` anyway, so declaring keys in the ``TABLES`` clause was
+   always required for them. Now native DuckDB tables follow the same explicit-declaration
+   rule, so there is one consistent model regardless of data source.
 
 .. code-block:: sql
 
-   -- Native DuckDB table: PRIMARY KEY can be omitted if the table was created with one
-   CREATE TABLE orders (id INTEGER PRIMARY KEY, amount DECIMAL);
-   CREATE TABLE customers (id INTEGER PRIMARY KEY, name VARCHAR);
-
-   CREATE SEMANTIC VIEW analytics AS
-   TABLES (
-       o AS orders,         -- PK resolved automatically from DuckDB catalog
-       c AS customers       -- PK resolved automatically from DuckDB catalog
-   )
-   RELATIONSHIPS (
-       order_customer AS o(customer_id) REFERENCES c
-   )
-   DIMENSIONS (c.name AS c.name)
-   METRICS (o.revenue AS SUM(o.amount));
-
-.. code-block:: sql
-
-   -- Iceberg or other external source: PRIMARY KEY must be declared explicitly
+   -- Every table used as a join target declares its key explicitly,
+   -- regardless of whether it is a native DuckDB table or an external source.
    CREATE SEMANTIC VIEW analytics AS
    TABLES (
        o AS orders    PRIMARY KEY (id),
@@ -241,8 +219,8 @@ The three cases are:
    DIMENSIONS (c.name AS c.name)
    METRICS (o.revenue AS SUM(o.amount));
 
-If a table involved in a ``RELATIONSHIPS`` entry has no primary key -- neither from the catalog
-nor from an explicit declaration -- the extension raises an error at ``CREATE`` time:
+If a table involved in a ``RELATIONSHIPS`` entry has no primary key from an explicit
+declaration, the extension raises an error at ``CREATE`` time:
 ``Table 'X' has no PRIMARY KEY. Specify referenced columns explicitly: REFERENCES X(col).``
 This prevents the extension from synthesizing an incorrect JOIN ON clause.
 

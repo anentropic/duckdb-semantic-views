@@ -47,6 +47,11 @@ Output
 
 Returns a single VARCHAR value containing the full ``CREATE OR REPLACE SEMANTIC VIEW`` DDL statement. The DDL includes all clauses (TABLES, RELATIONSHIPS, FACTS, DIMENSIONS, METRICS, MATERIALIZATIONS) with all annotations (COMMENT, WITH SYNONYMS, PRIVATE, NON ADDITIVE BY, OVER). The ``MATERIALIZATIONS`` clause is included only when the view has materializations declared; it is omitted for views without materializations.
 
+The rendered DDL re-parses to the same definition. In particular:
+
+- A relationship declared against a ``UNIQUE`` key (rather than the primary key) renders its ``REFERENCES <target>(<columns>)`` column list, so re-parsing keeps the join wired to the unique key instead of silently falling back to the primary key.
+- A view name that needs quoting (embedded whitespace or non-ASCII characters) is quoted in the rendered ``CREATE OR REPLACE SEMANTIC VIEW`` header. (Mixed-case names are never quoted for case: names fold to lowercase — see :ref:`ref-create-semantic-view`.)
+
 
 .. _ref-get-ddl-examples:
 
@@ -101,6 +106,27 @@ Sample output:
            DIMENSIONS (region),
            METRICS (revenue, order_count)
        )
+   )
+
+**Relationship against a UNIQUE key:**
+
+When a relationship references a target's ``UNIQUE`` key rather than its primary key, the rendered ``REFERENCES`` carries the explicit column list so the round-trip preserves the join:
+
+.. code-block:: text
+
+   CREATE OR REPLACE SEMANTIC VIEW sales AS
+   TABLES (
+       o AS orders   PRIMARY KEY (id),
+       c AS customers PRIMARY KEY (id) UNIQUE (email)
+   )
+   RELATIONSHIPS (
+       order_customer AS o(customer_email) REFERENCES c(email)
+   )
+   DIMENSIONS (
+       c.customer AS c.name
+   )
+   METRICS (
+       o.revenue AS SUM(o.amount)
    )
 
 **Round-trip verification:**

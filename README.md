@@ -195,7 +195,7 @@ RELATIONSHIPS (
 )
 ```
 
-The `o` and `c` tables declare their keys in `TABLES (... PRIMARY KEY (...))`, so each relationship's cardinality follows from the target key. (Explicit `ONE TO ONE` / `ONE TO MANY` / `MANY TO ONE` annotations were removed in v0.6.0 and are now rejected.)
+The `o` and `c` tables declare their keys in `TABLES (... PRIMARY KEY (...))`, so each relationship's cardinality follows from the target key. (Explicit `ONE TO ONE` / `ONE TO MANY` / `MANY TO ONE` annotations were removed in v0.5.4 and are now rejected.)
 
 ## Role-playing dimensions (USING RELATIONSHIPS)
 
