@@ -362,6 +362,7 @@ release:
     git commit -m "chore: update description.yml for v$VERSION release"
     git push origin main
     echo "Committed and pushed description.yml update to main"
+    DESC_SRC="$PWD/description.yml"
     # --- Copy to CE fork and open PR ---
     CE_REPO="${CE_REPO:-$HOME/Documents/Dev/Sources/community-extensions}"
     if [ ! -d "$CE_REPO" ]; then
@@ -369,21 +370,39 @@ release:
       echo "  Clone your fork of duckdb/community-extensions there, or set CE_REPO env var." >&2
       exit 1
     fi
-    mkdir -p "$CE_REPO/extensions/semantic_views"
-    cp description.yml "$CE_REPO/extensions/semantic_views/description.yml"
-    echo "Copied description.yml to CE fork"
     cd "$CE_REPO"
-    git checkout semantic-views
+    # Rebranch off CURRENT upstream main so the PR is a clean one-file change.
+    # Reusing a stale semantic-views branch makes the PR diff *every* other
+    # extension that updated upstream since the last release, which trips the
+    # registry's "cannot have multiple descriptors changed" gate (fast-fails the
+    # `prepare` job). Mirrors PublishExtension.yml. See MAINTAINER.md.
+    UPSTREAM_URL="https://github.com/duckdb/community-extensions.git"
+    if git remote get-url upstream &>/dev/null; then
+      git remote set-url upstream "$UPSTREAM_URL"
+    else
+      git remote add upstream "$UPSTREAM_URL"
+    fi
+    git fetch upstream main
+    git checkout -B semantic-views upstream/main
+    mkdir -p extensions/semantic_views
+    cp "$DESC_SRC" extensions/semantic_views/description.yml
     git add extensions/semantic_views/description.yml
     git commit -m "Update semantic_views to v$VERSION"
-    git push origin semantic-views
-    echo "Pushed to CE fork"
-    PR_URL=$(gh pr create \
-      --repo duckdb/community-extensions \
-      --head anentropic:semantic-views \
-      --base main \
-      --title "Update semantic_views to v$VERSION" \
-      --body "Update semantic_views extension to v$VERSION (ref: $SHA)")
+    git push --force origin semantic-views
+    echo "Pushed clean semantic-views branch (rebased on upstream/main) to CE fork"
+    # Open the PR, or report the existing open one (force-push updates it in place).
+    PR_URL=$(gh pr list --repo duckdb/community-extensions \
+      --head anentropic:semantic-views --state open --json url --jq '.[0].url // empty')
+    if [ -z "$PR_URL" ]; then
+      PR_URL=$(gh pr create \
+        --repo duckdb/community-extensions \
+        --head anentropic:semantic-views \
+        --base main \
+        --title "Update semantic_views to v$VERSION" \
+        --body "Update semantic_views extension to v$VERSION (ref: $SHA)")
+    else
+      echo "Existing open PR updated in place: $PR_URL"
+    fi
     echo ""
     echo "=== Release Summary ==="
     echo "  Version: v$VERSION"
