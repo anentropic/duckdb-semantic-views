@@ -318,10 +318,21 @@ Areas where test coverage is reduced compared to ideal, with justification.
   - Converting the two struct targets to raw-bytes/text fuzzing would **lose coverage** (most random bytes never parse into a full view) for marginal gain. The hand-rolled balance oracles are the right *kind* of check for a fast, DuckDB-free fuzz target; the fix was completing their preconditions, not replacing them.
   - What narrow B landed instead: two targeted `fuzz_keyword_body` seeds at the recently-fixed constructs (a quoted, comma-/paren-bearing constraint column list; a `MATERIALIZATIONS` clause) and this decision record. `Arbitrary`-on-the-struct stays correct for the serde targets (`fuzz_json_parse` / `fuzz_yaml_parse`), which have no sub-grammar. The text-boundary targets (`fuzz_ddl_parse`, `fuzz_keyword_body`) were already well-seeded, and `Fuzz.yml` / the `just fuzz` recipes already pass both `fuzz/corpus/<t>` and `fuzz/seeds/<t>` to libFuzzer, so seed files are used.
 
+### 34. ✅ Pre-commit hook triggered a ~10-min cold DuckDB build — switched to the no-C++ extension clippy — RESOLVED 2026-07-20
+
+- **Origin:** 2026-07-20. The `cargo-husky` pre-commit hook ran `cargo clippy -- -D warnings` under the **default** feature set (`duckdb/bundled`), which compiles the ~25 MB DuckDB amalgamation from source. That build uses a different cargo profile/fingerprint than `cargo test`, so a green `cargo test` never warmed it; on a cold cache (fresh checkout, or after disk-pressure eviction of the profile) `git commit` stalled for ~10 min, repeatedly blowing agent/CI command timeouts. The `-- -D warnings` clippy and the bundled C++ compile are inherently coupled under default features, and `SV_SKIP_CPP_BUILD` does not help there (it only gates the project `build.rs` extension shim, not `libduckdb-sys`'s bundled build).
+- **Applied:** the tracked hook source `.cargo-husky/hooks/pre-commit` (which cargo-husky installs into the untracked `.git/hooks/pre-commit`), plus the new `just lint-fast` recipe, now run `SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features --features extension -- -D warnings` — the same fast lint CI's `Clippy (extension feature, deny warnings)` step uses. No C++ amalgamation is built (clippy only type-checks): ~1 min cold, ~2 s warm. **No production lint coverage is lost:** every `#[cfg(not(feature = "extension"))]` item in `src/` is either inside a `#[cfg(test)]` module (clippy without `--tests` skips it) or the `src/lib.rs` `test_helpers` module (annotated `#[allow(clippy::pedantic, clippy::doc_markdown)]`). CI's default-features `Clippy (pedantic lints, deny warnings)` step (`just lint`) remains the authoritative full-coverage gate, so any default-only lint still fails CI.
+- **Verified:** the fast clippy runs clean on the current tree and, with a deliberately introduced `cast_possible_truncation` / `must_use_candidate` violation, fails `-D warnings` (it has teeth). Documented in MAINTAINER.md (Justfile recipe table + the extension-clippy section) and CLAUDE.md (code editing rules).
+
 ---
 
-**Last updated:** 2026-07-18 (v0.11 unreleased) — entry #33 resolved: the
-struct-domain fuzz targets tested inputs the parser can't produce; oracles
+**Last updated:** 2026-07-20 (v0.11 unreleased) — entry #34 resolved: the
+cargo-husky pre-commit hook triggered a ~10 min cold bundled-DuckDB build under
+default-features clippy; switched the hook (and a new `just lint-fast` recipe) to
+the no-C++ extension-feature clippy CI already runs, which lints the same
+production code in seconds. Prior: 2026-07-18 (v0.11 unreleased) — entry #33
+resolved: the struct-domain fuzz targets tested inputs the parser can't produce;
+oracles
 corrected (converge-once idempotence for render_roundtrip; `output_type` /
 `window_function` in sql_expand's balance precondition; double-quote skipping in
 query_names) and the full trust-boundary redesign was **considered and declined**
