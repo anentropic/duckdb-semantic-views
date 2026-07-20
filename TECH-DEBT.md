@@ -326,8 +326,13 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ---
 
-**Last updated:** 2026-07-18 (v0.11 unreleased) — entry #33 resolved: the
-struct-domain fuzz targets tested inputs the parser can't produce; oracles
+**Last updated:** 2026-07-20 (v0.11 unreleased) — entry #34 resolved: the
+cargo-husky pre-commit hook triggered a ~10 min cold bundled-DuckDB build under
+default-features clippy; switched the hook (and a new `just lint-fast` recipe) to
+the no-C++ extension-feature clippy CI already runs, which lints the same
+production code in seconds. Prior: 2026-07-18 (v0.11 unreleased) — entry #33
+resolved: the struct-domain fuzz targets tested inputs the parser can't produce;
+oracles
 corrected (converge-once idempotence for render_roundtrip; `output_type` /
 `window_function` in sql_expand's balance precondition; double-quote skipping in
 query_names) and the full trust-boundary redesign was **considered and declined**
