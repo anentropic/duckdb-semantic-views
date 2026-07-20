@@ -39,7 +39,7 @@ Parameters
      - Description
    * - ``<view_name>``
      - VARCHAR (positional)
-     - The name of the semantic view to query. Must match a registered view.
+     - The name of the semantic view to query. Must match a registered view. The name is folded to lowercase and matched case-insensitively, quoted or not (``'Sales'``, ``'SALES'``, and ``'"sales"'`` all resolve to the same view), following DuckDB's identifier semantics.
    * - ``dimensions``
      - LIST (named)
      - Optional list of dimension names to include in the result. Each name must match a dimension defined in the semantic view. Supports ``alias.*`` wildcard patterns.
@@ -133,6 +133,15 @@ Output
 Returns a result set with one column per requested dimension, metric, or fact, in the order: dimensions first (in the order requested), then metrics or facts (in the order requested).
 
 Column types are inferred at define time from the underlying table columns. If type inference is not available, columns default to VARCHAR.
+
+.. versionchanged:: 0.11.0
+
+   A dimension, metric, or fact declared with a double-quoted name (e.g.
+   ``"order date"``) now produces an output column named by its **logical
+   value** (``order date``), with the quote characters stripped. Previously the
+   column was named ``"order date"`` -- quote characters included. A consumer
+   selecting the old quote-laden column name must update. Queries over unquoted
+   names are unaffected.
 
 
 .. _ref-sv-filtering:

@@ -116,6 +116,22 @@ Unclosed parenthesis
 **Fix:** Check for mismatched parentheses in the clause body.
 
 
+Parser strictness
+-----------------
+
+.. versionchanged:: 0.11.0
+
+   Several malformed statements that earlier releases silently accepted (dropping
+   or mis-storing part of the input) are now rejected. If a statement that used
+   to "work" begins to error after upgrading, it was almost certainly one of
+   these:
+
+- **Stray or leading commas** in a clause list are rejected — ``DIMENSIONS (a AS x,, b AS y)`` and ``TABLES (,o AS orders ...)`` no longer silently drop an entry. A single *trailing* comma (``METRICS (a AS ..., )``) is still tolerated.
+- **Malformed identifier slots** are rejected instead of being stored as unqueryable names: a whitespace-separated multi-token name (``o.d junk AS ...``, which used to name the dimension ``d junk``) and an empty quoted identifier ``""`` in a name or alias slot now error. An unqualified entry name whose expression happens to contain a dot (``region AS upper(o.region)``) now reports the missing ``alias.name`` qualifier rather than a misleading "Expected 'AS'".
+- **Trailing tokens** after the view name on a name-only statement (``DROP`` / ``DESCRIBE`` / ``SHOW COLUMNS IN SEMANTIC VIEW``) are rejected — ``DROP SEMANTIC VIEW a b c`` no longer executes and silently discards the extra tokens. ``ALTER`` sub-operations do the same.
+- **DDL prefix keywords require a word boundary** — ``DROP SEMANTIC VIEWS`` (plural typo) no longer drops a view named ``s``, and ``CREATE SEMANTIC VIEWfoo`` is no longer recognised as ``CREATE SEMANTIC VIEW``.
+
+
 .. _ref-err-name-uniqueness:
 
 Duplicate or colliding names

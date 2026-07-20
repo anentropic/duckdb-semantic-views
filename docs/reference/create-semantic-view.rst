@@ -21,7 +21,7 @@ Syntax
 
    CREATE [ OR REPLACE ] SEMANTIC VIEW [ IF NOT EXISTS ] <name> AS
    TABLES (
-       <alias> AS <table_name>
+       [ <alias> AS ] <table_name>
            [ PRIMARY KEY ( <column> [, <column> ...] ) ]
            [ UNIQUE ( <column> [, <column> ...] ) ]
            [ COMMENT = '<text>' ]
@@ -72,6 +72,26 @@ Syntax
        )
        [, ... ]
    ) ]
+
+.. note::
+
+   **Snowflake syntax conveniences.**
+
+   .. versionadded:: 0.11.0
+
+   To make porting Snowflake DDL easier, several Snowflake spellings are now
+   accepted in addition to the canonical forms above:
+
+   - The table alias in ``TABLES`` is **optional** — ``TABLES (orders PRIMARY
+     KEY (id))`` defaults the alias to the table name, matching Snowflake's
+     ``[alias AS] table``.
+   - A view-level ``COMMENT = '<text>'`` may be written in Snowflake's
+     **trailing** position (after the last clause) as well as between the name
+     and ``AS``. Specifying it in both positions is rejected.
+   - An explicit ``PUBLIC`` modifier is accepted on a dimension (a no-op, since
+     public is the default). ``PRIVATE`` on a dimension is still rejected rather
+     than silently downgraded.
+   - ``WITH SYNONYMS (...)`` is accepted **without** the ``=``.
 
 **YAML body (FROM YAML):**
 
@@ -147,7 +167,7 @@ Declares the physical tables available to the semantic view. Each entry assigns 
 
 **Parameters:**
 
-- ``<alias>``, a short name used to reference this table in all other clauses.
+- ``<alias>``, a short name used to reference this table in all other clauses. Optional — ``AS <table_name>`` may be omitted (``TABLES (orders PRIMARY KEY (id))``), in which case the alias defaults to the table name.
 - ``<table_name>``, the physical table name. Supports catalog-qualified names (``catalog.schema.table``).
 - ``PRIMARY KEY (<column>, ...)``, optional. One or more columns forming the table's primary key. Used for JOIN synthesis and cardinality inference. This is semantic metadata, not a DuckDB constraint. Omit for fact tables that do not need to be join targets.
 - ``COMMENT = '<text>'``, optional. A human-readable description of the table.
@@ -257,6 +277,7 @@ Declares named grouping expressions available for queries.
 
 **Parameters:**
 
+- ``PUBLIC``, optional. Accepted as an explicit no-op (dimensions are always public). ``PRIVATE`` is **not** allowed on a dimension and is rejected rather than silently downgraded.
 - ``<alias>.<dim_name>``, the table alias and dimension name. The alias indicates which table the dimension comes from (used for join dependency resolution).
 - ``<expression>``, any SQL expression. Can be a simple column reference (``o.region``) or a computed expression (``date_trunc('month', o.ordered_at)``).
 - ``COMMENT = '<text>'``, optional. A human-readable description.

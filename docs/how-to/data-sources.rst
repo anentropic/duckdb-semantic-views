@@ -236,3 +236,27 @@ If your tables live in a specific catalog or schema, use the fully qualified tab
    );
 
 The extension quotes each segment of the table name separately (``"my_catalog"."my_schema"."orders"``) in the generated SQL.
+
+
+.. _howto-ds-ambiguous-paths:
+
+Ambiguous Join Paths Are Rejected
+=================================
+
+.. versionchanged:: 0.11.0
+
+   A table reachable from two *different* source tables -- a join "diamond",
+   e.g. ``orders → a → shared`` and ``orders → b → shared`` -- makes the join
+   path to ``shared`` ambiguous. Such a definition is now rejected at
+   ``CREATE`` time; previously it was accepted and a query silently joined the
+   shared table through whichever relationship was declared first, producing
+   wrong numbers when the two paths point at different rows.
+
+The safe fan-out shown above (``orders → customers`` and ``orders → products``,
+two *different* targets from one source) is unaffected -- only a shared
+*target* reached from two different sources is ambiguous.
+
+**Role-playing is still supported.** Multiple distinctly-named relationships
+from a *single* source table to one target (e.g. ``flights → airports`` via
+``dep_airport`` / ``arr_airport``) is the role-playing pattern, not a diamond,
+and remains supported. See :ref:`howto-role-playing`.

@@ -170,7 +170,7 @@ When a query includes any semi-additive or window metric, the extension skips al
        a.report_date  AS a.report_date
    )
    METRICS (
-       a.total_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
+       a.total_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
    )
    MATERIALIZATIONS (
        balance_agg AS (

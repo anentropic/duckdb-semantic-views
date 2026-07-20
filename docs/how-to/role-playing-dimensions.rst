@@ -162,3 +162,33 @@ Troubleshooting
    If two co-queried metrics have different USING paths that both target the dimension's
    table, the extension raises an ambiguity error. Query only one USING-scoped metric at
    a time alongside the ambiguous dimension.
+
+**Dimension on a descendant of a role-playing table**
+   .. versionchanged:: 0.11.0
+
+   A dimension on a table reached *through* a role-playing table -- for
+   example ``region_name`` on ``regions`` where ``airports`` references
+   ``regions`` -- is ambiguous, because which role's rows it groups by depends
+   on which role you traversed. Such a query is now rejected (previously it
+   silently used the first-declared relationship). Unlike a dimension directly
+   on the role-playing table, a descendant **cannot** be disambiguated by a
+   metric's ``USING``: give the target a distinct alias per role, or query it
+   through a non-role-playing table.
+
+**Facts on a role-playing table**
+   .. versionchanged:: 0.11.0
+
+   A fact sourced on a role-playing table (or a descendant of one) is now
+   rejected. Facts carry no ``USING`` context, so the role was always
+   unresolvable -- previously such a fact silently read the first-declared
+   relationship's rows.
+
+**Semi-additive metric snapshotting on a role-playing dimension**
+   .. versionchanged:: 0.11.0
+
+   A metric written ``m USING (<relationship>) NON ADDITIVE BY (<dim on the
+   role-played table>)`` now selects the snapshot for the role its ``USING``
+   names, instead of an arbitrary one. A semi-additive metric that snapshots on
+   a role-playing dimension but has no ``USING`` to disambiguate the role is
+   now rejected as ambiguous at query time -- the same error a directly-queried
+   role-playing dimension raises. See :ref:`howto-semi-additive`.

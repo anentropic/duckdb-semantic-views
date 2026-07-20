@@ -85,13 +85,26 @@ The default NULLS placement follows the sort direction, matching DuckDB and Snow
    -- Earliest balance (oldest report_date wins)
    a.opening_balance AS SUM(a.balance) NON ADDITIVE BY (report_date DESC)
 
-.. versionchanged:: 0.10.5
+.. versionchanged:: 0.11.0
 
    The polarity of ``NON ADDITIVE BY`` was corrected to match Snowflake: the
    default (ascending) direction now selects the **latest** snapshot and
    ``DESC`` selects the **earliest**. Before this change the mapping was
-   inverted. Views that previously wrote ``DESC`` to get the latest snapshot
-   should drop the ``DESC`` (or the whole modifier).
+   inverted.
+
+   .. warning::
+
+      This is a **breaking** change that silently inverts results rather than
+      raising an error, so review every existing semi-additive metric when you
+      upgrade:
+
+      - A view that wrote ``NON ADDITIVE BY (d DESC)`` to get the **latest**
+        snapshot should now drop the ``DESC`` (write ``NON ADDITIVE BY (d)``).
+      - A view that wrote no direction to get the **earliest** snapshot should
+        now add ``DESC`` (write ``NON ADDITIVE BY (d DESC)``).
+
+      ``NULLS`` placement is unchanged and kept as declared -- only the sort
+      direction is reversed internally.
 
 
 .. _howto-semi-additive-multiple:

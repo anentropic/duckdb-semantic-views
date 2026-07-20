@@ -148,6 +148,55 @@ Instead of ``o.order_count`` with ``li.status``, use ``li.revenue`` with ``li.st
 If you need both ``order_count`` by ``status``, consider creating a separate semantic view scoped to the appropriate table, or pre-aggregating at the line-item level.
 
 
+.. _howto-fan-other-shapes:
+
+Other Shapes the Fence Rejects
+==============================
+
+.. versionchanged:: 0.11.0
+
+   Three query shapes that inflate the same way as the classic fan trap
+   previously slipped past the fence and returned silently wrong numbers. They
+   now raise the same ``fan trap detected`` error.
+
+**A metric on a parent ("one" side) table the base table references.**
+   A metric such as ``SUM(customers.balance)`` in a view whose base table is
+   ``orders`` (with ``orders`` referencing ``customers`` many-to-one) was
+   aggregated at the base-table grain, counting each parent row once per
+   referencing base row -- and dropping parent rows with no children. Because
+   the query is always anchored ``FROM <base table>``, this inflated even when
+   the metric was queried alone or only alongside a dimension on that same
+   parent table, so neither pairwise check fired. Such a query is now rejected.
+   Fix: scope the metric to a view whose base table *is* the parent table.
+
+**A single derived or window metric that internally fuses two grains.**
+   A metric like ``avg AS order_total / item_count`` -- combining an
+   order-grain aggregate and a line-item-grain aggregate across a many-to-one
+   join -- inflated the parent-side component over the fanned join. Folding two
+   grains into one metric used to bypass the metric-versus-metric check (which
+   only compared *distinct* metrics); the metric is now checked against its own
+   grain span and rejected. Fix: query the two base metrics separately, or
+   pre-aggregate one grain.
+
+**An active semi-additive metric queried alongside a fanning child dimension.**
+   A ``NON ADDITIVE BY`` metric queried together with a dimension on a fanning
+   child table ran its snapshot (``RANK``) query over the already-multiplied
+   join, where ties across the fanned duplicates of one source row are
+   indistinguishable from ties across distinct rows -- so it could
+   double-count. Such metrics previously skipped the fan-trap check on the
+   assumption that the snapshot neutralised the fan; they now get the same
+   check. Fix: snapshot only on safe, root-ward dimensions, or query the
+   semi-additive metric without the fanning child dimension.
+
+.. note::
+
+   A semantic view whose ``RELATIONSHIPS`` form a **cycle** (``a`` references
+   ``b`` and ``b`` references ``a``) parses successfully but such a definition
+   is degenerate. As of v0.11.0 a query against it terminates with an error
+   instead of hanging with unbounded memory growth (the fan-trap ancestor walk
+   used to loop forever on a cyclic parent map).
+
+
 .. _howto-fan-onetoone:
 
 One-to-One Relationships
