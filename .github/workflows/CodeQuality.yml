@@ -26,9 +26,20 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Three of these checks each cold-compile the bundled ~25 MB DuckDB amalgamation
+# from scratch, under a DIFFERENT cargo profile that cannot share build output
+# with the others: default clippy (check), default doctests (build), and the
+# coverage run (llvm-cov instrumented) — ~9-10 min apiece. Run them as three
+# independent jobs so those compiles overlap on separate runners instead of
+# running back-to-back in one job (~32 min -> ~12 min wall-clock). The fast
+# SV_SKIP_CPP_BUILD extension steps (which skip the C++ build entirely) and
+# cargo-deny ride along on the lint/test jobs. Every job repeats checkout + the
+# pinned-toolchain setup; that ~30 s is far cheaper than the serial amalgamation
+# builds it unblocks — GitHub runners are ephemeral with no cargo cache, so a
+# single job cannot amortise the amalgamation across steps anyway.
 jobs:
-  quality:
-    name: Lint, format, and coverage
+  lint:
+    name: Lint & format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -41,9 +52,9 @@ jobs:
           components: rustfmt, clippy
 
       # Pre-install the toolchain pinned in rust-toolchain.toml before any
-      # cargo command (every fmt/clippy/llvm-cov step below runs under it), so
-      # cargo's flake-prone lazy rustup install is a no-op. See the composite
-      # action for the full rationale.
+      # cargo command (every fmt/clippy step below runs under it), so cargo's
+      # flake-prone lazy rustup install is a no-op. See the composite action for
+      # the full rationale.
       - name: Install pinned Rust toolchain
         uses: ./.github/actions/setup-pinned-rust
 
@@ -70,29 +81,6 @@ jobs:
       - name: Clippy (extension feature, deny warnings)
         run: SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features --features extension -- -D warnings
 
-      # T-12 (code-review 2026-07-16): doctests run in no other job — the
-      # coverage step below uses cargo-nextest, which skips them entirely. Run
-      # the default-feature doctests so their examples cannot silently rot, and
-      # the `extension`-gated FFI doctests separately: the load-bearing one is a
-      # `compile_fail` ABI-safety guard in src/ddl/read_ffi.rs that only
-      # type-checks (SV_SKIP_CPP_BUILD skips the C++ build; a compile_fail
-      # doctest never links). It is scoped to `read_ffi` because the other
-      # doctests assume the default `duckdb` feature and won't compile here.
-      - name: Doctests (default features)
-        run: cargo test --doc
-
-      - name: FFI doctests (extension feature, compile_fail ABI guard)
-        run: SV_SKIP_CPP_BUILD=1 cargo test --doc --no-default-features --features extension read_ffi
-
-      # The coverage step below runs `cargo llvm-cov nextest` on default
-      # features, so #[cfg(feature = "extension")] UNIT tests are compiled in no
-      # other job — they silently rotted twice (a stale assertion and a
-      # signature-change compile break) before this step existed. --lib scopes
-      # to the library's own tests (integration crates assume the default
-      # `duckdb` feature); SV_SKIP_CPP_BUILD skips the C++ build.
-      - name: Unit tests (extension feature)
-        run: SV_SKIP_CPP_BUILD=1 cargo test --lib --no-default-features --features extension
-
       # Pinned to a commit SHA (not the floating @v2) as a supply-chain
       # practice — this is v2.1.1 (bundles cargo-deny 0.20.2), bumped from
       # v2.0.20 (cargo-deny 0.19.8) in #128. The v2.1.x arg mismatch that had
@@ -103,6 +91,69 @@ jobs:
       # exiting clean.
       - name: cargo-deny (licenses + advisories)
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (cargo-deny 0.20.2)
+
+  test:
+    name: Doctests & extension unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Pre-install the toolchain pinned in rust-toolchain.toml before any
+      # cargo command (every test step below runs under it), so cargo's
+      # flake-prone lazy rustup install is a no-op. See the composite action for
+      # the full rationale.
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/setup-pinned-rust
+
+      # T-12 (code-review 2026-07-16): doctests run in no other job — the
+      # coverage job uses cargo-nextest, which skips them entirely. Run the
+      # default-feature doctests so their examples cannot silently rot, and the
+      # `extension`-gated FFI doctests separately: the load-bearing one is a
+      # `compile_fail` ABI-safety guard in src/ddl/read_ffi.rs that only
+      # type-checks (SV_SKIP_CPP_BUILD skips the C++ build; a compile_fail
+      # doctest never links). It is scoped to `read_ffi` because the other
+      # doctests assume the default `duckdb` feature and won't compile here.
+      - name: Doctests (default features)
+        run: cargo test --doc
+
+      - name: FFI doctests (extension feature, compile_fail ABI guard)
+        run: SV_SKIP_CPP_BUILD=1 cargo test --doc --no-default-features --features extension read_ffi
+
+      # The coverage job runs `cargo llvm-cov nextest` on default features, so
+      # #[cfg(feature = "extension")] UNIT tests are compiled in no other job —
+      # they silently rotted twice (a stale assertion and a signature-change
+      # compile break) before this step existed. --lib scopes to the library's
+      # own tests (integration crates assume the default `duckdb` feature);
+      # SV_SKIP_CPP_BUILD skips the C++ build.
+      - name: Unit tests (extension feature)
+        run: SV_SKIP_CPP_BUILD=1 cargo test --lib --no-default-features --features extension
+
+  coverage:
+    name: Coverage (80% minimum)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Pre-install the toolchain pinned in rust-toolchain.toml before any
+      # cargo command (the llvm-cov step below runs under it), so cargo's
+      # flake-prone lazy rustup install is a no-op. See the composite action for
+      # the full rationale.
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/setup-pinned-rust
 
       # `cargo llvm-cov` builds an instrumented copy of the WHOLE crate —
       # including the bundled DuckDB linked by the default-feature `duckdb`
