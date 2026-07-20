@@ -1,17 +1,15 @@
 name: "Build Extension: Quick (Linux x86_64)"
 
 on:
-  push:
-    # All branches except main (BuildAll.yml covers main with the full
-    # platform matrix). NOTE: this must be `branches-ignore`, not a
-    # negative pattern under `branches` — a `branches` filter containing
-    # only negative patterns ("!main") matches nothing, which silently
-    # disabled this workflow (it had zero runs before 2026-07-02).
-    branches-ignore: ["main"]
-    # Skip the build + sqllogictest suite for documentation/text-only changes
-    # (validated by DocsCheck.yml instead). A commit that also touches any
-    # non-doc file still triggers a build. Keep this list in sync with
-    # BuildAll / CodeQuality / IntegrationChecks.
+  # No `push` trigger (runs on pull_request + manual workflow_dispatch).
+  # BuildAll.yml runs the full platform matrix on pushes to main, so this quick
+  # Linux-only build exists purely for fast PR feedback — on every PR,
+  # same-repo AND fork (fork PRs don't fire this repo's push events, so a
+  # pull_request trigger is the only way they get a build — CI-2). No push
+  # trigger, so a same-repo PR builds exactly once and nothing double-runs. Skip
+  # documentation/text-only changes (validated by DocsCheck.yml); keep the
+  # paths-ignore list in sync with BuildAll / CodeQuality / IntegrationChecks.
+  pull_request:
     paths-ignore:
       - '**/*.md'
       - '_notes/**'
@@ -26,7 +24,6 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries (Linux x86_64)
-    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     # IMPORTANT: The @tag below must match the version in .duckdb-version (currently v1.5.4).
     # GitHub Actions 'uses:' does not support dynamic values, so update this manually
     # whenever .duckdb-version changes.

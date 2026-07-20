@@ -9,14 +9,13 @@ name: Docs Check
 # IntegrationChecks). The docs site includes CHANGELOG.md and README content via
 # MyST, so a markdown edit really can break the build.
 #
-# Pushes to `main` build AND deploy the docs via Docs.yml (the same `-W` build),
-# so `main` is excluded here to avoid a duplicate build.
+# No `push` trigger (runs on pull_request + manual workflow_dispatch). Pushes to
+# `main` build AND deploy the docs via Docs.yml (the same `-W` build), so `main`
+# needs no separate check here. Running on every PR — same-repo AND fork — is
+# also the only way fork doc PRs get validated (CI-2); with no push trigger a
+# same-repo PR runs exactly once, no double-run.
 on:
-  push:
-    tags-ignore:
-      - '**'
-    branches-ignore:
-      - main
+  pull_request:
   workflow_dispatch:
 
 concurrency:
