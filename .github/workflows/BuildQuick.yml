@@ -1,8 +1,9 @@
 name: "Build Extension: Quick (Linux x86_64)"
 
 on:
-  # PR-only: BuildAll.yml runs the full platform matrix on pushes to main, so
-  # this quick Linux-only build exists purely for fast PR feedback — on every PR,
+  # No `push` trigger (runs on pull_request + manual workflow_dispatch).
+  # BuildAll.yml runs the full platform matrix on pushes to main, so this quick
+  # Linux-only build exists purely for fast PR feedback — on every PR,
   # same-repo AND fork (fork PRs don't fire this repo's push events, so a
   # pull_request trigger is the only way they get a build — CI-2). No push
   # trigger, so a same-repo PR builds exactly once and nothing double-runs. Skip
