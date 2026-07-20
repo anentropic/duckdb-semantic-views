@@ -1,15 +1,20 @@
 name: Code Quality
 
 on:
+  # push to main = post-merge validation; pull_request = every PR, same-repo AND
+  # fork (fork PRs don't fire this repo's push events, so a pull_request trigger
+  # is the only way they get CI — CI-2). Because push is main-only, a same-repo
+  # PR's branch push does NOT trigger this workflow, so the PR runs exactly once
+  # via pull_request — no fork guard / double-run logic needed. Keep the
+  # paths-ignore list in sync with BuildAll / BuildQuick / IntegrationChecks.
   push:
-    tags-ignore:
-      - '**'
-    branches:
-      - '**'
-    # Skip Rust lint/format/coverage for documentation/text-only changes; none
-    # of these steps touch the docs. A commit that also changes any non-doc
-    # file still runs. Keep this list in sync with BuildAll / BuildQuick /
-    # IntegrationChecks.
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - '_notes/**'
+      - 'docs/**'
+      - 'LICENSE'
+  pull_request:
     paths-ignore:
       - '**/*.md'
       - '_notes/**'

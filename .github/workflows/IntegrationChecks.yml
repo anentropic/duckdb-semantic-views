@@ -1,16 +1,19 @@
 name: Integration Checks
 
 on:
+  # push to main = post-merge validation; pull_request = every PR, same-repo AND
+  # fork (fork PRs don't fire this repo's push events — CI-2). push is main-only,
+  # so a same-repo PR's branch push does NOT trigger this workflow and the PR
+  # runs exactly once via pull_request — no fork guard needed. Keep the
+  # paths-ignore list in sync with BuildAll / BuildQuick / CodeQuality.
   push:
-    tags-ignore:
-      - '**'
-    branches:
-      - '**'
-    # Skip the DuckLake + Python integration builds for documentation/text-only
-    # changes (they build the debug extension and run the Python suites, which
-    # docs changes cannot affect). The docs build check runs separately in
-    # DocsCheck.yml so text/markdown changes are still validated. Keep this list
-    # in sync with BuildAll / BuildQuick / CodeQuality.
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - '_notes/**'
+      - 'docs/**'
+      - 'LICENSE'
+  pull_request:
     paths-ignore:
       - '**/*.md'
       - '_notes/**'
