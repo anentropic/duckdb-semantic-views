@@ -51,8 +51,9 @@ true
 
 # Plain aggregate query on the quoted-name child metric: COUNT(*) on the
 # non-base table is rewritten to COUNT(li.id), so the childless EU order counts
-# 0, not 1. `SELECT *` avoids naming the metric's output column, which retains
-# the stored name's quote characters (a separate, unrelated quoting quirk).
+# 0, not 1. The metric's output column is cleanly named `Item Count` — the
+# stored name's quotes are stripped before quoting (EXP-7) — and `SELECT *`
+# reads the two columns positionally regardless.
 query TI rowsort
 SELECT * FROM semantic_view('cr718_v', dimensions := ['region'], metrics := ['"Item Count"']);
 ----

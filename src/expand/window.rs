@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::model::{Metric, NullsOrder, SemanticViewDefinition, SortOrder};
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
-use super::resolution::quote_ident;
+use super::resolution::{quote_ident, quote_stored_ident};
 use super::select_spec::{
     push_from_base, push_group_by_ordinals, FromSource, GroupBy, SelectItem, SelectSpec,
 };
@@ -21,9 +21,10 @@ use super::types::{ExpandError, ResolvedDim};
 
 /// Resolve a window dimension reference (bare, dotted, or quoted) to the
 /// `__sv_agg` CTE-alias column it must emit in the OVER clause — i.e.
-/// `quote_ident` of the *declared* dimension's stored name, the exact alias the
-/// CTE SELECT assigned it. Falls back to quoting the raw reference when it
-/// resolves to no declared dimension (fail-clean).
+/// `quote_stored_ident` of the *declared* dimension's stored name, the exact
+/// alias the CTE SELECT assigned it (a quoted stored name is stripped to its
+/// logical value and quoted once, EXP-7). Falls back to quoting the raw
+/// reference when it resolves to no declared dimension (fail-clean).
 ///
 /// The outer query runs over the CTE, so referencing the alias is safe (no
 /// physical column shadows it, unlike the semi-additive CTE's own SELECT which
@@ -33,7 +34,7 @@ use super::types::{ExpandError, ResolvedDim};
 /// emitted a doubled-quote or dotted non-column (TECH-DEBT #28/#30).
 fn window_dim_column(def: &SemanticViewDefinition, reference: &str) -> String {
     super::resolution::find_dimension(def, reference)
-        .map_or_else(|| quote_ident(reference), |d| quote_ident(&d.name))
+        .map_or_else(|| quote_ident(reference), |d| quote_stored_ident(&d.name))
 }
 
 /// Generate CTE-based expansion SQL for queries containing window function metrics.
@@ -168,7 +169,11 @@ pub(super) fn expand_window_metrics(
                 base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);
             }
         }
-        let item = SelectItem::new(base_expr, dim.output_type.clone(), quote_ident(&dim.name));
+        let item = SelectItem::new(
+            base_expr,
+            dim.output_type.clone(),
+            quote_stored_ident(&dim.name),
+        );
         cte_select_items.push(format!("        {}", item.render()));
     }
 
@@ -204,9 +209,9 @@ pub(super) fn expand_window_metrics(
     // referencing the alias is safe here).
     for rd in resolved_dims {
         outer_items.push(SelectItem::new(
-            quote_ident(&rd.dim.name),
+            quote_stored_ident(&rd.dim.name),
             None,
-            quote_ident(&rd.dim.name),
+            quote_stored_ident(&rd.dim.name),
         ));
     }
 
@@ -243,7 +248,7 @@ pub(super) fn expand_window_metrics(
                 .filter(|rd| {
                     !excluding_set.contains(&crate::ident::normalize_ident_part(&rd.dim.name))
                 })
-                .map(|rd| quote_ident(&rd.dim.name))
+                .map(|rd| quote_stored_ident(&rd.dim.name))
                 .collect()
         } else {
             // Explicit PARTITION BY: emit each listed dim's resolved CTE alias so
@@ -288,7 +293,7 @@ pub(super) fn expand_window_metrics(
         outer_items.push(SelectItem::new(
             window_expr,
             met.output_type.clone(),
-            quote_ident(&met.name),
+            quote_stored_ident(&met.name),
         ));
     }
 
@@ -960,12 +965,15 @@ mod tests {
         );
     }
 
-    /// TECH-DEBT #28/#30 (window half): a DOTTED-AND-QUOTED OVER ORDER BY
-    /// reference (`s."order date"`) to a quoted-stored dimension must emit the
-    /// dimension's CTE alias consistently, never the raw dotted text as a
-    /// doubled-quote non-column (`"s.""order date"""`). The CTE aliases the
-    /// dimension column as `quote_ident("\"order date\"")`; the OVER ORDER BY
-    /// must reference the identical token so it binds.
+    /// TECH-DEBT #28/#30 (window half) + EXP-7 (code-review 2026-07-18): a
+    /// DOTTED-AND-QUOTED OVER ORDER BY reference (`s."order date"`) to a
+    /// quoted-stored dimension must emit the dimension's CTE alias consistently,
+    /// never the raw dotted text as a doubled-quote non-column
+    /// (`"s.""order date"""`). The stored name (`"order date"`) is stripped to
+    /// its logical value and quoted once, so the CTE alias and the OVER ORDER BY
+    /// reference are both `"order date"` (one pair of quotes) — not the
+    /// triple-quoted `"""order date"""` that re-quoting the stored name used to
+    /// produce (EXP-7).
     #[test]
     fn test_window_dotted_quoted_order_by_matches_cte_alias() {
         let def = minimal_def("sales", "store", "store", "total_qty", "SUM(s.quantity)")
@@ -997,11 +1005,21 @@ mod tests {
         };
 
         let sql = expand("test_view", &def, &req).expect("dotted-quoted ORDER BY must resolve");
-        // The CTE aliases the dim column as quote_ident("\"order date\"") =
-        // """order date""" — the ORDER BY must reference that same token.
+        // The CTE aliases the dim column with one pair of quotes and the OVER
+        // ORDER BY references that identical token, so the query binds.
         assert!(
-            sql.contains("ORDER BY \"\"\"order date\"\"\""),
+            sql.contains("AS \"order date\""),
+            "CTE must alias the quoted dim with a single pair of quotes: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY \"order date\""),
             "ORDER BY must reference the dimension's CTE alias: {sql}"
+        );
+        // EXP-7: the stored name's quotes must not be re-quoted into a
+        // triple-quoted, literally-quote-named column.
+        assert!(
+            !sql.contains("\"\"\"order date\"\"\""),
+            "stored-name quotes must not be doubled into a triple-quoted alias: {sql}"
         );
         // The raw dotted reference must NOT be emitted as a non-column.
         assert!(
