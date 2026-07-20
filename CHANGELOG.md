@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.11.0] - 2026-07-20
+
 ### Changed
 
 - **View name case normalization**: view names now fold to lowercase in every DDL statement and in `semantic_view()` / `explain_semantic_view()` lookup arguments — whether written quoted or not — so `CREATE SEMANTIC VIEW Sales`, `DROP SEMANTIC VIEW SALES`, and `DROP SEMANTIC VIEW "sales"` all refer to the same view. This follows DuckDB's identifier semantics, where double-quoted identifiers are case-insensitive too; quoting only lets a name carry whitespace or special characters, it does not make it case-sensitive. Previously unquoted names were byte-exact case-sensitive. **Migration**: lookups fold the requested name to lowercase and match the stored catalog name exactly, so a view is only reachable if its stored name is lowercase. Unquoted `CREATE` always stored a lowercase name, so those views are unaffected; only a view created earlier via a *quoted* mixed-case identifier (e.g. `CREATE SEMANTIC VIEW "Sales"`) kept its original casing and is no longer reachable by any spelling — drop and recreate it, or rename its catalog row to lowercase.
@@ -365,7 +369,8 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.4...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.1...v0.10.2
