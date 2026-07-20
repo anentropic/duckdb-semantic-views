@@ -133,7 +133,6 @@ pub(super) fn is_active_semi_additive(
 ///
 /// Called from `expand()` when `has_active_semi_additive` is true.
 /// Receives already-resolved dims, metrics, expressions, and scoped aliases.
-#[allow(clippy::too_many_lines)]
 pub(super) fn expand_semi_additive(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -158,78 +157,23 @@ pub(super) fn expand_semi_additive(
     // 1. Identify distinct NON ADDITIVE BY dimension sets for ACTIVE metrics only.
     let na_groups = collect_na_groups(view_name, def, resolved_mets, &queried_dim_keys)?;
 
-    // 2. SG-5: validate every metric expression BEFORE emitting any SQL. The
-    //    snapshot CTE decomposes each metric into an inner-expression capture
-    //    (CTE column) plus an outer re-aggregation, which is only sound for a
-    //    single bare aggregate call. Anything else was previously mangled
-    //    silently (dropped arithmetic, star/DISTINCT arguments emitted as
-    //    broken CTE columns) -- reject it with a clear error instead.
-    let semi_metric_name = resolved_mets
-        .iter()
-        .find(|m| is_active_semi(m))
-        .map_or_else(String::new, |m| m.name.clone());
-    let mut decomposed: Vec<(String, String)> = Vec::with_capacity(resolved_mets.len());
-    for met in resolved_mets {
-        let resolved_expr = resolved_exprs
-            .get(&crate::ident::normalize_ident_part(&met.name))
-            .cloned()
-            .unwrap_or_else(|| met.expr.clone());
-        match parse_snapshot_aggregate(&resolved_expr) {
-            Ok(parts) => decomposed.push(parts),
-            Err(reason) => {
-                return Err(if is_active_semi(met) {
-                    ExpandError::SemiAdditiveUnsupportedExpression {
-                        view_name: view_name.to_string(),
-                        metric_name: met.name.clone(),
-                        metric_expr: resolved_expr,
-                        reason,
-                    }
-                } else {
-                    ExpandError::SemiAdditiveCoQueryUnsupported {
-                        view_name: view_name.to_string(),
-                        metric_name: met.name.clone(),
-                        metric_expr: resolved_expr,
-                        semi_metric_name: semi_metric_name.clone(),
-                        reason,
-                    }
-                });
-            }
-        }
-    }
+    // 2. SG-5: validate and decompose every metric expression BEFORE emitting
+    //    any SQL. The snapshot CTE decomposes each metric into an
+    //    inner-expression capture (CTE column) plus an outer re-aggregation,
+    //    which is only sound for a single bare aggregate call. Anything else
+    //    was previously mangled silently (dropped arithmetic, star/DISTINCT
+    //    arguments emitted as broken CTE columns) -- reject it with a clear
+    //    error instead.
+    let decomposed = decompose_metrics(view_name, resolved_mets, resolved_exprs, &is_active_semi)?;
 
     // === CTE ===
     sql.push_str("WITH __sv_snapshot AS (\n    SELECT\n");
 
     let mut cte_select_items: Vec<String> = Vec::new();
 
-    // Dimension columns in CTE. Keep each dimension's rendered expression:
-    // the RANK() window clauses below must repeat the EXPRESSION, never the
-    // select alias — inside the CTE's own SELECT, DuckDB resolves a
-    // window-clause identifier to a same-named physical FROM-clause column
-    // before the lateral select alias, so `PARTITION BY "region"` with
-    // `upper(o.region) AS region` silently partitioned on the raw column
-    // and produced wrong snapshot sums (E-1, code-review 2026-07-11). The
-    // standard path defends against the same shadowing with GROUP BY
-    // ordinals; this is the CTE-path equivalent.
-    let mut dim_cte_exprs: Vec<String> = Vec::with_capacity(resolved_dims.len());
-    for rd in resolved_dims {
-        let dim = rd.dim;
-        let mut base_expr = dim.expr.clone();
-        if let Some(ref scoped) = rd.scoped_alias {
-            if let Some(ref st) = dim.source_table {
-                base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);
-            }
-        }
-        let item = SelectItem::new(
-            base_expr,
-            dim.output_type.clone(),
-            quote_stored_ident(&dim.name),
-        );
-        cte_select_items.push(format!("        {}", item.render()));
-        // The window PARTITION/ORDER clauses must repeat this EXPRESSION, never
-        // the select alias (E-1) — see the comment above.
-        dim_cte_exprs.push(item.rendered_expr());
-    }
+    // Dimension columns in CTE (returns the rendered dimension EXPRESSIONS the
+    // RANK() window clauses must repeat, never the CTE aliases — E-1).
+    let dim_cte_exprs = push_cte_dimension_columns(resolved_dims, &mut cte_select_items);
 
     // Metric raw columns in CTE -- the validated inner expression of each
     // metric's aggregate call (decomposed above).
@@ -254,131 +198,12 @@ pub(super) fn expand_semi_additive(
             format!("__sv_rn_{}", group_idx + 1)
         };
 
-        // PARTITION BY: all queried dims (NA dims not in query are not in
-        // resolved_dims, so this naturally partitions by all queried dims).
-        // Key each NA dim through the shared resolver so a QUERIED NA dim
-        // named with a dotted/quoted reference is still excluded from the
-        // partition (#30) — a bare lowercase compare missed it.
-        let na_dim_keys: Vec<String> = group
-            .na_dims
-            .iter()
-            .map(|nd| na_dim_match_key(def, &nd.dimension))
-            .collect();
-
-        // Partition by the dimension EXPRESSIONS, not the CTE aliases (E-1).
-        let partition_dims: Vec<String> = resolved_dims
-            .iter()
-            .zip(&dim_cte_exprs)
-            .filter(|(rd, _)| {
-                !na_dim_keys.contains(&crate::ident::normalize_ident_part(&rd.dim.name))
-            })
-            .map(|(_, expr)| expr.clone())
-            .collect();
-
-        let partition_clause = if partition_dims.is_empty() {
-            String::new()
-        } else {
-            format!("PARTITION BY {}", partition_dims.join(", "))
-        };
-
-        // ORDER BY: the NA dims with their specified sort order, always as
-        // EXPRESSIONS (E-1: a queried NA dim previously ordered by its CTE
-        // alias, which DuckDB binds to a same-named physical column first).
-        // A queried NA dim uses its rendered CTE expression; an unqueried NA
-        // dim uses its raw definition expression (it has no CTE column). That
-        // raw expression may reference a non-base table -- its join is
-        // guaranteed below (SG-9).
-        let order_items: Vec<String> = group
-            .na_dims
-            .iter()
-            .zip(&group.na_dim_scoped)
-            .map(|(nd, scoped)| {
-                // #30: resolve the NA dim reference (bare OR dotted, quoted or
-                // not) to its declared dimension via the shared resolver, so a
-                // dotted `o."order date"` orders by the same expression a bare
-                // `order_date` would — not the raw dotted text emitted as a
-                // quoted non-column.
-                let dim_expr = super::resolution::find_dimension(def, &nd.dimension).map_or_else(
-                    // Unresolvable: Phase 47 (`body_parser::mod`) hard-errors at
-                    // CREATE on any NA dim that names no declared dimension, so
-                    // only a malformed/unknown residual reaches this arm.
-                    // Emit a quoted non-column that fails cleanly at bind time
-                    // (F-18), never the aliased-column shape E-1 fixed.
-                    || quote_ident(&nd.dimension),
-                    |d| {
-                        // A QUERIED NA dim repeats its CTE expression (E-1: the
-                        // rendered expression, never the alias). An UNQUERIED NA
-                        // dim uses its raw definition expression — it has no CTE
-                        // column, and its source table is guaranteed joined
-                        // below (SG-9). Match the resolved declared dimension
-                        // against the queried set by canonical key so a
-                        // dotted/quoted NA reference finds its queried dim.
-                        let key = crate::ident::normalize_ident_part(&d.name);
-                        resolved_dims
-                            .iter()
-                            .zip(&dim_cte_exprs)
-                            .find(|(rd, _)| crate::ident::normalize_ident_part(&rd.dim.name) == key)
-                            .map_or_else(
-                                || {
-                                    // UNQUERIED NA dim. Rewrite its declared
-                                    // expression to the role-playing scoped alias
-                                    // when its metric's USING disambiguates
-                                    // (T-15 / F-18) — the SAME instance the metric
-                                    // joins (e.g. `a.city` -> `a__dep_airport.city`).
-                                    // Without this the snapshot ordered by the bare
-                                    // table, whose join edge the resolver picks
-                                    // first (the first-declared relationship),
-                                    // ignoring USING — a silent wrong-role snapshot.
-                                    // Non-role-playing dims resolve to `None` and
-                                    // keep the raw expression (unchanged path).
-                                    let mut e = d.expr.clone();
-                                    if let (Some(sc), Some(st)) =
-                                        (scoped.as_ref(), d.source_table.as_ref())
-                                    {
-                                        e = crate::expr_tokens::rewrite_qualifier(&e, st, sc);
-                                    }
-                                    e
-                                },
-                                |(_, expr)| expr.clone(),
-                            )
-                    },
-                );
-                // Snowflake semi-additive semantics (F-1, code-review
-                // 2026-07-16): the rows are sorted by the NA dims and the values
-                // from the LAST ordering value of that sort are aggregated (with
-                // RANK(), every row tied at that value is included) — so the
-                // default (ASC) selects the LATEST snapshot and DESC selects the
-                // earliest. We pick the snapshot with `RANK() = 1`, which is the
-                // FIRST ordering value of this window's ORDER BY, so we emit the
-                // REVERSE of the declared direction: the first value of the
-                // reversed sort is the last value of the declared sort. NULLS
-                // ordering is kept as
-                // declared (not reversed) so that under the default (NULLS LAST)
-                // a NULL key never outranks a real snapshot — matching the
-                // "latest non-NULL wins" intent; declare NULLS FIRST to let a
-                // NULL key win.
-                let dir = match nd.order {
-                    SortOrder::Asc => "DESC",
-                    SortOrder::Desc => "ASC",
-                };
-                let nulls = match nd.nulls {
-                    NullsOrder::First => "NULLS FIRST",
-                    NullsOrder::Last => "NULLS LAST",
-                };
-                format!("{dim_expr} {dir} {nulls}")
-            })
-            .collect();
-
-        let order_clause = order_items.join(", ");
-
-        let window_spec = if partition_clause.is_empty() {
-            format!("ORDER BY {order_clause}")
-        } else {
-            format!("{partition_clause} ORDER BY {order_clause}")
-        };
-
-        cte_select_items.push(format!(
-            "        RANK() OVER ({window_spec}) AS \"{rn_alias}\""
+        cte_select_items.push(snapshot_rank_column(
+            def,
+            resolved_dims,
+            &dim_cte_exprs,
+            group,
+            &rn_alias,
         ));
     }
 
@@ -414,21 +239,12 @@ pub(super) fn expand_semi_additive(
 
     // Metric columns
     for (met_idx, met) in resolved_mets.iter().enumerate() {
-        let agg_func = &decomposed[met_idx].0;
-
-        // Active semi-additive aggregates only rows at the snapshot rank (all
-        // rows tied at rank 1 contribute — RANK semantics, SG-4); regular
-        // metrics aggregate over all rows.
-        let inner = if is_active_semi(met) {
-            let rn_col = get_rn_column_for_metric(met_idx, &na_groups);
-            format!("{agg_func}(CASE WHEN \"{rn_col}\" = 1 THEN \"__sv_semi_{met_idx}\" END)")
-        } else {
-            format!("{agg_func}(\"__sv_reg_{met_idx}\")")
-        };
-        outer_items.push(SelectItem::new(
-            inner,
-            met.output_type.clone(),
-            quote_stored_ident(&met.name),
+        outer_items.push(outer_metric_column(
+            met_idx,
+            met,
+            &decomposed[met_idx].0,
+            is_active_semi(met),
+            &na_groups,
         ));
     }
 
@@ -451,6 +267,281 @@ pub(super) fn expand_semi_additive(
     );
 
     Ok(sql)
+}
+
+/// Validate and decompose every metric's aggregate expression for the snapshot
+/// CTE (SG-5), returning `(agg_func, inner_expr)` per metric in `resolved_mets`
+/// order.
+///
+/// Each metric must be a single bare aggregate call the CTE can split into an
+/// inner-expression capture plus an outer re-aggregation
+/// ([`parse_snapshot_aggregate`]); anything else is rejected with a typed error
+/// rather than silently mangled. The error variant distinguishes the offending
+/// metric's role: an ACTIVE semi-additive metric yields
+/// [`ExpandError::SemiAdditiveUnsupportedExpression`], while a regular metric
+/// co-queried alongside one yields
+/// [`ExpandError::SemiAdditiveCoQueryUnsupported`] (naming the semi-additive
+/// metric it cannot share the snapshot CTE with).
+fn decompose_metrics(
+    view_name: &str,
+    resolved_mets: &[&Metric],
+    resolved_exprs: &HashMap<String, String>,
+    is_active_semi: &dyn Fn(&Metric) -> bool,
+) -> Result<Vec<(String, String)>, ExpandError> {
+    let semi_metric_name = resolved_mets
+        .iter()
+        .find(|m| is_active_semi(m))
+        .map_or_else(String::new, |m| m.name.clone());
+    let mut decomposed: Vec<(String, String)> = Vec::with_capacity(resolved_mets.len());
+    for met in resolved_mets {
+        let resolved_expr = resolved_exprs
+            .get(&crate::ident::normalize_ident_part(&met.name))
+            .cloned()
+            .unwrap_or_else(|| met.expr.clone());
+        match parse_snapshot_aggregate(&resolved_expr) {
+            Ok(parts) => decomposed.push(parts),
+            Err(reason) => {
+                return Err(if is_active_semi(met) {
+                    ExpandError::SemiAdditiveUnsupportedExpression {
+                        view_name: view_name.to_string(),
+                        metric_name: met.name.clone(),
+                        metric_expr: resolved_expr,
+                        reason,
+                    }
+                } else {
+                    ExpandError::SemiAdditiveCoQueryUnsupported {
+                        view_name: view_name.to_string(),
+                        metric_name: met.name.clone(),
+                        metric_expr: resolved_expr,
+                        semi_metric_name: semi_metric_name.clone(),
+                        reason,
+                    }
+                });
+            }
+        }
+    }
+    Ok(decomposed)
+}
+
+/// Emit each queried dimension's column into the snapshot CTE's SELECT list
+/// (appending to `cte_select_items`) and return the parallel list of rendered
+/// dimension EXPRESSIONS.
+///
+/// The returned expressions -- not the CTE select aliases -- are what the
+/// `RANK()` window PARTITION/ORDER clauses must repeat: inside the CTE's own
+/// SELECT, `DuckDB` resolves a window-clause identifier to a same-named physical
+/// FROM-clause column before the lateral select alias, so `PARTITION BY
+/// "region"` with `upper(o.region) AS region` silently partitioned on the raw
+/// column and produced wrong snapshot sums (E-1, code-review 2026-07-11). The
+/// standard path defends against the same shadowing with GROUP BY ordinals;
+/// this is the CTE-path equivalent.
+fn push_cte_dimension_columns(
+    resolved_dims: &[ResolvedDim],
+    cte_select_items: &mut Vec<String>,
+) -> Vec<String> {
+    let mut dim_cte_exprs: Vec<String> = Vec::with_capacity(resolved_dims.len());
+    for rd in resolved_dims {
+        let dim = rd.dim;
+        let mut base_expr = dim.expr.clone();
+        if let Some(ref scoped) = rd.scoped_alias {
+            if let Some(ref st) = dim.source_table {
+                base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);
+            }
+        }
+        let item = SelectItem::new(
+            base_expr,
+            dim.output_type.clone(),
+            quote_stored_ident(&dim.name),
+        );
+        cte_select_items.push(format!("        {}", item.render()));
+        // The window PARTITION/ORDER clauses must repeat this EXPRESSION, never
+        // the select alias (E-1) -- see the doc comment.
+        dim_cte_exprs.push(item.rendered_expr());
+    }
+    dim_cte_exprs
+}
+
+/// Build one `RANK() OVER (...) AS "<rn_alias>"` snapshot-rank column for a
+/// single NA group, as an 8-space-indented CTE SELECT-list line.
+///
+/// `RANK()` (not `ROW_NUMBER()`) so rows tied on all NA ordering keys share rank 1
+/// and ALL aggregate together (SG-4). The window partitions by the queried
+/// dimension EXPRESSIONS excluding this group's NA dims, and orders by each NA
+/// dim via [`na_order_item`]; both use expressions rather than CTE aliases
+/// (E-1).
+fn snapshot_rank_column(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[ResolvedDim],
+    dim_cte_exprs: &[String],
+    group: &NaGroup,
+    rn_alias: &str,
+) -> String {
+    // PARTITION BY: all queried dims (NA dims not in query are not in
+    // resolved_dims, so this naturally partitions by all queried dims).
+    // Key each NA dim through the shared resolver so a QUERIED NA dim
+    // named with a dotted/quoted reference is still excluded from the
+    // partition (#30) — a bare lowercase compare missed it.
+    let na_dim_keys: Vec<String> = group
+        .na_dims
+        .iter()
+        .map(|nd| na_dim_match_key(def, &nd.dimension))
+        .collect();
+
+    // Partition by the dimension EXPRESSIONS, not the CTE aliases (E-1).
+    let partition_dims: Vec<String> = resolved_dims
+        .iter()
+        .zip(dim_cte_exprs)
+        .filter(|(rd, _)| !na_dim_keys.contains(&crate::ident::normalize_ident_part(&rd.dim.name)))
+        .map(|(_, expr)| expr.clone())
+        .collect();
+
+    let partition_clause = if partition_dims.is_empty() {
+        String::new()
+    } else {
+        format!("PARTITION BY {}", partition_dims.join(", "))
+    };
+
+    // ORDER BY: the NA dims with their specified sort order, always as
+    // EXPRESSIONS (E-1: a queried NA dim previously ordered by its CTE
+    // alias, which DuckDB binds to a same-named physical column first).
+    // A queried NA dim uses its rendered CTE expression; an unqueried NA
+    // dim uses its raw definition expression (it has no CTE column). That
+    // raw expression may reference a non-base table -- its join is
+    // guaranteed below (SG-9).
+    let order_items: Vec<String> = group
+        .na_dims
+        .iter()
+        .zip(&group.na_dim_scoped)
+        .map(|(nd, scoped)| na_order_item(def, resolved_dims, dim_cte_exprs, nd, scoped.as_ref()))
+        .collect();
+
+    let order_clause = order_items.join(", ");
+
+    let window_spec = if partition_clause.is_empty() {
+        format!("ORDER BY {order_clause}")
+    } else {
+        format!("{partition_clause} ORDER BY {order_clause}")
+    };
+
+    format!("        RANK() OVER ({window_spec}) AS \"{rn_alias}\"")
+}
+
+/// Render one NA dimension's `ORDER BY` item for the snapshot `RANK()` window:
+/// `<dim_expr> <dir> <nulls>`.
+///
+/// #30: the NA dim reference (bare OR dotted, quoted or not) resolves to its
+/// declared dimension via the shared resolver, so a dotted `o."order date"`
+/// orders by the same expression a bare `order_date` would. A QUERIED NA dim
+/// repeats its CTE expression (E-1); an UNQUERIED NA dim uses its raw
+/// definition expression, rewritten to the role-playing scoped alias when its
+/// metric's `USING` disambiguates (T-15 / F-18). F-1: the direction is the
+/// REVERSE of the declared one (NULLS kept) so `RANK() = 1` lands on the LAST
+/// value of the declared sort.
+fn na_order_item(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[ResolvedDim],
+    dim_cte_exprs: &[String],
+    nd: &NonAdditiveDim,
+    scoped: Option<&String>,
+) -> String {
+    // #30: resolve the NA dim reference (bare OR dotted, quoted or
+    // not) to its declared dimension via the shared resolver, so a
+    // dotted `o."order date"` orders by the same expression a bare
+    // `order_date` would — not the raw dotted text emitted as a
+    // quoted non-column.
+    let dim_expr = super::resolution::find_dimension(def, &nd.dimension).map_or_else(
+        // Unresolvable: Phase 47 (`body_parser::mod`) hard-errors at
+        // CREATE on any NA dim that names no declared dimension, so
+        // only a malformed/unknown residual reaches this arm.
+        // Emit a quoted non-column that fails cleanly at bind time
+        // (F-18), never the aliased-column shape E-1 fixed.
+        || quote_ident(&nd.dimension),
+        |d| {
+            // A QUERIED NA dim repeats its CTE expression (E-1: the
+            // rendered expression, never the alias). An UNQUERIED NA
+            // dim uses its raw definition expression — it has no CTE
+            // column, and its source table is guaranteed joined
+            // below (SG-9). Match the resolved declared dimension
+            // against the queried set by canonical key so a
+            // dotted/quoted NA reference finds its queried dim.
+            let key = crate::ident::normalize_ident_part(&d.name);
+            resolved_dims
+                .iter()
+                .zip(dim_cte_exprs)
+                .find(|(rd, _)| crate::ident::normalize_ident_part(&rd.dim.name) == key)
+                .map_or_else(
+                    || {
+                        // UNQUERIED NA dim. Rewrite its declared
+                        // expression to the role-playing scoped alias
+                        // when its metric's USING disambiguates
+                        // (T-15 / F-18) — the SAME instance the metric
+                        // joins (e.g. `a.city` -> `a__dep_airport.city`).
+                        // Without this the snapshot ordered by the bare
+                        // table, whose join edge the resolver picks
+                        // first (the first-declared relationship),
+                        // ignoring USING — a silent wrong-role snapshot.
+                        // Non-role-playing dims resolve to `None` and
+                        // keep the raw expression (unchanged path).
+                        let mut e = d.expr.clone();
+                        if let (Some(sc), Some(st)) = (scoped, d.source_table.as_ref()) {
+                            e = crate::expr_tokens::rewrite_qualifier(&e, st, sc);
+                        }
+                        e
+                    },
+                    |(_, expr)| expr.clone(),
+                )
+        },
+    );
+    // Snowflake semi-additive semantics (F-1, code-review
+    // 2026-07-16): the rows are sorted by the NA dims and the values
+    // from the LAST ordering value of that sort are aggregated (with
+    // RANK(), every row tied at that value is included) — so the
+    // default (ASC) selects the LATEST snapshot and DESC selects the
+    // earliest. We pick the snapshot with `RANK() = 1`, which is the
+    // FIRST ordering value of this window's ORDER BY, so we emit the
+    // REVERSE of the declared direction: the first value of the
+    // reversed sort is the last value of the declared sort. NULLS
+    // ordering is kept as
+    // declared (not reversed) so that under the default (NULLS LAST)
+    // a NULL key never outranks a real snapshot — matching the
+    // "latest non-NULL wins" intent; declare NULLS FIRST to let a
+    // NULL key win.
+    let dir = match nd.order {
+        SortOrder::Asc => "DESC",
+        SortOrder::Desc => "ASC",
+    };
+    let nulls = match nd.nulls {
+        NullsOrder::First => "NULLS FIRST",
+        NullsOrder::Last => "NULLS LAST",
+    };
+    format!("{dim_expr} {dir} {nulls}")
+}
+
+/// Build the outer-SELECT aggregate column for one metric over the snapshot
+/// CTE.
+///
+/// An ACTIVE semi-additive metric aggregates only rows at its snapshot rank --
+/// `FUNC(CASE WHEN "<rn_col>" = 1 THEN "__sv_semi_<idx>" END)` -- where every
+/// row tied at rank 1 contributes (RANK semantics, SG-4). A regular or
+/// effectively-regular metric aggregates over all rows: `FUNC("__sv_reg_<idx>")`.
+fn outer_metric_column(
+    met_idx: usize,
+    met: &Metric,
+    agg_func: &str,
+    is_active_semi: bool,
+    na_groups: &[NaGroup],
+) -> SelectItem {
+    let inner = if is_active_semi {
+        let rn_col = get_rn_column_for_metric(met_idx, na_groups);
+        format!("{agg_func}(CASE WHEN \"{rn_col}\" = 1 THEN \"__sv_semi_{met_idx}\" END)")
+    } else {
+        format!("{agg_func}(\"__sv_reg_{met_idx}\")")
+    };
+    SelectItem::new(
+        inner,
+        met.output_type.clone(),
+        quote_stored_ident(&met.name),
+    )
 }
 
 /// A group of metrics sharing the same NON ADDITIVE BY dimension set.
