@@ -236,7 +236,7 @@ Fix: `rustup update stable`
 | `just test-all` | Rust + SQL logic + DuckLake CI + integration | Runs `test-rust`, `test-sql`, `test-ducklake-ci`, and `test-integration` sequentially |
 | `just coverage` | Coverage report | Runs unit tests with `cargo-llvm-cov`, fails if below 80% line coverage |
 | `just lint` | Code quality (authoritative) | `cargo fmt --check` + full default-features `cargo clippy` + `cargo deny check`. The clippy step compiles the ~25 MB bundled DuckDB, so a cold run is ~10 min. |
-| `just lint-fast` | Fast lint (pre-commit) | `cargo fmt --check` + the extension-feature clippy with `SV_SKIP_CPP_BUILD` (no C++ build). What the pre-commit hook runs; lints the same production code in seconds. |
+| `just lint-fast` | Fast lint (pre-commit) | `cargo fmt --check` + the extension-feature clippy with `SV_SKIP_CPP_BUILD` (no C++ build). What the pre-commit hook runs; lints the same production code in ~1 min cold, seconds warm. |
 
 ### The Critical Difference: `cargo test` vs `just test-sql`
 
