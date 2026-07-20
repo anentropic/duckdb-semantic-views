@@ -1,4 +1,15 @@
 #!/bin/sh
 set -e
+
+# Pre-commit gate. NOTE: `cargo clippy -- -D warnings` (default features =
+# duckdb/bundled) compiles the ~25 MB DuckDB amalgamation from source — a
+# ~10-minute COLD build that stalls `git commit` whenever the clippy build
+# cache is cold. Its cargo profile differs from `cargo test`'s, so even a green
+# `cargo test` does not warm it, and tight disk evicts it between runs. The
+# extension-feature clippy below lints the SAME production code without any C++
+# build — every `cfg(not(feature = "extension"))` item in src/ is test-only or
+# lint-suppressed (`src/lib.rs` `test_helpers`), so nothing lintable is lost —
+# in ~1 min cold, seconds warm. CI (CodeQuality.yml) still runs the full
+# default-features `cargo clippy -- -D warnings` as the authoritative gate.
 cargo fmt --check
-cargo clippy -- -D warnings
+SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features --features extension -- -D warnings

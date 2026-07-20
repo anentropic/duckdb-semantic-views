@@ -146,8 +146,13 @@ If a command not on the list needs the bypass, halt and ask first.
 
 ## Code editing rules
 
-- Pre-commit hook runs `cargo fmt --check` + clippy. If a commit fails on fmt-check, run
-  `cargo fmt`, re-stage, and retry. Never use `--no-verify`.
+- Pre-commit hook runs `cargo fmt --check` + the **fast** extension-feature clippy
+  (`SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features --features extension -- -D warnings`,
+  == `just lint-fast`), which skips the ~25 MB bundled-DuckDB amalgamation build so committing
+  stays fast (seconds warm, ~1 min cold) instead of the ~10 min the default-features clippy costs.
+  It lints the same production code; CI's full default-features `cargo clippy` (`just lint`) is the
+  authoritative gate. If a commit fails on fmt-check, run `cargo fmt`, re-stage, and retry. Never
+  use `--no-verify`.
 - New sqllogictest files must be added to `test/sql/TEST_LIST` or the runner will skip them.
 - For `statement error` assertions in sqllogictest, use the block form (`---- separator` +
   substring), not inline regex — the runner does not support inline form.

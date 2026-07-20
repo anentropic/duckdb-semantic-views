@@ -51,11 +51,22 @@ test-rust:
     # SV_SKIP_CPP_BUILD skips the C++ build, the pure-Rust tests still run.
     SV_SKIP_CPP_BUILD=1 cargo test --lib --no-default-features --features extension
 
-# Run all lints
+# Run all lints (authoritative: full default-features clippy, mirrors CI). The
+# `cargo clippy` step compiles the ~25 MB bundled DuckDB amalgamation, so a cold
+# run takes ~10 min — see `lint-fast` for the quick pre-commit-equivalent check.
 lint:
     cargo fmt --check
     cargo clippy -- -D warnings
     cargo deny check
+
+# Fast lint — what the pre-commit hook runs. The extension-feature clippy skips
+# the C++ amalgamation build (SV_SKIP_CPP_BUILD) and lints the same production
+# code (every `cfg(not(feature = "extension"))` item in src/ is test-only or
+# lint-suppressed): ~1 min cold, seconds warm. `just lint` / CI remain the
+# authoritative full-coverage gate.
+lint-fast:
+    cargo fmt --check
+    SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features --features extension -- -D warnings
 
 # Format code in place
 fmt:

@@ -235,7 +235,8 @@ Fix: `rustup update stable`
 | `just test-integration` | Python integration suites | Runs the full `test/integration/*.py` suite list (caret, ADBC, multi-db, concurrency, differential, …) |
 | `just test-all` | Rust + SQL logic + DuckLake CI + integration | Runs `test-rust`, `test-sql`, `test-ducklake-ci`, and `test-integration` sequentially |
 | `just coverage` | Coverage report | Runs unit tests with `cargo-llvm-cov`, fails if below 80% line coverage |
-| `just lint` | Code quality | `cargo fmt --check` + `cargo clippy` + `cargo deny check` |
+| `just lint` | Code quality (authoritative) | `cargo fmt --check` + full default-features `cargo clippy` + `cargo deny check`. The clippy step compiles the ~25 MB bundled DuckDB, so a cold run is ~10 min. |
+| `just lint-fast` | Fast lint (pre-commit) | `cargo fmt --check` + the extension-feature clippy with `SV_SKIP_CPP_BUILD` (no C++ build). What the pre-commit hook runs; lints the same production code in seconds. |
 
 ### The Critical Difference: `cargo test` vs `just test-sql`
 
@@ -266,6 +267,8 @@ SV_SKIP_CPP_BUILD=1 cargo clippy --no-default-features --features extension -- -
 ```
 
 `SV_SKIP_CPP_BUILD` makes `build.rs` skip the ~25 MB DuckDB amalgamation + C++ shim compile. Clippy only type-checks (it never links the final `cdylib`), so the C++ half is irrelevant and the check needs no amalgamation download — it runs in seconds. Use the same command locally before touching any FFI (`src/query/{table_function,explain}.rs`, `src/ddl/*_ffi.rs`, `src/parse/ffi.rs`) code. Do **not** set `SV_SKIP_CPP_BUILD` for a real `just build` — the extension won't link without the C++ shim.
+
+**This is also what the pre-commit hook runs** (`just lint-fast` / `.cargo-husky/hooks/pre-commit`). The default-features `cargo clippy -- -D warnings` compiles the bundled DuckDB amalgamation — a ~10 min COLD build (its cargo profile differs from `cargo test`'s, so a green `cargo test` does not warm it, and tight disk evicts it between runs), which used to stall every `git commit`. The extension-feature clippy lints the same production code with no C++ build, because every `#[cfg(not(feature = "extension"))]` item in `src/` is either inside a `#[cfg(test)]` module (clippy without `--tests` skips it) or the `test_helpers` module (which carries `#[allow(clippy::pedantic, ...)]`). CI's default-features `Clippy (pedantic lints, deny warnings)` step remains the authoritative full-coverage gate.
 
 ### DuckLake/Iceberg Tests
 
