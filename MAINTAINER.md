@@ -613,11 +613,13 @@ This will:
 - Verify you're on `main` with a clean working tree and `gh` CLI installed
 - Extract the version from `Cargo.toml` and the current commit SHA
 - Update `description.yml` with the new `ref` and `version`, and commit
-- Copy `description.yml` to the CE fork (default: `~/Documents/Dev/Sources/community-extensions`, override with `CE_REPO` env var)
-- Check out the `semantic-views` branch, commit, push, and open a PR to `duckdb/community-extensions`
+- In the CE fork (default: `~/Documents/Dev/Sources/community-extensions`, override with `CE_REPO` env var): ensure an `upstream` remote, `git fetch upstream main`, and **rebranch `semantic-views` off `upstream/main`** so the PR is a clean one-file change, then copy in `description.yml`, commit, and **force-push**
+- Open a PR to `duckdb/community-extensions` (or report the existing open one, which the force-push updates in place)
+
+> **Why rebranch off `upstream/main` (not reuse the local `semantic-views` branch)?** The registry's `prepare` job rejects a PR that touches more than one extension's descriptor (`ValueError: cannot have multiple descriptors changed`). If the branch is left pinned to a previous release's base, the ~100 other extensions that updated upstream in the meantime all show as changed and the job fast-fails. Rebranching off current `upstream/main` guarantees the diff is only `extensions/semantic_views/description.yml`. The `PublishExtension.yml` CI workflow does the same thing.
 
 **Prerequisites:**
-- A fork of [duckdb/community-extensions](https://github.com/duckdb/community-extensions) cloned locally
+- A fork of [duckdb/community-extensions](https://github.com/duckdb/community-extensions) cloned locally (an `upstream` remote is added automatically if missing)
 - The `gh` CLI authenticated with permissions to create PRs
 
 **After running:**
