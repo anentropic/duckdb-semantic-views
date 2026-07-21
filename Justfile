@@ -371,6 +371,12 @@ release:
       exit 1
     fi
     cd "$CE_REPO"
+    # The CE fork must have a clean working tree: we rewrite its branch and
+    # force-push below, which would fail partway (or carry stray edits) otherwise.
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+      echo "ERROR: CE fork working tree at '$CE_REPO' is not clean. Commit or stash there first." >&2
+      exit 1
+    fi
     # Rebranch off CURRENT upstream main so the PR is a clean one-file change.
     # Reusing a stale semantic-views branch makes the PR diff *every* other
     # extension that updated upstream since the last release, which trips the
@@ -383,20 +389,29 @@ release:
       git remote add upstream "$UPSTREAM_URL"
     fi
     git fetch upstream main
+    # Refresh the remote-tracking ref so --force-with-lease below has a current
+    # lease baseline (the branch is absent on the very first release -> ignore).
+    git fetch origin semantic-views 2>/dev/null || true
     git checkout -B semantic-views upstream/main
     mkdir -p extensions/semantic_views
     cp "$DESC_SRC" extensions/semantic_views/description.yml
     git add extensions/semantic_views/description.yml
     git commit -m "Update semantic_views to v$VERSION"
-    git push --force origin semantic-views
+    # --force-with-lease: reset the fork branch to our clean rebranch, but refuse
+    # if someone else pushed to it since the fetch above.
+    git push --force-with-lease origin semantic-views
     echo "Pushed clean semantic-views branch (rebased on upstream/main) to CE fork"
+    # Derive the fork owner from the CE fork's origin remote so the recipe works
+    # from any account/org fork, not just anentropic's.
+    FORK_OWNER=$(basename "$(dirname "$(git remote get-url origin)")")
+    HEAD_REF="$FORK_OWNER:semantic-views"
     # Open the PR, or report the existing open one (force-push updates it in place).
     PR_URL=$(gh pr list --repo duckdb/community-extensions \
-      --head anentropic:semantic-views --state open --json url --jq '.[0].url // empty')
+      --head "$HEAD_REF" --base main --state open --json url --jq '.[0].url // empty')
     if [ -z "$PR_URL" ]; then
       PR_URL=$(gh pr create \
         --repo duckdb/community-extensions \
-        --head anentropic:semantic-views \
+        --head "$HEAD_REF" \
         --base main \
         --title "Update semantic_views to v$VERSION" \
         --body "Update semantic_views extension to v$VERSION (ref: $SHA)")
