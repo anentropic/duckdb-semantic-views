@@ -98,7 +98,7 @@ def sdist_url(pyver: str) -> str:
     for f in data["urls"]:
         if f["packagetype"] == "sdist":
             return f["url"]
-    raise SystemExit(f"no sdist published for duckdb=={pyver} on PyPI")
+    raise SystemExit(f"no sdist published for duckdb==1.5.5{pyver} on PyPI")
 
 
 def extract_duckdb_source(sdist_path: str, dest: str) -> str:
