@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "semantic_views"
-version = "0.10.4"
+version = "0.12.0"
 dependencies = [
  "arbitrary",
  "duckdb",

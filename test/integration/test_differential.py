@@ -633,12 +633,12 @@ def run_harness() -> int:
                         print(f"  first differing row: got={g!r} want={w!r}")
                         break
 
-    # --- Multi-grain guard (SG-1): mixing grains must ERROR, not inflate ----
-    # A separate view with a metric on a ManyToOne child of the base: the
-    # pre-fix engine silently joined the child and inflated the base-grain
-    # SUM per child row. Post-fix the request must raise the fan-trap error.
-    # (item_count alone is NOT compared against reference SQL here until
-    # SG-8 — COUNT(*) over LEFT JOIN NULL-extension — lands.)
+    # --- Multi-grain (SG-1 / v0.12.0 per-grain): each metric at its own grain -
+    # A separate view with a metric on a ManyToOne child of the base. The
+    # pre-SG-1 engine silently joined the child and inflated the base-grain SUM
+    # per child row; v0.11.0 raised a fan-trap error instead. Since v0.12.0 the
+    # pair is computed per-grain, so it must SUCCEED and match a reference that
+    # aggregates each side separately.
     conn.execute(
         "CREATE TABLE line_items (id INTEGER PRIMARY KEY, order_id INTEGER, "
         "line_amount DECIMAL(10,2))"
@@ -651,19 +651,64 @@ def run_harness() -> int:
         "CREATE SEMANTIC VIEW diff_mg AS "
         "TABLES (o AS orders PRIMARY KEY (id), li AS line_items PRIMARY KEY (id)) "
         "RELATIONSHIPS (li_order AS li(order_id) REFERENCES o) "
-        "DIMENSIONS (o.region AS o.region) "
+        "DIMENSIONS (o.region AS o.region, li.line_id AS li.id) "
         "METRICS (o.revenue AS SUM(o.amount), li.item_count AS COUNT(*))"
     )
-    total += 2
-    try:
+    total += 3
+    # Each grain aggregated on its own table, then combined — the reference is
+    # written that way too (never one joined row set, which is what inflated).
+    got = normalize(
         conn.execute(
             "SELECT * FROM semantic_view('diff_mg', metrics := ['revenue', 'item_count'])"
         ).fetchall()
+    )
+    want = normalize(
+        conn.execute(
+            "SELECT (SELECT SUM(amount) FROM orders), (SELECT COUNT(*) FROM line_items)"
+        ).fetchall()
+    )
+    if rows_equal(got, want):
+        print("  PASS: multi-grain metric pair computed per-grain")
+    else:
         failures += 1
-        print("FAIL multi-grain: expected fan-trap error, query succeeded")
+        print(f"FAIL multi-grain: metric pair mismatch got={got} want={want}")
+
+    # The same pair grouped by a base-table dimension both grains reach: the
+    # child grain reaches `region` through its FK, the base grain owns it.
+    got = normalize(
+        conn.execute(
+            "SELECT * FROM semantic_view('diff_mg', "
+            "dimensions := ['region'], metrics := ['revenue', 'item_count'])"
+        ).fetchall()
+    )
+    want = normalize(
+        conn.execute(
+            "SELECT COALESCE(a.region, b.region), a.revenue, b.item_count FROM "
+            "(SELECT region, SUM(amount) AS revenue FROM orders GROUP BY 1) a "
+            "FULL OUTER JOIN "
+            "(SELECT o.region AS region, COUNT(*) AS item_count FROM line_items li "
+            " LEFT JOIN orders o ON li.order_id = o.id GROUP BY 1) b "
+            "ON a.region IS NOT DISTINCT FROM b.region"
+        ).fetchall()
+    )
+    if rows_equal(got, want):
+        print("  PASS: multi-grain metric pair by region computed per-grain")
+    else:
+        failures += 1
+        print(f"FAIL multi-grain: by-region mismatch got={got} want={want}")
+
+    # The boundary: a dimension BELOW a metric's grain is still rejected —
+    # per-grain aggregation cannot define it either.
+    try:
+        conn.execute(
+            "SELECT * FROM semantic_view('diff_mg', "
+            "dimensions := ['line_id'], metrics := ['revenue'])"
+        ).fetchall()
+        failures += 1
+        print("FAIL multi-grain: dimension below the metric grain was accepted")
     except Exception as exc:  # noqa: BLE001
         if "fan trap detected" in str(exc):
-            print("  PASS: multi-grain metric pair raises fan-trap error")
+            print("  PASS: dimension below a metric's grain still raises fan-trap")
         else:
             failures += 1
             print(f"FAIL multi-grain: wrong error: {exc}")
