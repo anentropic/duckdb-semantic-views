@@ -15,7 +15,7 @@
 
 use super::*;
 use crate::expand::test_helpers::{minimal_def, TestFixtureExt};
-use crate::model::{Cardinality, SemanticViewDefinition};
+use crate::model::{Cardinality, NullsOrder, SemanticViewDefinition, SortOrder, WindowSpec};
 
 /// Rename the base table declared by [`minimal_def`] so the fixture's physical
 /// table name differs from its alias (`"orders" AS "o"`), the shape real DDL
@@ -289,5 +289,293 @@ fn one_to_one_parent_metric_stays_flat() {
     assert!(
         !sql.contains("__sv_grain"),
         "OneToOne needs no per-grain rewrite, got:\n{sql}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GRAIN-04: a derived metric whose components span grains
+// ---------------------------------------------------------------------------
+
+/// `ratio = order_total / item_count` fuses an order-grain aggregate and a
+/// line-item-grain one. Its components are computed at their own grains and the
+/// division is evaluated over the pre-aggregates. v0.11.0 raised
+/// `MetricFanTrap` naming the derived metric.
+#[test]
+fn derived_metric_spanning_grains_is_assembled_from_components() {
+    let def = orders_with_child_line_items().with_metric(
+        "avg_order_size",
+        "order_total / item_count",
+        None,
+    );
+    let sql = expand("sales", &def, &req(&[], &["avg_order_size"]))
+        .expect("a derived metric spanning grains must be answerable");
+    assert!(
+        sql.contains(r#"FROM "orders" AS "o""#) && sql.contains(r#"FROM "line_items" AS "li""#),
+        "each component must be aggregated at its own grain, got:\n{sql}"
+    );
+    assert!(
+        sql.contains(r#""__sv_grain_0"."__sv_m0" / "__sv_grain_1"."__sv_m0" AS "avg_order_size""#),
+        "the derived expression must combine the two component columns, got:\n{sql}"
+    );
+    // The components are aggregates in the CTEs, never in the outer SELECT.
+    let outer = sql.split_once("\nSELECT\n").expect("outer SELECT").1;
+    assert!(
+        !outer.contains("SUM(") && !outer.contains("COUNT("),
+        "the outer SELECT combines pre-aggregates, it does not re-aggregate:\n{outer}"
+    );
+}
+
+/// The same, grouped by a dimension both grains can reach.
+#[test]
+fn derived_metric_spanning_grains_with_dimension() {
+    let def = orders_with_child_line_items().with_metric(
+        "avg_order_size",
+        "order_total / item_count",
+        None,
+    );
+    let sql = expand("sales", &def, &req(&["order_status"], &["avg_order_size"]))
+        .expect("derived multi-grain metric with a shared dimension must be answerable");
+    assert!(
+        sql.contains("FULL OUTER JOIN") && sql.contains("IS NOT DISTINCT FROM"),
+        "components join on the shared dimension, got:\n{sql}"
+    );
+    assert!(
+        sql.matches("GROUP BY").count() == 2,
+        "each component CTE groups by the dimension, got:\n{sql}"
+    );
+}
+
+/// A derived metric that reaches its multi-grain components through ANOTHER
+/// derived metric: `nested = avg_order_size * 2` where `avg_order_size =
+/// order_total / item_count`. The intermediate derived metric has no grain of
+/// its own — it must be inlined over the same component columns rather than
+/// left as a dangling reference.
+#[test]
+fn derived_metric_nested_over_multi_grain_components() {
+    let def = orders_with_child_line_items()
+        .with_metric("avg_order_size", "order_total / item_count", None)
+        .with_metric("scaled", "avg_order_size * 2", None);
+    let sql = expand("sales", &def, &req(&[], &["scaled"]))
+        .expect("a nested derived metric over multi-grain components must be answerable");
+    assert!(
+        !sql.contains("avg_order_size *"),
+        "the intermediate derived metric must be inlined, not referenced as a column:\n{sql}"
+    );
+    assert!(
+        sql.contains(r#"("__sv_grain_0"."__sv_m0" / "__sv_grain_1"."__sv_m0") * 2 AS "scaled""#),
+        "expected the inlined nested expression, got:\n{sql}"
+    );
+}
+
+/// Two derived metrics over the same components, queried together: each must be
+/// assembled independently — the shape that regressed when a single visited-set
+/// was shared across the whole rebuild instead of guarding one recursion path.
+#[test]
+fn two_derived_metrics_over_the_same_components() {
+    let def = orders_with_child_line_items()
+        .with_metric("avg_order_size", "order_total / item_count", None)
+        .with_metric("inverse", "item_count / order_total", None);
+    let sql = expand("sales", &def, &req(&[], &["avg_order_size", "inverse"]))
+        .expect("two derived multi-grain metrics must both be answerable");
+    assert!(
+        sql.contains(r#"AS "avg_order_size""#) && sql.contains(r#"AS "inverse""#),
+        "both metrics must be emitted, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("order_total / item_count") && !sql.contains("item_count / order_total"),
+        "neither expression may survive with unresolved metric references:\n{sql}"
+    );
+}
+
+/// A chain of intermediate derived metrics, where a later one references an
+/// earlier one: `half = order_total / item_count`, `scaled = half * 2`,
+/// `combined = scaled + half`. Every intermediate must be resolved down to
+/// component columns on each path it appears on — a rebuild that remembers
+/// "already inlined `half`" across sibling branches leaks the raw metric name
+/// into the SQL, which then fails to bind.
+#[test]
+fn derived_metric_chain_resolves_every_reference_to_columns() {
+    let def = orders_with_child_line_items()
+        .with_metric("half", "order_total / item_count", None)
+        .with_metric("scaled", "half * 2", None)
+        .with_metric("combined", "scaled + half", None);
+    let sql = expand("sales", &def, &req(&[], &["combined"]))
+        .expect("a chain of derived metrics over multi-grain components must be answerable");
+    for leaked in ["half", "scaled", "order_total", "item_count"] {
+        assert!(
+            !sql.contains(leaked),
+            "metric name '{leaked}' leaked into the SQL unresolved — it is not a column:\n{sql}"
+        );
+    }
+}
+
+/// The grain CTEs must be numbered deterministically: the same definition and
+/// request always produce byte-identical SQL. (Component collection walks a
+/// name set; iterating it directly made group 0 the line-item grain on some
+/// runs and the order grain on others.)
+#[test]
+fn per_grain_sql_is_deterministic() {
+    let def = orders_with_child_line_items().with_metric(
+        "avg_order_size",
+        "order_total / item_count",
+        None,
+    );
+    let first = expand("sales", &def, &req(&[], &["avg_order_size"])).expect("expands");
+    for _ in 0..16 {
+        assert_eq!(
+            first,
+            expand("sales", &def, &req(&[], &["avg_order_size"])).expect("expands"),
+            "per-grain SQL must not vary between expansions of the same query"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sibling grains (the chasm trap): two child tables of one parent
+// ---------------------------------------------------------------------------
+
+/// root `o` with TWO children — `li` (line items) and `s` (shipments). Neither
+/// is an ancestor of the other; the path between them runs through the root,
+/// and the `o -> s` leg of it fans.
+fn orders_with_two_children() -> SemanticViewDefinition {
+    base_table(minimal_def("o", "d", "d", "m", "count(*)"), "orders", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("li", "line_items", &["id"])
+        .with_table("s", "shipments", &["id"])
+        .with_dimension("order_status", "o.status", Some("o"))
+        .with_dimension("carrier", "s.carrier", Some("s"))
+        .with_metric("item_qty", "SUM(li.qty)", Some("li"))
+        .with_metric("ship_weight", "SUM(s.weight)", Some("s"))
+        .with_pkfk_join("item_to_order", "li", "o", &["order_id"], &["id"])
+        .with_pkfk_join("shipment_to_order", "s", "o", &["order_id"], &["id"])
+}
+
+/// GRAIN-03: metrics on two SIBLING child tables — the chasm trap. Joined into
+/// one query each multiplies the other (an order's 2 line items x 2 shipments =
+/// 4 rows), so each must be aggregated at its own grain.
+#[test]
+fn sibling_grain_metrics_are_computed_per_grain() {
+    let def = orders_with_two_children();
+    let sql = expand("sales", &def, &req(&[], &["item_qty", "ship_weight"]))
+        .expect("two sibling child grains must be answerable per-grain");
+    assert!(
+        sql.contains(r#"FROM "line_items" AS "li""#) && sql.contains(r#"FROM "shipments" AS "s""#),
+        "each sibling anchors its own CTE, got:\n{sql}"
+    );
+    assert!(
+        sql.contains("CROSS JOIN"),
+        "one row per grain, no dimensions to join on, got:\n{sql}"
+    );
+}
+
+/// The same pair grouped by a dimension on their shared parent — reachable from
+/// both grains without fanning either.
+#[test]
+fn sibling_grain_metrics_with_parent_dimension() {
+    let def = orders_with_two_children();
+    let sql = expand(
+        "sales",
+        &def,
+        &req(&["order_status"], &["item_qty", "ship_weight"]),
+    )
+    .expect("sibling grains grouped by a parent dimension must be answerable");
+    assert!(
+        sql.contains("FULL OUTER JOIN"),
+        "grain results join on the shared dimension, got:\n{sql}"
+    );
+    // Each CTE reaches the parent dimension through its own FK.
+    assert!(
+        sql.matches(r#"LEFT JOIN "orders" AS "o""#).count() == 2,
+        "each grain CTE joins the parent itself, got:\n{sql}"
+    );
+}
+
+/// A metric on one child table grouped by a dimension on its SIBLING is a fan
+/// trap — line-item rows are multiplied by the order's shipments before
+/// aggregation — and must be rejected. The path between two siblings runs
+/// through their shared parent, which the fence's parent-chain walk could not
+/// express: neither sibling is an ancestor of the other, so the walk found no
+/// path and the check silently passed.
+#[test]
+fn metric_grouped_by_sibling_dimension_errors() {
+    let def = orders_with_two_children();
+    let err = expand("sales", &def, &req(&["carrier"], &["item_qty"]))
+        .expect_err("a dimension on a sibling child table fans the metric");
+    assert!(
+        matches!(err, ExpandError::FanTrap { .. }),
+        "expected FanTrap, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GRAIN-07: the documented residual boundary (TECH-DEBT #36)
+// ---------------------------------------------------------------------------
+
+/// A multi-grain query carrying an ACTIVE semi-additive metric keeps the
+/// fan-trap error: the snapshot CTE that metric needs is anchored at the base
+/// table, and routing it through per-grain emission without designing that
+/// interaction would risk the silent-inflation class the fence exists to stop.
+#[test]
+fn multi_grain_with_active_semi_additive_metric_still_errors() {
+    let def = orders_with_parent_customers()
+        .with_dimension("snapshot_day", "c.as_of", Some("c"))
+        .with_non_additive_by(
+            "total_balance",
+            &[("snapshot_day", SortOrder::Asc, NullsOrder::Last)],
+        );
+    // `snapshot_day` is NOT queried, so the metric is *active* semi-additive.
+    let err = expand("sales", &def, &req(&[], &["total_balance"]))
+        .expect_err("an active semi-additive metric is not per-grain eligible");
+    assert!(
+        matches!(err, ExpandError::RootGrainFanTrap { .. }),
+        "expected the v0.11.0 fan-trap error, got: {err}"
+    );
+}
+
+/// The same boundary for window metrics.
+#[test]
+fn multi_grain_with_window_metric_still_errors() {
+    let def = orders_with_parent_customers()
+        .with_metric("running_balance", "SUM(total_balance)", None)
+        .with_window_spec(
+            "running_balance",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "total_balance".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["segment".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        );
+    let err = expand("sales", &def, &req(&["segment"], &["running_balance"]))
+        .expect_err("a window metric is not per-grain eligible");
+    assert!(
+        matches!(err, ExpandError::RootGrainFanTrap { .. }),
+        "expected the v0.11.0 fan-trap error, got: {err}"
+    );
+}
+
+/// A metric carrying `USING` role-playing context is not per-grain eligible
+/// either: which role a grain CTE should join is exactly what `USING` answers on
+/// the base-anchored path, and the grain CTEs do not carry that context.
+#[test]
+fn multi_grain_with_role_playing_still_errors() {
+    // `orders` reaches `customers` through TWO named relationships — the
+    // role-playing shape.
+    let def = orders_with_parent_customers().with_pkfk_join(
+        "o_to_billing_c",
+        "o",
+        "c",
+        &["billing_customer_id"],
+        &["id"],
+    );
+    let err = expand("sales", &def, &req(&[], &["total_balance"]))
+        .expect_err("role-playing is not per-grain eligible");
+    assert!(
+        matches!(err, ExpandError::RootGrainFanTrap { .. }),
+        "expected the v0.11.0 fan-trap error, got: {err}"
     );
 }

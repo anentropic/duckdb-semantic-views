@@ -250,15 +250,18 @@ fn decompose(
     // The base metrics this one transitively depends on: each is an aggregate
     // that must be computed at its own grain before the outer expression can
     // combine them.
+    //
+    // Walked in DECLARATION order, filtered by the dependency set, rather than
+    // iterating the set itself: the set is a `HashSet`, and its order decides
+    // which grain becomes `__sv_grain_0`. Iterating it directly made the
+    // generated SQL vary between runs of the same query.
+    let dependencies = super::facts::collect_transitive_metric_names(met, &def.metrics);
     let mut replacements: HashMap<String, String> = HashMap::new();
-    for name in super::facts::collect_transitive_metric_names(met, &def.metrics) {
-        let Some(base) = def
-            .metrics
-            .iter()
-            .find(|m| crate::ident::normalize_ident_part(&m.name) == name)
-        else {
-            continue; // Not a declared metric (a column reference) — left alone.
-        };
+    for base in &def.metrics {
+        let name = crate::ident::normalize_ident_part(&base.name);
+        if !dependencies.contains(&name) {
+            continue;
+        }
         let Some(ref source) = base.source_table else {
             continue; // Derived: inlined by the reference walk below, not a component.
         };
@@ -282,57 +285,62 @@ fn decompose(
         return None;
     }
     Some(Output::Derived {
-        expr: rebuild_expr(def, met, &replacements),
+        expr: rebuild_expr(def, met, &replacements)?,
     })
 }
 
+/// How deep a chain of derived metrics [`rebuild_expr`] will follow before
+/// giving up. Cycles are already rejected by `inline_derived_metrics`, which
+/// runs first — this only keeps the recursion total if a malformed definition
+/// ever reaches here, and mirrors the derivation-depth cap that path enforces.
+const MAX_REBUILD_DEPTH: usize = 64;
+
 /// Rebuild `met`'s expression with each base-metric reference replaced by its
 /// per-grain column reference, inlining any intermediate *derived* metric it
-/// references on the way (they carry no grain of their own).
+/// references on the way (they carry no grain of their own, so there is no
+/// column to read them from).
 ///
-/// Cycles and depth were already rejected by `inline_derived_metrics`, which
-/// runs before this; the visited set is belt-and-braces so a malformed
-/// definition cannot recurse forever here either.
+/// Resolution is on demand, per reference: every occurrence of an intermediate
+/// metric is expanded wherever it appears, on each branch. Inlined text is
+/// never rescanned — [`crate::expr_tokens::inline_references`] splices by byte
+/// span — so an intermediate must arrive already fully resolved. Remembering
+/// "this one was inlined earlier" across sibling branches is exactly what must
+/// not happen: the second branch would then splice the metric's *raw* text,
+/// leaking base-metric names into the SQL as non-existent columns.
+///
+/// `None` when the chain exceeds [`MAX_REBUILD_DEPTH`], leaving the query on
+/// the base-anchored path with its fence error.
 fn rebuild_expr(
     def: &SemanticViewDefinition,
     met: &Metric,
     replacements: &HashMap<String, String>,
-) -> String {
+) -> Option<String> {
     fn resolve(
         def: &SemanticViewDefinition,
         met: &Metric,
         replacements: &HashMap<String, String>,
-        visited: &mut HashSet<String>,
-    ) -> String {
-        let key = crate::ident::normalize_ident_part(&met.name);
-        if !visited.insert(key) {
-            return met.expr.clone();
+        depth: usize,
+    ) -> Option<String> {
+        if depth > MAX_REBUILD_DEPTH {
+            return None;
         }
-        let mut owned: HashMap<String, String> = replacements.clone();
-        // Intermediate derived metrics have no grain: inline them (recursively
-        // resolved over the same component columns) so only base-metric
-        // references remain.
-        for other in &def.metrics {
-            if other.source_table.is_some() {
-                continue;
+        let mut owned: HashMap<String, String> = HashMap::new();
+        for key in crate::expr_tokens::reference_keys(&met.expr) {
+            if let Some(column) = replacements.get(&key) {
+                owned.insert(key, column.clone());
+            } else if let Some(inner) = def.metrics.iter().find(|m| {
+                m.source_table.is_none() && crate::ident::normalize_ident_part(&m.name) == key
+            }) {
+                let inlined = resolve(def, inner, replacements, depth + 1)?;
+                owned.insert(key, format!("({inlined})"));
             }
-            let other_key = crate::ident::normalize_ident_part(&other.name);
-            if owned.contains_key(&other_key)
-                || other_key == crate::ident::normalize_ident_part(&met.name)
-            {
-                continue;
-            }
-            owned.insert(
-                other_key,
-                format!("({})", resolve(def, other, replacements, visited)),
-            );
         }
         let borrowed: HashMap<String, &str> =
             owned.iter().map(|(k, v)| (k.clone(), v.as_str())).collect();
-        crate::expr_tokens::inline_references(&met.expr, &borrowed)
+        Some(crate::expr_tokens::inline_references(&met.expr, &borrowed))
     }
 
-    resolve(def, met, replacements, &mut HashSet::new())
+    resolve(def, met, replacements, 0)
 }
 
 /// Whether the query's shape is one the per-grain emitter can express.
@@ -400,10 +408,17 @@ pub(super) fn expand_per_grain(
     resolved_mets: &[&Metric],
     plan: &Plan,
 ) -> String {
-    if plan.is_single_group() {
-        if let [Output::Direct { .. }, ..] = plan.outputs.as_slice() {
-            return render_single_grain(def, resolved_dims, resolved_mets, plan);
-        }
+    // A cross-grain assembly always spans at least two groups, so a single-group
+    // plan holds only `Direct` outputs — but check rather than assert: falling
+    // through to the general emitter is correct for any plan, and a wrong
+    // assumption here would panic inside DuckDB rather than mis-render.
+    if plan.is_single_group()
+        && plan
+            .outputs
+            .iter()
+            .all(|o| matches!(o, Output::Direct { .. }))
+    {
+        return render_single_grain(def, resolved_dims, resolved_mets, plan);
     }
     render_multi_grain(def, resolved_dims, resolved_mets, plan)
 }
@@ -429,7 +444,7 @@ fn render_single_grain(
         .collect();
     for (met, output) in resolved_mets.iter().zip(&plan.outputs) {
         let Output::Direct { column, .. } = output else {
-            unreachable!("a single-group plan holds only Direct outputs")
+            continue; // Caller established every output is Direct here.
         };
         items.push(SelectItem::new(
             group.exprs[*column].clone(),

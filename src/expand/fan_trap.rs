@@ -49,11 +49,13 @@ pub(super) fn check_fan_traps(
     let graph = build_relationship_graph(view_name, def)?;
     let card_map = build_card_map(def);
 
-    // The directed parent tree for path finding — derived once and shared with
-    // the fact-path validator + the SHOW-dims filter (E-7). In a validated tree
-    // each non-root node has exactly one parent via the reverse map.
-    let tree = JoinTree::from_graph(&graph);
-    let root = tree.root().to_string();
+    // Undirected adjacency over the relationship edges — the path derivation
+    // ALL three checks share. It is deliberately not the rooted parent tree:
+    // two sibling children of one table are connected through their parent but
+    // neither is an ancestor of the other, so a parent-chain walk finds no path
+    // between them and the pair goes unchecked (see `GrainGraph`).
+    let adjacency = build_adjacency(def);
+    let root = graph.root.clone();
 
     // For each metric + dimension pair, check for fan-out on the join path.
     //
@@ -89,11 +91,10 @@ pub(super) fn check_fan_traps(
                     continue; // Same table, no fan-out possible
                 }
 
-                // Path from met_table to dim_table through the tree (up to the
-                // LCA, then down), scanned for an edge traversed in the
-                // fan-out direction.
-                let Some(path) = tree_path(&tree, met_table, &dim_table) else {
-                    continue; // No common ancestor (shouldn't happen in a tree)
+                // The join path between the two tables, scanned for an edge
+                // traversed in the fan-out direction.
+                let Some(path) = find_path(met_table, &dim_table, &adjacency) else {
+                    continue; // Not connected (legacy joins carrying no FK metadata)
                 };
                 if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
                     return Err(ExpandError::FanTrap {
@@ -144,8 +145,8 @@ pub(super) fn check_fan_traps(
             if *met_table == root {
                 continue; // At the root grain: nothing fans it.
             }
-            let Some(path) = tree_path(&tree, met_table, &root) else {
-                continue; // No common ancestor (shouldn't happen in a tree).
+            let Some(path) = find_path(met_table, &root, &adjacency) else {
+                continue; // Not connected (legacy joins carrying no FK metadata).
             };
             if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
                 return Err(ExpandError::RootGrainFanTrap {
@@ -168,13 +169,12 @@ pub(super) fn check_fan_traps(
     // that multiplies A's rows, A's aggregate would be silently inflated.
     // Metrics with no source table (base-table metrics) sit at the root grain
     // and participate — they are the ones inflated by joins to child tables.
-    let adjacency = build_adjacency(def);
     let grains: Vec<Vec<String>> = resolved_mets
         .iter()
         .map(|m| {
             let tables = metric_grain_tables(m, def);
             if tables.is_empty() {
-                vec![tree.root().to_string()]
+                vec![root.clone()]
             } else {
                 tables
             }
@@ -322,46 +322,26 @@ fn build_card_map(def: &SemanticViewDefinition) -> CardMap {
     card_map
 }
 
-/// The join path between two table aliases through the rooted join tree:
-/// `[from, …, LCA, …, to]`. `None` when the two share no ancestor (not
-/// reachable from one another — a disconnected or malformed graph).
-///
-/// The single derivation of the "walk up to the lowest common ancestor, then
-/// back down" path that the metric × dimension and metric-grain × root checks
-/// (and [`GrainGraph`], which the per-grain planner and emitter share) all
-/// scan for a fanning edge.
-fn tree_path(tree: &JoinTree, from: &str, to: &str) -> Option<Vec<String>> {
-    if from == to {
-        return Some(vec![from.to_string()]);
-    }
-    let from_ancestors = tree.ancestors_to_root(from);
-    let to_ancestors = tree.ancestors_to_root(to);
-    let to_ancestor_set: HashSet<&String> = to_ancestors.iter().collect();
-    let lca = from_ancestors
-        .iter()
-        .find(|a| to_ancestor_set.contains(a))
-        .cloned()?;
-    let mut path = tree.path_to_ancestor(from, &lca);
-    // `path_from_ancestor_to_node` starts AT the LCA, already the last element
-    // of the up-leg — skip it so the junction is not duplicated.
-    path.extend(
-        tree.path_from_ancestor_to_node(&lca, to)
-            .into_iter()
-            .skip(1),
-    );
-    Some(path)
-}
-
-/// The grain topology of a definition: the rooted join tree plus the worst-case
-/// cardinality of each edge.
+/// The grain topology of a definition: the relationship graph as an undirected
+/// adjacency, plus the worst-case cardinality of each edge.
 ///
 /// Owned here, next to the fan-trap checks that define what "fanning" means, and
 /// consumed by [`super::per_grain`] — the planner asks the same questions the
 /// fence asks ("does the path from this grain to that one fan?"), and the
 /// emitter needs the path itself to synthesize the joins inside a grain CTE. One
 /// definition of the topology, two consumers.
+///
+/// Paths are found over the UNDIRECTED relationship graph, not the rooted
+/// parent tree. Two SIBLING children of one table (`line_items` and `shipments`
+/// both referencing `orders`) are connected through their shared parent, but
+/// neither is an ancestor of the other — a parent-chain walk finds no path
+/// between them at all, and a fan-trap check that silently skipped the pair
+/// would let a metric on one be grouped by a dimension on the other, inflated
+/// by the join. The undirected walk finds the real path, `li -> o -> s`, whose
+/// second leg fans.
 pub(super) struct GrainGraph {
-    tree: JoinTree,
+    root: String,
+    adjacency: HashMap<String, Vec<String>>,
     card_map: CardMap,
 }
 
@@ -374,19 +354,20 @@ impl GrainGraph {
     pub(super) fn build(def: &SemanticViewDefinition) -> Option<Self> {
         let graph = crate::graph::RelationshipGraph::from_definition(def).ok()?;
         Some(Self {
-            tree: JoinTree::from_graph(&graph),
+            root: graph.root.clone(),
+            adjacency: build_adjacency(def),
             card_map: build_card_map(def),
         })
     }
 
-    /// The base-table alias (lowercased) — the root of the join tree.
+    /// The base-table alias (lowercased).
     pub(super) fn root(&self) -> &str {
-        self.tree.root()
+        &self.root
     }
 
     /// The join path `[from, …, to]`, or `None` when the two are not connected.
     pub(super) fn path(&self, from: &str, to: &str) -> Option<Vec<String>> {
-        tree_path(&self.tree, from, to)
+        find_path(from, to, &self.adjacency)
     }
 
     /// The name of a relationship on the `from` → `to` path that is traversed in
