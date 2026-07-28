@@ -22,9 +22,64 @@ env:
   RUSTUP_TOOLCHAIN: nightly  # override rust-toolchain.toml (cargo-fuzz needs nightly)
 
 jobs:
+  # GitHub evaluates the `paths:` filter above against the commits a push
+  # *introduces*, not the push's net diff (see the "Gotcha" under CI Workflows in
+  # MAINTAINER.md). So restarting a feature branch on top of already-merged
+  # history re-triggers the whole 8 x 10-minute matrix even for a docs-only
+  # change: the squash-merge commit that became newly reachable carries `src/**`.
+  # This job re-checks the *net* diff and skips the matrix when nothing the
+  # fuzzers exercise actually changed.
+  #
+  # It fails OPEN — anything unexpected (new branch, unavailable before-commit,
+  # manual dispatch) fuzzes rather than skips. Guarding here rather than moving
+  # to a `pull_request` trigger keeps the CI-2 properties intact: fuzzing stays
+  # on same-repo pushes, never on untrusted fork code, and retains the
+  # `issues: write` token that fork PRs cannot grant.
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_fuzz: ${{ steps.check.outputs.should_fuzz }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          run_fuzz() { echo "$1"; echo "should_fuzz=true" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          [ "$EVENT_NAME" = "push" ] || run_fuzz "Event is '$EVENT_NAME', not a push — fuzzing."
+
+          case "$BEFORE" in
+            ''|0000000000000000000000000000000000000000)
+              run_fuzz "No before-commit (new branch) — fuzzing." ;;
+          esac
+          git cat-file -e "${BEFORE}^{commit}" 2>/dev/null \
+            || run_fuzz "Before-commit $BEFORE unavailable — fuzzing."
+
+          # Two-dot (tree-vs-tree) diff: the net effect of the push, which is
+          # what the `paths:` filter above should have matched on.
+          changed=$(git diff --name-only "$BEFORE" "$GITHUB_SHA" -- \
+            src fuzz Cargo.toml Cargo.lock .github/workflows/Fuzz.yml)
+
+          if [ -n "$changed" ]; then
+            echo "Net diff touches fuzzed paths:"
+            echo "$changed" | sed 's/^/  /'
+            echo "should_fuzz=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Push introduces commits touching fuzzed paths, but its net diff does not."
+            echo "Nothing for the fuzzers to exercise — skipping the matrix."
+            echo "should_fuzz=false" >> "$GITHUB_OUTPUT"
+          fi
+
   fuzz:
     name: Fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.should_fuzz == 'true'
     strategy:
       fail-fast: false
       matrix:
