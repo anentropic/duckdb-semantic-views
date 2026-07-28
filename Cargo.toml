@@ -48,7 +48,7 @@ proptest = "1.11"
 # `visit` for the AST walker trait. Transitively available via several
 # duckdb-rs build deps, but pinned explicitly here so the guard test does
 # not regress if those deps drop syn.
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 # `walkdir` powers `tests/no_long_lived_conn.rs::no_duckdb_disconnect_anywhere_in_src`
 # — Phase 65.1 (v0.10.0) Plan 03b's defence-in-depth AST walker that scans
 # every `src/**/*.rs` file for `duckdb_disconnect` call sites. The
