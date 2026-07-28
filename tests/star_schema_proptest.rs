@@ -15,19 +15,21 @@
 //!
 //! Two invariants are checked per case:
 //!
-//! 1. **Parent-table metric ⇒ rejected.** A metric on the parent table `u`
-//!    (`SUM(u.w)`) aggregated at the root grain is duplicated once per child row
-//!    — the classic silent inflation (EXP-1). `expand` MUST reject any query
-//!    selecting it, with a fan-trap-family error. Before the EXP-1 fix a
-//!    metrics-only (or parent-dim-only) query slipped through the fence and
-//!    returned inflated numbers, so this assertion is the RED reproducer.
+//! 1. **Parent-table metric + child dimension ⇒ rejected.** `SUM(u.w)` grouped
+//!    by `t.d` asks for a parent-grain aggregate at a grain below it: each
+//!    parent row genuinely fans across the child values. Neither the root-
+//!    anchored path (which silently inflated it — EXP-1) nor per-grain
+//!    aggregation can define it, so `expand` MUST reject it with a
+//!    fan-trap-family error.
 //! 2. **Accepted query ⇒ numerically correct.** For every query `expand`
-//!    accepts (metrics only on the root/child side), the result must equal an
-//!    independently hand-written `FROM t LEFT JOIN u` aggregation, compared as a
-//!    multiset inside DuckDB via a symmetric `EXCEPT ALL` difference (the same
-//!    type-agnostic, order-independent comparator the single-table harness
-//!    uses). This guards the fix against over-rejecting safe queries and pins
-//!    the generated join SQL as correct.
+//!    accepts, the result must equal an independently hand-written oracle,
+//!    compared as a multiset inside DuckDB via a symmetric `EXCEPT ALL`
+//!    difference (the same type-agnostic, order-independent comparator the
+//!    single-table harness uses). Since v0.12.0 that set includes queries
+//!    carrying the parent metric `SUM(u.w)`: they are computed **at the parent's
+//!    own grain** (`FROM u`, never through the join) and joined back to the
+//!    child-grain aggregate, so the oracle is a per-grain one. This pins both
+//!    halves — no inflation, and no over-rejection of safe queries.
 
 use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, MetricName, QueryRequest};
@@ -218,13 +220,14 @@ fn make_db(inst: &Instance) -> duckdb::Connection {
     conn
 }
 
-/// Independent oracle SQL for a query `expand` should accept (no `sw`). The
-/// FROM is always `t LEFT JOIN u`: because `u.id` is unique, joining `u` never
-/// changes `t`'s multiset for count(*)/sum(t.v), and grouping by a parent
-/// dimension is a plain group key. Metrics-only ⇒ global aggregate (no GROUP
-/// BY); anything with dimensions ⇒ GROUP BY the projected dimension ordinals
-/// (multiset-equal to the expansion's SELECT DISTINCT for the dims-only case).
-fn oracle_sql(case: &Case) -> String {
+/// The child-grain (`t`) half of the oracle: the metrics computed over `t`,
+/// grouped by the selected dimensions. The FROM is always `t LEFT JOIN u`:
+/// because `u.id` is unique, joining `u` never changes `t`'s multiset for
+/// `count(*)` / `sum(t.v)`, and grouping by a parent dimension is a plain group
+/// key. Metrics-only ⇒ global aggregate (no GROUP BY); anything with dimensions
+/// ⇒ GROUP BY the projected dimension ordinals (multiset-equal to the
+/// expansion's SELECT DISTINCT for the dims-only case).
+fn child_grain_sql(case: &Case) -> String {
     let dim_items: Vec<String> = case
         .sel_dims
         .iter()
@@ -237,10 +240,11 @@ fn oracle_sql(case: &Case) -> String {
     let met_items: Vec<String> = case
         .sel_metrics
         .iter()
+        .filter(|&&i| METS[i] != "sw")
         .map(|&i| match METS[i] {
             "sv" => "sum(t.v) AS sv".to_string(),
             "ct" => "count(*) AS ct".to_string(),
-            other => unreachable!("unexpected safe metric {other}"),
+            other => unreachable!("unexpected child-grain metric {other}"),
         })
         .collect();
     let select_items = dim_items
@@ -259,6 +263,69 @@ fn oracle_sql(case: &Case) -> String {
             .join(", ");
         format!("SELECT {select_items} {from} GROUP BY {group_by}")
     }
+}
+
+/// The parent-grain (`u`) half of the oracle: `sum(u.w)` over the parent table
+/// **on its own**, never through the join — that is the whole point of
+/// computing a metric at its own grain, and the independent statement of what
+/// the root-anchored `FROM t LEFT JOIN u` got wrong (each parent row counted
+/// once per child row, childless parents dropped entirely).
+///
+/// Only `ucat` can be selected alongside it: `td` lives below `u`'s grain and
+/// the query is rejected before it gets here.
+fn parent_grain_sql(case: &Case) -> String {
+    if case.sel_dims.is_empty() {
+        "SELECT sum(u.w) AS sw FROM u".to_string()
+    } else {
+        "SELECT u.ucat AS ucat, sum(u.w) AS sw FROM u GROUP BY 1".to_string()
+    }
+}
+
+/// Independent oracle SQL for a query `expand` should accept.
+///
+/// Without the parent metric this is the plain child-grain aggregation. With it
+/// the two grains are computed separately and combined — `CROSS JOIN` for the
+/// dimensionless case (one row each), `FULL OUTER JOIN` on the NULL-safe
+/// dimension key otherwise, so a `ucat` present at only one grain survives.
+fn oracle_sql(case: &Case) -> String {
+    let selects_parent_metric = case.sel_metrics.iter().any(|&i| METS[i] == "sw");
+    if !selects_parent_metric {
+        return child_grain_sql(case);
+    }
+    let child_metrics: Vec<&str> = case
+        .sel_metrics
+        .iter()
+        .map(|&i| METS[i])
+        .filter(|&m| m != "sw")
+        .collect();
+    let parent = parent_grain_sql(case);
+    if child_metrics.is_empty() {
+        // Only the parent metric: one grain, nothing to join it to.
+        return parent;
+    }
+    let mut items: Vec<String> = Vec::new();
+    if case.sel_dims.is_empty() {
+        for m in &child_metrics {
+            items.push(format!("a.{m}"));
+        }
+        items.push("b.sw".to_string());
+        let child = child_grain_sql(case);
+        return format!(
+            "SELECT {} FROM ({child}) a CROSS JOIN ({parent}) b",
+            items.join(", ")
+        );
+    }
+    items.push("COALESCE(a.ucat, b.ucat) AS ucat".to_string());
+    for m in &child_metrics {
+        items.push(format!("a.{m}"));
+    }
+    items.push("b.sw".to_string());
+    let child = child_grain_sql(case);
+    format!(
+        "SELECT {} FROM ({child}) a FULL OUTER JOIN ({parent}) b \
+         ON a.ucat IS NOT DISTINCT FROM b.ucat",
+        items.join(", ")
+    )
 }
 
 proptest! {
@@ -282,23 +349,25 @@ proptest! {
         };
 
         let selects_parent_metric = case.sel_metrics.iter().any(|&i| METS[i] == "sw");
+        let selects_child_dim = case.sel_dims.iter().any(|&i| DIMS[i] == "td");
         let result = expand("star", &def, &req);
 
-        if selects_parent_metric {
-            // EXP-1: a metric on the parent table aggregated at the root grain is
-            // silently inflated; the fence must reject it. (RED before the fix:
-            // a `sw`-only or `sw`+parent-dim query returned Ok with inflated SQL.)
+        if selects_parent_metric && selects_child_dim {
+            // The parent metric grouped by a CHILD dimension stays rejected:
+            // `t.d` is below `u`'s grain, so each parent row genuinely fans
+            // across the child values. Per-grain aggregation cannot define this
+            // query — only the fan-trap error is correct.
             match result {
                 Err(e) => {
                     let msg = e.to_string();
                     prop_assert!(
                         msg.contains("fan trap"),
-                        "parent-table metric rejected, but not as a fan trap: {msg}"
+                        "parent metric + child dimension rejected, but not as a fan trap: {msg}"
                     );
                 }
                 Ok(sql) => prop_assert!(
                     false,
-                    "parent-table metric SUM(u.w) must be rejected (EXP-1), got SQL:\n{sql}"
+                    "SUM(u.w) grouped by the child dimension t.d must be rejected, got SQL:\n{sql}"
                 ),
             }
             return Ok(());

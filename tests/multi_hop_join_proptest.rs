@@ -17,21 +17,25 @@
 //!
 //! Two invariants are checked per case:
 //!
-//! 1. **Ancestor-table metric ⇒ rejected.** A metric on the parent `u`
-//!    (`SUM(u.uw)`, one hop up) or the grandparent `w` (`SUM(w.ww)`, two hops up)
-//!    aggregated at the root grain is duplicated once per descendant `t` row —
-//!    the classic silent inflation (EXP-1). `expand` MUST reject any query
-//!    selecting either, with a fan-trap-family error. The two-hop case is the
-//!    piece the single-hop star harness never reached.
-//! 2. **Accepted query ⇒ numerically correct.** For every query `expand` accepts
-//!    (metrics only on the root `t`: `SUM(t.v)` / `count(*)`), the result must
-//!    equal an independently hand-written `t LEFT JOIN u LEFT JOIN w`
-//!    aggregation, compared as a multiset inside DuckDB via a symmetric
-//!    `EXCEPT ALL` difference (the same comparator the single-table and star
-//!    harnesses use). Selecting a grandparent dimension (`wcat`) without the
-//!    parent dimension forces the resolver to include the intermediate `u` to
-//!    reach `w`; a multi-hop resolution bug (dropped intermediate, wrong join
-//!    order, wrong ON columns) surfaces as invalid SQL or a non-zero diff.
+//! 1. **Dimension below a metric's grain ⇒ rejected.** `SUM(u.uw)` grouped by
+//!    `t.d`, or `SUM(w.ww)` grouped by `u.ucat` / `t.d`, asks for an ancestor's
+//!    aggregate at a grain below it: those rows genuinely fan across the
+//!    descendant's values, at one hop or two. `expand` MUST reject it with a
+//!    fan-trap-family error — neither the root-anchored path (which silently
+//!    inflated it, EXP-1) nor per-grain aggregation can define it.
+//! 2. **Accepted query ⇒ numerically correct.** For every query `expand`
+//!    accepts, the result must equal an independently hand-written oracle,
+//!    compared as a multiset inside DuckDB via a symmetric `EXCEPT ALL`
+//!    difference (the same comparator the single-table and star harnesses use).
+//!    Since v0.12.0 that set includes the **ancestor metrics** `SUM(u.uw)` /
+//!    `SUM(w.ww)`, alone or mixed with root-grain metrics: each is computed at
+//!    its own grain (`FROM u` / `FROM w`, never through the descendant join) and
+//!    the grains are joined back together, so the oracle is a per-grain one
+//!    spanning up to three grains at once. Selecting a grandparent dimension
+//!    (`wcat`) without the parent dimension still forces the resolver to include
+//!    the intermediate `u` to reach `w`; a multi-hop resolution bug (dropped
+//!    intermediate, wrong join order, wrong ON columns) surfaces as invalid SQL
+//!    or a non-zero diff.
 
 use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, MetricName, QueryRequest};
@@ -53,12 +57,10 @@ struct Instance {
 }
 
 /// Queryable objects, by stable name. `td`/`ucat`/`wcat` are dimensions at the
-/// three grains; `sv`/`ct` are root-grain (safe) metrics; `su`/`sw` are the
-/// parent/grandparent (ancestor) metrics the fence must reject.
+/// three grains; `sv`/`ct` are root-grain metrics; `su`/`sw` are the
+/// parent/grandparent (ancestor) metrics, each computed at its own grain.
 const DIMS: [&str; 3] = ["td", "ucat", "wcat"];
 const METS: [&str; 4] = ["sv", "ct", "su", "sw"];
-/// Metric names that aggregate an ancestor table and must be rejected (EXP-1).
-const ANCESTOR_METS: [&str; 2] = ["su", "sw"];
 
 /// A full case: an instance plus the non-empty subset of dims + metrics to query.
 #[derive(Debug, Clone)]
@@ -255,7 +257,49 @@ fn make_db(inst: &Instance) -> duckdb::Connection {
 /// a plain group key. Metrics-only ⇒ global aggregate (no GROUP BY); anything
 /// with dimensions ⇒ GROUP BY the projected dimension ordinals (multiset-equal
 /// to the expansion's SELECT DISTINCT for the dims-only case).
-fn oracle_sql(case: &Case) -> String {
+/// The chain position of a table: `t` (the base/"many"-most) is 0, its parent
+/// `u` is 1, its grandparent `w` is 2. A grain can be grouped by a dimension at
+/// its own level or ABOVE it (each hop up is many-to-one, so the join adds no
+/// rows); a dimension BELOW it fans it, which is the one shape that stays
+/// rejected.
+fn level(table: &str) -> usize {
+    match table {
+        "t" => 0,
+        "u" => 1,
+        "w" => 2,
+        other => unreachable!("unexpected table {other}"),
+    }
+}
+
+/// The table each dimension lives on.
+fn dim_table(dim: &str) -> &'static str {
+    match dim {
+        "td" => "t",
+        "ucat" => "u",
+        "wcat" => "w",
+        other => unreachable!("unexpected dim {other}"),
+    }
+}
+
+/// The table each metric aggregates — its **grain**. `ct` is `count(*)` with no
+/// declared source table, which sits at the base grain.
+fn metric_table(metric: &str) -> &'static str {
+    match metric {
+        "sv" | "ct" => "t",
+        "su" => "u",
+        "sw" => "w",
+        other => unreachable!("unexpected metric {other}"),
+    }
+}
+
+/// One grain's half of the oracle: the metrics that live on `anchor`, computed
+/// over `anchor`'s own rows and grouped by the selected dimensions, which are
+/// reached by chaining LEFT JOINs **upward** from the anchor.
+///
+/// This is the independent statement of "at its own grain": `su` is summed over
+/// `u` itself, never over `t LEFT JOIN u` (where each parent row appears once
+/// per child row and childless parents vanish).
+fn grain_sql(case: &Case, anchor: &str) -> String {
     let dim_items: Vec<String> = case
         .sel_dims
         .iter()
@@ -269,10 +313,13 @@ fn oracle_sql(case: &Case) -> String {
     let met_items: Vec<String> = case
         .sel_metrics
         .iter()
+        .filter(|&&i| metric_table(METS[i]) == anchor)
         .map(|&i| match METS[i] {
             "sv" => "sum(t.v) AS sv".to_string(),
             "ct" => "count(*) AS ct".to_string(),
-            other => unreachable!("unexpected safe metric {other}"),
+            "su" => "sum(u.uw) AS su".to_string(),
+            "sw" => "sum(w.ww) AS sw".to_string(),
+            other => unreachable!("unexpected metric {other}"),
         })
         .collect();
     let select_items = dim_items
@@ -281,7 +328,15 @@ fn oracle_sql(case: &Case) -> String {
         .cloned()
         .collect::<Vec<_>>()
         .join(", ");
-    let from = "FROM t LEFT JOIN u ON t.fk_u = u.id LEFT JOIN w ON u.fk_w = w.id";
+    // The up-chain from the anchor. Joining the whole remaining chain is
+    // harmless — every hop is many-to-one, so none of them changes the anchor's
+    // row multiset.
+    let from = match anchor {
+        "t" => "FROM t LEFT JOIN u ON t.fk_u = u.id LEFT JOIN w ON u.fk_w = w.id",
+        "u" => "FROM u LEFT JOIN w ON u.fk_w = w.id",
+        "w" => "FROM w",
+        other => unreachable!("unexpected anchor {other}"),
+    };
     if case.sel_dims.is_empty() {
         format!("SELECT {select_items} {from}")
     } else {
@@ -291,6 +346,79 @@ fn oracle_sql(case: &Case) -> String {
             .join(", ");
         format!("SELECT {select_items} {from} GROUP BY {group_by}")
     }
+}
+
+/// Independent oracle SQL: each selected grain aggregated on its own, then the
+/// grains combined — `CROSS JOIN` when the query has no dimensions (one row per
+/// grain), otherwise `FULL OUTER JOIN` on the NULL-safe dimension keys so a
+/// group present at one grain and absent at another is preserved.
+fn oracle_sql(case: &Case) -> String {
+    // Grains in first-selected order.
+    let mut anchors: Vec<&str> = Vec::new();
+    for &i in &case.sel_metrics {
+        let table = metric_table(METS[i]);
+        if !anchors.contains(&table) {
+            anchors.push(table);
+        }
+    }
+    if anchors.is_empty() {
+        anchors.push("t"); // Dimensions-only: the base-anchored DISTINCT shape.
+    }
+    let mut sql = format!(
+        "SELECT {} FROM ({}) g0",
+        oracle_projection(case, &anchors),
+        grain_sql(case, anchors[0])
+    );
+    for (n, anchor) in anchors.iter().enumerate().skip(1) {
+        let joined = grain_sql(case, anchor);
+        if case.sel_dims.is_empty() {
+            sql.push_str(&format!(" CROSS JOIN ({joined}) g{n}"));
+        } else {
+            let conditions: Vec<String> = case
+                .sel_dims
+                .iter()
+                .map(|&d| {
+                    let dim = DIMS[d];
+                    format!("{} IS NOT DISTINCT FROM g{n}.{dim}", coalesced(dim, n))
+                })
+                .collect();
+            sql.push_str(&format!(
+                " FULL OUTER JOIN ({joined}) g{n} ON {}",
+                conditions.join(" AND ")
+            ));
+        }
+    }
+    sql
+}
+
+/// `g0.<dim>` for one grain, `COALESCE(g0.<dim>, …, g{n-1}.<dim>)` beyond —
+/// the key must be read from whichever grain supplied the row.
+fn coalesced(dim: &str, groups: usize) -> String {
+    if groups == 1 {
+        format!("g0.{dim}")
+    } else {
+        let refs: Vec<String> = (0..groups).map(|g| format!("g{g}.{dim}")).collect();
+        format!("COALESCE({})", refs.join(", "))
+    }
+}
+
+/// The oracle's output projection: each dimension coalesced across every grain,
+/// each metric read from the grain that computed it.
+fn oracle_projection(case: &Case, anchors: &[&str]) -> String {
+    let mut items: Vec<String> = case
+        .sel_dims
+        .iter()
+        .map(|&d| format!("{} AS {}", coalesced(DIMS[d], anchors.len()), DIMS[d]))
+        .collect();
+    for &m in &case.sel_metrics {
+        let metric = METS[m];
+        let group = anchors
+            .iter()
+            .position(|a| *a == metric_table(metric))
+            .expect("every selected metric's grain is an anchor");
+        items.push(format!("g{group}.{metric}"));
+    }
+    items.join(", ")
 }
 
 proptest! {
@@ -313,29 +441,28 @@ proptest! {
             facts: vec![],
         };
 
-        let selects_ancestor_metric = case
-            .sel_metrics
-            .iter()
-            .any(|&i| ANCESTOR_METS.contains(&METS[i]));
+        // A dimension BELOW some selected metric's grain is the one shape that
+        // must stay rejected: those parent rows genuinely fan across the
+        // descendant's values, at one hop or two.
+        let dimension_below_a_metric_grain = case.sel_metrics.iter().any(|&m| {
+            case.sel_dims
+                .iter()
+                .any(|&d| level(dim_table(DIMS[d])) < level(metric_table(METS[m])))
+        });
         let result = expand("multihop", &def, &req);
 
-        if selects_ancestor_metric {
-            // EXP-1: a metric on a parent (u, one hop) or grandparent (w, two
-            // hops) aggregated at the root grain is silently inflated; the fence
-            // must reject it. The two-hop case is the multi-hop delta over the
-            // single-hop star harness.
+        if dimension_below_a_metric_grain {
             match result {
                 Err(e) => {
                     let msg = e.to_string();
                     prop_assert!(
                         msg.contains("fan trap"),
-                        "ancestor-table metric rejected, but not as a fan trap: {msg}"
+                        "dimension below a metric's grain rejected, but not as a fan trap: {msg}"
                     );
                 }
                 Ok(sql) => prop_assert!(
                     false,
-                    "ancestor-table metric (SUM(u.uw) / SUM(w.ww)) must be rejected (EXP-1), \
-                     got SQL:\n{sql}"
+                    "a dimension below a metric's grain must be rejected, got SQL:\n{sql}"
                 ),
             }
             return Ok(());

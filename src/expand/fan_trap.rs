@@ -13,19 +13,21 @@ type CardMap = HashMap<(String, String), (Cardinality, String)>;
 /// Check for fan traps: an aggregation whose input rows are multiplied by a
 /// one-to-many join boundary.
 ///
-/// Two checks run over the same relationship/cardinality machinery:
+/// Three checks run over the same relationship/cardinality machinery:
 ///
 /// 1. **metric × dimension**: walks the join path between each
 ///    (metric source, dimension source) pair and errors when any edge is
-///    traversed in the fan-out direction (`ExpandError::FanTrap`).
-/// 2. **metric × metric** (SG-1, code review 2026-07-02): join resolution
-///    joins EVERY queried metric's source table, so two metrics at different
-///    grains double-count whenever the join path between their source tables
-///    crosses a fan-out edge — a classic fan trap (root metric + `ManyToOne`
-///    child metric) or chasm trap (metrics on two different child tables of
-///    one root). Errors with `ExpandError::MetricFanTrap`.
-///    Policy (remediation plan): erroring on multi-grain metric combinations
-///    is correct for now; per-grain CTE aggregation is future work.
+///    traversed in the fan-out direction (`ExpandError::FanTrap`). This one is
+///    about the *dimension* being below the metric's own grain — per-grain
+///    aggregation cannot define such a query either, so it runs unconditionally.
+/// 2. **metric grain × root** (EXP-1) and 3. **metric × metric** (SG-1): both
+///    exist only because the base-anchored `FROM <root>` topology computes every
+///    metric over one joined row set. When the caller has routed the query to
+///    the per-grain path (`per_grain == true`, see [`super::per_grain`]) each
+///    metric is aggregated in its own CTE at its own grain, so neither check
+///    applies and both are skipped. On the base-anchored path they error with
+///    `ExpandError::RootGrainFanTrap` / `ExpandError::MetricFanTrap` exactly as
+///    before.
 ///
 /// # Fan-out direction
 ///
@@ -38,6 +40,7 @@ pub(super) fn check_fan_traps(
     def: &SemanticViewDefinition,
     resolved_dims: &[&crate::model::Dimension],
     resolved_mets: &[&Metric],
+    per_grain: bool,
 ) -> Result<(), ExpandError> {
     if def.joins.is_empty() {
         return Ok(());
@@ -86,29 +89,13 @@ pub(super) fn check_fan_traps(
                     continue; // Same table, no fan-out possible
                 }
 
-                // Find path from met_table to dim_table through the tree.
-                // Walk both up to root to get ancestor chains, then derive path.
-                let met_ancestors = tree.ancestors_to_root(met_table);
-                let dim_ancestors = tree.ancestors_to_root(&dim_table);
-
-                // Find the lowest common ancestor (LCA)
-                let dim_ancestor_set: HashSet<&String> = dim_ancestors.iter().collect();
-                let lca = met_ancestors
-                    .iter()
-                    .find(|a| dim_ancestor_set.contains(a))
-                    .cloned();
-
-                let Some(lca) = lca else {
+                // Path from met_table to dim_table through the tree (up to the
+                // LCA, then down), scanned for an edge traversed in the
+                // fan-out direction.
+                let Some(path) = tree_path(&tree, met_table, &dim_table) else {
                     continue; // No common ancestor (shouldn't happen in a tree)
                 };
-
-                // Build path: met_table -> ... -> LCA -> ... -> dim_table,
-                // then scan the up-leg and down-leg for a fanning edge.
-                let up_path = tree.path_to_ancestor(met_table, &lca);
-                let down_path = tree.path_from_ancestor_to_node(&lca, &dim_table);
-                let fanning = fanning_edge_on_path(&up_path, &card_map)
-                    .or_else(|| fanning_edge_on_path(&down_path, &card_map));
-                if let Some(rel_name) = fanning {
+                if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
                     return Err(ExpandError::FanTrap {
                         detail: Box::new(FanTrapError {
                             view_name: view_name.to_string(),
@@ -125,6 +112,14 @@ pub(super) fn check_fan_traps(
                 }
             }
         }
+    }
+
+    // Everything below this point is a consequence of the base-anchored
+    // topology: with each metric aggregated in its own per-grain CTE
+    // (`per_grain`), no metric is computed over another grain's row set, so the
+    // root-grain and metric × metric checks have nothing to guard.
+    if per_grain {
+        return Ok(());
     }
 
     // EXP-1 (code-review 2026-07-18): the root table is an IMPLICIT fan-trap
@@ -149,21 +144,10 @@ pub(super) fn check_fan_traps(
             if *met_table == root {
                 continue; // At the root grain: nothing fans it.
             }
-            let met_ancestors = tree.ancestors_to_root(met_table);
-            let root_ancestors = tree.ancestors_to_root(&root);
-            let root_ancestor_set: HashSet<&String> = root_ancestors.iter().collect();
-            let Some(lca) = met_ancestors
-                .iter()
-                .find(|a| root_ancestor_set.contains(a))
-                .cloned()
-            else {
+            let Some(path) = tree_path(&tree, met_table, &root) else {
                 continue; // No common ancestor (shouldn't happen in a tree).
             };
-            let up_path = tree.path_to_ancestor(met_table, &lca);
-            let down_path = tree.path_from_ancestor_to_node(&lca, &root);
-            let fanning = fanning_edge_on_path(&up_path, &card_map)
-                .or_else(|| fanning_edge_on_path(&down_path, &card_map));
-            if let Some(rel_name) = fanning {
+            if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
                 return Err(ExpandError::RootGrainFanTrap {
                     view_name: view_name.to_string(),
                     metric_name: met.name.clone(),
@@ -338,6 +322,82 @@ fn build_card_map(def: &SemanticViewDefinition) -> CardMap {
     card_map
 }
 
+/// The join path between two table aliases through the rooted join tree:
+/// `[from, …, LCA, …, to]`. `None` when the two share no ancestor (not
+/// reachable from one another — a disconnected or malformed graph).
+///
+/// The single derivation of the "walk up to the lowest common ancestor, then
+/// back down" path that the metric × dimension and metric-grain × root checks
+/// (and [`GrainGraph`], which the per-grain planner and emitter share) all
+/// scan for a fanning edge.
+fn tree_path(tree: &JoinTree, from: &str, to: &str) -> Option<Vec<String>> {
+    if from == to {
+        return Some(vec![from.to_string()]);
+    }
+    let from_ancestors = tree.ancestors_to_root(from);
+    let to_ancestors = tree.ancestors_to_root(to);
+    let to_ancestor_set: HashSet<&String> = to_ancestors.iter().collect();
+    let lca = from_ancestors
+        .iter()
+        .find(|a| to_ancestor_set.contains(a))
+        .cloned()?;
+    let mut path = tree.path_to_ancestor(from, &lca);
+    // `path_from_ancestor_to_node` starts AT the LCA, already the last element
+    // of the up-leg — skip it so the junction is not duplicated.
+    path.extend(
+        tree.path_from_ancestor_to_node(&lca, to)
+            .into_iter()
+            .skip(1),
+    );
+    Some(path)
+}
+
+/// The grain topology of a definition: the rooted join tree plus the worst-case
+/// cardinality of each edge.
+///
+/// Owned here, next to the fan-trap checks that define what "fanning" means, and
+/// consumed by [`super::per_grain`] — the planner asks the same questions the
+/// fence asks ("does the path from this grain to that one fan?"), and the
+/// emitter needs the path itself to synthesize the joins inside a grain CTE. One
+/// definition of the topology, two consumers.
+pub(super) struct GrainGraph {
+    tree: JoinTree,
+    card_map: CardMap,
+}
+
+impl GrainGraph {
+    /// Build from a definition, or `None` when the relationship graph cannot be
+    /// rebuilt. Callers that need the failure to be loud (the fence) build the
+    /// graph through [`build_relationship_graph`] instead; the per-grain planner
+    /// simply declines to route, leaving the fence to raise
+    /// `UncheckableDefinition`.
+    pub(super) fn build(def: &SemanticViewDefinition) -> Option<Self> {
+        let graph = crate::graph::RelationshipGraph::from_definition(def).ok()?;
+        Some(Self {
+            tree: JoinTree::from_graph(&graph),
+            card_map: build_card_map(def),
+        })
+    }
+
+    /// The base-table alias (lowercased) — the root of the join tree.
+    pub(super) fn root(&self) -> &str {
+        self.tree.root()
+    }
+
+    /// The join path `[from, …, to]`, or `None` when the two are not connected.
+    pub(super) fn path(&self, from: &str, to: &str) -> Option<Vec<String>> {
+        tree_path(&self.tree, from, to)
+    }
+
+    /// The name of a relationship on the `from` → `to` path that is traversed in
+    /// the fan-out direction — i.e. aggregating `from`'s rows over this path
+    /// would multiply them. `None` means the path is safe to join.
+    pub(super) fn fanning_relationship(&self, from: &str, to: &str) -> Option<String> {
+        let path = self.path(from, to)?;
+        fanning_edge_on_path(&path, &self.card_map)
+    }
+}
+
 /// Source tables (lowercased, sorted, deduped) whose rows feed `met`'s
 /// aggregation — the metric's "grain".
 ///
@@ -348,7 +408,7 @@ fn build_card_map(def: &SemanticViewDefinition) -> CardMap {
 ///   aggregate is what is computed over the joined row set (the window
 ///   function itself runs over the pre-aggregated CTE), so the inner metric's
 ///   grain is what fan-out inflates.
-fn metric_grain_tables(met: &Metric, def: &SemanticViewDefinition) -> Vec<String> {
+pub(super) fn metric_grain_tables(met: &Metric, def: &SemanticViewDefinition) -> Vec<String> {
     let mut tables: Vec<String> = if let Some(ref st) = met.source_table {
         vec![st.to_ascii_lowercase()]
     } else {
@@ -549,7 +609,7 @@ mod tests {
         let def = orders_view();
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         assert!(result.is_ok(), "No joins should be OK");
     }
 
@@ -578,7 +638,7 @@ mod tests {
             .retain(|m| m.source_table.is_some() || m.name == "total");
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         assert!(
             result.is_ok(),
             "ManyToOne forward direction should be safe, got: {result:?}"
@@ -607,7 +667,7 @@ mod tests {
         def.metrics.retain(|m| m.source_table.is_some());
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         assert!(result.is_err(), "Should detect fan-out");
         if let Err(ExpandError::FanTrap { detail }) = &result {
             assert_eq!(detail.metric_name, "total");
@@ -638,7 +698,7 @@ mod tests {
         def.joins.last_mut().unwrap().cardinality = Cardinality::OneToOne;
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         assert!(
             result.is_ok(),
             "OneToOne should be safe regardless of direction, got: {result:?}"
@@ -676,7 +736,7 @@ mod tests {
         def.metrics.retain(|m| m.source_table.is_some());
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         assert!(
             matches!(result, Err(ExpandError::FanTrap { .. })),
             "Effectively-regular semi-additive metric must get the standard \
@@ -725,7 +785,7 @@ mod tests {
             .filter(|d| d.name == "item_name")
             .collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         match result {
             Err(ExpandError::FanTrap { detail }) => {
                 assert_eq!(detail.metric_name, "total_sourced");
@@ -773,7 +833,7 @@ mod tests {
             .filter(|d| d.name == "cust_name")
             .collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         assert!(
             result.is_ok(),
             "Active semi-additive metric with a safe-direction dimension must be allowed, \
@@ -813,7 +873,7 @@ mod tests {
         def.metrics.retain(|m| m.source_table.is_some());
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         assert!(
             matches!(result, Err(ExpandError::FanTrap { .. })),
             "Window metrics must get the standard fan-trap check, got: {result:?}"
@@ -850,7 +910,7 @@ mod tests {
         def.metrics.retain(|m| m.source_table.is_some());
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         assert!(
             result.is_ok(),
             "Window metric over a forward ManyToOne edge is safe, got: {result:?}"
@@ -871,7 +931,7 @@ mod tests {
             .with_metric("item_count", "COUNT(*)", Some("li"))
             .with_pkfk_join("items_to_orders", "li", "o", &["order_id"], &["id"]);
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &[], &resolved_mets);
+        let result = check_fan_traps("test", &def, &[], &resolved_mets, false);
         match result {
             Err(ExpandError::MetricFanTrap { detail }) => {
                 assert_eq!(detail.metric_name, "order_total", "inflated metric");
@@ -899,7 +959,7 @@ mod tests {
             .with_pkfk_join("items_to_orders", "li", "o", &["order_id"], &["id"])
             .with_pkfk_join("payments_to_orders", "pay", "o", &["order_id"], &["id"]);
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &[], &resolved_mets);
+        let result = check_fan_traps("test", &def, &[], &resolved_mets, false);
         match result {
             Err(ExpandError::MetricFanTrap { detail }) => {
                 assert_eq!(detail.metric_name, "item_total");
@@ -931,7 +991,7 @@ mod tests {
             );
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         assert!(
             result.is_ok(),
             "Same-grain metrics with a root-ward dim join must be allowed, got: {result:?}"
@@ -951,7 +1011,7 @@ mod tests {
             .with_metric("item_count", "COUNT(*)", Some("li"))
             .with_pkfk_join("items_to_orders", "li", "o", &["order_id"], &["id"]);
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &[], &resolved_mets);
+        let result = check_fan_traps("test", &def, &[], &resolved_mets, false);
         match result {
             Err(ExpandError::MetricFanTrap { detail }) => {
                 assert_eq!(detail.metric_name, "order_total");
@@ -983,7 +1043,7 @@ mod tests {
             .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"]);
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets) {
+        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false) {
             Err(ExpandError::RootGrainFanTrap {
                 view_name,
                 metric_name,
@@ -1013,7 +1073,7 @@ mod tests {
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
         assert!(
             matches!(
-                check_fan_traps("test", &def, &[], &resolved_mets),
+                check_fan_traps("test", &def, &[], &resolved_mets, false),
                 Err(ExpandError::RootGrainFanTrap { .. })
             ),
             "A parent-table metric queried alone must error (EXP-1)"
@@ -1043,7 +1103,7 @@ mod tests {
         // (a child metric's rows appear once; the root metric is the anchor).
         for name in ["order_total", "item_total"] {
             let mets: Vec<&_> = def.metrics.iter().filter(|m| m.name == name).collect();
-            let result = check_fan_traps("test", &def, &[], &mets);
+            let result = check_fan_traps("test", &def, &[], &mets, false);
             assert!(
                 result.is_ok(),
                 "Metric '{name}' at/below root grain must be allowed, got: {result:?}"
@@ -1068,7 +1128,7 @@ mod tests {
             .with_pkfk_join("li_o", "li", "o", &["order_id"], &["id"]);
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets) {
+        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false) {
             Err(ExpandError::FanTrap { detail }) => {
                 assert_eq!(detail.metric_name, "total");
                 assert_eq!(detail.dimension_name, "item_name");
@@ -1098,7 +1158,7 @@ mod tests {
             .with_metric("ratio", "order_total / item_count", None) // derived, grain {o, li}
             .with_pkfk_join("li_o", "li", "o", &["order_id"], &["id"]);
         let ratio: Vec<&_> = def.metrics.iter().filter(|m| m.name == "ratio").collect();
-        match check_fan_traps("test", &def, &[], &ratio) {
+        match check_fan_traps("test", &def, &[], &ratio, false) {
             Err(ExpandError::MetricFanTrap { detail }) => {
                 assert_eq!(detail.metric_name, "ratio");
                 assert_eq!(detail.relationship_name, "li_o");
@@ -1124,7 +1184,7 @@ mod tests {
             .with_pkfk_join("li_o", "li", "o", &["order_id"], &["id"]);
         let ratio: Vec<&_> = def.metrics.iter().filter(|m| m.name == "ratio").collect();
         assert!(
-            check_fan_traps("test", &def, &[], &ratio).is_ok(),
+            check_fan_traps("test", &def, &[], &ratio, false).is_ok(),
             "A single-grain derived metric must be allowed"
         );
     }
@@ -1142,7 +1202,7 @@ mod tests {
         );
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+        let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
         match result {
             Err(ExpandError::UncheckableDefinition { view_name, reason }) => {
                 assert_eq!(view_name, "test");
@@ -1175,7 +1235,7 @@ mod tests {
         });
         let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
         let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets) {
+        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false) {
             Err(ExpandError::UncheckableDefinition { view_name, reason }) => {
                 assert_eq!(view_name, "test");
                 assert!(
@@ -1210,7 +1270,7 @@ mod tests {
             }
             let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
             let resolved_mets: Vec<&_> = def.metrics.iter().collect();
-            let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets);
+            let result = check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false);
             match result {
                 Err(ExpandError::FanTrap { detail }) => {
                     assert_eq!(

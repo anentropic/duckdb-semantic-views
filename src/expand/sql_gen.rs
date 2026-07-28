@@ -347,12 +347,24 @@ pub fn expand(
             cycle_description: e,
         })?;
 
+    // TECH-DEBT #35 / v0.12.0: decide whether this query must be computed at
+    // each metric's OWN grain. `plan` returns None for everything the
+    // base-anchored path already answers correctly (so single-grain SQL is
+    // unchanged) and for multi-grain shapes it cannot express (so those keep
+    // their fan-trap error). Decided before the checks below because both of
+    // them exist only to guard the base-anchored topology.
+    let grain_plan = super::per_grain::plan(def, &resolved_dims, &resolved_mets, &resolved.exprs);
+
     // SG-8: fail loudly when a REQUESTED metric (directly, via a derived
     // metric, or as a window metric's inner aggregate) depends on a COUNT(*)
     // that could not be rewritten to COUNT(<pk>) — a non-base source table
     // with no PRIMARY KEY declared. Emitting it as-is would count
     // NULL-extended LEFT JOIN rows (one per childless base row).
-    if !resolved.count_star_no_pk.is_empty() {
+    //
+    // On the per-grain path there is no such row: the metric's table anchors
+    // its own CTE instead of being LEFT JOINed to the base table, so a bare
+    // COUNT(*) counts exactly that table's rows and needs no PRIMARY KEY.
+    if grain_plan.is_none() && !resolved.count_star_no_pk.is_empty() {
         for met in &resolved_mets {
             for name in collect_transitive_metric_names(met, &def.metrics) {
                 if let Some(table_alias) = resolved.count_star_no_pk.get(&name) {
@@ -372,8 +384,25 @@ pub fn expand(
     }
     let resolved_exprs = resolved.exprs;
 
-    // Phase 31: Check for fan traps before generating SQL.
-    check_fan_traps(view_name, def, &resolved_dims, &resolved_mets)?;
+    // Phase 31: Check for fan traps before generating SQL. In per-grain mode the
+    // fence keeps only the metric × dimension check — the other two guard the
+    // base-anchored topology the per-grain plan replaces.
+    check_fan_traps(
+        view_name,
+        def,
+        &resolved_dims,
+        &resolved_mets,
+        grain_plan.is_some(),
+    )?;
+
+    if let Some(plan) = grain_plan {
+        return Ok(super::per_grain::expand_per_grain(
+            def,
+            &resolved_dims,
+            &resolved_mets,
+            &plan,
+        ));
+    }
 
     // Phase 32: pair each resolved dimension with its role-playing scoped alias
     // (e.g. "a__dep_airport"). R-8 (code-review 2026-07-11): zipped into
