@@ -81,17 +81,17 @@ SELECT * FROM semantic_view('p31_sales', dimensions := ['status'], metrics := ['
 fan trap detected
 
 # ============================================================
-# Test 3b (SG-1, code review 2026-07-02): metric x metric fan trap.
-# order_count (from o) + revenue (from li) sit at different grains:
-# joining li multiplies o's rows per line item, silently inflating
-# order_count (East would count 2 instead of 1). No dimension is needed
-# to trigger the join -- multi-grain metric combinations are blocked.
+# Test 3b (SG-1, code review 2026-07-02; per-grain since v0.12.0): metrics at
+# two grains. order_count (from o) and revenue (from li) sit either side of the
+# li->o fan-out edge, so a single base-anchored FROM would inflate order_count
+# to 3 (one row per line item) instead of 2. Each metric is now computed at its
+# own grain instead: 2 orders, and 100 + 200 + 150 = 450 of revenue.
 # ============================================================
 
-statement error
+query IR
 SELECT * FROM semantic_view('p31_sales', metrics := ['order_count', 'revenue']);
 ----
-fan trap detected
+2	450.0
 
 # ============================================================
 # Test 4: Safe query -- metric from li, dimension from c
@@ -223,15 +223,20 @@ SELECT * FROM semantic_view('p31_derived', dimensions := ['status'], metrics := 
 ----
 fan trap detected
 
-# Even with a safe DIMENSION (o.region needs no fan-out traversal), avg_revenue
-# is itself unsafe: it is a single derived metric whose grain spans {li, o}
-# across the li->o fan edge, so order_count is computed over the fanned
-# orders x line_items join (inflated denominator). It must be rejected
-# regardless of the dimension (EXP-2, code-review 2026-07-18).
-statement error
+# With a safe DIMENSION (o.region needs no fan-out traversal), the derived
+# metric's two components are computed at their own grains and divided
+# afterwards (per-grain, v0.12.0). Before that its grain span {li, o} across the
+# li->o fan edge meant order_count was computed over the fanned
+# orders x line_items join — an inflated denominator — so the query was
+# rejected (EXP-2, code-review 2026-07-18).
+#
+# East: revenue 100 + 200 = 300 over 1 order. West: 150 over 1 order.
+# The inflated denominator would have made East 300 / 2 = 150.
+query TR rowsort
 SELECT * FROM semantic_view('p31_derived', dimensions := ['region'], metrics := ['avg_revenue']);
 ----
-fan trap detected
+East	300.0
+West	150.0
 
 # ============================================================
 # Cleanup

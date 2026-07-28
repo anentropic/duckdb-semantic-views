@@ -105,6 +105,35 @@ pub(super) fn push_from_base(sql: &mut String, def: &SemanticViewDefinition, lea
     }
 }
 
+/// Append a FROM clause anchored at an arbitrary declared table:
+/// `<lead>FROM <qualified-table> AS <alias>`.
+///
+/// The per-grain strategy ([`super::per_grain`]) anchors each grain's CTE at
+/// that grain's own table rather than the base table, which is the whole point
+/// of computing a metric at its own grain. `alias` is the lowercased declared
+/// alias; an alias that matches no declared table falls back to
+/// [`push_from_base`] so the emitter can never produce a FROM-less SELECT.
+pub(super) fn push_from_anchor(
+    sql: &mut String,
+    def: &SemanticViewDefinition,
+    alias: &str,
+    lead: &str,
+) {
+    let Some(table_ref) = def
+        .tables
+        .iter()
+        .find(|t| t.alias.to_ascii_lowercase() == alias)
+    else {
+        push_from_base(sql, def, lead);
+        return;
+    };
+    sql.push_str(lead);
+    sql.push_str("FROM ");
+    sql.push_str(&qualify_and_quote_table_ref(&table_ref.table, def));
+    sql.push_str(" AS ");
+    sql.push_str(&quote_ident(&table_ref.alias));
+}
+
 /// Append an ordinal `GROUP BY` for `n` grouping columns: `<lead>GROUP BY\n`
 /// then `<item_indent>1,\n<item_indent>2,…`. No-op when `n == 0`.
 ///
@@ -147,6 +176,14 @@ pub(super) enum FromSource<'a> {
     /// and each join's physical table via [`push_join_clauses`]).
     BaseTable {
         def: &'a SemanticViewDefinition,
+        joins: Vec<ResolvedJoin<'a>>,
+    },
+    /// A declared table other than the base table, plus the joins reaching the
+    /// query's dimensions from it — the per-grain strategy's single-grain shape
+    /// (see [`push_from_anchor`]).
+    AnchorTable {
+        def: &'a SemanticViewDefinition,
+        anchor: String,
         joins: Vec<ResolvedJoin<'a>>,
     },
     /// A bare, already-safe relation name — a CTE alias such as `__sv_snapshot`
@@ -205,6 +242,10 @@ impl SelectSpec<'_> {
         match &self.from {
             FromSource::BaseTable { def, joins } => {
                 push_from_base(&mut sql, def, "\n");
+                push_join_clauses(&mut sql, joins, def, "\nLEFT JOIN ");
+            }
+            FromSource::AnchorTable { def, anchor, joins } => {
+                push_from_anchor(&mut sql, def, anchor, "\n");
                 push_join_clauses(&mut sql, joins, def, "\nLEFT JOIN ");
             }
             FromSource::Named(name) => {

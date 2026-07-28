@@ -16,7 +16,9 @@
 - ✅ **v0.7.0 YAML Definitions & Materialization Routing** -- Phases 51-57 (shipped 2026-04-24)
 - ✅ **v0.8.0 Transactional DDL & Architectural Unification** -- Phases 58-62 (shipped 2026-05-06)
 - ✅ **v0.9.0 Read-Only Database LOAD Support + Quoted Identifier Bugfix** -- Phases 63-64 (shipped 2026-05-17)
-- 🚧 **v0.10.0 Connection-Lifecycle & Catalog-Context Fixes** -- Phases 65-66 (in progress; originally scoped as v0.9.1 patch, reframed 2026-05-23 after B-prime architecture eliminated by EXEC-TIME-RC1 spike — read-elimination architecture replaces it)
+- ✅ **v0.10.0 Connection-Lifecycle & Catalog-Context Fixes** -- Phases 65-68 (shipped; originally scoped as v0.9.1 patch, reframed 2026-05-23 after B-prime architecture eliminated by EXEC-TIME-RC1 spike — read-elimination architecture replaces it)
+- ✅ **v0.11.0 Identifier Semantics & Fan-Trap Fence Hardening** -- shipped 2026-07-20 (driven by the 2026-07-02 / 2026-07-11 / 2026-07-16 / 2026-07-18 code reviews rather than numbered phases; see CHANGELOG `[0.11.0]`)
+- 🚧 **v0.12.0 Per-Grain Metric Aggregation** -- Phases 69-71 (closes TECH-DEBT #35: each metric computed at its own grain, so multi-grain queries are answered instead of rejected. See `milestones/v0.12.0-ROADMAP.md`)
 
 ## Phases
 

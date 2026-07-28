@@ -1,0 +1,309 @@
+# Phase 69/70 (v0.12.0): per-grain ("own-grain") metric aggregation.
+#
+# Each metric is computed at the grain of its own table and the results are
+# joined, the way Snowflake computes multi-grain queries. Before v0.12.0 every
+# query here raised a fan-trap error, because the generated SQL was always
+# anchored FROM the base table: a metric on a parent of the base table was
+# counted once per base row, and metrics either side of a fan-out edge inflated
+# each other.
+#
+# Every assertion below pins the VALUE, not just acceptance — each expected
+# number differs from what the base-anchored formulation would have produced
+# (noted per case), so a regression to base-anchored aggregation fails loudly.
+
+require semantic_views
+
+# ============================================================
+# Setup
+#
+#   c (customers) <--customer_id-- o (orders) <--order_id-- li (items)
+#
+# `o` is the base table, so `c` is a PARENT of the base (fan-out when joined
+# from `o`) and `li` is a CHILD (fan-out when joined from `o`).
+#
+# Customer 3 has no orders; order 12 has no items. Those absences are what
+# distinguish per-grain aggregation from the base-anchored join.
+# ============================================================
+
+statement ok
+CREATE TABLE p69_customers (id INTEGER, region VARCHAR, balance INTEGER);
+
+statement ok
+INSERT INTO p69_customers VALUES (1, 'East', 100), (2, 'East', 200), (3, 'West', 300);
+
+statement ok
+CREATE TABLE p69_orders (id INTEGER, customer_id INTEGER, status VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO p69_orders VALUES (10, 1, 'open', 50), (11, 1, 'closed', 70), (12, 2, 'open', 30);
+
+statement ok
+CREATE TABLE p69_items (order_id INTEGER, sku VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO p69_items VALUES (10, 'a', 2), (10, 'b', 3), (11, 'c', 1);
+
+statement ok
+CREATE SEMANTIC VIEW p69_sales AS
+  TABLES (
+    o AS p69_orders PRIMARY KEY (id),
+    c AS p69_customers PRIMARY KEY (id),
+    li AS p69_items
+  )
+  RELATIONSHIPS (
+    order_to_customer AS o(customer_id) REFERENCES c,
+    item_to_order AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    c.region AS c.region,
+    o.status AS o.status,
+    li.sku AS li.sku
+  )
+  METRICS (
+    c.total_balance AS SUM(c.balance),
+    o.order_count AS COUNT(*),
+    li.item_qty AS SUM(li.qty),
+    qty_per_order AS item_qty / order_count
+  );
+
+# ============================================================
+# GRAIN-01: a metric on a PARENT of the base table, queried alone.
+#
+# 100 + 200 + 300 = 600, each customer counted once.
+# Base-anchored (FROM orders LEFT JOIN customers) would give 400: customer 1
+# counted twice (two orders) and customer 3 — who has no orders — dropped.
+# ============================================================
+
+query I
+SELECT * FROM semantic_view('p69_sales', metrics := ['total_balance']);
+----
+600
+
+# ============================================================
+# GRAIN-02: the same metric grouped by a dimension on its own table.
+# East = 100 + 200, West = 300. Base-anchored: East 400, no West row at all.
+# ============================================================
+
+query TI rowsort
+SELECT * FROM semantic_view('p69_sales', dimensions := ['region'], metrics := ['total_balance']);
+----
+East	300
+West	300
+
+# ============================================================
+# GRAIN-03: parent-grain and base-grain metrics together.
+#
+# Customer 3 (West) has no orders, so the order grain has no West row while the
+# customer grain does: the NULL-safe FULL OUTER JOIN keeps West with a NULL
+# order_count rather than dropping the group.
+# ============================================================
+
+query TII rowsort
+SELECT * FROM semantic_view('p69_sales', dimensions := ['region'], metrics := ['total_balance', 'order_count']);
+----
+East	300	3
+West	300	NULL
+
+# ============================================================
+# GRAIN-03/05: two FACT tables at different grains (the chasm-trap shape),
+# with no dimensions — one row per grain, combined with CROSS JOIN.
+#
+# order_count = 3 orders; item_qty = 2 + 3 + 1 = 6.
+# Base-anchored, COUNT(*) over `orders LEFT JOIN items` counts 4 rows (order 10
+# duplicated by its two items, order 12 NULL-extended).
+# ============================================================
+
+query II
+SELECT * FROM semantic_view('p69_sales', metrics := ['order_count', 'item_qty']);
+----
+3	6
+
+# ============================================================
+# GRAIN-03: the same pair grouped by a base-table dimension both grains reach.
+# open: 2 orders (10, 12), items 2 + 3 = 5. closed: 1 order (11), 1 item.
+# ============================================================
+
+query TII rowsort
+SELECT * FROM semantic_view('p69_sales', dimensions := ['status'], metrics := ['order_count', 'item_qty']);
+----
+closed	1	1
+open	2	5
+
+# ============================================================
+# GRAIN-04: a derived metric whose components span grains. Each component is
+# aggregated at its own grain and the division is applied to the results:
+# 6 items / 3 orders = 2. Base-anchored, the denominator would be the inflated
+# 4-row count.
+# ============================================================
+
+query R
+SELECT * FROM semantic_view('p69_sales', metrics := ['qty_per_order']);
+----
+2.0
+
+# GRAIN-04 grouped: open = 5 / 2, closed = 1 / 1.
+query TR rowsort
+SELECT * FROM semantic_view('p69_sales', dimensions := ['status'], metrics := ['qty_per_order']);
+----
+closed	1.0
+open	2.5
+
+# ============================================================
+# GRAIN-08: COUNT(*) on a table with no declared PRIMARY KEY (`li`) is
+# answerable per-grain — the table anchors its own CTE, so there are no
+# NULL-extended rows to over-count and the SG-8 PRIMARY KEY requirement (which
+# exists only for the base-anchored LEFT JOIN) does not apply.
+# 3 item rows.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW p69_pkless AS
+  TABLES (
+    o AS p69_orders PRIMARY KEY (id),
+    li AS p69_items
+  )
+  RELATIONSHIPS (
+    item_to_order AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.status AS o.status
+  )
+  METRICS (
+    o.order_count AS COUNT(*),
+    li.item_count AS COUNT(*)
+  );
+
+query II
+SELECT * FROM semantic_view('p69_pkless', metrics := ['order_count', 'item_count']);
+----
+3	3
+
+# The same metric alone still goes through the base-anchored path, where
+# COUNT(*) on a PK-less joined table cannot be made safe — the guard stands.
+statement error
+SELECT * FROM semantic_view('p69_pkless', dimensions := ['status'], metrics := ['item_count']);
+----
+PRIMARY KEY
+
+statement ok
+DROP SEMANTIC VIEW p69_pkless;
+
+# ============================================================
+# GRAIN-03: two SIBLING child tables of one parent (the chasm trap).
+#
+# `li` and `s` both reference `o`, so neither is an ancestor of the other and
+# the path between them runs through their shared parent. Joined into one query
+# they multiply each other: order 10's 2 line items x 2 shipments = 4 rows.
+#
+# item_qty = 2 + 3 + 1 = 6; ship_weight = 10 + 40 + 15 = 65.
+# ============================================================
+
+statement ok
+CREATE TABLE p69_shipments (order_id INTEGER, carrier VARCHAR, weight INTEGER);
+
+statement ok
+INSERT INTO p69_shipments VALUES (10, 'air', 10), (10, 'sea', 40), (11, 'air', 15);
+
+statement ok
+CREATE SEMANTIC VIEW p69_siblings AS
+  TABLES (
+    o AS p69_orders PRIMARY KEY (id),
+    li AS p69_items,
+    s AS p69_shipments
+  )
+  RELATIONSHIPS (
+    item_to_order AS li(order_id) REFERENCES o,
+    shipment_to_order AS s(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.status AS o.status,
+    s.carrier AS s.carrier
+  )
+  METRICS (
+    li.item_qty AS SUM(li.qty),
+    s.ship_weight AS SUM(s.weight)
+  );
+
+query II
+SELECT * FROM semantic_view('p69_siblings', metrics := ['item_qty', 'ship_weight']);
+----
+6	65
+
+# Grouped by a dimension on their shared parent, which both grains reach
+# through their own FK without fanning.
+# open (order 10): 5 units, 50 kg. closed (order 11): 1 unit, 15 kg.
+query TII rowsort
+SELECT * FROM semantic_view('p69_siblings', dimensions := ['status'], metrics := ['item_qty', 'ship_weight']);
+----
+closed	1	15
+open	5	50
+
+# A metric on one child grouped by a dimension on its SIBLING is a fan trap:
+# each line item is multiplied by its order's shipments before aggregation.
+# Neither sibling is an ancestor of the other, so the fence's parent-chain walk
+# used to find no path between them and let this through silently.
+statement error
+SELECT * FROM semantic_view('p69_siblings', dimensions := ['carrier'], metrics := ['item_qty']);
+----
+fan trap detected
+
+statement ok
+DROP SEMANTIC VIEW p69_siblings;
+
+statement ok
+DROP TABLE p69_shipments;
+
+# ============================================================
+# GRAIN-07: what per-grain does NOT make answerable.
+#
+# A dimension BELOW a metric's own grain still raises a fan trap: each order
+# genuinely fans across its items' SKUs, and each customer across their orders'
+# statuses. Per-grain aggregation cannot define those queries either.
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('p69_sales', dimensions := ['sku'], metrics := ['order_count']);
+----
+fan trap detected
+
+statement error
+SELECT * FROM semantic_view('p69_sales', dimensions := ['status'], metrics := ['total_balance']);
+----
+fan trap detected
+
+# ============================================================
+# GRAIN-06: a single-grain query is untouched — same base-anchored SQL as
+# before, and the EXPLAIN output proves no CTE was introduced.
+# ============================================================
+
+query TI rowsort
+SELECT * FROM semantic_view('p69_sales', dimensions := ['region'], metrics := ['order_count']);
+----
+East	3
+
+query I
+SELECT count(*) FROM explain_semantic_view('p69_sales', dimensions := ['region'], metrics := ['order_count']) WHERE explain_output LIKE '%__sv_grain%';
+----
+0
+
+# The multi-grain query, by contrast, does route through the per-grain CTEs.
+query T
+SELECT count(*) > 0 FROM explain_semantic_view('p69_sales', dimensions := ['region'], metrics := ['total_balance', 'order_count']) WHERE explain_output LIKE '%__sv_grain_1%';
+----
+true
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW p69_sales;
+
+statement ok
+DROP TABLE p69_items;
+
+statement ok
+DROP TABLE p69_orders;
+
+statement ok
+DROP TABLE p69_customers;

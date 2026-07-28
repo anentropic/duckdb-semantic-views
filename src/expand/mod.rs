@@ -2,6 +2,7 @@ mod facts;
 mod fan_trap;
 mod join_resolver;
 mod materialization;
+mod per_grain;
 mod resolution;
 mod role_playing;
 mod select_spec;
@@ -42,6 +43,8 @@ mod tests_facts_path_role_playing;
 mod tests_fan_trap;
 #[cfg(test)]
 mod tests_join_emission_regression;
+#[cfg(test)]
+mod tests_per_grain;
 #[cfg(test)]
 mod tests_pkfk_expand;
 #[cfg(test)]

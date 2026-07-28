@@ -11,6 +11,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _No unreleased changes yet._
 
+## [0.12.0] - 2026-07-28
+
+### Added
+
+- **Each metric is now computed at its own grain, so multi-grain queries return results instead of a fan-trap error.** Until now every generated query was anchored `FROM <base table>` with `LEFT JOIN`s outward, which meant a metric whose table was not the base table could be aggregated over the multiplied join; v0.11.0 made those shapes raise `fan trap detected` rather than silently inflate. They are now *answered* the way Snowflake answers them — each metric pre-aggregated over its own table, the results joined on the queried dimensions. Three shapes become available:
+  - a metric on a **parent table** the base table references (`SUM(customers.balance)` in an `orders`-based view), queried alone or with dimensions at or above its own grain — customers are no longer counted once per order, and a customer with no orders is no longer dropped;
+  - **metrics at two different grains queried together** — a base-table metric with a child-table metric (fan trap), or metrics on two different children of one parent (chasm trap);
+  - a **single derived metric that fuses two grains** (`avg AS order_total / item_count`) — each component is aggregated at its own grain and the expression evaluated over the two pre-aggregates, so the denominator is the true count rather than the fanned one.
+
+  Dimension groups are combined with a NULL-safe `FULL OUTER JOIN`, so a group present at one grain and absent at another survives with a `NULL` metric rather than disappearing; a query with no dimensions yields one row per grain, combined with `CROSS JOIN`. Single-grain queries are unaffected and generate exactly the SQL they did before — the per-grain path is entered only where the query would previously have been rejected.
+- A `COUNT(*)` metric on a table with **no declared `PRIMARY KEY`** is answerable in a multi-grain query. The `PRIMARY KEY` requirement exists only because the base-anchored path reaches such a table through a `LEFT JOIN`, whose NULL-extended rows `COUNT(*)` would count; when the table anchors its own grain CTE there are none. Querying that metric on the base-anchored path still requires the key.
+
+### Fixed
+
+- **A metric grouped by a dimension on a *sibling* table now raises `fan trap detected` instead of silently returning inflated numbers.** When two tables both reference a third — `line_items` and `shipments` both referencing `orders` — neither is an ancestor of the other, and the fan-trap check walked parent chains to find the path between a metric's table and a dimension's table. For siblings that walk finds no path at all, so the pair was skipped and the query was accepted: joining both children multiplies each one's rows by the other's (an order with 2 line items and 2 shipments contributes 4 rows), inflating the aggregate. The check now walks the relationship graph itself, which finds the real path (`line_items → orders → shipments`) and the fanning leg on it.
+
+### Known limitations
+
+- Multi-grain queries whose metrics include a **window metric**, an **active semi-additive metric** (a `NON ADDITIVE BY` whose snapshot dimension is not itself queried), or **role-playing (`USING`) resolution** keep raising the fan-trap error: those strategies emit their own base-anchored CTEs. Query such metrics at a single grain.
+- A **dimension below a metric's own grain** (`SUM(customers.balance)` grouped by an order-grain dimension) remains an error in both engines: the metric's rows genuinely fan across the dimension's values, so there is no single correct value per group. Snowflake likewise requires dimensions to be reachable from a metric's table through many-to-one relationships.
+
 ## [0.11.0] - 2026-07-20
 
 ### Changed
@@ -369,7 +390,8 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.2...v0.10.3

@@ -270,6 +270,34 @@ Both systems infer cardinality from constraints. In DuckDB Semantic Views, cardi
 The extension uses inferred cardinality for :ref:`fan trap detection <howto-fan-traps>`.
 
 
+Metric Grain
+------------
+
+.. versionchanged:: 0.12.0
+
+Like Snowflake, each metric is computed **at the grain of its own logical
+table**. When a query's metrics sit at different grains — a metric on a parent
+table alongside one on the base table, two metrics on different child tables, or
+a single derived metric fusing two grains — each is aggregated separately over
+its own table and the results are joined on the queried dimensions. A metric on
+a parent table is therefore not multiplied by the number of child rows, and a
+parent row with no children is not dropped.
+
+Before v0.12.0 the generated SQL was always anchored ``FROM <base table>``, so
+these queries were rejected with a fan-trap error rather than silently inflated.
+Single-grain queries are unchanged: they are still a single base-anchored
+``SELECT``.
+
+Two boundaries are worth knowing:
+
+- A **dimension below a metric's grain** (``SUM(customers.balance)`` grouped by
+  an order-grain dimension) is rejected in both systems: dimensions must be
+  reachable from the metric's table through many-to-one relationships.
+- Multi-grain queries involving **window metrics**, **active semi-additive
+  metrics**, or **role-playing (**``USING``**) resolution** are not yet computed
+  per-grain here and keep raising the fan-trap error. Snowflake computes them.
+
+
 USING RELATIONSHIPS
 -------------------
 

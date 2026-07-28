@@ -24,8 +24,16 @@ use super::relationship::RelationshipGraph;
 /// alias mapped to its single parent (the first reverse edge — in a validated
 /// tree each non-root node has exactly one, and role-playing multi-edges to one
 /// node all share the same parent table).
+///
+/// Scope note (v0.12.0): this tree answers *ancestry* questions —
+/// "is A on the path between B and the base table?" — and nothing else. Finding
+/// the join **path** between two arbitrary tables is no longer done here: the
+/// fan-trap fence walks the undirected relationship graph
+/// (`expand::fan_trap::GrainGraph`) because two sibling children of one table
+/// have no ancestor relationship at all, so a parent-chain walk finds no path
+/// between them (see TECH-DEBT #37 for the same weakness in the remaining
+/// ancestry consumers).
 pub(crate) struct JoinTree {
-    root: String,
     parent: HashMap<String, String>,
 }
 
@@ -40,15 +48,7 @@ impl JoinTree {
                 parent.insert(child.clone(), p.clone());
             }
         }
-        Self {
-            root: graph.root.clone(),
-            parent,
-        }
-    }
-
-    /// The root (base-table) alias.
-    pub(crate) fn root(&self) -> &str {
-        &self.root
+        Self { parent }
     }
 
     /// This alias's parent (the neighbor toward the root), if any. Used by the
@@ -82,56 +82,14 @@ impl JoinTree {
         }
         chain
     }
-
-    /// Build the chain `[start, parent, …, ancestor]` by walking toward the
-    /// root. Stops early (returning a partial chain) if the parent chain breaks
-    /// before reaching `ancestor`, or — on a malformed cyclic parent map — if a
-    /// node is revisited before `ancestor` is reached (#141).
-    pub(crate) fn path_to_ancestor(&self, start: &str, ancestor: &str) -> Vec<String> {
-        let mut path = vec![start.to_string()];
-        let mut current = start.to_string();
-        let mut seen: HashSet<String> = HashSet::new();
-        seen.insert(current.clone());
-        while current != ancestor {
-            let Some(parent) = self.parent.get(&current) else {
-                break;
-            };
-            // Cyclic parent map guard (see `ancestors_to_root` / issue #141):
-            // if `ancestor` is not on the chain, a cyclic map would loop forever.
-            if !seen.insert(parent.clone()) {
-                break;
-            }
-            path.push(parent.clone());
-            current = parent.clone();
-        }
-        path
-    }
-
-    /// Build the path from `ancestor` down to `target`: `[ancestor, …,
-    /// target]`. Walks `target` UP to `ancestor` (a prefix of `target`'s full
-    /// ancestor chain — it stops at `ancestor` rather than continuing to the
-    /// root) and reverses, so callers that already hold `target`'s ancestor
-    /// chain don't pay for a second full walk to the root. Falls back to
-    /// `[ancestor, target]` when `ancestor` is not on `target`'s parent chain.
-    pub(crate) fn path_from_ancestor_to_node(&self, ancestor: &str, target: &str) -> Vec<String> {
-        let up = self.path_to_ancestor(target, ancestor);
-        if up.last().is_some_and(|last| last == ancestor) {
-            up.into_iter().rev().collect()
-        } else {
-            vec![ancestor.to_string(), target.to_string()]
-        }
-    }
 }
 
 #[cfg(test)]
 impl JoinTree {
-    /// Build directly from a root + parent map (test-only; production always
-    /// derives via [`Self::from_graph`]).
-    fn from_parts(root: &str, parent: HashMap<String, String>) -> Self {
-        Self {
-            root: root.to_string(),
-            parent,
-        }
+    /// Build directly from a parent map (test-only; production always derives
+    /// via [`Self::from_graph`]).
+    fn from_parts(parent: HashMap<String, String>) -> Self {
+        Self { parent }
     }
 }
 
@@ -141,7 +99,7 @@ mod tests {
 
     #[test]
     fn ancestors_to_root_at_root() {
-        let tree = JoinTree::from_parts("root", HashMap::new());
+        let tree = JoinTree::from_parts(HashMap::new());
         assert_eq!(tree.ancestors_to_root("root"), vec!["root"]);
     }
 
@@ -149,7 +107,7 @@ mod tests {
     fn ancestors_to_root_single_parent() {
         let mut parent = HashMap::new();
         parent.insert("child".to_string(), "root".to_string());
-        let tree = JoinTree::from_parts("root", parent);
+        let tree = JoinTree::from_parts(parent);
         assert_eq!(tree.ancestors_to_root("child"), vec!["child", "root"]);
     }
 
@@ -158,21 +116,8 @@ mod tests {
         let mut parent = HashMap::new();
         parent.insert("leaf".to_string(), "mid".to_string());
         parent.insert("mid".to_string(), "root".to_string());
-        let tree = JoinTree::from_parts("root", parent);
+        let tree = JoinTree::from_parts(parent);
         assert_eq!(tree.ancestors_to_root("leaf"), vec!["leaf", "mid", "root"]);
-    }
-
-    #[test]
-    fn path_to_ancestor_walks_up() {
-        let mut parent = HashMap::new();
-        parent.insert("leaf".to_string(), "mid".to_string());
-        parent.insert("mid".to_string(), "root".to_string());
-        let tree = JoinTree::from_parts("root", parent);
-        assert_eq!(tree.path_to_ancestor("leaf", "mid"), vec!["leaf", "mid"]);
-        assert_eq!(
-            tree.path_to_ancestor("leaf", "root"),
-            vec!["leaf", "mid", "root"]
-        );
     }
 
     #[test]
@@ -186,7 +131,7 @@ mod tests {
         let mut parent = HashMap::new();
         parent.insert("a".to_string(), "b".to_string());
         parent.insert("b".to_string(), "a".to_string());
-        let tree = JoinTree::from_parts("a", parent);
+        let tree = JoinTree::from_parts(parent);
 
         let chain = tree.ancestors_to_root("b");
         assert!(
@@ -202,29 +147,9 @@ mod tests {
             "cycle revisited a node: {chain:?}"
         );
 
-        // `ancestor` deliberately absent from the chain, so a naive walk never
-        // reaches it and loops the cycle forever.
-        let path = tree.path_to_ancestor("b", "not-on-chain");
-        assert!(
-            path.len() <= 2,
-            "path_to_ancestor did not stop at the cycle: {path:?}"
-        );
-    }
-
-    #[test]
-    fn path_from_ancestor_to_node_walks_down() {
-        let mut parent = HashMap::new();
-        parent.insert("leaf".to_string(), "mid".to_string());
-        parent.insert("mid".to_string(), "root".to_string());
-        let tree = JoinTree::from_parts("root", parent);
-        assert_eq!(
-            tree.path_from_ancestor_to_node("root", "leaf"),
-            vec!["root", "mid", "leaf"]
-        );
-        // Not an ancestor -> direct two-element fallback.
-        assert_eq!(
-            tree.path_from_ancestor_to_node("sibling", "leaf"),
-            vec!["sibling", "leaf"]
-        );
+        // The walk from a node whose chain never reaches a given ancestor is
+        // the shape that looped forever: `ancestors_to_root` covers it above,
+        // and the end-to-end guard is
+        // `expand::tests_fan_trap::cyclic_relationships_do_not_hang_expand`.
     }
 }
