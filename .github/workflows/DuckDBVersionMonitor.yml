@@ -72,10 +72,18 @@ jobs:
           sed -i "s/duckdb = { version = \"=[^\"]*\"/duckdb = { version = \"=$CRATE_VER\"/" Cargo.toml
           sed -i "s/libduckdb-sys = \"=[^\"]*\"/libduckdb-sys = \"=$CRATE_VER\"/" Cargo.toml
 
-          # Update Python PEP 723 headers
+          # Update the version declared to the loader at extension init. Guarded
+          # by tests::duckdb_version_pins_agree, which fails the build if this
+          # drifts from .duckdb-version.
+          sed -i "s|\(MINIMUM_DUCKDB_VERSION: &str = \)\"v[0-9.]*\"|\1\"$VER\"|" src/lib.rs
+
+          # Update Python PEP 723 headers. The `[0-9]` prefix is required: an
+          # unanchored `[0-9.]*` also matches the empty string, which mangles
+          # non-pin occurrences such as the f-string `duckdb=={pyver}` in
+          # scripts/fetch_amalgamation_offline.py into `duckdb==X.Y.Z{pyver}`.
           DDB_VER=$(echo $VER | sed 's/v//')
           find . -name '*.py' -not -path './extension-ci-tools/*' -not -path './.venv/*' -exec \
-            sed -i "s/duckdb==[0-9.]*/duckdb==$DDB_VER/" {} \;
+            sed -i "s/duckdb==[0-9][0-9.]*/duckdb==$DDB_VER/" {} \;
 
           # Update CI workflow files (uses:, duckdb_version, ci_tools_version, IMPORTANT comment)
           for WF in .github/workflows/BuildAll.yml .github/workflows/BuildQuick.yml; do
@@ -111,7 +119,13 @@ jobs:
       - name: Build and test against new DuckDB version
         if: steps.latest.outputs.is_new == 'true'
         id: build
-        run: make configure && make release && make test_release
+        run: |
+          # Pin-consistency first: `make test_release` runs sqllogictest, which
+          # never reads the Rust-side pins, so a location the step above missed
+          # would sail through and open a "build passed" PR that CI then rejects.
+          # These are pure-Rust unit tests — no C++ build needed.
+          SV_SKIP_CPP_BUILD=1 cargo test --lib --no-default-features --features extension
+          make configure && make release && make test_release
         continue-on-error: true
 
       - name: Run DuckLake integration test
@@ -250,9 +264,17 @@ jobs:
           sed -i "s/duckdb = { version = \"=[^\"]*\"/duckdb = { version = \"=$LTS_VER\"/" Cargo.toml
           sed -i "s/libduckdb-sys = \"=[^\"]*\"/libduckdb-sys = \"=$LTS_VER\"/" Cargo.toml
 
-          # Update Python PEP 723 headers
+          # Update the version declared to the loader at extension init. Guarded
+          # by tests::duckdb_version_pins_agree, which fails the build if this
+          # drifts from .duckdb-version.
+          sed -i "s|\(MINIMUM_DUCKDB_VERSION: &str = \)\"v[0-9.]*\"|\1\"v$LTS_VER\"|" src/lib.rs
+
+          # Update Python PEP 723 headers. The `[0-9]` prefix is required: an
+          # unanchored `[0-9.]*` also matches the empty string, which mangles
+          # non-pin occurrences such as the f-string `duckdb=={pyver}` in
+          # scripts/fetch_amalgamation_offline.py into `duckdb==X.Y.Z{pyver}`.
           find . -name '*.py' -not -path './extension-ci-tools/*' -not -path './.venv/*' -exec \
-            sed -i "s/duckdb==[0-9.]*/duckdb==$LTS_VER/" {} \;
+            sed -i "s/duckdb==[0-9][0-9.]*/duckdb==$LTS_VER/" {} \;
 
           # Update CI workflow files (uses:, duckdb_version, ci_tools_version, IMPORTANT comment)
           LTS_TAG="v$LTS_VER"
@@ -286,7 +308,13 @@ jobs:
       - name: Build and test against new LTS version
         if: steps.lts.outputs.is_new == 'true'
         id: build
-        run: make configure && make release && make test_release
+        run: |
+          # Pin-consistency first: `make test_release` runs sqllogictest, which
+          # never reads the Rust-side pins, so a location the step above missed
+          # would sail through and open a "build passed" PR that CI then rejects.
+          # These are pure-Rust unit tests — no C++ build needed.
+          SV_SKIP_CPP_BUILD=1 cargo test --lib --no-default-features --features extension
+          make configure && make release && make test_release
         continue-on-error: true
 
       - name: Run DuckLake integration test

@@ -368,9 +368,15 @@ The DuckDB version is pinned in a single source of truth: **`.duckdb-version`** 
 | `.duckdb-version` | **Source** — single `vX.Y.Z` line |
 | `Makefile` | Reads `.duckdb-version` via `$(shell cat .duckdb-version)` |
 | `Cargo.toml` | `duckdb` and `libduckdb-sys` `"=X.Y.Z"` — updated by monitor workflow |
+| `src/lib.rs` | `MINIMUM_DUCKDB_VERSION` — the version declared to DuckDB at extension init; updated by monitor workflow |
 | `test/**/*.py`, `configure/*.py` | PEP 723 `"duckdb==X.Y.Z"` — updated by monitor workflow |
 | `.github/workflows/BuildAll.yml` | `uses:` tag, `duckdb_version`, `ci_tools_version` — updated by monitor workflow |
 | `.github/workflows/BuildQuick.yml` | `uses:` tag, `duckdb_version`, `ci_tools_version` — updated by monitor workflow |
+
+Every row above is machine-guarded against drift by two unit tests in `src/lib.rs`:
+`tests::duckdb_version_pins_agree` (`.duckdb-version` ↔ `MINIMUM_DUCKDB_VERSION` ↔ the
+`libduckdb-sys` pin) and `tests::duckdb_derived_pins_agree` (the PEP 723 headers and the
+two build workflows). Miss a location and `cargo test` fails.
 
 ### Steps to Update Manually
 
@@ -387,12 +393,22 @@ Replace `X.Y.Z` below with the target DuckDB version (e.g., `1.5.1`). The duckdb
    libduckdb-sys = "=1.1XY0Z.0"
    ```
 
-3. Update Python PEP 723 headers (all `# dependencies = ["duckdb==..."]` lines):
-   ```bash
-   find . -name '*.py' -exec grep -l 'duckdb==' {} \; | xargs sed -i '' 's/duckdb==[^"]*/duckdb==X.Y.Z/g'
+3. Update `MINIMUM_DUCKDB_VERSION` in `src/lib.rs` (the version handed to
+   `duckdb_rs_extension_api_init` at load time):
+   ```rust
+   pub const MINIMUM_DUCKDB_VERSION: &str = "vX.Y.Z";
    ```
 
-4. Update both CI workflow files (`BuildAll.yml` and `BuildQuick.yml`) — the `uses:` tag, `duckdb_version`, and `ci_tools_version`:
+4. Update Python PEP 723 headers (all `# dependencies = ["duckdb==..."]` lines):
+   ```bash
+   find . -name '*.py' -exec grep -l 'duckdb==' {} \; | xargs sed -i '' 's/duckdb==[0-9][0-9.]*/duckdb==X.Y.Z/g'
+   ```
+   The leading `[0-9]` matters. A looser pattern (`[^"]*`, or `[0-9.]*`, both of which
+   also match the empty string) rewrites `duckdb==` occurrences that are not pins —
+   notably the f-string `f"no sdist published for duckdb=={pyver} on PyPI"` in
+   `scripts/fetch_amalgamation_offline.py`.
+
+5. Update both CI workflow files (`BuildAll.yml` and `BuildQuick.yml`) — the `uses:` tag, `duckdb_version`, and `ci_tools_version`:
    ```yaml
    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@vX.Y.Z
    ...
@@ -400,12 +416,12 @@ Replace `X.Y.Z` below with the target DuckDB version (e.g., `1.5.1`). The duckdb
      ci_tools_version: vX.Y.Z
    ```
 
-5. Download the new amalgamation, build, and run all tests:
+6. Download the new amalgamation, build, and run all tests:
    ```bash
    just update-headers && just build && just test-all
    ```
 
-6. Commit all files together.
+7. Commit all files together.
 
 The `DuckDBVersionMonitor` workflow automates all of this: it checks for new DuckDB releases weekly, updates `.duckdb-version` and all derived locations (including CI workflow files), then opens a PR. If the build passes, the PR bumps the version. If it fails, the PR tags `@copilot` to attempt an automated fix.
 
@@ -763,7 +779,7 @@ grep 'duckdb.*version' Cargo.toml  # check pinned version
 If they differ, either update the pin (see [Updating the DuckDB Version Pin](#updating-the-duckdb-version-pin)) or install the matching Python DuckDB version:
 
 ```bash
-pip install duckdb==1.4.4
+pip install "duckdb==$(sed 's/^v//' .duckdb-version)"
 ```
 
 ### `cargo test` passes but `just test-sql` fails
