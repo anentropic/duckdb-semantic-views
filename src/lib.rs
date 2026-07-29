@@ -26,7 +26,7 @@ pub mod util;
 /// tested against. The three sources of truth — this constant, the
 /// `.duckdb-version` file, and the pinned `libduckdb-sys` version in
 /// `Cargo.toml` — are asserted consistent by `tests::duckdb_version_pins_agree`.
-pub const MINIMUM_DUCKDB_VERSION: &str = "v1.5.4";
+pub const MINIMUM_DUCKDB_VERSION: &str = "v1.5.5";
 
 /// Test helpers for integration tests.
 ///
@@ -689,6 +689,127 @@ mod tests {
             "libduckdb-sys pin =1.{encoded}.0 disagrees with .duckdb-version {canonical} \
              (expected =1.{expected_encoded}.0)"
         );
+    }
+
+    /// Recursively collects `*.py` files, skipping vendored, hidden and build
+    /// directories.
+    ///
+    /// These exclusions are deliberately *wider* than the version-monitor's
+    /// `find`, which only skips `./extension-ci-tools/*` and `./.venv/*`. That
+    /// direction is the safe one: everything scanned here is also something the
+    /// monitor rewrites, so the caller's assertion can never fail on a file the
+    /// monitor would not have fixed. Widening the monitor's exclusions instead —
+    /// or narrowing these below the monitor's — would break that property.
+    fn collect_py_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        const SKIP_DIRS: [&str; 4] = ["target", "build", "extension-ci-tools", "node_modules"];
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+                    continue;
+                }
+                collect_py_files(&path, out);
+            } else if name.ends_with(".py") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Reads the token that follows `marker` in `haystack`, ending at the first
+    /// character that cannot be part of a version string.
+    fn token_after<'a>(haystack: &'a str, at: usize, marker: &str) -> &'a str {
+        let rest = &haystack[at + marker.len()..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ']' | ')'))
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Extends [`duckdb_version_pins_agree`] to the *derived* pin locations —
+    /// the ones the `DuckDBVersionMonitor` workflow rewrites with `sed` rather
+    /// than deriving at build time: PEP 723 `duckdb==X.Y.Z` headers in every
+    /// Python file, and the DuckDB / extension-ci-tools tags in `BuildAll.yml`
+    /// and `BuildQuick.yml`.
+    ///
+    /// A bump that updates `.duckdb-version` but leaves one of these stale — or
+    /// mangles it, as an over-broad `duckdb==[0-9.]*` pattern does to
+    /// `f"...duckdb=={pyver}..."` in `scripts/fetch_amalgamation_offline.py` —
+    /// fails here instead of at runtime or in a platform-specific build.
+    #[test]
+    fn duckdb_derived_pins_agree() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let version_file =
+            std::fs::read_to_string(root.join(".duckdb-version")).expect("read .duckdb-version");
+        let canonical = version_file.trim(); // e.g. "v1.5.5"
+        let numeric = canonical.strip_prefix('v').unwrap_or(canonical); // e.g. "1.5.5"
+
+        // --- PEP 723 headers in Python files -------------------------------
+        let mut py_files = Vec::new();
+        collect_py_files(root, &mut py_files);
+        let mut pins_seen = 0_usize;
+        for path in &py_files {
+            let Ok(src) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for (idx, _) in src.match_indices("duckdb==") {
+                let token = token_after(&src, idx, "duckdb==");
+                // `duckdb=={pyver}` and friends are format placeholders, not
+                // pins — the monitor must leave them alone.
+                if token.starts_with('{') {
+                    continue;
+                }
+                pins_seen += 1;
+                assert_eq!(
+                    token,
+                    numeric,
+                    "stale or mangled DuckDB pin `duckdb=={token}` in {} \
+                     (.duckdb-version says {canonical})",
+                    path.strip_prefix(root).unwrap_or(path).display()
+                );
+            }
+        }
+        // Guard against the assertion above going vacuous if the dependency is
+        // ever renamed or the headers restructured.
+        assert!(
+            pins_seen >= 10,
+            "expected the PEP 723 headers to pin duckdb in many files, found {pins_seen} — \
+             has the scan gone vacuous?"
+        );
+
+        // --- DuckDB tags in the build workflows ----------------------------
+        const MARKERS: [&str; 4] = [
+            "_extension_distribution.yml@",
+            "duckdb_version: ",
+            "ci_tools_version: ",
+            "currently ",
+        ];
+        for workflow in ["BuildAll.yml", "BuildQuick.yml"] {
+            let path = root.join(".github/workflows").join(workflow);
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for marker in MARKERS {
+                let mut hits = 0_usize;
+                for (idx, _) in src.match_indices(marker) {
+                    hits += 1;
+                    assert_eq!(
+                        token_after(&src, idx, marker),
+                        canonical,
+                        "stale DuckDB tag after `{marker}` in {workflow} \
+                         (.duckdb-version says {canonical})"
+                    );
+                }
+                assert!(
+                    hits > 0,
+                    "no `{marker}` found in {workflow} — the pin check has gone vacuous"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------

@@ -108,7 +108,7 @@ Constraints inherent to the current approach that affect users or maintainers.
 
 ### 2. ❓ DuckDB version pinning (exact)
 
-- **What:** The `duckdb` / `libduckdb-sys` crate dependencies are pinned to an exact version in `Cargo.toml` (currently `= 1.10504.0`, the duckdb-rs release tracking DuckDB **v1.5.4**; `.duckdb-version` holds the matching `v1.5.4`).
+- **What:** The `duckdb` / `libduckdb-sys` crate dependencies are pinned to an exact version in `Cargo.toml` — the duckdb-rs release tracking the DuckDB version held in `.duckdb-version` (the repo's single source of truth). The encoding is `vX.Y.Z` → `= 1.1XY0Z.0`; `tests::duckdb_version_pins_agree` asserts the two agree, so this entry deliberately does not restate the number.
 - **Why:** DuckDB's ABI is not stable across minor versions. An extension built against one version may crash or fail to load with a different DuckDB runtime.
 - **Impact:** Every DuckDB release requires a version bump, rebuild, and re-test of the extension. The `DuckDBVersionMonitor.yml` CI workflow automates detection and opens a PR when a new DuckDB version is available.
 - **Mitigation:** The version monitor workflow (Phase 1, INFRA-03) detects new releases and opens a PR with `@copilot` mention for automated investigation. Manual version bumps follow the process documented in MAINTAINER.md.

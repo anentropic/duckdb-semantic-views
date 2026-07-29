@@ -72,10 +72,18 @@ jobs:
           sed -i "s/duckdb = { version = \"=[^\"]*\"/duckdb = { version = \"=$CRATE_VER\"/" Cargo.toml
           sed -i "s/libduckdb-sys = \"=[^\"]*\"/libduckdb-sys = \"=$CRATE_VER\"/" Cargo.toml
 
-          # Update Python PEP 723 headers
+          # Update the version declared to the loader at extension init. Guarded
+          # by tests::duckdb_version_pins_agree, which fails the build if this
+          # drifts from .duckdb-version.
+          sed -i "s|\(MINIMUM_DUCKDB_VERSION: &str = \)\"v[0-9.]*\"|\1\"$VER\"|" src/lib.rs
+
+          # Update Python PEP 723 headers. The `[0-9]` prefix is required: an
+          # unanchored `[0-9.]*` also matches the empty string, which mangles
+          # non-pin occurrences such as the f-string `duckdb=={pyver}` in
+          # scripts/fetch_amalgamation_offline.py into `duckdb==X.Y.Z{pyver}`.
           DDB_VER=$(echo $VER | sed 's/v//')
           find . -name '*.py' -not -path './extension-ci-tools/*' -not -path './.venv/*' -exec \
-            sed -i "s/duckdb==[0-9.]*/duckdb==$DDB_VER/" {} \;
+            sed -i "s/duckdb==[0-9][0-9.]*/duckdb==$DDB_VER/" {} \;
 
           # Update CI workflow files (uses:, duckdb_version, ci_tools_version, IMPORTANT comment)
           for WF in .github/workflows/BuildAll.yml .github/workflows/BuildQuick.yml; do
@@ -85,16 +93,24 @@ jobs:
             sed -i "s/currently v[0-9.]*/currently $VER/" "$WF"
           done
 
-          # Update extension-ci-tools submodule to matching branch
-          cd extension-ci-tools
-          git fetch origin
-          if git rev-parse --verify "origin/$VER" >/dev/null 2>&1; then
-            git checkout "origin/$VER"
-            echo "extension-ci-tools submodule updated to $VER"
-          else
-            echo "WARNING: extension-ci-tools branch $VER not found, keeping current"
-          fi
-          cd ..
+          # Update extension-ci-tools submodule to matching branch.
+          #
+          # The refspec must be explicit. actions/checkout clones submodules with
+          # `submodule update --depth=1`, and --depth implies --single-branch, so
+          # the clone's remote.origin.fetch is narrowed to
+          # `+refs/heads/main:refs/remotes/origin/main`. A bare `git fetch origin`
+          # therefore only ever updates origin/main and can never create
+          # origin/$VER — the previous `rev-parse --verify origin/$VER` failed on
+          # every run since v1.5.0 and the `else` branch swallowed it, so the
+          # submodule silently stayed on the v1.5.0 tip across three bumps.
+          #
+          # No `|| echo WARNING` here: if extension-ci-tools has no branch for
+          # this DuckDB version then BuildAll/BuildQuick's
+          # `_extension_distribution.yml@$VER` does not resolve either, so the
+          # bump cannot work and the run must go red rather than open a PR.
+          git -C extension-ci-tools fetch --depth=1 origin "+refs/heads/$VER:refs/remotes/origin/$VER"
+          git -C extension-ci-tools checkout --detach "refs/remotes/origin/$VER"
+          echo "extension-ci-tools submodule -> $VER ($(git -C extension-ci-tools rev-parse --short HEAD))"
 
           # Download new amalgamation
           just update-headers
@@ -111,7 +127,13 @@ jobs:
       - name: Build and test against new DuckDB version
         if: steps.latest.outputs.is_new == 'true'
         id: build
-        run: make configure && make release && make test_release
+        run: |
+          # Pin-consistency first: `make test_release` runs sqllogictest, which
+          # never reads the Rust-side pins, so a location the step above missed
+          # would sail through and open a "build passed" PR that CI then rejects.
+          # These are pure-Rust unit tests — no C++ build needed.
+          SV_SKIP_CPP_BUILD=1 cargo test --lib --no-default-features --features extension
+          make configure && make release && make test_release
         continue-on-error: true
 
       - name: Run DuckLake integration test
@@ -250,9 +272,17 @@ jobs:
           sed -i "s/duckdb = { version = \"=[^\"]*\"/duckdb = { version = \"=$LTS_VER\"/" Cargo.toml
           sed -i "s/libduckdb-sys = \"=[^\"]*\"/libduckdb-sys = \"=$LTS_VER\"/" Cargo.toml
 
-          # Update Python PEP 723 headers
+          # Update the version declared to the loader at extension init. Guarded
+          # by tests::duckdb_version_pins_agree, which fails the build if this
+          # drifts from .duckdb-version.
+          sed -i "s|\(MINIMUM_DUCKDB_VERSION: &str = \)\"v[0-9.]*\"|\1\"v$LTS_VER\"|" src/lib.rs
+
+          # Update Python PEP 723 headers. The `[0-9]` prefix is required: an
+          # unanchored `[0-9.]*` also matches the empty string, which mangles
+          # non-pin occurrences such as the f-string `duckdb=={pyver}` in
+          # scripts/fetch_amalgamation_offline.py into `duckdb==X.Y.Z{pyver}`.
           find . -name '*.py' -not -path './extension-ci-tools/*' -not -path './.venv/*' -exec \
-            sed -i "s/duckdb==[0-9.]*/duckdb==$LTS_VER/" {} \;
+            sed -i "s/duckdb==[0-9][0-9.]*/duckdb==$LTS_VER/" {} \;
 
           # Update CI workflow files (uses:, duckdb_version, ci_tools_version, IMPORTANT comment)
           LTS_TAG="v$LTS_VER"
@@ -263,16 +293,13 @@ jobs:
             sed -i "s/currently v[0-9.]*/currently $LTS_TAG/" "$WF"
           done
 
-          # Update extension-ci-tools submodule to matching branch
-          cd extension-ci-tools
-          git fetch origin
-          if git rev-parse --verify "origin/$LTS_TAG" >/dev/null 2>&1; then
-            git checkout "origin/$LTS_TAG"
-            echo "extension-ci-tools submodule updated to $LTS_TAG"
-          else
-            echo "WARNING: extension-ci-tools branch $LTS_TAG not found, keeping current"
-          fi
-          cd ..
+          # Update extension-ci-tools submodule to matching branch. The refspec
+          # must be explicit and the failure must be fatal — see the equivalent
+          # block in the check-latest job for why a bare `git fetch origin`
+          # silently no-ops under actions/checkout's --depth=1 submodule clone.
+          git -C extension-ci-tools fetch --depth=1 origin "+refs/heads/$LTS_TAG:refs/remotes/origin/$LTS_TAG"
+          git -C extension-ci-tools checkout --detach "refs/remotes/origin/$LTS_TAG"
+          echo "extension-ci-tools submodule -> $LTS_TAG ($(git -C extension-ci-tools rev-parse --short HEAD))"
 
           # Download new amalgamation
           just update-headers
@@ -286,7 +313,13 @@ jobs:
       - name: Build and test against new LTS version
         if: steps.lts.outputs.is_new == 'true'
         id: build
-        run: make configure && make release && make test_release
+        run: |
+          # Pin-consistency first: `make test_release` runs sqllogictest, which
+          # never reads the Rust-side pins, so a location the step above missed
+          # would sail through and open a "build passed" PR that CI then rejects.
+          # These are pure-Rust unit tests — no C++ build needed.
+          SV_SKIP_CPP_BUILD=1 cargo test --lib --no-default-features --features extension
+          make configure && make release && make test_release
         continue-on-error: true
 
       - name: Run DuckLake integration test
