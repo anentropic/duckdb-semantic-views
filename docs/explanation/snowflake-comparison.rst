@@ -291,8 +291,14 @@ Single-grain queries are unchanged: they are still a single base-anchored
 Two boundaries are worth knowing:
 
 - A **dimension below a metric's grain** (``SUM(customers.balance)`` grouped by
-  an order-grain dimension) is rejected in both systems: dimensions must be
-  reachable from the metric's table through many-to-one relationships.
+  an order-grain dimension) is rejected in both systems. Snowflake's rule is
+  that `the logical table for the dimension must be related to the logical
+  table for the metric
+  <https://docs.snowflake.com/en/user-guide/views-semantic/querying>`_ and must
+  have "an equal or lower level of granularity than the logical table for the
+  metric"; our ``fan trap detected`` error enforces the same condition. Per-grain
+  aggregation does not make these answerable — the metric's rows genuinely fan
+  across the dimension's values, so there is no single correct value per group.
 - Multi-grain queries involving **window metrics**, **active semi-additive
   metrics**, or **role-playing (**``USING``**) resolution** are not yet computed
   per-grain here and keep raising the fan-trap error. Snowflake computes them.
@@ -400,13 +406,15 @@ The following Snowflake ``CREATE SEMANTIC VIEW`` features are not yet implemente
      - Status
    * - Direct SQL query interface
      - Not planned; :ref:`semantic_view() <ref-semantic-view-function>` table function is the query interface
-   * - Pre-aggregation ``WHERE`` (a predicate filtering dimensions / facts *before* metrics are computed)
+   * - Pre-aggregation ``WHERE`` -- ``SEMANTIC_VIEW( v METRICS ... DIMENSIONS ... WHERE <predicate> )``, where the predicate `may refer only to dimensions, facts, and expressions over them <https://docs.snowflake.com/en/sql-reference/constructs/semantic_view>`_ and "is applied before the metrics are computed"
      - Not yet supported. The only filter today is the outer SQL ``WHERE`` on the ``semantic_view()`` result, which applies *after* aggregation -- equivalent only when filtering on a queried dimension. A filter on a member that is not in the output (e.g. "revenue for orders shipped after X") cannot yet be expressed.
+   * - Named filters -- ``LABELS = (FILTER)`` on a fact or dimension resolving to ``BOOLEAN``, referenced bare in a query's ``WHERE`` (`Snowflake GA May 2026 <https://docs.snowflake.com/en/user-guide/views-semantic/filters>`_)
+     - Not yet supported. Depends on the pre-aggregation ``WHERE`` above -- a named filter is a boolean dimension or fact usable in that predicate.
    * - Column-level security
      - Out of scope; DuckDB handles access control
    * - ``ASOF`` / temporal relationships
      - Not planned; standard equi-joins cover most use cases
-   * - ``CREATE OR ALTER``, tags / ``LABELS``, ``MAX_STALENESS``, and the ``AI_*`` / ``COPILOT`` clauses
+   * - ``CREATE OR ALTER``, tags / other ``LABELS`` values, ``MAX_STALENESS``, and the ``AI_*`` / ``COPILOT`` clauses
      - Not planned; these are Snowflake-catalog or Cortex-specific and have no DuckDB equivalent
 
 

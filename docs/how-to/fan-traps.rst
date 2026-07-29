@@ -223,9 +223,12 @@ Other Shapes the Fence Rejects
    longer-range forms: ``SUM(customers.balance)`` grouped by an order-grain or
    line-item-grain dimension. Per-grain aggregation does not make these
    answerable — each customer genuinely fans across their orders' statuses, so
-   there is no single correct value per group. Snowflake requires dimensions to
-   be reachable from the metric's table through many-to-one relationships for
-   the same reason. Fix: use the fixes listed above.
+   there is no single correct value per group. Snowflake rejects the same shape:
+   its rule is that `the logical table for the dimension must be related to the
+   logical table for the metric
+   <https://docs.snowflake.com/en/user-guide/views-semantic/querying>`_ and must
+   have "an equal or lower level of granularity than the logical table for the
+   metric". Fix: use the fixes listed above.
 
 **A dimension on a sibling table.**
    .. versionchanged:: 0.12.0

@@ -1,7 +1,25 @@
 # Plan: Closing the Remaining Snowflake Parity Gaps
 
-**Drafted:** 2026-07-28, after v0.12.0 (per-grain metric aggregation) closed
+**Drafted:** 2026-07-28, after per-grain metric aggregation (#167) closed
 TECH-DEBT #35.
+**Revised:** 2026-07-28 — every item below ships **into v0.12.0**, which is
+bumped in `Cargo.toml` but **not yet tagged**, as its own pull request. There is
+no v0.12.1 / v0.13.0 / v0.14.0 staging: the milestone tag goes on once the
+sequence below is done, and each PR adds its bullets to the existing
+`## [0.12.0]` CHANGELOG section rather than opening a new one.
+
+### Working agreement
+
+- **One PR per item.** Each lands independently, green, on `main`.
+- **Sequential, on the designated branch.** Follow-up work reuses
+  `claude/snowflake-query-parity-ai9mbz`, restarted from `main` after each
+  merge — so one PR is open at a time, in the order below.
+- **The CHANGELOG accumulates.** `## [0.12.0] - 2026-07-28` stays open; its date
+  is corrected at tag time.
+- **Ordering is a dependency chain, not a preference.** PR 4 (`WHERE`) must
+  precede PR 6 (multi-grain completeness): a predicate has to be injected into
+  whatever CTEs that work produces, and the reverse order means touching the
+  same emitters twice.
 
 This plan covers what still diverges from Snowflake semantic views in **query
 semantics**, plus the interface differences that are currently "not planned" and
@@ -19,11 +37,25 @@ decisions were reasoned from the model rather than verified:
 | Can a predicate filter before aggregation? | Yes: `SEMANTIC_VIEW( v METRICS … DIMENSIONS … WHERE <predicate> )`. "In the condition, you can only refer to dimensions, facts, and expressions that use dimensions and facts." "This filter condition is applied before the metrics are computed." ([construct ref](https://docs.snowflake.com/en/sql-reference/constructs/semantic_view)) | ❌ **Gap 1.** We have no pre-aggregation filter at all. |
 | Named reusable filters? | `LABELS = (FILTER)` on a fact/dimension resolving to BOOLEAN, referenced bare in `WHERE` (GA May 2026) ([filters](https://docs.snowflake.com/en/user-guide/views-semantic/filters)) | ❌ **Gap 2.** Not modelled. |
 | Facts + dimensions together? | "All facts and dimensions used in the query (**including those specified in the WHERE clause**) must be defined in the same logical table." | ⚠️ Implemented as `FactPathViolation`, but over-strict under fan-in — TECH-DEBT #37. |
-| How are metrics at different grains combined? | **Not stated in the docs.** The construct reference documents the dimension-grain rule and the FACTS/METRICS exclusion, but not the join semantics between grains. | ⚠️ **Unverified.** We chose NULL-safe `FULL OUTER JOIN`; see Gap 5. |
+| How are metrics at different grains combined? | **Not stated in the docs.** The construct reference documents the dimension-grain rule and the FACTS/METRICS exclusion, but not the join semantics between grains. | ⚠️ **Unverified.** We chose NULL-safe `FULL OUTER JOIN`; see PR 3. |
 
-## The gaps, in execution order
+## The gaps, as a PR sequence
 
-### 0. Docs accuracy pass (~30 min)
+| PR | Item | Size | Blocked on |
+|---|---|---|---|
+| 1 | Docs accuracy pass (§0) | ~30 min | — |
+| 2 | TECH-DEBT #37 — fact-path fan-in fix (§1) | ~½ day | — |
+| 3 | Multi-grain join-semantics verification (§2) | ~½ day | **a Snowflake account — maintainer-run** |
+| 4 | Pre-aggregation `WHERE` (§3) | 2 phases, may split into 2 PRs | — |
+| 5 | `LABELS = (FILTER)` named filters (§4) | ~1 phase | PR 4 |
+| 6 | Multi-grain completeness, TECH-DEBT #36 (§5) | 3 sub-items, one PR each | PR 4 |
+| 7 | Query-syntax interface spike (§6) | spike first | decision after 4-6 |
+
+PR 3 is the only one that cannot be done in this environment; it does not block
+4-6, and if it turns up a divergence the correction is contained to
+`per_grain::render_multi_grain`.
+
+### 1. Docs accuracy pass (~30 min) — PR 1
 
 v0.12.0 shipped two doc statements phrased as our own reasoning. Both are now
 confirmed rules. Cite them.
@@ -37,10 +69,11 @@ No code. Do this first so the published docs stop hedging on a settled question.
 
 ---
 
-### 1. TECH-DEBT #37 — fact-path false rejection under fan-in (patch, ~half a day)
+### 2. TECH-DEBT #37 — fact-path false rejection under fan-in (~half a day) — PR 2
 
-**Why first:** smallest, purely a bug, and it is a *parity* bug — Snowflake's
-same-logical-table rule for facts does not reject the shapes we reject.
+**Why this early:** smallest code change in the sequence, purely a bug, and it
+is a *parity* bug — Snowflake's same-logical-table rule for facts does not
+reject the shapes we reject.
 
 `JoinTree::from_graph` takes each node's parent as `graph.reverse[node].first()`
 — the first table that *references* it. Under fan-in (two children of one
@@ -64,7 +97,7 @@ over-widening is the third test above.
 
 ---
 
-### 2. Verification spike — multi-grain join semantics (~half a day, no code)
+### 3. Verification spike — multi-grain join semantics (~half a day, no code) — PR 3
 
 The one place v0.12.0 may diverge silently. We combine per-grain results with a
 NULL-safe `FULL OUTER JOIN`, so a dimension group present at one grain and
@@ -79,8 +112,8 @@ sibling-child metrics by a parent dimension; a derived metric spanning grains.
 Record the transcript in `_notes/`.
 
 **Outcomes:** matches → delete the caveat from the docs and add the fixture as a
-golden test. Differs → a v0.12.1 correction; the join shape is one function
-(`per_grain::render_multi_grain`), so the change is contained.
+golden test. Differs → a correction PR before the tag; the join shape is one
+function (`per_grain::render_multi_grain`), so the change is contained.
 
 Same trip should settle two smaller unknowns, both currently listed as
 behavioural differences on the comparison page without evidence: whether
@@ -91,7 +124,7 @@ should say "matches Snowflake" instead of "difference".
 
 ---
 
-### 3. Gap 1 — Pre-aggregation `WHERE` (a milestone: v0.13.0)
+### 4. Gap 1 — Pre-aggregation `WHERE` — PR 4
 
 The largest remaining semantic gap, and the one with a now-exact contract. A
 filter on a member that is not in the output ("revenue for orders shipped after
@@ -143,11 +176,12 @@ is a SQL keyword in that position and may need quoting (`"where" := '…'`);
    plus differential tests comparing filtered results against hand-written SQL.
 
 **Size:** ~2 phases. Step 4 is where the real design work is; steps 1-2 are
-mechanical.
+mechanical. Split into two PRs (plumbing + base-anchored path, then the CTE
+paths) if the first grows past a reviewable diff.
 
 ---
 
-### 4. Gap 2 — `LABELS = (FILTER)` named filters (v0.13.0, second phase)
+### 5. Gap 2 — `LABELS = (FILTER)` named filters — PR 5
 
 Depends on Gap 1 — a named filter is a boolean dimension/fact usable bare in the
 predicate. Once the predicate machinery exists this is mostly DDL surface:
@@ -162,7 +196,7 @@ predicate. Once the predicate machinery exists this is mostly DDL surface:
 
 ---
 
-### 5. TECH-DEBT #36 — multi-grain completeness (v0.14.0)
+### 6. TECH-DEBT #36 — multi-grain completeness — PR 6 (three sub-PRs)
 
 The residual v0.12.0 recorded: multi-grain queries whose metrics include a
 window metric, an *active* semi-additive metric, or role-playing (`USING`)
@@ -187,7 +221,7 @@ emitters twice.
 
 ---
 
-### 6. Interface parity — an explicit decision, not a default (optional)
+### 7. Interface parity — an explicit decision, not a default — PR 7 (optional)
 
 Two long-standing "not planned" entries deserve re-examination now that the
 semantics are close:
@@ -209,18 +243,11 @@ semantics are close:
 **`ASOF` / temporal relationships** stays out of scope unless a concrete use case
 turns up; the docs' "standard equi-joins cover most use cases" is still true.
 
-## Suggested sequencing
+## Done when
 
-| Order | Item | Ship as |
-|---|---|---|
-| 1 | Docs accuracy pass (§0) | folded into the next commit |
-| 2 | TECH-DEBT #37 fact-path fix (§1) | v0.12.1 patch |
-| 3 | Verification spike (§2) | `_notes/` + whatever it forces |
-| 4 | Pre-aggregation `WHERE` (§3) | v0.13.0 phase 1 |
-| 5 | `LABELS = (FILTER)` (§4) | v0.13.0 phase 2 |
-| 6 | Multi-grain completeness (§5) | v0.14.0 |
-| 7 | Interface parity spike (§6) | decide after 4-6 |
-
-After §5 the only *semantic* divergences left would be `ASOF` relationships and
-anything the §2 spike turns up. Everything else is interface shape, which is a
-deliberate choice rather than a gap.
+After PR 6 the only *semantic* divergences left are `ASOF` relationships and
+anything PR 3 turns up. Everything else is interface shape — a deliberate
+choice rather than a gap. That is the point to tag v0.12.0: update the
+`## [0.12.0]` date, run the milestone checklist in `CLAUDE.md` (example file,
+version bump already done, `just clean-stale` after the tag), and decide PR 7
+separately.
