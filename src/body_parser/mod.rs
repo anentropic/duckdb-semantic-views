@@ -46,6 +46,8 @@ pub(super) struct ParsedQualifiedEntry {
     pub(super) expr: String,
     pub(super) comment: Option<String>,
     pub(super) synonyms: Vec<String>,
+    /// `LABELS = (FILTER)` — the member is a named filter.
+    pub(super) is_filter: bool,
     pub(super) access: AccessModifier,
 }
 
@@ -169,6 +171,7 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
             output_type: None,
             comment: e.comment,
             synonyms: e.synonyms,
+            is_filter: e.is_filter,
             access: e.access,
         })
         .collect();
@@ -184,6 +187,7 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
             output_type: None,
             comment: e.comment,
             synonyms: e.synonyms,
+            is_filter: e.is_filter,
         })
         .collect();
 

@@ -148,6 +148,7 @@ fn build_def() -> SemanticViewDefinition {
         output_type: None,
         comment: None,
         synonyms: vec![],
+        is_filter: false,
     };
     let dimensions = vec![
         dim("td", "t.d", "t"),

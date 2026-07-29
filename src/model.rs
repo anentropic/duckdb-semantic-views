@@ -73,6 +73,23 @@ pub struct Dimension {
     /// Old stored JSON without this field deserializes to empty Vec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub synonyms: Vec<String>,
+    /// Marks this member as a **named filter** — Snowflake's `LABELS = (FILTER)`.
+    ///
+    /// A filter is an ordinary boolean-valued member that is intended to be
+    /// referenced bare in a query's pre-aggregation predicate
+    /// (`where_clause := 'is_domestic'`) rather than selected as output. The
+    /// flag is metadata: resolution already substitutes any dimension/fact name
+    /// appearing in the predicate, so this records *intent* and drives
+    /// introspection (`DESCRIBE`, `SHOW`, `GET_DDL`).
+    ///
+    /// The BOOLEAN requirement is not checked here. We cannot evaluate the
+    /// expression's type without a binder, so a non-boolean filter surfaces as
+    /// `DuckDB`'s own type error at query time rather than a guess at define
+    /// time.
+    ///
+    /// Old stored JSON without this field deserializes to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_filter: bool,
 }
 
 /// Sort order for NON ADDITIVE BY dimension ordering.
@@ -271,6 +288,23 @@ pub struct Fact {
     /// Old stored JSON without this field deserializes to empty Vec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub synonyms: Vec<String>,
+    /// Marks this member as a **named filter** — Snowflake's `LABELS = (FILTER)`.
+    ///
+    /// A filter is an ordinary boolean-valued member that is intended to be
+    /// referenced bare in a query's pre-aggregation predicate
+    /// (`where_clause := 'is_domestic'`) rather than selected as output. The
+    /// flag is metadata: resolution already substitutes any dimension/fact name
+    /// appearing in the predicate, so this records *intent* and drives
+    /// introspection (`DESCRIBE`, `SHOW`, `GET_DDL`).
+    ///
+    /// The BOOLEAN requirement is not checked here. We cannot evaluate the
+    /// expression's type without a binder, so a non-boolean filter surfaces as
+    /// `DuckDB`'s own type error at query time rather than a guess at define
+    /// time.
+    ///
+    /// Old stored JSON without this field deserializes to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_filter: bool,
     /// Access modifier: PUBLIC (default, queryable) or PRIVATE (hidden from queries,
     /// usable only in derived metric expressions).
     /// Old stored JSON without this field deserializes as Public.
@@ -899,6 +933,7 @@ mod tests {
                 output_type: Some("BIGINT".to_string()),
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             };
             let json = serde_json::to_string(&dim).unwrap();
             let rt: Dimension = serde_json::from_str(&json).unwrap();
@@ -1119,6 +1154,7 @@ mod tests {
                 output_type: Some("DECIMAL(10,2)".to_string()),
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
                 access: AccessModifier::Public,
             };
             let json = serde_json::to_string(&fact).unwrap();
@@ -1286,6 +1322,7 @@ mod tests {
                 output_type: None,
                 comment: Some("Geographic region".to_string()),
                 synonyms: vec!["area".to_string(), "territory".to_string()],
+                is_filter: false,
             };
             let json = serde_json::to_string(&dim).unwrap();
             assert!(
@@ -1334,6 +1371,7 @@ mod tests {
                 output_type: None,
                 comment: Some("Price per unit".to_string()),
                 synonyms: vec!["price_per_item".to_string()],
+                is_filter: false,
                 access: AccessModifier::Private,
             };
             let json = serde_json::to_string(&fact).unwrap();

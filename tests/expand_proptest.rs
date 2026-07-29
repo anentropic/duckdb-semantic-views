@@ -28,6 +28,7 @@ fn simple_definition() -> SemanticViewDefinition {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             },
             Dimension {
                 name: "month".to_string(),
@@ -37,6 +38,7 @@ fn simple_definition() -> SemanticViewDefinition {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             },
             Dimension {
                 name: "status".to_string(),
@@ -46,6 +48,7 @@ fn simple_definition() -> SemanticViewDefinition {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             },
         ],
         metrics: vec![
@@ -137,6 +140,7 @@ fn joined_definition() -> SemanticViewDefinition {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             },
             Dimension {
                 name: "customer_name".to_string(),
@@ -146,6 +150,7 @@ fn joined_definition() -> SemanticViewDefinition {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             },
             Dimension {
                 name: "month".to_string(),
@@ -155,6 +160,7 @@ fn joined_definition() -> SemanticViewDefinition {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             },
             Dimension {
                 name: "product_category".to_string(),
@@ -164,6 +170,7 @@ fn joined_definition() -> SemanticViewDefinition {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             },
         ],
         metrics: vec![

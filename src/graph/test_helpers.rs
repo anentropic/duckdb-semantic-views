@@ -41,6 +41,7 @@ pub(super) fn make_def(
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             })
             .collect(),
         metrics: metrics
@@ -94,6 +95,7 @@ pub(super) fn make_def_with_facts(
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
                 access: AccessModifier::Public,
             })
             .collect(),
