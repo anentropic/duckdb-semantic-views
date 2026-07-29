@@ -15,6 +15,7 @@ fn output_type_on_metric_emits_cast() {
         .with_metric("revenue", "sum(amount)", None);
     def.metrics[0].output_type = Some("BIGINT".to_string());
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("revenue")],
@@ -36,6 +37,7 @@ fn output_type_on_dimension_emits_cast() {
         ..Default::default()
     });
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region_id")],
         metrics: vec![],
@@ -53,6 +55,7 @@ fn no_output_type_no_cast() {
         .with_table("orders", "orders", &[])
         .with_metric("revenue", "sum(amount)", None);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("revenue")],

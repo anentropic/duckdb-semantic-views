@@ -313,6 +313,12 @@ fn arb_query_request(def: &SemanticViewDefinition) -> impl Strategy<Value = Quer
             dimensions: dims.into_iter().map(DimensionName::new).collect(),
             metrics: mets.into_iter().map(MetricName::new).collect(),
             facts: vec![],
+            // No predicate: this generator covers the unfiltered shapes, and the
+            // invariants asserted below are about dimension/metric expansion.
+            // Property coverage for `where_clause` still needs its own generator
+            // (predicates are arbitrary user text spliced into generated SQL, so
+            // they want a fuzz/proptest of their own) — not yet written.
+            where_clause: None,
         })
 }
 
@@ -517,6 +523,7 @@ proptest! {
     ) {
         let def = simple_definition();
         let req = QueryRequest {
+            where_clause: None,
             dimensions: vec![],
             metrics: metrics.iter().map(MetricName::new).collect(),
             facts: vec![],

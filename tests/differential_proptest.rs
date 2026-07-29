@@ -232,6 +232,7 @@ proptest! {
         let def = build_def(&case.schema);
 
         let req = QueryRequest {
+            where_clause: None,
             dimensions: case
                 .sel_dims
                 .iter()

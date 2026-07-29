@@ -12,6 +12,7 @@ fn test_qualified_dimension_wrong_table_errors() {
     // SG-14: no fallback to "any dimension with that bare name".
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("x.region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -32,6 +33,7 @@ fn test_qualified_metric_wrong_table_errors() {
             .clear_metrics()
             .with_metric("total_revenue", "sum(amount)", Some("orders"));
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("x.total_revenue")],
@@ -51,6 +53,7 @@ fn test_base_alias_qualification_matches_unqualified_declaration() {
     // item; qualifying the request with the base alias must resolve.
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("orders.region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -65,6 +68,7 @@ fn test_bare_and_qualified_same_dimension_rejected_as_duplicate() {
     // `region` and `orders.region` cannot emit the column twice.
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![
             DimensionName::new("region"),
@@ -88,6 +92,7 @@ fn test_bare_and_qualified_same_metric_rejected_as_duplicate() {
             .clear_metrics()
             .with_metric("total_revenue", "sum(amount)", Some("orders"));
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![

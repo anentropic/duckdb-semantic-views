@@ -286,6 +286,7 @@ extern "C" {
         const uint8_t *dims_ptr, size_t dims_len,
         const uint8_t *metrics_ptr, size_t metrics_len,
         const uint8_t *facts_ptr, size_t facts_len,
+        const uint8_t *where_ptr, size_t where_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
 
@@ -314,6 +315,7 @@ extern "C" {
         const uint8_t *dims_ptr, size_t dims_len,
         const uint8_t *metrics_ptr, size_t metrics_len,
         const uint8_t *facts_ptr, size_t facts_len,
+        const uint8_t *where_ptr, size_t where_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
 }
@@ -573,6 +575,11 @@ static std::vector<std::pair<std::string, LogicalType>> sv_semantic_named_params
         {"dimensions", list_varchar},
         {"metrics", list_varchar},
         {"facts", list_varchar},
+        // The pre-aggregation predicate — Snowflake's `SEMANTIC_VIEW( … WHERE
+        // <predicate> )`. Named `where_clause` rather than `where` because
+        // DuckDB's parser reserves that keyword in named-parameter position:
+        // `where := '…'` is a syntax error before the binder ever sees it.
+        {"where_clause", LogicalType::VARCHAR},
     };
 }
 
@@ -2195,6 +2202,15 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
         facts_buf = sv_serialise_string_list(it_f->second, "facts");
     }
 
+    // Scalar VARCHAR, not a list — passed to Rust as a plain UTF-8 ptr/len.
+    // Absent or NULL yields (nullptr, 0), which the Rust side reads as "no
+    // predicate".
+    std::string where_clause;
+    auto it_w = input.named_parameters.find("where_clause");
+    if (it_w != input.named_parameters.end() && !it_w->second.IsNull()) {
+        where_clause = it_w->second.GetValue<std::string>();
+    }
+
     Connection probe(*context.db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
 
@@ -2208,6 +2224,8 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
         dims_buf.empty()    ? nullptr : dims_buf.data(),    dims_buf.size(),
         metrics_buf.empty() ? nullptr : metrics_buf.data(), metrics_buf.size(),
         facts_buf.empty()   ? nullptr : facts_buf.data(),   facts_buf.size(),
+        where_clause.empty() ? nullptr : reinterpret_cast<const uint8_t *>(where_clause.data()),
+        where_clause.size(),
         &payload.ptr, &payload.len,
         error_buf, sizeof(error_buf));
 
@@ -2482,6 +2500,15 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
         facts_buf = sv_serialise_string_list(it_f->second, "facts");
     }
 
+    // Scalar VARCHAR, not a list — passed to Rust as a plain UTF-8 ptr/len.
+    // Absent or NULL yields (nullptr, 0), which the Rust side reads as "no
+    // predicate".
+    std::string where_clause;
+    auto it_w = input.named_parameters.find("where_clause");
+    if (it_w != input.named_parameters.end() && !it_w->second.IsNull()) {
+        where_clause = it_w->second.GetValue<std::string>();
+    }
+
     Connection probe(*context.db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
 
@@ -2494,6 +2521,8 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
         dims_buf.empty()    ? nullptr : dims_buf.data(),    dims_buf.size(),
         metrics_buf.empty() ? nullptr : metrics_buf.data(), metrics_buf.size(),
         facts_buf.empty()   ? nullptr : facts_buf.data(),   facts_buf.size(),
+        where_clause.empty() ? nullptr : reinterpret_cast<const uint8_t *>(where_clause.data()),
+        where_clause.size(),
         &payload.ptr, &payload.len,
         error_buf, sizeof(error_buf));
     if (rc != 0) {

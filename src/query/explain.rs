@@ -67,6 +67,8 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
     metrics_len: usize,
     facts_ptr: *const u8,
     facts_len: usize,
+    where_ptr: *const u8,
+    where_len: usize,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
     error_buf: *mut u8,
@@ -93,6 +95,8 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
                 metrics_len,
                 facts_ptr,
                 facts_len,
+                where_ptr,
+                where_len,
             )
         },
     )
@@ -121,6 +125,8 @@ unsafe fn explain_semantic_view_bind_body(
     metrics_len: usize,
     facts_ptr: *const u8,
     facts_len: usize,
+    where_ptr: *const u8,
+    where_len: usize,
 ) -> Result<Vec<u8>, String> {
     use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg, serialize_varchar_rows};
 
@@ -134,6 +140,21 @@ unsafe fn explain_semantic_view_bind_body(
         .map_err(|detail| format!("malformed `metrics` payload: {detail}"))?;
     let facts = parse_varchar_list(facts_ptr, facts_len)
         .map_err(|detail| format!("malformed `facts` payload: {detail}"))?;
+
+    // The `where_clause` named parameter is optional: the shim passes
+    // (nullptr, 0) when the caller omitted it. An explicitly empty string is
+    // also treated as absent — `where_clause := ''` would otherwise splice an
+    // empty predicate and produce `WHERE ` followed by nothing.
+    let where_clause = if where_ptr.is_null() || where_len == 0 {
+        None
+    } else {
+        let raw = read_str_arg(where_ptr, where_len, "where_clause")?;
+        if raw.trim().is_empty() {
+            None
+        } else {
+            Some(raw)
+        }
+    };
 
     if dimensions.is_empty() && metrics.is_empty() && facts.is_empty() {
         // Match the QueryError::EmptyRequest message rendered by the legacy
@@ -220,6 +241,7 @@ unsafe fn explain_semantic_view_bind_body(
     };
 
     let req = QueryRequest {
+        where_clause,
         dimensions: dimensions
             .iter()
             .map(|s| crate::expand::DimensionName::new(s.clone()))

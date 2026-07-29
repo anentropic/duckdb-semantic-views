@@ -223,6 +223,7 @@ fn expand_with_facts_inlines_into_metric() {
     )
     .with_fact("net_price", "price * (1 - discount)", "line_items");
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("total_net")],
@@ -240,6 +241,7 @@ fn expand_without_facts_unchanged() {
         .with_table("orders", "orders", &[])
         .with_metric("total", "SUM(amount)", None);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("total")],
@@ -259,6 +261,7 @@ fn expand_multi_level_facts() {
         .with_fact("net_price", "extended_price * (1 - discount)", "line_items")
         .with_fact("tax_amount", "net_price * tax_rate", "line_items");
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("total_tax")],

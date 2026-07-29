@@ -300,6 +300,7 @@ pub(super) fn expand_window_metrics(
     // Window functions are row-level ⇒ no GROUP BY in the outer query.
     sql.push_str(
         &SelectSpec {
+            where_clause: None,
             distinct: false,
             items: outer_items,
             from: FromSource::Named("__sv_agg".to_string()),
@@ -381,6 +382,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("store")],
             metrics: vec![MetricName::new("total_qty")],
@@ -429,6 +431,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![
                 DimensionName::new("store"),
@@ -489,6 +492,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("store"), DimensionName::new("date")],
             metrics: vec![MetricName::new("total_qty")],
@@ -536,6 +540,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![
                 DimensionName::new("store"),
@@ -583,6 +588,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("store"), DimensionName::new("date")],
             metrics: vec![MetricName::new("total_qty")],
@@ -618,6 +624,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("store"), DimensionName::new("date")],
             metrics: vec![MetricName::new("total_qty")],
@@ -671,6 +678,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![
                 DimensionName::new("store"),
@@ -718,6 +726,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("store"), DimensionName::new("date")],
             metrics: vec![MetricName::new("total_qty"), MetricName::new("avg_price")],
@@ -765,6 +774,7 @@ mod tests {
 
         // Query with only 'store' -- missing 'date' which is required by EXCLUDING and ORDER BY
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("store")],
             metrics: vec![MetricName::new("total_qty")],
@@ -823,6 +833,7 @@ mod tests {
             .with_pkfk_join("cust_acct", "a", "c", &["customer_id"], &["id"]);
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("acct_name"), DimensionName::new("date")],
             metrics: vec![MetricName::new("total_balance")],
@@ -861,6 +872,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("store"), DimensionName::new("date")],
             metrics: vec![MetricName::new("total_qty")],
@@ -903,6 +915,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("date")],
             metrics: vec![MetricName::new("total_qty")],
@@ -948,6 +961,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("store"), DimensionName::new("date")],
             metrics: vec![MetricName::new("total_qty")],
@@ -996,6 +1010,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![
                 DimensionName::new("store"),

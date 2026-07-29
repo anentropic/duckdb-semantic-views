@@ -43,6 +43,7 @@ LEFT JOIN \"customers\" AS \"c\" ON \"o\".\"customer_id\" = \"c\".\"id\"
 GROUP BY
     1";
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("customer_name")],
         metrics: vec![MetricName::new("total_qty")],
@@ -68,6 +69,7 @@ fn sg2_two_parent_child_picks_connecting_edge() {
         .with_pkfk_join("li_to_p", "li", "p", &["product_id"], &["id"])
         .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("qty")],
@@ -107,6 +109,7 @@ fn ld_li_o_def() -> SemanticViewDefinition {
 #[test]
 fn sg10_fk_side_chain_includes_intermediate_join() {
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("detail_qty")],
@@ -136,6 +139,7 @@ GROUP BY
 #[test]
 fn sg10_fact_source_chain_includes_intermediate_join() {
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("detail_amount")],
         dimensions: vec![],
         metrics: vec![],
@@ -163,6 +167,7 @@ fn sg12_bare_alias_containing_double_underscore_joins_normally() {
         .with_metric("cnt", "count(*)", Some("o"))
         .with_pkfk_join("o_to_dim", "o", "my__dim", &["dim_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("dim_name")],
         metrics: vec![MetricName::new("cnt")],
@@ -205,6 +210,7 @@ fn sg12_role_playing_scoped_alias_format_preserved() {
             &["airport_code"],
         );
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("city")],
         metrics: vec![MetricName::new("departure_count")],

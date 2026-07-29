@@ -25,6 +25,7 @@ fn test_child_count_star_rewritten_exact_sql() {
     // PK, not NULL-extended rows (one per childless order).
     let def = child_count_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("item_count")],
@@ -42,6 +43,7 @@ LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"orders\".\"id\"";
 fn test_child_count_star_rewritten_with_base_dimension() {
     let def = child_count_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("item_count")],
@@ -60,6 +62,7 @@ fn test_base_table_count_star_unchanged() {
     // is never NULL-extended by the synthesized LEFT JOINs.
     let def = child_count_def().with_metric("order_count", "COUNT(*)", Some("orders"));
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("order_count")],
@@ -78,6 +81,7 @@ fn test_unqualified_count_star_metric_unchanged() {
     // table (None) is a base-table/derived metric — no rewrite.
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("order_count")],
@@ -98,6 +102,7 @@ fn test_child_count_star_without_pk_errors() {
         .with_metric("item_count", "COUNT(*)", Some("li"))
         .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("item_count")],
@@ -134,6 +139,7 @@ fn test_unrelated_metric_still_works_when_sibling_count_star_lacks_pk() {
         .with_metric("revenue", "SUM(li.amount)", Some("li"))
         .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("revenue")],
@@ -152,6 +158,7 @@ fn test_derived_metric_reaching_no_pk_count_star_errors() {
         .with_metric("double_items", "item_count * 2", None)
         .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("double_items")],
@@ -172,6 +179,7 @@ fn test_derived_metric_reaching_no_pk_count_star_errors() {
 fn test_derived_metric_inherits_rewritten_count_star() {
     let def = child_count_def().with_metric("double_items", "item_count * 2", None);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("double_items")],
@@ -204,6 +212,7 @@ fn test_window_inner_aggregate_gets_rewrite() {
         )
         .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("product")],
         metrics: vec![MetricName::new("rolling_items")],
@@ -244,6 +253,7 @@ fn test_window_inner_aggregate_quoted_name_gets_rewrite() {
         )
         .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("product")],
         metrics: vec![MetricName::new("rolling_items")],
@@ -286,6 +296,7 @@ fn test_semi_additive_co_query_uses_rewritten_count() {
             )],
         );
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("customer_id")],
         metrics: vec![MetricName::new("balance"), MetricName::new("txn_count")],

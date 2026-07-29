@@ -316,6 +316,7 @@ proptest! {
     fn window_metric_matches_independent_oracle(case in arb_case()) {
         let def = build_def(case.func, &case.mode);
         let req = QueryRequest {
+            where_clause: None,
             dimensions: case.sel_dims.iter().map(|&i| DimensionName::new(dim_name(i))).collect(),
             // Always query the (single) window metric so the window path fires.
             metrics: vec![MetricName::new("w")],

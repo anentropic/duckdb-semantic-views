@@ -513,6 +513,69 @@ fn fanning_edge_on_path(path: &[String], card_map: &CardMap) -> Option<String> {
     None
 }
 
+/// The metric × `where_clause`-member fan-out check.
+///
+/// Snowflake counts `WHERE`-clause members in its same-logical-table rule
+/// explicitly — "all facts and dimensions used in the query, **including those
+/// specified in the WHERE clause**" — and the hazard is identical to the metric
+/// × dimension one [`check_fan_traps`] guards: to filter on a table you must
+/// join it, and if that join crosses a one-to-many edge in the fan-out
+/// direction, the metric aggregates over multiplied rows. A filter that
+/// silently inflates the number it filters is the worst version of this bug, so
+/// it is rejected rather than fenced.
+///
+/// Kept separate from [`check_fan_traps`] rather than folded into its signature
+/// so that function's existing call sites and tests are untouched; both walk the
+/// same adjacency + cardinality machinery.
+///
+/// Skipped on the per-grain path for the same reason [`check_fan_traps`] skips
+/// its base-anchored-only checks there — though today the per-grain strategy
+/// rejects a `where_clause` outright, so this is belt and braces.
+pub(super) fn check_where_clause_fan_traps(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    where_members: &[(String, Option<String>)],
+    resolved_mets: &[&Metric],
+) -> Result<(), ExpandError> {
+    if def.joins.is_empty() || where_members.is_empty() {
+        return Ok(());
+    }
+    let graph = build_relationship_graph(view_name, def)?;
+    let card_map = build_card_map(def);
+    let adjacency = build_adjacency(def);
+    let root = graph.root.clone();
+
+    for met in resolved_mets {
+        let mut met_tables = metric_grain_tables(met, def);
+        if met_tables.is_empty() {
+            met_tables.push(root.clone());
+        }
+        for (member_name, member_table) in where_members {
+            let Some(member_table) = member_table else {
+                continue; // Unqualified member: base-table grain, nothing to fan.
+            };
+            for met_table in &met_tables {
+                if met_table == member_table {
+                    continue;
+                }
+                let Some(path) = find_path(met_table, member_table, &adjacency) else {
+                    continue; // Not connected (legacy joins carrying no FK metadata).
+                };
+                if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
+                    return Err(ExpandError::WhereClauseFanTrap {
+                        view_name: view_name.to_string(),
+                        metric_name: met.name.clone(),
+                        member_name: member_name.clone(),
+                        member_table: member_table.clone(),
+                        relationship_name: rel_name,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate that all tables referenced by a fact query can be joined without
 /// multiplying rows.
 ///

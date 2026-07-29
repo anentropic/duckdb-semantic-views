@@ -68,6 +68,7 @@ fn def_with_join_columns() -> crate::model::SemanticViewDefinition {
 fn table_qualified_dimension_lookup_with_matching_source_table() {
     let def = def_with_join_columns();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("o.region")],
         metrics: vec![],
@@ -87,6 +88,7 @@ fn table_qualified_dimension_lookup_with_matching_source_table() {
 fn bare_dimension_name_still_resolves() {
     let def = def_with_join_columns();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![],
@@ -103,6 +105,7 @@ fn bare_dimension_name_still_resolves() {
 fn table_qualified_unknown_dimension_returns_error() {
     let def = def_with_join_columns();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("o.nosuch")],
         metrics: vec![],
@@ -120,6 +123,7 @@ fn table_qualified_unknown_dimension_returns_error() {
 fn table_qualified_metric_lookup_with_matching_source_table() {
     let def = def_with_join_columns();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("o.revenue")],
@@ -163,6 +167,7 @@ fn quoted_stored_names_emit_single_quoted_output_aliases() {
         ..Default::default()
     };
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("order date")],
         metrics: vec![MetricName::new("total sales")],
