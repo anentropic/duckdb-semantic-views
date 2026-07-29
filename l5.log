@@ -1,0 +1,418 @@
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+    Checking semantic_views v0.12.0 (/home/user/duckdb-semantic-views)
+error: expected type, found keyword `false`
+  --> src/ddl/show_entities.rs:47:16
+   |
+39 | struct EntityRow {
+   |        --------- while parsing this struct
+...
+47 |     is_filter: false,
+   |                ^^^^^ expected type
+
+error[E0062]: field `is_filter` specified more than once
+   --> src/body_parser/entries.rs:172:9
+    |
+171 |         is_filter: false,
+    |         ---------------- first use of `is_filter`
+172 |         is_filter: annotations.is_filter,
+    |         ^^^^^^^^^ used more than once
+
+error[E0560]: struct `ParsedMetric` has no field named `is_filter`
+   --> src/body_parser/metrics.rs:328:13
+    |
+328 |             is_filter: false,
+    |             ^^^^^^^^^ `ParsedMetric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `ParsedMetric` has no field named `is_filter`
+   --> src/body_parser/metrics.rs:381:13
+    |
+381 |             is_filter: false,
+    |             ^^^^^^^^^ `ParsedMetric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `TableRef` has no field named `is_filter`
+   --> src/body_parser/tables.rs:217:9
+    |
+217 |         is_filter: false,
+    |         ^^^^^^^^^ `TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0062]: field `is_filter` specified more than once
+   --> src/body_parser/mod.rs:175:13
+    |
+174 |             is_filter: false,
+    |             ---------------- first use of `is_filter`
+175 |             is_filter: e.is_filter,
+    |             ^^^^^^^^^ used more than once
+
+error[E0062]: field `is_filter` specified more than once
+   --> src/body_parser/mod.rs:192:13
+    |
+191 |             is_filter: false,
+    |             ---------------- first use of `is_filter`
+192 |             is_filter: e.is_filter,
+    |             ^^^^^^^^^ used more than once
+
+error[E0560]: struct `Metric` has no field named `is_filter`
+   --> src/body_parser/mod.rs:206:13
+    |
+206 |             is_filter: false,
+    |             ^^^^^^^^^ `Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+Some errors have detailed explanations: E0062, E0560.
+For more information about an error, try `rustc --explain E0062`.
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+error: could not compile `semantic_views` (lib) due to 8 previous errors
+warning: build failed, waiting for other jobs to finish...
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/body_parser/tables.rs:217:9
+    |
+217 |         is_filter: false,
+    |         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/body_parser/mod.rs:206:13
+    |
+206 |             is_filter: false,
+    |             ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/expand/facts.rs:624:13
+    |
+624 |             is_filter: false,
+    |             ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+  --> src/expand/test_helpers.rs:25:13
+   |
+25 |             is_filter: false,
+   |             ^^^^^^^^^ `model::TableRef` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+  --> src/expand/test_helpers.rs:56:17
+   |
+56 |                 is_filter: false,
+   |                 ^^^^^^^^^ `model::Metric` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+  --> src/expand/test_helpers.rs:69:17
+   |
+69 |                 is_filter: false,
+   |                 ^^^^^^^^^ `model::Metric` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/expand/test_helpers.rs:105:13
+    |
+105 |             is_filter: false,
+    |             ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/expand/test_helpers.rs:124:13
+    |
+124 |             is_filter: false,
+    |             ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/expand/test_helpers.rs:197:13
+    |
+197 |             is_filter: false,
+    |             ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/expand/test_helpers.rs:213:13
+    |
+213 |             is_filter: false,
+    |             ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:564:17
+    |
+564 |                 is_filter: false,
+    |                 ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:802:25
+    |
+802 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:811:25
+    |
+811 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:840:25
+    |
+840 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:849:25
+    |
+849 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:878:25
+    |
+878 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:887:25
+    |
+887 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:920:25
+    |
+920 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:929:25
+    |
+929 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:960:25
+    |
+960 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:969:25
+    |
+969 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/relationship.rs:999:25
+    |
+999 |                         is_filter: false,
+    |                         ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+    --> src/graph/relationship.rs:1008:25
+     |
+1008 |                         is_filter: false,
+     |                         ^^^^^^^^^ `model::TableRef` does not have this field
+     |
+     = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+  --> src/graph/test_helpers.rs:24:17
+   |
+24 |                 is_filter: false,
+   |                 ^^^^^^^^^ `model::TableRef` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+  --> src/graph/test_helpers.rs:58:17
+   |
+58 |                 is_filter: false,
+   |                 ^^^^^^^^^ `model::Metric` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+  --> src/graph/test_helpers.rs:89:17
+   |
+89 |                 is_filter: false,
+   |                 ^^^^^^^^^ `model::TableRef` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/graph/test_helpers.rs:132:13
+    |
+132 |             is_filter: false,
+    |             ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/graph/test_helpers.rs:147:13
+    |
+147 |             is_filter: false,
+    |             ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/test_helpers.rs:161:13
+    |
+161 |             is_filter: false,
+    |             ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/graph/test_helpers.rs:192:17
+    |
+192 |                 is_filter: false,
+    |                 ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/graph/test_helpers.rs:216:17
+    |
+216 |                 is_filter: false,
+    |                 ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/model.rs:880:17
+    |
+880 |                 is_filter: false,
+    |                 ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/model.rs:913:17
+    |
+913 |                 is_filter: false,
+    |                 ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/model.rs:955:17
+    |
+955 |                 is_filter: false,
+    |                 ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+    --> src/model.rs:1012:17
+     |
+1012 |                 is_filter: false,
+     |                 ^^^^^^^^^ `model::TableRef` does not have this field
+     |
+     = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+    --> src/model.rs:1069:17
+     |
+1069 |                 is_filter: false,
+     |                 ^^^^^^^^^ `model::TableRef` does not have this field
+     |
+     = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+    --> src/model.rs:1103:17
+     |
+1103 |                 is_filter: false,
+     |                 ^^^^^^^^^ `model::TableRef` does not have this field
+     |
+     = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+    --> src/model.rs:1278:17
+     |
+1278 |                 is_filter: false,
+     |                 ^^^^^^^^^ `model::Metric` does not have this field
+     |
+     = note: all struct fields are already assigned
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+    --> src/model.rs:1302:17
+     |
+1302 |                 is_filter: false,
+     |                 ^^^^^^^^^ `model::Metric` does not have this field
+     |
+     = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+    --> src/model.rs:1358:17
+     |
+1358 |                 is_filter: false,
+     |                 ^^^^^^^^^ `model::TableRef` does not have this field
+     |
+     = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+    --> src/parse/rewrite.rs:1730:17
+     |
+1730 |                 is_filter: false,
+     |                 ^^^^^^^^^ `model::TableRef` does not have this field
+     |
+     = note: all struct fields are already assigned
+
+error[E0560]: struct `model::TableRef` has no field named `is_filter`
+   --> src/render_yaml.rs:201:17
+    |
+201 |                 is_filter: false,
+    |                 ^^^^^^^^^ `model::TableRef` does not have this field
+    |
+    = note: available fields are: `unique_constraints`
+
+error[E0560]: struct `model::Metric` has no field named `is_filter`
+   --> src/render_yaml.rs:220:17
+    |
+220 |                 is_filter: false,
+    |                 ^^^^^^^^^ `model::Metric` does not have this field
+    |
+    = note: available fields are: `output_type`, `using_relationships`, `non_additive_by`, `window_spec`
+
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+error: could not compile `semantic_views` (lib test) due to 49 previous errors

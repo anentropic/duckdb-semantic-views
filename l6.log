@@ -1,0 +1,24 @@
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+    Checking semantic_views v0.12.0 (/home/user/duckdb-semantic-views)
+error[E0062]: field `is_filter` specified more than once
+   --> src/body_parser/mod.rs:175:13
+    |
+174 |             is_filter: false,
+    |             ---------------- first use of `is_filter`
+175 |             is_filter: e.is_filter,
+    |             ^^^^^^^^^ used more than once
+
+error[E0062]: field `is_filter` specified more than once
+   --> src/body_parser/mod.rs:192:13
+    |
+191 |             is_filter: false,
+    |             ---------------- first use of `is_filter`
+192 |             is_filter: e.is_filter,
+    |             ^^^^^^^^^ used more than once
+
+For more information about this error, try `rustc --explain E0062`.
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+error: could not compile `semantic_views` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+error: could not compile `semantic_views` (lib test) due to 2 previous errors

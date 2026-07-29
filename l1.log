@@ -1,0 +1,17 @@
+   Compiling semantic_views v0.12.0 (/home/user/duckdb-semantic-views)
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+error[E0063]: missing field `is_filter` in initializer of `Fact`
+   --> src/body_parser/mod.rs:165:18
+    |
+165 |         .map(|e| Fact {
+    |                  ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `Dimension`
+   --> src/body_parser/mod.rs:180:18
+    |
+180 |         .map(|e| Dimension {
+    |                  ^^^^^^^^^ missing `is_filter`
+
+For more information about this error, try `rustc --explain E0063`.
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+error: could not compile `semantic_views` (lib) due to 2 previous errors

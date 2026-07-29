@@ -765,6 +765,7 @@ mod tests {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         }];
         let topo = toposort_facts(&facts).unwrap();
@@ -785,6 +786,7 @@ mod tests {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         }];
         let topo = toposort_facts(&facts).unwrap();
@@ -814,6 +816,7 @@ mod tests {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
                 access: AccessModifier::Public,
             },
             Fact {
@@ -824,6 +827,7 @@ mod tests {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
                 access: AccessModifier::Public,
             },
         ];
@@ -861,6 +865,7 @@ mod tests {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         }];
         let topo = toposort_facts(&facts).unwrap();
@@ -897,6 +902,7 @@ mod tests {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         }];
         let topo = toposort_facts(&facts).unwrap();
@@ -1104,6 +1110,7 @@ mod tests {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         }
     }

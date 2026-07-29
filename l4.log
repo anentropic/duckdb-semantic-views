@@ -1,0 +1,207 @@
+   Compiling semantic_views v0.12.0 (/home/user/duckdb-semantic-views)
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/facts.rs:761:26
+    |
+761 |         let facts = vec![Fact {
+    |                          ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/facts.rs:781:26
+    |
+781 |         let facts = vec![Fact {
+    |                          ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/facts.rs:810:13
+    |
+810 |             Fact {
+    |             ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/facts.rs:819:13
+    |
+819 |             Fact {
+    |             ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/facts.rs:857:26
+    |
+857 |         let facts = vec![Fact {
+    |                          ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/facts.rs:893:26
+    |
+893 |         let facts = vec![Fact {
+    |                          ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+    --> src/expand/facts.rs:1100:9
+     |
+1100 |         Fact {
+     |         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Dimension`
+  --> src/expand/test_helpers.rs:27:13
+   |
+27 |             Dimension {
+   |             ^^^^^^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Dimension`
+  --> src/expand/test_helpers.rs:35:13
+   |
+35 |             Dimension {
+   |             ^^^^^^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Dimension`
+   --> src/expand/test_helpers.rs:101:26
+    |
+101 |         dimensions: vec![Dimension {
+    |                          ^^^^^^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Dimension`
+   --> src/expand/test_helpers.rs:168:30
+    |
+168 |         self.dimensions.push(Dimension {
+    |                              ^^^^^^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/test_helpers.rs:208:25
+    |
+208 |         self.facts.push(Fact {
+    |                         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/test_helpers.rs:221:25
+    |
+221 |         self.facts.push(Fact {
+    |                         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+  --> src/expand/tests_derived_metric.rs:98:22
+   |
+98 |     let facts = vec![Fact {
+   |                      ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/tests_derived_metric.rs:383:21
+    |
+383 |         facts: vec![Fact {
+    |                     ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+  --> src/expand/tests_fact_inlining.rs:21:9
+   |
+21 |         Fact {
+   |         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+  --> src/expand/tests_fact_inlining.rs:30:9
+   |
+30 |         Fact {
+   |         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+  --> src/expand/tests_fact_inlining.rs:49:9
+   |
+49 |         Fact {
+   |         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+  --> src/expand/tests_fact_inlining.rs:58:9
+   |
+58 |         Fact {
+   |         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+  --> src/expand/tests_fact_inlining.rs:78:9
+   |
+78 |         Fact {
+   |         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+  --> src/expand/tests_fact_inlining.rs:87:9
+   |
+87 |         Fact {
+   |         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+  --> src/expand/tests_fact_inlining.rs:96:9
+   |
+96 |         Fact {
+   |         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/tests_fact_inlining.rs:123:22
+    |
+123 |     let facts = vec![Fact {
+    |                      ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/tests_fact_inlining.rs:140:9
+    |
+140 |         Fact {
+    |         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/tests_fact_inlining.rs:149:9
+    |
+149 |         Fact {
+    |         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/tests_fact_inlining.rs:166:22
+    |
+166 |     let facts = vec![Fact {
+    |                      ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/tests_fact_inlining.rs:182:22
+    |
+182 |     let facts = vec![Fact {
+    |                      ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+   --> src/expand/tests_fact_inlining.rs:201:22
+    |
+201 |     let facts = vec![Fact {
+    |                      ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Dimension`
+  --> src/graph/test_helpers.rs:37:35
+   |
+37 |             .map(|(name, source)| Dimension {
+   |                                   ^^^^^^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+  --> src/graph/test_helpers.rs:90:41
+   |
+90 |             .map(|(name, expr, source)| Fact {
+   |                                         ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Dimension`
+   --> src/model.rs:929:23
+    |
+929 |             let dim = Dimension {
+    |                       ^^^^^^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+    --> src/model.rs:1149:24
+     |
+1149 |             let fact = Fact {
+     |                        ^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Dimension`
+    --> src/model.rs:1316:23
+     |
+1316 |             let dim = Dimension {
+     |                       ^^^^^^^^^ missing `is_filter`
+
+error[E0063]: missing field `is_filter` in initializer of `model::Fact`
+    --> src/model.rs:1364:24
+     |
+1364 |             let fact = Fact {
+     |                        ^^^^ missing `is_filter`
+
+For more information about this error, try `rustc --explain E0063`.
+error: could not compile `semantic_views` (lib test) due to 34 previous errors

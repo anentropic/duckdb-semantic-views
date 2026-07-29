@@ -31,6 +31,7 @@ pub(super) fn orders_view() -> SemanticViewDefinition {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             },
             Dimension {
                 name: "status".to_string(),
@@ -39,6 +40,7 @@ pub(super) fn orders_view() -> SemanticViewDefinition {
                 output_type: None,
                 comment: None,
                 synonyms: vec![],
+                is_filter: false,
             },
         ],
         metrics: vec![
@@ -105,6 +107,7 @@ pub(super) fn minimal_def(
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
         }],
         metrics: vec![Metric {
             name: metric_name.to_string(),
@@ -172,6 +175,7 @@ impl TestFixtureExt for SemanticViewDefinition {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
         });
         self
     }
@@ -212,6 +216,7 @@ impl TestFixtureExt for SemanticViewDefinition {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         });
         self
@@ -225,6 +230,7 @@ impl TestFixtureExt for SemanticViewDefinition {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Private,
         });
         self

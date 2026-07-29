@@ -11,6 +11,8 @@ use crate::model::AccessModifier;
 pub(super) struct ParsedAnnotations {
     pub(super) comment: Option<String>,
     pub(super) synonyms: Vec<String>,
+    /// `LABELS = (FILTER)` was present — the member is a named filter.
+    pub(super) is_filter: bool,
 }
 
 /// Extract a single-quoted string value, handling '' escape sequences.
@@ -61,6 +63,48 @@ fn parse_synonym_list(content: &str, base_offset: usize) -> Result<Vec<String>, 
     Ok(result)
 }
 
+/// Parse a `LABELS = (...)` list, returning whether it declares `FILTER`.
+///
+/// Only `FILTER` is supported. Snowflake's other label values (tags and the
+/// like) are out of scope, and an unrecognised label is REJECTED rather than
+/// ignored: silently dropping a label the user wrote would let a definition
+/// round-trip having quietly lost meaning. Labels are bare keywords, not
+/// quoted strings, so this does not reuse `parse_synonym_list`.
+fn parse_label_list(content: &str, base_offset: usize) -> Result<bool, ParseError> {
+    let entries = split_at_depth0_commas(content)?;
+    let mut is_filter = false;
+    for (_, entry) in entries {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let entry_offset = base_offset + crate::util::byte_offset_within(content, trimmed);
+        if trimmed.eq_ignore_ascii_case("FILTER") {
+            if is_filter {
+                return Err(ParseError {
+                    message: "Duplicate FILTER label.".to_string(),
+                    position: Some(entry_offset),
+                });
+            }
+            is_filter = true;
+        } else {
+            return Err(ParseError {
+                message: format!(
+                    "Unsupported label '{trimmed}'. Only FILTER is supported in LABELS = (...)."
+                ),
+                position: Some(entry_offset),
+            });
+        }
+    }
+    if !is_filter {
+        return Err(ParseError {
+            message: "LABELS = () is empty. Expected LABELS = (FILTER).".to_string(),
+            position: Some(base_offset),
+        });
+    }
+    Ok(is_filter)
+}
+
 /// Separate the SQL expression from trailing COMMENT / WITH SYNONYMS annotations.
 ///
 /// Input: the text after "AS" in an entry (e.g., "SUM(o.amount) COMMENT = 'test' WITH SYNONYMS = ('a')")
@@ -69,7 +113,8 @@ fn parse_synonym_list(content: &str, base_offset: usize) -> Result<Vec<String>, 
 /// Handles:
 /// - COMMENT = 'string with ''escaped'' quotes'
 /// - WITH SYNONYMS = ('syn1', 'syn2')
-/// - Either order (COMMENT then SYNONYMS or vice versa)
+/// - LABELS = (FILTER)
+/// - Any order (the clauses must tile the annotation region, but not in a fixed sequence)
 /// - No annotations at all (returns original expression with empty annotations)
 /// - COMMENT as an identifier inside expressions (only matches at depth-0 with word boundaries)
 ///
@@ -125,6 +170,14 @@ pub(super) fn parse_trailing_annotations(
                         annotation_start = Some(i);
                     }
                 }
+                // Check for LABELS keyword (LABELS = (FILTER))
+                if i + 6 <= bytes.len() && &upper_bytes[i..i + 6] == b"LABELS" {
+                    let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
+                    let after_ok = i + 6 == bytes.len() || !is_ident_continuation(bytes[i + 6]);
+                    if before_ok && after_ok && annotation_start.is_none() {
+                        annotation_start = Some(i);
+                    }
+                }
                 // Check for WITH keyword (for WITH SYNONYMS)
                 if i + 4 <= bytes.len() && &upper_bytes[i..i + 4] == b"WITH" {
                     let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
@@ -157,6 +210,8 @@ pub(super) fn parse_trailing_annotations(
     // trailing junk (`COMMENT = 'a' banana`) was accepted.
     let mut comment: Option<String> = None;
     let mut synonyms: Option<Vec<String>> = None;
+    let mut labels_seen = false;
+    let mut is_filter = false;
     let mut rest = annotation_text;
 
     loop {
@@ -231,10 +286,28 @@ pub(super) fn parse_trailing_annotations(
             })?;
             synonyms = Some(parse_synonym_list(content, pos_of(content))?);
             rest = &after_eq[consumed..];
+        } else if starts_with_keyword(&rest_upper, "LABELS") {
+            if labels_seen {
+                return Err(ParseError {
+                    message: "Duplicate LABELS annotation.".to_string(),
+                    position: Some(pos_of(rest)),
+                });
+            }
+            // `LABELS` is 6 ASCII bytes. The `=` is optional, matching the
+            // WITH SYNONYMS relaxation (F-12).
+            let after_kw = rest[6..].trim_start();
+            let after_eq = after_kw.strip_prefix('=').unwrap_or(after_kw).trim_start();
+            let (content, consumed) = extract_paren_prefix(after_eq).ok_or_else(|| ParseError {
+                message: "Expected parenthesized list after LABELS.".to_string(),
+                position: Some(pos_of(after_eq)),
+            })?;
+            is_filter = parse_label_list(content, pos_of(content))?;
+            labels_seen = true;
+            rest = &after_eq[consumed..];
         } else {
             return Err(ParseError {
                 message: format!(
-                    "Unexpected text in annotations: '{rest}'. Expected COMMENT = '...' or WITH SYNONYMS = (...)."
+                    "Unexpected text in annotations: '{rest}'. Expected COMMENT = '...', WITH SYNONYMS = (...), or LABELS = (FILTER)."
                 ),
                 position: Some(pos_of(rest)),
             });
@@ -246,6 +319,7 @@ pub(super) fn parse_trailing_annotations(
         ParsedAnnotations {
             comment,
             synonyms: synonyms.unwrap_or_default(),
+            is_filter,
         },
     ))
 }
@@ -300,5 +374,98 @@ pub(super) fn parse_leading_access_modifier(entry: &str) -> (AccessModifier, &st
         }
     } else {
         (AccessModifier::Public, entry)
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::parse_trailing_annotations;
+
+    fn parse(text: &str) -> (String, bool) {
+        let (expr, ann) = parse_trailing_annotations(text, 0).expect("should parse");
+        (expr, ann.is_filter)
+    }
+
+    #[test]
+    fn labels_filter_sets_the_flag_and_is_stripped_from_the_expression() {
+        let (expr, is_filter) = parse("o.amount > 100 LABELS = (FILTER)");
+        assert_eq!(expr, "o.amount > 100");
+        assert!(is_filter);
+    }
+
+    #[test]
+    fn labels_is_case_insensitive_and_the_equals_is_optional() {
+        // The `=` relaxation mirrors WITH SYNONYMS (F-12).
+        for text in [
+            "x LABELS = (FILTER)",
+            "x labels = (filter)",
+            "x LABELS (FILTER)",
+            "x Labels(Filter)",
+        ] {
+            let (expr, is_filter) = parse(text);
+            assert_eq!(expr, "x", "for {text:?}");
+            assert!(is_filter, "for {text:?}");
+        }
+    }
+
+    #[test]
+    fn absent_labels_leaves_the_flag_false() {
+        let (expr, is_filter) = parse("o.amount > 100");
+        assert_eq!(expr, "o.amount > 100");
+        assert!(!is_filter);
+    }
+
+    #[test]
+    fn labels_composes_with_comment_and_synonyms_in_any_order() {
+        for text in [
+            "x LABELS = (FILTER) COMMENT = 'c' WITH SYNONYMS = ('s')",
+            "x COMMENT = 'c' LABELS = (FILTER) WITH SYNONYMS = ('s')",
+            "x WITH SYNONYMS = ('s') COMMENT = 'c' LABELS = (FILTER)",
+        ] {
+            let (expr, ann) = parse_trailing_annotations(text, 0).expect("should parse");
+            assert_eq!(expr, "x", "for {text:?}");
+            assert!(ann.is_filter, "for {text:?}");
+            assert_eq!(ann.comment.as_deref(), Some("c"), "for {text:?}");
+            assert_eq!(ann.synonyms, vec!["s".to_string()], "for {text:?}");
+        }
+    }
+
+    #[test]
+    fn an_unsupported_label_is_rejected_rather_than_ignored() {
+        // Silently dropping a label would let a definition round-trip having
+        // quietly lost meaning. Snowflake's tags and other LABELS values are
+        // out of scope, so they must fail loudly.
+        let err = parse_trailing_annotations("x LABELS = (TAG)", 0).unwrap_err();
+        assert!(
+            err.message.contains("Unsupported label 'TAG'"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn an_empty_label_list_is_rejected() {
+        let err = parse_trailing_annotations("x LABELS = ()", 0).unwrap_err();
+        assert!(err.message.contains("empty"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn a_duplicate_labels_clause_is_rejected() {
+        let err =
+            parse_trailing_annotations("x LABELS = (FILTER) LABELS = (FILTER)", 0).unwrap_err();
+        assert!(
+            err.message.contains("Duplicate LABELS"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn labels_as_a_quoted_column_name_is_not_an_annotation() {
+        // The detection scan is quote-aware (PA-6/PA-9): a column literally
+        // named `labels` stays part of the expression.
+        let (expr, is_filter) = parse("o.\"labels\" IS NOT NULL");
+        assert_eq!(expr, "o.\"labels\" IS NOT NULL");
+        assert!(!is_filter);
     }
 }

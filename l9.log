@@ -1,0 +1,3 @@
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+    Checking semantic_views v0.12.0 (/home/user/duckdb-semantic-views)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.68s

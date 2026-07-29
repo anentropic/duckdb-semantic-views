@@ -206,6 +206,7 @@ mod tests {
                 source_table: Some("o".to_string()),
                 comment: Some("Geographic region".to_string()),
                 synonyms: vec!["area".to_string(), "territory".to_string()],
+                is_filter: false,
                 ..Default::default()
             }],
             metrics: vec![Metric {
@@ -224,6 +225,7 @@ mod tests {
                 access: AccessModifier::Private,
                 comment: Some("Price per unit".to_string()),
                 synonyms: vec!["price_per_item".to_string()],
+                is_filter: false,
                 ..Default::default()
             }],
             comment: Some("Revenue analytics view".to_string()),

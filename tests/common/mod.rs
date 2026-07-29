@@ -249,7 +249,7 @@ pub fn arb_canonical_def() -> impl Strategy<Value = SemanticViewDefinition> {
                     .into_iter()
                     .enumerate()
                     .map(
-                        |(i, (alias_idx, name, expr, _private, comment, synonyms)): (
+                        |(i, (alias_idx, name, expr, private, comment, synonyms)): (
                             usize,
                             EntrySpec,
                         )| {
@@ -259,6 +259,13 @@ pub fn arb_canonical_def() -> impl Strategy<Value = SemanticViewDefinition> {
                                 source_table: Some(format!("t{}", alias_idx % n_tables)),
                                 comment,
                                 synonyms,
+                                // Dimensions carry no access modifier, so the
+                                // spec's `private` bool is otherwise unused --
+                                // reuse it as a genuinely generator-produced
+                                // filter flag so `LABELS = (FILTER)` actually
+                                // round-trips here instead of the assertion
+                                // being vacuous on a field always left false.
+                                is_filter: private,
                                 ..Default::default()
                             }
                         },
@@ -283,6 +290,10 @@ pub fn arb_canonical_def() -> impl Strategy<Value = SemanticViewDefinition> {
                             },
                             comment,
                             synonyms,
+                            // Varied independently of `private` (which facts DO
+                            // use, for access) so a filter fact is generated at
+                            // both access levels.
+                            is_filter: i % 2 == 0,
                             ..Default::default()
                         },
                     )

@@ -31,6 +31,17 @@ fn emit_comment(out: &mut String, comment: Option<&str>) {
     }
 }
 
+/// Append ` LABELS = (FILTER)` to `out` when the member is a named filter.
+///
+/// Emitted after COMMENT / WITH SYNONYMS so the annotation region renders in a
+/// stable order; the parser accepts the clauses in any order, so the round-trip
+/// does not depend on this choice.
+fn emit_labels(out: &mut String, is_filter: bool) {
+    if is_filter {
+        out.push_str(" LABELS = (FILTER)");
+    }
+}
+
 /// Append ` WITH SYNONYMS = ('<escaped1>', '<escaped2>')` to `out` if non-empty.
 fn emit_synonyms(out: &mut String, synonyms: &[String]) {
     if !synonyms.is_empty() {
@@ -218,6 +229,7 @@ fn emit_facts(out: &mut String, def: &SemanticViewDefinition) {
         out.push_str(&fact.expr);
         emit_comment(out, fact.comment.as_deref());
         emit_synonyms(out, &fact.synonyms);
+        emit_labels(out, fact.is_filter);
         if i + 1 < def.facts.len() {
             out.push(',');
         }
@@ -240,6 +252,7 @@ fn emit_dimensions(out: &mut String, def: &SemanticViewDefinition) {
         out.push_str(&dim.expr);
         emit_comment(out, dim.comment.as_deref());
         emit_synonyms(out, &dim.synonyms);
+        emit_labels(out, dim.is_filter);
         if i + 1 < def.dimensions.len() {
             out.push(',');
         }
@@ -1442,5 +1455,32 @@ mod tests {
         };
         let ddl2 = render_create_ddl("rt", &def2).unwrap();
         assert_eq!(ddl1, ddl2, "Round-trip DDL should be identical");
+    }
+
+    #[test]
+    fn test_labels_filter_renders_on_dimension_and_fact() {
+        let mut def = minimal_def();
+        def.dimensions[0].is_filter = true;
+        let ddl = render_create_ddl("sv", &def).unwrap();
+        assert!(
+            ddl.contains("LABELS = (FILTER)"),
+            "dimension filter must render: {ddl}"
+        );
+    }
+
+    #[test]
+    fn test_labels_absent_renders_nothing() {
+        let def = minimal_def();
+        let ddl = render_create_ddl("sv", &def).unwrap();
+        assert!(!ddl.contains("LABELS"), "no spurious LABELS: {ddl}");
+    }
+
+    #[test]
+    fn test_emit_labels_helper() {
+        let mut out = String::new();
+        emit_labels(&mut out, false);
+        assert!(out.is_empty());
+        emit_labels(&mut out, true);
+        assert_eq!(out, " LABELS = (FILTER)");
     }
 }

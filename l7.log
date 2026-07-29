@@ -1,0 +1,38 @@
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+    Checking semantic_views v0.12.0 (/home/user/duckdb-semantic-views)
+error[E0432]: unresolved import `semantic_views::test_helpers`
+  --> tests/output_proptest.rs:20:21
+   |
+20 | use semantic_views::test_helpers::{execute_sql_raw, read_typed_value, RawDb, TestValue};
+   |                     ^^^^^^^^^^^^ could not find `test_helpers` in `semantic_views`
+   |
+note: found an item that was configured out
+  --> src/lib.rs:42:9
+   |
+40 | #[cfg(not(feature = "extension"))]
+   |          ----------------------- the item is gated here
+41 | #[allow(clippy::pedantic, clippy::doc_markdown)]
+42 | pub mod test_helpers {
+   |         ^^^^^^^^^^^^
+
+error[E0432]: unresolved import `semantic_views::test_helpers`
+  --> tests/vector_reference_test.rs:10:21
+   |
+10 | use semantic_views::test_helpers::{execute_sql_raw, read_typed_value, RawDb, TestValue};
+   |                     ^^^^^^^^^^^^ could not find `test_helpers` in `semantic_views`
+   |
+note: found an item that was configured out
+  --> src/lib.rs:42:9
+   |
+40 | #[cfg(not(feature = "extension"))]
+   |          ----------------------- the item is gated here
+41 | #[allow(clippy::pedantic, clippy::doc_markdown)]
+42 | pub mod test_helpers {
+   |         ^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0432`.
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+error: could not compile `semantic_views` (test "vector_reference_test") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+warning: semantic_views@0.12.0: SV_SKIP_CPP_BUILD set: skipping DuckDB amalgamation + C++ shim compile (analysis-only; the resulting artifact will NOT link/load as an extension)
+error: could not compile `semantic_views` (test "output_proptest") due to 1 previous error
