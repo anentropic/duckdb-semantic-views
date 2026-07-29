@@ -93,16 +93,24 @@ jobs:
             sed -i "s/currently v[0-9.]*/currently $VER/" "$WF"
           done
 
-          # Update extension-ci-tools submodule to matching branch
-          cd extension-ci-tools
-          git fetch origin
-          if git rev-parse --verify "origin/$VER" >/dev/null 2>&1; then
-            git checkout "origin/$VER"
-            echo "extension-ci-tools submodule updated to $VER"
-          else
-            echo "WARNING: extension-ci-tools branch $VER not found, keeping current"
-          fi
-          cd ..
+          # Update extension-ci-tools submodule to matching branch.
+          #
+          # The refspec must be explicit. actions/checkout clones submodules with
+          # `submodule update --depth=1`, and --depth implies --single-branch, so
+          # the clone's remote.origin.fetch is narrowed to
+          # `+refs/heads/main:refs/remotes/origin/main`. A bare `git fetch origin`
+          # therefore only ever updates origin/main and can never create
+          # origin/$VER — the previous `rev-parse --verify origin/$VER` failed on
+          # every run since v1.5.0 and the `else` branch swallowed it, so the
+          # submodule silently stayed on the v1.5.0 tip across three bumps.
+          #
+          # No `|| echo WARNING` here: if extension-ci-tools has no branch for
+          # this DuckDB version then BuildAll/BuildQuick's
+          # `_extension_distribution.yml@$VER` does not resolve either, so the
+          # bump cannot work and the run must go red rather than open a PR.
+          git -C extension-ci-tools fetch --depth=1 origin "+refs/heads/$VER:refs/remotes/origin/$VER"
+          git -C extension-ci-tools checkout --detach "refs/remotes/origin/$VER"
+          echo "extension-ci-tools submodule -> $VER ($(git -C extension-ci-tools rev-parse --short HEAD))"
 
           # Download new amalgamation
           just update-headers
@@ -285,16 +293,13 @@ jobs:
             sed -i "s/currently v[0-9.]*/currently $LTS_TAG/" "$WF"
           done
 
-          # Update extension-ci-tools submodule to matching branch
-          cd extension-ci-tools
-          git fetch origin
-          if git rev-parse --verify "origin/$LTS_TAG" >/dev/null 2>&1; then
-            git checkout "origin/$LTS_TAG"
-            echo "extension-ci-tools submodule updated to $LTS_TAG"
-          else
-            echo "WARNING: extension-ci-tools branch $LTS_TAG not found, keeping current"
-          fi
-          cd ..
+          # Update extension-ci-tools submodule to matching branch. The refspec
+          # must be explicit and the failure must be fatal — see the equivalent
+          # block in the check-latest job for why a bare `git fetch origin`
+          # silently no-ops under actions/checkout's --depth=1 submodule clone.
+          git -C extension-ci-tools fetch --depth=1 origin "+refs/heads/$LTS_TAG:refs/remotes/origin/$LTS_TAG"
+          git -C extension-ci-tools checkout --detach "refs/remotes/origin/$LTS_TAG"
+          echo "extension-ci-tools submodule -> $LTS_TAG ($(git -C extension-ci-tools rev-parse --short HEAD))"
 
           # Download new amalgamation
           just update-headers

@@ -372,11 +372,19 @@ The DuckDB version is pinned in a single source of truth: **`.duckdb-version`** 
 | `test/**/*.py`, `configure/*.py` | PEP 723 `"duckdb==X.Y.Z"` — updated by monitor workflow |
 | `.github/workflows/BuildAll.yml` | `uses:` tag, `duckdb_version`, `ci_tools_version` — updated by monitor workflow |
 | `.github/workflows/BuildQuick.yml` | `uses:` tag, `duckdb_version`, `ci_tools_version` — updated by monitor workflow |
+| `extension-ci-tools` submodule | Checked out to the `vX.Y.Z` branch of `duckdb/extension-ci-tools` — updated by monitor workflow. Supplies the makefiles local `make` uses; CI's platform builds fetch `ci_tools_version` independently, so drift here shows up as a local-vs-CI build difference rather than a red check. |
 
-Every row above is machine-guarded against drift by two unit tests in `src/lib.rs`:
+Every row above **except the submodule** is machine-guarded against drift by two unit tests in `src/lib.rs`:
 `tests::duckdb_version_pins_agree` (`.duckdb-version` ↔ `MINIMUM_DUCKDB_VERSION` ↔ the
 `libduckdb-sys` pin) and `tests::duckdb_derived_pins_agree` (the PEP 723 headers and the
 two build workflows). Miss a location and `cargo test` fails.
+
+The submodule cannot be guarded that way — the correct commit is a *remote* branch tip, so
+no offline test can know it. It is guarded instead by the monitor's submodule step failing
+hard when the branch does not resolve. If you move that step, keep it fatal: the version it
+replaced logged `WARNING: ... not found, keeping current` and exited 0, which left the
+submodule on the v1.5.0 tip across the v1.5.2, v1.5.3 and v1.5.4 bumps without anything
+going red.
 
 ### Steps to Update Manually
 
@@ -416,12 +424,21 @@ Replace `X.Y.Z` below with the target DuckDB version (e.g., `1.5.1`). The duckdb
      ci_tools_version: vX.Y.Z
    ```
 
-6. Download the new amalgamation, build, and run all tests:
+6. Move the `extension-ci-tools` submodule to the matching branch. The explicit
+   refspec is required — the submodule clone is usually shallow, and `--depth`
+   implies `--single-branch`, so a bare `git fetch origin` will not create
+   `origin/vX.Y.Z`:
+   ```bash
+   git -C extension-ci-tools fetch --depth=1 origin "+refs/heads/vX.Y.Z:refs/remotes/origin/vX.Y.Z"
+   git -C extension-ci-tools checkout --detach refs/remotes/origin/vX.Y.Z
+   ```
+
+7. Download the new amalgamation, build, and run all tests:
    ```bash
    just update-headers && just build && just test-all
    ```
 
-7. Commit all files together.
+8. Commit all files together.
 
 The `DuckDBVersionMonitor` workflow automates all of this: it checks for new DuckDB releases weekly, updates `.duckdb-version` and all derived locations (including CI workflow files), then opens a PR. If the build passes, the PR bumps the version. If it fails, the PR tags `@copilot` to attempt an automated fix.
 
