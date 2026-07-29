@@ -405,7 +405,7 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.11.0...HEAD
 [0.12.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.3...v0.10.4
