@@ -720,15 +720,22 @@ Incompatible table paths for facts
 
 .. versionadded:: 0.6.0
 
+.. versionchanged:: 0.12.0
+   The rule is now about row multiplication rather than tree position, and the
+   message wording changed to match. Pairs that are reachable one way without
+   fanning out — a fact on a table that references the base table, with a
+   dimension on a table the base table references — are now accepted.
+
 .. code-block:: text
 
    semantic view '<view>': fact query references objects from incompatible
-   table paths -- tables '<table_a>' and '<table_b>' are not on the same
-   root-to-leaf path in the relationship tree
+   table paths -- neither table '<table_a>' nor '<table_b>' can be reached
+   from the other without crossing a one-to-many relationship, so joining
+   them would duplicate the rows returned
 
-**Cause:** A fact query combines facts and dimensions from tables that are on different branches of the relationship tree. All objects in a fact query must be on the same root-to-leaf path.
+**Cause:** A fact query does not aggregate, so it returns rows as they are. Reaching one of these two tables from the other means traversing a one-to-many relationship *against* its direction — every row on one side matching many on the other — and that holds whichever of the two you start from. The rows returned would silently be duplicates. The usual shape is two tables that both reference a third (``line_items`` and ``shipments`` both referencing ``orders``): joining both multiplies each one's rows by the other's.
 
-**Fix:** Restrict the query to facts and dimensions from tables that share a direct path in the relationship tree.
+**Fix:** Query the two tables separately. Facts and dimensions can be combined freely as long as one side is reachable from the other without fanning out — a chain of many-to-one relationships in either direction is fine, however long.
 
 
 Window and aggregate metric mixing

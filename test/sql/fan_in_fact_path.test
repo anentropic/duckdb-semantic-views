@@ -120,7 +120,7 @@ US	4.50
 statement error
 SELECT * FROM semantic_view('fi_sv', facts := ['ship_cost'], dimensions := ['item_qty']);
 ----
-not on the same root-to-leaf path
+without crossing a one-to-many relationship
 
 # ============================================================
 # Cleanup
