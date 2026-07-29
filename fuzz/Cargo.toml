@@ -58,3 +58,8 @@ doc = false
 name = "fuzz_render_roundtrip"
 path = "fuzz_targets/fuzz_render_roundtrip.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_where_predicate"
+path = "fuzz_targets/fuzz_where_predicate.rs"
+doc = false

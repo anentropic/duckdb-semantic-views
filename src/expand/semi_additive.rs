@@ -139,6 +139,7 @@ pub(super) fn expand_semi_additive(
     resolved_dims: &[ResolvedDim],
     resolved_mets: &[&Metric],
     resolved_exprs: &HashMap<String, String>,
+    where_clause: Option<&super::where_clause::ResolvedWhere>,
 ) -> Result<String, ExpandError> {
     let mut sql = String::with_capacity(512);
 
@@ -217,10 +218,26 @@ pub(super) fn expand_semi_additive(
     // source tables must be joined too. They are passed through the
     // resolver's extra-alias parameter, which appends each with its path
     // intermediaries (aliases already joined for dims/metrics are skipped).
-    let na_dim_sources = collect_na_dim_source_tables(def, &na_groups);
+    let mut na_dim_sources = collect_na_dim_source_tables(def, &na_groups);
+    // A `where_clause` member's table must be joined inside the CTE too — the
+    // predicate is applied here, so its aliases have to be in the CTE's FROM.
+    if let Some(w) = where_clause {
+        na_dim_sources.extend(w.source_tables.iter().cloned());
+    }
     let dims: Vec<&crate::model::Dimension> = resolved_dims.iter().map(|rd| rd.dim).collect();
     let resolved_joins = resolve_joins_pkfk(def, &dims, resolved_mets, &na_dim_sources);
     push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
+
+    // The predicate goes INSIDE the snapshot CTE, which puts it before the
+    // `RANK()` in the select list is evaluated. That ordering is the whole
+    // point: filtering changes which row wins the snapshot, and "applied before
+    // the metrics are computed" has to mean before the snapshot is picked. On
+    // the outer query it would pick the snapshot from unfiltered rows and then
+    // discard some of them — a different, wrong answer.
+    if let Some(w) = where_clause {
+        sql.push_str("\n    WHERE ");
+        sql.push_str(&w.sql);
+    }
 
     sql.push_str("\n)\n");
 
@@ -2325,5 +2342,57 @@ mod tests {
                 "earliest_bal must snapshot the earliest date (999), not share latest_bal's column: {rows:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-aggregation `where_clause`
+    //
+    // The predicate must land INSIDE `__sv_snapshot`, which puts it before the
+    // `RANK()` is evaluated. That ordering is the whole point: filtering
+    // changes which row wins the snapshot. On the outer query the snapshot
+    // would be picked from unfiltered rows and only then narrowed -- a
+    // different, wrong answer.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn where_clause_is_injected_inside_the_snapshot_cte_before_the_rank() {
+        let def = minimal_def(
+            "accounts",
+            "customer_id",
+            "customer_id",
+            "balance",
+            "SUM(balance)",
+        )
+        .with_dimension("report_date", "report_date", None)
+        .with_non_additive_by(
+            "balance",
+            &[("report_date", SortOrder::Desc, NullsOrder::First)],
+        );
+
+        let req = QueryRequest {
+            where_clause: Some("report_date >= DATE '2024-01-01'".to_string()),
+            facts: vec![],
+            dimensions: vec![DimensionName::new("customer_id")],
+            metrics: vec![MetricName::new("balance")],
+        };
+
+        let sql = expand("test_view", &def, &req).unwrap();
+
+        let cte_end = sql.find("\n)\n").expect("the snapshot CTE must close");
+        let cte = &sql[..cte_end];
+        let outer = &sql[cte_end..];
+
+        assert!(
+            cte.contains("WHERE report_date >= DATE '2024-01-01'"),
+            "predicate must be inside the snapshot CTE: {sql}"
+        );
+        assert!(
+            !outer.contains("WHERE"),
+            "predicate must NOT be on the outer query, where it would filter \
+             after the snapshot was already chosen: {outer}"
+        );
+        // The RANK lives in the CTE's select list, so a WHERE in the same CTE
+        // is evaluated first -- the filter decides which rows compete.
+        assert!(cte.contains("RANK() OVER"), "RANK stays in the CTE: {cte}");
     }
 }

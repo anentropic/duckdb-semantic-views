@@ -133,6 +133,72 @@ SELECT * FROM semantic_view('wc_sv', metrics := ['revenue'], dimensions := ['reg
 ----
 
 # ============================================================
+# Test 9: MULTI-GRAIN. `revenue` (orders) and `item_count` (line_items) are at
+# different grains, so this routes to the per-grain strategy: one CTE per grain,
+# combined FULL OUTER. The predicate must be injected into EACH grain CTE.
+#
+# Unfiltered: EU has 2 orders (150.00) with 3 line items; US 1 order (70.00)
+# with 1 item. Filtering to 2024 drops EU's 2023 order and its single item, so
+# BOTH metrics are recomputed -- 100.00 and 2. An outer WHERE could do neither.
+# ============================================================
+
+statement ok
+CREATE TABLE wc_items (id INTEGER, order_id INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO wc_items VALUES (100, 10, 2), (101, 10, 1), (102, 11, 1), (103, 12, 1);
+
+statement ok
+CREATE SEMANTIC VIEW wc_mg AS
+  TABLES (
+    o AS wc_orders PRIMARY KEY (id),
+    c AS wc_customers PRIMARY KEY (id),
+    li AS wc_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_customer AS o(customer_id) REFERENCES c,
+    item_order AS li(order_id) REFERENCES o
+  )
+  FACTS (
+    o.odate AS o.ordered_at
+  )
+  DIMENSIONS (
+    c.region AS c.region
+  )
+  METRICS (
+    o.revenue AS sum(o.amount),
+    li.item_count AS count(li.id)
+  );
+
+query TTT rowsort
+SELECT * FROM semantic_view('wc_mg', metrics := ['revenue', 'item_count'], dimensions := ['region']);
+----
+EU	150.00	3
+US	70.00	1
+
+query TTT rowsort
+SELECT * FROM semantic_view('wc_mg', metrics := ['revenue', 'item_count'], dimensions := ['region'], where_clause := 'odate >= DATE ''2024-01-01''');
+----
+EU	100.00	2
+US	70.00	1
+
+# The predicate appears once per grain CTE -- never on the outer query.
+query T
+SELECT count(*) FROM (
+  SELECT unnest(string_split(explain_output, chr(10))) AS plan
+  FROM (SELECT * FROM explain_semantic_view('wc_mg', metrics := ['revenue', 'item_count'], dimensions := ['region'], where_clause := 'odate >= DATE ''2024-01-01'''))
+    AS t(explain_output)
+) WHERE trim(plan) LIKE 'WHERE o.ordered_at%';
+----
+2
+
+statement ok
+DROP SEMANTIC VIEW wc_mg;
+
+statement ok
+DROP TABLE wc_items;
+
+# ============================================================
 # Cleanup
 # ============================================================
 

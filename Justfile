@@ -274,6 +274,7 @@ fuzz-all time="300":
     cargo +nightly fuzz run fuzz_parser_override_ffi fuzz/corpus/fuzz_parser_override_ffi fuzz/seeds/fuzz_parser_override_ffi -- -max_total_time={{time}}
     cargo +nightly fuzz run fuzz_keyword_body fuzz/corpus/fuzz_keyword_body fuzz/seeds/fuzz_keyword_body -- -max_total_time={{time}}
     cargo +nightly fuzz run fuzz_render_roundtrip fuzz/corpus/fuzz_render_roundtrip fuzz/seeds/fuzz_render_roundtrip -- -max_total_time={{time}}
+    cargo +nightly fuzz run fuzz_where_predicate fuzz/corpus/fuzz_where_predicate fuzz/seeds/fuzz_where_predicate -- -max_total_time={{time}}
 
 # Minimize corpus for a fuzz target (removes inputs that don't add coverage)
 fuzz-cmin target="fuzz_json_parse":

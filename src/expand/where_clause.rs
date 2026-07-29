@@ -213,4 +213,26 @@ mod tests {
         let r = resolve_where_clause("v", &def(), "lower(region) = 'eu'").unwrap();
         assert_eq!(r.sql, "lower(c.region) = 'eu'");
     }
+
+    #[test]
+    fn a_blank_predicate_emits_no_where_clause() {
+        // Found by `fuzz_where_predicate` on its first CI run: a `Some("")`
+        // predicate rendered a bare `WHERE ` with no condition -- invalid SQL.
+        // The FFI layer maps an empty parameter to None, but `expand()` is a
+        // public API and was reachable directly with `Some("")`.
+        use crate::expand::{expand, MetricName, QueryRequest};
+        for blank in ["", "   ", "\t\n "] {
+            let req = QueryRequest {
+                dimensions: vec![],
+                metrics: vec![MetricName::new("revenue")],
+                facts: vec![],
+                where_clause: Some(blank.to_string()),
+            };
+            let sql = expand("v", &def(), &req).unwrap();
+            assert!(
+                !sql.contains("WHERE"),
+                "blank predicate {blank:?} must emit no WHERE: {sql}"
+            );
+        }
+    }
 }

@@ -453,13 +453,6 @@ pub enum ExpandError {
         member_table: String,
         relationship_name: String,
     },
-    /// A `where_clause` was supplied alongside a query shape whose emission
-    /// strategy does not yet inject it. Raised rather than silently dropping the
-    /// filter, which would return unfiltered numbers under a filtered query.
-    WhereClauseUnsupportedStrategy {
-        view_name: String,
-        strategy: &'static str,
-    },
     /// Window function metrics cannot be mixed with aggregate metrics.
     WindowAggregateMixing {
         view_name: String,
@@ -773,18 +766,6 @@ impl fmt::Display for ExpandError {
                      relationship '{relationship_name}' fans out along the way, so metric \
                      '{metric_name}' would be aggregated over multiplied rows. Filter on a \
                      member reachable from the metric's table without fanning out."
-                )
-            }
-            Self::WhereClauseUnsupportedStrategy {
-                view_name,
-                strategy,
-            } => {
-                write!(
-                    f,
-                    "semantic view '{view_name}': where_clause is not yet supported for this \
-                     query -- it is computed via the {strategy} strategy, whose filter injection \
-                     is not implemented. Query without where_clause, or filter on a shape that \
-                     uses the base-anchored path."
                 )
             }
             Self::WindowAggregateMixing {

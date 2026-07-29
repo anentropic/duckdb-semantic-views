@@ -115,6 +115,9 @@ fn def_fragments_balanced(def: &SemanticViewDefinition) -> bool {
 
 fuzz_target!(|input: FuzzInput| {
     let req = QueryRequest {
+        // No predicate: this target's oracle is about name/definition
+        // handling. `fuzz_where_predicate` covers the predicate splice.
+        where_clause: None,
         dimensions: input.dim_names.into_iter().map(Into::into).collect(),
         metrics: input.metric_names.into_iter().map(Into::into).collect(),
         facts: vec![],

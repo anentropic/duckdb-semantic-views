@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The parameter is spelled `where_clause` rather than `where` because DuckDB reserves `where` in named-parameter position — `where := '…'` is a parse error before the extension is ever consulted.
 
-  **Not yet supported** for queries computed through the per-grain (multi-grain metrics), semi-additive snapshot, or window strategies: each of those must filter inside its own CTE (before the `RANK`, before the window function), and applying the predicate to the outer query instead would filter after the fact. Those combinations raise a clear error naming the strategy rather than silently returning unfiltered numbers.
+  The predicate is applied before aggregation on **every** emission path: before the `GROUP BY` on the base-anchored and fact paths, inside *each* grain CTE for a multi-grain query, inside the `__sv_snapshot` CTE *before* the `RANK` for a semi-additive metric (so filtering changes which row wins the snapshot, which is what "before the metrics are computed" has to mean there), and inside `__sv_agg` before a window function runs. Tables named only by the predicate are joined into whichever CTE evaluates it.
 
 ### Changed
 
