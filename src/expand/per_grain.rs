@@ -56,6 +56,7 @@ use super::resolution::{quote_ident, quote_stored_ident};
 use super::select_spec::{
     push_from_anchor, push_group_by_ordinals, FromSource, GroupBy, SelectItem, SelectSpec,
 };
+use super::where_clause::ResolvedWhere;
 
 /// The CTE name for grain group `i`. Bare (unquoted) by construction — the
 /// index is the only variable part — matching `__sv_agg` / `__sv_snapshot`.
@@ -407,6 +408,7 @@ pub(super) fn expand_per_grain(
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
     plan: &Plan,
+    where_clause: Option<&ResolvedWhere>,
 ) -> String {
     // A cross-grain assembly always spans at least two groups, so a single-group
     // plan holds only `Direct` outputs — but check rather than assert: falling
@@ -418,9 +420,9 @@ pub(super) fn expand_per_grain(
             .iter()
             .all(|o| matches!(o, Output::Direct { .. }))
     {
-        return render_single_grain(def, resolved_dims, resolved_mets, plan);
+        return render_single_grain(def, resolved_dims, resolved_mets, plan, where_clause);
     }
-    render_multi_grain(def, resolved_dims, resolved_mets, plan)
+    render_multi_grain(def, resolved_dims, resolved_mets, plan, where_clause)
 }
 
 /// The one-grain case: the ordinary aggregation shape, anchored at the metrics'
@@ -430,8 +432,12 @@ fn render_single_grain(
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
     plan: &Plan,
+    where_clause: Option<&ResolvedWhere>,
 ) -> String {
     let group = &plan.groups[0];
+    let where_tables = where_clause
+        .map(|w| w.source_tables.clone())
+        .unwrap_or_default();
     let mut items: Vec<SelectItem> = resolved_dims
         .iter()
         .map(|dim| {
@@ -458,13 +464,15 @@ fn render_single_grain(
         GroupBy::Ordinals(resolved_dims.len())
     };
     SelectSpec {
-        where_clause: None,
+        // Filters the anchor's rows on their way into the aggregation, the same
+        // position the base-anchored path uses.
+        where_clause: where_clause.map(|w| w.sql.clone()),
         distinct: false,
         items,
         from: FromSource::AnchorTable {
             def,
             anchor: group.anchor.clone(),
-            joins: anchor_joins(def, &group.anchor, resolved_dims),
+            joins: anchor_joins(def, &group.anchor, resolved_dims, &where_tables),
         },
         group_by,
     }
@@ -477,8 +485,12 @@ fn render_multi_grain(
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
     plan: &Plan,
+    where_clause: Option<&ResolvedWhere>,
 ) -> String {
     let mut sql = String::with_capacity(512);
+    let where_tables = where_clause
+        .map(|w| w.source_tables.clone())
+        .unwrap_or_default();
     for (i, group) in plan.groups.iter().enumerate() {
         sql.push_str(if i == 0 { "WITH " } else { ",\n" });
         sql.push_str(&grain_cte(i));
@@ -503,10 +515,17 @@ fn render_multi_grain(
         push_from_anchor(&mut sql, def, &group.anchor, "\n    ");
         push_join_clauses(
             &mut sql,
-            &anchor_joins(def, &group.anchor, resolved_dims),
+            &anchor_joins(def, &group.anchor, resolved_dims, &where_tables),
             def,
             "\n    LEFT JOIN ",
         );
+        // Inside the CTE, before its GROUP BY: each grain must aggregate over
+        // only the matching rows. On the outer query this would instead filter
+        // the already-combined result — a post-aggregation filter.
+        if let Some(w) = where_clause {
+            sql.push_str("\n    WHERE ");
+            sql.push_str(&w.sql);
+        }
         push_group_by_ordinals(&mut sql, resolved_dims.len(), "\n    ", "        ");
         sql.push_str("\n)");
     }
@@ -592,6 +611,7 @@ fn anchor_joins<'a>(
     def: &'a SemanticViewDefinition,
     anchor: &str,
     resolved_dims: &[&Dimension],
+    where_tables: &[String],
 ) -> Vec<ResolvedJoin<'a>> {
     let Some(graph) = GrainGraph::build(def) else {
         return Vec::new();
@@ -599,10 +619,13 @@ fn anchor_joins<'a>(
     let mut joins: Vec<ResolvedJoin<'a>> = Vec::new();
     let mut emitted: HashSet<String> = HashSet::new();
     emitted.insert(anchor.to_string());
-    for dim in resolved_dims {
-        let Some(ref source) = dim.source_table else {
-            continue;
-        };
+    // A `where_clause` member's table has to be reachable from THIS grain's
+    // anchor, exactly like a dimension's — the predicate is injected into every
+    // grain CTE, so every one of them must join what the predicate names or the
+    // filter would reference an alias absent from that CTE's FROM.
+    let dim_sources = resolved_dims.iter().filter_map(|d| d.source_table.clone());
+    let sources: Vec<String> = dim_sources.chain(where_tables.iter().cloned()).collect();
+    for source in &sources {
         let Some(path) = graph.path(anchor, &source.to_ascii_lowercase()) else {
             continue;
         };

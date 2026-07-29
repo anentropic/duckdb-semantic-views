@@ -13,6 +13,9 @@ struct NameFuzzInput {
 fuzz_target!(|input: NameFuzzInput| {
     let def = fixed_definition();
     let req = QueryRequest {
+        // No predicate: this target's oracle is about name/definition
+        // handling. `fuzz_where_predicate` covers the predicate splice.
+        where_clause: None,
         dimensions: input.dim_names.into_iter().map(Into::into).collect(),
         metrics: input.metric_names.into_iter().map(Into::into).collect(),
         facts: vec![],

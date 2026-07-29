@@ -440,22 +440,16 @@ pub fn expand(
     }
 
     if let Some(plan) = grain_plan {
-        // The predicate would have to go inside EACH grain CTE, so that every
-        // metric aggregates over only the matching rows. Rendering it on the
-        // outer query instead would filter the already-combined result — a
-        // post-aggregation filter wearing a pre-aggregation name. Reject until
-        // per-grain injection lands rather than answer the wrong question.
-        if resolved_where.is_some() {
-            return Err(ExpandError::WhereClauseUnsupportedStrategy {
-                view_name: view_name.to_string(),
-                strategy: "per-grain (multi-grain metrics)",
-            });
-        }
+        // The predicate goes inside EACH grain CTE, so every metric aggregates
+        // over only the matching rows. On the outer query it would instead
+        // filter the already-combined result — a post-aggregation filter
+        // wearing a pre-aggregation name.
         return Ok(super::per_grain::expand_per_grain(
             def,
             &resolved_dims,
             &resolved_mets,
             &plan,
+            resolved_where.as_ref(),
         ));
     }
 
@@ -485,23 +479,13 @@ pub fn expand(
         .any(|m| super::semi_additive::is_active_semi_additive(def, m, &queried_dim_keys));
 
     if has_active_semi_additive {
-        // The predicate belongs inside `__sv_snapshot`, BEFORE the RANK:
-        // filtering changes which row wins the snapshot, and that is precisely
-        // what "applied before the metrics are computed" has to mean here.
-        // Filtering the outer query would pick the snapshot from unfiltered rows
-        // and then discard some — a different, wrong answer.
-        if resolved_where.is_some() {
-            return Err(ExpandError::WhereClauseUnsupportedStrategy {
-                view_name: view_name.to_string(),
-                strategy: "semi-additive snapshot",
-            });
-        }
         return super::semi_additive::expand_semi_additive(
             view_name,
             def,
             &resolved,
             &resolved_mets,
             &resolved_exprs,
+            resolved_where.as_ref(),
         );
     }
 
@@ -526,21 +510,13 @@ pub fn expand(
                 aggregate_metrics: aggregate_names,
             });
         }
-        // The predicate belongs inside `__sv_agg`, before the window function
-        // runs over the aggregated rows; on the outer query it would filter the
-        // window's output instead of its input.
-        if resolved_where.is_some() {
-            return Err(ExpandError::WhereClauseUnsupportedStrategy {
-                view_name: view_name.to_string(),
-                strategy: "window metric",
-            });
-        }
         return super::window::expand_window_metrics(
             view_name,
             def,
             &resolved,
             &resolved_mets,
             &resolved_exprs,
+            resolved_where.as_ref(),
         );
     }
 

@@ -105,9 +105,10 @@ src/
     └── mod.rs
 
 fuzz/                          # Fuzz testing (independent Cargo crate; depends on semantic_views + "arbitrary")
-├── fuzz_targets/              #   Eight targets — see the Fuzzing section for what each covers
+├── fuzz_targets/              #   Nine targets — see the Fuzzing section for what each covers
 │   ├── fuzz_json_parse.rs fuzz_yaml_parse.rs fuzz_ddl_parse.rs fuzz_keyword_body.rs
-│   └── fuzz_sql_expand.rs fuzz_query_names.rs fuzz_render_roundtrip.rs fuzz_parser_override_ffi.rs
+│   ├── fuzz_sql_expand.rs fuzz_query_names.rs fuzz_render_roundtrip.rs fuzz_parser_override_ffi.rs
+│   └── fuzz_where_predicate.rs
 ├── seeds/                     #   Committed seed inputs (per target)
 └── corpus/                    #   Fuzzer-discovered inputs (gitignored)
 
@@ -549,6 +550,7 @@ cargo +nightly fuzz list          # see available targets
 | `fuzz_render_roundtrip` | Generated definitions → normalize once via `parse(render(def))` → assert `render` is idempotent on the parser-produced def | Grammar drift between `render_ddl` and the body parser (dropped field, reordered clause, mis-quoted identifier). Uses the converge-once invariant, not the strong `render(parse(render(def))) == render(def)` fixpoint — that is unsatisfiable on arbitrary defs (a free-form `expr`'s surrounding whitespace is trimmed by the parser and cannot be quote-protected) |
 | `fuzz_sql_expand` | Arbitrary `SemanticViewDefinition` + name arrays → `expand()` | Panics/assertion failures in SQL generation; quote/paren imbalance in the emitted SQL |
 | `fuzz_query_names` | Fuzzes dimension/metric name strings against a fixed known-good definition | SQL injection via user-supplied column names, quoting bugs, name resolution panics |
+| `fuzz_where_predicate` | Arbitrary `SemanticViewDefinition` + an arbitrary `where_clause` predicate → `expand()`, across the metric and fact paths | Corruption of the pre-aggregation predicate splice — the one place arbitrary user text is interpolated verbatim into generated SQL. Same balanced-in/balanced-out oracle as `fuzz_sql_expand`, with the predicate added to the precondition (an unbalanced predicate legitimately yields unbalanced SQL). This is the seam issue #145 came from |
 | `fuzz_parser_override_ffi` | Drives the `parser_override` FFI entry path with fuzzed input | Panics crossing the FFI boundary; unexpected rc / error propagation |
 
 > **Note:** most targets accumulate a coverage corpus under `fuzz/corpus/<target>/` (gitignored) seeded from `fuzz/seeds/<target>/` (committed). Both directories are passed to libFuzzer — `cargo fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- …` in `Fuzz.yml` and the `just fuzz` / `just fuzz-all` recipes — so committed seed files ARE used as starting inputs. `Fuzz.yml` creates the (gitignored) dirs before running; the older "corpus/seed wiring is a CI gap" note is resolved (CI-1, #135).
@@ -863,7 +865,7 @@ Do **not** set a directory-level nightly override (`rustup override set nightly`
 | **IntegrationChecks** | Push to `main` + pull requests (skips doc-only changes) | DuckLake CI integration test **and** the full Python integration suite (`just test-integration`), each building the debug extension. |
 | **DocsCheck** | Pull requests | Sphinx docs build with `-W` (warnings as errors). Deliberately **not** path-filtered, so documentation/text-only changes are still validated when the heavier workflows skip. No `push` trigger (runs on PRs + manual dispatch) — `main` gets the build+deploy from Docs. |
 | **Docs** | Push to `main` | Same `-W` Sphinx build, then deploys the site to GitHub Pages. |
-| **Fuzz** | Push touching `src/**`, `fuzz/**`, or the Cargo manifests | Runs all eight fuzz targets for 10 minutes each. Detects crashes via artifact files (not exit codes), uploads them, opens a `bug`/`fuzzing` issue, and fails the job on any crash. A `changes` guard job re-checks the push's **net** diff and skips the matrix when the trigger fired only because of the push-range quirk below. |
+| **Fuzz** | Push touching `src/**`, `fuzz/**`, or the Cargo manifests | Runs all nine fuzz targets for 10 minutes each. Detects crashes via artifact files (not exit codes), uploads them, opens a `bug`/`fuzzing` issue, and fails the job on any crash. A `changes` guard job re-checks the push's **net** diff and skips the matrix when the trigger fired only because of the push-range quirk below. |
 | **DuckDBVersionMonitor** | Weekly (Monday 09:00 UTC) + manual | Queries the DuckDB GitHub API for the latest / LTS release. If newer than the pin, updates all derived version locations, builds, and tests, then opens a version-bump PR on success or a breakage PR (tagging `@copilot`) on failure. |
 | **PublishExtension** | Manual (`workflow_dispatch`) only | Release automation for the Community Extension registry. |
 

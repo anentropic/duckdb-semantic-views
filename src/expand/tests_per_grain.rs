@@ -580,3 +580,105 @@ fn multi_grain_with_role_playing_still_errors() {
         "expected the v0.11.0 fan-trap error, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pre-aggregation `where_clause` on the per-grain path
+//
+// The predicate goes into EACH grain CTE, so every metric aggregates over only
+// the matching rows. On the outer query it would filter the already-combined
+// result -- and because the grains are joined FULL OUTER, that would drop whole
+// groups rather than recompute them.
+// ---------------------------------------------------------------------------
+
+/// The two-grain shape plus a `customers` parent that neither metric anchors,
+/// so a predicate on `segment` forces every grain CTE to join it.
+fn two_grains_with_unqueried_parent() -> SemanticViewDefinition {
+    orders_with_child_line_items()
+        .with_table("c", "customers", &["id"])
+        .with_dimension("segment", "c.segment", Some("c"))
+        .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"])
+}
+
+/// The bodies of the grain CTEs, excluding the outer query (which also mentions
+/// `__sv_grain_N`, so splitting on the CTE name alone would over-match).
+fn grain_cte_bodies(sql: &str) -> Vec<&str> {
+    sql.split(" AS (\n").skip(1).collect()
+}
+
+#[test]
+fn where_clause_is_injected_into_every_grain_cte() {
+    let def = two_grains_with_unqueried_parent();
+    let req = QueryRequest {
+        dimensions: vec![DimensionName::new("order_status")],
+        metrics: vec![
+            MetricName::new("order_total"),
+            MetricName::new("item_count"),
+        ],
+        facts: vec![],
+        where_clause: Some("segment = 'ENTERPRISE'".to_string()),
+    };
+    let sql = expand("test_view", &def, &req).unwrap();
+
+    let bodies = grain_cte_bodies(&sql);
+    assert_eq!(bodies.len(), 2, "expected two grain CTEs: {sql}");
+    for (i, body) in bodies.iter().enumerate() {
+        let where_at = body.find("WHERE c.segment = 'ENTERPRISE'");
+        let group_at = body.find("GROUP BY");
+        assert!(
+            where_at.is_some(),
+            "grain {i} missing the predicate: {body}"
+        );
+        assert!(
+            group_at.is_some() && where_at < group_at,
+            "grain {i}: WHERE must precede GROUP BY so it filters the rows going \
+             INTO the aggregation: {body}"
+        );
+    }
+
+    // The outer query must NOT carry it -- there it would be post-aggregation.
+    let outer = sql.rsplit_once(")\n").expect("a closing CTE").1;
+    assert!(
+        !outer.contains("WHERE"),
+        "predicate must not leak onto the outer query: {outer}"
+    );
+}
+
+#[test]
+fn where_clause_joins_its_table_into_every_grain_cte() {
+    // `c` is referenced only by the predicate, and the `li` grain reaches it
+    // only via li -> o -> c, so this also pins the multi-hop join path.
+    let def = two_grains_with_unqueried_parent();
+    let req = QueryRequest {
+        dimensions: vec![DimensionName::new("order_status")],
+        metrics: vec![
+            MetricName::new("order_total"),
+            MetricName::new("item_count"),
+        ],
+        facts: vec![],
+        where_clause: Some("segment = 'ENTERPRISE'".to_string()),
+    };
+    let sql = expand("test_view", &def, &req).unwrap();
+    for (i, body) in grain_cte_bodies(&sql).iter().enumerate() {
+        assert!(
+            body.contains("\"customers\" AS \"c\""),
+            "grain {i} must join customers to evaluate the filter: {body}"
+        );
+    }
+}
+
+#[test]
+fn where_clause_on_a_single_grain_plan_filters_before_aggregation() {
+    let def = orders_with_parent_customers();
+    let req = QueryRequest {
+        dimensions: vec![DimensionName::new("segment")],
+        metrics: vec![MetricName::new("total_balance")],
+        facts: vec![],
+        where_clause: Some("segment <> 'CHURNED'".to_string()),
+    };
+    let sql = expand("test_view", &def, &req).unwrap();
+    let where_at = sql.find("WHERE c.segment <> 'CHURNED'");
+    assert!(where_at.is_some(), "predicate must be emitted: {sql}");
+    if let Some(group_at) = sql.find("GROUP BY") {
+        assert!(where_at < Some(group_at), "WHERE before GROUP BY: {sql}");
+    }
+}

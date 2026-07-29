@@ -58,6 +58,7 @@ pub(super) fn expand_window_metrics(
     resolved_dims: &[ResolvedDim],
     resolved_mets: &[&Metric],
     resolved_exprs: &HashMap<String, String>,
+    where_clause: Option<&super::where_clause::ResolvedWhere>,
 ) -> Result<String, ExpandError> {
     // 1. Validate required dimensions for each window metric.
     //
@@ -192,8 +193,22 @@ pub(super) fn expand_window_metrics(
 
     // CTE JOINs
     let dims: Vec<&crate::model::Dimension> = resolved_dims.iter().map(|rd| rd.dim).collect();
-    let resolved_joins = resolve_joins_pkfk(def, &dims, resolved_mets, &[]);
+    // Tables named only by the predicate must be joined inside the CTE, where
+    // the filter is applied.
+    let where_tables: Vec<String> = where_clause
+        .map(|w| w.source_tables.clone())
+        .unwrap_or_default();
+    let resolved_joins = resolve_joins_pkfk(def, &dims, resolved_mets, &where_tables);
     push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
+
+    // Inside the CTE and before its GROUP BY, so the inner aggregates the
+    // window function reads are computed over only the matching rows. On the
+    // outer query the predicate would filter the window's OUTPUT instead of its
+    // input, which for a running total or rank is a different number entirely.
+    if let Some(w) = where_clause {
+        sql.push_str("\n    WHERE ");
+        sql.push_str(&w.sql);
+    }
 
     // CTE GROUP BY (all dimension columns)
     if !resolved_dims.is_empty() {
@@ -1040,6 +1055,63 @@ mod tests {
         assert!(
             !sql.contains("\"s.\"\"order date\"\"\""),
             "dotted-quoted ORDER BY text must not leak as a non-column: {sql}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-aggregation `where_clause`
+    //
+    // The predicate must land inside `__sv_agg`, before its GROUP BY, so the
+    // inner aggregates the window function reads are computed over only the
+    // matching rows. On the outer query it would filter the window's OUTPUT --
+    // for a running total or a rank, a different number entirely.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn where_clause_is_injected_inside_the_agg_cte_not_the_outer_query() {
+        let def = minimal_def("sales", "store", "store", "total_qty", "SUM(s.quantity)")
+            .with_dimension("date", "date", None)
+            .with_window_spec(
+                "total_qty",
+                WindowSpec {
+                    window_function: "AVG".to_string(),
+                    inner_metric: "total_qty".to_string(),
+                    extra_args: vec![],
+                    excluding_dims: vec!["date".to_string()],
+                    partition_dims: vec![],
+                    order_by: vec![WindowOrderBy {
+                        expr: "date".to_string(),
+                        order: SortOrder::Asc,
+                        nulls: NullsOrder::Last,
+                    }],
+                    frame_clause: None,
+                },
+            );
+        let req = QueryRequest {
+            where_clause: Some("date >= DATE '2024-01-01'".to_string()),
+            facts: vec![],
+            dimensions: vec![DimensionName::new("store"), DimensionName::new("date")],
+            metrics: vec![MetricName::new("total_qty")],
+        };
+        let sql = expand("test_view", &def, &req).unwrap();
+
+        let cte_end = sql.find("\n)\n").expect("the agg CTE must close");
+        let cte = &sql[..cte_end];
+        let outer = &sql[cte_end..];
+
+        let where_at = cte.find("WHERE");
+        let group_at = cte.find("GROUP BY");
+        assert!(
+            where_at.is_some(),
+            "predicate must be inside __sv_agg: {sql}"
+        );
+        assert!(
+            group_at.is_none() || where_at < group_at,
+            "WHERE must precede the CTE GROUP BY: {cte}"
+        );
+        assert!(
+            !outer.contains("WHERE"),
+            "predicate must not filter the window output: {outer}"
         );
     }
 }
