@@ -1,0 +1,142 @@
+# TECH-DEBT #37: fan-in onto the base table must not hide reachable tables.
+#
+# Shape (o is the BASE table):
+#     c (customers)
+#     ^
+#     | o(customer_id) REFERENCES c
+#     o (orders)
+#     ^                ^
+#     | li(order_id)   | s(order_id)
+#     li (line_items)  s (shipments)
+#
+# Two children (`li`, `s`) reference the base table `o`. This is the only legal
+# fan-in -- `check_no_diamonds` exempts the root and rejects every other
+# multi-parent node as an ambiguous join diamond.
+#
+# The parent map used to take the first-declared child as the base table's
+# "parent", so `o` hung off `li` and chains ran through the root and out the far
+# branch: `c`'s chain was [c, o, li] and never reached `s`. Consequences, both
+# fixed here:
+#   1. a fact on `s` with a dimension on `c` was rejected as a fact-path
+#      violation though `s -> o -> c` is many-to-one at every hop, and
+#   2. `SHOW SEMANTIC DIMENSIONS ... FOR METRIC` hid `c`'s dimensions from a
+#      metric on `s` for the same reason.
+
+require semantic_views
+
+statement ok
+CREATE TABLE fi_customers (id INTEGER PRIMARY KEY, name VARCHAR, country VARCHAR);
+
+statement ok
+INSERT INTO fi_customers VALUES (1, 'Alice', 'US'), (2, 'Bob', 'FR');
+
+statement ok
+CREATE TABLE fi_orders (id INTEGER PRIMARY KEY, customer_id INTEGER);
+
+statement ok
+INSERT INTO fi_orders VALUES (10, 1), (11, 2);
+
+statement ok
+CREATE TABLE fi_line_items (id INTEGER PRIMARY KEY, order_id INTEGER, qty INTEGER, price DECIMAL(10,2));
+
+statement ok
+INSERT INTO fi_line_items VALUES (100, 10, 2, 5.00), (101, 10, 1, 7.00), (102, 11, 3, 2.00);
+
+statement ok
+CREATE TABLE fi_shipments (id INTEGER PRIMARY KEY, order_id INTEGER, carrier VARCHAR, cost DECIMAL(10,2));
+
+statement ok
+INSERT INTO fi_shipments VALUES (1000, 10, 'DHL', 4.50), (1001, 11, 'UPS', 6.25);
+
+# `item_order` is declared first, so it was the child the base table used to be
+# given as its "parent" -- that ordering is what triggered the bug.
+statement ok
+CREATE SEMANTIC VIEW fi_sv AS
+  TABLES (
+    o AS fi_orders PRIMARY KEY (id),
+    li AS fi_line_items PRIMARY KEY (id),
+    s AS fi_shipments PRIMARY KEY (id),
+    c AS fi_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    item_order AS li(order_id) REFERENCES o,
+    shipment_order AS s(order_id) REFERENCES o,
+    order_customer AS o(customer_id) REFERENCES c
+  )
+  FACTS (
+    s.ship_cost AS s.cost
+  )
+  DIMENSIONS (
+    s.carrier AS s.carrier,
+    c.customer_country AS c.country,
+    li.item_qty AS li.qty
+  )
+  METRICS (
+    s.total_ship_cost AS SUM(s.cost),
+    li.line_total AS SUM(li.price * li.qty)
+  )
+
+# ============================================================
+# Test 1: SHOW ... FOR METRIC across the fan-in
+# A metric on `s` reaches `c` via s -> o -> c (many-to-one throughout), so
+# customer_country is listed. `item_qty` is NOT: reaching `li` from `s` walks
+# o -> li backwards, which fans out.
+# ============================================================
+
+query TTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN fi_sv FOR METRIC total_ship_cost
+----
+fi_customers	customer_country	(empty)	false
+fi_shipments	carrier	(empty)	false
+
+# ============================================================
+# Test 2: the mirror case -- a metric on the sibling branch reaches `c` too,
+# and does not reach `s`.
+# ============================================================
+
+query TTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN fi_sv FOR METRIC line_total
+----
+fi_customers	customer_country	(empty)	false
+fi_line_items	item_qty	(empty)	false
+
+# ============================================================
+# Test 3: a fact on the base table with a dimension across the fan-in
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('fi_sv', facts := ['ship_cost'], dimensions := ['customer_country']);
+----
+FR	6.25
+US	4.50
+
+# ============================================================
+# Test 4: the over-widening guard -- `li` and `s` are the fan-in siblings, so
+# reaching one from the other walks a many-to-one edge backwards and multiplies
+# rows. Once the parent map is rooted at the base table both share the ancestor
+# `o`, so this pair must be rejected on fan-out DIRECTION, not on connectivity.
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('fi_sv', facts := ['ship_cost'], dimensions := ['item_qty']);
+----
+not on the same root-to-leaf path
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW fi_sv
+
+statement ok
+DROP TABLE fi_shipments
+
+statement ok
+DROP TABLE fi_line_items
+
+statement ok
+DROP TABLE fi_orders
+
+statement ok
+DROP TABLE fi_customers
