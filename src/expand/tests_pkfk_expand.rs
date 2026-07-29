@@ -133,6 +133,7 @@ fn pkfk_three_table_def() -> SemanticViewDefinition {
 fn test_pkfk_on_clause_simple() {
     let def = pkfk_two_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("customer_name")],
         metrics: vec![MetricName::new("total_amount")],
@@ -189,6 +190,7 @@ fn test_pkfk_on_clause_composite() {
         comment: None,
     };
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("detail")],
         metrics: vec![MetricName::new("cnt")],
@@ -209,6 +211,7 @@ fn test_pkfk_on_clause_composite() {
 fn test_pkfk_left_join_emitted() {
     let def = pkfk_two_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("customer_name")],
         metrics: vec![MetricName::new("total_amount")],
@@ -234,6 +237,7 @@ fn test_pkfk_left_join_emitted() {
 fn test_pkfk_transitive_join_inclusion() {
     let def = pkfk_three_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("customer_name")],
         metrics: vec![MetricName::new("total_qty")],
@@ -253,6 +257,7 @@ fn test_pkfk_transitive_join_inclusion() {
 fn test_pkfk_pruning() {
     let def = pkfk_three_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("product")],
         metrics: vec![MetricName::new("total_qty")],
@@ -269,6 +274,7 @@ fn test_pkfk_topological_order() {
     let mut def = pkfk_three_table_def();
     def.joins.reverse();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("customer_name")],
         metrics: vec![MetricName::new("total_qty")],

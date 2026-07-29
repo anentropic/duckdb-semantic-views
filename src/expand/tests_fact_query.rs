@@ -24,6 +24,7 @@ fn multi_table_def() -> SemanticViewDefinition {
 fn test_fact_query_basic() {
     let def = multi_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("net_price")],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![],
@@ -46,6 +47,7 @@ fn test_fact_query_basic() {
 fn test_fact_query_no_dimensions() {
     let def = multi_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("net_price")],
         dimensions: vec![],
         metrics: vec![],
@@ -75,6 +77,7 @@ fn test_fact_query_inline_facts() {
         .with_fact("line_total", "net_price * li.quantity", "li")
         .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("line_total")],
         dimensions: vec![],
         metrics: vec![],
@@ -91,6 +94,7 @@ fn test_fact_query_inline_facts() {
 fn test_fact_query_unknown_fact() {
     let def = multi_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("nonexistent")],
         dimensions: vec![],
         metrics: vec![],
@@ -108,6 +112,7 @@ fn test_fact_query_unknown_fact() {
 fn test_fact_query_duplicate_fact() {
     let def = multi_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("net_price"), FactName::new("net_price")],
         dimensions: vec![],
         metrics: vec![],
@@ -125,6 +130,7 @@ fn test_fact_query_duplicate_fact() {
 fn test_fact_query_private_fact() {
     let def = multi_table_def().with_private_fact("raw_price", "li.price", "li");
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("raw_price")],
         dimensions: vec![],
         metrics: vec![],
@@ -151,6 +157,7 @@ fn test_fact_path_violation() {
         .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"])
         .with_pkfk_join("p_to_o", "p", "o", &["order_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("net_price")],
         dimensions: vec![DimensionName::new("pay_status")],
         metrics: vec![],
@@ -198,6 +205,7 @@ fn fact_with_dimension_across_fan_in_is_allowed() {
     // unrelated fan-in sibling `li` must not hide `c` from it.
     let def = fan_in_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("ship_cost")],
         dimensions: vec![DimensionName::new("country")],
         metrics: vec![],
@@ -220,6 +228,7 @@ fn fact_across_fan_in_siblings_still_violates() {
     // must be checked for fan-out DIRECTION, not merely for connectivity.
     let def = fan_in_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("line_price")],
         dimensions: vec![DimensionName::new("carrier")],
         metrics: vec![],
@@ -240,6 +249,7 @@ fn fact_reaches_a_multi_hop_chain_across_fan_in() {
         .with_dimension("region_name", "r.name", Some("r"))
         .with_pkfk_join("c_to_r", "c", "r", &["region_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("ship_cost")],
         dimensions: vec![DimensionName::new("region_name")],
         metrics: vec![],
@@ -264,6 +274,7 @@ fn test_fact_path_valid_linear() {
         .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"])
         .with_pkfk_join("d_to_li", "d", "li", &["line_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("detail_val")],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![],
@@ -277,6 +288,7 @@ fn test_fact_query_with_output_type() {
     let mut def = multi_table_def();
     def.facts[0].output_type = Some("DECIMAL(10,2)".to_string());
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("net_price")],
         dimensions: vec![],
         metrics: vec![],

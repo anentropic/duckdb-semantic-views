@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pre-aggregation filtering via a new `where_clause` query parameter**, the equivalent of Snowflake's `SEMANTIC_VIEW( … WHERE <predicate> )`. The predicate names declared dimensions and facts and is applied *before* metrics are aggregated, so a filter on a member that is not in the output finally works: `where_clause := 'ordered_at >= DATE ''2024-01-01'''` recomputes each group's revenue over the matching rows. An outer SQL `WHERE` on the result cannot express this — by then the aggregation has run over every row, and the member being filtered on is not in the output to filter by. Members the predicate references are joined in and counted by the same reachability and fan-out checks as queried dimensions, matching Snowflake's rule that WHERE-clause members participate in the same-logical-table constraint. Referencing a **metric** is rejected, also matching Snowflake: the filter runs before aggregation, so an aggregate has no value yet.
+
+  The parameter is spelled `where_clause` rather than `where` because DuckDB reserves `where` in named-parameter position — `where := '…'` is a parse error before the extension is ever consulted.
+
+  **Not yet supported** for queries computed through the per-grain (multi-grain metrics), semi-additive snapshot, or window strategies: each of those must filter inside its own CTE (before the `RANK`, before the window function), and applying the predicate to the outer query instead would filter after the fact. Those combinations raise a clear error naming the strategy rather than silently returning unfiltered numbers.
+
 ### Changed
 
 - DuckDB version pin bumped to `v1.5.5`.
@@ -397,7 +405,7 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.11.0...HEAD
 [0.12.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.3...v0.10.4

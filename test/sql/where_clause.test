@@ -1,0 +1,146 @@
+# Pre-aggregation `where_clause` — Snowflake's SEMANTIC_VIEW( … WHERE … ).
+#
+# The predicate filters the rows that feed the metrics, BEFORE they are
+# aggregated. That is what makes it inexpressible as an outer WHERE: by then the
+# aggregation has already run over every row, and the members the predicate
+# names are not in the output.
+#
+# Named `where_clause` because DuckDB reserves `where` in named-parameter
+# position -- `where := '…'` is a parse error before the binder sees it.
+
+require semantic_views
+
+statement ok
+CREATE TABLE wc_customers (id INTEGER, region VARCHAR);
+
+statement ok
+CREATE TABLE wc_orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10,2), ordered_at DATE);
+
+statement ok
+INSERT INTO wc_customers VALUES (1, 'EU'), (2, 'US');
+
+statement ok
+INSERT INTO wc_orders VALUES
+  (10, 1, 100.00, DATE '2024-01-15'),
+  (11, 1,  50.00, DATE '2023-06-01'),
+  (12, 2,  70.00, DATE '2024-03-02');
+
+statement ok
+CREATE SEMANTIC VIEW wc_sv AS
+  TABLES (
+    o AS wc_orders PRIMARY KEY (id),
+    c AS wc_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_customer AS o(customer_id) REFERENCES c
+  )
+  FACTS (
+    o.amt AS o.amount,
+    o.odate AS o.ordered_at
+  )
+  DIMENSIONS (
+    c.region AS c.region
+  )
+  METRICS (
+    o.revenue AS sum(o.amount)
+  );
+
+# ============================================================
+# Test 1: the baseline, no predicate. EU = 100 + 50.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('wc_sv', metrics := ['revenue'], dimensions := ['region']);
+----
+EU	150.00
+US	70.00
+
+# ============================================================
+# Test 2: the point of the feature. Filtering on `odate` -- a fact that is NOT
+# in the output -- RECOMPUTES EU's revenue over the matching rows (100.00), it
+# does not merely drop result rows. An outer WHERE could not express this: it
+# has no `odate` column to filter on, and EU's 150.00 would already be summed.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('wc_sv', metrics := ['revenue'], dimensions := ['region'], where_clause := 'odate >= DATE ''2024-01-01''');
+----
+EU	100.00
+US	70.00
+
+# ============================================================
+# Test 3: the predicate is emitted between the joins and the GROUP BY, with the
+# member name resolved to its declared expression.
+# ============================================================
+
+query T
+SELECT plan FROM (
+  SELECT unnest(string_split(explain_output, chr(10))) AS plan
+  FROM (SELECT * FROM explain_semantic_view('wc_sv', metrics := ['revenue'], dimensions := ['region'], where_clause := 'odate >= DATE ''2024-01-01'''))
+    AS t(explain_output)
+) WHERE plan LIKE 'WHERE %';
+----
+WHERE o.ordered_at >= DATE '2024-01-01'
+
+# ============================================================
+# Test 4: a dimension predicate filters before aggregation too.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('wc_sv', metrics := ['revenue'], dimensions := ['region'], where_clause := 'region = ''EU''');
+----
+EU	150.00
+
+# ============================================================
+# Test 5: Snowflake's rule -- the predicate may reference dimensions and facts,
+# never a metric. It runs before aggregation, so an aggregate has no value yet.
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('wc_sv', metrics := ['revenue'], where_clause := 'revenue > 5');
+----
+where_clause cannot reference the metric 'revenue'
+
+# ============================================================
+# Test 6: a fact query takes a plain WHERE -- nothing is aggregated, so there is
+# no "before" to be careful about.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('wc_sv', facts := ['amt'], dimensions := ['region'], where_clause := 'amt > 60');
+----
+EU	100.00
+US	70.00
+
+# ============================================================
+# Test 7: an empty predicate is treated as absent rather than spliced in as an
+# empty WHERE.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('wc_sv', metrics := ['revenue'], dimensions := ['region'], where_clause := '');
+----
+EU	150.00
+US	70.00
+
+# ============================================================
+# Test 8: a member name inside a string literal is data, not a reference -- the
+# splice is quote-aware, so this compares region against the text 'region'.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('wc_sv', metrics := ['revenue'], dimensions := ['region'], where_clause := 'region = ''region''');
+----
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW wc_sv;
+
+statement ok
+DROP TABLE wc_orders;
+
+statement ok
+DROP TABLE wc_customers;

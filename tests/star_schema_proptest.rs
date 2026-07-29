@@ -335,6 +335,7 @@ proptest! {
     fn star_join_fence_and_aggregation(case in arb_case()) {
         let def = build_def();
         let req = QueryRequest {
+            where_clause: None,
             dimensions: case
                 .sel_dims
                 .iter()

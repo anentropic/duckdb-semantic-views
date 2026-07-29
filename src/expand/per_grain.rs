@@ -458,6 +458,7 @@ fn render_single_grain(
         GroupBy::Ordinals(resolved_dims.len())
     };
     SelectSpec {
+        where_clause: None,
         distinct: false,
         items,
         from: FromSource::AnchorTable {

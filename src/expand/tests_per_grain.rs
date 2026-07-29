@@ -75,6 +75,7 @@ fn orders_with_pkless_child() -> SemanticViewDefinition {
 
 fn req(dims: &[&str], mets: &[&str]) -> QueryRequest {
     QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: dims.iter().map(|d| DimensionName::new(*d)).collect(),
         metrics: mets.iter().map(|m| MetricName::new(*m)).collect(),

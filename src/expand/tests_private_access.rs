@@ -79,6 +79,7 @@ fn make_def_with_private_and_derived() -> SemanticViewDefinition {
 fn private_metric_rejected() {
     let def = make_def_with_private_metric();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("secret_cost")],
@@ -95,6 +96,7 @@ fn private_metric_rejected() {
 fn private_metric_error_message_contains_private() {
     let def = make_def_with_private_metric();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("secret_cost")],
@@ -115,6 +117,7 @@ fn private_metric_error_message_contains_private() {
 fn public_metric_still_works() {
     let def = make_def_with_private_metric();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -130,6 +133,7 @@ fn public_metric_still_works() {
 fn derived_metric_referencing_private_base_works() {
     let def = make_def_with_private_and_derived();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("profit")],

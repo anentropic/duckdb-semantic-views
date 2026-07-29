@@ -12,6 +12,7 @@ use crate::model::SemanticViewDefinition;
 fn test_basic_single_dimension_single_metric() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -31,6 +32,7 @@ GROUP BY
 fn test_multiple_dimensions_multiple_metrics() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region"), DimensionName::new("status")],
         metrics: vec![
@@ -69,6 +71,7 @@ fn test_multiple_dimensions_multiple_metrics() {
 fn test_global_aggregate_no_dimensions() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("total_revenue")],
@@ -90,6 +93,7 @@ fn test_global_aggregate_no_dimensions() {
 fn test_identifier_quoting() {
     let def = minimal_def("select", "col", "col", "cnt", "count(*)");
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("col")],
         metrics: vec![MetricName::new("cnt")],
@@ -109,6 +113,7 @@ fn test_dimension_expression_not_quoted() {
         "sum(amount)",
     );
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("month")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -123,6 +128,7 @@ fn test_dimension_expression_not_quoted() {
 fn test_empty_request_error() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![],
@@ -141,6 +147,7 @@ fn test_empty_request_error() {
 fn test_dimensions_only_generates_distinct() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region"), DimensionName::new("status")],
         metrics: vec![],
@@ -172,6 +179,7 @@ fn test_dimensions_only_generates_distinct() {
 fn test_metrics_only_still_works() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![
@@ -205,6 +213,7 @@ fn test_case_insensitive_dimension_lookup() {
     let def = minimal_def("orders", "Region", "region", "total_revenue", "sum(amount)");
     // Request uses lowercase "region" but definition has "Region"
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -219,6 +228,7 @@ fn test_case_insensitive_dimension_lookup() {
 fn test_unknown_dimension_error() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("reigon")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -245,6 +255,7 @@ fn test_unknown_dimension_error() {
 fn test_unknown_metric_error() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("totl_revenue")],
@@ -271,6 +282,7 @@ fn test_unknown_metric_error() {
 fn test_unknown_dimension_no_suggestion() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("xyzzy")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -289,6 +301,7 @@ fn test_unknown_dimension_no_suggestion() {
 fn test_duplicate_dimension_error() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region"), DimensionName::new("region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -308,6 +321,7 @@ fn test_duplicate_dimension_error() {
 fn test_duplicate_metric_error() {
     let def = orders_view();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![
@@ -333,6 +347,7 @@ fn test_case_insensitive_metric_lookup() {
         .with_metric("Total_Revenue", "sum(amount)", None);
     // Request uses lowercase "total_revenue" but definition has "Total_Revenue"
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("total_revenue")],
@@ -415,6 +430,7 @@ fn test_join_excluded_when_not_needed() {
         .with_pkfk_join("cust", "orders", "customers", &["customer_id"], &["id"]);
     // Request only "region" which comes from base table
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -430,6 +446,7 @@ fn test_join_excluded_when_not_needed() {
 fn test_no_joins_declared_no_error() {
     let def = minimal_def("orders", "region", "region", "total_revenue", "sum(amount)");
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -451,6 +468,7 @@ fn test_dot_qualified_base_table() {
         "count(*)",
     );
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("status")],
         metrics: vec![MetricName::new("order_count")],
@@ -473,6 +491,7 @@ fn test_base_table_qualified_with_catalog_schema() {
     def.database_name = Some("memory".to_string());
     def.schema_name = Some("main".to_string());
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -495,6 +514,7 @@ fn test_join_table_qualified_with_catalog_schema() {
     def.database_name = Some("memory".to_string());
     def.schema_name = Some("main".to_string());
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![
             DimensionName::new("region"),
@@ -520,6 +540,7 @@ fn test_base_table_qualified_schema_only() {
     let mut def = minimal_def("orders", "region", "region", "total_revenue", "sum(amount)");
     def.schema_name = Some("analytics".to_string());
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -537,6 +558,7 @@ fn test_base_table_qualified_schema_only() {
 fn test_base_table_unqualified_when_no_catalog_schema() {
     let def = minimal_def("orders", "region", "region", "total_revenue", "sum(amount)");
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("total_revenue")],
@@ -569,6 +591,7 @@ fn test_already_qualified_table_not_double_qualified() {
     def.database_name = Some("memory".to_string());
     def.schema_name = Some("main".to_string());
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("total_revenue")],

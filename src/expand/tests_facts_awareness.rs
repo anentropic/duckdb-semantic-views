@@ -11,6 +11,7 @@ use crate::expand::test_helpers::{orders_view, TestFixtureExt};
 fn test_facts_metrics_mutual_exclusion() {
     let def = orders_view().with_fact("line_total", "quantity * price", "orders");
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("line_total")],
         dimensions: vec![],
         metrics: vec![MetricName::new("total_revenue")],
@@ -33,6 +34,7 @@ fn test_facts_metrics_mutual_exclusion() {
 fn test_empty_request_with_facts_is_not_empty() {
     let def = orders_view().with_fact("line_total", "quantity * price", "orders");
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("line_total")],
         dimensions: vec![],
         metrics: vec![],

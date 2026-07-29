@@ -192,6 +192,7 @@ fn expand_derived_metric_correct_sql() {
     let mut def = def;
     def.metrics[0].source_table = Some("o".to_string());
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("profit")],
@@ -263,6 +264,7 @@ fn expand_derived_only_no_base_metrics_requested() {
         comment: None,
     };
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("profit")],
@@ -341,6 +343,7 @@ fn resolve_joins_includes_transitive_deps_from_derived() {
         comment: None,
     };
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("avg_order_value")],
@@ -393,6 +396,7 @@ fn expand_derived_metric_with_facts_chain() {
         comment: None,
     };
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![],
         metrics: vec![MetricName::new("profit")],

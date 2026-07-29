@@ -218,6 +218,15 @@ pub(super) struct SelectSpec<'a> {
     pub(super) items: Vec<SelectItem>,
     /// The `FROM` source (+ joins, for the base-table case).
     pub(super) from: FromSource<'a>,
+    /// The pre-aggregation predicate, already resolved to raw SQL, or `None`.
+    ///
+    /// Rendered between the joins and the `GROUP BY`, which is what makes it
+    /// *pre*-aggregation: the rows are filtered on their way into the grouping,
+    /// not after it. Only the base-anchored and facts emitters set this; the CTE
+    /// strategies must filter inside their CTE (before `RANK`/the window
+    /// function), so they reject a predicate rather than render one out here
+    /// where it would be applied too late.
+    pub(super) where_clause: Option<String>,
     /// The `GROUP BY`, if any.
     pub(super) group_by: GroupBy,
 }
@@ -252,6 +261,10 @@ impl SelectSpec<'_> {
                 sql.push_str("\nFROM ");
                 sql.push_str(name);
             }
+        }
+        if let Some(predicate) = &self.where_clause {
+            sql.push_str("\nWHERE ");
+            sql.push_str(predicate);
         }
         match self.group_by {
             GroupBy::None => {}
@@ -349,6 +362,7 @@ mod tests {
         // base table qualifies to `"orders" AS "orders"`.
         let def = minimal_def("orders", "region", "region", "cnt", "count(*)");
         let spec = SelectSpec {
+            where_clause: None,
             distinct: false,
             items: vec![
                 SelectItem::new("region".to_string(), None, "\"region\"".to_string()),
@@ -372,6 +386,7 @@ mod tests {
         // Dimensions-only base query: SELECT DISTINCT, no GROUP BY.
         let def = minimal_def("orders", "region", "region", "cnt", "count(*)");
         let spec = SelectSpec {
+            where_clause: None,
             distinct: true,
             items: vec![SelectItem::new(
                 "region".to_string(),
@@ -395,6 +410,7 @@ mod tests {
         // The semi-additive OUTER shape: SELECT over a bare CTE name (no
         // qualification, no alias, no joins) with an ordinal GROUP BY.
         let spec = SelectSpec {
+            where_clause: None,
             distinct: false,
             items: vec![
                 SelectItem::new("\"region\"".to_string(), None, "\"region\"".to_string()),
@@ -418,6 +434,7 @@ mod tests {
     fn render_named_source_no_group_by() {
         // The window OUTER shape: SELECT over a bare CTE name, no GROUP BY.
         let spec = SelectSpec {
+            where_clause: None,
             distinct: false,
             items: vec![SelectItem::new(
                 "AVG(\"q\") OVER ()".to_string(),

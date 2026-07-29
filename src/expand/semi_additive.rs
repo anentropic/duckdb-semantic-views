@@ -258,6 +258,7 @@ pub(super) fn expand_semi_additive(
 
     sql.push_str(
         &SelectSpec {
+            where_clause: None,
             distinct: false,
             items: outer_items,
             from: FromSource::Named("__sv_snapshot".to_string()),
@@ -829,6 +830,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("balance")],
@@ -886,6 +888,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("region")],
             metrics: vec![MetricName::new("balance")],
@@ -924,6 +927,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("region")],
             metrics: vec![MetricName::new("balance")],
@@ -961,6 +965,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![
                 DimensionName::new("customer_id"),
@@ -999,6 +1004,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("balance")],
@@ -1036,6 +1042,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("amount"), MetricName::new("balance")],
@@ -1070,6 +1077,7 @@ mod tests {
     fn test_no_semi_additive_no_cte() {
         let def = orders_view();
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("region")],
             metrics: vec![MetricName::new("total_revenue")],
@@ -1194,6 +1202,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("discounted"), MetricName::new("balance")],
@@ -1233,6 +1242,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("row_count"), MetricName::new("balance")],
@@ -1275,6 +1285,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![
@@ -1311,6 +1322,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("safe_total"), MetricName::new("balance")],
@@ -1348,6 +1360,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("profit"), MetricName::new("balance")],
@@ -1391,6 +1404,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("balance")],
@@ -1432,6 +1446,7 @@ mod tests {
             .with_pkfk_join("acct_date", "a", "d", &["date_id"], &["id"]);
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("balance")],
@@ -1478,6 +1493,7 @@ mod tests {
             .with_pkfk_join("acct_date", "a", "d", &["date_id"], &["id"]);
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("balance")],
@@ -1526,6 +1542,7 @@ mod tests {
             );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![
                 DimensionName::new("customer_id"),
@@ -1606,6 +1623,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![],
             metrics: vec![MetricName::new("balance")],
@@ -1657,6 +1675,7 @@ mod tests {
             .with_pkfk_join("cust_acct", "a", "c", &["customer_id"], &["id"]);
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("acct_name")],
             metrics: vec![MetricName::new("total_balance")],
@@ -1690,6 +1709,7 @@ mod tests {
             .with_pkfk_join("acct_cust", "a", "c", &["customer_id"], &["id"]);
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_name")],
             metrics: vec![MetricName::new("total_balance")],
@@ -1723,6 +1743,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("balance")],
@@ -1758,6 +1779,7 @@ mod tests {
         );
 
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("customer_id")],
             metrics: vec![MetricName::new("balance")],
@@ -1809,6 +1831,7 @@ mod tests {
 
     fn carrier_only_req() -> QueryRequest {
         QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("carrier")],
             metrics: vec![MetricName::new("latest_bal")],
@@ -1903,6 +1926,7 @@ mod tests {
                 &[("city", SortOrder::Asc, NullsOrder::Last)],
             );
         let req = QueryRequest {
+            where_clause: None,
             facts: vec![],
             dimensions: vec![DimensionName::new("carrier")],
             metrics: vec![
@@ -1967,6 +1991,7 @@ mod tests {
 
         fn snapshot_req() -> QueryRequest {
             QueryRequest {
+                where_clause: None,
                 facts: vec![],
                 dimensions: vec![DimensionName::new("customer_id")],
                 metrics: vec![MetricName::new("balance")],
@@ -2248,6 +2273,7 @@ mod tests {
             );
 
             let req = QueryRequest {
+                where_clause: None,
                 facts: vec![],
                 dimensions: vec![DimensionName::new("customer_id")],
                 metrics: vec![

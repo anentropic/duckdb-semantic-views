@@ -97,6 +97,7 @@ fn fan_trap_three_table_def() -> SemanticViewDefinition {
 fn fan_trap_one_to_many_blocked() {
     let def = fan_trap_three_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("status")],
         metrics: vec![MetricName::new("order_count")],
@@ -117,6 +118,7 @@ fn fan_trap_one_to_many_blocked() {
 fn fan_trap_many_to_one_safe() {
     let def = fan_trap_three_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("revenue")],
@@ -175,6 +177,7 @@ fn fan_trap_one_to_one_safe() {
         comment: None,
     };
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("detail")],
         metrics: vec![MetricName::new("cnt")],
@@ -191,6 +194,7 @@ fn fan_trap_one_to_one_safe() {
 fn fan_trap_same_table_safe() {
     let def = fan_trap_three_table_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("status")],
         metrics: vec![MetricName::new("revenue")],
@@ -207,6 +211,7 @@ fn fan_trap_same_table_safe() {
 fn fan_trap_no_joins_safe() {
     let def = minimal_def("orders", "region", "region", "cnt", "COUNT(*)");
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("cnt")],
@@ -225,6 +230,7 @@ fn fan_trap_transitive_chain() {
         ..Default::default()
     });
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("status")],
         metrics: vec![MetricName::new("customer_count")],
@@ -252,6 +258,7 @@ fn fan_trap_derived_metric_blocked() {
         ..Default::default()
     });
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("status")],
         metrics: vec![MetricName::new("avg_order")],
@@ -353,6 +360,7 @@ fn cyclic_relationships_do_not_hang_expand() {
         ..Default::default()
     };
     let req = QueryRequest {
+        where_clause: None,
         dimensions: vec!["d".into()],
         metrics: vec!["m".into()],
         facts: vec![],

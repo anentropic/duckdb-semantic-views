@@ -576,6 +576,7 @@ mod tests {
             &["total_revenue"],
         );
         let req = QueryRequest {
+            where_clause: None,
             dimensions: vec![DimensionName::new("region")],
             metrics: vec![MetricName::new("total_revenue")],
             facts: vec![],
@@ -694,6 +695,7 @@ mod tests {
         );
         // Request dims/mets that don't match the materialization
         let req = QueryRequest {
+            where_clause: None,
             dimensions: vec![DimensionName::new("region"), DimensionName::new("status")],
             metrics: vec![MetricName::new("total_revenue")],
             facts: vec![],

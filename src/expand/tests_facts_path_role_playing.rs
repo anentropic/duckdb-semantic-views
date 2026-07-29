@@ -31,6 +31,7 @@ fn test_facts_path_role_playing_dimension_raises_ambiguous_path() {
     // arbitrary edge.
     let def = role_playing_facts_def(true);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("order_note")],
         dimensions: vec![DimensionName::new("city")],
         metrics: vec![],
@@ -70,6 +71,7 @@ fn fact_on_role_playing_table_errors_ambiguous() {
         .with_pkfk_join("dep_airport", "orders", "a", &["dep_code"], &["code"])
         .with_pkfk_join("arr_airport", "orders", "a", &["arr_code"], &["code"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("airport_city")],
         dimensions: vec![],
         metrics: vec![],
@@ -112,6 +114,7 @@ fn fact_on_descendant_of_role_playing_table_errors_ambiguous() {
         .with_pkfk_join("arr_airport", "orders", "a", &["arr_code"], &["code"])
         .with_pkfk_join("airport_region", "a", "r", &["region_id"], &["region_id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("region_name")],
         dimensions: vec![],
         metrics: vec![],
@@ -136,6 +139,7 @@ fn fact_on_descendant_of_role_playing_table_errors_ambiguous() {
 fn test_facts_path_single_relationship_dimension_ok() {
     let def = role_playing_facts_def(false);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("order_note")],
         dimensions: vec![DimensionName::new("city")],
         metrics: vec![],
@@ -167,6 +171,7 @@ fn test_facts_path_convergent_parent_dimension_not_ambiguous() {
         .with_pkfk_join("li_to_o", "li", "orders", &["order_id"], &["id"])
         .with_pkfk_join("pay_to_o", "pay", "orders", &["order_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![FactName::new("net_price")],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![],
@@ -190,6 +195,7 @@ fn test_metrics_path_convergent_parent_dimension_not_ambiguous() {
         .with_pkfk_join("li_to_o", "li", "orders", &["order_id"], &["id"])
         .with_pkfk_join("pay_to_o", "pay", "orders", &["order_id"], &["id"]);
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("revenue")],

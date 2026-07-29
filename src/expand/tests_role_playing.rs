@@ -133,6 +133,7 @@ fn descendant_of_role_playing_table_errors_ambiguous() {
     // as a dimension directly on `a` does.
     let def = flights_airports_regions_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region_name")],
         metrics: vec![MetricName::new("arrival_count")],
@@ -173,6 +174,7 @@ fn descendant_through_single_relationship_still_resolves() {
     def.metrics
         .retain(|m| m.name != "arrival_count" && m.name != "total_flights");
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region_name")],
         metrics: vec![MetricName::new("departure_count")],
@@ -185,6 +187,7 @@ fn descendant_through_single_relationship_still_resolves() {
 fn using_metric_generates_scoped_join_alias() {
     let def = flights_airports_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("city")],
         metrics: vec![MetricName::new("departure_count")],
@@ -204,6 +207,7 @@ fn using_metric_generates_scoped_join_alias() {
 fn two_using_metrics_generate_two_scoped_joins() {
     let def = flights_airports_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("carrier")],
         metrics: vec![
@@ -226,6 +230,7 @@ fn two_using_metrics_generate_two_scoped_joins() {
 fn dimension_rewritten_to_scoped_alias() {
     let def = flights_airports_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("city")],
         metrics: vec![MetricName::new("departure_count")],
@@ -241,6 +246,7 @@ fn dimension_rewritten_to_scoped_alias() {
 fn ambiguous_dimension_without_using_produces_error() {
     let def = flights_airports_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("city")],
         metrics: vec![],
@@ -296,6 +302,7 @@ fn non_ambiguous_single_relationship_works_without_using() {
         ..Default::default()
     });
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("customer_name")],
         metrics: vec![MetricName::new("revenue")],
@@ -312,6 +319,7 @@ fn non_ambiguous_single_relationship_works_without_using() {
 fn base_table_dimension_works_unchanged() {
     let def = flights_airports_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("carrier")],
         metrics: vec![MetricName::new("departure_count")],
@@ -369,6 +377,7 @@ fn fan_trap_detection_works_with_using_paths() {
         comment: None,
     };
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("carrier")],
         metrics: vec![MetricName::new("airport_count")],
@@ -385,6 +394,7 @@ fn fan_trap_detection_works_with_using_paths() {
 fn derived_metric_with_two_using_resolves_both_joins() {
     let def = flights_airports_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("carrier")],
         metrics: vec![MetricName::new("total_flights")],
@@ -430,6 +440,7 @@ fn metric_using_from_base_table_no_unnecessary_join() {
         comment: None,
     };
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("cnt")],
@@ -485,6 +496,7 @@ fn backward_compat_no_using_expands_as_before() {
         comment: None,
     };
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("customer_name")],
         metrics: vec![MetricName::new("revenue")],
@@ -504,6 +516,7 @@ fn backward_compat_no_using_expands_as_before() {
 fn ambiguous_dimension_with_derived_metric_using_both_paths() {
     let def = flights_airports_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("city")],
         metrics: vec![MetricName::new("total_flights")],
@@ -523,6 +536,7 @@ fn ambiguous_dimension_with_derived_metric_using_both_paths() {
 fn scoped_join_on_clause_uses_correct_fk_pk() {
     let def = flights_airports_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("city")],
         metrics: vec![MetricName::new("departure_count")],

@@ -304,6 +304,7 @@ proptest! {
     fn semi_additive_snapshot_matches_independent_oracle(case in arb_case()) {
         let def = build_def(case.order);
         let req = QueryRequest {
+            where_clause: None,
             dimensions: case.sel_dims.iter().map(|&i| DimensionName::new(DIMS[i])).collect(),
             metrics: case.sel_metrics.iter().map(|&i| MetricName::new(METS[i])).collect(),
             facts: vec![],

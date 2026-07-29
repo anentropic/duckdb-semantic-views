@@ -56,6 +56,7 @@ fn qualified_ref_def() -> SemanticViewDefinition {
 fn test_expand_qualified_column_refs_verbatim() {
     let def = qualified_ref_def();
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("customer_name")],
         metrics: vec![MetricName::new("total_amount")],
@@ -126,6 +127,7 @@ fn test_expand_multiple_qualified_refs_different_tables() {
         comment: None,
     };
     let req = QueryRequest {
+        where_clause: None,
         facts: vec![],
         dimensions: vec![
             DimensionName::new("customer_name"),

@@ -201,15 +201,30 @@ fn expand_facts(
     // 2. Resolve requested dimensions (same logic as expand()).
     let resolved_dims = resolve_names::<Dimension, _>(&req.dimensions, view_name, def)?;
 
+    // 2b. Resolve the pre-aggregation predicate, if any. Done before the path
+    // check so the members it references take part in it: Snowflake's
+    // same-logical-table rule counts WHERE-clause members explicitly ("all facts
+    // and dimensions used in the query, INCLUDING those specified in the WHERE
+    // clause"). A filter on a table that fans out against the queried facts is
+    // the same row-multiplication hazard as selecting from it.
+    let resolved_where = req
+        .where_clause
+        .as_deref()
+        .map(|raw| super::where_clause::resolve_where_clause(view_name, def, raw))
+        .transpose()?;
+
     // 3. Validate table path constraint (FACT-04).
     let fact_tables: Vec<String> = resolved_facts
         .iter()
         .filter_map(|f| f.source_table.clone())
         .collect();
-    let dim_tables: Vec<String> = resolved_dims
+    let mut dim_tables: Vec<String> = resolved_dims
         .iter()
         .filter_map(|d| d.source_table.clone())
         .collect();
+    if let Some(rw) = &resolved_where {
+        dim_tables.extend(rw.source_tables.iter().cloned());
+    }
     validate_fact_table_path(view_name, def, &fact_tables, &dim_tables)?;
 
     // 3b. Role-playing ambiguity detection (SG-17), mirroring the metrics
@@ -263,15 +278,22 @@ fn expand_facts(
     // Fact queries have no metrics; fact source tables are resolved through
     // the same path walk as dimensions (SG-10) and their joins are appended
     // after the dimension-driven joins.
-    let fact_sources: Vec<String> = resolved_facts
+    // Tables named only by the predicate still have to be joined, or the
+    // filter would reference an alias that is not in the FROM.
+    let mut fact_sources: Vec<String> = resolved_facts
         .iter()
         .filter_map(|f| f.source_table.clone())
         .collect();
+    if let Some(rw) = &resolved_where {
+        fact_sources.extend(rw.source_tables.iter().cloned());
+    }
     let joins = resolve_joins_pkfk(def, &resolved_dims, &[], &fact_sources);
 
     // 7. A fact query is an unaggregated top-level SELECT over the base table
-    //    (+ joins): no DISTINCT, no GROUP BY.
+    //    (+ joins): no DISTINCT, no GROUP BY. The predicate is a plain WHERE —
+    //    nothing is aggregated, so there is no "before" to be careful about.
     Ok(SelectSpec {
+        where_clause: resolved_where.map(|rw| rw.sql),
         distinct: false,
         items,
         from: FromSource::BaseTable { def, joins },
@@ -326,13 +348,32 @@ pub fn expand(
     // inline_derived_metrics resolves expressions, not access modifiers.
     let resolved_mets = resolve_names::<Metric, _>(&req.metrics, view_name, def)?;
 
+    // Resolve the pre-aggregation predicate up front: it decides materialization
+    // routing below, participates in the fan-trap checks, and is rejected by the
+    // strategies that cannot yet inject it.
+    let resolved_where = req
+        .where_clause
+        .as_deref()
+        .map(|raw| super::where_clause::resolve_where_clause(view_name, def, raw))
+        .transpose()?;
+
     // Phase 55: Materialization routing.
     // Attempt to route to a pre-aggregated table if an exact match exists.
     // Returns None if no match, or if any metric is semi-additive / window.
-    if let Some(routed_sql) =
-        super::materialization::try_route_materialization(def, &resolved_dims, &resolved_mets)
-    {
-        return Ok(routed_sql);
+    //
+    // A pre-aggregated table cannot answer a predicate: its rows are already
+    // aggregated, so filtering them is a post-aggregation filter over whatever
+    // members it happens to carry — not the pre-aggregation filter that was
+    // asked for. Skip routing entirely whenever a predicate is present and
+    // compute from the base tables (correct, if slower). Routing a filtered
+    // query when every referenced member is a materialized dimension is a
+    // separate, later change.
+    if resolved_where.is_none() {
+        if let Some(routed_sql) =
+            super::materialization::try_route_materialization(def, &resolved_dims, &resolved_mets)
+        {
+            return Ok(routed_sql);
+        }
     }
 
     // 4. Pre-compute all metric expressions: inline facts into base metrics,
@@ -394,8 +435,22 @@ pub fn expand(
         &resolved_mets,
         grain_plan.is_some(),
     )?;
+    if let Some(rw) = &resolved_where {
+        super::fan_trap::check_where_clause_fan_traps(view_name, def, &rw.members, &resolved_mets)?;
+    }
 
     if let Some(plan) = grain_plan {
+        // The predicate would have to go inside EACH grain CTE, so that every
+        // metric aggregates over only the matching rows. Rendering it on the
+        // outer query instead would filter the already-combined result — a
+        // post-aggregation filter wearing a pre-aggregation name. Reject until
+        // per-grain injection lands rather than answer the wrong question.
+        if resolved_where.is_some() {
+            return Err(ExpandError::WhereClauseUnsupportedStrategy {
+                view_name: view_name.to_string(),
+                strategy: "per-grain (multi-grain metrics)",
+            });
+        }
         return Ok(super::per_grain::expand_per_grain(
             def,
             &resolved_dims,
@@ -430,6 +485,17 @@ pub fn expand(
         .any(|m| super::semi_additive::is_active_semi_additive(def, m, &queried_dim_keys));
 
     if has_active_semi_additive {
+        // The predicate belongs inside `__sv_snapshot`, BEFORE the RANK:
+        // filtering changes which row wins the snapshot, and that is precisely
+        // what "applied before the metrics are computed" has to mean here.
+        // Filtering the outer query would pick the snapshot from unfiltered rows
+        // and then discard some — a different, wrong answer.
+        if resolved_where.is_some() {
+            return Err(ExpandError::WhereClauseUnsupportedStrategy {
+                view_name: view_name.to_string(),
+                strategy: "semi-additive snapshot",
+            });
+        }
         return super::semi_additive::expand_semi_additive(
             view_name,
             def,
@@ -458,6 +524,15 @@ pub fn expand(
                 view_name: view_name.to_string(),
                 window_metrics: window_names,
                 aggregate_metrics: aggregate_names,
+            });
+        }
+        // The predicate belongs inside `__sv_agg`, before the window function
+        // runs over the aggregated rows; on the outer query it would filter the
+        // window's output instead of its input.
+        if resolved_where.is_some() {
+            return Err(ExpandError::WhereClauseUnsupportedStrategy {
+                view_name: view_name.to_string(),
+                strategy: "window metric",
             });
         }
         return super::window::expand_window_metrics(
@@ -511,7 +586,13 @@ pub fn expand(
     // 6. Join resolution via PK/FK graph.
     //    The resolver returns structured edges in emission order; role-playing
     //    scoped joins (e.g. "a__dep_airport") follow the bare joins.
-    let joins = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets, &[]);
+    // Tables named only by the predicate must still be joined, or the filter
+    // would reference an alias absent from the FROM.
+    let where_tables: Vec<String> = resolved_where
+        .as_ref()
+        .map(|rw| rw.source_tables.clone())
+        .unwrap_or_default();
+    let joins = resolve_joins_pkfk(def, &resolved_dims, &resolved_mets, &where_tables);
 
     // 7. GROUP BY (only when both dimensions and metrics are present).
     //    Ordinal positions avoid ambiguity when an expression matches its alias
@@ -523,6 +604,10 @@ pub fn expand(
     };
 
     Ok(SelectSpec {
+        // Rendered between the joins and the GROUP BY, so rows are filtered on
+        // their way INTO the aggregation — Snowflake's "applied before the
+        // metrics are computed".
+        where_clause: resolved_where.map(|rw| rw.sql),
         distinct,
         items,
         from: FromSource::BaseTable { def, joins },

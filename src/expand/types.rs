@@ -147,11 +147,24 @@ pub type FactName = CiName<FactKind>;
 /// - Metrics only: global aggregate (no `GROUP BY`)
 /// - Both: grouped aggregation with `GROUP BY`
 /// - Facts mode: row-level query (facts cannot be combined with metrics)
-#[derive(Debug, Clone)]
+///
+/// [`Self::where_clause`] carries the pre-aggregation filter — Snowflake's
+/// `SEMANTIC_VIEW( … WHERE <predicate> )`, surfaced here as the
+/// `where_clause := '…'` named parameter.
+#[derive(Debug, Clone, Default)]
 pub struct QueryRequest {
     pub dimensions: Vec<DimensionName>,
     pub metrics: Vec<MetricName>,
     pub facts: Vec<FactName>,
+    /// The raw pre-aggregation predicate, exactly as the caller wrote it, or
+    /// `None` when no `where_clause` was supplied.
+    ///
+    /// It references declared dimension and fact *names*; those are resolved to
+    /// their expressions before emission. It is applied BEFORE metrics are
+    /// aggregated — which is the whole point, and why it cannot be expressed by
+    /// wrapping the generated query in an outer `WHERE`. Snowflake's rule that
+    /// the predicate may not reference metrics is enforced during resolution.
+    pub where_clause: Option<String>,
 }
 
 /// A resolved dimension paired with its role-playing scoped alias, if any.
@@ -419,6 +432,33 @@ pub enum ExpandError {
         view_name: String,
         table_a: String,
         table_b: String,
+    },
+    /// The `where_clause` predicate references a metric. Snowflake's rule for
+    /// the `WHERE` inside `SEMANTIC_VIEW(…)`: "you can only refer to dimensions,
+    /// facts, and expressions that use dimensions and facts". A metric is an
+    /// aggregate, and the predicate is applied *before* aggregation, so there is
+    /// no value to compare against.
+    WhereClauseReferencesMetric {
+        view_name: String,
+        metric_name: String,
+    },
+    /// A `where_clause` member sits across a fan-out edge from a metric's
+    /// grain. Filtering on a table requires joining it, and that join
+    /// multiplies the metric's rows exactly as a grouping join would — so the
+    /// metric would be inflated by the very filter meant to narrow it.
+    WhereClauseFanTrap {
+        view_name: String,
+        metric_name: String,
+        member_name: String,
+        member_table: String,
+        relationship_name: String,
+    },
+    /// A `where_clause` was supplied alongside a query shape whose emission
+    /// strategy does not yet inject it. Raised rather than silently dropping the
+    /// filter, which would return unfiltered numbers under a filtered query.
+    WhereClauseUnsupportedStrategy {
+        view_name: String,
+        strategy: &'static str,
     },
     /// Window function metrics cannot be mixed with aggregate metrics.
     WindowAggregateMixing {
@@ -706,6 +746,45 @@ impl fmt::Display for ExpandError {
                      table paths -- neither table '{table_a}' nor '{table_b}' can be reached from \
                      the other without crossing a one-to-many relationship, so joining them would \
                      duplicate the rows returned"
+                )
+            }
+            Self::WhereClauseReferencesMetric {
+                view_name,
+                metric_name,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': where_clause cannot reference the metric \
+                     '{metric_name}' -- the filter is applied before metrics are computed, so \
+                     only dimensions and facts (and expressions over them) can appear in it"
+                )
+            }
+            Self::WhereClauseFanTrap {
+                view_name,
+                metric_name,
+                member_name,
+                member_table,
+                relationship_name,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': fan trap detected -- filtering on \
+                     '{member_name}' (table '{member_table}') requires joining that table, and \
+                     relationship '{relationship_name}' fans out along the way, so metric \
+                     '{metric_name}' would be aggregated over multiplied rows. Filter on a \
+                     member reachable from the metric's table without fanning out."
+                )
+            }
+            Self::WhereClauseUnsupportedStrategy {
+                view_name,
+                strategy,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': where_clause is not yet supported for this \
+                     query -- it is computed via the {strategy} strategy, whose filter injection \
+                     is not implemented. Query without where_clause, or filter on a shape that \
+                     uses the base-anchored path."
                 )
             }
             Self::WindowAggregateMixing {
