@@ -36,15 +36,15 @@ decisions were reasoned from the model rather than verified:
 | Which dimensions may be queried with a metric? | "The logical table for the dimension must be related to the logical table for the metric" and must have "an equal or lower level of granularity than the logical table for the metric" ([querying](https://docs.snowflake.com/en/user-guide/views-semantic/querying)) | ✅ **Matches.** Our `FanTrap` rejection of a dimension below a metric's grain is their rule, not our invention. v0.12.0's docs inferred this — they can now cite it. |
 | Can a predicate filter before aggregation? | Yes: `SEMANTIC_VIEW( v METRICS … DIMENSIONS … WHERE <predicate> )`. "In the condition, you can only refer to dimensions, facts, and expressions that use dimensions and facts." "This filter condition is applied before the metrics are computed." ([construct ref](https://docs.snowflake.com/en/sql-reference/constructs/semantic_view)) | ❌ **Gap 1.** We have no pre-aggregation filter at all. |
 | Named reusable filters? | `LABELS = (FILTER)` on a fact/dimension resolving to BOOLEAN, referenced bare in `WHERE` (GA May 2026) ([filters](https://docs.snowflake.com/en/user-guide/views-semantic/filters)) | ❌ **Gap 2.** Not modelled. |
-| Facts + dimensions together? | "All facts and dimensions used in the query (**including those specified in the WHERE clause**) must be defined in the same logical table." | ⚠️ Implemented as `FactPathViolation`, but over-strict under fan-in — TECH-DEBT #37. |
+| Facts + dimensions together? | "All facts and dimensions used in the query (**including those specified in the WHERE clause**) must be defined in the same logical table." | ✅ Implemented as `FactPathViolation`, relaxed to "reachable without fan-out". The fan-in over-strictness (TECH-DEBT #37) is fixed. |
 | How are metrics at different grains combined? | **Not stated in the docs.** The construct reference documents the dimension-grain rule and the FACTS/METRICS exclusion, but not the join semantics between grains. | ⚠️ **Unverified.** We chose NULL-safe `FULL OUTER JOIN`; see PR 3. |
 
 ## The gaps, as a PR sequence
 
 | PR | Item | Size | Blocked on |
 |---|---|---|---|
-| 1 | Docs accuracy pass (§0) | ~30 min | — |
-| 2 | TECH-DEBT #37 — fact-path fan-in fix (§1) | ~½ day | — |
+| 1 | Docs accuracy pass (§0) | ~30 min | ✅ landed (#168) |
+| 2 | TECH-DEBT #37 — fact-path fan-in fix (§1) | ~½ day | ✅ landed |
 | 3 | Multi-grain join-semantics verification (§2) | ~½ day | **a Snowflake account — maintainer-run** |
 | 4 | Pre-aggregation `WHERE` (§3) | 2 phases, may split into 2 PRs | — |
 | 5 | `LABELS = (FILTER)` named filters (§4) | ~1 phase | PR 4 |
@@ -94,6 +94,28 @@ regression test that a genuinely unrelated pair still raises `FactPathViolation`
 
 **Risk:** low, but it *widens* what the facts path accepts — the guard against
 over-widening is the third test above.
+
+---
+
+**✅ Landed. Two corrections to the plan above, both found while implementing:**
+
+1. **Only fan-in onto the base table exists.** `RelationshipGraph::check_no_diamonds`
+   exempts the root and rejects every other multi-parent node as an ambiguous
+   join diamond, so the `s → o → c` shape is only reachable with `o` as the base
+   table. The first fixtures written for this used a non-root fan-in and were
+   rejected at `CREATE` time.
+2. **The parent-map fix alone was not sufficient — it would have traded a false
+   rejection for a false acceptance.** Rooting the tree correctly makes the base
+   table an ancestor of *every* alias, including the fan-in siblings reachable
+   only by walking a many-to-one edge backwards, so an ancestry test would then
+   have *accepted* a fact on `line_items` with a dimension on `shipments` and
+   silently returned row-multiplied output. `validate_fact_table_path` therefore
+   moved off ancestry altogether onto the direction-aware `find_path` +
+   `fanning_edge_on_path` walk. The parent-map fix still lands, and is what fixes
+   `SHOW … FOR METRIC` (which already checked direction via its own card map).
+
+The "guard against over-widening" test the plan asked for is what caught this:
+it was written to pass before *and* after, and would have failed the naive fix.
 
 ---
 

@@ -164,6 +164,93 @@ fn test_fact_path_violation() {
     );
 }
 
+/// Fan-in onto the base table: `li` and `s` both reference the base table `o`,
+/// which in turn references `c`.
+///
+/// This is the only legal fan-in — `RelationshipGraph::check_no_diamonds`
+/// exempts the root and rejects every other multi-parent node as an ambiguous
+/// join diamond.
+///
+/// TECH-DEBT #37: the parent map used to take `reverse[node].first()`, so the
+/// base table was handed a "parent" — whichever child was declared first — and
+/// chains ran through the root and out the far branch. `c`'s chain became
+/// `[c, o, li]`, which never reaches `s`.
+fn fan_in_def() -> SemanticViewDefinition {
+    SemanticViewDefinition::default()
+        .with_table("o", "orders", &["id"])
+        .with_table("li", "line_items", &["id"])
+        .with_table("s", "shipments", &["id"])
+        .with_table("c", "customers", &["id"])
+        .with_fact("ship_cost", "s.cost", "s")
+        .with_fact("line_price", "li.price", "li")
+        .with_dimension("carrier", "s.carrier", Some("s"))
+        .with_dimension("country", "c.country", Some("c"))
+        // Declared first -- this ordering is what gave the root its bogus parent.
+        .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"])
+        .with_pkfk_join("s_to_o", "s", "o", &["order_id"], &["id"])
+        .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"])
+}
+
+#[test]
+fn fact_with_dimension_across_fan_in_is_allowed() {
+    // TECH-DEBT #37: `s -> o -> c` is many-to-one at every hop, so a fact on the
+    // base table with a dimension on `c` joins without multiplying rows. The
+    // unrelated fan-in sibling `li` must not hide `c` from it.
+    let def = fan_in_def();
+    let req = QueryRequest {
+        facts: vec![FactName::new("ship_cost")],
+        dimensions: vec![DimensionName::new("country")],
+        metrics: vec![],
+    };
+    let result = expand("test_view", &def, &req);
+    assert!(
+        result.is_ok(),
+        "s -> o -> c is safe at every hop; the fan-in sibling must not cause a \
+         FactPathViolation: {result:?}"
+    );
+}
+
+#[test]
+fn fact_across_fan_in_siblings_still_violates() {
+    // The over-widening guard. `li` and `s` are the two fan-in siblings:
+    // reaching one from the other traverses a many-to-one edge BACKWARDS
+    // (`o -> li` or `o -> s`), which multiplies rows. Once the parent map is
+    // rooted at the base table both siblings share the ancestor `o`, so a check
+    // that only asked about ancestry would be tempted to accept them — the path
+    // must be checked for fan-out DIRECTION, not merely for connectivity.
+    let def = fan_in_def();
+    let req = QueryRequest {
+        facts: vec![FactName::new("line_price")],
+        dimensions: vec![DimensionName::new("carrier")],
+        metrics: vec![],
+    };
+    let result = expand("test_view", &def, &req);
+    assert!(
+        matches!(result, Err(ExpandError::FactPathViolation { .. })),
+        "Expected FactPathViolation for fan-in siblings li/s, got: {result:?}"
+    );
+}
+
+#[test]
+fn fact_reaches_a_multi_hop_chain_across_fan_in() {
+    // The safe direction holds for more than one hop past the fan-in:
+    // s -> o -> c -> r is many-to-one throughout.
+    let def = fan_in_def()
+        .with_table("r", "regions", &["id"])
+        .with_dimension("region_name", "r.name", Some("r"))
+        .with_pkfk_join("c_to_r", "c", "r", &["region_id"], &["id"]);
+    let req = QueryRequest {
+        facts: vec![FactName::new("ship_cost")],
+        dimensions: vec![DimensionName::new("region_name")],
+        metrics: vec![],
+    };
+    let result = expand("test_view", &def, &req);
+    assert!(
+        result.is_ok(),
+        "s -> o -> c -> r is safe at every hop: {result:?}"
+    );
+}
+
 #[test]
 fn test_fact_path_valid_linear() {
     // Chain: o -> li -> details (linear path)

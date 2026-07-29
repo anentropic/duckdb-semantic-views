@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::graph::JoinTree;
 use crate::model::{Cardinality, Metric, SemanticViewDefinition};
 
 use super::facts::collect_derived_metric_source_tables;
@@ -514,13 +513,16 @@ fn fanning_edge_on_path(path: &[String], card_map: &CardMap) -> Option<String> {
     None
 }
 
-/// Validate that all tables referenced by a fact query are on the same
-/// root-to-leaf path in the relationship tree.
+/// Validate that all tables referenced by a fact query can be joined without
+/// multiplying rows.
 ///
 /// Snowflake constraint: "all facts and dimensions used in the query must be
-/// defined in the same logical table." For our multi-table model, this means
-/// all `source_table` aliases must be reachable through a single linear path
-/// (no fan-out — each pair must have an ancestor/descendant relationship).
+/// defined in the same logical table." For our multi-table model this is
+/// relaxed to: for every pair of `source_table` aliases, one must be reachable
+/// from the other along the join path without traversing a many-to-one edge
+/// backwards. A fact query does not aggregate, so a fan-out here does not skew
+/// a total — it silently duplicates the rows returned, which is why the pair is
+/// rejected outright rather than fenced.
 ///
 /// Skips validation when there is only one unique table (trivially valid)
 /// or when there are no joins (single-table view).
@@ -549,21 +551,33 @@ pub(super) fn validate_fact_table_path(
     }
 
     // SG-7: an unbuildable graph is an error, not a skipped check.
-    let graph = build_relationship_graph(view_name, def)?;
+    build_relationship_graph(view_name, def)?;
 
-    // The directed parent tree (shared derivation with check_fan_traps, E-7).
-    let tree = JoinTree::from_graph(&graph);
+    let adjacency = build_adjacency(def);
+    let card_map = build_card_map(def);
 
-    // For each pair, verify one is an ancestor of the other
+    // For each pair, one table's rows must be enrichable from the other without
+    // multiplying them — i.e. the join path between them is traversable in at
+    // least one direction without crossing a many-to-one edge backwards.
+    //
+    // TECH-DEBT #37: this used to ask the parent tree whether one table was an
+    // ancestor of the other. Ancestry is the wrong question in both directions.
+    // Too strict: under fan-in the chain ran out through a sibling branch, so
+    // `s -> o -> c` (many-to-one at every hop, perfectly safe) was rejected.
+    // Too loose, once the tree is correctly rooted at the base table: the base
+    // table becomes an ancestor of EVERY alias, including siblings it can only
+    // reach by walking a many-to-one edge backwards. Checking the path's
+    // direction answers both at once.
     for i in 0..all_tables.len() {
         for j in (i + 1)..all_tables.len() {
             let a = &all_tables[i];
             let b = &all_tables[j];
-            let a_ancestors = tree.ancestors_to_root(a);
-            let b_ancestors = tree.ancestors_to_root(b);
-            let a_is_ancestor_of_b = b_ancestors.iter().any(|x| x == a);
-            let b_is_ancestor_of_a = a_ancestors.iter().any(|x| x == b);
-            if !a_is_ancestor_of_b && !b_is_ancestor_of_a {
+            let safe = find_path(a, b, &adjacency).is_some_and(|forward| {
+                let backward: Vec<String> = forward.iter().rev().cloned().collect();
+                fanning_edge_on_path(&forward, &card_map).is_none()
+                    || fanning_edge_on_path(&backward, &card_map).is_none()
+            });
+            if !safe {
                 return Err(ExpandError::FactPathViolation {
                     view_name: view_name.to_string(),
                     table_a: a.clone(),

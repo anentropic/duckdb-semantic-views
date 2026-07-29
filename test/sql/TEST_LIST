@@ -24,6 +24,7 @@ test/sql/error_caret_drop.test
 test/sql/error_caret_multiline.test
 test/sql/error_caret_unicode.test
 test/sql/extension_reload.test
+test/sql/fan_in_fact_path.test
 test/sql/ff3_attach_single_catalog.test
 test/sql/ff4_wave2_name_handling.test
 test/sql/ident_component_case_sensitivity.test
