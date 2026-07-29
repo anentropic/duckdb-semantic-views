@@ -210,6 +210,11 @@ fn expand_facts(
     let resolved_where = req
         .where_clause
         .as_deref()
+        // A blank predicate is absent, not an empty condition: `Some("")` would
+        // otherwise emit a bare `WHERE ` with nothing after it. The FFI maps an
+        // empty parameter to None, but `expand()` is public and reachable
+        // directly (found by `fuzz_where_predicate`).
+        .filter(|raw| !raw.trim().is_empty())
         .map(|raw| super::where_clause::resolve_where_clause(view_name, def, raw))
         .transpose()?;
 
@@ -354,6 +359,11 @@ pub fn expand(
     let resolved_where = req
         .where_clause
         .as_deref()
+        // A blank predicate is absent, not an empty condition: `Some("")` would
+        // otherwise emit a bare `WHERE ` with nothing after it. The FFI maps an
+        // empty parameter to None, but `expand()` is public and reachable
+        // directly (found by `fuzz_where_predicate`).
+        .filter(|raw| !raw.trim().is_empty())
         .map(|raw| super::where_clause::resolve_where_clause(view_name, def, raw))
         .transpose()?;
 

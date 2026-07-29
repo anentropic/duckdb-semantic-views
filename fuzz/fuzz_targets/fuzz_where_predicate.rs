@@ -84,35 +84,52 @@ fn is_balanced(s: &str) -> bool {
 
 /// Every free-form fragment of the definition that reaches the output verbatim.
 ///
-/// The precondition must cover ALL of them: an incomplete precondition is the
-/// recurring bug class in these targets (TECH-DEBT #33), because an unbalanced
-/// *input* fragment legitimately produces unbalanced output and would be
-/// reported as a false crash.
+/// Mirrors `fuzz_sql_expand`'s coverage exactly, and must keep mirroring it: a
+/// "verbatim fragment" is anything `expand` interpolates UN-quoted, which is
+/// every `expr` PLUS the `output_type` filling the `CAST(expr AS <type>)` slot
+/// and a window spec's function/args/order-by fields. Names and aliases are not
+/// fragments — they pass through `quote_ident`, whose output is always balanced.
+///
+/// An INCOMPLETE precondition is the recurring bug class in these targets
+/// (TECH-DEBT #33), and this target reproduced it on its first CI run: omitting
+/// `output_type` let an unbalanced CAST type manufacture unbalanced SQL from a
+/// balanced predicate, tripping the assertion on something the predicate splice
+/// had nothing to do with. Over-inclusion is harmless — it can only skip more
+/// inputs, never assert a false positive.
 fn def_fragments_balanced(def: &SemanticViewDefinition) -> bool {
     let mut frags: Vec<&str> = Vec::new();
-    for t in &def.tables {
-        frags.push(&t.alias);
-        frags.push(&t.table);
-    }
     for d in &def.dimensions {
-        frags.push(&d.name);
         frags.push(&d.expr);
-        if let Some(s) = d.source_table.as_deref() {
-            frags.push(s);
-        }
-    }
-    for m in &def.metrics {
-        frags.push(&m.name);
-        frags.push(&m.expr);
-        if let Some(s) = m.source_table.as_deref() {
-            frags.push(s);
+        if let Some(ot) = &d.output_type {
+            frags.push(ot);
         }
     }
     for f in &def.facts {
-        frags.push(&f.name);
         frags.push(&f.expr);
-        if let Some(s) = f.source_table.as_deref() {
-            frags.push(s);
+        if let Some(ot) = &f.output_type {
+            frags.push(ot);
+        }
+    }
+    for m in &def.metrics {
+        frags.push(&m.expr);
+        if let Some(ot) = &m.output_type {
+            frags.push(ot);
+        }
+        for na in &m.non_additive_by {
+            frags.push(&na.dimension);
+        }
+        if let Some(ws) = &m.window_spec {
+            frags.push(&ws.window_function);
+            frags.push(&ws.inner_metric);
+            frags.extend(ws.extra_args.iter().map(String::as_str));
+            frags.extend(ws.excluding_dims.iter().map(String::as_str));
+            frags.extend(ws.partition_dims.iter().map(String::as_str));
+            for ob in &ws.order_by {
+                frags.push(&ob.expr);
+            }
+            if let Some(fc) = &ws.frame_clause {
+                frags.push(fc);
+            }
         }
     }
     frags.into_iter().all(is_balanced)
