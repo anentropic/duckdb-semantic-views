@@ -80,7 +80,7 @@ SELECT plan FROM (
     AS t(explain_output)
 ) WHERE plan LIKE 'WHERE %';
 ----
-WHERE o.ordered_at >= DATE '2024-01-01'
+WHERE (o.ordered_at) >= DATE '2024-01-01'
 
 # ============================================================
 # Test 4: a dimension predicate filters before aggregation too.
@@ -188,7 +188,7 @@ SELECT count(*) FROM (
   SELECT unnest(string_split(explain_output, chr(10))) AS plan
   FROM (SELECT * FROM explain_semantic_view('wc_mg', metrics := ['revenue', 'item_count'], dimensions := ['region'], where_clause := 'odate >= DATE ''2024-01-01'''))
     AS t(explain_output)
-) WHERE trim(plan) LIKE 'WHERE o.ordered_at%';
+) WHERE trim(plan) LIKE 'WHERE (o.ordered_at)%';
 ----
 2
 

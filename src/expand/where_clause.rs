@@ -17,6 +17,8 @@
 //! into their expressions before emission — the same splice the derived-metric
 //! path uses ([`crate::expr_tokens::inline_references`]), which is
 //! quote/literal-aware, so a member name inside a string literal is untouched.
+//! Each substituted expression is parenthesized, since the splice is textual and
+//! the predicate is an operator expression — see [`resolve_where_clause`].
 
 use std::collections::{HashMap, HashSet};
 
@@ -73,18 +75,31 @@ pub(super) fn resolve_where_clause(
 ) -> Result<ResolvedWhere, ExpandError> {
     // Member lookup tables, keyed the same way `inline_references` keys its
     // replacements so FIND and SPLICE agree.
-    let mut dim_exprs: HashMap<String, &str> = HashMap::new();
+    //
+    // Each replacement is PARENTHESIZED, because the splice is textual and the
+    // predicate is an operator expression: a member whose expression binds
+    // looser than its surrounding context would otherwise have its grouping
+    // silently destroyed. `us_or_eu AND is_large` spliced bare yields
+    // `… = 'US' OR … = 'EU' AND amount > 100`, which SQL reads as
+    // `US OR (EU AND large)` — wrong rows, and no error to notice it by. The
+    // other two `inline_references` call sites (fact chaining in
+    // `expand::facts`, derived metrics in `expand::per_grain`) already wrap for
+    // exactly this reason. Wrapping unconditionally keeps the three consistent;
+    // a redundant `(o.region)` around a plain column is harmless.
+    let mut dim_exprs: HashMap<String, String> = HashMap::new();
     let mut member_tables: HashMap<String, Option<&str>> = HashMap::new();
     for dim in &def.dimensions {
         let key = normalize_ident_part(&dim.name);
-        dim_exprs.insert(key.clone(), dim.expr.as_str());
+        dim_exprs.insert(key.clone(), format!("({})", dim.expr));
         member_tables.insert(key, dim.source_table.as_deref());
     }
     for fact in &def.facts {
         let key = normalize_ident_part(&fact.name);
         // A dimension and a fact may share a name; the dimension wins, matching
         // the precedence the select-list resolution already uses.
-        dim_exprs.entry(key.clone()).or_insert(fact.expr.as_str());
+        dim_exprs
+            .entry(key.clone())
+            .or_insert_with(|| format!("({})", fact.expr));
         member_tables
             .entry(key)
             .or_insert(fact.source_table.as_deref());
@@ -122,8 +137,12 @@ pub(super) fn resolve_where_clause(
         }
     }
 
+    let borrowed: HashMap<String, &str> = dim_exprs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_str()))
+        .collect();
     Ok(ResolvedWhere {
-        sql: inline_references(raw, &dim_exprs),
+        sql: inline_references(raw, &borrowed),
         source_tables,
         members,
     })
@@ -148,20 +167,67 @@ mod tests {
     #[test]
     fn substitutes_dimension_and_fact_expressions() {
         let r = resolve_where_clause("v", &def(), "order_date > DATE '1995-01-01'").unwrap();
-        assert_eq!(r.sql, "o.ordered_at > DATE '1995-01-01'");
+        assert_eq!(r.sql, "(o.ordered_at) > DATE '1995-01-01'");
         assert_eq!(r.source_tables, vec!["o"]);
     }
 
     #[test]
     fn substitutes_a_fact_expression() {
         let r = resolve_where_clause("v", &def(), "net_price > 100").unwrap();
-        assert_eq!(r.sql, "o.price * (1 - o.discount) > 100");
+        assert_eq!(r.sql, "(o.price * (1 - o.discount)) > 100");
+    }
+
+    /// A member whose expression is a compound of LOOSER-binding operators than
+    /// the context it lands in must keep its grouping. `us_or_eu` is an `OR`;
+    /// composing it with `AND` must not let the tighter `AND` capture only the
+    /// `OR`'s right operand.
+    ///
+    /// Spliced bare this yielded
+    /// `o.country = 'US' OR o.country = 'EU' AND o.amount > 100`, which SQL
+    /// reads as `US OR (EU AND large)` — silently WRONG ROWS, not an error. The
+    /// other two `inline_references` call sites (fact chaining in `facts.rs`,
+    /// derived metrics in `per_grain.rs`) already wrap each replacement in
+    /// parentheses for exactly this reason; this path did not.
+    ///
+    /// Named filters make this the common case rather than a corner: a filter's
+    /// expression is boolean by construction, so it is far more likely to be a
+    /// compound than an ordinary dimension's column reference.
+    #[test]
+    fn a_compound_member_keeps_its_grouping_when_spliced() {
+        let def = SemanticViewDefinition::default()
+            .with_table("o", "orders", &["id"])
+            .with_dimension(
+                "us_or_eu",
+                "o.country = 'US' OR o.country = 'EU'",
+                Some("o"),
+            )
+            .with_fact("is_large", "o.amount > 100", "o");
+        let r = resolve_where_clause("v", &def, "us_or_eu AND is_large").unwrap();
+        assert_eq!(
+            r.sql,
+            "(o.country = 'US' OR o.country = 'EU') AND (o.amount > 100)"
+        );
+    }
+
+    /// `NOT` over a compound member has the same hazard: `NOT` binds tighter
+    /// than `OR`, so a bare splice negates only the first operand.
+    #[test]
+    fn negating_a_compound_member_negates_the_whole_expression() {
+        let def = SemanticViewDefinition::default()
+            .with_table("o", "orders", &["id"])
+            .with_dimension(
+                "us_or_eu",
+                "o.country = 'US' OR o.country = 'EU'",
+                Some("o"),
+            );
+        let r = resolve_where_clause("v", &def, "NOT us_or_eu").unwrap();
+        assert_eq!(r.sql, "NOT (o.country = 'US' OR o.country = 'EU')");
     }
 
     #[test]
     fn member_lookup_is_case_and_quote_insensitive() {
         let r = resolve_where_clause("v", &def(), "\"REGION\" = 'EU'").unwrap();
-        assert_eq!(r.sql, "c.region = 'EU'");
+        assert_eq!(r.sql, "(c.region) = 'EU'");
         assert_eq!(r.source_tables, vec!["c"]);
     }
 
@@ -186,13 +252,13 @@ mod tests {
     fn a_member_name_inside_a_string_literal_is_not_substituted() {
         // The splice is literal-aware: 'region' is data, not a reference.
         let r = resolve_where_clause("v", &def(), "region = 'region'").unwrap();
-        assert_eq!(r.sql, "c.region = 'region'");
+        assert_eq!(r.sql, "(c.region) = 'region'");
     }
 
     #[test]
     fn a_metric_name_inside_a_string_literal_does_not_trigger_rejection() {
         let r = resolve_where_clause("v", &def(), "region = 'revenue'").unwrap();
-        assert_eq!(r.sql, "c.region = 'revenue'");
+        assert_eq!(r.sql, "(c.region) = 'revenue'");
     }
 
     #[test]
@@ -211,7 +277,7 @@ mod tests {
     #[test]
     fn function_calls_are_left_alone() {
         let r = resolve_where_clause("v", &def(), "lower(region) = 'eu'").unwrap();
-        assert_eq!(r.sql, "lower(c.region) = 'eu'");
+        assert_eq!(r.sql, "lower((c.region)) = 'eu'");
     }
 
     #[test]

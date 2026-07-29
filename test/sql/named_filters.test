@@ -169,7 +169,54 @@ SELECT plan FROM (
     AS t(explain_output)
 ) WHERE plan LIKE 'WHERE %';
 ----
-WHERE o.country = 'US'
+WHERE (o.country = 'US')
+
+# A filter whose expression is a COMPOUND keeps its grouping when composed.
+# `us_or_eu` is an OR; AND binds tighter, so a bare textual splice would yield
+# `US OR (EU AND large)` — silently wrong rows rather than an error. Each
+# substituted member is parenthesized, so this reads `(US OR EU) AND large`.
+#
+# Named filters make this the common case: a filter's expression is boolean by
+# construction, so it is far likelier to be compound than a plain dimension's
+# column reference.
+
+statement ok
+CREATE SEMANTIC VIEW nf_compound AS
+  TABLES (o AS nf_orders PRIMARY KEY (id))
+  FACTS (o.is_large AS o.amount > 100 LABELS = (FILTER))
+  DIMENSIONS (
+    o.country AS o.country,
+    o.us_or_eu AS o.country = 'US' OR o.country = 'EU' LABELS = (FILTER)
+  )
+  METRICS (o.revenue AS sum(o.amount));
+
+# (US OR EU) AND amount > 100 keeps order 1 (US, 200) and order 3 (EU, 300).
+# The bare-splice bug would have returned US 250.00 as well, by binding the AND
+# to the OR's right operand only.
+query TT rowsort
+SELECT * FROM semantic_view('nf_compound', metrics := ['revenue'], dimensions := ['country'], where_clause := 'us_or_eu AND is_large');
+----
+EU	300.00
+US	200.00
+
+query T
+SELECT plan FROM (
+  SELECT unnest(string_split(explain_output, chr(10))) AS plan
+  FROM (SELECT * FROM explain_semantic_view('nf_compound', metrics := ['revenue'], where_clause := 'us_or_eu AND is_large'))
+    AS t(explain_output)
+) WHERE plan LIKE 'WHERE %';
+----
+WHERE (o.country = 'US' OR o.country = 'EU') AND (o.amount > 100)
+
+# NOT over a compound member negates the whole expression, not just its first
+# operand: neither US nor EU, so only rows outside both survive — none here.
+query T
+SELECT count(*) FROM semantic_view('nf_compound', metrics := ['revenue'], dimensions := ['country'], where_clause := 'NOT us_or_eu');
+----
+0
+
+statement ok
+DROP SEMANTIC VIEW nf_compound;
 
 # ============================================================
 # Test 6: the flag is declarative metadata, not an access restriction — a filter

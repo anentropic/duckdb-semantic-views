@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `where_clause` member whose expression is a compound no longer loses its grouping when substituted.** The predicate splices each referenced member's expression in textually, and did so without parentheses, so a member binding looser than its surrounding context was silently regrouped: a filter defined as `o.country = 'US' OR o.country = 'EU'`, used as `where_clause := 'us_or_eu AND is_large'`, produced `… = 'US' OR … = 'EU' AND amount > 100`, which SQL reads as `US OR (EU AND large)`. That returned **wrong rows with no error** — and `NOT us_or_eu` negated only the first operand. Each substituted expression is now parenthesized, matching what the fact-chaining and derived-metric inliners already did. Generated SQL for a member whose expression is a plain column now shows a redundant but harmless `WHERE (o.region) = 'EU'`. Named filters make this the common case rather than a corner, since a filter's expression is boolean by construction and therefore often compound.
 - Corrected the documented annotation order: `COMMENT`, `WITH SYNONYMS` and `LABELS` may appear in **any** order on an entry. The DDL reference and the metadata-annotations how-to previously stated that `COMMENT` must precede `WITH SYNONYMS` and that the reverse was a parse error; the parser has always accepted either order, requiring only that the annotation region be tiled by recognized clauses with no leftover text.
 
 ## [0.12.0] - 2026-07-28
