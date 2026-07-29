@@ -393,10 +393,10 @@ See :ref:`explanation-transactional-ddl` for the full mechanism and worked examp
 
 .. _explanation-sf-not-supported:
 
-Features Not Yet Supported
-==========================
+Feature Parity Notes
+====================
 
-The following Snowflake ``CREATE SEMANTIC VIEW`` features are not yet implemented in DuckDB Semantic Views:
+Snowflake ``CREATE SEMANTIC VIEW`` features that are commonly asked about, and where each one stands. Rows marked **Supported** have since landed; the rest are unimplemented, out of scope, or not planned, with the reason given:
 
 .. list-table::
    :header-rows: 1
@@ -409,7 +409,7 @@ The following Snowflake ``CREATE SEMANTIC VIEW`` features are not yet implemente
    * - Pre-aggregation ``WHERE`` -- ``SEMANTIC_VIEW( v METRICS ... DIMENSIONS ... WHERE <predicate> )``, where the predicate `may refer only to dimensions, facts, and expressions over them <https://docs.snowflake.com/en/sql-reference/constructs/semantic_view>`_ and "is applied before the metrics are computed"
      - **Supported** as the ``where_clause := '...'`` named parameter (``where`` is a reserved word in DuckDB's named-parameter position, so it cannot be spelled ``where :=``). The predicate names declared dimensions and facts, is substituted to their expressions, and is applied before aggregation on every emission path -- before the ``GROUP BY`` on the base-anchored and fact paths, inside *each* grain CTE for multi-grain queries, inside ``__sv_snapshot`` before the ``RANK`` for semi-additive metrics, and inside ``__sv_agg`` before the window function. So "revenue for orders shipped after X" recomputes each group over the matching rows. Referencing a metric is rejected, matching Snowflake, and members the predicate names participate in the same reachability and fan-out checks as queried dimensions.
    * - Named filters -- ``LABELS = (FILTER)`` on a fact or dimension resolving to ``BOOLEAN``, referenced bare in a query's ``WHERE`` (`Snowflake GA May 2026 <https://docs.snowflake.com/en/user-guide/views-semantic/filters>`_)
-     - Not yet supported. Depends on the pre-aggregation ``WHERE`` above -- a named filter is a boolean dimension or fact usable in that predicate.
+     - **Supported.** ``LABELS = (FILTER)`` is accepted on a fact or dimension entry, in any order among ``COMMENT`` / ``WITH SYNONYMS``, and survives ``GET_DDL``, YAML export, and ``DESCRIBE`` (as a ``LABELS`` property row valued ``["FILTER"]``). Referencing the member bare in ``where_clause`` works via the pre-aggregation predicate above -- a filter is an ordinary boolean member, so the label declares *intent* and drives introspection rather than gating resolution. The ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time, not at ``CREATE``: typing an arbitrary expression needs a binder, so a non-boolean filter raises DuckDB's own type error when queried. Labels other than ``FILTER`` are rejected rather than silently dropped.
    * - Column-level security
      - Out of scope; DuckDB handles access control
    * - ``ASOF`` / temporal relationships

@@ -1,0 +1,291 @@
+# Named filters — Snowflake's `LABELS = (FILTER)` on a dimension or fact.
+#
+# A named filter is an ordinary boolean-valued member that is MEANT to be
+# referenced bare in a query's pre-aggregation predicate
+# (`where_clause := 'is_domestic'`) rather than selected as output.
+#
+# The query side needs nothing new: `where_clause` resolution already
+# substitutes any declared dimension or fact name, and a filter is just a
+# boolean member. What `LABELS = (FILTER)` adds is the ability to DECLARE that
+# intent and have it survive GET_DDL / YAML / DESCRIBE — so this file covers the
+# DDL surface and introspection, then confirms the declared member really does
+# work bare in the predicate.
+
+require semantic_views
+
+statement ok
+CREATE TABLE nf_orders (id INTEGER, country VARCHAR, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO nf_orders VALUES
+  (1, 'US', 200.00),
+  (2, 'US',  50.00),
+  (3, 'EU', 300.00),
+  (4, 'EU',  20.00);
+
+# `is_domestic` is a FILTER dimension, `is_large` a FILTER fact. `country` and
+# `amt` are plain members alongside them, so every assertion below can tell
+# "labelled" apart from "happens to be in the same clause".
+statement ok
+CREATE SEMANTIC VIEW nf_sv AS
+  TABLES (
+    o AS nf_orders PRIMARY KEY (id)
+  )
+  FACTS (
+    o.amt AS o.amount,
+    o.is_large AS o.amount > 100 LABELS = (FILTER)
+  )
+  DIMENSIONS (
+    o.country AS o.country,
+    o.is_domestic AS o.country = 'US' LABELS = (FILTER)
+  )
+  METRICS (
+    o.revenue AS sum(o.amount)
+  );
+
+# ============================================================
+# Test 1: DESCRIBE surfaces a LABELS row valued ["FILTER"], for the labelled
+# dimension and the labelled fact only.
+#
+# Like ACCESS_MODIFIER, this is a DESCRIBE property row rather than a new SHOW
+# column — SHOW SEMANTIC {DIMENSIONS,FACTS} keeps its 8 Snowflake-aligned
+# columns.
+# ============================================================
+
+query TTTTT rowsort
+SELECT * FROM describe_semantic_view('nf_sv') WHERE property = 'LABELS';
+----
+DIMENSION	is_domestic	nf_orders	LABELS	["FILTER"]
+FACT	is_large	nf_orders	LABELS	["FILTER"]
+
+# The plain members emit no LABELS row at all — it is omitted when unset, the
+# same rule COMMENT and SYNONYMS follow, not emitted empty.
+query T
+SELECT count(*) FROM describe_semantic_view('nf_sv')
+  WHERE property = 'LABELS' AND object_name IN ('country', 'amt', 'revenue');
+----
+0
+
+# SHOW keeps its 8 Snowflake-aligned columns — the filter flag is reported
+# through DESCRIBE, exactly as ACCESS_MODIFIER is. The 8-character type string
+# guards that decision: a 9th `labels` column would fail these outright. A
+# labelled member still lists as an ordinary dimension / fact.
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN nf_sv
+----
+memory	main	nf_sv	nf_orders	country	(empty)	[]	(empty)
+memory	main	nf_sv	nf_orders	is_domestic	(empty)	[]	(empty)
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC FACTS IN nf_sv
+----
+memory	main	nf_sv	nf_orders	amt	(empty)	[]	(empty)
+memory	main	nf_sv	nf_orders	is_large	(empty)	[]	(empty)
+
+# ============================================================
+# Test 2: GET_DDL renders the clause back, exactly twice — once per labelled
+# member, and not on the two plain ones.
+# ============================================================
+
+query I
+SELECT GET_DDL('SEMANTIC_VIEW', 'nf_sv') LIKE '%LABELS = (FILTER)%';
+----
+true
+
+query I
+SELECT length(GET_DDL('SEMANTIC_VIEW', 'nf_sv'))
+     - length(replace(GET_DDL('SEMANTIC_VIEW', 'nf_sv'), 'LABELS = (FILTER)', ''))
+     = 2 * length('LABELS = (FILTER)');
+----
+true
+
+# ============================================================
+# Test 3: YAML export carries the flag, and carries it only for the labelled
+# members — exactly two `is_filter` keys, so the two plain members do not export
+# a redundant `is_filter: false`.
+# ============================================================
+
+query I
+SELECT read_yaml_from_semantic_view('nf_sv') LIKE '%is_filter%';
+----
+true
+
+query I
+SELECT length(read_yaml_from_semantic_view('nf_sv'))
+     - length(replace(read_yaml_from_semantic_view('nf_sv'), 'is_filter', ''))
+     = 2 * length('is_filter');
+----
+true
+
+# ============================================================
+# Test 4: the declared filter works bare in the predicate — the whole point.
+#
+# Baseline: US = 200 + 50, EU = 300 + 20.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('nf_sv', metrics := ['revenue'], dimensions := ['country']);
+----
+EU	320.00
+US	250.00
+
+# A FILTER *dimension* referenced bare: only US rows feed the metric.
+query TT rowsort
+SELECT * FROM semantic_view('nf_sv', metrics := ['revenue'], dimensions := ['country'], where_clause := 'is_domestic');
+----
+US	250.00
+
+# A FILTER *fact* referenced bare: amount > 100 keeps one row per country, so
+# BOTH groups are recomputed rather than merely dropped.
+query TT rowsort
+SELECT * FROM semantic_view('nf_sv', metrics := ['revenue'], dimensions := ['country'], where_clause := 'is_large');
+----
+EU	300.00
+US	200.00
+
+# Two filters composed with AND.
+query TT rowsort
+SELECT * FROM semantic_view('nf_sv', metrics := ['revenue'], dimensions := ['country'], where_clause := 'is_domestic AND is_large');
+----
+US	200.00
+
+# A filter composes with a non-filter member in the same predicate — the flag
+# gates nothing about resolution.
+query TT rowsort
+SELECT * FROM semantic_view('nf_sv', metrics := ['revenue'], dimensions := ['country'], where_clause := 'is_large AND country = ''EU''');
+----
+EU	300.00
+
+# ============================================================
+# Test 5: the bare filter name is substituted with its declared expression,
+# emitted before the GROUP BY.
+# ============================================================
+
+query T
+SELECT plan FROM (
+  SELECT unnest(string_split(explain_output, chr(10))) AS plan
+  FROM (SELECT * FROM explain_semantic_view('nf_sv', metrics := ['revenue'], dimensions := ['country'], where_clause := 'is_domestic'))
+    AS t(explain_output)
+) WHERE plan LIKE 'WHERE %';
+----
+WHERE o.country = 'US'
+
+# ============================================================
+# Test 6: the flag is declarative metadata, not an access restriction — a filter
+# stays selectable as an ordinary member. Recorded so that if filters are ever
+# hidden from output, it is a deliberate, visible change here.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('nf_sv', metrics := ['revenue'], dimensions := ['is_domestic']);
+----
+false	320.00
+true	250.00
+
+# ============================================================
+# Test 7: LABELS is case-insensitive, the `=` is optional (matching the WITH
+# SYNONYMS relaxation), and it composes with COMMENT / WITH SYNONYMS in any
+# order — including COMMENT *after* WITH SYNONYMS (`comment_last`), which the
+# docs had wrongly described as a parse error. The annotation region is
+# order-free; it just has to be tiled by recognised clauses.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW nf_forms AS
+  TABLES (
+    o AS nf_orders PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    o.lower_form AS o.country = 'US' labels = (filter),
+    o.no_equals AS o.country = 'US' LABELS (FILTER),
+    o.before_comment AS o.country = 'US' LABELS = (FILTER) COMMENT = 'c',
+    o.after_synonyms AS o.country = 'US' WITH SYNONYMS = ('dom') LABELS = (FILTER),
+    o.comment_last AS o.country = 'US' WITH SYNONYMS = ('d2') COMMENT = 'c2' LABELS = (FILTER)
+  )
+  METRICS (
+    o.revenue AS sum(o.amount)
+  );
+
+query T
+SELECT count(*) FROM describe_semantic_view('nf_forms') WHERE property = 'LABELS';
+----
+5
+
+# The neighbouring annotations survive alongside LABELS in either order.
+query TTTTT rowsort
+SELECT * FROM describe_semantic_view('nf_forms')
+  WHERE property IN ('COMMENT', 'SYNONYMS') AND object_kind = 'DIMENSION';
+----
+DIMENSION	after_synonyms	nf_orders	SYNONYMS	["dom"]
+DIMENSION	before_comment	nf_orders	COMMENT	c
+DIMENSION	comment_last	nf_orders	COMMENT	c2
+DIMENSION	comment_last	nf_orders	SYNONYMS	["d2"]
+
+statement ok
+DROP SEMANTIC VIEW nf_forms;
+
+# ============================================================
+# Test 8: an unrecognised label is REJECTED, not ignored. Snowflake's tags and
+# other LABELS values are out of scope, and silently dropping a label the user
+# wrote would let a definition round-trip having quietly lost meaning.
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW nf_bad AS
+  TABLES (o AS nf_orders PRIMARY KEY (id))
+  DIMENSIONS (o.d AS o.country LABELS = (TAG))
+  METRICS (o.revenue AS sum(o.amount));
+----
+Unsupported label 'TAG'
+
+statement error
+CREATE SEMANTIC VIEW nf_bad AS
+  TABLES (o AS nf_orders PRIMARY KEY (id))
+  DIMENSIONS (o.d AS o.country LABELS = ())
+  METRICS (o.revenue AS sum(o.amount));
+----
+LABELS = () is empty
+
+statement error
+CREATE SEMANTIC VIEW nf_bad AS
+  TABLES (o AS nf_orders PRIMARY KEY (id))
+  DIMENSIONS (o.d AS o.country LABELS = (FILTER) LABELS = (FILTER))
+  METRICS (o.revenue AS sum(o.amount));
+----
+Duplicate LABELS annotation
+
+statement error
+CREATE SEMANTIC VIEW nf_bad AS
+  TABLES (o AS nf_orders PRIMARY KEY (id))
+  DIMENSIONS (o.d AS o.country LABELS = (FILTER, TAG))
+  METRICS (o.revenue AS sum(o.amount));
+----
+Unsupported label 'TAG'
+
+# ============================================================
+# Test 9: a filter whose expression is not BOOLEAN is not rejected at define
+# time — we cannot type an expression without a binder, so DuckDB's own type
+# error surfaces at query time rather than a guess at CREATE.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW nf_nonbool AS
+  TABLES (o AS nf_orders PRIMARY KEY (id))
+  DIMENSIONS (o.not_a_bool AS o.country LABELS = (FILTER))
+  METRICS (o.revenue AS sum(o.amount));
+
+statement error
+SELECT * FROM semantic_view('nf_nonbool', metrics := ['revenue'], where_clause := 'not_a_bool');
+----
+to BOOL
+
+statement ok
+DROP SEMANTIC VIEW nf_nonbool;
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW nf_sv;
+
+statement ok
+DROP TABLE nf_orders;

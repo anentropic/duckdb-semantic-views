@@ -144,6 +144,49 @@ In this example:
    ``PRIVATE`` is placed before the table alias (``PRIVATE li.total_cost``), not after the expression. Dimensions do not support access modifiers.
 
 
+.. _howto-annotations-filters:
+
+Mark a Named Filter
+===================
+
+A **named filter** is a boolean-valued fact or dimension meant to be reused in a query's pre-aggregation predicate instead of selected as output. Declare one by adding ``LABELS = (FILTER)`` after the expression:
+
+.. code-block:: sql
+   :emphasize-lines: 7,10
+
+   CREATE SEMANTIC VIEW sales AS
+   TABLES (
+       o AS orders PRIMARY KEY (id)
+   )
+   FACTS (
+       o.amount AS o.amount,
+       o.is_large AS o.amount > 100 LABELS = (FILTER)
+   )
+   DIMENSIONS (
+       o.is_domestic AS o.country = 'US' LABELS = (FILTER)
+   )
+   METRICS (
+       o.revenue AS SUM(o.amount)
+   );
+
+Reference the filter by name in :ref:`where_clause <ref-semantic-view-function>`, which applies it *before* the metrics aggregate:
+
+.. code-block:: sql
+
+   SELECT * FROM semantic_view('sales', metrics := ['revenue'], where_clause := 'is_domestic AND is_large');
+
+The label is **declarative metadata**, not an access restriction or a resolution rule:
+
+- ``where_clause`` already substitutes any declared fact or dimension name, labelled or not. The label records that the member *exists to be filtered on*, and surfaces it in :ref:`DESCRIBE <ref-describe-semantic-view>` and ``GET_DDL`` for discoverability.
+- A filter is still a queryable member. ``dimensions := ['is_domestic']`` returns its boolean values like any other dimension. To hide a member from queries, use ``PRIVATE`` (facts only) instead.
+
+.. note::
+
+   The ``BOOLEAN`` requirement is checked by DuckDB's binder at **query** time, not at ``CREATE``. Typing an arbitrary SQL expression requires a binder, so a filter over a non-boolean expression is created successfully and raises DuckDB's own type error the first time it is used in a predicate.
+
+``FILTER`` is the only supported label. Any other value (Snowflake's tags, for instance) is rejected at ``CREATE`` rather than silently dropped, so a definition cannot round-trip having quietly lost a label you wrote.
+
+
 .. _howto-annotations-inspect:
 
 Inspect Annotations
@@ -162,6 +205,7 @@ Look for these property rows:
 
 - ``COMMENT`` -- the comment text (conditional, only when set)
 - ``SYNONYMS`` -- JSON array of synonyms (conditional, only when set)
+- ``LABELS`` -- ``["FILTER"]`` for a :ref:`named filter <howto-annotations-filters>` (conditional, only on labelled facts and dimensions)
 - ``ACCESS_MODIFIER`` -- ``PUBLIC`` or ``PRIVATE`` (always emitted for facts and metrics)
 - ``NON_ADDITIVE_BY`` -- non-additive dimension list (conditional, only for semi-additive metrics)
 - ``WINDOW_SPEC`` -- reconstructed OVER clause (conditional, only for window metrics)
@@ -202,5 +246,11 @@ Troubleshooting
 **Synonyms not affecting query resolution**
    Synonyms are informational metadata only. They do not expand the set of names recognized by :ref:`semantic_view() <ref-semantic-view-function>` or :ref:`explain_semantic_view() <ref-explain-semantic-view>`. Use the declared name to query an item.
 
-**COMMENT and WITH SYNONYMS order**
-   When both are present on the same entry, ``COMMENT`` must come before ``WITH SYNONYMS``. The reverse order produces a parse error.
+**COMMENT, WITH SYNONYMS and LABELS order**
+   The annotations on one entry may appear in any order -- ``o.region AS o.region WITH SYNONYMS = ('territory') COMMENT = 'c'`` parses the same as the reverse. What the parser does require is that the annotation region be *tiled* by recognized clauses: once the first annotation keyword is seen, everything after it must be a valid ``COMMENT`` / ``WITH SYNONYMS`` / ``LABELS`` clause separated by whitespace. Leftover text (``COMMENT = 'a' banana``) or a repeated clause is an error rather than being silently dropped.
+
+**Unsupported label**
+   ``FILTER`` is the only value accepted in ``LABELS = (...)``. Snowflake's tags and other label values are rejected at ``CREATE`` -- deliberately, so a definition cannot round-trip having quietly lost a label. Remove the unsupported value to create the view.
+
+**A named filter still shows up in query output**
+   Expected. ``LABELS = (FILTER)`` declares intent and drives introspection; it does not hide the member. Use ``PRIVATE`` (facts and metrics only) to make an item unqueryable.
