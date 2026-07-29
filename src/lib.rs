@@ -692,7 +692,14 @@ mod tests {
     }
 
     /// Recursively collects `*.py` files, skipping vendored, hidden and build
-    /// directories (the same exclusions the version-monitor's `find` applies).
+    /// directories.
+    ///
+    /// These exclusions are deliberately *wider* than the version-monitor's
+    /// `find`, which only skips `./extension-ci-tools/*` and `./.venv/*`. That
+    /// direction is the safe one: everything scanned here is also something the
+    /// monitor rewrites, so the caller's assertion can never fail on a file the
+    /// monitor would not have fixed. Widening the monitor's exclusions instead —
+    /// or narrowing these below the monitor's — would break that property.
     fn collect_py_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         const SKIP_DIRS: [&str; 4] = ["target", "build", "extension-ci-tools", "node_modules"];
         let Ok(entries) = std::fs::read_dir(dir) else {
